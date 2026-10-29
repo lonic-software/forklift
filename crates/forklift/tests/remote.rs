@@ -5442,6 +5442,422 @@ fn a_cache_franchise_is_a_partial_warehouse() {
     assert!(!area.path("both").exists(), "nothing was created");
 }
 
+/// The parcels of `head`'s history, newest first, each with its root tree, read from `directory`.
+fn history_with_roots(area: &TestArea, directory: &str, head: &str) -> Vec<(String, String)> {
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path(directory));
+    let mut history = Vec::new();
+    let mut frontier = vec![head.to_string()];
+    let mut seen = std::collections::HashSet::new();
+
+    while let Some(hash) = frontier.pop() {
+        if !seen.insert(hash.clone()) {
+            continue;
+        }
+
+        let parcel = forklift_core::util::object_utils::load_parcel(&hash).unwrap();
+        history.push((hash, parcel.tree_hash.clone()));
+        frontier.extend(parcel.parents);
+    }
+
+    history
+}
+
+/// Whether every tree and blob below `tree` is present in `directory`'s store.
+fn closure_present(area: &TestArea, directory: &str, tree: &str) -> bool {
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path(directory));
+    let mut frontier = vec![tree.to_string()];
+
+    while let Some(hash) = frontier.pop() {
+        if !forklift_core::util::file_utils::does_object_exist(&hash).unwrap() {
+            return false;
+        }
+
+        let tree = forklift_core::util::object_utils::load_tree(&hash).unwrap();
+
+        for (_, file) in tree.get_files() {
+            if !forklift_core::util::file_utils::does_object_exist(&file.hash).unwrap() {
+                return false;
+            }
+        }
+
+        frontier.extend(tree.get_subtrees().map(|(_, subtree)| subtree.hash.clone()));
+    }
+
+    true
+}
+
+/// Whether `hash` is in `directory`'s store, loose or packed.
+fn object_held(area: &TestArea, directory: &str, hash: &str) -> bool {
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path(directory));
+    forklift_core::util::file_utils::does_object_exist(hash).unwrap()
+}
+
+/// `directory`'s sealed record, compared against exactly `hashes`.
+fn assert_record_is(area: &TestArea, directory: &str, hashes: &[&str]) {
+    use forklift_core::util::sealed_utils;
+
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path(directory));
+    let mut expected = sealed_utils::header_bytes();
+    for hash in hashes {
+        expected.extend(sealed_utils::encode_frame(sealed_utils::SealOp::Record, hash).unwrap());
+    }
+
+    assert_eq!(sealed_utils::read_sealed().unwrap(), sealed_utils::parse(&expected).unwrap().set,
+        "the record must name exactly {:?}", hashes);
+}
+
+/// A remote whose `main` holds three signed parcels with three different trees, each with a
+/// subdirectory, and the area's working copy `a` at its head. Returns the server and the head.
+fn three_signed_parcels(area: &TestArea) -> (Server, String) {
+    let server = Server::start(area, None);
+    prepare_warehouse(area, "a", &server.url);
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+
+    for version in ["one", "two", "three"] {
+        area.write_file("a/src/code.txt", &format!("{}\n", version));
+        area.write_file(&format!("a/docs/{}.txt", version), "notes\n");
+        assert_success(&area.forklift("a", &["load", "."]));
+        assert_success(&area.forklift("a", &["stack", version]));
+    }
+    assert_success(&area.forklift("a", &["lift"]));
+
+    let head = pallet_head(area, "server-root", "main");
+    (server, head)
+}
+
+/// A cache franchise holds every parcel and signature sidecar of the history it fetches, and the
+/// whole closure of the head it checks out; of every other parcel it records the root tree in the
+/// sealed record instead of fetching it, so `audit` passes and counts them held by hash. The meta
+/// pallets are fetched whole. A full franchise of the same remote is the baseline that holds every
+/// root, so the fixture's roots are distinct and absent only because the cache skipped them.
+///
+/// Revert: push each parcel's root into the cache walk's tree frontier → the older roots are
+/// present and the record is empty; skip the record → the franchise's ref write is refused; skip
+/// the tip's content fetch → nothing is checked out.
+#[test]
+fn a_cache_franchise_holds_the_parcels_and_its_tip_and_records_the_rest() {
+    let area = TestArea::new("cache-fetch");
+    let (server, head) = three_signed_parcels(&area);
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "full"]));
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_eq!(area.read_file("cached/src/code.txt"), "three\n");
+
+    let history = history_with_roots(&area, "full", &head);
+    let tip_root = history[0].1.clone();
+    let older: Vec<&str> = history[1..].iter().map(|(_, root)| root.as_str()).filter(|root| *root != tip_root).collect();
+    assert!(older.len() >= 2, "the fixture's older parcels have roots of their own: {:?}", history);
+
+    let mut signed = 0;
+    for (parcel, root) in &history {
+        assert!(object_held(&area, "cached", parcel), "every parcel is held: {}", parcel);
+        assert!(closure_present(&area, "full", root), "the baseline holds every root");
+
+        let sidecar = format!(".forklift/objects/{}/{}.sig", &parcel[0..2], &parcel[2..]);
+        if area.path(&format!("full/{}", sidecar)).exists() {
+            signed += 1;
+            assert!(area.path(&format!("cached/{}", sidecar)).exists(), "every sidecar is held: {}", parcel);
+        }
+    }
+    assert!(signed >= 3, "the fixture's parcels are signed");
+
+    assert!(closure_present(&area, "cached", &tip_root), "the tip's whole closure is held");
+    for root in &older {
+        assert!(!object_held(&area, "cached", root), "an older root is not fetched: {}", root);
+    }
+    assert_record_is(&area, "cached", &older);
+
+    let audit = area.forklift("cached", &["--json", "audit"]);
+    assert_success(&audit);
+    let scope = &json_of(&audit)["data"]["scope"];
+    assert_eq!(scope["held_by_hash"], older.len(), "{}", stdout(&audit));
+    assert!(scope.get("present_and_recorded").is_none(), "{}", stdout(&audit));
+
+    // The meta pallets are fetched whole, whatever the mode.
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("cached"));
+    let meta: Vec<String> = forklift_core::util::pallet_utils::all_pallet_refs().unwrap().into_iter()
+        .filter(|(pallet, _)| pallet.namespace != forklift_core::util::pallet_utils::PalletNamespace::User)
+        .map(|(_, head)| head)
+        .collect();
+    drop(_scope);
+    assert!(!meta.is_empty(), "the signed remote has an office pallet");
+    for meta_head in &meta {
+        for (parcel, root) in history_with_roots(&area, "cached", meta_head) {
+            assert!(closure_present(&area, "cached", &root), "a meta parcel's content is held whole: {}", parcel);
+        }
+    }
+}
+
+/// `lower` in a cache checks out the remote's new head, so it fetches that head's whole closure and
+/// records the root of every other new parcel; the root of the tip it moved from stays held.
+///
+/// Revert: skip lower's content fetch → the checkout fails on the new head's absent root.
+#[test]
+fn a_cache_lower_fetches_the_new_tip_and_records_what_it_skips() {
+    let area = TestArea::new("cache-lower");
+    let (server, old_head) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    let old_root = history_with_roots(&area, "cached", &old_head)[0].1.clone();
+    let recorded_before: Vec<String> = history_with_roots(&area, "cached", &old_head)[1..].iter()
+        .map(|(_, root)| root.clone()).filter(|root| *root != old_root).collect();
+
+    for version in ["four", "five"] {
+        area.write_file("a/src/code.txt", &format!("{}\n", version));
+        assert_success(&area.forklift("a", &["load", "."]));
+        assert_success(&area.forklift("a", &["stack", version]));
+    }
+    assert_success(&area.forklift("a", &["lift"]));
+    let new_head = pallet_head(&area, "server-root", "main");
+
+    assert_success(&area.forklift("cached", &["lower"]));
+    assert_eq!(area.read_file("cached/src/code.txt"), "five\n");
+    assert_eq!(pallet_head(&area, "cached", "main"), new_head);
+
+    let history = history_with_roots(&area, "cached", &new_head);
+    let (new_root, between_root) = (history[0].1.clone(), history[1].1.clone());
+    assert!(closure_present(&area, "cached", &new_root), "the new tip's closure is held");
+    assert!(!object_held(&area, "cached", &between_root), "the parcel between is recorded, not fetched");
+    assert!(closure_present(&area, "cached", &old_root), "the tip lowered from stays held");
+
+    let mut expected: Vec<&str> = recorded_before.iter().map(String::as_str).collect();
+    expected.push(&between_root);
+    assert_record_is(&area, "cached", &expected);
+    assert_success(&area.forklift("cached", &["audit"]));
+}
+
+/// A cache fetch records the roots it skips before it returns, so before any caller can move a ref
+/// onto the head: run in-process with no ref write after it, the record already names the new
+/// head's root, and the ref has not moved.
+///
+/// Revert: record the roots after returning (or not at all) → the record lacks the root here.
+#[test]
+fn a_cache_fetch_records_before_it_returns() {
+    let area = TestArea::new("cache-record-order");
+    let (server, old_head) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+
+    area.write_file("a/src/code.txt", "four\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "four"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    let new_head = pallet_head(&area, "server-root", "main");
+
+    cache_fetch_in_process(&area, "cached", &server.url, &new_head);
+
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("cached"));
+    let new_root = forklift_core::util::object_utils::load_parcel(&new_head).unwrap().tree_hash;
+    assert!(!forklift_core::util::file_utils::does_object_exist(&new_root).unwrap(), "a recorded head's root is not fetched");
+    assert!(forklift_core::util::sealed_utils::read_sealed().unwrap().contains(&new_root),
+        "the root is recorded when the fetch returns");
+    drop(_scope);
+
+    assert_eq!(pallet_head(&area, "cached", "main"), old_head, "the fetch moves no ref");
+}
+
+/// A lift from a cache onto a diverged remote auto-merges: the merge reads the remote head's tree,
+/// so the fetch before it brings that head's whole closure, and the merged parcel lifts.
+///
+/// Revert: skip the auto-merge's content fetch → the merge cannot read the remote's tree.
+#[test]
+fn a_cache_lift_auto_merges_a_diverged_remote() {
+    let area = TestArea::new("cache-auto-merge");
+    let (server, _) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+
+    area.write_file("a/from_a.txt", "a\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "a's file"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    let theirs = pallet_head(&area, "server-root", "main");
+
+    area.write_file("cached/from_cache.txt", "cache\n");
+    assert_success(&area.forklift("cached", &["load", "."]));
+    assert_success(&area.forklift("cached", &["stack", "the cache's file"]));
+    let lifted = area.forklift("cached", &["lift"]);
+    assert_success(&lifted);
+    assert!(stdout(&lifted).contains("auto-merged"), "{}", stdout(&lifted));
+    assert_eq!(area.read_file("cached/from_a.txt"), "a\n");
+
+    let their_root = history_with_roots(&area, "cached", &theirs)[0].1.clone();
+    assert!(closure_present(&area, "cached", &their_root), "the merged-in head's closure is held");
+    assert_success(&area.forklift("cached", &["audit"]));
+}
+
+/// Fetch `head` into `directory` in-process, as a cache fetch that no ref write follows.
+fn cache_fetch_in_process(area: &TestArea, directory: &str, url: &str, head: &str) {
+    // A current-thread runtime: the fetch spawns its transfers, and the storage scope is a
+    // thread-local, so the tasks must stay on this thread.
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path(directory));
+    let client = forklift_core::util::remote_utils::RemoteClient::new(url, None).unwrap();
+
+    runtime.block_on(forklift_core::util::remote_utils::fetch_history_scoped(&client, head, "main", &Progress::NONE))
+        .expect("fetch");
+}
+
+/// The parcel of the remote's head can already be in a cache with its root only recorded, when a
+/// fetch that checked nothing out brought it. A lift that auto-merges that head still fetches its
+/// content, since the merge reads it.
+///
+/// Revert: fetch the head's content only when its parcel is absent → the merge cannot read the
+/// remote's tree.
+#[test]
+fn a_cache_auto_merge_fetches_a_held_parcels_content() {
+    let area = TestArea::new("cache-merge-held");
+    let (server, _) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+
+    area.write_file("a/from_a.txt", "a\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "a's file"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    let theirs = pallet_head(&area, "server-root", "main");
+
+    cache_fetch_in_process(&area, "cached", &server.url, &theirs);
+    let their_root = history_with_roots(&area, "cached", &theirs)[0].1.clone();
+    assert!(!object_held(&area, "cached", &their_root), "the fixture holds their parcel without its root");
+
+    area.write_file("cached/from_cache.txt", "cache\n");
+    assert_success(&area.forklift("cached", &["load", "."]));
+    assert_success(&area.forklift("cached", &["stack", "the cache's file"]));
+    let lifted = area.forklift("cached", &["lift"]);
+    assert_success(&lifted);
+    assert!(stdout(&lifted).contains("auto-merged"), "{}", stdout(&lifted));
+    assert_eq!(area.read_file("cached/from_a.txt"), "a\n");
+    assert!(closure_present(&area, "cached", &their_root), "the merged-in head's closure is held");
+}
+
+/// A `lower` that finds the remote diverged is refused with a next step that checks the remote
+/// head out on a pallet of its own, so a cache fetches that head's content before refusing, and
+/// the next step works through to a lift.
+///
+/// Revert: fetch the head's content only past the divergence check → `palletize` cannot check the
+/// remote head out.
+#[test]
+fn a_diverged_cache_lower_leaves_its_next_step_workable() {
+    let area = TestArea::new("cache-lower-diverged");
+    let (server, _) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+
+    area.write_file("a/from_a.txt", "a\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "a's file"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    let theirs = pallet_head(&area, "server-root", "main");
+
+    area.write_file("cached/from_cache.txt", "cache\n");
+    assert_success(&area.forklift("cached", &["load", "."]));
+    assert_success(&area.forklift("cached", &["stack", "the cache's file"]));
+    let lowered = area.forklift("cached", &["lower"]);
+    assert!(!lowered.status.success(), "a diverged lower is refused: {}", stdout(&lowered));
+
+    let short = &theirs[..12];
+    let side = format!("main-remote-{}", short);
+    assert_success(&area.forklift("cached", &["palletize", &side, short]));
+    assert_eq!(area.read_file("cached/from_a.txt"), "a\n");
+    assert_success(&area.forklift("cached", &["shift", "main"]));
+    assert_success(&area.forklift("cached", &["consolidate", &side]));
+    assert_success(&area.forklift("cached", &["lift"]));
+    assert_success(&area.forklift("cached", &["audit"]));
+}
+
+/// A lift onto a diverged remote from a dirty cache does not auto-merge, and is refused with the
+/// same next step as a diverged lower; the remote head's content is fetched for it all the same.
+///
+/// Revert: fetch the head's content only once the warehouse is found clean → the remote head's
+/// root stays absent after the refusal.
+#[test]
+fn a_dirty_cache_lift_fetches_the_diverged_heads_content() {
+    let area = TestArea::new("cache-lift-dirty");
+    let (server, _) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+
+    area.write_file("a/from_a.txt", "a\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "a's file"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    let theirs = pallet_head(&area, "server-root", "main");
+
+    area.write_file("cached/from_cache.txt", "cache\n");
+    assert_success(&area.forklift("cached", &["load", "."]));
+    assert_success(&area.forklift("cached", &["stack", "the cache's file"]));
+    area.write_file("cached/src/code.txt", "edited, not loaded\n");
+    let lifted = area.forklift("cached", &["lift"]);
+    assert!(!lifted.status.success(), "a dirty diverged lift is refused: {}", stdout(&lifted));
+
+    let their_root = history_with_roots(&area, "cached", &theirs)[0].1.clone();
+    assert!(closure_present(&area, "cached", &their_root), "the diverged head's content is held");
+}
+
+/// A content fetch that fails partway has stored its root and some trees but not what lies below
+/// them. Before it returns the error it records those absences, so the closure is whole up to the
+/// record. No ref moved, so the closing audit only shows the failure left nothing else behind.
+///
+/// Revert: return the fill's error without recording → the missing file is not recorded.
+#[test]
+fn a_failed_cache_fill_records_what_it_left_absent() {
+    let area = TestArea::new("cache-fill-fails");
+    let (server, _) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+
+    area.write_file("a/docs/deep/lost.txt", "the remote loses this\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "four"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    let new_head = pallet_head(&area, "server-root", "main");
+
+    let lost = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("a"));
+        let mut tree = forklift_core::util::object_utils::load_parcel(&new_head).unwrap().tree_hash;
+        for directory in ["docs", "deep"] {
+            let next = forklift_core::util::object_utils::load_tree(&tree).unwrap().get_subtrees()
+                .find(|(name, _)| name.as_str() == directory).map(|(_, subtree)| subtree.hash.clone());
+            tree = next.expect("the fixture's directory");
+        }
+        let file = forklift_core::util::object_utils::load_tree(&tree).unwrap().get_files()
+            .find(|(name, _)| name.as_str() == "lost.txt").map(|(_, file)| file.hash.clone());
+        file.expect("the fixture's file")
+    };
+    std::fs::remove_file(object_store_path(&area, "server-root", &lost)).expect("the server holds the file loose");
+
+    let lowered = area.forklift("cached", &["lower"]);
+    assert!(!lowered.status.success(), "the fill fails: {}", stdout(&lowered));
+    assert_ne!(pallet_head(&area, "cached", "main"), new_head, "no ref moved");
+
+    let new_root = history_with_roots(&area, "cached", &new_head)[0].1.clone();
+    assert!(object_held(&area, "cached", &new_root), "the fill stored the root before failing");
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("cached"));
+    assert!(forklift_core::util::sealed_utils::read_sealed().unwrap().contains(&lost), "the missing file is recorded");
+    drop(_scope);
+    assert_success(&area.forklift("cached", &["audit"]));
+}
+
+/// A root can be present while objects beneath it are absent, when a fetch of its closure stopped
+/// partway. Recording what a fetch skips then records those absences, not the root.
+///
+/// Revert: record only absent roots → the record lacks the absent subtree.
+#[test]
+fn recording_a_present_root_records_what_is_absent_beneath_it() {
+    let area = TestArea::new("cache-record-beneath");
+    let (server, head) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("cached"));
+    let root = forklift_core::util::object_utils::load_parcel(&head).unwrap().tree_hash;
+    let subtree = forklift_core::util::object_utils::load_tree(&root).unwrap().get_subtrees()
+        .map(|(_, subtree)| subtree.hash.clone()).next().expect("the fixture's root has a subdirectory");
+
+    let loose = area.path(&format!("cached/.forklift/objects/{}/{}", &subtree[0..2], &subtree[2..]));
+    std::fs::remove_file(&loose).expect("the subtree is loose");
+    assert!(!forklift_core::util::file_utils::does_object_exist(&subtree).unwrap());
+    assert!(!forklift_core::util::sealed_utils::read_sealed().unwrap().contains(&subtree));
+
+    forklift_core::util::sealed_utils::record_absences_under(&[root.clone(), root.clone()]).unwrap();
+    let after = forklift_core::util::sealed_utils::read_sealed().unwrap();
+    assert!(after.contains(&subtree), "the absent subtree is recorded");
+    assert!(!after.contains(&root), "the present root is not");
+}
+
 #[test]
 fn lift_and_franchise_round_trip_a_chunked_file() {
     // Chunk transport, end to end (§9.4b Stage 3). A chunk-aware server advertises `chunking` on

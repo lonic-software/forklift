@@ -514,6 +514,70 @@ pub fn append_locked(lock: &RefLock, ops: &[(SealOp, &str)]) -> Result<SealedSet
     append_decided_locked(lock, |_| Ok(ops))
 }
 
+/// Record every absence in the closures of `roots` the record does not already hold: a root that
+/// is absent itself, and beneath one that is present, every absent object its present closure
+/// reaches. A root can be present above absent subtrees and blobs when a fetch of its closure
+/// stopped partway. The closures are walked before the ref lock is taken, then what is already
+/// recorded is judged on the record as it is re-read under the lock, so a concurrent writer's
+/// entry is not written twice. Synced when this returns, as [`append_locked`] is; nothing is
+/// written when nothing is absent.
+///
+/// # Returns
+/// * `Ok(())`      - Every absence is recorded.
+/// * `Err(String)` - If a present closure cannot be walked, or as [`append_locked`].
+pub fn record_absences_under(roots: &[String]) -> Result<(), String> {
+    let mut absent: Vec<String> = Vec::new();
+    let mut closed: HashSet<String> = HashSet::new();
+
+    for root in roots {
+        if !is_present(root)? {
+            absent.push(root.clone());
+        } else if !closed.contains(root) {
+            let walk = closure_absences(root, &closed)
+                .map_err(|why| format!("Could not walk the content of {}: {}", root, why))?;
+            absent.extend(walk.absent);
+            closed.extend(walk.walked);
+        }
+    }
+
+    if absent.is_empty() {
+        return Ok(());
+    }
+
+    let lock = RefLock::acquire()?;
+
+    append_decided_locked(&lock, |set| {
+        let mut written: HashSet<&str> = HashSet::new();
+
+        Ok(absent.iter()
+            .filter(|hash| !set.contains(hash) && written.insert(hash.as_str()))
+            .map(|hash| (SealOp::Record, hash.clone()))
+            .collect())
+    })?;
+
+    Ok(())
+}
+
+/// Remove the records of those of `filled` the record holds, under a ref lock it takes and
+/// releases. Unlike [`unseal`] this pushes nothing down, so the caller must have just made the
+/// whole closure of each present: every tree and file of it, not a part. Judged
+/// on the record as it is re-read under the lock; nothing is written when none is recorded.
+///
+/// # Returns
+/// * `Ok(())`      - None of `filled` is recorded.
+/// * `Err(String)` - As [`append_locked`].
+pub fn forget_filled<'a>(filled: impl Iterator<Item = &'a String>) -> Result<(), String> {
+    let lock = RefLock::acquire()?;
+
+    append_decided_locked(&lock, |set| {
+        Ok(filled.filter(|hash| set.contains(hash))
+            .map(|hash| (SealOp::Remove, hash.clone()))
+            .collect())
+    })?;
+
+    Ok(())
+}
+
 /// [`append_locked`] with the ops decided from the set the record replays to when it is re-read
 /// under the lock, so a decision about what is recorded is made on what is recorded.
 fn append_decided_locked(

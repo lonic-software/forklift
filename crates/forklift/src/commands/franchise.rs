@@ -579,11 +579,13 @@ async fn franchise_into_prepared_target(
 
     // The pallet's history is fetched and verified against the anchor the remote serves before
     // that anchor, its office or a meta pallet is installed, so a refusal leaves no trust behind.
-    // At the scope this franchise asks for, which is not on disk yet.
+    // At the scope this franchise asks for, which is not on disk yet. A cache fetches the parcels and
+    // records their content, then fetches the verified head's own content, which it checks out.
     let fetched = match &remote_head {
         Some(remote_head) => {
-            let stats = remote_utils::fetch_history_at(client, remote_head, &pallet_name, &fetch_scope, &Progress::NONE).await?;
+            let mut stats = remote_utils::fetch_history_at(client, remote_head, &pallet_name, &fetch_scope, &Progress::NONE).await?;
             take_utils::verify_take(Some(client), &take_trust, remote_head, &pallet_name, FetchAt::Scope(&fetch_scope)).await?;
+            stats.add(&remote_utils::fetch_head_content(client, remote_head, &Progress::NONE).await?);
             Some(stats)
         }
         // Unborn on the remote: no history to judge.

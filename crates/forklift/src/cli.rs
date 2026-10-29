@@ -348,8 +348,11 @@ pub enum Command {
                          history reaches. It is then treated as partial: a server never serves \
                          it, it lifts only to the remote it was franchised from, \"mirror\" and \
                          \"expand\" refuse, and \"audit\" checks the content it holds. The \
-                         remote's bundle is skipped. Fetching less is not built yet: today the \
-                         whole history is still fetched. Cannot be combined with --only."
+                         remote's bundle is skipped. It fetches every parcel and signature of the \
+                         history, and the content of the head it checks out; the content of \
+                         older history stays with the remote, recorded by hash. Reading content \
+                         it lacks is not built yet: such a read fails. Cannot be combined with \
+                         --only."
         )]
         cache: bool,
 

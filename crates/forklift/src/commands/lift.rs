@@ -258,7 +258,8 @@ async fn try_auto_merge(client: &RemoteClient,
                         progress: &Progress) -> Result<bool, String> {
     // Their work must be local before we can compare ancestry or merge it. Path-pruned in a
     // sparse workspace (a full fetch scope makes this the whole closure, as before), so an
-    // optimistic auto-merge stays as sparse as the workspace it runs in.
+    // optimistic auto-merge stays as sparse as the workspace it runs in. A cache fetches only
+    // the parcels here, and their head's content below, once their history is verified.
     if !file_utils::does_object_exist(remote_head)? {
         remote_utils::fetch_history_scoped(client, remote_head, pallet, progress).await?;
     }
@@ -281,6 +282,11 @@ async fn try_auto_merge(client: &RemoteClient,
     // Their work becomes a parent of the merge parcel, so it is verified before anything is
     // merged. The merge's own write is conditioned by `stack`, which judges it again.
     take_utils::verify_take(Some(client), &TakeTrust::local()?, remote_head, pallet, FetchAt::Warehouse).await?;
+
+    // The merge reads their head's content, and so does the diverged refusal's next step when no
+    // merge happens here. In a cache it may be absent even when the parcel was already here: a
+    // fetch that did not check that head out recorded its root instead.
+    remote_utils::fetch_head_content(client, remote_head, progress).await?;
 
     // Merging materializes into the working directory, so only a clean warehouse qualifies.
     let our_tree = object_utils::load_parcel(head)?.tree_hash;
