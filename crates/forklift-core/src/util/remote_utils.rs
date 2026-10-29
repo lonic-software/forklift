@@ -6111,6 +6111,8 @@ async fn fetch_missing_signatures(client: &RemoteClient,
 /// * `remote_head` - The remote's current head of the pallet (from the handshake).
 /// * `tombstone`   - With no `remote_head`, the head of the remote's tombstone of the pallet, which
 ///                   the creation acknowledges (see [`acknowledged_tombstone`]).
+/// * `info`        - The handshake: the remote's other heads, which bound the walk, and whether it
+///                   takes chunked files.
 /// * `progress`    - Where to report the lift's phases and how many objects have uploaded.
 ///
 /// # Returns
@@ -6121,9 +6123,9 @@ pub async fn lift_pallet(client: &RemoteClient,
                          local_head: &str,
                          remote_head: Option<&str>,
                          tombstone: Option<&str>,
-                         chunking_supported: bool,
+                         info: &WarehouseInfo,
                          progress: &Progress) -> Result<LiftResult, String> {
-    lift_pallet_inner(client, pallet, local_head, remote_head, tombstone, false, chunking_supported, progress).await
+    lift_pallet_inner(client, pallet, local_head, remote_head, tombstone, false, info, progress).await
 }
 
 /// The tombstone a lift of user pallet `pallet` from `local_head` acknowledges, when the remote
@@ -6191,7 +6193,7 @@ async fn lift_pallet_inner(client: &RemoteClient,
                            remote_head: Option<&str>,
                            tombstone: Option<&str>,
                            adopted_reset: bool,
-                           chunking_supported: bool,
+                           info: &WarehouseInfo,
                            progress: &Progress) -> Result<LiftResult, String> {
     if remote_head == Some(local_head) {
         return Ok(LiftResult::UpToDate);
@@ -6232,7 +6234,8 @@ async fn lift_pallet_inner(client: &RemoteClient,
     let (new_parcels, uploaded_objects, uploaded_signatures) =
         // An acknowledged tombstone's head is held on the remote (a gc root), so a re-creation
         // uploads only the work past it.
-        upload_history(client, local_head, remote_head.or(tombstone), chunking_supported, progress).await?;
+        upload_history(client, local_head, remote_head.or(tombstone), &held_elsewhere(info, pallet)?, info.chunking,
+                       progress).await?;
 
     client.update_ref(pallet, remote_head, local_head, tombstone).await?;
 
@@ -6294,6 +6297,20 @@ pub fn diverged_refusal(pallet: &str, remote_head: &str) -> CoreError {
     )
 }
 
+/// The heads the remote holds history from, other than `pallet`'s own, whose parcel is present
+/// here: a lift's parcel walk stops at them ([`new_parcels_parents_first`]).
+fn held_elsewhere(info: &WarehouseInfo, pallet: &str) -> Result<Vec<String>, String> {
+    let mut heads = Vec::new();
+
+    for (name, head) in info.held_pallet_heads() {
+        if name != pallet && !heads.contains(&head) && file_utils::does_object_exist(&head)? {
+            heads.push(head);
+        }
+    }
+
+    Ok(heads)
+}
+
 /// Upload the history `local_head` reaches and the remote does not — every parcel past
 /// `remote_head` (all of them when `None`), its objects and its signatures — without moving any
 /// ref. [`lift_pallet_inner`] follows it with the ref update; [`push_local_trust`] uses it alone
@@ -6305,6 +6322,7 @@ pub fn diverged_refusal(pallet: &str, remote_head: &str) -> CoreError {
 async fn upload_history(client: &RemoteClient,
                         local_head: &str,
                         remote_head: Option<&str>,
+                        elsewhere: &[String],
                         chunking_supported: bool,
                         progress: &Progress) -> Result<(usize, usize, usize), String> {
     // The new parcels the remote does not have, ordered parents-first — see
@@ -6312,7 +6330,7 @@ async fn upload_history(client: &RemoteClient,
     // loop below depends on.
     progress.status("Finding objects to lift");
 
-    let new_parcels = new_parcels_parents_first(local_head, remote_head)?;
+    let new_parcels = new_parcels_parents_first(local_head, remote_head, elsewhere)?;
 
     // Candidate objects for the negotiation: each new parcel's tree, walked against
     // its parents' trees — a subtree identical to *any* parent's at the same path is
@@ -6323,9 +6341,6 @@ async fn upload_history(client: &RemoteClient,
     let mut seen_trees: HashSet<String> = HashSet::new();
     let mut seen_blobs: HashSet<String> = HashSet::new();
     let mut seen_recipes: HashSet<String> = HashSet::new();
-
-    // A cache holds some of this history's content only by record: see `collect_changed_closure`.
-    let recorded = if scope_utils::is_cache_mode()? { Some(sealed_utils::read_sealed()?) } else { None };
 
     // Parents first, guaranteed by `new_parcels_parents_first`: every parent of the parcel
     // being walked is remote-known or already processed, so everything a base "explains" is
@@ -6347,7 +6362,7 @@ async fn upload_history(client: &RemoteClient,
 
         collect_changed_closure(&parcel.tree_hash, "", &base_trees,
                                 &mut seen_trees, &mut seen_blobs, &mut seen_recipes,
-                                &mut candidates, recorded.as_ref(), chunking_supported)?;
+                                &mut candidates, chunking_supported)?;
     }
 
     // Control-plane objects — parcels, trees, and recipes — are promoted synchronously when a
@@ -6388,13 +6403,15 @@ async fn upload_history(client: &RemoteClient,
 /// The new parcels of a lift — everything reachable from the local head that the remote does
 /// not already have — **ordered parents-first**.
 ///
-/// The walk stops at the remote head and at any ancestor of it (a merge's other side rejoins
-/// below the remote head), so a linear lift touches O(new parcels) and a merge never re-walks
-/// the shared slice. Pruning at every ancestor — not just the remote head hash — is also what
-/// keeps a sparse workspace liftable: an interior parcel the remote already has may carry an
-/// out-of-scope change whose object this workspace never fetched, and re-walking it would try
-/// to load that sealed object. The remote provably has it (it is an ancestor of the remote
-/// head, whose closure is complete there), so it is correctly never uploaded and never walked.
+/// The walk stops at the remote head, at every head in `elsewhere` and at any ancestor of one (a
+/// merge's other side rejoins below the remote head), so a linear lift touches O(new parcels) and
+/// a merge never re-walks the shared slice. The remote holds the whole closure of every head it
+/// lists, not only the lifted pallet's, so a new pallet branched off another one stops
+/// where it branched instead of walking, negotiating and uploading the whole history. Pruning at
+/// every ancestor — not just the head hashes — is also what keeps a partial warehouse liftable: an
+/// interior parcel the remote already has may carry content this warehouse never fetched (out of
+/// a sparse scope, or held by a cache only by hash), and re-walking it would try to load it. The
+/// remote provably has it, so it is correctly never uploaded and never walked.
 ///
 /// The order is the caller's whole reason for this being one function. The candidate walk
 /// prunes each parcel's subtrees against its parents' trees, and it may only do so once those
@@ -6428,19 +6445,21 @@ async fn upload_history(client: &RemoteClient,
 /// # Arguments
 /// * `local_head`  - The local head parcel of the pallet.
 /// * `remote_head` - The remote's current head, if the pallet exists there.
+/// * `elsewhere`   - The remote's other held heads that are present here: see [`held_elsewhere`].
 ///
 /// # Returns
 /// * `Ok(Vec<String>)` - The new parcels, every parcel preceded by all of its in-set parents.
 /// * `Err(String)`     - If a parcel could not be read, or the walked set contains a cycle.
 fn new_parcels_parents_first(local_head: &str,
-                             remote_head: Option<&str>) -> Result<Vec<String>, String> {
+                             remote_head: Option<&str>,
+                             elsewhere: &[String]) -> Result<Vec<String>, String> {
     let mut new_parcels: Vec<String> = Vec::new();
     let mut parents_of: HashMap<String, Vec<String>> = HashMap::new();
     let mut queue: Vec<String> = vec![local_head.to_string()];
     let mut visited: HashSet<String> = HashSet::new();
 
     while let Some(hash) = queue.pop() {
-        if Some(hash.as_str()) == remote_head || !visited.insert(hash.clone()) {
+        if Some(hash.as_str()) == remote_head || elsewhere.contains(&hash) || !visited.insert(hash.clone()) {
             continue;
         }
 
@@ -6448,6 +6467,12 @@ fn new_parcels_parents_first(local_head: &str,
             if merge_utils::is_ancestor(&hash, remote_head)? {
                 continue;
             }
+        }
+
+        // Another head is only a shortcut: one whose ancestry cannot be read here (fetched
+        // before its ancestors) answers "not known", and the parcel is walked as it was before.
+        if elsewhere.iter().any(|head| merge_utils::is_ancestor(&hash, head).unwrap_or(false)) {
+            continue;
         }
 
         let parcel = object_utils::load_parcel(&hash)?;
@@ -6518,19 +6543,9 @@ fn new_parcels_parents_first(local_head: &str,
 /// only by seal. It is scope-agnostic and correct in full stores too — an object pruned against a
 /// parent is provably on the remote (that parent is already there or is uploaded in this session),
 /// exactly the guarantee the first-parent-only walk gave for linear history.
-///
-/// `recorded` is a cache's sealed record. A tree or recipe it records that is absent here is taken
-/// to be on the origin with its closure, the premise the read path's fetch of a recorded object
-/// rests on too, and a cache lifts only to its origin. The walk treats it like a base-explained
-/// one: no candidate, no descent, no read. Without that, a first lift of a new pallet, which walks
-/// the whole history, would fetch every older root only to learn the remote has it. Should the
-/// origin lack one, the remote's closure check refuses the lift, where reading it would have
-/// failed at the fetch. A base is still read when it is absent, through the read path's fetch:
-/// treating its content as changed instead would widen the walk.
 // Three dedup ledgers (trees, blobs/chunks, recipes) plus the candidate accumulator, the path
-// prefix for error naming, the base set, the record, and the chunking capability — each
-// meaningfully distinct and threaded through the recursion, so a parameter object would only
-// obscure them.
+// prefix for error naming, the base set, and the chunking capability — each meaningfully distinct
+// and threaded through the recursion, so a parameter object would only obscure them.
 #[allow(clippy::too_many_arguments)]
 fn collect_changed_closure(tree_hash: &str,
                            path_prefix: &str,
@@ -6539,7 +6554,6 @@ fn collect_changed_closure(tree_hash: &str,
                            seen_blobs: &mut HashSet<String>,
                            seen_recipes: &mut HashSet<String>,
                            candidates: &mut Vec<String>,
-                           recorded: Option<&sealed_utils::SealedSet>,
                            chunking_supported: bool) -> Result<(), String> {
     // Record the visit before checking base-explained, not after: content-addressing means the
     // same subtree hash can recur at another path in the same walk (e.g. a merge adopting one
@@ -6552,7 +6566,7 @@ fn collect_changed_closure(tree_hash: &str,
 
     // Explained by some parent at this path (or already walked): the remote has it, so it needs
     // neither upload nor descent — and, critically, its object is never loaded.
-    if base_tree_hashes.iter().any(|hash| hash == tree_hash) || !first_visit || held_by_record(recorded, tree_hash)? {
+    if base_tree_hashes.iter().any(|hash| hash == tree_hash) || !first_visit {
         return Ok(());
     }
 
@@ -6598,7 +6612,7 @@ fn collect_changed_closure(tree_hash: &str,
 
             // 2. An identical recipe on a parent at this name ⟹ the remote already has that
             //    recipe and its whole chunk closure (a base's closure is complete on the remote).
-            if explained || held_by_record(recorded, &file.hash)? {
+            if explained {
                 continue;
             }
 
@@ -6636,19 +6650,11 @@ fn collect_changed_closure(tree_hash: &str,
             .unwrap_or_default();
 
         collect_changed_closure(&subtree.hash, &join_path(path_prefix, name), &child_bases,
-                                seen_trees, seen_blobs, seen_recipes, candidates, recorded,
+                                seen_trees, seen_blobs, seen_recipes, candidates,
                                 chunking_supported)?;
     }
 
     Ok(())
-}
-
-/// Whether `hash` is in `recorded` and absent from the store: content a cache holds only by record.
-fn held_by_record(recorded: Option<&sealed_utils::SealedSet>, hash: &str) -> Result<bool, String> {
-    match recorded {
-        Some(recorded) if recorded.contains(hash) => Ok(!file_utils::does_object_exist(hash)?),
-        _ => Ok(false),
-    }
 }
 
 /// Join a directory path prefix and an entry name into the entry's warehouse path (`""` prefix
@@ -7765,7 +7771,7 @@ pub async fn push_local_trust(client: &RemoteClient,
         // refuses an anchor whose adopted history it does not hold, and every warehouse that
         // later adopts this anchor fetches that history from it.
         if let Some(adopts) = &local.adopts {
-            upload_history(client, adopts, None, info.chunking, &Progress::NONE).await?;
+            upload_history(client, adopts, None, &[], info.chunking, &Progress::NONE).await?;
         }
         client.put_trust(&TrustAnchorDto::from(&local)).await?;
     }
@@ -7787,9 +7793,7 @@ pub async fn push_local_trust(client: &RemoteClient,
         remote_office_head,
         None,
         adopted_reset,
-        // The office pallet carries only structural, tracked-metadata objects — never a chunked
-        // file — so the capability never actually gates it; threaded honestly all the same.
-        info.chunking,
+        info,
         &Progress::NONE,
     ).await?;
 
@@ -7849,7 +7853,7 @@ pub async fn lift_meta_pallets(client: &RemoteClient,
         let remote_head = info.pallets.get(&wire).map(String::as_str);
 
         // Meta pallets never carry a chunked file; the capability is threaded for uniformity.
-        let result = lift_pallet(client, &wire, &local_head, remote_head, None, info.chunking, &Progress::NONE).await;
+        let result = lift_pallet(client, &wire, &local_head, remote_head, None, info, &Progress::NONE).await;
         lifts.push(MetaPalletLift { pallet: wire, result });
     }
 
@@ -7897,7 +7901,7 @@ pub async fn lift_haul_pallet(client: &RemoteClient,
                  lifts it (lowering it first when the remote's head is not held here), then lift again{}.",
                 haul_utils::describe_held(&held), drop))
         }
-        Ok(_) => lift_pallet(client, &wire, &local_head, remote_head, None, info.chunking, &Progress::NONE).await,
+        Ok(_) => lift_pallet(client, &wire, &local_head, remote_head, None, info, &Progress::NONE).await,
     };
 
     Some(MetaPalletLift { pallet: wire, result })
@@ -8890,7 +8894,7 @@ mod tests {
             })
         };
 
-        let shipped = new_parcels_parents_first(&m, Some(&r))
+        let shipped = new_parcels_parents_first(&m, Some(&r), &[])
             .expect("the walk must succeed on a well-formed DAG");
 
         assert_eq!(shipped.len(), 4, "R is the remote head, so the push carries M, A, B and P");
@@ -8950,7 +8954,7 @@ mod tests {
         let a = stack(vec![r.clone()], "A new");
         let m = stack(vec![a.clone()], "M head");
 
-        let walked = new_parcels_parents_first(&m, Some(&r));
+        let walked = new_parcels_parents_first(&m, Some(&r), &[]);
         assert!(
             walked.is_err(),
             "the walk itself must fail on an unreadable ancestor of the remote head — if this \
@@ -8965,6 +8969,28 @@ mod tests {
             via_generation.is_err(),
             "the generation route must fail on the same absent ancestor, not survive it"
         );
+    }
+
+    /// The walk stops at another head the remote holds and at its ancestors, so a new pallet
+    /// sends only what lies past where it branched. A head whose ancestry cannot be read here
+    /// is only a shortcut lost: the walk answers "not known" and goes on, as it would without it.
+    ///
+    /// Revert: ignore `elsewhere` → `B` and `R` are walked too; propagate the other head's
+    /// ancestry error → the walk fails.
+    #[test]
+    fn the_walk_stops_at_another_held_head_and_walks_past_an_unreadable_one() {
+        let _scratch = Scratch::new("walk-held-elsewhere");
+
+        let b = stack(vec![], "B base");
+        let r = stack(vec![b.clone()], "R another pallet's head");
+        let n = stack(vec![r.clone()], "N new");
+
+        assert_eq!(new_parcels_parents_first(&n, None, &[r.clone()]).unwrap(), vec![n.clone()]);
+        assert_eq!(new_parcels_parents_first(&n, None, &[]).unwrap().len(), 3);
+
+        let unreadable = stack(vec!["f".repeat(64)], "U a head over an absent parent");
+        let walked = new_parcels_parents_first(&n, None, &[unreadable]).unwrap();
+        assert_eq!(walked, vec![b, r, n]);
     }
 
     /// The lift closure walk prunes a subtree against **every** parent, not just the
@@ -9005,7 +9031,7 @@ mod tests {
             let mut seen_recipes = HashSet::new();
             let mut candidates = Vec::new();
             collect_changed_closure(&root_merge, "", bases, &mut seen_trees, &mut seen_blobs,
-                                    &mut seen_recipes, &mut candidates, None, true)
+                                    &mut seen_recipes, &mut candidates, true)
                 .expect("the closure walk must not load a pruned object");
             candidates
         };
@@ -9116,7 +9142,7 @@ mod tests {
             .expect("warm the commit graph");
 
         // The client's priced quantity, computed exactly as `lift_pallet_inner` computes it.
-        let new_parcels = new_parcels_parents_first(&merge, Some(&k))
+        let new_parcels = new_parcels_parents_first(&merge, Some(&k), &[])
             .expect("the segment walk must succeed");
         let mut candidates: Vec<String> = new_parcels.clone();
         let mut seen_trees = HashSet::new();
@@ -9129,7 +9155,7 @@ mod tests {
                 .collect::<Result<_, _>>()
                 .expect("every parent resolves");
             collect_changed_closure(&parcel.tree_hash, "", &base_trees, &mut seen_trees,
-                                    &mut seen_blobs, &mut seen_recipes, &mut candidates, None, true)
+                                    &mut seen_blobs, &mut seen_recipes, &mut candidates, true)
                 .expect("the client walk must not load a pruned object");
         }
         let priced: HashSet<String> = candidates.iter().cloned().collect();
@@ -9222,7 +9248,7 @@ mod tests {
         let mut seen_recipes = HashSet::new();
         let mut candidates = Vec::new();
         collect_changed_closure(&new_root, "", &[base_root], &mut seen_trees, &mut seen_blobs,
-                                &mut seen_recipes, &mut candidates, None, true)
+                                &mut seen_recipes, &mut candidates, true)
             .expect("the second path must be recognized as already-seen, not re-loaded");
 
         assert!(!candidates.contains(&shared),
@@ -9291,7 +9317,7 @@ mod tests {
 
         // `false` = the remote's handshake omitted the chunking capability.
         let error = collect_changed_closure(&root, "", &[], &mut seen_trees, &mut seen_blobs,
-                                            &mut seen_recipes, &mut candidates, None, false)
+                                            &mut seen_recipes, &mut candidates, false)
             .expect_err("a chunked file entry must refuse a lift to a non-chunking remote");
 
         let (code, message, next_step) = scope_utils::decode_refusal(&error)
@@ -9328,7 +9354,7 @@ mod tests {
         let mut candidates = Vec::new();
 
         collect_changed_closure(&root, "", &[], &mut seen_trees, &mut seen_blobs,
-                                &mut seen_recipes, &mut candidates, None, true)
+                                &mut seen_recipes, &mut candidates, true)
             .expect("a chunked file must negotiate, not refuse, against a chunking remote");
 
         // The recipe is a control-plane candidate; every chunk is a blob candidate.
@@ -9341,50 +9367,6 @@ mod tests {
         // The recipe is not double-classified as a blob.
         assert!(!seen_blobs.contains(&recipe_hash), "the recipe is not a blob");
         assert!(candidates.contains(&plain), "the plain sibling still negotiates as a blob");
-    }
-
-    /// A cache's lift walk skips a tree or recipe the record holds absent: no candidate, no read.
-    /// A recorded tree that is present seals nothing and is walked, and an absent one the record
-    /// does not name fails the walk rather than being guessed at.
-    ///
-    /// Revert: judge a recorded entry by the record alone → the present recorded tree is skipped;
-    /// skip only trees → the walk reads the absent recipe and fails.
-    #[test]
-    fn the_lift_walk_skips_only_what_the_record_holds_absent() {
-        use crate::enums::dir_entry_type::DirEntryType::{Normal, NormalChunked, Tree};
-        use crate::util::sealed_utils::{self, SealOp};
-
-        let _scratch = Scratch::new("closure-recorded");
-
-        let (absent_tree, absent_recipe) = ("a".repeat(64), "b".repeat(64));
-        let plain = store_blob("held");
-        let held = store_tree(&[("plain.txt", &plain, Normal)]);
-        let root = store_tree(&[
-            ("gone", &absent_tree, Tree),
-            ("big.bin", &absent_recipe, NormalChunked),
-            ("held", &held, Tree),
-        ]);
-
-        let mut bytes = sealed_utils::header_bytes();
-        for hash in [&absent_tree, &absent_recipe, &held] {
-            bytes.extend(sealed_utils::encode_frame(SealOp::Record, hash).unwrap());
-        }
-        let recorded = sealed_utils::parse(&bytes).unwrap().set;
-
-        let walk = |recorded: Option<&sealed_utils::SealedSet>| {
-            let mut seen_trees = HashSet::new();
-            let mut seen_blobs = HashSet::new();
-            let mut seen_recipes = HashSet::new();
-            let mut candidates = Vec::new();
-            collect_changed_closure(&root, "", &[], &mut seen_trees, &mut seen_blobs,
-                                    &mut seen_recipes, &mut candidates, recorded, true)
-                .map(|()| candidates)
-        };
-
-        let candidates = walk(Some(&recorded)).expect("the walk reads nothing the record holds absent");
-        assert_eq!(candidates, vec![root.clone(), held.clone(), plain.clone()]);
-
-        walk(None).expect_err("an absent object the record does not name fails the walk");
     }
 
     /// Plant a blob above the whole-object ceiling directly, bypassing `LooseObject::store`'s
