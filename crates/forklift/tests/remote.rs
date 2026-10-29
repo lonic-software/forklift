@@ -5752,6 +5752,141 @@ fn a_cache_shift_to_a_pallet_lowered_elsewhere_fetches_its_head() {
     assert_success(&area.forklift("cached", &["audit"]));
 }
 
+/// Every file under `directory`, its `.forklift` included, with its bytes. A lock sidecar is left
+/// out, as in [`forklift_dir_snapshot`].
+fn bay_snapshot(area: &TestArea, directory: &str) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let root = area.path(directory);
+    let mut snapshot = std::collections::BTreeMap::new();
+    let mut frontier = vec![root.clone()];
+
+    while let Some(dir) = frontier.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                frontier.push(path);
+            } else if path.extension().is_none_or(|extension| extension != "lock") {
+                snapshot.insert(path.strip_prefix(&root).unwrap().to_path_buf(), std::fs::read(&path).unwrap());
+            }
+        }
+    }
+
+    snapshot
+}
+
+/// The hash of the file `name` in the tree `tree`, read from `directory`.
+fn file_of(area: &TestArea, directory: &str, tree: &str, name: &str) -> String {
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path(directory));
+    let tree = forklift_core::util::object_utils::load_tree(tree).unwrap();
+    tree.get_files().find(|(file, _)| file.as_str() == name).map(|(_, file)| file.hash.clone()).unwrap()
+}
+
+/// On the fixture of [`three_signed_parcels`], a `feature` pallet lifted from `a` that adds two
+/// files under `src` and removes `docs/one.txt`. Returns its head, its root, and the two new
+/// files' blobs.
+fn lift_feature(area: &TestArea) -> (String, String, [String; 2]) {
+    assert_success(&area.forklift("a", &["palletize", "feature"]));
+    area.write_file("a/src/feature.txt", "feature\n");
+    area.write_file("a/src/more.txt", "more\n");
+    std::fs::remove_file(area.path("a/docs/one.txt")).unwrap();
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "a feature"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    let head = pallet_head(area, "server-root", "feature");
+    let root = history_with_roots(area, "a", &head)[0].1.clone();
+    let src = subtree_of(area, "a", &root, "src");
+    let blobs = [file_of(area, "a", &src, "feature.txt"), file_of(area, "a", &src, "more.txt")];
+
+    (head, root, blobs)
+}
+
+/// A cache `shift`, a fast-forward `consolidate` and a merging one each fetch the content they are
+/// about to write before they change anything, so with the origin unreachable each refuses as a
+/// cache miss (exit 36) with the bay byte for byte as it was: no file removed, no marker raised. Here the target's trees are held (a `show` fetched
+/// them) and only its two new blobs are recorded, so the refusal comes from the presence phase,
+/// not from reading the trees. With the origin back, the shift succeeds.
+///
+/// Revert: drop shift's or the fast-forward's presence phase → it removes `docs/one.txt` and
+/// raises its marker before the first write meets the absent blob; drop the merge's → it raises
+/// its marker first.
+#[test]
+fn a_cache_shift_with_its_origin_unreachable_refuses_before_it_changes_anything() {
+    let area = TestArea::new("cache-phase-offline");
+    let (mut server, _) = three_signed_parcels(&area);
+    let (feature, root, blobs) = lift_feature(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift("cached", &["lower", "feature"]));
+
+    for file in ["src/code.txt", "docs/two.txt"] {
+        assert_success(&area.forklift("cached", &["show", &format!("{}:{}", feature, file)]));
+    }
+    for tree in [root.clone(), subtree_of(&area, "a", &root, "src"), subtree_of(&area, "a", &root, "docs")] {
+        assert!(object_held(&area, "cached", &tree), "the target's trees are held: {}", tree);
+    }
+    for blob in &blobs {
+        assert!(!object_held(&area, "cached", blob), "the new blob is absent: {}", blob);
+    }
+
+    server.stop();
+
+    let refuses_unchanged = |args: &[&str]| {
+        let before = bay_snapshot(&area, "cached");
+        let refused = area.forklift("cached", &[&["--json"][..], args].concat());
+        assert_eq!(refused.status.code(), Some(36), "{:?}: {}{}", args, stdout(&refused), stderr(&refused));
+        let json = json_of(&refused);
+        assert_eq!(json["error"]["code"], "cache_miss", "{:?}: {}", args, json);
+        assert!(json["error"]["next_step"].as_str().unwrap().contains(&server.url), "{:?}: {}", args, json);
+        assert!(bay_snapshot(&area, "cached") == before, "{:?} refused changes nothing", args);
+    };
+
+    refuses_unchanged(&["shift", "feature"]);
+    refuses_unchanged(&["consolidate", "feature"]);
+
+    // Diverged, the same consolidate is a merge, which takes the two blobs from `feature`.
+    area.write_file("cached/local.txt", "local\n");
+    assert_success(&area.forklift("cached", &["load", "."]));
+    assert_success(&area.forklift("cached", &["stack", "local"]));
+    refuses_unchanged(&["consolidate", "feature"]);
+
+    server.restart(&area);
+    assert_success(&area.forklift("cached", &["shift", "feature"]));
+    assert_eq!(area.read_file("cached/src/more.txt"), "more\n");
+    assert!(!area.path("cached/docs/one.txt").exists());
+    assert_success(&area.forklift("cached", &["audit"]));
+}
+
+/// A cache `shift`'s presence phase asks the origin for every file it writes in one batch, not
+/// one request per file.
+///
+/// Revert: send each hash on its own → the blobs are fetched by loose `GET`s and no batch is asked.
+#[test]
+fn a_cache_shift_fetches_the_files_it_writes_in_one_batch() {
+    let area = TestArea::new("cache-phase-batch");
+    let (server, _) = three_signed_parcels(&area);
+    let (_, _, blobs) = lift_feature(&area);
+
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let saw = std::sync::Arc::clone(&seen);
+    let proxy = InterceptingProxy::start(&server.url, move |path| {
+        saw.lock().unwrap().push(path.to_string());
+        None
+    });
+
+    assert_success(&area.forklift(".", &["franchise", &proxy.url, "cached", "--cache"]));
+    assert_success(&area.forklift("cached", &["lower", "feature"]));
+    seen.lock().unwrap().clear();
+
+    assert_success(&area.forklift("cached", &["shift", "feature"]));
+    assert_eq!(area.read_file("cached/src/feature.txt"), "feature\n");
+
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.iter().filter(|path| path.ends_with("/objects/batch")).count(), 1, "{:?}", seen);
+    for blob in &blobs {
+        assert!(!seen.iter().any(|path| path.ends_with(blob.as_str())), "{} was fetched on its own: {:?}", blob, seen);
+    }
+    assert_success(&area.forklift("cached", &["audit"]));
+}
+
 /// `lower` in a cache checks out the remote's new head, so it fetches that head's whole closure and
 /// records the root of every other new parcel; the root of the tip it moved from stays held.
 ///

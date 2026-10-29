@@ -7,7 +7,7 @@ use forklift_core::util::path_utils::{self, WarehousePath};
 use forklift_core::util::inventory_utils::TrackedKind;
 use forklift_core::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use forklift_core::util::{
-    alias_utils, file_utils, inventory_utils, load_guard_utils, object_utils, pallet_utils, shift_utils, tree_utils,
+    alias_utils, cache_miss, file_utils, inventory_utils, load_guard_utils, object_utils, pallet_utils, shift_utils, tree_utils,
 };
 use crate::output;
 
@@ -126,7 +126,7 @@ fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
     // Recording only stat data keeps the rollups (see `ShardMutationBatch`).
     let mut batch = inventory_utils::ShardMutationBatch::over(&ledger);
 
-    let message = match restore_entry(parent.as_key(), &item)? {
+    let message = match restore_entry(parent.as_key(), &item, true)? {
         Restored::Untouched => format!("\"{}\" already matches the inventory.", path.as_key()),
         Restored::Restatted(refreshed) => {
             batch.update(parent.as_key(), |inventory| inventory.add_item(refreshed))?;
@@ -144,6 +144,33 @@ fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
     Ok(())
 }
 
+/// The presence phase for restoring the directory at `key` (see `cache_miss::ensure_files_present`):
+/// in a cache warehouse, the content of every tracked file under it, fetched in one batch before
+/// any file is written. That is every file, not only those a restore rewrites, which are known
+/// only by reading each one: offline, a restore refuses even where every file already matches,
+/// rather than rewrite some of them and then refuse.
+fn ensure_directory_present(ledger: &inventory_utils::ShardLedger, key: &str) -> Result<(), String> {
+    if !scope_utils::is_cache_mode().unwrap_or(false) {
+        return Ok(());
+    }
+
+    let mut files: Vec<(String, DirEntryType)> = Vec::new();
+
+    for shard_key in ledger.keys() {
+        if !path_utils::covers(key, shard_key) {
+            continue;
+        }
+
+        let Some(inventory) = ledger.inventory(shard_key)? else { continue };
+
+        files.extend(inventory.get_items()
+            .filter(|(_, item)| item.state != InventoryItemState::Deleted && item.item_type != DirEntryType::Tree)
+            .map(|(_, item)| (item.hash.clone(), item.item_type)));
+    }
+
+    cache_miss::ensure_files_present(files.iter().map(|(hash, item_type)| (hash.as_str(), *item_type)))
+}
+
 /// Restore every tracked file of a directory (and its subdirectories) from the inventory.
 ///
 /// # Arguments
@@ -159,6 +186,8 @@ fn restore_worktree_directory(ledger: &inventory_utils::ShardLedger, key: &str) 
     let mut matched_count = 0usize;
     let mut batch = inventory_utils::ShardMutationBatch::over(ledger);
     let mut result: Result<(), String> = Ok(());
+
+    ensure_directory_present(ledger, key)?;
 
     for shard_key in ledger.keys() {
         if !path_utils::covers(key, shard_key) {
@@ -178,7 +207,7 @@ fn restore_worktree_directory(ledger: &inventory_utils::ShardLedger, key: &str) 
                 continue;
             }
 
-            let recorded = restore_entry(shard_key, item).and_then(|restored| match restored {
+            let recorded = restore_entry(shard_key, item, false).and_then(|restored| match restored {
                 Restored::Untouched => {
                     matched_count += 1;
                     Ok(())
@@ -260,12 +289,14 @@ enum Restored {
 /// # Arguments
 /// * `parent_key` - The warehouse path key of the entry's directory.
 /// * `item`       - The inventory entry.
+/// * `fetch`      - Whether to fetch its content, in a cache warehouse, before a rewrite: false
+///                  where the caller's presence phase fetched it already.
 ///
 /// # Returns
 /// * `Ok(Restored)` - What was done.
 /// * `Err(String)`  - If the path was refused, the clock probe could not be stamped, or a write
 ///                    failed.
-fn restore_entry(parent_key: &str, item: &InventoryItem) -> Result<Restored, String> {
+fn restore_entry(parent_key: &str, item: &InventoryItem, fetch: bool) -> Result<Restored, String> {
     let file_path = tracked_path(parent_key, &item.name);
 
     ensure_restorable(&file_path)?;
@@ -278,6 +309,11 @@ fn restore_entry(parent_key: &str, item: &InventoryItem) -> Result<Restored, Str
         }
     }
 
+    // A directory's restore fetched every file's content already (`ensure_directory_present`); a
+    // single file's is fetched only once it is known to need rewriting.
+    if fetch {
+        cache_miss::ensure_files_present([(item.hash.as_str(), item.item_type)])?;
+    }
     shift_utils::write_tracked_file(&file_path, &item.hash, item.item_type, false)?;
 
     // Anchored and statted right after the write: a file statted later would record an editor's

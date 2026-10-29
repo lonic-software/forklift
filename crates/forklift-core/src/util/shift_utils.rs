@@ -5,7 +5,7 @@ use crate::model::inventory::{Inventory, InventoryItem};
 use crate::model::tree_item::TreeItem;
 use crate::util::progress_utils::Progress;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
-use crate::util::{alias_utils, fanout_utils, file_utils, inventory_utils, object_utils, office_utils, tree_utils, warehouse_utils};
+use crate::util::{alias_utils, cache_miss, fanout_utils, file_utils, inventory_utils, object_utils, office_utils, tree_utils, warehouse_utils};
 
 /// A single file operation needed to turn one tree into another in the working directory.
 pub enum FileOp {
@@ -46,6 +46,14 @@ pub enum FileOp {
 ///                                      (deepest first).
 /// * `Err(String)`                    - If a tree object could not be loaded.
 pub fn diff_trees(from: Option<&str>, to: &str) -> Result<(Vec<FileOp>, Vec<String>), String> {
+    diff_trees_in(from, to, &scope_utils::current_scope()?)
+}
+
+/// [`diff_trees`] in `scope`, for a caller planning a checkout under a scope other than this
+/// bay's.
+pub fn diff_trees_in(from: Option<&str>,
+                     to: &str,
+                     scope: &MaterializationScope) -> Result<(Vec<FileOp>, Vec<String>), String> {
     let from_tree = match from {
         Some(hash) => Some(object_utils::load_tree(hash)?),
         None => None,
@@ -63,14 +71,12 @@ pub fn diff_trees(from: Option<&str>, to: &str) -> Result<(Vec<FileOp>, Vec<Stri
     // materialization to the in-scope subtree(s): the walk copies nothing out of scope, so no
     // out-of-scope blob is ever written and no absent object is touched. The scope is full (no
     // restriction) in a plain bay or a full warehouse's main tree, so this is a no-op there.
-    let scope = scope_utils::current_scope()?;
-
     let mut aliased_removes = Vec::new();
     diff_directory(from_tree.as_ref(), Some(&to_tree), "", &mut Plan {
         ops: &mut ops, removed_dirs: &mut removed_dirs, aliased_removes: &mut aliased_removes,
-    }, false, &scope)?;
+    }, false, scope)?;
 
-    keep_aliased_files(&to_tree, &aliased_removes, &mut ops, &scope)?;
+    keep_aliased_files(&to_tree, &aliased_removes, &mut ops, scope)?;
 
     // Deepest directories first, so empty-directory cleanup can proceed bottom-up.
     removed_dirs.sort_by_key(|dir| std::cmp::Reverse(dir.matches('/').count()));
@@ -1523,6 +1529,28 @@ pub fn materialize_tree(from_tree: Option<&str>,
     crate::util::inventory_utils::replace_all_inventories(&shards)?;
 
     Ok(())
+}
+
+/// The presence phase for applying `ops` (see [`cache_miss::ensure_files_present`]): in a cache
+/// warehouse, every file they write that the store lacks and the sealed-object record holds is
+/// fetched, in one batch. Run before the operation marker is raised, so an origin that cannot be
+/// reached refuses the operation with the bay unchanged. Its error is the refusal itself, for the
+/// caller to return as it is, so a cache miss keeps its exit code.
+pub fn ensure_writes_present(ops: &[FileOp]) -> Result<(), String> {
+    cache_miss::ensure_files_present(ops.iter().filter_map(|op| match op {
+        FileOp::Write { hash, item_type, .. } => Some((hash.as_str(), *item_type)),
+        FileOp::Remove { .. } => None,
+    }))
+}
+
+/// [`ensure_writes_present`] for checking out `to_tree` from nothing in `scope`, for a caller that
+/// does not diff it itself. Outside a cache warehouse it diffs nothing.
+pub fn ensure_tree_present(to_tree: &str, scope: &MaterializationScope) -> Result<(), String> {
+    if !scope_utils::is_cache_mode().unwrap_or(false) {
+        return Ok(());
+    }
+
+    ensure_writes_present(&diff_trees_in(None, to_tree, scope)?.0)
 }
 
 /// Move `pallet` from `expected` (the bay's base) to `new` after `written_tree` (the tree of `new`)
