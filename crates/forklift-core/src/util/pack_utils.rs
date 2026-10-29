@@ -3466,7 +3466,8 @@ struct WindowEntry {
 /// *larger* than the store it started from. One-shot and CPU-bound: every live object is
 /// re-read and re-compressed, not just the ones a plain repack would have touched anyway.
 ///
-/// Signature sidecars (`.sig`) and temp files are left alone (sidecars are read by path).
+/// Signature sidecars (`.sig`) are not objects and are never packed here — the signature sweep
+/// that runs after the packs moves them into signature tables — and temp files are left alone.
 /// Objects with no path base are packed largest-first and offered a **delta** against a small
 /// size window, kept only when smaller than the full blob — the size ordering is what gives
 /// that window any chance of similarity. Objects `compute_path_bases` gave a path base instead
@@ -5546,7 +5547,7 @@ fn enumerate_loose_objects() -> Result<Vec<PackTarget>, String> {
             let file = file.map_err(|e| format!("Error while listing an objects folder: {}", e))?;
             let name = file.file_name().to_string_lossy().to_string();
 
-            // Sidecars stay loose (read by path, not hash); temp files are half-written.
+            // Sidecars are not objects (the signature sweep tables them); temp files are half-written.
             if name.ends_with(sign_utils::FILE_SUFFIX_SIGNATURE) || name.contains(".tmp") {
                 continue;
             }

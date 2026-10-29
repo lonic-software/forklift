@@ -36,9 +36,10 @@ before it copies a byte into quarantine. The current limits are 4,096 packs, app
 per data section (the 512 MiB rollover plus one maximum-size object and framing), and 4,832,792
 bytes per index (the index of a 100,000-object pack, the object-count rollover). A header newline must occur within 128 bytes. Bytes between the signature section and the digest are rejected.
 
-Parcel signature sidecars remain a separate envelope section because they are addressed by the
-parcel they sign rather than by their own content hash. They retain their existing sidecar storage
-and audit semantics; the native-pack change applies to objects.
+Parcel signatures remain a separate envelope section because they are addressed by the parcel they
+sign rather than by their own content hash. Import stores each as a sidecar, which a later `compact`
+moves into a signature table (`PARCEL_SIGNATURE_FORMAT.md`); the native-pack change applies to
+objects.
 
 ## Digest
 
@@ -180,8 +181,8 @@ fetches. A known-format integrity failure, a digest mismatch included, remains f
 
 ## Future extensions
 
-- A native signature pack/index, so a warehouse with very many signed parcels also avoids loose
-  sidecar durability barriers.
+- Importing the signature section straight into a signature table, so a warehouse with very many
+  signed parcels also avoids one sidecar durability barrier per signature on import.
 - Generational bundles (`base` plus changes since it), so server rebuilds and repeat syncs are
   incremental.
 - Range negotiation over native indexes, allowing a client to fetch selected pack sections.

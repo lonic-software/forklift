@@ -533,6 +533,29 @@ A command not listed here either reports only the generic human-message shape `{
         "unaccounted"
       ],
       "type": "object"
+    },
+    "SignatureConflict": {
+      "description": "A loose signature file a compaction left loose.",
+      "properties": {
+        "parcel": {
+          "description": "The parcel the file signs.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why it was left loose.",
+          "type": "string"
+        },
+        "sidecar_path": {
+          "description": "The file's path.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "parcel",
+        "sidecar_path",
+        "reason"
+      ],
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -597,6 +620,38 @@ A command not listed here either reports only the generic human-message shape `{
       "format": "uint",
       "minimum": 0,
       "type": "integer"
+    },
+    "signature_conflicts": {
+      "description": "Loose signature files left loose: one that differs from the signature already in a table\nfor its parcel (the tabled one is what reads return), or one that is malformed.",
+      "items": {
+        "$ref": "#/$defs/SignatureConflict"
+      },
+      "type": "array"
+    },
+    "signature_sidecars_swept": {
+      "description": "Loose signature files removed because a table now holds the same signature.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "signature_tables_unreadable": {
+      "description": "Signature tables that could not be read, left as found. Each entry names the table and\nwhat to do about it.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "signature_tables_written": {
+      "description": "Signature tables written: loose signatures moved into tables (a repack rewrites them all).",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "signatures_dropped": {
+      "description": "Signatures a full repack dropped because their parcel is no longer in the store. Always 0\nwithout `--all`.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
     }
   },
   "required": [
@@ -609,7 +664,12 @@ A command not listed here either reports only the generic human-message shape `{
     "corrupt_skipped",
     "over_ceiling_skipped",
     "damaged_packs_dropped",
-    "damaged_packs_kept"
+    "damaged_packs_kept",
+    "signature_tables_written",
+    "signature_sidecars_swept",
+    "signatures_dropped",
+    "signature_conflicts",
+    "signature_tables_unreadable"
   ],
   "title": "Compacted",
   "type": "object"
@@ -5023,12 +5083,19 @@ A command not listed here either reports only the generic human-message shape `{
         "repack_due": {
           "description": "Whether a consolidating repack is due now.",
           "type": "boolean"
+        },
+        "signature_table_threshold": {
+          "description": "Count of signature tables below the size bound above which an incremental compaction is\ndue, to merge them (`maintenance.signatureTables`).",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
         "auto",
         "loose_threshold",
         "pack_threshold",
+        "signature_table_threshold",
         "compaction_due",
         "repack_due"
       ],
@@ -5085,6 +5152,29 @@ A command not listed here either reports only the generic human-message shape `{
         "bytes"
       ],
       "type": "object"
+    },
+    "SignatureConflictIssue": {
+      "description": "One entry in [`StoreReport::signature_conflicts`].",
+      "properties": {
+        "parcel": {
+          "description": "The parcel the file signs.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why a compaction leaves it loose.",
+          "type": "string"
+        },
+        "sidecar_path": {
+          "description": "The file's path.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "parcel",
+        "sidecar_path",
+        "reason"
+      ],
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -5126,6 +5216,12 @@ A command not listed here either reports only the generic human-message shape `{
       "minimum": 0,
       "type": "integer"
     },
+    "loose_signatures": {
+      "description": "Loose signature files a compaction would move into a table.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
     "maintenance": {
       "$ref": "#/$defs/Maintenance",
       "description": "The maintenance thresholds and the current verdict."
@@ -5155,12 +5251,31 @@ A command not listed here either reports only the generic human-message shape `{
       },
       "type": "array"
     },
+    "partial_signature_tables": {
+      "description": "Of `signature_tables`, how many are below the size bound, so a compaction would merge them.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
     "quarantined_packs": {
       "description": "Pack indexes that parsed but whose data file could not be loaded — their\nobjects are quarantined, not lost: `forklift heal` can still refetch any of them under a\ndurability taint, and restoring the data file recovers the rest. Empty on a healthy store.",
       "items": {
         "$ref": "#/$defs/PackIndexIssue"
       },
       "type": "array"
+    },
+    "signature_conflicts": {
+      "description": "Loose signature files a compaction leaves loose: each differs from the signature already in\na table for its parcel (the tabled one is what reads return), or is malformed. Empty on a\nhealthy store.",
+      "items": {
+        "$ref": "#/$defs/SignatureConflictIssue"
+      },
+      "type": "array"
+    },
+    "signature_tables": {
+      "description": "Signature tables: parcel signatures packed many to a file.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
     },
     "total_bytes": {
       "description": "Loose + packed bytes — the object store's on-disk footprint.",
@@ -5170,6 +5285,13 @@ A command not listed here either reports only the generic human-message shape `{
     },
     "unenumerable_indexes": {
       "description": "Pack index files that could not even be parsed — move the file aside and\nre-run. Empty on a healthy store.",
+      "items": {
+        "$ref": "#/$defs/PackIndexIssue"
+      },
+      "type": "array"
+    },
+    "unreadable_signature_tables": {
+      "description": "Signature tables that cannot be read: every signature lookup one might answer fails naming\nit. `error` says what to do, which depends on the cause. Empty on a healthy store.",
       "items": {
         "$ref": "#/$defs/PackIndexIssue"
       },
@@ -5190,7 +5312,12 @@ A command not listed here either reports only the generic human-message shape `{
     "quarantined_packs",
     "damaged_packs",
     "unenumerable_indexes",
-    "foreign_version_indexes"
+    "foreign_version_indexes",
+    "signature_tables",
+    "partial_signature_tables",
+    "loose_signatures",
+    "unreadable_signature_tables",
+    "signature_conflicts"
   ],
   "title": "StoreReport",
   "type": "object"

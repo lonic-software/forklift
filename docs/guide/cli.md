@@ -1991,6 +1991,17 @@ to check the store. A loose object larger than the 64 MiB object ceiling is skip
 way, but it is not corrupt — it predates the ceiling — so it is counted separately as
 `over_ceiling_skipped` and left loose, fully readable, forever.
 
+A signed warehouse writes one small signature file per parcel. `compact` moves those into
+**signature tables** (`.forklift/objects/pack/<id>.sigs`, up to 100,000 signatures each),
+merging small tables as it goes, and removes a signature file only once a durably written table
+holds the same signature. `signature_tables_written` and `signature_sidecars_swept` count that.
+A signature file that differs from the signature a table already holds for its parcel, or that
+is malformed, is left loose and listed under `signature_conflicts` (`[{parcel, sidecar_path,
+reason}]`): the tabled signature is the one every read returns. `compact --all` also drops the
+signatures of parcels no longer in the store (`signatures_dropped`). A table that cannot be read
+is left as found and listed under `signature_tables_unreadable`, with what to do about it; a
+full repack refuses until it is dealt with.
+
 `compact` also **builds the commit-graph** (`.forklift/graph/`) while it is here: a sharded,
 self-healing cache that gives each parcel a generation number — so ancestry checks
 (`consolidate`, `haul`) find a merge base without walking history to the roots — and a
@@ -2003,7 +2014,8 @@ first time you need it.
 mutating command once the store has accumulated enough loose objects or packs to warrant it
 (git's `gc --auto`). It runs synchronously, under that command's lock, so it is correct and
 never races — which means it can add a brief pause when it fires (rarely). Turn it off with
-`config maintenance.auto false`, or tune the thresholds (`maintenance.loose`, `maintenance.packs`).
+`config maintenance.auto false`, or tune the thresholds (`maintenance.loose`, `maintenance.packs`,
+`maintenance.signatureTables`).
 
 Compaction also takes a **shared object-store lock** (separate from the per-bay lock ordinary
 commands hold), so two bays or two processes never compact the same store at once. If another
@@ -2139,6 +2151,18 @@ aside and re-run. `foreign_version_indexes` (same shape) lists an index written 
 different pack format, naming its version. Every read it might answer fails with that error rather
 than reporting the object missing, so re-create the warehouse with this build — do not move the
 file aside, which would make its objects read as missing. In the human view all four appear as a `pack problems:` section, only when non-empty.
+
+Signatures get their own counts: `signature_tables`, `partial_signature_tables` (tables below the
+size bound, which the next compaction merges), `loose_signatures` (signature files the next
+compaction moves into a table) and `maintenance.signature_table_threshold`
+(`maintenance.signatureTables`). Two more lists are ordinarily empty.
+`unreadable_signature_tables` (`[{index_path, error}]`) names a table that cannot be read: a
+signature lookup it might answer fails rather than reporting the parcel unsigned. If the table
+was written by a build with another table format, use that build and do not move the file aside;
+if it is corrupt, move it out of the pack folder, accepting that the signatures only it held are
+lost from this store until it is franchised again. `signature_conflicts` (`[{parcel,
+sidecar_path, reason}]`) names a signature file that a compaction leaves loose, as described
+under [`compact`](#compact--pack-the-object-store).
 
 ### `heal` — resolve a durability taint or an interrupted operation
 
@@ -2310,6 +2334,7 @@ value. Known keys:
 | `maintenance.auto` | Auto-compact after mutating commands: `true`/`1`/`on`/`yes` or `false`/`0`/`off`/`no` (default on). |
 | `maintenance.loose` | Loose-object count that triggers an auto incremental compact (default 6700). |
 | `maintenance.packs` | Pack count that triggers an auto consolidating repack (default 20). |
+| `maintenance.signatureTables` | Count of signature tables below their 100,000-entry bound that triggers an auto incremental compact to merge them (default 20). |
 | `mirror.url` | The git remote `mirror` pushes to (see [`mirror`](#mirror--keep-a-git-remote-in-step)). |
 | `mirror.pallets` | The pallets to mirror, comma-separated (default: every pallet the remote holds). The first mirror fetches the history of each one you never lowered, and the warehouse keeps it. |
 | `mirror.auto` | Mirror the lifted pallet after each `lift`, spelled as `maintenance.auto` (default on). The mirror runs inside the lift, so the warehouse stays locked until git has answered. |
@@ -2358,7 +2383,7 @@ Refused, in either file:
 | `loose = 6700`, `tor = true` | every value is a **string on disk**, including the numeric and boolean ones — write `"6700"` and `"on"` |
 | `torProxy` spelled `torproxy` | keys are case-sensitive |
 | `tor = "onn"` | `remote.tor` accepts only `auto`, `on` or `off`. A typo here used to mean `auto` silently, un-proxying every non-onion remote |
-| `auto = "flase"`, `loose = "10k"` | `maintenance.auto` accepts only the spellings listed above, and `maintenance.loose`/`maintenance.packs` only a whole number. A typo here used to leave maintenance on, or fall back to the default threshold, without a word |
+| `auto = "flase"`, `loose = "10k"` | `maintenance.auto` accepts only the spellings listed above, and `maintenance.loose`/`maintenance.packs`/`maintenance.signatureTables` only a whole number. A typo here used to leave maintenance on, or fall back to the default threshold, without a word |
 | an unknown field in a `[profile.<name>]` section | profiles hold only `identifier` |
 | any key set to `""` (or to whitespace) | a key holds a value or is absent, there is no third state — an empty `identifier` was read as an identity by one path and as "fill this in" by the other, which minted a new id *over* your entry. Remove a section key with `forklift config --unset <key>` (add `--global` for the global file); a `[profile.<name>]` field the command cannot address, so remove that one in an editor |
 
