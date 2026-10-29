@@ -228,8 +228,11 @@ async fn fetch_all(remote: &RemoteClient, origin: &str, hashes: Vec<String>, rep
                     loose.extend(left);
                 } else {
                     let left: Vec<String> = left.collect();
-                    retrying = Some(left.len());
-                    pending.splice(0..0, left).for_each(drop);
+
+                    if !left.is_empty() {
+                        retrying = Some(left.len());
+                        pending.splice(0..0, left).for_each(drop);
+                    }
                 }
             }
         }
