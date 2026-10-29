@@ -5586,7 +5586,7 @@ fn a_fetch_tables_the_signatures_of_its_walk_and_a_dead_one_stores_none() {
     };
     let held = object_store_path(&area, "server-root", &lost);
     let aside = area.path("lost-aside");
-    std::fs::rename(&held, &aside).expect("the server holds the file loose");
+    forklift_core::util::file_utils::rename(&held, &aside).expect("the server holds the file loose");
 
     let died = area.forklift("b", &["lower"]);
     assert!(!died.status.success(), "the fetch dies: {}", stdout(&died));
@@ -5598,7 +5598,7 @@ fn a_fetch_tables_the_signatures_of_its_walk_and_a_dead_one_stores_none() {
     }
     assert_eq!(signature_files(&area, "b"), (tables.clone(), 0), "a dead fetch writes no signature file");
 
-    std::fs::rename(&aside, &held).unwrap();
+    forklift_core::util::file_utils::rename(&aside, &held).unwrap();
     assert_success(&area.forklift("b", &["lower"]));
     assert_eq!(pallet_head(&area, "b", "main"), new_head);
     for parcel in &new_parcels {
