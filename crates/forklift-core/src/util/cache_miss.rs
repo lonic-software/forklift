@@ -15,7 +15,7 @@
 //! and each miss re-reads the record: a read of a whole old tree pays both once per object it
 //! lacks, which is what a presence phase is for.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::OnceLock;
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::error::{CoreError, RefusalCode};
@@ -132,6 +132,68 @@ fn ensure_with<'a>(hook: Option<&FetchHook>, hashes: impl IntoIterator<Item = &'
     }
 
     refill_with(hook, &absent).map(|_| ())
+}
+
+/// [`ensure_present`] for the trees a planner is about to walk: in a cache warehouse, every tree
+/// it descends into, one batch per level, so planning a mutation over trees the cache lacks costs
+/// one fetch per level of the walk rather than one per tree.
+///
+/// The walk starts at `roots`, one per side the planner compares (an absent side is `None`), and
+/// goes down level by level: at each directory, every subtree name any side holds is a child, with
+/// each side's hash for it, and `descend(path, sides)` says whether the planner would load it. It
+/// must be the planner's own rule, so what this fetches is what the planner reads. Outside a cache
+/// warehouse, nothing is walked.
+///
+/// # Returns
+/// * `Ok(())`      - Every tree the walk reached is held, or absent and not recorded, which the
+///                   planner's own read reports.
+/// * `Err(String)` - As [`ensure_present`], or a tree it fetched could not be read.
+pub fn ensure_trees_present(roots: &[Option<&str>],
+                            descend: impl Fn(&str, &[Option<&str>]) -> bool) -> Result<(), String> {
+    walk_with(HOOK.get(), roots, descend)
+}
+
+fn walk_with(hook: Option<&FetchHook>,
+             roots: &[Option<&str>],
+             descend: impl Fn(&str, &[Option<&str>]) -> bool) -> Result<(), String> {
+    if !scope_utils::is_cache_mode().unwrap_or(false) {
+        return Ok(());
+    }
+
+    let mut level: Vec<(String, Vec<Option<String>>)> =
+        vec![(String::new(), roots.iter().map(|hash| hash.map(str::to_string)).collect())];
+
+    while !level.is_empty() {
+        ensure_with(hook, level.iter().flat_map(|(_, sides)| sides.iter().flatten().map(String::as_str)))?;
+
+        let mut next: Vec<(String, Vec<Option<String>>)> = Vec::new();
+
+        for (key, sides) in &level {
+            let trees = sides.iter()
+                .map(|hash| hash.as_deref().map(object_utils::load_tree_shared).transpose())
+                .collect::<Result<Vec<_>, String>>()?;
+
+            let subtrees: Vec<BTreeMap<&String, &str>> = trees.iter()
+                .map(|tree| tree.as_ref()
+                    .map(|tree| tree.get_subtrees().map(|(name, item)| (name, item.hash.as_str())).collect())
+                    .unwrap_or_default())
+                .collect();
+            let names: BTreeSet<&String> = subtrees.iter().flat_map(|side| side.keys().copied()).collect();
+
+            for name in names {
+                let child: Vec<Option<&str>> = subtrees.iter().map(|side| side.get(name).copied()).collect();
+                let path = if key.is_empty() { name.clone() } else { format!("{}/{}", key, name) };
+
+                if descend(&path, &child) {
+                    next.push((path, child.into_iter().map(|hash| hash.map(str::to_string)).collect()));
+                }
+            }
+        }
+
+        level = next;
+    }
+
+    Ok(())
 }
 
 /// [`ensure_present`] for the files a mutation is about to write, by entry hash and kind: their
@@ -611,6 +673,56 @@ mod tests {
 
         assert!(held(&fixture.root) && !held(&fixture.web));
         assert_recorded(&[&fixture.web]);
+    }
+
+    /// A hook that delivers whichever of `objects` it is asked for, and every batch it was asked.
+    fn serving(objects: Vec<(String, Vec<u8>)>) -> (FetchHook, Arc<std::sync::Mutex<Vec<Vec<String>>>>) {
+        let asked: Arc<std::sync::Mutex<Vec<Vec<String>>>> = Default::default();
+        let saw = asked.clone();
+        let objects: std::collections::HashMap<String, Vec<u8>> = objects.into_iter().collect();
+        (Box::new(move |hashes, deliver| {
+            saw.lock().unwrap().push(hashes.to_vec());
+            for hash in hashes {
+                if let Some(bytes) = objects.get(hash) {
+                    if let Err(why) = deliver(hash.clone(), bytes.clone()) {
+                        return Fetched::Failed(why);
+                    }
+                }
+            }
+            Fetched::Done
+        }), asked)
+    }
+
+    // Revert: fetch each tree the walk reaches on its own → three batches, not two; ignore the
+    // descent rule → `deep/c`'s tree is fetched though the planner would not load it.
+    #[test]
+    fn a_tree_walk_fetches_one_batch_per_level_and_only_where_it_descends() {
+        let fixture = fixture("tree-walk");
+        let deep = tree(&[("c", &blob("c"), DirEntryType::Normal)]);
+        let docs = tree(&[("d", &blob("d"), DirEntryType::Normal), ("deep", &deep, DirEntryType::Tree)]);
+        let root = tree(&[("src", &fixture.root, DirEntryType::Tree), ("docs", &docs, DirEntryType::Tree)]);
+        let mut objects: Vec<(String, Vec<u8>)> = [&root, &docs, &deep].iter()
+            .map(|hash| (hash.to_string(), bytes_of(hash))).collect();
+        objects.push((fixture.root.clone(), fixture.bytes.clone()));
+        objects.push((fixture.web.clone(), fixture.web_bytes.clone()));
+        sealed_utils::append(&[(SealOp::Record, &root)]).unwrap();
+        for hash in [&root, &docs, &deep] {
+            remove(hash);
+        }
+        let (hook, asked) = serving(objects);
+
+        walk_with(Some(&hook), &[Some(&root)], |path, _| path != "docs/deep").unwrap();
+
+        let asked = asked.lock().unwrap().clone();
+        let mut levels: Vec<Vec<String>> = asked.into_iter().map(|mut batch| { batch.sort(); batch }).collect();
+        let mut second = vec![fixture.root.clone(), docs.clone()];
+        second.sort();
+        assert_eq!(levels.remove(0), vec![root.clone()]);
+        assert_eq!(levels.remove(0), second);
+        assert_eq!(levels.remove(0), vec![fixture.web.clone()], "the third level is `src/web`, `src` being the fixture's root");
+        assert!(levels.is_empty(), "nothing else is asked for: {:?}", levels);
+        assert!(!held(&deep), "a subtree the planner does not descend into is not fetched");
+        assert_recorded(&[&deep]);
     }
 
     // Revert: drop the check after the fetch → the phase succeeds with `web` still absent.

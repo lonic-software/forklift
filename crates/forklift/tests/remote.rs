@@ -5855,35 +5855,151 @@ fn a_cache_shift_with_its_origin_unreachable_refuses_before_it_changes_anything(
     assert_success(&area.forklift("cached", &["audit"]));
 }
 
-/// A cache `shift`'s presence phase asks the origin for every file it writes in one batch, not
-/// one request per file.
+/// The proxied origin of a cache warehouse `cached` franchised through it, and every request path
+/// the cache sent it since the last [`Seen::clear`].
+struct Seen {
+    _proxy: InterceptingProxy,
+    paths: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Seen {
+    fn franchise(area: &TestArea, server: &Server) -> Seen {
+        let paths: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let saw = std::sync::Arc::clone(&paths);
+        let proxy = InterceptingProxy::start(&server.url, move |path| {
+            saw.lock().unwrap().push(path.to_string());
+            None
+        });
+        assert_success(&area.forklift(".", &["franchise", &proxy.url, "cached", "--cache"]));
+        Seen { _proxy: proxy, paths }
+    }
+
+    fn clear(&self) {
+        self.paths.lock().unwrap().clear();
+    }
+
+    /// How many object requests were sent (a batch, or one object fetched alone), after asserting
+    /// that none of `batched` was fetched alone.
+    fn object_requests(&self, batched: &[String]) -> usize {
+        let paths = self.paths.lock().unwrap().clone();
+        for hash in batched {
+            assert!(!paths.iter().any(|path| path.ends_with(hash.as_str())), "{} was fetched on its own: {:?}", hash, paths);
+        }
+        paths.iter().filter(|path| path.starts_with("/v1/objects/")).count()
+    }
+}
+
+/// A cache `shift` onto a head whose trees the cache lacks asks the origin for them one request per
+/// level of the walk, then for the files it writes in one more: the root, then `src` and `docs` in
+/// one batch, then the two new blobs in another.
 ///
-/// Revert: send each hash on its own → the blobs are fetched by loose `GET`s and no batch is asked.
+/// Revert: drop the planner's tree walk → each tree is fetched by the read that meets it, one
+/// request per tree; send the files' hashes each on its own → a request per blob.
 #[test]
-fn a_cache_shift_fetches_the_files_it_writes_in_one_batch() {
-    let area = TestArea::new("cache-phase-batch");
+fn a_cache_shift_fetches_the_trees_it_plans_over_one_batch_per_level() {
+    let area = TestArea::new("cache-phase-levels");
     let (server, _) = three_signed_parcels(&area);
-    let (_, _, blobs) = lift_feature(&area);
+    let (_, root, blobs) = lift_feature(&area);
+    let trees = [root.clone(), subtree_of(&area, "a", &root, "src"), subtree_of(&area, "a", &root, "docs")];
 
-    let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
-    let saw = std::sync::Arc::clone(&seen);
-    let proxy = InterceptingProxy::start(&server.url, move |path| {
-        saw.lock().unwrap().push(path.to_string());
-        None
-    });
-
-    assert_success(&area.forklift(".", &["franchise", &proxy.url, "cached", "--cache"]));
+    let seen = Seen::franchise(&area, &server);
     assert_success(&area.forklift("cached", &["lower", "feature"]));
-    seen.lock().unwrap().clear();
+    for tree in &trees {
+        assert!(!object_held(&area, "cached", tree), "the target's tree is absent: {}", tree);
+    }
+    seen.clear();
 
     assert_success(&area.forklift("cached", &["shift", "feature"]));
-    assert_eq!(area.read_file("cached/src/feature.txt"), "feature\n");
+    assert_eq!(area.read_file("cached/src/more.txt"), "more\n");
 
-    let seen = seen.lock().unwrap().clone();
-    assert_eq!(seen.iter().filter(|path| path.ends_with("/objects/batch")).count(), 1, "{:?}", seen);
-    for blob in &blobs {
-        assert!(!seen.iter().any(|path| path.ends_with(blob.as_str())), "{} was fetched on its own: {:?}", blob, seen);
+    assert_eq!(seen.object_requests(&[&trees[1..], &blobs[..]].concat()), 3, "{:?}", seen.paths.lock().unwrap());
+    assert_success(&area.forklift("cached", &["audit"]));
+}
+
+/// A merging `consolidate` in a cache plans over their trees one request per level, then fetches
+/// every blob its planning reads in one batch: here their side of the two files both sides
+/// changed, and of the file the bay deleted and they changed, which is put back in conflict.
+///
+/// Revert: drop the merge's tree walk → a request per tree; drop its blob batch → a request per
+/// file merged; load the put-back blob during the walk again → a request for it alone.
+#[test]
+fn a_cache_merge_fetches_its_trees_by_level_and_its_blobs_in_one_batch() {
+    let area = TestArea::new("cache-merge-levels");
+    let (server, _) = three_signed_parcels(&area);
+    assert_success(&area.forklift("a", &["palletize", "feature"]));
+    for (file, content) in [("src/code.txt", "feature\n"), ("docs/two.txt", "feature two\n"), ("docs/three.txt", "feature three\n")] {
+        area.write_file(&format!("a/{}", file), content);
     }
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "a feature"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    let feature = pallet_head(&area, "server-root", "feature");
+    let root = history_with_roots(&area, "a", &feature)[0].1.clone();
+    let (src, docs) = (subtree_of(&area, "a", &root, "src"), subtree_of(&area, "a", &root, "docs"));
+    let theirs = vec![
+        root.clone(), src.clone(), docs.clone(),
+        file_of(&area, "a", &src, "code.txt"), file_of(&area, "a", &docs, "two.txt"), file_of(&area, "a", &docs, "three.txt"),
+    ];
+
+    let seen = Seen::franchise(&area, &server);
+    assert_success(&area.forklift("cached", &["lower", "feature"]));
+    area.write_file("cached/src/code.txt", "local\n");
+    area.write_file("cached/docs/two.txt", "local two\n");
+    std::fs::remove_file(area.path("cached/docs/three.txt")).unwrap();
+    assert_success(&area.forklift("cached", &["load", "."]));
+    assert_success(&area.forklift("cached", &["stack", "local"]));
+    for hash in &theirs {
+        assert!(!object_held(&area, "cached", hash), "their side is absent: {}", hash);
+    }
+    seen.clear();
+
+    let merged = area.forklift("cached", &["consolidate", "feature"]);
+    assert_eq!(area.read_file("cached/docs/three.txt"), "feature three\n", "{}{}", stdout(&merged), stderr(&merged));
+    assert!(area.read_file("cached/src/code.txt").contains("feature\n"), "{}", stdout(&merged));
+
+    assert_eq!(seen.object_requests(&theirs[1..]), 3, "{:?}", seen.paths.lock().unwrap());
+}
+
+/// With the subtrees of the target absent as well, a cache `shift`, a fast-forward `consolidate`
+/// and a merging one refuse as a cache miss from planning, before they change anything: the
+/// planner's tree walk fetches before it reads.
+///
+/// Revert: drop the planners' tree walks → the same refusals come from the reads; this pins the
+/// code and the unchanged bay, not which fetch refused.
+#[test]
+fn a_cache_shift_over_absent_trees_with_its_origin_unreachable_refuses_unchanged() {
+    let area = TestArea::new("cache-plan-offline");
+    let (mut server, _) = three_signed_parcels(&area);
+    let (_, root, _) = lift_feature(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift("cached", &["lower", "feature"]));
+    for tree in [root.clone(), subtree_of(&area, "a", &root, "src"), subtree_of(&area, "a", &root, "docs")] {
+        assert!(!object_held(&area, "cached", &tree), "the target's tree is absent: {}", tree);
+    }
+
+    server.stop();
+
+    let refuses_unchanged = |args: &[&str]| {
+        let before = bay_snapshot(&area, "cached");
+        let refused = area.forklift("cached", &[&["--json"][..], args].concat());
+        assert_eq!(refused.status.code(), Some(36), "{:?}: {}{}", args, stdout(&refused), stderr(&refused));
+        let json = json_of(&refused);
+        assert_eq!(json["error"]["code"], "cache_miss", "{:?}: {}", args, json);
+        assert!(json["error"]["next_step"].as_str().unwrap().contains(&server.url), "{:?}: {}", args, json);
+        assert!(bay_snapshot(&area, "cached") == before, "{:?} refused changes nothing", args);
+    };
+
+    refuses_unchanged(&["shift", "feature"]);
+    refuses_unchanged(&["consolidate", "feature"]);
+
+    area.write_file("cached/local.txt", "local\n");
+    assert_success(&area.forklift("cached", &["load", "."]));
+    assert_success(&area.forklift("cached", &["stack", "local"]));
+    refuses_unchanged(&["consolidate", "feature"]);
+
+    server.restart(&area);
+    assert_success(&area.forklift("cached", &["consolidate", "feature"]));
+    assert_eq!(area.read_file("cached/src/more.txt"), "more\n");
     assert_success(&area.forklift("cached", &["audit"]));
 }
 

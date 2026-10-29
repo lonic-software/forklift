@@ -54,6 +54,13 @@ pub fn diff_trees(from: Option<&str>, to: &str) -> Result<(Vec<FileOp>, Vec<Stri
 pub fn diff_trees_in(from: Option<&str>,
                      to: &str,
                      scope: &MaterializationScope) -> Result<(Vec<FileOp>, Vec<String>), String> {
+    // The presence phase for the walk below, by its own rule: a subtree whose hash differs between
+    // the sides, out-of-scope ones skipped. Its refusal is returned as it is, so a cache miss
+    // keeps its exit code.
+    cache_miss::ensure_trees_present(&[from, Some(to)], |path, sides| {
+        sides[0] != sides[1] && (scope.is_full() || scope.classify(path) != ScopeClass::OutOfScope)
+    })?;
+
     let from_tree = match from {
         Some(hash) => Some(object_utils::load_tree(hash)?),
         None => None,

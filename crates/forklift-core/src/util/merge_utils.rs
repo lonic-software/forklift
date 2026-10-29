@@ -5,7 +5,7 @@ use crate::enums::dir_entry_type::DirEntryType;
 use crate::model::remote::{HoldAnswer, MAX_HOLDS_CANDIDATES};
 use crate::globals::bay_root;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
-use crate::util::{fanout_utils, file_utils, graph_utils, lcs, object_utils, pallet_utils, record_utils};
+use crate::util::{cache_miss, fanout_utils, file_utils, graph_utils, lcs, object_utils, pallet_utils, record_utils};
 
 /// The name of the consolidation-state file (inside the forklift root folder). While a
 /// consolidation is in progress, it holds the head parcel hash of the pallet being
@@ -888,6 +888,14 @@ enum PendingAction {
     /// A file both sides changed: load its three sides and line-merge them (deferred so the
     /// merges fan out across the cores).
     Merge(MergeJob),
+
+    /// A plain file we deleted and they changed: put their version back, in conflict. Its blob is
+    /// loaded after the walk, so a cache warehouse fetches it with the merges' blobs.
+    PutBack {
+        path: String,
+        hash: String,
+        item_type: crate::enums::dir_entry_type::DirEntryType,
+    },
 }
 
 /// A deferred three-way line merge of one file both sides changed (see [`PendingAction`]).
@@ -936,6 +944,14 @@ pub fn compute_merge_actions(base_hash: &str,
                              ours_label: &str,
                              theirs_label: &str,
                              scope: &MaterializationScope) -> Result<Vec<MergeAction>, String> {
+    // The presence phase for the walk below, by its own rule: a subtree both sides agree on, or
+    // their side left as the base had it, is skipped, and so is an out-of-scope one. Its refusal
+    // is returned as it is, so a cache miss keeps its exit code.
+    cache_miss::ensure_trees_present(&[Some(base_hash), Some(ours_hash), Some(theirs_hash)], |path, sides| {
+        let (b, o, t) = (sides[0], sides[1], sides[2]);
+        !(o == t || t == b) && scope.classify(path) != ScopeClass::OutOfScope
+    })?;
+
     let base_tree = object_utils::load_tree(base_hash)?;
     let ours_tree = object_utils::load_tree(ours_hash)?;
     let theirs_tree = object_utils::load_tree(theirs_hash)?;
@@ -952,6 +968,19 @@ pub fn compute_merge_actions(base_hash: &str,
         scope,
         &mut pending
     )?;
+
+    // The blobs phase 2 reads, fetched in one batch in a cache warehouse.
+    cache_miss::ensure_files_present(pending.iter().flat_map(|entry| match entry {
+        PendingAction::Ready(_) => Vec::new(),
+        PendingAction::PutBack { hash, item_type, .. } => vec![(hash.as_str(), *item_type)],
+        PendingAction::Merge(job) => {
+            let mut sides = vec![(job.our_hash.as_str(), job.our_type), (job.their_hash.as_str(), job.their_type)];
+            if let (Some(hash), Some(item_type)) = (&job.base_hash, job.base_type) {
+                sides.push((hash.as_str(), item_type));
+            }
+            sides
+        }
+    }))?;
 
     // Phase 2 — run the deferred three-way merges across the cores and reassemble the
     // actions in walk order.
@@ -977,6 +1006,12 @@ fn resolve_pending(pending: Vec<PendingAction>,
     for (index, entry) in pending.into_iter().enumerate() {
         match entry {
             PendingAction::Ready(action) => ready.push((index, action)),
+            PendingAction::PutBack { path, hash, item_type } => ready.push((index, MergeAction::Conflict {
+                path,
+                content: Some(object_utils::load_blob(&hash)?.content),
+                entry_hash: hash,
+                item_type,
+            })),
             PendingAction::Merge(job) => jobs.push((index, job)),
         }
     }
@@ -1203,18 +1238,16 @@ fn merge_directory(base: Option<&crate::model::tree_item::TreeItem>,
             // whole into memory here — it carries no inline content; the apply path
             // re-materializes it from its recipe hash (which `entry_hash` holds).
             (None, Some((their_hash, their_type))) => {
-                let content = if their_type.is_chunked() {
-                    None
+                pending.push(if their_type.is_chunked() {
+                    PendingAction::Ready(MergeAction::Conflict {
+                        path,
+                        content: None,
+                        entry_hash: their_hash.clone(),
+                        item_type: *their_type,
+                    })
                 } else {
-                    Some(object_utils::load_blob(their_hash)?.content)
-                };
-
-                pending.push(PendingAction::Ready(MergeAction::Conflict {
-                    path,
-                    content,
-                    entry_hash: their_hash.clone(),
-                    item_type: *their_type,
-                }));
+                    PendingAction::PutBack { path, hash: their_hash.clone(), item_type: *their_type }
+                });
             }
 
             // Modify/delete: we changed it, they deleted it. Our file is kept, in conflict.
