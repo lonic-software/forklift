@@ -3566,10 +3566,13 @@ fn compact_bounded(all: bool,
     remove_stale_temp_files(&pack_folder);
 
     // A repack rewrites every signature table, so one it cannot read would be lost with the rest
-    // of the rewrite: refuse before anything is written, naming it.
-    if all {
-        refuse_unreadable_signature_tables(&pack_folder)?;
-    }
+    // of the rewrite: refuse before anything is written, naming it. The checked tables are kept
+    // for the signature phase at the end.
+    let checked_signature_tables = if all {
+        Some(refuse_unreadable_signature_tables(&pack_folder)?)
+    } else {
+        None
+    };
 
     progress.status("Collecting objects");
 
@@ -3982,7 +3985,11 @@ fn compact_bounded(all: bool,
 
     // The packs are final, so a repack's presence test below sees the store as it now stands.
     progress.status("Packing signatures");
-    sweep_signatures(&pack_folder, table_bound, all, &mut stats)?;
+    let signature_tables = match checked_signature_tables {
+        Some(tables) => tables,
+        None => open_signature_tables(&pack_folder)?,
+    };
+    sweep_signatures(&pack_folder, table_bound, all, signature_tables, &mut stats)?;
 
     // Populate the commit-graph for the whole reachable history while the lock is held and the
     // object caches are warm, so the first ancestry query (merge base, divergence check) after
@@ -4042,15 +4049,16 @@ fn list_signature_sidecars(objects_root: &Path) -> Result<Vec<(String, PathBuf)>
     Ok(sidecars)
 }
 
-/// One signature table in the pack folder as a compaction reads it: wholly into memory, by a
-/// plain read, or the message naming why it could not be.
+/// One signature table in the pack folder as a compaction opens it: mapped, as the registry maps
+/// one, or the message naming why it could not be opened.
 struct TableFile {
     path: PathBuf,
-    table: Result<SignatureTable<Vec<u8>>, String>,
+    table: Result<SignatureTable<memmap2::Mmap>, String>,
 }
 
-/// Read every signature table in `pack_folder`, sorted by name.
-fn read_signature_tables(pack_folder: &Path) -> Result<Vec<TableFile>, String> {
+/// Open every signature table in `pack_folder`, sorted by name. Each is mapped, not read: an
+/// incremental compaction only consults a full table, and a lookup touches one bucket of it.
+fn open_signature_tables(pack_folder: &Path) -> Result<Vec<TableFile>, String> {
     let entries = match std::fs::read_dir(pack_folder) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -4066,11 +4074,9 @@ fn read_signature_tables(pack_folder: &Path) -> Result<Vec<TableFile>, String> {
             continue;
         }
 
-        let table = match std::fs::read(&path) {
-            Ok(bytes) => SignatureTable::open(bytes)
-                .map_err(|error| signature_table::unreadable_message(&path, &error)),
-            Err(e) => Err(signature_table::io_message(&path, &e)),
-        };
+        let table = open_signature_table(&path, IndexCheck::Lazy)
+            .map(|loaded| loaded.table)
+            .map_err(|unreadable| unreadable.message);
         tables.push(TableFile { path, table });
     }
 
@@ -4083,9 +4089,11 @@ fn corrupt_table_message(path: &Path, detail: String) -> String {
     signature_table::unreadable_message(path, &signature_table::TableError::Corrupt(detail))
 }
 
-/// Refuse a full repack while any signature table cannot be read in full, naming it.
-fn refuse_unreadable_signature_tables(pack_folder: &Path) -> Result<(), String> {
-    for file in read_signature_tables(pack_folder)? {
+/// Refuse a full repack while any signature table cannot be read in full, naming it. Returns the
+/// tables, checked, for the repack's signature phase to rewrite without opening them again.
+fn refuse_unreadable_signature_tables(pack_folder: &Path) -> Result<Vec<TableFile>, String> {
+    let tables = open_signature_tables(pack_folder)?;
+    for file in &tables {
         let problem = match &file.table {
             Err(message) => Some(message.clone()),
             Ok(table) => table.all_entries().err().map(|detail| corrupt_table_message(&file.path, detail)),
@@ -4099,7 +4107,7 @@ fn refuse_unreadable_signature_tables(pack_folder: &Path) -> Result<(), String> 
         }
     }
 
-    Ok(())
+    Ok(tables)
 }
 
 /// Where a parcel is after a full repack, for keeping its signature (see [`sweep_signatures`]).
@@ -4129,8 +4137,28 @@ fn parcel_presence(set: &PackSet, hash: &str, hash_bytes: &[u8; HASH_LEN]) -> Pr
     if packed { Presence::Packed } else { Presence::Absent }
 }
 
+/// Below this many parcels, a repack probes their presence on the calling thread: each probe is a
+/// stat and a few index lookups, too little to pay for spawning workers.
+const PRESENCE_PARALLEL_THRESHOLD: usize = 1024;
+
+/// The presence of every parcel in `hashes` once a full repack's packs are final, probed in
+/// parallel ([`fanout_utils::fanout_map`]): a repack of a large history probes one per signature.
+fn parcel_presences(hashes: Vec<[u8; HASH_LEN]>) -> Result<HashMap<[u8; HASH_LEN], Presence>, String> {
+    let set = loaded_packs()?;
+    let probe = |hash_bytes: &[u8; HASH_LEN]| parcel_presence(&set, &sign_utils::to_hex(hash_bytes), hash_bytes);
+
+    let presences = if hashes.len() < PRESENCE_PARALLEL_THRESHOLD {
+        hashes.iter().map(probe).collect()
+    } else {
+        fanout_utils::fanout_map(&hashes, probe)
+    };
+
+    Ok(hashes.into_iter().zip(presences).collect())
+}
+
 /// The signature phase of a compaction (FORK-333): move loose sidecars into signature tables of
-/// at most `bound` entries, durably, and only then delete what the new tables replace.
+/// at most `bound` entries, durably, and only then delete what the new tables replace. `tables`
+/// is every table in `pack_folder` ([`open_signature_tables`]).
 ///
 /// An incremental run merges every loose sidecar and every readable table below the bound into
 /// new tables, leaving at most one below it. It never refuses as a whole: a sidecar that differs
@@ -4145,19 +4173,19 @@ fn parcel_presence(set: &PackSet, hash: &str, hash_bytes: &[u8; HASH_LEN]) -> Pr
 ///
 /// Names derive from content, so a rewrite that changes nothing lands on the name of a table it
 /// read: a just-published name is never deleted.
-fn sweep_signatures(pack_folder: &Path, bound: usize, repack: bool, stats: &mut CompactStats) -> Result<(), String> {
+fn sweep_signatures(pack_folder: &Path,
+                    bound: usize,
+                    repack: bool,
+                    tables: Vec<TableFile>,
+                    stats: &mut CompactStats) -> Result<(), String> {
     let objects_root = PathBuf::from(file_utils::get_path_objects_root());
     let sidecars = list_signature_sidecars(&objects_root)?;
-    let tables = read_signature_tables(pack_folder)?;
-    let presence_set = if repack { Some(loaded_packs()?) } else { None };
-    let present = |hash: &str, hash_bytes: &[u8; HASH_LEN]| presence_set.as_ref()
-        .map_or(Presence::Packed, |set| parcel_presence(set, hash, hash_bytes));
 
     // The tables this run consumes, the entries they and the sidecars contribute, and the tables
     // it only consults: full ones an incremental run leaves in place.
-    let mut inputs: Vec<&Path> = Vec::new();
+    let mut inputs: Vec<PathBuf> = Vec::new();
     let mut merged: std::collections::BTreeMap<[u8; HASH_LEN], Vec<u8>> = std::collections::BTreeMap::new();
-    let mut consulted: Vec<(&Path, &SignatureTable<Vec<u8>>)> = Vec::new();
+    let mut consulted: Vec<(&Path, &SignatureTable<memmap2::Mmap>)> = Vec::new();
 
     for file in &tables {
         let table = match &file.table {
@@ -4176,15 +4204,11 @@ fn sweep_signatures(pack_folder: &Path, bound: usize, repack: bool, stats: &mut 
         match table.all_entries() {
             Ok(entries) => {
                 for (hash_bytes, entry) in entries {
-                    if present(&sign_utils::to_hex(&hash_bytes), &hash_bytes) == Presence::Absent {
-                        stats.signatures_dropped += 1;
-                        continue;
-                    }
                     // Tables are immutable and a parcel has one signature, so two tables never
                     // disagree; should one have been edited, the first in name order stands.
                     merged.entry(hash_bytes).or_insert_with(|| entry.to_vec());
                 }
-                inputs.push(&file.path);
+                inputs.push(file.path.clone());
             }
             Err(detail) => stats.signature_tables_unreadable.push(corrupt_table_message(&file.path, detail)),
         }
@@ -4194,16 +4218,38 @@ fn sweep_signatures(pack_folder: &Path, bound: usize, repack: bool, stats: &mut 
         return Ok(());
     }
 
+    let sidecar_hashes: Vec<[u8; HASH_LEN]> = sidecars.iter()
+        .map(|(hash, _)| hash_to_bytes(hash).expect("a listed sidecar names a hash"))
+        .collect();
+
+    // A repack keeps a signature only while its parcel is present.
+    let presence = if repack {
+        let mut hashes: Vec<[u8; HASH_LEN]> = merged.keys().copied().collect();
+        hashes.extend(&sidecar_hashes);
+        Some(parcel_presences(hashes)?)
+    } else {
+        None
+    };
+    let present = |hash_bytes: &[u8; HASH_LEN]| presence.as_ref()
+        .map_or(Presence::Packed, |presence| presence[hash_bytes]);
+
+    merged.retain(|hash_bytes, _| {
+        let keep = present(hash_bytes) != Presence::Absent;
+        if !keep {
+            stats.signatures_dropped += 1;
+        }
+        keep
+    });
+
     // Sidecars a new table now holds, and leftover copies of signatures already tabled.
     let mut moved: Vec<&Path> = Vec::new();
     let mut leftovers: Vec<&Path> = Vec::new();
     let mut dropped: Vec<&Path> = Vec::new();
 
-    for (hash, path) in &sidecars {
+    for ((hash, path), hash_bytes) in sidecars.iter().zip(sidecar_hashes) {
         let conflict = |reason: String| SignatureConflict {
             parcel: hash.clone(), sidecar_path: path.to_string_lossy().to_string(), reason,
         };
-        let hash_bytes = hash_to_bytes(hash).expect("a listed sidecar names a hash");
 
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
@@ -4219,7 +4265,7 @@ fn sweep_signatures(pack_folder: &Path, bound: usize, repack: bool, stats: &mut 
             continue;
         }
 
-        match present(hash, &hash_bytes) {
+        match present(&hash_bytes) {
             Presence::Loose => continue,
             Presence::Absent => {
                 dropped.push(path);
@@ -4258,42 +4304,17 @@ fn sweep_signatures(pack_folder: &Path, bound: usize, repack: bool, stats: &mut 
         }
     }
 
-    // The repack's own mappings, held both here and by the process registry, are released before
+    // This run's mappings of the tables, and those of the process registry, are released before
     // anything is renamed or deleted: Windows refuses to rename over a mapped file.
-    drop(presence_set);
+    drop(consulted);
+    drop(tables);
     invalidate_cache();
 
-    // Publish: each table written and fsynced under a temp name, renamed into place, and the
-    // folder fsynced once, before anything it replaces is deleted. A name is its content, so a
-    // table this run read and checked under the same name already holds these bytes: it stands
-    // as it is, never rewritten over itself (a rename over a file another reader has mapped fails
-    // on Windows).
     let entries: Vec<([u8; HASH_LEN], Vec<u8>)> = merged.into_iter().collect();
-    let mut published: HashSet<PathBuf> = HashSet::new();
-    let mut written: Vec<PathBuf> = Vec::new();
-
-    for chunk in entries.chunks(bound.max(1)) {
-        let final_path = pack_folder.join(format!("{}.{}", signature_table::table_id(chunk), SIGNATURE_TABLE_EXTENSION));
-        if inputs.contains(&final_path.as_path()) {
-            published.insert(final_path);
-            continue;
-        }
-        let temp = temp_path(pack_folder, SIGNATURE_TABLE_EXTENSION);
-        write_and_sync(&temp, &signature_table::build(chunk))?;
-        file_utils::rename(&temp, &final_path).map_err(|e| format!(
-            "Error while finalizing signature table \"{}\": {}", final_path.to_string_lossy(), e
-        ))?;
-        published.insert(final_path.clone());
-        written.push(final_path);
-        stats.signature_tables_written += 1;
-    }
-
-    if !written.is_empty() {
-        let written_refs: Vec<&Path> = written.iter().map(PathBuf::as_path).collect();
-        file_utils::sync_dir_or_taint(pack_folder, &written_refs)?;
-    }
-
-    invalidate_cache();
+    let published = write_signature_tables(pack_folder, &entries, bound, |path| {
+        inputs.iter().any(|input| input == path) || table_stands(path)
+    })?;
+    stats.signature_tables_written += published.written;
 
     let remove = |path: &Path, what: &str| match std::fs::remove_file(path) {
         Ok(()) => Ok(true),
@@ -4319,9 +4340,9 @@ fn sweep_signatures(pack_folder: &Path, bound: usize, repack: bool, stats: &mut 
         }
     }
 
-    for path in inputs {
+    for path in &inputs {
         // A content-derived name means an unchanged rewrite lands on the table it read.
-        if published.contains(path) {
+        if published.names.contains(path) {
             continue;
         }
         remove(path, "signature table")?;
@@ -4329,6 +4350,76 @@ fn sweep_signatures(pack_folder: &Path, bound: usize, repack: bool, stats: &mut 
 
     invalidate_cache();
     Ok(())
+}
+
+/// Whether a table that reads in full stands at `path`.
+fn table_stands(path: &Path) -> bool {
+    open_signature_table(path, IndexCheck::Full).is_ok()
+}
+
+/// What [`write_signature_tables`] left in the pack folder.
+struct PublishedTables {
+    /// Every table name the entries landed on, written now or already standing.
+    names: HashSet<PathBuf>,
+    /// How many of them it wrote.
+    written: usize,
+}
+
+/// Publish `entries` (one per parcel, sorted by hash) as signature tables of at most `bound`
+/// entries each: each written and fsynced under a temp name and renamed into place, then the
+/// folder fsynced once, so every table is durable before the caller deletes anything it replaces.
+///
+/// A name is its content, so a table that `stands` under a chunk's name already holds its bytes:
+/// it is never rewritten over itself (a rename over a file another reader has mapped fails on
+/// Windows).
+fn write_signature_tables(pack_folder: &Path,
+                          entries: &[([u8; HASH_LEN], Vec<u8>)],
+                          bound: usize,
+                          stands: impl Fn(&Path) -> bool) -> Result<PublishedTables, String> {
+    let mut names: HashSet<PathBuf> = HashSet::new();
+    let mut written: Vec<PathBuf> = Vec::new();
+
+    for chunk in entries.chunks(bound.max(1)) {
+        let final_path = pack_folder.join(format!("{}.{}", signature_table::table_id(chunk), SIGNATURE_TABLE_EXTENSION));
+        if stands(&final_path) {
+            names.insert(final_path);
+            continue;
+        }
+        let temp = temp_path(pack_folder, SIGNATURE_TABLE_EXTENSION);
+        write_and_sync(&temp, &signature_table::build(chunk))?;
+        file_utils::rename(&temp, &final_path).map_err(|e| format!(
+            "Error while finalizing signature table \"{}\": {}", final_path.to_string_lossy(), e
+        ))?;
+        names.insert(final_path.clone());
+        written.push(final_path);
+    }
+
+    if !written.is_empty() {
+        let written_refs: Vec<&Path> = written.iter().map(PathBuf::as_path).collect();
+        file_utils::sync_dir_or_taint(pack_folder, &written_refs)?;
+    }
+
+    invalidate_cache();
+    Ok(PublishedTables { names, written: written.len() })
+}
+
+/// Publish signatures received from elsewhere, a bundle or a fetch, as signature tables of at most
+/// `bound` entries, durably, instead of one loose sidecar each (FORK-333). `entries` holds one
+/// entry per parcel, sorted by hash, and the caller has already settled immutability
+/// ([`sign_utils::SignatureBatch`]).
+///
+/// # Returns
+/// * `Ok(usize)`   - How many tables were written.
+/// * `Err(String)` - If a table could not be written durably.
+pub(crate) fn publish_signature_tables(entries: &[([u8; HASH_LEN], Vec<u8>)], bound: usize) -> Result<usize, String> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+
+    let folder = pack_folder();
+    file_utils::create_folder_if_not_exists(&folder)?;
+
+    Ok(write_signature_tables(&folder, entries, bound, table_stands)?.written)
 }
 
 /// The outcome of reading and decompressing one target's bytes for [`prepare_target`]. A loose
@@ -10707,7 +10798,7 @@ pub(crate) mod tests {
 
     /// The signature tables in the pack folder: each one's path and entry count, by name.
     fn signature_tables() -> Vec<(PathBuf, usize)> {
-        read_signature_tables(&pack_folder()).unwrap().into_iter()
+        open_signature_tables(&pack_folder()).unwrap().into_iter()
             .map(|file| {
                 let count = file.table.as_ref().map(|table| table.count()).unwrap();
                 (file.path, count)
@@ -10789,6 +10880,65 @@ pub(crate) mod tests {
 
             std::fs::remove_dir_all(&temp).ok();
         }
+    }
+
+    /// Ingress (vi, vii) stores through a signature batch: it publishes a table each time a
+    /// table's worth has gathered and the rest when it finishes, and writes no sidecar.
+    ///
+    /// Revert: publish only in `finish` → one table of seven → red.
+    #[test]
+    fn a_signature_batch_publishes_a_table_at_each_bound() {
+        let (temp, _scope) = enter_signature_root("sig-batch-bound");
+
+        let mut batch = sign_utils::SignatureBatch::with_bound(sign_utils::OnConflict::Refuse, 3);
+        for n in 0..7 {
+            batch.add(fake_parcel("", n), fake_signature(n as u8)).unwrap();
+        }
+        let counts = batch.finish().unwrap();
+
+        assert_eq!(counts, sign_utils::StoredSignatures { stored: 7, skipped: 0 });
+        let mut sizes: Vec<usize> = signature_tables().into_iter().map(|(_, count)| count).collect();
+        sizes.sort();
+        assert_eq!(sizes, vec![1, 3, 3], "a table at each bound, then the rest");
+        assert!(loose_sidecars().is_empty(), "ingress writes no sidecar");
+        for n in 0..7 {
+            assert_eq!(sign_utils::load_raw_parcel_signature(&fake_parcel("", n)).unwrap(), Some(fake_signature(n as u8)));
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// A refusing batch (a fetch's) skips a signature the parcel already carries, and refuses one
+    /// that differs from it, loose or tabled, storing nothing of the batch.
+    ///
+    /// Revert: look for the existing signature in the tables only → the loose conflict is tabled
+    /// beside it → red; skip a conflict instead of refusing → the batch succeeds → red.
+    #[test]
+    fn a_refusing_signature_batch_stores_nothing_when_one_conflicts_in_either_layer() {
+        let (temp, _scope) = enter_signature_root("sig-batch-refuse");
+        let (loose, tabled, fresh) = (fake_parcel("", 0), fake_parcel("", 1), fake_parcel("", 2));
+        sign_utils::store_raw_parcel_signature(&loose, &fake_signature(1)).unwrap();
+
+        let mut batch = sign_utils::SignatureBatch::new(sign_utils::OnConflict::Refuse);
+        batch.add(tabled.clone(), fake_signature(2)).unwrap();
+        batch.add(loose.clone(), fake_signature(1)).unwrap();
+        assert_eq!(batch.finish().unwrap(), sign_utils::StoredSignatures { stored: 1, skipped: 1 },
+            "the signature the parcel already carries is skipped");
+        assert_eq!(signature_tables().len(), 1, "sanity: one parcel tabled");
+
+        for (conflicting, layer) in [(&loose, "loose"), (&tabled, "tabled")] {
+            let mut batch = sign_utils::SignatureBatch::new(sign_utils::OnConflict::Refuse);
+            batch.add(fresh.clone(), fake_signature(3)).unwrap();
+            batch.add(conflicting.clone(), fake_signature(9)).unwrap();
+            let refused = batch.finish().expect_err(&format!("a {} conflict refuses the batch", layer));
+            assert!(refused.contains("signatures are immutable"), "{}", refused);
+            assert_eq!(sign_utils::load_raw_parcel_signature(&fresh).unwrap(), None,
+                "{}: nothing of a refused batch is stored", layer);
+            assert_eq!(signature_tables().len(), 1, "{}: no table is written", layer);
+        }
+        assert_eq!(loose_sidecars(), vec![loose.clone()], "the batch wrote no sidecar");
+
+        std::fs::remove_dir_all(&temp).ok();
     }
 
     /// (iii) A signature is immutable across both layers: once tabled, a different one is refused

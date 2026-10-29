@@ -4795,7 +4795,7 @@ impl Drop for RemoveFileOnDrop<'_> {
 }
 
 /// Fetch everything reachable from a parcel head that is missing locally: the parcel
-/// graph, every parcel's signature sidecar, and the full tree/blob closure — verified
+/// graph, every parcel's signature, and the full tree/blob closure — verified
 /// object by object before storing.
 ///
 /// The walk stops at any parcel already reachable from a **local ref head** — every pallet
@@ -4812,7 +4812,7 @@ impl Drop for RemoveFileOnDrop<'_> {
 /// ref moved. (`audit` is what re-proves a whole history; this is a fetch, not an audit.)
 ///
 /// The old walk also re-probed the remote for the signature of every unsigned parcel on
-/// every sync, since "no sidecar here" is indistinguishable from "not fetched yet". Behind
+/// every sync, since "no signature here" is indistinguishable from "not fetched yet". Behind
 /// the bound, it no longer asks.
 ///
 /// # Arguments
@@ -4878,6 +4878,7 @@ async fn walk_history(client: &RemoteClient,
     let mut parcel_frontier: Vec<String> = vec![head.to_string()];
     let mut seen_parcels: HashSet<String> = HashSet::new();
     let mut seen = ContentSeen::default();
+    let mut signatures = walk_signatures();
 
     while !parcel_frontier.is_empty() {
         let candidates: Vec<String> = parcel_frontier.drain(..)
@@ -4898,7 +4899,7 @@ async fn walk_history(client: &RemoteClient,
 
         stats.walked_parcels += wave.len();
         stats.fetched_objects += fetch_missing_objects(client, &wave).await?;
-        stats.fetched_signatures += fetch_missing_signatures(client, &wave).await?;
+        stats.fetched_signatures += fetch_missing_signatures(client, &wave, &mut signatures).await?;
         report_fetch(progress, &stats);
 
         // The parcels are present now; their trees and parents drive the next waves.
@@ -4918,7 +4919,18 @@ async fn walk_history(client: &RemoteClient,
         fetch_tree_closures(client, tree_frontier, &mut seen, &mut stats, progress).await?;
     }
 
+    signatures.finish()?;
     Ok((stats, skipped_roots))
+}
+
+/// The signatures one fetch walk receives, held across all its waves and published as signature
+/// tables before the walk returns, so before its caller moves a ref or records a root. A wave is
+/// one generation of parcels, a single parcel on linear history, so a table per wave would still
+/// be a file per parcel. A walk that dies first loses only the signatures it held: their parcels
+/// are behind no ref and no root yet, so the next fetch walks them again and fetches the
+/// signatures it finds missing.
+fn walk_signatures() -> sign_utils::SignatureBatch {
+    sign_utils::SignatureBatch::new(sign_utils::OnConflict::Refuse)
 }
 
 /// The trees and blobs a walk has already fetched, so a subtree shared between parcels is walked once.
@@ -5576,6 +5588,7 @@ async fn fetch_scoped_from(client: &RemoteClient,
     progress.status("Fetching history");
 
     let mut parcel_frontier: Vec<String> = vec![head.to_string()];
+    let mut signatures = walk_signatures();
 
     while !parcel_frontier.is_empty() {
         let candidates: Vec<String> = parcel_frontier.drain(..)
@@ -5596,7 +5609,7 @@ async fn fetch_scoped_from(client: &RemoteClient,
 
         stats.walked_parcels += wave.len();
         stats.fetched_objects += fetch_missing_objects(client, &wave).await?;
-        stats.fetched_signatures += fetch_missing_signatures(client, &wave).await?;
+        stats.fetched_signatures += fetch_missing_signatures(client, &wave, &mut signatures).await?;
         report_fetch(progress, &stats);
 
         // Each parcel's root tree is a spine node (path ""); descend the spine, collecting the
@@ -5700,6 +5713,7 @@ async fn fetch_scoped_from(client: &RemoteClient,
         }
     }
 
+    signatures.finish()?;
     Ok(stats)
 }
 
@@ -6041,14 +6055,16 @@ pub(crate) async fn fetch_corrupt_replacements(
 /// abort on), while the hash rides along for the caller to split back off.
 const HASH_ERROR_DELIMITER: char = '\u{1}';
 
-/// Fetch (concurrently) the signature sidecars of the given parcels, where the sidecar
-/// is missing locally. Unsigned parcels (no sidecar on the remote either) are fine.
+/// Fetch (concurrently) the signatures of the given parcels that carry none locally, into
+/// `signatures`, which the walk publishes as signature tables. Unsigned parcels (no signature on
+/// the remote either) are fine.
 ///
 /// # Returns
-/// * `Ok(usize)`   - How many sidecars were fetched.
-/// * `Err(String)` - If a transfer failed.
+/// * `Ok(usize)`   - How many signatures were fetched.
+/// * `Err(String)` - If a transfer failed, or a fetched signature could not be stored.
 async fn fetch_missing_signatures(client: &RemoteClient,
-                                  parcel_hashes: &[String]) -> Result<usize, String> {
+                                  parcel_hashes: &[String],
+                                  signatures: &mut sign_utils::SignatureBatch) -> Result<usize, String> {
     let mut wanted: Vec<String> = Vec::new();
 
     for hash in parcel_hashes {
@@ -6062,7 +6078,7 @@ async fn fetch_missing_signatures(client: &RemoteClient,
     }
 
     let semaphore = Arc::new(Semaphore::new(CONCURRENT_TRANSFERS));
-    let mut tasks: JoinSet<Result<usize, String>> = JoinSet::new();
+    let mut tasks: JoinSet<Result<Option<(String, Vec<u8>)>, String>> = JoinSet::new();
 
     for hash in wanted {
         let client = client.clone();
@@ -6072,21 +6088,17 @@ async fn fetch_missing_signatures(client: &RemoteClient,
             let _permit = semaphore.acquire().await
                 .map_err(|_| "The transfer pool was closed unexpectedly.".to_string())?;
 
-            match client.fetch_signature(&hash).await? {
-                Some(bytes) => {
-                    sign_utils::store_raw_parcel_signature(&hash, &bytes)?;
-                    Ok(1)
-                }
-                None => Ok(0),
-            }
+            Ok(client.fetch_signature(&hash).await?.map(|bytes| (hash, bytes)))
         });
     }
 
-    // Routed through the same `join_all` every other coordinator in this module uses, rather
-    // than a second, hand-rolled copy of its join/drain loop — see `join_all`'s doc for the
-    // not-return-while-writing guarantee this gets for free; `sign_utils::store_raw_parcel_signature`
-    // is one of the two store helpers that guarantee names.
-    join_all(tasks).await.map(|counts| counts.into_iter().sum())
+    let mut fetched = 0;
+    for (hash, bytes) in join_all(tasks).await?.into_iter().flatten() {
+        signatures.add(hash, bytes)?;
+        fetched += 1;
+    }
+
+    Ok(fetched)
 }
 
 /// Lift one pallet: negotiate the missing objects, upload them (and the new parcels'
@@ -7083,13 +7095,14 @@ fn build_commit_batches(control_plane: &[String],
 /// Await every task of a set, surfacing the first failure and discarding the rest — first error
 /// wins, so a later, possibly less actionable failure (e.g. one surfaced only by best-effort
 /// cleanup after the real one) never overwrites the first. Generic over the task payload `T` so
-/// every coordinator in this module — fetching objects, fetching signature sidecars, and both
+/// every coordinator in this module — fetching objects, fetching signatures, and both
 /// upload paths — routes through this one implementation instead of each hand-rolling its own
 /// copy of this loop.
 ///
 /// The coordinating call must not return while a sibling task's body may still be writing
-/// (`object_utils::store_object_bytes` and `sign_utils::store_raw_parcel_signature` both have no
-/// await between reading the fetched bytes and finishing the write) — see [`drain_remaining`],
+/// (`object_utils::store_object_bytes` has no await between reading the fetched bytes and
+/// finishing the write; fetched signatures are written by the walk, not by a task) — see
+/// [`drain_remaining`],
 /// which this delegates to on the error path. Any panic evidence [`drain_remaining`] observed
 /// while draining is appended to the first error below, never substituted for it.
 ///
@@ -10960,9 +10973,9 @@ mod tests {
     // leave evidence rather than vanish. `join_all` is the single implementation every
     // coordinator in this module routes through — fetching objects, fetching signature sidecars,
     // and both upload paths — so the tests below, exercising `join_all`/`drain_remaining`
-    // directly, structurally cover all of them, including the two real task bodies that motivate
-    // the fix: `object_utils::store_object_bytes` and `sign_utils::store_raw_parcel_signature`
-    // (see `join_all`'s doc for the exact no-await shape they share that motivates this). The
+    // directly, structurally cover all of them, including the real task body that motivates the
+    // fix: `object_utils::store_object_bytes` (see `join_all`'s doc for the exact no-await shape
+    // that motivates this). The
     // tests reproduce that shape with `std::thread::sleep` — never `tokio::time::sleep`, which
     // would give cancellation somewhere to land — gated by atomic flags so a sibling is provably
     // resident, and provably past whatever it is waiting on, before the task driving each
@@ -11002,9 +11015,8 @@ mod tests {
     }
 
     /// Spawns into `tasks` the "unyielding sibling" shape shared by every test below — mirroring
-    /// the two real task bodies `join_all`/`drain_remaining` guard
-    /// (`object_utils::store_object_bytes` and `sign_utils::store_raw_parcel_signature`; see
-    /// `join_all`'s doc for the exact no-await shape being mirrored here). Sets `started` as soon
+    /// the real task body `join_all`/`drain_remaining` guard (`object_utils::store_object_bytes`;
+    /// see `join_all`'s doc for the exact no-await shape being mirrored here). Sets `started` as soon
     /// as it is first polled — these bare spawned bodies have no other await point, so
     /// `abort_all` (which can only cancel a task suspended at one) cancels a never-polled task
     /// outright; `started` is what proves this sibling's first, and only, poll has begun, i.e. it
