@@ -515,6 +515,19 @@ fn get_signature_path(parcel_hash: &str) -> Result<PathBuf, String> {
 /// * `Err(String)` - If the parcel carries a different signature, or the write failed.
 pub fn store_parcel_signature(parcel_hash: &str,
                               signature: &ParcelSignature) -> Result<(), String> {
+    store_signature_once(parcel_hash, &encode_parcel_signature(signature))
+}
+
+/// Replace a parcel's loose sidecar with `signature`, bypassing immutability: a test that forges
+/// a signature needs the store to hold one it would refuse.
+#[cfg(test)]
+pub(crate) fn overwrite_signature_sidecar_for_test(parcel_hash: &str, signature: &ParcelSignature) {
+    let path = get_signature_path(parcel_hash).unwrap();
+    file_utils::write_file_atomically(&path, &encode_parcel_signature(signature)).unwrap();
+}
+
+/// The sidecar bytes of `signature` (see `store_parcel_signature` for the layout).
+fn encode_parcel_signature(signature: &ParcelSignature) -> Vec<u8> {
     let mut content: Vec<u8> = Vec::new();
 
     content.extend(crate::util::byte_utils::number_to_vlq_bytes(1)); // format version
@@ -523,17 +536,17 @@ pub fn store_parcel_signature(parcel_hash: &str,
     content.extend(crate::util::byte_utils::number_to_vlq_bytes(signature.signature.len() as u64));
     content.extend(&signature.signature);
 
-    store_signature_once(parcel_hash, &content)
+    content
 }
 
-/// Read a parcel's signature sidecar.
+/// Read a parcel's signature, from a signature table or its sidecar.
 ///
 /// # Arguments
 /// * `parcel_hash` - The hash of the parcel.
 ///
 /// # Returns
 /// * `Ok(Some(ParcelSignature))` - The stored signature.
-/// * `Ok(None)`                  - If the parcel has no signature sidecar.
+/// * `Ok(None)`                  - If the parcel has no signature.
 /// * `Err(String)`               - If the sidecar exists but is malformed.
 pub fn load_parcel_signature(parcel_hash: &str) -> Result<Option<ParcelSignature>, String> {
     match load_raw_parcel_signature(parcel_hash)? {

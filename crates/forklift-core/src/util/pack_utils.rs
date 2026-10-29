@@ -173,6 +173,11 @@ pub enum AutoCompaction {
 /// * `Ok(AutoCompaction)` - What is due (often `None`).
 /// * `Err(String)`        - If the store or configuration could not be read.
 pub fn auto_compaction_action() -> Result<AutoCompaction, String> {
+    auto_compaction_action_bounded(signature_table::MAX_TABLE_ENTRIES)
+}
+
+/// [`auto_compaction_action`], with a signature table counted as full at `table_bound` entries.
+fn auto_compaction_action_bounded(table_bound: usize) -> Result<AutoCompaction, String> {
     use crate::util::config_utils;
 
     if !maintenance_auto_enabled()? {
@@ -190,7 +195,7 @@ pub fn auto_compaction_action() -> Result<AutoCompaction, String> {
     }
 
     // Small signature tables have accumulated → merge them.
-    if count_partial_signature_tables(table_threshold)? > table_threshold {
+    if count_partial_signature_tables(table_threshold, table_bound)? > table_threshold {
         return Ok(AutoCompaction::Incremental);
     }
 
@@ -522,10 +527,11 @@ fn classify_sidecar(set: &PackSet, hash: &str, path: &Path) -> SidecarState {
     }
 }
 
-/// Count the readable signature tables below the bound. Only a table's header is read, unless
-/// the count exceeds `threshold`: then each is checked in full, and one that fails does not
-/// count, since a compaction leaves it alone and would be triggered again on every command.
-fn count_partial_signature_tables(threshold: usize) -> Result<usize, String> {
+/// Count the readable signature tables holding fewer than `bound` entries. Only a table's header
+/// is read, unless the count exceeds `threshold`: then each is checked in full, and one that fails
+/// does not count, since a compaction leaves it alone and would be triggered again on every
+/// command.
+fn count_partial_signature_tables(threshold: usize, bound: usize) -> Result<usize, String> {
     let entries = match std::fs::read_dir(pack_folder()) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -540,7 +546,7 @@ fn count_partial_signature_tables(threshold: usize) -> Result<usize, String> {
         }
         let mut header = [0u8; 16];
         let read = std::fs::File::open(&path).and_then(|mut file| file.read_exact(&mut header));
-        if read.is_ok() && signature_table::header_count(&header).is_some_and(|count| count < signature_table::MAX_TABLE_ENTRIES) {
+        if read.is_ok() && signature_table::header_count(&header).is_some_and(|count| count < bound) {
             partial.push(path);
         }
     }
@@ -10641,6 +10647,341 @@ pub(crate) mod tests {
             "a stamp whose tick has passed must be re-checked once");
         assert!(!broken_pair_changed(index, &settled, FailureKind::Fixed, now, index),
             "a settled stamp on unchanged files is trusted");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    // FORK-333: signature tables.
+
+    /// A well-formed signature (never verified here) whose bytes differ per `seed`.
+    fn fake_signature(seed: u8) -> Vec<u8> {
+        let key_id = b"test-key";
+        let mut bytes = crate::util::byte_utils::number_to_vlq_bytes(1);
+        bytes.extend(crate::util::byte_utils::number_to_vlq_bytes(key_id.len() as u64));
+        bytes.extend_from_slice(key_id);
+        bytes.extend(crate::util::byte_utils::number_to_vlq_bytes(64));
+        bytes.extend_from_slice(&[seed; 64]);
+        bytes
+    }
+
+    /// A parcel hash (no object behind it) that starts with `prefix`, distinct per `n`.
+    fn fake_parcel(prefix: &str, n: usize) -> String {
+        let hash = blake3::hash(format!("fake parcel {} {}", prefix, n).as_bytes()).to_hex().to_string();
+        format!("{}{}", prefix, &hash[prefix.len()..])
+    }
+
+    fn sidecar_path(hash: &str) -> PathBuf {
+        let (folder, file_name) = file_utils::get_path_for_object(hash).unwrap();
+        Path::new(&folder).join(format!("{}{}", file_name, sign_utils::FILE_SUFFIX_SIGNATURE))
+    }
+
+    fn loose_sidecars() -> Vec<String> {
+        list_signature_sidecars(Path::new(&file_utils::get_path_objects_root())).unwrap()
+            .into_iter().map(|(hash, _)| hash).collect()
+    }
+
+    /// The signature tables in the pack folder: each one's path and entry count, by name.
+    fn signature_tables() -> Vec<(PathBuf, usize)> {
+        read_signature_tables(&pack_folder()).unwrap().into_iter()
+            .map(|file| {
+                let count = file.table.as_ref().map(|table| table.count()).unwrap();
+                (file.path, count)
+            })
+            .collect()
+    }
+
+    /// Enter a fresh full-mode warehouse root with an existing pack folder.
+    fn enter_signature_root(name: &str) -> (PathBuf, StorageRootScope) {
+        let temp = fresh_root(name);
+        let scope = StorageRootScope::enter(&temp);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+        std::fs::create_dir_all(pack_folder()).unwrap();
+        (temp, scope)
+    }
+
+    fn compact_signatures(bound: usize) -> CompactStats {
+        compact_bounded(false, false, false, &Progress::NONE, bound).unwrap()
+    }
+
+    /// (i) An incremental compact sweeps every loose sidecar into a table, and each signature
+    /// reads back byte-identical.
+    ///
+    /// Revert: skip the `sweep_signatures` call in `compact_bounded` → the sidecars stay → red.
+    #[test]
+    fn an_incremental_compact_tables_every_sidecar_and_each_reads_back_identical() {
+        let (temp, _scope) = enter_signature_root("sig-sweep");
+
+        let signed: Vec<(String, Vec<u8>)> = (0..7).map(|n| (fake_parcel("", n), fake_signature(n as u8))).collect();
+        for (hash, bytes) in &signed {
+            sign_utils::store_raw_parcel_signature(hash, bytes).unwrap();
+        }
+
+        let stats = compact_signatures(signature_table::MAX_TABLE_ENTRIES);
+
+        assert_eq!(stats.signature_sidecars_swept, 7);
+        assert!(loose_sidecars().is_empty(), "no sidecar may stay loose");
+        assert_eq!(signature_tables().len(), 1);
+        for (hash, bytes) in &signed {
+            assert_eq!(sign_utils::load_raw_parcel_signature(hash).unwrap().as_ref(), Some(bytes), "{}", hash);
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (ii) A reader whose cached pack set predates a table another handle published, with the
+    /// sidecar it read before then deleted, still finds the signature: once with the pack folder's
+    /// mtime moved, and once with it set back to the stamped value so only the name compare of a
+    /// racy stamp can notice.
+    ///
+    /// Reverts: drop `"sigs"` from `is_pack_file_name` → the racy run misses the table → red;
+    /// make the second `tabled_signature` call in `load_raw_parcel_signature` not revalidate →
+    /// both runs miss → red.
+    #[cfg(unix)]
+    #[test]
+    fn a_table_published_after_caching_is_found_once_its_sidecar_is_gone() {
+        for racy in [false, true] {
+            let (temp, _scope) = enter_signature_root(&format!("sig-after-caching-{}", racy));
+
+            let hash = fake_parcel("", 1);
+            let bytes = fake_signature(1);
+            sign_utils::store_raw_parcel_signature(&hash, &bytes).unwrap();
+            assert_eq!(sign_utils::load_raw_parcel_signature(&hash).unwrap().as_ref(), Some(&bytes),
+                "sanity: the sidecar reads, and the pack set is cached");
+            let stamped = cached_pack_set().stamp.times.lock().unwrap().modified
+                .expect("the pack folder existed when the set was stamped")
+                .expect("this platform reports directory mtimes");
+
+            let entries = vec![(hash_to_bytes(&hash).unwrap(), bytes.clone())];
+            let name = format!("{}.{}", signature_table::table_id(&entries), SIGNATURE_TABLE_EXTENSION);
+            std::fs::write(pack_folder().join(name), signature_table::build(&entries)).unwrap();
+            std::fs::remove_file(sidecar_path(&hash)).unwrap();
+
+            let folder_mtime = if racy { stamped } else { stamped + Duration::from_secs(5) };
+            std::fs::File::open(pack_folder()).unwrap().set_modified(folder_mtime).unwrap();
+
+            assert_eq!(sign_utils::load_raw_parcel_signature(&hash).unwrap().as_ref(), Some(&bytes),
+                "racy {}: a table published after caching must be found", racy);
+
+            std::fs::remove_dir_all(&temp).ok();
+        }
+    }
+
+    /// (iii) A signature is immutable across both layers: once tabled, a different one is refused
+    /// and the same one is a no-op that writes no sidecar.
+    ///
+    /// Revert: make `store_signature_once` check the loose layer only → the different signature
+    /// lands as a sidecar → red.
+    #[test]
+    fn a_tabled_signature_refuses_a_different_one_and_ignores_the_same() {
+        let (temp, _scope) = enter_signature_root("sig-immutable");
+
+        let hash = fake_parcel("", 1);
+        sign_utils::store_raw_parcel_signature(&hash, &fake_signature(1)).unwrap();
+        compact_signatures(signature_table::MAX_TABLE_ENTRIES);
+        assert!(!sidecar_path(&hash).exists(), "sanity: the signature is tabled");
+
+        let refused = sign_utils::store_raw_parcel_signature(&hash, &fake_signature(2)).unwrap_err();
+        assert!(refused.contains("signatures are immutable"), "{}", refused);
+        let signer = sign_utils::ParcelSignature { key_id: "test-key".to_string(), signature: vec![3; 64] };
+        let refused = sign_utils::store_parcel_signature(&hash, &signer).unwrap_err();
+        assert!(refused.contains("signatures are immutable"), "{}", refused);
+
+        sign_utils::store_raw_parcel_signature(&hash, &fake_signature(1)).unwrap();
+        assert!(!sidecar_path(&hash).exists(), "storing the tabled signature again writes nothing");
+        assert_eq!(sign_utils::load_raw_parcel_signature(&hash).unwrap(), Some(fake_signature(1)));
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (iv) A sidecar that differs from its parcel's tabled signature stays loose and is named, the
+    /// tabled one keeps answering, and every other sidecar is swept.
+    ///
+    /// Reverts: let the sidecar replace the tabled entry → the read returns it → red; return an
+    /// error on the conflict → the compact fails → red.
+    #[test]
+    fn a_conflicting_sidecar_stays_loose_and_named_while_the_rest_are_swept() {
+        let (temp, _scope) = enter_signature_root("sig-conflict");
+
+        let tabled = fake_parcel("", 1);
+        sign_utils::store_raw_parcel_signature(&tabled, &fake_signature(1)).unwrap();
+        compact_signatures(signature_table::MAX_TABLE_ENTRIES);
+        std::fs::write(sidecar_path(&tabled), fake_signature(9)).unwrap();
+
+        let others: Vec<String> = (2..5).map(|n| fake_parcel("", n)).collect();
+        for (n, hash) in others.iter().enumerate() {
+            sign_utils::store_raw_parcel_signature(hash, &fake_signature(n as u8 + 2)).unwrap();
+        }
+
+        let stats = compact_signatures(signature_table::MAX_TABLE_ENTRIES);
+
+        assert_eq!(stats.signature_conflicts.len(), 1, "{:?}", stats.signature_conflicts);
+        assert_eq!(stats.signature_conflicts[0].parcel, tabled);
+        assert!(stats.signature_conflicts[0].reason.contains("differs"), "{:?}", stats.signature_conflicts);
+        assert_eq!(loose_sidecars(), vec![tabled.clone()], "only the conflicting sidecar stays loose");
+        assert_eq!(sign_utils::load_raw_parcel_signature(&tabled).unwrap(), Some(fake_signature(1)),
+            "the tabled signature stands");
+        for (n, hash) in others.iter().enumerate() {
+            assert_eq!(sign_utils::load_raw_parcel_signature(hash).unwrap(), Some(fake_signature(n as u8 + 2)));
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// Flip one byte of a signature table at `offset` (negative: from the end).
+    fn flip_table_byte(path: &Path, offset: isize) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let at = if offset < 0 { bytes.len() - offset.unsigned_abs() } else { offset as usize };
+        bytes[at] ^= 0x01;
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// (x) A corrupt table, a damaged record or a damaged entry, makes a lookup it might answer
+    /// fail naming the table, never read as unsigned, and a Repack refuses naming it. Moved aside,
+    /// lookups answer again and its parcels read as unsigned. A table of another version fails
+    /// with its own advice, not the move-aside one.
+    ///
+    /// Reverts: treat a corrupt table as missing (quarantine and ignore, as for a pack index) →
+    /// the lookup returns `None` → red; give the move-aside advice for a foreign version → red.
+    #[test]
+    fn a_corrupt_table_fails_the_lookup_and_a_foreign_one_names_its_own_advice() {
+        // The record of a one-entry table starts after the 24-byte header and 256 fanout entries.
+        let record = (24 + 256 * 8) as isize;
+        let cases: [(&str, isize); 2] = [("record", record), ("entry", -1)];
+
+        for (what, offset) in cases {
+            let (temp, _scope) = enter_signature_root(&format!("sig-corrupt-{}", what));
+
+            let hash = fake_parcel("", 1);
+            sign_utils::store_raw_parcel_signature(&hash, &fake_signature(1)).unwrap();
+            compact_signatures(signature_table::MAX_TABLE_ENTRIES);
+            let (table, _) = signature_tables().remove(0);
+            let name = table.file_name().unwrap().to_string_lossy().to_string();
+            flip_table_byte(&table, offset);
+            invalidate_cache();
+
+            let error = sign_utils::load_raw_parcel_signature(&hash)
+                .expect_err(&format!("{}: a corrupt table must not read as unsigned", what));
+            assert!(error.contains(&name) && error.contains("Move it out of the pack folder"), "{}: {}", what, error);
+
+            let refused = compact_bounded(true, false, false, &Progress::NONE, signature_table::MAX_TABLE_ENTRIES)
+                .expect_err(&format!("{}: a Repack must refuse", what));
+            assert!(refused.contains(&name), "{}: {}", what, refused);
+
+            let aside = temp.join(&name);
+            std::fs::rename(&table, &aside).unwrap();
+            assert_eq!(sign_utils::load_raw_parcel_signature(&hash).unwrap(), None,
+                "{}: moved aside, its parcels read as unsigned", what);
+
+            std::fs::remove_dir_all(&temp).ok();
+        }
+
+        let (temp, _scope) = enter_signature_root("sig-foreign");
+        let hash = fake_parcel("", 1);
+        sign_utils::store_raw_parcel_signature(&hash, &fake_signature(1)).unwrap();
+        compact_signatures(signature_table::MAX_TABLE_ENTRIES);
+        let (table, _) = signature_tables().remove(0);
+        let mut bytes = std::fs::read(&table).unwrap();
+        bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+        std::fs::write(&table, bytes).unwrap();
+        invalidate_cache();
+
+        let error = sign_utils::load_raw_parcel_signature(&hash).expect_err("a foreign table must not read as unsigned");
+        assert!(error.contains("Use a build that reads it"), "{}", error);
+        assert!(!error.contains("Move it out"), "{}", error);
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (xi) With the bound at 3, seven signatures make tables of 3, 3 and 1. A second compact that
+    /// finds only leftover copies of tabled signatures rewrites the partial table onto its own
+    /// name and must keep it.
+    ///
+    /// Revert: drop the just-published-name guard in `sweep_signatures` → the second compact
+    /// deletes the table it wrote → the signature reads as unsigned → red.
+    #[test]
+    fn tables_split_at_the_bound_and_an_unchanged_rewrite_keeps_its_table() {
+        let (temp, _scope) = enter_signature_root("sig-bound");
+
+        let signed: Vec<(String, Vec<u8>)> = (0..7).map(|n| (fake_parcel("", n), fake_signature(n as u8))).collect();
+        for (hash, bytes) in &signed {
+            sign_utils::store_raw_parcel_signature(hash, bytes).unwrap();
+        }
+        compact_signatures(3);
+
+        let mut counts: Vec<usize> = signature_tables().into_iter().map(|(_, count)| count).collect();
+        counts.sort();
+        assert_eq!(counts, vec![1, 3, 3]);
+        let before: Vec<PathBuf> = signature_tables().into_iter().map(|(path, _)| path).collect();
+
+        // Leftover copies, as a compaction killed between its publish and its deletes leaves.
+        for (hash, bytes) in &signed {
+            std::fs::write(sidecar_path(hash), bytes).unwrap();
+        }
+        let stats = compact_signatures(3);
+
+        assert_eq!(stats.signature_sidecars_swept, 7);
+        assert!(loose_sidecars().is_empty());
+        assert_eq!(signature_tables().into_iter().map(|(path, _)| path).collect::<Vec<_>>(), before,
+            "an unchanged rewrite must leave the tables in place");
+        for (hash, bytes) in &signed {
+            assert_eq!(sign_utils::load_raw_parcel_signature(hash).unwrap().as_ref(), Some(bytes), "{}", hash);
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (xiv) Full tables never trigger maintenance, however many there are: there is nothing to
+    /// merge them into.
+    ///
+    /// Revert: count every table in `count_partial_signature_tables` → two full tables exceed the
+    /// threshold of 1 → red.
+    #[test]
+    fn full_signature_tables_never_trigger_maintenance() {
+        let (temp, _scope) = enter_signature_root("sig-full-trigger");
+        crate::util::config_utils::set_value(crate::util::config_utils::KEY_MAINTENANCE_SIGNATURE_TABLES, "1", crate::enums::config_scope::ConfigScope::Warehouse).unwrap();
+
+        for n in 0..6 {
+            sign_utils::store_raw_parcel_signature(&fake_parcel("", n), &fake_signature(n as u8)).unwrap();
+        }
+        compact_signatures(3);
+        assert_eq!(signature_tables().into_iter().map(|(_, count)| count).collect::<Vec<_>>(), vec![3, 3]);
+
+        assert!(matches!(auto_compaction_action_bounded(3).unwrap(), AutoCompaction::None),
+            "full tables must not trigger maintenance");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (xvi) A conflicting sidecar in the sampled folder does not trigger maintenance, since no
+    /// compaction can discharge it. Once pending sidecars grow past the threshold, one compaction
+    /// sweeps all but the conflict, and maintenance is then no longer due.
+    ///
+    /// Reverts: count every sidecar in `estimate_loose_count` → the conflict alone triggers →
+    /// red; refuse the whole sweep on a conflict → the compaction fails → red.
+    #[test]
+    fn a_conflicting_sidecar_never_keeps_maintenance_due() {
+        let (temp, _scope) = enter_signature_root("sig-conflict-trigger");
+        crate::util::config_utils::set_value(crate::util::config_utils::KEY_MAINTENANCE_LOOSE, "1", crate::enums::config_scope::ConfigScope::Warehouse).unwrap();
+
+        let conflicting = fake_parcel(AUTO_SAMPLE_FOLDER, 0);
+        sign_utils::store_raw_parcel_signature(&conflicting, &fake_signature(1)).unwrap();
+        compact_signatures(signature_table::MAX_TABLE_ENTRIES);
+        std::fs::write(sidecar_path(&conflicting), fake_signature(2)).unwrap();
+
+        assert!(matches!(auto_compaction_action_bounded(signature_table::MAX_TABLE_ENTRIES).unwrap(), AutoCompaction::None),
+            "a conflicting sidecar alone must not trigger maintenance");
+
+        for n in 1..4 {
+            sign_utils::store_raw_parcel_signature(&fake_parcel(AUTO_SAMPLE_FOLDER, n), &fake_signature(n as u8 + 2)).unwrap();
+        }
+        assert!(matches!(auto_compaction_action_bounded(signature_table::MAX_TABLE_ENTRIES).unwrap(), AutoCompaction::Incremental),
+            "sanity: pending sidecars past the threshold trigger maintenance");
+
+        let stats = compact_signatures(signature_table::MAX_TABLE_ENTRIES);
+        assert_eq!(stats.signature_sidecars_swept, 3);
+        assert_eq!(loose_sidecars(), vec![conflicting.clone()]);
+        assert!(matches!(auto_compaction_action_bounded(signature_table::MAX_TABLE_ENTRIES).unwrap(), AutoCompaction::None),
+            "after the sweep, the conflict alone must not keep maintenance due");
 
         std::fs::remove_dir_all(&temp).ok();
     }

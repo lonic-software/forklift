@@ -1886,14 +1886,16 @@ mod tests {
     }
 
     /// A signed kv parcel over `cells` with any parents and format marker, built without the
-    /// content check and without moving a head — the shape a hostile writer can produce.
+    /// content check and without moving a head — the shape a hostile writer can produce. The
+    /// actor names the signing key, so two signers forging the same content within one clock tick
+    /// make two parcels: a parcel carries one signature.
     fn forge(parents: &[&str], format: &str, cells: Option<&str>, signer: &MetaSigner) -> String {
         let tree = store_meta_tree(format.as_bytes(), cells).unwrap();
 
         stack_signed_parcel(
             tree,
             parents.iter().map(|parent| parent.to_string()).collect(),
-            &actor("forger"),
+            &actor(&format!("forger-{}", signer.key_id)),
             "forged",
             signer,
         ).unwrap()
@@ -2523,11 +2525,12 @@ mod tests {
         verify(&office, None, &parcel).unwrap();
 
         // Alice's key id is public; a signature claiming it proves nothing unless it verifies.
+        // A signature is immutable once stored, so the forger replaces the sidecar file itself.
         for bytes in [vec![7u8; 64], bob.signing.sign(parcel.as_bytes()).to_bytes().to_vec()] {
-            sign_utils::store_parcel_signature(&parcel, &ParcelSignature {
+            sign_utils::overwrite_signature_sidecar_for_test(&parcel, &ParcelSignature {
                 key_id: alice.id().to_string(),
                 signature: bytes,
-            }).unwrap();
+            });
 
             let error = verify(&office, None, &parcel).unwrap_err();
             assert!(error.contains("does not verify"), "{}", error);
