@@ -210,7 +210,7 @@ async fn lower_working_pallet(client: &RemoteClient,
     // Path-pruned in a sparse warehouse (out-of-scope content stays sealed), whole in a full one
     // — a full fetch scope makes this byte-identical to the unscoped fetch — and in a cache only
     // the parcels, whose content it records; the head's own is fetched below, once this lower is
-    // known to check it out. The office and meta pallets synced above keep routing through the
+    // known not to be ahead. The office and meta pallets synced above keep routing through the
     // unscoped fetch, since their audit reads full content.
     let stats = remote_utils::fetch_history_scoped(client, remote_head, &pallet, progress).await?;
     report.fetched_objects = stats.fetched_objects;
@@ -222,7 +222,14 @@ async fn lower_working_pallet(client: &RemoteClient,
             report.outcome = Some(LowerOutcome::Ahead);
             return Ok(());
         }
+    }
 
+    // The content of the head this lower checks out, or that a diverged refusal's next step checks
+    // out on a pallet of its own. A lower that is ahead fetches none.
+    let content = remote_utils::fetch_head_content(client, remote_head, progress).await?;
+    report.fetched_objects += content.fetched_objects;
+
+    if let Some(local) = &local_head {
         if !merge_utils::is_ancestor(local, remote_head)? {
             return Err(remote_utils::diverged_refusal(&pallet, remote_head).into());
         }
@@ -232,10 +239,6 @@ async fn lower_working_pallet(client: &RemoteClient,
     // heal's roll-forward of an interrupted one — carries the verdict's preconditions, so an office
     // or anchor change since rolls the take back rather than landing it.
     let preconditions = take_utils::verify_take(Some(client), &TakeTrust::local()?, remote_head, &pallet, FetchAt::Warehouse).await?;
-
-    // The content this lower checks out, verified first like the history it belongs to.
-    let content = remote_utils::fetch_head_content(client, remote_head, progress).await?;
-    report.fetched_objects += content.fetched_objects;
 
     let remote_tree = object_utils::load_parcel(remote_head)?.tree_hash;
 

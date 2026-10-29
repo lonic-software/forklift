@@ -259,7 +259,7 @@ async fn try_auto_merge(client: &RemoteClient,
     // Their work must be local before we can compare ancestry or merge it. Path-pruned in a
     // sparse workspace (a full fetch scope makes this the whole closure, as before), so an
     // optimistic auto-merge stays as sparse as the workspace it runs in. A cache fetches only
-    // the parcels here, and their head's content below, once a merge is certain.
+    // the parcels here, and their head's content below, once the remote is known to diverge.
     if !file_utils::does_object_exist(remote_head)? {
         remote_utils::fetch_history_scoped(client, remote_head, pallet, progress).await?;
     }
@@ -270,6 +270,11 @@ async fn try_auto_merge(client: &RemoteClient,
     if !diverged {
         return Ok(false);
     }
+
+    // The merge reads their head's content, and so does the diverged refusal's next step when no
+    // merge happens here. In a cache it may be absent even when the parcel was already here: a
+    // fetch that did not check that head out recorded its root instead.
+    remote_utils::fetch_head_content(client, remote_head, progress).await?;
 
     // The merge materializes into this bay and moves the pallet from the tree it holds, so a bay
     // another bay or process left behind its pallet is told so instead of attempting it.
@@ -292,10 +297,6 @@ async fn try_auto_merge(client: &RemoteClient,
     if !consolidate::is_warehouse_clean(&our_tree).await? {
         return Ok(false);
     }
-
-    // The merge reads their head's content. In a cache it may be absent even when the parcel was
-    // already here: a fetch that did not check that head out recorded its root instead.
-    remote_utils::fetch_head_content(client, remote_head, progress).await?;
 
     // Unlike `consolidate`, this path has no fast-forward branch to exempt — reaching here
     // already means a genuine, unresolved divergence (checked above), so every path past this

@@ -559,7 +559,8 @@ pub fn record_absences_under(roots: &[String]) -> Result<(), String> {
 }
 
 /// Remove the records of those of `filled` the record holds, under a ref lock it takes and
-/// releases. The caller has just fetched the whole closure of each, so none needs a record. Judged
+/// releases. Unlike [`unseal`] this pushes nothing down, so the caller must have just made the
+/// whole closure of each present: every tree and file of it, not a part. Judged
 /// on the record as it is re-read under the lock; nothing is written when none is recorded.
 ///
 /// # Returns

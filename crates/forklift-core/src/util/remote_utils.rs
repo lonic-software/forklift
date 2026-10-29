@@ -4925,10 +4925,13 @@ pub async fn fetch_cache(client: &RemoteClient,
 /// in-scope object. `head` itself must be present, fetched with its history first.
 ///
 /// The fetch that brought `head` recorded its root, and a ref may already reach that root while it
-/// is recorded and absent. Once the closure is present, the records of the trees and files it
-/// filled are removed, since a whole present closure needs none. Both steps are safe for the
-/// record's lock-free readers: a present object seals nothing whether it is recorded or not, so a
-/// reader judges it the same before, between and after.
+/// is recorded and absent. The closure fills top-down, so while it fills, a present tree stands
+/// over children not fetched yet and not recorded: a lock-free reader then sees an incomplete
+/// closure, and a ref write leaning on it is refused until the fill ends. A fill that fails records
+/// every absence beneath the root before it returns, so the closure is whole up to the record
+/// again; one the process does not survive leaves absences that `heal` refetches. Once the closure
+/// is present, the records of the trees and files it filled are removed, since a whole present
+/// closure needs none.
 ///
 /// # Arguments
 /// * `client` - The remote.
@@ -4945,7 +4948,14 @@ pub async fn fetch_head_content(client: &RemoteClient,
     if scope_utils::is_cache_mode()? {
         let root = object_utils::load_parcel(head)?.tree_hash;
         let mut seen = ContentSeen::default();
-        fetch_tree_closures(client, vec![root], &mut seen, &mut stats, progress).await?;
+
+        if let Err(why) = fetch_tree_closures(client, vec![root.clone()], &mut seen, &mut stats, progress).await {
+            return Err(match sealed_utils::record_absences_under(&[root]) {
+                Ok(()) => why,
+                Err(unrecorded) => format!("{} What it left absent could not be recorded either: {}", why, unrecorded),
+            });
+        }
+
         sealed_utils::forget_filled(seen.trees.iter().chain(&seen.blobs))?;
     }
 

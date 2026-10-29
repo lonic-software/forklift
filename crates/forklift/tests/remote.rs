@@ -5727,13 +5727,14 @@ fn a_cache_auto_merge_fetches_a_held_parcels_content() {
     assert!(closure_present(&area, "cached", &their_root), "the merged-in head's closure is held");
 }
 
-/// A `lower` that finds the remote diverged checks nothing out, so a cache fetches none of the
-/// remote head's content for it: the root stays recorded.
+/// A `lower` that finds the remote diverged is refused with a next step that checks the remote
+/// head out on a pallet of its own, so a cache fetches that head's content before refusing, and
+/// the next step works through to a lift.
 ///
-/// Revert: fetch the head's content before the ancestry checks → the refused lower leaves the
-/// remote head's root held.
+/// Revert: fetch the head's content only past the divergence check → `palletize` cannot check the
+/// remote head out.
 #[test]
-fn a_refused_cache_lower_fetches_no_content() {
+fn a_diverged_cache_lower_leaves_its_next_step_workable() {
     let area = TestArea::new("cache-lower-diverged");
     let (server, _) = three_signed_parcels(&area);
     assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
@@ -5750,10 +5751,42 @@ fn a_refused_cache_lower_fetches_no_content() {
     let lowered = area.forklift("cached", &["lower"]);
     assert!(!lowered.status.success(), "a diverged lower is refused: {}", stdout(&lowered));
 
+    let short = &theirs[..12];
+    let side = format!("main-remote-{}", short);
+    assert_success(&area.forklift("cached", &["palletize", &side, short]));
+    assert_eq!(area.read_file("cached/from_a.txt"), "a\n");
+    assert_success(&area.forklift("cached", &["shift", "main"]));
+    assert_success(&area.forklift("cached", &["consolidate", &side]));
+    assert_success(&area.forklift("cached", &["lift"]));
+    assert_success(&area.forklift("cached", &["audit"]));
+}
+
+/// A lift onto a diverged remote from a dirty cache does not auto-merge, and is refused with the
+/// same next step as a diverged lower; the remote head's content is fetched for it all the same.
+///
+/// Revert: fetch the head's content only once the warehouse is found clean → the remote head's
+/// root stays absent after the refusal.
+#[test]
+fn a_dirty_cache_lift_fetches_the_diverged_heads_content() {
+    let area = TestArea::new("cache-lift-dirty");
+    let (server, _) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+
+    area.write_file("a/from_a.txt", "a\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "a's file"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    let theirs = pallet_head(&area, "server-root", "main");
+
+    area.write_file("cached/from_cache.txt", "cache\n");
+    assert_success(&area.forklift("cached", &["load", "."]));
+    assert_success(&area.forklift("cached", &["stack", "the cache's file"]));
+    area.write_file("cached/src/code.txt", "edited, not loaded\n");
+    let lifted = area.forklift("cached", &["lift"]);
+    assert!(!lifted.status.success(), "a dirty diverged lift is refused: {}", stdout(&lifted));
+
     let their_root = history_with_roots(&area, "cached", &theirs)[0].1.clone();
-    assert!(!object_held(&area, "cached", &their_root), "the refused lower fetched no content");
-    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("cached"));
-    assert!(forklift_core::util::sealed_utils::read_sealed().unwrap().contains(&their_root), "the root is recorded instead");
+    assert!(closure_present(&area, "cached", &their_root), "the diverged head's content is held");
 }
 
 /// A root can be present while objects beneath it are absent, when a fetch of its closure stopped
