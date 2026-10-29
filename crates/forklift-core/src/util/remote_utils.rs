@@ -3888,29 +3888,57 @@ impl RemoteClient {
     /// A `429` is waited out (see [`Self::send_waiting_out_throttle`]). A degraded batch fetch
     /// sends a whole wave of these at once, which is exactly what a rate-limited head throttles.
     pub async fn fetch_object(&self, hash: &str) -> Result<Vec<u8>, String> {
+        match self.fetch_object_classified(hash).await {
+            ObjectFetch::Fetched(bytes) => Ok(bytes),
+            ObjectFetch::Unreachable(e) | ObjectFetch::Refused(e) => Err(e),
+        }
+    }
+
+    /// [`Self::fetch_object`], telling a remote that could not serve the object now from one that
+    /// answered and refused: a cache warehouse's read refuses the first as a cache miss it can
+    /// retry once the origin is reachable, and the second as the remote's own answer. A remote that
+    /// could not be reached, stopped answering, answered `502`, `503` or `504`, or kept throttling
+    /// past the patience is the first; any other answer is the second.
+    pub async fn fetch_object_classified(&self, hash: &str) -> ObjectFetch {
         let posture = Posture::BoundedObjectReads;
-        let outcome = self.send_waiting_out_throttle(
+        let outcome = match self.send_waiting_out_throttle(
             posture, reqwest::Method::GET, &format!("/v1/objects/{}", hash), SendBody::Empty,
             &format!("object {}", hash),
-        ).await?;
-        let response = self.response_from_send(
-            &format!("fetching object {}", hash), posture, outcome
-        )?;
+        ).await {
+            Ok(outcome) => outcome,
+            // Only a throttle that outlasted the patience is an error here.
+            Err(e) => return ObjectFetch::Unreachable(e),
+        };
+        let response = match outcome {
+            SendOutcome::Sent(response) => response,
+            outcome => {
+                let unsent = self.response_from_send(&format!("fetching object {}", hash), posture, outcome);
+                return ObjectFetch::Unreachable(unsent.err().unwrap_or_default());
+            }
+        };
 
         if !response.status().is_success() {
-            return Err(self.error_of(response, &format!("object {}", hash)).await);
+            // A gateway or an unavailable server stands in front of an origin that is not up now;
+            // any other status, a `500` included, is the origin's own answer for this object.
+            let unavailable = matches!(response.status().as_u16(), 502..=504);
+            let error = self.error_of(response, &format!("object {}", hash)).await;
+
+            return if unavailable { ObjectFetch::Unreachable(error) } else { ObjectFetch::Refused(error) };
         }
 
         // An object over the ceiling cannot be stored however it arrives, so it is refused in
         // the ceiling's own terms rather than as a misbehaving remote: a store may still hold one
         // authored before the ceiling existed.
-        body_utils::read_body_capped(response, MAX_OBJECT_BYTES as u64).await.map_err(|e| match e {
-            BodyReadError::Transport(e) => self.describe_transport_error(&format!("reading object {}", hash), posture, e),
-            BodyReadError::OverCap { cap } => format!(
+        match body_utils::read_body_capped(response, MAX_OBJECT_BYTES as u64).await {
+            Ok(bytes) => ObjectFetch::Fetched(bytes),
+            Err(BodyReadError::Transport(e)) => ObjectFetch::Unreachable(
+                self.describe_transport_error(&format!("reading object {}", hash), posture, e)
+            ),
+            Err(BodyReadError::OverCap { cap }) => ObjectFetch::Refused(format!(
                 "Object {} on the remote is larger than the {}-byte whole-object ceiling; refusing to fetch it.",
                 hash, cap
-            ),
-        })
+            )),
+        }
     }
 
     /// Upload one object's raw bytes to the control plane (`PUT /v1/objects/{hash}`), where the
@@ -4578,6 +4606,19 @@ pub struct PartialBundle {
 
     /// How much of it was synced to the download file. At most `total`.
     pub length: u64,
+}
+
+/// What [`RemoteClient::fetch_object_classified`] found.
+#[derive(Debug)]
+pub enum ObjectFetch {
+    /// The object's bytes, unverified.
+    Fetched(Vec<u8>),
+    /// The remote could not serve it now: it could not be reached, stopped answering before the
+    /// object arrived, answered as a gateway or unavailable server (`502`–`504`), or kept
+    /// throttling.
+    Unreachable(String),
+    /// The remote answered, and refused to hand the object over.
+    Refused(String),
 }
 
 /// What [`RemoteClient::download_bundle`] found.
@@ -10750,6 +10791,30 @@ mod tests {
 
         assert!(error.contains("(503)"), "{}", error);
         assert_eq!(remote.hits_for(&format!("/v1/objects/{}", hashes[0])), 1);
+    }
+
+    /// An unavailable server and a throttle outlasting the patience are a remote that could not
+    /// serve the object now; any other refusal, a `500` included, is its answer. Revert: classify
+    /// every status as an answer → the `503` and the `429` are refused; every `5xx` as unavailable
+    /// → the `500` is not.
+    #[test]
+    fn fetch_object_classified_tells_a_remote_that_cannot_serve_now_from_one_that_refuses() {
+        let classify = |status: u16| {
+            let (hashes, objects) = unstored_chunks(&format!("classified-{}", status), 1);
+            let remote = ScriptedObjectRemote::start(objects, status, usize::MAX, Some(0));
+            let client = fast_client(&remote.url);
+
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(client.fetch_object_classified(&hashes[0]))
+        };
+
+        for status in [503, 429] {
+            assert!(matches!(classify(status), ObjectFetch::Unreachable(_)), "a {} cannot serve now", status);
+        }
+
+        for status in [500, 404] {
+            assert!(matches!(classify(status), ObjectFetch::Refused(_)), "a {} is the remote's answer", status);
+        }
     }
 
     /// The throttle wait is the remote's `Retry-After` when it sent one, never under the backoff.

@@ -10,7 +10,7 @@ use std::sync::{Mutex, OnceLock};
 use crate::model::tree_item::TreeItem;
 use crate::util::office_utils::{KeyRecord, OfficeState, TrustAnchor};
 use crate::util::scope_utils::{MaterializationScope, ScopeClass};
-use crate::util::{fanout_utils, file_utils, graph_utils, object_utils, office_utils, pallet_utils, recovery_utils, sign_utils};
+use crate::util::{cache_miss, fanout_utils, file_utils, graph_utils, object_utils, office_utils, pallet_utils, recovery_utils, sign_utils};
 use crate::util::sealed_utils::SealedSet;
 use crate::util::pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletNamespace, PalletsPrecondition, RefPreconditions};
 
@@ -1987,6 +1987,10 @@ fn verify_closure_core(
     seams: &ClosureSeams,
 ) -> Result<(), ClosureError> {
     let ClosureSeams { blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, sealed } = *seams;
+
+    // The walk reads to learn what the store holds, and a failed read is what it reports: it
+    // fetches nothing, or a cache's gate would fetch the history it holds by hash.
+    let _unfetched = cache_miss::Unfetched::enter();
 
     // Only the new segment: the closure behind each bound was proven complete when that head
     // was written. This walk used to build its prune set with `collect_reachable` from the bound,

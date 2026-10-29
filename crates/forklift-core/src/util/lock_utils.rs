@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use crate::globals::{bay_root, forklift_root};
@@ -475,6 +476,49 @@ impl MirrorLock {
 pub struct RefLock {
     // Held only to keep the lock: closing the handle releases it.
     _file: std::fs::File,
+    // Whose hold this is.
+    holder: Holder,
+    // Not `Send`: the hold is counted against the thread that took it, so it stays there.
+    _thread_bound: std::marker::PhantomData<*const ()>,
+}
+
+/// A [`RefLock`]'s holder: the thread that took it, and the sidecar's absolute path.
+type Holder = (std::thread::ThreadId, PathBuf);
+
+/// How many [`RefLock`]s each thread of this process took, by sidecar path. Counted against the
+/// taking thread, so a lock dropped on another thread still clears its own count.
+static REF_LOCKS_HELD: std::sync::LazyLock<std::sync::Mutex<HashMap<Holder, usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+impl RefLock {
+    /// Count a hold this thread just took on the sidecar at `path`.
+    fn held(file: std::fs::File, path: PathBuf) -> RefLock {
+        let holder = (std::thread::current().id(), path);
+        *REF_LOCKS_HELD.lock().unwrap_or_else(|e| e.into_inner()).entry(holder.clone()).or_default() += 1;
+        RefLock { _file: file, holder, _thread_bound: std::marker::PhantomData }
+    }
+
+    /// Whether this thread holds the active warehouse's ref lock, so that taking it again would
+    /// wait on itself: the cache-miss refill, which writes the sealed-object record, does not run
+    /// then. Another thread's hold is waited out like any other holder's.
+    pub(crate) fn held_by_this_thread() -> bool {
+        let holder = (std::thread::current().id(), absolute(forklift_root().join(FILE_NAME_REF_LOCK)));
+        REF_LOCKS_HELD.lock().unwrap_or_else(|e| e.into_inner()).get(&holder).is_some_and(|held| *held > 0)
+    }
+}
+
+impl Drop for RefLock {
+    fn drop(&mut self) {
+        let mut held = REF_LOCKS_HELD.lock().unwrap_or_else(|e| e.into_inner());
+
+        if let Some(count) = held.get_mut(&self.holder) {
+            *count -= 1;
+
+            if *count == 0 {
+                held.remove(&self.holder);
+            }
+        }
+    }
 }
 
 impl RefLock {
@@ -496,7 +540,7 @@ impl RefLock {
         let file = open_lock_sidecar(&path)?;
         file.lock().map_err(|e| lock_error(&path, &e))?;
 
-        Ok(RefLock { _file: file })
+        Ok(RefLock::held(file, path))
     }
 
     /// Take the ref lock of the warehouse whose forklift root is `root` without waiting, for a
@@ -512,7 +556,7 @@ impl RefLock {
         let file = open_lock_sidecar(&path)?;
 
         match file.try_lock() {
-            Ok(()) => Ok(Some(RefLock { _file: file })),
+            Ok(()) => Ok(Some(RefLock::held(file, path))),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(e)) => Err(lock_error(&path, &e)),
         }

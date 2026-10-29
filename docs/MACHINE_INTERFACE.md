@@ -18,7 +18,7 @@ The envelope is the one every Lonic tool shares. Success:
 {
   "lonic_json": 1,
   "tool": "forklift",
-  "schema": 9,
+  "schema": 10,
   "command": "stocktake",
   "ok": true,
   "data": { "…command-specific…" }
@@ -32,7 +32,7 @@ Failure keeps the same header, with `"ok": false` and an `error` in place of `da
 {
   "lonic_json": 1,
   "tool": "forklift",
-  "schema": 9,
+  "schema": 10,
   "command": "stocktake",
   "ok": false,
   "error": {
@@ -83,7 +83,9 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 9** (current): `batch_lane` may also be `out_of_time`, when the remote ran out of time for
+**Schema 10** (current): the `cache_miss` error code exists.
+
+**Schema 9**: `batch_lane` may also be `out_of_time`, when the remote ran out of time for
 a batch download and the rest of the command fetched one object at a time.
 
 **Schema 8**: the `pallet_deleted_on_remote` error code exists; `palletize --remote` lists the
@@ -493,6 +495,22 @@ A `lift` that would re-create a pallet the remote has only as a tombstone refuse
 `forklift palletize --restore <name> --remote` otherwise. The remote raises the same code, with
 the restore as `next_step`, when a creation of a deleted pallet does not acknowledge its tombstone
 or does not descend from it, and when a ref update or delete finds its pallet deleted.
+
+### Content a cache could not fetch: `cache_miss`
+
+A warehouse franchised with `--cache` holds some content by hash alone, and a command that reads
+such content fetches it from the warehouse's origin as it reads. When the origin cannot be reached,
+answers as an unavailable server (`502`, `503` or `504`), or keeps throttling, the command refuses
+with `cache_miss` (exit 36), naming the object in `message`. `next_step` names the origin: running
+the same command again once it can be reached is the way out. Not every command keeps the code
+yet: one that reads the content inside a step of its own can fail with a plain error instead,
+whose message says the same and names the origin. What a command fetched before it refused stays
+in the cache; a command that only reads, such as `show` or `diff`, changes nothing else. A command
+that changes the bay, such as `shift`, does not yet fetch everything it needs before it starts, so
+it can refuse partway through, with part of its change made.
+
+A remote that answers but does not hand the object over, or a configured remote that is not the
+origin, is a plain failure, not `cache_miss`: running the command again would not help.
 
 ### An unfinished franchise: `franchise_incomplete`
 

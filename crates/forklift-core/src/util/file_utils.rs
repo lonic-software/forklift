@@ -2368,6 +2368,17 @@ fn read_object_uncached(hash: &str) -> Result<Vec<u8>, String> {
         StoreReadOutcome::Verified(bytes) => Ok(bytes),
         StoreReadOutcome::Unverifiable(e) => Err(e),
         StoreReadOutcome::Absent => {
+            // A cache warehouse fetches an object it holds by hash, then reads it as stored.
+            if super::cache_miss::refill_recorded(hash)? {
+                return match read_object_classified(hash)? {
+                    StoreReadOutcome::Verified(bytes) => Ok(bytes),
+                    StoreReadOutcome::Unverifiable(e) => Err(e),
+                    StoreReadOutcome::Absent => Err(format!(
+                        "Object {} was fetched from the origin and stored, yet the store does not hold it.", hash
+                    )),
+                };
+            }
+
             // The same NotFound-shaped message the read path has always produced for this case —
             // reconstructed here (rather than carried on the `Absent` variant, which is bare by
             // design) since nothing about the message depends on which of the two `Absent`

@@ -311,12 +311,17 @@ mod tests {
     fn a_waiting_first_mark_waits_for_the_ref_lock() {
         let _scratch = Scratch::new("wait");
 
-        let lock = RefLock::acquire().unwrap();
+        // The bay's hold is taken on its own thread: a ref lock stays on the thread that took it.
+        let root = crate::globals::current_scope_root().unwrap();
+        let (locked, held) = std::sync::mpsc::channel();
         let releaser = std::thread::spawn(move || {
+            let _scope = crate::globals::StorageRootScope::enter(&root);
+            let _lock = RefLock::acquire().unwrap();
+            locked.send(()).unwrap();
             std::thread::sleep(std::time::Duration::from_millis(100));
-            drop(lock);
         });
 
+        held.recv().unwrap();
         assert!(mark_served(true).unwrap(), "a waiting mark is written once the bay lets go");
         assert!(is_served().unwrap());
         releaser.join().unwrap();
