@@ -2,12 +2,12 @@
 //! object a read lacks is fetched from the warehouse's origin.
 //!
 //! The configuration is read on the reading thread, which resolves the warehouse the read is in.
-//! The request runs on one fetch thread with a runtime of its own, and the reading thread waits for
-//! its reply: a read is synchronous, and may run on a runtime thread that must not start another
-//! runtime inside its own.
+//! The request runs on a runtime of the hook's own, started on first use, and the reading thread
+//! waits for its reply: a read is synchronous, and may run on a runtime thread that must not start
+//! another runtime inside its own. Requests from several reading threads run at once.
 
 use std::sync::mpsc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use forklift_core::enums::config_scope::ConfigScope;
 use forklift_core::util::cache_miss::{self, Fetched};
 use forklift_core::util::config_utils;
@@ -35,7 +35,7 @@ fn fetch(hash: &str) -> Fetched {
     };
 
     let (reply, replied) = mpsc::channel();
-    let sent = fetch_thread().lock().expect("cache fetch thread lock poisoned").send(Request {
+    let sent = fetch_thread().send(Request {
         url,
         token,
         tor,
@@ -75,8 +75,8 @@ fn origin_settings() -> Result<(String, Option<String>, TorSettings), String> {
 }
 
 /// The sending end of the fetch thread's queue, which starts it on first use.
-fn fetch_thread() -> &'static Mutex<mpsc::Sender<Request>> {
-    static SENDER: OnceLock<Mutex<mpsc::Sender<Request>>> = OnceLock::new();
+fn fetch_thread() -> &'static mpsc::Sender<Request> {
+    static SENDER: OnceLock<mpsc::Sender<Request>> = OnceLock::new();
 
     SENDER.get_or_init(|| {
         let (sender, requests) = mpsc::channel::<Request>();
@@ -88,13 +88,14 @@ fn fetch_thread() -> &'static Mutex<mpsc::Sender<Request>> {
         // A thread that could not start drops the receiver, so every send reports it.
         drop(spawned);
 
-        Mutex::new(sender)
+        sender
     })
 }
 
-/// Answer requests until every sender is gone, keeping the client of the last origin asked.
+/// Start each request on the runtime as it arrives, until every sender is gone, keeping the
+/// client of the last origin asked.
 fn serve(requests: mpsc::Receiver<Request>) {
-    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(runtime) => runtime,
         Err(e) => {
             for request in requests {
@@ -121,13 +122,16 @@ fn serve(requests: mpsc::Receiver<Request>) {
         }
 
         let (_, remote) = client.as_ref().expect("a client was just kept");
+        let remote = remote.clone();
 
-        let fetched = match runtime.block_on(remote.fetch_object_classified(&request.hash)) {
-            ObjectFetch::Fetched(bytes) => Fetched::Bytes(bytes),
-            ObjectFetch::Unreachable(why) => Fetched::Unreachable { origin: request.url, why },
-            ObjectFetch::Refused(why) => Fetched::Failed(why),
-        };
+        runtime.spawn(async move {
+            let fetched = match remote.fetch_object_classified(&request.hash).await {
+                ObjectFetch::Fetched(bytes) => Fetched::Bytes(bytes),
+                ObjectFetch::Unreachable(why) => Fetched::Unreachable { origin: request.url, why },
+                ObjectFetch::Refused(why) => Fetched::Failed(why),
+            };
 
-        let _ = request.reply.send(fetched);
+            let _ = request.reply.send(fetched);
+        });
     }
 }

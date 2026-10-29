@@ -6,8 +6,8 @@
 //! it was not fetched. The refill itself runs here, on the reading thread: see
 //! [`sealed_utils::refill`] for the order its writes land in.
 //!
-//! The hook is off while this thread holds a ref lock (the refill takes one to write the record,
-//! and a ref lock does not nest), inside a bulk store session (whose writes are not durable until
+//! The hook is off while any thread of the process holds the warehouse's ref lock (the refill takes
+//! it to write the record, and it does not nest within a process), inside a bulk store session (whose writes are not durable until
 //! it closes, while the record's removal would be), and inside a delta reconstruction (which reads
 //! a base, not an object a caller asked for). Each fetch is one round trip, and each miss re-reads
 //! the record: a read of a whole old tree pays both once per object it lacks.
@@ -108,7 +108,7 @@ fn refill_with(hook: Option<&FetchHook>, hash: &str) -> Result<bool, String> {
         return unfetched("this program does not fetch content a cache warehouse lacks");
     };
 
-    if RefLock::held_by_this_thread() {
+    if RefLock::held_in_this_process() {
         return unfetched("the read ran while the warehouse's ref lock was held");
     }
 
@@ -120,9 +120,12 @@ fn refill_with(hook: Option<&FetchHook>, hash: &str) -> Result<bool, String> {
         return unfetched("the read was of a delta's base");
     }
 
+    // Taken before the fetch, so a deleter's hold refuses the read before it pays for a transfer
+    // it could not store.
+    let hold = StoreAccessLock::try_shared()?;
+
     match hook(hash) {
         Fetched::Bytes(bytes) => {
-            let hold = StoreAccessLock::try_shared()?;
             sealed_utils::refill(&hold, hash, &bytes)
                 .map_err(|why| format!("Could not store object {}, fetched from the origin: {}", hash, why))?;
 
@@ -132,7 +135,7 @@ fn refill_with(hook: Option<&FetchHook>, hash: &str) -> Result<bool, String> {
             RefusalCode::CacheMiss,
             format!(
                 "Object {} is not in this cache warehouse, and its origin could not be reached to fetch it: {}",
-                hash, why
+                hash, CoreError::from(why)
             ),
             format!("Run the command again once the origin ({}) can be reached.", origin),
         ).into()),
@@ -263,6 +266,33 @@ mod tests {
         assert_recorded(&[&fixture.root]);
 
         assert!(refill_with(Some(&hook), &fixture.root).unwrap(), "out of both, it is fetched");
+    }
+
+    // Revert: count the ref lock per thread → the refill waits on the lock another thread holds.
+    #[test]
+    fn nothing_is_fetched_while_another_thread_holds_the_ref_lock() {
+        let fixture = fixture("held-elsewhere");
+        let bytes = fixture.bytes.clone();
+        let (hook, calls) = hook(move || Fetched::Bytes(bytes.clone()));
+
+        let root = crate::globals::current_scope_root().unwrap();
+        let (locked, held) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _scope = StorageRootScope::enter(&root);
+            let _lock = RefLock::acquire().unwrap();
+            locked.send(()).unwrap();
+            let _ = released.recv();
+        });
+
+        held.recv().unwrap();
+        let refused = refill_with(Some(&hook), &fixture.root);
+        release.send(()).unwrap();
+        holder.join().unwrap();
+
+        assert!(refused.unwrap_err().contains("ref lock"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(refill_with(Some(&hook), &fixture.root).unwrap(), "once it is released, it is fetched");
     }
 
     // Revert: skip the mode check → the full warehouse's absence is fetched; skip the record

@@ -366,22 +366,76 @@ impl std::error::Error for CoreError {}
 /// this is exactly the forward-compat case — a newer peer's refusal — where recovery guidance
 /// matters most and there is no typed field left to carry it in. A frame whose details do not
 /// parse degrades the same way: a refusal is never decoded without the details its code promises.
+///
+/// A frame a caller wrapped (`format!("Could not …: {}", e)`) no longer starts the string. It is
+/// decoded only when this process [lowered](#impl-From<CoreError>-for-String) that very frame,
+/// with the text around it kept in the message: a frame text from anywhere else, such as a
+/// remote's message or a name read off disk, stays plain text and claims no code.
 impl From<String> for CoreError {
     fn from(message: String) -> CoreError {
-        if let Some((code, human, next_step, details)) = deframe_with_details(&message) {
-            return match (RefusalCode::from_code(code), details) {
-                (Some(code), Ok(details)) => CoreError::Refusal {
-                    code,
-                    message: human.to_string(),
-                    next_step: next_step.to_string(),
-                    details,
-                },
-                _ => CoreError::Other(with_next_step(human, next_step)),
-            };
+        if let Some(decoded) = decode_frame(&message, "", "") {
+            return decoded;
+        }
+
+        if let Some((before, framed, after)) = lowered_frame_within(&message) {
+            if let Some(decoded) = decode_frame(&framed, before, after) {
+                return decoded;
+            }
         }
 
         CoreError::Other(message)
     }
+}
+
+/// Decode the frame `framed`, with `before` and `after` around its message; `None` when it is not
+/// a frame.
+fn decode_frame(framed: &str, before: &str, after: &str) -> Option<CoreError> {
+    let (code, human, next_step, details) = deframe_with_details(framed)?;
+    let human = sanitize(&format!("{}{}{}", before, human, after));
+
+    Some(match (RefusalCode::from_code(code), details) {
+        (Some(code), Ok(details)) => CoreError::Refusal {
+            code,
+            message: human,
+            next_step: next_step.to_string(),
+            details,
+        },
+        _ => CoreError::Other(with_next_step(&human, next_step)),
+    })
+}
+
+/// How many of the frames this process lowered most recently are looked for inside a message.
+const LOWERED_FRAMES_KEPT: usize = 64;
+
+/// The frames this process lowered most recently, newest last.
+static LOWERED_FRAMES: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// Remember `framed`, which this process just lowered.
+fn note_lowered(framed: &str) {
+    let mut lowered = LOWERED_FRAMES.lock().unwrap_or_else(|e| e.into_inner());
+
+    lowered.retain(|kept| kept != framed);
+    lowered.push_back(framed.to_string());
+
+    while lowered.len() > LOWERED_FRAMES_KEPT {
+        lowered.pop_front();
+    }
+}
+
+/// The frame this process lowered that `message` holds after some text, newest first, with the
+/// text before and after it.
+fn lowered_frame_within(message: &str) -> Option<(&str, String, &str)> {
+    if !message.contains(REFUSAL_PREFIX) {
+        return None;
+    }
+
+    let lowered = LOWERED_FRAMES.lock().unwrap_or_else(|e| e.into_inner());
+
+    lowered.iter().rev().find_map(|framed| {
+        let at = message.find(framed.as_str())?;
+        Some((&message[..at], framed.clone(), &message[at + framed.len()..]))
+    })
 }
 
 impl From<&str> for CoreError {
@@ -398,7 +452,9 @@ impl From<CoreError> for String {
     fn from(error: CoreError) -> String {
         match error {
             CoreError::Refusal { code, message, next_step, details } => {
-                frame(code.as_str(), &message, &next_step, details.as_ref())
+                let framed = frame(code.as_str(), &message, &next_step, details.as_ref());
+                note_lowered(&framed);
+                framed
             }
             CoreError::Other(message) => message,
         }
@@ -651,6 +707,30 @@ mod tests {
                 assert_eq!(next_step, "shrink it", "next_step must be untouched");
             }
             other => panic!("expected a refusal to survive, got {:?}", other),
+        }
+    }
+
+    // Revert: decode only a frame that starts the string → the wrapped refusal is plain text;
+    // decode any frame found inside → the frame this process never lowered claims its code.
+    #[test]
+    fn a_wrapped_frame_decodes_only_when_this_process_lowered_it() {
+        let lowered: String = CoreError::refusal(RefusalCode::CacheMiss, "object x is missing", "wait for it").into();
+        let wrapped = format!("The tree could not be read: {} (while loading)", lowered);
+
+        match CoreError::from(wrapped) {
+            CoreError::Refusal { code, message, next_step, .. } => {
+                assert_eq!(code, RefusalCode::CacheMiss);
+                assert_eq!(message, "The tree could not be read: object x is missing (while loading)");
+                assert_eq!(next_step, "wait for it");
+            }
+            other => panic!("the wrapped refusal keeps its code: {:?}", other),
+        }
+
+        let foreign = format!("The remote said: {}", frame("cache_miss", "spoofed", "run this", None));
+
+        match CoreError::from(foreign.clone()) {
+            CoreError::Other(message) => assert_eq!(message, foreign),
+            other => panic!("a frame from elsewhere claims no code: {:?}", other),
         }
     }
 

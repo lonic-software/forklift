@@ -3894,9 +3894,11 @@ impl RemoteClient {
         }
     }
 
-    /// [`Self::fetch_object`], telling a remote that could not be reached from one that answered
-    /// and refused: a cache warehouse's read refuses the first as a cache miss it can retry once
-    /// the origin is reachable, and the second as the remote's own answer.
+    /// [`Self::fetch_object`], telling a remote that could not serve the object now from one that
+    /// answered and refused: a cache warehouse's read refuses the first as a cache miss it can
+    /// retry once the origin is reachable, and the second as the remote's own answer. A remote that
+    /// could not be reached, stopped answering, answered with a server error (`5xx`) or kept
+    /// throttling past the patience is the first; any other answer is the second.
     pub async fn fetch_object_classified(&self, hash: &str) -> ObjectFetch {
         let posture = Posture::BoundedObjectReads;
         let outcome = match self.send_waiting_out_throttle(
@@ -3904,7 +3906,8 @@ impl RemoteClient {
             &format!("object {}", hash),
         ).await {
             Ok(outcome) => outcome,
-            Err(e) => return ObjectFetch::Refused(e),
+            // Only a throttle that outlasted the patience is an error here.
+            Err(e) => return ObjectFetch::Unreachable(e),
         };
         let response = match outcome {
             SendOutcome::Sent(response) => response,
@@ -3915,7 +3918,10 @@ impl RemoteClient {
         };
 
         if !response.status().is_success() {
-            return ObjectFetch::Refused(self.error_of(response, &format!("object {}", hash)).await);
+            let server_error = response.status().is_server_error();
+            let error = self.error_of(response, &format!("object {}", hash)).await;
+
+            return if server_error { ObjectFetch::Unreachable(error) } else { ObjectFetch::Refused(error) };
         }
 
         // An object over the ceiling cannot be stored however it arrives, so it is refused in
@@ -4605,9 +4611,10 @@ pub struct PartialBundle {
 pub enum ObjectFetch {
     /// The object's bytes, unverified.
     Fetched(Vec<u8>),
-    /// The remote could not be reached, or stopped answering before the object arrived.
+    /// The remote could not serve it now: it could not be reached, stopped answering before the
+    /// object arrived, failed with a server error, or kept throttling.
     Unreachable(String),
-    /// The remote answered and did not hand the object over.
+    /// The remote answered, and refused to hand the object over.
     Refused(String),
 }
 
@@ -10781,6 +10788,27 @@ mod tests {
 
         assert!(error.contains("(503)"), "{}", error);
         assert_eq!(remote.hits_for(&format!("/v1/objects/{}", hashes[0])), 1);
+    }
+
+    /// A server error and a throttle outlasting the patience are a remote that could not serve
+    /// the object now; any other refusal is its answer. Revert: classify every status as an
+    /// answer → the `503` and the `429` are refused.
+    #[test]
+    fn fetch_object_classified_tells_a_remote_that_cannot_serve_now_from_one_that_refuses() {
+        let classify = |status: u16| {
+            let (hashes, objects) = unstored_chunks(&format!("classified-{}", status), 1);
+            let remote = ScriptedObjectRemote::start(objects, status, usize::MAX, Some(0));
+            let client = fast_client(&remote.url);
+
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(client.fetch_object_classified(&hashes[0]))
+        };
+
+        for status in [503, 429] {
+            assert!(matches!(classify(status), ObjectFetch::Unreachable(_)), "a {} cannot serve now", status);
+        }
+
+        assert!(matches!(classify(404), ObjectFetch::Refused(_)), "a 404 is the remote's answer");
     }
 
     /// The throttle wait is the remote's `Retry-After` when it sent one, never under the backoff.

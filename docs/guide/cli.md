@@ -1631,8 +1631,9 @@ checking it out. A command that reads content the cache lacks (`show` or `diff` 
 parcel, `shift` to a pallet lowered that way) fetches each object it meets from the origin as it
 reads it, and keeps it. The configured remote must be the origin. When the origin cannot be
 reached, the command refuses with exit 36 (`cache_miss`) and names the origin: run it again once
-the origin is back. A read-only command changes nothing when it refuses; one that changes the bay,
-such as `shift`, can refuse partway through with part of its change made.
+the origin is back. What it fetched before refusing stays in the cache; a read-only command changes
+nothing else, while one that changes the bay, such as `shift`, can refuse partway through with part
+of its change made.
 
 When the remote's bundle installs native packs straight into the new warehouse, `franchise`
 tips the same densify suggestion `import-git` does: those packs are the far end's own bulk

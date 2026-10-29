@@ -5715,7 +5715,7 @@ fn a_cache_read_with_its_origin_unreachable_refuses_as_a_cache_miss() {
         assert!(json["error"]["next_step"].as_str().unwrap().contains(&server.url), "{}", json);
     }
 
-    assert!(forklift_dir_snapshot(&area, "cached") == before, "a refused read changes nothing");
+    assert!(forklift_dir_snapshot(&area, "cached") == before, "a read refused before it fetched anything changes nothing");
 
     server.restart(&area);
     let shown = area.forklift("cached", &["show", &target]);

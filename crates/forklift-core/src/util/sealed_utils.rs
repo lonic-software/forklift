@@ -822,23 +822,33 @@ pub fn unseal(_hold: &impl StoreAccessHold, hashes: &[String]) -> Result<Unseale
 pub fn refill(_hold: &impl StoreAccessHold, hash: &str, bytes: &[u8]) -> Result<(), String> {
     object_utils::verify_object_bytes(hash, bytes)?;
 
+    // A tree or recipe child has a closure to walk when present; a leaf (an unchunked file, a
+    // chunk, a parcel's parent) is only looked for, never read.
     let mut walked: Vec<String> = Vec::new();
-    let mut parents: Vec<String> = Vec::new();
+    let mut leaves: Vec<String> = Vec::new();
 
     match object_utils::peek_object_header(bytes)?.0 {
         ObjectType::Tree => {
             let tree = object_utils::parse_tree_bytes(hash, bytes)?;
-            walked.extend(tree.get_files().map(|(_, file)| file.hash.clone()));
+
+            for (_, file) in tree.get_files() {
+                if file.item_type.is_chunked() {
+                    walked.push(file.hash.clone());
+                } else {
+                    leaves.push(file.hash.clone());
+                }
+            }
+
             walked.extend(tree.get_subtrees().map(|(_, subtree)| subtree.hash.clone()));
         }
         ObjectType::Recipe => {
             let recipe = object_utils::parse_recipe_bytes(hash, bytes)?;
-            walked.extend(recipe.chunks.into_iter().map(|chunk| chunk.hash));
+            leaves.extend(recipe.chunks.into_iter().map(|chunk| chunk.hash));
         }
         ObjectType::Parcel => {
             let parcel = object_utils::parse_parcel_bytes(hash, bytes)?;
             walked.push(parcel.tree_hash);
-            parents = parcel.parents;
+            leaves.extend(parcel.parents);
         }
         ObjectType::Blob | ObjectType::Chunk => {}
     }
@@ -857,9 +867,9 @@ pub fn refill(_hold: &impl StoreAccessHold, hash: &str, bytes: &[u8]) -> Result<
         }
     }
 
-    for parent in parents {
-        if !is_present(&parent)? {
-            absent.push(parent);
+    for leaf in leaves {
+        if !is_present(&leaf)? {
+            absent.push(leaf);
         }
     }
 
