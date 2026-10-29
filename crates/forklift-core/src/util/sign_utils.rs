@@ -622,6 +622,118 @@ pub fn store_raw_parcel_signature(parcel_hash: &str, bytes: &[u8]) -> Result<(),
     store_signature_once(parcel_hash, bytes)
 }
 
+/// What a [`SignatureBatch`] does with a received signature for a parcel that already
+/// carries a different one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OnConflict {
+    /// Keep the signature already stored and skip the received one.
+    Skip,
+    /// Refuse the whole batch, storing none of it.
+    Refuse,
+}
+
+/// How many signatures a [`SignatureBatch`] stored, and how many it skipped because the parcel
+/// already carried one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct StoredSignatures {
+    pub(crate) stored: usize,
+    pub(crate) skipped: usize,
+}
+
+/// How many bytes of signatures a [`SignatureBatch`] holds before it publishes them. A real
+/// sidecar is about a hundred bytes, so this is reached only by entries far larger than any
+/// signer writes; it keeps a batch's memory bounded whatever its source declares.
+const SIGNATURE_BATCH_BYTES: usize = 64 * 1024 * 1024;
+
+/// Signatures received in bulk, from a bundle or a fetch, stored as signature tables rather than
+/// one loose sidecar each (FORK-333). They are held in memory and published as one table whenever
+/// a table's worth (or [`SIGNATURE_BATCH_BYTES`]) has gathered, and the rest by
+/// [`SignatureBatch::finish`]. One dropped unfinished loses only what it still holds.
+///
+/// Each signature is validated structurally when it is published. A signature is immutable
+/// across both layers: one the parcel already carries, in a sidecar or a table, is skipped, and a
+/// different one is skipped or refused as `on_conflict` says. A refusal stores nothing of the
+/// batch being published.
+pub(crate) struct SignatureBatch {
+    pending: Vec<(String, Vec<u8>)>,
+    pending_bytes: usize,
+    bound: usize,
+    on_conflict: OnConflict,
+    counts: StoredSignatures,
+}
+
+impl SignatureBatch {
+    pub(crate) fn new(on_conflict: OnConflict) -> SignatureBatch {
+        SignatureBatch::with_bound(on_conflict, crate::util::signature_table::MAX_TABLE_ENTRIES)
+    }
+
+    /// A batch that publishes tables of at most `bound` entries.
+    pub(crate) fn with_bound(on_conflict: OnConflict, bound: usize) -> SignatureBatch {
+        SignatureBatch { pending: Vec::new(), pending_bytes: 0, bound: bound.max(1), on_conflict, counts: StoredSignatures::default() }
+    }
+
+    /// Add `bytes` as `parcel_hash`'s signature, publishing the batch if it is now full.
+    pub(crate) fn add(&mut self, parcel_hash: String, bytes: Vec<u8>) -> Result<(), String> {
+        self.pending_bytes += bytes.len();
+        self.pending.push((parcel_hash, bytes));
+
+        if self.pending.len() >= self.bound || self.pending_bytes >= SIGNATURE_BATCH_BYTES {
+            self.publish()?;
+        }
+        Ok(())
+    }
+
+    /// Publish what the batch still holds.
+    ///
+    /// # Returns
+    /// * `Ok(StoredSignatures)` - How many the whole batch stored and skipped.
+    /// * `Err(String)`          - If a signature is malformed, conflicts under
+    ///                            [`OnConflict::Refuse`], or a table could not be written.
+    pub(crate) fn finish(mut self) -> Result<StoredSignatures, String> {
+        self.publish()?;
+        Ok(self.counts)
+    }
+
+    fn publish(&mut self) -> Result<(), String> {
+        let pending = std::mem::take(&mut self.pending);
+        self.pending_bytes = 0;
+
+        let conflict = |parcel_hash: &str| format!(
+            "Parcel {} already carries a different signature; signatures are immutable.", parcel_hash
+        );
+        let mut admitted: std::collections::BTreeMap<[u8; pack_utils::HASH_LEN], Vec<u8>> = std::collections::BTreeMap::new();
+        let mut skipped = 0;
+
+        for (parcel_hash, bytes) in pending {
+            let hash_bytes = pack_utils::hash_to_bytes(&parcel_hash)
+                .ok_or_else(|| format!("\"{}\" is not a parcel hash.", parcel_hash))?;
+
+            // The parcel's own signature first: a copy of one it already carries is skipped (or
+            // refused) whatever its bytes, so only a signature that would be stored is parsed.
+            let existing = match admitted.get(&hash_bytes) {
+                Some(admitted) => Some(admitted.clone()),
+                None => load_raw_parcel_signature(&parcel_hash)?,
+            };
+            match existing {
+                None => {
+                    parse_parcel_signature(&bytes, &parcel_hash)?;
+                    admitted.insert(hash_bytes, bytes);
+                }
+                Some(existing) if existing == bytes => skipped += 1,
+                Some(_) if self.on_conflict == OnConflict::Skip => skipped += 1,
+                Some(_) => return Err(conflict(&parcel_hash)),
+            }
+        }
+
+        let entries: Vec<([u8; pack_utils::HASH_LEN], Vec<u8>)> = admitted.into_iter().collect();
+        pack_utils::publish_signature_tables(&entries, self.bound)?;
+        self.counts.stored += entries.len();
+        self.counts.skipped += skipped;
+
+        Ok(())
+    }
+}
+
 /// Write `bytes` as `parcel_hash`'s loose sidecar unless the parcel already carries a signature
 /// in either layer: identical bytes are a no-op, different ones are refused.
 fn store_signature_once(parcel_hash: &str, bytes: &[u8]) -> Result<(), String> {

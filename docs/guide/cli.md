@@ -1991,7 +1991,8 @@ to check the store. A loose object larger than the 64 MiB object ceiling is skip
 way, but it is not corrupt — it predates the ceiling — so it is counted separately as
 `over_ceiling_skipped` and left loose, fully readable, forever.
 
-A signed warehouse writes one small signature file per parcel. `compact` moves those into
+A signed warehouse writes one small signature file per parcel it signs (a franchise or `lower`
+writes the signatures it fetches straight into tables). `compact` moves those into
 **signature tables** (`.forklift/objects/pack/<id>.sigs`, up to 100,000 signatures each),
 merging small tables as it goes, and removes a signature file only once a durably written table
 holds the same signature. `signature_tables_written` and `signatures_moved` count that;

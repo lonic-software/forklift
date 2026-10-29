@@ -37,22 +37,21 @@ per data section (the 512 MiB rollover plus one maximum-size object and framing)
 bytes per index (the index of a 100,000-object pack, the object-count rollover). A header newline must occur within 128 bytes. Bytes between the signature section and the digest are rejected.
 
 Parcel signatures remain a separate envelope section because they are addressed by the parcel they
-sign rather than by their own content hash. Import stores each as a sidecar, which a later `compact`
-moves into a signature table (`PARCEL_SIGNATURE_FORMAT.md`); the native-pack change applies to
-objects.
+sign rather than by their own content hash. Import writes them as signature tables
+(`PARCEL_SIGNATURE_FORMAT.md`), not a sidecar each; the native-pack change applies to objects.
 
 ## Digest
 
 The last 32 bytes are the blake3 digest of everything before them. Import reads the header line
 first, so a file in another version is reported unsupported whatever it ends with. It then hashes
 the whole file and compares, before it creates a temporary file, publishes a pack or stores a
-sidecar. A mismatch, or a file too short to end in a digest, is refused with an error of its own
+signature. A mismatch, or a file too short to end in a digest, is refused with an error of its own
 kind, and nothing of the file is stored.
 
 The digest exists for the signature section. Import hash-verifies every pack object, but it stores
-a signature payload after checking only its framing and the parcel it names, and a stored sidecar
+a signature payload after checking only its framing and the parcel it names, and a stored signature
 is never replaced by a later fetch. Without the digest, a file spliced from two builds could store a
-well-formed but wrong sidecar, and a genuine parcel would then audit as tampered. The digest is not
+well-formed but wrong signature, and a genuine parcel would then audit as tampered. The digest is not
 a signature: it says the file is the one some builder wrote, not that the builder is trusted. Each
 object is still verified by its own hash.
 
@@ -118,9 +117,10 @@ Import is deliberately two-phase, and runs only once the whole file has matched 
 4. Sync the handful of verified aggregate files, then publish data first and index last. The index
    is the reader-visible commit point. Finally sync the pack directory and invalidate the in-process
    pack cache.
-5. Import the signature sidecar section and require the digest to follow it. Each entry becomes its own sidecar file,
-   so it is admitted only when its hash names a parcel present in the store once the packs have
-   landed, and only once per bundle. An entry naming a blob, a tree, an absent hash, or a parcel an
+5. Import the signature section and require the digest to follow it, then write the signatures
+   as signature tables. An entry is admitted only when its hash names a parcel present in the store
+   once the packs have landed, and only once per bundle; a parcel the store already holds a
+   different signature for keeps its own, and the bundle's copy is skipped. An entry naming a blob, a tree, an absent hash, or a parcel an
    earlier entry already signed rejects the bundle before its bytes are read. (The importer runs
    only against a freshly prepared warehouse, so "present in the store" is "carried by the packs".)
 
@@ -181,8 +181,6 @@ fetches. A known-format integrity failure, a digest mismatch included, remains f
 
 ## Future extensions
 
-- Importing the signature section straight into a signature table, so a warehouse with very many
-  signed parcels also avoids one sidecar durability barrier per signature on import.
 - Generational bundles (`base` plus changes since it), so server rebuilds and repeat syncs are
   incremental.
 - Range negotiation over native indexes, allowing a client to fetch selected pack sections.

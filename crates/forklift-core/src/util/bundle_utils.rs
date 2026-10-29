@@ -1406,10 +1406,14 @@ fn import_native_bundle_reader(reader: &mut impl Read) -> Result<ImportStats, St
         installed_packs: imported.stored_objects > 0,
     };
 
-    // Each entry becomes its own sidecar file, so an entry is admitted only for a parcel the packs
-    // carry, once: a sidecar naming anything else would cost a file for bytes the bundle never
-    // carried. Each admitted parcel moves from the carried set to the signed one.
+    // An entry is admitted only for a parcel the packs carry, once: a signature naming anything
+    // else would store bytes for a parcel the bundle never carried. Each admitted parcel moves
+    // from the carried set to the signed one.
     let mut signed: HashSet<String> = HashSet::new();
+    // The admitted signatures go into signature tables, not a sidecar each. A signature already
+    // stored in either layer wins and the bundle's copy is skipped, even a conflicting one, whose
+    // refusal would otherwise fail the import after its packs were already published.
+    let mut signatures = sign_utils::SignatureBatch::new(sign_utils::OnConflict::Skip);
 
     for _ in 0..signature_count {
         let mut hash_bytes = [0u8; 64];
@@ -1434,24 +1438,21 @@ fn import_native_bundle_reader(reader: &mut impl Read) -> Result<ImportStats, St
             });
         }
         signed.insert(hash.clone());
-        let payload = read_exact_payload(reader, length)?;
-        // An already-present sidecar wins and the bundle's copy is skipped — even a conflicting
-        // one, whose refusal would otherwise fail the import after its packs were already
-        // published.
-        if sign_utils::load_raw_parcel_signature(&hash)?.is_some() {
-            stats.skipped_records += 1;
-        } else {
-            sign_utils::store_raw_parcel_signature(&hash, &payload)?;
-            stats.stored_signatures += 1;
-        }
+        signatures.add(hash, read_exact_payload(reader, length)?)?;
     }
 
     let mut trailing = [0u8; 1];
     match reader.read(&mut trailing) {
-        Ok(0) => Ok(stats),
-        Ok(_) => Err("The bundle has bytes between its signature section and its digest.".into()),
-        Err(e) => Err(format!("Error while checking the end of the bundle: {}", e)),
+        Ok(0) => {}
+        Ok(_) => return Err("The bundle has bytes between its signature section and its digest.".into()),
+        Err(e) => return Err(format!("Error while checking the end of the bundle: {}", e)),
     }
+
+    let stored = signatures.finish()?;
+    stats.stored_signatures = stored.stored;
+    stats.skipped_records += stored.skipped;
+
+    Ok(stats)
 }
 
 fn read_u32_be(reader: &mut impl Read, what: &str) -> Result<u32, String> {
@@ -2157,6 +2158,77 @@ mod tests {
 
         let kept = sign_utils::load_raw_parcel_signature(&parcel_hash).unwrap().unwrap();
         assert_eq!(kept, local, "the local sidecar survives the import untouched");
+    }
+
+    /// Build a native bundle of `count` signed parcels in a line, each over a tree of its own, in
+    /// its own scratch; returns the bundle bytes and each parcel's hash with its signature.
+    fn build_signed_line_bundle(name: &str, count: usize) -> (Vec<u8>, Vec<(String, Vec<u8>)>) {
+        let _source = Scratch::new(name);
+        let mut signed: Vec<(String, Vec<u8>)> = Vec::new();
+
+        for n in 0..count {
+            let tree = store_tree(&[("a.txt", &store_blob(format!("version {}", n).as_bytes()))], &[]);
+            let parent: Vec<&str> = signed.last().map(|(hash, _)| hash.as_str()).into_iter().collect();
+            let parcel = store_head_parcel(&tree, &parent);
+            let signature = raw_signature_sidecar("test-key", format!("signature {}", n).as_bytes());
+            sign_utils::store_raw_parcel_signature(&parcel, &signature).unwrap();
+            signed.push((parcel, signature));
+        }
+
+        let stats = build_bundle().unwrap();
+        assert_eq!(stats.signatures, count);
+        (std::fs::read(&stats.path).unwrap(), signed)
+    }
+
+    /// The signature tables and the loose signature sidecars under the object store.
+    fn signature_files() -> (usize, usize) {
+        fn walk(folder: &Path, counts: &mut (usize, usize)) {
+            for entry in std::fs::read_dir(folder).into_iter().flatten().flatten() {
+                let path = entry.path();
+                match path.extension().and_then(|extension| extension.to_str()) {
+                    _ if path.is_dir() => walk(&path, counts),
+                    Some("sigs") => counts.0 += 1,
+                    Some("sig") => counts.1 += 1,
+                    _ => {}
+                }
+            }
+        }
+
+        let mut counts = (0, 0);
+        walk(Path::new(&file_utils::get_path_objects_root()), &mut counts);
+        counts
+    }
+
+    /// (vi) A bundle's signatures land in one signature table, not a sidecar each, and a copy that
+    /// conflicts with a signature the destination already stores, loose or tabled, is skipped.
+    ///
+    /// Revert: store each entry with `store_raw_parcel_signature` → five sidecars and no new table
+    /// → red; look for an existing signature in the tables only → the bundle's copy of the loose
+    /// conflict is tabled and read first → red.
+    #[test]
+    fn import_tables_its_signatures_and_skips_copies_that_conflict_in_either_layer() {
+        let (bundle_bytes, signed) = build_signed_line_bundle("bundle-sig-tables-src", 5);
+
+        let _destination = Scratch::new("bundle-sig-tables-dst");
+        let loose = raw_signature_sidecar("local-key", b"a loose local signature");
+        sign_utils::store_raw_parcel_signature(&signed[0].0, &loose).unwrap();
+        let tabled = raw_signature_sidecar("local-key", b"a tabled local signature");
+        let mut batch = sign_utils::SignatureBatch::new(sign_utils::OnConflict::Refuse);
+        batch.add(signed[1].0.clone(), tabled.clone()).unwrap();
+        batch.finish().unwrap();
+        assert_eq!(signature_files(), (1, 1), "sanity: one local signature in each layer");
+
+        let stats = import_bundle_bytes(&bundle_bytes).unwrap();
+        assert_eq!(stats.stored_signatures, 3, "the three the destination lacked");
+        assert_eq!(stats.skipped_records, 2, "both conflicting copies are skipped");
+        assert_eq!(signature_files(), (2, 1), "one new table, and no sidecar beside the local one");
+
+        let read = |hash: &str| sign_utils::load_raw_parcel_signature(hash).unwrap().unwrap();
+        assert_eq!(read(&signed[0].0), loose, "the loose local signature stands");
+        assert_eq!(read(&signed[1].0), tabled, "the tabled local signature stands");
+        for (parcel, signature) in &signed[2..] {
+            assert_eq!(read(parcel), *signature);
+        }
     }
 
     /// Store a tree of `files` (name, blob hash) and `subtrees` (name, tree hash).

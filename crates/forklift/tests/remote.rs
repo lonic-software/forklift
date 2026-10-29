@@ -5513,6 +5513,101 @@ fn object_held(area: &TestArea, directory: &str, hash: &str) -> bool {
     forklift_core::util::file_utils::does_object_exist(hash).unwrap()
 }
 
+/// Whether `directory`'s store holds a signature for `parcel`, tabled or loose.
+fn signature_held(area: &TestArea, directory: &str, parcel: &str) -> bool {
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path(directory));
+    forklift_core::util::sign_utils::load_raw_parcel_signature(parcel).unwrap().is_some()
+}
+
+/// The signature tables and the count of loose signature sidecars in `directory`'s store.
+fn signature_files(area: &TestArea, directory: &str) -> (Vec<PathBuf>, usize) {
+    let mut tables = Vec::new();
+    let mut sidecars = 0;
+    let mut frontier = vec![area.path(&format!("{}/.forklift/objects", directory))];
+
+    while let Some(folder) = frontier.pop() {
+        for entry in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
+            let path = entry.path();
+            match path.extension().and_then(|extension| extension.to_str()) {
+                _ if path.is_dir() => frontier.push(path),
+                Some("sigs") => tables.push(path),
+                Some("sig") => sidecars += 1,
+                _ => {}
+            }
+        }
+    }
+
+    (tables, sidecars)
+}
+
+/// (vii) A fetch buffers the signatures of its walk and, below a full table's worth, writes them
+/// as one signature table, no sidecar each, before the ref moves; a franchise walks each pallet's
+/// history apart. A fetch that dies partway leaves the parcels it stored unsigned and the ref
+/// where it was; the next fetch re-walks them and stores their signatures.
+///
+/// Revert: publish each wave's signatures as it lands → a table per wave, and the dead fetch's
+/// signatures stored → red.
+#[test]
+fn a_fetch_tables_the_signatures_of_its_walk_and_a_dead_one_stores_none() {
+    let area = TestArea::new("fetch-sig-tables");
+    let (server, head) = three_signed_parcels(&area);
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+    let (tables, sidecars) = signature_files(&area, "b");
+    assert_eq!(sidecars, 0, "a fetch writes no signature sidecar");
+    let history = history_with_roots(&area, "b", &head);
+    for (parcel, _) in &history {
+        assert!(signature_held(&area, "b", parcel), "every fetched parcel is signed: {}", parcel);
+    }
+    assert_eq!(tables.len(), 2, "a table per walk, main's and the office pallet's: {:?}", tables);
+
+    // Two more parcels; the newer one's file is lost on the remote, so the next fetch dies after
+    // storing the parcels and before their content is whole.
+    area.write_file("a/src/code.txt", "four\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "four"]));
+    area.write_file("a/lost.txt", "the remote loses this for a while\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "five"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    let new_head = pallet_head(&area, "server-root", "main");
+    let new_parcels: Vec<String> = history_with_roots(&area, "a", &new_head).into_iter()
+        .map(|(parcel, _)| parcel)
+        .filter(|parcel| !history.iter().any(|(old, _)| old == parcel))
+        .collect();
+    assert_eq!(new_parcels.len(), 2, "{:?}", new_parcels);
+
+    let lost = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("a"));
+        let root = forklift_core::util::object_utils::load_parcel(&new_head).unwrap().tree_hash;
+        let file = forklift_core::util::object_utils::load_tree(&root).unwrap().get_files()
+            .find(|(name, _)| name.as_str() == "lost.txt").map(|(_, file)| file.hash.clone());
+        file.expect("the fixture's file")
+    };
+    let held = object_store_path(&area, "server-root", &lost);
+    let aside = area.path("lost-aside");
+    forklift_core::util::file_utils::rename(&held, &aside).expect("the server holds the file loose");
+
+    let died = area.forklift("b", &["lower"]);
+    assert!(!died.status.success(), "the fetch dies: {}", stdout(&died));
+    assert_eq!(pallet_head(&area, "b", "main"), head, "no ref moved");
+    assert!(new_parcels.iter().any(|parcel| object_held(&area, "b", parcel)),
+            "sanity: the fetch stored a parcel before it died");
+    for parcel in &new_parcels {
+        assert!(!signature_held(&area, "b", parcel), "a dead fetch stores no signature: {}", parcel);
+    }
+    assert_eq!(signature_files(&area, "b"), (tables.clone(), 0), "a dead fetch writes no signature file");
+
+    forklift_core::util::file_utils::rename(&aside, &held).unwrap();
+    assert_success(&area.forklift("b", &["lower"]));
+    assert_eq!(pallet_head(&area, "b", "main"), new_head);
+    for parcel in &new_parcels {
+        assert!(signature_held(&area, "b", parcel), "the re-walk stores the signature: {}", parcel);
+    }
+    let (after, sidecars) = signature_files(&area, "b");
+    assert_eq!((after.len(), sidecars), (tables.len() + 1, 0), "the re-walk's signatures land in one new table: {:?}", after);
+}
+
 /// `directory`'s sealed record, compared against exactly `hashes`.
 fn assert_record_is(area: &TestArea, directory: &str, hashes: &[&str]) {
     use forklift_core::util::sealed_utils;
@@ -5546,7 +5641,7 @@ fn three_signed_parcels(area: &TestArea) -> (Server, String) {
     (server, head)
 }
 
-/// A cache franchise holds every parcel and signature sidecar of the history it fetches, and the
+/// A cache franchise holds every parcel and signature of the history it fetches, and the
 /// whole closure of the head it checks out; of every other parcel it records the root tree in the
 /// sealed record instead of fetching it, so `audit` passes and counts them held by hash. The meta
 /// pallets are fetched whole. A full franchise of the same remote is the baseline that holds every
@@ -5575,10 +5670,9 @@ fn a_cache_franchise_holds_the_parcels_and_its_tip_and_records_the_rest() {
         assert!(object_held(&area, "cached", parcel), "every parcel is held: {}", parcel);
         assert!(closure_present(&area, "full", root), "the baseline holds every root");
 
-        let sidecar = format!(".forklift/objects/{}/{}.sig", &parcel[0..2], &parcel[2..]);
-        if area.path(&format!("full/{}", sidecar)).exists() {
+        if signature_held(&area, "full", parcel) {
             signed += 1;
-            assert!(area.path(&format!("cached/{}", sidecar)).exists(), "every sidecar is held: {}", parcel);
+            assert!(signature_held(&area, "cached", parcel), "every signature is held: {}", parcel);
         }
     }
     assert!(signed >= 3, "the fixture's parcels are signed");
