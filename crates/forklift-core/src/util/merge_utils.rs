@@ -894,7 +894,7 @@ enum PendingAction {
     PutBack {
         path: String,
         hash: String,
-        item_type: crate::enums::dir_entry_type::DirEntryType,
+        item_type: DirEntryType,
     },
 }
 
@@ -944,13 +944,9 @@ pub fn compute_merge_actions(base_hash: &str,
                              ours_label: &str,
                              theirs_label: &str,
                              scope: &MaterializationScope) -> Result<Vec<MergeAction>, String> {
-    // The presence phase for the walk below, by its own rule: a subtree both sides agree on, or
-    // their side left as the base had it, is skipped, and so is an out-of-scope one. Its refusal
-    // is returned as it is, so a cache miss keeps its exit code.
-    cache_miss::ensure_trees_present(&[Some(base_hash), Some(ours_hash), Some(theirs_hash)], |path, sides| {
-        let (b, o, t) = (sides[0], sides[1], sides[2]);
-        !(o == t || t == b) && scope.classify(path) != ScopeClass::OutOfScope
-    })?;
+    cache_miss::prefetch_trees(&[Some(base_hash), Some(ours_hash), Some(theirs_hash)], |path, sides| {
+        !merge_skips_subtree(sides[0], sides[1], sides[2]) && scope.classify(path) != ScopeClass::OutOfScope
+    });
 
     let base_tree = object_utils::load_tree(base_hash)?;
     let ours_tree = object_utils::load_tree(ours_hash)?;
@@ -1115,6 +1111,13 @@ fn resolve_merge_job(job: &MergeJob,
             item_type: merged_type,
         }
     })
+}
+
+/// Whether [`merge_directory`] has nothing to merge below a subtree whose hash on each side is
+/// `base`, `ours` and `theirs`: both sides agree, or their side is as the base had it. Any other
+/// subtree it descends into, unless it is out of scope.
+fn merge_skips_subtree(base: Option<&str>, ours: Option<&str>, theirs: Option<&str>) -> bool {
+    ours == theirs || theirs == base
 }
 
 /// Merge one directory level of the three trees (recursively).
@@ -1315,7 +1318,7 @@ fn merge_directory(base: Option<&crate::model::tree_item::TreeItem>,
         let t = their_subtrees.get(name);
 
         // Identical on both sides, or unchanged on their side: nothing to merge below.
-        if o == t || t == b {
+        if merge_skips_subtree(b.map(String::as_str), o.map(String::as_str), t.map(String::as_str)) {
             continue;
         }
 

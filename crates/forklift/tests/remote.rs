@@ -5953,19 +5953,27 @@ fn a_cache_merge_fetches_its_trees_by_level_and_its_blobs_in_one_batch() {
     }
     seen.clear();
 
-    let merged = area.forklift("cached", &["consolidate", "feature"]);
-    assert_eq!(area.read_file("cached/docs/three.txt"), "feature three\n", "{}{}", stdout(&merged), stderr(&merged));
-    assert!(area.read_file("cached/src/code.txt").contains("feature\n"), "{}", stdout(&merged));
+    assert_success(&area.forklift("cached", &["consolidate", "feature"]));
+    assert_eq!(area.read_file("cached/docs/three.txt"), "feature three\n", "the file the bay deleted is put back");
+    for (file, ours, theirs) in [("src/code.txt", "local\n", "feature\n"), ("docs/two.txt", "local two\n", "feature two\n")] {
+        let content = area.read_file(&format!("cached/{}", file));
+        assert!(content.contains("<<<<<<<") && content.contains(ours) && content.contains(theirs), "{}: {}", file, content);
+    }
+    let conflicts = area.forklift("cached", &["--json", "conflicts"]);
+    assert_success(&conflicts);
+    let mut paths: Vec<String> = json_of(&conflicts)["data"]["conflicts"].as_array().unwrap().iter()
+        .map(|conflict| conflict["path"].as_str().unwrap().to_string()).collect();
+    paths.sort();
+    assert_eq!(paths, ["docs/three.txt", "docs/two.txt", "src/code.txt"]);
 
     assert_eq!(seen.object_requests(&theirs[1..]), 3, "{:?}", seen.paths.lock().unwrap());
 }
 
 /// With the subtrees of the target absent as well, a cache `shift`, a fast-forward `consolidate`
-/// and a merging one refuse as a cache miss from planning, before they change anything: the
-/// planner's tree walk fetches before it reads.
+/// and a merging one refuse as a cache miss while they plan, before they change anything.
 ///
-/// Revert: drop the planners' tree walks → the same refusals come from the reads; this pins the
-/// code and the unchanged bay, not which fetch refused.
+/// Revert: drop the planners' prefetch → the same refusals come from the planners' reads, so
+/// this stays green: it pins the code and the unchanged bay, not which fetch refused.
 #[test]
 fn a_cache_shift_over_absent_trees_with_its_origin_unreachable_refuses_unchanged() {
     let area = TestArea::new("cache-plan-offline");

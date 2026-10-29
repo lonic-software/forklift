@@ -134,23 +134,21 @@ fn ensure_with<'a>(hook: Option<&FetchHook>, hashes: impl IntoIterator<Item = &'
     refill_with(hook, &absent).map(|_| ())
 }
 
-/// [`ensure_present`] for the trees a planner is about to walk: in a cache warehouse, every tree
-/// it descends into, one batch per level, so planning a mutation over trees the cache lacks costs
-/// one fetch per level of the walk rather than one per tree.
+/// A planner's presence phase: in a cache warehouse, fetch the trees it is about to walk, one
+/// batch per level, so planning a mutation over trees the cache lacks costs one request per level
+/// of the walk rather than one per tree.
 ///
 /// The walk starts at `roots`, one per side the planner compares (an absent side is `None`), and
 /// goes down level by level: at each directory, every subtree name any side holds is a child, with
-/// each side's hash for it, and `descend(path, sides)` says whether the planner would load it. It
-/// must be the planner's own rule, so what this fetches is what the planner reads. Outside a cache
-/// warehouse, nothing is walked.
+/// each side's hash for it, and `descend(path, sides)` says whether the planner loads it, so pass
+/// the planner's own rule. Outside a cache warehouse, nothing is walked.
 ///
-/// # Returns
-/// * `Ok(())`      - Every tree the walk reached is held, or absent and not recorded, which the
-///                   planner's own read reports.
-/// * `Err(String)` - As [`ensure_present`], or a tree it fetched could not be read.
-pub fn ensure_trees_present(roots: &[Option<&str>],
-                            descend: impl Fn(&str, &[Option<&str>]) -> bool) -> Result<(), String> {
-    walk_with(HOOK.get(), roots, descend)
+/// A fetch only: it reports nothing. Where it fails (the origin cannot be reached, a tree is absent
+/// and not recorded), the planner's own read of that tree fails as the fetch did, a cache miss
+/// keeping its code; and where the planner refuses before it reaches the tree, as it does an
+/// out-of-scope conflict, its refusal is the one the caller sees, as it was before any fetch.
+pub fn prefetch_trees(roots: &[Option<&str>], descend: impl Fn(&str, &[Option<&str>]) -> bool) {
+    let _ = walk_with(HOOK.get(), roots, descend);
 }
 
 fn walk_with(hook: Option<&FetchHook>,
@@ -170,7 +168,7 @@ fn walk_with(hook: Option<&FetchHook>,
 
         for (key, sides) in &level {
             let trees = sides.iter()
-                .map(|hash| hash.as_deref().map(object_utils::load_tree_shared).transpose())
+                .map(|hash| hash.as_deref().map(object_utils::load_tree).transpose())
                 .collect::<Result<Vec<_>, String>>()?;
 
             let subtrees: Vec<BTreeMap<&String, &str>> = trees.iter()
@@ -693,8 +691,8 @@ mod tests {
         }), asked)
     }
 
-    // Revert: fetch each tree the walk reaches on its own → three batches, not two; ignore the
-    // descent rule → `deep/c`'s tree is fetched though the planner would not load it.
+    // Revert: fetch each tree the walk reaches on its own → four batches, not three; ignore the
+    // descent rule → `docs/deep` is fetched though the planner would not load it.
     #[test]
     fn a_tree_walk_fetches_one_batch_per_level_and_only_where_it_descends() {
         let fixture = fixture("tree-walk");
@@ -723,6 +721,42 @@ mod tests {
         assert!(levels.is_empty(), "nothing else is asked for: {:?}", levels);
         assert!(!held(&deep), "a subtree the planner does not descend into is not fetched");
         assert_recorded(&[&deep]);
+    }
+
+    // A planner's own refusal, raised before it reads the tree its prefetch could not fetch (no
+    // hook here, so every fetch fails), is the one returned: the metadata-folder refusal of a
+    // shift, and a scoped merge's out-of-scope conflict.
+    //
+    // Revert: return the prefetch's error from the planners → both refuse that `meta` and `in`
+    // could not be fetched instead.
+    #[test]
+    fn a_planner_refusal_comes_before_a_failed_prefetch() {
+        use crate::util::scope_utils::MaterializationScope;
+        use crate::util::{merge_utils, shift_utils};
+
+        let fixture = fixture("precedence");
+        let meta = tree(&[("m", &blob("m"), DirEntryType::Normal)]);
+        let root = tree(&[(crate::globals::FOLDER_NAME_FORKLIFT_ROOT, &meta, DirEntryType::Tree)]);
+        sealed_utils::append(&[(SealOp::Record, &meta)]).unwrap();
+        remove(&meta);
+
+        let refused = shift_utils::diff_trees_in(None, &root, &MaterializationScope::full()).err().expect("the shift refuses");
+        assert!(refused.contains("metadata folder"), "{}", refused);
+
+        let held_in = tree(&[("a", &blob("a"), DirEntryType::Normal)]);
+        let their_in = tree(&[("b", &blob("b"), DirEntryType::Normal)]);
+        let side = |out: &str, inner: &str| tree(&[("in", inner, DirEntryType::Tree), ("out.txt", &blob(out), DirEntryType::Normal)]);
+        let (base, ours, theirs) = (side("0", &held_in), side("1", &held_in), side("2", &their_in));
+        sealed_utils::append(&[(SealOp::Record, &their_in)]).unwrap();
+        remove(&their_in);
+
+        let scope = MaterializationScope::from_prefixes(["in"]);
+        match CoreError::from(merge_utils::compute_merge_actions(&base, &ours, &theirs, "ours", "theirs", &scope).err().expect("the merge refuses")) {
+            CoreError::Refusal { code, .. } => assert_eq!(code, RefusalCode::OutOfScopeConflict),
+            other => panic!("not the planner's refusal: {:?}", other),
+        }
+
+        assert!(!held(&their_in) && !held(&meta) && !held(&fixture.root), "nothing was fetched");
     }
 
     // Revert: drop the check after the fetch → the phase succeeds with `web` still absent.
