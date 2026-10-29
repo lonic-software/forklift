@@ -6324,6 +6324,9 @@ async fn upload_history(client: &RemoteClient,
     let mut seen_blobs: HashSet<String> = HashSet::new();
     let mut seen_recipes: HashSet<String> = HashSet::new();
 
+    // A cache holds some of this history's content only by record: see `collect_changed_closure`.
+    let recorded = if scope_utils::is_cache_mode()? { Some(sealed_utils::read_sealed()?) } else { None };
+
     // Parents first, guaranteed by `new_parcels_parents_first`: every parent of the parcel
     // being walked is remote-known or already processed, so everything a base "explains" is
     // on the remote or in the candidates already. Do not reorder this loop — a base that
@@ -6344,7 +6347,7 @@ async fn upload_history(client: &RemoteClient,
 
         collect_changed_closure(&parcel.tree_hash, "", &base_trees,
                                 &mut seen_trees, &mut seen_blobs, &mut seen_recipes,
-                                &mut candidates, chunking_supported)?;
+                                &mut candidates, recorded.as_ref(), chunking_supported)?;
     }
 
     // Control-plane objects — parcels, trees, and recipes — are promoted synchronously when a
@@ -6515,9 +6518,19 @@ fn new_parcels_parents_first(local_head: &str,
 /// only by seal. It is scope-agnostic and correct in full stores too — an object pruned against a
 /// parent is provably on the remote (that parent is already there or is uploaded in this session),
 /// exactly the guarantee the first-parent-only walk gave for linear history.
+///
+/// `recorded` is a cache's sealed record. A tree or recipe it records that is absent here is taken
+/// to be on the origin with its closure, the premise the read path's fetch of a recorded object
+/// rests on too, and a cache lifts only to its origin. The walk treats it like a base-explained
+/// one: no candidate, no descent, no read. Without that, a first lift of a new pallet, which walks
+/// the whole history, would fetch every older root only to learn the remote has it. Should the
+/// origin lack one, the remote's closure check refuses the lift, where reading it would have
+/// failed at the fetch. A base is still read when it is absent, through the read path's fetch:
+/// treating its content as changed instead would widen the walk.
 // Three dedup ledgers (trees, blobs/chunks, recipes) plus the candidate accumulator, the path
-// prefix for error naming, the base set, and the chunking capability — each meaningfully distinct
-// and threaded through the recursion, so a parameter object would only obscure them.
+// prefix for error naming, the base set, the record, and the chunking capability — each
+// meaningfully distinct and threaded through the recursion, so a parameter object would only
+// obscure them.
 #[allow(clippy::too_many_arguments)]
 fn collect_changed_closure(tree_hash: &str,
                            path_prefix: &str,
@@ -6526,6 +6539,7 @@ fn collect_changed_closure(tree_hash: &str,
                            seen_blobs: &mut HashSet<String>,
                            seen_recipes: &mut HashSet<String>,
                            candidates: &mut Vec<String>,
+                           recorded: Option<&sealed_utils::SealedSet>,
                            chunking_supported: bool) -> Result<(), String> {
     // Record the visit before checking base-explained, not after: content-addressing means the
     // same subtree hash can recur at another path in the same walk (e.g. a merge adopting one
@@ -6538,7 +6552,7 @@ fn collect_changed_closure(tree_hash: &str,
 
     // Explained by some parent at this path (or already walked): the remote has it, so it needs
     // neither upload nor descent — and, critically, its object is never loaded.
-    if base_tree_hashes.iter().any(|hash| hash == tree_hash) || !first_visit {
+    if base_tree_hashes.iter().any(|hash| hash == tree_hash) || !first_visit || held_by_record(recorded, tree_hash)? {
         return Ok(());
     }
 
@@ -6584,7 +6598,7 @@ fn collect_changed_closure(tree_hash: &str,
 
             // 2. An identical recipe on a parent at this name ⟹ the remote already has that
             //    recipe and its whole chunk closure (a base's closure is complete on the remote).
-            if explained {
+            if explained || held_by_record(recorded, &file.hash)? {
                 continue;
             }
 
@@ -6622,11 +6636,19 @@ fn collect_changed_closure(tree_hash: &str,
             .unwrap_or_default();
 
         collect_changed_closure(&subtree.hash, &join_path(path_prefix, name), &child_bases,
-                                seen_trees, seen_blobs, seen_recipes, candidates,
+                                seen_trees, seen_blobs, seen_recipes, candidates, recorded,
                                 chunking_supported)?;
     }
 
     Ok(())
+}
+
+/// Whether `hash` is in `recorded` and absent from the store: content a cache holds only by record.
+fn held_by_record(recorded: Option<&sealed_utils::SealedSet>, hash: &str) -> Result<bool, String> {
+    match recorded {
+        Some(recorded) if recorded.contains(hash) => Ok(!file_utils::does_object_exist(hash)?),
+        _ => Ok(false),
+    }
 }
 
 /// Join a directory path prefix and an entry name into the entry's warehouse path (`""` prefix
@@ -8983,7 +9005,7 @@ mod tests {
             let mut seen_recipes = HashSet::new();
             let mut candidates = Vec::new();
             collect_changed_closure(&root_merge, "", bases, &mut seen_trees, &mut seen_blobs,
-                                    &mut seen_recipes, &mut candidates, true)
+                                    &mut seen_recipes, &mut candidates, None, true)
                 .expect("the closure walk must not load a pruned object");
             candidates
         };
@@ -9107,7 +9129,7 @@ mod tests {
                 .collect::<Result<_, _>>()
                 .expect("every parent resolves");
             collect_changed_closure(&parcel.tree_hash, "", &base_trees, &mut seen_trees,
-                                    &mut seen_blobs, &mut seen_recipes, &mut candidates, true)
+                                    &mut seen_blobs, &mut seen_recipes, &mut candidates, None, true)
                 .expect("the client walk must not load a pruned object");
         }
         let priced: HashSet<String> = candidates.iter().cloned().collect();
@@ -9200,7 +9222,7 @@ mod tests {
         let mut seen_recipes = HashSet::new();
         let mut candidates = Vec::new();
         collect_changed_closure(&new_root, "", &[base_root], &mut seen_trees, &mut seen_blobs,
-                                &mut seen_recipes, &mut candidates, true)
+                                &mut seen_recipes, &mut candidates, None, true)
             .expect("the second path must be recognized as already-seen, not re-loaded");
 
         assert!(!candidates.contains(&shared),
@@ -9269,7 +9291,7 @@ mod tests {
 
         // `false` = the remote's handshake omitted the chunking capability.
         let error = collect_changed_closure(&root, "", &[], &mut seen_trees, &mut seen_blobs,
-                                            &mut seen_recipes, &mut candidates, false)
+                                            &mut seen_recipes, &mut candidates, None, false)
             .expect_err("a chunked file entry must refuse a lift to a non-chunking remote");
 
         let (code, message, next_step) = scope_utils::decode_refusal(&error)
@@ -9306,7 +9328,7 @@ mod tests {
         let mut candidates = Vec::new();
 
         collect_changed_closure(&root, "", &[], &mut seen_trees, &mut seen_blobs,
-                                &mut seen_recipes, &mut candidates, true)
+                                &mut seen_recipes, &mut candidates, None, true)
             .expect("a chunked file must negotiate, not refuse, against a chunking remote");
 
         // The recipe is a control-plane candidate; every chunk is a blob candidate.

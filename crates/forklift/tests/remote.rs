@@ -6200,6 +6200,38 @@ fn a_cache_lift_auto_merges_a_diverged_remote() {
     assert_success(&area.forklift("cached", &["audit"]));
 }
 
+/// Lifting a new pallet from a cache walks the whole history beneath it, since the remote names no
+/// head of it to stop at. An older parcel whose root the cache holds only by record is on the
+/// origin already, so the walk does not read it: the oldest root stays absent and recorded. The
+/// middle root is the base the tip's tree is pruned against, so the walk reads it, fetching it from
+/// the origin. The lift lands a pallet a full franchise of the remote checks out and audits.
+///
+/// Revert: read a recorded root like any other → the walk fetches the oldest root.
+#[test]
+fn a_cache_lift_of_a_new_pallet_fetches_no_recorded_root() {
+    let area = TestArea::new("cache-lift-new-pallet");
+    let (server, head) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+
+    let history = history_with_roots(&area, "cached", &head);
+    let (middle_root, oldest_root) = (history[1].1.clone(), history[2].1.clone());
+    assert_record_is(&area, "cached", &[&middle_root, &oldest_root]);
+
+    assert_success(&area.forklift("cached", &["palletize", "feature"]));
+    area.write_file("cached/src/feature.txt", "feature\n");
+    assert_success(&area.forklift("cached", &["load", "."]));
+    assert_success(&area.forklift("cached", &["stack", "the feature"]));
+    assert_success(&area.forklift("cached", &["lift"]));
+
+    assert!(!object_held(&area, "cached", &oldest_root), "the lift fetched a root it holds by record");
+    assert!(object_held(&area, "cached", &middle_root), "the lift reads the base of the tip's tree");
+    assert_success(&area.forklift("cached", &["audit"]));
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "full", "--pallet", "feature"]));
+    assert_eq!(area.read_file("full/src/feature.txt"), "feature\n");
+    assert_success(&area.forklift("full", &["audit"]));
+}
+
 /// Fetch `head` into `directory` in-process, as a cache fetch that no ref write follows.
 fn cache_fetch_in_process(area: &TestArea, directory: &str, url: &str, head: &str) {
     // A current-thread runtime: the fetch spawns its transfers, and the storage scope is a
