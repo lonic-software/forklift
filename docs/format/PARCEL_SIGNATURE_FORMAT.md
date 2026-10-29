@@ -7,15 +7,19 @@ the design document (§6, FORK-13 review).
 
 The signature is never inside the parcel: the parcel hash covers the full uncompressed
 object (design invariant §4.4), so a signature over that hash cannot be part of the hashed
-content. A new signature is first written as a **sidecar file**, named like the parcel's
-loose object file plus the `.sig` suffix:
+content. A signature made or received one at a time (local signing, a lift's upload to a server)
+is written as a **sidecar file**, named like the parcel's loose object file plus the `.sig` suffix:
 
 ```
 .forklift/objects/<first-2-hash-chars>/<remaining-hash-chars>.sig
 ```
 
 `compact` later moves sidecars into **signature tables** in the pack folder (see "Signature
-tables" below). A read looks in the tables first, then for the sidecar, and returns the same
+tables" below). Signatures that arrive in bulk go straight into tables: a bundle import writes
+its signature section as tables, and a fetch gathers the signatures of its whole history walk and
+writes them as tables before the walk returns, so before any ref moves. A fetch that fails partway
+writes none; the parcels it stored are not yet behind a ref, so the next fetch walks them again
+and fetches their signatures. A read looks in the tables first, then for the sidecar, and returns the same
 bytes from either. A parcel's signature never changes once stored: storing a different
 signature for a parcel that already has one, in either place, is refused.
 

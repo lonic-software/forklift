@@ -4144,10 +4144,15 @@ const PRESENCE_PARALLEL_THRESHOLD: usize = 1024;
 /// The presence of every parcel in `hashes` once a full repack's packs are final, probed in
 /// parallel ([`fanout_utils::fanout_map`]): a repack of a large history probes one per signature.
 fn parcel_presences(hashes: Vec<[u8; HASH_LEN]>) -> Result<HashMap<[u8; HASH_LEN], Presence>, String> {
+    parcel_presences_from(hashes, PRESENCE_PARALLEL_THRESHOLD)
+}
+
+/// [`parcel_presences`], probing in parallel once there are at least `parallel_from` parcels.
+fn parcel_presences_from(hashes: Vec<[u8; HASH_LEN]>, parallel_from: usize) -> Result<HashMap<[u8; HASH_LEN], Presence>, String> {
     let set = loaded_packs()?;
     let probe = |hash_bytes: &[u8; HASH_LEN]| parcel_presence(&set, &sign_utils::to_hex(hash_bytes), hash_bytes);
 
-    let presences = if hashes.len() < PRESENCE_PARALLEL_THRESHOLD {
+    let presences = if hashes.len() < parallel_from {
         hashes.iter().map(probe).collect()
     } else {
         fanout_utils::fanout_map(&hashes, probe)
@@ -10885,7 +10890,7 @@ pub(crate) mod tests {
     /// Ingress (vi, vii) stores through a signature batch: it publishes a table each time a
     /// table's worth has gathered and the rest when it finishes, and writes no sidecar.
     ///
-    /// Revert: publish only in `finish` → one table of seven → red.
+    /// Revert: publish only in `finish` → no table before it → red.
     #[test]
     fn a_signature_batch_publishes_a_table_at_each_bound() {
         let (temp, _scope) = enter_signature_root("sig-batch-bound");
@@ -10894,6 +10899,9 @@ pub(crate) mod tests {
         for n in 0..7 {
             batch.add(fake_parcel("", n), fake_signature(n as u8)).unwrap();
         }
+        assert_eq!(signature_tables().len(), 2, "each full table is published as it fills, before the finish");
+        assert_eq!(sign_utils::load_raw_parcel_signature(&fake_parcel("", 6)).unwrap(), None,
+            "the remainder waits for the finish");
         let counts = batch.finish().unwrap();
 
         assert_eq!(counts, sign_utils::StoredSignatures { stored: 7, skipped: 0 });
@@ -11277,6 +11285,40 @@ pub(crate) mod tests {
             assert_eq!(sign_utils::load_raw_parcel_signature(hash).unwrap(), Some(fake_signature(seed)),
                 "a present parcel keeps its signature: {}", hash);
         }
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// The presence probes a Repack makes return the same answers, each for its own parcel,
+    /// whether they run serially or fan out.
+    ///
+    /// Revert: reverse the fanned-out results before pairing them with their parcels → red.
+    #[test]
+    fn presence_probes_agree_serial_and_fanned_out() {
+        let (temp, _scope) = salvage_root("sig-presence-arms");
+        std::fs::create_dir_all(pack_folder()).unwrap();
+
+        let packed = numbered_objects("packed parcel", 40);
+        let mut builder = TransportPackBuilder::new(&pack_folder()).unwrap();
+        for (content, _, hex) in &packed {
+            builder.append_full(hex, content).unwrap();
+        }
+        builder.finish().unwrap();
+        let loose = numbered_objects("loose parcel", 40);
+        for (content, _, hex) in &loose {
+            store_loose(hex, content);
+        }
+        invalidate_cache();
+
+        let mut expected = Vec::new();
+        expected.extend(packed.iter().map(|(_, hash, _)| (*hash, Presence::Packed)));
+        expected.extend(loose.iter().map(|(_, hash, _)| (*hash, Presence::Loose)));
+        expected.extend((0..40).map(|n| (hash_to_bytes(&fake_parcel("", n)).unwrap(), Presence::Absent)));
+        let hashes: Vec<[u8; HASH_LEN]> = expected.iter().map(|(hash, _)| *hash).collect();
+        let expected: HashMap<[u8; HASH_LEN], Presence> = expected.into_iter().collect();
+
+        assert_eq!(parcel_presences_from(hashes.clone(), usize::MAX).unwrap(), expected, "serial");
+        assert_eq!(parcel_presences_from(hashes, 0).unwrap(), expected, "fanned out");
 
         std::fs::remove_dir_all(&temp).ok();
     }

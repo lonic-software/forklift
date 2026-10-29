@@ -121,8 +121,9 @@ The read fallback lives behind the two centralised object-store functions
 (`retrieve_object_by_hash`, `does_object_exist` in `file_utils.rs`): the loose
 store stays the fast path, and a loose miss consults the packs — so every caller
 (history, audit, export, the server data plane) benefits with no change of its own.
-Signature sidecars (`.sig`) are not objects, so they are never packed; `compact`
-instead moves them into signature tables (`objects/pack/<id>.sigs`, see
+Signature sidecars (`.sig`) are not objects, so they are never packed; bundle import
+and fetch write signature tables directly, and `compact` moves the sidecars local
+signing writes into them (`objects/pack/<id>.sigs`, see
 `format/PARCEL_SIGNATURE_FORMAT.md`), which the pack registry loads beside the packs
 and a signature read consults before the sidecar. Imported history is unsigned, so
 git.git has none anyway.

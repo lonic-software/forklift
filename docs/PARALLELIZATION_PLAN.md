@@ -272,6 +272,13 @@ contention.** Two things decide almost every row:
    files are actually gone from disk afterward — the outcome the drop exists to protect, even
    though the specific Windows failure mode can't be exercised from this (POSIX) dev environment.
 
+7. **`compact --all`'s signature sweep — fanned out, not measured (FORK-333).** A repack keeps a
+   tabled or loose signature only while its parcel is still in the store, which is one presence
+   probe per signature across the loaded packs. `pack_utils::parcel_presences` runs those probes
+   through `fanout_map` once a sweep has 1,024 or more to make (`PRESENCE_PARALLEL_THRESHOLD`),
+   serially below it; each probe is independent and read-only. The sweep maps its tables instead
+   of reading them into memory, and a repack reuses the tables it validated before it started.
+
 ## Where parallelism does *not* pay (and why)
 
 - **`history` / `blame` / ancestry — Amdahl-bound.** These are sequential walks whose parallel

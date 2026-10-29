@@ -608,8 +608,8 @@ fn list_names(dir: &Path) -> Result<Vec<std::ffi::OsString>, String> {
 /// 1. The object store's durability taints: a torn taint discards the whole store, otherwise each
 ///    recorded path is deleted, and each deletion is made durable before step 2 drops the taint
 ///    records. Without an anchor to verify against (`record` is `None`, or recorded no genesis),
-///    every kept signature sidecar is deleted too, so the resume fetches them again exactly as a
-///    fresh franchise would.
+///    every kept signature, sidecar or table, is deleted too, so the resume fetches them again
+///    exactly as a fresh franchise would.
 /// 2. Every entry of `.forklift` but the object store, the record, the held lock and, unless
 ///    `keep` is [`BundleState::None`], the bundles. Refs above all: the history walk stops at any
 ///    parcel a local ref holds, and a ref an earlier attempt wrote is complete only at that
