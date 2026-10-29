@@ -1235,10 +1235,13 @@ mod tests {
         let forklift = dir.join(".forklift");
         let objects = forklift.join("objects");
         std::fs::create_dir_all(objects.join("ab")).unwrap();
+        std::fs::create_dir_all(objects.join("pack")).unwrap();
         std::fs::create_dir_all(forklift.join("pallets")).unwrap();
         std::fs::create_dir_all(forklift.join("bundles")).unwrap();
         std::fs::write(objects.join("ab/cdef"), b"x").unwrap();
         std::fs::write(objects.join("ab/cdef.sig"), b"x").unwrap();
+        std::fs::write(objects.join("pack/p.pack"), b"x").unwrap();
+        std::fs::write(objects.join("pack/t.sigs"), b"x").unwrap();
         std::fs::write(forklift.join("pallets/main"), b"x").unwrap();
         std::fs::write(forklift.join("operation"), b"x").unwrap();
         std::fs::write(forklift.join("lock"), b"1").unwrap();
@@ -1252,13 +1255,17 @@ mod tests {
         assert_eq!(kept, vec!["franchise", "lock", "objects"]);
         assert_eq!(list_names(&dir).unwrap(), vec![".forklift"]);
         assert!(objects.join("ab/cdef.sig").exists(), "an anchored resume keeps its sidecars");
+        assert!(objects.join("pack/t.sigs").exists(), "an anchored resume keeps its signature tables");
 
-        // Unanchored: the sidecars go too, and a finished bundle is kept when asked.
+        // Unanchored: every signature goes too, sidecars and tables (FORK-333), and a finished
+        // bundle is kept when asked.
         std::fs::create_dir_all(forklift.join("bundles")).unwrap();
         let unanchored = FranchiseRecord { genesis: None, ..record() };
         assert_eq!(prepare_resume(&dir, Some(&unanchored), &BundleState::Imported), Ok(BundleState::Imported));
         assert!(!objects.join("ab/cdef.sig").exists());
+        assert!(!objects.join("pack/t.sigs").exists(), "an unanchored resume removes the signature tables");
         assert!(objects.join("ab/cdef").exists());
+        assert!(objects.join("pack/p.pack").exists());
         assert!(forklift.join("bundles").exists());
 
         std::fs::remove_dir_all(&dir).ok();

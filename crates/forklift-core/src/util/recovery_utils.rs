@@ -1232,7 +1232,7 @@ struct StoreWidePaths {
     /// currently *present*, not just whatever a torn taint's own (untrusted, lower-bound) record
     /// happened to name — see the module doc comment's torn-rescan section.
     loose: Vec<PathBuf>,
-    /// Every `.pack`/`.idx` file under `objects/pack/` (skips in-progress `.tmp` staging debris a
+    /// Every `.pack`/`.idx`/`.sigs` file under `objects/pack/` (skips in-progress `.tmp` staging debris a
     /// killed `compact` may have left behind — see `pack_utils`'s own temp-file naming).
     packs: Vec<PathBuf>,
     /// Every staged inventory shard `data` file, across every bay.
@@ -7862,5 +7862,108 @@ mod tests {
             std::fs::remove_dir_all(&dir).ok();
             failure
         });
+    }
+
+    // FORK-333: signature tables and sidecars under recovery.
+
+    /// A fresh, activated, full-mode storage root for a signature recovery test, entered.
+    fn enter_signature_heal_root(name: &str) -> (PathBuf, crate::globals::StorageRootScope) {
+        let root = std::env::temp_dir().join(format!("forklift-recovery-utils-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let scope = crate::globals::StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
+        std::fs::create_dir_all(pack_utils::pack_folder()).unwrap();
+        (root, scope)
+    }
+
+    /// A well-formed signature (never verified here).
+    fn some_signature() -> Vec<u8> {
+        let mut bytes = vec![1, 8];
+        bytes.extend_from_slice(b"test-key");
+        bytes.push(64);
+        bytes.extend_from_slice(&[5; 64]);
+        bytes
+    }
+
+    /// (xiii) The torn rescan knows a signature table: it restages it with the packs.
+    ///
+    /// Revert: drop the `.sigs` extension from `walk_pack_paths` → the table is not restaged → red.
+    #[test]
+    fn a_torn_rescan_restages_a_signature_table() {
+        let _serial = lock_activation();
+        taint_utils::activate();
+        let (root, _scope) = enter_signature_heal_root("torn-sigs");
+        let forklift = forklift_root();
+
+        let hash = "ab".repeat(32);
+        let entries = vec![(pack_utils::hash_to_bytes(&hash).unwrap(), some_signature())];
+        let name = format!("{}.{}", signature_table::table_id(&entries), signature_table::SIGNATURE_TABLE_EXTENSION);
+        std::fs::write(pack_utils::pack_folder().join(name), signature_table::build(&entries)).unwrap();
+
+        plant_torn_taint(&forklift, &[]);
+        let outcome = run_heal().expect("a torn taint over an intact store must clear");
+
+        // The rescan reports counts, not paths: the table is the only pack-folder file here.
+        assert!(outcome.notes.iter().any(|note| note.contains("1 pack file(s)") && note.contains("of which 1 were")),
+            "the torn rescan must restage the table: {:?}", outcome.notes);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// (xv) A recorded signature table that has vanished resolves with a note naming the loss and
+    /// leaves no taint standing; a compaction's table that vanished before its sweep ran loses no
+    /// signature, since the sidecars it would have replaced are still there.
+    ///
+    /// Revert: classify a vanished table into the gating remainder (as an unrecognized path) →
+    /// heal refuses → red.
+    #[test]
+    fn heal_resolves_a_vanished_signature_table_with_a_loss_note() {
+        let _serial = lock_activation();
+        taint_utils::activate();
+        let (root, _scope) = enter_signature_heal_root("vanished-sigs");
+        let forklift = forklift_root();
+
+        let hash = "cd".repeat(32);
+        sign_utils::store_raw_parcel_signature(&hash, &some_signature()).unwrap();
+        let relative = format!("objects/pack/{}.sigs", "e".repeat(64));
+        plant_complete_taint(&forklift, &[&relative]);
+
+        let outcome = run_heal().expect("a vanished signature table must not gate the store");
+
+        assert!(outcome.resolved.iter().any(|path| path.replace('\\', "/") == relative), "{:?}", outcome.resolved);
+        assert!(outcome.notes.iter().any(|note| note.contains("signature table") && note.contains("lost locally")),
+            "{:?}", outcome.notes);
+        assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "no taint may stand");
+        assert_eq!(sign_utils::load_raw_parcel_signature(&hash).unwrap(), Some(some_signature()),
+            "the sidecar the table would have replaced still answers");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// (xvii) A recorded loose signature sidecar that has vanished, with no table holding its
+    /// parcel, resolves with the same loss note and leaves no taint standing.
+    ///
+    /// Revert: leave a `.sig` path unrecognized in `classify_vanished` → heal refuses → red.
+    #[test]
+    fn heal_resolves_a_vanished_signature_sidecar_with_a_loss_note() {
+        let _serial = lock_activation();
+        taint_utils::activate();
+        let (root, _scope) = enter_signature_heal_root("vanished-sig");
+        let forklift = forklift_root();
+
+        let hash = "ef".repeat(32);
+        let relative = format!("objects/{}/{}.sig", &hash[..2], &hash[2..]);
+        plant_complete_taint(&forklift, &[&relative]);
+
+        let outcome = run_heal().expect("a vanished signature sidecar must not gate the store");
+
+        assert!(outcome.resolved.iter().any(|path| path.replace('\\', "/") == relative), "{:?}", outcome.resolved);
+        assert!(outcome.notes.iter().any(|note| note.contains(&hash) && note.contains("lost locally")),
+            "{:?}", outcome.notes);
+        assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty(), "no taint may stand");
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
