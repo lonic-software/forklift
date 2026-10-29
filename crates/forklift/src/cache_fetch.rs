@@ -173,13 +173,14 @@ async fn fetch_all(remote: &RemoteClient, origin: &str, hashes: Vec<String>, rep
     let stopped = Arc::new(AtomicBool::new(false));
     let mut pending = hashes;
     let mut loose: Vec<String> = Vec::new();
-    // Whether the batch at the front of `pending` is the rest of one that failed, asked for again.
-    let mut retrying = false;
+    // How many hashes at the front of `pending` are the rest of a batch that failed, asked for
+    // again as a batch of their own.
+    let mut retrying: Option<usize> = None;
 
     while pending.len() > 1 && remote.batch_lane_open() {
-        let rest = pending.split_off(pending.len().min(MAX_MISSING_BATCH));
+        let retry = retrying.take();
+        let rest = pending.split_off(pending.len().min(retry.unwrap_or(MAX_MISSING_BATCH)));
         let batch = std::mem::replace(&mut pending, rest);
-        let retry = std::mem::take(&mut retrying);
         let (to, sent_here, stopped_here) = (reply.clone(), sent.clone(), stopped.clone());
 
         let outcome = remote.fetch_batch_delivering(&batch, move |hash, bytes| {
@@ -223,10 +224,11 @@ async fn fetch_all(remote: &RemoteClient, origin: &str, hashes: Vec<String>, rep
                     ObjectFetch::Refused(why) => return Fetched::Failed(why),
                 }
 
-                if retry {
+                if retry.is_some() {
                     loose.extend(left);
                 } else {
-                    retrying = true;
+                    let left: Vec<String> = left.collect();
+                    retrying = Some(left.len());
                     pending.splice(0..0, left).for_each(drop);
                 }
             }
