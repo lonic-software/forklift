@@ -1994,7 +1994,9 @@ way, but it is not corrupt — it predates the ceiling — so it is counted sepa
 A signed warehouse writes one small signature file per parcel. `compact` moves those into
 **signature tables** (`.forklift/objects/pack/<id>.sigs`, up to 100,000 signatures each),
 merging small tables as it goes, and removes a signature file only once a durably written table
-holds the same signature. `signature_tables_written` and `signature_sidecars_swept` count that.
+holds the same signature. `signature_tables_written` and `signatures_moved` count that;
+`signature_leftovers_removed` counts leftover signature files removed because a table already held
+the same signature.
 A signature file that differs from the signature a table already holds for its parcel, or that
 is malformed, is left loose and listed under `signature_conflicts` (`[{parcel, sidecar_path,
 reason}]`): the tabled signature is the one every read returns. `compact --all` also drops the

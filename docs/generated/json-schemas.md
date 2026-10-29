@@ -628,8 +628,8 @@ A command not listed here either reports only the generic human-message shape `{
       },
       "type": "array"
     },
-    "signature_sidecars_swept": {
-      "description": "Loose signature files removed because a table now holds the same signature.",
+    "signature_leftovers_removed": {
+      "description": "Loose signature files removed because a table already held the same signature: leftover\ncopies, not signatures this run moved.",
       "format": "uint",
       "minimum": 0,
       "type": "integer"
@@ -652,6 +652,12 @@ A command not listed here either reports only the generic human-message shape `{
       "format": "uint",
       "minimum": 0,
       "type": "integer"
+    },
+    "signatures_moved": {
+      "description": "Loose signature files moved into a signature table this run wrote.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
     }
   },
   "required": [
@@ -666,7 +672,8 @@ A command not listed here either reports only the generic human-message shape `{
     "damaged_packs_dropped",
     "damaged_packs_kept",
     "signature_tables_written",
-    "signature_sidecars_swept",
+    "signatures_moved",
+    "signature_leftovers_removed",
     "signatures_dropped",
     "signature_conflicts",
     "signature_tables_unreadable"

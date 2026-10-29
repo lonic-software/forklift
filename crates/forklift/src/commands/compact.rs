@@ -44,7 +44,8 @@ pub fn handle_command(all: bool, redelta: bool) -> Result<(), String> {
             unaccounted: kept.unaccounted,
         }).collect(),
         signature_tables_written: stats.signature_tables_written,
-        signature_sidecars_swept: stats.signature_sidecars_swept,
+        signatures_moved: stats.signatures_moved,
+        signature_leftovers_removed: stats.signature_leftovers_removed,
         signatures_dropped: stats.signatures_dropped,
         signature_conflicts: stats.signature_conflicts.into_iter().map(|conflict| SignatureConflict {
             parcel: conflict.parcel,
@@ -100,8 +101,12 @@ pub(crate) struct Compacted {
     /// Signature tables written: loose signatures moved into tables (a repack rewrites them all).
     signature_tables_written: usize,
 
-    /// Loose signature files removed because a table now holds the same signature.
-    signature_sidecars_swept: usize,
+    /// Loose signature files moved into a signature table this run wrote.
+    signatures_moved: usize,
+
+    /// Loose signature files removed because a table already held the same signature: leftover
+    /// copies, not signatures this run moved.
+    signature_leftovers_removed: usize,
 
     /// Signatures a full repack dropped because their parcel is no longer in the store. Always 0
     /// without `--all`.
@@ -183,25 +188,29 @@ impl Compacted {
 
     /// Report what the signature sweep did and left behind — shared by both render paths.
     fn print_signatures_note(&self) {
-        if self.signature_tables_written == 0 && self.signature_sidecars_swept > 0 && self.signatures_dropped == 0 {
+        let plural = |count: usize| if count == 1 { "" } else { "s" };
+        if self.signatures_moved > 0 {
+            println!(
+                "Moved {} signature{} into {} signature table{}.",
+                self.signatures_moved, plural(self.signatures_moved),
+                self.signature_tables_written, plural(self.signature_tables_written),
+            );
+        } else if self.signature_tables_written > 0 {
+            println!(
+                "Rewrote {} signature table{}.",
+                self.signature_tables_written, plural(self.signature_tables_written),
+            );
+        }
+        if self.signatures_dropped > 0 {
+            println!(
+                "Dropped {} signature{} of parcels no longer in the store.",
+                self.signatures_dropped, plural(self.signatures_dropped),
+            );
+        }
+        if self.signature_leftovers_removed > 0 {
             println!(
                 "Removed {} signature file{} already held in signature tables.",
-                self.signature_sidecars_swept,
-                if self.signature_sidecars_swept == 1 { "" } else { "s" },
-            );
-        } else if self.signature_sidecars_swept > 0 || self.signatures_dropped > 0 {
-            let dropped = if self.signatures_dropped > 0 {
-                format!(", dropped {} of parcels no longer in the store", self.signatures_dropped)
-            } else {
-                String::new()
-            };
-            println!(
-                "Moved {} signature{} into {} signature table{}{}.",
-                self.signature_sidecars_swept,
-                if self.signature_sidecars_swept == 1 { "" } else { "s" },
-                self.signature_tables_written,
-                if self.signature_tables_written == 1 { "" } else { "s" },
-                dropped,
+                self.signature_leftovers_removed, plural(self.signature_leftovers_removed),
             );
         }
         for conflict in &self.signature_conflicts {

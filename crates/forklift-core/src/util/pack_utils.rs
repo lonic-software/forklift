@@ -637,8 +637,12 @@ pub struct CompactStats {
     /// Signature tables written (FORK-333).
     pub signature_tables_written: usize,
 
-    /// Loose signature sidecars removed because a table now holds the same signature.
-    pub signature_sidecars_swept: usize,
+    /// Loose signature sidecars moved into a table this compaction wrote.
+    pub signatures_moved: usize,
+
+    /// Loose signature sidecars removed because a table already held the same signature: leftover
+    /// copies, never a signature this compaction moved.
+    pub signature_leftovers_removed: usize,
 
     /// Signatures a full repack dropped, from tables and sidecars alike, because their parcel is
     /// no longer anywhere in the store. Always 0 for an incremental compaction.
@@ -3635,7 +3639,7 @@ fn compact_bounded(all: bool,
     let mut stats = CompactStats {
         objects_packed: 0, packs_written: 0, loose_removed: 0, deltas: 0, bytes_packed: 0,
         corrupt_skipped: 0, over_ceiling_skipped: 0, damaged_packs_dropped, damaged_packs_kept,
-        damaged_packs_skipped, signature_tables_written: 0, signature_sidecars_swept: 0, signatures_dropped: 0,
+        damaged_packs_skipped, signature_tables_written: 0, signatures_moved: 0, signature_leftovers_removed: 0, signatures_dropped: 0,
         signature_conflicts: Vec::new(), signature_tables_unreadable: Vec::new(),
     };
     let mut writer: Option<PackWriter> = None;
@@ -4190,7 +4194,9 @@ fn sweep_signatures(pack_folder: &Path, bound: usize, repack: bool, stats: &mut 
         return Ok(());
     }
 
-    let mut swept: Vec<&Path> = Vec::new();
+    // Sidecars a new table now holds, and leftover copies of signatures already tabled.
+    let mut moved: Vec<&Path> = Vec::new();
+    let mut leftovers: Vec<&Path> = Vec::new();
     let mut dropped: Vec<&Path> = Vec::new();
 
     for (hash, path) in &sidecars {
@@ -4235,7 +4241,7 @@ fn sweep_signatures(pack_folder: &Path, bound: usize, repack: bool, stats: &mut 
         }
 
         match tabled {
-            Some(Ok((entry, _))) if entry == bytes.as_slice() => swept.push(path),
+            Some(Ok((entry, _))) if entry == bytes.as_slice() => leftovers.push(path),
             Some(Ok((_, table_path))) => stats.signature_conflicts.push(conflict(match table_path {
                 Some(table_path) => format!(
                     "it differs from the signature in table \"{}\", which stands", table_path.to_string_lossy()
@@ -4247,7 +4253,7 @@ fn sweep_signatures(pack_folder: &Path, bound: usize, repack: bool, stats: &mut 
             ))),
             None => {
                 merged.insert(hash_bytes, bytes);
-                swept.push(path);
+                moved.push(path);
             }
         }
     }
@@ -4295,9 +4301,15 @@ fn sweep_signatures(pack_folder: &Path, bound: usize, repack: bool, stats: &mut 
         Err(e) => Err(format!("Error while removing {} \"{}\": {}", what, path.to_string_lossy(), e)),
     };
 
-    for path in swept {
+    for path in moved {
         if remove(path, "signature sidecar")? {
-            stats.signature_sidecars_swept += 1;
+            stats.signatures_moved += 1;
+        }
+    }
+
+    for path in leftovers {
+        if remove(path, "signature sidecar")? {
+            stats.signature_leftovers_removed += 1;
         }
     }
 
@@ -10731,7 +10743,7 @@ pub(crate) mod tests {
 
         let stats = compact_signatures(signature_table::MAX_TABLE_ENTRIES);
 
-        assert_eq!(stats.signature_sidecars_swept, 7);
+        assert_eq!(stats.signatures_moved, 7);
         assert!(loose_sidecars().is_empty(), "no sidecar may stay loose");
         assert_eq!(signature_tables().len(), 1);
         for (hash, bytes) in &signed {
@@ -10951,7 +10963,8 @@ pub(crate) mod tests {
         }
         let stats = compact_signatures(3);
 
-        assert_eq!(stats.signature_sidecars_swept, 7);
+        assert_eq!((stats.signatures_moved, stats.signature_leftovers_removed), (0, 7),
+            "every sidecar is a leftover copy of a tabled signature");
         assert_eq!(stats.signature_tables_written, 0, "a table whose name already stands is never rewritten");
         assert!(loose_sidecars().is_empty());
         assert_eq!(signature_tables().into_iter().map(|(path, _)| path).collect::<Vec<_>>(), before,
@@ -11053,7 +11066,7 @@ pub(crate) mod tests {
             "sanity: pending sidecars past the threshold trigger maintenance");
 
         let stats = compact_signatures(signature_table::MAX_TABLE_ENTRIES);
-        assert_eq!(stats.signature_sidecars_swept, 3);
+        assert_eq!(stats.signatures_moved, 3);
         assert_eq!(loose_sidecars(), vec![conflicting.clone()]);
         assert!(matches!(auto_compaction_action_bounded(signature_table::MAX_TABLE_ENTRIES).unwrap(), AutoCompaction::None),
             "after the sweep, the conflict alone must not keep maintenance due");
