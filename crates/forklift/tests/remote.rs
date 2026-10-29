@@ -5611,7 +5611,8 @@ fn a_cache_franchise_holds_the_parcels_and_its_tip_and_records_the_rest() {
 }
 
 /// Every file under `directory`'s `.forklift`, with its bytes: the store, the sealed record and
-/// everything else a command could write there.
+/// everything else a command could write there. A lock sidecar is left out: taking a lock creates
+/// it empty, and it holds nothing.
 fn forklift_dir_snapshot(area: &TestArea, directory: &str) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
     let root = area.path(&format!("{}/.forklift", directory));
     let mut snapshot = std::collections::BTreeMap::new();
@@ -5622,7 +5623,7 @@ fn forklift_dir_snapshot(area: &TestArea, directory: &str) -> std::collections::
             let path = entry.unwrap().path();
             if path.is_dir() {
                 frontier.push(path);
-            } else {
+            } else if path.extension().is_none_or(|extension| extension != "lock") {
                 snapshot.insert(path.strip_prefix(&root).unwrap().to_path_buf(), std::fs::read(&path).unwrap());
             }
         }
