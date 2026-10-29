@@ -194,9 +194,8 @@ fn auto_compaction_action_bounded(table_bound: usize) -> Result<AutoCompaction, 
         return Ok(AutoCompaction::Incremental);
     }
 
-    // Small signature tables have accumulated → merge them. A merge always leaves one, so a
-    // single partial table is never due, whatever the threshold.
-    if count_partial_signature_tables(table_threshold, table_bound)? > table_threshold.max(1) {
+    // Small signature tables have accumulated → merge them.
+    if signature_tables_due(count_partial_signature_tables(table_threshold, table_bound)?, table_threshold) {
         return Ok(AutoCompaction::Incremental);
     }
 
@@ -206,6 +205,12 @@ fn auto_compaction_action_bounded(table_bound: usize) -> Result<AutoCompaction, 
     }
 
     Ok(AutoCompaction::None)
+}
+
+/// Whether `partial` signature tables below the bound make a compaction due at `threshold`. A
+/// merge always leaves one, so a single partial table is never due, whatever the threshold.
+pub fn signature_tables_due(partial: usize, threshold: usize) -> bool {
+    partial > threshold.max(1)
 }
 
 /// One pack's contribution to the object store, for the `store` census.
@@ -384,7 +389,7 @@ pub fn store_status() -> Result<StoreStatus, String> {
         crate::util::config_utils::KEY_MAINTENANCE_SIGNATURE_TABLES, AUTO_SIGNATURE_TABLE_THRESHOLD
     )?;
     let incremental_due = loose_objects + loose_signatures > loose_threshold
-        || partial_signature_tables > signature_table_threshold;
+        || signature_tables_due(partial_signature_tables, signature_table_threshold);
     let repack_due = packs.len() > pack_threshold;
 
     let quarantined_packs = quarantined.into_iter().map(|q| PackIndexProblem {
@@ -4247,9 +4252,10 @@ fn sweep_signatures(pack_folder: &Path, bound: usize, repack: bool, stats: &mut 
         }
     }
 
-    // The repack's own mappings are released before anything is renamed or deleted: Windows
-    // refuses to remove a mapped file.
+    // The repack's own mappings, held both here and by the process registry, are released before
+    // anything is renamed or deleted: Windows refuses to rename over a mapped file.
     drop(presence_set);
+    invalidate_cache();
 
     // Publish: each table written and fsynced under a temp name, renamed into place, and the
     // folder fsynced once, before anything it replaces is deleted. A name is its content, so a
@@ -11003,7 +11009,8 @@ pub(crate) mod tests {
     /// A single partial table never makes maintenance due, even at a threshold of 0: a merge
     /// would leave it as it is, so the trigger would fire on every command.
     ///
-    /// Revert: compare against the bare threshold → one partial table exceeds 0 → red.
+    /// Revert: compare against the bare threshold in `signature_tables_due` → one partial table
+    /// exceeds 0 → red.
     #[test]
     fn one_partial_table_never_triggers_maintenance() {
         let (temp, _scope) = enter_signature_root("sig-one-partial");
@@ -11015,6 +11022,7 @@ pub(crate) mod tests {
 
         assert!(matches!(auto_compaction_action_bounded(signature_table::MAX_TABLE_ENTRIES).unwrap(), AutoCompaction::None),
             "one partial table must not trigger maintenance");
+        assert!(!store_status().unwrap().incremental_due, "nor may the census report it due");
 
         std::fs::remove_dir_all(&temp).ok();
     }

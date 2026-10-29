@@ -231,7 +231,7 @@ impl CommandOutput for StoreReport {
         } else {
             (self.loose_objects, "loose objects")
         };
-        if self.partial_signature_tables > m.signature_table_threshold {
+        if pack_utils::signature_tables_due(self.partial_signature_tables, m.signature_table_threshold) {
             println!(
                 "    compaction  {}",
                 verdict(true, self.partial_signature_tables, m.signature_table_threshold, "small signature tables"),

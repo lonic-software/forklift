@@ -183,7 +183,13 @@ impl Compacted {
 
     /// Report what the signature sweep did and left behind — shared by both render paths.
     fn print_signatures_note(&self) {
-        if self.signature_sidecars_swept > 0 || self.signatures_dropped > 0 {
+        if self.signature_tables_written == 0 && self.signature_sidecars_swept > 0 && self.signatures_dropped == 0 {
+            println!(
+                "Removed {} signature file{} already held in signature tables.",
+                self.signature_sidecars_swept,
+                if self.signature_sidecars_swept == 1 { "" } else { "s" },
+            );
+        } else if self.signature_sidecars_swept > 0 || self.signatures_dropped > 0 {
             let dropped = if self.signatures_dropped > 0 {
                 format!(", dropped {} of parcels no longer in the store", self.signatures_dropped)
             } else {
