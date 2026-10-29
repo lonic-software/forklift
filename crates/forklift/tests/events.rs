@@ -173,8 +173,8 @@ fn compact_reports_its_phases_on_the_channel() {
     assert_monotonic_within_phases(&lines);
 
     assert_phases(&lines,
-                  &["Collecting objects", "Packing objects", "Removing packed originals"],
-                  &["Packing objects", "Removing packed originals"]);
+                  &["Collecting objects", "Packing objects", "Removing packed originals", "Packing signatures"],
+                  &["Packing objects", "Packing signatures"]);
 
     // The channel is separate from stdout, which stays exactly one JSON document.
     let document: serde_json::Value = serde_json::from_slice(&output.stdout)
@@ -337,7 +337,7 @@ fn an_mcp_call_with_a_progress_token_gets_progress_notifications() {
     // Under 2025-06-18 every notification has a `message`, and the last names the last phase.
     assert!(notifications.iter().all(|n| n["params"]["message"].is_string()), "{:?}", notifications);
     let last = notifications.last().unwrap()["params"]["message"].as_str().unwrap().to_string();
-    assert!(last.starts_with("Removing packed originals"), "last message: {:?}", last);
+    assert!(last.starts_with("Packing signatures"), "last message: {:?}", last);
 }
 
 #[test]

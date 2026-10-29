@@ -9808,15 +9808,28 @@ fn compact_preserves_signed_history_for_audit() {
     // Audit verifies the signed chain before compaction.
     assert!(stdout(&warehouse.run(&["audit"])).contains("verified"));
 
-    assert_success(&warehouse.run(&["compact"]));
-
-    // The parcel object is packed away (its loose file is gone) but its signature sidecar
-    // stays loose — sidecars are read by path, not through the object store.
     let objects = warehouse.root.join(".forklift/objects");
     let loose_parcel = objects.join(&signed[0..2]).join(&signed[2..]);
     let sidecar = objects.join(&signed[0..2]).join(format!("{}.sig", &signed[2..]));
+    let signature = std::fs::read(&sidecar).unwrap();
+
+    assert_success(&warehouse.run(&["compact"]));
+
+    // The parcel object is packed away, and its signature sidecar is swept into a signature
+    // table beside the packs.
     assert!(!loose_parcel.exists(), "the parcel object should be packed away");
-    assert!(sidecar.exists(), "the signature sidecar must stay loose");
+    assert!(!sidecar.exists(), "the signature sidecar must be swept into a table");
+    let tables = std::fs::read_dir(objects.join("pack")).unwrap()
+        .filter(|entry| entry.as_ref().unwrap().path().extension().is_some_and(|x| x == "sigs"))
+        .count();
+    assert_eq!(tables, 1, "the signatures must be packed into one table");
+
+    // A leftover copy of a tabled signature is removed, and said so: nothing is moved or written.
+    std::fs::write(&sidecar, &signature).unwrap();
+    let rerun = stdout(&warehouse.run(&["compact"]));
+    assert!(rerun.contains("Removed 1 signature file already held in signature tables."), "{}", rerun);
+    assert!(!rerun.contains("into 0 signature tables"), "{}", rerun);
+    assert!(!sidecar.exists(), "the leftover must be removed");
 
     // Signed history still verifies, now against the packed objects.
     let audit = warehouse.run(&["audit"]);

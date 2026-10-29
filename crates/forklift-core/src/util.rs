@@ -6,6 +6,7 @@ pub mod delta_utils;
 pub mod gc_utils;
 pub mod graph_utils;
 pub mod pack_utils;
+pub(crate) mod signature_table;
 pub mod config_utils;
 pub mod lock_utils;
 pub mod office_utils;

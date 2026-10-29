@@ -61,8 +61,8 @@ contention.** Two things decide almost every row:
 
    The **lesson**, measured on a 5000-parcel signed warehouse (236 ms → 96 ms): the plan's
    "pure CPU, near-linear" premise was **wrong**. Phase 2 is dominated by the per-parcel *reads* —
-   a loose `.sig` sidecar (which `compact` deliberately never packs) and the parcel body, both
-   through the shared object caches — not by the ed25519 CPU, so it scales ~2.7× even on 18 cores.
+   the parcel's signature (a loose `.sig` sidecar at the time; `compact` now moves them into
+   signature tables) and the parcel body, both through the shared object caches — not by the ed25519 CPU, so it scales ~2.7× even on 18 cores.
    Still a clean, real win with no semantic change (unlike parallel `blame`, which got 1.0×), but a
    reminder that almost every forklift loop touches the object caches, and *that* is the recurring
    ceiling (see the cross-cutting lever below). A near-linear audit would need the reads off the
@@ -379,7 +379,8 @@ worth recording honestly:
 
 - **`audit`'s 2.4× ceiling did not move, because audit no longer reads through the read cache at
   all.** Its phase-2 loop reads the parcel body *uncached* (`load_parcel` bypasses the cache — a
-  parcel is read about once) and the `.sig` sidecar via a direct `fs::read`; the only shared lock
+  parcel is read about once) and the signature from a table or, failing that, the `.sig` sidecar via
+  a direct `fs::read`; the only shared lock
   it touches per parcel is the pack registry's brief `Arc` hand-back. The plan's earlier
   "read-cache ceiling" description of audit is stale relative to the uncached-parcel + direct-sig
   read path the code actually takes now.
