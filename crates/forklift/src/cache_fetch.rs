@@ -173,10 +173,13 @@ async fn fetch_all(remote: &RemoteClient, origin: &str, hashes: Vec<String>, rep
     let stopped = Arc::new(AtomicBool::new(false));
     let mut pending = hashes;
     let mut loose: Vec<String> = Vec::new();
+    // Whether the batch at the front of `pending` is the rest of one that failed, asked for again.
+    let mut retrying = false;
 
     while pending.len() > 1 && remote.batch_lane_open() {
         let rest = pending.split_off(pending.len().min(MAX_MISSING_BATCH));
         let batch = std::mem::replace(&mut pending, rest);
+        let retry = std::mem::take(&mut retrying);
         let (to, sent_here, stopped_here) = (reply.clone(), sent.clone(), stopped.clone());
 
         let outcome = remote.fetch_batch_delivering(&batch, move |hash, bytes| {
@@ -202,7 +205,8 @@ async fn fetch_all(remote: &RemoteClient, origin: &str, hashes: Vec<String>, rep
             // for only if this outcome left the lane open.
             Ok(_) => loose.extend(left),
             // An error says nothing this side can classify, and may be the origin out of reach: one
-            // object fetched on its own says which, before the next batch is asked for.
+            // object fetched on its own says which. An origin that answers is asked for the rest
+            // in a batch once more, and what a second error leaves is fetched on its own.
             Err(_) => {
                 let mut left = left.into_iter();
                 let Some(probe) = left.next() else { continue };
@@ -219,7 +223,12 @@ async fn fetch_all(remote: &RemoteClient, origin: &str, hashes: Vec<String>, rep
                     ObjectFetch::Refused(why) => return Fetched::Failed(why),
                 }
 
-                loose.extend(left);
+                if retry {
+                    loose.extend(left);
+                } else {
+                    retrying = true;
+                    pending.splice(0..0, left).for_each(drop);
+                }
             }
         }
     }
