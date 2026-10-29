@@ -6426,9 +6426,9 @@ async fn upload_history(client: &RemoteClient,
 /// Deliberately *not* a sort by commit-graph generation number, though that is also
 /// topological and was this fix's first form. Reading generations calls `graph_utils::ensure`,
 /// which walks below the lifted set to the first parcel carrying a stored record, computes a
-/// record for every parcel on the way, and persists the lot. On a first lift — `remote_head`
-/// `None`, where `is_ancestor` never runs — that is a whole commit-graph build and shard flush
-/// newly attached to the lift path. Ordering the walked set against its own edges costs no
+/// record for every parcel on the way, and persists the lot. On a lift with no held head to stop
+/// at — a first lift into an empty remote, where `is_ancestor` never runs — that is a whole
+/// commit-graph build and shard flush newly attached to the lift path. Ordering the walked set against its own edges costs no
 /// object read the walk has not already paid for and writes nothing.
 ///
 /// What that choice is *not* is a fix for absent ancestors, and the tempting version of this
