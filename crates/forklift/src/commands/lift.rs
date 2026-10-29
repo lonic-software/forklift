@@ -2,7 +2,7 @@ use serde::Serialize;
 use forklift_core::error::CoreError;
 use forklift_core::enums::config_scope::ConfigScope;
 use forklift_core::util::progress_utils::Progress;
-use forklift_core::util::remote_utils::{BatchLaneClosure, LiftResult, RemoteClient};
+use forklift_core::util::remote_utils::{BatchLaneClosure, HeadContent, LiftResult, RemoteClient};
 use forklift_core::util::{
     config_utils, file_utils, merge_utils, object_utils, pallet_utils,
     remote_utils, scope_utils, take_utils,
@@ -258,9 +258,10 @@ async fn try_auto_merge(client: &RemoteClient,
                         progress: &Progress) -> Result<bool, String> {
     // Their work must be local before we can compare ancestry or merge it. Path-pruned in a
     // sparse workspace (a full fetch scope makes this the whole closure, as before), so an
-    // optimistic auto-merge stays as sparse as the workspace it runs in.
+    // optimistic auto-merge stays as sparse as the workspace it runs in. A cache fetches their
+    // head's own content with the parcels, since the merge reads it.
     if !file_utils::does_object_exist(remote_head)? {
-        remote_utils::fetch_history_scoped(client, remote_head, pallet, progress).await?;
+        remote_utils::fetch_history_scoped(client, remote_head, pallet, HeadContent::Whole, progress).await?;
     }
 
     let diverged = !merge_utils::is_ancestor(remote_head, head)?   // we do not already contain them

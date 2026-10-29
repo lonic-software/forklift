@@ -514,6 +514,27 @@ pub fn append_locked(lock: &RefLock, ops: &[(SealOp, &str)]) -> Result<SealedSet
     append_decided_locked(lock, |_| Ok(ops))
 }
 
+/// Record each of `hashes` the record does not already hold, under a ref lock it takes and
+/// releases. What is already recorded is judged on the record as it is re-read under the lock, so
+/// a concurrent writer's entry is not written twice. Synced when this returns, as [`append_locked`]
+/// is.
+///
+/// # Returns
+/// * `Ok(SealedSet)` - The set the record now replays to.
+/// * `Err(String)`   - As [`append_locked`].
+pub fn record_unrecorded(hashes: &[String]) -> Result<SealedSet, String> {
+    let lock = RefLock::acquire()?;
+
+    append_decided_locked(&lock, |set| {
+        let mut written: HashSet<&str> = HashSet::new();
+
+        Ok(hashes.iter()
+            .filter(|hash| !set.contains(hash) && written.insert(hash.as_str()))
+            .map(|hash| (SealOp::Record, hash.clone()))
+            .collect())
+    })
+}
+
 /// [`append_locked`] with the ops decided from the set the record replays to when it is re-read
 /// under the lock, so a decision about what is recorded is made on what is recorded.
 fn append_decided_locked(

@@ -7,7 +7,7 @@ use forklift_core::model::remote::WarehouseInfo;
 use forklift_core::util::franchise_utils::{self, Admission, Attempt, BundleState, Failure, FranchiseRecord, Phase, Request};
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::progress_utils::Progress;
-use forklift_core::util::remote_utils::{self as remote, BatchLaneClosure, BundleDownload, PartialBundle, RemoteClient, TorSettings};
+use forklift_core::util::remote_utils::{self as remote, BatchLaneClosure, BundleDownload, HeadContent, PartialBundle, RemoteClient, TorSettings};
 use forklift_core::util::scope_utils::MaterializationScope;
 use forklift_core::util::warehouse_utils::PrepareMode;
 use forklift_core::util::{
@@ -582,7 +582,7 @@ async fn franchise_into_prepared_target(
     // At the scope this franchise asks for, which is not on disk yet.
     let fetched = match &remote_head {
         Some(remote_head) => {
-            let stats = remote_utils::fetch_history_at(client, remote_head, &pallet_name, &fetch_scope, &Progress::NONE).await?;
+            let stats = remote_utils::fetch_history_at(client, remote_head, &pallet_name, &fetch_scope, HeadContent::Whole, &Progress::NONE).await?;
             take_utils::verify_take(Some(client), &take_trust, remote_head, &pallet_name, FetchAt::Scope(&fetch_scope)).await?;
             Some(stats)
         }
