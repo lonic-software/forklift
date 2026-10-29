@@ -165,9 +165,9 @@ fn serve(requests: mpsc::Receiver<Request>) {
 
 /// Fetch `hashes` from `remote`, sending each object to `reply`: in batches of at most what a head
 /// answers while the origin serves them and more than one is left, then each of the rest on its
-/// own. A failed batch ends the batches, and an origin that cannot be reached ends the rest, so a
-/// reading thread offline learns so from a batch and the first fetches on their own, not one
-/// request per object.
+/// own. A failed batch is followed by one object fetched on its own, and an origin that cannot be
+/// reached ends the fetch there, so a reading thread offline learns so from two requests, not one
+/// per object, while an origin that answers goes on in batches.
 async fn fetch_all(remote: &RemoteClient, origin: &str, hashes: Vec<String>, reply: &mpsc::SyncSender<Reply>) -> Fetched {
     let sent: Arc<Mutex<HashSet<String>>> = Default::default();
     let stopped = Arc::new(AtomicBool::new(false));
@@ -201,11 +201,25 @@ async fn fetch_all(remote: &RemoteClient, origin: &str, hashes: Vec<String>, rep
             // What this batch did not bring is fetched on its own below; the next batch is asked
             // for only if this outcome left the lane open.
             Ok(_) => loose.extend(left),
-            // An error says nothing this side can classify, and may be the origin out of reach:
-            // everything left is fetched on its own, whose first fetch says which.
+            // An error says nothing this side can classify, and may be the origin out of reach: one
+            // object fetched on its own says which, before the next batch is asked for.
             Err(_) => {
+                let mut left = left.into_iter();
+                let Some(probe) = left.next() else { continue };
+
+                match remote.fetch_object_classified(&probe).await {
+                    ObjectFetch::Fetched(bytes) => {
+                        let to = reply.clone();
+
+                        if tokio::task::block_in_place(move || to.send(Reply::Object(probe, bytes))).is_err() {
+                            return Fetched::Failed("the read stopped taking objects".to_string());
+                        }
+                    }
+                    ObjectFetch::Unreachable(why) => return Fetched::Unreachable { origin: origin.to_string(), why },
+                    ObjectFetch::Refused(why) => return Fetched::Failed(why),
+                }
+
                 loose.extend(left);
-                break;
             }
         }
     }

@@ -816,7 +816,8 @@ pub fn unseal(_hold: &impl StoreAccessHold, hashes: &[String]) -> Result<Unseale
 /// * `_hold`   - The caller's store-access hold, spanning the call, so nothing the push-down found
 ///               present is deleted before the objects land above it.
 /// * `objects` - Each recorded object's hash and its bytes, as the remote sent them, each already
-///               verified against its hash by the caller.
+///               verified against its hash by the caller, so one corrupt object is refused before
+///               any of the batch is written. The store checks each again as it writes it.
 ///
 /// # Returns
 /// * `Ok(())`      - Every object is in the store and the record holds none of them.
