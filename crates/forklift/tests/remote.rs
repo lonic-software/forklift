@@ -5803,8 +5803,8 @@ fn lift_feature(area: &TestArea) -> (String, String, [String; 2]) {
 /// A cache `shift`, a fast-forward `consolidate` and a merging one each fetch the content they are
 /// about to write before they change anything, so with the origin unreachable each refuses as a
 /// cache miss (exit 36) with the bay byte for byte as it was: no file removed, no marker raised. Here the target's trees are held (a `show` fetched
-/// them) and only its two new blobs are recorded, so the refusal comes from the presence phase,
-/// not from reading the trees. With the origin back, the shift succeeds.
+/// them) and only its two new blobs are recorded, so the refusal comes from the phase that fetches
+/// what it writes, not from planning over the trees. With the origin back, the shift succeeds.
 ///
 /// Revert: drop shift's or the fast-forward's presence phase → it removes `docs/one.txt` and
 /// raises its marker before the first write meets the absent blob; drop the merge's → it raises
