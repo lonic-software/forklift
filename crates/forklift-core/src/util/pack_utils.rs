@@ -194,8 +194,9 @@ fn auto_compaction_action_bounded(table_bound: usize) -> Result<AutoCompaction, 
         return Ok(AutoCompaction::Incremental);
     }
 
-    // Small signature tables have accumulated → merge them.
-    if count_partial_signature_tables(table_threshold, table_bound)? > table_threshold {
+    // Small signature tables have accumulated → merge them. A merge always leaves one, so a
+    // single partial table is never due, whatever the threshold.
+    if count_partial_signature_tables(table_threshold, table_bound)? > table_threshold.max(1) {
         return Ok(AutoCompaction::Incremental);
     }
 
@@ -2190,11 +2191,7 @@ fn open_signature_table(path: &Path, check: IndexCheck) -> Result<LoadedSignatur
     let unreadable = |message: String, failure: FailureKind| UnreadableSignatureTable {
         path: path.to_path_buf(), message, stamp: stamp.clone(), failure, attempted_at,
     };
-    let io_message = |error: &dyn std::fmt::Display| format!(
-        "Signature table \"{}\" could not be read: {}. Restore access to it; the signatures it \
-        holds have no other local copy.",
-        path.to_string_lossy(), error
-    );
+    let io_message = |error: &dyn std::fmt::Display| signature_table::io_message(path, error);
 
     let file = open_pack_file(path).map_err(|failure| unreadable(io_message(&failure.error), failure.kind))?;
     let len = file.metadata().map_err(|e| unreadable(io_message(&e), FailureKind::Io))?.len();
@@ -4063,11 +4060,7 @@ fn read_signature_tables(pack_folder: &Path) -> Result<Vec<TableFile>, String> {
         let table = match std::fs::read(&path) {
             Ok(bytes) => SignatureTable::open(bytes)
                 .map_err(|error| signature_table::unreadable_message(&path, &error)),
-            Err(e) => Err(format!(
-                "Signature table \"{}\" could not be read: {}. Restore access to it; the signatures it \
-                holds have no other local copy.",
-                path.to_string_lossy(), e
-            )),
+            Err(e) => Err(signature_table::io_message(&path, &e)),
         };
         tables.push(TableFile { path, table });
     }
@@ -4254,25 +4247,38 @@ fn sweep_signatures(pack_folder: &Path, bound: usize, repack: bool, stats: &mut 
         }
     }
 
+    // The repack's own mappings are released before anything is renamed or deleted: Windows
+    // refuses to remove a mapped file.
+    drop(presence_set);
+
     // Publish: each table written and fsynced under a temp name, renamed into place, and the
-    // folder fsynced once, before anything it replaces is deleted.
+    // folder fsynced once, before anything it replaces is deleted. A name is its content, so a
+    // table this run read and checked under the same name already holds these bytes: it stands
+    // as it is, never rewritten over itself (a rename over a file another reader has mapped fails
+    // on Windows).
     let entries: Vec<([u8; HASH_LEN], Vec<u8>)> = merged.into_iter().collect();
     let mut published: HashSet<PathBuf> = HashSet::new();
+    let mut written: Vec<PathBuf> = Vec::new();
 
     for chunk in entries.chunks(bound.max(1)) {
         let final_path = pack_folder.join(format!("{}.{}", signature_table::table_id(chunk), SIGNATURE_TABLE_EXTENSION));
+        if inputs.contains(&final_path.as_path()) {
+            published.insert(final_path);
+            continue;
+        }
         let temp = temp_path(pack_folder, SIGNATURE_TABLE_EXTENSION);
         write_and_sync(&temp, &signature_table::build(chunk))?;
         file_utils::rename(&temp, &final_path).map_err(|e| format!(
             "Error while finalizing signature table \"{}\": {}", final_path.to_string_lossy(), e
         ))?;
-        published.insert(final_path);
+        published.insert(final_path.clone());
+        written.push(final_path);
         stats.signature_tables_written += 1;
     }
 
-    if !published.is_empty() {
-        let published_refs: Vec<&Path> = published.iter().map(PathBuf::as_path).collect();
-        file_utils::sync_dir_or_taint(pack_folder, &published_refs)?;
+    if !written.is_empty() {
+        let written_refs: Vec<&Path> = written.iter().map(PathBuf::as_path).collect();
+        file_utils::sync_dir_or_taint(pack_folder, &written_refs)?;
     }
 
     invalidate_cache();
@@ -10839,10 +10845,12 @@ pub(crate) mod tests {
     /// (x) A corrupt table, a damaged record or a damaged entry, makes a lookup it might answer
     /// fail naming the table, never read as unsigned, and a Repack refuses naming it. Moved aside,
     /// lookups answer again and its parcels read as unsigned. A table of another version fails
-    /// with its own advice, not the move-aside one.
+    /// with its own advice, not the move-aside one; a version field rot changed under this
+    /// version's checksum is corrupt, with the move-aside advice.
     ///
     /// Reverts: treat a corrupt table as missing (quarantine and ignore, as for a pack index) →
-    /// the lookup returns `None` → red; give the move-aside advice for a foreign version → red.
+    /// the lookup returns `None` → red; give the move-aside advice for a foreign version → red;
+    /// classify the version before the checksum → the rotted field reads as foreign → red.
     #[test]
     fn a_corrupt_table_fails_the_lookup_and_a_foreign_one_names_its_own_advice() {
         // The record of a one-entry table starts after the 24-byte header and 256 fanout entries.
@@ -10876,29 +10884,46 @@ pub(crate) mod tests {
             std::fs::remove_dir_all(&temp).ok();
         }
 
-        let (temp, _scope) = enter_signature_root("sig-foreign");
-        let hash = fake_parcel("", 1);
-        sign_utils::store_raw_parcel_signature(&hash, &fake_signature(1)).unwrap();
-        compact_signatures(signature_table::MAX_TABLE_ENTRIES);
-        let (table, _) = signature_tables().remove(0);
-        let mut bytes = std::fs::read(&table).unwrap();
-        bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
-        std::fs::write(&table, bytes).unwrap();
-        invalidate_cache();
+        // Another build writes its own version under its own checksum; rot changes the field alone.
+        for (what, rewrite_checksum) in [("foreign", true), ("rotted", false)] {
+            let (temp, _scope) = enter_signature_root(&format!("sig-version-{}", what));
+            let hash = fake_parcel("", 1);
+            sign_utils::store_raw_parcel_signature(&hash, &fake_signature(1)).unwrap();
+            compact_signatures(signature_table::MAX_TABLE_ENTRIES);
+            let (table, _) = signature_tables().remove(0);
+            let mut bytes = std::fs::read(&table).unwrap();
+            bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+            if rewrite_checksum {
+                let mut crc = crc32fast::Hasher::new();
+                crc.update(&bytes[..20]);
+                crc.update(&bytes[24..24 + 256 * 8]);
+                let crc = crc.finalize();
+                bytes[20..24].copy_from_slice(&crc.to_le_bytes());
+            }
+            std::fs::write(&table, bytes).unwrap();
+            invalidate_cache();
 
-        let error = sign_utils::load_raw_parcel_signature(&hash).expect_err("a foreign table must not read as unsigned");
-        assert!(error.contains("Use a build that reads it"), "{}", error);
-        assert!(!error.contains("Move it out"), "{}", error);
+            let error = sign_utils::load_raw_parcel_signature(&hash)
+                .expect_err(&format!("{}: the table must not read as unsigned", what));
+            if rewrite_checksum {
+                assert!(error.contains("Use a build that reads it"), "{}: {}", what, error);
+                assert!(!error.contains("Move it out"), "{}: {}", what, error);
+            } else {
+                assert!(error.contains("Move it out of the pack folder"), "{}: {}", what, error);
+                assert!(!error.contains("Use a build"), "{}: {}", what, error);
+            }
 
-        std::fs::remove_dir_all(&temp).ok();
+            std::fs::remove_dir_all(&temp).ok();
+        }
     }
 
     /// (xi) With the bound at 3, seven signatures make tables of 3, 3 and 1. A second compact that
-    /// finds only leftover copies of tabled signatures rewrites the partial table onto its own
-    /// name and must keep it.
+    /// finds only leftover copies of tabled signatures lands the partial table on its own name:
+    /// it must keep it, and never write it over itself.
     ///
-    /// Revert: drop the just-published-name guard in `sweep_signatures` → the second compact
-    /// deletes the table it wrote → the signature reads as unsigned → red.
+    /// Reverts: drop the just-published-name guard in `sweep_signatures` → the second compact
+    /// deletes the table it landed on → the signature reads as unsigned → red; rewrite a table
+    /// whose name already stands → a table is written → red.
     #[test]
     fn tables_split_at_the_bound_and_an_unchanged_rewrite_keeps_its_table() {
         let (temp, _scope) = enter_signature_root("sig-bound");
@@ -10921,6 +10946,7 @@ pub(crate) mod tests {
         let stats = compact_signatures(3);
 
         assert_eq!(stats.signature_sidecars_swept, 7);
+        assert_eq!(stats.signature_tables_written, 0, "a table whose name already stands is never rewritten");
         assert!(loose_sidecars().is_empty());
         assert_eq!(signature_tables().into_iter().map(|(path, _)| path).collect::<Vec<_>>(), before,
             "an unchanged rewrite must leave the tables in place");
@@ -10970,6 +10996,25 @@ pub(crate) mod tests {
         }
         assert!(matches!(auto_compaction_action_bounded(signature_table::MAX_TABLE_ENTRIES).unwrap(), AutoCompaction::Incremental),
             "pending sidecars alone must make a compaction due");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// A single partial table never makes maintenance due, even at a threshold of 0: a merge
+    /// would leave it as it is, so the trigger would fire on every command.
+    ///
+    /// Revert: compare against the bare threshold → one partial table exceeds 0 → red.
+    #[test]
+    fn one_partial_table_never_triggers_maintenance() {
+        let (temp, _scope) = enter_signature_root("sig-one-partial");
+        crate::util::config_utils::set_value(crate::util::config_utils::KEY_MAINTENANCE_SIGNATURE_TABLES, "0", crate::enums::config_scope::ConfigScope::Warehouse).unwrap();
+
+        sign_utils::store_raw_parcel_signature(&fake_parcel("", 0), &fake_signature(0)).unwrap();
+        compact_signatures(signature_table::MAX_TABLE_ENTRIES);
+        assert_eq!(signature_tables().len(), 1, "sanity: one partial table");
+
+        assert!(matches!(auto_compaction_action_bounded(signature_table::MAX_TABLE_ENTRIES).unwrap(), AutoCompaction::None),
+            "one partial table must not trigger maintenance");
 
         std::fs::remove_dir_all(&temp).ok();
     }

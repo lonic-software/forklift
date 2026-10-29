@@ -162,6 +162,19 @@ impl<B: AsRef<[u8]>> SignatureTable<B> {
 
         let version = read_u32_le(data, 8);
         if version != VERSION {
+            // A version field that rot changed still leaves this version's header checksum
+            // matching once the field is read as this version: that table is corrupt, not
+            // another build's.
+            if data.len() >= RECORDS_START {
+                let mut header_crc = crc32fast::Hasher::new();
+                header_crc.update(&data[..8]);
+                header_crc.update(&VERSION.to_le_bytes());
+                header_crc.update(&data[12..HEADER_CRC_OFFSET]);
+                header_crc.update(&data[HEADER_LEN..RECORDS_START]);
+                if header_crc.finalize() == read_u32_le(data, HEADER_CRC_OFFSET) {
+                    return corrupt("version field damaged");
+                }
+            }
             return if (1..PLAUSIBLE_VERSION_LIMIT).contains(&version) {
                 Err(TableError::ForeignVersion(version))
             } else {
@@ -340,6 +353,15 @@ pub(crate) fn unreadable_message(path: &Path, error: &TableError) -> String {
     }
 }
 
+/// The message for a table that could not be read at all: the remedy is access, not a move.
+pub(crate) fn io_message(path: &Path, error: &dyn std::fmt::Display) -> String {
+    format!(
+        "Signature table \"{}\" could not be read: {}. Restore access to it; the signatures it \
+        holds have no other local copy.",
+        path.to_string_lossy(), error
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,8 +421,15 @@ mod tests {
 
     #[test]
     fn open_tells_a_foreign_version_from_corruption() {
+        // Another build's table carries its own header checksum; rot changes the field alone.
         let mut bytes = build(&sample());
         bytes[8] = 2;
+        assert!(matches!(SignatureTable::open(bytes.as_slice()).err(), Some(TableError::Corrupt(_))));
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&bytes[..HEADER_CRC_OFFSET]);
+        crc.update(&bytes[HEADER_LEN..RECORDS_START]);
+        let crc = crc.finalize();
+        bytes[HEADER_CRC_OFFSET..HEADER_LEN].copy_from_slice(&crc.to_le_bytes());
         assert_eq!(SignatureTable::open(bytes.as_slice()).err(), Some(TableError::ForeignVersion(2)));
 
         let bytes = build(&sample());
