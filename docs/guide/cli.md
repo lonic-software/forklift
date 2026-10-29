@@ -1631,7 +1631,12 @@ checking it out. A command that reads content the cache lacks (`show` or `diff` 
 parcel, `shift` to a pallet lowered that way) fetches each object it meets from the origin as it
 reads it, and keeps it. A command that changes the bay's files (`shift`, `consolidate`,
 `cherry-pick`, `park`, `lower`, `restore`, `bay add`) fetches every file it is about to write
-in one batch first, before it changes anything. The configured remote must be the origin. When
+in one batch first, before it changes anything. A `lift` sends only what the origin lacks. It
+neither reads nor fetches content the cache holds by hash, since that content came from the
+origin. Where the work being lifted changed a directory, it does read the parent parcel's version
+of that directory, to tell what changed, and fetches it if the cache lacks it. A first `lift` of a
+new pallet walks the whole history beneath it, so this is what keeps that lift from fetching it.
+The configured remote must be the origin. When
 the origin cannot be reached, answers that it is unavailable (`502`–`504`), or keeps throttling,
 the command refuses with exit 36 (`cache_miss`) and names the origin: run it again once the
 origin is back. Some commands report it as a plain error that names the origin instead. What a

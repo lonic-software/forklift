@@ -167,6 +167,11 @@ in the store, unreferenced. Run `audit` where the history came from.
 - A merge signed here makes the merged history this warehouse's, so the `stack`
   that completes a conflicted merge judges the merged head again under the
   office it signs under: a key revoked since the merge began refuses it.
+- A cache (`franchise --cache`) takes every parcel and signature of the history,
+  so its takes are judged exactly as a full warehouse's are. The content it
+  fetches later, when a command reads or writes it, is checked against the hash
+  it was asked for before it is stored. That hash comes from the signed history,
+  so the origin cannot swap the content.
 - A warehouse with no anchor, syncing with a remote that has none, has nothing
   to verify against, and takes what it is served.
 
@@ -470,6 +475,10 @@ same checks before it accepts any ref update, so a remote can never be pushed
 into a state a local `audit` would reject — and a client runs them again on
 everything it takes (§2), so history altered in a remote's storage behind its
 server is refused at the sync rather than found by a later `audit`.
+
+In a cache (`franchise --cache`), `audit` checks every signature as above, since
+a cache holds every parcel. It reads only the content the cache holds and counts
+the rest as held by hash, without fetching it.
 
 ---
 
