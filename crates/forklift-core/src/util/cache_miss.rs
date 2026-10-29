@@ -6,11 +6,11 @@
 //! it was not fetched. The refill itself runs here, on the reading thread: see
 //! [`sealed_utils::refill`] for the order its writes land in.
 //!
-//! The hook is off while any thread of the process holds the warehouse's ref lock (the refill takes
-//! it to write the record, and it does not nest within a process), inside a bulk store session (whose writes are not durable until
-//! it closes, while the record's removal would be), and inside a delta reconstruction (which reads
-//! a base, not an object a caller asked for). Each fetch is one round trip, and each miss re-reads
-//! the record: a read of a whole old tree pays both once per object it lacks.
+//! The hook is off while this thread holds the warehouse's ref lock (the refill takes it to write
+//! the record, and it does not nest), inside a bulk store session (whose writes are not durable
+//! until it closes, while the record's removal would be), and inside a delta reconstruction (which
+//! reads a base, not an object a caller asked for). Each fetch is one round trip, and each miss
+//! re-reads the record: a read of a whole old tree pays both once per object it lacks.
 
 use std::sync::OnceLock;
 use crate::error::{CoreError, RefusalCode};
@@ -108,7 +108,7 @@ fn refill_with(hook: Option<&FetchHook>, hash: &str) -> Result<bool, String> {
         return unfetched("this program does not fetch content a cache warehouse lacks");
     };
 
-    if RefLock::held_in_this_process() {
+    if RefLock::held_by_this_thread() {
         return unfetched("the read ran while the warehouse's ref lock was held");
     }
 
@@ -120,12 +120,13 @@ fn refill_with(hook: Option<&FetchHook>, hash: &str) -> Result<bool, String> {
         return unfetched("the read was of a delta's base");
     }
 
-    // Taken before the fetch, so a deleter's hold refuses the read before it pays for a transfer
-    // it could not store.
-    let hold = StoreAccessLock::try_shared()?;
+    // Probed before the fetch, so a deleter's hold refuses the read before it pays for a transfer
+    // it could not store, and taken after it, so no deleter waits out the round trip.
+    drop(StoreAccessLock::try_shared()?);
 
     match hook(hash) {
         Fetched::Bytes(bytes) => {
+            let hold = StoreAccessLock::try_shared()?;
             sealed_utils::refill(&hold, hash, &bytes)
                 .map_err(|why| format!("Could not store object {}, fetched from the origin: {}", hash, why))?;
 
@@ -268,31 +269,30 @@ mod tests {
         assert!(refill_with(Some(&hook), &fixture.root).unwrap(), "out of both, it is fetched");
     }
 
-    // Revert: count the ref lock per thread → the refill waits on the lock another thread holds.
+    // Revert: refuse while any thread holds the ref lock → the read refuses instead of waiting out
+    // another thread's hold.
     #[test]
-    fn nothing_is_fetched_while_another_thread_holds_the_ref_lock() {
+    fn another_threads_ref_lock_is_waited_out() {
         let fixture = fixture("held-elsewhere");
         let bytes = fixture.bytes.clone();
         let (hook, calls) = hook(move || Fetched::Bytes(bytes.clone()));
 
         let root = crate::globals::current_scope_root().unwrap();
         let (locked, held) = std::sync::mpsc::channel();
-        let (release, released) = std::sync::mpsc::channel::<()>();
         let holder = std::thread::spawn(move || {
             let _scope = StorageRootScope::enter(&root);
             let _lock = RefLock::acquire().unwrap();
             locked.send(()).unwrap();
-            let _ = released.recv();
+            std::thread::sleep(std::time::Duration::from_millis(200));
         });
 
         held.recv().unwrap();
-        let refused = refill_with(Some(&hook), &fixture.root);
-        release.send(()).unwrap();
+        let refilled = refill_with(Some(&hook), &fixture.root);
         holder.join().unwrap();
 
-        assert!(refused.unwrap_err().contains("ref lock"));
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert!(refill_with(Some(&hook), &fixture.root).unwrap(), "once it is released, it is fetched");
+        assert!(refilled.unwrap(), "the refill waits for the other thread's hold to end");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_recorded(&[&fixture.web]);
     }
 
     // Revert: skip the mode check → the full warehouse's absence is fetched; skip the record

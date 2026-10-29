@@ -500,12 +500,14 @@ or does not descend from it, and when a ref update or delete finds its pallet de
 
 A warehouse franchised with `--cache` holds some content by hash alone, and a command that reads
 such content fetches it from the warehouse's origin as it reads. When the origin cannot be reached,
-or answers with a server error (`5xx`), or keeps throttling, the command refuses with `cache_miss`
-(exit 36), naming the object in `message`. `next_step` names the origin: running the same command
-again once it can be reached is the way out. What a command fetched before it refused stays in the
-cache; a command that only reads, such as `show` or `diff`, changes nothing else. A command that
-changes the bay, such as `shift`, does not yet fetch everything it needs before it starts, so it
-can refuse partway through, with part of its change made.
+answers as an unavailable server (`502`, `503` or `504`), or keeps throttling, the command refuses
+with `cache_miss` (exit 36), naming the object in `message`. `next_step` names the origin: running
+the same command again once it can be reached is the way out. Not every command keeps the code
+yet: one that reads the content inside a step of its own can fail with a plain error instead,
+whose message says the same and names the origin. What a command fetched before it refused stays
+in the cache; a command that only reads, such as `show` or `diff`, changes nothing else. A command
+that changes the bay, such as `shift`, does not yet fetch everything it needs before it starts, so
+it can refuse partway through, with part of its change made.
 
 A remote that answers but does not hand the object over, or a configured remote that is not the
 origin, is a plain failure, not `cache_miss`: running the command again would not help.

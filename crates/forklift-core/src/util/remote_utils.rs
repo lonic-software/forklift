@@ -3897,8 +3897,8 @@ impl RemoteClient {
     /// [`Self::fetch_object`], telling a remote that could not serve the object now from one that
     /// answered and refused: a cache warehouse's read refuses the first as a cache miss it can
     /// retry once the origin is reachable, and the second as the remote's own answer. A remote that
-    /// could not be reached, stopped answering, answered with a server error (`5xx`) or kept
-    /// throttling past the patience is the first; any other answer is the second.
+    /// could not be reached, stopped answering, answered `502`, `503` or `504`, or kept throttling
+    /// past the patience is the first; any other answer is the second.
     pub async fn fetch_object_classified(&self, hash: &str) -> ObjectFetch {
         let posture = Posture::BoundedObjectReads;
         let outcome = match self.send_waiting_out_throttle(
@@ -3918,10 +3918,12 @@ impl RemoteClient {
         };
 
         if !response.status().is_success() {
-            let server_error = response.status().is_server_error();
+            // A gateway or an unavailable server stands in front of an origin that is not up now;
+            // any other status, a `500` included, is the origin's own answer for this object.
+            let unavailable = matches!(response.status().as_u16(), 502..=504);
             let error = self.error_of(response, &format!("object {}", hash)).await;
 
-            return if server_error { ObjectFetch::Unreachable(error) } else { ObjectFetch::Refused(error) };
+            return if unavailable { ObjectFetch::Unreachable(error) } else { ObjectFetch::Refused(error) };
         }
 
         // An object over the ceiling cannot be stored however it arrives, so it is refused in
@@ -4612,7 +4614,8 @@ pub enum ObjectFetch {
     /// The object's bytes, unverified.
     Fetched(Vec<u8>),
     /// The remote could not serve it now: it could not be reached, stopped answering before the
-    /// object arrived, failed with a server error, or kept throttling.
+    /// object arrived, answered as a gateway or unavailable server (`502`–`504`), or kept
+    /// throttling.
     Unreachable(String),
     /// The remote answered, and refused to hand the object over.
     Refused(String),
@@ -10790,9 +10793,10 @@ mod tests {
         assert_eq!(remote.hits_for(&format!("/v1/objects/{}", hashes[0])), 1);
     }
 
-    /// A server error and a throttle outlasting the patience are a remote that could not serve
-    /// the object now; any other refusal is its answer. Revert: classify every status as an
-    /// answer → the `503` and the `429` are refused.
+    /// An unavailable server and a throttle outlasting the patience are a remote that could not
+    /// serve the object now; any other refusal, a `500` included, is its answer. Revert: classify
+    /// every status as an answer → the `503` and the `429` are refused; every `5xx` as unavailable
+    /// → the `500` is not.
     #[test]
     fn fetch_object_classified_tells_a_remote_that_cannot_serve_now_from_one_that_refuses() {
         let classify = |status: u16| {
@@ -10808,7 +10812,9 @@ mod tests {
             assert!(matches!(classify(status), ObjectFetch::Unreachable(_)), "a {} cannot serve now", status);
         }
 
-        assert!(matches!(classify(404), ObjectFetch::Refused(_)), "a 404 is the remote's answer");
+        for status in [500, 404] {
+            assert!(matches!(classify(status), ObjectFetch::Refused(_)), "a {} is the remote's answer", status);
+        }
     }
 
     /// The throttle wait is the remote's `Retry-After` when it sent one, never under the backoff.
