@@ -4927,9 +4927,11 @@ pub async fn fetch_cache(client: &RemoteClient,
 /// The fetch that brought `head` recorded its root, and a ref may already reach that root while it
 /// is recorded and absent. The closure fills top-down, so while it fills, a present tree stands
 /// over children not fetched yet and not recorded: a lock-free reader then sees an incomplete
-/// closure, and a ref write leaning on it is refused until the fill ends. A fill that fails records
-/// every absence beneath the root before it returns, so the closure is whole up to the record
-/// again; one the process does not survive leaves absences that `heal` refetches. Once the closure
+/// closure, and a ref write leaning on it is refused until the fill ends. A fill that returns an
+/// error records every absence beneath the root first, so the closure is whole up to the record
+/// again. One that stops without returning (the process killed, or the future dropped) leaves the
+/// root present and recorded over unrecorded absences: `heal` records them as it unseals the root,
+/// and rerunning the command fills them. Once the closure
 /// is present, the records of the trees and files it filled are removed, since a whole present
 /// closure needs none.
 ///

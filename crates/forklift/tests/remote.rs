@@ -5789,6 +5789,50 @@ fn a_dirty_cache_lift_fetches_the_diverged_heads_content() {
     assert!(closure_present(&area, "cached", &their_root), "the diverged head's content is held");
 }
 
+/// A content fetch that fails partway has stored its root and some trees but not what lies below
+/// them. Before it returns the error it records those absences, so the closure is whole up to the
+/// record and the warehouse audits clean.
+///
+/// Revert: return the fill's error without recording → the missing file is not recorded, and
+/// `audit` finds the root's closure incomplete.
+#[test]
+fn a_failed_cache_fill_records_what_it_left_absent() {
+    let area = TestArea::new("cache-fill-fails");
+    let (server, _) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+
+    area.write_file("a/docs/deep/lost.txt", "the remote loses this\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "four"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    let new_head = pallet_head(&area, "server-root", "main");
+
+    let lost = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("a"));
+        let mut tree = forklift_core::util::object_utils::load_parcel(&new_head).unwrap().tree_hash;
+        for directory in ["docs", "deep"] {
+            let next = forklift_core::util::object_utils::load_tree(&tree).unwrap().get_subtrees()
+                .find(|(name, _)| name.as_str() == directory).map(|(_, subtree)| subtree.hash.clone());
+            tree = next.expect("the fixture's directory");
+        }
+        let file = forklift_core::util::object_utils::load_tree(&tree).unwrap().get_files()
+            .find(|(name, _)| name.as_str() == "lost.txt").map(|(_, file)| file.hash.clone());
+        file.expect("the fixture's file")
+    };
+    std::fs::remove_file(object_store_path(&area, "server-root", &lost)).expect("the server holds the file loose");
+
+    let lowered = area.forklift("cached", &["lower"]);
+    assert!(!lowered.status.success(), "the fill fails: {}", stdout(&lowered));
+    assert_ne!(pallet_head(&area, "cached", "main"), new_head, "no ref moved");
+
+    let new_root = history_with_roots(&area, "cached", &new_head)[0].1.clone();
+    assert!(object_held(&area, "cached", &new_root), "the fill stored the root before failing");
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("cached"));
+    assert!(forklift_core::util::sealed_utils::read_sealed().unwrap().contains(&lost), "the missing file is recorded");
+    drop(_scope);
+    assert_success(&area.forklift("cached", &["audit"]));
+}
+
 /// A root can be present while objects beneath it are absent, when a fetch of its closure stopped
 /// partway. Recording what a fetch skips then records those absences, not the root.
 ///
