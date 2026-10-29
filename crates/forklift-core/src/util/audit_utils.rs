@@ -1885,7 +1885,7 @@ pub enum ClosureError {
     /// A parcel, tree, blob or chunk of the history is missing or unreadable; the message names it.
     Incomplete(String),
 
-    /// A new parcel of a user pallet's history has a root tree holding the metadata folder: the
+    /// A new parcel of a user pallet's history has a root tree holding a `.forklift` entry: the
     /// shape of office and meta history, which heal and scope prune walk in full whatever the
     /// fetch scope. No fetch can mend it, so it is never reported as missing history.
     MetaShapedRoot {

@@ -731,7 +731,7 @@ pub enum RefUpdateError {
     },
 
     /// The new head of a user pallet has, at a parcel the ref would newly reach, a root tree
-    /// holding the metadata folder: the shape only office and meta history may take. Nothing was
+    /// holding a `.forklift` entry: the shape only office and meta history may take. Nothing was
     /// written, and no fetch can mend it.
     MetaShaped {
         /// The pallet whose ref was to move.
