@@ -4924,11 +4924,11 @@ async fn walk_history(client: &RemoteClient,
 }
 
 /// The signatures one fetch walk receives, held across all its waves and published as signature
-/// tables before the walk returns, so before its caller moves a ref or records a root. A wave is
-/// one generation of parcels, a single parcel on linear history, so a table per wave would still
-/// be a file per parcel. A walk that dies first loses only the signatures it held: their parcels
-/// are behind no ref and no root yet, so the next fetch walks them again and fetches the
-/// signatures it finds missing.
+/// tables, a full table as soon as one has gathered and the rest before the walk returns, so
+/// before its caller moves a ref or records a root. A wave is one generation of parcels, a single
+/// parcel on linear history, so a table per wave would still be a file per parcel. A walk that
+/// dies first loses only the signatures it still held: their parcels are behind no ref and no
+/// root yet, so the next fetch walks them again and fetches the signatures it finds missing.
 fn walk_signatures() -> sign_utils::SignatureBatch {
     sign_utils::SignatureBatch::new(sign_utils::OnConflict::Refuse)
 }

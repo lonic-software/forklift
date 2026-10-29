@@ -5540,9 +5540,10 @@ fn signature_files(area: &TestArea, directory: &str) -> (Vec<PathBuf>, usize) {
     (tables, sidecars)
 }
 
-/// (vii) A fetch buffers the signatures of its whole walk and writes them as one signature table,
-/// no sidecar each, before the ref moves; a franchise walks each pallet's history apart. A fetch that dies partway leaves the parcels it stored
-/// unsigned and the ref where it was; the next fetch re-walks them and stores their signatures.
+/// (vii) A fetch buffers the signatures of its walk and, below a full table's worth, writes them
+/// as one signature table, no sidecar each, before the ref moves; a franchise walks each pallet's
+/// history apart. A fetch that dies partway leaves the parcels it stored unsigned and the ref
+/// where it was; the next fetch re-walks them and stores their signatures.
 ///
 /// Revert: publish each wave's signatures as it lands → a table per wave, and the dead fetch's
 /// signatures stored → red.

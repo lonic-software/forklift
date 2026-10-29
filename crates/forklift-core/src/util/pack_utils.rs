@@ -11289,6 +11289,30 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&temp).ok();
     }
 
+    /// A skipping batch (a bundle import's) skips any copy for a parcel that is already signed,
+    /// malformed or not, and refuses a malformed signature only when it would store it.
+    ///
+    /// Revert: parse every signature before looking for the parcel's own → the malformed copy of
+    /// a signed parcel fails the batch → red.
+    #[test]
+    fn a_skipping_signature_batch_skips_a_malformed_copy_of_a_signed_parcel() {
+        let (temp, _scope) = enter_signature_root("sig-batch-malformed");
+        let (signed, fresh) = (fake_parcel("", 0), fake_parcel("", 1));
+        sign_utils::store_raw_parcel_signature(&signed, &fake_signature(1)).unwrap();
+
+        let mut batch = sign_utils::SignatureBatch::new(sign_utils::OnConflict::Skip);
+        batch.add(signed.clone(), b"not a signature".to_vec()).unwrap();
+        batch.add(fresh.clone(), fake_signature(2)).unwrap();
+        assert_eq!(batch.finish().unwrap(), sign_utils::StoredSignatures { stored: 1, skipped: 1 });
+        assert_eq!(sign_utils::load_raw_parcel_signature(&signed).unwrap(), Some(fake_signature(1)));
+
+        let mut batch = sign_utils::SignatureBatch::new(sign_utils::OnConflict::Skip);
+        batch.add(fake_parcel("", 2), b"not a signature".to_vec()).unwrap();
+        assert!(batch.finish().is_err(), "a malformed signature it would store is refused");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
     /// The presence probes a Repack makes return the same answers, each for its own parcel,
     /// whether they run serially or fan out.
     ///

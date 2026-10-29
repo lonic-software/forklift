@@ -705,16 +705,18 @@ impl SignatureBatch {
         let mut skipped = 0;
 
         for (parcel_hash, bytes) in pending {
-            parse_parcel_signature(&bytes, &parcel_hash)?;
             let hash_bytes = pack_utils::hash_to_bytes(&parcel_hash)
                 .ok_or_else(|| format!("\"{}\" is not a parcel hash.", parcel_hash))?;
 
+            // The parcel's own signature first: a copy of one it already carries is skipped (or
+            // refused) whatever its bytes, so only a signature that would be stored is parsed.
             let existing = match admitted.get(&hash_bytes) {
                 Some(admitted) => Some(admitted.clone()),
                 None => load_raw_parcel_signature(&parcel_hash)?,
             };
             match existing {
                 None => {
+                    parse_parcel_signature(&bytes, &parcel_hash)?;
                     admitted.insert(hash_bytes, bytes);
                 }
                 Some(existing) if existing == bytes => skipped += 1,
