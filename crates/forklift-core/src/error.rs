@@ -383,9 +383,14 @@ impl From<String> for CoreError {
         // A frame a caller wrapped (`format!("Could not …: {}", e)`) claims no code: text from a
         // remote or off disk can hold a frame too, and only a frame that starts the string is
         // known to be this process's. It is rendered readable, its next step folded in.
+        // The frame's own fields were sanitized when it was built; the caller's text keeps its
+        // lines, and what it wrote after a frame's detail is kept after the next step.
         if let Some(at) = message.find(REFUSAL_PREFIX) {
-            if let Some((_, human, next_step, _)) = deframe_with_details(&message[at..]) {
-                return CoreError::Other(sanitize(&format!("{}{}", &message[..at], with_next_step(human, next_step))));
+            let mut fields = message[at + REFUSAL_PREFIX.len()..].splitn(4, REFUSAL_FIELD_SEPARATOR);
+
+            if let (Some(_code), Some(human), Some(next_step)) = (fields.next(), fields.next(), fields.next()) {
+                let after = fields.next().map(after_detail).unwrap_or_default();
+                return CoreError::Other(format!("{}{}{}", &message[..at], with_next_step(human, next_step), after));
             }
         }
 
@@ -447,6 +452,17 @@ pub fn prefix_message(context: &str, error: String) -> String {
             details,
         }.into(),
         CoreError::Other(message) => format!("{}: {}", context, message),
+    }
+}
+
+/// What follows a frame's detail field, `text`: the detail is one JSON value, and anything after it
+/// was written by a caller that wrapped the frame.
+fn after_detail(text: &str) -> &str {
+    let mut values = serde_json::Deserializer::from_str(text).into_iter::<serde_json::Value>();
+
+    match values.next() {
+        Some(Ok(_)) => &text[values.byte_offset()..],
+        _ => "",
     }
 }
 
@@ -664,7 +680,9 @@ mod tests {
     }
 
     // Revert: decode only a frame that starts the string → the wrapped frame's separators reach
-    // the message; decode its code too → the wrapped frame claims `cache_miss`.
+    // the message; decode its code too → the wrapped frame claims `cache_miss`; sanitize the
+    // whole message → the caller's line break is lost; drop what follows a detail → so is its
+    // closing sentence.
     #[test]
     fn a_wrapped_frame_reads_as_plain_text_and_claims_no_code() {
         let framed: String = CoreError::refusal(RefusalCode::CacheMiss, "object x is missing", "Wait for it.").into();
@@ -674,6 +692,17 @@ mod tests {
             CoreError::Other(message) => assert_eq!(
                 message, "The tree could not be read: object x is missing Wait for it. No parcel was made."
             ),
+            other => panic!("a wrapped frame claims no code: {:?}", other),
+        }
+
+        // A frame with detail keeps what the caller wrote after it, and the caller's lines.
+        let detailed: String = CoreError::refusal_with_details(
+            RefusalCode::CacheMiss, "object y is missing", "Wait.", serde_json::json!({"hash": "y"})
+        ).into();
+        let wrapped = format!("Two reads failed:\n{} Nothing was written.", detailed);
+
+        match CoreError::from(wrapped) {
+            CoreError::Other(message) => assert_eq!(message, "Two reads failed:\nobject y is missing Wait. Nothing was written."),
             other => panic!("a wrapped frame claims no code: {:?}", other),
         }
     }

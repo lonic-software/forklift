@@ -270,12 +270,17 @@ mod tests {
     }
 
     // Revert: refuse while any thread holds the ref lock → the read refuses instead of waiting out
-    // another thread's hold.
+    // another thread's hold, which lasts until the hook is asked.
     #[test]
     fn another_threads_ref_lock_is_waited_out() {
         let fixture = fixture("held-elsewhere");
         let bytes = fixture.bytes.clone();
-        let (hook, calls) = hook(move || Fetched::Bytes(bytes.clone()));
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let release = std::sync::Mutex::new(release);
+        let (hook, calls) = hook(move || {
+            let _ = release.lock().unwrap().send(());
+            Fetched::Bytes(bytes.clone())
+        });
 
         let root = crate::globals::current_scope_root().unwrap();
         let (locked, held) = std::sync::mpsc::channel();
@@ -283,7 +288,7 @@ mod tests {
             let _scope = StorageRootScope::enter(&root);
             let _lock = RefLock::acquire().unwrap();
             locked.send(()).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            let _ = released.recv_timeout(std::time::Duration::from_secs(30));
         });
 
         held.recv().unwrap();

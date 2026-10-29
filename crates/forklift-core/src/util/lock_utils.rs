@@ -478,6 +478,8 @@ pub struct RefLock {
     _file: std::fs::File,
     // Whose hold this is.
     holder: Holder,
+    // Not `Send`: the hold is counted against the thread that took it, so it stays there.
+    _thread_bound: std::marker::PhantomData<*const ()>,
 }
 
 /// A [`RefLock`]'s holder: the thread that took it, and the sidecar's absolute path.
@@ -493,7 +495,7 @@ impl RefLock {
     fn held(file: std::fs::File, path: PathBuf) -> RefLock {
         let holder = (std::thread::current().id(), path);
         *REF_LOCKS_HELD.lock().unwrap_or_else(|e| e.into_inner()).entry(holder.clone()).or_default() += 1;
-        RefLock { _file: file, holder }
+        RefLock { _file: file, holder, _thread_bound: std::marker::PhantomData }
     }
 
     /// Whether this thread holds the active warehouse's ref lock, so that taking it again would
