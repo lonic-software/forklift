@@ -126,7 +126,7 @@ fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
     // Recording only stat data keeps the rollups (see `ShardMutationBatch`).
     let mut batch = inventory_utils::ShardMutationBatch::over(&ledger);
 
-    let message = match restore_entry(parent.as_key(), &item)? {
+    let message = match restore_entry(parent.as_key(), &item, true)? {
         Restored::Untouched => format!("\"{}\" already matches the inventory.", path.as_key()),
         Restored::Restatted(refreshed) => {
             batch.update(parent.as_key(), |inventory| inventory.add_item(refreshed))?;
@@ -207,7 +207,7 @@ fn restore_worktree_directory(ledger: &inventory_utils::ShardLedger, key: &str) 
                 continue;
             }
 
-            let recorded = restore_entry(shard_key, item).and_then(|restored| match restored {
+            let recorded = restore_entry(shard_key, item, false).and_then(|restored| match restored {
                 Restored::Untouched => {
                     matched_count += 1;
                     Ok(())
@@ -289,12 +289,14 @@ enum Restored {
 /// # Arguments
 /// * `parent_key` - The warehouse path key of the entry's directory.
 /// * `item`       - The inventory entry.
+/// * `fetch`      - Whether to fetch its content, in a cache warehouse, before a rewrite: false
+///                  where the caller's presence phase fetched it already.
 ///
 /// # Returns
 /// * `Ok(Restored)` - What was done.
 /// * `Err(String)`  - If the path was refused, the clock probe could not be stamped, or a write
 ///                    failed.
-fn restore_entry(parent_key: &str, item: &InventoryItem) -> Result<Restored, String> {
+fn restore_entry(parent_key: &str, item: &InventoryItem, fetch: bool) -> Result<Restored, String> {
     let file_path = tracked_path(parent_key, &item.name);
 
     ensure_restorable(&file_path)?;
@@ -309,7 +311,9 @@ fn restore_entry(parent_key: &str, item: &InventoryItem) -> Result<Restored, Str
 
     // A directory's restore fetched every file's content already (`ensure_directory_present`); a
     // single file's is fetched only once it is known to need rewriting.
-    cache_miss::ensure_files_present([(item.hash.as_str(), item.item_type)])?;
+    if fetch {
+        cache_miss::ensure_files_present([(item.hash.as_str(), item.item_type)])?;
+    }
     shift_utils::write_tracked_file(&file_path, &item.hash, item.item_type, false)?;
 
     // Anchored and statted right after the write: a file statted later would record an editor's

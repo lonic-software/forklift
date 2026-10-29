@@ -271,7 +271,7 @@ fn describe(hashes: &[String]) -> Named {
     }
 }
 
-/// Fetched objects not stored yet.
+/// Fetched objects not stored yet, each verified as it arrived.
 #[derive(Default)]
 struct Group {
     objects: Vec<(String, Vec<u8>)>,
@@ -284,8 +284,12 @@ impl Group {
     /// none of the good ones.
     fn add(&mut self, hash: String, bytes: Vec<u8>) -> Result<(), String> {
         if let Err(why) = object_utils::verify_object_bytes(&hash, &bytes) {
-            self.flush()?;
-            return Err(format!("The origin sent object {} corrupt: {}", hash, why));
+            let corrupt = format!("The origin sent object {} corrupt: {}", hash, why);
+
+            return Err(match self.flush() {
+                Ok(()) => corrupt,
+                Err(unstored) => format!("{}\n{}", corrupt, unstored),
+            });
         }
 
         self.bytes += bytes.len();
@@ -310,7 +314,7 @@ impl Group {
         let hold = StoreAccessLock::try_shared()?;
         let refs: Vec<(&str, &[u8])> = objects.iter().map(|(hash, bytes)| (hash.as_str(), bytes.as_slice())).collect();
 
-        sealed_utils::refill_all(&hold, &refs).map_err(|why| format!(
+        sealed_utils::refill_verified(&hold, &refs).map_err(|why| format!(
             "Could not store {}, fetched from the origin: {}", describe_held(&objects), why
         ))
     }

@@ -22,7 +22,8 @@ const LOOSE_FETCHES: usize = 8;
 
 /// How many fetched objects wait for the reading thread before the fetch does. An object may be
 /// as large as the store admits, so this is kept small: what the fetch holds beyond the reading
-/// thread's group is these, plus the one being read.
+/// thread's group is these, plus the one a batch is reading, or the [`LOOSE_FETCHES`] fetched on
+/// their own.
 const QUEUED_OBJECTS: usize = 2;
 
 /// One fetch, sent to the fetch thread.
@@ -196,14 +197,11 @@ async fn fetch_all(remote: &RemoteClient, origin: &str, hashes: Vec<String>, rep
             // A remote cut at its byte budget sent what fit: ask again for the rest, while it
             // sends something.
             Ok(BatchOutcome::Partial(_)) if left.len() < before => pending.splice(0..0, left).for_each(drop),
-            // What a whole answer lacked, the origin may still serve on its own.
-            Ok(BatchOutcome::Imported(_)) => loose.extend(left),
-            // An error says nothing this side can classify: each fetch on its own below says
-            // whether the origin can be reached, at its first. Every other outcome closed the lane.
-            Ok(_) | Err(_) => {
-                loose.extend(left);
-                break;
-            }
+            // What this batch did not bring is fetched on its own below, and the next batch is
+            // still asked for while the lane is open: every outcome but these two closed it. An
+            // error says nothing this side can classify; a fetch on its own says whether the
+            // origin can be reached.
+            Ok(_) | Err(_) => loose.extend(left),
         }
     }
 

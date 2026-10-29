@@ -823,15 +823,23 @@ pub fn unseal(_hold: &impl StoreAccessHold, hashes: &[String]) -> Result<Unseale
 /// * `Err(String)` - If some bytes are not their object's or do not parse, a present object
 ///                   beneath one cannot be walked, or as [`append_locked`]. Before the store,
 ///                   nothing but push-down records may have been written.
-pub fn refill_all(_hold: &impl StoreAccessHold, objects: &[(&str, &[u8])]) -> Result<(), String> {
+pub fn refill_all(hold: &impl StoreAccessHold, objects: &[(&str, &[u8])]) -> Result<(), String> {
+    for (hash, bytes) in objects {
+        object_utils::verify_object_bytes(hash, bytes)?;
+    }
+
+    refill_verified(hold, objects)
+}
+
+/// [`refill_all`] of `objects` the caller has already verified against their hashes, one by one as
+/// they arrived.
+pub(crate) fn refill_verified(_hold: &impl StoreAccessHold, objects: &[(&str, &[u8])]) -> Result<(), String> {
     // A tree or recipe child has a closure to walk when present; a leaf (an unchunked file, a
     // chunk, a parcel's parent) is only looked for, never read.
     let mut walked: Vec<String> = Vec::new();
     let mut leaves: Vec<String> = Vec::new();
 
     for (hash, bytes) in objects {
-        object_utils::verify_object_bytes(hash, bytes)?;
-
         match object_utils::peek_object_header(bytes)?.0 {
             ObjectType::Tree => {
                 let tree = object_utils::parse_tree_bytes(hash, bytes)?;
