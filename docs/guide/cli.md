@@ -1629,12 +1629,14 @@ files whole. Every other file stays with the remote, recorded by hash (`audit` c
 held by hash): an older parcel's, and the head's of a pallet `lower <pallet>` moves without
 checking it out. A command that reads content the cache lacks (`show` or `diff` of an older
 parcel, `shift` to a pallet lowered that way) fetches each object it meets from the origin as it
-reads it, and keeps it. The configured remote must be the origin. When the origin cannot be
-reached, answers that it is unavailable (`502`–`504`), or keeps throttling, the command refuses
-with exit 36 (`cache_miss`) and names the origin: run it again once the origin is back. Some
-commands report it as a plain error that names the origin instead. What a command fetched before
-refusing stays in the cache; a read-only command changes nothing else, while one that changes the
-bay, such as `shift`, can refuse partway through with part of its change made.
+reads it, and keeps it. A command that changes the bay's files (`shift`, `consolidate`,
+`cherry-pick`, `park`, `lower`, `restore`, `bay add`) fetches every file it is about to write
+in one batch first, before it changes anything. The configured remote must be the origin. When
+the origin cannot be reached, answers that it is unavailable (`502`–`504`), or keeps throttling,
+the command refuses with exit 36 (`cache_miss`) and names the origin: run it again once the
+origin is back. Some commands report it as a plain error that names the origin instead. What a
+command fetched before refusing stays in the cache; a read-only command changes nothing else, and
+those listed above refuse before their first change to the bay, leaving it as it was.
 
 When the remote's bundle installs native packs straight into the new warehouse, `franchise`
 tips the same densify suggestion `import-git` does: those packs are the far end's own bulk

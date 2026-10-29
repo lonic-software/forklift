@@ -127,6 +127,7 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
 
     consolidate::keep_aliased_files(&mut actions, &our_tree, &scope)?;
     let ledger = consolidate::ensure_no_untracked_collisions(&actions, &source_label)?;
+    consolidate::ensure_actions_present(&actions)?;
 
     consolidate::raise_merge_marker(OperationKind::CherryPick, &current, &our_head, &our_tree, &theirs_tree)?;
 

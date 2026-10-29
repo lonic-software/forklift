@@ -88,6 +88,10 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
     // created, so a refusal leaves no half-made bay behind.
     bay_utils::check_bay_paths_recordable(&warehouse_root, &bay_dir)?;
 
+    // In a cache warehouse, the bay's content is fetched before anything is created, so an origin
+    // that cannot be reached refuses the bay with nothing made.
+    shift_utils::ensure_tree_present(&tree, &scope)?;
+
     // The bay's pallet, at the current head (a shared ref).
     pallet_utils::update_pallet_head(name, None, &head, &pallet_utils::RefPreconditions::NONE)?;
 

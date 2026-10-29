@@ -239,6 +239,7 @@ fn move_files(from_tree: Option<&str>,
     // case alias. This is checked up front, before anything is touched, so a conflict aborts
     // the move with the warehouse unchanged.
     alias_utils::refuse_collisions(doing, &shift_utils::collect_collisions(&ops, &removed_dirs)?)?;
+    shift_utils::ensure_writes_present(&ops)?;
 
     // Raised before the first file moves and finished only once the position records the target:
     // a crash anywhere between leaves files and staging at the target under a position still on

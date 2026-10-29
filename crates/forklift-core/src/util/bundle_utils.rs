@@ -1143,6 +1143,35 @@ pub fn import_streamed_bundle<R: std::io::BufRead>(mut reader: R,
     import_record_stream(reader, Admitter::new(admission))
 }
 
+/// Read a streamed partial bundle as [`import_streamed_bundle`] does, handing each admitted
+/// record's hash and bytes to `deliver` instead of storing it. The bytes are unverified: the
+/// receiver checks them against the hash before it keeps them. Every record is buffered whole,
+/// up to [`object_utils::MAX_OBJECT_BYTES`].
+///
+/// # Returns
+/// * `Ok(usize)`   - How many records were delivered.
+/// * `Err(String)` - As [`import_streamed_bundle`], or `deliver`'s error, which stops the read.
+pub fn read_streamed_bundle<R: std::io::BufRead>(mut reader: R,
+                                                 admission: StreamAdmission,
+                                                 mut deliver: impl FnMut(String, Vec<u8>) -> Result<(), String>)
+                                                 -> Result<usize, String> {
+    let header = read_bundle_header(&mut reader)?;
+
+    if header != BUNDLE_HEADER_V3.as_bytes() {
+        return Err(format!(
+            "The remote sent a \"{}\" bundle where only a \"{}\" one belongs; refusing to read it.",
+            String::from_utf8_lossy(&header), BUNDLE_HEADER_V3
+        ));
+    }
+
+    let stats = read_record_stream(reader, Admitter::new(admission), |hash, mut payload, length| {
+        deliver(hash.to_string(), read_exact_payload(&mut payload, length)?)?;
+        Ok(true)
+    })?;
+
+    Ok(stats.stored_objects)
+}
+
 /// Read a bundle's uncompressed header line, without its newline.
 fn read_bundle_header<R: std::io::BufRead>(reader: &mut R) -> Result<Vec<u8>, String> {
     // The header line is uncompressed; everything after it is one zstd stream. `length` is not
@@ -1240,7 +1269,28 @@ fn verify_bundle_digest<R: Read + std::io::Seek>(reader: &mut R) -> Result<u64, 
 
 /// Import the zstd record stream that follows a version-3 header, storing only the records
 /// `admitter` admits.
-fn import_record_stream<R: std::io::BufRead>(reader: R, mut admitter: Admitter) -> Result<ImportStats, String> {
+fn import_record_stream<R: std::io::BufRead>(reader: R, admitter: Admitter) -> Result<ImportStats, String> {
+    read_record_stream(reader, admitter, |hash, mut payload, length| {
+        // A small object is buffered whole and stored in one shot; a large one streams through an
+        // incremental Blake3 to a temp file, bounding memory regardless of the declared length.
+        // `store_object_stream` reports truncation, verifies the hash, and enforces the per-chunk
+        // ceiling itself.
+        if length <= object_utils::STREAM_STORE_THRESHOLD_BYTES as u64 {
+            let payload = read_exact_payload(&mut payload, length)?;
+            object_utils::store_object_bytes(hash, &payload)
+        } else {
+            object_utils::store_object_stream(hash, &mut payload, length)
+        }
+    })
+}
+
+/// Read the zstd record stream that follows a version-3 header, handing each record `admitter`
+/// admits to `take` with its payload, which `take` must read to exactly its declared length.
+/// `take` returns whether it kept the record, counted as stored or skipped.
+fn read_record_stream<R: std::io::BufRead>(reader: R,
+                                           mut admitter: Admitter,
+                                           mut take: impl FnMut(&str, &mut dyn Read, u64) -> Result<bool, String>)
+                                           -> Result<ImportStats, String> {
     let mut decoder = object_utils::bounded_zstd_decoder(reader)
         .map_err(|e| format!("Error while opening the bundle stream: {}", e))?;
 
@@ -1292,16 +1342,7 @@ fn import_record_stream<R: std::io::BufRead>(reader: R, mut admitter: Admitter) 
             return Err(oversized_record_refusal("object", length));
         }
 
-        // A small object is buffered whole and stored in one shot; a large one streams through an
-        // incremental Blake3 to a temp file, bounding memory regardless of the declared length.
-        // `store_object_stream` reports truncation, verifies the hash, and enforces the per-chunk
-        // ceiling itself.
-        let stored = if length <= object_utils::STREAM_STORE_THRESHOLD_BYTES as u64 {
-            let payload = read_exact_payload(&mut decoder, length)?;
-            object_utils::store_object_bytes(&hash, &payload)?
-        } else {
-            object_utils::store_object_stream(&hash, decoder.by_ref(), length)?
-        };
+        let stored = take(&hash, &mut decoder, length)?;
 
         if stored { stats.stored_objects += 1; } else { stats.skipped_records += 1; }
 

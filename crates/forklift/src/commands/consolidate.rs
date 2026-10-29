@@ -7,7 +7,7 @@ use forklift_core::util::merge_utils::{ConsolidationState, MergeAction};
 use forklift_core::util::operation_utils::{Operation, OperationKind};
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
-    alias_utils, cherry_pick_utils, file_utils, inventory_utils, load_guard_utils, merge_utils, object_utils,
+    alias_utils, cache_miss, cherry_pick_utils, file_utils, inventory_utils, load_guard_utils, merge_utils, object_utils,
     office_utils, operation_utils, pallet_utils, scope_utils, shift_utils, stack_utils, stocktake_utils,
 };
 use forklift_core::util::shift_utils::HeadWrite;
@@ -309,6 +309,7 @@ pub(crate) async fn merge_head_into_current(current: &str,
 
     keep_aliased_files(&mut actions, &our_tree_hash, &scope)?;
     let ledger = ensure_no_untracked_collisions(&actions, their_label)?;
+    ensure_actions_present(&actions)?;
 
     // Raised here, before the merge's first change to the bay, so every caller (consolidate,
     // haul's merge, lift's auto-merge) inherits it: a crash part-way through applying leaves a
@@ -450,6 +451,7 @@ fn fast_forward(current: &str,
         &format!("Consolidating \"{}\"", target),
         &shift_utils::collect_collisions(&ops, &removed_dirs)?,
     )?;
+    shift_utils::ensure_writes_present(&ops)?;
 
     // Finished by `write_head_or_roll_back` once the bay is settled at one head or the other.
     let mut operation = Operation::new(
@@ -626,6 +628,18 @@ pub(crate) fn keep_aliased_files(actions: &mut Vec<MergeAction>,
     }));
 
     Ok(())
+}
+
+/// The presence phase for applying `actions` (see [`shift_utils::ensure_writes_present`]): every
+/// file they write from the store, fetched before the merge marker is raised.
+pub(crate) fn ensure_actions_present(actions: &[MergeAction]) -> Result<(), String> {
+    cache_miss::ensure_files_present(actions.iter().filter_map(|action| match action {
+        MergeAction::TakeTheirs { hash, item_type, .. } => Some((hash.as_str(), *item_type)),
+        MergeAction::Conflict { content: None, entry_hash, item_type, .. } if item_type.is_chunked() => {
+            Some((entry_hash.as_str(), *item_type))
+        }
+        _ => None,
+    }))
 }
 
 /// Whether applying a conflict writes its file: inline content, or a chunked file materialized

@@ -1,25 +1,40 @@
-//! The CLI's fetch hook for a cache warehouse's reads (see `forklift_core::util::cache_miss`): an
-//! object a read lacks is fetched from the warehouse's origin.
+//! The CLI's fetch hook for a cache warehouse's reads (see `forklift_core::util::cache_miss`): the
+//! objects a read or a presence phase lacks are fetched from the warehouse's origin, many in one
+//! batch where the origin serves one, and each of the rest on its own.
 //!
 //! The configuration is read on the reading thread, which resolves the warehouse the read is in.
 //! The request runs on a runtime of the hook's own, started on first use, and the reading thread
-//! waits for its reply: a read is synchronous, and may run on a runtime thread that must not start
+//! hands on each object as it arrives: a read is synchronous, and may run on a runtime thread that must not start
 //! another runtime inside its own. Requests from several reading threads run at once.
 
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::mpsc;
-use std::sync::OnceLock;
 use forklift_core::enums::config_scope::ConfigScope;
-use forklift_core::util::cache_miss::{self, Fetched};
+use forklift_core::util::cache_miss::{self, Deliver, Fetched};
 use forklift_core::util::config_utils;
-use forklift_core::util::remote_utils::{ObjectFetch, RemoteClient, TorMode, TorSettings};
+use forklift_core::util::remote_utils::{BatchOutcome, ObjectFetch, RemoteClient, TorMode, TorSettings};
+
+/// How many objects are fetched on their own at once.
+const LOOSE_FETCHES: usize = 8;
+
+/// How many fetched objects wait for the reading thread before the fetch does.
+const QUEUED_OBJECTS: usize = 16;
 
 /// One fetch, sent to the fetch thread.
 struct Request {
     url: String,
     token: Option<String>,
     tor: TorSettings,
-    hash: String,
-    reply: mpsc::Sender<Fetched>,
+    hashes: Vec<String>,
+    reply: mpsc::SyncSender<Reply>,
+}
+
+/// What the fetch thread sends back: each object as it arrives, then how the fetch ended. A
+/// reply that cannot be sent, because the reading thread stopped taking them, stops the fetch.
+enum Reply {
+    Object(String, Vec<u8>),
+    End(Fetched),
 }
 
 /// Register the hook, for the rest of this process.
@@ -27,19 +42,19 @@ pub fn install() {
     cache_miss::register(Box::new(fetch));
 }
 
-/// Fetch `hash` from the origin of the warehouse this thread reads.
-fn fetch(hash: &str) -> Fetched {
+/// Fetch `hashes` from the origin of the warehouse this thread reads, delivering each object here.
+fn fetch(hashes: &[String], deliver: Deliver) -> Fetched {
     let (url, token, tor) = match origin_settings() {
         Ok(settings) => settings,
         Err(why) => return Fetched::Failed(why),
     };
 
-    let (reply, replied) = mpsc::channel();
+    let (reply, replies) = mpsc::sync_channel(QUEUED_OBJECTS);
     let sent = fetch_thread().send(Request {
         url,
         token,
         tor,
-        hash: hash.to_string(),
+        hashes: hashes.to_vec(),
         reply,
     });
 
@@ -47,7 +62,19 @@ fn fetch(hash: &str) -> Fetched {
         return Fetched::Failed("the fetch thread has stopped".to_string());
     }
 
-    replied.recv().unwrap_or_else(|_| Fetched::Failed("the fetch thread stopped before it replied".to_string()))
+    // Returning drops `replies`, which stops the fetch at its next object.
+    for reply in replies {
+        match reply {
+            Reply::Object(hash, bytes) => {
+                if let Err(why) = deliver(hash, bytes) {
+                    return Fetched::Failed(why);
+                }
+            }
+            Reply::End(fetched) => return fetched,
+        }
+    }
+
+    Fetched::Failed("the fetch thread stopped before it replied".to_string())
 }
 
 /// The origin's URL, the token and the Tor settings to fetch with. The configured remote must be
@@ -99,7 +126,7 @@ fn serve(requests: mpsc::Receiver<Request>) {
         Ok(runtime) => runtime,
         Err(e) => {
             for request in requests {
-                let _ = request.reply.send(Fetched::Failed(format!("could not start the fetch runtime: {}", e)));
+                let _ = request.reply.send(Reply::End(Fetched::Failed(format!("could not start the fetch runtime: {}", e))));
             }
 
             return;
@@ -115,7 +142,7 @@ fn serve(requests: mpsc::Receiver<Request>) {
             match RemoteClient::new_with_tor(&request.url, request.token.clone(), request.tor.clone()) {
                 Ok(built) => client = Some((key, built)),
                 Err(why) => {
-                    let _ = request.reply.send(Fetched::Failed(why));
+                    let _ = request.reply.send(Reply::End(Fetched::Failed(why)));
                     continue;
                 }
             }
@@ -125,13 +152,80 @@ fn serve(requests: mpsc::Receiver<Request>) {
         let remote = remote.clone();
 
         runtime.spawn(async move {
-            let fetched = match remote.fetch_object_classified(&request.hash).await {
-                ObjectFetch::Fetched(bytes) => Fetched::Bytes(bytes),
-                ObjectFetch::Unreachable(why) => Fetched::Unreachable { origin: request.url, why },
-                ObjectFetch::Refused(why) => Fetched::Failed(why),
-            };
-
-            let _ = request.reply.send(fetched);
+            let end = fetch_all(&remote, &request.url, request.hashes, &request.reply).await;
+            let _ = tokio::task::block_in_place(move || request.reply.send(Reply::End(end)));
         });
     }
+}
+
+/// Fetch `hashes` from `remote`, sending each object to `reply`: in batches while the origin
+/// serves them and more than one is left, then each of the rest on its own. An origin that cannot
+/// be reached ends it at once, so a reading thread offline learns so from one failed request, not
+/// one per object.
+async fn fetch_all(remote: &RemoteClient, origin: &str, hashes: Vec<String>, reply: &mpsc::SyncSender<Reply>) -> Fetched {
+    let sent: Arc<Mutex<HashSet<String>>> = Default::default();
+    let mut left = hashes;
+
+    while left.len() > 1 && remote.batch_lane_open() {
+        let (to, sent_here) = (reply.clone(), sent.clone());
+
+        let outcome = remote.fetch_batch_delivering(&left, move |hash, bytes| {
+            sent_here.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(hash.clone());
+            to.send(Reply::Object(hash, bytes)).map_err(|_| "the read stopped taking objects".to_string())
+        }).await;
+
+        let before = left.len();
+        left = unsent(left, &sent);
+
+        match outcome {
+            // A remote cut at its byte budget sent what fit: ask again for the rest, while it
+            // sends something.
+            Ok(BatchOutcome::Partial(_)) if left.len() < before => continue,
+            // An error says nothing this side can classify: each fetch on its own below says
+            // whether the origin can be reached, at its first.
+            Ok(_) | Err(_) => break,
+        }
+    }
+
+    let mut fetches = tokio::task::JoinSet::new();
+    let mut left = left.into_iter();
+
+    loop {
+        while fetches.len() < LOOSE_FETCHES {
+            let Some(hash) = left.next() else { break };
+            let remote = remote.clone();
+
+            fetches.spawn(async move {
+                let fetched = remote.fetch_object_classified(&hash).await;
+                (hash, fetched)
+            });
+        }
+
+        let Some(joined) = fetches.join_next().await else { return Fetched::Done };
+
+        let (hash, fetched) = match joined {
+            Ok(done) => done,
+            Err(e) => return Fetched::Failed(format!("a fetch stopped: {}", e)),
+        };
+
+        match fetched {
+            ObjectFetch::Fetched(bytes) => {
+                let to = reply.clone();
+                let sent = tokio::task::block_in_place(move || to.send(Reply::Object(hash, bytes)));
+
+                if sent.is_err() {
+                    return Fetched::Failed("the read stopped taking objects".to_string());
+                }
+            }
+            // Dropping `fetches` stops the rest.
+            ObjectFetch::Unreachable(why) => return Fetched::Unreachable { origin: origin.to_string(), why },
+            ObjectFetch::Refused(why) => return Fetched::Failed(why),
+        }
+    }
+}
+
+/// Those of `hashes` not sent yet.
+fn unsent(hashes: Vec<String>, sent: &Mutex<HashSet<String>>) -> Vec<String> {
+    let sent = sent.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    hashes.into_iter().filter(|hash| !sent.contains(hash)).collect()
 }

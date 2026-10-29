@@ -178,6 +178,7 @@ pub async fn park_changes() -> Result<(), String> {
     let (ops, removed_dirs) = shift_utils::diff_trees(Some(&root_tree.hash), &head_tree_hash)?;
 
     alias_utils::refuse_collisions("Parking", &shift_utils::collect_collisions(&ops, &removed_dirs)?)?;
+    shift_utils::ensure_writes_present(&ops)?;
 
     if let Some(key_id) = &signing_key_id {
         let signature = sign_utils::sign_parcel_hash(key_id, &object.hash)?;
@@ -296,6 +297,8 @@ pub fn pop_parked() -> Result<(), String> {
             parked_base
         ));
     }
+
+    shift_utils::ensure_writes_present(&ops)?;
 
     // Every removal (and the directories it empties) before every write: across a case-only
     // rename the write would otherwise land on the old name through the alias, and the removal

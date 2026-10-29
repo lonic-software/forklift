@@ -661,6 +661,7 @@ async fn franchise_into_prepared_target(
     // franchise record outlives it: a franchise interrupted anywhere is resumed by `franchise`,
     // which discards the marker with the rest of the attempt.
     let position = pallet_utils::BayPosition::new(&pallet_name, Some(remote_head.clone()));
+    shift_utils::ensure_tree_present(&tree_hash, &scope_utils::current_scope()?)?;
     operation_utils::raise(&Operation::new(OperationKind::Franchise, position.clone(), None, position))?;
 
     // A franchise fills a fresh warehouse (a resume discarded every ref), so the pallet is unborn

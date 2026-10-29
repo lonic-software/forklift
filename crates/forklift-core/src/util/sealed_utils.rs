@@ -798,59 +798,71 @@ pub fn unseal(_hold: &impl StoreAccessHold, hashes: &[String]) -> Result<Unseale
     Ok(Unsealed { removed, pushed_down, kept })
 }
 
-/// Store `bytes`, fetched for the recorded object `hash`, and remove its record, pushing its
-/// coverage down first as [`unseal`] does: every absent object its closure reaches is recorded
-/// before the object is stored, and the removal is appended after. A crash between any two steps
-/// leaves the object absent and recorded with more recorded beneath it, or present and recorded,
-/// and both seal what they sealed before. Two refills of one object both store the same bytes and
-/// remove a record at most once, since each decides on the record re-read under the ref lock.
+/// Store `bytes`, fetched for the recorded object `hash`, and remove its record: [`refill_all`]
+/// of the one object.
+pub fn refill(hold: &impl StoreAccessHold, hash: &str, bytes: &[u8]) -> Result<(), String> {
+    refill_all(hold, &[(hash, bytes)])
+}
+
+/// Store `objects`, each the bytes fetched for a recorded object, and remove their records,
+/// pushing their coverage down first as [`unseal`] does: every absent object their closures reach
+/// is recorded, in one synced append, before any of them is stored, and the removals are appended
+/// after, in one. A crash between any two steps leaves each object absent and recorded with more
+/// recorded beneath it, or present and recorded, and both seal what they sealed before. Two
+/// refills of one object both store the same bytes and remove a record at most once, since each
+/// decides on the record re-read under the ref lock.
+///
+/// An object's children are judged by presence before anything is stored, so a child fetched in
+/// the same batch is recorded by the push-down and its record removed with the rest.
 ///
 /// A parcel's parents are recorded when absent, but not walked when present: the history they name
 /// is the parcel record's to hold.
 ///
 /// # Arguments
-/// * `_hold` - The caller's store-access hold, spanning the call, so nothing the push-down found
-///             present is deleted before the object lands above it.
-/// * `hash`  - The recorded object.
-/// * `bytes` - Its bytes, as the remote sent them: verified against `hash` here.
+/// * `_hold`   - The caller's store-access hold, spanning the call, so nothing the push-down found
+///               present is deleted before the objects land above it.
+/// * `objects` - Each recorded object's hash and its bytes, as the remote sent them: verified
+///               against the hash here.
 ///
 /// # Returns
-/// * `Ok(())`      - The object is in the store and the record no longer holds it.
-/// * `Err(String)` - If the bytes are not `hash`'s or do not parse, a present object beneath it
-///                   cannot be walked, or as [`append_locked`]. Before the store, nothing but
-///                   push-down records may have been written.
-pub fn refill(_hold: &impl StoreAccessHold, hash: &str, bytes: &[u8]) -> Result<(), String> {
-    object_utils::verify_object_bytes(hash, bytes)?;
-
+/// * `Ok(())`      - Every object is in the store and the record holds none of them.
+/// * `Err(String)` - If some bytes are not their object's or do not parse, a present object
+///                   beneath one cannot be walked, or as [`append_locked`]. Before the store,
+///                   nothing but push-down records may have been written.
+pub fn refill_all(_hold: &impl StoreAccessHold, objects: &[(&str, &[u8])]) -> Result<(), String> {
     // A tree or recipe child has a closure to walk when present; a leaf (an unchunked file, a
     // chunk, a parcel's parent) is only looked for, never read.
     let mut walked: Vec<String> = Vec::new();
     let mut leaves: Vec<String> = Vec::new();
 
-    match object_utils::peek_object_header(bytes)?.0 {
-        ObjectType::Tree => {
-            let tree = object_utils::parse_tree_bytes(hash, bytes)?;
+    for (hash, bytes) in objects {
+        object_utils::verify_object_bytes(hash, bytes)?;
 
-            for (_, file) in tree.get_files() {
-                if file.item_type.is_chunked() {
-                    walked.push(file.hash.clone());
-                } else {
-                    leaves.push(file.hash.clone());
+        match object_utils::peek_object_header(bytes)?.0 {
+            ObjectType::Tree => {
+                let tree = object_utils::parse_tree_bytes(hash, bytes)?;
+
+                for (_, file) in tree.get_files() {
+                    if file.item_type.is_chunked() {
+                        walked.push(file.hash.clone());
+                    } else {
+                        leaves.push(file.hash.clone());
+                    }
                 }
-            }
 
-            walked.extend(tree.get_subtrees().map(|(_, subtree)| subtree.hash.clone()));
+                walked.extend(tree.get_subtrees().map(|(_, subtree)| subtree.hash.clone()));
+            }
+            ObjectType::Recipe => {
+                let recipe = object_utils::parse_recipe_bytes(hash, bytes)?;
+                leaves.extend(recipe.chunks.into_iter().map(|chunk| chunk.hash));
+            }
+            ObjectType::Parcel => {
+                let parcel = object_utils::parse_parcel_bytes(hash, bytes)?;
+                walked.push(parcel.tree_hash);
+                leaves.extend(parcel.parents);
+            }
+            ObjectType::Blob | ObjectType::Chunk => {}
         }
-        ObjectType::Recipe => {
-            let recipe = object_utils::parse_recipe_bytes(hash, bytes)?;
-            leaves.extend(recipe.chunks.into_iter().map(|chunk| chunk.hash));
-        }
-        ObjectType::Parcel => {
-            let parcel = object_utils::parse_parcel_bytes(hash, bytes)?;
-            walked.push(parcel.tree_hash);
-            leaves.extend(parcel.parents);
-        }
-        ObjectType::Blob | ObjectType::Chunk => {}
     }
 
     let mut closed: HashSet<String> = HashSet::new();
@@ -886,12 +898,19 @@ pub fn refill(_hold: &impl StoreAccessHold, hash: &str, bytes: &[u8]) -> Result<
         })?;
     }
 
-    object_utils::store_object_bytes(hash, bytes)?;
+    for (hash, bytes) in objects {
+        object_utils::store_object_bytes(hash, bytes)?;
+    }
 
     let lock = RefLock::acquire()?;
 
     append_decided_locked(&lock, |set| {
-        Ok(set.contains(hash).then(|| (SealOp::Remove, hash.to_string())).into_iter().collect())
+        let mut written: HashSet<&str> = HashSet::new();
+
+        Ok(objects.iter()
+            .filter(|(hash, _)| set.contains(hash) && written.insert(hash))
+            .map(|(hash, _)| (SealOp::Remove, hash.to_string()))
+            .collect())
     })?;
 
     Ok(())

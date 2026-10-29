@@ -342,6 +342,14 @@ pub enum BatchOutcome {
     Degraded,
 }
 
+/// How [`RemoteClient::fetch_batch_as`] reads a batch's bundle.
+enum BatchRead {
+    /// Into the store.
+    Import,
+    /// To the receiver, object by object.
+    Deliver(Box<dyn FnMut(String, Vec<u8>) -> Result<(), String> + Send>),
+}
+
 /// Why the remote's batch download stopped being used, after which the command fetched one
 /// object at a time.
 // Read from `RemoteClient::batch_lane_closure` once the command's fetches are done. The lane
@@ -3578,6 +3586,21 @@ impl RemoteClient {
     /// is why their [`Self::describe_transport_error`] arms have to be told apart by wording — see
     /// that function's doc.
     pub async fn fetch_batch(&self, hashes: &[String]) -> Result<BatchOutcome, String> {
+        self.fetch_batch_as(hashes, BatchRead::Import).await
+    }
+
+    /// [`Self::fetch_batch`], handing each object the bundle carries to `deliver`, unverified,
+    /// instead of storing it: for a caller that must write something before each object lands.
+    /// An outcome's stats count the objects delivered as stored.
+    pub async fn fetch_batch_delivering(&self,
+                                        hashes: &[String],
+                                        deliver: impl FnMut(String, Vec<u8>) -> Result<(), String> + Send + 'static)
+                                        -> Result<BatchOutcome, String> {
+        self.fetch_batch_as(hashes, BatchRead::Deliver(Box::new(deliver))).await
+    }
+
+    /// [`Self::fetch_batch`], reading the bundle as `read` says.
+    async fn fetch_batch_as(&self, hashes: &[String], read: BatchRead) -> Result<BatchOutcome, String> {
         // Each hash is asked for once, and the response may carry nothing else (see
         // `StreamAdmission::Requested`).
         let mut requested: HashSet<String> = HashSet::new();
@@ -3623,7 +3646,16 @@ impl RemoteClient {
         }
 
         let admission = bundle_utils::StreamAdmission::Requested(requested);
-        let stats = self.import_response(response, "reading the batch response", body_posture, admission).await?;
+        let action = "reading the batch response";
+        let stats = match read {
+            BatchRead::Import => self.import_response(response, action, body_posture, admission).await?,
+            BatchRead::Deliver(deliver) => bundle_utils::ImportStats {
+                stored_objects: self.read_response(response, action, body_posture, move |body| {
+                    bundle_utils::read_streamed_bundle(body, admission, deliver)
+                }).await?,
+                ..Default::default()
+            },
+        };
 
         match cut.as_deref() {
             Some(value) if value == BATCH_CUT_DEADLINE.as_bytes() => {
@@ -3739,7 +3771,7 @@ impl RemoteClient {
     }
 
     /// Whether [`Self::fetch_batch`] is still worth asking, for this instance and every clone of it.
-    pub(crate) fn batch_lane_open(&self) -> bool {
+    pub fn batch_lane_open(&self) -> bool {
         self.batch_lane_closed.get().is_none()
     }
 
@@ -3836,16 +3868,27 @@ impl RemoteClient {
     ///   is armed only while the body is polled, so this never trips the client's own timeout; a
     ///   remote's idle timeout could, which is the price of not holding the bundle in memory.
     async fn import_response(&self,
-                             mut response: reqwest::Response,
+                             response: reqwest::Response,
                              action: &str,
                              posture: Posture,
                              admission: bundle_utils::StreamAdmission) -> Result<bundle_utils::ImportStats, String> {
+        self.read_response(response, action, posture, move |body| bundle_utils::import_streamed_bundle(body, admission)).await
+    }
+
+    /// [`Self::import_response`], with the body read by `read` on a blocking thread in this
+    /// thread's storage root.
+    async fn read_response<T: Send + 'static>(&self,
+                                              mut response: reqwest::Response,
+                                              action: &str,
+                                              posture: Posture,
+                                              read: impl FnOnce(std::io::BufReader<ChannelBody>) -> Result<T, String> + Send + 'static)
+                                              -> Result<T, String> {
         let (sender, receiver) = tokio::sync::mpsc::channel::<BodyPiece>(IMPORT_CHANNEL_DEPTH);
         let scope_root = globals::current_scope_root();
 
         let importer = tokio::task::spawn_blocking(move || {
             let _scope = scope_root.as_deref().map(StorageRootScope::enter);
-            bundle_utils::import_streamed_bundle(std::io::BufReader::new(ChannelBody::new(receiver)), admission)
+            read(std::io::BufReader::new(ChannelBody::new(receiver)))
         });
 
         let transferred: Result<(), String> = loop {

@@ -247,6 +247,7 @@ async fn lower_working_pallet(client: &RemoteClient,
     // again, finding the same).
     let (ops, removed_dirs) = shift_utils::diff_trees(local_tree.as_deref(), &remote_tree)?;
     alias_utils::refuse_collisions("Lowering", &shift_utils::collect_collisions(&ops, &removed_dirs)?)?;
+    shift_utils::ensure_writes_present(&ops)?;
 
     // Finished by `write_head_or_roll_back` once the bay is settled at one head or the other.
     let mut operation = Operation::new(

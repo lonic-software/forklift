@@ -684,6 +684,7 @@ fn put_back(from: &str, to: &str) -> Result<(), String> {
         FileOp::Remove { path } => (present(&path) && !off_from.contains(&path)).then_some(FileOp::Remove { path }),
     }).collect();
 
+    shift_utils::ensure_writes_present(&ops)?;
     shift_utils::apply_ops(&ops, &removed_dirs)
 }
 
