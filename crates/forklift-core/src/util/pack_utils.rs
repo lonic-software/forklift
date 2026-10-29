@@ -10895,7 +10895,7 @@ pub(crate) mod tests {
             assert!(refused.contains(&name), "{}: {}", what, refused);
 
             let aside = temp.join(&name);
-            std::fs::rename(&table, &aside).unwrap();
+            file_utils::rename(&table, &aside).unwrap();
             assert_eq!(sign_utils::load_raw_parcel_signature(&hash).unwrap(), None,
                 "{}: moved aside, its parcels read as unsigned", what);
 
