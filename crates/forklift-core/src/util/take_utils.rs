@@ -38,7 +38,7 @@ use crate::util::{file_utils, merge_utils, object_utils, record_utils};
 use crate::util::office_utils::{OfficeState, TrustAnchor};
 use crate::util::pallet_utils::{self, AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions};
 use crate::util::progress_utils::Progress;
-use crate::util::remote_utils::{self, HeadContent, RemoteClient};
+use crate::util::remote_utils::{self, RemoteClient};
 use crate::util::scope_utils::MaterializationScope;
 
 /// What a take is verified against.
@@ -266,8 +266,8 @@ async fn judge(client: Option<&RemoteClient>,
         // verdict says so.
         for boundary_head in &heads {
             let result = match at {
-                FetchAt::Warehouse => remote_utils::fetch_history_scoped(client, boundary_head, pallet, HeadContent::Recorded, &Progress::NONE).await,
-                FetchAt::Scope(scope) => remote_utils::fetch_history_at(client, boundary_head, pallet, scope, HeadContent::Recorded, &Progress::NONE).await,
+                FetchAt::Warehouse => remote_utils::fetch_history_scoped(client, boundary_head, pallet, &Progress::NONE).await,
+                FetchAt::Scope(scope) => remote_utils::fetch_history_at(client, boundary_head, pallet, scope, &Progress::NONE).await,
             };
 
             if let Err(error) = result {

@@ -4761,18 +4761,6 @@ pub async fn fetch_history_within(client: &RemoteClient,
     Ok(walk_history(client, head, roots, true, progress).await?.0)
 }
 
-/// What a fetch brings of its head's own content in a cache warehouse. In a full or sparse one both
-/// fetch the same: every walked parcel's content, or every walked parcel's content in scope.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum HeadContent {
-    /// The head is about to be checked out or merged into a bay, so a cache fetches its whole
-    /// closure as well as its history's parcels.
-    Whole,
-
-    /// The head's root tree is recorded like every other walked parcel's.
-    Recorded,
-}
-
 /// The bounded parcel walk of [`fetch_history_within`]: every parcel and signature from `head` down
 /// to what is already known complete, and with `content`, every walked parcel's closure as well.
 /// Without it, nothing below a parcel is fetched and the walked parcels' root trees are returned
@@ -4904,20 +4892,19 @@ async fn fetch_tree_closures(client: &RemoteClient,
 }
 
 /// A cache warehouse's fetch of `head`: the parcels and signatures of its history, bounded as
-/// [`fetch_history`] bounds them, and of their content only `head`'s own closure, and that only
-/// for [`HeadContent::Whole`]. Every other root tree the walk reaches that is absent is recorded in
-/// the sealed-object record ([`sealed_utils`]), synced, before this returns, so before any caller
-/// moves a ref onto the head: the ref gate finds each absent root recorded. A root already
-/// recorded is not recorded again, and one present seals nothing, so it is left out.
+/// [`fetch_history`] bounds them, and none of their content. Every root tree the walk reaches is
+/// recorded in the sealed-object record ([`sealed_utils`]) where it is absent, and where it is
+/// present so is every absent object beneath it, synced, before this returns, so before any
+/// caller moves a ref onto the head: the ref gate finds each absence recorded. A bay that checks
+/// the head out fetches its content with [`fetch_head_content`] first.
 ///
-/// The record's readers take no lock, and one may read while this appends. Each root recorded here
-/// belongs to a parcel the walk did not find known complete, so no local ref reaches it yet: a
-/// reader that misses the append judges nothing that leans on it.
+/// The record's readers take no lock, and one may read while this appends. Every object a local
+/// ref reaches is present or already recorded, so what this appends, absent and unrecorded, no
+/// local ref reaches yet: a reader that misses the append judges nothing that leans on it.
 ///
 /// # Arguments
-/// * `client`  - The remote.
-/// * `head`    - The parcel hash to fetch from.
-/// * `content` - Whether `head`'s own closure is fetched too.
+/// * `client` - The remote.
+/// * `head`   - The parcel hash to fetch from.
 ///
 /// # Returns
 /// * `Ok(FetchStats)` - What was actually transferred, and how many parcels were walked.
@@ -4925,28 +4912,41 @@ async fn fetch_tree_closures(client: &RemoteClient,
 ///                      Whatever transferred stays, and no ref has moved.
 pub async fn fetch_cache(client: &RemoteClient,
                          head: &str,
-                         content: HeadContent,
                          progress: &Progress) -> Result<FetchStats, String> {
-    let (mut stats, skipped_roots) = walk_history(client, head, &[], false, progress).await?;
+    let (stats, skipped_roots) = walk_history(client, head, &[], false, progress).await?;
 
-    // Walked or not: a head a ref already names may still have its root recorded, and a bay
-    // about to check it out needs it present.
-    if content == HeadContent::Whole {
+    sealed_utils::record_absences_under(&skipped_roots)?;
+
+    Ok(stats)
+}
+
+/// In a cache warehouse, fetch the whole closure of `head`'s root tree, for a bay about to check
+/// out or merge `head`; anywhere else nothing, since a user pallet's fetch already brought every
+/// in-scope object. `head` itself must be present, fetched with its history first.
+///
+/// The fetch that brought `head` recorded its root, and a ref may already reach that root while it
+/// is recorded and absent. Once the closure is present, the records of the trees and files it
+/// filled are removed, since a whole present closure needs none. Both steps are safe for the
+/// record's lock-free readers: a present object seals nothing whether it is recorded or not, so a
+/// reader judges it the same before, between and after.
+///
+/// # Arguments
+/// * `client` - The remote.
+/// * `head`   - The parcel whose content is fetched.
+///
+/// # Returns
+/// * `Ok(FetchStats)` - What was actually transferred.
+/// * `Err(String)`    - If the mode cannot be read, or a transfer or verification failed.
+pub async fn fetch_head_content(client: &RemoteClient,
+                                head: &str,
+                                progress: &Progress) -> Result<FetchStats, String> {
+    let mut stats = FetchStats::default();
+
+    if scope_utils::is_cache_mode()? {
         let root = object_utils::load_parcel(head)?.tree_hash;
-        fetch_tree_closures(client, vec![root], &mut ContentSeen::default(), &mut stats, progress).await?;
-    }
-
-    let mut absent: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-
-    for root in skipped_roots {
-        if seen.insert(root.clone()) && !file_utils::does_object_exist(&root)? {
-            absent.push(root);
-        }
-    }
-
-    if !absent.is_empty() {
-        sealed_utils::record_unrecorded(&absent)?;
+        let mut seen = ContentSeen::default();
+        fetch_tree_closures(client, vec![root], &mut seen, &mut stats, progress).await?;
+        sealed_utils::forget_filled(seen.trees.iter().chain(&seen.blobs))?;
     }
 
     Ok(stats)
@@ -4956,10 +4956,9 @@ pub async fn fetch_cache(client: &RemoteClient,
 /// [`fetch_history`].
 async fn fetch_unscoped(client: &RemoteClient,
                         head: &str,
-                        content: HeadContent,
                         progress: &Progress) -> Result<FetchStats, String> {
     if scope_utils::is_cache_mode()? {
-        fetch_cache(client, head, content, progress).await
+        fetch_cache(client, head, progress).await
     } else {
         fetch_history(client, head, progress).await
     }
@@ -4973,7 +4972,7 @@ async fn fetch_unscoped(client: &RemoteClient,
 /// keep routing through the unscoped [`fetch_history`], because their audit reads full content.
 ///
 /// A full warehouse delegates to [`fetch_history`] verbatim and records nothing, and a cache to
-/// [`fetch_cache`], which fetches `content` of the head and records the roots it skips. A full warehouse
+/// [`fetch_cache`], which fetches the parcels only and records the content it skips. A full warehouse
 /// never becomes sparse (`scope-prune` refuses one, and `franchise` writes a scope only into a new
 /// warehouse), so that check needs no lock.
 ///
@@ -4992,8 +4991,7 @@ async fn fetch_unscoped(client: &RemoteClient,
 /// # Arguments
 /// * `client` - The remote.
 /// * `head`   - The parcel hash to fetch from.
-/// * `pallet`  - The pallet the head is fetched for, as its wire name (recorded in the ledger).
-/// * `content` - In a cache, whether the head's own closure is fetched too.
+/// * `pallet` - The pallet the head is fetched for, as its wire name (recorded in the ledger).
 ///
 /// # Returns
 /// * `Ok(FetchStats)` - What was actually transferred, and how many parcels were walked.
@@ -5001,10 +4999,9 @@ async fn fetch_unscoped(client: &RemoteClient,
 pub async fn fetch_history_scoped(client: &RemoteClient,
                                   head: &str,
                                   pallet: &str,
-                                  content: HeadContent,
                                   progress: &Progress) -> Result<FetchStats, String> {
     if scope_utils::read_fetch_scope()?.is_full() {
-        return fetch_unscoped(client, head, content, progress).await;
+        return fetch_unscoped(client, head, progress).await;
     }
 
     fetch_recorded(head, pallet, async |scope: &MaterializationScope| {
@@ -5022,9 +5019,8 @@ pub async fn fetch_history_scoped(client: &RemoteClient,
 /// * `client` - The remote.
 /// * `head`   - The parcel hash to fetch from.
 /// * `pallet` - The pallet the head is fetched for, as its wire name.
-/// * `scope`   - The fetch scope to fetch at.
-/// * `content` - In a cache, whether the head's own closure is fetched too. A full scope in a
-///               warehouse whose mode on disk is cache fetches as [`fetch_cache`] does.
+/// * `scope`  - The fetch scope to fetch at. A full one in a warehouse whose mode on disk is
+///              cache fetches as [`fetch_cache`] does.
 ///
 /// # Returns
 /// * `Ok(FetchStats)` - What was actually transferred, and how many parcels were walked.
@@ -5033,10 +5029,9 @@ pub async fn fetch_history_at(client: &RemoteClient,
                               head: &str,
                               pallet: &str,
                               scope: &MaterializationScope,
-                              content: HeadContent,
                               progress: &Progress) -> Result<FetchStats, String> {
     if scope.is_full() {
-        return fetch_unscoped(client, head, content, progress).await;
+        return fetch_unscoped(client, head, progress).await;
     }
 
     {
@@ -5109,7 +5104,8 @@ fn ref_heads() -> Result<Vec<String>, String> {
 }
 
 impl FetchStats {
-    fn add(&mut self, other: &FetchStats) {
+    /// Add what `other` transferred and walked to these stats.
+    pub fn add(&mut self, other: &FetchStats) {
         self.fetched_objects += other.fetched_objects;
         self.fetched_signatures += other.fetched_signatures;
         self.walked_parcels += other.walked_parcels;
@@ -16812,7 +16808,7 @@ mod tests {
             sparse_main();
             let head = "c".repeat(64);
 
-            let error = runtime().block_on(fetch_history_scoped(&unreachable(), &head, "other", HeadContent::Recorded, &Progress::NONE));
+            let error = runtime().block_on(fetch_history_scoped(&unreachable(), &head, "other", &Progress::NONE));
 
             assert!(error.is_err(), "nothing serves the head");
             assert_eq!(fetch_ledger::read_ledger().unwrap(), vec![LedgerEntry { head, pallet: "other".to_string() }]);
@@ -16822,7 +16818,7 @@ mod tests {
         fn a_full_warehouse_records_nothing() {
             let _scratch = Scratch::new("ledger-full");
 
-            let _ = runtime().block_on(fetch_history_scoped(&unreachable(), &"c".repeat(64), "main", HeadContent::Recorded, &Progress::NONE));
+            let _ = runtime().block_on(fetch_history_scoped(&unreachable(), &"c".repeat(64), "main", &Progress::NONE));
 
             assert!(!globals::forklift_root().join("fetched-heads").exists());
         }

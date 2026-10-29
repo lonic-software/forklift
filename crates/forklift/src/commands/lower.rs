@@ -4,7 +4,7 @@ use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::model::operator::Operator;
 use forklift_core::util::meta_tree::{self, CellRead, Entry, KeepSide, MetaConflict, MetaSigner, PalletRules, ReplayError};
 use forklift_core::util::progress_utils::Progress;
-use forklift_core::util::remote_utils::{BatchLaneClosure, HeadContent, RemoteClient};
+use forklift_core::util::remote_utils::{BatchLaneClosure, RemoteClient};
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
     alias_utils, audit_utils, bay_utils, config_utils, file_utils, haul_utils, held_heads, kv_utils, merge_utils, object_utils,
@@ -89,7 +89,7 @@ pub async fn handle_command(pallet: Option<String>, expect: Option<String>, keep
         let mut verified = Vec::new();
 
         if let Some(remote_head) = info.pallets.get(target) {
-            remote_utils::fetch_history_scoped(&client, remote_head, target, HeadContent::Recorded, &progress).await?;
+            remote_utils::fetch_history_scoped(&client, remote_head, target, &progress).await?;
             take_utils::verify_take(Some(&client), &first_contact, remote_head, target, FetchAt::Warehouse).await?;
             verified.push(remote_head.as_str());
         }
@@ -208,11 +208,11 @@ async fn lower_working_pallet(client: &RemoteClient,
     ensure_warehouse_is_clean(local_tree.as_deref()).await?;
 
     // Path-pruned in a sparse warehouse (out-of-scope content stays sealed), whole in a full one
-    // — a full fetch scope makes this byte-identical to the unscoped fetch — and in a cache the
-    // parcels and the head's own content, which this lower checks out. The office and meta
-    // pallets synced above keep routing through the unscoped fetch, since their audit reads full
-    // content.
-    let stats = remote_utils::fetch_history_scoped(client, remote_head, &pallet, HeadContent::Whole, progress).await?;
+    // — a full fetch scope makes this byte-identical to the unscoped fetch — and in a cache only
+    // the parcels, whose content it records; the head's own is fetched below, once this lower is
+    // known to check it out. The office and meta pallets synced above keep routing through the
+    // unscoped fetch, since their audit reads full content.
+    let stats = remote_utils::fetch_history_scoped(client, remote_head, &pallet, progress).await?;
     report.fetched_objects = stats.fetched_objects;
     report.fetched_signatures = stats.fetched_signatures;
 
@@ -232,6 +232,10 @@ async fn lower_working_pallet(client: &RemoteClient,
     // heal's roll-forward of an interrupted one — carries the verdict's preconditions, so an office
     // or anchor change since rolls the take back rather than landing it.
     let preconditions = take_utils::verify_take(Some(client), &TakeTrust::local()?, remote_head, &pallet, FetchAt::Warehouse).await?;
+
+    // The content this lower checks out, verified first like the history it belongs to.
+    let content = remote_utils::fetch_head_content(client, remote_head, progress).await?;
+    report.fetched_objects += content.fetched_objects;
 
     let remote_tree = object_utils::load_parcel(remote_head)?.tree_hash;
 
@@ -349,7 +353,7 @@ async fn lower_named_pallet(client: &RemoteClient,
         return Ok(());
     }
 
-    let stats = remote_utils::fetch_history_scoped(client, remote_head, &pallet, HeadContent::Recorded, progress).await?;
+    let stats = remote_utils::fetch_history_scoped(client, remote_head, &pallet, progress).await?;
     report.fetched_objects = stats.fetched_objects;
     report.fetched_signatures = stats.fetched_signatures;
 

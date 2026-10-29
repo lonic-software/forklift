@@ -2752,7 +2752,8 @@ fn remedy_text(consultation: &RemoteConsultation) -> String {
 ///
 /// Best-effort and read/store-only throughout: a failure in any one pass, for one pallet, or for
 /// one hash in the targeted batches, never aborts the rest, and nothing here ever calls
-/// `update_pallet_head` or merges a pallet. Whether anything is actually recovered is decided
+/// `update_pallet_head` or merges a pallet. In a cache the user pallets' fetches also append to
+/// the sealed-object record what content they skip, as every cache fetch does; no ref moves. Whether anything is actually recovered is decided
 /// afterward, uniformly, by the caller's own recheck — never by this function's return value (§3.2
 /// D3, see the module doc comment); `RemoteConsultation` only ever feeds [`remedy_text`]'s wording.
 ///
@@ -2803,7 +2804,7 @@ async fn attempt_heal_driven_refetch(
             for (wire, remote_head) in &info.pallets {
                 let fetched = match (wire.strip_prefix(pallet_utils::META_QUALIFIER), &fetch_scope) {
                     (Some(_), _) => remote_utils::fetch_history(&client, remote_head, &Progress::NONE).await,
-                    (None, Ok(_)) => remote_utils::fetch_history_scoped(&client, remote_head, wire, remote_utils::HeadContent::Recorded, &Progress::NONE).await,
+                    (None, Ok(_)) => remote_utils::fetch_history_scoped(&client, remote_head, wire, &Progress::NONE).await,
                     (None, Err(reason)) => {
                         scope_failure = Some(reason.clone());
                         continue;

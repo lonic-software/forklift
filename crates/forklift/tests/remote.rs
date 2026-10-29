@@ -5532,8 +5532,8 @@ fn three_signed_parcels(area: &TestArea) -> (Server, String) {
 /// root, so the fixture's roots are distinct and absent only because the cache skipped them.
 ///
 /// Revert: push each parcel's root into the cache walk's tree frontier → the older roots are
-/// present and the record is empty; skip the record → the franchise's ref write is refused; fetch
-/// the tip as `Recorded` → nothing is checked out.
+/// present and the record is empty; skip the record → the franchise's ref write is refused; skip
+/// the tip's content fetch → nothing is checked out.
 #[test]
 fn a_cache_franchise_holds_the_parcels_and_its_tip_and_records_the_rest() {
     let area = TestArea::new("cache-fetch");
@@ -5591,7 +5591,7 @@ fn a_cache_franchise_holds_the_parcels_and_its_tip_and_records_the_rest() {
 /// `lower` in a cache checks out the remote's new head, so it fetches that head's whole closure and
 /// records the root of every other new parcel; the root of the tip it moved from stays held.
 ///
-/// Revert: lower's own fetch as `Recorded` → the checkout fails on the new head's absent root.
+/// Revert: skip lower's content fetch → the checkout fails on the new head's absent root.
 #[test]
 fn a_cache_lower_fetches_the_new_tip_and_records_what_it_skips() {
     let area = TestArea::new("cache-lower");
@@ -5642,22 +5642,14 @@ fn a_cache_fetch_records_before_it_returns() {
     assert_success(&area.forklift("a", &["lift"]));
     let new_head = pallet_head(&area, "server-root", "main");
 
-    {
-        // A current-thread runtime: the fetch spawns its transfers, and the storage scope is a
-        // thread-local, so the tasks must stay on this thread.
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("cached"));
-        let client = forklift_core::util::remote_utils::RemoteClient::new(&server.url, None).unwrap();
+    cache_fetch_in_process(&area, "cached", &server.url, &new_head);
 
-        runtime.block_on(forklift_core::util::remote_utils::fetch_history_scoped(
-            &client, &new_head, "main", forklift_core::util::remote_utils::HeadContent::Recorded, &Progress::NONE,
-        )).expect("fetch");
-
-        let new_root = forklift_core::util::object_utils::load_parcel(&new_head).unwrap().tree_hash;
-        assert!(!forklift_core::util::file_utils::does_object_exist(&new_root).unwrap(), "a recorded head's root is not fetched");
-        assert!(forklift_core::util::sealed_utils::read_sealed().unwrap().contains(&new_root),
-            "the root is recorded when the fetch returns");
-    }
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("cached"));
+    let new_root = forklift_core::util::object_utils::load_parcel(&new_head).unwrap().tree_hash;
+    assert!(!forklift_core::util::file_utils::does_object_exist(&new_root).unwrap(), "a recorded head's root is not fetched");
+    assert!(forklift_core::util::sealed_utils::read_sealed().unwrap().contains(&new_root),
+        "the root is recorded when the fetch returns");
+    drop(_scope);
 
     assert_eq!(pallet_head(&area, "cached", "main"), old_head, "the fetch moves no ref");
 }
@@ -5665,7 +5657,7 @@ fn a_cache_fetch_records_before_it_returns() {
 /// A lift from a cache onto a diverged remote auto-merges: the merge reads the remote head's tree,
 /// so the fetch before it brings that head's whole closure, and the merged parcel lifts.
 ///
-/// Revert: the auto-merge's fetch as `Recorded` → the merge cannot read the remote's tree.
+/// Revert: skip the auto-merge's content fetch → the merge cannot read the remote's tree.
 #[test]
 fn a_cache_lift_auto_merges_a_diverged_remote() {
     let area = TestArea::new("cache-auto-merge");
@@ -5689,6 +5681,105 @@ fn a_cache_lift_auto_merges_a_diverged_remote() {
     let their_root = history_with_roots(&area, "cached", &theirs)[0].1.clone();
     assert!(closure_present(&area, "cached", &their_root), "the merged-in head's closure is held");
     assert_success(&area.forklift("cached", &["audit"]));
+}
+
+/// Fetch `head` into `directory` in-process, as a cache fetch that no ref write follows.
+fn cache_fetch_in_process(area: &TestArea, directory: &str, url: &str, head: &str) {
+    // A current-thread runtime: the fetch spawns its transfers, and the storage scope is a
+    // thread-local, so the tasks must stay on this thread.
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path(directory));
+    let client = forklift_core::util::remote_utils::RemoteClient::new(url, None).unwrap();
+
+    runtime.block_on(forklift_core::util::remote_utils::fetch_history_scoped(&client, head, "main", &Progress::NONE))
+        .expect("fetch");
+}
+
+/// The parcel of the remote's head can already be in a cache with its root only recorded, when a
+/// fetch that checked nothing out brought it. A lift that auto-merges that head still fetches its
+/// content, since the merge reads it.
+///
+/// Revert: fetch the head's content only when its parcel is absent → the merge cannot read the
+/// remote's tree.
+#[test]
+fn a_cache_auto_merge_fetches_a_held_parcels_content() {
+    let area = TestArea::new("cache-merge-held");
+    let (server, _) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+
+    area.write_file("a/from_a.txt", "a\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "a's file"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    let theirs = pallet_head(&area, "server-root", "main");
+
+    cache_fetch_in_process(&area, "cached", &server.url, &theirs);
+    let their_root = history_with_roots(&area, "cached", &theirs)[0].1.clone();
+    assert!(!object_held(&area, "cached", &their_root), "the fixture holds their parcel without its root");
+
+    area.write_file("cached/from_cache.txt", "cache\n");
+    assert_success(&area.forklift("cached", &["load", "."]));
+    assert_success(&area.forklift("cached", &["stack", "the cache's file"]));
+    let lifted = area.forklift("cached", &["lift"]);
+    assert_success(&lifted);
+    assert!(stdout(&lifted).contains("auto-merged"), "{}", stdout(&lifted));
+    assert_eq!(area.read_file("cached/from_a.txt"), "a\n");
+    assert!(closure_present(&area, "cached", &their_root), "the merged-in head's closure is held");
+}
+
+/// A `lower` that finds the remote diverged checks nothing out, so a cache fetches none of the
+/// remote head's content for it: the root stays recorded.
+///
+/// Revert: fetch the head's content before the ancestry checks → the refused lower leaves the
+/// remote head's root held.
+#[test]
+fn a_refused_cache_lower_fetches_no_content() {
+    let area = TestArea::new("cache-lower-diverged");
+    let (server, _) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+
+    area.write_file("a/from_a.txt", "a\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "a's file"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    let theirs = pallet_head(&area, "server-root", "main");
+
+    area.write_file("cached/from_cache.txt", "cache\n");
+    assert_success(&area.forklift("cached", &["load", "."]));
+    assert_success(&area.forklift("cached", &["stack", "the cache's file"]));
+    let lowered = area.forklift("cached", &["lower"]);
+    assert!(!lowered.status.success(), "a diverged lower is refused: {}", stdout(&lowered));
+
+    let their_root = history_with_roots(&area, "cached", &theirs)[0].1.clone();
+    assert!(!object_held(&area, "cached", &their_root), "the refused lower fetched no content");
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("cached"));
+    assert!(forklift_core::util::sealed_utils::read_sealed().unwrap().contains(&their_root), "the root is recorded instead");
+}
+
+/// A root can be present while objects beneath it are absent, when a fetch of its closure stopped
+/// partway. Recording what a fetch skips then records those absences, not the root.
+///
+/// Revert: record only absent roots → the record lacks the absent subtree.
+#[test]
+fn recording_a_present_root_records_what_is_absent_beneath_it() {
+    let area = TestArea::new("cache-record-beneath");
+    let (server, head) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("cached"));
+    let root = forklift_core::util::object_utils::load_parcel(&head).unwrap().tree_hash;
+    let subtree = forklift_core::util::object_utils::load_tree(&root).unwrap().get_subtrees()
+        .map(|(_, subtree)| subtree.hash.clone()).next().expect("the fixture's root has a subdirectory");
+
+    let loose = area.path(&format!("cached/.forklift/objects/{}/{}", &subtree[0..2], &subtree[2..]));
+    std::fs::remove_file(&loose).expect("the subtree is loose");
+    assert!(!forklift_core::util::file_utils::does_object_exist(&subtree).unwrap());
+    assert!(!forklift_core::util::sealed_utils::read_sealed().unwrap().contains(&subtree));
+
+    forklift_core::util::sealed_utils::record_absences_under(&[root.clone(), root.clone()]).unwrap();
+    let after = forklift_core::util::sealed_utils::read_sealed().unwrap();
+    assert!(after.contains(&subtree), "the absent subtree is recorded");
+    assert!(!after.contains(&root), "the present root is not");
 }
 
 #[test]
