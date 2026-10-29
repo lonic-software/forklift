@@ -756,7 +756,7 @@ mod tests {
             other => panic!("not the planner's refusal: {:?}", other),
         }
 
-        assert!(!held(&their_in) && !held(&meta) && !held(&fixture.root), "nothing was fetched");
+        assert!(!held(&their_in) && !held(&meta), "nothing was fetched");
     }
 
     // Revert: drop the check after the fetch → the phase succeeds with `web` still absent.

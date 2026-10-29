@@ -122,10 +122,11 @@ fn diff_directory(from: Option<&TreeItem>,
                   plan: &mut Plan,
                   aliased: bool,
                   scope: &MaterializationScope) -> Result<(), String> {
-    // Hoisted once per directory (not per entry): a full (unscoped) scope always classifies
-    // everything in scope, so on the hot, common full-bay path the scope checks below are
-    // pure overhead — short-circuit them away entirely, the same way `stack_parcel` gates the
-    // whole overlay on `is_full()`.
+    // Hoisted once per directory (not per entry) for the file loops: a full (unscoped) scope
+    // always classifies everything in scope, so on the hot, common full-bay path their scope
+    // checks are pure overhead — short-circuit them away entirely, the same way `stack_parcel`
+    // gates the whole overlay on `is_full()`. The subtree loops ask `diff_descends`, the rule
+    // the presence walk shares.
     let scope_is_full = scope.is_full();
 
     let from_files: BTreeMap<&String, &TreeItem> = from
