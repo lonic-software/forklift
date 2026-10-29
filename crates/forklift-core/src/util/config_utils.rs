@@ -95,6 +95,10 @@ pub const KEY_MAINTENANCE_LOOSE: &str = "maintenance.loose";
 /// The pack count above which background maintenance consolidates the packs (default 20).
 pub const KEY_MAINTENANCE_PACKS: &str = "maintenance.packs";
 
+/// The count of signature tables below the size bound above which background maintenance
+/// merges them (default 20).
+pub const KEY_MAINTENANCE_SIGNATURE_TABLES: &str = "maintenance.signatureTables";
+
 /// The git remote `forklift mirror` pushes the mirrored pallets to (§9.8). Unset, nothing is
 /// mirrored.
 pub const KEY_MIRROR_URL: &str = "mirror.url";
@@ -178,7 +182,8 @@ pub fn parse_mirror_pallets(value: &str) -> Result<Vec<String>, String> {
     Ok(pallets)
 }
 
-/// What a [`KEY_MAINTENANCE_LOOSE`] or [`KEY_MAINTENANCE_PACKS`] value means: a whole,
+/// What a [`KEY_MAINTENANCE_LOOSE`], [`KEY_MAINTENANCE_PACKS`] or
+/// [`KEY_MAINTENANCE_SIGNATURE_TABLES`] value means: a whole,
 /// non-negative count. Surrounding whitespace is ignored.
 ///
 /// A value that is not a count is refused, not replaced by the default — `loose = "10k"` was
@@ -201,10 +206,10 @@ pub fn parse_maintenance_threshold(key: &str, value: &str) -> Result<usize, Stri
 
 /// The configuration keys Forklift understands, in `section.key` form.
 /// Setting a key outside this list is rejected (it would silently do nothing).
-pub const KNOWN_KEYS: [&str; 13] = [
+pub const KNOWN_KEYS: [&str; 14] = [
     KEY_OPERATOR_IDENTIFIER, KEY_OPERATOR_PROFILE, KEY_REMOTE_URL, KEY_REMOTE_TOKEN,
     KEY_REMOTE_ORIGIN, KEY_REMOTE_TOR, KEY_REMOTE_TOR_PROXY, KEY_MAINTENANCE_AUTO, KEY_MAINTENANCE_LOOSE,
-    KEY_MAINTENANCE_PACKS, KEY_MIRROR_URL, KEY_MIRROR_PALLETS, KEY_MIRROR_AUTO,
+    KEY_MAINTENANCE_PACKS, KEY_MAINTENANCE_SIGNATURE_TABLES, KEY_MIRROR_URL, KEY_MIRROR_PALLETS, KEY_MIRROR_AUTO,
 ];
 
 /// The global-config section that holds the named profiles (`[profile.<name>]`).
@@ -275,6 +280,8 @@ pub struct MaintenanceSection {
     pub loose: Option<String>,
     /// [`KEY_MAINTENANCE_PACKS`].
     pub packs: Option<String>,
+    /// [`KEY_MAINTENANCE_SIGNATURE_TABLES`].
+    pub signature_tables: Option<String>,
 }
 
 /// The `[mirror]` section of a [`ConfigFile`].
@@ -332,6 +339,7 @@ impl ConfigFile {
             KEY_MAINTENANCE_AUTO    => &self.maintenance.auto,
             KEY_MAINTENANCE_LOOSE   => &self.maintenance.loose,
             KEY_MAINTENANCE_PACKS   => &self.maintenance.packs,
+            KEY_MAINTENANCE_SIGNATURE_TABLES => &self.maintenance.signature_tables,
             KEY_MIRROR_URL          => &self.mirror.url,
             KEY_MIRROR_PALLETS      => &self.mirror.pallets,
             KEY_MIRROR_AUTO         => &self.mirror.auto,
@@ -368,6 +376,7 @@ impl ConfigFile {
             KEY_MAINTENANCE_AUTO    => &mut self.maintenance.auto,
             KEY_MAINTENANCE_LOOSE   => &mut self.maintenance.loose,
             KEY_MAINTENANCE_PACKS   => &mut self.maintenance.packs,
+            KEY_MAINTENANCE_SIGNATURE_TABLES => &mut self.maintenance.signature_tables,
             KEY_MIRROR_URL          => &mut self.mirror.url,
             KEY_MIRROR_PALLETS      => &mut self.mirror.pallets,
             KEY_MIRROR_AUTO         => &mut self.mirror.auto,
@@ -1093,7 +1102,9 @@ fn validate_value(key: &str, value: &str) -> Result<(), String> {
         KEY_MAINTENANCE_AUTO | KEY_MIRROR_AUTO => { parse_switch(key, value)?; }
         KEY_MIRROR_PALLETS => { parse_mirror_pallets(value)?; }
         KEY_MIRROR_URL => { parse_mirror_url(value)?; }
-        KEY_MAINTENANCE_LOOSE | KEY_MAINTENANCE_PACKS => { parse_maintenance_threshold(key, value)?; }
+        KEY_MAINTENANCE_LOOSE | KEY_MAINTENANCE_PACKS | KEY_MAINTENANCE_SIGNATURE_TABLES => {
+            parse_maintenance_threshold(key, value)?;
+        }
         _ => {}
     }
 
@@ -1157,7 +1168,7 @@ fn storable_value(key: &str, value: &str) -> String {
         KEY_MAINTENANCE_AUTO | KEY_MIRROR_AUTO => value.trim().to_ascii_lowercase(),
         KEY_MIRROR_PALLETS => parse_mirror_pallets(value)
             .map_or_else(|_| value.to_string(), |pallets| pallets.join(",")),
-        KEY_MAINTENANCE_LOOSE | KEY_MAINTENANCE_PACKS => parse_maintenance_threshold(key, value)
+        KEY_MAINTENANCE_LOOSE | KEY_MAINTENANCE_PACKS | KEY_MAINTENANCE_SIGNATURE_TABLES => parse_maintenance_threshold(key, value)
             .map_or_else(|_| value.to_string(), |count| count.to_string()),
         _ => value.to_string(),
     }
@@ -1550,6 +1561,7 @@ mod tests {
                 KEY_MIRROR_PALLETS => "main,feat".to_string(),
                 KEY_MAINTENANCE_LOOSE => "6701".to_string(),
                 KEY_MAINTENANCE_PACKS => "21".to_string(),
+                KEY_MAINTENANCE_SIGNATURE_TABLES => "22".to_string(),
                 _ => format!("value-of-{}", key),
             };
 
@@ -1828,7 +1840,7 @@ mod tests {
             assert!(parse_switch(KEY_MAINTENANCE_AUTO, typo).is_err(), "the reader must refuse {typo:?} too");
         }
 
-        for key in [KEY_MAINTENANCE_LOOSE, KEY_MAINTENANCE_PACKS] {
+        for key in [KEY_MAINTENANCE_LOOSE, KEY_MAINTENANCE_PACKS, KEY_MAINTENANCE_SIGNATURE_TABLES] {
             assert_eq!(parse_maintenance_threshold(key, " 6700 "), Ok(6700));
             assert_eq!(parse_maintenance_threshold(key, "0"), Ok(0));
             assert!(validate_value(key, "20").is_ok());

@@ -58,6 +58,31 @@ pub(crate) struct StoreReport {
     /// answer fails naming the version. Re-create the warehouse with this build; moving one aside
     /// would make its objects read as missing. Empty on a healthy store.
     foreign_version_indexes: Vec<PackIndexIssue>,
+    /// Signature tables: parcel signatures packed many to a file.
+    signature_tables: usize,
+    /// Of `signature_tables`, how many are below the size bound, so a compaction would merge them.
+    partial_signature_tables: usize,
+    /// Loose signature files a compaction would move into a table.
+    loose_signatures: usize,
+    /// Signature tables that cannot be read: every signature lookup one might answer fails naming
+    /// it. `error` says what to do, which depends on the cause. Empty on a healthy store.
+    unreadable_signature_tables: Vec<PackIndexIssue>,
+    /// Loose signature files a compaction leaves loose: each differs from the signature already in
+    /// a table for its parcel (the tabled one is what reads return), or is malformed. Empty on a
+    /// healthy store.
+    signature_conflicts: Vec<SignatureConflictIssue>,
+}
+
+/// One entry in [`StoreReport::signature_conflicts`].
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct SignatureConflictIssue {
+    /// The parcel the file signs.
+    parcel: String,
+    /// The file's path.
+    sidecar_path: String,
+    /// Why a compaction leaves it loose.
+    reason: String,
 }
 
 /// One entry in any of [`StoreReport`]'s pack problem lists.
@@ -95,6 +120,9 @@ pub(crate) struct Maintenance {
     loose_threshold: usize,
     /// Pack-count above which a consolidating repack is due (`maintenance.packs`).
     pack_threshold: usize,
+    /// Count of signature tables below the size bound above which an incremental compaction is
+    /// due, to merge them (`maintenance.signatureTables`).
+    signature_table_threshold: usize,
     /// Whether an incremental compaction is due now.
     compaction_due: bool,
     /// Whether a consolidating repack is due now.
@@ -121,6 +149,7 @@ impl From<StoreStatus> for StoreReport {
                 auto: status.auto_enabled,
                 loose_threshold: status.loose_threshold,
                 pack_threshold: status.pack_threshold,
+                signature_table_threshold: status.signature_table_threshold,
                 compaction_due: status.incremental_due,
                 repack_due: status.repack_due,
             },
@@ -140,6 +169,18 @@ impl From<StoreStatus> for StoreReport {
             foreign_version_indexes: status.foreign_version_indexes.into_iter().map(|p| PackIndexIssue {
                 index_path: p.index_path,
                 error: p.error,
+            }).collect(),
+            signature_tables: status.signature_tables,
+            partial_signature_tables: status.partial_signature_tables,
+            loose_signatures: status.loose_signatures,
+            unreadable_signature_tables: status.unreadable_signature_tables.into_iter().map(|p| PackIndexIssue {
+                index_path: p.index_path,
+                error: p.error,
+            }).collect(),
+            signature_conflicts: status.signature_conflicts.into_iter().map(|c| SignatureConflictIssue {
+                parcel: c.parcel,
+                sidecar_path: c.sidecar_path,
+                reason: c.reason,
             }).collect(),
         }
     }
@@ -172,14 +213,32 @@ impl CommandOutput for StoreReport {
             percent_packed,
         );
         println!("  total:   {} on disk", human_bytes(self.total_bytes));
+        if self.signature_tables > 0 || self.loose_signatures > 0 {
+            println!(
+                "  signatures: {} table{} ({} below the size bound), {} loose",
+                self.signature_tables,
+                plural(self.signature_tables),
+                self.partial_signature_tables,
+                self.loose_signatures,
+            );
+        }
         println!();
 
         let m = &self.maintenance;
         println!("  maintenance: auto {}", if m.auto { "on" } else { "off" });
-        println!(
-            "    compaction  {}",
-            verdict(m.compaction_due, self.loose_objects, m.loose_threshold, "loose objects"),
-        );
+        let (loose, noun) = if self.loose_signatures > 0 {
+            (self.loose_objects + self.loose_signatures, "loose objects and signatures")
+        } else {
+            (self.loose_objects, "loose objects")
+        };
+        if self.partial_signature_tables > m.signature_table_threshold {
+            println!(
+                "    compaction  {}",
+                verdict(true, self.partial_signature_tables, m.signature_table_threshold, "small signature tables"),
+            );
+        } else {
+            println!("    compaction  {}", verdict(m.compaction_due, loose, m.loose_threshold, noun));
+        }
         println!(
             "    repack      {}",
             verdict(m.repack_due, self.pack_files, m.pack_threshold, "packs"),
@@ -216,6 +275,20 @@ impl CommandOutput for StoreReport {
                 an index of another format means re-creating the warehouse with this build (moving \
                 it aside would make its objects read as missing)."
             );
+        }
+
+        if !self.unreadable_signature_tables.is_empty() || !self.signature_conflicts.is_empty() {
+            println!();
+            println!("  signature problems:");
+            for issue in &self.unreadable_signature_tables {
+                println!("    unreadable table:  {}", issue.error);
+            }
+            for conflict in &self.signature_conflicts {
+                println!(
+                    "    left loose:        \"{}\" (parcel {}) — {}",
+                    conflict.sidecar_path, conflict.parcel, conflict.reason
+                );
+            }
         }
     }
 }

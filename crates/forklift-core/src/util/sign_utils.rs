@@ -6,7 +6,7 @@ use argon2::Argon2;
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use crate::util::file_utils;
+use crate::util::{file_utils, pack_utils};
 
 /// The environment variable that overrides the private key directory. Its main purpose
 /// is to keep tests away from the developer's real keys (like `FORKLIFT_GLOBAL_CONFIG`).
@@ -500,15 +500,19 @@ fn get_signature_path(parcel_hash: &str) -> Result<PathBuf, String> {
 
 /// Write a parcel's signature sidecar (atomically). The signature lives *next to* the
 /// parcel object, never inside it: the parcel hash covers the full object (§4.4), so the
-/// signature over that hash cannot be part of the hashed content.
+/// signature over that hash cannot be part of the hashed content. A later `compact` sweeps the
+/// sidecar into a signature table.
+///
+/// A parcel has at most one signature: storing the one it already carries, in a sidecar or a
+/// table, is a no-op, and storing a different one is refused.
 ///
 /// # Arguments
 /// * `parcel_hash` - The hash of the signed parcel.
 /// * `signature`   - The signature to store.
 ///
 /// # Returns
-/// * `Ok(())`      - If the sidecar was written.
-/// * `Err(String)` - If it could not be written.
+/// * `Ok(())`      - If the sidecar was written, or the parcel already carried this signature.
+/// * `Err(String)` - If the parcel carries a different signature, or the write failed.
 pub fn store_parcel_signature(parcel_hash: &str,
                               signature: &ParcelSignature) -> Result<(), String> {
     let mut content: Vec<u8> = Vec::new();
@@ -519,9 +523,7 @@ pub fn store_parcel_signature(parcel_hash: &str,
     content.extend(crate::util::byte_utils::number_to_vlq_bytes(signature.signature.len() as u64));
     content.extend(&signature.signature);
 
-    let path = get_signature_path(parcel_hash)?;
-
-    file_utils::write_file_atomically(&path, &content)
+    store_signature_once(parcel_hash, &content)
 }
 
 /// Read a parcel's signature sidecar.
@@ -540,17 +542,44 @@ pub fn load_parcel_signature(parcel_hash: &str) -> Result<Option<ParcelSignature
     }
 }
 
-/// Read the raw bytes of a parcel's signature sidecar (the transfer form — see
-/// `docs/format/PARCEL_SIGNATURE_FORMAT.md`).
+/// Read the raw bytes of a parcel's signature (the transfer form — see
+/// `docs/format/PARCEL_SIGNATURE_FORMAT.md`), from a signature table or a loose sidecar: both
+/// hold the same bytes.
+///
+/// The tables are searched first, then the sidecar. Only when both miss is the cached table set
+/// revalidated against the pack folder and searched again: a compaction publishes a table before
+/// it deletes the sidecars it replaces, so a reader that saw the sidecar gone finds the table.
+/// A table that cannot be read never reads as "unsigned": if one might hold the signature, the
+/// lookup fails naming it.
 ///
 /// # Arguments
 /// * `parcel_hash` - The hash of the parcel.
 ///
 /// # Returns
-/// * `Ok(Some(Vec<u8>))` - The sidecar bytes.
-/// * `Ok(None)`          - If the parcel has no signature sidecar.
-/// * `Err(String)`       - If the sidecar could not be read.
+/// * `Ok(Some(Vec<u8>))` - The signature bytes.
+/// * `Ok(None)`          - If the parcel has no signature.
+/// * `Err(String)`       - If the sidecar could not be read, or an unreadable table might hold
+///                         the signature.
 pub fn load_raw_parcel_signature(parcel_hash: &str) -> Result<Option<Vec<u8>>, String> {
+    if let pack_utils::TabledSignature::Found(bytes) = pack_utils::tabled_signature(parcel_hash, false)? {
+        return Ok(Some(bytes));
+    }
+
+    if let Some(bytes) = load_loose_signature(parcel_hash)? {
+        return Ok(Some(bytes));
+    }
+
+    match pack_utils::tabled_signature(parcel_hash, true)? {
+        pack_utils::TabledSignature::Found(bytes) => Ok(Some(bytes)),
+        pack_utils::TabledSignature::Missing => Ok(None),
+        pack_utils::TabledSignature::Unreadable(message) => Err(format!(
+            "The signature of parcel {} cannot be read: {}", parcel_hash, message
+        )),
+    }
+}
+
+/// Read a parcel's loose signature sidecar only.
+fn load_loose_signature(parcel_hash: &str) -> Result<Option<Vec<u8>>, String> {
     let path = get_signature_path(parcel_hash)?;
 
     match std::fs::read(&path) {
@@ -564,7 +593,8 @@ pub fn load_raw_parcel_signature(parcel_hash: &str) -> Result<Option<Vec<u8>>, S
 
 /// Store raw signature sidecar bytes received from elsewhere (a remote or a bundle).
 /// The bytes are validated structurally before the write. A signature is immutable:
-/// re-storing identical bytes is a no-op, a conflicting sidecar is refused.
+/// re-storing identical bytes is a no-op, and a different signature, in a sidecar or a
+/// signature table, is refused.
 ///
 /// # Arguments
 /// * `parcel_hash` - The hash of the signed parcel.
@@ -576,6 +606,12 @@ pub fn load_raw_parcel_signature(parcel_hash: &str) -> Result<Option<Vec<u8>>, S
 pub fn store_raw_parcel_signature(parcel_hash: &str, bytes: &[u8]) -> Result<(), String> {
     parse_parcel_signature(bytes, parcel_hash)?;
 
+    store_signature_once(parcel_hash, bytes)
+}
+
+/// Write `bytes` as `parcel_hash`'s loose sidecar unless the parcel already carries a signature
+/// in either layer: identical bytes are a no-op, different ones are refused.
+fn store_signature_once(parcel_hash: &str, bytes: &[u8]) -> Result<(), String> {
     if let Some(existing) = load_raw_parcel_signature(parcel_hash)? {
         if existing == bytes {
             return Ok(());

@@ -44,9 +44,10 @@ use crate::util::{
     audit_utils, bundle_utils, byte_utils, delta_utils, fanout_utils, file_utils, graph_utils,
     lock_utils, object_utils, pallet_utils, sign_utils,
 };
+use crate::util::signature_table::{self, SignatureTable, SIGNATURE_TABLE_EXTENSION};
 
 /// The folder under the object store that holds packs.
-const PACK_FOLDER_NAME: &str = "pack";
+pub(crate) const PACK_FOLDER_NAME: &str = "pack";
 
 /// The extension of a pack's data file (concatenated object blobs). `pub(crate)` so the
 /// durability-taint recovery walk (`recovery_utils`) can recognize a recorded taint path as a
@@ -148,6 +149,10 @@ const AUTO_LOOSE_THRESHOLD: usize = 6700;
 /// Pack count above which a background consolidating repack is due.
 const AUTO_PACK_THRESHOLD: usize = 20;
 
+/// Count of signature tables below the bound above which a background incremental compaction is
+/// due, to merge them (FORK-333). Full tables never count: there is nothing to merge them into.
+const AUTO_SIGNATURE_TABLE_THRESHOLD: usize = 20;
+
 /// The maintenance a warehouse is due for — decided cheaply by [`auto_compaction_action`].
 pub enum AutoCompaction {
     /// Nothing to do.
@@ -177,9 +182,15 @@ pub fn auto_compaction_action() -> Result<AutoCompaction, String> {
     // Thresholds are configurable (like git's gc.auto / gc.autoPackLimit) but default sensibly.
     let loose_threshold = config_threshold(config_utils::KEY_MAINTENANCE_LOOSE, AUTO_LOOSE_THRESHOLD)?;
     let pack_threshold = config_threshold(config_utils::KEY_MAINTENANCE_PACKS, AUTO_PACK_THRESHOLD)?;
+    let table_threshold = config_threshold(config_utils::KEY_MAINTENANCE_SIGNATURE_TABLES, AUTO_SIGNATURE_TABLE_THRESHOLD)?;
 
-    // Loose objects have accumulated → pack them.
+    // Loose objects or signatures have accumulated → pack them.
     if estimate_loose_count()? > loose_threshold {
+        return Ok(AutoCompaction::Incremental);
+    }
+
+    // Small signature tables have accumulated → merge them.
+    if count_partial_signature_tables(table_threshold)? > table_threshold {
         return Ok(AutoCompaction::Incremental);
     }
 
@@ -268,6 +279,23 @@ pub struct StoreStatus {
     /// than reporting the object absent. Moving one aside would make its objects read as missing;
     /// the remedy is re-creating the warehouse with this build. Empty on a healthy store.
     pub foreign_version_indexes: Vec<PackIndexProblem>,
+    /// Signature tables that read in full (FORK-333).
+    pub signature_tables: usize,
+    /// Of `signature_tables`, how many are below the size bound, so a compaction would merge them.
+    pub partial_signature_tables: usize,
+    /// The effective `maintenance.signatureTables` threshold.
+    pub signature_table_threshold: usize,
+    /// Loose signature sidecars a compaction would move into a table. Counted toward the loose
+    /// threshold with `loose_objects`.
+    pub loose_signatures: usize,
+    /// Signature tables that cannot be read. Unlike a broken pack index, each one fails every
+    /// signature lookup it might answer, by name; `error` names the remedy its cause calls for.
+    /// Empty on a healthy store.
+    pub unreadable_signature_tables: Vec<PackIndexProblem>,
+    /// Loose signature sidecars a compaction leaves loose: each differs from the signature already
+    /// tabled for its parcel (the tabled one is what reads return), or is malformed. Empty on a
+    /// healthy store.
+    pub signature_conflicts: Vec<SignatureConflict>,
 }
 
 /// Take an exact, read-only census of the object store: how many objects are loose vs packed,
@@ -291,7 +319,32 @@ pub fn store_status() -> Result<StoreStatus, String> {
     // orphaned or unparseable pack pair never fails this census (FORK-47, DESIGN.html §3.1.1) —
     // the problem lists are surfaced below instead. The load validates every index in full, so a
     // pack with a corrupt bucket is listed as damaged rather than counted.
-    let PackSet { packs: loaded, quarantined, unenumerable, damaged, .. } = load_packs_from_disk(&pack_folder(), IndexCheck::Full)?;
+    let set = load_packs_from_disk(&pack_folder(), IndexCheck::Full)?;
+
+    // Signatures: what a compaction would do with each loose sidecar, judged against the tables
+    // this census loaded and checked in full.
+    let mut loose_signatures = 0;
+    let mut signature_conflicts = Vec::new();
+    for (hash, path) in list_signature_sidecars(Path::new(&file_utils::get_path_objects_root()))? {
+        match classify_sidecar(&set, &hash, &path) {
+            SidecarState::Pending => loose_signatures += 1,
+            SidecarState::Conflict(reason) => signature_conflicts.push(SignatureConflict {
+                parcel: hash, sidecar_path: path.to_string_lossy().into_owned(), reason,
+            }),
+            SidecarState::Leftover | SidecarState::Undecidable => {}
+        }
+    }
+
+    let PackSet {
+        packs: loaded, quarantined, unenumerable, damaged, signature_tables, unreadable_signature_tables, ..
+    } = set;
+    let partial_signature_tables = signature_tables.iter()
+        .filter(|loaded| loaded.table.count() < signature_table::MAX_TABLE_ENTRIES)
+        .count();
+    let unreadable_signature_tables = unreadable_signature_tables.into_iter().map(|t| PackIndexProblem {
+        index_path: t.path.to_string_lossy().into_owned(),
+        error: t.message,
+    }).collect();
 
     let mut packs = Vec::new();
     for pack in loaded {
@@ -321,7 +374,11 @@ pub fn store_status() -> Result<StoreStatus, String> {
     let auto_enabled = maintenance_auto_enabled()?;
     let loose_threshold = config_threshold(crate::util::config_utils::KEY_MAINTENANCE_LOOSE, AUTO_LOOSE_THRESHOLD)?;
     let pack_threshold = config_threshold(crate::util::config_utils::KEY_MAINTENANCE_PACKS, AUTO_PACK_THRESHOLD)?;
-    let incremental_due = loose_objects > loose_threshold;
+    let signature_table_threshold = config_threshold(
+        crate::util::config_utils::KEY_MAINTENANCE_SIGNATURE_TABLES, AUTO_SIGNATURE_TABLE_THRESHOLD
+    )?;
+    let incremental_due = loose_objects + loose_signatures > loose_threshold
+        || partial_signature_tables > signature_table_threshold;
     let repack_due = packs.len() > pack_threshold;
 
     let quarantined_packs = quarantined.into_iter().map(|q| PackIndexProblem {
@@ -359,6 +416,12 @@ pub fn store_status() -> Result<StoreStatus, String> {
         damaged_packs,
         unenumerable_indexes,
         foreign_version_indexes,
+        signature_tables: signature_tables.len(),
+        partial_signature_tables,
+        signature_table_threshold,
+        loose_signatures,
+        unreadable_signature_tables,
+        signature_conflicts,
     })
 }
 
@@ -384,8 +447,11 @@ fn config_threshold(key: &str, default: usize) -> Result<usize, String> {
     }
 }
 
-/// Estimate the loose object count without a full scan: count one fan-out folder (excluding
-/// sidecars and temp files) and multiply by the 256 folders.
+/// Estimate the loose object count without a full scan: count one fan-out folder and multiply by
+/// the 256 folders. Temp files do not count. A signature sidecar counts only when a compaction
+/// would sweep it into a table ([`SidecarState::Pending`]): one whose parcel is already tabled,
+/// which the sweep leaves loose as a conflict, would otherwise trigger a compaction that cannot
+/// discharge it, on every command.
 fn estimate_loose_count() -> Result<usize, String> {
     let folder = PathBuf::from(file_utils::get_path_objects_root()).join(AUTO_SAMPLE_FOLDER);
 
@@ -396,15 +462,98 @@ fn estimate_loose_count() -> Result<usize, String> {
     };
 
     let mut count = 0;
+    let mut sidecars = Vec::new();
     for entry in entries {
-        let name = entry.map_err(|e| format!("Error while sampling loose objects: {}", e))?
-            .file_name().to_string_lossy().to_string();
-        if !name.ends_with(sign_utils::FILE_SUFFIX_SIGNATURE) && !name.contains(".tmp") {
-            count += 1;
+        let entry = entry.map_err(|e| format!("Error while sampling loose objects: {}", e))?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.contains(".tmp") {
+            continue;
+        }
+        match name.strip_suffix(sign_utils::FILE_SUFFIX_SIGNATURE) {
+            Some(stem) => sidecars.push((format!("{}{}", AUTO_SAMPLE_FOLDER, stem), entry.path())),
+            None => count += 1,
         }
     }
 
+    if !sidecars.is_empty() {
+        let set = loaded_packs()?;
+        count += sidecars.iter()
+            .filter(|(hash, path)| classify_sidecar(&set, hash, path) == SidecarState::Pending)
+            .count();
+    }
+
     Ok(count * 256)
+}
+
+/// What a compaction would do with one loose signature sidecar, judged against the tables in
+/// `set`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SidecarState {
+    /// No table holds the parcel's signature: the sweep moves it into one.
+    Pending,
+    /// A table holds the same signature: the sweep deletes the leftover.
+    Leftover,
+    /// The sweep leaves it loose, for this reason: a table holds a different signature, or the
+    /// sidecar is malformed.
+    Conflict(String),
+    /// A table that might hold the parcel cannot be read, so neither is known.
+    Undecidable,
+}
+
+fn classify_sidecar(set: &PackSet, hash: &str, path: &Path) -> SidecarState {
+    let Some(hash_bytes) = hash_to_bytes(hash) else {
+        return SidecarState::Undecidable;
+    };
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) => return SidecarState::Conflict(format!("it could not be read: {}", e)),
+    };
+    if let Err(error) = sign_utils::validate_raw_parcel_signature(&bytes, hash) {
+        return SidecarState::Conflict(error);
+    }
+
+    match signature_in_set(set, &hash_bytes) {
+        TabledSignature::Found(entry) if entry == bytes => SidecarState::Leftover,
+        TabledSignature::Found(_) => SidecarState::Conflict(
+            "it differs from the signature already tabled for this parcel, which stands".to_string()
+        ),
+        TabledSignature::Missing => SidecarState::Pending,
+        TabledSignature::Unreadable(_) => SidecarState::Undecidable,
+    }
+}
+
+/// Count the readable signature tables below the bound. Only a table's header is read, unless
+/// the count exceeds `threshold`: then each is checked in full, and one that fails does not
+/// count, since a compaction leaves it alone and would be triggered again on every command.
+fn count_partial_signature_tables(threshold: usize) -> Result<usize, String> {
+    let entries = match std::fs::read_dir(pack_folder()) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(format!("Error while counting signature tables: {}", error)),
+    };
+
+    let mut partial = Vec::new();
+    for entry in entries {
+        let path = entry.map_err(|e| format!("Error while counting signature tables: {}", e))?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some(SIGNATURE_TABLE_EXTENSION) {
+            continue;
+        }
+        let mut header = [0u8; 16];
+        let read = std::fs::File::open(&path).and_then(|mut file| file.read_exact(&mut header));
+        if read.is_ok() && signature_table::header_count(&header).is_some_and(|count| count < signature_table::MAX_TABLE_ENTRIES) {
+            partial.push(path);
+        }
+    }
+
+    if partial.len() <= threshold {
+        return Ok(partial.len());
+    }
+
+    Ok(partial.iter()
+        .filter(|path| std::fs::read(path).ok()
+            .and_then(|bytes| SignatureTable::open(bytes).ok())
+            .is_some_and(|table| table.all_entries().is_ok()))
+        .count())
 }
 
 /// Count the pack data files in the object store's pack folder.
@@ -472,6 +621,37 @@ pub struct CompactStats {
     /// not salvaged, copied from or deleted. Each entry is the validation error, which names the
     /// index file. Always empty for a run with salvage, and for an incremental compaction.
     pub damaged_packs_skipped: Vec<String>,
+
+    /// Signature tables written (FORK-333).
+    pub signature_tables_written: usize,
+
+    /// Loose signature sidecars removed because a table now holds the same signature.
+    pub signature_sidecars_swept: usize,
+
+    /// Signatures a full repack dropped, from tables and sidecars alike, because their parcel is
+    /// no longer anywhere in the store. Always 0 for an incremental compaction.
+    pub signatures_dropped: usize,
+
+    /// Loose sidecars the sweep left loose and why: one that differs from the signature already
+    /// tabled for its parcel (the tabled one keeps answering reads), or one that is malformed.
+    pub signature_conflicts: Vec<SignatureConflict>,
+
+    /// Signature tables that could not be read, left exactly as found; each entry names the table
+    /// and its remedy. Always empty for a full repack, which refuses while one stands.
+    pub signature_tables_unreadable: Vec<String>,
+}
+
+/// A loose signature sidecar a compaction left loose (see [`CompactStats::signature_conflicts`]).
+#[derive(Debug, Clone)]
+pub struct SignatureConflict {
+    /// The parcel the sidecar signs.
+    pub parcel: String,
+
+    /// The sidecar's path.
+    pub sidecar_path: String,
+
+    /// Why it was left loose.
+    pub reason: String,
 }
 
 /// A damaged pack a full repack kept (see [`CompactStats::damaged_packs_kept`]).
@@ -1304,8 +1484,31 @@ struct PackSet {
     /// Pairs that load but fail full validation. Filled only by a census load
     /// ([`IndexCheck::Full`]); the registry loads these pairs into `packs`.
     damaged: Vec<DamagedPack>,
+    /// The signature tables that opened (FORK-333), sorted by file name.
+    signature_tables: Vec<LoadedSignatureTable>,
+    /// The signature tables that did not. Unlike a broken pack index, each one gates every
+    /// signature lookup that finds nothing elsewhere (see [`tabled_signature`]).
+    unreadable_signature_tables: Vec<UnreadableSignatureTable>,
     /// The folder as it stood when this set was loaded (see [`reloaded_if_stale`]).
     stamp: FolderStamp,
+}
+
+/// A signature table the registry opened: its header and fanout checked, its buckets checked as
+/// lookups reach them ([`signature_table`]).
+struct LoadedSignatureTable {
+    path: PathBuf,
+    table: SignatureTable<memmap2::Mmap>,
+}
+
+/// A signature table that could not be opened. `message` names it and the remedy its cause calls
+/// for; `stamp`, `failure` and `attempted_at` mean what they do on [`QuarantinedPack`], with the
+/// table in the index's place.
+struct UnreadableSignatureTable {
+    path: PathBuf,
+    message: String,
+    stamp: PairStamp,
+    failure: FailureKind,
+    attempted_at: Instant,
 }
 
 impl PackSet {
@@ -1315,6 +1518,8 @@ impl PackSet {
             quarantined: Vec::new(),
             unenumerable: Vec::new(),
             damaged: Vec::new(),
+            signature_tables: Vec::new(),
+            unreadable_signature_tables: Vec::new(),
             stamp: FolderStamp {
                 names: Vec::new(),
                 times: Mutex::new(StampTimes { modified: None, read_at: SystemTime::UNIX_EPOCH }),
@@ -1510,7 +1715,10 @@ fn pack_set_is_current(set: &PackSet, folder: &Path) -> Result<bool, String> {
     let broken = set.quarantined.iter()
         .map(|q| (&q.index_path, &q.stamp, q.failure, q.attempted_at, q.index_path.with_extension(PACK_DATA_EXTENSION)))
         .chain(set.unenumerable.iter()
-            .map(|u| (&u.index_path, &u.stamp, u.failure, u.attempted_at, u.index_path.clone())));
+            .map(|u| (&u.index_path, &u.stamp, u.failure, u.attempted_at, u.index_path.clone())))
+        // A table has no data file, so its stamp's data half stays `Absent` on both sides.
+        .chain(set.unreadable_signature_tables.iter()
+            .map(|t| (&t.path, &t.stamp, t.failure, t.attempted_at, t.path.clone())));
 
     for (index_path, stamp, failure, attempted_at, open_probe) in broken {
         if broken_pair_changed(index_path, stamp, failure, attempted_at, &open_probe) {
@@ -1894,6 +2102,8 @@ fn load_packs_from_disk(pack_folder: &Path, check: IndexCheck) -> Result<PackSet
     let mut quarantined = Vec::new();
     let mut unenumerable = Vec::new();
     let mut damaged = Vec::new();
+    let mut signature_tables = Vec::new();
+    let mut unreadable_signature_tables = Vec::new();
     let mut names = Vec::new();
 
     // Stamp first, list second (see `FolderStamp`).
@@ -1904,7 +2114,10 @@ fn load_packs_from_disk(pack_folder: &Path, check: IndexCheck) -> Result<PackSet
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let stamp = FolderStamp { names, times: Mutex::new(StampTimes { modified: None, read_at }) };
-            return Ok(PackSet { packs, quarantined, unenumerable, damaged, stamp });
+            return Ok(PackSet {
+                packs, quarantined, unenumerable, damaged, signature_tables: Vec::new(),
+                unreadable_signature_tables: Vec::new(), stamp,
+            });
         }
         Err(error) => return Err(format!(
             "Error while reading the pack folder \"{}\": {}", pack_folder.to_string_lossy(), error
@@ -1917,6 +2130,14 @@ fn load_packs_from_disk(pack_folder: &Path, check: IndexCheck) -> Result<PackSet
 
         if is_pack_file_name(&path) {
             names.push(entry.file_name());
+        }
+
+        if path.extension().and_then(|e| e.to_str()) == Some(SIGNATURE_TABLE_EXTENSION) {
+            match open_signature_table(&path, check) {
+                Ok(table) => signature_tables.push(table),
+                Err(table) => unreadable_signature_tables.push(table),
+            }
+            continue;
         }
 
         if path.extension().and_then(|e| e.to_str()) != Some(PACK_INDEX_EXTENSION) {
@@ -1937,15 +2158,112 @@ fn load_packs_from_disk(pack_folder: &Path, check: IndexCheck) -> Result<PackSet
     packs.sort_by(|a, b| a.data_path.file_name().cmp(&b.data_path.file_name()));
     quarantined.sort_by(|a, b| a.index_path.file_name().cmp(&b.index_path.file_name()));
     damaged.sort_by(|a, b| a.index_path.file_name().cmp(&b.index_path.file_name()));
+    signature_tables.sort_by(|a, b| a.path.file_name().cmp(&b.path.file_name()));
+    unreadable_signature_tables.sort_by(|a, b| a.path.file_name().cmp(&b.path.file_name()));
     names.sort();
 
     let stamp = FolderStamp { names, times: Mutex::new(StampTimes { modified: Some(modified), read_at }) };
-    Ok(PackSet { packs, quarantined, unenumerable, damaged, stamp })
+    Ok(PackSet { packs, quarantined, unenumerable, damaged, signature_tables, unreadable_signature_tables, stamp })
 }
 
-/// Whether `path` names a pack index or pack data file — the names a [`FolderStamp`] records.
+/// Whether `path` names a pack index, pack data file or signature table — the names a
+/// [`FolderStamp`] records.
 fn is_pack_file_name(path: &Path) -> bool {
-    matches!(path.extension().and_then(|e| e.to_str()), Some(PACK_INDEX_EXTENSION) | Some(PACK_DATA_EXTENSION))
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some(PACK_INDEX_EXTENSION) | Some(PACK_DATA_EXTENSION) | Some(SIGNATURE_TABLE_EXTENSION)
+    )
+}
+
+/// Open the signature table at `path` for the registry, mapped. Stamped before it is opened, as a
+/// pack pair is. Under [`IndexCheck::Full`] every bucket and entry is checked too, so a census
+/// reports a table a lookup would fail on.
+fn open_signature_table(path: &Path, check: IndexCheck) -> Result<LoadedSignatureTable, UnreadableSignatureTable> {
+    let stamp = pair_stamp(path);
+    let attempted_at = Instant::now();
+    let unreadable = |message: String, failure: FailureKind| UnreadableSignatureTable {
+        path: path.to_path_buf(), message, stamp: stamp.clone(), failure, attempted_at,
+    };
+    let io_message = |error: &dyn std::fmt::Display| format!(
+        "Signature table \"{}\" could not be read: {}. Restore access to it; the signatures it \
+        holds have no other local copy.",
+        path.to_string_lossy(), error
+    );
+
+    let file = open_pack_file(path).map_err(|failure| unreadable(io_message(&failure.error), failure.kind))?;
+    let len = file.metadata().map_err(|e| unreadable(io_message(&e), FailureKind::Io))?.len();
+    // Mapping an empty file fails on some platforms with an error that would read as an I/O fault.
+    if len == 0 {
+        let error = signature_table::TableError::Corrupt("empty".to_string());
+        return Err(unreadable(signature_table::unreadable_message(path, &error), FailureKind::Fixed));
+    }
+    // SAFETY: a published table is write-once: it is created under a temp name, renamed into
+    // place, and never modified again, only deleted (as a pack index is).
+    let bytes = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| unreadable(io_message(&e), FailureKind::Io))?;
+
+    let table = SignatureTable::open(bytes)
+        .map_err(|error| unreadable(signature_table::unreadable_message(path, &error), FailureKind::Fixed))?;
+
+    if check == IndexCheck::Full {
+        if let Err(detail) = table.all_entries() {
+            let error = signature_table::TableError::Corrupt(detail);
+            return Err(unreadable(signature_table::unreadable_message(path, &error), FailureKind::Fixed));
+        }
+    }
+
+    Ok(LoadedSignatureTable { path: path.to_path_buf(), table })
+}
+
+/// What the signature tables say about one parcel (FORK-333) — see [`tabled_signature`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TabledSignature {
+    /// A table holds the parcel's signature: these bytes, checked against their crc.
+    Found(Vec<u8>),
+    /// No table holds it, and every table could rule it out.
+    Missing,
+    /// No readable table holds it, and an unreadable table, bucket or entry might: the message
+    /// names the table and its remedy.
+    Unreadable(String),
+}
+
+/// Look `hash`'s signature up in the active warehouse's signature tables. With `revalidate`, the
+/// cached set is checked against the pack folder first and reloaded if it moved on — what a
+/// lookup does after both layers missed, since a compaction publishes a table before it deletes
+/// the sidecars the table replaces.
+pub(crate) fn tabled_signature(hash: &str, revalidate: bool) -> Result<TabledSignature, String> {
+    let Some(hash_bytes) = hash_to_bytes(hash) else {
+        return Ok(TabledSignature::Missing);
+    };
+
+    let mut set = loaded_packs()?;
+    if revalidate {
+        if let Some(fresh) = reloaded_if_stale(&set)? {
+            set = fresh;
+        }
+    }
+
+    Ok(signature_in_set(&set, &hash_bytes))
+}
+
+fn signature_in_set(set: &PackSet, hash_bytes: &[u8; HASH_LEN]) -> TabledSignature {
+    let mut unreadable = None;
+
+    for loaded in &set.signature_tables {
+        match loaded.table.lookup(hash_bytes) {
+            signature_table::Lookup::Found(entry) => return TabledSignature::Found(entry.to_vec()),
+            signature_table::Lookup::Missing => {}
+            signature_table::Lookup::Corrupt(detail) => {
+                unreadable.get_or_insert_with(|| signature_table::unreadable_message(
+                    &loaded.path, &signature_table::TableError::Corrupt(detail)
+                ));
+            }
+        }
+    }
+
+    match unreadable.or_else(|| set.unreadable_signature_tables.first().map(|t| t.message.clone())) {
+        Some(message) => TabledSignature::Unreadable(message),
+        None => TabledSignature::Missing,
+    }
 }
 
 /// The pack folder's modification time: `Ok(None)` when it exists but the platform reports none,
@@ -3179,6 +3497,16 @@ struct WindowEntry {
 ///                        the affected paths and clears the taint once they are durable again —
 ///                        `compact`'s own destructive sweep stays refused until then either way.
 pub fn compact(all: bool, redelta: bool, salvage: bool, progress: &Progress) -> Result<CompactStats, String> {
+    compact_bounded(all, redelta, salvage, progress, signature_table::MAX_TABLE_ENTRIES)
+}
+
+/// [`compact`], with the most entries a signature table it writes may hold as a parameter, so a
+/// test can reach the bound with a handful of signatures.
+fn compact_bounded(all: bool,
+                   redelta: bool,
+                   salvage: bool,
+                   progress: &Progress,
+                   table_bound: usize) -> Result<CompactStats, String> {
     let pack_folder = pack_folder();
     file_utils::create_folder_if_not_exists(&pack_folder)?;
 
@@ -3223,6 +3551,12 @@ pub fn compact(all: bool, redelta: bool, salvage: bool, progress: &Progress) -> 
     };
 
     remove_stale_temp_files(&pack_folder);
+
+    // A repack rewrites every signature table, so one it cannot read would be lost with the rest
+    // of the rewrite: refuse before anything is written, naming it.
+    if all {
+        refuse_unreadable_signature_tables(&pack_folder)?;
+    }
 
     progress.status("Collecting objects");
 
@@ -3292,7 +3626,8 @@ pub fn compact(all: bool, redelta: bool, salvage: bool, progress: &Progress) -> 
     let mut stats = CompactStats {
         objects_packed: 0, packs_written: 0, loose_removed: 0, deltas: 0, bytes_packed: 0,
         corrupt_skipped: 0, over_ceiling_skipped: 0, damaged_packs_dropped, damaged_packs_kept,
-        damaged_packs_skipped,
+        damaged_packs_skipped, signature_tables_written: 0, signature_sidecars_swept: 0, signatures_dropped: 0,
+        signature_conflicts: Vec::new(), signature_tables_unreadable: Vec::new(),
     };
     let mut writer: Option<PackWriter> = None;
 
@@ -3632,6 +3967,10 @@ pub fn compact(all: bool, redelta: bool, salvage: bool, progress: &Progress) -> 
     // A later read in this same process must see the packs we just wrote (and not the old ones).
     invalidate_cache();
 
+    // The packs are final, so a repack's presence test below sees the store as it now stands.
+    progress.status("Packing signatures");
+    sweep_signatures(&pack_folder, table_bound, all, &mut stats)?;
+
     // Populate the commit-graph for the whole reachable history while the lock is held and the
     // object caches are warm, so the first ancestry query (merge base, divergence check) after
     // an import or repack is already fast. The graph is derived and self-healing, so a failure
@@ -3648,6 +3987,317 @@ pub fn compact(all: bool, redelta: bool, salvage: bool, progress: &Progress) -> 
     }
 
     Ok(stats)
+}
+
+/// The loose signature sidecars in the object store's fan-out folders: each parcel hash and the
+/// sidecar's path. Temp files are not among them, and a name that does not spell a hash is
+/// skipped.
+fn list_signature_sidecars(objects_root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+    let read_error = |path: &Path, e: std::io::Error| format!(
+        "Error while listing signature sidecars in \"{}\": {}", path.to_string_lossy(), e
+    );
+
+    let folders = match std::fs::read_dir(objects_root) {
+        Ok(folders) => folders,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(read_error(objects_root, e)),
+    };
+
+    let mut sidecars = Vec::new();
+    for folder in folders {
+        let folder = folder.map_err(|e| read_error(objects_root, e))?;
+        let Some(prefix) = folder.file_name().to_str().map(str::to_string) else { continue };
+        if prefix.len() != 2 || !folder.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+            continue;
+        }
+
+        let files = std::fs::read_dir(folder.path()).map_err(|e| read_error(&folder.path(), e))?;
+        for file in files {
+            let file = file.map_err(|e| read_error(&folder.path(), e))?;
+            let name = file.file_name();
+            let Some(stem) = name.to_str().and_then(|name| name.strip_suffix(sign_utils::FILE_SUFFIX_SIGNATURE)) else {
+                continue;
+            };
+            let hash = format!("{}{}", prefix, stem);
+            if object_utils::is_object_hash(&hash) {
+                sidecars.push((hash, file.path()));
+            }
+        }
+    }
+
+    sidecars.sort();
+    Ok(sidecars)
+}
+
+/// One signature table in the pack folder as a compaction reads it: wholly into memory, by a
+/// plain read, or the message naming why it could not be.
+struct TableFile {
+    path: PathBuf,
+    table: Result<SignatureTable<Vec<u8>>, String>,
+}
+
+/// Read every signature table in `pack_folder`, sorted by name.
+fn read_signature_tables(pack_folder: &Path) -> Result<Vec<TableFile>, String> {
+    let entries = match std::fs::read_dir(pack_folder) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!(
+            "Error while reading the pack folder \"{}\": {}", pack_folder.to_string_lossy(), e
+        )),
+    };
+
+    let mut tables = Vec::new();
+    for entry in entries {
+        let path = entry.map_err(|e| format!("Error while listing the pack folder: {}", e))?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some(SIGNATURE_TABLE_EXTENSION) {
+            continue;
+        }
+
+        let table = match std::fs::read(&path) {
+            Ok(bytes) => SignatureTable::open(bytes)
+                .map_err(|error| signature_table::unreadable_message(&path, &error)),
+            Err(e) => Err(format!(
+                "Signature table \"{}\" could not be read: {}. Restore access to it; the signatures it \
+                holds have no other local copy.",
+                path.to_string_lossy(), e
+            )),
+        };
+        tables.push(TableFile { path, table });
+    }
+
+    tables.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(tables)
+}
+
+/// The corrupt-table message for `path` whose full check failed with `detail`.
+fn corrupt_table_message(path: &Path, detail: String) -> String {
+    signature_table::unreadable_message(path, &signature_table::TableError::Corrupt(detail))
+}
+
+/// Refuse a full repack while any signature table cannot be read in full, naming it.
+fn refuse_unreadable_signature_tables(pack_folder: &Path) -> Result<(), String> {
+    for file in read_signature_tables(pack_folder)? {
+        let problem = match &file.table {
+            Err(message) => Some(message.clone()),
+            Ok(table) => table.all_entries().err().map(|detail| corrupt_table_message(&file.path, detail)),
+        };
+
+        if let Some(message) = problem {
+            return Err(format!(
+                "A full repack rewrites every signature table, so it cannot run while one is unreadable. {}",
+                message
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Where a parcel is after a full repack, for keeping its signature (see [`sweep_signatures`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Presence {
+    /// A loose file: the repack packs every live loose object, so this one is unreachable or
+    /// could not be packed, and its sidecar stays beside it for gc.
+    Loose,
+    /// In a pack, or possibly in one: a corrupt bucket, a quarantined index or an index that
+    /// could not be parsed cannot rule it out, so its signature is kept.
+    Packed,
+    Absent,
+}
+
+fn parcel_presence(set: &PackSet, hash: &str, hash_bytes: &[u8; HASH_LEN]) -> Presence {
+    let loose = file_utils::get_path_for_object(hash)
+        .map(|(folder, filename)| PathBuf::from(folder).join(filename));
+    match loose.map(|path| std::fs::symlink_metadata(path)) {
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return Presence::Loose,
+    }
+
+    let packed = set.packs.iter().any(|pack| !matches!(pack.locate(hash_bytes), Located::Missing))
+        || set.quarantined.iter().any(|quarantined| quarantined.contains(hash_bytes))
+        || !set.unenumerable.is_empty();
+
+    if packed { Presence::Packed } else { Presence::Absent }
+}
+
+/// The signature phase of a compaction (FORK-333): move loose sidecars into signature tables of
+/// at most `bound` entries, durably, and only then delete what the new tables replace.
+///
+/// An incremental run merges every loose sidecar and every readable table below the bound into
+/// new tables, leaving at most one below it. It never refuses as a whole: a sidecar that differs
+/// from the signature already tabled for its parcel, or that is malformed, stays loose and is
+/// named, and a table it cannot read is left alone and named. It does nothing when there is no
+/// sidecar and at most one table below the bound.
+///
+/// A full repack (`repack`) rewrites every table instead, keeping an entry while its parcel is
+/// still present anywhere in the store ([`parcel_presence`]): presence, not membership in the
+/// live set, so the signature of a parcel in a damaged pack the repack skipped survives. A
+/// sidecar of an absent parcel is deleted; one beside a loose parcel stays loose for gc.
+///
+/// Names derive from content, so a rewrite that changes nothing lands on the name of a table it
+/// read: a just-published name is never deleted.
+fn sweep_signatures(pack_folder: &Path, bound: usize, repack: bool, stats: &mut CompactStats) -> Result<(), String> {
+    let objects_root = PathBuf::from(file_utils::get_path_objects_root());
+    let sidecars = list_signature_sidecars(&objects_root)?;
+    let tables = read_signature_tables(pack_folder)?;
+    let presence_set = if repack { Some(loaded_packs()?) } else { None };
+    let present = |hash: &str, hash_bytes: &[u8; HASH_LEN]| presence_set.as_ref()
+        .map_or(Presence::Packed, |set| parcel_presence(set, hash, hash_bytes));
+
+    // The tables this run consumes, the entries they and the sidecars contribute, and the tables
+    // it only consults: full ones an incremental run leaves in place.
+    let mut inputs: Vec<&Path> = Vec::new();
+    let mut merged: std::collections::BTreeMap<[u8; HASH_LEN], Vec<u8>> = std::collections::BTreeMap::new();
+    let mut consulted: Vec<(&Path, &SignatureTable<Vec<u8>>)> = Vec::new();
+
+    for file in &tables {
+        let table = match &file.table {
+            Ok(table) => table,
+            Err(message) => {
+                stats.signature_tables_unreadable.push(message.clone());
+                continue;
+            }
+        };
+
+        if !repack && table.count() >= bound {
+            consulted.push((&file.path, table));
+            continue;
+        }
+
+        match table.all_entries() {
+            Ok(entries) => {
+                for (hash_bytes, entry) in entries {
+                    if present(&sign_utils::to_hex(&hash_bytes), &hash_bytes) == Presence::Absent {
+                        stats.signatures_dropped += 1;
+                        continue;
+                    }
+                    // Tables are immutable and a parcel has one signature, so two tables never
+                    // disagree; should one have been edited, the first in name order stands.
+                    merged.entry(hash_bytes).or_insert_with(|| entry.to_vec());
+                }
+                inputs.push(&file.path);
+            }
+            Err(detail) => stats.signature_tables_unreadable.push(corrupt_table_message(&file.path, detail)),
+        }
+    }
+
+    if !repack && sidecars.is_empty() && inputs.len() <= 1 {
+        return Ok(());
+    }
+
+    let mut swept: Vec<&Path> = Vec::new();
+    let mut dropped: Vec<&Path> = Vec::new();
+
+    for (hash, path) in &sidecars {
+        let conflict = |reason: String| SignatureConflict {
+            parcel: hash.clone(), sidecar_path: path.to_string_lossy().to_string(), reason,
+        };
+        let hash_bytes = hash_to_bytes(hash).expect("a listed sidecar names a hash");
+
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                stats.signature_conflicts.push(conflict(format!("it could not be read: {}", e)));
+                continue;
+            }
+        };
+
+        if let Err(error) = sign_utils::validate_raw_parcel_signature(&bytes, hash) {
+            stats.signature_conflicts.push(conflict(error));
+            continue;
+        }
+
+        match present(hash, &hash_bytes) {
+            Presence::Loose => continue,
+            Presence::Absent => {
+                dropped.push(path);
+                continue;
+            }
+            Presence::Packed => {}
+        }
+
+        let mut tabled = merged.get(&hash_bytes).map(|entry| Ok((entry.as_slice(), None)));
+        for (table_path, table) in &consulted {
+            if tabled.is_some() {
+                break;
+            }
+            tabled = match table.lookup(&hash_bytes) {
+                signature_table::Lookup::Found(entry) => Some(Ok((entry, Some(*table_path)))),
+                signature_table::Lookup::Missing => None,
+                signature_table::Lookup::Corrupt(detail) => Some(Err(corrupt_table_message(table_path, detail))),
+            };
+        }
+
+        match tabled {
+            Some(Ok((entry, _))) if entry == bytes.as_slice() => swept.push(path),
+            Some(Ok((_, table_path))) => stats.signature_conflicts.push(conflict(match table_path {
+                Some(table_path) => format!(
+                    "it differs from the signature in table \"{}\", which stands", table_path.to_string_lossy()
+                ),
+                None => "it differs from the signature already tabled for this parcel, which stands".to_string(),
+            })),
+            Some(Err(message)) => stats.signature_conflicts.push(conflict(format!(
+                "it cannot be compared with the tabled signature: {}", message
+            ))),
+            None => {
+                merged.insert(hash_bytes, bytes);
+                swept.push(path);
+            }
+        }
+    }
+
+    // Publish: each table written and fsynced under a temp name, renamed into place, and the
+    // folder fsynced once, before anything it replaces is deleted.
+    let entries: Vec<([u8; HASH_LEN], Vec<u8>)> = merged.into_iter().collect();
+    let mut published: HashSet<PathBuf> = HashSet::new();
+
+    for chunk in entries.chunks(bound.max(1)) {
+        let final_path = pack_folder.join(format!("{}.{}", signature_table::table_id(chunk), SIGNATURE_TABLE_EXTENSION));
+        let temp = temp_path(pack_folder, SIGNATURE_TABLE_EXTENSION);
+        write_and_sync(&temp, &signature_table::build(chunk))?;
+        file_utils::rename(&temp, &final_path).map_err(|e| format!(
+            "Error while finalizing signature table \"{}\": {}", final_path.to_string_lossy(), e
+        ))?;
+        published.insert(final_path);
+        stats.signature_tables_written += 1;
+    }
+
+    if !published.is_empty() {
+        let published_refs: Vec<&Path> = published.iter().map(PathBuf::as_path).collect();
+        file_utils::sync_dir_or_taint(pack_folder, &published_refs)?;
+    }
+
+    invalidate_cache();
+
+    let remove = |path: &Path, what: &str| match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("Error while removing {} \"{}\": {}", what, path.to_string_lossy(), e)),
+    };
+
+    for path in swept {
+        if remove(path, "signature sidecar")? {
+            stats.signature_sidecars_swept += 1;
+        }
+    }
+
+    for path in dropped {
+        if remove(path, "signature sidecar")? {
+            stats.signatures_dropped += 1;
+        }
+    }
+
+    for path in inputs {
+        // A content-derived name means an unchanged rewrite lands on the table it read.
+        if published.contains(path) {
+            continue;
+        }
+        remove(path, "signature table")?;
+    }
+
+    invalidate_cache();
+    Ok(())
 }
 
 /// The outcome of reading and decompressing one target's bytes for [`prepare_target`]. A loose
