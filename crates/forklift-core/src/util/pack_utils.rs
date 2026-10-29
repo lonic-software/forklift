@@ -10953,6 +10953,27 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&temp).ok();
     }
 
+    /// (ix) A store whose only growth is signature sidecars is due for an incremental compaction:
+    /// a signed warehouse otherwise accumulates one small file per parcel with nothing to sweep it.
+    ///
+    /// Revert: skip `.sig` names in `estimate_loose_count` → the sampled folder counts as empty →
+    /// red.
+    #[test]
+    fn sidecars_alone_make_an_incremental_compaction_due() {
+        let (temp, _scope) = enter_signature_root("sig-only-trigger");
+        crate::util::config_utils::set_value(crate::util::config_utils::KEY_MAINTENANCE_LOOSE, "1", crate::enums::config_scope::ConfigScope::Warehouse).unwrap();
+
+        assert!(matches!(auto_compaction_action_bounded(signature_table::MAX_TABLE_ENTRIES).unwrap(), AutoCompaction::None),
+            "sanity: an empty store is not due");
+        for n in 0..2 {
+            sign_utils::store_raw_parcel_signature(&fake_parcel(AUTO_SAMPLE_FOLDER, n), &fake_signature(n as u8)).unwrap();
+        }
+        assert!(matches!(auto_compaction_action_bounded(signature_table::MAX_TABLE_ENTRIES).unwrap(), AutoCompaction::Incremental),
+            "pending sidecars alone must make a compaction due");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
     /// (xvi) A conflicting sidecar in the sampled folder does not trigger maintenance, since no
     /// compaction can discharge it. Once pending sidecars grow past the threshold, one compaction
     /// sweeps all but the conflict, and maintenance is then no longer due.
