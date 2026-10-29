@@ -260,6 +260,11 @@ refusal_codes! {
     /// acknowledging the deletion (`lift --recreate`) from work that descends from that head; the
     /// next step otherwise brings the pallet back there (`palletize --restore <name> --remote`).
     PalletDeletedOnRemote => "pallet_deleted_on_remote",
+
+    /// A cache warehouse (franchised with `--cache`) does not hold content the command reads, and
+    /// could not fetch it because its origin could not be reached. The next step names the origin
+    /// to wait for.
+    CacheMiss => "cache_miss",
 }
 
 impl RefusalCode {

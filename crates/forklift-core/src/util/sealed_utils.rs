@@ -798,6 +798,95 @@ pub fn unseal(_hold: &impl StoreAccessHold, hashes: &[String]) -> Result<Unseale
     Ok(Unsealed { removed, pushed_down, kept })
 }
 
+/// Store `bytes`, fetched for the recorded object `hash`, and remove its record, pushing its
+/// coverage down first as [`unseal`] does: every absent object its closure reaches is recorded
+/// before the object is stored, and the removal is appended after. A crash between any two steps
+/// leaves the object absent and recorded with more recorded beneath it, or present and recorded,
+/// and both seal what they sealed before. Two refills of one object both store the same bytes and
+/// remove a record at most once, since each decides on the record re-read under the ref lock.
+///
+/// A parcel's parents are recorded when absent, but not walked when present: the history they name
+/// is the parcel record's to hold.
+///
+/// # Arguments
+/// * `_hold` - The caller's store-access hold, spanning the call, so nothing the push-down found
+///             present is deleted before the object lands above it.
+/// * `hash`  - The recorded object.
+/// * `bytes` - Its bytes, as the remote sent them: verified against `hash` here.
+///
+/// # Returns
+/// * `Ok(())`      - The object is in the store and the record no longer holds it.
+/// * `Err(String)` - If the bytes are not `hash`'s or do not parse, a present object beneath it
+///                   cannot be walked, or as [`append_locked`]. Before the store, nothing but
+///                   push-down records may have been written.
+pub fn refill(_hold: &impl StoreAccessHold, hash: &str, bytes: &[u8]) -> Result<(), String> {
+    object_utils::verify_object_bytes(hash, bytes)?;
+
+    let mut walked: Vec<String> = Vec::new();
+    let mut parents: Vec<String> = Vec::new();
+
+    match object_utils::peek_object_header(bytes)?.0 {
+        ObjectType::Tree => {
+            let tree = object_utils::parse_tree_bytes(hash, bytes)?;
+            walked.extend(tree.get_files().map(|(_, file)| file.hash.clone()));
+            walked.extend(tree.get_subtrees().map(|(_, subtree)| subtree.hash.clone()));
+        }
+        ObjectType::Recipe => {
+            let recipe = object_utils::parse_recipe_bytes(hash, bytes)?;
+            walked.extend(recipe.chunks.into_iter().map(|chunk| chunk.hash));
+        }
+        ObjectType::Parcel => {
+            let parcel = object_utils::parse_parcel_bytes(hash, bytes)?;
+            walked.push(parcel.tree_hash);
+            parents = parcel.parents;
+        }
+        ObjectType::Blob | ObjectType::Chunk => {}
+    }
+
+    let mut closed: HashSet<String> = HashSet::new();
+    let mut absent: Vec<String> = Vec::new();
+
+    for child in &walked {
+        if !is_present(child)? {
+            absent.push(child.clone());
+        } else if !closed.contains(child) {
+            let walk = closure_absences(child, &closed)
+                .map_err(|why| format!("Could not walk the content of {}: {}", child, why))?;
+            absent.extend(walk.absent);
+            closed.extend(walk.walked);
+        }
+    }
+
+    for parent in parents {
+        if !is_present(&parent)? {
+            absent.push(parent);
+        }
+    }
+
+    if !absent.is_empty() {
+        let lock = RefLock::acquire()?;
+
+        append_decided_locked(&lock, |set| {
+            let mut written: HashSet<&str> = HashSet::new();
+
+            Ok(absent.iter()
+                .filter(|child| !set.contains(child) && written.insert(child.as_str()))
+                .map(|child| (SealOp::Record, child.clone()))
+                .collect())
+        })?;
+    }
+
+    object_utils::store_object_bytes(hash, bytes)?;
+
+    let lock = RefLock::acquire()?;
+
+    append_decided_locked(&lock, |set| {
+        Ok(set.contains(hash).then(|| (SealOp::Remove, hash.to_string())).into_iter().collect())
+    })?;
+
+    Ok(())
+}
+
 /// What one push-down walk found.
 struct ClosureAbsences {
     /// The trees and recipes it walked.

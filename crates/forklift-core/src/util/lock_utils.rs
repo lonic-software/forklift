@@ -477,6 +477,31 @@ pub struct RefLock {
     _file: std::fs::File,
 }
 
+thread_local! {
+    /// How many [`RefLock`]s this thread holds.
+    static REF_LOCKS_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl RefLock {
+    /// Count a hold this thread just took.
+    fn held(file: std::fs::File) -> RefLock {
+        REF_LOCKS_HELD.with(|held| held.set(held.get() + 1));
+        RefLock { _file: file }
+    }
+
+    /// Whether this thread holds a ref lock, so that taking one would wait on itself: the
+    /// cache-miss refill, which writes the sealed-object record, does not run then.
+    pub(crate) fn held_by_this_thread() -> bool {
+        REF_LOCKS_HELD.with(|held| held.get() > 0)
+    }
+}
+
+impl Drop for RefLock {
+    fn drop(&mut self) {
+        REF_LOCKS_HELD.with(|held| held.set(held.get().saturating_sub(1)));
+    }
+}
+
 impl RefLock {
     /// Take the ref lock of the active warehouse, waiting while another thread or process holds
     /// it. The forklift root folder must exist.
@@ -496,7 +521,7 @@ impl RefLock {
         let file = open_lock_sidecar(&path)?;
         file.lock().map_err(|e| lock_error(&path, &e))?;
 
-        Ok(RefLock { _file: file })
+        Ok(RefLock::held(file))
     }
 
     /// Take the ref lock of the warehouse whose forklift root is `root` without waiting, for a
@@ -512,7 +537,7 @@ impl RefLock {
         let file = open_lock_sidecar(&path)?;
 
         match file.try_lock() {
-            Ok(()) => Ok(Some(RefLock { _file: file })),
+            Ok(()) => Ok(Some(RefLock::held(file))),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(e)) => Err(lock_error(&path, &e)),
         }

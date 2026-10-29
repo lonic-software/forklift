@@ -217,6 +217,27 @@ impl Server {
         Server { child, url }
     }
 
+    /// Stop serving, so the remote cannot be reached.
+    fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    /// Serve `server-root` again at the same address, after [`Server::stop`], whose kill left the
+    /// stopped server's lock behind.
+    fn restart(&mut self, area: &TestArea) {
+        std::fs::remove_file(area.path("server-root/.forklift/serve.lock")).unwrap();
+        let addr = self.url.trim_start_matches("http://").to_string();
+        let restarted = Server::spawn(vec![
+            "serve".to_string(),
+            "--root".to_string(), area.path("server-root").to_str().unwrap().to_string(),
+            "--addr".to_string(), addr,
+        ], None);
+
+        assert_eq!(restarted.url, self.url, "the server came back at the same address");
+        *self = restarted;
+    }
+
     fn rebuild_bundle(&self, area: &TestArea) -> Output {
         let output = server_command()
             .args(["bundle", "--root", area.path("server-root").to_str().unwrap()])
@@ -5533,7 +5554,8 @@ fn three_signed_parcels(area: &TestArea) -> (Server, String) {
 ///
 /// Revert: push each parcel's root into the cache walk's tree frontier → the older roots are
 /// present and the record is empty; skip the record → the franchise's ref write is refused; skip
-/// the tip's content fetch → nothing is checked out.
+/// the tip's content fetch → nothing is checked out; let the ref write's closure check fetch what
+/// it reads → the older roots are present.
 #[test]
 fn a_cache_franchise_holds_the_parcels_and_its_tip_and_records_the_rest() {
     let area = TestArea::new("cache-fetch");
@@ -5586,6 +5608,147 @@ fn a_cache_franchise_holds_the_parcels_and_its_tip_and_records_the_rest() {
             assert!(closure_present(&area, "cached", &root), "a meta parcel's content is held whole: {}", parcel);
         }
     }
+}
+
+/// Every file under `directory`'s `.forklift`, with its bytes: the store, the sealed record and
+/// everything else a command could write there.
+fn forklift_dir_snapshot(area: &TestArea, directory: &str) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let root = area.path(&format!("{}/.forklift", directory));
+    let mut snapshot = std::collections::BTreeMap::new();
+    let mut frontier = vec![root.clone()];
+
+    while let Some(dir) = frontier.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                frontier.push(path);
+            } else {
+                snapshot.insert(path.strip_prefix(&root).unwrap().to_path_buf(), std::fs::read(&path).unwrap());
+            }
+        }
+    }
+
+    snapshot
+}
+
+/// The subtree `name` of the tree `tree`, read from `directory`.
+fn subtree_of(area: &TestArea, directory: &str, tree: &str, name: &str) -> String {
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path(directory));
+    let tree = forklift_core::util::object_utils::load_tree(tree).unwrap();
+    tree.get_subtrees().find(|(subtree, _)| subtree.as_str() == name).map(|(_, subtree)| subtree.hash.clone()).unwrap()
+}
+
+/// Reading an older parcel's content in a cache fetches each object the read meets absent from the
+/// origin, and the record then holds what the read did not reach: the older parcel's root and its
+/// `src` subtree are fetched, while its `docs` subtree, which the root's record covered, is
+/// recorded in their place. With the remote pointed elsewhere, a read refuses to fetch from it,
+/// naming the origin. `diff` between two older parcels fetches the other root too, and `audit`
+/// still passes over what is held.
+///
+/// Revert: leave the read path's absent arm without the refill → `show` fails on the absent root;
+/// drop the push-down → the record misses the `docs` subtree and `audit` fails over it.
+#[test]
+fn a_cache_read_of_an_older_parcel_fetches_what_it_reads() {
+    let area = TestArea::new("cache-miss-fetch");
+    let (server, head) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "full"]));
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+
+    let history = history_with_roots(&area, "full", &head);
+    let (oldest, oldest_root) = history[2].clone();
+    let (middle, middle_root) = history[1].clone();
+    let oldest_docs = subtree_of(&area, "full", &oldest_root, "docs");
+    assert!(!object_held(&area, "cached", &oldest_root) && !object_held(&area, "cached", &oldest_docs));
+
+    let listed = area.forklift("cached", &["history", &oldest]);
+    assert_success(&listed);
+
+    let shown = area.forklift("cached", &["show", &format!("{}:src/code.txt", oldest)]);
+    assert_success(&shown);
+    assert_eq!(stdout(&shown), "one\n");
+    assert!(object_held(&area, "cached", &oldest_root), "the read fetched the root it met absent");
+    assert!(!object_held(&area, "cached", &oldest_docs), "nothing the read did not reach is fetched");
+    assert_record_is(&area, "cached", &[&middle_root, &oldest_docs]);
+
+    let other = Server::start_at(&area, "server-root-2", None);
+    assert_success(&area.forklift("cached", &["config", "remote.url", &other.url]));
+    let elsewhere = area.forklift("cached", &["show", &format!("{}:docs/two.txt", middle)]);
+    assert!(!elsewhere.status.success(), "{}", stdout(&elsewhere));
+    assert_ne!(elsewhere.status.code(), Some(36), "a remote that is not the origin is not a cache miss");
+    assert!(stderr(&elsewhere).contains(&server.url), "the refusal names the origin: {}", stderr(&elsewhere));
+    assert!(!object_held(&area, "cached", &middle_root));
+    assert_success(&area.forklift("cached", &["config", "remote.url", &server.url]));
+
+    let diffed = area.forklift("cached", &["diff", &oldest, &middle]);
+    assert_success(&diffed);
+    assert!(stdout(&diffed).contains("code.txt"), "{}", stdout(&diffed));
+    assert!(object_held(&area, "cached", &middle_root));
+
+    let audit = area.forklift("cached", &["--json", "audit"]);
+    assert_success(&audit);
+}
+
+/// A cache whose origin cannot be reached refuses a read of content it lacks as a cache miss (exit
+/// 36), naming the origin, and the refused read leaves the warehouse's files byte for byte as they
+/// were. Once the origin is back, the next step (running the command again) succeeds.
+///
+/// Revert: classify an unreachable origin as a failed fetch → the exit is 1, not 36.
+#[test]
+fn a_cache_read_with_its_origin_unreachable_refuses_as_a_cache_miss() {
+    let area = TestArea::new("cache-miss-offline");
+    let (mut server, head) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "full"]));
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    let history = history_with_roots(&area, "full", &head);
+    let (oldest, middle) = (history[2].0.clone(), history[1].0.clone());
+
+    server.stop();
+    let before = forklift_dir_snapshot(&area, "cached");
+
+    assert_success(&area.forklift("cached", &["history", &oldest]));
+    let target = format!("{}:src/code.txt", oldest);
+    for args in [vec!["--json", "show", target.as_str()], vec!["--json", "diff", oldest.as_str(), middle.as_str()]] {
+        let refused = area.forklift("cached", &args);
+        assert_eq!(refused.status.code(), Some(36), "{:?}: {}{}", args, stdout(&refused), stderr(&refused));
+        let json = json_of(&refused);
+        assert_eq!(json["error"]["code"], "cache_miss", "{}", json);
+        assert!(json["error"]["next_step"].as_str().unwrap().contains(&server.url), "{}", json);
+    }
+
+    assert!(forklift_dir_snapshot(&area, "cached") == before, "a refused read changes nothing");
+
+    server.restart(&area);
+    let shown = area.forklift("cached", &["show", &target]);
+    assert_success(&shown);
+    assert_eq!(stdout(&shown), "one\n");
+}
+
+/// `shift` to a pallet a cache lowered without checking it out reads that head's content, which the
+/// record holds by hash, so the checkout fetches it from the origin.
+///
+/// Revert: leave the read path's absent arm without the refill → `shift` fails on the head's
+/// absent root.
+#[test]
+fn a_cache_shift_to_a_pallet_lowered_elsewhere_fetches_its_head() {
+    let area = TestArea::new("cache-miss-shift");
+    let (server, _) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+
+    assert_success(&area.forklift("a", &["palletize", "feature"]));
+    area.write_file("a/src/feature.txt", "feature\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "a feature"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    let feature = pallet_head(&area, "server-root", "feature");
+
+    assert_success(&area.forklift("cached", &["lower", "feature"]));
+    let root = history_with_roots(&area, "cached", &feature)[0].1.clone();
+    assert!(!object_held(&area, "cached", &root), "lower records the head it does not check out");
+
+    assert_success(&area.forklift("cached", &["shift", "feature"]));
+    assert_eq!(area.read_file("cached/src/feature.txt"), "feature\n");
+    assert!(closure_present(&area, "cached", &root), "the checkout fetched the head's closure");
+    assert_success(&area.forklift("cached", &["audit"]));
 }
 
 /// `lower` in a cache checks out the remote's new head, so it fetches that head's whole closure and

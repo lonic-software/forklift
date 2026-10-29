@@ -514,6 +514,10 @@ error_codes! {
     /// The remote has the pallet only as a tombstone: it was deleted there. The refused lift, ref
     /// update or delete wrote nothing there.
     PalletDeletedOnRemote,
+
+    /// A cache warehouse does not hold content the command reads, and could not reach its origin
+    /// to fetch it.
+    CacheMiss,
 }
 
 impl ErrorCode {
@@ -554,6 +558,7 @@ impl ErrorCode {
             ErrorCode::MirrorIncomplete => RefusalCode::MirrorIncomplete.as_str(),
             ErrorCode::HistoryUnverified => RefusalCode::HistoryUnverified.as_str(),
             ErrorCode::PalletDeletedOnRemote => RefusalCode::PalletDeletedOnRemote.as_str(),
+            ErrorCode::CacheMiss => RefusalCode::CacheMiss.as_str(),
         }
     }
 
@@ -597,6 +602,7 @@ impl ErrorCode {
             ErrorCode::MirrorIncomplete => 33,
             ErrorCode::HistoryUnverified => 34,
             ErrorCode::PalletDeletedOnRemote => 35,
+            ErrorCode::CacheMiss => 36,
         }
     }
 
@@ -691,6 +697,9 @@ impl ErrorCode {
                 "The remote has the pallet only as a tombstone: it was deleted there, and the name \
                  stays reserved for that history; \"palletize --restore <name> --remote\" brings it \
                  back, \"lift --recreate\" re-creates it from work that descends from it",
+            ErrorCode::CacheMiss =>
+                "A cache warehouse does not hold content the command reads, and could not reach its \
+                 origin to fetch it; the command works once the origin can be reached",
         }
     }
 
@@ -731,6 +740,7 @@ impl ErrorCode {
             RefusalCode::HistoryUnverified => ErrorCode::HistoryUnverified,
             RefusalCode::NotAWarehouse => ErrorCode::NotAWarehouse,
             RefusalCode::PalletDeletedOnRemote => ErrorCode::PalletDeletedOnRemote,
+            RefusalCode::CacheMiss => ErrorCode::CacheMiss,
         }
     }
 }
@@ -1230,6 +1240,7 @@ mod tests {
             (RefusalCode::HistoryUnverified, "history_unverified", 34),
             (RefusalCode::NotAWarehouse, "not_a_warehouse", 3),
             (RefusalCode::PalletDeletedOnRemote, "pallet_deleted_on_remote", 35),
+            (RefusalCode::CacheMiss, "cache_miss", 36),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

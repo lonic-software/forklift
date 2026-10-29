@@ -3888,29 +3888,49 @@ impl RemoteClient {
     /// A `429` is waited out (see [`Self::send_waiting_out_throttle`]). A degraded batch fetch
     /// sends a whole wave of these at once, which is exactly what a rate-limited head throttles.
     pub async fn fetch_object(&self, hash: &str) -> Result<Vec<u8>, String> {
+        match self.fetch_object_classified(hash).await {
+            ObjectFetch::Fetched(bytes) => Ok(bytes),
+            ObjectFetch::Unreachable(e) | ObjectFetch::Refused(e) => Err(e),
+        }
+    }
+
+    /// [`Self::fetch_object`], telling a remote that could not be reached from one that answered
+    /// and refused: a cache warehouse's read refuses the first as a cache miss it can retry once
+    /// the origin is reachable, and the second as the remote's own answer.
+    pub async fn fetch_object_classified(&self, hash: &str) -> ObjectFetch {
         let posture = Posture::BoundedObjectReads;
-        let outcome = self.send_waiting_out_throttle(
+        let outcome = match self.send_waiting_out_throttle(
             posture, reqwest::Method::GET, &format!("/v1/objects/{}", hash), SendBody::Empty,
             &format!("object {}", hash),
-        ).await?;
-        let response = self.response_from_send(
-            &format!("fetching object {}", hash), posture, outcome
-        )?;
+        ).await {
+            Ok(outcome) => outcome,
+            Err(e) => return ObjectFetch::Refused(e),
+        };
+        let response = match outcome {
+            SendOutcome::Sent(response) => response,
+            outcome => {
+                let unsent = self.response_from_send(&format!("fetching object {}", hash), posture, outcome);
+                return ObjectFetch::Unreachable(unsent.err().unwrap_or_default());
+            }
+        };
 
         if !response.status().is_success() {
-            return Err(self.error_of(response, &format!("object {}", hash)).await);
+            return ObjectFetch::Refused(self.error_of(response, &format!("object {}", hash)).await);
         }
 
         // An object over the ceiling cannot be stored however it arrives, so it is refused in
         // the ceiling's own terms rather than as a misbehaving remote: a store may still hold one
         // authored before the ceiling existed.
-        body_utils::read_body_capped(response, MAX_OBJECT_BYTES as u64).await.map_err(|e| match e {
-            BodyReadError::Transport(e) => self.describe_transport_error(&format!("reading object {}", hash), posture, e),
-            BodyReadError::OverCap { cap } => format!(
+        match body_utils::read_body_capped(response, MAX_OBJECT_BYTES as u64).await {
+            Ok(bytes) => ObjectFetch::Fetched(bytes),
+            Err(BodyReadError::Transport(e)) => ObjectFetch::Unreachable(
+                self.describe_transport_error(&format!("reading object {}", hash), posture, e)
+            ),
+            Err(BodyReadError::OverCap { cap }) => ObjectFetch::Refused(format!(
                 "Object {} on the remote is larger than the {}-byte whole-object ceiling; refusing to fetch it.",
                 hash, cap
-            ),
-        })
+            )),
+        }
     }
 
     /// Upload one object's raw bytes to the control plane (`PUT /v1/objects/{hash}`), where the
@@ -4578,6 +4598,17 @@ pub struct PartialBundle {
 
     /// How much of it was synced to the download file. At most `total`.
     pub length: u64,
+}
+
+/// What [`RemoteClient::fetch_object_classified`] found.
+#[derive(Debug)]
+pub enum ObjectFetch {
+    /// The object's bytes, unverified.
+    Fetched(Vec<u8>),
+    /// The remote could not be reached, or stopped answering before the object arrived.
+    Unreachable(String),
+    /// The remote answered and did not hand the object over.
+    Refused(String),
 }
 
 /// What [`RemoteClient::download_bundle`] found.

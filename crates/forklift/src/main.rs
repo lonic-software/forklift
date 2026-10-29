@@ -6,6 +6,7 @@ use forklift_core::util::fanout_utils::block_on_worker_stack;
 use crate::cli::{Cli, Command, OfficeAction, ParkAction, ProfileAction};
 use crate::output::{ErrorCode, ForkliftError, OutputMode};
 
+pub mod cache_fetch;
 pub mod cli;
 pub mod color;
 pub mod commands;
@@ -72,6 +73,9 @@ async fn async_main() {
 
     // Core delegates protected-key unlocking back to the terminal through this provider.
     passphrase::install_provider();
+
+    // A cache warehouse's reads fetch what it holds by hash from its origin.
+    cache_fetch::install();
 
     // On a terminal, long read-only output (history, diff, …) is piped through a pager so
     // it is scrollable. The command's own writes are unchanged — the pager is wired in under
