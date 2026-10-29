@@ -793,7 +793,7 @@ impl std::fmt::Display for RefUpdateError {
             ),
             RefUpdateError::MetaShaped { pallet, head, parcel } => write!(
                 f,
-                "Refusing to set pallet \"{}\" to {}: parcel {} of its history holds a \"{}\" folder \
+                "Refusing to set pallet \"{}\" to {}: parcel {} of its history holds a \"{}\" entry \
                 at its root, which only metadata history may hold. Nothing was written.",
                 pallet, &head[..head.len().min(12)], &parcel[..parcel.len().min(12)],
                 crate::globals::FOLDER_NAME_FORKLIFT_ROOT
@@ -1087,6 +1087,8 @@ pub fn update_meta_pallet_head(name: &str,
 ///                                    - A precondition did not hold; nothing was written.
 /// * `Err(RefUpdateError::Incomplete)` - A user pallet's new head does not have its history
 ///                                      completely present; nothing was written.
+/// * `Err(RefUpdateError::MetaShaped)` - A user pallet's new history holds a parcel whose root
+///                                      tree is meta-shaped; nothing was written.
 /// * `Err(RefUpdateError::Deleted)`   - The pallet was deleted in this served warehouse; nothing
 ///                                      was written.
 /// * `Err(RefUpdateError::Backward)`  - A user pallet in this served warehouse would move to a
@@ -1117,8 +1119,8 @@ pub fn recreate_pallet_head(name: &str,
 
 /// [`update_pallet_head_in`] for a caller that has just verified `new`'s closure itself (a
 /// remote's ref update, after its own closure check): the write skips its own verification when
-/// `verified` is for `new` at the current fetch scope, walked for `namespace`, and verifies as
-/// usual otherwise. A creation
+/// `verified` is for `new` at the current fetch scope, walked for `namespace` and bounded at
+/// `expected`, and verifies as usual otherwise. A creation
 /// may acknowledge the name's tombstone, as [`recreate_pallet_head`]'s does.
 pub fn update_pallet_head_verified(
     namespace: PalletNamespace,
@@ -1132,8 +1134,10 @@ pub fn update_pallet_head_verified(
     update_pallet_head_checked(namespace, name, expected, new, preconditions, Some(verified), tombstone)
 }
 
-/// That a head's closure was verified, at which fetch scope, and for which namespace's pallet: only
-/// a user pallet's walk refuses a meta-shaped root. Minted only by the verifier
+/// That a head's closure was verified, at which fetch scope, for which namespace's pallet (only a
+/// user pallet's walk refuses a meta-shaped root), and down to which bound. The bound matters
+/// because the walk trusts what the bound reaches, a root it carries included: a write takes the
+/// proof only when the bound is the head its compare-and-set pins the ref to. Minted only by the verifier
 /// ([`audit_utils::verify_parcel_closure_for_write`](crate::util::audit_utils::verify_parcel_closure_for_write)),
 /// so holding one means the check ran.
 #[derive(Clone, Debug)]
@@ -1141,11 +1145,15 @@ pub struct VerifiedClosure {
     head: String,
     scope: MaterializationScope,
     namespace: PalletNamespace,
+    bound: Option<String>,
 }
 
 impl VerifiedClosure {
-    pub(crate) fn new(head: &str, scope: MaterializationScope, namespace: PalletNamespace) -> VerifiedClosure {
-        VerifiedClosure { head: head.to_string(), scope, namespace }
+    pub(crate) fn new(head: &str,
+                      scope: MaterializationScope,
+                      namespace: PalletNamespace,
+                      bound: Option<&str>) -> VerifiedClosure {
+        VerifiedClosure { head: head.to_string(), scope, namespace, bound: bound.map(str::to_string) }
     }
 }
 
@@ -1186,6 +1194,7 @@ fn update_pallet_head_checked(
 
             let leaned_on = match verified.is_some_and(|verified| {
                 verified.head == new && verified.scope == scope && verified.namespace == namespace
+                    && verified.bound.as_deref() == expected
             }) {
                 true => None,
                 false => verify_new_head(name, expected, new, &scope)?,
@@ -1927,7 +1936,7 @@ pub(crate) mod tests {
                                                    expected: Option<&str>,
                                                    new: &str,
                                                    preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
-        let verified = VerifiedClosure::new(new, crate::util::scope_utils::read_fetch_scope()?, namespace);
+        let verified = VerifiedClosure::new(new, crate::util::scope_utils::read_fetch_scope()?, namespace, expected);
         update_pallet_head_verified(namespace, name, expected, new, preconditions, &verified, None)
     }
 
@@ -2346,18 +2355,18 @@ pub(crate) mod tests {
             remove(&missing);
             let full = MaterializationScope::full();
 
-            let wrong_head = VerifiedClosure::new(&other, full.clone(), PalletNamespace::User);
+            let wrong_head = VerifiedClosure::new(&other, full.clone(), PalletNamespace::User, None);
             assert_incomplete(update_pallet_head_verified(
                 PalletNamespace::User, "main", None, &head, &RefPreconditions::NONE, &wrong_head, None
             ), "main", None);
 
-            let wrong_scope = VerifiedClosure::new(&head, MaterializationScope::from_prefixes(["src"]), PalletNamespace::User);
+            let wrong_scope = VerifiedClosure::new(&head, MaterializationScope::from_prefixes(["src"]), PalletNamespace::User, None);
             assert_incomplete(update_pallet_head_verified(
                 PalletNamespace::User, "main", None, &head, &RefPreconditions::NONE, &wrong_scope, None
             ), "main", None);
 
             // The token stands for a verification its caller made: the write takes its word.
-            let token = VerifiedClosure::new(&head, full, PalletNamespace::User);
+            let token = VerifiedClosure::new(&head, full, PalletNamespace::User, None);
             update_pallet_head_verified(PalletNamespace::User, "main", None, &head, &RefPreconditions::NONE, &token, None).unwrap();
         }
 
@@ -2454,6 +2463,24 @@ pub(crate) mod tests {
 
             let token = crate::util::audit_utils::verify_parcel_closure_for_write(&head, Some(&base), PalletNamespace::Meta)
                 .expect("a meta walk takes a meta-shaped root");
+            assert_meta_shaped(update_pallet_head_verified(
+                PalletNamespace::User, "main", Some(&base), &head, &RefPreconditions::NONE, &token, None
+            ), "main", Some(&base), &head);
+        }
+
+        // Revert: stop comparing the token's bound → a user walk cut at a meta-shaped parcel no user
+        // ref reaches skips the root `head` reuses from it, and the write takes that token and lands.
+        #[test]
+        fn a_token_walked_to_another_bound_does_not_let_a_user_write_skip_the_shape_check() {
+            let (_root, _scope) = scratch("closure-meta-bound");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let crafted_root = meta_shaped("m");
+            let elsewhere = parcel(&crafted_root, &[]);
+            let head = parcel(&crafted_root, &[&base]);
+
+            let token = crate::util::audit_utils::verify_parcel_closure_for_write(&head, Some(&elsewhere), PalletNamespace::User)
+                .expect("the bound carries the root, so the walk skips it");
             assert_meta_shaped(update_pallet_head_verified(
                 PalletNamespace::User, "main", Some(&base), &head, &RefPreconditions::NONE, &token, None
             ), "main", Some(&base), &head);

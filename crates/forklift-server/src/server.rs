@@ -1110,7 +1110,8 @@ fn is_missing_or_empty_folder(root: &std::path::Path) -> std::io::Result<bool> {
 
 /// Map a trust install that did not land to the answer a ref update gives for the same condition:
 /// a `409` when the office or the anchor it was judged against moved, or when a pallet head here
-/// stands outside the anchor's boundary (it wrote nothing), and a 500 when a write failed.
+/// stands outside the anchor's boundary (it wrote nothing), a `422` for a meta-shaped user history,
+/// and a 500 when a write failed.
 fn trust_install_refusal(error: RefUpdateError) -> HandlerError {
     match error {
         RefUpdateError::OfficeMoved { found } => office_moved(found.as_deref()),

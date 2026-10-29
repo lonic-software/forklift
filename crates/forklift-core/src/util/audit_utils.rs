@@ -1791,7 +1791,8 @@ fn verify_local_closure(head: &str,
 /// ([`pallet_utils::update_pallet_head_verified`]). The walk is unscoped, so the proof is for the
 /// full scope: in a sparse warehouse the write verifies again at its own. A user pallet's walk also
 /// refuses a meta-shaped root (see [`verify_parcel_closure_with`]), and the proof records the
-/// namespace it was walked for, so a meta walk's proof never lets a user-pallet write skip that.
+/// namespace it was walked for, so a meta walk's proof never lets a user-pallet write skip that,
+/// and `known_complete`, which a write accepts only as the head its compare-and-set expects.
 ///
 /// # Returns
 /// * `Ok(VerifiedClosure)` - Everything is present.
@@ -1802,7 +1803,7 @@ pub fn verify_parcel_closure_for_write(head: &str,
                                        namespace: PalletNamespace) -> Result<pallet_utils::VerifiedClosure, ClosureError> {
     verify_local_closure(head, known_complete, namespace)?;
 
-    Ok(pallet_utils::VerifiedClosure::new(head, MaterializationScope::full(), namespace))
+    Ok(pallet_utils::VerifiedClosure::new(head, MaterializationScope::full(), namespace, known_complete))
 }
 
 /// [`verify_parcel_closure`], with the leaf-blob presence check made pluggable.
@@ -1905,7 +1906,7 @@ impl std::fmt::Display for ClosureError {
             ClosureError::Incomplete(missing) => f.write_str(missing),
             ClosureError::MetaShapedRoot { parcel } => write!(
                 f,
-                "Parcel {} holds a \"{}\" folder at its root, which only metadata history may hold.",
+                "Parcel {} holds a \"{}\" entry at its root, which only metadata history may hold.",
                 parcel, crate::globals::FOLDER_NAME_FORKLIFT_ROOT
             ),
         }
