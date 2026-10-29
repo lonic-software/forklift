@@ -54,6 +54,8 @@ pub fn diff_trees(from: Option<&str>, to: &str) -> Result<(Vec<FileOp>, Vec<Stri
 pub fn diff_trees_in(from: Option<&str>,
                      to: &str,
                      scope: &MaterializationScope) -> Result<(Vec<FileOp>, Vec<String>), String> {
+    cache_miss::prefetch_trees(&[from, Some(to)], |path, sides| diff_descends(path, sides[0], sides[1], scope));
+
     let from_tree = match from {
         Some(hash) => Some(object_utils::load_tree(hash)?),
         None => None,
@@ -82,6 +84,12 @@ pub fn diff_trees_in(from: Option<&str>,
     removed_dirs.sort_by_key(|dir| std::cmp::Reverse(dir.matches('/').count()));
 
     Ok((ops, removed_dirs))
+}
+
+/// Whether [`diff_directory`] descends into the subtree at `path`, `from` and `to` being its hash
+/// on each side: where they differ, and the subtree is not out of scope.
+fn diff_descends(path: &str, from: Option<&str>, to: Option<&str>, scope: &MaterializationScope) -> bool {
+    from != to && (scope.is_full() || scope.classify(path) != ScopeClass::OutOfScope)
 }
 
 /// What [`diff_directory`] collects.
@@ -114,10 +122,11 @@ fn diff_directory(from: Option<&TreeItem>,
                   plan: &mut Plan,
                   aliased: bool,
                   scope: &MaterializationScope) -> Result<(), String> {
-    // Hoisted once per directory (not per entry): a full (unscoped) scope always classifies
-    // everything in scope, so on the hot, common full-bay path the scope checks below are
-    // pure overhead — short-circuit them away entirely, the same way `stack_parcel` gates the
-    // whole overlay on `is_full()`.
+    // Hoisted once per directory (not per entry) for the file loops: a full (unscoped) scope
+    // always classifies everything in scope, so on the hot, common full-bay path their scope
+    // checks are pure overhead — short-circuit them away entirely, the same way `stack_parcel`
+    // gates the whole overlay on `is_full()`. The subtree loops ask `diff_descends`, the rule
+    // the presence walk shares.
     let scope_is_full = scope.is_full();
 
     let from_files: BTreeMap<&String, &TreeItem> = from
@@ -185,17 +194,13 @@ fn diff_directory(from: Option<&TreeItem>,
     for (name, to_subtree) in &to_subtrees {
         let child_key = join_key(key, name);
 
-        // An out-of-scope subtree is sealed by hash: never load it, never materialize it. A
-        // shift whose out-of-scope siblings changed simply re-materializes in scope; the new
-        // hashes flow into the next stack through the overlay (§3.2/§3.5).
-        if !scope_is_full && scope.classify(&child_key) == ScopeClass::OutOfScope {
-            continue;
-        }
-
         let from_subtree = from_subtrees.get(*name);
 
-        // Identical subtree hashes mean identical content all the way down.
-        if from_subtree.map(|subtree| subtree.hash == to_subtree.hash).unwrap_or(false) {
+        // Identical subtree hashes mean identical content all the way down. An out-of-scope
+        // subtree is sealed by hash: never load it, never materialize it. A shift whose
+        // out-of-scope siblings changed simply re-materializes in scope; the new hashes flow into
+        // the next stack through the overlay (§3.2/§3.5).
+        if !diff_descends(&child_key, from_subtree.map(|subtree| subtree.hash.as_str()), Some(&to_subtree.hash), scope) {
             continue;
         }
 
@@ -218,11 +223,7 @@ fn diff_directory(from: Option<&TreeItem>,
     for (name, from_subtree) in &from_subtrees {
         let subtree_key = join_key(key, name);
 
-        if !scope_is_full && scope.classify(&subtree_key) == ScopeClass::OutOfScope {
-            continue;
-        }
-
-        if !to_subtrees.contains_key(*name) {
+        if !to_subtrees.contains_key(*name) && diff_descends(&subtree_key, Some(&from_subtree.hash), None, scope) {
             let from_loaded = object_utils::load_tree(&from_subtree.hash)?;
 
             diff_directory(Some(&from_loaded), None, &subtree_key, plan, aliased || paired.contains(name.as_str()), scope)?;
