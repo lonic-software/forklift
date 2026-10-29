@@ -10985,4 +10985,92 @@ pub(crate) mod tests {
 
         std::fs::remove_dir_all(&temp).ok();
     }
+
+    /// (v) A Repack keeps a tabled signature exactly while its parcel is still present once the
+    /// Repack is done: live, loose, or in a damaged pack it skips. It drops the signature of a
+    /// parcel it drops.
+    ///
+    /// Reverts: carry every entry over → the dropped parcel's signature survives → red; keep an
+    /// entry only when its parcel is found in a sound pack, as membership in the live set would →
+    /// the loose and the damaged-pack parcels lose theirs → red.
+    #[test]
+    fn a_repack_keeps_a_signature_while_its_parcel_is_present_and_drops_it_with_the_parcel() {
+        let (temp, _scope) = salvage_root("sig-repack-presence");
+        std::fs::create_dir_all(pack_folder()).unwrap();
+
+        let mut live_blob = salvage_blob(b"live content");
+        live_blob.store().unwrap();
+        let mut live_tree = salvage_tree(&[("live.txt", &live_blob.hash, crate::enums::dir_entry_type::DirEntryType::Normal)]);
+        live_tree.store().unwrap();
+        commit_salvage_tree(&live_tree.hash);
+        let live = pallet_utils::get_pallet_head("main").unwrap().unwrap();
+
+        let dropped_content = b"packed garbage a repack drops".to_vec();
+        let dropped = blake3::hash(&dropped_content).to_hex().to_string();
+        store_loose(&dropped, &dropped_content);
+        let loose_content = b"garbage that stays loose".to_vec();
+        let loose = blake3::hash(&loose_content).to_hex().to_string();
+        store_loose(&loose, &loose_content);
+        let damaged_batch = numbered_objects("signed in a damaged pack", 200);
+        let damaged = damaged_batch[0].2.clone();
+
+        let signed = [(&live, 1u8), (&dropped, 2), (&loose, 3), (&damaged, 4)];
+        for (hash, seed) in signed {
+            sign_utils::store_raw_parcel_signature(hash, &fake_signature(seed)).unwrap();
+        }
+        compact(false, false, false, &Progress::NONE).unwrap();
+        assert!(loose_sidecars().is_empty(), "sanity: every signature is tabled");
+
+        store_loose(&loose, &loose_content);
+        let mut builder = TransportPackBuilder::new(&pack_folder()).unwrap();
+        for (content, _, hex) in &damaged_batch {
+            builder.append_full(hex, content).unwrap();
+        }
+        let damaged_pair = builder.finish().unwrap().remove(0);
+        corrupt_record_of(&damaged_pair.index_path, &damaged_batch[0].1);
+        invalidate_cache();
+
+        let stats = compact(true, false, false, &Progress::NONE).unwrap();
+
+        assert_eq!(stats.damaged_packs_skipped.len(), 1, "sanity: the damaged pack is skipped, not salvaged");
+        assert_eq!(stats.signatures_dropped, 1, "{:?}", stats);
+        assert_eq!(sign_utils::load_raw_parcel_signature(&dropped).unwrap(), None, "the dropped parcel's signature goes with it");
+        for (hash, seed) in [(&live, 1u8), (&loose, 3), (&damaged, 4)] {
+            assert_eq!(sign_utils::load_raw_parcel_signature(hash).unwrap(), Some(fake_signature(seed)),
+                "a present parcel keeps its signature: {}", hash);
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// (xii) A Repack that drops no signature rewrites every table onto its own name and must
+    /// keep it.
+    ///
+    /// Revert: drop the just-published-name guard in `sweep_signatures` → the Repack deletes the
+    /// table it wrote → the signature reads as unsigned → red.
+    #[test]
+    fn a_repack_that_drops_nothing_keeps_every_table() {
+        let (temp, _scope) = salvage_root("sig-repack-keeps");
+        std::fs::create_dir_all(pack_folder()).unwrap();
+
+        let mut blob = salvage_blob(b"live and signed");
+        blob.store().unwrap();
+        let mut tree = salvage_tree(&[("live.txt", &blob.hash, crate::enums::dir_entry_type::DirEntryType::Normal)]);
+        tree.store().unwrap();
+        commit_salvage_tree(&tree.hash);
+        let live = pallet_utils::get_pallet_head("main").unwrap().unwrap();
+        sign_utils::store_raw_parcel_signature(&live, &fake_signature(1)).unwrap();
+        compact(false, false, false, &Progress::NONE).unwrap();
+        let before: Vec<PathBuf> = signature_tables().into_iter().map(|(path, _)| path).collect();
+        assert_eq!(before.len(), 1, "sanity: one table");
+
+        let stats = compact(true, false, false, &Progress::NONE).unwrap();
+
+        assert_eq!(stats.signatures_dropped, 0);
+        assert_eq!(signature_tables().into_iter().map(|(path, _)| path).collect::<Vec<_>>(), before,
+            "a Repack that drops nothing must leave the table in place");
+        assert_eq!(sign_utils::load_raw_parcel_signature(&live).unwrap(), Some(fake_signature(1)));
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
 }
