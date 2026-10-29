@@ -1110,7 +1110,8 @@ fn is_missing_or_empty_folder(root: &std::path::Path) -> std::io::Result<bool> {
 
 /// Map a trust install that did not land to the answer a ref update gives for the same condition:
 /// a `409` when the office or the anchor it was judged against moved, or when a pallet head here
-/// stands outside the anchor's boundary (it wrote nothing), and a 500 when a write failed.
+/// stands outside the anchor's boundary (it wrote nothing), a `422` for a meta-shaped user history,
+/// and a 500 when a write failed.
 fn trust_install_refusal(error: RefUpdateError) -> HandlerError {
     match error {
         RefUpdateError::OfficeMoved { found } => office_moved(found.as_deref()),
@@ -1129,6 +1130,7 @@ fn trust_install_refusal(error: RefUpdateError) -> HandlerError {
             | RefUpdateError::Backward { .. }) => {
             (StatusCode::CONFLICT, moved.to_string())
         }
+        refused @ RefUpdateError::MetaShaped { .. } => unprocessable(refused.to_string()),
         RefUpdateError::Failed(message) => internal(message),
     }
 }
@@ -2778,8 +2780,10 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             // covers the request's two heads, whose content no other writer can change.
             let verified = match verified_closure.take() {
                 Some(verified) => verified,
-                None => audit_utils::verify_parcel_closure_for_write(&request.new_head, request.old_head.as_deref())
-                    .map_err(unprocessable)?,
+                // A user pallet's walk also refuses a meta-shaped root: a 422 as well, which no
+                // retry or further upload mends.
+                None => audit_utils::verify_parcel_closure_for_write(&request.new_head, request.old_head.as_deref(), namespace)
+                    .map_err(|refusal| unprocessable(refusal.to_string()))?,
             };
 
             // An early refusal too, after the closure check, so its walk of the new history reads
@@ -2935,7 +2939,9 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                 }
                 // The fast-forward check above refuses such a move first; a conflict all the same.
                 Err(backward @ RefUpdateError::Backward { .. }) => return Err((StatusCode::CONFLICT, backward.to_string())),
-                Err(incomplete @ RefUpdateError::Incomplete { .. }) => return Err(unprocessable(incomplete.to_string())),
+                Err(refused @ (RefUpdateError::Incomplete { .. } | RefUpdateError::MetaShaped { .. })) => {
+                    return Err(unprocessable(refused.to_string()));
+                }
                 Err(RefUpdateError::Deleted { pallet, head, acknowledged }) => {
                     return Err(pallet_deleted(&pallet, &head, acknowledged));
                 }
@@ -5964,14 +5970,24 @@ mod tests {
                            signing_key_id: &str,
                            parents: Vec<String>,
                            description: &str) -> String {
-        use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
         use forklift_core::enums::dir_entry_type::DirEntryType;
+
+        let root_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        store_signed_parcel_over(actor, signing_key_id, parents, description, &root_tree)
+    }
+
+    /// [`store_signed_parcel`] over `root_tree`, stored with it.
+    fn store_signed_parcel_over(actor: &Operator,
+                                signing_key_id: &str,
+                                parents: Vec<String>,
+                                description: &str,
+                                root_tree: &TreeItem) -> String {
+        use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
         use forklift_core::enums::parcel_action_type::ParcelActionType;
         use forklift_core::model::parcel::Parcel;
         use forklift_core::model::parcel_action::ParcelAction;
 
-        let root_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
-        let mut root_object = LooseObjectBuilder::build_tree(&root_tree);
+        let mut root_object = LooseObjectBuilder::build_tree(root_tree);
         root_object.store().unwrap();
 
         let timestamp = chrono::Utc::now();
@@ -6004,6 +6020,51 @@ mod tests {
         forklift_core::util::sign_utils::store_parcel_signature(&parcel_object.hash, &signature).unwrap();
 
         parcel_object.hash
+    }
+
+    /// A user pallet's ref update to a history whose root holds the metadata folder is a 422, and
+    /// the ref stays unborn; the same writer's clean parcel lifts.
+    // Revert: drop the shape check from the walk, or walk every pallet as the meta namespace → the
+    // crafted head lifts.
+    #[tokio::test]
+    async fn a_ref_update_to_a_meta_shaped_user_history_is_refused() {
+        use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+        use forklift_core::enums::dir_entry_type::DirEntryType;
+
+        let fixture = OfficeFixture::genesis("post-ref-meta-shaped");
+        let quinn_key_id = fixture.admit("quinn", Role::Writer, vec!["crafted".to_string()], IdentityClass::Human, None);
+        let quinn = Operator { identifier: "quinn".to_string() };
+        let mut operator_tokens = HashMap::new();
+        operator_tokens.insert("tok-quinn".to_string(), "quinn".to_string());
+        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+
+        let metadata = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        let mut metadata_object = LooseObjectBuilder::build_tree(&metadata);
+        metadata_object.store().unwrap();
+        let mut root_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        root_tree.add_child(TreeItem::new(FOLDER_NAME_FORKLIFT_ROOT.to_string(), metadata_object.hash, DirEntryType::Tree));
+        let crafted = store_signed_parcel_over(&quinn, &quinn_key_id, Vec::new(), "crafted", &root_tree);
+
+        let response = post_ref_update(
+            State(Arc::clone(&state)), headers_with_bearer("tok-quinn"), Path(ref_update_params("crafted")),
+            Json(RefUpdateRequest { old_head: None, new_head: crafted.clone(), tombstone: None }),
+        ).await.into_response();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = body_text(response).await;
+        assert!(body.contains(FOLDER_NAME_FORKLIFT_ROOT) && body.contains(&crafted), "{}", body);
+        assert_eq!(forklift_core::util::pallet_utils::get_pallet_head("crafted").unwrap(), None,
+            "the pallet must be unchanged");
+
+        // The control: the gate refuses the shape, not the writer or the push.
+        let clean = store_signed_parcel(&quinn, &quinn_key_id, Vec::new(), "clean");
+        let response = post_ref_update(
+            State(state), headers_with_bearer("tok-quinn"), Path(ref_update_params("crafted")),
+            Json(RefUpdateRequest { old_head: None, new_head: clean.clone(), tombstone: None }),
+        ).await.into_response();
+
+        assert!(response.status().is_success(), "{}", body_text(response).await);
+        assert_eq!(forklift_core::util::pallet_utils::get_pallet_head("crafted").unwrap(), Some(clean));
     }
 
     /// Store an unsigned parcel over an empty tree and return its hash: a pallet head whose history

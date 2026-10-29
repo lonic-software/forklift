@@ -390,6 +390,66 @@ fn a_ref_update_with_a_missing_blob_is_refused() {
     assert_eq!(err.status, Status::Unprocessable);
 }
 
+/// A parcel over `parent` whose root tree holds the metadata folder, stored in `warehouse`: a user
+/// history crafted into the shape of meta history.
+fn store_meta_shaped_parcel(warehouse: &Path, parent: &str) -> String {
+    use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+    use forklift_core::enums::dir_entry_type::DirEntryType;
+    use forklift_core::model::blob::Blob;
+    use forklift_core::model::parcel::Parcel;
+    use forklift_core::model::tree_item::TreeItem;
+
+    let _scope = StorageRootScope::enter(warehouse);
+    let mut blob = LooseObjectBuilder::build_blob(&Blob { content: b"crafted\n".to_vec() });
+    blob.store().expect("store the blob");
+    let mut metadata = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+    metadata.add_child(TreeItem::new("state".to_string(), blob.hash.clone(), DirEntryType::Normal));
+    let mut metadata = LooseObjectBuilder::build_tree(&metadata);
+    metadata.store().expect("store the metadata tree");
+    let mut root = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+    root.add_child(TreeItem::new(".forklift".to_string(), metadata.hash.clone(), DirEntryType::Tree));
+    let mut root = LooseObjectBuilder::build_tree(&root);
+    root.store().expect("store the root tree");
+    let mut parcel = LooseObjectBuilder::build_parcel(&Parcel {
+        tree_hash: root.hash.clone(),
+        parents: vec![parent.to_string()],
+        actions: Vec::new(),
+        description: None,
+    });
+    parcel.store().expect("store the parcel");
+    parcel.hash
+}
+
+/// A user-pallet ref update to a history holding a meta-shaped root is refused (`422`), every
+/// object of it uploaded, and the ref stays where it was.
+// Revert: drop the shape check from the walk, or pass the meta namespace for every pallet → the
+// update commits.
+#[test]
+fn a_ref_update_to_a_meta_shaped_user_history_is_refused() {
+    let area = Area::new("meta-shaped");
+    prepare(&area, "wh");
+    area.write_file("wh/a.txt", "alpha\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "first"]);
+    let main_head = harvest(&area.path("wh")).head_of("main").expect("main head");
+    let crafted = store_meta_shaped_parcel(&area.path("wh"), &main_head);
+
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &harvest(&area.path("wh")));
+    let lift = RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None };
+    head.ref_update(&Principal::Static, "main", &lift).expect("the control: the clean head lifts");
+
+    let request = RefUpdateRequest { old_head: Some(main_head.clone()), new_head: crafted.clone(), tombstone: None };
+    let err = head.ref_update(&Principal::Static, "main", &request).expect_err("a meta-shaped user history");
+    assert_eq!(err.status, Status::Unprocessable);
+    assert!(err.message.contains(".forklift") && err.message.contains(&crafted), "{}", err.message);
+    assert_eq!(
+        head.refs.get_head(pallet_utils::PalletNamespace::User, "main").unwrap().live(),
+        Some(main_head.as_str()),
+        "nothing was written"
+    );
+}
+
 /// Classify an object as a blob by trying to parse it as a parcel/tree under the source
 /// warehouse's scope; a blob is neither.
 fn is_probably_blob(warehouse: &Path, hash: &str) -> bool {

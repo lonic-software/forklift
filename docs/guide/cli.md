@@ -1740,6 +1740,11 @@ it checked; once it is present again, what it names is checked as usual. When so
 is missing, for instance after a fetch that stopped part-way, the command refuses, names the
 missing object, and writes nothing; running that fetch again completes the history.
 
+The same check refuses a history in which a parcel it newly reaches has a folder or file named
+`.forklift` at its root. Only metadata history takes that shape, and `heal` and scope pruning walk
+such a tree in full whatever the fetch scope. The command names the parcel and writes nothing, and
+no fetch mends it. A remote refuses a push of such a history the same way.
+
 The meta pallets sync first, each on its own: one that fails or conflicts is reported, and the
 working pallet still lowers. A diverged `@kv`, `@manifest`, `@tags` or `@haul`
 replays your changes onto the remote's, and `--keep` resolves the paths both sides changed (see
