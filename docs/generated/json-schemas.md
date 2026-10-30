@@ -3878,6 +3878,10 @@ A command not listed here either reports only the generic human-message shape `{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Whether the alias exists, and where it points.",
   "properties": {
+    "foreign": {
+      "description": "Whether a file forklift does not manage holds the alias's name, so `install` would\nrefuse to overwrite it.",
+      "type": "boolean"
+    },
     "installed": {
       "type": "boolean"
     },
@@ -3897,7 +3901,8 @@ A command not listed here either reports only the generic human-message shape `{
   "required": [
     "name",
     "path",
-    "installed"
+    "installed",
+    "foreign"
   ],
   "title": "StatusReport",
   "type": "object"

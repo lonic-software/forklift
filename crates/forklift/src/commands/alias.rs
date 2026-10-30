@@ -63,7 +63,8 @@ fn install(name: &str) -> Result<(), String> {
         )),
         Existing::Foreign => return Err(format!(
             "\"{}\" already exists and is not an alias forklift manages (not a symlink to a \
-            forklift binary). Refusing to overwrite it.",
+            forklift binary). Refusing to overwrite it — remove it yourself first if that's what \
+            you want (a shim an older release wrote is one this release no longer recognizes).",
             display(&alias_path)
         )),
         Existing::None => {}
@@ -101,7 +102,9 @@ fn uninstall(name: &str) -> Result<(), String> {
             Ok(())
         }
         Existing::Foreign => Err(format!(
-            "\"{}\" exists but is not an alias forklift manages. Refusing to remove it.",
+            "\"{}\" exists but is not an alias forklift manages. Refusing to remove it — remove \
+            it yourself if that's what you want (a shim an older release wrote is one this release \
+            no longer recognizes).",
             display(&alias_path)
         )),
         Existing::PointsHere | Existing::PointsElsewhere(_) => {
@@ -124,7 +127,9 @@ fn status() -> Result<(), String> {
     let target = this_binary()?;
     let alias_path = platform_alias_path(&dir, DEFAULT_NAME);
 
-    let (installed, target_display) = match inspect(&alias_path, &target) {
+    let existing = inspect(&alias_path, &target);
+    let foreign = matches!(existing, Existing::Foreign);
+    let (installed, target_display) = match existing {
         Existing::None | Existing::Foreign => (false, None),
         Existing::PointsHere => (true, Some(display(&target))),
         Existing::PointsElsewhere(other) => (true, Some(display(&other))),
@@ -135,6 +140,7 @@ fn status() -> Result<(), String> {
         path: display(&alias_path),
         installed,
         target: target_display,
+        foreign,
     });
 
     Ok(())
@@ -426,12 +432,21 @@ pub(crate) struct StatusReport {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<String>,
+
+    /// Whether a file forklift does not manage holds the alias's name, so `install` would
+    /// refuse to overwrite it.
+    foreign: bool,
 }
 
 impl CommandOutput for StatusReport {
     fn render_human(&self) {
         match &self.target {
             Some(target) => println!("\"{}\" -> \"{}\"", self.path, target),
+            None if self.foreign => println!(
+                "\"{}\" exists but is not an alias forklift manages, so no \"{}\" alias is installed. \
+                 Remove it yourself, then run \"forklift self alias install\".",
+                self.path, self.name
+            ),
             None => println!(
                 "No \"{}\" alias installed at \"{}\". Run \"forklift self alias install\" to create it.",
                 self.name, self.path

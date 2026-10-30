@@ -253,17 +253,10 @@ fn describe(root: &Command, tables: &Tables) -> Result<SelfSchema, String> {
     let description = about(root, &[])?;
     command_settings(&[], root)?;
 
-    for (path, _) in tables.excluded {
-        if path.split(' ').try_fold(root, |command, name| command.find_subcommand(name)).is_none() {
-            return Err(format!(
-                "self schema: the exclusion list names `{path}`, which is not a command"
-            ));
-        }
-    }
-
     let mut walk = Walk {
         tables,
         commands: Vec::new(),
+        excluded_used: vec![false; tables.excluded.len()],
         secret_used: vec![false; tables.secret.len()],
         not_secret_used: vec![false; tables.not_secret.len()],
     };
@@ -272,6 +265,14 @@ fn describe(root: &Command, tables: &Tables) -> Result<SelfSchema, String> {
         walk.command(command, vec![command.get_name()])?;
     }
 
+    for (index, (path, _)) in tables.excluded.iter().enumerate() {
+        if !walk.excluded_used[index] {
+            return Err(format!(
+                "self schema: the exclusion list names `{path}`, which is not a visible command \
+                 under its own name"
+            ));
+        }
+    }
     for (index, (path, id)) in tables.secret.iter().enumerate() {
         if !walk.secret_used[index] {
             return Err(format!(
@@ -302,7 +303,8 @@ struct Walk<'a> {
     tables: &'a Tables,
     commands: Vec<SchemaCommand>,
 
-    /// Which table entries matched an argument, for the staleness check.
+    /// Which table entries matched a command or an argument, for the staleness check.
+    excluded_used: Vec<bool>,
     secret_used: Vec<bool>,
     not_secret_used: Vec<bool>,
 }
@@ -321,7 +323,9 @@ impl Walk<'_> {
     /// Describe `command` at `path`: a group contributes its bare form when it runs without a
     /// subcommand, then each visible subcommand; a leaf contributes itself.
     fn command(&mut self, command: &Command, path: Vec<&str>) -> Result<(), String> {
-        if self.tables.excluded.iter().any(|(excluded, _)| *excluded == path.join(" ")) {
+        let full = path.join(" ");
+        if let Some(index) = self.tables.excluded.iter().position(|(excluded, _)| *excluded == full) {
+            self.excluded_used[index] = true;
             return Ok(());
         }
         command_settings(&path, command)?;
@@ -1430,8 +1434,9 @@ mod tests {
         let root = Command::new("probe").about("Probe")
             .subcommand(Command::new("fam").about("Fam").subcommand_required(true)
                 .subcommand(Command::new("keep").about("Keep"))
-                .subcommand(Command::new("drop").about("Drop")))
-            .subcommand(Command::new("drop").about("Drop at the top"));
+                .subcommand(Command::new("drop").about("Drop").alias("dr")))
+            .subcommand(Command::new("drop").about("Drop at the top"))
+            .subcommand(Command::new("secret").about("Hidden").hide(true));
         let ids = |tables: &Tables| -> Vec<String> {
             describe(&root, tables).unwrap().commands.into_iter().map(|command| command.id).collect()
         };
@@ -1446,6 +1451,12 @@ mod tests {
 
         const STALE: Tables = Tables { excluded: &[("fam gone", "")], secret: &[], not_secret: &[] };
         assert!(describe(&root, &STALE).err().unwrap().contains("`fam gone`"));
+        // The walk matches visible commands by name, so neither an alias nor a hidden command
+        // would ever be left out: naming one is as stale as naming nothing.
+        const ALIAS: Tables = Tables { excluded: &[("fam dr", "")], secret: &[], not_secret: &[] };
+        assert!(describe(&root, &ALIAS).err().unwrap().contains("`fam dr`"));
+        const HIDDEN: Tables = Tables { excluded: &[("secret", "")], secret: &[], not_secret: &[] };
+        assert!(describe(&root, &HIDDEN).err().unwrap().contains("`secret`"));
     }
 
     // (e) A table entry that names nothing is an error.

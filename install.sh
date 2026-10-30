@@ -151,10 +151,13 @@ install_one() { # $1 = binary base name (forklift / forklift-server)
     # on, opt out with FORKLIFT_NO_ALIAS=1; best effort (never fails the install over it —
     # e.g. a read-only install dir, or a name collision it correctly refuses to clobber).
     # Releases before the `self` family spell it `alias install`, and FORKLIFT_VERSION can
-    # install one of those, so the binary is asked which family it has.
+    # install one of those, so the binary is asked which family it has. Only a binary that has
+    # `alias` and lacks `self` is an older release; one that fails both gets today's spelling.
     if [ "$name" = "forklift" ] && [ -z "${FORKLIFT_NO_ALIAS:-}" ]; then
         alias_install="self alias install"
-        "$dest" self --help >/dev/null 2>&1 || alias_install="alias install"
+        if ! "$dest" self --help >/dev/null 2>&1 && "$dest" alias --help >/dev/null 2>&1; then
+            alias_install="alias install"
+        fi
         # shellcheck disable=SC2086 # the words are split on purpose
         "$dest" $alias_install || say "warning: could not create the \"fl\" alias (see above); \"$dest $alias_install\" retries it"
     fi

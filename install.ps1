@@ -76,13 +76,19 @@ try {
         # on, opt out with FORKLIFT_NO_ALIAS=1; best effort (never fails the install over it).
         if ($Name -eq "forklift" -and -not $env:FORKLIFT_NO_ALIAS) {
             # Releases before the `self` family spell it `alias install`, and FORKLIFT_VERSION
-            # can install one of those, so the binary is asked which family it has.
+            # can install one of those, so the binary is asked which family it has. Only a
+            # binary that has `alias` and lacks `self` is an older release; one that fails both
+            # gets today's spelling. A probe that throws counts as a failed probe.
             $Exe = Join-Path $InstallDir "forklift.exe"
-            $AliasInstall = @("alias", "install")
-            try {
-                & $Exe self --help *> $null
-                if ($LASTEXITCODE -eq 0) { $AliasInstall = @("self", "alias", "install") }
-            } catch {}
+            $AliasInstall = @("self", "alias", "install")
+            $HasSelf = $false
+            try { & $Exe self --help *> $null; $HasSelf = ($LASTEXITCODE -eq 0) } catch {}
+            if (-not $HasSelf) {
+                try {
+                    & $Exe alias --help *> $null
+                    if ($LASTEXITCODE -eq 0) { $AliasInstall = @("alias", "install") }
+                } catch {}
+            }
             # $ErrorActionPreference = "Stop" only turns PowerShell-native errors into
             # exceptions - it does not touch an external process's exit code, so the
             # try/catch alone never fires on failure here. Check $LASTEXITCODE ourselves,

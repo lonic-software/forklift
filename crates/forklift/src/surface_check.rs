@@ -112,6 +112,13 @@ fn parse_spec(text: &str) -> Result<Spec, String> {
                              (`{name}: sub …`) after the line that lists it"
                         ));
                     }
+                    let given = spec.commands.iter().any(|command| command.len() > path.len() && command.starts_with(&path));
+                    if given || subs.is_some_and(|subs| subs.trim().is_empty()) {
+                        return Err(format!(
+                            "spec.txt:{number}: the family `{name}` is written once, on one line \
+                             that lists every subcommand"
+                        ));
+                    }
                 } else {
                     spec.commands.push(path.clone());
                 }
@@ -144,6 +151,10 @@ fn a_nested_family_is_written_after_its_parent() {
     for refused in ["[commands]\nfam inner: deep\nfam: one inner\n", "[commands]\nfam: one inner\nfam inner\n"] {
         let error = paths(refused).err().unwrap_or_else(|| panic!("accepted {refused:?}"));
         assert!(error.contains("`fam inner` is a path"), "{error}");
+    }
+    for refused in ["[commands]\nfam: one inner\nfam inner: deep\nfam inner: deeper\n", "[commands]\nfam: one inner\nfam inner:\n"] {
+        let error = paths(refused).err().unwrap_or_else(|| panic!("accepted {refused:?}"));
+        assert!(error.contains("`fam inner` is written once"), "{error}");
     }
 }
 

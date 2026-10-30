@@ -5700,6 +5700,14 @@ fn alias_install_refuses_a_foreign_file() {
     assert_eq!(json(&result)["error"]["code"], "error");
     assert!(stdout(&result).contains("Refusing"));
 
+    // Status names the file as what blocks the install, rather than suggesting an install.
+    let status = scratch.run(&["--json", "self", "alias", "status"]);
+    assert_success(&status);
+    assert_eq!(json(&status)["data"]["installed"], false);
+    assert_eq!(json(&status)["data"]["foreign"], true);
+    let human = scratch.run(&["self", "alias", "status"]);
+    assert!(stdout(&human).contains("not an alias forklift manages"), "{}", stdout(&human));
+
     // The foreign file must be untouched.
     assert_eq!(
         std::fs::read_to_string(scratch.alias_path("fl")).unwrap(),
@@ -5744,6 +5752,7 @@ fn alias_status_reports_installed_state() {
     let before = scratch.run(&["--json", "self", "alias", "status"]);
     assert_success(&before);
     assert_eq!(json(&before)["data"]["installed"], false);
+    assert_eq!(json(&before)["data"]["foreign"], false);
 
     assert_success(&scratch.run(&["self", "alias", "install"]));
 
