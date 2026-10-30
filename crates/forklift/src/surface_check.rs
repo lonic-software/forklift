@@ -1,6 +1,6 @@
-//! The command-surface drift guard: two checks that hold the clap tree in `cli.rs` to a file
-//! a person edits on purpose, so a new command, a renamed one or a dropped one is a reviewed decision
-//! and never a side effect.
+//! The command-surface drift guard: two checks that hold the clap tree in `cli.rs` to a file a
+//! person edits on purpose, so a new command, a renamed one or a dropped one is a reviewed
+//! decision and never a side effect.
 //!
 //! - **The surface spec** (`surface/spec.txt`) lists every command path the binary accepts, and
 //!   three lists drawn by written criteria: the daily loop, the destructive operations and the

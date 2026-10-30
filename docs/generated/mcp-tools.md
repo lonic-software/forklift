@@ -70,7 +70,7 @@ Every tool `forklift mcp` serves, generated from the same command definition the
 | `tag_create` | `forklift tag create` | Create a signed tag pointing at a revision (admin only) | `name` (a string, required)<br>`revision` (a string)<br>`message` (a string) |
 | `tag_show` | `forklift tag show` | Show one tag in full (subject, tagger, message) | `name` (a string, required) |
 | `tag_list` | `forklift tag list` | List every tag (the default) |  |
-| `undo` | `forklift undo` | Undo the last stack, consolidate, pick, shift or pallet delete, keeping your changes | `as` (a string) |
+| `undo` | `forklift undo` | Undo the last stack, consolidate, pick, shift or pallet delete | `as` (a string) |
 | `unload` | `forklift unload` | Unstage a file or directory (keep your changes) | `path` (a string, required) |
 
 ## Not served
