@@ -825,7 +825,8 @@ fn referenced(parcels: &[String], sealed: &SealedSet) -> Result<Result<HashSet<S
     let (present_parcels, gaps) = audit_utils::collect_reachable_noting_gaps(&heads, is_present)?;
     let mut referenced: HashSet<String> = gaps.into_iter().collect();
     let damage = |hash: &str, named_by: &str| Ok(Err(format!(
-        "object {} is missing, and the record does not say the origin holds it ({} references it)",
+        "object {} is missing, and the record does not say the origin holds it ({} references it), so \
+        no eviction shrinks the record until that content is back",
         hash, named_by
     )));
 
