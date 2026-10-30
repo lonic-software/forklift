@@ -1,5 +1,5 @@
-//! The command-surface drift guard: two checks that hold the clap tree in `cli.rs` to files a
-//! person edits on purpose, so a new command, a renamed one or a dropped one is a reviewed decision
+//! The command-surface drift guard: two checks that hold the clap tree in `cli.rs` to a file
+//! a person edits on purpose, so a new command, a renamed one or a dropped one is a reviewed decision
 //! and never a side effect.
 //!
 //! - **The surface spec** (`surface/spec.txt`) lists every command path the binary accepts, and
@@ -20,8 +20,8 @@
 //!   behaviour test that holds its preview to that mode.
 //!
 //! `docs/generated/commands.md` is generated from the same tree and checked by `bin/gen-docs
-//! --check`; it follows the binary wherever it goes. These files do not: they change only when
-//! someone edits them, which is what makes them a guard.
+//! --check`; it follows the binary wherever it goes. The spec does not: it changes only when
+//! someone edits it, which is what makes it a guard.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

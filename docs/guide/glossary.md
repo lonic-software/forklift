@@ -227,8 +227,8 @@ See [`scope prune`](cli.md#scope-prune--reclaim-disk-from-a-sparse-warehouse).
 disk. See [`store evict`](cli.md#store-evict--free-disk-in-a-cache-warehouse).
 
 **Held-heads record.** A record of pallet heads this warehouse saw the remote accept or serve.
-`scope prune` and `store evict` ask the remote which of them it still holds before freeing
-anything. See
+`scope prune` and `store evict` ask the remote which of them it still holds (the *holds request*)
+before freeing anything. See
 [`scope prune`](cli.md#scope-prune--reclaim-disk-from-a-sparse-warehouse).
 
 **Fetched-heads ledger.** A sparse warehouse's record of the heads its fetches brought in, so that
@@ -236,9 +236,9 @@ anything. See
 
 **Origin.** The remote a partial warehouse (cloned with `--only` or `--cache`) fetched from.
 
-**Cache warehouse.** A warehouse cloned with `--cache`: it keeps every parcel and signature, but
-content only for what a bay has checked out or a command has read. It holds the rest by hash and
-fetches it from its origin on demand.
+**Cache warehouse** (also: cache mode). A warehouse cloned with `--cache`: it keeps every
+parcel and signature, but content only for what a bay has checked out or a command has read. It
+holds the rest by hash and fetches it from its origin on demand.
 
 ## Durability and recovery
 
@@ -323,7 +323,7 @@ asks again for the rest. See
 **Served root.** A warehouse folder that `forklift-server` serves.
 
 **Tombstone.** The head a pallet was at when it was deleted in a served warehouse, kept so its
-history stays safe until the tombstone is dropped. See
+history stays safe until the pallet is restored or the tombstone is dropped. See
 [`pallet`](cli.md#pallet--list-create-delete-and-restore-pallets).
 
 **Control plane, data plane.** The *control plane* carries requests such as the handshake and refs;

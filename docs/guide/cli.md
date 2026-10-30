@@ -731,7 +731,7 @@ verified reading.
 
 ```sh
 forklift query --class agent                    # parcels verifiably signed by an agent
-forklift query main --class agent --unsupervised     # the compliance headline, one pallet
+forklift query main --class agent --unsupervised # the compliance headline, one pallet
 forklift query --supervisor alice@corp          # work supervised by one human
 forklift query --signer 91ff02                  # parcels signed by one key (prefix)
 forklift query --grep 'fix*walk' --no-merges    # parcel-local facts compose in
@@ -1410,11 +1410,11 @@ A bay name follows the pallet-name rules (see `pallet`) and is one folder, so it
 `bay remove <name>` matches the
 name exactly against the folders under `.forklift/bays/`, so it also removes a bay whose name
 the rules refuse (one an older version created), and it never treats `.`, `..` or a path as a
-bay. Listing the bays (`forklift bay`) refuses a bay folder whose name breaks the rules, and a bay whose position
-cannot be read, naming it, instead of listing it; for a folder it gives the `bay remove` command
-that removes it. A command run inside a bay whose redirect names a bay outside the rules refuses
-too, naming the bay's `.forklift` folder: remove the bay from the warehouse, or delete that
-folder.
+bay. Listing the bays (`forklift bay`) refuses a bay folder whose name breaks the rules, and a
+bay whose position cannot be read, naming it, instead of listing it; for a folder it gives the
+`bay remove` command that removes it. A command run inside a bay whose redirect names a bay
+outside the rules refuses too, naming the bay's `.forklift` folder: remove the bay from the
+warehouse, or delete that folder.
 
 Because the refs are shared, two bays can reach for the same pallet — say both are on `main`.
 Each bay records the parcel its files stand on. When another bay stacks on the pallet, this bay
@@ -2127,9 +2127,9 @@ flag. A text option's value that looks like a flag (`-x`, `--json`) has to ride 
 option as one word, `--grep=-x`, which is how `pult tool` passes it; written as two words, it
 is refused rather than read as a value. Each param carries its argument's help text as its
 `description`, which Pult shows beside the prompt and in its own `--help`; when a command's
-optional positionals collapse into one param, each part is labelled with its name. `pult tool` reads it and
-prefixes the path of the binary it found; the document is not a runnable `pult.yaml` on its
-own.
+optional positionals collapse into one param, each part is labelled with its name. `pult tool`
+reads it and prefixes the path of the binary it found; the document is not a runnable
+`pult.yaml` on its own.
 
 The global `--json`, `--verbose`, `--no-pager` and `--color` are not params: they are the caller's
 choice of rendering. `help`, `mcp` and `self schema` itself are left out. The bearer token
