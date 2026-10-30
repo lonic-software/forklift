@@ -42,15 +42,25 @@ use crate::output::{self, CommandOutput};
 /// * `expect` - The genesis the remote's trust anchor must have (an out-of-band pin), checked
 ///              against the handshake before anything is fetched.
 /// * `keep`   - Conflict resolutions, each `<pallet>:<path>=ours|theirs`.
+/// * `confirm` - Whether a "theirs" resolution may drop the local changes it names. Without it,
+///              one is refused (`confirmation_required`) before the remote is contacted.
 ///
 /// # Returns
 /// * `Ok(())`      - If every pallet is now in sync with the remote (or ahead of it).
 /// * `Err(String)` - If no remote is configured, its trust anchor is not the expected one or
-///                   not the one held, the remote has no such pallet, the warehouse is dirty, the
+///                   not the one held, a "theirs" resolution lacks `confirm`, the remote has no
+///                   such pallet, the warehouse is dirty, the
 ///                   histories diverged, a meta pallet conflicted or failed to sync, or a transfer
 ///                   failed.
-pub async fn handle_command(pallet: Option<String>, expect: Option<String>, keep: Vec<String>) -> Result<(), String> {
+pub async fn handle_command(pallet: Option<String>, expect: Option<String>, keep: Vec<String>, confirm: bool) -> Result<(), String> {
     let keeps = parse_keeps(&keep)?;
+
+    // Rule 5: a "theirs" resolution destroys local changes nobody else made. One is accepted only
+    // where a local change lies at or beneath its path, so an accepted one always drops something
+    // (or, where both sides made the same change, nothing anyone would miss).
+    if !confirm {
+        theirs_unconfirmed(&keep)?;
+    }
 
     if let Some(name) = &pallet {
         pallet_utils::validate_pallet_name(name)?;
@@ -1038,12 +1048,38 @@ fn meta_conflict_refusal(conflicts: &[MetaPalletConflicts], pallet: &str, head: 
             if pallets.len() == 1 { "it" } else { "them" }
         ),
         format!(
-            "Rerun lower with --keep @<pallet>:<path>=ours|theirs for each named path, e.g. \
-            --keep {}=theirs.",
+            "Rerun lower with --keep @<pallet>:<path>=ours|theirs for each named path (\"theirs\" \
+            also needs --confirm), e.g. --keep {}=theirs --confirm.",
             example
         ),
         serde_json::json!({ "pallets": conflicts, "lowered": { "pallet": pallet, "head": head } }),
     ).into()
+}
+
+/// Refuse (`confirmation_required`) when `specs`, already parsed, hold a "theirs" resolution,
+/// listing each as it was spelled: run without --confirm, it would drop the local changes at or
+/// beneath its path.
+fn theirs_unconfirmed(specs: &[String]) -> Result<(), CoreError> {
+    let theirs: Vec<&str> = specs.iter().filter_map(|spec| spec.strip_suffix("=theirs")).collect();
+
+    if theirs.is_empty() {
+        return Ok(());
+    }
+
+    crate::human!("Taking \"theirs\" would drop every local change at or beneath:");
+    for path in &theirs {
+        crate::human!("  {}", path);
+    }
+
+    Err(CoreError::refusal_with_details(
+        RefusalCode::ConfirmationRequired,
+        format!(
+            "{} \"theirs\" resolution(s) would drop local changes nothing else holds; nothing was changed.",
+            theirs.len()
+        ),
+        "Check that no local change there is still wanted, then run the same lower again with --confirm.",
+        serde_json::json!({ "theirs": theirs }),
+    ))
 }
 
 /// The error for meta pallets that failed to sync, naming each.

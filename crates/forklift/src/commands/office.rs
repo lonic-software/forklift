@@ -1,6 +1,6 @@
 use chrono::Utc;
 use serde::Serialize;
-use forklift_core::error::sanitize;
+use forklift_core::error::{sanitize, CoreError, RefusalCode};
 use forklift_core::model::operator::Operator;
 use forklift_core::util::office_utils::{IdentityClass, OfficeState, RevocationReason, Role, TrustAnchor, UserRecord};
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
@@ -770,7 +770,7 @@ pub fn regenesis(confirm: bool) -> Result<(), String> {
     }
 
     if !confirm {
-        // Dry-run guidance is for a person; under --json the refusal below is the result.
+        // The preview is for a person; under --json the refusal's details carry it.
         crate::human!("Re-genesis would RESET this warehouse's trust:");
         crate::human!("  current genesis:  {}", old_anchor.genesis);
         crate::human!("  office head:      {} (pinned as attested history)", old_office_head);
@@ -779,10 +779,17 @@ pub fn regenesis(confirm: bool) -> Result<(), String> {
         crate::human!("readable but degrades from verified to attested; all enrolled operators");
         crate::human!("and keys are gone from the new office; every clone of this warehouse will");
         crate::human!("refuse to sync until its holder consciously re-accepts the new anchor.");
-        crate::human!();
-        crate::human!("Re-run with --confirm to proceed.");
 
-        return Err("Re-genesis needs --confirm.".to_string());
+        return Err(CoreError::refusal_with_details(
+            RefusalCode::ConfirmationRequired,
+            "Re-genesis resets this warehouse's trust; nothing was changed.",
+            "Check what it would reset, then run \"forklift office regenesis --confirm\" to reset it.",
+            serde_json::json!({
+                "genesis": old_anchor.genesis,
+                "office_head": old_office_head,
+                "operator": operator.identifier,
+            }),
+        ).into());
     }
 
     // The new boundary: everything that exists right now — across both namespaces, so

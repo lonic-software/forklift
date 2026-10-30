@@ -35,9 +35,9 @@ pub const TOOL: &str = "forklift";
 /// `data` shape or the error-code registry changes incompatibly, so an agent can pin it and
 /// detect drift.
 ///
-/// Version 14 (this one): `scope` reports this checkout's scope as `checkout_scope`, not
-/// `materialization_scope`.
-/// Versions 10–13 are recorded in docs/MACHINE_INTERFACE.md.
+/// Version 15 (this one): the `confirmation_required` error code exists, and `scope prune`'s
+/// report drops `dry_run`.
+/// Versions 10–14 are recorded in docs/MACHINE_INTERFACE.md.
 /// Version 9: `batch_lane` may be `out_of_time`, when the remote ran out of time for a
 /// batch download and the rest of the command fetched one object at a time.
 /// Version 8: the `pallet_deleted_on_remote` error code exists; `palletize --remote`
@@ -62,7 +62,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 14;
+pub const SCHEMA_VERSION: u32 = 15;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -530,6 +530,10 @@ error_codes! {
     /// A move of a partial warehouse's origin found the new server lacking content this warehouse
     /// relies on its origin to hold; the origin was left where it was.
     OriginMoveIncomplete,
+
+    /// A destructive command had something to destroy and was run without `--confirm`; it showed
+    /// what it would destroy and changed nothing.
+    ConfirmationRequired,
 }
 
 impl ErrorCode {
@@ -573,6 +577,7 @@ impl ErrorCode {
             ErrorCode::CacheMiss => RefusalCode::CacheMiss.as_str(),
             ErrorCode::OriginMovePending => RefusalCode::OriginMovePending.as_str(),
             ErrorCode::OriginMoveIncomplete => RefusalCode::OriginMoveIncomplete.as_str(),
+            ErrorCode::ConfirmationRequired => RefusalCode::ConfirmationRequired.as_str(),
         }
     }
 
@@ -619,6 +624,7 @@ impl ErrorCode {
             ErrorCode::CacheMiss => 36,
             ErrorCode::OriginMovePending => 37,
             ErrorCode::OriginMoveIncomplete => 38,
+            ErrorCode::ConfirmationRequired => 39,
         }
     }
 
@@ -723,6 +729,10 @@ impl ErrorCode {
                 "The server a partial warehouse's origin was to move to lacks content the warehouse \
                  relies on its origin to hold; the origin was left where it was, and copying the old \
                  server's warehouse to the new one, server-side, lets the move run again",
+            ErrorCode::ConfirmationRequired =>
+                "A destructive command had something to destroy and was run without --confirm; it \
+                 showed what it would destroy, changed nothing, and running it again with --confirm \
+                 destroys it",
         }
     }
 
@@ -766,6 +776,7 @@ impl ErrorCode {
             RefusalCode::CacheMiss => ErrorCode::CacheMiss,
             RefusalCode::OriginMovePending => ErrorCode::OriginMovePending,
             RefusalCode::OriginMoveIncomplete => ErrorCode::OriginMoveIncomplete,
+            RefusalCode::ConfirmationRequired => ErrorCode::ConfirmationRequired,
         }
     }
 }
@@ -1268,6 +1279,7 @@ mod tests {
             (RefusalCode::CacheMiss, "cache_miss", 36),
             (RefusalCode::OriginMovePending, "origin_move_pending", 37),
             (RefusalCode::OriginMoveIncomplete, "origin_move_incomplete", 38),
+            (RefusalCode::ConfirmationRequired, "confirmation_required", 39),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

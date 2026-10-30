@@ -164,7 +164,7 @@ mod tests {
         expands_to("sco st", "scope status");
         expands_to("sco f src", "scope fetch src");
         expands_to("scope n docs", "scope narrow docs");
-        expands_to("scope p --dry-run docs", "scope prune --dry-run docs");
+        expands_to("scope p --confirm docs", "scope prune --confirm docs");
         // Two levels of families: `self alias install`.
         expands_to("se up --check", "self update --check");
         expands_to("sel al i fl2", "self alias install fl2");

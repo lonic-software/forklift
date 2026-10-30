@@ -3607,8 +3607,8 @@ mod tests {
         assert_eq!(haul_utils::held_by_lift(&local, None, &target).unwrap(), fresh, "a remote with no @haul yet");
 
         // Dropping keeps the remote's state where it has one, else the haul it lacks.
-        assert_eq!(haul_utils::drop_held(&waiting), format!("\"forklift lower --keep @haul:{}/state=theirs\"", id));
-        assert!(haul_utils::drop_held(&fresh).starts_with(&format!("\"forklift lower --keep @haul:{}=theirs\" (", id)));
+        assert_eq!(haul_utils::drop_held(&waiting), format!("\"forklift lower --keep @haul:{}/state=theirs --confirm\"", id));
+        assert!(haul_utils::drop_held(&fresh).starts_with(&format!("\"forklift lower --keep @haul:{}=theirs --confirm\" (", id)));
     }
 
     #[test]

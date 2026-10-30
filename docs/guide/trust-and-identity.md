@@ -410,7 +410,7 @@ trust. It is recovery, not management: it's refused while you're an admin with a
 usable key (use `rotate`/`link`/`admit`/`retire` for normal management).
 
 ```sh
-forklift office regenesis            # dry-run: explains what would happen
+forklift office regenesis            # shows what it would reset, changes nothing
 forklift office regenesis --confirm  # actually reset
 ```
 

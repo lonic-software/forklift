@@ -433,10 +433,16 @@ pub enum Command {
                          the path beneath it. SIDE is ours or theirs. \"theirs\" drops every local change at or beneath the path; \
                          \"ours\" puts the local value back on top of the remote one, and must \
                          name a conflicted key exactly. \"theirs\" also discards a local change \
-                         nobody else made. A resolution naming a path with nothing to resolve is \
-                         refused. Repeat the flag for each path."
+                         nobody else made, so a \"theirs\" resolution needs --confirm: without it, \
+                         the lower lists what each one drops, changes nothing and exits non-zero. \
+                         A resolution naming a path with nothing to resolve is refused. Repeat \
+                         the flag for each path."
         )]
         keep: Vec<String>,
+
+        /// Drop the local changes a "theirs" resolution names (only a "theirs" --keep needs it)
+        #[arg(long)]
+        confirm: bool,
     },
 
     /// Facts recorded about a parcel after the fact: notes, approvals, provenance, keyed values
@@ -692,12 +698,19 @@ pub enum Command {
     #[command(
         visible_alias = "r",
         long_about = "Restore a file or directory in the working directory from the inventory \
-                      (discard unstaged changes). To unstage instead, leaving the working \
-                      directory untouched, use \"forklift unload\"."
+                      (discard unstaged changes). When that would overwrite a changed file, it \
+                      lists the files whose changes would be lost, changes nothing and exits \
+                      non-zero unless --confirm is given; restoring a missing file needs no \
+                      --confirm. To unstage instead, leaving the working directory untouched, use \
+                      \"forklift unload\"."
     )]
     Restore {
         /// The file or directory to restore
         path: String,
+
+        /// Discard the unstaged changes the restore would overwrite
+        #[arg(long)]
+        confirm: bool,
     },
 
     /// Manage this binary itself: its update, its short alias and its self-description
@@ -1081,8 +1094,10 @@ pub enum ScopeAction {
                       origin with \"forklift scope fetch\". A full (non-sparse) warehouse has \
                       nothing to prune. If an earlier prune was interrupted before it finished \
                       freeing everything, running it again on the same path resumes and finishes \
-                      the job rather than refusing. Use --dry-run to see what it would free \
-                      without changing anything."
+                      the job rather than refusing. Without --confirm it shows what it would free, \
+                      changes nothing and exits non-zero; when there is nothing to free, it runs \
+                      without --confirm. A confirmed run plans again, so if the remote moved meanwhile it \
+                      may free a little more or less than the preview showed."
     )]
     Prune {
         /// The fetched path(s) to prune. Repeatable; also accepts a path an earlier, interrupted
@@ -1090,9 +1105,9 @@ pub enum ScopeAction {
         #[arg(value_name = "PATH", required = true)]
         paths: Vec<String>,
 
-        /// Report what would be freed and change nothing
+        /// Free the content (without it, what would be freed is shown and nothing changes)
         #[arg(long)]
-        dry_run: bool,
+        confirm: bool,
     },
 }
 
@@ -1815,7 +1830,7 @@ pub enum OfficeAction {
                       what would happen."
     )]
     Regenesis {
-        /// Actually perform the reset (without it, a dry-run explanation is printed)
+        /// Reset trust (without it, what the reset would do is shown and nothing changes)
         #[arg(long)]
         confirm: bool,
     },

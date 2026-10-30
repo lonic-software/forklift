@@ -885,9 +885,9 @@ pub fn describe_held(held: &[HeldMerge]) -> String {
 /// publish is empty, and needs no signature.
 pub fn drop_held(held: &[HeldMerge]) -> String {
     let drops: Vec<String> = held.iter().map(|merge| match merge.on_remote {
-        true => format!("\"forklift lower --keep @{}:{}/state=theirs\"", HAUL_PALLET_NAME, merge.haul),
+        true => format!("\"forklift lower --keep @{}:{}/state=theirs --confirm\"", HAUL_PALLET_NAME, merge.haul),
         false => format!(
-            "\"forklift lower --keep @{}:{}=theirs\" (which drops the haul, not on the remote yet)",
+            "\"forklift lower --keep @{}:{}=theirs --confirm\" (which drops the haul, not on the remote yet)",
             HAUL_PALLET_NAME, merge.haul
         ),
     }).collect();

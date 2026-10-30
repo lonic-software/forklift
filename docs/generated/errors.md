@@ -51,4 +51,5 @@ Exit code 17 is reserved for a future feature and is not yet assigned to any cod
 | `cache_miss` | 36 | A cache warehouse does not hold content the command reads, and could not reach its origin to fetch it; the command works once the origin can be reached |
 | `origin_move_pending` | 37 | A move of a partial warehouse's origin has not finished; "forklift remote move <url>" finishes it, "forklift remote abort" abandons one that has not started rewriting |
 | `origin_move_incomplete` | 38 | The server a partial warehouse's origin was to move to lacks content the warehouse relies on its origin to hold; the origin was left where it was, and copying the old server's warehouse to the new one, server-side, lets the move run again |
+| `confirmation_required` | 39 | A destructive command had something to destroy and was run without --confirm; it showed what it would destroy, changed nothing, and running it again with --confirm destroys it |
 

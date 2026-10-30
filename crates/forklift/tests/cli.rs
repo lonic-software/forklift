@@ -1172,7 +1172,7 @@ fn a_volume_without_the_executable_bit_shifts_twice_and_keeps_each_entry_s_bit()
     let back = std::env::temp_dir().join(format!("forklift-test-exfat-exec-bit-back-{}", std::process::id()));
     copy(&root, &back);
     let back = TestWarehouse { root: back, home: built.home.clone() };
-    assert_success(&back.run(&["restore", "."]));
+    assert_success(&back.run(&["restore", "--confirm", "."]));
     assert_ne!(mode(&back.root, "tool.sh") & 0o111, 0, "the tracked executable kept its bit");
     assert_eq!(mode(&back.root, "notes.txt") & 0o111, 0, "a plain file stayed plain");
     assert_eq!(mode(&back.root, "new.txt") & 0o111, 0, "a new file on a blind volume is recorded plain");
@@ -1582,7 +1582,7 @@ fn remove_and_restore_follow_a_directory_replaced_by_a_file() {
     assert_success(&warehouse.run(&["load", "."]));
 
     warehouse.write_file("a", "edited\n");
-    assert_success(&warehouse.run(&["restore", "a"]));
+    assert_success(&warehouse.run(&["restore", "--confirm", "a"]));
     assert_eq!(read(&warehouse, "a"), "now a file\n", "restore must restore the file");
 
     assert_success(&warehouse.run(&["remove", "a"]));
@@ -1604,7 +1604,7 @@ fn restore_follows_a_file_replaced_by_a_directory() {
     assert_success(&warehouse.run(&["load", "a/b.txt"]));
 
     warehouse.write_file("a/b.txt", "edited\n");
-    assert_success(&warehouse.run(&["restore", "a"]));
+    assert_success(&warehouse.run(&["restore", "--confirm", "a"]));
     assert_eq!(read(&warehouse, "a/b.txt"), "b\n", "restore must restore the directory's tracked files");
 }
 
@@ -1705,7 +1705,7 @@ fn restore_refuses_a_file_replaced_by_a_folder_and_keeps_the_folder() {
     std::fs::remove_file(warehouse.root.join("notes.txt")).unwrap();
     warehouse.write_file("notes.txt/new.txt", "new\n");
 
-    let restore = warehouse.run(&["restore", "notes.txt"]);
+    let restore = warehouse.run(&["restore", "--confirm", "notes.txt"]);
     assert!(!restore.status.success(), "{}", stdout(&restore));
     assert!(stderr(&restore).contains("replaced by a folder"), "{}", stderr(&restore));
     assert_eq!(read(&warehouse, "notes.txt/new.txt"), "new\n");
@@ -2210,7 +2210,7 @@ fn restore_discards_unstaged_changes() {
 
     // A single modified file reverts to its staged content.
     warehouse.write_file("a.txt", "scribbled over\n");
-    assert_success(&warehouse.run(&["restore", "a.txt"]));
+    assert_success(&warehouse.run(&["restore", "--confirm", "a.txt"]));
     assert_eq!(
         std::fs::read_to_string(warehouse.root.join("a.txt")).unwrap(),
         "original a\n"
@@ -2219,7 +2219,7 @@ fn restore_discards_unstaged_changes() {
     // Restoring a directory rewrites modified files and brings deleted ones back.
     warehouse.write_file("dir/b.txt", "scribbled over\n");
     std::fs::remove_file(warehouse.root.join("a.txt")).unwrap();
-    assert_success(&warehouse.run(&["restore", "."]));
+    assert_success(&warehouse.run(&["restore", "--confirm", "."]));
     assert_eq!(
         std::fs::read_to_string(warehouse.root.join("a.txt")).unwrap(),
         "original a\n"
@@ -2234,9 +2234,49 @@ fn restore_discards_unstaged_changes() {
     assert!(status.contains("The working directory matches the inventory"));
 
     // Untracked paths cannot be restored.
-    let untracked = warehouse.run(&["restore", "nope.txt"]);
+    let untracked = warehouse.run(&["restore", "--confirm", "nope.txt"]);
     assert!(!untracked.status.success());
     assert!(stderr(&untracked).contains("not in the inventory"));
+}
+
+/// Discarding a change needs --confirm: without it, restore lists the files whose changes it would
+/// discard, refuses with confirmation_required and writes nothing, not even the missing file it
+/// could write back losslessly. The command its next step names, run as written, discards them.
+#[test]
+fn restore_needs_confirm_to_discard_a_change() {
+    let warehouse = TestWarehouse::new("restore-confirm");
+    warehouse.write_file("a.txt", "original a\n");
+    warehouse.write_file("dir/b.txt", "original b\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "baseline"]));
+
+    warehouse.write_file("dir/b.txt", "wanted?\n");
+    std::fs::remove_file(warehouse.root.join("a.txt")).unwrap();
+
+    let refused = warehouse.run(&["--json", "restore", "."]);
+    assert_eq!(refused.status.code(), Some(39), "{}", stdout(&refused));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&refused)).unwrap();
+    assert_eq!(value["error"]["code"], "confirmation_required", "{}", value);
+    assert_eq!(value["error"]["details"]["discards"], serde_json::json!(["dir/b.txt"]), "{}", value);
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("dir/b.txt")).unwrap(), "wanted?\n");
+    assert!(!warehouse.root.join("a.txt").exists(), "a refused restore writes nothing");
+
+    let human = warehouse.run(&["restore", "."]);
+    assert_eq!(human.status.code(), Some(39));
+    assert!(stdout(&human).contains("dir/b.txt"), "{}", stdout(&human));
+
+    // Writing back the missing file alone loses nothing, so it needs no --confirm.
+    assert_success(&warehouse.run(&["restore", "a.txt"]));
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("a.txt")).unwrap(), "original a\n");
+
+    let next_step = value["error"]["next_step"].as_str().unwrap();
+    let quoted = next_step.split('"').nth(1).expect("the next step quotes a command");
+    let named: Vec<&str> = quoted.split(' ').skip(1).collect();
+    assert_eq!(named, ["restore", "--confirm", "./"], "{}", next_step);
+    assert_success(&warehouse.run(&named));
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("dir/b.txt")).unwrap(), "original b\n");
 }
 
 /// A working file's mtime and, on unix, inode: a rewrite moves the mtime (and the inode too,
@@ -2300,13 +2340,13 @@ fn restore_leaves_files_that_already_match_untouched() {
 
     // Only the modified file is written; the stat-clean ones keep their mtime and inode.
     warehouse.write_file("dir/b.txt", "scribbled over\n");
-    let restored = stdout(&warehouse.run(&["restore", "."]));
+    let restored = stdout(&warehouse.run(&["restore", "--confirm", "."]));
     assert!(restored.contains("Restored 1 file(s) from the inventory; 2 already matched it."), "{}", restored);
     assert_eq!(std::fs::read_to_string(warehouse.root.join("dir/b.txt")).unwrap(), "original b\n");
     assert_eq!(file_identity(&warehouse.root.join("a.txt")), a_before, "a stat-clean file must not be rewritten");
     assert_eq!(file_identity(&warehouse.root.join("dir/c.txt")), c_before, "a stat-clean file must not be rewritten");
 
-    let single = stdout(&warehouse.run(&["restore", "a.txt"]));
+    let single = stdout(&warehouse.run(&["restore", "--confirm", "a.txt"]));
     assert!(single.contains("\"a.txt\" already matches the inventory."), "{}", single);
     assert_eq!(file_identity(&warehouse.root.join("a.txt")), a_before, "a stat-clean file must not be rewritten");
 
@@ -2320,7 +2360,7 @@ fn restore_leaves_files_that_already_match_untouched() {
     let rollup = shard_rollup(&warehouse, "");
     assert!(rollup.is_some(), "the stack must stamp the root's rollup");
 
-    let restored = stdout(&warehouse.run(&["restore", "dir"]));
+    let restored = stdout(&warehouse.run(&["restore", "--confirm", "dir"]));
     assert!(restored.contains("Restored 0 file(s) from the inventory; 2 already matched it."), "{}", restored);
     assert_eq!(file_identity(&warehouse.root.join("dir/c.txt")), c_touched, "a matching file must not be rewritten");
     assert_eq!(inventory_entry(&warehouse, "dir", "c.txt").content_change_timestamp, touched_secs,
@@ -2330,7 +2370,7 @@ fn restore_leaves_files_that_already_match_untouched() {
     // rollup, since no content changed.
     backdate(&warehouse.root.join("a.txt"), 7200);
     let a_touched = file_identity(&warehouse.root.join("a.txt")).0.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    let single = stdout(&warehouse.run(&["restore", "a.txt"]));
+    let single = stdout(&warehouse.run(&["restore", "--confirm", "a.txt"]));
     assert!(single.contains("\"a.txt\" already matches the inventory."), "{}", single);
     assert_eq!(inventory_entry(&warehouse, "", "a.txt").content_change_timestamp, a_touched,
         "the hash-matched entry must record the file's fresh stat data");
@@ -2360,7 +2400,7 @@ fn restore_records_a_racily_matching_file_as_unproven() {
     file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600)).unwrap();
     drop(file);
 
-    let restored = stdout(&warehouse.run(&["restore", "."]));
+    let restored = stdout(&warehouse.run(&["restore", "--confirm", "."]));
     assert!(restored.contains("Restored 0 file(s) from the inventory; 1 already matched it."), "{}", restored);
     assert_eq!(inventory_entry(&warehouse, "", "a.txt").content_change_timestamp,
         forklift_core::model::inventory::UNPROVEN_MTIME,
@@ -2594,7 +2634,7 @@ fn import_git_reports_a_file_git_converted_on_checkout_from_the_start() {
     assert_eq!(unstaged_changes(&warehouse), expected, "once the stats miss");
 
     // Restored, a file holds the imported content; loaded and stacked, the converted one is tracked.
-    assert_success(&warehouse.run(&["restore", "run.bat"]));
+    assert_success(&warehouse.run(&["restore", "--confirm", "run.bat"]));
     assert_eq!(std::fs::read(root.join("run.bat")).unwrap(), b"echo one\necho two\n");
     assert_success(&warehouse.run(&["load", "id.txt"]));
     assert_success(&warehouse.run(&["stack", "-m", "Track the expanded ident"]));
@@ -2666,7 +2706,7 @@ fn a_large_tree_lands_every_entry_in_its_own_shard() {
         "the edit must not be proven against the tree");
 
     // A shift between two pallets on the same parcel writes nothing and rebuilds every shard.
-    assert_success(&warehouse.run(&["restore", "d17/f2.txt"]));
+    assert_success(&warehouse.run(&["restore", "--confirm", "d17/f2.txt"]));
     std::thread::sleep(std::time::Duration::from_millis(2100));
     assert_success(&warehouse.run(&["pallet", "create", "other"]));
     assert_success(&warehouse.run(&["shift", "main"]));
@@ -3015,7 +3055,7 @@ fn restore_rewrites_a_matching_file_of_another_kind() {
     let path = warehouse.root.join("run.sh");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let restored = stdout(&warehouse.run(&["restore", "run.sh"]));
+    let restored = stdout(&warehouse.run(&["restore", "--confirm", "run.sh"]));
     assert!(restored.contains("Restored \"run.sh\" from the inventory."), "{}", restored);
     assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o111, 0, "the staged mode must come back");
 }
@@ -6942,10 +6982,19 @@ fn regenesis_resets_trust_and_pins_prior_history_as_attested() {
     assert!(!locked.status.success());
     assert!(stderr(&locked).contains("No active key"), "{}", stderr(&locked));
 
-    // The reset is loud: without --confirm it only explains itself.
+    let trust_before = std::fs::read_to_string(warehouse.root.join(".forklift/trust")).unwrap();
+
+    // The reset is loud: without --confirm it only explains itself, refusing with
+    // confirmation_required and the anchor it would replace in its details.
     let dry = warehouse.run(&["office", "regenesis"]);
-    assert!(!dry.status.success());
+    assert_eq!(dry.status.code(), Some(39), "{}", stderr(&dry));
     assert!(stdout(&dry).contains("RESET"), "{}", stdout(&dry));
+    let previewed = warehouse.run(&["--json", "office", "regenesis"]);
+    assert_eq!(previewed.status.code(), Some(39));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&previewed)).unwrap();
+    assert_eq!(value["error"]["code"], "confirmation_required", "{}", value);
+    assert!(value["error"]["details"]["genesis"].is_string(), "{}", value);
+    assert!(std::fs::read_to_string(warehouse.root.join(".forklift/trust")).unwrap() == trust_before, "the preview changes nothing");
 
     let reset = warehouse.run(&["office", "regenesis", "--confirm"]);
     assert_success(&reset);
@@ -7713,7 +7762,7 @@ fn json_mode_wraps_every_result_in_a_versioned_envelope() {
     let value = json(&prepared);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 14);
+    assert_eq!(value["schema"], 15);
     assert_eq!(value["command"], "prepare");
     assert_eq!(value["ok"], true);
     assert!(value["data"]["created"].is_array());
@@ -7755,7 +7804,7 @@ fn json_errors_carry_a_stable_code_and_a_deterministic_exit_code() {
     // failed, so a consumer classifies by the same header on either outcome.
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 14);
+    assert_eq!(value["schema"], 15);
     assert_eq!(value["command"], "stocktake");
     assert!(value.get("data").is_none(), "a failure carries no data: {}", value);
 }
@@ -7784,7 +7833,7 @@ fn a_usage_error_under_json_is_one_failure_document_with_exit_2() {
     let value = json(&unknown);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 14);
+    assert_eq!(value["schema"], 15);
     assert_eq!(value["ok"], false);
     assert!(value["command"].is_null(), "no known command was named: {}", value);
     assert_eq!(value["error"]["code"], "usage");
@@ -7990,7 +8039,7 @@ fn every_json_document_starts_with_the_header_in_its_documented_order() {
     let warehouse = TestWarehouse::new("json-key-order");
 
     // The order is checked on the raw text: a parsed `Value` would hide it.
-    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 14,\n  \"command\": ";
+    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 15,\n  \"command\": ";
 
     for args in [&["--json", "version"][..], &["--json", "bogus"], &["--json", "stocktake"]] {
         let output = warehouse.run(args);
@@ -13406,7 +13455,7 @@ fn scope_prune_reports_a_local_refusal_before_asking_the_remote() {
     warehouse.write_file("docs/guide.md", "guide\n");
     assert_success(&warehouse.run(&["prepare"]));
 
-    let refused = warehouse.run(&["scope", "prune", "docs"]);
+    let refused = warehouse.run(&["scope", "prune", "--confirm", "docs"]);
     assert!(!refused.status.success());
     assert!(stderr(&refused).contains("holds the full tree"), "{}", stderr(&refused));
 }

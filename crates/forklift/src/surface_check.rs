@@ -18,7 +18,10 @@
 //!   switches a command into a different operation;
 //! - a visible hyphenated name sits only below the top level;
 //! - recorded text is always `-m/--message`, on exactly the commands of the `[recorded-text]` list;
-//! - a visible alias sits only on a command of the `[daily-loop]` list, at most one each.
+//! - a visible alias sits only on a command of the `[daily-loop]` list, at most one each;
+//! - `--confirm` sits exactly on the commands of the `[destructive]` list, none of which has
+//!   `--dry-run`, and each mode the list names (destructive only in one mode) names the
+//!   behaviour test that holds its preview to that mode.
 //!
 //! `docs/generated/commands.md` is generated from the same tree and checked by `bin/gen-docs
 //! --check`; it follows the binary wherever it goes. These files do not: they change only when
@@ -1016,4 +1019,103 @@ fn the_alias_check_finds_each_violation() {
     }
     assert_eq!(probe(Command::new("stack").visible_alias("s").aliases(["commit", "ci"])), Vec::<String>::new());
     assert_eq!(probe(Command::new("pick").alias("cherry-pick")), Vec::<String>::new());
+}
+
+/// Every command that breaks the confirmation rule, given the paths of the [destructive] list: a
+/// listed command has `--confirm` and no `--dry-run`, because its preview is the default, and a
+/// command off the list has no `--confirm`. A preview on a command that destroys nothing is
+/// spelled `--dry-run`. The check sees that the flag exists, not when it is needed: a listed
+/// mode's behaviour is pinned by the test [`MODE_TESTS`] names.
+fn destructive_violations(cli: &clap::Command, listed: &BTreeSet<Vec<String>>) -> Vec<String> {
+    let mut failures = Vec::new();
+    for (path, command) in command_paths(cli) {
+        if path.is_empty() {
+            continue;
+        }
+        let name = path.join(" ");
+        let has = |long: &str| command.get_arguments().any(|arg| arg.get_long() == Some(long)
+            || arg.get_all_aliases().is_some_and(|aliases| aliases.contains(&long)));
+        if listed.contains(&path) {
+            if !has("confirm") {
+                failures.push(format!("`{name}` is destructive but has no --confirm"));
+            }
+            if has("dry-run") {
+                failures.push(format!("`{name}` is destructive, so its preview is the default, but it has --dry-run"));
+            }
+        } else if has("confirm") {
+            failures.push(format!("`{name}` is not on the [destructive] list but has --confirm"));
+        }
+    }
+    failures
+}
+
+/// Every command on the [destructive] list confirms with `--confirm` and previews by default, and
+/// no command off it has `--confirm`.
+#[test]
+fn destructive_commands_confirm_and_nothing_else_does() {
+    let listed = spec_list(&parse_spec(SPEC).unwrap(), "destructive");
+    let failures = destructive_violations(&built_cli(), &listed);
+    assert!(failures.is_empty(),
+        "a destructive operation shows what it would destroy unless --confirm is given, and only the \
+         commands surface/spec.txt lists under [destructive] take --confirm:\n{}", failures.join("\n"));
+}
+
+/// The confirmation check finds every way a command can break the rule, and nothing else.
+#[test]
+fn the_destructive_check_finds_each_violation() {
+    use clap::{Arg, ArgAction, Command};
+    let confirm = || Arg::new("confirm").long("confirm").action(ArgAction::SetTrue);
+    let dry_run = || Arg::new("dry_run").long("dry-run").action(ArgAction::SetTrue);
+    let probe = |sub: Command, listed: bool| {
+        let mut root = Command::new("probe").subcommand(Command::new("scope").subcommand(sub));
+        root.build();
+        let name = root.find_subcommand("scope").unwrap().get_subcommands().next().unwrap().get_name().to_string();
+        let listed = match listed {
+            true => BTreeSet::from([vec!["scope".to_string(), name]]),
+            false => BTreeSet::new(),
+        };
+        destructive_violations(&root, &listed)
+    };
+    let broken = [
+        (Command::new("prune").arg(Arg::new("path")), true, "has no --confirm"),
+        (Command::new("prune").arg(confirm()).arg(dry_run()), true, "but it has --dry-run"),
+        (Command::new("prune").arg(Arg::new("yes").long("yes").alias("confirm")).arg(dry_run()), true, "but it has --dry-run"),
+        (Command::new("evict").arg(confirm()), false, "is not on the [destructive] list"),
+        (Command::new("evict").arg(Arg::new("yes").long("yes").alias("confirm")), false, "is not on the [destructive] list"),
+    ];
+    for (sub, listed, expected) in broken {
+        let name = sub.get_name().to_string();
+        let failures = probe(sub, listed);
+        assert!(failures.len() == 1 && failures[0].contains(expected), "{name} ({expected}): {failures:?}");
+    }
+    assert_eq!(probe(Command::new("prune").arg(confirm()), true), Vec::<String>::new());
+    assert_eq!(probe(Command::new("evict").arg(dry_run()), false), Vec::<String>::new());
+    assert_eq!(probe(Command::new("accept").arg(Arg::new("confirm").long("confirm").value_name("GENESIS")), true), Vec::<String>::new());
+}
+
+/// The destructive entries that name a mode, each with the end-to-end test that runs the command
+/// in that mode without `--confirm` (expecting the preview and a non-zero exit, nothing changed)
+/// and outside it (expecting no `--confirm` to be needed), as `file::test`.
+const MODE_TESTS: &[(&str, &str)] = &[
+    ("lower --keep …=theirs", "tests/remote.rs::lower_needs_confirm_only_to_take_theirs"),
+];
+
+/// Every mode the [destructive] list names has a behaviour test, and the test exists: the flag
+/// check above cannot tell a mode that previews from one that acts.
+#[test]
+fn every_destructive_mode_has_its_behaviour_test() {
+    let spec = parse_spec(SPEC).unwrap();
+    let modes: BTreeSet<String> = spec.lists["destructive"].iter()
+        .filter(|(_, words)| words.iter().any(|word| word.starts_with('-')))
+        .map(|(_, words)| words.join(" "))
+        .collect();
+    let tested: BTreeSet<String> = MODE_TESTS.iter().map(|(mode, _)| mode.to_string()).collect();
+    assert_eq!(modes, tested, "each destructive mode in surface/spec.txt needs its row in MODE_TESTS, and only those");
+    for (mode, test) in MODE_TESTS {
+        let (file, name) = test.split_once("::").unwrap();
+        let source = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file))
+            .unwrap_or_else(|e| panic!("{mode}: cannot read {file}: {e}"));
+        let declared = source.lines().any(|line| line.trim_start().starts_with(&format!("fn {name}()")));
+        assert!(declared, "{mode}: {file} declares no `fn {name}()`");
+    }
 }

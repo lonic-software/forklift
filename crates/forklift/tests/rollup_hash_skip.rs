@@ -489,7 +489,7 @@ fn restore_dot_preserves_every_rollup_and_a_later_stocktake_still_skips() {
 
     warehouse.write_file("a/b/c/file.txt", "deep edited\n");
     warehouse.write_file("sibling/file.txt", "sibling edited\n");
-    warehouse.run_ok(&["restore", "."]);
+    warehouse.run_ok(&["restore", "--confirm", "."]);
 
     assert_eq!(std::fs::read_to_string(warehouse.root.join("a/b/c/file.txt")).unwrap(), "deep v1\n");
     assert_eq!(std::fs::read_to_string(warehouse.root.join("sibling/file.txt")).unwrap(), "sibling v1\n");

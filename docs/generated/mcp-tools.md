@@ -34,7 +34,7 @@ Every tool `forklift mcp` serves, generated from the same command definition the
 | `history` | `forklift history` | Print the parcels of a revision, newest first | `revision` (a string)<br>`limit` (an integer of at least 1)<br>`after` (a string)<br>`oneline` (a boolean) |
 | `lift` | `forklift lift` | Upload the current pallet's new parcels to the remote (push) | `recreate` (a boolean) |
 | `load` | `forklift load` | Take the current state of a file or directory into the inventory (stage) | `path` (a string, required) |
-| `lower` | `forklift lower` | Download the remote's new parcels and fast-forward the current pallet, or another (pull) | `pallet` (a string)<br>`expect` (a string)<br>`keep` (an array of strings) |
+| `lower` | `forklift lower` | Download the remote's new parcels and fast-forward the current pallet, or another (pull) | `pallet` (a string)<br>`expect` (a string)<br>`keep` (an array of strings)<br>`confirm` (a boolean) |
 | `manifest` | `forklift manifest` | Facts recorded about a parcel after the fact: notes, approvals, provenance, keyed values |  |
 | `manifest_note` | `forklift manifest note` | Attach a free-form note to a parcel | `revision` (a string, required)<br>`message` (a string, required) |
 | `manifest_approve` | `forklift manifest approve` | Record a signed approval (sign-off) of a parcel | `revision` (a string, required)<br>`message` (a string) |
@@ -56,7 +56,7 @@ Every tool `forklift mcp` serves, generated from the same command definition the
 | `pick` | `forklift pick` | Apply a parcel's changes onto the current pallet as a new, author-preserving parcel | `revision` (a string, required)<br>`message` (a string) |
 | `query` | `forklift query` | Query parcel history by signed identity, signer and parcel facts | `revisions` (an array of strings)<br>`from` (a string)<br>`class` (a string)<br>`unsupervised` (a boolean)<br>`supervisor` (a string)<br>`signer` (a string)<br>`author_after` (a string)<br>`author_before` (a string)<br>`merges` (a boolean)<br>`no_merges` (a boolean)<br>`grep` (a string)<br>`model` (a string)<br>`tool` (a string)<br>`tag` (a string)<br>`touches` (a string)<br>`verify` (a boolean)<br>`recorded` (a boolean)<br>`where` (an object)<br>`limit` (an integer of at least 1)<br>`after` (a string)<br>`oneline` (a boolean) |
 | `remove` | `forklift remove` | Stage a file or directory for removal | `path` (a string, required) |
-| `restore` | `forklift restore` | Restore a file or directory from the inventory (discard unstaged changes) | `path` (a string, required) |
+| `restore` | `forklift restore` | Restore a file or directory from the inventory (discard unstaged changes) | `path` (a string, required)<br>`confirm` (a boolean) |
 | `shift` | `forklift shift` | Shift to another pallet | `pallet` (a string, required) |
 | `show` | `forklift show` | Print a file's content at a revision, as git show does for REV:PATH | `target` (a string, required) |
 | `stack` | `forklift stack` | Stack the inventory as a new parcel (commit) on the current pallet | `message` (a string) |

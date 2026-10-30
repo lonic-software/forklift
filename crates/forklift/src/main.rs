@@ -512,7 +512,7 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
         },
         Command::Lift { recreate } => commands::lift::handle_command(recreate).await,
         Command::Load { path } => commands::load::handle_command(&path).await,
-        Command::Lower { pallet, expect, keep } => commands::lower::handle_command(pallet, expect, keep).await,
+        Command::Lower { pallet, expect, keep, confirm } => commands::lower::handle_command(pallet, expect, keep, confirm).await,
         Command::Manifest { action } => commands::manifest::handle_command(action),
         Command::Haul { action } => commands::haul::handle_command(action).await,
         Command::Mcp { root } => commands::mcp::handle_command(root),
@@ -565,12 +565,12 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
         },
         Command::Prepare => commands::prepare::handle_command(cli.verbose),
         Command::Remove { path } => commands::remove::handle_command(&path),
-        Command::Restore { path } => commands::restore::handle_command(&path),
+        Command::Restore { path, confirm } => commands::restore::handle_command(&path, confirm),
         Command::Scope { action } => match action {
             Some(ScopeAction::Status) | None => commands::scope::handle_command(),
             Some(ScopeAction::Fetch { paths }) => commands::scope_fetch::handle_command(paths).await,
             Some(ScopeAction::Narrow { paths }) => commands::scope_narrow::handle_command(paths).await,
-            Some(ScopeAction::Prune { paths, dry_run }) => commands::scope_prune::handle_command(paths, dry_run).await,
+            Some(ScopeAction::Prune { paths, confirm }) => commands::scope_prune::handle_command(paths, confirm).await,
         },
         Command::Remote { action } => match action {
             None => commands::remote::show(),

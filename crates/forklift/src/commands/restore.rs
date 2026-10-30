@@ -1,4 +1,5 @@
 use forklift_core::enums::dir_entry_type::DirEntryType;
+use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::enums::inventory_item_state::InventoryItemState;
 use forklift_core::model::inventory::InventoryItem;
 use forklift_core::util::path_utils::{self, WarehousePath};
@@ -13,13 +14,19 @@ use crate::output;
 /// differs from its entry) in the working directory from the inventory, discarding unstaged
 /// changes. Unstaging is `unload`'s.
 ///
+/// Discarding a change is destructive (Rule 5): when the restore would overwrite a file that
+/// differs from its entry, it lists those files and refuses (`confirmation_required`) before
+/// writing anything, unless `confirm` is given. Writing back a missing file loses nothing, so it
+/// needs no confirmation.
+///
 /// # Arguments
-/// * `target` - The path of the file or directory to restore.
+/// * `target`  - The path of the file or directory to restore.
+/// * `confirm` - Whether changes the restore would discard may be discarded.
 ///
 /// # Returns
 /// * `Ok(())`      - If the restore completed successfully.
 /// * `Err(String)` - If there was an error while handling the command.
-pub fn handle_command(target: &str) -> Result<(), String> {
+pub fn handle_command(target: &str, confirm: bool) -> Result<(), String> {
     let path = WarehousePath::from_user_input(target)?;
 
     // An out-of-scope path is sealed by hash in a scoped bay and was never materialized;
@@ -27,7 +34,7 @@ pub fn handle_command(target: &str) -> Result<(), String> {
     // walk below silently do the wrong thing.
     crate::commands::scope::ensure_path_in_scope(path.as_key())?;
 
-    restore_worktree(&path)
+    restore_worktree(&path, confirm)
 }
 
 /// Restore the working directory from the inventory: rewrite the file (or, for a
@@ -35,21 +42,23 @@ pub fn handle_command(target: &str) -> Result<(), String> {
 /// that already holds that content untouched (see `restore_entry`).
 ///
 /// # Arguments
-/// * `path` - The path to restore.
+/// * `path`    - The path to restore.
+/// * `confirm` - Whether changes the restore would discard may be discarded.
 ///
 /// # Returns
 /// * `Ok(())`      - If the restore completed.
-/// * `Err(String)` - If the path is not in the inventory or a write failed.
-fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
+/// * `Err(String)` - If the path is not in the inventory, the restore would discard a change
+///   without `confirm`, or a write failed.
+fn restore_worktree(path: &WarehousePath, confirm: bool) -> Result<(), String> {
     // Read once: nothing below writes the metadata before the batch publishes.
     let ledger = inventory_utils::ShardLedger::read()?;
 
     if path.is_root() {
-        return restore_worktree_directory(&ledger, path.as_key());
+        return restore_worktree_directory(&ledger, path.as_key(), confirm);
     }
 
     match inventory_utils::tracked_kind(&ledger, path)? {
-        TrackedKind::Directory => return restore_worktree_directory(&ledger, path.as_key()),
+        TrackedKind::Directory => return restore_worktree_directory(&ledger, path.as_key(), confirm),
         TrackedKind::UntrackedDirectory => return Err(format!("No inventory found for folder \"{}\".", path.as_key())),
         TrackedKind::File => {}
     }
@@ -81,10 +90,18 @@ fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
         ));
     }
 
+    // Judged before what is on disk is compared: another spelling's file is not this one's change.
+    ensure_restorable(path.as_key())?;
+    let anchor = file_utils::take_stat_anchor()?;
+
+    if !confirm && would_discard(path.as_key(), &item, anchor)? {
+        return Err(discard_refusal(&[path.as_key().to_string()], path.as_key()));
+    }
+
     // Recording only stat data keeps the rollups (see `ShardMutationBatch`).
     let mut batch = inventory_utils::ShardMutationBatch::over(&ledger);
 
-    let message = match restore_entry(parent.as_key(), &item, true)? {
+    let message = match restore_entry(parent.as_key(), &item, true, confirm)? {
         Restored::Untouched => format!("\"{}\" already matches the inventory.", path.as_key()),
         Restored::Restatted(refreshed) => {
             batch.update(parent.as_key(), |inventory| inventory.add_item(refreshed))?;
@@ -133,12 +150,22 @@ fn ensure_directory_present(ledger: &inventory_utils::ShardLedger, key: &str) ->
 ///
 /// # Arguments
 /// * `ledger` - The registered set.
-/// * `key`    - The warehouse path key of the directory.
+/// * `key`     - The warehouse path key of the directory.
+/// * `confirm` - Whether changes the restore would discard may be discarded.
 ///
 /// # Returns
 /// * `Ok(())`      - If the restore completed.
-/// * `Err(String)` - If the directory has no inventory or a write failed.
-fn restore_worktree_directory(ledger: &inventory_utils::ShardLedger, key: &str) -> Result<(), String> {
+/// * `Err(String)` - If the directory has no inventory, a file was refused, the restore would
+///   discard a change without `confirm`, or a write failed.
+fn restore_worktree_directory(ledger: &inventory_utils::ShardLedger, key: &str, confirm: bool) -> Result<(), String> {
+    // Every file is judged before any is written, so a refusal (a change to discard without
+    // --confirm, an alias, a folder where a file was) leaves the whole directory as it was.
+    let discards = plan_directory(ledger, key)?;
+
+    if !confirm && !discards.is_empty() {
+        return Err(discard_refusal(&discards, &load_guard_utils::display_path(key)));
+    }
+
     let mut restored_any = false;
     let mut restored_count = 0usize;
     let mut matched_count = 0usize;
@@ -165,7 +192,7 @@ fn restore_worktree_directory(ledger: &inventory_utils::ShardLedger, key: &str) 
                 continue;
             }
 
-            let recorded = restore_entry(shard_key, item, false).and_then(|restored| match restored {
+            let recorded = restore_entry(shard_key, item, false, confirm).and_then(|restored| match restored {
                 Restored::Untouched => {
                     matched_count += 1;
                     Ok(())
@@ -220,6 +247,95 @@ fn restore_worktree_directory(ledger: &inventory_utils::ShardLedger, key: &str) 
     Ok(())
 }
 
+/// The files under the directory at `key` whose changes restoring it would discard, refusing a
+/// file the restore could not write: one aliased by another spelling, one under a non-directory,
+/// or one replaced by a folder. Nothing is written, not even fresh stat data.
+///
+/// # Arguments
+/// * `ledger` - The registered set.
+/// * `key`    - The warehouse path key of the directory.
+///
+/// # Returns
+/// * `Ok(Vec<String>)` - The warehouse paths whose changes would be discarded.
+/// * `Err(String)`     - If a file was refused or could not be read.
+fn plan_directory(ledger: &inventory_utils::ShardLedger, key: &str) -> Result<Vec<String>, String> {
+    let anchor = file_utils::take_stat_anchor()?;
+    let mut discards: Vec<String> = Vec::new();
+
+    for shard_key in ledger.keys() {
+        if !path_utils::covers(key, shard_key) {
+            continue;
+        }
+
+        let Some(inventory) = ledger.inventory(shard_key)? else { continue };
+
+        for (_, item) in inventory.get_items() {
+            if item.state == InventoryItemState::Deleted || item.item_type == DirEntryType::Tree {
+                continue;
+            }
+
+            let file_path = tracked_path(shard_key, &item.name);
+            ensure_restorable(&file_path)?;
+
+            if would_discard(&file_path, item, anchor)? {
+                discards.push(file_path);
+            }
+        }
+    }
+
+    Ok(discards)
+}
+
+/// Whether restoring `item` would discard what is at `file_path`: a file (or link) is there and
+/// does not hold the entry's content as a file of its kind. A conflict entry's file is compared
+/// too, though the restore rewrites it either way. A missing file loses nothing.
+///
+/// # Arguments
+/// * `file_path` - The warehouse path of the tracked file.
+/// * `item`      - Its inventory entry.
+/// * `anchor`    - The stat anchor the comparison proves against.
+///
+/// # Returns
+/// * `Ok(bool)`    - Whether a change would be discarded.
+/// * `Err(String)` - If a folder replaced the file: restoring it would delete the folder.
+fn would_discard(file_path: &str, item: &InventoryItem, anchor: file_utils::StatAnchor) -> Result<bool, String> {
+    let Ok(metadata) = std::fs::symlink_metadata(file_path) else {
+        return Ok(false);
+    };
+
+    if metadata.is_dir() {
+        return Err(format!(
+            "Cannot restore \"{}\": the tracked file was replaced by a folder. Move or delete the folder first.",
+            file_path
+        ));
+    }
+
+    Ok(matching_content(file_path, item, anchor).is_none())
+}
+
+/// The `confirmation_required` refusal for a restore of `target` that would discard the changes
+/// to `files`, which its details list.
+fn discard_refusal(files: &[String], target: &str) -> String {
+    let shown: Vec<String> = files.iter().take(20).map(|file| format!("  {}", file)).collect();
+    let more = match files.len() > shown.len() {
+        true => format!("\n  ... and {} more", files.len() - shown.len()),
+        false => String::new(),
+    };
+    let separator = if target.starts_with('-') { "-- " } else { "" };
+
+    crate::human!("Restoring \"{}\" would discard the changes to:\n{}{}", target, shown.join("\n"), more);
+
+    CoreError::refusal_with_details(
+        RefusalCode::ConfirmationRequired,
+        format!("Restoring \"{}\" would discard the changes to {} file(s); nothing was changed.", target, files.len()),
+        format!(
+            "Keep any change you want first (load it, or copy it aside), then run \"forklift restore --confirm {}{}\" to discard the rest.",
+            separator, target
+        ),
+        serde_json::json!({ "path": target, "discards": files }),
+    ).into()
+}
+
 /// What restoring one tracked entry did.
 pub(super) enum Restored {
     /// The file already held the staged content and the stat cache proved it: nothing was
@@ -249,22 +365,32 @@ pub(super) enum Restored {
 /// * `item`       - The inventory entry.
 /// * `fetch`      - Whether to fetch its content, in a cache warehouse, before a rewrite: false
 ///                  where the caller's presence phase fetched it already.
+/// * `discard`    - Whether a file that differs from the entry may be overwritten. The caller
+///                  judged it would not be; without this, one changed since is refused, not lost.
 ///
 /// # Returns
 /// * `Ok(Restored)` - What was done.
-/// * `Err(String)`  - If the path was refused, the clock probe could not be stamped, or a write
-///                    failed.
-fn restore_entry(parent_key: &str, item: &InventoryItem, fetch: bool) -> Result<Restored, String> {
+/// * `Err(String)`  - If the path was refused, a file changed since the caller judged it, the
+///                    clock probe could not be stamped, or a write failed.
+fn restore_entry(parent_key: &str, item: &InventoryItem, fetch: bool, discard: bool) -> Result<Restored, String> {
     let file_path = tracked_path(parent_key, &item.name);
 
     ensure_restorable(&file_path)?;
 
-    if item.state == InventoryItemState::Normal {
-        let anchor = file_utils::take_stat_anchor()?;
+    let anchor = file_utils::take_stat_anchor()?;
+    let present = std::fs::symlink_metadata(&file_path).is_ok();
+    let matched = if present { matching_content(&file_path, item, anchor) } else { None };
 
-        if let Some(restored) = matching_content(&file_path, item, anchor) {
+    if item.state == InventoryItemState::Normal {
+        if let Some(restored) = matched {
             return Ok(restored);
         }
+    }
+
+    // A conflict entry is rewritten even when its file matches, which loses nothing; a file that
+    // differs is lost unless the caller allowed it.
+    if present && matched.is_none() && !discard {
+        return Err(changed_since(&file_path));
     }
 
     // A directory's restore fetched every file's content already (`ensure_directory_present`); a
@@ -286,6 +412,15 @@ fn restore_entry(parent_key: &str, item: &InventoryItem, fetch: bool) -> Result<
     )?;
 
     Ok(Restored::Rewritten(refreshed))
+}
+
+/// The refusal for a file that changed after the restore judged it would discard nothing.
+fn changed_since(file_path: &str) -> String {
+    format!(
+        "\"{}\" changed while it was being restored, so it was left as it is; files before it may \
+        already be restored. Run the restore again to see what it would discard.",
+        file_path
+    )
 }
 
 /// `Untouched` or `Restatted` when the file at `file_path` already holds `item`'s content as a
@@ -391,8 +526,78 @@ mod tests {
         // One read by the command, and one by its batch's publish, which re-reads under the lock.
         for target in ["dir/a.txt", "dir", "."] {
             std::fs::write(warehouse.root.join("dir/a.txt"), b"changed\n").unwrap();
-            assert_eq!(ledger_reads(|| handle_command(target).unwrap()), 2, "restore {}", target);
+            assert_eq!(ledger_reads(|| handle_command(target, true).unwrap()), 2, "restore {}", target);
         }
 
+    }
+
+    /// A warehouse holding `dir/a.txt` and `dir/b.txt` loaded, named `name`.
+    fn loaded_pair(name: &str) -> Warehouse {
+        let warehouse = Warehouse::with_working_tree(name);
+        forklift_core::util::pallet_utils::write_position(&forklift_core::util::pallet_utils::BayPosition::new("main", None)).unwrap();
+        std::fs::create_dir_all(warehouse.root.join("dir")).unwrap();
+        std::fs::write(warehouse.root.join("dir/a.txt"), b"a\n").unwrap();
+        std::fs::write(warehouse.root.join("dir/b.txt"), b"b\n").unwrap();
+        test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
+        warehouse
+    }
+
+    #[test]
+    fn a_restore_that_would_discard_a_change_lists_it_and_writes_nothing_without_confirm() {
+        let warehouse = loaded_pair("restore-needs-confirm");
+        std::fs::write(warehouse.root.join("dir/a.txt"), b"edited\n").unwrap();
+        std::fs::remove_file(warehouse.root.join("dir/b.txt")).unwrap();
+
+        // The missing file would be written back first, were anything written: nothing is.
+        for target in ["dir", "dir/a.txt", "."] {
+            let error = handle_command(target, false).unwrap_err();
+            assert!(error.contains("dir/a.txt") && !error.contains("dir/b.txt"), "{}", error);
+            assert_eq!(std::fs::read(warehouse.root.join("dir/a.txt")).unwrap(), b"edited\n", "restore {}", target);
+            assert!(!warehouse.root.join("dir/b.txt").exists(), "restore {}", target);
+        }
+
+        handle_command("dir", true).unwrap();
+        assert_eq!(std::fs::read(warehouse.root.join("dir/a.txt")).unwrap(), b"a\n");
+        assert_eq!(std::fs::read(warehouse.root.join("dir/b.txt")).unwrap(), b"b\n");
+    }
+
+    #[test]
+    fn a_restore_that_discards_nothing_needs_no_confirm() {
+        let warehouse = loaded_pair("restore-no-confirm");
+        std::fs::remove_file(warehouse.root.join("dir/a.txt")).unwrap();
+
+        handle_command("dir/a.txt", false).unwrap();
+        assert_eq!(std::fs::read(warehouse.root.join("dir/a.txt")).unwrap(), b"a\n");
+
+        std::fs::remove_file(warehouse.root.join("dir/b.txt")).unwrap();
+        handle_command("dir", false).unwrap();
+        assert_eq!(std::fs::read(warehouse.root.join("dir/b.txt")).unwrap(), b"b\n");
+    }
+
+    #[test]
+    fn a_folder_where_a_file_was_refuses_the_directory_before_anything_is_written() {
+        let warehouse = loaded_pair("restore-folder-first");
+        std::fs::write(warehouse.root.join("dir/a.txt"), b"edited\n").unwrap();
+        std::fs::remove_file(warehouse.root.join("dir/b.txt")).unwrap();
+        std::fs::create_dir(warehouse.root.join("dir/b.txt")).unwrap();
+
+        let error = handle_command("dir", true).unwrap_err();
+        assert!(error.contains("replaced by a folder"), "{}", error);
+        assert_eq!(std::fs::read(warehouse.root.join("dir/a.txt")).unwrap(), b"edited\n");
+    }
+
+    #[test]
+    fn a_file_changed_after_it_was_judged_is_refused_not_overwritten() {
+        let warehouse = loaded_pair("restore-changed-since");
+        std::fs::write(warehouse.root.join("dir/a.txt"), b"edited\n").unwrap();
+
+        let ledger = inventory_utils::ShardLedger::read().unwrap();
+        let inventory = ledger.inventory("dir").unwrap().unwrap();
+        let item = inventory.get_item_by_name("a.txt").unwrap();
+
+        let error = restore_entry("dir", &item, false, false).err().unwrap();
+        assert!(error.contains("changed while it was being restored"), "{}", error);
+        assert_eq!(std::fs::read(warehouse.root.join("dir/a.txt")).unwrap(), b"edited\n");
+        assert!(matches!(restore_entry("dir", &item, false, true), Ok(Restored::Rewritten(_))));
     }
 }

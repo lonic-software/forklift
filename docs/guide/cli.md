@@ -493,11 +493,16 @@ digits only, so neither grammar can ever contain a `:`.
 ### `restore` — discard changes (`r`)
 
 ```sh
-forklift restore path   # rewrite path from the inventory (drop unstaged edits)
+forklift restore path             # list the unstaged edits it would drop, change nothing
+forklift restore --confirm path   # rewrite path from the inventory (drop unstaged edits)
 ```
 
 `restore path` overwrites the working file(s) from what's staged — it throws away
-unstaged edits, so use it deliberately. Outside a conflict, a file that already holds the
+unstaged edits. So when a file it would overwrite differs from what's staged, it lists those
+files and changes nothing, refusing with `confirmation_required` (exit 39, the files in its
+`details`) until you run it again with `--confirm`. Every file is judged before any is written,
+so a refusal leaves the whole path as it was. Writing back a file that is missing loses nothing
+and needs no `--confirm`. Outside a conflict, a file that already holds the
 staged content is left alone, so its modification time does not change and build tools don't
 see it as edited. To un-stage instead, leaving the working directory alone, use
 [`unload`](#unload--unstage-ul). Files that already hold the pallet head's content usually keep counting
@@ -992,9 +997,14 @@ lifts nothing for `@kv`, lists each such key with both values, and exits 24 (`me
 choose a side per key and lower again:
 
 ```sh
-forklift lower --keep @kv:<parcel-hash>/ci=theirs   # take the remote's value
-forklift lower --keep @kv:<parcel-hash>/ci=ours     # keep yours, lifted over theirs
+forklift lower --keep @kv:<parcel-hash>/ci=theirs --confirm  # take the remote's value
+forklift lower --keep @kv:<parcel-hash>/ci=ours              # keep yours, lifted over theirs
 ```
+
+Taking `theirs` drops your local changes at or beneath the path, which nothing else holds, so it
+needs `--confirm`: without it, `lower` lists what each `theirs` would drop and refuses with
+`confirmation_required` (exit 39) before contacting the remote. Keeping `ours` loses nothing and
+needs no `--confirm`.
 
 `--keep` names the meta pallet with its `@`, as every command does, and the path as the conflict
 names it: a parcel or haul by its full hash, a tag by its name. A bare `kv:` is refused, never
@@ -1019,10 +1029,10 @@ requires an admin — an authoritative act, which the remote enforces too. Tag n
 **immutable**: a name already in use is refused, and no one, the remote included, can move or
 delete a tag. Tags live on the `@tags` meta pallet, reserving no user pallet name; without a
 revision, `tag create` tags the current pallet's head. If two admins cut the same name
-concurrently, `lower` reports the conflict: `--keep @tags:<name>=theirs` drops your tag, and
+concurrently, `lower` reports the conflict: `--keep @tags:<name>=theirs --confirm` drops your tag, and
 keeping yours is refused, since that would move theirs. An admin demoted before lifting a tag
 they cut is left holding a tag the remote refuses; `lift` says so, and
-`lower --keep @tags:<name>=theirs` drops it the same way, once `@tags` is on the remote.
+`lower --keep @tags:<name>=theirs --confirm` drops it the same way, once `@tags` is on the remote.
 
 A tag's subject is nothing more than a parcel hash: if the parcel was never fetched here,
 or was collected because nothing else referenced it (e.g. after an `undo` moved the only
@@ -1086,9 +1096,9 @@ merge whose parcel the remote's target does not hold yet; lifting the target (lo
 first if someone else moved it) lets it go. A `lower` that replays a diverged `@haul` holds it
 the same way: once the target is lifted and lowered here, `lower` again. Either way, an
 operator who cannot lift the target drops the record instead, as the message names it:
-`lower --keep @haul:<haul>/state=theirs` puts back the remote's state of the haul and keeps
+`lower --keep @haul:<haul>/state=theirs --confirm` puts back the remote's state of the haul and keeps
 its reviews and comments, or, for a haul the remote does not hold yet,
-`lower --keep @haul:<haul>=theirs` drops the haul.
+`lower --keep @haul:<haul>=theirs --confirm` drops the haul.
 
 This release is **intra-warehouse** (pallet → pallet), and reviews are **recorded but not
 enforced** — any writer of the target can merge (approval-gating is a later policy layer).
@@ -1751,7 +1761,7 @@ again, which uploads it afresh.
 forklift lower
 forklift lower feature              # bring in, or fast-forward, another pallet; this bay stays put
 forklift lower --expect <genesis>   # refuse unless the remote's trust anchor is this one
-forklift lower --keep @kv:<hash>/<key>=theirs  # resolve a custom-metadata conflict
+forklift lower --keep @kv:<hash>/<key>=theirs --confirm  # resolve a custom-metadata conflict
 ```
 
 Fetches the remote's new parcels for the current pallet and fast-forwards to them
@@ -1854,8 +1864,8 @@ tree (a folder with its own `.forklift`) at any depth, whatever `.forkliftignore
 ### `scope prune` — reclaim disk from a sparse warehouse
 
 ```sh
-forklift scope prune docs            # forget a fetched path and free its content
-forklift scope prune docs --dry-run  # show what it would free, change nothing
+forklift scope prune docs            # show what it would free, change nothing
+forklift scope prune --confirm docs  # forget a fetched path and free its content
 ```
 
 The deliberate, **destructive** counterpart of `scope narrow`. Where `scope narrow` is bay-local and frees
@@ -1884,9 +1894,12 @@ under the path, narrow and prune; the parked edits survive, and `park pop` re-ap
 `scope fetch` has brought the path back. If any of that state cannot be read, the prune refuses
 before changing anything; so does a sealed-object record that cannot be read. The prune reads
 nothing beneath an object the warehouse holds by hash alone (see `audit`). A full (non-sparse)
-warehouse has nothing to prune. Use `--dry-run` before you leap. (Objects already inside a pack
-are reported but not reclaimed yet — a scope-aware repack is future work.) A prune, dry run
-included, is **refused while a mutating command runs in another bay**, since that writer could
+warehouse has nothing to prune. Without `--confirm` the prune only shows what it would free and
+leaves the fetch scope as it was, refusing with `confirmation_required` (exit 39, the preview in
+its `details`); with nothing to free it runs without `--confirm`. A confirmed run plans again, so
+if the remote moved in between it may free slightly more or less than the preview showed.
+(Objects already inside a pack are reported but not reclaimed yet — a scope-aware repack is future
+work.) A prune, preview included, is **refused while a mutating command runs in another bay**, since that writer could
 reuse an object the prune is about to free; run it again once the other command finishes.
 (A `forklift-server` never serves a sparse warehouse, a cache, or a root whose sealed-object
 record holds anything, so no server is in the way.)
