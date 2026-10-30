@@ -1046,7 +1046,15 @@ fn tool_for(command: &clap::Command, path: &[String], params: Vec<ToolParam>) ->
             if param.injected.is_some() {
                 return Err(format!("`forklift {}` requires one of a group whose `{id}` the server sets", path.join(" ")));
             }
+            // A value-taking member is present in the schema's eyes even when null or empty, which
+            // the refusal counts as not given; only a switch has one meaning in both.
+            if !matches!(param.value, ValueKind::Boolean) {
+                return Err(format!("`forklift {}` requires one of a group whose `{id}` is not a switch", path.join(" ")));
+            }
             keys.push(param.key.clone());
+        }
+        if keys.len() < 2 {
+            return Err(format!("`forklift {}` requires one of a group of fewer than two; mark the argument required", path.join(" ")));
         }
         one_of.push((keys, group.clone().is_multiple()));
     }
@@ -1148,13 +1156,12 @@ impl Tool {
             "required": required,
             "additionalProperties": false,
         });
-        // A required group: exactly one member given (at least one where several may be), and a
-        // switch counts only when true.
+        // A required group: exactly one member given (at least one where several may be).
         let groups: Vec<Value> = self.one_of.iter().map(|(keys, multiple)| {
-            let members: Vec<Value> = keys.iter().map(|key| match self.param(key).value {
-                ValueKind::Boolean => json!({ "properties": { key: { "const": true } }, "required": [key] }),
-                _ => json!({ "required": [key] }),
-            }).collect();
+            // Every member is a switch (`tool_for`), so a member counts only when true.
+            let members: Vec<Value> = keys.iter()
+                .map(|key| json!({ "properties": { key: { "const": true } }, "required": [key] }))
+                .collect();
             json!({ if *multiple { "anyOf" } else { "oneOf" }: members })
         }).collect();
         match groups.as_slice() {
@@ -1781,7 +1788,15 @@ mod tests {
         let grouped = |args: [&'static str; 2]| cli().mut_subcommand("manifest", move |manifest| manifest
             .mut_subcommand("provenance", move |provenance| provenance
                 .group(clap::ArgGroup::new("either").required(true).args(args))));
-        assert!(refused(grouped(["model", "session"])).ends_with("requires one of a group whose `session` the server sets"));
+        assert!(refused(grouped(["session", "model"])).ends_with("requires one of a group whose `session` the server sets"));
+        let switches = |args: &'static [&'static str]| cli().subcommand(clap::Command::new("pick-one").about("Pick one")
+            .arg(clap::Arg::new("up").long("up").action(clap::ArgAction::SetTrue))
+            .arg(clap::Arg::new("down").long("down").action(clap::ArgAction::SetTrue))
+            .arg(clap::Arg::new("to").long("to"))
+            .group(clap::ArgGroup::new("way").required(true).args(args)));
+        assert!(refused(switches(&["up", "to"])).ends_with("requires one of a group whose `to` is not a switch"));
+        assert!(refused(switches(&["up"])).contains("requires one of a group of fewer than two"));
+        assert!(super::generate_tools(&switches(&["up", "down"])).is_ok());
     }
 
     /// A required group is in the schema, and a call that gives no member of it is refused by
