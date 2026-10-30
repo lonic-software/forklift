@@ -1,7 +1,6 @@
 use serde::Serialize;
-use forklift_core::error::{self, CoreError};
-use forklift_core::util::{bay_utils, held_heads, journal_utils};
-use forklift_core::util::remote_utils::{self, RemoteClient};
+use forklift_core::error::CoreError;
+use forklift_core::util::{bay_utils, journal_utils};
 use forklift_core::util::lock_utils::StoreAccessLock;
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::scope_utils::{self, MaterializationScope, ScopeClass};
@@ -202,39 +201,14 @@ fn judge_request(paths: &[String]) -> Result<PruneRequest, String> {
     Ok(PruneRequest { post_prune, to_reclaim, all_resumed })
 }
 
-/// The heads whose history the remote holds: its pallet heads, and for each pallet deleted there the
-/// head its tombstone keeps, from a handshake whose trust is
-/// judged as a lower would judge it but adopts nothing, and the earlier heads of the held-heads
-/// record that the remote confirms its pallets still reach. The prune frees only what history
-/// these heads reach needs, so it never runs without them: an unreachable or untrusted remote
-/// refuses the prune before anything changes.
-///
-/// A recorded head counts only when the remote answers that it holds it, so the record never frees
-/// more than the current heads alone unless the remote affirms it; when the confirmation cannot be
-/// had, the prune frees what the current heads alone allow and warns which pallet went unanswered.
-///
-/// # Returns
-/// * `Ok(Vec<String>)` - The head of every pallet the remote holds or keeps a tombstone of, and the
-///   confirmed recorded heads.
-/// * `Err(String)`     - If no remote is configured, it cannot be reached, its trust state is
-///   refused, or the held-heads record does not parse; the message says nothing was changed.
+/// The heads whose history the remote holds ([`crate::remote_heads::held_by_remote`]). The prune
+/// frees only what history these heads reach needs, so an unreachable or untrusted remote refuses
+/// it before anything changes.
 async fn remote_pallet_heads() -> Result<Vec<String>, String> {
-    let note = "\"scope-prune\" asks the remote which history it holds, so that it never frees work \
-        that exists only here; nothing was changed.";
-
-    let client = RemoteClient::from_config().map_err(|e| error::append_to_message(e, note))?;
-    let info = client.fetch_info().await.map_err(|e| error::append_to_message(e, note))?;
-    remote_utils::check_remote_trust(&client, &info, None).map_err(|e| error::append_to_message(e, note))?;
-
-    // A deleted pallet's tombstone keeps its history on the remote as a live ref would.
-    let held = info.held_pallet_heads();
-    let confirmation = held_heads::confirmed_heads(&client, &held).await
-        .map_err(|e| error::append_to_message(e, note))?;
-    for (pallet, why) in &confirmation.unanswered {
-        output::warn_holds_unanswered(pallet, why);
-    }
-
-    Ok(held.into_values().chain(confirmation.heads).collect())
+    crate::remote_heads::held_by_remote(
+        "\"scope-prune\" asks the remote which history it holds, so that it never frees work that \
+        exists only here; nothing was changed.",
+    ).await
 }
 
 /// Refuse the prune if the main tree or any bay still materializes a pruned path. Every

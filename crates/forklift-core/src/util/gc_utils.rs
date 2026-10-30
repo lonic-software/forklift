@@ -233,13 +233,14 @@ pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
         // but is not); gc's job is to free provably-unreachable garbage without ever touching a
         // live hash, and it stays correct whichever kind of absence this is.
         //
-        // The store invariant that makes skipping the descent safe: if a subtree object is
-        // absent, nothing beneath it is present here either (a warehouse never holds a child
-        // without its parent tree). So this marks the boundary hash live and stops — and there is
-        // nothing below it on disk for the sweep to see, let alone wrongly collect. Durable-
-        // before-destructive holds: the sealed boundary hash stays live, and nothing beneath it
-        // is ever left unmarked in a way that matters, because nothing beneath it exists locally
-        // to mark. A present-but-corrupt object is the other case: it *is* present, so the load
+        // The store invariant that makes skipping the descent safe: an object present beneath an
+        // absent subtree is reached by another, present path from a root, or by none. A fetch
+        // never stores a child without its parent tree; `evict` frees trees while keeping objects
+        // beneath them, but only the objects a present path from a root reaches (a checkout's
+        // base, a meta pallet, staged work), which this walk marks along that path. So this marks
+        // the boundary hash live and stops, and what it does not reach below the boundary is
+        // nothing a root needs. Durable-before-destructive holds: the sealed boundary hash stays
+        // live. A present-but-corrupt object is the other case: it *is* present, so the load
         // below runs and fails, and `collect_garbage` deletes nothing on that error (safe, loud).
         // An object only an unreadable pack index might hold is that case too, not absence: its
         // bytes may still be on disk with its children elsewhere, so the invariant does not cover
@@ -288,8 +289,9 @@ pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
 ///
 /// The recipe hash itself is already marked live by the caller; this descends it to reach the
 /// chunk hashes. Tolerance mirrors the subtree descent exactly, one level deeper: an **absent**
-/// recipe (out of scope in a sparse warehouse, never fetched — and by the store invariant its
-/// chunks are absent too) is skipped, since we cannot descend bytes we do not hold, and its
+/// recipe (out of scope in a sparse warehouse, never fetched, or evicted from a cache — and by the
+/// store invariant a chunk still present is reached through another, present recipe) is skipped,
+/// since we cannot descend bytes we do not hold, and its
 /// already-live hash is never collected. A **present** recipe is loaded (which re-hashes it on the
 /// content-addressed read, so a corrupt one fails here and `collect_garbage` then deletes nothing
 /// — safe and loud) and each chunk hash is marked live, tolerating an absent chunk with no read.

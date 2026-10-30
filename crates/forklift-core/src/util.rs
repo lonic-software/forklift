@@ -3,6 +3,7 @@ pub mod blame_utils;
 pub mod body_utils;
 pub mod bundle_utils;
 pub mod delta_utils;
+pub mod evict_utils;
 pub mod gc_utils;
 pub mod graph_utils;
 pub mod pack_utils;

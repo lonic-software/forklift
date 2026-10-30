@@ -222,6 +222,9 @@ holds.
 fetch back, to free disk.
 See [`scope-prune`](cli.md#scope-prune--reclaim-disk-from-a-sparse-warehouse).
 
+**evict** (git: none). Deletes content a cache warehouse can fetch back from its origin, to free
+disk. See [`evict`](cli.md#evict--free-disk-in-a-cache-warehouse).
+
 **Held-heads record.** A record of pallet heads this warehouse saw the remote accept or serve. See
 [`scope-prune`](cli.md#scope-prune--reclaim-disk-from-a-sparse-warehouse).
 
@@ -262,7 +265,7 @@ Forklift has several locks, each guarding a different thing.
 | Warehouse lock (git: `index.lock`) | one bay's inventory and working directory |
 | Ref lock (`refs.lock`) | pallets and other state every bay shares |
 | Object-store lock (`store.lock`) | the object store, against overlapping compactions |
-| Store-access lock (`store-access.lock`) | the object store, ordering commands that write objects against those that delete them (`compact --all`, `scope-prune`, gc) |
+| Store-access lock (`store-access.lock`) | the object store, ordering commands that write objects against those that delete them (`compact --all`, `scope-prune`, `evict`, gc) |
 | Config lock | one config file |
 | Serve lock (`serve.lock`) | a warehouse a server is serving; gc and `compact --all` also take it while they run |
 | Server base lock (`.forklift-server.lock`) | a server's base folder |

@@ -2792,8 +2792,9 @@ pub fn does_object_exist(hash: &str) -> Result<bool, String> {
 /// [`does_object_exist`] for the liveness walk of a sweep that deletes (`gc`, `compact --all`,
 /// scope prune): `false` only when the hash is genuinely absent.
 ///
-/// A walk that stops descending at an absent object relies on a store invariant: nothing beneath
-/// an absent object is present. A hash that only an unreadable index might hold breaks it. A
+/// A walk that stops descending at an absent object relies on a store invariant: what is present
+/// beneath an absent object is reached by another, present path from a root, or by none. A hash
+/// that only an unreadable index might hold breaks it. A
 /// quarantined index, a corrupt bucket of a loaded one, or an index of another format version
 /// reads `false` from [`does_object_exist`], yet the object's bytes may still be on disk, and its
 /// children may be present in another pack or loose. Reading that `false` as absent would leave

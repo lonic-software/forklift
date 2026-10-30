@@ -1,10 +1,9 @@
 use serde::Serialize;
 use forklift_core::error::CoreError;
-use forklift_core::enums::config_scope::ConfigScope;
 use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{BatchLaneClosure, LiftResult, RemoteClient};
 use forklift_core::util::{
-    config_utils, file_utils, merge_utils, object_utils, pallet_utils,
+    file_utils, merge_utils, object_utils, pallet_utils,
     remote_utils, scope_utils, take_utils,
 };
 use forklift_core::util::take_utils::{FetchAt, TakeTrust};
@@ -222,26 +221,14 @@ fn ensure_origin_remote() -> Result<(), CoreError> {
         return Ok(());
     }
 
-    let Some(origin) = config_utils::get_scoped_value(config_utils::KEY_REMOTE_ORIGIN, ConfigScope::Warehouse)? else {
-        // Franchise records the origin before the head, so a partial warehouse without one was left
-        // by an interrupted franchise or had it unset. Its lift is refused rather than left to the
-        // remote's closure check, which would fail late against the wrong remote.
-        return Err(scope_utils::unrecorded_origin_lift_refusal());
-    };
-
-    let Some((configured, _scope)) = config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)? else {
-        // No remote is configured at all — a different, unrelated problem. Leave it to
-        // `RemoteClient::from_config` (called right after this guard) to report that plainly,
-        // rather than treating "unset" as "configured to the empty string" and masking it
-        // behind a confusing "lifting to \"\"" origin refusal.
-        return Ok(());
-    };
-
-    if configured != origin {
-        return Err(scope_utils::non_origin_lift_refusal(&origin, &configured));
-    }
-
-    Ok(())
+    // Franchise records the origin before the head, so a partial warehouse without one was left by
+    // an interrupted franchise or had it unset. Its lift is refused rather than left to the
+    // remote's closure check, which would fail late against the wrong remote. No remote configured
+    // at all is left to `RemoteClient::from_config`, called right after this guard.
+    scope_utils::ensure_remote_is_origin(
+        scope_utils::unrecorded_origin_lift_refusal,
+        scope_utils::non_origin_lift_refusal,
+    )
 }
 
 /// If the remote head has genuinely diverged from ours and a clean auto-merge is possible,

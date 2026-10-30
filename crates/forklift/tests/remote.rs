@@ -6414,6 +6414,280 @@ fn recording_a_present_root_records_what_is_absent_beneath_it() {
     assert!(!after.contains(&root), "the present root is not");
 }
 
+/// The heads `server-root` holds, as the origin would answer for them: every pallet head.
+fn origin_heads(area: &TestArea) -> Vec<String> {
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("server-root"));
+    forklift_core::util::pallet_utils::all_pallet_refs().unwrap().into_iter().map(|(_, head)| head).collect()
+}
+
+/// Whether `directory`'s sealed record holds `hash`.
+fn recorded(area: &TestArea, directory: &str, hash: &str) -> bool {
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path(directory));
+    forklift_core::util::sealed_utils::read_sealed().unwrap().contains(hash)
+}
+
+/// `evict` frees only a cache: a full and a sparse warehouse refuse it as a plain failure, before
+/// asking any remote, and change nothing.
+///
+/// Revert: drop the cache check → the full warehouse plans an eviction and frees its history.
+#[test]
+fn evict_refuses_a_warehouse_that_is_not_a_cache() {
+    let area = TestArea::new("evict-not-cache");
+    let (server, _) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "full"]));
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src"]));
+
+    for directory in ["full", "sparse"] {
+        let before = forklift_dir_snapshot(&area, directory);
+        let refused = area.forklift(directory, &["evict"]);
+        assert_eq!(refused.status.code(), Some(1), "{}: {}", directory, stderr(&refused));
+        assert!(stderr(&refused).contains("not a cache"), "{}", stderr(&refused));
+        assert!(forklift_dir_snapshot(&area, directory) == before, "{} is unchanged", directory);
+    }
+}
+
+/// `evict` asks the origin which history it holds, and only the origin: with the remote pointed
+/// elsewhere it refuses as `non_origin_lift` naming both, and with the origin unreachable it
+/// refuses too, each leaving every file under `.forklift` as it was. With the origin back, it runs.
+///
+/// Revert: skip the origin check → the other remote's heads decide what is freed; ask the remote
+/// after the plan → nothing changes, but the plan ran before the refusal (the unreachable case still
+/// refuses, so this half pins only the order the doc states).
+#[test]
+fn evict_refuses_a_remote_that_is_not_the_origin_and_an_unreachable_origin() {
+    let area = TestArea::new("evict-origin");
+    let (mut server, head) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    let oldest = history_with_roots(&area, "cached", &head)[2].0.clone();
+    assert_success(&area.forklift("cached", &["show", &format!("{}:src/code.txt", oldest)]));
+    let before = forklift_dir_snapshot(&area, "cached");
+
+    let other = Server::start_at(&area, "server-root-2", None);
+    assert_success(&area.forklift("cached", &["config", "remote.url", &other.url]));
+    let elsewhere = area.forklift("cached", &["--json", "evict"]);
+    assert_eq!(elsewhere.status.code(), Some(11), "{}", stderr(&elsewhere));
+    let json = json_of(&elsewhere);
+    assert_eq!(json["error"]["code"], "non_origin_lift", "{}", json);
+    let message = json["error"]["message"].as_str().unwrap();
+    assert!(message.contains(&server.url) && message.contains(&other.url), "{}", message);
+    assert_success(&area.forklift("cached", &["config", "remote.url", &server.url]));
+
+    server.stop();
+    let unreachable = area.forklift("cached", &["evict"]);
+    assert!(!unreachable.status.success(), "{}", stdout(&unreachable));
+    assert!(stderr(&unreachable).contains("nothing was changed"), "{}", stderr(&unreachable));
+    assert!(forklift_dir_snapshot(&area, "cached") == before, "a refused evict changes nothing");
+
+    server.restart(&area);
+    assert_success(&area.forklift("cached", &["evict"]));
+}
+
+/// An eviction frees what the origin holds and the checkout does not stand on, and keeps what only
+/// local history reaches. Here the cache read the oldest parcel (fetching its root, `src` subtree
+/// and file), then stacked two parcels it never lifted: the first writes the oldest parcel's
+/// `code.txt` content back plus a `mine.txt`, the second changes both. The oldest parcel's root
+/// and `src` are evicted and recorded; its `code.txt` blob is evicted too, though the unlifted
+/// parcel shares it, since the origin holds it; the first `mine.txt` is kept, since only unlifted
+/// history reaches it; the checkout's base is kept whole. Reads of both then fetch what they need
+/// again, and `audit` passes.
+///
+/// Revert: walk local history as held → the first `mine.txt` is evicted and its read fails; drop
+/// the checkout keep → the base's blobs are evicted; skip the record → the read of the oldest
+/// parcel fails instead of refilling.
+#[test]
+fn evict_frees_what_the_origin_holds_and_a_read_fetches_it_again() {
+    let area = TestArea::new("evict-frees");
+    let (server, head) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    let (oldest, oldest_root) = history_with_roots(&area, "cached", &head)[2].clone();
+    assert_success(&area.forklift("cached", &["show", &format!("{}:src/code.txt", oldest)]));
+    let oldest_src = subtree_of(&area, "cached", &oldest_root, "src");
+    let one = file_of(&area, "cached", &oldest_src, "code.txt");
+
+    area.write_file("cached/src/code.txt", "one\n");
+    area.write_file("cached/src/mine.txt", "mine\n");
+    assert_success(&area.forklift("cached", &["load", "."]));
+    assert_success(&area.forklift("cached", &["stack", "four"]));
+    let four = pallet_head(&area, "cached", "main");
+    let four_src = subtree_of(&area, "cached", &history_with_roots(&area, "cached", &four)[0].1, "src");
+    let mine = file_of(&area, "cached", &four_src, "mine.txt");
+    assert_eq!(file_of(&area, "cached", &four_src, "code.txt"), one, "the unlifted parcel shares the blob");
+
+    area.write_file("cached/src/code.txt", "five\n");
+    area.write_file("cached/src/mine.txt", "mine, five\n");
+    assert_success(&area.forklift("cached", &["load", "."]));
+    assert_success(&area.forklift("cached", &["stack", "five"]));
+    let base_root = history_with_roots(&area, "cached", &pallet_head(&area, "cached", "main"))[0].1.clone();
+
+    let evicted = area.forklift("cached", &["--json", "evict"]);
+    assert_success(&evicted);
+    let report = &json_of(&evicted)["data"];
+    assert!(report["evicted"].as_u64().unwrap() >= 3, "{}", report);
+    assert!(report["not_held"].as_u64().unwrap() >= 1, "{}", report);
+    assert!(report["kept_for_checkouts"].as_u64().unwrap() >= 1, "{}", report);
+
+    for hash in [&oldest_root, &oldest_src, &one] {
+        assert!(!object_held(&area, "cached", hash) && recorded(&area, "cached", hash), "{} is evicted and recorded", hash);
+    }
+    assert!(object_held(&area, "cached", &mine), "content only unlifted history reaches stays");
+    assert!(closure_present(&area, "cached", &base_root), "the checkout's base stays whole");
+    assert!(object_held(&area, "cached", &oldest) && object_held(&area, "cached", &four), "parcels stay");
+
+    let shown = area.forklift("cached", &["show", &format!("{}:src/code.txt", oldest)]);
+    assert_success(&shown);
+    assert_eq!(stdout(&shown), "one\n");
+    let shown = area.forklift("cached", &["show", &format!("{}:src/mine.txt", four)]);
+    assert_success(&shown);
+    assert_eq!(stdout(&shown), "mine\n");
+    assert_success(&area.forklift("cached", &["audit"]));
+
+    let dry = area.forklift("cached", &["--json", "evict", "--dry-run"]);
+    assert_success(&dry);
+    assert_eq!(json_of(&dry)["data"]["dry_run"], true);
+}
+
+/// A staged file whose content history the origin holds also has is kept: staged work never
+/// depends on the network. The cache read the oldest parcel, then staged a file with its
+/// `code.txt` content without stacking it; the eviction frees the oldest parcel's root but keeps
+/// that blob.
+///
+/// Revert: drop the staged leaves from the keep set → the blob is evicted.
+#[test]
+fn evict_keeps_a_staged_blob_that_history_shares() {
+    let area = TestArea::new("evict-staged");
+    let (server, head) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    let (oldest, oldest_root) = history_with_roots(&area, "cached", &head)[2].clone();
+    assert_success(&area.forklift("cached", &["show", &format!("{}:src/code.txt", oldest)]));
+    let one = file_of(&area, "cached", &subtree_of(&area, "cached", &oldest_root, "src"), "code.txt");
+
+    area.write_file("cached/staged.txt", "one\n");
+    assert_success(&area.forklift("cached", &["load", "staged.txt"]));
+
+    assert_success(&area.forklift("cached", &["evict"]));
+    assert!(!object_held(&area, "cached", &oldest_root), "the oldest root is evicted");
+    assert!(object_held(&area, "cached", &one), "the staged blob stays");
+
+    assert_success(&area.forklift("cached", &["stack", "staged"]));
+    assert_success(&area.forklift("cached", &["audit"]));
+}
+
+/// A consolidation in progress keeps the trees of both its sides, so it finishes as it would have.
+/// The cache's `main` stacks a change to `code.txt` the origin's `feature` also changed, and
+/// consolidating `feature` stops on the conflict; an eviction then keeps `feature`'s root, which no
+/// checkout stands on, and stacking the resolution completes the merge.
+///
+/// Revert: drop the consolidation's parcels from the keep set → `feature`'s root is evicted.
+#[test]
+fn evict_keeps_an_in_progress_consolidation_and_it_finishes() {
+    let area = TestArea::new("evict-consolidation");
+    let (server, _) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+
+    assert_success(&area.forklift("a", &["palletize", "feature"]));
+    area.write_file("a/src/code.txt", "feature\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "feature"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    let feature = pallet_head(&area, "server-root", "feature");
+
+    assert_success(&area.forklift("cached", &["lower", "feature"]));
+    area.write_file("cached/src/code.txt", "mine\n");
+    assert_success(&area.forklift("cached", &["load", "."]));
+    assert_success(&area.forklift("cached", &["stack", "mine"]));
+    let consolidated = area.forklift("cached", &["consolidate", "feature"]);
+    assert!(stdout(&consolidated).contains("conflict: src/code.txt"), "the consolidation stops on the conflict: {}", stdout(&consolidated));
+    assert!(area.path("cached/.forklift/consolidation").exists(), "a consolidation is in progress: {}{}", stdout(&consolidated), stderr(&consolidated));
+    let feature_root = history_with_roots(&area, "cached", &feature)[0].1.clone();
+    assert!(object_held(&area, "cached", &feature_root));
+
+    assert_success(&area.forklift("cached", &["evict"]));
+    assert!(closure_present(&area, "cached", &feature_root), "the consolidated side's tree stays");
+
+    area.write_file("cached/src/code.txt", "resolved\n");
+    assert_success(&area.forklift("cached", &["load", "."]));
+    assert_success(&area.forklift("cached", &["stack", "merged"]));
+    assert!(!area.path("cached/.forklift/consolidation").exists(), "the consolidation finished");
+}
+
+/// An object the origin's history reaches that is absent and unrecorded is damage, not cache
+/// state: `evict` refuses over it, naming `heal`, and changes nothing. A fill killed after storing
+/// a root leaves exactly that (the root present and recorded, its children absent and not):
+/// `heal` unseals the root, recording its children, and `evict` then runs.
+///
+/// Revert: tolerate an unrecorded absence in the held walk → the first evict succeeds.
+#[test]
+fn evict_refuses_an_unrecorded_absence_until_heal_records_it() {
+    let area = TestArea::new("evict-heal");
+    let (server, head) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "full"]));
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    let oldest_root = history_with_roots(&area, "full", &head)[2].1.clone();
+    assert!(recorded(&area, "cached", &oldest_root));
+
+    let target = object_store_path(&area, "cached", &oldest_root);
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::copy(object_store_path(&area, "full", &oldest_root), &target).expect("the full franchise holds the root loose");
+    let before = forklift_dir_snapshot(&area, "cached");
+
+    let refused = area.forklift("cached", &["evict"]);
+    assert!(!refused.status.success(), "{}", stdout(&refused));
+    assert!(stderr(&refused).contains("forklift heal"), "{}", stderr(&refused));
+    assert!(forklift_dir_snapshot(&area, "cached") == before, "a refused evict changes nothing");
+
+    assert_success(&area.forklift("cached", &["heal"]));
+    assert_success(&area.forklift("cached", &["evict"]));
+    assert!(!object_held(&area, "cached", &oldest_root) && recorded(&area, "cached", &oldest_root));
+    assert_success(&area.forklift("cached", &["audit"]));
+}
+
+/// An eviction interrupted after its record is written and before its deletes finish leaves a
+/// readable warehouse, and running `evict` again finishes. The interruption is a delete that fails
+/// on a read-only fan-out folder, run in process so nothing in the binary needs a fault hook.
+///
+/// Revert: free before recording → the failed run leaves deleted objects unrecorded and `audit`
+/// fails over them.
+#[cfg(unix)]
+#[test]
+fn an_interrupted_evict_leaves_a_readable_warehouse_and_a_rerun_finishes() {
+    use std::os::unix::fs::PermissionsExt;
+    use forklift_core::util::evict_utils;
+
+    let area = TestArea::new("evict-interrupted");
+    let (server, head) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    let (oldest, oldest_root) = history_with_roots(&area, "cached", &head)[2].clone();
+    assert_success(&area.forklift("cached", &["show", &format!("{}:src/code.txt", oldest)]));
+
+    let held = origin_heads(&area);
+    let (plan, stuck) = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("cached"));
+        let hold = forklift_core::util::lock_utils::StoreAccessLock::try_exclusive().unwrap();
+        let plan = evict_utils::plan_evict(&held, &hold).unwrap();
+        assert!(plan.to_free.len() >= 3, "the oldest parcel's content is planned");
+
+        // The last object goes last; make its folder refuse the delete, so the run stops there.
+        let stuck = plan.to_free.last().unwrap().clone();
+        let folder = object_store_path(&area, "cached", &stuck).parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let outcome = evict_utils::carry_out(&plan, &hold);
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(outcome.is_err(), "the delete of {} fails", stuck);
+        (plan, stuck)
+    };
+    assert!(object_held(&area, "cached", &stuck), "the run stopped before {}", stuck);
+    assert!(plan.to_free.iter().all(|hash| recorded(&area, "cached", hash)), "everything planned is recorded");
+
+    assert_success(&area.forklift("cached", &["audit"]));
+    let shown = area.forklift("cached", &["show", &format!("{}:src/code.txt", oldest)]);
+    assert_success(&shown);
+    assert_eq!(stdout(&shown), "one\n");
+
+    assert_success(&area.forklift("cached", &["evict"]));
+    assert!(!object_held(&area, "cached", &oldest_root));
+    assert_success(&area.forklift("cached", &["audit"]));
+}
+
 #[test]
 fn lift_and_franchise_round_trip_a_chunked_file() {
     // Chunk transport, end to end (§9.4b Stage 3). A chunk-aware server advertises `chunking` on

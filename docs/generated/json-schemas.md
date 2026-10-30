@@ -5057,6 +5057,84 @@ A command not listed here either reports only the generic human-message shape `{
 }
 ```
 
+## `evict`
+
+### `EvictReport`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The result of an eviction: how much was (or would be) freed, and why the rest stays.",
+  "properties": {
+    "dry_run": {
+      "description": "Whether this was a dry run (nothing changed).",
+      "type": "boolean"
+    },
+    "evicted": {
+      "description": "Loose objects freed (`0` on a dry run). A read of one fetches it again from the origin.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "heads_not_lowered": {
+      "description": "Origin heads this warehouse does not hold yet; their history frees nothing until a `lower`\nbrings it in.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "kept_for_checkouts": {
+      "description": "Objects the origin holds that stay because a checkout's base tree needs them.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "kept_local": {
+      "description": "Objects the origin holds that stay for a meta pallet, a parked, consolidating or\ncherry-picking bay, a trust pin, or staged work.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "not_held": {
+      "description": "Present objects only local history reaches (unlifted work, a haul, a deleted pallet), which\nthe origin is not known to hold. Lifting that work lets a later eviction free them.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "still_packed": {
+      "description": "Evictable objects held only inside a pack, which this eviction does not free.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "unsealed": {
+      "description": "Kept objects an earlier eviction had recorded as held by hash, and a read had fetched again,\nwhose record this run removed (on a dry run, would remove).",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "would_evict": {
+      "description": "Loose objects the plan frees. After a real run, `evicted` is less only by objects already\ngone when it came to delete them.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "dry_run",
+    "evicted",
+    "would_evict",
+    "kept_for_checkouts",
+    "kept_local",
+    "not_held",
+    "still_packed",
+    "heads_not_lowered",
+    "unsealed"
+  ],
+  "title": "EvictReport",
+  "type": "object"
+}
+```
+
 ## `store`
 
 ### `StoreReport`

@@ -746,6 +746,39 @@ pub fn scope_prune_blocked_refusal(path: &str, blockers: &str) -> CoreError {
     )
 }
 
+/// Refuse unless the configured remote is this partial warehouse's recorded origin, the only
+/// remote proved to hold what it lacks. No remote configured at all passes: the remote client
+/// reports that plainly, rather than a refusal naming an empty remote.
+///
+/// # Arguments
+/// * `unrecorded` - The refusal when no origin is recorded (an interrupted franchise, or unset).
+/// * `non_origin` - The refusal when the configured remote differs, given the origin and it.
+///
+/// # Returns
+/// * `Ok(())`         - If the configured remote is the origin, or none is configured.
+/// * `Err(CoreError)` - The matching refusal, or a config read failure.
+pub fn ensure_remote_is_origin(
+    unrecorded: fn() -> CoreError,
+    non_origin: fn(&str, &str) -> CoreError,
+) -> Result<(), CoreError> {
+    use crate::enums::config_scope::ConfigScope;
+    use crate::util::config_utils;
+
+    let Some(origin) = config_utils::get_scoped_value(config_utils::KEY_REMOTE_ORIGIN, ConfigScope::Warehouse)? else {
+        return Err(unrecorded());
+    };
+
+    let Some((configured, _scope)) = config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)? else {
+        return Ok(());
+    };
+
+    if configured != origin {
+        return Err(non_origin(&origin, &configured));
+    }
+
+    Ok(())
+}
+
 /// A ready-made `non_origin_lift` refusal for a lift from a partial warehouse (franchised with
 /// `--only` or `--cache`) to a remote other than the one it fetched against. A partial warehouse
 /// only ever proved the closure it does not hold present on its origin; a different remote may
@@ -785,6 +818,41 @@ pub fn unrecorded_origin_lift_refusal() -> CoreError {
             "This is a partial warehouse, but the remote it was franchised from (\"remote.origin\") \
             is not recorded, so Forklift cannot tell whether the remote it would lift to holds the \
             objects this warehouse does not. {}",
+            next_step
+        ),
+        next_step,
+    )
+}
+
+/// A ready-made `non_origin_lift` refusal for an `evict` while the configured remote is not the
+/// cache's origin: only the origin was proved to hold what this warehouse lacks, so only its heads
+/// may decide what a refill can fetch back.
+pub fn non_origin_evict_refusal(origin: &str, other: &str) -> CoreError {
+    let next_step = format!("Point \"remote.url\" back at \"{}\", then run \"forklift evict\" again.", origin);
+
+    refusal(
+        RefusalCode::NonOriginLift,
+        format!(
+            "This cache warehouse was franchised from \"{}\", and the configured remote is \"{}\"; \
+            evicting asks the origin which history it holds, since only the origin can refill what \
+            is freed. Nothing was changed. {}",
+            origin, other, next_step
+        ),
+        next_step,
+    )
+}
+
+/// A ready-made `non_origin_lift` refusal for an `evict` in a cache whose origin is not recorded.
+pub fn unrecorded_origin_evict_refusal() -> CoreError {
+    let next_step = "Record the remote this warehouse was franchised from with \"forklift config \
+        remote.origin <url>\", then run \"forklift evict\" again.";
+
+    refusal(
+        RefusalCode::NonOriginLift,
+        format!(
+            "The remote this cache warehouse was franchised from (\"remote.origin\") is not recorded, \
+            so Forklift cannot tell which remote can refill what an eviction frees. Nothing was \
+            changed. {}",
             next_step
         ),
         next_step,
