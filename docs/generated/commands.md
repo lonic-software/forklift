@@ -8,7 +8,7 @@ or a `--json` output struct).
 
 # Commands and aliases
 
-Every `forklift` command and subcommand, generated from the same command definition the binary parses its arguments with; CI fails when this page falls behind it. Commands are in alphabetical order, each followed by its subcommands. An **alias** is a short name shown in `forklift help`. A **hidden alias** is accepted but not shown; most are git's name for the same command, so `forklift commit` runs `stack`. `forklift help <command>` explains any row in full, and `docs/guide/cli.md` walks through them by task.
+Every `forklift` command and subcommand, generated from the same command definition the binary parses its arguments with; CI fails when this page falls behind it. Commands are in alphabetical order, each followed by its subcommands. An **alias** is a short name shown in `forklift help`. A **hidden alias** is accepted but not shown; most are git's name for the same command, so `forklift commit` runs `forklift stack`. `forklift help <command>` explains any row in full, and `docs/guide/cli.md` walks through them by task.
 
 | Command | Alias | Hidden alias | Does |
 |---|---|---|---|

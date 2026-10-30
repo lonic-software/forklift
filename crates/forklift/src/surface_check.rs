@@ -452,8 +452,11 @@ fn hint_error(hint: &str) -> Option<String> {
     }
 }
 
-/// Every hint in every string literal of the crates' sources, beside the file it is in.
-fn source_hints() -> Vec<(String, String)> {
+/// Every text a user can be shown, beside where it comes from: each string literal in the crates'
+/// sources, and each help text of the binary's commands and arguments. The help comes from the
+/// clap tree rather than the sources because most of it is written as doc comments, which the
+/// literal scan skips: the rest of the doc comments are prose for maintainers.
+fn shown_texts() -> Vec<(String, String)> {
     let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut files = Vec::new();
     rust_sources(&crates, &mut files);
@@ -465,11 +468,26 @@ fn source_hints() -> Vec<(String, String)> {
         let mut literals = Vec::new();
         string_literals(stream, &mut literals);
         let shown = file.strip_prefix(&crates).unwrap_or(&file).display().to_string();
-        for literal in literals {
-            out.extend(hints(&literal).into_iter().map(|hint| (shown.clone(), hint)));
-        }
+        out.extend(literals.into_iter().map(|literal| (shown.clone(), literal)));
+    }
+    let cli = built_cli();
+    for (path, command) in command_paths(&cli) {
+        let shown = format!("the help of `{}`", std::iter::once("forklift")
+            .chain(path.iter().map(String::as_str)).collect::<Vec<_>>().join(" "));
+        let helps = [command.get_about(), command.get_long_about(), command.get_before_help(),
+            command.get_before_long_help(), command.get_after_help(), command.get_after_long_help()]
+            .into_iter()
+            .chain(command.get_arguments().flat_map(|arg| [arg.get_help(), arg.get_long_help()]));
+        out.extend(helps.flatten().map(|help| (shown.clone(), help.to_string())));
     }
     out
+}
+
+/// Every hint in every text a user can be shown, beside where it comes from.
+fn source_hints() -> Vec<(String, String)> {
+    shown_texts().into_iter()
+        .flat_map(|(shown, text)| hints(&text).into_iter().map(move |hint| (shown.clone(), hint)))
+        .collect()
 }
 
 /// Every hint a message gives names a command, flags and values the binary accepts.
@@ -507,14 +525,9 @@ fn no_exemption_is_a_command() {
 fn every_quoted_command_says_forklift() {
     let cli = built_cli();
     let names: BTreeSet<&str> = cli.get_subcommands().map(|command| command.get_name()).collect();
-    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    let mut files = Vec::new();
-    rust_sources(&crates, &mut files);
     let mut failures = Vec::new();
-    for file in files {
-        let mut literals = Vec::new();
-        string_literals(TokenStream::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap(), &mut literals);
-        for literal in literals {
+    for (shown, literal) in shown_texts() {
+        {
             for quote in ['"', '`'] {
                 let parts: Vec<&str> = literal.split(quote).collect();
                 if parts.len() < 3 {
@@ -525,8 +538,7 @@ fn every_quoted_command_says_forklift() {
                     let json = parts[i - 1].ends_with(':') || parts[i + 1].starts_with(':');
                     let named = [" tool", " pallet", " field"].iter().any(|noun| parts[i + 1].starts_with(noun));
                     if names.contains(first) && !json && !named {
-                        failures.push(format!("{}: {quote}{}{quote}",
-                            file.strip_prefix(&crates).unwrap_or(&file).display(), parts[i]));
+                        failures.push(format!("{shown}: {quote}{}{quote}", parts[i]));
                     }
                 }
             }

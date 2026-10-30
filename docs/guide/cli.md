@@ -304,7 +304,7 @@ by default, calling the same command under the hood:
 forklift alias install            # create "fl" next to this binary
 forklift alias install fl2        # create a differently-named alias instead
 forklift alias uninstall          # remove it
-forklift alias                    # (or "alias status") report whether it's installed, and where
+forklift alias                    # (or "forklift alias status") report whether it's installed, and where
 ```
 
 `install` is idempotent (an alias that already points at this binary succeeds

@@ -188,7 +188,7 @@ Adopted the @kv pallet from the remote.
 Adopted the @manifest pallet from the remote.
 Adopted the @tags pallet from the remote.
 Franchised http://127.0.0.1:7171 into "slim": pallet "main" at … (… object(s) fetched loose).
-Sparse: fetched and materialized only src. The rest of the tree is sealed by hash — widen with "expand".
+Sparse: fetched and materialized only src. The rest of the tree is sealed by hash — widen with "forklift expand".
 ```
 
 There are two scopes. The **fetch scope** is what the warehouse has downloaded; the
@@ -224,7 +224,7 @@ reclaim the disk:
 ```console
 $ forklift expand docs
 Expanded the fetch scope with docs (… object(s) fetched). Fetch scope now: docs, src.
-Scope a bay to a newly fetched path with "bay add --scope".
+Scope a bay to a newly fetched path with "forklift bay add --scope".
 $ forklift show main:docs/pricing.md
 Prices in euros.
 ```

@@ -56,7 +56,7 @@ On pallet "main" (unborn — nothing stacked yet)
 
 The inventory matches the pallet head; nothing is staged.
 
-Changes not in the inventory (use "load" to stage them):
+Changes not in the inventory (use "forklift load" to stage them):
   untracked: .forkliftignore
   untracked: readme.md
 ```
@@ -145,7 +145,7 @@ $ forklift consolidate shout
 Consolidating "shout" into "main" produced 1 conflict(s):
   conflict: readme.md
 
-Resolve the conflicts, "load" the resolved files, then "stack" to complete the consolidation.
+Resolve the conflicts, "forklift load" the resolved files, then "forklift stack" to complete the consolidation.
 $ cat readme.md
 <<<<<<< main
 Hello, forklift and friends!
@@ -158,7 +158,7 @@ $ forklift conflicts
 Unresolved conflicts (1):
   readme.md (base …, ours …, theirs …)
 
-Resolve each file, "load" it, then "stack" to complete the consolidation.
+Resolve each file, "forklift load" it, then "forklift stack" to complete the consolidation.
 ```
 
 Resolve it by writing the file you want, then load and stack. The stack completes the
@@ -209,7 +209,7 @@ $ forklift undo
 Undid stack on pallet "main".
   (Half-finished idea)
 The pallet head is now ….
-Its changes are staged again — "stack" to redo, or adjust them first.
+Its changes are staged again — "forklift stack" to redo, or adjust them first.
 ```
 
 Park the idea again for later; `park list` shows what is parked:

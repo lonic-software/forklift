@@ -206,7 +206,7 @@ pub enum Command {
         #[arg(short, long)]
         global: bool,
 
-        /// Remove the key from the configuration (e.g. "config --unset remote.token")
+        /// Remove the key from the configuration (e.g. "forklift config --unset remote.token")
         #[arg(long, conflicts_with = "value")]
         unset: bool,
 
@@ -275,7 +275,7 @@ pub enum Command {
                       path limits the report to a file or directory."
     )]
     Diff {
-        /// Compare the inventory against the pallet head (what "stack" would record)
+        /// Compare the inventory against the pallet head (what "forklift stack" would record)
         #[arg(short, long)]
         staged: bool,
 
@@ -411,7 +411,7 @@ pub enum Command {
     /// Print the command list, or detailed help about one command
     #[command(visible_alias = "h")]
     Help {
-        /// The command to explain (subcommands work too, e.g. "help office admit")
+        /// The command to explain (subcommands work too, e.g. "forklift help office admit")
         #[arg(value_name = "COMMAND")]
         command: Vec<String>,
     },
@@ -508,8 +508,8 @@ pub enum Command {
                       reported, never merged implicitly."
     )]
     Lower {
-        /// The pallet to lower (default: the current pallet); "palletize --remote" lists the
-        /// remote's
+        /// The pallet to lower (default: the current pallet); "forklift palletize --remote" lists
+        /// the remote's
         pallet: Option<String>,
 
         /// Refuse unless the remote's trust anchor is this genesis (an out-of-band pin)
@@ -638,7 +638,7 @@ pub enum Command {
         revision: Option<String>,
 
         /// When listing, also show the meta pallets (the office and other tracked
-        /// metadata; reach them with the "@" qualifier, e.g. "history @office")
+        /// metadata; reach them with the "@" qualifier, e.g. "forklift history @office")
         #[arg(short, long)]
         all: bool,
 
@@ -1598,7 +1598,7 @@ pub enum OfficeAction {
                       sign autonomously under their own marked identity, never as a human)."
     )]
     Admit {
-        /// The operator's UUID (printed by their "office keygen")
+        /// The operator's UUID (printed by their "forklift office keygen")
         #[arg(value_name = "OPERATOR_UUID")]
         operator_id: String,
 
@@ -1606,7 +1606,7 @@ pub enum OfficeAction {
         #[arg(value_name = "PUBLIC_KEY_HEX")]
         public_key: String,
 
-        /// The key's proof-of-possession (printed by their "office keygen")
+        /// The key's proof-of-possession (printed by their "forklift office keygen")
         #[arg(value_name = "PROOF_OF_POSSESSION_HEX")]
         pop: String,
 
@@ -1649,7 +1649,7 @@ pub enum OfficeAction {
         #[arg(value_name = "PUBLIC_KEY_HEX")]
         public_key: String,
 
-        /// The new key's proof-of-possession (printed by "office keygen")
+        /// The new key's proof-of-possession (printed by "forklift office keygen")
         #[arg(value_name = "PROOF_OF_POSSESSION_HEX")]
         pop: String,
     },
@@ -1667,7 +1667,7 @@ pub enum OfficeAction {
                       operator use \"forklift office admit\"."
     )]
     Authorize {
-        /// The enrolled operator's UUID (printed by their "office keygen")
+        /// The enrolled operator's UUID (printed by their "forklift office keygen")
         #[arg(value_name = "OPERATOR_UUID")]
         operator_id: String,
 
@@ -1675,7 +1675,7 @@ pub enum OfficeAction {
         #[arg(value_name = "PUBLIC_KEY_HEX")]
         public_key: String,
 
-        /// The new key's proof-of-possession (printed by "office keygen")
+        /// The new key's proof-of-possession (printed by "forklift office keygen")
         #[arg(value_name = "PROOF_OF_POSSESSION_HEX")]
         pop: String,
     },

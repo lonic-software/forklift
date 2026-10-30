@@ -1298,7 +1298,7 @@ mod tests {
         std::fs::write(forklift_path.join(FILE_NAME_BAY_REDIRECT), "/srv/warehouse\nreview\n").unwrap();
 
         let error = read_bay_redirect(&forklift_path).err().expect("a headerless redirect must be refused");
-        assert!(error.contains("is not a valid forklift bay"), "{}", error);
+        assert!(error.contains("is not a valid bay redirect"), "{}", error);
 
         std::fs::remove_dir_all(&dir).ok();
     }
