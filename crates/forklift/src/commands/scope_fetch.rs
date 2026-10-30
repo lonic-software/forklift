@@ -5,7 +5,7 @@ use forklift_core::util::scope_utils::ScopeClass;
 use forklift_core::util::{object_utils, pallet_utils, remote_utils, scope_utils};
 use crate::output::{self, CommandOutput};
 
-/// Handle the expand command (§7.6): widen a sparse warehouse's fetch scope and download the
+/// Handle `scope fetch` (§7.6): widen a sparse warehouse's fetch scope and download the
 /// newly in-scope subtree(s) across every closure the warehouse holds.
 ///
 /// A ref's closure is complete only at the scope it was fetched at, so widening the scope
@@ -13,7 +13,7 @@ use crate::output::{self, CommandOutput};
 /// yet ([`remote_utils::Expansion`]); the shared history is walked once. The content is fetched
 /// from the origin (a partial warehouse dials no other remote, [`forklift_core::util::origin_utils::checked_remote`])
 /// and hash-verified against the seals the history already commits. A full
-/// (non-sparse) warehouse already holds everything, so there is nothing to expand.
+/// (non-sparse) warehouse already holds everything, so there is nothing to fetch.
 ///
 /// # Arguments
 /// * `paths` - The subtree path(s) to add to the warehouse fetch scope.
@@ -30,14 +30,14 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
     if scope_utils::is_cache_mode()? {
         return Err(
             "This warehouse was cloned with --cache: its scope is already the whole tree, so \
-            there is nothing to expand. \"forklift expand\" widens a sparse (\"forklift clone --only\") \
+            there is nothing to fetch. \"forklift scope fetch\" widens a sparse (\"forklift clone --only\") \
             warehouse's fetch scope.".to_string()
         );
     }
 
     if current.is_full() {
         return Err(
-            "This warehouse already holds the full tree; there is nothing to expand. \"forklift expand\" \
+            "This warehouse already holds the full tree; there is nothing to fetch. \"forklift scope fetch\" \
             widens a sparse (\"forklift clone --only\") warehouse's fetch scope.".to_string()
         );
     }
@@ -50,7 +50,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
 
         if path.is_root() {
             return Err(
-                "Expanding to the warehouse root would fetch the whole tree — re-clone \
+                "Fetching the warehouse root would fetch the whole tree — re-clone \
                 without --only for a full warehouse.".to_string()
             );
         }
@@ -66,7 +66,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
 
     if added.is_empty() {
         // Everything requested is already fetched — a clean no-op.
-        output::emit(&ExpandReport {
+        output::emit(&ScopeFetchReport {
             added: Vec::new(),
             scope: current.prefixes().to_vec(),
             fetched_objects: 0,
@@ -81,7 +81,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
     let position = pallet_utils::read_position()?;
     let pallet = position.pallet.clone();
     let head = position.base.clone().ok_or_else(|| format!(
-        "Pallet \"{}\" has nothing stacked yet; there is nothing to expand.", pallet
+        "Pallet \"{}\" has nothing stacked yet; there is nothing to fetch.", pallet
     ))?;
 
     // Fetch the newly in-scope content FIRST, at the widened scope, and only then record it: the
@@ -114,7 +114,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
 
         match expansion.commit()? {
             ExpandCommit::Written(scope) => {
-                output::emit(&ExpandReport {
+                output::emit(&ScopeFetchReport {
                     added: expansion.added().to_vec(),
                     scope: scope.prefixes().to_vec(),
                     fetched_objects: expansion.fetched_objects(),
@@ -124,7 +124,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
                 return Ok(());
             }
             ExpandCommit::Covered(scope) => {
-                output::emit(&ExpandReport {
+                output::emit(&ScopeFetchReport {
                     added: Vec::new(),
                     scope: scope.prefixes().to_vec(),
                     fetched_objects: expansion.fetched_objects(),
@@ -138,7 +138,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
     }
 
     Err(
-        "The warehouse kept changing while expand ran, so the fetch scope was not widened; run it \
+        "The warehouse kept changing while \"forklift scope fetch\" ran, so the fetch scope was not widened; run it \
         again.".to_string()
     )
 }
@@ -161,15 +161,15 @@ fn is_directory_in_tree(root_tree_hash: &str, key: &str) -> Result<bool, String>
     Ok(true)
 }
 
-/// The result of an expand: what was added to the fetch scope and how much was fetched.
+/// The result of a `scope fetch`: what was added to the fetch scope and how much was fetched.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-pub(crate) struct ExpandReport {
+pub(crate) struct ScopeFetchReport {
     /// The prefixes newly added to the fetch scope (empty when everything was already in scope).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     added: Vec<String>,
 
-    /// The warehouse fetch scope after the expand.
+    /// The warehouse fetch scope after the fetch.
     scope: Vec<String>,
 
     /// Loose objects fetched for the newly in-scope subtree(s).
@@ -180,13 +180,13 @@ pub(crate) struct ExpandReport {
     batch_lane: Option<BatchLaneClosure>,
 }
 
-impl CommandOutput for ExpandReport {
+impl CommandOutput for ScopeFetchReport {
     fn render_human(&self) {
         if self.added.is_empty() {
-            println!("Nothing to expand: every requested path is already in the fetch scope.");
+            println!("Nothing to fetch: every requested path is already in the fetch scope.");
         } else {
             println!(
-                "Expanded the fetch scope with {} ({} object(s) fetched). Fetch scope now: {}.",
+                "Widened the fetch scope with {} ({} object(s) fetched). Fetch scope now: {}.",
                 self.added.join(", "), self.fetched_objects, self.scope.join(", ")
             );
             println!("Scope a bay to a newly fetched path with \"forklift bay add --scope\".");
@@ -201,6 +201,6 @@ impl CommandOutput for ExpandReport {
 #[cfg(feature = "docgen")]
 pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
-        crate::docgen::OutputSchema::of::<ExpandReport>(),
+        crate::docgen::OutputSchema::of::<ScopeFetchReport>(),
     ]
 }

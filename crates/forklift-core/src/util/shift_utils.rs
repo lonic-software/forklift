@@ -4,7 +4,7 @@ use crate::enums::dir_entry_type::DirEntryType;
 use crate::model::inventory::{Inventory, InventoryItem};
 use crate::model::tree_item::TreeItem;
 use crate::util::progress_utils::Progress;
-use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
+use crate::util::scope_utils::{self, PathScope, ScopeClass};
 use crate::util::{alias_utils, cache_miss, fanout_utils, file_utils, inventory_utils, object_utils, office_utils, tree_utils, warehouse_utils};
 
 /// A single file operation needed to turn one tree into another in the working directory.
@@ -53,7 +53,7 @@ pub fn diff_trees(from: Option<&str>, to: &str) -> Result<(Vec<FileOp>, Vec<Stri
 /// bay's.
 pub fn diff_trees_in(from: Option<&str>,
                      to: &str,
-                     scope: &MaterializationScope) -> Result<(Vec<FileOp>, Vec<String>), String> {
+                     scope: &PathScope) -> Result<(Vec<FileOp>, Vec<String>), String> {
     cache_miss::prefetch_trees(&[from, Some(to)], |path, sides| diff_descends(path, sides[0], sides[1], scope));
 
     let from_tree = match from {
@@ -88,7 +88,7 @@ pub fn diff_trees_in(from: Option<&str>,
 
 /// Whether [`diff_directory`] descends into the subtree at `path`, `from` and `to` being its hash
 /// on each side: where they differ, and the subtree is not out of scope.
-fn diff_descends(path: &str, from: Option<&str>, to: Option<&str>, scope: &MaterializationScope) -> bool {
+fn diff_descends(path: &str, from: Option<&str>, to: Option<&str>, scope: &PathScope) -> bool {
     from != to && (scope.is_full() || scope.classify(path) != ScopeClass::OutOfScope)
 }
 
@@ -121,7 +121,7 @@ fn diff_directory(from: Option<&TreeItem>,
                   key: &str,
                   plan: &mut Plan,
                   aliased: bool,
-                  scope: &MaterializationScope) -> Result<(), String> {
+                  scope: &PathScope) -> Result<(), String> {
     // Hoisted once per directory (not per entry) for the file loops: a full (unscoped) scope
     // always classifies everything in scope, so on the hot, common full-bay path their scope
     // checks are pure overhead — short-circuit them away entirely, the same way `stack_parcel`
@@ -255,7 +255,7 @@ fn fold_paired_names(tree: &TreeItem) -> HashSet<&str> {
 /// * `to`              - The target root tree.
 /// * `aliased_removes` - The removals to check (see [`Plan::aliased_removes`]).
 /// * `ops`             - The plan's operations, extended in place.
-/// * `scope`           - The materialization scope.
+/// * `scope`           - The checkout scope.
 ///
 /// # Returns
 /// * `Ok(())`      - If every kept file was judged.
@@ -263,7 +263,7 @@ fn fold_paired_names(tree: &TreeItem) -> HashSet<&str> {
 fn keep_aliased_files(to: &TreeItem,
                       aliased_removes: &[String],
                       ops: &mut Vec<FileOp>,
-                      scope: &MaterializationScope) -> Result<(), String> {
+                      scope: &PathScope) -> Result<(), String> {
     if aliased_removes.is_empty() {
         return Ok(());
     }
@@ -295,7 +295,7 @@ fn keep_aliased_files(to: &TreeItem,
 /// * `tree`    - The tree the materialization leaves in place.
 /// * `removed` - The paths it removes.
 /// * `planned` - Every path it already writes or removes.
-/// * `scope`   - The materialization scope.
+/// * `scope`   - The checkout scope.
 ///
 /// # Returns
 /// * `Ok(Vec<(String, TreeItem)>)` - The kept files, each once.
@@ -303,7 +303,7 @@ fn keep_aliased_files(to: &TreeItem,
 pub fn kept_through_aliases(tree: &TreeItem,
                             removed: &[String],
                             planned: &HashSet<&str>,
-                            scope: &MaterializationScope) -> Result<Vec<(String, TreeItem)>, String> {
+                            scope: &PathScope) -> Result<Vec<(String, TreeItem)>, String> {
     let mut index = FoldIndex::new(tree);
     let mut check = alias_utils::AliasCheck::new();
     let mut seen = HashSet::new();
@@ -1384,7 +1384,7 @@ fn verified_tree_entry(file_path: &Path,
 /// # Arguments
 /// * `root_tree`      - The (loaded) root tree.
 /// * `root_tree_hash` - The hash of `root_tree` (a loaded tree carries no hash of its own).
-/// * `scope`          - The bay's materialization scope.
+/// * `scope`          - The bay's checkout scope.
 /// * `shards`         - The collected shards, by directory key.
 /// * `files`          - The collected files, each naming its shard's index.
 ///
@@ -1393,7 +1393,7 @@ fn verified_tree_entry(file_path: &Path,
 /// * `Err(String)` - If a subtree could not be loaded.
 fn collect_tree_directories(root_tree: TreeItem,
                             root_tree_hash: &str,
-                            scope: &MaterializationScope,
+                            scope: &PathScope,
                             shards: &mut Vec<(String, Inventory)>,
                             files: &mut Vec<TreeFile>) -> Result<(), String> {
     // Hoisted once (not per entry): a full (unscoped) scope always classifies everything in
@@ -1546,7 +1546,7 @@ pub fn ensure_writes_present(ops: &[FileOp]) -> Result<(), String> {
 
 /// [`ensure_writes_present`] for checking out `to_tree` from nothing in `scope`, for a caller that
 /// does not diff it itself. Outside a cache warehouse it diffs nothing.
-pub fn ensure_tree_present(to_tree: &str, scope: &MaterializationScope) -> Result<(), String> {
+pub fn ensure_tree_present(to_tree: &str, scope: &PathScope) -> Result<(), String> {
     if !scope_utils::is_cache_mode().unwrap_or(false) {
         return Ok(());
     }

@@ -55,7 +55,7 @@ A served root must hold the full tree. A partial warehouse (one cloned with `--o
 it holds that object by hash alone, without its content, whatever its marker says, and any root
 that records an origin (`.forklift/origin`), which only a partial warehouse has; a record that
 cannot be read is refused too (a `500` from a `--warehouses` server). Clients trust a server to
-hold every object its pallet heads reach, and `scope-prune`, `evict` and `remote move` rely on that,
+hold every object its pallet heads reach, and `scope prune`, `evict` and `remote move` rely on that,
 so such a root could lead a client to free content it can never fetch back. To serve a cloned
 copy, clone it without `--only` or `--cache`. A clone that has not finished is
 not served either (`503` from a `--warehouses` server) until it is resumed or deleted.

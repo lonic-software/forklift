@@ -204,8 +204,8 @@ but file content only for some paths. See [`clone`](cli.md#clone--clone-a-remote
 
 **Fetch scope.** The paths a warehouse holds content for, shared by every bay.
 
-**Materialization scope** (git: sparse-checkout). The paths one checkout writes to disk, always
-within the fetch scope. See [`scope`](cli.md#scope--show-the-sparse-workspace-scope).
+**Checkout scope** (git: sparse-checkout). The paths one checkout (a bay or the main tree) writes
+to disk, always within the fetch scope. See [`scope`](cli.md#scope--show-the-sparse-workspace-scope).
 
 **Sealed.** Content outside the fetch scope: not on disk, but pinned by the hashes of the trees
 that hold it. See [`clone`](cli.md#clone--clone-a-remote-warehouse).
@@ -213,24 +213,24 @@ that hold it. See [`clone`](cli.md#clone--clone-a-remote-warehouse).
 **Spine.** The trees from the root down to each scoped folder, which a sparse warehouse always
 holds.
 
-**Expand.** Widens the fetch scope and fetches the new content. See
-[`expand`](cli.md#expand--widen-a-sparse-warehouses-fetch-scope).
+**scope fetch.** Widens the fetch scope and fetches the new content. See
+[`scope fetch`](cli.md#scope-fetch--widen-a-sparse-warehouses-fetch-scope).
 
-**Narrow.** Shrinks a checkout's materialization scope without freeing storage. See
-[`narrow`](cli.md#narrow--shrink-this-checkouts-materialization-scope).
+**scope narrow.** Shrinks a checkout's scope without freeing storage. See
+[`scope narrow`](cli.md#scope-narrow--shrink-this-checkouts-scope).
 
-**scope-prune** (git: none). Shrinks the fetch scope and deletes dropped content it can safely
+**scope prune** (git: none). Shrinks the fetch scope and deletes dropped content it can safely
 fetch back, to free disk.
-See [`scope-prune`](cli.md#scope-prune--reclaim-disk-from-a-sparse-warehouse).
+See [`scope prune`](cli.md#scope-prune--reclaim-disk-from-a-sparse-warehouse).
 
 **evict** (git: none). Deletes content a cache warehouse can fetch back from its origin, to free
 disk. See [`store evict`](cli.md#store-evict--free-disk-in-a-cache-warehouse).
 
 **Held-heads record.** A record of pallet heads this warehouse saw the remote accept or serve. See
-[`scope-prune`](cli.md#scope-prune--reclaim-disk-from-a-sparse-warehouse).
+[`scope prune`](cli.md#scope-prune--reclaim-disk-from-a-sparse-warehouse).
 
 **Fetched-heads ledger.** A sparse warehouse's record of the heads its fetches brought in, so that
-`expand` widens their history too.
+`scope fetch` widens their history too.
 
 **Origin.** The remote a partial warehouse (cloned with `--only` or `--cache`) fetched from.
 
@@ -266,7 +266,7 @@ Forklift has several locks, each guarding a different thing.
 | Warehouse lock (git: `index.lock`) | one bay's inventory and working directory |
 | Ref lock (`refs.lock`) | pallets and other state every bay shares |
 | Object-store lock (`store.lock`) | the object store, against overlapping compactions |
-| Store-access lock (`store-access.lock`) | the object store, ordering commands that write objects against those that delete them (`store compact --all`, `scope-prune`, `store evict`, gc) |
+| Store-access lock (`store-access.lock`) | the object store, ordering commands that write objects against those that delete them (`store compact --all`, `scope prune`, `store evict`, gc) |
 | Config lock | one config file |
 | Serve lock (`serve.lock`) | a warehouse a server is serving; gc and `store compact --all` also take it while they run |
 | Server base lock (`.forklift-server.lock`) | a server's base folder |
@@ -494,7 +494,7 @@ tool that drives command-line tools. See
 | Word | Meanings |
 |------|----------|
 | head | (1) the parcel a pallet points at; (2) a server program: `forklift-server` or the Lambda head |
-| scope | (1) fetch scope, what the warehouse holds; (2) materialization scope, what one checkout writes to disk |
+| scope | (1) fetch scope, what the warehouse holds; (2) checkout scope, what one checkout writes to disk |
 | lock | several different locks; see [Locks](#locks) |
 | marker | the warehouse marker; the operation marker; conflict markers inside a file |
 | staging | (1) the inventory; (2) the Lambda head's holding area for unchecked uploads |

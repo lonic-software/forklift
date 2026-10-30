@@ -7703,7 +7703,7 @@ fn json_mode_wraps_every_result_in_a_versioned_envelope() {
     let value = json(&prepared);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 13);
+    assert_eq!(value["schema"], 14);
     assert_eq!(value["command"], "prepare");
     assert_eq!(value["ok"], true);
     assert!(value["data"]["created"].is_array());
@@ -7745,7 +7745,7 @@ fn json_errors_carry_a_stable_code_and_a_deterministic_exit_code() {
     // failed, so a consumer classifies by the same header on either outcome.
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 13);
+    assert_eq!(value["schema"], 14);
     assert_eq!(value["command"], "stocktake");
     assert!(value.get("data").is_none(), "a failure carries no data: {}", value);
 }
@@ -7774,7 +7774,7 @@ fn a_usage_error_under_json_is_one_failure_document_with_exit_2() {
     let value = json(&unknown);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 13);
+    assert_eq!(value["schema"], 14);
     assert_eq!(value["ok"], false);
     assert!(value["command"].is_null(), "no known command was named: {}", value);
     assert_eq!(value["error"]["code"], "usage");
@@ -7980,7 +7980,7 @@ fn every_json_document_starts_with_the_header_in_its_documented_order() {
     let warehouse = TestWarehouse::new("json-key-order");
 
     // The order is checked on the raw text: a parsed `Value` would hide it.
-    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 13,\n  \"command\": ";
+    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 14,\n  \"command\": ";
 
     for args in [&["--json", "version"][..], &["--json", "bogus"], &["--json", "stocktake"]] {
         let output = warehouse.run(args);
@@ -10585,7 +10585,7 @@ fn compact_finds_a_directorys_path_base_across_many_versions() {
 #[test]
 fn a_writer_waits_for_object_store_maintenance_and_says_so() {
     // FORK-150: a writing command holds the object store shared for its whole run, so a full
-    // repack, gc or scope-prune in another process — which takes it exclusively — cannot delete
+    // repack, gc or scope prune in another process — which takes it exclusively — cannot delete
     // an object the command has just decided it can reuse. Writers wait rather than fail, and
     // say what they are waiting for. The test process stands in for the maintenance.
     //
@@ -10840,12 +10840,12 @@ fn a_scoped_bay_materializes_only_its_subtree_and_reports_the_scope() {
     assert!(!scoped_dir.join("src/web").exists(), "out-of-scope subtree must not be materialized");
     assert!(!scoped_dir.join("README.md").exists(), "out-of-scope file must not be materialized");
 
-    // `scope` reports the bay's materialization scope; the main tree is full.
+    // `scope` reports the bay's checkout scope; the main tree is full.
     let scoped_status = warehouse.run_at(&scoped_dir, &["--json", "scope"]);
     assert_success(&scoped_status);
     let value = json(&scoped_status);
     assert_eq!(value["data"]["scoped"], true);
-    assert_eq!(value["data"]["materialization_scope"][0], "src/api");
+    assert_eq!(value["data"]["checkout_scope"][0], "src/api");
 
     let main_status = warehouse.run(&["--json", "scope"]);
     assert_success(&main_status);
@@ -13396,7 +13396,7 @@ fn scope_prune_reports_a_local_refusal_before_asking_the_remote() {
     warehouse.write_file("docs/guide.md", "guide\n");
     assert_success(&warehouse.run(&["prepare"]));
 
-    let refused = warehouse.run(&["scope-prune", "docs"]);
+    let refused = warehouse.run(&["scope", "prune", "docs"]);
     assert!(!refused.status.success());
     assert!(stderr(&refused).contains("holds the full tree"), "{}", stderr(&refused));
 }

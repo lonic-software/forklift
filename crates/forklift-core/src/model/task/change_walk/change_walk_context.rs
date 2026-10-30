@@ -22,7 +22,7 @@ pub struct ChangeWalkContext {
     /// `diff.rs`'s `inventory_content`). Dropped with this context at the end of one walk —
     /// never a cross-invocation cache, since a shard is a mutable file, not content-addressed.
     /// Only populated when [`collect_shards`](Self::collect_shards) is set — every other caller
-    /// (`stocktake`, `narrow`, `consolidate`, `lower`, `shift`) never reads this map, so they
+    /// (`stocktake`, `scope narrow`, `consolidate`, `lower`, `shift`) never reads this map, so they
     /// must not pay for the extra lock per directory that filling it in costs.
     pub shards: Arc<Mutex<HashMap<String, Arc<Inventory>>>>,
 

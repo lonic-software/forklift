@@ -1,17 +1,17 @@
 use serde::Serialize;
 use forklift_core::error::CoreError;
 use forklift_core::util::path_utils::WarehousePath;
-use forklift_core::util::scope_utils::MaterializationScope;
+use forklift_core::util::scope_utils::PathScope;
 use forklift_core::util::stocktake_utils::ChangeKind;
 use std::path::Path;
 use forklift_core::util::{inventory_utils, object_utils, office_utils, pallet_utils, scope_utils, stocktake_utils};
 use crate::output::{self, CommandOutput};
 
-/// Handle the narrow command (§7.6): shrink this checkout's materialization scope, dropping
+/// Handle `scope narrow` (§7.6): shrink this checkout's scope, dropping
 /// subtree path(s) and de-materializing their files. This frees nothing in the shared object
 /// store — the dropped content is ordinary reachable history, not garbage — it only shrinks what
 /// this checkout shows. Bay-local and reversible: widen the bay again with `bay add --scope` on a
-/// fresh checkout, or `expand` the warehouse and re-scope.
+/// fresh checkout, or `scope fetch` the warehouse and re-scope.
 ///
 /// # Arguments
 /// * `paths` - The in-scope subtree path(s) to drop.
@@ -26,8 +26,8 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
 
     if current.is_full() {
         return Err(
-            "This checkout materializes the full tree; there is nothing to narrow. \"forklift narrow\" \
-            shrinks a scoped (sparse) checkout's materialization scope.".to_string()
+            "This checkout has the full tree; there is nothing to narrow. \"forklift scope narrow\" \
+            shrinks a scoped (sparse) checkout's scope.".to_string()
         );
     }
 
@@ -80,7 +80,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
         ensure_narrow_target_is_clean(prefix).await?;
     }
 
-    let narrowed = MaterializationScope::from_prefixes(keep);
+    let narrowed = PathScope::from_prefixes(keep);
     scope_utils::set_bay_scope(&narrowed)?;
 
     // De-materialize each dropped subtree: drop its staged shards (so it stops being reported),
@@ -90,7 +90,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
         remove_working_subtree(prefix)?;
     }
 
-    output::emit(&NarrowReport {
+    output::emit(&ScopeNarrowReport {
         dropped,
         scope: narrowed.prefixes().to_vec(),
     });
@@ -210,18 +210,18 @@ fn remove_working_subtree(prefix: &str) -> Result<(), String> {
 /// The result of a narrow: the paths dropped and the scope that remains.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-pub(crate) struct NarrowReport {
+pub(crate) struct ScopeNarrowReport {
     /// The in-scope prefixes dropped from this checkout.
     dropped: Vec<String>,
 
-    /// This checkout's materialization scope after the narrow.
+    /// This checkout's scope after the narrow.
     scope: Vec<String>,
 }
 
-impl CommandOutput for NarrowReport {
+impl CommandOutput for ScopeNarrowReport {
     fn render_human(&self) {
         println!(
-            "Narrowed away {}; those files are de-materialized. Materialization scope now: {}.",
+            "Narrowed away {}; those files are de-materialized. Checkout scope now: {}.",
             self.dropped.join(", "), self.scope.join(", ")
         );
         println!("Nothing was freed in the object store — the content is still reachable history.");
@@ -233,6 +233,6 @@ impl CommandOutput for NarrowReport {
 #[cfg(feature = "docgen")]
 pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
-        crate::docgen::OutputSchema::of::<NarrowReport>(),
+        crate::docgen::OutputSchema::of::<ScopeNarrowReport>(),
     ]
 }

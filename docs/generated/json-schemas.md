@@ -160,7 +160,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "string"
     },
     "scope": {
-      "description": "The bay's materialization scope prefixes (empty for a full, unscoped bay).",
+      "description": "The bay's checkout scope prefixes (empty for a full, unscoped bay).",
       "items": {
         "type": "string"
       },
@@ -4394,9 +4394,68 @@ A command not listed here either reports only the generic human-message shape `{
 }
 ```
 
-## `expand`
+## `scope`
 
-### `ExpandReport`
+### `ScopeStatus`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The sparse-workspace scope of the current bay. An empty prefix list means the full\ntree (an unscoped bay or the main tree).",
+  "properties": {
+    "bay": {
+      "description": "The active bay's name (`null` in the main tree).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "checkout_scope": {
+      "description": "The bay's in-scope prefixes (empty = the full tree).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "fetch_scope": {
+      "description": "The warehouse's fetch-scope prefixes (empty = fully fetched; a sparse clone records\nits fetched prefixes here).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "implicit_fetch_scope": {
+      "description": "The paths a sparse fetch scope holds without listing them as prefixes: the root ignore\nfile, which the store fetches along with the prefixes. Empty when fully fetched.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "implicit_scope": {
+      "description": "The paths a scoped bay holds in scope without listing them as prefixes: the root ignore\nfile, so its rules apply to the checkout. Empty when the bay is not scoped.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "scoped": {
+      "description": "Whether this bay is scoped (has a non-full checkout scope).",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "scoped",
+    "checkout_scope",
+    "implicit_scope",
+    "fetch_scope",
+    "implicit_fetch_scope"
+  ],
+  "title": "ScopeStatus",
+  "type": "object"
+}
+```
+
+### `ScopeFetchReport`
 
 ```json
 {
@@ -4423,7 +4482,7 @@ A command not listed here either reports only the generic human-message shape `{
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "The result of an expand: what was added to the fetch scope and how much was fetched.",
+  "description": "The result of a `scope fetch`: what was added to the fetch scope and how much was fetched.",
   "properties": {
     "added": {
       "description": "The prefixes newly added to the fetch scope (empty when everything was already in scope).",
@@ -4450,7 +4509,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "integer"
     },
     "scope": {
-      "description": "The warehouse fetch scope after the expand.",
+      "description": "The warehouse fetch scope after the fetch.",
       "items": {
         "type": "string"
       },
@@ -4461,14 +4520,12 @@ A command not listed here either reports only the generic human-message shape `{
     "scope",
     "fetched_objects"
   ],
-  "title": "ExpandReport",
+  "title": "ScopeFetchReport",
   "type": "object"
 }
 ```
 
-## `narrow`
-
-### `NarrowReport`
+### `ScopeNarrowReport`
 
 ```json
 {
@@ -4483,7 +4540,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "array"
     },
     "scope": {
-      "description": "This checkout's materialization scope after the narrow.",
+      "description": "This checkout's scope after the narrow.",
       "items": {
         "type": "string"
       },
@@ -4494,80 +4551,17 @@ A command not listed here either reports only the generic human-message shape `{
     "dropped",
     "scope"
   ],
-  "title": "NarrowReport",
+  "title": "ScopeNarrowReport",
   "type": "object"
 }
 ```
 
-## `scope`
-
-### `ScopeStatus`
+### `ScopePruneReport`
 
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "The sparse-workspace scope of the current bay. An empty prefix list means the full\ntree (an unscoped bay or the main tree).",
-  "properties": {
-    "bay": {
-      "description": "The active bay's name (`null` in the main tree).",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "fetch_scope": {
-      "description": "The warehouse's fetch-scope prefixes (empty = fully fetched; a sparse clone records\nits fetched prefixes here).",
-      "items": {
-        "type": "string"
-      },
-      "type": "array"
-    },
-    "implicit_fetch_scope": {
-      "description": "The paths a sparse fetch scope holds without listing them as prefixes: the root ignore\nfile, which the store fetches along with the prefixes. Empty when fully fetched.",
-      "items": {
-        "type": "string"
-      },
-      "type": "array"
-    },
-    "implicit_scope": {
-      "description": "The paths a scoped bay holds in scope without listing them as prefixes: the root ignore\nfile, so its rules apply to the checkout. Empty when the bay is not scoped.",
-      "items": {
-        "type": "string"
-      },
-      "type": "array"
-    },
-    "materialization_scope": {
-      "description": "The bay's in-scope prefixes (empty = the full tree).",
-      "items": {
-        "type": "string"
-      },
-      "type": "array"
-    },
-    "scoped": {
-      "description": "Whether this bay is scoped (has a non-full materialization scope).",
-      "type": "boolean"
-    }
-  },
-  "required": [
-    "scoped",
-    "materialization_scope",
-    "implicit_scope",
-    "fetch_scope",
-    "implicit_fetch_scope"
-  ],
-  "title": "ScopeStatus",
-  "type": "object"
-}
-```
-
-## `scope-prune`
-
-### `PruneReport`
-
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "The result of a scope-prune: what was pruned, the fetch scope that remains, and how much was\n(or would be) freed.",
+  "description": "The result of a scope prune: what was pruned, the fetch scope that remains, and how much was\n(or would be) freed.",
   "properties": {
     "all_resumed": {
       "description": "Whether every requested path was already outside the fetch scope before this call — a\npure resume of an earlier, interrupted prune, rather than a path pruned for the first\ntime here.",
@@ -4662,7 +4656,7 @@ A command not listed here either reports only the generic human-message shape `{
     "unlifted_pallets",
     "all_resumed"
   ],
-  "title": "PruneReport",
+  "title": "ScopePruneReport",
   "type": "object"
 }
 ```

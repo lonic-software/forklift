@@ -1,18 +1,18 @@
 //! The fetched-heads ledger of a sparse warehouse.
 //!
 //! A history fetch in a sparse warehouse stops at every local ref head, on the understanding that
-//! a ref's closure is complete at the current fetch scope. `expand` widens that scope, so it
+//! a ref's closure is complete at the current fetch scope. `scope fetch` widens that scope, so it
 //! re-walks every ref head under the widened scope before recording it. A closure can outlive the
 //! command that fetched it without a ref, though: `lower` fetches the remote head and then refuses
 //! as diverged, and the refusal's own next step creates a pallet at that head through a write that fetches
-//! nothing. If an `expand` ran in between, that head's newly in-scope content would never be
+//! nothing. If a `scope fetch` ran in between, that head's newly in-scope content would never be
 //! fetched. So every scoped fetch records its head here, under the
-//! [`RefLock`](crate::util::lock_utils::RefLock), before it transfers anything, and `expand` walks
+//! [`RefLock`](crate::util::lock_utils::RefLock), before it transfers anything, and `scope fetch` walks
 //! the recorded heads as well as the ref heads. A ref write that leaves a head no longer reached
 //! from its ref records that head too, since an `undo` can write it back without fetching.
 //!
 //! A recorded head that no ref reaches and that the remote can no longer serve cannot be walked;
-//! `expand` drops it rather than failing. Nothing here guards against such a head becoming a ref:
+//! `scope fetch` drops it rather than failing. Nothing here guards against such a head becoming a ref:
 //! the ref compare-and-set verifies a new head's closure at the current fetch scope, so a head that
 //! is not complete there is refused whatever fetched it.
 //!

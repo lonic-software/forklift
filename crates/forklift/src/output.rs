@@ -35,8 +35,9 @@ pub const TOOL: &str = "forklift";
 /// `data` shape or the error-code registry changes incompatibly, so an agent can pin it and
 /// detect drift.
 ///
-/// Version 13 (this one): the `franchise_incomplete` error code is renamed `clone_incomplete`.
-/// Versions 10–12 are recorded in docs/MACHINE_INTERFACE.md.
+/// Version 14 (this one): `scope` reports this checkout's scope as `checkout_scope`, not
+/// `materialization_scope`.
+/// Versions 10–13 are recorded in docs/MACHINE_INTERFACE.md.
 /// Version 9: `batch_lane` may be `out_of_time`, when the remote ran out of time for a
 /// batch download and the rest of the command fetched one object at a time.
 /// Version 8: the `pallet_deleted_on_remote` error code exists; `palletize --remote`
@@ -61,7 +62,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 13;
+pub const SCHEMA_VERSION: u32 = 14;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -206,7 +207,7 @@ pub fn message(text: impl Into<String>) {
 pub const DENSIFY_TIP: &str = "Tip: \"forklift store compact --all --redelta\" can significantly \
     shrink this store (one-shot, takes a few minutes on large histories).";
 
-/// The line `clone`, `lower`, `expand`, `lift` and `office accept-regenesis` print when their
+/// The line `clone`, `lower`, `scope fetch`, `lift` and `office accept-regenesis` print when their
 /// remote's batch lane closed, so a command that ran slow says why. One shared wording, so the
 /// commands never drift apart.
 pub fn batch_lane_line(closure: BatchLaneClosure) -> &'static str {
@@ -392,7 +393,7 @@ error_codes! {
     /// Another forklift process holds the warehouse lock.
     WarehouseLocked,
 
-    /// A path argument is outside the bay's materialization scope (§7.6).
+    /// A path argument is outside the bay's checkout scope (§7.6).
     OutOfScope,
 
     /// A scoped bay's spine path flipped between a directory and a file (§7.6): the scope
@@ -411,11 +412,11 @@ error_codes! {
     /// so every remote command refuses up front.
     NonOriginRemote,
 
-    /// `narrow` was asked to drop a subtree that still holds uncommitted work (staged,
+    /// `scope narrow` was asked to drop a subtree that still holds uncommitted work (staged,
     /// unstaged or untracked): it refuses rather than silently discard it.
     NarrowUnclean,
 
-    /// `scope-prune` was asked to free a path a checkout still materializes: freeing it would
+    /// `scope prune` was asked to free a path a checkout still materializes: freeing it would
     /// break that checkout, so it refuses until the checkout narrows the path away.
     ScopePruneBlocked,
 
@@ -646,9 +647,9 @@ impl ErrorCode {
             ErrorCode::NonOriginRemote =>
                 "A partial (--only or --cache) warehouse was asked to talk to a remote other than its origin, or its origin record is missing",
             ErrorCode::NarrowUnclean =>
-                "\"forklift narrow\" would delete a subtree that still holds uncommitted work",
+                "\"forklift scope narrow\" would delete a subtree that still holds uncommitted work",
             ErrorCode::ScopePruneBlocked =>
-                "\"forklift scope-prune\" would free a path a checkout still materializes",
+                "\"forklift scope prune\" would free a path a checkout still materializes",
             ErrorCode::ChunkedTransportUnsupported =>
                 "A chunked large file can't go into a bundle, or is being lifted to a remote \
                  that doesn't support chunking",

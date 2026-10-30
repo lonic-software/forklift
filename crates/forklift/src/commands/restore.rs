@@ -5,7 +5,7 @@ use forklift_core::model::inventory::{Inventory, InventoryItem};
 use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::path_utils::{self, WarehousePath};
 use forklift_core::util::inventory_utils::TrackedKind;
-use forklift_core::util::scope_utils::{self, MaterializationScope, ScopeClass};
+use forklift_core::util::scope_utils::{self, PathScope, ScopeClass};
 use forklift_core::util::{
     alias_utils, cache_miss, file_utils, inventory_utils, load_guard_utils, object_utils, pallet_utils, shift_utils, tree_utils,
 };
@@ -605,7 +605,7 @@ fn nothing_staged_under(ledger: &inventory_utils::ShardLedger, path: &WarehouseP
 ///                 carries no hash of its own; the caller passes the resolved head subtree
 ///                 hash for the root of the walk).
 /// * `shards`    - The collected shards.
-/// * `scope`     - The active bay's materialization scope.
+/// * `scope`     - The active bay's checkout scope.
 ///
 /// Once a level is itself fully in scope (`ScopeClass::InScope`), everything below it is
 /// included without further per-entry classification — the classifier's own "nothing below
@@ -619,7 +619,7 @@ fn build_unstaged_shards(ledger: &inventory_utils::ShardLedger,
                          key: &str,
                          tree_hash: &str,
                          shards: &mut BTreeMap<String, Inventory>,
-                         scope: &MaterializationScope) -> Result<(), String> {
+                         scope: &PathScope) -> Result<(), String> {
     // Hoisted once per directory (not per entry): a full (unscoped) scope, or a level already
     // fully in scope, never needs the per-entry classify calls below — short-circuit them away
     // entirely on that hot, common path.

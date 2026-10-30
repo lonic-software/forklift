@@ -17,8 +17,8 @@
 //! warehouse would break.
 //!
 //! The fetched-heads ledger and the held-heads record are not checked. Both name heads a remote
-//! may no longer hold, and both readers ask the remote rather than trust an entry: `expand` drops a
-//! ledger head the origin cannot serve, and `scope-prune` asks the origin about each held head. A
+//! may no longer hold, and both readers ask the remote rather than trust an entry: `scope fetch` drops a
+//! ledger head the origin cannot serve, and `scope prune` asks the origin about each held head. A
 //! ledger head may also be local work an `undo` left, which no server holds.
 
 use std::collections::HashSet;

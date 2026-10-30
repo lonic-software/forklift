@@ -378,7 +378,7 @@ pub(crate) fn write_back_in_hold(_lock: &crate::util::lock_utils::RefLock,
 }
 
 /// The removed heads of every delete entry in every bay's journal, the main tree's included: the
-/// heads an undo can still put back, which gc, compaction and scope-prune keep. Read under the
+/// heads an undo can still put back, which gc, compaction and scope prune keep. Read under the
 /// same rule as the rest of a bay's state: a journal that cannot be read is an error, so a sweep
 /// fails closed rather than freeing what it might hold.
 ///

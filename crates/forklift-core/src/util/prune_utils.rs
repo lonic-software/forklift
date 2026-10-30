@@ -50,7 +50,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::util::pallet_utils::PalletNamespace;
-use crate::util::scope_utils::{MaterializationScope, ScopeClass};
+use crate::util::scope_utils::{PathScope, ScopeClass};
 use crate::util::sealed_utils::{self, SealedSet};
 use crate::util::{
     bay_utils, file_utils, gc_utils, object_utils, office_utils, pack_utils, pallet_utils, recovery_utils,
@@ -133,7 +133,7 @@ pub struct PruneStats {
 ///   object and publish a reference to it between the plan and the deletion (FORK-150).
 pub fn plan_prune(
     pruned_prefixes: &[String],
-    post_prune: &MaterializationScope,
+    post_prune: &PathScope,
     remote_heads: &[String],
     removed_heads: &[String],
     _store_access: &StoreAccessExclusive,
@@ -145,7 +145,7 @@ pub fn plan_prune(
 /// both the history a haul holds and the local roots.
 fn plan_from(
     pruned_prefixes: &[String],
-    post_prune: &MaterializationScope,
+    post_prune: &PathScope,
     remote_heads: &[String],
     removed_heads: &[String],
     sources: recovery_utils::GcRootSources,
@@ -580,7 +580,7 @@ fn local_roots(user_parcels: &[String], meta_parcels: &[String], sources: recove
 fn collect_retained(
     user_parcels: &[String],
     meta_parcels: &[String],
-    post_prune: &MaterializationScope,
+    post_prune: &PathScope,
     sealed: &SealedSet,
 ) -> Result<HashSet<String>, String> {
     let mut retained: HashSet<String> = HashSet::new();
@@ -717,7 +717,7 @@ fn collect_retained(
 /// * `retained`   - The retained set to add to.
 fn retain_local_closure(
     local: &LocalRoots,
-    post_prune: &MaterializationScope,
+    post_prune: &PathScope,
     retained: &mut HashSet<String>,
 ) -> Result<(), String> {
     for (hash, item_type) in &local.staged {
@@ -988,7 +988,7 @@ mod tests {
     use crate::util::pack_utils::tests::{for_each_unreadable, pack_as_unreadable, Unreadable};
     use std::path::PathBuf;
 
-    /// Exclusive store access at the active storage root, as the scope-prune handler holds it.
+    /// Exclusive store access at the active storage root, as the scope prune handler holds it.
     fn store_access() -> StoreAccessExclusive {
         crate::util::lock_utils::StoreAccessLock::try_exclusive().expect("no other holder in a test root")
     }
@@ -1138,7 +1138,7 @@ mod tests {
         let f = build_fixture();
 
         // Prune src/web, keeping src/api in scope.
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
 
         // Exactly the pruned subtree's closure is freed.
@@ -1188,7 +1188,7 @@ mod tests {
         let mut sources = root_sources().unwrap();
         sources.pin_parcels.push((adopted.clone(), office_utils::PinAbsencePolicy::Loss));
 
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
         let plan = plan_from(&["src/web".to_string()], &post_prune, &lifted(), &[], sources).unwrap();
 
         assert!(!plan.to_free.contains(&f.web_blob),
@@ -1213,7 +1213,7 @@ mod tests {
         let mut sources = root_sources().unwrap();
         sources.pin_parcels.push((pinned, office_utils::PinAbsencePolicy::Gap));
 
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
         let plan = plan_from(&["src/web".to_string()], &post_prune, &lifted(), &[], sources).unwrap();
 
         assert!(plan.to_free.contains(&f.web_blob),
@@ -1229,7 +1229,7 @@ mod tests {
         let f = build_fixture();
         let removed = office_parcel_holding(&f.web_blob);
 
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[removed], &store_access()).unwrap();
 
         assert!(!plan.to_free.contains(&f.web_blob),
@@ -1244,7 +1244,7 @@ mod tests {
         let _scratch = Scratch::new("keeps-unlifted");
         let f = build_fixture();
 
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &[], &[], &store_access()).unwrap();
 
         assert!(plan.to_free.is_empty(), "unlifted content must not be freed: {:?}", plan.to_free);
@@ -1282,7 +1282,7 @@ mod tests {
             "main", Some(f.parcel.as_str()), &child, &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[], &store_access())
             .unwrap();
 
@@ -1331,7 +1331,7 @@ mod tests {
         ]);
         let deleted = store_parcel(&root_tree_v2, vec![f.parcel.clone()]);
 
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[deleted.clone()], &store_access())
             .unwrap();
 
@@ -1412,7 +1412,7 @@ mod tests {
             "main", Some(f.parcel.as_str()), &api_child, &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[], &store_access())
             .unwrap();
         assert_eq!(plan.kept_unlifted, 0);
@@ -1462,7 +1462,7 @@ mod tests {
             &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
 
         // The shared blob stays (retained via src/api); only web's unique tree object is freed.
@@ -1482,7 +1482,7 @@ mod tests {
             ("src/api/y.txt", &f.web_blob, DirEntryType::Normal),
         ]);
 
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
 
         assert!(!plan.to_free.contains(&f.web_blob), "a blob a staged entry shares must not be freed");
@@ -1515,7 +1515,7 @@ mod tests {
         let f = build_fixture();
         plant_parked("b", &src_tree_with("api", "y.txt", &f.web_blob));
 
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
         assert!(!plan.to_free.contains(&f.web_blob), "a blob parked in scope must not be freed");
         assert!(plan.to_free.contains(&f.web_tree), "the head's own unique tree is still freed");
@@ -1523,7 +1523,7 @@ mod tests {
 
     #[test]
     fn plan_prune_never_frees_parked_edits_under_the_pruned_path_yet_still_reclaims_it() {
-        // The flow `narrow` suggests: park uncommitted edits under the path, narrow, prune. The
+        // The flow `scope narrow` suggests: park uncommitted edits under the path, narrow, prune. The
         // park snapshots the whole tree, so it shares the head's own `src/web` content too.
         let _scratch = Scratch::new("parked-under-pruned");
         let f = build_fixture();
@@ -1533,7 +1533,7 @@ mod tests {
         let snapshot = store_tree(&[("src", &src, DirEntryType::Tree), ("README.md", &f.readme_blob, DirEntryType::Normal)]);
         plant_parked("b", &snapshot);
 
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
 
         // The parked work is no history, so never a target: it survives.
@@ -1558,7 +1558,7 @@ mod tests {
         let src = store_tree(&[("api", &api, DirEntryType::Tree)]);
         plant_parked("b", &store_tree(&[("src", &src, DirEntryType::Tree)]));
 
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
         assert!(plan.to_free.contains(&f.web_blob));
     }
@@ -1584,7 +1584,7 @@ mod tests {
         };
         std::fs::write(dir.join("consolidation"), crate::util::merge_utils::consolidation_state_bytes(&state)).unwrap();
 
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
         assert!(!plan.to_free.contains(&f.web_blob), "a blob the consolidation holds in scope must not be freed");
         assert!(plan.to_free.contains(&f.web_tree), "the head's own unique tree is still freed");
@@ -1622,7 +1622,7 @@ mod tests {
             &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
 
         // Both versions of the pruned subtree — and both their blobs — are freed.
@@ -1640,7 +1640,7 @@ mod tests {
         let _scratch = Scratch::new("free-and-heal");
         let f = build_fixture();
 
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
 
         assert!(loose_exists(&f.web_tree) && loose_exists(&f.web_blob), "the pruned objects start present");
@@ -1685,7 +1685,7 @@ mod tests {
             &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
 
         assert_eq!(plan.to_free.len(), 3, "web_tree, inner_tree and deep_blob");
@@ -1704,7 +1704,7 @@ mod tests {
         let _scratch = Scratch::new("resumable");
         let f = build_fixture();
 
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
         assert_eq!(plan.to_free.len(), 2, "src/web's tree and blob are the whole plan");
 
@@ -1760,7 +1760,7 @@ mod tests {
             &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
 
         // The recipe and both chunks and the web tree are freed — nothing else.
@@ -1821,7 +1821,7 @@ mod tests {
             &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
 
         // The shared chunk (and the api-only chunk and recipe) survive; web's unique chunk, its
@@ -1884,7 +1884,7 @@ mod tests {
             &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
 
         // Nothing of the giant file is freed: the recipe and both its chunks are still needed by
@@ -1933,7 +1933,7 @@ mod tests {
             &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
 
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
         assert_eq!(plan.to_free.len(), 4, "2 chunks + recipe + web tree");
 
@@ -1963,7 +1963,7 @@ mod tests {
     /// Returns what went wrong, if anything; freeing `kept` is checked first, since it is the harm
     /// the refusal exists to prevent.
     fn plan_outcome(how: Unreadable, unreadable: &str, kept: &str) -> Option<String> {
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
 
         match plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()) {
             Ok(plan) if plan.to_free.contains(&kept.to_string()) => {
@@ -2070,7 +2070,7 @@ mod tests {
             ("README.md", &f.readme_blob, DirEntryType::Normal),
         ]), Vec::new());
 
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
         let remote = [f.parcel.clone()];
         let Err(error) = plan_prune(&["src/web".to_string()], &post_prune, &remote, &[], &store_access()) else {
             panic!("an unrecorded absent tree fails the plan");
@@ -2096,7 +2096,7 @@ mod tests {
         plant_other(&f.root_tree, vec![base]);
         seal(&[&held_src]);
 
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[], &store_access())
             .unwrap();
         assert!(plan.to_free.is_empty(), "the unlifted change keeps the whole pruned path: {:?}", plan.to_free);
@@ -2116,7 +2116,7 @@ mod tests {
         plant_other(&store_tree(&[("src", &held_src, DirEntryType::Tree)]), Vec::new());
         seal(&[&held_src]);
 
-        let post_prune = MaterializationScope::from_prefixes(["README.md"]);
+        let post_prune = PathScope::from_prefixes(["README.md"]);
         let plan = plan_prune(&["src".to_string()], &post_prune, &[], &[], &store_access()).unwrap();
         assert!(plan.kept_unlifted > 0, "main's unlifted change keeps its path");
         assert_eq!(plan.unlifted_pallets, vec!["main".to_string()]);
@@ -2139,7 +2139,7 @@ mod tests {
         ]), Vec::new());
         seal(&[&held_lib, &held_deep, &held_top]);
 
-        let post_prune = MaterializationScope::from_prefixes(["src/api", "lib", "big.bin"]);
+        let post_prune = PathScope::from_prefixes(["src/api", "lib", "big.bin"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
         let freed: HashSet<String> = plan.to_free.iter().cloned().collect();
         assert_eq!(freed, [f.web_tree, f.web_blob].into_iter().collect());
@@ -2157,7 +2157,7 @@ mod tests {
         plant_other(&store_tree(&[("src", &src, DirEntryType::Tree)]), Vec::new());
         seal(&[&api, &src]);
 
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
         assert_eq!(plan.to_free, vec![f.web_tree], "the blob the present recorded tree names is kept");
     }
@@ -2171,7 +2171,7 @@ mod tests {
         build_fixture();
         std::fs::write(sealed_utils::sealed_path(), b"not a sealed record").unwrap();
 
-        let post_prune = MaterializationScope::from_prefixes(["src/api"]);
+        let post_prune = PathScope::from_prefixes(["src/api"]);
         let Err(error) = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()) else {
             panic!("an unreadable record must fail the plan");
         };

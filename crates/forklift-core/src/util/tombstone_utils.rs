@@ -1,7 +1,7 @@
 //! The served mark and the tombstones of a served root.
 //!
 //! A client that has seen a pallet's head on a remote may free its own copy of that history
-//! (scope-prune, a delete's containment check): the remote holds it. A ref removed on a served root
+//! (scope prune, a delete's containment check): the remote holds it. A ref removed on a served root
 //! would break that promise if nothing kept the removed head, since gc frees what no root reaches.
 //! So in a root that has been served, every ref removal leaves a tombstone: the pallet's wire name
 //! and the head its ref held. The tombstone is a gc root, the handshake lists it, and the name

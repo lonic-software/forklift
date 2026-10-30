@@ -4,7 +4,7 @@ use forklift_core::globals;
 use forklift_core::util::operation_utils::{Operation, OperationKind};
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::progress_utils::Progress;
-use forklift_core::util::scope_utils::{MaterializationScope, ScopeClass};
+use forklift_core::util::scope_utils::{PathScope, ScopeClass};
 use forklift_core::util::{
     bay_utils, file_utils, lock_utils, object_utils, operation_utils, pallet_utils, scope_utils,
     shift_utils, warehouse_utils,
@@ -99,7 +99,7 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
     std::fs::create_dir_all(&bay_dir)
         .map_err(|e| format!("Error while creating the bay directory \"{}\": {}", bay_dir.to_string_lossy(), e))?;
     file_utils::create_folder_if_not_exists(&bay_utils::bay_state_dir(name))?;
-    // The materialization scope goes in before the marker, so recovery fills in only the scope:
+    // The checkout scope goes in before the marker, so recovery fills in only the scope:
     // the materialize (and every later scope-aware verb in this bay, `forklift heal` included)
     // reads it back through `scope_utils::current_scope`. It is written for an unscoped bay too,
     // since a bay with no scope file is refused rather than read as unscoped.
@@ -145,7 +145,7 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
     Ok(())
 }
 
-/// Normalize the `--scope` prefixes into a [`MaterializationScope`] and verify each names a
+/// Normalize the `--scope` prefixes into a [`PathScope`] and verify each names a
 /// directory (subtree) in the head tree. An empty list yields the full (unscoped) scope, which a
 /// sparse warehouse refuses here, before any bay state exists.
 ///
@@ -157,7 +157,7 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
 /// `add` creates any bay state, also keeps a rejected `--scope` from leaving a half-created bay
 /// behind — `scope_utils::set_bay_scope` re-checks the same ⊆ invariant later, but only after
 /// the pallet ref, directory and redirect already exist.
-fn resolve_scope(scope_paths: &[String], head_tree_hash: &str) -> Result<MaterializationScope, String> {
+fn resolve_scope(scope_paths: &[String], head_tree_hash: &str) -> Result<PathScope, String> {
     let fetch_scope = scope_utils::read_fetch_scope()?;
 
     if scope_paths.is_empty() {
@@ -168,7 +168,7 @@ fn resolve_scope(scope_paths: &[String], head_tree_hash: &str) -> Result<Materia
                 fetch_scope.prefixes().join(", ")
             ));
         }
-        return Ok(MaterializationScope::full());
+        return Ok(PathScope::full());
     }
     let mut keys: Vec<String> = Vec::new();
 
@@ -193,7 +193,7 @@ fn resolve_scope(scope_paths: &[String], head_tree_hash: &str) -> Result<Materia
         if !fetch_scope.is_full() && fetch_scope.classify(&key) != ScopeClass::InScope {
             return Err(format!(
                 "\"{}\" is outside the warehouse's fetch scope ({}), so it cannot be a bay \
-                scope. Fetch it first with \"forklift expand {}\".",
+                scope. Fetch it first with \"forklift scope fetch {}\".",
                 raw, fetch_scope.prefixes().join(", "), raw
             ));
         }
@@ -208,7 +208,7 @@ fn resolve_scope(scope_paths: &[String], head_tree_hash: &str) -> Result<Materia
         keys.push(key);
     }
 
-    Ok(MaterializationScope::from_prefixes(keys))
+    Ok(PathScope::from_prefixes(keys))
 }
 
 /// Whether a warehouse path resolves to a subtree (directory) in the given root tree.
@@ -364,7 +364,7 @@ pub(crate) struct BayCreated {
     pallet: String,
     head: String,
 
-    /// The bay's materialization scope prefixes (empty for a full, unscoped bay).
+    /// The bay's checkout scope prefixes (empty for a full, unscoped bay).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     scope: Vec<String>,
 }

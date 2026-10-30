@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::sync::{Mutex, OnceLock};
 use crate::model::tree_item::TreeItem;
 use crate::util::office_utils::{KeyRecord, OfficeState, TrustAnchor};
-use crate::util::scope_utils::{MaterializationScope, ScopeClass};
+use crate::util::scope_utils::{PathScope, ScopeClass};
 use crate::util::{cache_miss, fanout_utils, file_utils, graph_utils, object_utils, office_utils, pallet_utils, recovery_utils, sign_utils};
 use crate::util::sealed_utils::SealedSet;
 use crate::util::pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletNamespace, PalletsPrecondition, RefPreconditions};
@@ -1803,7 +1803,7 @@ pub fn verify_parcel_closure_for_write(head: &str,
                                        namespace: PalletNamespace) -> Result<pallet_utils::VerifiedClosure, ClosureError> {
     verify_local_closure(head, known_complete, namespace)?;
 
-    Ok(pallet_utils::VerifiedClosure::new(head, MaterializationScope::full(), namespace, known_complete))
+    Ok(pallet_utils::VerifiedClosure::new(head, PathScope::full(), namespace, known_complete))
 }
 
 /// [`verify_parcel_closure`], with the leaf-blob presence check made pluggable.
@@ -1874,7 +1874,7 @@ pub fn verify_parcel_closure_with(
     let seams = ClosureSeams { blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, sealed: None };
 
     verify_closure_core(
-        head, known_complete.as_ref().map(std::slice::from_ref), known_complete, &MaterializationScope::full(),
+        head, known_complete.as_ref().map(std::slice::from_ref), known_complete, &PathScope::full(),
         false, namespace == PalletNamespace::User, &seams,
     )
 }
@@ -1981,7 +1981,7 @@ fn verify_closure_core(
     head: &str,
     bounds: Option<&[&str]>,
     base: Option<&str>,
-    scope: &MaterializationScope,
+    scope: &PathScope,
     reverify: bool,
     refuse_meta_roots: bool,
     seams: &ClosureSeams,
@@ -2275,7 +2275,7 @@ fn parents_first(segment: &[String],
 /// [`verify_parcel_closure`].
 ///
 /// Object presence is a warehouse property (what was fetched at all), so the walk is bounded by
-/// the warehouse fetch scope, never a narrower bay materialization scope: an object fetched but
+/// the warehouse fetch scope, never a narrower bay checkout scope: an object fetched but
 /// not materialized in *this* bay is still present in the shared store and is verified here.
 ///
 /// # Arguments
@@ -2297,7 +2297,7 @@ fn parents_first(segment: &[String],
 pub fn verify_parcel_closure_scoped(
     head: &str,
     known_complete: Option<&str>,
-    scope: &MaterializationScope,
+    scope: &PathScope,
     reverify: bool,
     sealed: Option<&SealedTolerance>,
 ) -> Result<(), String> {
@@ -2351,7 +2351,7 @@ pub fn verify_parcel_closure_scoped(
 pub fn verify_ref_head_closure(head: &str,
                                known_complete: &[String],
                                base: Option<&str>,
-                               scope: &MaterializationScope,
+                               scope: &PathScope,
                                sealed: Option<&SealedSet>) -> Result<(), ClosureError> {
     let bounds: Vec<&str> = known_complete.iter().map(String::as_str).collect();
     let tolerance = sealed.map(SealedTolerance::new);
@@ -2403,7 +2403,7 @@ fn verify_tree_closure_scoped(tree_hash: &str,
                               chunks_missing: &dyn Fn(&[String]) -> Result<Vec<String>, String>,
                               load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
                               load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>,
-                              scope: &MaterializationScope,
+                              scope: &PathScope,
                               reverify: bool,
                               sealed: Option<&SealedTolerance>) -> Result<(), String> {
     match scope.classify(prefix) {

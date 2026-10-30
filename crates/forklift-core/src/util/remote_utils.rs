@@ -24,7 +24,7 @@ use crate::util::office_utils::OFFICE_PALLET_NAME;
 use crate::util::lock_utils::RefLock;
 use crate::util::pallet_utils::RefPreconditions;
 use crate::util::progress_utils::Progress;
-use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
+use crate::util::scope_utils::{self, PathScope, ScopeClass};
 use crate::util::body_utils::{self, BodyReadError, JsonReadError};
 use crate::util::object_utils::MAX_OBJECT_BYTES;
 use crate::util::{
@@ -5118,14 +5118,14 @@ async fn fetch_unscoped(client: &RemoteClient,
 ///
 /// A full warehouse delegates to [`fetch_history`] verbatim and records nothing, and a cache to
 /// [`fetch_cache`], which fetches the parcels only and records the content it skips. A full warehouse
-/// never becomes sparse (`scope-prune` refuses one, and `clone` writes a scope only into a new
+/// never becomes sparse (`scope prune` refuses one, and `clone` writes a scope only into a new
 /// warehouse), so that check needs no lock.
 ///
 /// In a sparse warehouse the fetch is recorded before anything transfers: under the
 /// [`RefLock`], in one hold, it reads the fetch scope and adds the head to the fetched-heads
-/// ledger ([`fetch_ledger`]), so an `expand` that commits while this fetch runs walks the head at
+/// ledger ([`fetch_ledger`]), so a `scope fetch` that commits while this fetch runs walks the head at
 /// the widened scope. Once the transfer completes it takes the lock again and re-reads the scope;
-/// if an `expand` widened it meanwhile, it records the head again and fetches at the new scope,
+/// if a `scope fetch` widened it meanwhile, it records the head again and fetches at the new scope,
 /// until the scope it fetched at is still current. Only then does it return and let the caller
 /// write its ref.
 ///
@@ -5149,7 +5149,7 @@ pub async fn fetch_history_scoped(client: &RemoteClient,
         return fetch_unscoped(client, head, progress).await;
     }
 
-    fetch_recorded(head, pallet, async |scope: &MaterializationScope| {
+    fetch_recorded(head, pallet, async |scope: &PathScope| {
         fetch_bounded_at(client, head, scope, progress).await
     }).await
 }
@@ -5158,7 +5158,7 @@ pub async fn fetch_history_scoped(client: &RemoteClient,
 /// `clone`, which fetches before it writes any scope, so that an `--only` naming nothing is
 /// refused with nothing left behind. A sparse scope records the head in the ledger the same way,
 /// under the [`RefLock`], before anything transfers. It does not re-check the scope afterwards:
-/// no scope exists on disk for an `expand` to widen until the caller writes this one.
+/// no scope exists on disk for a `scope fetch` to widen until the caller writes this one.
 ///
 /// # Arguments
 /// * `client` - The remote.
@@ -5173,7 +5173,7 @@ pub async fn fetch_history_scoped(client: &RemoteClient,
 pub async fn fetch_history_at(client: &RemoteClient,
                               head: &str,
                               pallet: &str,
-                              scope: &MaterializationScope,
+                              scope: &PathScope,
                               progress: &Progress) -> Result<FetchStats, String> {
     if scope.is_full() {
         return fetch_unscoped(client, head, progress).await;
@@ -5192,7 +5192,7 @@ pub async fn fetch_history_at(client: &RemoteClient,
 /// neither fetching nor walking).
 async fn fetch_bounded_at(client: &RemoteClient,
                           head: &str,
-                          scope: &MaterializationScope,
+                          scope: &PathScope,
                           progress: &Progress) -> Result<FetchStats, String> {
     if scope.is_full() {
         return fetch_history(client, head, progress).await;
@@ -5205,7 +5205,7 @@ async fn fetch_bounded_at(client: &RemoteClient,
 /// can change the scope while it runs.
 async fn fetch_recorded<F>(head: &str, pallet: &str, mut transfer: F) -> Result<FetchStats, String>
 where
-    F: AsyncFnMut(&MaterializationScope) -> Result<FetchStats, String>,
+    F: AsyncFnMut(&PathScope) -> Result<FetchStats, String>,
 {
     let mut scope = {
         let lock = RefLock::acquire()?;
@@ -5226,7 +5226,7 @@ where
             return Ok(stats);
         }
 
-        // An `expand` committed while this fetch ran: it may have dropped or never seen this
+        // An `scope fetch` committed while this fetch ran: it may have dropped or never seen this
         // head, so record it again before fetching what the widened scope adds.
         fetch_ledger::record_fetch(&lock, head, pallet)?;
         drop(lock);
@@ -5257,23 +5257,23 @@ impl FetchStats {
     }
 }
 
-/// How many times `expand` walks and tries to commit before it gives up on a warehouse that keeps
+/// How many times `scope fetch` walks and tries to commit before it gives up on a warehouse that keeps
 /// changing under it.
 pub const EXPAND_ATTEMPTS: usize = 3;
 
 /// The outcome of one [`Expansion::commit`].
 pub enum ExpandCommit {
     /// The widened scope and the pruned ledger were written.
-    Written(MaterializationScope),
+    Written(PathScope),
 
-    /// Another `expand` already brought every added prefix into scope; nothing was written.
-    Covered(MaterializationScope),
+    /// Another `scope fetch` already brought every added prefix into scope; nothing was written.
+    Covered(PathScope),
 
     /// The warehouse changed since the walk: walk again, then commit again.
     Retry,
 }
 
-/// The engine behind `expand`: widen a sparse warehouse's fetch scope, fetching the newly
+/// The engine behind `scope fetch`: widen a sparse warehouse's fetch scope, fetching the newly
 /// in-scope content of every closure the warehouse holds first.
 ///
 /// Every closure means the bay's base, every local ref head and every present head in the
@@ -5305,8 +5305,8 @@ pub struct Expansion {
     added: Vec<String>,
 
     /// The fetch scope the walk widens from, and the widened scope it walks at.
-    from: MaterializationScope,
-    widened: MaterializationScope,
+    from: PathScope,
+    widened: PathScope,
 
     /// What the successful walks visited, shared across heads.
     seen: WalkSeen,
@@ -5338,7 +5338,7 @@ pub struct Expansion {
 impl Expansion {
     /// Start an expansion of the scope `from` by `added`, for the bay standing on `pallet` at
     /// `base`. No prefix in `added` may already be in `from`.
-    pub fn new(pallet: &str, base: &str, from: MaterializationScope, added: Vec<String>) -> Expansion {
+    pub fn new(pallet: &str, base: &str, from: PathScope, added: Vec<String>) -> Expansion {
         let mut prefixes: Vec<String> = from.prefixes().to_vec();
         prefixes.extend(added.iter().cloned());
 
@@ -5346,7 +5346,7 @@ impl Expansion {
             pallet: pallet.to_string(),
             base: base.to_string(),
             added,
-            widened: MaterializationScope::from_prefixes(prefixes),
+            widened: PathScope::from_prefixes(prefixes),
             from,
             seen: WalkSeen::default(),
             base_walked: false,
@@ -5566,7 +5566,7 @@ impl Expansion {
     }
 }
 
-/// The refusal for a closure `expand` cannot widen.
+/// The refusal for a closure `scope fetch` cannot widen.
 fn unservable(pallet: &str, error: &str) -> String {
     format!(
         "Pallet \"{}\" cannot be fetched at the widened scope: {} Nothing was recorded.",
@@ -5613,7 +5613,7 @@ fn first_visit<K: Eq + std::hash::Hash + Clone>(prior: &HashSet<K>, seen: &mut H
 /// visits.
 async fn fetch_scoped_from(client: &RemoteClient,
                            head: &str,
-                           scope: &MaterializationScope,
+                           scope: &PathScope,
                            complete: &[String],
                            prior: &WalkSeen,
                            seen: &mut WalkSeen,
@@ -5903,13 +5903,13 @@ async fn fetch_missing_objects_in_chunks(client: &RemoteClient,
 /// Fetch every chunk of the given recipes that is missing locally — the second half of fetching a
 /// chunked file, run *after* the recipes themselves have landed (they ride the ordinary blob wave,
 /// since a tree entry names the recipe like any other file object). Bundles never carry chunks
-/// (trees don't reference them, so no closure walk ever emits one), so a clone/lower/expand
+/// (trees don't reference them, so no closure walk ever emits one), so a clone/lower/scope fetch
 /// imports the tree+recipe closure and then fetches the in-scope chunks per object here, exactly
 /// the "a bundle is an optimization; missing objects fall back to loose GET" contract.
 ///
 /// Deliberately calls [`fetch_loose_objects`] directly rather than [`fetch_missing_objects`] —
 /// chunks always fetch one presigned `GET` each, **never** through `POST /v1/objects/batch`, no
-/// matter how many are missing (DESIGN.html §9.4b: "clone, lower and expand fetch chunks
+/// matter how many are missing (DESIGN.html §9.4b: "clone, lower and scope fetch all fetch chunks
 /// per-object after the bundle wave"). A chunk is capped at 4 MiB and already hash-verified on
 /// store, so a bundle buys chunks nothing a loose fetch doesn't already give; routing them
 /// through `batch` would only be a redirect an offloading head has to mint and a client has to
@@ -10765,7 +10765,7 @@ mod tests {
         assert!(file_utils::does_object_exist(&hash).unwrap(), "the dripped object landed in this store");
     }
 
-    /// The designed transport for chunks (DESIGN.html §9.4b: "clone, lower and expand fetch
+    /// The designed transport for chunks (DESIGN.html §9.4b: "clone, lower and scope fetch all fetch
     /// chunks per-object after the bundle wave") — `fetch_recipe_chunks` must never route
     /// through `POST /v1/objects/batch`, no matter how many chunks are missing at once, unlike
     /// the general `fetch_missing_objects` path it deliberately does not delegate to for this.
@@ -17027,7 +17027,7 @@ mod tests {
         );
     }
 
-    /// The scoped fetch's ledger record and `expand`'s engine, in a sparse warehouse whose objects
+    /// The scoped fetch's ledger record and `scope fetch`'s engine, in a sparse warehouse whose objects
     /// are all local and signed, so the walks never need the remote; the client points where
     /// nothing listens, so a walk that does reach for it fails.
     mod scoped_fetch {
@@ -17091,7 +17091,7 @@ mod tests {
         /// A sparse warehouse scoped to `src` whose `main` holds one parcel. Returns that parcel.
         fn sparse_main() -> String {
             crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
-            scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
+            scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src"])).unwrap();
             let head = parcel("main", Vec::new());
             pallet_utils::update_pallet_head("main", None, &head, &RefPreconditions::NONE).unwrap();
             head
@@ -17142,7 +17142,7 @@ mod tests {
             let head = "c".repeat(64);
             let mut scopes: Vec<Vec<String>> = Vec::new();
 
-            runtime().block_on(fetch_recorded(&head, "other", async |scope: &MaterializationScope| {
+            runtime().block_on(fetch_recorded(&head, "other", async |scope: &PathScope| {
                 scopes.push(scope.prefixes().to_vec());
 
                 if scopes.len() == 1 {
@@ -17150,7 +17150,7 @@ mod tests {
                     let lock = RefLock::acquire().unwrap();
                     fetch_ledger::write_ledger(&lock, &[]).unwrap();
                     crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
-                    scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src", "web"])).unwrap();
+                    scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src", "web"])).unwrap();
                 }
 
                 Ok(FetchStats::default())
@@ -17205,7 +17205,7 @@ mod tests {
             runtime().block_on(expansion.walk(&unreachable())).unwrap();
 
             crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
-            scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src", "docs"])).unwrap();
+            scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src", "docs"])).unwrap();
 
             assert!(matches!(expansion.commit().unwrap(), ExpandCommit::Retry));
             runtime().block_on(expansion.walk(&unreachable())).unwrap();
@@ -17221,7 +17221,7 @@ mod tests {
             runtime().block_on(expansion.walk(&unreachable())).unwrap();
 
             crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
-            scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src", "web"])).unwrap();
+            scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src", "web"])).unwrap();
 
             assert!(matches!(expansion.commit().unwrap(), ExpandCommit::Covered(_)));
         }

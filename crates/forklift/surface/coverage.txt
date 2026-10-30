@@ -126,10 +126,13 @@ forklift show: <REVISION:PATH>
 forklift stack: [DESCRIPTION]
 forklift stocktake: --summary
 forklift expand: <PATH>...
+    -> forklift scope fetch: <PATH>...
 forklift narrow: <PATH>...
+    -> forklift scope narrow: <PATH>...
 forklift scope:
 forklift scope status:
 forklift scope-prune: <PATH>... --dry-run
+    -> forklift scope prune: <PATH>... --dry-run
 forklift evict: --dry-run
     -> forklift store evict: --dry-run
 forklift remote:

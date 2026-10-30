@@ -11,7 +11,7 @@
 //! but may never have been fetched — so the walk marks an absent subtree's hash live and
 //! skips the descent it cannot make, rather than erroring. This is a tolerance, not a new
 //! collection policy: an object still reachable from a head is live and kept, always,
-//! including one a bay merely narrowed its materialization scope away from (that object is
+//! including one a bay merely narrowed its checkout scope away from (that object is
 //! still reachable history). Freeing objects that a store narrowed away but that remain
 //! reachable is a separate, deliberate, destructive operation — never something this
 //! reachability sweep does.

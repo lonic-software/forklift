@@ -680,8 +680,8 @@ pub fn cleanup_after_stack_with(prepared: &PreparedInventory,
 
 /// Remove every inventory shard at or under a warehouse path prefix, dropping those keys from
 /// the metadata too. Unlike [`stage_removal_for_directory`], this leaves no `Deleted` record —
-/// the entries vanish, as if the subtree had never been inventoried. Used by `narrow` when a
-/// subtree leaves the checkout's materialization scope: it should stop being reported entirely,
+/// the entries vanish, as if the subtree had never been inventoried. Used by `scope narrow` when a
+/// subtree leaves the checkout's scope: it should stop being reported entirely,
 /// not appear as a staged removal to be committed.
 ///
 /// # Arguments

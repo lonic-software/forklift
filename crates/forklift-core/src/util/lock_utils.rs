@@ -139,7 +139,7 @@ fn serve_lock_path() -> PathBuf {
 /// (compaction vs compaction) — a server never compacts, so it never takes that lock; this one is
 /// the serve-vs-maintenance gate. It is not what orders a deleter against the objects a server
 /// writes: a served warehouse also holds [`StoreAccessLock`] shared, which every deleter's
-/// exclusive try refuses beside, scope-prune included. Like the other locks it is a lock *file* created with
+/// exclusive try refuses beside, scope prune included. Like the other locks it is a lock *file* created with
 /// `create_new` (atomic on every platform) and removed on drop; a hard-killed holder leaves it
 /// behind for the next command to report by PID (a crashed server thus blocks `gc` and a repack until
 /// the operator removes it, which is the safe default — better than sweeping a root that might
@@ -193,7 +193,7 @@ impl Drop for ServeLock {
 /// object is *live*: unreachable garbage stays present until a deleter removes it. A deleter
 /// computes its keep-set once and then deletes everything outside it — a full repack
 /// (`pack_utils::compact` with `all`), the loose sweep (`gc_utils::collect_garbage`) and
-/// scope-prune. Without an order between the two, a writer in another bay can dedup against an
+/// scope prune. Without an order between the two, a writer in another bay can dedup against an
 /// object the deleter has already excluded, publish a root that references it, and be left with
 /// a dangling reference when the deletion lands. Holding this lock shared across the writer's
 /// whole decide-then-publish window, and exclusive from before the keep-set is computed until the
@@ -201,7 +201,7 @@ impl Drop for ServeLock {
 ///
 /// Who holds which side:
 /// * **shared, waiting** — every CLI command that takes the warehouse lock, except `compact` and
-///   `scope-prune`, which host deleters (a process's own shared hold refuses its own exclusive
+///   `scope prune`, which host deleters (a process's own shared hold refuses its own exclusive
 ///   try). Taken right after the bay lock, so the order is always bay lock first and no cycle is
 ///   possible; released before auto-maintenance, which may repack.
 /// * **shared, try** — a server, for every warehouse it serves, for as long as it keeps that
@@ -259,7 +259,7 @@ impl StoreAccessLock {
         match file.try_lock_shared() {
             Ok(()) => Ok(StoreAccessLock { _file: file }),
             Err(std::fs::TryLockError::WouldBlock) => Err(format!(
-                "Object-store maintenance (a full repack, gc or scope-prune) is running on the \
+                "Object-store maintenance (a full repack, gc or scope prune) is running on the \
                 warehouse at \"{}\". Try again once it finishes.",
                 warehouse_root_of(&path)
             )),
@@ -495,7 +495,7 @@ impl MoveLock {
 /// ([`fetch_ledger`](crate::util::fetch_ledger)) against the ref writes and the fetch scope: a
 /// scoped fetch records its head, and re-checks the scope when its transfer completes, under it;
 /// a ref write records a head it leaves unreached in the same hold as the write, and re-reads the
-/// scope its closure check ran against; `expand` compares and writes the scope and the ledger
+/// scope its closure check ran against; `scope fetch` compares and writes the scope and the ledger
 /// under it.
 /// None of them holds it across a transfer or a walk. It also serializes the read-modify-write of
 /// the held-heads record ([`held_heads`](crate::util::held_heads)), which walks history before
@@ -505,7 +505,7 @@ impl MoveLock {
 /// It is not reentrant: a thread that holds it must not take it again (on Unix a second open
 /// file description conflicts with the first, and on Windows a lock is per handle). Only the
 /// ref compare-and-set (which writes and clears tombstones in its hold), the trust install, `heal`'s
-/// restage of a ref or the anchor, the scoped fetch's record and re-check, `expand`'s commit, the
+/// restage of a ref or the anchor, the scoped fetch's record and re-check, `scope fetch`'s commit, the
 /// held-heads write, a sealed-object record write, the first served mark and a tombstone drop
 /// (taken inside its serve lock) take it, and none of them calls another: work inside a hold uses the lock-free variants, which take the held lock as
 /// an argument.

@@ -11,7 +11,7 @@ use crate::model::tree_item::TreeItem;
 use crate::parser;
 use crate::traits::task_context::TaskContext;
 use crate::types::task::Task;
-use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
+use crate::util::scope_utils::{self, PathScope, ScopeClass};
 use crate::util::{file_utils, inventory_utils, object_utils};
 
 /// The kind of a change reported by a stocktake.
@@ -212,7 +212,7 @@ fn walk_directory_staged(context: Arc<ChangeWalkContext>,
                          key: String,
                          head_tree: Option<Arc<TreeItem>>,
                          children: Arc<BTreeMap<String, Vec<String>>>,
-                         scope: Arc<MaterializationScope>)
+                         scope: Arc<PathScope>)
                          -> impl Future<Output = Result<(), String>> + Send {
     async move {
         // Hoisted once per directory (not per entry): a full (unscoped) scope always

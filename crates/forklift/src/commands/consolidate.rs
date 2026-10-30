@@ -597,7 +597,7 @@ impl alias_utils::Removals for MergeRemovals {
 /// under its own spelling (see [`shift_utils::kept_through_aliases`]). Shared with `cherry-pick`.
 pub(crate) fn keep_aliased_files(actions: &mut Vec<MergeAction>,
                                  our_tree_hash: &str,
-                                 scope: &scope_utils::MaterializationScope) -> Result<(), String> {
+                                 scope: &scope_utils::PathScope) -> Result<(), String> {
     let removed: Vec<String> = actions.iter()
         .filter_map(|action| match action {
             MergeAction::Delete { path } => Some(path.clone()),

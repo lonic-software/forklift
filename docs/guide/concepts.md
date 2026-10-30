@@ -152,7 +152,7 @@ size rather than by the paths you work on.
 **How Forklift handles it.** Sparseness is one concept across the commands: a sparse warehouse
 fetches only the paths you ask for, and everything else stays **sealed by hash**, pinned to the
 content the signed parcels commit to and fetched later only on request. `audit`, `scope` and
-`expand` all know where the boundary is.
+`scope fetch` all know where the boundary is.
 
 To try it, share the warehouse through a local server. Prepare an empty warehouse for it to serve:
 
@@ -188,16 +188,16 @@ Adopted the @kv pallet from the remote.
 Adopted the @manifest pallet from the remote.
 Adopted the @tags pallet from the remote.
 Cloned http://127.0.0.1:7171 into "slim": pallet "main" at … (… object(s) fetched loose).
-Sparse: fetched and materialized only src. The rest of the tree is sealed by hash — widen with "forklift expand".
+Sparse: fetched and materialized only src. The rest of the tree is sealed by hash — widen with "forklift scope fetch".
 ```
 
 There are two scopes. The **fetch scope** is what the warehouse has downloaded; the
-**materialization scope** is what one checkout shows on disk. Here they are the same:
+**checkout scope** is what one checkout shows on disk. Here they are the same:
 
 ```console
 $ cd slim
 $ forklift scope
-the main tree is a scoped (sparse) bay. Materialization scope:
+the main tree is scoped (sparse). Checkout scope:
   src
   .forkliftignore (always in scope)
 Warehouse fetch scope:
@@ -217,22 +217,22 @@ Signatures are verified in full; within the fetched scope every tree was re-hash
 Out-of-scope content is pinned to the hash a signed parcel commits — it cannot be forged or substituted, only fetched. The boundary is advisory, not enforced by the remote.
 ```
 
-`expand` widens the fetch scope later, checking what it downloads against those seals.
-`narrow` shrinks what one checkout shows, and `scope-prune` forgets a path warehouse-wide to
+`scope fetch` widens the fetch scope later, checking what it downloads against those seals.
+`scope narrow` shrinks what one checkout shows, and `scope prune` forgets a path warehouse-wide to
 reclaim the disk:
 
 ```console
-$ forklift expand docs
-Expanded the fetch scope with docs (… object(s) fetched). Fetch scope now: docs, src.
+$ forklift scope fetch docs
+Widened the fetch scope with docs (… object(s) fetched). Fetch scope now: docs, src.
 Scope a bay to a newly fetched path with "forklift bay add --scope".
 $ forklift show main:docs/pricing.md
 Prices in euros.
 ```
 
 Reference: [`clone`](cli.md#clone--clone-a-remote-warehouse),
-[`expand`](cli.md#expand--widen-a-sparse-warehouses-fetch-scope),
-[`narrow`](cli.md#narrow--shrink-this-checkouts-materialization-scope),
-[`scope-prune`](cli.md#scope-prune--reclaim-disk-from-a-sparse-warehouse) and
+[`scope fetch`](cli.md#scope-fetch--widen-a-sparse-warehouses-fetch-scope),
+[`scope narrow`](cli.md#scope-narrow--shrink-this-checkouts-scope),
+[`scope prune`](cli.md#scope-prune--reclaim-disk-from-a-sparse-warehouse) and
 [scoped bays](cli.md#bay-add---scope--a-scoped-sparse-bay).
 
 ## 5. Built for serverless hosting

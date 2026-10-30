@@ -4,7 +4,7 @@ use forklift_core::util::remote_utils::{self, RemoteClient};
 use crate::output;
 
 /// The heads whose history the configured remote holds, for a command that frees what that history
-/// reaches (`scope-prune`, `evict`): its pallet heads, and for each pallet deleted there the head
+/// reaches (`scope prune`, `evict`): its pallet heads, and for each pallet deleted there the head
 /// its tombstone keeps, from a handshake whose trust is judged as a lower would judge it but adopts
 /// nothing, and the earlier heads of the held-heads record that the remote confirms its pallets
 /// still reach. The caller frees only what these heads reach, so it never runs without them: an

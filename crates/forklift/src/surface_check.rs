@@ -814,3 +814,43 @@ fn the_conflict_check_finds_every_declaration() {
     assert_eq!(untested.len(), 1, "{untested:?}");
     assert!(untested[0].contains("untested"), "{untested:?}");
 }
+
+/// Every top-level name and visible alias with a hyphen in it. A hyphenated top-level name is
+/// a family written as one word (`scope-prune` beside `scope`), so the operation belongs inside
+/// the family. Hidden aliases are exempt: they keep git's own words, and git's `cherry-pick` is
+/// hyphenated. Names below the top level may be hyphenated (`office accept-regenesis`).
+fn hyphenated_top_level_names(cli: &clap::Command) -> Vec<String> {
+    cli.get_subcommands()
+        .flat_map(|command| std::iter::once(command.get_name()).chain(command.get_visible_aliases())
+            .filter(|name| name.contains('-'))
+            .map(move |name| match name == command.get_name() {
+                true => format!("`{name}`"),
+                false => format!("`{name}` (a visible alias of `{}`)", command.get_name()),
+            }))
+        .collect()
+}
+
+/// No top-level name or visible alias is hyphenated.
+#[test]
+fn no_top_level_name_is_hyphenated() {
+    let failures = hyphenated_top_level_names(&built_cli());
+    assert!(failures.is_empty(),
+        "a hyphenated top-level name is a family written as one word; make it a subcommand:\n{}",
+        failures.join("\n"));
+}
+
+/// The hyphen check finds a hyphenated name or visible alias at the top level, and nothing else.
+#[test]
+fn the_hyphen_check_finds_only_visible_top_level_hyphens() {
+    use clap::Command;
+    let probe = |sub: Command| {
+        let mut root = Command::new("probe").subcommand(sub);
+        root.build();
+        hyphenated_top_level_names(&root)
+    };
+    assert_eq!(probe(Command::new("scope-prune")), vec!["`scope-prune`"]);
+    assert_eq!(probe(Command::new("prune").visible_alias("scope-prune")),
+        vec!["`scope-prune` (a visible alias of `prune`)"]);
+    assert_eq!(probe(Command::new("pick").alias("cherry-pick")), Vec::<String>::new());
+    assert_eq!(probe(Command::new("office").subcommand(Command::new("accept-regenesis"))), Vec::<String>::new());
+}

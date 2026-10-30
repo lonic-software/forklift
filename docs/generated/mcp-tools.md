@@ -61,9 +61,9 @@ Every tool `forklift mcp` serves, generated from the same command definition the
 | `show` | `forklift show` | Print a file's content at a revision, as git show does for REV:PATH | `target` (a string, required) |
 | `stack` | `forklift stack` | Stack the inventory as a new parcel (commit) on the current pallet | `description` (a string) |
 | `stocktake` | `forklift stocktake` | Report the staged and unstaged changes of the warehouse | `summary` (a boolean) |
-| `expand` | `forklift expand` | Widen a sparse warehouse's fetch scope and download the newly in-scope subtree(s) | `paths` (an array of strings, required) |
-| `narrow` | `forklift narrow` | Narrow this checkout's materialization scope and de-materialize the dropped subtree(s) | `paths` (an array of strings, required) |
-| `scope_status` | `forklift scope status` | Show the current bay's materialization scope and the warehouse fetch scope (the default) |  |
+| `scope_status` | `forklift scope status` | Show this checkout's scope and the warehouse fetch scope (the default) |  |
+| `scope_fetch` | `forklift scope fetch` | Widen a sparse warehouse's fetch scope and download the newly in-scope subtree(s) | `paths` (an array of strings, required) |
+| `scope_narrow` | `forklift scope narrow` | Narrow this checkout's scope and remove the dropped subtree(s) from the working directory | `paths` (an array of strings, required) |
 | `store_status` | `forklift store status` | Report object-store health: loose vs packed objects, packs, and whether compaction is due (the default) |  |
 | `store_compact` | `forklift store compact` | Compact the object store: pack loose objects into a few dense pack files | `all` (a boolean)<br>`redelta` (a boolean) |
 | `store_peek` | `forklift store peek` | Peek into an object (print its content) | `inventory` (a string)<br>`object` (a string) |
@@ -92,8 +92,8 @@ Each of these commands, and every command below it, is a tool for nobody: a pers
 - `forklift office regenesis`: resets trust, a recovery step.
 - `forklift office accept-regenesis`: accepts a remote's trust reset, a recovery step.
 - `forklift self`: manages this binary itself: its updates and its `fl` alias are host concerns, and the description it gives Pult is the tool list agents already have.
-- `forklift scope-prune`: destructive, warehouse-wide disk reclamation: an admin verb, never a sub-agent's.
-- `forklift store evict`: warehouse-wide disk reclamation in a cache: an admin verb, like scope-prune.
+- `forklift scope prune`: destructive, warehouse-wide disk reclamation: an admin verb, never a sub-agent's.
+- `forklift store evict`: warehouse-wide disk reclamation in a cache: an admin verb, like scope prune.
 - `forklift remote`: shows the remote configuration, like config, and repoints a partial warehouse at another server: setup.
 - `forklift mcp`: this server itself.
 - `forklift help`: meta.
