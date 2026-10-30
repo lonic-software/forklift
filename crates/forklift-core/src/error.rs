@@ -240,7 +240,7 @@ refusal_codes! {
     /// afresh.
     StagedUploadDiscarded => "staged_upload_discarded",
 
-    /// A `forklift mirror` run left at least one mirrored pallet out of step with git: refused,
+    /// A `forklift git mirror` run left at least one mirrored pallet out of step with git: refused,
     /// failed or busy. The others went through. The refusal's details carry the run's report
     /// (`{url, pallets}`), each pallet's message naming its own step.
     MirrorIncomplete => "mirror_incomplete",

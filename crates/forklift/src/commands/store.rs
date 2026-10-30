@@ -38,7 +38,7 @@ pub(crate) struct StoreReport {
     packs: Vec<PackReport>,
     /// The maintenance thresholds and the current verdict.
     maintenance: Maintenance,
-    /// Whether this store was bulk-ingested (`import-git`, or a franchise's native bundle
+    /// Whether this store was bulk-ingested (`git import`, or a franchise's native bundle
     /// install) and would still benefit from a one-shot `compact --all --redelta` pass.
     /// Additive field; never acted on automatically.
     densify_suggested: bool,
@@ -47,7 +47,7 @@ pub(crate) struct StoreReport {
     /// durability taint, and restoring the data file recovers the rest. Empty on a healthy store.
     quarantined_packs: Vec<PackIndexIssue>,
     /// Packs that load but whose index is damaged in places: their sound parts are still read,
-    /// and an object in a damaged part reads as unverifiable. `forklift compact --all` salvages
+    /// and an object in a damaged part reads as unverifiable. `forklift store compact --all` salvages
     /// what the pack's data file still holds, and removes the pack when every live object it may
     /// hold reads from another copy. Empty on a healthy store.
     damaged_packs: Vec<PackIndexIssue>,
@@ -268,7 +268,7 @@ impl CommandOutput for StoreReport {
             }
             println!(
                 "    quarantined objects are recoverable via \"forklift heal\"; a damaged pack's \
-                sound parts are still read, and \"forklift compact --all\" salvages it, recovering \
+                sound parts are still read, and \"forklift store compact --all\" salvages it, recovering \
                 what its data file still holds (if it keeps the pack, or refuses because the pack \
                 could not be completely salvaged, the objects it reports cannot be recovered from \
                 this store); an unenumerable index should be moved aside, then re-run; \

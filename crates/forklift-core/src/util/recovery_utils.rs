@@ -451,7 +451,7 @@ fn pack_health_warning_lines() -> Result<Vec<String>, String> {
         lines.push(format!(
             "pack index \"{}\" is damaged ({}); its sound parts are still read, but an object in a \
             damaged part reads as unverifiable; once no durability taint is standing, \
-            \"forklift compact --all\" salvages what the pack's data file still holds and removes \
+            \"forklift store compact --all\" salvages what the pack's data file still holds and removes \
             the pack when every live object it may hold reads from another copy; if it keeps the \
             pack, or refuses because the pack could not be completely salvaged, the objects it \
             reports cannot be recovered from this store",
@@ -7761,7 +7761,7 @@ mod tests {
         assert!(b.starts_with("1 object(s)") && b.ends_with(&format!("\"{}\".", "f".repeat(64))), "{}", b);
     }
 
-    /// (FORK-194) The warning for a damaged pack names `forklift compact --all` as the repack that
+    /// (FORK-194) The warning for a damaged pack names `forklift store compact --all` as the repack that
     /// salvages it, and says what it means when that repack keeps the pack or refuses.
     ///
     /// Revert: restore the wording that named no salvage → red.
@@ -7783,7 +7783,7 @@ mod tests {
 
         assert_eq!(lines.len(), 1, "{:?}", lines);
         assert!(lines[0].contains("is damaged"), "{}", lines[0]);
-        assert!(lines[0].contains("\"forklift compact --all\" salvages what the pack's data file still holds"), "{}", lines[0]);
+        assert!(lines[0].contains("\"forklift store compact --all\" salvages what the pack's data file still holds"), "{}", lines[0]);
         assert!(lines[0].contains("refuses because the pack could not be completely salvaged"), "{}", lines[0]);
         assert!(lines[0].contains("cannot be recovered from this store"), "{}", lines[0]);
     }

@@ -156,42 +156,6 @@ pub enum Command {
         message: Option<String>,
     },
 
-    /// Compact the object store: pack loose objects into a few dense pack files
-    #[command(
-        long_about = "Compact the object store: sweep the loose objects (each its own \
-                      zstd-compressed file) into a few dense pack files — an append-only data \
-                      file plus a sorted index. At scale that turns hundreds of thousands of \
-                      tiny files into a handful of large ones, so a history walk stops paying an \
-                      open-per-object and the store stops paying per-file slack. Objects are only \
-                      moved, never re-hashed; a loose file is deleted only after the pack that \
-                      holds it is durably written, so compacting can never lose an object. Packs \
-                      roll over at a size/count threshold, so no single pack grows unbounded. \
-                      Run it after a large \"forklift import-git\" or periodically as maintenance. With \
-                      --all, also rewrite the existing packs: drop unreachable (garbage) \
-                      objects that were stuck in packs and consolidate many packs into few — a \
-                      heavier full repack, worth running occasionally. Add --redelta to a full \
-                      repack to also re-delta-compress every object instead of copying already-\
-                      packed records verbatim — denser, but a one-shot CPU-bound pass."
-    )]
-    Compact {
-        /// Repack existing packs too: drop unreachable objects and consolidate (a full repack)
-        #[arg(long)]
-        all: bool,
-
-        /// Re-encode every object to delta-compress across the whole store (only with --all)
-        #[arg(
-            long,
-            long_help = "Re-encode every live object — packed or loose, files and directories \
-                         alike — to delta-compress across the whole store, instead of a \
-                         repack's usual verbatim copy of already-packed records. Buys back the \
-                         cross-path similarity (renames, moved files) a per-object copy cannot \
-                         see, at the cost of a full re-read, re-compress and re-delta of every \
-                         object: one-shot and CPU-bound, not something to run routinely. Safe to \
-                         repeat any number of times on the same store. Only valid with --all."
-        )]
-        redelta: bool,
-    },
-
     /// Read or change configuration values
     #[command(
         visible_alias = "cfg",
@@ -284,20 +248,6 @@ pub enum Command {
         targets: Vec<String>,
     },
 
-    /// Export this warehouse's history into a new git repository (one-way, lossy)
-    #[command(
-        long_about = "One-way export of this warehouse's history into a new git repository: \
-                      parcels become commits, trees become trees, blobs become blobs, and each user \
-                      pallet becomes a branch. The escape hatch that makes trying forklift reversible \
-                      — but lossy in this direction: git has no home for the signed office, the \
-                      @manifest, or per-parcel signatures, so those are dropped. The path must be \
-                      empty or new. Requires git on PATH."
-    )]
-    ExportGit {
-        /// Where to create the git repository (must be empty or new)
-        path: String,
-    },
-
     /// Open a local franchise of a remote warehouse (clone)
     #[command(
         visible_alias = "fr",
@@ -346,7 +296,7 @@ pub enum Command {
             conflicts_with = "only",
             long_help = "Franchise as a cache: mark the warehouse as one that may lack content its \
                          history reaches. It is then treated as partial: a server never serves \
-                         it, it lifts only to the remote it was franchised from, \"forklift mirror\" and \
+                         it, it lifts only to the remote it was franchised from, \"forklift git mirror\" and \
                          \"forklift expand\" refuse, and \"forklift audit\" checks the content it holds. The \
                          remote's bundle is skipped. It fetches every parcel and signature of the \
                          history, and the content of the head it checks out; the content of \
@@ -366,6 +316,21 @@ pub enum Command {
                          anchor the remote holds, and says which."
         )]
         expect: Option<String>,
+    },
+
+    /// Move history between this warehouse and git: import, export and mirror
+    #[command(
+        subcommand_required = true,
+        arg_required_else_help = true,
+        long_about = "Move history between this warehouse and git. \"forklift git import\" brings a \
+                      git repository's history in, \"forklift git export\" writes this warehouse's \
+                      history out to a new git repository, and \"forklift git mirror\" keeps a git \
+                      remote in step with the pallets the Forklift remote holds. Each one requires \
+                      git on PATH."
+    )]
+    Git {
+        #[command(subcommand)]
+        action: GitAction,
     },
 
     /// Reviewable merge proposals (pull requests) on the @haul meta pallet
@@ -398,7 +363,7 @@ pub enum Command {
                       Exits 0 once every recorded path is resolved; exits 21, with the taint left \
                       standing on exactly what remains, otherwise.\n\n\
                       It then finishes or undoes an operation that rewrites the whole staging \
-                      area (shift, park, a merge, cherry-pick or fast-forward, lower, import-git, \
+                      area (shift, park, a merge, cherry-pick or fast-forward, lower, git import, \
                       bay creation) and was interrupted (\"incomplete_load\" refusals naming it, \
                       exit 20): rolled forward where the bay's state shows it got far enough, \
                       rolled back otherwise. Either way it rewrites only files that still hold \
@@ -445,28 +410,6 @@ pub enum Command {
         /// office/display-name work behind them — so it is the fastest way to scan history.
         #[arg(long)]
         oneline: bool,
-    },
-
-    /// Import a git repository's history into this warehouse (one-way migration)
-    #[command(
-        long_about = "One-way migration of a git repository's history into this warehouse: \
-                      git commits become parcels, trees become trees, blobs become blobs, and each \
-                      local branch becomes a pallet. The imported history is unsigned (it predates \
-                      trust), so import into a fresh warehouse and then run \"forklift office enroll\" to \
-                      anchor it. Run it from the git repo's directory (\"forklift import-git .\") so \
-                      the checked-out working tree already holds the imported HEAD. Forklift \
-                      converts nothing on checkout, so a file git converted (line endings, ident, \
-                      a filter) reads as modified, and the import warns about it. Requires git \
-                      on PATH."
-    )]
-    ImportGit {
-        /// The git repository to import from (e.g. \".\")
-        path: String,
-
-        /// Store the imported objects loose instead of packing (and delta-compressing) them
-        /// on the way in
-        #[arg(long)]
-        no_compact: bool,
     },
 
     /// Upload the current pallet's new parcels to the remote (push)
@@ -593,21 +536,6 @@ pub enum Command {
         root: Option<String>,
     },
 
-    /// Mirror the remote's pallets to a git remote (mirror.url), never by force
-    #[command(
-        long_about = "Keep the git remote at mirror.url in step with the pallets the Forklift \
-                      remote holds (mirror.pallets, or every user pallet). Each pallet's remote head \
-                      is fetched, exported incrementally into .forklift/mirror.git, and pushed to the \
-                      git branch of the same name, never by force: a git branch holding a commit the \
-                      export does not is refused, and left as it is. Only lifted heads are mirrored. \
-                      Tags, the signed office, the @manifest and signatures are not mirrored. A \
-                      head is exported only once its history verifies against the trust anchor \
-                      (the one held, or the one the remote serves). With \
-                      mirror.auto on (the default), every lift mirrors the pallet it lifted. \
-                      Requires git on PATH."
-    )]
-    Mirror,
-
     /// Manage the warehouse office: users and signing keys
     #[command(
         visible_alias = "o",
@@ -686,23 +614,6 @@ pub enum Command {
     Park {
         #[command(subcommand)]
         action: Option<ParkAction>,
-    },
-
-    /// Peek into an object (print its content)
-    #[command(
-        visible_alias = "pk",
-        long_about = "Print the content of an object: a blob's bytes, a tree's entries, or a \
-                      parcel's fields. With --inventory, print the inventory of a working-directory \
-                      folder instead."
-    )]
-    Peek {
-        /// Peek into the inventory of a working-directory folder instead of an object
-        #[arg(short, long, value_name = "PATH", conflicts_with = "object")]
-        inventory: Option<String>,
-
-        /// The hash of the object to peek into
-        #[arg(value_name = "HASH", required_unless_present = "inventory")]
-        object: Option<String>,
     },
 
     /// Prepare a new warehouse in the current directory
@@ -921,7 +832,7 @@ pub enum Command {
         pallet: String,
     },
 
-    /// Print a file's content at a revision (`git show <rev>:<path>`'s equivalent)
+    /// Print a file's content at a revision, as git show does for REV:PATH
     #[command(
         long_about = "Print a file's content at a revision in one invocation: \
                       \"<revision>:<path>\", split on the first \":\" (a revision — a pallet \
@@ -1040,47 +951,29 @@ pub enum Command {
         dry_run: bool,
     },
 
-    /// Free cached content the origin holds, to be fetched again when read
+    /// Show the remote and the origin, or move a partial warehouse's origin to another server
     #[command(
-        long_about = "Free disk in a cache warehouse (one franchised with \"--cache\"): delete the \
-                      content its origin holds and nothing here needs, so that a later read fetches \
-                      it again. Parcels and signatures always stay. It asks the origin which history \
-                      it holds first, and refuses, changing nothing, when the configured remote is \
-                      not the origin or the origin cannot be reached; work never lifted keeps its \
-                      content. It keeps every checkout's files, metadata and trust records, staged \
-                      work, and anything a parked or in-progress operation needs. If it is \
-                      interrupted, running it again finishes the job. Objects inside packs are not \
-                      freed yet. Use --dry-run to see what it would free without changing anything."
-    )]
-    Evict {
-        /// Report what would be freed and change nothing
-        #[arg(long)]
-        dry_run: bool,
-    },
-
-    /// Manage the remote of a partial warehouse: move its origin to another server
-    #[command(
-        long_about = "Manage the remote of a partial warehouse (one franchised with \"--only\" or \
-                      \"--cache\"). Such a warehouse talks only to its origin, the remote it was \
+        long_about = "Show where this warehouse lifts to and lowers from: the configured remote \
+                      (\"remote.url\") and, in a partial warehouse (one franchised with \"--only\" \
+                      or \"--cache\"), its origin, with any move of the origin that has not \
+                      finished. A partial warehouse talks only to its origin, the remote it was \
                       franchised from, because only the origin was proved to hold the content it \
-                      lacks; \"forklift remote move\" is the one way to change it."
+                      lacks; \"forklift remote move\" is the one way to change it. A full \
+                      warehouse has no origin and may talk to any remote."
     )]
     Remote {
         #[command(subcommand)]
-        action: RemoteAction,
+        action: Option<RemoteAction>,
     },
-
-    /// Report object-store health: loose vs packed objects, packs, and whether compaction is due
+    /// Inspect and maintain the object store: its health, packing, raw records and cached content
     #[command(
-        long_about = "Report the health of the object store — the counterpart of \"forklift stocktake\" \
-                      (which reports the working tree). Shows how many objects are loose \
-                      (unpacked) versus packed, how many pack files there are and how \
-                      delta-dense they are, the on-disk sizes, and whether an incremental \
-                      compaction or a consolidating repack is currently due per the \
-                      maintenance.loose / maintenance.packs thresholds. Read-only; run \
-                      \"forklift compact\" to act on it."
+        long_about = "Inspect and maintain the object store. Without a subcommand, report its \
+                      health, as \"forklift store status\" does."
     )]
-    Store,
+    Store {
+        #[command(subcommand)]
+        action: Option<StoreAction>,
+    },
 
     /// Manage signed tags: named, admin-signed pointers at a parcel (releases)
     #[command(
@@ -1254,6 +1147,141 @@ pub enum BayAction {
 pub enum ScopeAction {
     /// Show the current bay's materialization scope and the warehouse fetch scope (the default)
     Status,
+}
+
+#[derive(Subcommand)]
+pub enum StoreAction {
+    /// Report object-store health: loose vs packed objects, packs, and whether compaction is due
+    /// (the default)
+    #[command(
+        long_about = "Report the health of the object store — the counterpart of \"forklift stocktake\" \
+                      (which reports the working tree). Shows how many objects are loose \
+                      (unpacked) versus packed, how many pack files there are and how \
+                      delta-dense they are, the on-disk sizes, and whether an incremental \
+                      compaction or a consolidating repack is currently due per the \
+                      maintenance.loose / maintenance.packs thresholds. Read-only; run \
+                      \"forklift store compact\" to act on it."
+    )]
+    Status,
+    /// Compact the object store: pack loose objects into a few dense pack files
+    #[command(
+        long_about = "Compact the object store: sweep the loose objects (each its own \
+                      zstd-compressed file) into a few dense pack files — an append-only data \
+                      file plus a sorted index. At scale that turns hundreds of thousands of \
+                      tiny files into a handful of large ones, so a history walk stops paying an \
+                      open-per-object and the store stops paying per-file slack. Objects are only \
+                      moved, never re-hashed; a loose file is deleted only after the pack that \
+                      holds it is durably written, so compacting can never lose an object. Packs \
+                      roll over at a size/count threshold, so no single pack grows unbounded. \
+                      Run it after a large \"forklift git import\" or periodically as maintenance. With \
+                      --all, also rewrite the existing packs: drop unreachable (garbage) \
+                      objects that were stuck in packs and consolidate many packs into few — a \
+                      heavier full repack, worth running occasionally. Add --redelta to a full \
+                      repack to also re-delta-compress every object instead of copying already-\
+                      packed records verbatim — denser, but a one-shot CPU-bound pass."
+    )]
+    Compact {
+        /// Repack existing packs too: drop unreachable objects and consolidate (a full repack)
+        #[arg(long)]
+        all: bool,
+
+        /// Re-encode every object to delta-compress across the whole store (only with --all)
+        #[arg(
+            long,
+            long_help = "Re-encode every live object — packed or loose, files and directories \
+                         alike — to delta-compress across the whole store, instead of a \
+                         repack's usual verbatim copy of already-packed records. Buys back the \
+                         cross-path similarity (renames, moved files) a per-object copy cannot \
+                         see, at the cost of a full re-read, re-compress and re-delta of every \
+                         object: one-shot and CPU-bound, not something to run routinely. Safe to \
+                         repeat any number of times on the same store. Only valid with --all."
+        )]
+        redelta: bool,
+    },
+    /// Peek into an object (print its content)
+    #[command(
+        long_about = "Print the content of an object: a blob's bytes, a tree's entries, or a \
+                      parcel's fields. With --inventory, print the inventory of a working-directory \
+                      folder instead."
+    )]
+    Peek {
+        /// Peek into the inventory of a working-directory folder instead of an object
+        #[arg(short, long, value_name = "PATH", conflicts_with = "object")]
+        inventory: Option<String>,
+
+        /// The hash of the object to peek into
+        #[arg(value_name = "HASH", required_unless_present = "inventory")]
+        object: Option<String>,
+    },
+    /// Free cached content the origin holds, to be fetched again when read
+    #[command(
+        long_about = "Free disk in a cache warehouse (one franchised with \"--cache\"): delete the \
+                      content its origin holds and nothing here needs, so that a later read fetches \
+                      it again. Parcels and signatures always stay. It asks the origin which history \
+                      it holds first, and refuses, changing nothing, when the configured remote is \
+                      not the origin or the origin cannot be reached; work never lifted keeps its \
+                      content. It keeps every checkout's files, metadata and trust records, staged \
+                      work, and anything a parked or in-progress operation needs. If it is \
+                      interrupted, running it again finishes the job. Objects inside packs are not \
+                      freed yet. Use --dry-run to see what it would free without changing anything."
+    )]
+    Evict {
+        /// Report what would be freed and change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum GitAction {
+    /// Import a git repository's history into this warehouse (one-way migration)
+    #[command(
+        long_about = "One-way migration of a git repository's history into this warehouse: \
+                      git commits become parcels, trees become trees, blobs become blobs, and each \
+                      local branch becomes a pallet. The imported history is unsigned (it predates \
+                      trust), so import into a fresh warehouse and then run \"forklift office enroll\" to \
+                      anchor it. Run it from the git repo's directory (\"forklift git import .\") so \
+                      the checked-out working tree already holds the imported HEAD. Forklift \
+                      converts nothing on checkout, so a file git converted (line endings, ident, \
+                      a filter) reads as modified, and the import warns about it. Requires git \
+                      on PATH."
+    )]
+    Import {
+        /// The git repository to import from (e.g. \".\")
+        path: String,
+
+        /// Store the imported objects loose instead of packing (and delta-compressing) them
+        /// on the way in
+        #[arg(long)]
+        no_compact: bool,
+    },
+    /// Export this warehouse's history into a new git repository (one-way, lossy)
+    #[command(
+        long_about = "One-way export of this warehouse's history into a new git repository: \
+                      parcels become commits, trees become trees, blobs become blobs, and each user \
+                      pallet becomes a branch. The escape hatch that makes trying forklift reversible \
+                      — but lossy in this direction: git has no home for the signed office, the \
+                      @manifest, or per-parcel signatures, so those are dropped. The path must be \
+                      empty or new. Requires git on PATH."
+    )]
+    Export {
+        /// Where to create the git repository (must be empty or new)
+        path: String,
+    },
+    /// Mirror the remote's pallets to a git remote (mirror.url), never by force
+    #[command(
+        long_about = "Keep the git remote at mirror.url in step with the pallets the Forklift \
+                      remote holds (mirror.pallets, or every user pallet). Each pallet's remote head \
+                      is fetched, exported incrementally into .forklift/mirror.git, and pushed to the \
+                      git branch of the same name, never by force: a git branch holding a commit the \
+                      export does not is refused, and left as it is. Only lifted heads are mirrored. \
+                      Tags, the signed office, the @manifest and signatures are not mirrored. A \
+                      head is exported only once its history verifies against the trust anchor \
+                      (the one held, or the one the remote serves). With \
+                      mirror.auto on (the default), every lift mirrors the pallet it lifted. \
+                      Requires git on PATH."
+    )]
+    Mirror,
 }
 
 #[derive(Subcommand)]
@@ -1849,40 +1877,35 @@ impl Command {
                 | Command::Bay { .. }
                 | Command::Blame { .. }
                 | Command::CherryPick { .. }
-                | Command::Compact { .. }
                 | Command::Conflicts
                 | Command::Consolidate { .. }
                 | Command::Deliver { .. }
                 | Command::Diff { .. }
                 | Command::Expand { .. }
-                | Command::ExportGit { .. }
+                | Command::Git { .. }
                 | Command::Heal
                 | Command::History { .. }
-                | Command::ImportGit { .. }
                 | Command::Lift { .. }
                 | Command::Load { .. }
                 | Command::Lower { .. }
                 | Command::Haul { .. }
                 | Command::Kv { .. }
                 | Command::Manifest { .. }
-                | Command::Mirror
                 | Command::Narrow { .. }
                 | Command::Office { .. }
                 | Command::Palletize { .. }
                 | Command::Park { .. }
-                | Command::Peek { .. }
                 | Command::Query { .. }
                 | Command::Remove { .. }
                 | Command::Remote { .. }
                 | Command::Restore { .. }
                 | Command::Scope { .. }
                 | Command::ScopePrune { .. }
-                | Command::Evict { .. }
                 | Command::Shift { .. }
                 | Command::Show { .. }
                 | Command::Stack { .. }
                 | Command::Stocktake { .. }
-                | Command::Store
+                | Command::Store { .. }
                 | Command::Tag { .. }
                 | Command::Undo { .. }
                 | Command::Unload { .. }
@@ -1932,7 +1955,7 @@ impl Command {
             Command::CherryPick { .. }
                 | Command::Consolidate { .. }
                 | Command::Expand { .. }
-                | Command::ImportGit { .. }
+                | Command::Git { action: GitAction::Import { .. } }
                 | Command::Lift { .. }
                 | Command::Load { .. }
                 | Command::Lower { .. }
@@ -1943,7 +1966,7 @@ impl Command {
                 | Command::Remove { .. }
                 | Command::Restore { .. }
                 | Command::ScopePrune { .. }
-                | Command::Evict { .. }
+                | Command::Store { action: Some(StoreAction::Evict { .. }) }
                 | Command::Shift { .. }
                 | Command::Stack { .. }
                 | Command::Undo { .. }
@@ -1965,28 +1988,26 @@ impl Command {
             self,
             Command::Bay { .. }
                 | Command::CherryPick { .. }
-                | Command::Compact { .. }
                 | Command::Consolidate { .. }
                 | Command::Deliver { .. }
                 | Command::Expand { .. }
                 | Command::Heal
-                | Command::ImportGit { .. }
+                | Command::Git { action: GitAction::Import { .. } | GitAction::Mirror }
                 | Command::Lift { .. }
                 | Command::Load { .. }
                 | Command::Lower { .. }
                 | Command::Haul { .. }
                 | Command::Kv { .. }
                 | Command::Manifest { .. }
-                | Command::Mirror
                 | Command::Narrow { .. }
                 | Command::Office { .. }
                 | Command::Palletize { .. }
                 | Command::Park { .. }
                 | Command::Remove { .. }
-                | Command::Remote { .. }
+                | Command::Remote { action: Some(_) }
                 | Command::Restore { .. }
                 | Command::ScopePrune { .. }
-                | Command::Evict { .. }
+                | Command::Store { action: Some(StoreAction::Compact { .. } | StoreAction::Evict { .. }) }
                 | Command::Shift { .. }
                 | Command::Stack { .. }
                 | Command::Tag { .. }
@@ -2005,24 +2026,28 @@ impl Command {
     /// that list that sets a pallet head, and it writes into a store it has just created, which
     /// no other process uses yet.
     ///
-    /// `compact`, `scope-prune` and `evict` are excluded because they host deleters, which take
-    /// the exclusive side; their own shared hold would refuse them. They take the side they need
-    /// themselves: a full repack, scope-prune and evict the exclusive one, incremental compaction
-    /// the shared one, tried.
+    /// `store compact`, `store evict` and `scope-prune` are excluded because they host deleters,
+    /// which take the exclusive side; their own shared hold would refuse them. They take the side
+    /// they need themselves: a full repack, evict and scope-prune the exclusive one, incremental
+    /// compaction the shared one, tried.
     ///
     /// # Returns
     /// * `true`  - Take the shared hold right after the warehouse lock.
     /// * `false` - A read-only command, or one that hosts a deleter.
     pub fn holds_store_access(&self) -> bool {
         self.requires_warehouse_lock()
-            && !matches!(self, Command::Compact { .. } | Command::ScopePrune { .. } | Command::Evict { .. })
+            && !matches!(
+                self,
+                Command::Store { action: Some(StoreAction::Compact { .. } | StoreAction::Evict { .. }) }
+                    | Command::ScopePrune { .. }
+            )
     }
 
     /// Whether finishing this command should kick off background object-store maintenance
     /// (git's `gc --auto`): the mutating commands that add loose objects, so the store stays
-    /// packed without the user remembering to `compact`. `compact` itself is excluded (or it
-    /// would re-trigger), `import-git` is (it compacts on its own), and so is `evict`, which only
-    /// removes objects. `lift` and `lower` are
+    /// packed without the user remembering to `store compact`. `store compact` itself is excluded
+    /// (or it would re-trigger), `git import` is (it compacts on its own), and so is `store evict`,
+    /// which only removes objects. `lift` and `lower` are
     /// included on purpose: both bring in objects from a remote. The actual work is
     /// still gated on a cheap loose/pack threshold, so triggering here is only a *check*.
     ///
@@ -2031,7 +2056,11 @@ impl Command {
     /// * `false` - Do not (a read-only, setup, or self-compacting command).
     pub fn triggers_auto_maintenance(&self) -> bool {
         self.requires_warehouse_lock()
-            && !matches!(self, Command::Compact { .. } | Command::Evict { .. } | Command::ImportGit { .. })
+            && !matches!(
+                self,
+                Command::Store { action: Some(StoreAction::Compact { .. } | StoreAction::Evict { .. }) }
+                    | Command::Git { action: GitAction::Import { .. } }
+            )
     }
 
     /// Whether the command produces read-only, potentially long output that should go
@@ -2040,7 +2069,7 @@ impl Command {
     /// this is exactly the read-only display commands.
     ///
     /// # Returns
-    /// * `true`  - Page the output on a terminal (`history`, `diff`, `peek`, `show`, `blame`, `audit`).
+    /// * `true`  - Page the output on a terminal (`history`, `diff`, `store peek`, `show`, `blame`, `audit`).
     /// * `false` - Print straight through (mutating, interactive, or short-output commands).
     pub fn pages_output(&self) -> bool {
         matches!(
@@ -2048,7 +2077,7 @@ impl Command {
             Command::History { .. }
                 | Command::Query { .. }
                 | Command::Diff { .. }
-                | Command::Peek { .. }
+                | Command::Store { action: Some(StoreAction::Peek { .. }) }
                 | Command::Show { .. }
                 | Command::Blame { .. }
                 | Command::Audit { .. }

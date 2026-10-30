@@ -205,7 +205,7 @@ isn't sampled on macOS, so wall-clock attribution also came from `hyperfine` A/B
 FORK-163 section below, and the rest was FORK-192 (below).
 
 **Found on the way:**
-- FORK-187: `import-git` records git's LF blob against the stat of a CRLF-converted working
+- FORK-187: `git import` records git's LF blob against the stat of a CRLF-converted working
   file (`eol=crlf`), so the file reads modified once its stat cache misses. Closed by FORK-208's
   re-proving tree build: such a file now reads modified from the import on (pinned under FORK-187).
   Until it is restored or loaded, every stocktake re-reads it, since stocktake does not persist
@@ -903,7 +903,7 @@ in-memory copy and publishes each shard once. `restore <dir>`, `park pop`,
 git.git's working tree (4,775 files, every file brand-new — the same per-file blob-store
 barrier finding 1 fixed) went **35.8 s → 0.66 s** (≈54×) under PR A; unchanged by round
 2 (that fix only reordered *when* the same work becomes durable, not how much of it there
-is). A git.git-scale incremental script (5 real files touched, `import-git`'d history,
+is). A git.git-scale incremental script (5 real files touched, `git import`'d history,
 release build) re-measured after round 2's fixes, median of 5 runs (1 for `stack`, which
 consumes its staged input, so 6 independent touch-load-stack cycles were used instead):
 `stocktake` **28.8 ms**, `diff --staged` **20.2 ms**, `stack` **55.9 ms** — no regression

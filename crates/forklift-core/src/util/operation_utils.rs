@@ -2,7 +2,7 @@
 //! wholesale is under way, so that a crash or an error part-way through it is never committed.
 //!
 //! Every operation that ends in [`inventory_utils::replace_all_inventories`] — shift, park,
-//! consolidate's fast-forward, lower, bay creation, import-git, every merge and cherry-pick, and
+//! consolidate's fast-forward, lower, bay creation, git import, every merge and cherry-pick, and
 //! franchise — raises the marker before its first durable change and finishes it only once its own
 //! final write has landed. Raising it around the rewrite alone would not be enough: shift records
 //! its new position only after the rewrite, so a crash between the two leaves files and staging at
@@ -61,7 +61,7 @@ impl OperationKind {
             OperationKind::FastForward => "fast-forward",
             OperationKind::Lower => "lower",
             OperationKind::BayCreation => "bay creation",
-            OperationKind::ImportGit => "import-git",
+            OperationKind::ImportGit => "git import",
             OperationKind::Merge => "merge",
             OperationKind::CherryPick => "cherry-pick",
             OperationKind::Franchise => "franchise",
@@ -82,7 +82,7 @@ impl OperationKind {
         match self {
             OperationKind::Shift | OperationKind::FastForward | OperationKind::Lower
             | OperationKind::Merge | OperationKind::CherryPick => true,
-            // Park does not move the bay; bay creation and import-git write the position BEFORE
+            // Park does not move the bay; bay creation and git import write the position BEFORE
             // their rewrite; franchise only refuses.
             OperationKind::Park | OperationKind::BayCreation | OperationKind::ImportGit
             | OperationKind::Franchise => false,

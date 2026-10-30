@@ -730,7 +730,7 @@ const FETCH_OBJECT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from
 ///   it** — measured, and only measured; see the retraction below for what that does not cover.
 ///   Time-to-first-byte for `POST /v1/objects/batch` (0.3.0, 3 runs per point):
 ///   0.4–0.9ms for 1 object / 256KiB; 4.1–13.0ms for 50 objects / 12.8MiB; 14.1–39.3ms for 203
-///   objects / 52.5MiB loose, 52ms for the same set after `forklift compact`.
+///   objects / 52.5MiB loose, 52ms for the same set after `forklift store compact`.
 ///
 /// **What that measurement is not, stated rather than laundered.** It was taken warm-page-cache, on
 /// a local SSD, over loopback. **Cold I/O on network-backed storage is unmeasured, and is the

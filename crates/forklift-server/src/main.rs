@@ -1442,7 +1442,7 @@ mod tests {
                     prepare_is_the_remedy,
                     "{} {}: {}", command, name, next_step
                 );
-                assert!(!next_step.contains("\"forklift prepare\"") && !next_step.contains("import-git"), "{} {}: {}", command, name, next_step);
+                assert!(!next_step.contains("\"forklift prepare\"") && !next_step.contains("git import"), "{} {}: {}", command, name, next_step);
             }
             assert_eq!(listing(&root), before, "{}: nothing written", name);
             assert!(name == "none" || root.join(forklift_name).exists());

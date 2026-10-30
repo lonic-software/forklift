@@ -88,10 +88,10 @@ The everyday verbs map onto git like this:
 | `diff` | `diff` | line-by-line changes |
 | `restore` | `restore` | discard working-directory changes |
 | `show` | `show <rev>:<path>` | a file's content at a revision |
-| `peek` | `cat-file` | inspect one object |
+| `store peek` | `cat-file` | inspect one object |
 | `blame` | `blame` | who wrote each line |
-| `import-git` / `export-git` | none | migrate a git repository in, or back out |
-| `mirror` | none | keep a git remote's branches in step with the remote's pallets |
+| `git import` / `git export` | none | migrate a git repository in, or back out |
+| `git mirror` | none | keep a git remote's branches in step with the remote's pallets |
 
 Every command, with its short alias, is listed in
 [the generated command list](../generated/commands.md).
@@ -119,7 +119,7 @@ ordered list of its chunks. See [Large files](cli.md#large-files).
 **Delta** (git: delta). An object stored compressed against a similar base object.
 
 **Compact** (git: `repack`). Moves loose objects into packs; with more flags, rewrites the store.
-See [`compact`](cli.md#compact--pack-the-object-store).
+See [`store compact`](cli.md#store-compact--pack-the-object-store).
 
 **Maintenance** (git: `gc --auto`). The automatic compaction a command runs once the store passes
 its thresholds.
@@ -127,8 +127,8 @@ its thresholds.
 **Commit-graph** (git: commit-graph). A derived cache that speeds up history walks. It is never a
 source of truth.
 
-**Salvage.** Recovering the readable objects out of a damaged pack, which `compact --all` does.
-See [`compact`](cli.md#compact--pack-the-object-store).
+**Salvage.** Recovering the readable objects out of a damaged pack, which `store compact --all` does.
+See [`store compact`](cli.md#store-compact--pack-the-object-store).
 
 **Object ceiling.** The largest object Forklift will write. Large files are chunked well below it.
 
@@ -223,7 +223,7 @@ fetch back, to free disk.
 See [`scope-prune`](cli.md#scope-prune--reclaim-disk-from-a-sparse-warehouse).
 
 **evict** (git: none). Deletes content a cache warehouse can fetch back from its origin, to free
-disk. See [`evict`](cli.md#evict--free-disk-in-a-cache-warehouse).
+disk. See [`store evict`](cli.md#store-evict--free-disk-in-a-cache-warehouse).
 
 **Held-heads record.** A record of pallet heads this warehouse saw the remote accept or serve. See
 [`scope-prune`](cli.md#scope-prune--reclaim-disk-from-a-sparse-warehouse).
@@ -254,7 +254,7 @@ See [`heal`](cli.md#heal--resolve-a-durability-taint-or-an-interrupted-operation
 finishes. One left behind marks an **interrupted operation**. See
 [Interrupted operations](cli.md#interrupted-operations).
 
-**Store health.** What [`store`](cli.md#store--object-store-health) reports about the object store.
+**Store health.** What [`store`](cli.md#store-status--object-store-health) reports about the object store.
 
 ## Locks
 
@@ -265,9 +265,9 @@ Forklift has several locks, each guarding a different thing.
 | Warehouse lock (git: `index.lock`) | one bay's inventory and working directory |
 | Ref lock (`refs.lock`) | pallets and other state every bay shares |
 | Object-store lock (`store.lock`) | the object store, against overlapping compactions |
-| Store-access lock (`store-access.lock`) | the object store, ordering commands that write objects against those that delete them (`compact --all`, `scope-prune`, `evict`, gc) |
+| Store-access lock (`store-access.lock`) | the object store, ordering commands that write objects against those that delete them (`store compact --all`, `scope-prune`, `store evict`, gc) |
 | Config lock | one config file |
-| Serve lock (`serve.lock`) | a warehouse a server is serving; gc and `compact --all` also take it while they run |
+| Serve lock (`serve.lock`) | a warehouse a server is serving; gc and `store compact --all` also take it while they run |
 | Server base lock (`.forklift-server.lock`) | a server's base folder |
 | Move lock (`origin-move.lock`) | a move of a partial warehouse's origin, against a second move or abort |
 | Build lock | a warehouse still being created |

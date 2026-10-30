@@ -31,7 +31,7 @@ impl LooseObject {
     ///    * `bool`: True if a new object was stored, false if the object already existed.
     /// * `Err(String)`- The error message, if the operation failed.
     pub fn store(&mut self) -> Result<(String, bool), String> {
-        // The whole-object ceiling, on the way in from local authorship (`stack`, `import-git`, a
+        // The whole-object ceiling, on the way in from local authorship (`stack`, `git import`, a
         // meta write). Only a tree or a recipe can legitimately approach it; blobs and chunks are
         // bounded well below it by construction. Reads never re-store an object, so a grandfathered
         // giant authored before this policy stays readable — this gates new authorship only.

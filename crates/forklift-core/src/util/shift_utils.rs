@@ -1218,7 +1218,7 @@ pub enum TreeProvenance {
     /// recorded unproven rather than trusted with a hash it no longer holds.
     Written(file_utils::StatAnchor),
 
-    /// The files were never written or hashed by this command (`import-git` over an existing
+    /// The files were never written or hashed by this command (`git import` over an existing
     /// checkout): each is re-proved against its tree entry, in that entry's representation. A file
     /// that does not hold its tree entry's content (an uncommitted edit, a missing file) is
     /// recorded with the tree's hash and an unproven stat, so it reads as an unstaged change.

@@ -136,7 +136,7 @@ impl Head {
     fn recreate_step(self, forklift: &Path, root: &Path) -> String {
         match self {
             Head::Client => format!(
-                "Move \"{}\" aside, run {}, then import the history again (\"forklift import-git\") or \
+                "Move \"{}\" aside, run {}, then import the history again (\"forklift git import\") or \
                 franchise it again; or, if it was a bay's, restore its redirect.",
                 forklift.to_string_lossy(), self.prepare_command(root)
             ),
@@ -275,7 +275,7 @@ fn open_bay_warehouse(bay_root: &Path, redirect: &bay_utils::BayRedirect) -> Res
                 ),
                 format!(
                     "Re-create the warehouse at \"{}\" (move its \"{}\" aside, run \"forklift prepare\" there, \
-                    then import the history again with \"forklift import-git\" or franchise it again), then move \
+                    then import the history again with \"forklift git import\" or franchise it again), then move \
                     \"{}\" aside and add the bay again with \"forklift bay add\" in \"{}\".",
                     target.to_string_lossy(), FOLDER_NAME_FORKLIFT_ROOT,
                     bay.to_string_lossy(), target.to_string_lossy()

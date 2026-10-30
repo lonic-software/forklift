@@ -57,26 +57,26 @@ new one and lowering its history into it. Every command needs the marker: a
 sits inside another warehouse, the next step says to remove it first, so the folder
 uses that warehouse. `prepare` refuses a `.forklift/` with something in it but no
 marker, such as one made by a Forklift that did not mark warehouses yet: move it
-aside, run `prepare`, then import the history again (`import-git`) or franchise it
+aside, run `prepare`, then import the history again (`git import`) or franchise it
 again. It refuses a bay's folder too. A new `.forklift/` (or one that is there but empty) is built under the name
 `.forklift.tmp~<pid>-<n>` and renamed into place when it is complete, so an interrupted
 `prepare` leaves no half-built warehouse, only that folder. It is never tracked, and
 the next `prepare` in the same directory removes it; one it cannot tell is abandoned
 is left for you to delete.
 
-### `import-git` — migrate a git repository
+### `git import` — migrate a git repository
 
 ```sh
 cd my-git-repo
 forklift prepare
-forklift import-git .
+forklift git import .
 ```
 
 One-way migration of a git repo's history into the warehouse: git commits become
 parcels, trees become trees, blobs become blobs, and each **local branch becomes a
 pallet** (git's author/committer split maps onto forklift's author/stack). An author or committer
 becomes the operator id of their git email; the git name is not kept, since forklift records no
-names (so `export-git` later writes that email as the author name). A branch's pallet
+names (so `git export` later writes that email as the author name). A branch's pallet
 name is its name lowercased, with every character a pallet name does not allow replaced by `-`,
 and any part that would then start with `-` prefixed with `branch` (`@wip` becomes `branch-wip`).
 Before anything is converted, the import refuses, naming the branches, when a mapped name is
@@ -114,13 +114,13 @@ files.
 
 A large history lands hundreds of thousands of objects at once — the case the loose store
 is slowest and largest in — so the imported objects are written **straight into native
-packs** ([`compact`](#compact--pack-the-object-store)'s format, without the detour through
+packs** ([`store compact`](#store-compact--pack-the-object-store)'s format, without the detour through
 one loose file per object), delta-compressing successive versions of files and directory
-trees on the way in. The store arrives dense and you never have to remember to `compact`
+trees on the way in. The store arrives dense and you never have to remember to `store compact`
 it. Pass `--no-compact` to store loose objects instead (e.g. to inspect the raw store or
 benchmark the loose baseline). Because that packing only ever sees one file's own history as
-it streams in, `import-git` tips a one-line suggestion (also visible from `store`) that a
-one-shot `compact --all --redelta` could shrink the result further by delta-compressing
+it streams in, `git import` tips a one-line suggestion (also visible from `store`) that a
+one-shot `store compact --all --redelta` could shrink the result further by delta-compressing
 across the whole store, including similarity a per-path pass cannot see.
 
 Refuses in a scoped (sparse) bay (see `bay add --scope` below): importing builds
@@ -128,13 +128,13 @@ every pallet's history straight from the git tree, bypassing the sparse overlay 
 and materializes the whole imported HEAD — not a sensible operation to scope. Run it from
 a full workspace.
 
-### `export-git` — migrate back to git
+### `git export` — migrate back to git
 
 ```sh
-forklift export-git ../my-repo-in-git
+forklift git export ../my-repo-in-git
 ```
 
-The reverse of `import-git`, and the **escape hatch**: parcels become commits, trees become
+The reverse of `git import`, and the **escape hatch**: parcels become commits, trees become
 trees, blobs become blobs, and each **user pallet becomes a branch** (git's HEAD is set to
 the current pallet, and its working tree is checked out). The point is that trying forklift is
 reversible — your code history is never trapped. Requires `git` on your PATH; the target path
@@ -151,15 +151,15 @@ machine, whatever your own git configuration says (it is shut out of every objec
 Each commit message ends in a `Forklift-Parcel: <parcel> export/<N>` line naming the parcel
 it came from and the export format it was written in.
 
-### `mirror` — keep a git remote in step
+### `git mirror` — keep a git remote in step
 
 ```sh
 forklift config mirror.url git@github.com:me/project.git
-forklift mirror
+forklift git mirror
 ```
 
-A continuous, one-way `export-git`: each pallet the Forklift remote holds becomes the git
-branch of the same name at `mirror.url`, with the same commits `export-git` writes. Only what
+A continuous, one-way `git export`: each pallet the Forklift remote holds becomes the git
+branch of the same name at `mirror.url`, with the same commits `git export` writes. Only what
 the Forklift remote holds is mirrored, never a parcel you stacked but did not lift. The
 pallets are those in `mirror.pallets` (comma-separated), or every pallet the remote holds when
 it is unset. Requires `remote.url` and `git` on your PATH.
@@ -179,7 +179,7 @@ is read from the warehouse's root folder, from every bay. A URL beginning with `
 - git is ahead, at a later lift another warehouse mirrored: nothing to do ("already ahead");
 - git holds a commit that is not part of the export (someone pushed to the branch directly):
   the pallet is refused as **diverged**, naming the commit, and nothing is pushed. Return the
-  branch to an ancestor of the export, then run `forklift mirror` again;
+  branch to an ancestor of the export, then run `forklift git mirror` again;
 - git's branch was written in another export format (a different Forklift version): refused as
   **layout skew**, naming both formats.
 
@@ -188,13 +188,13 @@ three times. A push git declines for any other reason (a protected branch, a hoo
 with git's own message.
 
 After a successful `lift`, the lifted pallet is mirrored too when `mirror.url` is set and
-`mirror.auto` is on (the default), and the outcome is a line of lift's report (the `mirror`
+`mirror.auto` is on (the default), and the outcome is a line of lift's report (the `git mirror`
 field under `--json`). A mirror failure never fails the lift: the lift has already landed, and
-the next lift of that pallet or `forklift mirror` catches git up. Inside a lift, git may not
+the next lift of that pallet or `forklift git mirror` catches git up. Inside a lift, git may not
 prompt for credentials; one that would fails at once and is reported.
 
 A pallet whose name git does not accept as a branch name (`feature.lock`, `a..b`) is skipped,
-as is one in `mirror.pallets` the remote does not have; neither is a failure. `mirror` fails
+as is one in `mirror.pallets` the remote does not have; neither is a failure. `git mirror` fails
 with `mirror_incomplete` (exit 33) when any pallet is refused or its push fails, after the
 others went through; under `--json` the error's `details` carry the whole run's report. Tags, the
 signed office, the `@manifest` and signatures are not mirrored: git has no equivalent. A head
@@ -207,8 +207,8 @@ in a scoped bay or a franchise made with `--only` or `--cache`, which may hold o
 each tree. Two runs never share
 the mirror: a run that finds another in progress reports it busy and stops.
 
-If `mirror` reports that `.forklift/mirror.git` holds something it did not write, delete that
-folder and run `forklift mirror` again: it exports everything once more, byte for byte the same,
+If `git mirror` reports that `.forklift/mirror.git` holds something it did not write, delete that
+folder and run `forklift git mirror` again: it exports everything once more, byte for byte the same,
 so git receives nothing it already holds.
 
 ### `config` — who you are, and settings
@@ -255,7 +255,7 @@ own lines:
 The file is **tracked content**, like `.gitignore`: `load` and `stack` it, and its
 rules travel with the history — a `franchise` or `lower` brings the remote's rules
 along. Only `.forklift/` and the `.forklift.tmp~<pid>-<n>` folders an interrupted
-`prepare` or `franchise` leaves (at any depth) are always ignored. `import-git` adds a rule for `.git/` when
+`prepare` or `franchise` leaves (at any depth) are always ignored. `git import` adds a rule for `.git/` when
 the warehouse holds a `.git` folder. The rules are read only from the file on disk at
 the warehouse root. Every sparse scope holds that file, whatever its prefixes: a
 `franchise --only` checkout fetches and materializes it, so its rules apply there too and
@@ -273,7 +273,7 @@ space the pattern needs at its edge as `\x20`, and a tab as `\t`. A space inside
 pattern is fine. The error names the character's code point and its escape, so an
 invisible one can be found. Save the file with newline (or CRLF) line endings; a
 byte order mark at its start is skipped.
-`import-git` leaves a refused ignore file as it is and says why.
+`git import` leaves a refused ignore file as it is and says why.
 
 As in git, a rule covers only **untracked** paths. A path inside a folder a rule
 covers is covered too, even where no rule matches the path itself. A tracked path
@@ -525,7 +525,7 @@ refuses if a previous `load` over any recorded path never finished cleanly
 (`incomplete_load`, exit 20) — see the note under `load` above; either re-run the
 named `load`(s), or `restore --staged` the affected path(s) to abandon them, then
 stack again. The same code covers a command that rewrites the whole staging area (a shift, park,
-merge, cherry-pick, fast-forward, `lower`, `import-git` or bay creation) and was interrupted
+merge, cherry-pick, fast-forward, `lower`, `git import` or bay creation) and was interrupted
 before it finished: then the message names that command, and `forklift heal` is the way out (see
 `heal` below). And it refuses with `staged_content_missing` (exit 25), naming the path and the
 hash, when the store no longer holds the content of a file staged since the head (for a large
@@ -638,12 +638,12 @@ different journal format — makes `undo` fail naming the file, never "nothing t
 Remove the file to start a fresh journal; the undo history is lost, nothing else. Other
 commands keep working meanwhile and leave the file alone.
 
-### `peek` — inspect an object (`pk`)
+### `store peek` — inspect an object
 
 ```sh
-forklift peek <object-hash>          # print a blob / tree / parcel
-forklift peek --inventory src        # print a folder's inventory entries
-forklift peek --inventory src -v     # ...with full stat detail
+forklift store peek <object-hash>          # print a blob / tree / parcel
+forklift store peek --inventory src        # print a folder's inventory entries
+forklift store peek --inventory src -v     # ...with full stat detail
 ```
 
 A debugging/inspection tool: it decodes any object by hash (a blob's text, a
@@ -823,7 +823,7 @@ it drive your terminal: control characters (ANSI escapes, carriage returns) and 
 bidirectional overrides print as spaces; tabs are kept. A multi-line text is printed line
 by line, except in a listing that gives each record one row, where it is flattened onto
 that row. `--json` is never touched — it carries the record's text exactly as stored.
-File content (`show`, `peek` of a blob, `blame`'s lines) prints as-is, the way `cat` and
+File content (`show`, `store peek` of a blob, `blame`'s lines) prints as-is, the way `cat` and
 git do. The hashes a parcel names are checked when it is read, and a parcel naming
 anything that is not a hash is refused.
 
@@ -842,7 +842,7 @@ human or an agent, under whose supervision"*, offline and forge-proof. An agent-
 line reads `[agent, supervised by <human>]` in the gutter, exactly like `history`. The walk
 follows the first-parent chain from the revision (git's `blame --first-parent`); a line a
 merge brought in from a side line is attributed to the merge parcel. On a long history the walk
-uses the commit-graph's **changed-path filters** (built by [`compact`](#compact--pack-the-object-store))
+uses the commit-graph's **changed-path filters** (built by [`store compact`](#store-compact--pack-the-object-store))
 to skip the parcels that never touched the file, so it stays fast as history grows. Each
 version is matched against the one before it the way `git diff` matches them, so where a
 repeated line (a blank, a closing brace) could be credited to either of two parcels, blame
@@ -1070,7 +1070,7 @@ haul stays merged — no one can reopen or close it, on any head. `merge` reuses
 `consolidate` (a clean disjoint merge auto-stacks; a conflict leaves the consolidation in
 progress — resolve, `stack`, then re-run `haul merge` to record it). A haul opened in another
 warehouse can propose a head this one never fetched; `merge` then refuses, naming the source pallet
-to `lower` first. The head an open or closed haul proposes is kept by `gc`, `compact --all` and
+to `lower` first. The head an open or closed haul proposes is kept by `gc`, `store compact --all` and
 `scope-prune` even after its source pallet moves off it or is deleted. A haul id is
 content-addressed; use any unique prefix.
 
@@ -1323,7 +1323,7 @@ Applies a parcel's diff — its change against its first parent — onto the cur
 a new parcel. Unlike rebase, cherry-pick only **adds**: no rewrite, no
 force-push, nothing an audit has to bless twice. The picked parcel's **authors are
 preserved** and you are recorded as the stacker (the same author/stacker split as
-`import-git`/`export-git` and `deliver`), and the new parcel is freshly signed. It is
+`git import`/`git export` and `deliver`), and the new parcel is freshly signed. It is
 applied by three-way merge, so a **clean** pick is stacked immediately as a single-parent
 parcel; a **conflicting** one writes diff3 markers and leaves a cherry-pick in progress —
 resolve, `load`, and `stack` to complete it (still single-parent, still author-preserving),
@@ -1339,7 +1339,7 @@ forklift conflicts --json     # structured: each file's base/ours/theirs as cont
 
 Lists the files a consolidation or cherry-pick left in conflict. With `--json`, each file's
 three sides (base, ours, theirs) are reconstructed from the diff3 markers and
-given as content-addressed blob hashes you can `peek` — designed for agents,
+given as content-addressed blob hashes you can `store peek` — designed for agents,
 which resolve merges well given structure instead of marker soup. An empty list
 is a valid answer (nothing to resolve).
 
@@ -1460,7 +1460,7 @@ Inside a scoped bay:
   **both** sides has no content here to reconcile, so the merge refuses with
   `out_of_scope_conflict`; widen the scope to include that path and retry, or resolve the merge
   in a full workspace.
-- `export-git`, `import-git` and `cherry-pick` refuse in a scoped bay (`sparse_workspace`): the
+- `git export`, `git import` and `cherry-pick` refuse in a scoped bay (`sparse_workspace`): the
   first two bypass the sparse overlay and would export/import a truncated or scope-inconsistent
   view, and a cherry-pick materializes a diff that may touch paths this bay never fetched. Run
   them from a full workspace.
@@ -1621,7 +1621,7 @@ A sparse franchise records its origin — see the origin-only lift rule under `l
 **Cache franchise (`--cache`).** Marks the warehouse as a cache: one that may lack content its
 history reaches, whose remote holds the rest. Like a sparse franchise, it skips the bundle,
 records its origin (see the origin-only lift rule under `lift`), is never served, and refuses
-`mirror`; `expand` refuses too, since its scope is already the whole tree. `audit` checks the
+`git mirror`; `expand` refuses too, since its scope is already the whole tree. `audit` checks the
 content it holds and says the pass is a cache's. Commands that act on a sparse franchise's
 *scope* (scoped bays, `query`'s scope report) do not apply to a cache. It cannot be combined with `--only`.
 A cache fetches every parcel and signature of the history, so ancestry and signatures check
@@ -1644,8 +1644,8 @@ command fetched before refusing stays in the cache; a read-only command changes 
 those listed above refuse before their first change to the bay, leaving it as it was.
 
 When the remote's bundle installs native packs straight into the new warehouse, `franchise`
-tips the same densify suggestion `import-git` does: those packs are the far end's own bulk
-ingest, unseen by a cross-store `compact --all --redelta` pass.
+tips the same densify suggestion `git import` does: those packs are the far end's own bulk
+ingest, unseen by a cross-store `store compact --all --redelta` pass.
 
 ### Configuring a remote on an existing warehouse
 
@@ -1687,7 +1687,7 @@ remote it was franchised from — its origin, which the franchise records in `.f
 before it fetches anything. Talking to a *different* remote could lift onto one that lacks what
 this warehouse never verified there, fetch another history into what this warehouse records, or
 free content by heads the origin does not have. So every command that dials the remote from a
-partial warehouse — `lift`, `lower`, `expand`, `scope-prune`, `evict`, `palletize --remote`
+partial warehouse — `lift`, `lower`, `expand`, `scope-prune`, `store evict`, `palletize --remote`
 (listing, `--delete` and `--restore`), `office enroll`, `rotate`, `retire` and
 `accept-regenesis`, and a cache's fetch of content it lacks — refuses with the
 `non_origin_remote` code (exit 11) when `remote.url` is not the origin, naming both and changing
@@ -1897,11 +1897,11 @@ head reaches. A `lift`, `lower` or `franchise` that cannot write the record prin
 makes a prune refuse, changing nothing; it can be removed, since it only names heads to ask the
 remote about, and the next `lift`, `lower` or `franchise` starts a new one.
 
-### `evict` — free disk in a cache warehouse
+### `store evict` — free disk in a cache warehouse
 
 ```sh
-forklift evict            # free cached content the origin holds
-forklift evict --dry-run  # show what it would free, change nothing
+forklift store evict            # free cached content the origin holds
+forklift store evict --dry-run  # show what it would free, change nothing
 ```
 
 Frees disk in a cache warehouse (`franchise --cache`): it deletes content the origin holds and
@@ -1917,7 +1917,7 @@ nothing, if the remote cannot be reached or is not trusted, and if the configure
 the origin (`non_origin_remote`, as for `lift`, including when the origin is not recorded). Only
 content that history reaches is freed; content only local history reaches (stacks not lifted yet,
 a haul, a deleted pallet) stays, and the report counts it (`not_held`): lift that work and run
-`evict` again. An origin head this warehouse has not lowered yet frees nothing
+`store evict` again. An origin head this warehouse has not lowered yet frees nothing
 (`heads_not_lowered`).
 
 It keeps every checkout's files (the base tree of the main checkout and of each bay,
@@ -1926,20 +1926,20 @@ stash, an unfinished consolidation or cherry-pick needs (`kept_local`). A kept o
 earlier eviction recorded as held by hash and a later read fetched again has that record removed
 (`unsealed`).
 An object the origin's history reaches that is missing here without a record is damage, not an
-eviction: `evict` refuses, changing nothing, and names it; run `heal`, then `evict` again.
+eviction: `store evict` refuses, changing nothing, and names it; run `heal`, then `store evict` again.
 
 Every object is recorded before it is deleted, and an object's children go before it, so an
-interrupted eviction leaves a readable warehouse, and running `evict` again finishes the job.
+interrupted eviction leaves a readable warehouse, and running `store evict` again finishes the job.
 Loose copies are deleted; objects inside a pack are dropped by rewriting the packs without them,
-as `compact --all` does (`would_drop` counts them; `repack` says whether the packs are rewritten,
+as `store compact --all` does (`would_drop` counts them; `repack` says whether the packs are rewritten,
 which also happens when packed content stands on a loose copy being freed), and the report says how
 many bytes that freed (`bytes_freed`). A damaged pack refuses the eviction before anything changes:
-run `compact --all` to salvage it, then `evict` again. An eviction, dry run included, is refused while the
+run `store compact --all` to salvage it, then `store evict` again. An eviction, dry run included, is refused while the
 warehouse root is being served, and while another command in another bay uses the object store,
 since either could rely on an object the eviction is about to free; run it again once the other
-command finishes. Nothing frees content on its own yet: `evict` runs only when you run it.
+command finishes. Nothing frees content on its own yet: `store evict` runs only when you run it.
 
-Last, `evict` shrinks the record of what it freed, so it does not grow with every run: an evicted
+Last, `store evict` shrinks the record of what it freed, so it does not grow with every run: an evicted
 object nothing present here names any more, such as a file under an evicted directory, loses its
 record (`record_dropped`), since it is reached only through that directory, whose record stays.
 Reading the directory again fetches it and records its contents again, so reads by path work as
@@ -1950,6 +1950,20 @@ though the record may still have shrunk. Either way the eviction itself still st
 object here is one only local history names (the origin's history was checked before anything was
 freed), so the record keeps everything until that content is back, for example by restoring it from
 a copy that has it.
+
+### `remote` — the remote and the origin
+
+```sh
+forklift remote
+```
+
+Shows the configured remote (`remote.url`) and, for a sparse or cache warehouse, its origin: the
+one server this warehouse talks to (below). A full warehouse holds its whole history and has no
+origin, so it may talk to any remote. When something would stop a command that dials the remote
+from here, it says what and how to clear it: a remote that is not the origin
+(`non_origin_remote`), or a move of the origin that has not finished (`origin_move_pending`). With
+`--json`, `blocked` carries that refusal's `code`, `message` and `next_step`, and is null when
+nothing stops it. It only reads, so it runs while a move stands.
 
 ### `remote move` — move a partial warehouse to another origin
 
@@ -2028,7 +2042,7 @@ AI agents. Full details — the envelope schema, the error/exit-code taxonomy, t
 `conflicts` content addresses, and wiring `forklift mcp` into a client — are in
 **[`../MACHINE_INTERFACE.md`](../MACHINE_INTERFACE.md)**.
 
-A program running `compact`, `lift`, `lower` or `import-git` can follow its progress
+A program running `store compact`, `lift`, `lower` or `git import` can follow its progress
 without parsing stdout: set `PULT_EVENTS` to the number of an inherited pipe's write end
 (above 2), and Forklift writes `status <phase>` and `progress <0-100|?> [text]` lines to
 it. An fd that is not a pipe, FIFO or socket is ignored. See
@@ -2086,20 +2100,20 @@ of `franchise --token` and a `config` value are marked secret. An argument shape
 document cannot express exactly is refused with an error naming the command and argument,
 never dropped: you get the whole surface or none of it.
 
-### `compact` — pack the object store
+### `store compact` — pack the object store
 
 ```sh
-forklift compact
+forklift store compact
 ```
 
 Forklift stores every object as its own compressed file. That is simple and safe, but at
 scale (say after importing a large git history) it becomes hundreds of thousands of tiny
-files: each pays filesystem slack, and a full-history walk pays an open per object. `compact`
+files: each pays filesystem slack, and a full-history walk pays an open per object. `store compact`
 sweeps the loose objects into a few dense **pack** files — an append-only data file plus a
 sorted index — so the store is a handful of large files and a read is a binary search plus one
 seek. Each file's successive versions are stored as **deltas** — the change from the previous
 version of the *same file* rather than a whole new copy — which is git's biggest space win.
-`compact` finds that previous version the way git does, by walking history to associate each
+`store compact` finds that previous version the way git does, by walking history to associate each
 blob with its path, so the deltas are as tight as git's: **git.git packs to 261 MB, smaller
 than git's own 310 MB pack.** A loose object is removed only after the pack that holds it is
 durably written, and a delta is content-verified on read, so compacting can never lose or
@@ -2108,14 +2122,14 @@ single pack grows unbounded. `--json` reports
 `{objects_packed, packs_written, loose_removed, deltas, bytes_packed, corrupt_skipped,
 over_ceiling_skipped}`.
 If a loose object's bytes do not decode, or decode but do not hash to the address its filename
-promises, `compact` skips it and leaves it in place rather than packing or removing it;
+promises, `store compact` skips it and leaves it in place rather than packing or removing it;
 `corrupt_skipped` counts those. A nonzero count is worth investigating — run `forklift audit`
 to check the store. A loose object larger than the 64 MiB object ceiling is skipped the same
 way, but it is not corrupt — it predates the ceiling — so it is counted separately as
 `over_ceiling_skipped` and left loose, fully readable, forever.
 
 A signed warehouse writes one small signature file per parcel it signs (a franchise or `lower`
-writes the signatures it fetches straight into tables). `compact` moves those into
+writes the signatures it fetches straight into tables). `store compact` moves those into
 **signature tables** (`.forklift/objects/pack/<id>.sigs`, up to 100,000 signatures each),
 merging small tables as it goes, and removes a signature file only once a durably written table
 holds the same signature. `signature_tables_written` and `signatures_moved` count that;
@@ -2123,19 +2137,19 @@ holds the same signature. `signature_tables_written` and `signatures_moved` coun
 the same signature.
 A signature file that differs from the signature a table already holds for its parcel, or that
 is malformed, is left loose and listed under `signature_conflicts` (`[{parcel, sidecar_path,
-reason}]`): the tabled signature is the one every read returns. `compact --all` also drops the
+reason}]`): the tabled signature is the one every read returns. `store compact --all` also drops the
 signatures of parcels no longer in the store (`signatures_dropped`). A table that cannot be read
 is left as found and listed under `signature_tables_unreadable`, with what to do about it; a
 full repack refuses until it is dealt with.
 
-`compact` also **builds the commit-graph** (`.forklift/graph/`) while it is here: a sharded,
+`store compact` also **builds the commit-graph** (`.forklift/graph/`) while it is here: a sharded,
 self-healing cache that gives each parcel a generation number — so ancestry checks
 (`consolidate`, `haul`) find a merge base without walking history to the roots — and a
 changed-path filter — so `blame` skips parcels that did not touch the file. It is derived and
-repairs itself, so you never manage it; building it during `compact` just means it is warm the
+repairs itself, so you never manage it; building it during `store compact` just means it is warm the
 first time you need it.
 
-**You rarely need to run this by hand.** `import-git` writes packs directly on the way in
+**You rarely need to run this by hand.** `git import` writes packs directly on the way in
 (unless you pass `--no-compact`), and afterwards forklift **compacts automatically** in the background of a
 mutating command once the store has accumulated enough loose objects or packs to warrant it
 (git's `gc --auto`). It runs synchronously, under that command's lock, so it is correct and
@@ -2145,14 +2159,14 @@ never races — which means it can add a brief pause when it fires (rarely). Tur
 
 Compaction also takes a **shared object-store lock** (separate from the per-bay lock ordinary
 commands hold), so two bays or two processes never compact the same store at once. If another
-compaction is already running, an explicit `forklift compact` reports it and stops; the
+compaction is already running, an explicit `forklift store compact` reports it and stops; the
 automatic background compaction simply skips (the other run is doing the same work). An
 incremental compaction never blocks ordinary mutating commands; a full repack does, briefly (see
 below). Compaction of either kind is refused while a `scope-prune` or `forklift-server gc` runs
 on the warehouse.
 
-Plain `compact` is **incremental**: it packs the loose objects into a *new* pack and leaves
-existing packs alone (cheap, but packs accumulate over time). `compact --all` is a **full
+Plain `store compact` is **incremental**: it packs the loose objects into a *new* pack and leaves
+existing packs alone (cheap, but packs accumulate over time). `store compact --all` is a **full
 repack**: it rewrites every pack too, **dropping unreachable objects** that were stuck in
 packs (garbage from undone stacks, abandoned pushes) and **consolidating many packs into
 few**. Content you have loaded but not yet stacked is never garbage: every bay's staged files
@@ -2161,9 +2175,9 @@ proposes (so a haul still merges after its source pallet moved off that head). I
 delta (a byte-copy, not a re-compress), so it is
 fast and never balloons the store — but heavier than incremental; run it occasionally (auto
 does when packs pile up). Because it drops unreachable packed objects with no grace period,
-`compact --all` is **refused while a `forklift-server` is serving that root** (or a
+`store compact --all` is **refused while a `forklift-server` is serving that root** (or a
 `forklift-server gc` is running against it): a lift in flight would lose objects it had already
-uploaded. Stop the server, repack, then restart. Plain `compact` drops nothing and stays
+uploaded. Stop the server, repack, then restart. Plain `store compact` drops nothing and stays
 allowed; the automatic repack simply waits until the root is no longer served. A server that was
 hard-killed leaves its `serve.lock` behind, which blocks repacks (automatic ones silently) until
 it is removed, exactly as it blocks `gc`.
@@ -2180,7 +2194,7 @@ objects no other copy serves (`--json`: `damaged_packs_kept`, `[{index_path, err
 this store cannot recover those (a good copy of the pack's files, or of the objects from
 elsewhere, can). Salvage writes every object it decodes, garbage included; the garbage is collected
 later by `gc`, and until then it can need up to the pack's decompressed size in free space. Only an
-explicit `compact --all` salvages: the automatic repack leaves a damaged pack exactly as it found it.
+explicit `store compact --all` salvages: the automatic repack leaves a damaged pack exactly as it found it.
 Ordinary commands never pay that whole-index check: they verify only the slice of an index they
 actually read.
 
@@ -2207,11 +2221,11 @@ another process…` and carries on once it finishes. The coordination is a kerne
 up.
 
 ```sh
-forklift compact          # incremental: pack the loose objects
-forklift compact --all    # full repack: drop garbage, consolidate every pack
+forklift store compact          # incremental: pack the loose objects
+forklift store compact --all    # full repack: drop garbage, consolidate every pack
 ```
 
-`compact --all --redelta` goes further: instead of reusing each object's existing delta, it
+`store compact --all --redelta` goes further: instead of reusing each object's existing delta, it
 re-reads and re-compresses **every** live object (packed or loose, files and directories alike)
 and re-runs delta selection on the whole store together. That matters because a repack's
 copy-fast-path can only keep whatever delta an object was *originally* given — and an object
@@ -2220,7 +2234,7 @@ only ever saw a few neighbors) has no way to know a much better match (a rename,
 anything similar outside its own path) sits elsewhere in the store. `--redelta` gives every
 object one more shot at the best base across the *entire* live set. It costs a full re-encode —
 one-shot and CPU-bound, not something to run routinely — and it is only valid together with
-`--all`. Safe to repeat any number of times on the same store. `store` (and `import-git`'s and
+`--all`. Safe to repeat any number of times on the same store. `store` (and `git import`'s and
 `franchise`'s own output) suggest running it when the store was bulk-ingested and has not been
 through a redelta pass yet; a successful run clears that suggestion.
 
@@ -2228,13 +2242,14 @@ through a redelta pass yet; a successful run clears that suggestion.
 > between similar versions (the rest of the size gap vs git) is additional work on top —
 > see [`../OBJECT_STORE_SCALING.md`](../OBJECT_STORE_SCALING.md).
 
-### `store` — object-store health
+### `store status` — object-store health
 
 ```sh
-forklift store
+forklift store status
+forklift store            # the same
 ```
 
-The read-only counterpart of `compact` (and the object-store analog of `stocktake`, which
+The read-only counterpart of `store compact` (and the object-store analog of `stocktake`, which
 reports the working tree). It takes an **exact** census of `.forklift/objects`: how many
 objects are **loose** (unpacked) versus **packed**, how many pack files there are and how
 **delta-dense** they are, the on-disk sizes, and — against the `maintenance.loose` /
@@ -2257,10 +2272,10 @@ Object store
 total_bytes, packs:[{id, objects, deltas, bytes}], maintenance:{auto, loose_threshold,
 pack_threshold, compaction_due, repack_due}, densify_suggested, quarantined_packs, damaged_packs,
 unenumerable_indexes, foreign_version_indexes}`
-— every size an exact byte count. Nothing is written; run `compact` to act on what it reports.
+— every size an exact byte count. Nothing is written; run `store compact` to act on what it reports.
 `densify_suggested` (and, in the human view, a one-line tip) appears once the store was
-bulk-ingested (`import-git` or a franchise's bundle install) and clears once a `compact --all
---redelta` pass has run (see [`--redelta`](#compact--pack-the-object-store)).
+bulk-ingested (`git import` or a franchise's bundle install) and clears once a `store compact --all
+--redelta` pass has run (see [`--redelta`](#store-compact--pack-the-object-store)).
 
 The four problem lists are ordinarily all empty. A pack pair loses its
 data file only in unusual circumstances (a file removed by hand, a partial restore); when that
@@ -2270,7 +2285,7 @@ failing the census: the objects it named are not lost, only unreachable through 
 rest, restore the pack's data file). `store` checks every index in full: a pack whose
 index is damaged in places is listed under `damaged_packs` (same shape) and left out of the counts.
 Ordinary reads keep using its sound parts; an object in a damaged part reads as unverifiable.
-`forklift compact --all` salvages it (see [`compact`](#compact--pack-the-object-store)). `unenumerable_indexes` — the same `[{index_path,
+`forklift store compact --all` salvages it (see [`store compact`](#store-compact--pack-the-object-store)). `unenumerable_indexes` — the same `[{index_path,
 error}]` shape — lists any `.idx` file that could not even be parsed (its own magic/version/shape
 is wrong); its hash set is unknown, so nothing can be recovered through it automatically — move it
 aside and re-run. `foreign_version_indexes` (same shape) lists an index written by a build with a
@@ -2288,7 +2303,7 @@ was written by a build with another table format, use that build and do not move
 if it is corrupt, move it out of the pack folder, accepting that the signatures only it held are
 lost from this store until it is franchised again. `signature_conflicts` (`[{parcel,
 sidecar_path, reason}]`) names a signature file that a compaction leaves loose, as described
-under [`compact`](#compact--pack-the-object-store).
+under [`store compact`](#store-compact--pack-the-object-store).
 
 ### `heal` — resolve a durability taint or an interrupted operation
 
@@ -2376,7 +2391,7 @@ above) and prints a warning line for each one it finds — unconditionally, whet
 else was tainted this run, and whether or not that index is what caused the taint. A quarantined
 index's objects are left recoverable (`heal` refetches those under a durability taint, and
 restoring the pack's data file recovers the rest); a damaged pack still serves its
-sound parts, and once no taint is standing `forklift compact --all` salvages it; an index of another format means re-creating the warehouse; an unenumerable one names
+sound parts, and once no taint is standing `forklift store compact --all` salvages it; an index of another format means re-creating the warehouse; an unenumerable one names
 the file to move aside. This appears even when `heal` still has to refuse — as a
 clearly-separated "Pack index problems in this store (clear each as its line says)" section. An
 index the refusal itself names (see the bullet above) is part of its cause; the time one coincides
@@ -2408,7 +2423,7 @@ record cannot be read. A failure to write the record is reported (`unseal_failed
 #### Interrupted operations
 
 Every command that rewrites the whole staging area — `shift`, `park`, `consolidate` (a merge or a
-fast-forward, and the merges `haul` and `lift` run for you), `cherry-pick`, `lower`, `import-git`,
+fast-forward, and the merges `haul` and `lift` run for you), `cherry-pick`, `lower`, `git import`,
 and creating a bay — first records that it has begun, and clears the record once it is done. If
 one is killed or fails part-way (a crash, a full disk, a power cut), the record stays, and every
 command that changes the bay or commits staged content (`stack`, `load`, `shift`, `park`, `lift`,
@@ -2422,7 +2437,7 @@ of every tracked file.
   on top) — the record is cleared and nothing else is touched.
 - **It can be finished** — a shift (always: the tree it was moving to is already stored), a
   fast-forward or merge whose head landed, a park whose work is already in the parked list, an
-  `import-git` or a bay creation — the files it had not written yet are written, staging is
+  `git import` or a bay creation — the files it had not written yet are written, staging is
   rebuilt from the tree it was moving to, and the bay is put at that position. For a park, that
   means the working files are reset to the head, as the park would have left them.
 - **It did not get that far** — the head it was moving to never landed, or another bay moved the
@@ -2461,7 +2476,7 @@ value. Known keys:
 | `maintenance.loose` | Loose-object count that triggers an auto incremental compact (default 6700). |
 | `maintenance.packs` | Pack count that triggers an auto consolidating repack (default 20). |
 | `maintenance.signatureTables` | Count of signature tables below their 100,000-entry bound that triggers an auto incremental compact to merge them (default 20). |
-| `mirror.url` | The git remote `mirror` pushes to (see [`mirror`](#mirror--keep-a-git-remote-in-step)). |
+| `mirror.url` | The git remote `git mirror` pushes to (see [`git mirror`](#git-mirror--keep-a-git-remote-in-step)). |
 | `mirror.pallets` | The pallets to mirror, comma-separated (default: every pallet the remote holds). The first mirror fetches the history of each one you never lowered, and the warehouse keeps it. |
 | `mirror.auto` | Mirror the lifted pallet after each `lift`, spelled as `maintenance.auto` (default on). The mirror runs inside the lift, so the warehouse stays locked until git has answered. |
 

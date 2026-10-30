@@ -441,7 +441,7 @@ shape, `what_changed: "first_contact"` and no `previous`.
 
 ### A mirror run left behind: `mirror_incomplete`
 
-`forklift mirror` goes through every mirrored pallet even when one fails. When any was refused
+`forklift git mirror` goes through every mirrored pallet even when one fails. When any was refused
 (diverged, layout skew, a mirror repository it did not write), its push failed or raced, or
 another run held the mirror, the command fails with `mirror_incomplete` (exit 33) after the rest
 went through. `error.details` is the run's report, the same `{url, pallets}` shape a successful
@@ -619,7 +619,7 @@ ignored, so a stale resolution never applies to a later conflict.
 
 `forklift conflicts` lists the files an unresolved consolidation or cherry-pick left in conflict.
 With `--json`, each file's three sides are **content addresses** — blob hashes a
-resolver fetches (`forklift peek <hash>`) and diffs, instead of parsing marker soup:
+resolver fetches (`forklift store peek <hash>`) and diffs, instead of parsing marker soup:
 
 ```json
 {
@@ -642,7 +642,7 @@ separate from stdout. Open a pipe (or a FIFO, or a socket), leave its write end 
 the child at some fd number above 2, and put that number in the environment:
 
 ```sh
-PULT_EVENTS=7 forklift compact --json 7>events.fifo
+PULT_EVENTS=7 forklift store compact --json 7>events.fifo
 ```
 
 Forklift writes one event per line to that fd. Two verbs appear:
@@ -663,7 +663,7 @@ These commands report today, with these phases:
 | `compact` | `Collecting objects`, `Packing objects`, `Removing packed originals` |
 | `lift` | `Fetching history` (only when it merges first), `Finding objects to lift`, `Uploading objects`, `Committing staged objects` (only against a staging remote), `Updating the remote` |
 | `lower` | `Fetching history`, `Writing files`, `Rebuilding the inventory` |
-| `import-git` | `Converting commits`, `Publishing objects`, `Building the inventory` |
+| `git import` | `Converting commits`, `Publishing objects`, `Building the inventory` |
 
 Phase names are for display. Treat them as text, not as an API to branch on.
 
@@ -709,7 +709,7 @@ gone, even after Forklift exits.
 
 **The channel is Forklift's alone.** Forklift removes `PULT_EVENTS` from its environment and
 marks the descriptor close-on-exec, so nothing it runs (the per-call `forklift` processes of
-`forklift mcp`, `git` during `import-git`) writes to the channel or keeps it open. At exit, Forklift gives the writer up to 200 ms to deliver what
+`forklift mcp`, `git` during `git import`) writes to the channel or keeps it open. At exit, Forklift gives the writer up to 200 ms to deliver what
 is still queued, then exits anyway.
 
 The channel exists on macOS and Linux. On other platforms the variable is ignored.

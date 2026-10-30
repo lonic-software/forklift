@@ -22,14 +22,14 @@ use forklift_core::util::operation_utils::{Operation, OperationKind};
 use crate::events;
 use crate::output::{self, CommandOutput};
 
-/// Handle the import-git command (§7.8): one-way migration of a git repository's history
+/// Handle the git import command (§7.8): one-way migration of a git repository's history
 /// into this warehouse. Git commits become parcels, trees become trees, blobs become
 /// blobs, and each local branch becomes a pallet — so a project (or an agent moving one)
 /// can adopt forklift without leaving its history behind.
 ///
 /// The imported history is **unsigned** (it predates any trust): import into a warehouse
 /// where trust is not yet established, then `office enroll` to anchor it as the legacy
-/// boundary. Run it from the git repository's directory (`forklift import-git .`), so the
+/// boundary. Run it from the git repository's directory (`forklift git import .`), so the
 /// checked-out working tree already holds the imported HEAD — except a file git converted on
 /// checkout (line endings, `ident`, a smudge filter), which reads as an unstaged change, since
 /// the history keeps the bytes git stored and forklift converts nothing. The import warns,
@@ -54,10 +54,10 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
     // Import builds each pallet's parcels straight from the git tree (bypassing the overlay
     // entirely, unlike `stack`/`park`) and materializes the whole imported HEAD into the
     // working directory — importing into a scoped bay is not a sensible operation (§7.6).
-    // Refuse cleanly, like export-git.
+    // Refuse cleanly, like git export.
     crate::commands::scope::refuse_in_scoped_bay(
-        "import-git",
-        "Run import-git from a full workspace (or the main tree), not a scoped bay.",
+        "git import",
+        "Run \"forklift git import\" from a full workspace (or the main tree), not a scoped bay.",
     )?;
 
     // Imported parcels are unsigned; a trusted warehouse rejects those, so import must
@@ -312,7 +312,7 @@ fn ignore_git_directory() -> Result<GitRule, String> {
     if !content.is_empty() && !content.ends_with('\n') {
         content.push('\n');
     }
-    content.push_str("# git metadata (added by import-git)\n");
+    content.push_str("# git metadata (added by git import)\n");
     content.push_str(pattern);
     content.push('\n');
 

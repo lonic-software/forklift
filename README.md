@@ -14,7 +14,7 @@ So, I decided to build my own VCS with this in mind, and also add some other nic
 > getting the design right is worth more than keeping older versions working.
 >
 > So: keep anything you care about in a tool you already trust, and try Forklift beside it rather than
-> instead of it. That path is supported on purpose — `forklift export-git` turns a warehouse back into
+> instead of it. That path is supported on purpose — `forklift git export` turns a warehouse back into
 > an ordinary git repository, so trying this out is meant to be reversible.
 >
 > Bug reports and design arguments are very welcome; assumptions of stability are not yet.

@@ -197,11 +197,11 @@ pub fn message(text: impl Into<String>) {
 }
 
 /// The densify suggestion (§ densify-pending marker, `forklift_core::util::pack_utils`): shown
-/// by `store`, `import-git` and `franchise` whenever the object store carries content a bulk
+/// by `store`, `git import` and `franchise` whenever the object store carries content a bulk
 /// ingest wrote without ever seeing cross-path similarity. One shared string so the three
 /// commands never drift apart in wording. Never phrased as "recommended" — redelta is an
 /// optional, opt-in, CPU-bound pass, not something owed to every store.
-pub const DENSIFY_TIP: &str = "Tip: \"forklift compact --all --redelta\" can significantly \
+pub const DENSIFY_TIP: &str = "Tip: \"forklift store compact --all --redelta\" can significantly \
     shrink this store (one-shot, takes a few minutes on large histories).";
 
 /// The line `franchise`, `lower`, `expand`, `lift` and `office accept-regenesis` print when their
@@ -856,7 +856,7 @@ impl From<String> for ForkliftError {
 /// agent that just saw the triggering command exit 0 and has no way to know a *later*, unrelated
 /// command may exit 21 (`durability_taint`) for a reason it never caused. This codebase has no
 /// existing machine-visible side-channel for a non-fatal diagnostic (the closest precedent,
-/// `import-git`'s per-command `warnings` field, is baked into that command's own `data` before it
+/// `git import`'s per-command `warnings` field, is baked into that command's own `data` before it
 /// ever emits — not available here, since `run_if_due` runs after the triggering command's own
 /// `output::emit`/`output::message` call already printed). Stderr, structured the same way in
 /// both modes, is the least-bad channel available: never shares stdout, so the invariant above

@@ -138,7 +138,7 @@ fn json(output: &Output) -> serde_json::Value {
         .unwrap_or_else(|e| panic!("stdout is not one JSON document ({}): {}", e, stdout(output)))
 }
 
-/// Assert the state `import-git` leaves a colocated repo in: the imported tree is checked out,
+/// Assert the state `git import` leaves a colocated repo in: the imported tree is checked out,
 /// nothing is staged, and the only working-tree change is the ignore file the import wrote its
 /// `.git` rule into. That file is tracked content, so the import leaves it for the user to stack.
 fn assert_only_the_ignore_file_is_untracked(warehouse: &TestWarehouse) {
@@ -199,11 +199,11 @@ fn prepare_load_peek_remove_flow() {
     assert_success(&warehouse.run(&["prepare"]));
     assert_success(&warehouse.run(&["load", "."]));
 
-    let peek_root = warehouse.run(&["peek", "--inventory", "."]);
+    let peek_root = warehouse.run(&["store", "peek", "--inventory", "."]);
     assert_success(&peek_root);
     assert!(stdout(&peek_root).contains("readme.txt"));
 
-    let peek_nested = warehouse.run(&["peek", "--inventory", "src/data"]);
+    let peek_nested = warehouse.run(&["store", "peek", "--inventory", "src/data"]);
     assert_success(&peek_nested);
     assert!(stdout(&peek_nested).contains("nested.txt"));
 
@@ -211,13 +211,13 @@ fn prepare_load_peek_remove_flow() {
 
     // Removing stages removals instead of erasing the inventory: the entries survive,
     // marked as staged for removal.
-    let peek_after_remove = warehouse.run(&["peek", "--inventory", "."]);
+    let peek_after_remove = warehouse.run(&["store", "peek", "--inventory", "."]);
     assert_success(&peek_after_remove);
     let root_listing = stdout(&peek_after_remove);
     assert!(root_listing.contains("readme.txt"));
     assert!(root_listing.contains("Staged for removal"));
 
-    let nested_after_remove = stdout(&warehouse.run(&["peek", "--inventory", "src/data"]));
+    let nested_after_remove = stdout(&warehouse.run(&["store", "peek", "--inventory", "src/data"]));
     assert!(nested_after_remove.contains("nested.txt"));
     assert!(nested_after_remove.contains("Staged for removal"));
 }
@@ -231,7 +231,7 @@ fn removing_a_file_stages_its_removal_and_reloading_restores_it() {
     assert_success(&warehouse.run(&["load", "file.txt"]));
     assert_success(&warehouse.run(&["remove", "file.txt"]));
 
-    let staged = stdout(&warehouse.run(&["peek", "--inventory", "."]));
+    let staged = stdout(&warehouse.run(&["store", "peek", "--inventory", "."]));
     assert!(staged.contains("Staged for removal"), "remove must mark the entry, not erase it");
 
     // Removing an untracked path is still an error.
@@ -241,7 +241,7 @@ fn removing_a_file_stages_its_removal_and_reloading_restores_it() {
 
     // Loading the file again (it is still on disk) re-stages it as a normal entry.
     assert_success(&warehouse.run(&["load", "file.txt"]));
-    let restored = stdout(&warehouse.run(&["peek", "--inventory", "."]));
+    let restored = stdout(&warehouse.run(&["store", "peek", "--inventory", "."]));
     assert!(restored.contains("Loaded"));
     assert!(!restored.contains("Staged for removal"));
 }
@@ -254,12 +254,12 @@ fn reloading_a_modified_file_updates_the_staged_hash() {
     assert_success(&warehouse.run(&["prepare"]));
     assert_success(&warehouse.run(&["load", "file.txt"]));
 
-    let first_peek = stdout(&warehouse.run(&["peek", "--inventory", "."]));
+    let first_peek = stdout(&warehouse.run(&["store", "peek", "--inventory", "."]));
 
     warehouse.write_file("file.txt", "modified\n");
     assert_success(&warehouse.run(&["load", "file.txt"]));
 
-    let second_peek = stdout(&warehouse.run(&["peek", "--inventory", "."]));
+    let second_peek = stdout(&warehouse.run(&["store", "peek", "--inventory", "."]));
 
     assert!(first_peek.contains("file.txt"));
     assert!(second_peek.contains("file.txt"));
@@ -277,7 +277,7 @@ fn commands_work_from_a_subdirectory_of_the_warehouse() {
     // The inventory must land in the warehouse root, not in a new ".forklift" in "src".
     assert!(!warehouse.root.join("src/.forklift").exists());
 
-    let peek = warehouse.run(&["peek", "--inventory", "src"]);
+    let peek = warehouse.run(&["store", "peek", "--inventory", "src"]);
     assert_success(&peek);
     assert!(stdout(&peek).contains("main.txt"));
 }
@@ -294,7 +294,7 @@ fn removing_a_directory_keeps_sibling_directories_with_the_same_prefix() {
     assert_success(&warehouse.run(&["remove", "src"]));
 
     // "src2" shares a string prefix with "src" but must survive the removal.
-    let peek = warehouse.run(&["peek", "--inventory", "src2"]);
+    let peek = warehouse.run(&["store", "peek", "--inventory", "src2"]);
     assert_success(&peek);
     assert!(stdout(&peek).contains("b.txt"));
 }
@@ -336,7 +336,7 @@ fn reloading_stages_deleted_directories_and_files_for_removal() {
 
     assert_success(&warehouse.run(&["prepare"]));
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["peek", "--inventory", "src/gone_dir"]));
+    assert_success(&warehouse.run(&["store", "peek", "--inventory", "src/gone_dir"]));
 
     std::fs::remove_dir_all(warehouse.root.join("src/gone_dir")).unwrap();
     std::fs::remove_file(warehouse.root.join("src/gone_file.txt")).unwrap();
@@ -346,7 +346,7 @@ fn reloading_stages_deleted_directories_and_files_for_removal() {
     // alone.
     assert_success(&warehouse.run(&["load", "src"]));
 
-    let gone_dir = warehouse.run(&["peek", "--inventory", "src/gone_dir"]);
+    let gone_dir = warehouse.run(&["store", "peek", "--inventory", "src/gone_dir"]);
     assert_success(&gone_dir);
     let gone_dir_listing = stdout(&gone_dir);
     assert!(gone_dir_listing.contains("file.txt"));
@@ -355,7 +355,7 @@ fn reloading_stages_deleted_directories_and_files_for_removal() {
         "a deleted directory's entries must be staged for removal"
     );
 
-    let src = stdout(&warehouse.run(&["peek", "--inventory", "src"]));
+    let src = stdout(&warehouse.run(&["store", "peek", "--inventory", "src"]));
     assert!(src.contains("keep.txt"));
     let gone_file_line = src.lines().find(|line| line.contains("gone_file.txt"))
         .expect("deleted file's entry must be kept as a staged removal");
@@ -363,7 +363,7 @@ fn reloading_stages_deleted_directories_and_files_for_removal() {
     let keep_line = src.lines().find(|line| line.contains("keep.txt")).unwrap();
     assert!(keep_line.contains("Loaded"), "a present file must stay a normal entry");
 
-    let sibling = warehouse.run(&["peek", "--inventory", "src2"]);
+    let sibling = warehouse.run(&["store", "peek", "--inventory", "src2"]);
     assert_success(&sibling);
     assert!(stdout(&sibling).contains("other.txt"), "unrelated inventories must survive");
 }
@@ -391,7 +391,7 @@ fn unchanged_files_are_not_rehashed_on_reload() {
     // Find the stored blob and delete it from the object store. If the stat-cache fast
     // path works, re-loading the unchanged file must NOT re-store the blob (the file is
     // never read); if the file changes, the fallback path must re-store it.
-    let peek = stdout(&warehouse.run(&["peek", "--inventory", "src"]));
+    let peek = stdout(&warehouse.run(&["store", "peek", "--inventory", "src"]));
     let hash = peek.split_whitespace().nth(1).expect("peek line: <state> <hash> <name>");
     let object_path = warehouse.root
         .join(".forklift/objects")
@@ -864,7 +864,7 @@ fn identity_is_zero_configuration_an_id_is_minted_on_first_use() {
         "the minted id must be a UUID: {}", minted
     );
 
-    let peek = stdout(&warehouse.run(&["peek", &extract_parcel_hash(&stacked)]));
+    let peek = stdout(&warehouse.run(&["store", "peek", &extract_parcel_hash(&stacked)]));
     assert!(peek.contains(&minted), "unexpected peek: {}", peek);
 
     // The mint is stable: a second stack reuses the same id.
@@ -893,7 +893,7 @@ fn stack_creates_a_parcel_and_advances_the_pallet_head() {
     assert_eq!(ref_content.trim(), first_hash);
 
     // The parcel records the tree, the stacking operator and the description.
-    let peek = warehouse.run(&["peek", &first_hash]);
+    let peek = warehouse.run(&["store", "peek", &first_hash]);
     assert_success(&peek);
     let peek_output = stdout(&peek);
     assert!(peek_output.contains("tree"));
@@ -915,7 +915,7 @@ fn stack_creates_a_parcel_and_advances_the_pallet_head() {
     let second_hash = extract_parcel_hash(&second_stack);
     assert_ne!(first_hash, second_hash);
 
-    let second_peek = stdout(&warehouse.run(&["peek", &second_hash]));
+    let second_peek = stdout(&warehouse.run(&["store", "peek", &second_hash]));
     assert!(second_peek.contains(&format!("parent {}", first_hash)));
 }
 
@@ -946,7 +946,7 @@ fn store_reports_loose_then_packed_object_counts() {
     assert_eq!(data["maintenance"]["compaction_due"].as_bool(), Some(false));
 
     // Compact, then the same objects are packed: nothing loose, exactly one pack.
-    assert_success(&warehouse.run(&["compact"]));
+    assert_success(&warehouse.run(&["store", "compact"]));
     let packed = warehouse.run(&["--json", "store"]);
     assert_success(&packed);
     let packed = json(&packed);
@@ -1761,20 +1761,20 @@ fn stack_consumes_staged_removals() {
     let parcel_hash = extract_parcel_hash(&stack);
 
     // The staged removal was consumed: the entry is gone from the inventory...
-    let inventory = stdout(&warehouse.run(&["peek", "--inventory", "."]));
+    let inventory = stdout(&warehouse.run(&["store", "peek", "--inventory", "."]));
     assert!(inventory.contains("keep.txt"));
     assert!(!inventory.contains("remove.txt"));
     assert!(!inventory.contains("Staged for removal"));
 
     // ...and the parcel's tree does not contain the removed file.
-    let parcel_peek = stdout(&warehouse.run(&["peek", &parcel_hash]));
+    let parcel_peek = stdout(&warehouse.run(&["store", "peek", &parcel_hash]));
     let tree_hash = parcel_peek.lines()
         .find(|line| line.starts_with("tree"))
         .and_then(|line| line.split_whitespace().nth(1))
         .expect("parcel peek must print the tree hash")
         .to_string();
 
-    let tree_peek = stdout(&warehouse.run(&["peek", &tree_hash]));
+    let tree_peek = stdout(&warehouse.run(&["store", "peek", &tree_hash]));
     assert!(tree_peek.contains("keep.txt"));
     assert!(!tree_peek.contains("remove.txt"));
 }
@@ -2400,7 +2400,7 @@ fn unstaged_changes(warehouse: &TestWarehouse) -> Vec<(String, String)> {
         .collect()
 }
 
-/// `import-git` builds its inventory from git's tree over a working tree it never wrote, so it
+/// `git import` builds its inventory from git's tree over a working tree it never wrote, so it
 /// proves each file against the tree before trusting its stat: an uncommitted edit that keeps the
 /// file's size is still reported, and a large file git stores as one plain blob, which a fresh
 /// ingest would chunk, is not mistaken for a change.
@@ -2422,7 +2422,7 @@ fn import_git_proves_the_working_tree_against_the_imported_tree() {
 
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
-    assert_success(&warehouse.run(&["import-git", "."]));
+    assert_success(&warehouse.run(&["git", "import", "."]));
 
     let modified = ("modified".to_string(), "edited.txt".to_string());
     let untracked_ignore = ("untracked".to_string(), ".forkliftignore".to_string());
@@ -2444,7 +2444,7 @@ fn import_git_proves_the_working_tree_against_the_imported_tree() {
     assert_eq!(unstaged_changes(&warehouse), vec![untracked_ignore]);
 }
 
-/// An `import-git` that records the bay's position and then cannot build its inventory (a file it
+/// An `git import` that records the bay's position and then cannot build its inventory (a file it
 /// cannot read) leaves its operation standing: every command that changes the bay or commits
 /// staged content refuses until `heal`, which builds the inventory once the file can be read.
 #[cfg(unix)]
@@ -2465,7 +2465,7 @@ fn an_import_git_that_cannot_build_its_inventory_is_refused_until_heal() {
     configure_operator(&warehouse);
 
     std::fs::set_permissions(root.join("locked.txt"), std::fs::Permissions::from_mode(0o000)).unwrap();
-    let import = warehouse.run(&["import-git", "."]);
+    let import = warehouse.run(&["git", "import", "."]);
     std::fs::set_permissions(root.join("locked.txt"), std::fs::Permissions::from_mode(0o644)).unwrap();
     assert!(!import.status.success(), "the inventory build must fail on the unreadable file");
 
@@ -2473,11 +2473,11 @@ fn an_import_git_that_cannot_build_its_inventory_is_refused_until_heal() {
         let refused = json(&warehouse.run(args));
         assert_eq!(refused["error"]["code"], "incomplete_load", "{:?}: {}", args, refused);
         assert_eq!(refused["error"]["next_step"], "forklift heal", "{:?}: {}", args, refused);
-        assert!(refused["error"]["message"].as_str().unwrap().contains("import-git"), "{}", refused);
+        assert!(refused["error"]["message"].as_str().unwrap().contains("git import"), "{}", refused);
     }
 
     let healed = json(&warehouse.run(&["--json", "heal"]));
-    assert_eq!(healed["data"]["operation"]["operation"], "import-git", "{}", healed);
+    assert_eq!(healed["data"]["operation"]["operation"], "git import", "{}", healed);
     assert_eq!(healed["data"]["operation"]["outcome"], "rolled_forward", "{}", healed);
     assert_eq!(healed["data"]["operation"]["pallet"], "main", "{}", healed);
 
@@ -2509,7 +2509,7 @@ fn import_git_does_not_report_its_own_ignore_rule_as_an_unheld_file() {
 
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
-    let imported = json(&warehouse.run(&["--json", "import-git", "."]));
+    let imported = json(&warehouse.run(&["--json", "git", "import", "."]));
     assert_eq!(imported["data"]["ignored_git"], true, "{}", imported);
     assert_eq!(imported["data"]["unheld"], serde_json::json!(["edited.txt"]), "{}", imported);
     let warnings = imported["data"]["warnings"].to_string();
@@ -2525,7 +2525,7 @@ fn import_git_does_not_report_its_own_ignore_rule_as_an_unheld_file() {
 }
 
 /// Forklift has no checkout conversion, so a file git rewrote on checkout (`eol=crlf`, `ident`,
-/// `core.autocrlf=true`, a smudge filter) does not hold the bytes `import-git` imports for it. It
+/// `core.autocrlf=true`, a smudge filter) does not hold the bytes `git import` imports for it. It
 /// reads as an unstaged change from the first stocktake, and still does once its stat no longer
 /// matches, rather than reading clean until then; the import warns, naming it; and both ways of
 /// settling it the warning names leave the file clean. A file git checked out unconverted reads
@@ -2567,7 +2567,7 @@ fn import_git_reports_a_file_git_converted_on_checkout_from_the_start() {
 
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
-    let imported = json(&warehouse.run(&["--json", "import-git", "."]));
+    let imported = json(&warehouse.run(&["--json", "git", "import", "."]));
     assert_eq!(imported["data"]["unheld"], serde_json::json!(["auto.txt", "id.txt", "run.bat", "shout.up"]),
         "{}", imported);
     let warnings = imported["data"]["warnings"].as_array().unwrap();
@@ -2598,7 +2598,7 @@ fn import_git_reports_a_file_git_converted_on_checkout_from_the_start() {
 
 /// A tree large enough for the inventory build to fan out (its files recorded on worker threads,
 /// a level's subtrees loaded in parallel) lands every entry in its own directory's shard, with
-/// that file's own hash, proven: after `import-git`, which verifies each file, and after a
+/// that file's own hash, proven: after `git import`, which verifies each file, and after a
 /// `shift`, which records the files it found clean. The directories share their file names, so
 /// an entry gathered into a sibling's shard reads with the wrong content's hash.
 #[test]
@@ -2633,7 +2633,7 @@ fn a_large_tree_lands_every_entry_in_its_own_shard() {
 
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
-    assert_success(&warehouse.run(&["import-git", "."]));
+    assert_success(&warehouse.run(&["git", "import", "."]));
 
     let untracked_ignore = ("untracked".to_string(), ".forkliftignore".to_string());
     assert_eq!(unstaged_changes(&warehouse),
@@ -2656,7 +2656,7 @@ fn a_large_tree_lands_every_entry_in_its_own_shard() {
         }
     };
 
-    assert_every_entry_in_place("import-git", Some("d17/f2.txt"));
+    assert_every_entry_in_place("git import", Some("d17/f2.txt"));
     assert_eq!(inventory_entry(&warehouse, "d17", "f2.txt").content_change_timestamp, UNPROVEN_MTIME,
         "the edit must not be proven against the tree");
 
@@ -2820,12 +2820,12 @@ fn import_git_proves_an_unedited_symlink() {
 
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
-    assert_success(&warehouse.run(&["import-git", "."]));
+    assert_success(&warehouse.run(&["git", "import", "."]));
     assert_only_the_ignore_file_is_untracked(&warehouse);
 }
 
 /// A file proven against git's tree keeps the tree's kind: an executable bit the tree does not
-/// record (a checkout under `core.fileMode=false`) is not something `import-git` stages.
+/// record (a checkout under `core.fileMode=false`) is not something `git import` stages.
 #[cfg(unix)]
 #[test]
 fn import_git_keeps_the_tree_kind_of_a_proven_file() {
@@ -2842,7 +2842,7 @@ fn import_git_keeps_the_tree_kind_of_a_proven_file() {
 
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
-    assert_success(&warehouse.run(&["import-git", "."]));
+    assert_success(&warehouse.run(&["git", "import", "."]));
     assert_eq!(inventory_entry(&warehouse, "", "tool.sh").item_type,
         forklift_core::enums::dir_entry_type::DirEntryType::Normal, "the tree's kind must be kept");
 }
@@ -2948,7 +2948,7 @@ fn re_proving_an_unproven_entry_never_hides_a_kind_change() {
     git_in(&root, &["commit", "-qm", "first commit"]);
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
-    assert_success(&warehouse.run(&["import-git", "."]));
+    assert_success(&warehouse.run(&["git", "import", "."]));
 
     std::fs::set_permissions(root.join("big.bin"), std::fs::Permissions::from_mode(0o755)).unwrap();
     forklift_core::util::file_utils::rename(root.join("file.txt"), root.join("copy.txt")).unwrap();
@@ -3272,7 +3272,7 @@ fn consolidate_merges_divergent_pallets_cleanly() {
 
     // The merge parcel records both parents; the consolidation state is consumed.
     let merge_hash = merge_output.split_whitespace().last().unwrap().trim_end_matches('.');
-    let peek = stdout(&warehouse.run(&["peek", merge_hash]));
+    let peek = stdout(&warehouse.run(&["store", "peek", merge_hash]));
     assert!(peek.contains(&format!("parent {}", main_head)));
     assert!(peek.contains(&format!("parent {}", feature_head)));
     assert!(!warehouse.root.join(".forklift/consolidation").exists());
@@ -3306,7 +3306,7 @@ fn commit_graph_is_built_by_compact_and_ancestry_stays_correct() {
     assert_success(&warehouse.run(&["stack", "main work"]));
 
     // Compact builds and persists the commit-graph (sharded by parcel-hash prefix).
-    assert_success(&warehouse.run(&["compact"]));
+    assert_success(&warehouse.run(&["store", "compact"]));
     let graph_root = warehouse.root.join(".forklift/graph");
     assert!(graph_root.exists(), "compact must create the commit-graph store");
     let shard_count = std::fs::read_dir(&graph_root).unwrap().filter_map(Result::ok).count();
@@ -3355,7 +3355,7 @@ fn a_corrupted_commit_graph_shard_is_ignored_and_rewritten() {
     assert_success(&warehouse.run(&["load", "file.txt"]));
     assert_success(&warehouse.run(&["stack", "main work"]));
 
-    assert_success(&warehouse.run(&["compact"]));
+    assert_success(&warehouse.run(&["store", "compact"]));
     let graph_root = warehouse.root.join(".forklift/graph");
     let shards: Vec<_> = std::fs::read_dir(&graph_root).unwrap()
         .map(|entry| entry.unwrap().path())
@@ -3387,7 +3387,7 @@ fn a_corrupted_commit_graph_shard_is_ignored_and_rewritten() {
     assert!(rewritten > 0, "the merge must have rewritten at least one damaged shard");
 
     // A rebuild from every head heals the rest: each shard is sealed again and holds records.
-    assert_success(&warehouse.run(&["compact"]));
+    assert_success(&warehouse.run(&["store", "compact"]));
     for shard in &shards {
         assert!(graph_shard_is_sealed_with_records(shard),
             "every damaged shard must be rewritten whole: {}", shard.display());
@@ -3447,7 +3447,7 @@ fn compact_rebuilds_lost_ancestor_shards_behind_a_recorded_head() {
         assert_success(&warehouse.run(&["load", "."]));
         assert_success(&warehouse.run(&["stack", &format!("c{}", i)]));
     }
-    assert_success(&warehouse.run(&["compact"]));
+    assert_success(&warehouse.run(&["store", "compact"]));
 
     let graph_root = warehouse.root.join(".forklift/graph");
     let head = pallet_head_hash(&warehouse, "main");
@@ -3461,7 +3461,7 @@ fn compact_rebuilds_lost_ancestor_shards_behind_a_recorded_head() {
         std::fs::remove_file(shard).unwrap();
     }
 
-    assert_success(&warehouse.run(&["compact"]));
+    assert_success(&warehouse.run(&["store", "compact"]));
     for shard in &shards {
         assert!(shard.exists() && graph_shard_is_sealed_with_records(shard),
             "compact must rebuild the lost ancestor shard {}", shard.display());
@@ -3575,7 +3575,7 @@ fn a_cold_blame_writes_each_commit_graph_shard_a_bounded_number_of_times() {
 
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
-    assert_success(&warehouse.run(&["import-git", ".", "--no-compact"]));
+    assert_success(&warehouse.run(&["git", "import", ".", "--no-compact"]));
 
     let graph_root = warehouse.root.join(".forklift/graph");
     let _ = std::fs::remove_dir_all(&graph_root);
@@ -3654,7 +3654,7 @@ fn consolidate_conflicts_are_marked_and_resolved_by_stacking() {
     assert_success(&resolved);
     let merge_hash = extract_parcel_hash(&resolved);
 
-    let peek = stdout(&warehouse.run(&["peek", &merge_hash]));
+    let peek = stdout(&warehouse.run(&["store", "peek", &merge_hash]));
     assert!(peek.contains(&format!("parent {}", feature_head)));
     assert!(!warehouse.root.join(".forklift/consolidation").exists());
 
@@ -3800,7 +3800,7 @@ fn symlinks_are_stored_as_symlinks_and_cycles_do_not_hang() {
         assert_success(&warehouse.run(&["prepare"]));
         assert_success(&warehouse.run(&["load", "src"]));
 
-        let peek = warehouse.run(&["peek", "--inventory", "src"]);
+        let peek = warehouse.run(&["store", "peek", "--inventory", "src"]);
         assert_success(&peek);
         assert!(stdout(&peek).contains("loop"), "the symlink itself must be tracked");
     }
@@ -3890,7 +3890,7 @@ fn diff_renders_many_files_in_path_order_in_every_mode() {
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "first"]));
-    assert_success(&warehouse.run(&["compact"]));
+    assert_success(&warehouse.run(&["store", "compact"]));
 
     for name in &names {
         warehouse.write_file(name, &format!("new {}\n", name));
@@ -4051,7 +4051,7 @@ fn reading_a_pack_validates_only_the_index_buckets_it_touches() {
         }
         assert_success(&warehouse.run(&["load", "."]));
         assert_success(&warehouse.run(&["stack", &format!("round {}", round)]));
-        assert_success(&warehouse.run(&["compact"]));
+        assert_success(&warehouse.run(&["store", "compact"]));
     }
     let counts = [("FORKLIFT_DEBUG_PACK_COUNTS", "1")];
 
@@ -4064,7 +4064,7 @@ fn reading_a_pack_validates_only_the_index_buckets_it_touches() {
     // costs at most one bucket per pack, found or not — a whole-index check would cost all 32.
     assert!((1..=4).contains(&buckets), "one parcel read must validate a few buckets of 32, got {}", buckets);
 
-    let repack = warehouse.run_with_env(&["compact", "--all"], &counts);
+    let repack = warehouse.run_with_env(&["store", "compact", "--all"], &counts);
     assert_success(&repack);
     assert_eq!(index_validation_counts(&repack).1, 2, "a full repack validates each of the two packs once");
 }
@@ -4082,7 +4082,7 @@ fn diff_preloads_the_pack_set_only_for_a_change_it_renders() {
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "first"]));
-    assert_success(&warehouse.run(&["compact"]));
+    assert_success(&warehouse.run(&["store", "compact"]));
     let counts = [("FORKLIFT_DEBUG_PACK_COUNTS", "1")];
 
     let clean = warehouse.run_with_env(&["diff"], &counts);
@@ -4124,7 +4124,7 @@ fn diff_prints_the_files_before_an_unreadable_one_then_fails() {
     assert_success(&warehouse.run(&["load", "."]));
 
     let stored_hash = |dir: &str, name: &str| -> String {
-        let peek = stdout(&warehouse.run(&["peek", "--inventory", dir]));
+        let peek = stdout(&warehouse.run(&["store", "peek", "--inventory", dir]));
         let line = peek.lines().find(|line| line.ends_with(name)).unwrap_or_else(|| panic!("{} not in: {}", name, peek));
         line.split_whitespace().nth(1).expect("peek line: <state> <hash> <name>").to_string()
     };
@@ -4792,7 +4792,7 @@ fn import_git_migrates_a_repo_into_the_warehouse() {
     // Import it (the warehouse is fresh — imported history is unsigned).
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
-    let imported = warehouse.run(&["import-git", "."]);
+    let imported = warehouse.run(&["git", "import", "."]);
     assert_success(&imported);
     assert!(stdout(&imported).contains("Imported 2 commit(s) into 2 pallet(s)"), "{}", stdout(&imported));
 
@@ -4812,12 +4812,12 @@ fn import_git_migrates_a_repo_into_the_warehouse() {
     assert!(stdout(&warehouse.run(&["audit"])).contains("legacy"));
 
     // A second import into the now-trusted warehouse is refused.
-    assert!(!warehouse.run(&["import-git", "."]).status.success());
+    assert!(!warehouse.run(&["git", "import", "."]).status.success());
 }
 
 #[test]
 fn import_git_ignores_only_the_git_directory_not_its_dotfile_siblings() {
-    // The `.git` rule import-git writes must not swallow tracked files that merely start
+    // The `.git` rule git import writes must not swallow tracked files that merely start
     // with `.git`: if it does, the first ordinary `load .` stages their removal.
     let warehouse = TestWarehouse::new("import-git-siblings");
     let root = warehouse.root.clone();
@@ -4844,7 +4844,7 @@ fn import_git_ignores_only_the_git_directory_not_its_dotfile_siblings() {
 
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
-    assert_success(&warehouse.run(&["import-git", "."]));
+    assert_success(&warehouse.run(&["git", "import", "."]));
 
     // Before the load, nothing is staged and only the import's ignore file is untracked: the
     // import builds the tree from git objects, not the worktree. The over-broad rule only bites
@@ -4900,7 +4900,7 @@ fn import_git_auto_compacts_unless_no_compact() {
     seed_git_repo(&packed.root);
     assert_success(&packed.run(&["prepare"]));
     configure_operator(&packed);
-    let out = packed.run(&["import-git", "."]);
+    let out = packed.run(&["git", "import", "."]);
     assert_success(&out);
     assert!(stdout(&out).contains("Packed the imported store"), "import should pack the store: {}", stdout(&out));
     assert!(stdout(&out).contains("2 delta-compressed"),
@@ -4916,7 +4916,7 @@ fn import_git_auto_compacts_unless_no_compact() {
     seed_git_repo(&loose.root);
     assert_success(&loose.run(&["prepare"]));
     configure_operator(&loose);
-    let out = loose.run(&["import-git", ".", "--no-compact"]);
+    let out = loose.run(&["git", "import", ".", "--no-compact"]);
     assert_success(&out);
     assert!(!stdout(&out).contains("Packed the imported store"), "--no-compact must skip packing: {}", stdout(&out));
     assert!(count_loose_objects(&loose.root.join(".forklift/objects")) > 0, "objects should stay loose with --no-compact");
@@ -4970,7 +4970,7 @@ fn import_git_rederives_tree_bases_when_the_cache_is_starved() {
     seed_repo(&default_budget.root);
     assert_success(&default_budget.run(&["prepare"]));
     configure_operator(&default_budget);
-    let baseline = default_budget.run(&["import-git", "."]);
+    let baseline = default_budget.run(&["git", "import", "."]);
     assert_success(&baseline);
     let baseline_deltas = delta_count(&stdout(&baseline));
     assert!(baseline_deltas > 0, "expected at least one delta in the baseline import: {}", stdout(&baseline));
@@ -4982,7 +4982,7 @@ fn import_git_rederives_tree_bases_when_the_cache_is_starved() {
     seed_repo(&starved.root);
     assert_success(&starved.run(&["prepare"]));
     configure_operator(&starved);
-    let zero_budget = starved.run_with_env(&["import-git", "."], &[("FORKLIFT_IMPORT_CACHE_BYTES", "0")]);
+    let zero_budget = starved.run_with_env(&["git", "import", "."], &[("FORKLIFT_IMPORT_CACHE_BYTES", "0")]);
     assert_success(&zero_budget);
     let starved_deltas = delta_count(&stdout(&zero_budget));
     assert_eq!(starved_deltas, baseline_deltas,
@@ -5029,7 +5029,7 @@ fn import_git_never_replaces_an_ignore_file_it_cannot_read() {
         return;
     }
 
-    let imported = warehouse.run(&["import-git", "."]);
+    let imported = warehouse.run(&["git", "import", "."]);
     std::fs::set_permissions(&ignore_file, std::fs::Permissions::from_mode(0o644)).unwrap();
 
     assert_success(&imported);
@@ -5063,7 +5063,7 @@ fn import_git_from_elsewhere_writes_no_ignore_file() {
     warehouse.write_file("a.txt", "hello\n");
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
-    let imported = warehouse.run(&["import-git", source.root.to_str().unwrap()]);
+    let imported = warehouse.run(&["git", "import", source.root.to_str().unwrap()]);
     assert_success(&imported);
     assert!(!stdout(&imported).contains(".forkliftignore"), "{}", stdout(&imported));
     assert!(!warehouse.root.join(".forkliftignore").exists(), "no `.git` here, so no rule to add");
@@ -5074,7 +5074,7 @@ fn import_git_from_elsewhere_writes_no_ignore_file() {
     configure_operator(&colocated);
     std::fs::create_dir(colocated.root.join(".git")).unwrap();
     colocated.write_file("a.txt", "hello\n");
-    assert_success(&colocated.run(&["import-git", source.root.to_str().unwrap()]));
+    assert_success(&colocated.run(&["git", "import", source.root.to_str().unwrap()]));
     let rules = std::fs::read_to_string(colocated.root.join(".forkliftignore")).unwrap();
     assert!(rules.lines().any(|line| line == r"^\.git(/.*)?$"), "{:?}", rules);
 }
@@ -5111,7 +5111,7 @@ fn import_git_warnings_are_sanitized_for_the_terminal() {
     warehouse.write_file("a.txt", "hello\n");
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
-    let imported = warehouse.run(&["import-git", source.root.to_str().unwrap()]);
+    let imported = warehouse.run(&["git", "import", source.root.to_str().unwrap()]);
     assert_success(&imported);
     assert!(stdout(&imported).contains(&format!("  warning: skipped submodule \"{}\"", shown)), "{:?}", stdout(&imported));
     assert!(!stdout(&imported).contains(['\u{202E}', '\u{1b}', '\u{7}']), "{:?}", stdout(&imported));
@@ -5148,20 +5148,20 @@ fn import_git_reports_a_rule_already_covering_git_and_leaves_a_refused_file_alon
     // A differently spelled rule that covers `.git` is reported by line, and none is added.
     let rules = "^x$\n^\\.git($|/)\n";
     let spelled = colocated("import-git-rule-spelled", rules);
-    let imported = spelled.run(&["--json", "import-git", source.root.to_str().unwrap()]);
+    let imported = spelled.run(&["--json", "git", "import", source.root.to_str().unwrap()]);
     assert_success(&imported);
     let report = json(&imported);
     assert_eq!(report["data"]["ignored_git"], false, "{}", report);
     assert_eq!(report["data"]["git_already_ignored"], serde_json::json!({"line": 2, "pattern": "^\\.git($|/)"}), "{}", report);
     assert_eq!(std::fs::read_to_string(spelled.root.join(".forkliftignore")).unwrap(), rules);
-    let human = colocated("import-git-rule-spelled-human", rules).run(&["import-git", source.root.to_str().unwrap()]);
+    let human = colocated("import-git-rule-spelled-human", rules).run(&["git", "import", source.root.to_str().unwrap()]);
     assert_success(&human);
     assert!(stdout(&human).contains("\".git/\" is already ignored by line 2 of \".forkliftignore\": ^\\.git($|/)"),
         "{}", stdout(&human));
 
     // A rule that does not match `.git` itself is no rule for it: the rule is added.
     let unrelated = colocated("import-git-rule-unrelated", "^\\.github$\n");
-    let imported = json(&unrelated.run(&["--json", "import-git", source.root.to_str().unwrap()]));
+    let imported = json(&unrelated.run(&["--json", "git", "import", source.root.to_str().unwrap()]));
     assert_eq!(imported["data"]["ignored_git"], true, "{}", imported);
     assert!(imported["data"].get("git_already_ignored").is_none(), "{}", imported);
 
@@ -5169,7 +5169,7 @@ fn import_git_reports_a_rule_already_covering_git_and_leaves_a_refused_file_alon
     // leave it refused: the file is left as it was, with a warning naming why.
     let rules = "  ^\\.git(/.*)?$\n";
     let indented = colocated("import-git-rule-indented", rules);
-    let imported = indented.run(&["import-git", source.root.to_str().unwrap()]);
+    let imported = indented.run(&["git", "import", source.root.to_str().unwrap()]);
     assert_success(&imported);
     assert!(stdout(&imported).contains(r"is refused, so it was left unchanged. Fix the problem below, then add the rule ^\.git(/.*)?$ if no rule covers"),
         "{}", stdout(&imported));
@@ -5188,7 +5188,7 @@ fn import_git_reports_a_rule_already_covering_git_and_leaves_a_refused_file_alon
         std::fs::remove_file(&ignore_file).unwrap();
         linked.write_file("rules.txt", "^x$\n");
         std::os::unix::fs::symlink("rules.txt", &ignore_file).unwrap();
-        let imported = linked.run(&["import-git", source.root.to_str().unwrap()]);
+        let imported = linked.run(&["git", "import", source.root.to_str().unwrap()]);
         assert_success(&imported);
         assert!(stdout(&imported).contains("is refused, so it was left unchanged") && stdout(&imported).contains("must be a regular file"),
             "{}", stdout(&imported));
@@ -5329,7 +5329,7 @@ fn import_git_tolerates_non_utf8_author_names() {
     configure_operator(&warehouse);
 
     // The import must succeed rather than abort on the non-UTF-8 author name…
-    let imported = warehouse.run(&["import-git", "."]);
+    let imported = warehouse.run(&["git", "import", "."]);
     assert_success(&imported);
     assert!(stdout(&imported).contains("Imported 1 commit(s)"), "{}", stdout(&imported));
 
@@ -5365,8 +5365,8 @@ fn import_git_refuses_a_top_level_alias_of_the_metadata_folder() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
 
-    let imported = warehouse.run(&["import-git", "."]);
-    assert!(!imported.status.success(), "import-git accepted the alias: {}", stdout(&imported));
+    let imported = warehouse.run(&["git", "import", "."]);
+    assert!(!imported.status.success(), "git import accepted the alias: {}", stdout(&imported));
     assert!(stderr(&imported).contains("\".forklift.\""), "the refusal must name the entry: {}", stderr(&imported));
 }
 
@@ -5402,8 +5402,8 @@ fn import_git_refuses_the_alias_in_a_root_tree_it_first_met_as_a_subdirectory() 
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
 
-    let imported = warehouse.run(&["import-git", "."]);
-    assert!(!imported.status.success(), "import-git accepted the alias: {}", stdout(&imported));
+    let imported = warehouse.run(&["git", "import", "."]);
+    assert!(!imported.status.success(), "git import accepted the alias: {}", stdout(&imported));
     assert!(stderr(&imported).contains("\".forklift.\""), "the refusal must name the entry: {}", stderr(&imported));
 }
 
@@ -5423,7 +5423,7 @@ fn export_git_writes_the_history_into_a_git_repo() {
 
     let out = warehouse.root.join("exported");
     let out_str = out.to_str().unwrap();
-    let exported = warehouse.run(&["export-git", out_str]);
+    let exported = warehouse.run(&["git", "export", out_str]);
     assert_success(&exported);
     assert!(stdout(&exported).contains("Exported 2 commit(s)"), "unexpected: {}", stdout(&exported));
 
@@ -5451,7 +5451,7 @@ fn export_git_writes_the_history_into_a_git_repo() {
     git(&["fsck", "--strict"]);
 
     // A non-empty target is refused.
-    assert!(!warehouse.run(&["export-git", out_str]).status.success());
+    assert!(!warehouse.run(&["git", "export", out_str]).status.success());
 }
 
 /// Test 1 of the export design: the user's git configuration and environment never reach an
@@ -5485,7 +5485,7 @@ fn export_git_writes_the_same_tip_under_a_hostile_git_environment() {
 
     let export = |name: &str, env: &[(&str, &str)]| -> String {
         let out = warehouse.root.join(name);
-        assert_success(&warehouse.run_with_env(&["export-git", out.to_str().unwrap()], env));
+        assert_success(&warehouse.run_with_env(&["git", "export", out.to_str().unwrap()], env));
         let output = Command::new("git").args(["rev-parse", "main"]).current_dir(&out).output().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         String::from_utf8(output.stdout).unwrap().trim().to_string()
@@ -5522,7 +5522,7 @@ fn export_git_keeps_tree_names_with_line_breaks_tabs_and_quotes() {
     assert_success(&warehouse.run(&["stack", "hostile names"]));
 
     let out = warehouse.root.join("exported");
-    assert_success(&warehouse.run(&["export-git", out.to_str().unwrap()]));
+    assert_success(&warehouse.run(&["git", "export", out.to_str().unwrap()]));
 
     let listing = Command::new("git")
         .args(["ls-tree", "-r", "-z", "--name-only", "main"])
@@ -5999,7 +5999,7 @@ fn record_text_renders_inert_for_humans_and_verbatim_in_json() {
     let renders: [&[&str]; 7] = [
         &["history"],
         &["history", "--oneline"],
-        &["peek", &parcel],
+        &["store", "peek", &parcel],
         &["haul", "list"],
         &["haul", "show", &id],
         &["query", &parcel],
@@ -6904,7 +6904,7 @@ fn profiles_select_the_identity_a_warehouse_acts_under() {
     assert_success(&warehouse.run(&["load", "."]));
     let stacked = warehouse.run(&["stack", "as work"]);
     assert_success(&stacked);
-    let peek = stdout(&warehouse.run(&["peek", &extract_parcel_hash(&stacked)]));
+    let peek = stdout(&warehouse.run(&["store", "peek", &extract_parcel_hash(&stacked)]));
     assert!(peek.contains(&work_id), "unexpected peek: {}", peek);
     assert!(!peek.contains("test@forklift"), "unexpected peek: {}", peek);
 
@@ -7677,6 +7677,16 @@ fn a_unique_prefix_runs_the_command_and_an_ambiguous_one_is_a_usage_error() {
                "\"he\" could be \"forklift heal\" or \"forklift help\"; type more of the name");
     assert!(value["command"].is_null(), "{}", value);
 
+    // `sto` starts stocktake and store.
+    let value = json(&warehouse.run(&["--json", "sto"]));
+    assert_eq!(value["error"]["message"],
+               "\"sto\" could be \"forklift stocktake\" or \"forklift store\"; type more of the name");
+
+    // A family's subcommand is matched the same way, and the header names the family.
+    let value = json(&warehouse.run(&["--json", "stor", "pe", "0"]));
+    assert_eq!(value["error"]["code"], "not_a_warehouse", "{}", value);
+    assert_eq!(value["command"], "store", "{}", value);
+
     // Below the top level, the words before the ambiguous one still name their command.
     let value = json(&warehouse.run(&["--json", "ha", "re"]));
     assert_eq!(value["error"]["code"], "usage");
@@ -7697,6 +7707,32 @@ fn a_unique_prefix_runs_the_command_and_an_ambiguous_one_is_a_usage_error() {
     let help = json(&warehouse.run(&["--json", "help", "hau", "re"]));
     assert_eq!(help["error"]["message"],
                "\"re\" could be \"forklift help haul review\" or \"forklift help haul reopen\"; type more of the name");
+}
+
+/// The families that hold only operations print their help run bare, and run nothing: `git`,
+/// whose subcommands each name a different direction, and not `store`, whose bare form reports
+/// as `store status` does.
+///
+/// Revert: drop `arg_required_else_help` from `git` → the bare run is clap's missing-subcommand
+/// error, with no subcommand list; give `store` a required subcommand → its bare run fails.
+#[test]
+fn bare_git_prints_its_help_and_bare_store_reports() {
+    let warehouse = TestWarehouse::new("bare-families");
+    let family = "git";
+
+    let bare = warehouse.run(&[family]);
+    assert_eq!(bare.status.code(), Some(2), "{}{}", stdout(&bare), stderr(&bare));
+    let help = format!("{}{}", stdout(&bare), stderr(&bare));
+    for sub in ["import", "export", "mirror"] {
+        assert!(help.contains(&format!("  {} ", sub)), "{} lists {}: {}", family, sub, help);
+    }
+
+    assert_success(&warehouse.run(&["prepare"]));
+    let store = json(&warehouse.run(&["--json", "store"]));
+    let status = json(&warehouse.run(&["--json", "store", "status"]));
+    assert_eq!(store["ok"], true, "{}", store);
+    assert_eq!(store["data"], status["data"], "bare store reports as store status does");
+    assert_eq!(store["command"], "store", "{}", store);
 }
 
 #[test]
@@ -8453,13 +8489,13 @@ fn conflicts_json_exposes_the_three_sides_as_content_addresses() {
     assert_eq!(conflict["markers"], true);
 
     // The three sides are content addresses a resolver can fetch: peek each.
-    let base = stdout(&warehouse.run(&["peek", conflict["base"].as_str().unwrap()]));
+    let base = stdout(&warehouse.run(&["store", "peek", conflict["base"].as_str().unwrap()]));
     assert!(base.contains("line2") && !base.contains("OURS") && !base.contains("THEIRS"), "{}", base);
 
-    let ours = stdout(&warehouse.run(&["peek", conflict["ours"].as_str().unwrap()]));
+    let ours = stdout(&warehouse.run(&["store", "peek", conflict["ours"].as_str().unwrap()]));
     assert!(ours.contains("OURS"), "{}", ours);
 
-    let theirs = stdout(&warehouse.run(&["peek", conflict["theirs"].as_str().unwrap()]));
+    let theirs = stdout(&warehouse.run(&["store", "peek", conflict["theirs"].as_str().unwrap()]));
     assert!(theirs.contains("THEIRS"), "{}", theirs);
 }
 
@@ -8546,11 +8582,11 @@ fn mcp_exposes_and_runs_the_parity_pass_tools() {
     let reply: serde_json::Value = serde_json::from_str(stdout(&list).lines().next().unwrap()).unwrap();
     let names: std::collections::HashSet<&str> = reply["result"]["tools"]
         .as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    for expected in ["blame", "deliver", "cherry_pick", "manifest_provenance", "haul_open", "park_pop", "tag_list", "compact"] {
+    for expected in ["blame", "deliver", "cherry_pick", "manifest_provenance", "haul_open", "park_pop", "tag_list", "store_status", "store_compact", "store_peek"] {
         assert!(names.contains(expected), "MCP must advertise `{}`", expected);
     }
     // A family whose bare form is one of its subcommands is that subcommand's tool alone.
-    for absent in ["tag", "haul", "office", "scope", "office_enroll", "prepare"] {
+    for absent in ["tag", "haul", "office", "scope", "store", "store_evict", "git_import", "remote", "office_enroll", "prepare"] {
         assert!(!names.contains(absent), "MCP must not advertise `{}`", absent);
     }
 
@@ -8567,7 +8603,7 @@ fn mcp_exposes_and_runs_the_parity_pass_tools() {
     assert_eq!(call("park_list", "{}")["result"]["isError"], false);
     assert_eq!(call("haul_list", "{}")["result"]["isError"], false);
     // A no-arg maintenance tool runs through the same subprocess path (and packs the store).
-    assert_eq!(call("compact", "{}")["result"]["isError"], false);
+    assert_eq!(call("store_compact", "{}")["result"]["isError"], false);
     // A missing required argument is surfaced as a JSON-RPC error, not a panic.
     let missing = call("blame", "{}");
     assert!(missing["error"].is_object(), "a missing required arg must be an error: {}", missing);
@@ -9294,7 +9330,7 @@ fn blame_skips_untouched_parcels_via_the_changed_path_filter_and_stays_correct()
     let c4 = extract_parcel_hash(&warehouse.run(&["stack", "change target"]));
 
     // Compact builds the changed-path filters, so the blame below reads them (the fast path).
-    assert_success(&warehouse.run(&["compact"]));
+    assert_success(&warehouse.run(&["store", "compact"]));
 
     let blame = json(&warehouse.run(&["--json", "blame", "target.txt"]));
     let lines = blame["data"]["lines"].as_array().unwrap();
@@ -9846,7 +9882,7 @@ fn compact_packs_the_object_store_and_reads_survive() {
     assert!(loose_before > 0, "there should be loose objects to pack");
 
     // Compact reports exactly what it packed and removed.
-    let compact = warehouse.run(&["--json", "compact"]);
+    let compact = warehouse.run(&["--json", "store", "compact"]);
     assert_success(&compact);
     let data = json(&compact)["data"].clone();
     assert_eq!(data["objects_packed"].as_u64().unwrap(), loose_before as u64);
@@ -9863,10 +9899,10 @@ fn compact_packs_the_object_store_and_reads_survive() {
     assert_success(&history);
     assert!(stdout(&history).contains("first"), "history must read packed parcels");
     assert!(stdout(&history).contains("second"));
-    assert_success(&warehouse.run(&["peek", &head]));
+    assert_success(&warehouse.run(&["store", "peek", &head]));
 
     // A second compaction has nothing to do.
-    let again = warehouse.run(&["--json", "compact"]);
+    let again = warehouse.run(&["--json", "store", "compact"]);
     assert_success(&again);
     assert_eq!(json(&again)["data"]["objects_packed"].as_u64().unwrap(), 0);
 }
@@ -9892,7 +9928,7 @@ fn compact_preserves_signed_history_for_audit() {
     let sidecar = objects.join(&signed[0..2]).join(format!("{}.sig", &signed[2..]));
     let signature = std::fs::read(&sidecar).unwrap();
 
-    assert_success(&warehouse.run(&["compact"]));
+    assert_success(&warehouse.run(&["store", "compact"]));
 
     // The parcel object is packed away, and its signature sidecar is swept into a signature
     // table beside the packs.
@@ -9905,7 +9941,7 @@ fn compact_preserves_signed_history_for_audit() {
 
     // A leftover copy of a tabled signature is removed, and said so: nothing is moved or written.
     std::fs::write(&sidecar, &signature).unwrap();
-    let rerun = stdout(&warehouse.run(&["compact"]));
+    let rerun = stdout(&warehouse.run(&["store", "compact"]));
     assert!(rerun.contains("Removed 1 signature file already held in signature tables."), "{}", rerun);
     assert!(!rerun.contains("into 0 signature tables"), "{}", rerun);
     assert!(!sidecar.exists(), "the leftover must be removed");
@@ -9939,7 +9975,7 @@ fn compact_path_aware_delta_chains_reconstruct() {
     let oldest = entries[11]["parcel"].as_str().unwrap().to_string();
 
     // Compact: the versioned blob is stored as a path-aware delta chain.
-    let compact = warehouse.run(&["--json", "compact"]);
+    let compact = warehouse.run(&["--json", "store", "compact"]);
     assert_success(&compact);
     assert!(json(&compact)["data"]["deltas"].as_u64().unwrap() > 0, "path versions should delta");
     assert_eq!(count_loose_objects(&warehouse.root.join(".forklift/objects")), 0);
@@ -9966,7 +10002,7 @@ fn compact_all_repacks_consolidates_and_drops_garbage() {
         warehouse.write_file("f.txt", &format!("content {} xyzzy\n", v));
         assert_success(&warehouse.run(&["load", "."]));
         assert_success(&warehouse.run(&["stack", &format!("v{}", v)]));
-        assert_success(&warehouse.run(&["compact"]));
+        assert_success(&warehouse.run(&["store", "compact"]));
     }
 
     // Create garbage: stack a parcel, then undo it (orphaning its objects), and compact so
@@ -9975,21 +10011,21 @@ fn compact_all_repacks_consolidates_and_drops_garbage() {
     assert_success(&warehouse.run(&["load", "."]));
     let orphan = extract_parcel_hash(&warehouse.run(&["stack", "garbage"]));
     assert_success(&warehouse.run(&["undo"]));
-    assert_success(&warehouse.run(&["compact"]));
+    assert_success(&warehouse.run(&["store", "compact"]));
     // The orphan is packed but not yet collected, so it is still retrievable.
-    assert_success(&warehouse.run(&["peek", &orphan]));
+    assert_success(&warehouse.run(&["store", "peek", &orphan]));
 
     let objects = warehouse.root.join(".forklift/objects");
     assert!(count_packs(&objects) > 1, "several compacts should have made several packs");
 
     // Repack: consolidate the packs and drop the orphaned (unreachable) parcel.
-    let repack = warehouse.run(&["--json", "compact", "--all"]);
+    let repack = warehouse.run(&["--json", "store", "compact", "--all"]);
     assert_success(&repack);
     assert_eq!(json(&repack)["data"]["all"], true);
     assert_eq!(count_packs(&objects), 1, "a repack consolidates to a single pack");
 
     // The garbage is gone; the live history is intact and still reads.
-    assert!(!warehouse.run(&["peek", &orphan]).status.success(), "the orphaned parcel must be dropped");
+    assert!(!warehouse.run(&["store", "peek", &orphan]).status.success(), "the orphaned parcel must be dropped");
     assert_eq!(
         json(&warehouse.run(&["--json", "history"]))["data"]["entries"].as_array().unwrap().len(),
         4, "every live parcel must survive the repack"
@@ -9997,7 +10033,7 @@ fn compact_all_repacks_consolidates_and_drops_garbage() {
 
     // A second repack is idempotent and never loses the pack (regression: the layout-derived
     // pack name once made the repack delete the very pack it had just written).
-    assert_success(&warehouse.run(&["compact", "--all"]));
+    assert_success(&warehouse.run(&["store", "compact", "--all"]));
     assert_eq!(count_packs(&objects), 1, "an idempotent repack must keep the pack");
     assert_eq!(
         json(&warehouse.run(&["--json", "history"]))["data"]["entries"].as_array().unwrap().len(),
@@ -10006,7 +10042,7 @@ fn compact_all_repacks_consolidates_and_drops_garbage() {
 }
 
 /// (FORK-194) A pack whose index has a corrupt bucket but whose data is intact: `store` lists it as
-/// damaged and names `forklift compact --all` as the remedy, saying what a kept pack or a refusal
+/// damaged and names `forklift store compact --all` as the remedy, saying what a kept pack or a refusal
 /// means; `compact --all` salvages it, lists it as dropped in `--json`, and the history still
 /// reads in full.
 #[test]
@@ -10019,7 +10055,7 @@ fn compact_all_salvages_a_pack_with_a_corrupt_index_bucket() {
         assert_success(&warehouse.run(&["load", "."]));
         assert_success(&warehouse.run(&["stack", &format!("v{}", v)]));
     }
-    assert_success(&warehouse.run(&["compact"]));
+    assert_success(&warehouse.run(&["store", "compact"]));
 
     // Flip one bit of the first record's offset: its bucket's crc fails, the header and fanout
     // table still parse, and the data file is untouched. The layout: a 24-byte header whose byte
@@ -10040,11 +10076,11 @@ fn compact_all_salvages_a_pack_with_a_corrupt_index_bucket() {
     assert_success(&store);
     let text = stdout(&store);
     assert!(text.contains("damaged:") && text.contains(&index_name), "{}", text);
-    assert!(text.contains("\"forklift compact --all\" salvages it"), "{}", text);
+    assert!(text.contains("\"forklift store compact --all\" salvages it"), "{}", text);
     assert!(text.contains("refuses because the pack could not be completely salvaged"), "{}", text);
     assert_eq!(json(&warehouse.run(&["--json", "store"]))["data"]["damaged_packs"].as_array().unwrap().len(), 1);
 
-    let repack = warehouse.run(&["--json", "compact", "--all"]);
+    let repack = warehouse.run(&["--json", "store", "compact", "--all"]);
     assert_success(&repack);
     let dropped = json(&repack)["data"]["damaged_packs_dropped"].as_array().unwrap().clone();
     assert_eq!(dropped.len(), 1, "{:?}", dropped);
@@ -10122,17 +10158,17 @@ fn redelta_fixture(name: &str) -> TestWarehouse {
         warehouse.write_file("data/a.txt", &format!("{}unique tail v{}\n", body, v));
         assert_success(&warehouse.run(&["load", "."]));
         assert_success(&warehouse.run(&["stack", &format!("v{}", v)]));
-        assert_success(&warehouse.run(&["compact"]));
+        assert_success(&warehouse.run(&["store", "compact"]));
     }
 
     // Near-duplicate (not byte-identical — a true duplicate would just dedupe to the same
     // content-addressed blob, testing nothing) of the final version of "data/a.txt", at a
-    // different path: a rename a per-path chain (import-git) and a per-batch window (a fresh
+    // different path: a rename a per-path chain (git import) and a per-batch window (a fresh
     // incremental compact, whose window starts empty) both miss.
     warehouse.write_file("data/b-renamed.txt", &format!("{}unique tail v3 renamed copy tweak\n", body));
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "renamed"]));
-    assert_success(&warehouse.run(&["compact"]));
+    assert_success(&warehouse.run(&["store", "compact"]));
 
     warehouse
 }
@@ -10147,7 +10183,7 @@ fn compact_redelta_without_all_is_refused() {
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "first"]));
 
-    let refused = warehouse.run(&["compact", "--redelta"]);
+    let refused = warehouse.run(&["store", "compact", "--redelta"]);
     assert!(!refused.status.success(), "--redelta without --all must be refused");
     assert!(
         stderr(&refused).contains("--redelta") && stderr(&refused).contains("--all"),
@@ -10166,10 +10202,10 @@ fn compact_all_redelta_shrinks_the_store_and_round_trips() {
 
     // Plain `--all` is the copy-fast path: it consolidates packs but must not, by itself,
     // improve on the (sub-optimal) encodings already on disk.
-    assert_success(&warehouse.run(&["compact", "--all"]));
+    assert_success(&warehouse.run(&["store", "compact", "--all"]));
     let after_plain_all = objects_store_bytes(&objects);
 
-    let redelta = warehouse.run(&["--json", "compact", "--all", "--redelta"]);
+    let redelta = warehouse.run(&["--json", "store", "compact", "--all", "--redelta"]);
     assert_success(&redelta);
     assert!(json(&redelta)["data"]["objects_packed"].as_u64().unwrap() > 0);
 
@@ -10204,7 +10240,7 @@ fn compact_all_redelta_repeats_without_data_loss() {
     let warehouse = redelta_fixture("redelta-repeat");
     let objects = warehouse.root.join(".forklift/objects");
 
-    assert_success(&warehouse.run(&["compact", "--all", "--redelta"]));
+    assert_success(&warehouse.run(&["store", "compact", "--all", "--redelta"]));
     assert!(objects_store_bytes(&objects) > 0);
 
     // `--redelta` re-encodes the whole live set again on *every* run — `Source::Reconstruct` is
@@ -10222,7 +10258,7 @@ fn compact_all_redelta_repeats_without_data_loss() {
     // depends on the *previous* run's own shape), so this does not assert a fixed pack id — only
     // what must hold on every run: no object lost, every object still reads back byte-correct.
     for _ in 0..2 {
-        let repeat = warehouse.run(&["--json", "compact", "--all", "--redelta"]);
+        let repeat = warehouse.run(&["--json", "store", "compact", "--all", "--redelta"]);
         assert_success(&repeat);
         assert_eq!(
             json(&repeat)["data"]["objects_packed"].as_u64().unwrap(), 20,
@@ -10251,13 +10287,13 @@ fn compact_all_without_redelta_still_takes_the_copy_path() {
 
     // First `--all` consolidates the several incremental packs into one, by copying each
     // live record verbatim.
-    assert_success(&warehouse.run(&["compact", "--all"]));
+    assert_success(&warehouse.run(&["store", "compact", "--all"]));
     let names_first = pack_file_names(&objects);
     let bytes_first = objects_store_bytes(&objects);
 
     // A second plain `--all`, with nothing to drop and nothing new, must be the steady-state
     // copy-bound repack: same pack name (nothing re-encoded to a different layout), same size.
-    let second = warehouse.run(&["--json", "compact", "--all"]);
+    let second = warehouse.run(&["--json", "store", "compact", "--all"]);
     assert_success(&second);
     assert_eq!(pack_file_names(&objects), names_first, "a steady-state repack must not churn pack names");
     assert_eq!(objects_store_bytes(&objects), bytes_first, "a steady-state repack must not change the store size");
@@ -10293,13 +10329,13 @@ fn redelta_tree_fixture(name: &str) -> TestWarehouse {
     }
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "setup"]));
-    assert_success(&warehouse.run(&["compact"]));
+    assert_success(&warehouse.run(&["store", "compact"]));
 
     for v in 0..REDELTA_TREE_FIXTURE_FILES_PER_DIR {
         warehouse.write_file(&format!("data/sub/f{:02}.txt", v), &format!("file {} v1 filler content\n", v));
         assert_success(&warehouse.run(&["load", "."]));
         assert_success(&warehouse.run(&["stack", &format!("v{}", v)]));
-        assert_success(&warehouse.run(&["compact"]));
+        assert_success(&warehouse.run(&["store", "compact"]));
     }
 
     warehouse
@@ -10314,7 +10350,7 @@ fn compact_finds_a_directorys_path_base_across_many_versions() {
     // doc comment), so the density this pins comes from the incremental compacts themselves;
     // the closing `--all` (no `--redelta`) just consolidates the already-packed records
     // verbatim into one pack for a clean total-byte measurement.
-    assert_success(&warehouse.run(&["compact", "--all"]));
+    assert_success(&warehouse.run(&["store", "compact", "--all"]));
     let after_plain_all = objects_store_bytes(&objects);
 
     // Each directory version is `REDELTA_TREE_FIXTURE_FILES_PER_DIR` entries; without a path
@@ -10338,7 +10374,7 @@ fn compact_finds_a_directorys_path_base_across_many_versions() {
     // `--all --redelta` on the same store must not be a regression: it has nothing further to
     // buy back here (no cross-path rename in this fixture), but re-encoding from scratch must
     // land in the same ballpark, not the multi-times-larger store the original bug produced.
-    let redelta = warehouse.run(&["--json", "compact", "--all", "--redelta"]);
+    let redelta = warehouse.run(&["--json", "store", "compact", "--all", "--redelta"]);
     assert_success(&redelta);
     assert!(json(&redelta)["data"]["objects_packed"].as_u64().unwrap() > 0);
     let after_redelta = objects_store_bytes(&objects);
@@ -10438,7 +10474,7 @@ fn a_mutating_command_runs_maintenance_when_due() {
         warehouse.write_file("f.txt", &format!("v{}\n", v));
         assert_success(&warehouse.run(&["load", "."]));
         assert_success(&warehouse.run(&["stack", &format!("v{}", v)]));
-        assert_success(&warehouse.run(&["compact"]));
+        assert_success(&warehouse.run(&["store", "compact"]));
     }
     assert!(count_packs(&objects) > 1, "there should be several packs to consolidate");
 
@@ -10477,7 +10513,7 @@ fn a_mutating_command_runs_maintenance_when_due() {
 // binary (no `lib` target `tests/cli.rs` could link a unit under test from).
 
 // ---------------------------------------------------------------------------------------------
-// The densify suggestion: `import-git`'s pack-direct path (and a franchise's native bundle
+// The densify suggestion: `git import`'s pack-direct path (and a franchise's native bundle
 // install) can only ever see per-path/per-window similarity on the way in, unlike a plain
 // `compact --all --redelta`'s whole-store pass — so a bulk-ingested store sets a marker that
 // `store` surfaces as a one-line suggestion, cleared once a redelta run actually earns it back.
@@ -10510,18 +10546,18 @@ fn store_suggests_densify_after_import_git_and_clears_after_redelta() {
     configure_operator(&warehouse);
 
     // The import itself packs at least one object, so its own human output tips the suggestion.
-    let imported = warehouse.run(&["import-git", "."]);
+    let imported = warehouse.run(&["git", "import", "."]);
     assert_success(&imported);
     assert!(
-        stdout(&imported).contains("forklift compact --all --redelta"),
-        "import-git should tip the densify suggestion after packing on the way in: {}", stdout(&imported)
+        stdout(&imported).contains("forklift store compact --all --redelta"),
+        "git import should tip the densify suggestion after packing on the way in: {}", stdout(&imported)
     );
 
     // `store` surfaces it too: the human line, and an additive `--json` flag.
     let store = warehouse.run(&["store"]);
     assert_success(&store);
     assert!(
-        stdout(&store).contains("forklift compact --all --redelta"),
+        stdout(&store).contains("forklift store compact --all --redelta"),
         "store should surface the densify suggestion after a bulk ingest: {}", stdout(&store)
     );
 
@@ -10530,7 +10566,7 @@ fn store_suggests_densify_after_import_git_and_clears_after_redelta() {
     assert_eq!(json(&store_json)["data"]["densify_suggested"], true);
 
     // A successful `compact --all --redelta` clears the marker — the suggestion is gone.
-    assert_success(&warehouse.run(&["compact", "--all", "--redelta"]));
+    assert_success(&warehouse.run(&["store", "compact", "--all", "--redelta"]));
 
     let after = warehouse.run(&["--json", "store"]);
     assert_success(&after);
@@ -10542,7 +10578,7 @@ fn store_suggests_densify_after_import_git_and_clears_after_redelta() {
     let store_after = warehouse.run(&["store"]);
     assert_success(&store_after);
     assert!(
-        !stdout(&store_after).contains("forklift compact --all --redelta"),
+        !stdout(&store_after).contains("forklift store compact --all --redelta"),
         "the human suggestion must be gone once the marker is cleared"
     );
 }
@@ -10559,7 +10595,7 @@ fn store_never_suggests_densify_for_ordinary_incremental_use() {
     warehouse.write_file("f.txt", "content\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "first"]));
-    assert_success(&warehouse.run(&["compact"]));
+    assert_success(&warehouse.run(&["store", "compact"]));
 
     let store_json = warehouse.run(&["--json", "store"]);
     assert_success(&store_json);
@@ -10567,7 +10603,7 @@ fn store_never_suggests_densify_for_ordinary_incremental_use() {
 
     let store = warehouse.run(&["store"]);
     assert_success(&store);
-    assert!(!stdout(&store).contains("forklift compact --all --redelta"));
+    assert!(!stdout(&store).contains("forklift store compact --all --redelta"));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -10588,7 +10624,7 @@ fn pallet_head_hash(warehouse: &TestWarehouse, pallet: &str) -> String {
 
 /// The root tree hash a parcel commits (pure content, no wall-clock) — read via `peek`.
 fn parcel_tree_hash(warehouse: &TestWarehouse, parcel: &str) -> String {
-    let output = warehouse.run(&["--json", "peek", parcel]);
+    let output = warehouse.run(&["--json", "store", "peek", parcel]);
     assert_success(&output);
     json(&output)["data"]["tree"].as_str().unwrap().to_string()
 }
@@ -10803,11 +10839,11 @@ fn a_scoped_bay_refuses_whole_tree_verbs_with_a_stable_code() {
     let scoped_dir = warehouse.home.join("bay-scoped");
     assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
 
-    // export-git (would silently truncate the out-of-scope content) refuses with the
+    // git export (would silently truncate the out-of-scope content) refuses with the
     // sparse_workspace code + exit 9. (consolidate no longer refuses — a scoped bay resolves
     // out-of-scope siblings by hash; see the scoped-merge tests below.)
     let export_dir = warehouse.home.join("export-git-out");
-    let export = warehouse.run_at(&scoped_dir, &["--json", "export-git", export_dir.to_str().unwrap()]);
+    let export = warehouse.run_at(&scoped_dir, &["--json", "git", "export", export_dir.to_str().unwrap()]);
     assert_eq!(export.status.code(), Some(9));
     assert_eq!(json(&export)["error"]["code"], "sparse_workspace");
 }
@@ -10971,14 +11007,14 @@ fn a_multi_path_scoped_stack_produces_a_byte_identical_root_tree() {
 
 #[test]
 fn a_scoped_bay_refuses_import_git() {
-    // import-git bypasses the overlay entirely (it builds parcels straight from the git tree);
+    // git import bypasses the overlay entirely (it builds parcels straight from the git tree);
     // a scoped bay is not a sensible import target — refuse before even validating the path.
     let warehouse = scoped_fixture("scoped-refuse-import-git");
 
     let scoped_dir = warehouse.home.join("bay-scoped");
     assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
 
-    let import = warehouse.run_at(&scoped_dir, &["--json", "import-git", "."]);
+    let import = warehouse.run_at(&scoped_dir, &["--json", "git", "import", "."]);
     assert_eq!(import.status.code(), Some(9), "stdout/err: {}", stdout(&import));
     assert_eq!(json(&import)["error"]["code"], "sparse_workspace");
 }
@@ -11005,7 +11041,7 @@ fn path_object_hash(warehouse: &TestWarehouse, parcel: &str, path: &str) -> Stri
     let mut hash = parcel_tree_hash(warehouse, parcel);
 
     for component in path.split('/') {
-        let peeked = warehouse.run(&["--json", "peek", &hash]);
+        let peeked = warehouse.run(&["--json", "store", "peek", &hash]);
         assert_success(&peeked);
 
         let entries = json(&peeked)["data"]["entries"].as_array().unwrap().clone();
@@ -11181,7 +11217,7 @@ fn path_object_entry(warehouse: &TestWarehouse, parcel: &str, path: &str) -> (St
     let mut item_type = String::new();
 
     for component in &components {
-        let peeked = warehouse.run(&["--json", "peek", &hash]);
+        let peeked = warehouse.run(&["--json", "store", "peek", &hash]);
         assert_success(&peeked);
         let entries = json(&peeked)["data"]["entries"].as_array().unwrap().clone();
         let entry = entries.iter()
@@ -11451,7 +11487,7 @@ fn compact_all_tolerates_a_sparse_store_and_a_later_scoped_stack_still_works() {
 
     // The repack must not error on the absent-but-reachable subtree: it packs the present live set.
     let objects = warehouse.root.join(".forklift/objects");
-    let repack = warehouse.run(&["--json", "compact", "--all"]);
+    let repack = warehouse.run(&["--json", "store", "compact", "--all"]);
     assert_success(&repack);
     assert_eq!(json(&repack)["data"]["all"], true);
     assert_eq!(count_packs(&objects), 1, "the present live set consolidates into a single pack");
@@ -11459,12 +11495,12 @@ fn compact_all_tolerates_a_sparse_store_and_a_later_scoped_stack_still_works() {
     // Byte-reproducible on the sparse store: a second repack lands on the same single pack (the
     // pack id is layout-derived, so an unchanged repack neither churns the name nor loses an
     // object) — the determinism contract, holding with objects legitimately missing.
-    assert_success(&warehouse.run(&["compact", "--all"]));
+    assert_success(&warehouse.run(&["store", "compact", "--all"]));
     assert_eq!(count_packs(&objects), 1, "an idempotent repack on a sparse store keeps the one pack");
 
     // The live, present history still reads back after the repack; the deleted objects stay gone
     // (the repack neither collected the sealed spine nor resurrected the unfetched objects).
-    assert_success(&warehouse.run(&["peek", &head]));
+    assert_success(&warehouse.run(&["store", "peek", &head]));
     assert_eq!(
         json(&warehouse.run(&["--json", "history"]))["data"]["entries"].as_array().unwrap().len(),
         1, "the one live parcel survives the sparse repack"
@@ -11521,7 +11557,7 @@ fn write_bytes(warehouse: &TestWarehouse, relative_path: &str, bytes: &[u8]) {
 /// The stored object type (`"blob"`, `"recipe"`, …) of the tree entry a parcel commits at `path`.
 fn entry_object_type(warehouse: &TestWarehouse, parcel: &str, path: &str) -> String {
     let hash = path_object_hash(warehouse, parcel, path);
-    let peeked = warehouse.run(&["--json", "peek", &hash]);
+    let peeked = warehouse.run(&["--json", "store", "peek", &hash]);
     assert_success(&peeked);
     json(&peeked)["data"]["object_type"].as_str().unwrap().to_string()
 }
@@ -11638,7 +11674,7 @@ fn compact_leaves_chunks_loose_and_the_file_still_materializes() {
 
     // Every chunk of the recipe, so we can prove they survive `compact` as loose objects.
     let recipe_hash = path_object_hash(&warehouse, &parcel, "big.bin");
-    let peeked = warehouse.run(&["--json", "peek", &recipe_hash]);
+    let peeked = warehouse.run(&["--json", "store", "peek", &recipe_hash]);
     assert_success(&peeked);
     let chunk_hashes: Vec<String> = json(&peeked)["data"]["chunks"].as_array().unwrap().iter()
         .map(|c| c["hash"].as_str().unwrap().to_string())
@@ -11647,7 +11683,7 @@ fn compact_leaves_chunks_loose_and_the_file_still_materializes() {
 
     // Compact the whole store (repack). Chunks must never be packed — they stay individually
     // addressable loose objects.
-    assert_success(&warehouse.run(&["compact", "--all"]));
+    assert_success(&warehouse.run(&["store", "compact", "--all"]));
 
     for chunk in &chunk_hashes {
         assert!(object_store_path(&warehouse, chunk).exists(),
@@ -11681,7 +11717,7 @@ fn a_corrupt_chunk_makes_materialization_fail_loudly() {
 
     // Find the recipe, peek its first chunk hash, and corrupt that chunk object on disk.
     let recipe_hash = path_object_hash(&warehouse, &parcel, "big.bin");
-    let peeked = warehouse.run(&["--json", "peek", &recipe_hash]);
+    let peeked = warehouse.run(&["--json", "store", "peek", &recipe_hash]);
     assert_success(&peeked);
     let chunk_hash = json(&peeked)["data"]["chunks"][0]["hash"].as_str().unwrap().to_string();
     let chunk_path = object_store_path(&warehouse, &chunk_hash);
@@ -12036,7 +12072,7 @@ fn peek_json_reports_a_binary_blob_honestly() {
     });
 
     let hash = path_object_hash(&warehouse, &parcel, "blob.bin");
-    let peeked = warehouse.run(&["--json", "peek", &hash]);
+    let peeked = warehouse.run(&["--json", "store", "peek", &hash]);
     assert_success(&peeked);
     let data = json(&peeked)["data"].clone();
     assert_eq!(data["binary"], true);
@@ -12060,7 +12096,7 @@ fn peek_json_reports_nul_free_invalid_utf8_content_as_binary() {
     });
 
     let hash = path_object_hash(&warehouse, &parcel, "blob.bin");
-    let peeked = warehouse.run(&["--json", "peek", &hash]);
+    let peeked = warehouse.run(&["--json", "store", "peek", &hash]);
     assert_success(&peeked);
     let data = json(&peeked)["data"].clone();
     assert_eq!(data["binary"], true);
@@ -12678,7 +12714,7 @@ fn heal_resurrecting_a_compact_superseded_pack_only_duplicates_content_the_new_p
     assert_success(&warehouse.run(&["stack", "parcel one"]));
 
     // Pack parcel one's loose objects into a first pack (P1).
-    assert_success(&warehouse.run(&["compact"]));
+    assert_success(&warehouse.run(&["store", "compact"]));
     let packs_after_first_compact = pack_data_files(&warehouse);
     assert_eq!(packs_after_first_compact.len(), 1, "sanity: exactly one pack after the first compact");
     let p1_data = packs_after_first_compact[0].clone();
@@ -12694,7 +12730,7 @@ fn heal_resurrecting_a_compact_superseded_pack_only_duplicates_content_the_new_p
 
     // A full repack: every reachable object (parcel one's included) consolidates into ONE new,
     // content-distinct pack; P1 — now fully redundant — is physically deleted.
-    assert_success(&warehouse.run(&["compact", "--all"]));
+    assert_success(&warehouse.run(&["store", "compact", "--all"]));
     assert!(!p1_data.exists(), "sanity: the repack physically deleted the superseded pack");
     assert!(!p1_index.exists(), "sanity: the repack physically deleted the superseded index");
     let packs_after_repack = pack_data_files(&warehouse);
@@ -12723,13 +12759,13 @@ fn heal_resurrecting_a_compact_superseded_pack_only_duplicates_content_the_new_p
 
     // (b) Self-healing: an ordinary command touching the object store still runs clean with the
     // duplicate pack present...
-    assert_success(&warehouse.run(&["compact"]));
+    assert_success(&warehouse.run(&["store", "compact"]));
     // ...and a SECOND full repack independently re-derives the same live set and physically
     // removes the resurrected duplicate again — the same "supersede and delete" logic the first
     // repack ran, applied to whatever packs currently exist, with no special-casing needed for a
     // duplicate. This is the evidence for "benign, self-correcting gc-food," not merely an
     // assumption: the resurrected pack does not survive the next maintenance pass.
-    assert_success(&warehouse.run(&["compact", "--all"]));
+    assert_success(&warehouse.run(&["store", "compact", "--all"]));
     assert!(!p1_data.exists(),
         "a later repack must clean up the resurrected duplicate pack again — it is inert, \
         self-correcting duplication, not a permanent or escalating problem");
@@ -13089,7 +13125,7 @@ fn git_repo_with_branches(dir: &std::path::Path, branches: &[&str]) {
     std::fs::write(dir.join(".git").join("packed-refs"), format!("{}\n", lines.join("\n"))).unwrap();
 }
 
-/// import-git maps and checks every branch before converting anything: a branch that maps outside
+/// git import maps and checks every branch before converting anything: a branch that maps outside
 /// the grammar, two branches that map to one pallet, or a branch mapping onto an existing pallet
 /// each refuse naming the branches, and no object or ref is written.
 #[test]
@@ -13111,7 +13147,7 @@ fn import_git_refuses_an_unmappable_branch_set_before_writing_anything() {
         let objects_before = metadata_listing(&warehouse, "objects");
         let pallets_before = metadata_listing(&warehouse, "pallets");
 
-        let output = warehouse.run(&["import-git", dir.to_str().unwrap()]);
+        let output = warehouse.run(&["git", "import", dir.to_str().unwrap()]);
         assert!(!output.status.success(), "{}: the import must be refused", repo);
         for text in expected {
             assert!(stderr(&output).contains(text), "{}: {}", repo, stderr(&output));
@@ -13127,7 +13163,7 @@ fn import_git_refuses_an_unmappable_branch_set_before_writing_anything() {
     let dir = warehouse.home.join("repo-existing");
     git_repo_with_branches(&dir, &[]);
     let objects_before = metadata_listing(&warehouse, "objects");
-    let output = warehouse.run(&["import-git", dir.to_str().unwrap()]);
+    let output = warehouse.run(&["git", "import", dir.to_str().unwrap()]);
     assert!(!output.status.success());
     assert!(stderr(&output).contains("maps to pallet \"main\", which already exists"), "{}", stderr(&output));
     assert_eq!(metadata_listing(&warehouse, "objects"), objects_before, "no object written");
@@ -13138,7 +13174,7 @@ fn import_git_refuses_an_unmappable_branch_set_before_writing_anything() {
     // Through another name: on a case-folding disk git's own `main` ref file blocks `Main/X`.
     git_in(&dir, &["branch", "-m", "main", "tmp"]);
     git_in(&dir, &["branch", "-m", "tmp", "Main/X"]);
-    let output = warehouse.run(&["import-git", dir.to_str().unwrap()]);
+    let output = warehouse.run(&["git", "import", dir.to_str().unwrap()]);
     assert!(!output.status.success());
     assert!(stderr(&output).contains("Branch \"Main/X\" maps to pallet \"main/x\", which nests with the pallet \"main\""),
         "{}", stderr(&output));
@@ -13159,7 +13195,7 @@ fn import_git_lowercases_a_branch_and_keeps_a_lowercase_one() {
     // branch still imports under its own name, and so does the default branch.
     git_in(&dir, &["tag", "fix/fork-17"]);
     git_in(&dir, &["tag", "main"]);
-    assert_success(&warehouse.run(&["import-git", dir.to_str().unwrap()]));
+    assert_success(&warehouse.run(&["git", "import", dir.to_str().unwrap()]));
 
     // A component that would start with "-" is anchored alike at every level.
     let pallets = stdout(&warehouse.run(&["palletize"]));
@@ -13507,13 +13543,13 @@ fn a_repack_keeps_a_deleted_head_until_the_bay_that_deleted_it_is_removed() {
     assert_success(&warehouse.run(&["palletize", "--delete", "side", "--force"]));
 
     // Automatic maintenance repacks on the next command.
-    assert_success(&warehouse.run(&["compact"]));
+    assert_success(&warehouse.run(&["store", "compact"]));
     std::fs::write(
         warehouse.root.join(".forklift/config/warehouse.toml"),
         "[maintenance]\nloose = \"100000\"\npacks = \"0\"\n",
     ).unwrap();
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["compact", "--all"]));
+    assert_success(&warehouse.run(&["store", "compact", "--all"]));
     assert_success(&warehouse.run(&["show", &format!("{}:side.txt", head)]));
 
     assert_success(&warehouse.run(&["undo"]));
@@ -13522,10 +13558,10 @@ fn a_repack_keeps_a_deleted_head_until_the_bay_that_deleted_it_is_removed() {
     // Deleted from a bay, then the bay removed: nothing roots the head any more.
     let bay = open_bay(&warehouse, "b2");
     assert_success(&bay.run(&["palletize", "--delete", "side", "--force"]));
-    assert_success(&bay.run(&["compact", "--all"]));
+    assert_success(&bay.run(&["store", "compact", "--all"]));
     assert_success(&warehouse.run(&["show", &format!("{}:side.txt", head)]));
     assert_success(&warehouse.run(&["bay", "remove", "b2"]));
-    assert_success(&warehouse.run(&["compact", "--all"]));
+    assert_success(&warehouse.run(&["store", "compact", "--all"]));
     assert!(!warehouse.run(&["show", &format!("{}:side.txt", head)]).status.success(), "the head is freed once its window ends");
 }
 
@@ -13540,9 +13576,9 @@ fn a_version_two_journal_takes_a_delete_and_its_undo() {
     assert!(text.contains("\"version\":3"), "{}", text);
     std::fs::write(&path, text.replace("\"version\":3", "\"version\":2")).unwrap();
 
-    assert_success(&warehouse.run(&["compact", "--all"]));
+    assert_success(&warehouse.run(&["store", "compact", "--all"]));
     assert_success(&warehouse.run(&["palletize", "--delete", "side"]));
-    assert_success(&warehouse.run(&["compact", "--all"]));
+    assert_success(&warehouse.run(&["store", "compact", "--all"]));
     assert_success(&warehouse.run(&["undo"]));
     assert!(pallet_heads(&warehouse).iter().any(|(name, _)| name == "side"));
 
@@ -13663,11 +13699,11 @@ fn a_repack_keeps_the_head_an_open_or_closed_haul_proposes_after_its_source_move
     let (closed, _) = &hauls[1];
     assert_success(&warehouse.run(&["haul", "close", closed]));
 
-    assert_success(&warehouse.run(&["compact"]));
-    assert_success(&warehouse.run(&["compact", "--all"]));
+    assert_success(&warehouse.run(&["store", "compact"]));
+    assert_success(&warehouse.run(&["store", "compact", "--all"]));
 
     for (_, proposed) in &hauls {
-        assert_success(&warehouse.run(&["peek", proposed]));
+        assert_success(&warehouse.run(&["store", "peek", proposed]));
     }
 
     assert_success(&warehouse.run(&["haul", "reopen", closed]));

@@ -137,6 +137,36 @@ async fn check_and_rewrite(target: &str,
     Ok(checked)
 }
 
+/// Handle bare `remote`: report the configured remote, whether this is a partial warehouse and,
+/// for one, its origin, and what would stop a client talking to the remote from here (a move of
+/// the origin standing, or a remote that is not the origin). Reads only; takes no lock.
+///
+/// # Returns
+/// * `Ok(())`      - The report was emitted.
+/// * `Err(String)` - The configuration, the fetch state or the origin record could not be read.
+pub fn show() -> Result<(), String> {
+    let remote = config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)?.map(|(value, _)| value);
+    let partial = scope_utils::content_may_be_absent()?;
+    let origin = if partial { origin_utils::read_origin()? } else { None };
+
+    // What `checked_remote` refuses is what every client that dials the remote would refuse; with
+    // no remote configured its unclassified error is only that, which the report already says.
+    let blocked = match origin_utils::checked_remote() {
+        Ok(_) => None,
+        Err(CoreError::Refusal { code, message, next_step, .. }) => Some(RemoteBlock {
+            code: code.as_str(),
+            message,
+            next_step,
+        }),
+        Err(_) if remote.is_none() => None,
+        Err(other) => return Err(other.into()),
+    };
+
+    output::emit(&RemoteReport { remote, partial, origin, blocked });
+
+    Ok(())
+}
+
 /// `remote move --abort`: clear an intent a move left before rewriting, and report one it left
 /// while rewriting, which only a completed move clears.
 fn abort_move(move_lock: &MoveLock) -> Result<(), String> {
@@ -165,6 +195,62 @@ fn running_refusal() -> String {
         format!("Another move of this warehouse's origin is running; nothing was changed. {}", next_step),
         next_step,
     ).into()
+}
+
+/// What bare `remote` reports.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct RemoteReport {
+    /// The configured `remote.url`; none when no remote is configured.
+    remote: Option<String>,
+
+    /// Whether this is a partial warehouse (franchised with `--only` or `--cache`), which talks
+    /// only to its origin.
+    partial: bool,
+
+    /// A partial warehouse's origin, the one server proved to hold what it lacks; none for a full
+    /// warehouse, which may talk to any remote, and for a partial one whose record is missing.
+    origin: Option<String>,
+
+    /// The refusal a command that dials the remote would meet from here; none when nothing stops
+    /// it, or when no remote is configured.
+    blocked: Option<RemoteBlock>,
+}
+
+/// A refusal that stops clients talking to the remote.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct RemoteBlock {
+    /// The stable refusal code, such as `non_origin_remote` or `origin_move_pending`.
+    code: &'static str,
+
+    /// The refusal's explanation.
+    message: String,
+
+    /// The step that clears it.
+    next_step: String,
+}
+
+impl CommandOutput for RemoteReport {
+    fn render_human(&self) {
+        match &self.remote {
+            Some(remote) => println!("Remote: {}", remote),
+            None => println!(
+                "No remote is configured. Set one with \"forklift config {} <url>\".",
+                config_utils::KEY_REMOTE_URL
+            ),
+        }
+
+        if !self.partial {
+            println!("This warehouse holds its whole history, so it has no origin and may talk to any remote.");
+        } else if let Some(origin) = &self.origin {
+            println!("Origin: {} (this partial warehouse fetches what it lacks from there alone)", origin);
+        }
+
+        if let Some(blocked) = &self.blocked {
+            println!("{}", blocked.message);
+        }
+    }
 }
 
 /// The result of a move of the origin.
@@ -240,6 +326,7 @@ impl CommandOutput for RemoteAbortReport {
 #[cfg(feature = "docgen")]
 pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
+        crate::docgen::OutputSchema::of::<RemoteReport>(),
         crate::docgen::OutputSchema::of::<RemoteMoveReport>(),
         crate::docgen::OutputSchema::of::<RemoteAbortReport>(),
     ]

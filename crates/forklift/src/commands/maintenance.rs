@@ -5,7 +5,7 @@ use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::taint_utils;
 
 /// Run background object-store maintenance if it is due — the recurring counterpart of
-/// `import-git`'s one-shot compaction (git's `gc --auto`): pack accumulated loose objects, or
+/// `git import`'s one-shot compaction (git's `gc --auto`): pack accumulated loose objects, or
 /// consolidate accumulated packs, so the store stays healthy without the user remembering to
 /// `compact`. Opt out with `maintenance.auto = false`.
 ///

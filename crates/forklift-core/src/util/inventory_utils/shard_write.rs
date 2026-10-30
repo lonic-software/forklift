@@ -353,7 +353,7 @@ impl ShardLedger {
 /// Replace the whole staging area with the given shards, so that the store holds exactly them and
 /// the metadata registers exactly their directories. Used when `shift` repopulates the inventory
 /// from the target pallet's tree, `park`'s push resets to the pallet head, a `consolidate`
-/// fast-forward repopulates from the target pallet, `import-git` checks out its initial branch, and
+/// fast-forward repopulates from the target pallet, `git import` checks out its initial branch, and
 /// `lower`/`franchise` materialize a fetched tree (`shift_utils::materialize_tree`).
 ///
 /// Only the shards whose bytes differ are written (see [`replace_differing_inventories`]): a

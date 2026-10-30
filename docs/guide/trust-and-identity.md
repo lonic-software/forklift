@@ -89,7 +89,7 @@ this warehouse must be signed** — this cannot be undone.
 - Protect your key with a passphrase (recommended for a human): add
   `--passphrase` (see §6).
 - That trust boundary keeps every parcel it names alive across `gc` and
-  `compact` — even one no pallet points at any more — so the pre-trust history
+  `store compact` — even one no pallet points at any more — so the pre-trust history
   it attests can't be swept out from under a future audit.
 
 ### Joining a trusted warehouse: first contact
@@ -134,7 +134,7 @@ overrides it).
 A head another store serves becomes this warehouse's at the ref write that
 adopts it, so every such write is judged first, with the same check `audit` runs:
 `lower` (of the working pallet or one named), `franchise`, `lift`'s auto-merge
-of a remote that moved ahead, and `mirror` before it exports a head to git — and,
+of a remote that moved ahead, and `git mirror` before it exports a head to git — and,
 for a parcel already in the store, `palletize <name> <hash>` and `haul merge`.
 With an anchor held, the head's history must verify against it and the office
 this warehouse holds; nothing the remote serves gets past them, including a
@@ -395,8 +395,8 @@ forklift office retire <key-id> --compromised   # revoke a key that may be in ot
 - Revocations are append-once for everyone (including admins) and a revoked key
   can no longer extend the office chain or endorse new keys.
 - Like the anchor's own boundary, a distrust boundary keeps the history it
-  names alive across `gc` and `compact`, so a parcel it vouches for can't be
-  swept just because no pallet points at it any more. `gc` and `compact --all`
+  names alive across `gc` and `store compact`, so a parcel it vouches for can't be
+  swept just because no pallet points at it any more. `gc` and `store compact --all`
   both refuse outright — rather than sweep with an incomplete picture — if the
   office record behind these pins can't be read; `heal` (see [`cli.md`](cli.md))
   is more forgiving and will usually resolve it first.

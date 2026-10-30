@@ -22,16 +22,17 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `bay remove` |  |  | De-register a bay (its pallet ref and materialized files are kept) |
 | `blame` | `bl` | `annotate` | Show, for each line of a file, the parcel and author that last changed it |
 | `cherry-pick` | `cp` |  | Apply a parcel's changes onto the current pallet as a new, author-preserving parcel |
-| `compact` |  |  | Compact the object store: pack loose objects into a few dense pack files |
 | `config` | `cfg` |  | Read or change configuration values |
 | `conflicts` |  |  | List the files left in conflict by an unresolved consolidation |
 | `consolidate` | `con` | `merge` | Consolidate (merge) another pallet into the current one |
 | `deliver` | `dv` |  | Squash the current draft pallet onto a target as one clean parcel, keeping the trail |
 | `diff` | `d` |  | Show line-by-line changes |
-| `evict` |  |  | Free cached content the origin holds, to be fetched again when read |
 | `expand` |  |  | Widen a sparse warehouse's fetch scope and download the newly in-scope subtree(s) |
-| `export-git` |  |  | Export this warehouse's history into a new git repository (one-way, lossy) |
 | `franchise` | `fr` | `clone` | Open a local franchise of a remote warehouse (clone) |
+| `git` |  |  | Move history between this warehouse and git: import, export and mirror |
+| `git import` |  |  | Import a git repository's history into this warehouse (one-way migration) |
+| `git export` |  |  | Export this warehouse's history into a new git repository (one-way, lossy) |
+| `git mirror` |  |  | Mirror the remote's pallets to a git remote (mirror.url), never by force |
 | `haul` |  |  | Reviewable merge proposals (pull requests) on the @haul meta pallet |
 | `haul open` |  |  | Open a merge proposal |
 | `haul list` |  |  | List proposals |
@@ -45,7 +46,6 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `heal` |  |  | Resolve a standing durability taint, or finish or undo an interrupted operation |
 | `help` | `h` |  | Print the command list, or detailed help about one command |
 | `history` | `hi` | `log` | Print the parcels of a revision, newest first |
-| `import-git` |  |  | Import a git repository's history into this warehouse (one-way migration) |
 | `kv` |  |  | Custom metadata: signed text values keyed by parcel and key |
 | `kv set` |  |  | Set a key on a parcel |
 | `kv get` |  |  | Show a key's value on a parcel |
@@ -61,7 +61,6 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `manifest provenance` |  |  | Record how a parcel was produced: model, tool, session (AI provenance) |
 | `manifest show` |  |  | Show the manifest entries attached to a parcel |
 | `mcp` |  |  | Serve the command surface to an AI agent as MCP tools (stdio) |
-| `mirror` |  |  | Mirror the remote's pallets to a git remote (mirror.url), never by force |
 | `narrow` |  |  | Narrow this checkout's materialization scope and de-materialize the dropped subtree(s) |
 | `office` | `o` |  | Manage the warehouse office: users and signing keys |
 | `office enroll` |  |  | Enroll the configured operator and establish trust — one-way! |
@@ -79,14 +78,13 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `park` | `pa` | `stash` | Park the work in progress and reset to the pallet head |
 | `park pop` |  |  | Re-apply the most recently parked changes (staged) and drop them from the list |
 | `park list` |  |  | List the parked parcels, newest first |
-| `peek` | `pk` |  | Peek into an object (print its content) |
 | `prepare` | `p` | `init` | Prepare a new warehouse in the current directory |
 | `profile` |  |  | Manage identity profiles (named operator ids) and select one per warehouse |
 | `profile list` |  |  | List the profiles and the local keys each one holds (the default) |
 | `profile create` |  |  | Create a named profile (mints an operator id unless one is given) |
 | `profile use` |  |  | Act as this profile in the current warehouse |
 | `query` | `q` |  | Query parcel history by signed identity, signer and parcel facts |
-| `remote` |  |  | Manage the remote of a partial warehouse: move its origin to another server |
+| `remote` |  |  | Show the remote and the origin, or move a partial warehouse's origin to another server |
 | `remote move` |  |  | Move a partial warehouse's origin to another server that holds its content |
 | `remove` | `rm` |  | Stage a file or directory for removal |
 | `restore` | `r` |  | Restore a file or directory from the inventory (discard unstaged changes) |
@@ -96,10 +94,14 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `self-schema` |  |  | Describe this binary's command surface as a Pult manifest |
 | `self-update` |  |  | Check for a newer release and update this binary (client only) |
 | `shift` | `sh` | `checkout`, `switch` | Shift to another pallet |
-| `show` |  |  | Print a file's content at a revision (`git show <rev>:<path>`'s equivalent) |
+| `show` |  |  | Print a file's content at a revision, as git show does for REV:PATH |
 | `stack` | `s` | `commit` | Stack the inventory as a new parcel (commit) on the current pallet |
 | `stocktake` | `st` | `status` | Report the staged and unstaged changes of the warehouse |
-| `store` |  |  | Report object-store health: loose vs packed objects, packs, and whether compaction is due |
+| `store` |  |  | Inspect and maintain the object store: its health, packing, raw records and cached content |
+| `store status` |  |  | Report object-store health: loose vs packed objects, packs, and whether compaction is due (the default) |
+| `store compact` |  |  | Compact the object store: pack loose objects into a few dense pack files |
+| `store peek` |  |  | Peek into an object (print its content) |
+| `store evict` |  |  | Free cached content the origin holds, to be fetched again when read |
 | `tag` |  |  | Manage signed tags: named, admin-signed pointers at a parcel (releases) |
 | `tag create` |  |  | Create a signed tag pointing at a revision (admin only) |
 | `tag show` |  |  | Show one tag in full (subject, tagger, message) |

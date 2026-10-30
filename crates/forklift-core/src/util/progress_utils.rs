@@ -1,5 +1,5 @@
 //! Progress reporting out of long-running core operations (`compact`, `lift`, `lower`,
-//! `import-git`). Core never prints: an operation reports into a [`Progress`] handle, and the
+//! `git import`). Core never prints: an operation reports into a [`Progress`] handle, and the
 //! head that created the handle decides where the reports go. The CLI wires it to the
 //! `PULT_EVENTS` channel; every other caller passes [`Progress::NONE`], which costs one branch.
 //!

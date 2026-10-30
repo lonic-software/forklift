@@ -93,7 +93,7 @@ pub const KEY_MAINTENANCE_PACKS: &str = "maintenance.packs";
 /// merges them (default 20).
 pub const KEY_MAINTENANCE_SIGNATURE_TABLES: &str = "maintenance.signatureTables";
 
-/// The git remote `forklift mirror` pushes the mirrored pallets to (§9.8). Unset, nothing is
+/// The git remote `forklift git mirror` pushes the mirrored pallets to (§9.8). Unset, nothing is
 /// mirrored.
 pub const KEY_MIRROR_URL: &str = "mirror.url";
 

@@ -6,7 +6,7 @@
 //! bless twice. The source parcel's change (the diff against its first parent) is three-way
 //! merged onto the current head — exactly the merge machinery consolidate uses — and the
 //! result is stacked as a **single-parent** parcel that preserves the source's authors and
-//! records the picker as the stacker (the same Author/Stack split as import/export-git and
+//! records the picker as the stacker (the same Author/Stack split as git import and export and
 //! deliver). A clean pick is stacked immediately; a conflicting one leaves markers and a
 //! cherry-pick state, and the next `stack` completes it — still single-parent, still
 //! author-preserving.

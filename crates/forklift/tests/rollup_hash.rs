@@ -65,7 +65,7 @@ impl Warehouse {
 
     /// The pallet head's tree hash (deterministic content, no wall clock).
     fn head_tree_hash(&self, pallet: &str) -> String {
-        let output = self.run_ok(&["--json", "peek", &self.head(pallet)]);
+        let output = self.run_ok(&["--json", "store", "peek", &self.head(pallet)]);
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         value["data"]["tree"].as_str().unwrap().to_string()
     }

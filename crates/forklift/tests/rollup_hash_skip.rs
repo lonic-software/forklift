@@ -87,7 +87,7 @@ impl Warehouse {
     fn head_tree_hash(&self, pallet: &str) -> String {
         let head = std::fs::read_to_string(self.root.join(".forklift").join("pallets").join(pallet))
             .unwrap().trim().to_string();
-        let output = self.run_ok(&["--json", "peek", &head]);
+        let output = self.run_ok(&["--json", "store", "peek", &head]);
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         value["data"]["tree"].as_str().unwrap().to_string()
     }
@@ -378,8 +378,8 @@ fn a_narrowed_sparse_bay_still_produces_correct_stocktake_and_stack_with_skips_a
     let full_head = std::fs::read_to_string(trunk.root.join(".forklift").join("pallets").join("full"))
         .unwrap().trim().to_string();
 
-    let scoped_peek = trunk.run_ok_at(&scoped_dir, &["--json", "peek", &scoped_head]);
-    let full_peek = trunk.run_ok_at(&full_dir, &["--json", "peek", &full_head]);
+    let scoped_peek = trunk.run_ok_at(&scoped_dir, &["--json", "store", "peek", &scoped_head]);
+    let full_peek = trunk.run_ok_at(&full_dir, &["--json", "store", "peek", &full_head]);
     let scoped_tree = serde_json::from_slice::<serde_json::Value>(&scoped_peek.stdout).unwrap()
         ["data"]["tree"].as_str().unwrap().to_string();
     let full_tree = serde_json::from_slice::<serde_json::Value>(&full_peek.stdout).unwrap()
@@ -744,7 +744,7 @@ fn stack_never_reads_a_shard_beneath_a_rollup_that_matches_the_head() {
         warehouse.run_ok(&["stack", "base"]);
 
         let head_untouched = {
-            let output = warehouse.run_ok(&["--json", "peek", &warehouse.head_tree_hash("main")]);
+            let output = warehouse.run_ok(&["--json", "store", "peek", &warehouse.head_tree_hash("main")]);
             let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
             value.to_string()
         };

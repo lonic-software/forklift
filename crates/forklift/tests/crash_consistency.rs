@@ -92,7 +92,7 @@ impl Area {
                 "{context}: history must read the parcel chain, stderr: {}",
                 String::from_utf8_lossy(&history.stderr));
 
-            let peek = self.run(&["peek", head]);
+            let peek = self.run(&["store", "peek", head]);
             assert!(peek.status.success(),
                 "{context}: peek of the head parcel must succeed, stderr: {}",
                 String::from_utf8_lossy(&peek.stderr));
@@ -328,7 +328,7 @@ fn killing_stack_midway_never_corrupts_the_store() {
     }
 
     // 4. Final recovery: the store must still accept a clean write, and every object reachable from
-    //    the final head must read back (export-git walks the whole graph — parcels, trees, blobs —
+    //    the final head must read back (git export walks the whole graph — parcels, trees, blobs —
     //    so a torn object anywhere would fail here via the read-side hash check).
     area.clear_stale_lock();
     area.assert_consistent("final");
@@ -345,9 +345,9 @@ fn killing_stack_midway_never_corrupts_the_store() {
     area.assert_consistent("after recovery stack");
 
     let export_dir = area.root.join("git-export");
-    let export = area.run(&["export-git", export_dir.to_str().unwrap()]);
+    let export = area.run(&["git", "export", export_dir.to_str().unwrap()]);
     assert!(export.status.success(),
-        "export-git must read every committed object without a torn read, stderr: {}",
+        "git export must read every committed object without a torn read, stderr: {}",
         String::from_utf8_lossy(&export.stderr));
 
     // Sanity: across the run at least one kill fell after a completed ref update, so the durable
@@ -396,7 +396,7 @@ fn calibrate_load_duration(area: &Area, files: &[PathBuf], base_line: &str, labe
 /// their files, so a second `load .` would not necessarily re-touch (or heal) a shard a first,
 /// interrupted `load .` already made durable and visible. `stack` itself never verifies a blob's
 /// existence (it only carries hashes forward into tree entries), so the sharp check is deferred
-/// to a final `export-git` after the whole spread (DESIGN.html §5.0 D item 10, finding #1) —
+/// to a final `git export` after the whole spread (DESIGN.html §5.0 D item 10, finding #1) —
 /// see the caller.
 ///
 /// Returns how many iterations produced a completed `stack` (the signal that this iteration's
@@ -502,7 +502,7 @@ fn stack_or_nothing(area: &Area, message: &str) -> bool {
 /// while a blob it references is still just an unpublished temp file: SIGKILL `load` at a spread
 /// of delays straddling its write window, and after every kill, stack and (at the end) export
 /// whatever survived — a torn or missing blob referenced by any committed tree fails the
-/// read-side hash check `export-git` performs on every object it walks.
+/// read-side hash check `git export` performs on every object it walks.
 #[test]
 fn killing_load_midway_never_leaves_a_shard_referencing_a_missing_or_torn_blob() {
     let area = Area::new("load");
@@ -554,15 +554,15 @@ fn killing_load_midway_never_leaves_a_shard_referencing_a_missing_or_torn_blob()
 
     // Final recovery and the sharp check: every object reachable from every pallet's history —
     // including every blob any kill's `load` ever staged and published — must read back. A shard
-    // durably referencing a missing or torn blob fails here via `export-git`'s read-side hash
+    // durably referencing a missing or torn blob fails here via `git export`'s read-side hash
     // check, exactly as it would for `stack`'s crash test above.
     area.clear_stale_lock();
     area.assert_consistent("final");
 
     let export_dir = area.root.join("git-export");
-    let export = area.run(&["export-git", export_dir.to_str().unwrap()]);
+    let export = area.run(&["git", "export", export_dir.to_str().unwrap()]);
     assert!(export.status.success(),
-        "export-git must read every committed object without a torn or missing blob, stderr: {}",
+        "git export must read every committed object without a torn or missing blob, stderr: {}",
         String::from_utf8_lossy(&export.stderr));
 
     // Sanity: across the run at least one kill left something a later `stack` actually built on,

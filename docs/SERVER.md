@@ -298,9 +298,9 @@ revocation by more than about a day.
   `forklift-server tombstone list --root …` shows them; `forklift-server tombstone drop --root …
   NAME` frees the name for unrelated history and lets the next `gc` collect what only the
   tombstone held. Dropping is refused while the root is served, like `gc`.
-- **Repack:** `forklift compact --all` against a served root is refused for the same reason
+- **Repack:** `forklift store compact --all` against a served root is refused for the same reason
   as `gc` — it drops unreachable packed objects with no grace period at all — so it also
-  belongs in the maintenance window. Plain `forklift compact` (incremental) never drops an
+  belongs in the maintenance window. Plain `forklift store compact` (incremental) never drops an
   object and is safe beside a live server.
 - **Shutdown:** SIGINT/SIGTERM drain in-flight requests before exiting.
 

@@ -1,4 +1,4 @@
-//! End-to-end tests of `forklift mirror` and lift's mirror trigger (DESIGN.html §9.8): a real
+//! End-to-end tests of `forklift git mirror` and lift's mirror trigger (DESIGN.html §9.8): a real
 //! `forklift-server` as the Forklift remote, a bare git repository as the mirror, and the real CLI.
 //!
 //! Every git call the tests make themselves, and every forklift run, ignores the machine's system
@@ -318,11 +318,11 @@ fn an_idle_run_pushes_nothing() {
     let fixture = Fixture::new("idle");
     let area = &fixture.area;
 
-    let first = area.json("a", &["mirror"]);
+    let first = area.json("a", &["git", "mirror"]);
     assert_eq!(outcome(&first, "main")["status"], "pushed", "{}", first);
     let pushed = tip(&fixture.git, "main").unwrap();
 
-    let second = area.json("a", &["mirror"]);
+    let second = area.json("a", &["git", "mirror"]);
     assert_eq!(outcome(&second, "main")["status"], "up_to_date", "{}", second);
     assert_eq!(outcome(&second, "main")["exported"], 0, "{}", second);
     assert_eq!(tip(&fixture.git, "main").unwrap(), pushed);
@@ -337,7 +337,7 @@ fn a_lift_advances_git_by_one_fast_forward_naming_its_parcel() {
     let fixture = Fixture::new("one-parcel");
     let area = &fixture.area;
 
-    area.forklift_ok("a", &["mirror"]);
+    area.forklift_ok("a", &["git", "mirror"]);
     let before = tip(&fixture.git, "main").unwrap();
     assert_eq!(last_line(&fixture.git, &before), parcel_line(&fixture.first));
 
@@ -362,7 +362,7 @@ fn a_foreign_commit_on_the_git_branch_is_a_divergence_and_stays() {
     let fixture = Fixture::new("divergence");
     let area = &fixture.area;
 
-    area.forklift_ok("a", &["mirror"]);
+    area.forklift_ok("a", &["git", "mirror"]);
     let mirrored = tip(&fixture.git, "main").unwrap();
     let tree = git_ok(&fixture.git, &["rev-parse", &format!("{}^{{tree}}", mirrored)]);
     let foreign = write_commit(&fixture.git, &tree, &[&mirrored], "Made in git\n");
@@ -375,7 +375,7 @@ fn a_foreign_commit_on_the_git_branch_is_a_divergence_and_stays() {
     assert_eq!(tip(&fixture.git, "main").unwrap(), foreign);
 
     // An explicit run fails, and its JSON error still carries the report.
-    let explicit = area.forklift("a", &["--json", "mirror"]);
+    let explicit = area.forklift("a", &["--json", "git", "mirror"]);
     assert_eq!(explicit.status.code(), Some(33), "{}", stdout(&explicit));
     let document: serde_json::Value = serde_json::from_str(&stdout(&explicit)).unwrap();
     assert_eq!(document["error"]["code"], "mirror_incomplete", "{}", document);
@@ -395,7 +395,7 @@ fn a_git_side_rewrite_is_a_divergence() {
     let fixture = Fixture::new("rewrite");
     let area = &fixture.area;
 
-    area.forklift_ok("a", &["mirror"]);
+    area.forklift_ok("a", &["git", "mirror"]);
     let mirrored = tip(&fixture.git, "main").unwrap();
     let message = git_ok(&fixture.git, &["log", "-1", "--format=%B", &mirrored]);
     let empty = git_ok(&fixture.git, &["hash-object", "-t", "tree", "-w", "--stdin"]);
@@ -429,7 +429,7 @@ fn git_already_ahead_after_a_race_the_mirror_lacks_ends_already_ahead() {
 
     // Create the mirror repository, with nothing yet on git.
     area.forklift_ok("a", &["config", "mirror.pallets", "none-yet"]);
-    area.forklift_ok("a", &["mirror"]);
+    area.forklift_ok("a", &["git", "mirror"]);
     area.forklift_ok("a", &["config", "mirror.pallets", "main"]);
 
     install_hook(&fixture.mirror_dir("a"), "reference-transaction", &format!(
@@ -439,7 +439,7 @@ fn git_already_ahead_after_a_race_the_mirror_lacks_ends_already_ahead() {
         lift = forklift_line(area, "b", "lift"),
     ));
 
-    let report = area.json("a", &["mirror"]);
+    let report = area.json("a", &["git", "mirror"]);
     assert!(area.path("raced").exists(), "the race never ran");
     let log = std::fs::read_to_string(area.path("hook.log")).unwrap_or_default();
     assert!(log.contains("Mirrored \"main\""), "the other warehouse did not mirror: {}", log);
@@ -469,7 +469,7 @@ fn a_race_to_a_tip_the_mirror_holds_ends_already_ahead() {
     area.forklift_ok("a", &["shift", "main"]);
 
     area.forklift_ok("a", &["config", "mirror.pallets", "feat"]);
-    area.forklift_ok("a", &["mirror"]);
+    area.forklift_ok("a", &["git", "mirror"]);
     area.forklift_ok("a", &["config", "mirror.pallets", "main"]);
 
     // B moves the remote's main to feat's head, ready to lift.
@@ -488,7 +488,7 @@ fn a_race_to_a_tip_the_mirror_holds_ends_already_ahead() {
         log = area.path("hook.log").display(),
     ));
 
-    let report = area.json("a", &["mirror"]);
+    let report = area.json("a", &["git", "mirror"]);
     assert!(area.path("raced").exists(), "the race never ran");
     assert_eq!(tip(&fixture.git, "main"), tip(&fixture.git, "feat"),
         "{}", std::fs::read_to_string(area.path("hook.log")).unwrap_or_default());
@@ -507,7 +507,7 @@ fn a_hook_decline_is_quoted_and_not_a_race() {
 
     install_hook(&fixture.git, "pre-receive", "echo 'pushes are frozen by policy' >&2\nexit 1\n");
 
-    let refused = area.forklift("a", &["mirror"]);
+    let refused = area.forklift("a", &["git", "mirror"]);
     assert!(!refused.status.success(), "{}", stdout(&refused));
     let error = stderr(&refused);
     assert!(error.contains("pushes are frozen by policy"), "{}", error);
@@ -526,14 +526,14 @@ fn a_foreign_commit_stacked_on_the_tip_is_a_divergence() {
     let fixture = Fixture::new("stacked");
     let area = &fixture.area;
 
-    area.forklift_ok("a", &["mirror"]);
+    area.forklift_ok("a", &["git", "mirror"]);
     let mirrored = tip(&fixture.git, "main").unwrap();
     let tree = git_ok(&fixture.git, &["rev-parse", &format!("{}^{{tree}}", mirrored)]);
     let foreign = write_commit(&fixture.git, &tree, &[&mirrored], "Hand-written\n");
     let labelled = write_commit(&fixture.git, &tree, &[&foreign], &format!("Copied\n\n{}\n", parcel_line(&fixture.first)));
     git_ok(&fixture.git, &["update-ref", "refs/heads/main", &labelled, &mirrored]);
 
-    let refused = area.forklift("a", &["mirror"]);
+    let refused = area.forklift("a", &["git", "mirror"]);
     assert!(!refused.status.success(), "{}", stdout(&refused));
     let error = stderr(&refused);
     assert!(error.contains(&foreign) && error.contains("not part of this warehouse's export"), "{}", error);
@@ -554,7 +554,7 @@ fn a_branch_in_another_layout_is_layout_skew() {
         &format!("first\n\nForklift-Parcel: {} export/2\n", fixture.first));
     git_ok(&fixture.git, &["update-ref", "refs/heads/main", &other]);
 
-    let refused = area.forklift("a", &["mirror"]);
+    let refused = area.forklift("a", &["git", "mirror"]);
     assert!(!refused.status.success(), "{}", stdout(&refused));
     let error = stderr(&refused);
     assert!(error.contains("export layout 2") && error.contains("export layout 1"), "{}", error);
@@ -570,11 +570,11 @@ fn an_unlifted_parcel_never_reaches_git() {
     let fixture = Fixture::new("unlifted");
     let area = &fixture.area;
 
-    area.forklift_ok("a", &["mirror"]);
+    area.forklift_ok("a", &["git", "mirror"]);
     let mirrored = tip(&fixture.git, "main").unwrap();
     area.stack("a", "code.txt", "local only\n", "unlifted");
 
-    let report = area.json("a", &["mirror"]);
+    let report = area.json("a", &["git", "mirror"]);
     assert_eq!(outcome(&report, "main")["status"], "up_to_date", "{}", report);
     assert_eq!(tip(&fixture.git, "main").unwrap(), mirrored);
 }
@@ -592,7 +592,7 @@ fn a_rewritten_exported_commit_is_refused_with_the_delete_step() {
 
     area.stack("a", "code.txt", "v2\n", "second");
     let second = area.lift("a")["head"].as_str().unwrap().to_string();
-    area.forklift_ok("a", &["mirror"]);
+    area.forklift_ok("a", &["git", "mirror"]);
 
     let mirror = fixture.mirror_dir("a");
     let exported = git_ok(&mirror, &["rev-parse", "refs/forklift/exported/main"]);
@@ -604,9 +604,9 @@ fn a_rewritten_exported_commit_is_refused_with_the_delete_step() {
         let rewritten = write_commit(&mirror, &tree, &[&parent], &format!("second\n\n{}\n", line));
         git_ok(&mirror, &["update-ref", "refs/forklift/exported/main", &rewritten]);
 
-        let refused = area.forklift("a", &["mirror"]);
+        let refused = area.forklift("a", &["git", "mirror"]);
         assert!(!refused.status.success(), "{}", stdout(&refused));
-        assert!(stderr(&refused).contains("Delete .forklift/mirror.git and run \"forklift mirror\""),
+        assert!(stderr(&refused).contains("Delete .forklift/mirror.git and run \"forklift git mirror\""),
             "{}: {}", line, stderr(&refused));
     }
 }
@@ -637,7 +637,7 @@ fn a_repeated_parent_mirrors_on_every_run() {
 
     area.forklift_ok("source", &["prepare"]);
     area.forklift_ok("source", &["config", "--global", "operator.identifier", "tester@forklift"]);
-    area.forklift_ok("source", &["import-git", "."]);
+    area.forklift_ok("source", &["git", "import", "."]);
     area.forklift_ok("source", &["config", "remote.url", &server.url]);
     let main = area.lift("source")["head"].as_str().unwrap().to_string();
     area.forklift_ok("source", &["shift", "feat"]);
@@ -645,20 +645,20 @@ fn a_repeated_parent_mirrors_on_every_run() {
     area.forklift_ok("source", &["shift", "main"]);
 
     // The merge parcel keeps its repeated parent.
-    let tip_parcel = area.json("source", &["peek", &main]);
+    let tip_parcel = area.json("source", &["store", "peek", &main]);
     let merge = tip_parcel["parents"][0].as_str().unwrap().to_string();
-    let merge_parcel = area.json("source", &["peek", &merge]);
+    let merge_parcel = area.json("source", &["store", "peek", &merge]);
     assert_eq!(merge_parcel["parents"].as_array().unwrap().len(), 2, "{}", merge_parcel);
 
     let git = area.path("git.git");
     git_ok(&area.root, &["init", "-q", "--bare", "git.git"]);
     area.forklift_ok("source", &["config", "mirror.url", git.to_str().unwrap()]);
     area.forklift_ok("source", &["config", "mirror.pallets", "main"]);
-    area.forklift_ok("source", &["mirror"]);
+    area.forklift_ok("source", &["git", "mirror"]);
 
     // feat's head lies below the merge, so this run descends through it from main's export.
     area.forklift_ok("source", &["config", "mirror.pallets", "main,feat"]);
-    let report = area.json("source", &["mirror"]);
+    let report = area.json("source", &["git", "mirror"]);
     assert_eq!(outcome(&report, "feat")["status"], "pushed", "{}", report);
     assert_eq!(outcome(&report, "feat")["exported"], 0, "{}", report);
     let merged = git_ok(&git, &["rev-parse", "main^"]);
@@ -676,12 +676,12 @@ fn a_deleted_mirror_repository_re_exports_and_pushes_nothing() {
 
     area.stack("a", "code.txt", "v2\n", "second");
     area.lift("a");
-    area.forklift_ok("a", &["mirror"]);
+    area.forklift_ok("a", &["git", "mirror"]);
     let mirrored = tip(&fixture.git, "main").unwrap();
 
     std::fs::remove_dir_all(fixture.mirror_dir("a")).unwrap();
 
-    let report = area.json("a", &["mirror"]);
+    let report = area.json("a", &["git", "mirror"]);
     assert_eq!(outcome(&report, "main")["status"], "up_to_date", "{}", report);
     assert_eq!(outcome(&report, "main")["exported"], 2, "{}", report);
     assert_eq!(tip(&fixture.git, "main").unwrap(), mirrored);
@@ -706,7 +706,7 @@ fn a_failed_push_resumes_without_re_exporting_after_gc() {
     install_hook(&fixture.git, "pre-receive",
         "while read old new ref; do [ \"$ref\" = refs/heads/feat ] && { echo 'feat is frozen' >&2; exit 1; }; done\nexit 0\n");
 
-    let refused = area.forklift("a", &["mirror"]);
+    let refused = area.forklift("a", &["git", "mirror"]);
     assert!(!refused.status.success(), "{}", stdout(&refused));
     assert!(stderr(&refused).contains("feat is frozen"), "{}", stderr(&refused));
     assert!(tip(&fixture.git, "main").is_some());
@@ -717,7 +717,7 @@ fn a_failed_push_resumes_without_re_exporting_after_gc() {
     }
 
     std::fs::remove_file(fixture.git.join("hooks").join("pre-receive")).unwrap();
-    let report = area.json("a", &["mirror"]);
+    let report = area.json("a", &["git", "mirror"]);
     assert_eq!(outcome(&report, "feat")["status"], "pushed", "{}", report);
     assert_eq!(outcome(&report, "feat")["exported"], 0, "{}", report);
 }
@@ -736,7 +736,7 @@ fn a_boundary_survives_gc_and_only_the_new_parcel_exports() {
     area.stack("b", "feat.txt", "feat 1\n", "feat one");
     area.lift("b");
 
-    let first = area.json("a", &["mirror"]);
+    let first = area.json("a", &["git", "mirror"]);
     assert_eq!(outcome(&first, "feat")["status"], "pushed", "{}", first);
 
     {
@@ -747,13 +747,13 @@ fn a_boundary_survives_gc_and_only_the_new_parcel_exports() {
     area.stack("b", "feat.txt", "feat 2\n", "feat two");
     area.lift("b");
 
-    let second = area.json("a", &["mirror"]);
+    let second = area.json("a", &["git", "mirror"]);
     assert_eq!(outcome(&second, "feat")["status"], "pushed", "{}", second);
     assert_eq!(outcome(&second, "feat")["exported"], 1, "{}", second);
 }
 
 /// Memo test 20: a mirror failure never fails the lift. An unreachable mirror is reported with
-/// git's message and the step `forklift mirror`; a mirror that asks for credentials fails at once,
+/// git's message and the step `forklift git mirror`; a mirror that asks for credentials fails at once,
 /// because git may not prompt inside a lift.
 ///
 /// Revert: drop GIT_TERMINAL_PROMPT=0 → git's message no longer says prompts are disabled.
@@ -768,7 +768,7 @@ fn a_lift_reports_an_unreachable_mirror_without_failing() {
     let lifted = area.lift("a");
     assert_eq!(lifted["mirror"]["status"], "failed", "{}", lifted);
     let message = lifted["mirror"]["message"].as_str().unwrap();
-    assert!(message.contains("git fetch from the mirror failed") && message.contains("forklift mirror"), "{}", message);
+    assert!(message.contains("git fetch from the mirror failed") && message.contains("forklift git mirror"), "{}", message);
 
     // A git host that wants credentials for everything.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -790,7 +790,7 @@ fn a_lift_reports_an_unreachable_mirror_without_failing() {
     assert!(started.elapsed() < std::time::Duration::from_secs(60));
     assert_eq!(lifted["mirror"]["status"], "failed", "{}", lifted);
     let message = lifted["mirror"]["message"].as_str().unwrap();
-    assert!(message.contains("terminal prompts disabled") && message.contains("forklift mirror"), "{}", message);
+    assert!(message.contains("terminal prompts disabled") && message.contains("forklift git mirror"), "{}", message);
 }
 
 /// A pass-through HTTP proxy that answers the requests `refuse` picks with a 500.
@@ -893,7 +893,7 @@ fn a_failed_meta_pallet_lift_runs_no_mirror() {
 }
 
 /// Memo test 22: a scoped bay holds only part of each tree, so lift's mirror is skipped there and
-/// `forklift mirror` refuses.
+/// `forklift git mirror` refuses.
 ///
 /// Revert: drop the scope gate → the lift mirrors a partial tree.
 #[test]
@@ -910,7 +910,7 @@ fn a_scoped_bay_skips_the_lift_mirror_and_refuses_mirror() {
     let lifted = area.lift("bay");
     assert_eq!(lifted["mirror"]["status"], "skipped", "{}", lifted);
 
-    let refused = area.forklift("bay", &["mirror"]);
+    let refused = area.forklift("bay", &["git", "mirror"]);
     assert!(!refused.status.success(), "{}", stdout(&refused));
     assert!(stderr(&refused).contains("scoped bay"), "{}", stderr(&refused));
 }
@@ -927,7 +927,7 @@ fn a_busy_mirror_is_reported_and_a_killed_holder_releases_it() {
     let fixture = Fixture::new("lock");
     let area = &fixture.area;
 
-    area.forklift_ok("a", &["mirror"]);
+    area.forklift_ok("a", &["git", "mirror"]);
     area.forklift_ok("a", &["config", "mirror.auto", "off"]);
     area.stack("a", "code.txt", "v2\n", "second");
     area.lift("a");
@@ -941,7 +941,7 @@ fn a_busy_mirror_is_reported_and_a_killed_holder_releases_it() {
         area.path("holding").display()
     ));
 
-    let mut holder = area.forklift_in(&area.path("a")).arg("mirror")
+    let mut holder = area.forklift_in(&area.path("a")).args(["git", "mirror"])
         .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
     let started = std::time::Instant::now();
     while !area.path("holding").exists() {
@@ -949,7 +949,7 @@ fn a_busy_mirror_is_reported_and_a_killed_holder_releases_it() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
-    let busy = area.forklift("bay", &["mirror"]);
+    let busy = area.forklift("bay", &["git", "mirror"]);
     assert!(!busy.status.success(), "{}", stdout(&busy));
     assert!(stderr(&busy).contains("Another mirror run"), "{}", stderr(&busy));
 
@@ -957,7 +957,7 @@ fn a_busy_mirror_is_reported_and_a_killed_holder_releases_it() {
     holder.wait().unwrap();
     std::fs::remove_file(fixture.mirror_dir("a").join("hooks").join("reference-transaction")).unwrap();
 
-    let report = area.json("bay", &["mirror"]);
+    let report = area.json("bay", &["git", "mirror"]);
     assert_eq!(outcome(&report, "main")["status"], "pushed", "{}", report);
 }
 
@@ -976,7 +976,7 @@ fn unmirrorable_pallets_are_skipped_without_refs() {
     area.forklift_ok("a", &["shift", "main"]);
 
     area.forklift_ok("a", &["config", "mirror.pallets", "ghost,feature.lock"]);
-    let report = area.json("a", &["mirror"]);
+    let report = area.json("a", &["git", "mirror"]);
     assert_eq!(outcome(&report, "ghost")["status"], "skipped", "{}", report);
     assert_eq!(outcome(&report, "feature.lock")["status"], "skipped", "{}", report);
 
@@ -998,13 +998,13 @@ fn a_fast_forward_to_another_pallet_is_a_divergence() {
     area.stack("a", "code.txt", "feat\n", "on feat");
     area.lift("a");
     area.forklift_ok("a", &["shift", "main"]);
-    area.forklift_ok("a", &["mirror"]);
+    area.forklift_ok("a", &["git", "mirror"]);
 
     let feat = tip(&fixture.git, "feat").unwrap();
     git_ok(&fixture.git, &["push", "-q", ".", "refs/heads/feat:refs/heads/main"]);
 
     area.forklift_ok("a", &["config", "mirror.pallets", "main"]);
-    let refused = area.forklift("a", &["mirror"]);
+    let refused = area.forklift("a", &["git", "mirror"]);
     assert!(!refused.status.success(), "{}", stdout(&refused));
     assert!(stderr(&refused).contains(&feat) && stderr(&refused).contains("not part of this warehouse's export"),
         "{}", stderr(&refused));
@@ -1023,7 +1023,7 @@ fn an_unreadable_roots_record_is_rebuilt_from_the_exported_refs() {
     area.stack("a", "code.txt", "feat\n", "on feat");
     area.lift("a");
     area.forklift_ok("a", &["shift", "main"]);
-    area.forklift_ok("a", &["mirror"]);
+    area.forklift_ok("a", &["git", "mirror"]);
 
     let pallets = |entries: Vec<(String, String)>| entries.into_iter().map(|(pallet, _)| pallet).collect::<Vec<_>>();
 
@@ -1034,7 +1034,7 @@ fn an_unreadable_roots_record_is_rebuilt_from_the_exported_refs() {
     assert_eq!(pallets(record_entries(&fixture.roots_record("a"))), ["feat", "main"]);
 
     std::fs::write(fixture.roots_record("a"), "not a record\n").unwrap();
-    area.forklift_ok("a", &["mirror"]);
+    area.forklift_ok("a", &["git", "mirror"]);
     assert_eq!(pallets(record_entries(&fixture.roots_record("a"))), ["feat", "main"]);
 }
 
@@ -1049,7 +1049,7 @@ fn a_relative_url_is_read_from_the_warehouse_root() {
     let area = &fixture.area;
 
     area.forklift_ok("a", &["config", "mirror.url", "../git.git"]);
-    let report = area.json("a", &["mirror"]);
+    let report = area.json("a", &["git", "mirror"]);
     assert_eq!(outcome(&report, "main")["status"], "pushed", "{}", report);
 
     area.forklift_ok("a", &["config", "mirror.auto", "off"]);
@@ -1058,7 +1058,7 @@ fn a_relative_url_is_read_from_the_warehouse_root() {
     let bay = area.path("bay");
     area.forklift_ok("a", &["bay", "add", "full", bay.to_str().unwrap()]);
 
-    let report = area.json("bay", &["mirror"]);
+    let report = area.json("bay", &["git", "mirror"]);
     assert_eq!(outcome(&report, "main")["status"], "pushed", "{}", report);
     assert_eq!(last_line(&fixture.git, &tip(&fixture.git, "main").unwrap()), parcel_line(&second));
 }
@@ -1073,7 +1073,7 @@ fn hooks_never_run_on_the_mirror_network_calls() {
     let fixture = Fixture::new("no-hooks");
     let area = &fixture.area;
 
-    area.forklift_ok("a", &["mirror"]);
+    area.forklift_ok("a", &["git", "mirror"]);
     install_hook(&fixture.mirror_dir("a"), "pre-push", &format!(
         "touch '{}'\nexit 1\n", area.path("hooked").display()
     ));
@@ -1094,7 +1094,7 @@ fn a_race_that_ends_at_the_export_is_up_to_date() {
     let fixture = Fixture::new("last-race");
     let area = &fixture.area;
 
-    area.forklift_ok("a", &["mirror"]);
+    area.forklift_ok("a", &["git", "mirror"]);
     area.forklift_ok("a", &["config", "mirror.auto", "off"]);
     for version in ["v2", "v3", "v4"] {
         area.stack("a", "code.txt", &format!("{}\n", version), version);
@@ -1105,7 +1105,7 @@ fn a_race_that_ends_at_the_export_is_up_to_date() {
     let scratch = area.path("scratch.git");
     git_ok(&area.root, &["init", "-q", "--bare", "scratch.git"]);
     area.forklift_ok("a", &["config", "mirror.url", scratch.to_str().unwrap()]);
-    area.forklift_ok("a", &["mirror"]);
+    area.forklift_ok("a", &["git", "mirror"]);
     let export = tip(&scratch, "main").unwrap();
     git_ok(&scratch, &["push", "-q", fixture.git.to_str().unwrap(), "main:refs/held/main"]);
     area.forklift_ok("a", &["config", "mirror.url", fixture.git.to_str().unwrap()]);
@@ -1122,7 +1122,7 @@ fn a_race_that_ends_at_the_export_is_up_to_date() {
         log = area.path("hook.log").display(),
     ));
 
-    let report = area.json("a", &["mirror"]);
+    let report = area.json("a", &["git", "mirror"]);
     assert_eq!(std::fs::read_to_string(area.path("attempts")).unwrap().trim(), "3", "{}", report);
     assert_eq!(outcome(&report, "main")["status"], "up_to_date", "{}", report);
     assert_eq!(tip(&fixture.git, "main").unwrap(), export);
@@ -1143,14 +1143,14 @@ fn an_exported_parcel_fetched_by_the_run_is_built_on() {
     area.stack("a", "feat.txt", "feat\n", "feat only");
     area.lift("a");
     area.forklift_ok("a", &["config", "mirror.pallets", "main,feat"]);
-    let report = area.json("a", &["mirror"]);
+    let report = area.json("a", &["git", "mirror"]);
     assert_eq!(outcome(&report, "feat")["status"], "pushed", "{}", report);
 
     copy_dir(&fixture.mirror_dir("a"), &fixture.mirror_dir("b"));
     area.forklift_ok("b", &["config", "mirror.url", fixture.git.to_str().unwrap()]);
     area.forklift_ok("b", &["config", "mirror.pallets", "main,feat"]);
 
-    let report = area.json("b", &["mirror"]);
+    let report = area.json("b", &["git", "mirror"]);
     assert_eq!(outcome(&report, "feat")["status"], "up_to_date", "{}", report);
     assert_eq!(outcome(&report, "feat")["exported"], 0, "{}", report);
 }
@@ -1183,7 +1183,7 @@ fn a_damaged_export_refuses_only_its_own_pallet() {
     area.lift("a");
     area.forklift_ok("a", &["shift", "main"]);
     area.forklift_ok("a", &["config", "mirror.pallets", "main,feat"]);
-    area.forklift_ok("a", &["mirror"]);
+    area.forklift_ok("a", &["git", "mirror"]);
 
     let mirror = fixture.mirror_dir("a");
     let exported = git_ok(&mirror, &["rev-parse", "refs/forklift/exported/feat"]);
@@ -1203,7 +1203,7 @@ fn a_damaged_export_refuses_only_its_own_pallet() {
         area.stack("a", "code.txt", &format!("v{}\n", round + 2), "next");
         let head = area.lift("a")["head"].as_str().unwrap().to_string();
 
-        let run = area.forklift("a", &["--json", "mirror"]);
+        let run = area.forklift("a", &["--json", "git", "mirror"]);
         assert_eq!(run.status.code(), Some(33), "{}: {}", line, stdout(&run));
         let document: serde_json::Value = serde_json::from_str(&stdout(&run)).unwrap();
         let details = &document["error"]["details"];
@@ -1240,7 +1240,7 @@ fn a_head_the_anchor_does_not_vouch_for_is_never_exported() {
 
     fixture.franchise("b");
     area.forklift_ok("b", &["config", "mirror.url", fixture.git.to_str().unwrap()]);
-    area.forklift_ok("b", &["mirror"]);
+    area.forklift_ok("b", &["git", "mirror"]);
     let mirrored = tip(&fixture.git, "main").unwrap();
 
     let trust = area.path("server-root/.forklift/trust");
@@ -1258,7 +1258,7 @@ fn a_head_the_anchor_does_not_vouch_for_is_never_exported() {
         std::fs::write(path, bytes).unwrap();
     }
 
-    let run = area.forklift("b", &["--json", "mirror"]);
+    let run = area.forklift("b", &["--json", "git", "mirror"]);
     let report: serde_json::Value = serde_json::from_str(&stdout(&run)).unwrap();
     assert_eq!(report["error"]["code"], "mirror_incomplete", "{}", report);
     let main = outcome(&report["error"]["details"], "main");

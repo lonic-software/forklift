@@ -1160,13 +1160,13 @@ pub(crate) fn is_bulk_session_open() -> bool {
 ///
 /// Exactly one session may be active per process (enforced by [`open`](BulkStoreSession::open)
 /// through the `Mutex` in [`bulk_session_registry`]). This is deliberately not a concurrency
-/// primitive: it exists for a single, sequential bulk writer (`import-git --no-compact`) and must
+/// primitive: it exists for a single, sequential bulk writer (`git import --no-compact`) and must
 /// never be opened by anything with concurrent writers — in particular the server head, which
 /// serves many warehouses and many requests from one process, must never open one.
 ///
 /// The facility generalizes to any other bulk, sequential loose writer (an incremental batch
 /// fetch landing many objects loose, say) — it is deliberately not wired into one yet, since
-/// `import-git` is the only place that need has actually shown up so far.
+/// `git import` is the only place that need has actually shown up so far.
 pub struct BulkStoreSession {
     finished: bool,
 }
@@ -2655,7 +2655,7 @@ static PASSED_INVENTORY_ROOTS: std::sync::RwLock<BTreeSet<PathBuf>> = std::sync:
 
 /// Refuse an inventory root whose metadata header names another format version, once per process
 /// per root. Every shard path comes from [`get_inventory_store_root`], so this guards the paths
-/// that reach a shard without reading the metadata first (`import-git` resets the inventory without
+/// that reach a shard without reading the metadata first (`git import` resets the inventory without
 /// reading it). A damaged, unreadable or absent metadata file passes, as does one that is not a
 /// regular file, which is never opened (a link is never followed): the metadata read reports all
 /// but the absent one, and a reset rewrites the file without reading it.

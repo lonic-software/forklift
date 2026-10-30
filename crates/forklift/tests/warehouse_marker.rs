@@ -243,7 +243,7 @@ fn a_bay_of_an_unmarked_warehouse_is_refused_and_nothing_is_written() {
             refusal.next_step,
             format!(
                 "Re-create the warehouse at {} (move its \".forklift\" aside, run \"forklift prepare\" there, then \
-                import the history again with \"forklift import-git\" or franchise it again), then move {} aside and add \
+                import the history again with \"forklift git import\" or franchise it again), then move {} aside and add \
                 the bay again with \"forklift bay add\" in {}.",
                 quoted(&root), quoted(&bay), quoted(&root)
             ),
@@ -494,7 +494,7 @@ fn the_server_serves_no_unmarked_root() {
         let stderr = text(&served.stderr);
         let (_, next_step) = stderr.trim_end().split_once('\n').expect("a message line");
         assert!(next_step.starts_with(expected), "{:?}", stderr);
-        assert!(!stderr.contains("\"forklift prepare\"") && !stderr.contains("import-git"), "{:?}", stderr);
+        assert!(!stderr.contains("\"forklift prepare\"") && !stderr.contains("git import"), "{:?}", stderr);
         assert_eq!(listing(root), before, "refused before any lock is taken");
     }
 }
