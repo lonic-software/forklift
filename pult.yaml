@@ -30,7 +30,7 @@ commands:
       # The `fl` short alias (§5.0 F) — same one implementation every install method calls.
       # Default on; FORKLIFT_NO_ALIAS=1 opts out. Best effort: a refusal (e.g. an unrelated
       # "fl" already on PATH) must not fail this install step.
-      - "[ -n \"${FORKLIFT_NO_ALIAS:-}\" ] || forklift alias install || true"
+      - "[ -n \"${FORKLIFT_NO_ALIAS:-}\" ] || forklift self alias install || true"
 
   # NOT `serve`: pult reserves that id for its own subcommands, and it rejects the whole config on
   # sight — so a reserved id here breaks every pult command in this repo, not just this one.

@@ -12,10 +12,6 @@ Every `forklift` command and subcommand, generated from the same command definit
 
 | Command | Alias | Hidden alias | Does |
 |---|---|---|---|
-| `alias` |  |  | Manage the `fl` short alias for this binary |
-| `alias install` |  |  | Create the alias next to this binary (default name: "fl") |
-| `alias uninstall` |  |  | Remove the alias next to this binary (default name: "fl") |
-| `alias status` |  |  | Report whether the alias is installed and where it points (the default) |
 | `audit` | `a` |  | Verify the warehouse's signed history offline |
 | `bay` |  |  | Manage bays: parallel working directories bound to this warehouse |
 | `bay add` |  |  | Open a new bay (a new working directory on a new pallet) |
@@ -99,8 +95,13 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `scope` |  |  | Show this bay's sparse materialization scope, and the warehouse fetch scope |
 | `scope status` |  |  | Show the current bay's materialization scope and the warehouse fetch scope (the default) |
 | `scope-prune` |  |  | Reclaim disk from a sparse warehouse: forget a fetched path and free its content |
-| `self-schema` |  |  | Describe this binary's command surface as a Pult manifest |
-| `self-update` |  |  | Check for a newer release and update this binary (client only) |
+| `self` |  |  | Manage this binary itself: its update, its short alias and its self-description |
+| `self alias` |  |  | Manage the `fl` short alias for this binary |
+| `self alias install` |  |  | Create the alias next to this binary (default name: "fl") |
+| `self alias uninstall` |  |  | Remove the alias next to this binary (default name: "fl") |
+| `self alias status` |  |  | Report whether the alias is installed and where it points (the default) |
+| `self schema` |  |  | Describe this binary's command surface as a Pult manifest |
+| `self update` |  |  | Check for a newer release and update this binary (client only) |
 | `shift` | `sh` | `checkout`, `switch` | Shift to another pallet |
 | `show` |  |  | Print a file's content at a revision, as git show does for REV:PATH |
 | `stack` | `s` | `commit` | Stack the inventory as a new parcel (commit) on the current pallet |

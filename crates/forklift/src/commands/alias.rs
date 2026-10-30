@@ -15,11 +15,11 @@ pub const DEFAULT_NAME: &str = "fl";
 /// doubles as an escape hatch when the binary's own directory is not writable.
 const ENV_ALIAS_DIR: &str = "FORKLIFT_ALIAS_DIR";
 
-/// Handle the "alias" command: manage the `fl` short alias next to this binary.
+/// Handle the "self alias" command: manage the `fl` short alias next to this binary.
 ///
-/// * `alias` / `alias status`      - Report whether the alias exists and where it points.
-/// * `alias install [name]`       - Create the alias (default name: "fl").
-/// * `alias uninstall [name]`     - Remove the alias.
+/// * `self alias` / `self alias status`  - Report whether the alias exists and where it points.
+/// * `self alias install [name]`        - Create the alias (default name: "fl").
+/// * `self alias uninstall [name]`      - Remove the alias.
 ///
 /// # Arguments
 /// * `action` - The alias subcommand (`None` reports status).
@@ -61,9 +61,11 @@ fn install(name: &str) -> Result<(), String> {
             overwrite it — remove it yourself first if that's what you want.",
             display(&alias_path), display(&other), display(&target)
         )),
+        Existing::Unreadable(e) => return Err(unreadable(&alias_path, &e)),
         Existing::Foreign => return Err(format!(
             "\"{}\" already exists and is not an alias forklift manages (not a symlink to a \
-            forklift binary). Refusing to overwrite it.",
+            forklift binary). Refusing to overwrite it — remove it yourself first if that's what \
+            you want (a shim an older release wrote is one this release no longer recognizes).",
             display(&alias_path)
         )),
         Existing::None => {}
@@ -100,8 +102,11 @@ fn uninstall(name: &str) -> Result<(), String> {
 
             Ok(())
         }
+        Existing::Unreadable(e) => Err(unreadable(&alias_path, &e)),
         Existing::Foreign => Err(format!(
-            "\"{}\" exists but is not an alias forklift manages. Refusing to remove it.",
+            "\"{}\" exists but is not an alias forklift manages. Refusing to remove it — remove \
+            it yourself if that's what you want (a shim an older release wrote is one this release \
+            no longer recognizes).",
             display(&alias_path)
         )),
         Existing::PointsHere | Existing::PointsElsewhere(_) => {
@@ -124,8 +129,13 @@ fn status() -> Result<(), String> {
     let target = this_binary()?;
     let alias_path = platform_alias_path(&dir, DEFAULT_NAME);
 
-    let (installed, target_display) = match inspect(&alias_path, &target) {
-        Existing::None | Existing::Foreign => (false, None),
+    let existing = inspect(&alias_path, &target);
+    if let Existing::Unreadable(e) = &existing {
+        return Err(unreadable(&alias_path, e));
+    }
+    let foreign = matches!(existing, Existing::Foreign);
+    let (installed, target_display) = match existing {
+        Existing::None | Existing::Foreign | Existing::Unreadable(_) => (false, None),
         Existing::PointsHere => (true, Some(display(&target))),
         Existing::PointsElsewhere(other) => (true, Some(display(&other))),
     };
@@ -135,13 +145,14 @@ fn status() -> Result<(), String> {
         path: display(&alias_path),
         installed,
         target: target_display,
+        foreign,
     });
 
     Ok(())
 }
 
 /// Whether `name` currently exists next to this binary (any recognized alias, not
-/// necessarily pointing here) — used by `self-update` to decide whether to restore it after
+/// necessarily pointing here) — used by `self update` to decide whether to restore it after
 /// an in-place update. Best-effort: any resolution failure reads as "not installed".
 pub(crate) fn exists(name: &str) -> bool {
     match (alias_dir(), this_binary()) {
@@ -154,10 +165,10 @@ pub(crate) fn exists(name: &str) -> bool {
 }
 
 /// Silently (re)create `name` next to this binary if it is currently missing. Used by
-/// `self-update`: if the alias existed before an in-place update, make sure it still does
+/// `self update`: if the alias existed before an in-place update, make sure it still does
 /// afterwards. Never overwrites a foreign file or an alias pointing elsewhere — same
 /// conservative rule as `install` — and never fails the update it's called from; a failure
-/// here is swallowed, since self-update already reported its own result.
+/// here is swallowed, since self update already reported its own result.
 pub(crate) fn reinstall_silently(name: &str) {
     if let (Ok(dir), Ok(target)) = (alias_dir(), this_binary()) {
         let alias_path = platform_alias_path(&dir, name);
@@ -182,6 +193,19 @@ enum Existing {
     /// Something is there, but it is not an alias forklift recognizes as its own (a real
     /// file, a directory, or unrecognized content) — never touched.
     Foreign,
+
+    /// Something may be there, but it could not be read, so whose it is is unknown — never
+    /// touched, and never reported as foreign.
+    Unreadable(io::Error),
+}
+
+/// Why nothing was done to an alias path that could not be read.
+fn unreadable(alias_path: &Path, error: &io::Error) -> String {
+    format!(
+        "Could not read \"{}\" to tell whether it is an alias forklift manages: {}. Leaving it \
+         as it is.",
+        display(alias_path), error
+    )
 }
 
 /// The directory the alias is created next to: `FORKLIFT_ALIAS_DIR` when set, otherwise this
@@ -236,7 +260,7 @@ fn inspect(alias_path: &Path, target: &Path) -> Existing {
     let metadata = match std::fs::symlink_metadata(alias_path) {
         Ok(metadata) => metadata,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Existing::None,
-        Err(_) => return Existing::Foreign,
+        Err(e) => return Existing::Unreadable(e),
     };
 
     if !metadata.file_type().is_symlink() {
@@ -266,7 +290,7 @@ fn remove_alias(alias_path: &Path) -> io::Result<()> {
 // ── Windows: symlinks need elevated privilege, so drop a `.cmd` shim instead ──────────────
 
 #[cfg(windows)]
-const SHIM_MARKER: &str = "rem forklift-alias: managed by \"forklift alias\" \u{2014} do not edit by hand";
+const SHIM_MARKER: &str = "rem forklift-alias: managed by \"forklift self alias\" \u{2014} do not edit by hand";
 
 #[cfg(windows)]
 fn platform_alias_path(dir: &Path, name: &str) -> PathBuf {
@@ -299,7 +323,9 @@ fn inspect(alias_path: &Path, target: &Path) -> Existing {
     let content = match std::fs::read_to_string(alias_path) {
         Ok(content) => content,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Existing::None,
-        Err(_) => return Existing::Foreign,
+        // A directory or non-UTF-8 content was read well enough to know it is no shim.
+        Err(e) if e.kind() == io::ErrorKind::InvalidData || alias_path.is_dir() => return Existing::Foreign,
+        Err(e) => return Existing::Unreadable(e),
     };
 
     if !content.contains(SHIM_MARKER) {
@@ -426,14 +452,23 @@ pub(crate) struct StatusReport {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<String>,
+
+    /// Whether a file forklift does not manage holds the alias's name, so `install` would
+    /// refuse to overwrite it.
+    foreign: bool,
 }
 
 impl CommandOutput for StatusReport {
     fn render_human(&self) {
         match &self.target {
             Some(target) => println!("\"{}\" -> \"{}\"", self.path, target),
+            None if self.foreign => println!(
+                "\"{}\" exists but is not an alias forklift manages, so no \"{}\" alias is installed. \
+                 Remove it yourself, then run \"forklift self alias install\".",
+                self.path, self.name
+            ),
             None => println!(
-                "No \"{}\" alias installed at \"{}\". Run \"forklift alias install\" to create it.",
+                "No \"{}\" alias installed at \"{}\". Run \"forklift self alias install\" to create it.",
                 self.name, self.path
             ),
         }

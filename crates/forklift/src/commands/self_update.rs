@@ -21,9 +21,9 @@ const INSTALL_SH: &str =
 const INSTALL_PS1: &str =
     "irm https://raw.githubusercontent.com/lonic-software/forklift/main/install.ps1 | iex";
 
-/// Handle the self-update command: check the latest published release against this binary
+/// Handle the self update command: check the latest published release against this binary
 /// and, for a script/manual install, update in place by re-running the verified install
-/// script. A **package-manager** install is never overwritten — self-update defers to the
+/// script. A **package-manager** install is never overwritten — self update defers to the
 /// package manager with the right command, so it can't fight `cargo`/`brew`/the system.
 ///
 /// Forklift deliberately keeps this to the *client*. A server is a deployed artifact — it
@@ -157,7 +157,7 @@ fn parts(version: &str) -> (u64, u64, u64) {
 /// We pin `FORKLIFT_VERSION` to the version we already resolved from the GitHub API,
 /// instead of letting the install script resolve "latest" itself. The script's own
 /// `latest` uses the `releases/latest/download/` redirect, which GitHub CDN-caches and can
-/// serve a *stale* release right after a publish (the reason a self-update could reinstall
+/// serve a *stale* release right after a publish (the reason a self update could reinstall
 /// the old version, checksum and all). Pinning downloads from the stable per-tag URL.
 fn perform_update(version: &str) -> Result<(), String> {
     println!("Installing forklift {} via the install script…", version);
@@ -225,7 +225,7 @@ impl InstallMethod {
     }
 }
 
-/// The result of a self-update check (or update).
+/// The result of a self update check (or update).
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
 pub(crate) struct SelfUpdate {
@@ -274,10 +274,10 @@ impl CommandOutput for SelfUpdate {
         println!("forklift {} is available — you have {}.", latest, self.current);
 
         if self.install_method == "script" {
-            println!("Run \"forklift self-update\" to update in place, or:");
+            println!("Run \"forklift self update\" to update in place, or:");
         } else {
             println!(
-                "This looks like a {}-managed install, so self-update won't overwrite it. Update with:",
+                "This looks like a {}-managed install, so self update won't overwrite it. Update with:",
                 self.install_method
             );
         }

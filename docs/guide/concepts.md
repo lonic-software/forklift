@@ -326,7 +326,7 @@ $ forklift stocktake --json
 ```
 
 A failure carries a stable error code and a fixed exit code, so a script can branch without reading
-the message. `self-schema` describes the whole command surface, and `forklift mcp` serves it to AI
+the message. `self schema` describes the whole command surface, and `forklift mcp` serves it to AI
 agents as native tools.
 
 Reference: [the machine and agent interface](../MACHINE_INTERFACE.md),

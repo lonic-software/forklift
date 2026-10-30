@@ -77,7 +77,6 @@ Every tool `forklift mcp` serves, generated from the same command definition the
 
 Each of these commands, and every command below it, is a tool for nobody: a person runs it.
 
-- `forklift alias`: manages the `fl` shell alias next to this binary, a host concern.
 - `forklift prepare`: creates a warehouse, which is setup.
 - `forklift config`: reads and sets configuration, which is setup.
 - `forklift profile`: manages identity profiles, which is setup.
@@ -92,8 +91,7 @@ Each of these commands, and every command below it, is a tool for nobody: a pers
 - `forklift office retire`: revokes a key: trust administration.
 - `forklift office regenesis`: resets trust, a recovery step.
 - `forklift office accept-regenesis`: accepts a remote's trust reset, a recovery step.
-- `forklift self-update`: updates the binary, a host concern.
-- `forklift self-schema`: describes the CLI for Pult; agents get the tool list instead.
+- `forklift self`: manages this binary itself: its updates and its `fl` alias are host concerns, and the description it gives Pult is the tool list agents already have.
 - `forklift scope-prune`: destructive, warehouse-wide disk reclamation: an admin verb, never a sub-agent's.
 - `forklift store evict`: warehouse-wide disk reclamation in a cache: an admin verb, like scope-prune.
 - `forklift remote`: shows the remote configuration, like config, and repoints a partial warehouse at another server: setup.

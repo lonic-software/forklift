@@ -14,9 +14,13 @@
 
 forklift: -v/--verbose --json --no-pager --color=<WHEN>{auto|always|never} -h/--help -V/--version
 forklift alias:
+    -> forklift self alias:
 forklift alias install: [NAME]
+    -> forklift self alias install: [NAME]
 forklift alias uninstall: [NAME]
+    -> forklift self alias uninstall: [NAME]
 forklift alias status:
+    -> forklift self alias status:
 forklift audit: [PALLET] --full
 forklift bay:
 forklift bay add: <NAME> [PATH] --scope=<PATH>...
@@ -113,7 +117,10 @@ forklift query: [REVISION]... --from=<REVISION> --class=<CLASS> --unsupervised -
 forklift remove: <PATH>
 forklift restore: -s/--staged <PATH>
 forklift self-schema:
+    -> forklift self:
+    -> forklift self schema:
 forklift self-update: --check
+    -> forklift self update: --check
 forklift shift: <PALLET>
 forklift show: <REVISION:PATH>
 forklift stack: [DESCRIPTION]

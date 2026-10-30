@@ -107,10 +107,10 @@ install_one() { # $1 = binary base name (forklift / forklift-server)
     dest="${INSTALL_DIR}/${binfile}"
 
     # Refuse to update a *running* server: replacing its binary would leave the live
-    # process on the old code until it restarts (and there is no server self-update by
+    # process on the old code until it restarts (and there is no server self update by
     # design). Stop it first, then re-run — see SERVER.md. Best effort (only with pgrep);
     # FORKLIFT_FORCE=1 overrides. The client is not guarded: it is short-lived, and
-    # `forklift self-update` re-runs this script from a live `forklift` process.
+    # `forklift self update` re-runs this script from a live `forklift` process.
     if [ "$name" = "forklift-server" ] && [ -z "${FORKLIFT_FORCE:-}" ] \
        && command -v pgrep >/dev/null 2>&1 && pgrep -x forklift-server >/dev/null 2>&1; then
         err "a forklift-server is running — updating now would swap its binary while it runs,
@@ -147,11 +147,19 @@ install_one() { # $1 = binary base name (forklift / forklift-server)
     say "installed ${dest} — $("$dest" --version 2>/dev/null || echo "$name")"
 
     # The `fl` short alias (DESIGN.html §5.0 F): every install method converges on the
-    # same `forklift alias install`, so this is the one place the behavior lives. Default
+    # same `forklift self alias install`, so this is the one place the behavior lives. Default
     # on, opt out with FORKLIFT_NO_ALIAS=1; best effort (never fails the install over it —
     # e.g. a read-only install dir, or a name collision it correctly refuses to clobber).
+    # Releases before the `self` family spell it `alias install`, and FORKLIFT_VERSION can
+    # install one of those, so the binary is asked which family it has. Only a binary that has
+    # `alias` and lacks `self` is an older release; one that fails both gets today's spelling.
     if [ "$name" = "forklift" ] && [ -z "${FORKLIFT_NO_ALIAS:-}" ]; then
-        "$dest" alias install || say "warning: could not create the \"fl\" alias (see above); \"$dest alias install\" retries it"
+        alias_install="self alias install"
+        if ! "$dest" self --help >/dev/null 2>&1 && "$dest" alias --help >/dev/null 2>&1; then
+            alias_install="alias install"
+        fi
+        # shellcheck disable=SC2086 # the words are split on purpose
+        "$dest" $alias_install || say "warning: could not create the \"fl\" alias (see above); \"$dest $alias_install\" retries it"
     fi
 }
 

@@ -485,9 +485,9 @@ Context Protocol.
 
 **Protocol version.** The version of the remote protocol client and server speak.
 
-**`self-schema`, Pult.** `self-schema` describes Forklift's commands for Pult, a separate Lonic
+**`self schema`, Pult.** `self schema` describes Forklift's commands for Pult, a separate Lonic
 tool that drives command-line tools. See
-[`self-schema`](cli.md#self-schema--describe-the-command-surface-for-pult).
+[`self schema`](cli.md#self-schema--describe-the-command-surface-for-pult).
 
 ## Overloaded words
 
