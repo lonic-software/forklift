@@ -777,7 +777,7 @@ pub(crate) const HUMAN_ONLY: &[(&str, &str)] = &[
 /// alone or with others it does something an agent may do.
 pub(crate) const HUMAN_ONLY_TOGETHER: &[(&str, &[&str], &str)] = &[
     ("palletize", &["remote", "delete"], "deletes the remote's pallet, which every clone shares: an admin's call, never a sub-agent's"),
-    ("palletize", &["remote", "restore"], "restores the remote's pallet, which every clone shares: an admin's call, never a sub-agent's"),
+    ("palletize", &["remote", "restore"], "brings back a pallet someone deleted on the remote, which every clone shares, with no work of the caller's: an admin's call, never a sub-agent's (re-creating it under new work, by lifting with \"recreate\", is a push and served)"),
 ];
 
 /// The families whose bare form runs the same operation as one of their subcommands, with that
@@ -970,17 +970,7 @@ fn generate_tools(root: &clap::Command) -> Result<Vec<Tool>, String> {
     if let Some(((entry, _), _)) = HUMAN_ONLY.iter().zip(&used.human_only).find(|(_, used)| !**used) {
         return Err(format!("HUMAN_ONLY names `{entry}`, which is not a visible command"));
     }
-    for (path, keys, why) in HUMAN_ONLY_TOGETHER {
-        let tool = tools.iter_mut().find(|tool| tool.path.join(" ") == *path)
-            .ok_or_else(|| format!("HUMAN_ONLY_TOGETHER names `{path}`, which is not a tool"))?;
-        if let Some(key) = keys.iter().find(|key| !tool.params.iter().any(|param| param.key == **key)) {
-            return Err(format!("HUMAN_ONLY_TOGETHER names `{key}` of `{path}`, which is not an argument of its tool"));
-        }
-        if keys.len() < 2 {
-            return Err(format!("HUMAN_ONLY_TOGETHER names fewer than two arguments of `{path}`"));
-        }
-        tool.together.push((keys, why));
-    }
+    attach_together(&mut tools, HUMAN_ONLY_TOGETHER)?;
     for ((family, sub), used) in BARE_SAME_AS.iter().zip(&used.bare_same_as) {
         let path = format!("{family} {sub}");
         if !*used || !tools.iter().any(|tool| tool.path.join(" ") == path) {
@@ -999,6 +989,27 @@ fn generate_tools(root: &clap::Command) -> Result<Vec<Tool>, String> {
         return Err(format!("two commands make the tool name `{}`", tool.name));
     }
     Ok(tools)
+}
+
+/// Attaches each combination of `table` (shaped as [`HUMAN_ONLY_TOGETHER`]) to its tool.
+///
+/// # Returns
+/// * `Ok(())`      - Every entry names a tool and two or more distinct arguments of it.
+/// * `Err(String)` - An entry names no tool, an argument its tool lacks, or fewer than two
+///   distinct arguments (which would refuse an argument alone).
+fn attach_together(tools: &mut [Tool], table: &'static [(&'static str, &'static [&'static str], &'static str)]) -> Result<(), String> {
+    for (path, keys, why) in table {
+        let tool = tools.iter_mut().find(|tool| tool.path.join(" ") == *path)
+            .ok_or_else(|| format!("HUMAN_ONLY_TOGETHER names `{path}`, which is not a tool"))?;
+        if let Some(key) = keys.iter().find(|key| !tool.params.iter().any(|param| param.key == **key)) {
+            return Err(format!("HUMAN_ONLY_TOGETHER names `{key}` of `{path}`, which is not an argument of its tool"));
+        }
+        if keys.iter().collect::<std::collections::HashSet<_>>().len() < 2 {
+            return Err(format!("HUMAN_ONLY_TOGETHER names fewer than two distinct arguments of `{path}`"));
+        }
+        tool.together.push((keys, why));
+    }
+    Ok(())
 }
 
 /// The tool for the command at `path`, with its arguments. Its description is the command's
@@ -1158,8 +1169,9 @@ impl Tool {
             return Some(format!("the \"{name}\" tool needs the \"{}\" argument", param.key));
         }
 
-        // A switch passed as false is not given: it puts nothing in the command.
-        let given = |key: &&str| arguments.get(*key).is_some_and(|value| !value.is_null() && *value != Value::Bool(false));
+        // A switch passed as false, or an empty list, is not given: it puts nothing in the command.
+        let given = |key: &&str| arguments.get(*key)
+            .is_some_and(|value| !value.is_null() && *value != Value::Bool(false) && *value != json!([]));
         let refused = self.together.iter().find(|(keys, _)| keys.iter().all(given));
         refused.map(|(keys, why)| {
             let keys: Vec<String> = keys.iter().map(|key| format!("\"{key}\"")).collect();
@@ -1703,6 +1715,19 @@ mod tests {
         assert!(refused(cli().subcommand(clap::Command::new("mute"))).ends_with("has no description"));
         let error = refused(cli().mut_subcommand("palletize", |palletize| palletize.mut_arg("remote", |remote| remote.hide(true))));
         assert!(error.starts_with("HUMAN_ONLY_TOGETHER names") && error.ends_with("which is not an argument of its tool"), "{error}");
+        let mut tools = super::generate_tools(&cli()).unwrap();
+        let error = super::attach_together(&mut tools, &[("palletize", &["delete", "delete"], "twice")]).unwrap_err();
+        assert!(error.contains("fewer than two distinct arguments"), "{error}");
+
+        // An empty list puts nothing in the command, so it does not complete a combination.
+        let tree = cli().subcommand(clap::Command::new("multi").about("Multi")
+            .arg(clap::Arg::new("tag").long("tag").action(clap::ArgAction::Append))
+            .arg(clap::Arg::new("flag").long("flag").action(clap::ArgAction::SetTrue)));
+        let mut tools = super::generate_tools(&tree).unwrap();
+        super::attach_together(&mut tools, &[("multi", &["tag", "flag"], "both")]).unwrap();
+        let multi = tools.iter().find(|tool| tool.name == "multi").unwrap();
+        assert_eq!(multi.refusal(&json!({ "tag": [], "flag": true })), None);
+        assert!(multi.refusal(&json!({ "tag": ["a"], "flag": true })).is_some());
         let error = refused(cli().mut_subcommand("palletize", |palletize| palletize.hide(true)));
         assert!(error.starts_with("HUMAN_ONLY_TOGETHER names") && error.ends_with("which is not a tool"), "{error}");
         assert!(refused(cli().subcommand(clap::Command::new("signed").about("Signed")
