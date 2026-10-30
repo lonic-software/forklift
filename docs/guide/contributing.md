@@ -268,7 +268,12 @@ changelog), `SERVER.md` (server ops), `MACHINE_INTERFACE.md` (`--json`/MCP),
    loop, destructive, recorded text). `coverage.txt` records what every earlier command became;
    a new command gets its own row, and renaming or reshaping one adds `-> forklift …` lines under
    its old row instead of deleting it. The surface tests (`cargo test -p forklift --bin forklift
-   surface_check`) fail until both agree with the binary.
+   surface_check`) fail until both agree with the binary. A new name may make a prefix people
+   type ambiguous (`pi` stops meaning `pick` once `pin` exists); that is expected, because
+   prefixes are only for typing. A command with subcommands takes no positional argument, and
+   each of its options takes no value or exactly one, so the prefix expansion in
+   `crates/forklift/src/prefix.rs` can tell its subcommand from its arguments; that module's
+   tests hold it.
 9. **Decide whether agents drive it.** `forklift mcp` generates its tools from the command
    definition, so a new command is an agent tool with nothing more to do: its one-line and long
    descriptions are the tool's description and each argument's help is that argument's (put

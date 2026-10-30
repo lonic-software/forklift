@@ -18,6 +18,7 @@ mod internal_refs;
 pub mod output;
 pub mod pager;
 pub mod passphrase;
+pub mod prefix;
 mod remote_heads;
 #[cfg(test)]
 mod surface_check;
@@ -141,30 +142,39 @@ async fn async_main() {
 /// failure never returns: without `--json` clap prints and exits as it always has; with it, the
 /// failure becomes the process's one stdout document (see [`report_usage_error`]).
 fn parse_or_exit() -> Cli {
-    let args: Vec<OsString> = std::env::args_os().collect();
+    let mut args: Vec<OsString> = std::env::args_os().collect();
 
     // clap colours its own help and usage errors, so it follows `--color` as the commands do.
     let mut command = Cli::command();
     if let Some(choice) = color::from_args(&args) {
         command = command.color(choice.for_clap());
     }
+    command.build();
 
-    let error = match command.try_get_matches_from_mut(&args) {
-        Ok(mut matches) => {
-            output::set_command(matches.subcommand_name());
+    // A unique prefix of a command name is that command (`ha rev` is `haul review`), so clap is
+    // given the full names. An ambiguous prefix is a usage error like clap's own.
+    let error = match prefix::expand(&command, args.clone()) {
+        Err(error) => error,
+        Ok(expanded) => {
+            args = expanded;
+            match command.try_get_matches_from_mut(&args) {
+                Ok(mut matches) => {
+                    output::set_command(matches.subcommand_name());
 
-            match Cli::from_arg_matches_mut(&mut matches) {
-                Ok(cli) => match cross_argument_error(&cli) {
-                    None => return cli,
-                    // Raised on the subcommand, so the usage line clap prints is its own.
-                    Some((name, message)) => command.find_subcommand_mut(name)
-                        .expect("the parsed subcommand exists")
-                        .error(ErrorKind::MissingRequiredArgument, message),
-                },
+                    match Cli::from_arg_matches_mut(&mut matches) {
+                        Ok(cli) => match cross_argument_error(&cli) {
+                            None => return cli,
+                            // Raised on the subcommand, so the usage line clap prints is its own.
+                            Some((name, message)) => command.find_subcommand_mut(name)
+                                .expect("the parsed subcommand exists")
+                                .error(ErrorKind::MissingRequiredArgument, message),
+                        },
+                        Err(error) => error,
+                    }
+                }
                 Err(error) => error,
             }
         }
-        Err(error) => error,
     };
 
     // The parse failed, so `cli.json` does not exist: read the flag off the raw arguments. It is

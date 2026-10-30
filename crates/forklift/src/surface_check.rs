@@ -565,6 +565,23 @@ fn every_hint_names_a_real_command() {
         "these hints name a command the binary does not accept as written:\n{}", failures.join("\n"));
 }
 
+/// Hints and MCP argv are machine surfaces, so they must spell full names: a prefix that works
+/// today breaks when a command starting with the same letters is added. Both checks parse with
+/// `Cli::command()` alone, where the binary's prefix expansion does not run; this holds them
+/// there. clap's own inference, switched on in the tree, would let a prefix through both.
+#[test]
+fn hints_and_mcp_argv_parse_with_prefixes_off() {
+    for line in [&["forklift", "ha", "list"][..], &["forklift", "haul", "li"][..]] {
+        let error = Cli::command().try_get_matches_from(line).map(|_| ()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidSubcommand, "{line:?}");
+    }
+    assert_eq!(hint_error("haul list"), None);
+    // A prefix the binary itself would expand (`ha`, `hel`) is not a command here.
+    assert!(hint_error("ha list").is_some());
+    assert!(hint_error("haul li").is_some());
+    assert!(hint_error("help hau").is_some());
+}
+
 /// An exemption that was also a command would let a hint naming that command pass unparsed.
 #[test]
 fn no_exemption_is_a_command() {

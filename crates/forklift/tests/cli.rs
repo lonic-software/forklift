@@ -7658,6 +7658,40 @@ fn a_usage_error_under_json_is_one_failure_document_with_exit_2() {
 }
 
 #[test]
+fn a_unique_prefix_runs_the_command_and_an_ambiguous_one_is_a_usage_error() {
+    let warehouse = TestWarehouse::new("json-prefix");
+
+    // `stoc` starts only stocktake: it runs, and the header names the command.
+    let outside = warehouse.run(&["--json", "stoc"]);
+    assert_eq!(outside.status.code(), Some(3));
+    let value = json(&outside);
+    assert_eq!(value["error"]["code"], "not_a_warehouse");
+    assert_eq!(value["command"], "stocktake");
+
+    // `he` starts heal and help: a usage failure naming both, and no command ran.
+    let ambiguous = warehouse.run(&["--json", "he"]);
+    assert_eq!(ambiguous.status.code(), Some(2));
+    let value = json(&ambiguous);
+    assert_eq!(value["error"]["code"], "usage");
+    assert_eq!(value["error"]["message"], "\"he\" could be heal or help; type more of the name");
+    assert!(value["command"].is_null(), "{}", value);
+
+    // Below the top level, and without `--json`: prose on stderr with the family's usage line.
+    let human = warehouse.run(&["hau", "re"]);
+    assert_eq!(human.status.code(), Some(2));
+    assert!(stdout(&human).is_empty(), "{}", stdout(&human));
+    assert!(stderr(&human).contains("\"re\" could be review or reopen"), "{}", stderr(&human));
+    assert!(stderr(&human).contains(" haul "), "the usage line is haul's: {}", stderr(&human));
+
+    // The help command matches names the same way.
+    let help = json(&warehouse.run(&["--json", "hel", "hau", "rev"]));
+    assert_eq!(help["ok"], true, "{}", help);
+    assert!(help["data"]["message"].as_str().unwrap().contains(" haul review "), "{}", help);
+    let help = json(&warehouse.run(&["--json", "help", "hau", "re"]));
+    assert_eq!(help["error"]["message"], "\"re\" could be review or reopen; type more of the name");
+}
+
+#[test]
 fn help_and_version_under_json_are_success_documents() {
     let warehouse = TestWarehouse::new("json-help");
 
