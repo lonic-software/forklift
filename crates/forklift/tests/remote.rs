@@ -6833,7 +6833,7 @@ fn a_move_to_a_server_lacking_content_refuses_and_leaves_the_origin() {
     // A full warehouse has no origin.
     assert_success(&area.forklift(".", &["clone", &server.url, "full"]));
     let full = area.forklift("full", &["remote", "move", &fresh.url]);
-    assert!(!full.status.success() && stderr(&full).contains("config remote.url"), "{}", stderr(&full));
+    assert!(!full.status.success() && stderr(&full).contains("forklift config set remote.url"), "{}", stderr(&full));
     assert_eq!(configured_remote(&area, "full"), server.url);
 }
 
