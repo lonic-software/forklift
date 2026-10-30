@@ -222,7 +222,7 @@ for ((i=1; i<N_PARCELS; i++)); do
 done
 
 echo "-> fresh compact (loose -> packed)…"
-t0=$(_now_ms); fl compact >/dev/null; t1=$(_now_ms)
+t0=$(_now_ms); fl store compact >/dev/null; t1=$(_now_ms)
 FRESH_COMPACT_MS=$(( t1 - t0 ))
 
 echo "-> building the diverging shift-target pallet…"
