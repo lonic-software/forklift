@@ -115,7 +115,7 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `tag create` |  |  | Create a signed tag pointing at a revision (admin only) |
 | `tag show` |  |  | Show one tag in full (subject, tagger, message) |
 | `tag list` |  |  | List every tag (the default) |
-| `undo` |  |  | Undo the last stack, consolidate, cherry-pick or shift (soft — keeps your changes) |
+| `undo` |  |  | Undo the last stack, consolidate, pick, shift or pallet delete (soft — keeps your changes) |
 | `unload` | `ul` |  | Unstage a file or directory (keep your changes) |
 | `version` |  |  | Print the version of Forklift |
 

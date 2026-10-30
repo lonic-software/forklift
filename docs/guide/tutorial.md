@@ -282,7 +282,7 @@ Lifted the office pallet: 1 new parcel(s).
 Lifted pallet "main" to …: … new parcel(s), … object(s) and 1 signature(s) uploaded.
 ```
 
-`clone` (clone) a second copy beside it, as a colleague would. The first contact with a server
+`clone` a second copy beside it, as a colleague would. The first contact with a server
 adopts its trust anchor and warns you to check it; `--expect` checks it before anything is
 fetched:
 

@@ -94,7 +94,7 @@ The everyday verbs map onto git like this:
 | `git import` / `git export` | none | migrate a git repository in, or back out |
 | `git mirror` | none | keep a git remote's branches in step with the remote's pallets |
 
-Every command, with its short alias, is listed in
+Every command, with its short alias where it has one, is listed in
 [the generated command list](../generated/commands.md).
 
 ## Objects and storage
@@ -205,7 +205,7 @@ but file content only for some paths. See [`clone`](cli.md#clone--clone-a-remote
 **Fetch scope.** The paths a warehouse holds content for, shared by every bay.
 
 **Checkout scope** (git: sparse-checkout). The paths one checkout (a bay or the main tree) writes
-to disk, always within the fetch scope. See [`scope`](cli.md#scope--show-the-sparse-workspace-scope).
+to disk, always within the fetch scope. See [`scope`](cli.md#scope--the-checkout-scope-and-the-fetch-scope).
 
 **Sealed.** Content outside the fetch scope: not on disk, but pinned by the hashes of the trees
 that hold it. See [`clone`](cli.md#clone--clone-a-remote-warehouse).
@@ -226,13 +226,19 @@ See [`scope prune`](cli.md#scope-prune--reclaim-disk-from-a-sparse-warehouse).
 **evict** (git: none). Deletes content a cache warehouse can fetch back from its origin, to free
 disk. See [`store evict`](cli.md#store-evict--free-disk-in-a-cache-warehouse).
 
-**Held-heads record.** A record of pallet heads this warehouse saw the remote accept or serve. See
+**Held-heads record.** A record of pallet heads this warehouse saw the remote accept or serve.
+`scope prune` and `store evict` ask the remote which of them it still holds before freeing
+anything. See
 [`scope prune`](cli.md#scope-prune--reclaim-disk-from-a-sparse-warehouse).
 
 **Fetched-heads ledger.** A sparse warehouse's record of the heads its fetches brought in, so that
 `scope fetch` widens their history too.
 
 **Origin.** The remote a partial warehouse (cloned with `--only` or `--cache`) fetched from.
+
+**Cache warehouse.** A warehouse cloned with `--cache`: it keeps every parcel and signature, but
+content only for what a bay has checked out or a command has read. It holds the rest by hash and
+fetches it from its origin on demand.
 
 ## Durability and recovery
 
@@ -315,6 +321,10 @@ asks again for the rest. See
 **Lambda head**, the **serverless head**, which runs on AWS. See [SERVER.md](../SERVER.md).
 
 **Served root.** A warehouse folder that `forklift-server` serves.
+
+**Tombstone.** The head a pallet was at when it was deleted in a served warehouse, kept so its
+history stays safe until the tombstone is dropped. See
+[`pallet`](cli.md#pallet--list-create-delete-and-restore-pallets).
 
 **Control plane, data plane.** The *control plane* carries requests such as the handshake and refs;
 the *data plane* (also *byte plane*) carries object bytes.
@@ -506,14 +516,6 @@ tool that drives command-line tools. See
 
 These terms appear in design notes and tickets. The features they describe are designed or
 proposed, but not built.
-
-**Tombstone.** A record of a deleted pallet's last head on a server, keeping that history safe.
-
-**Holds request.** A remote request asking whether it still holds a given head.
-
-**Cache mode.** A warehouse cloned with `--cache`: it keeps every parcel and signature, but
-content only for what a bay has checked out or a command has read. It holds the rest by hash and
-fetches it from its origin on demand.
 
 **Lazy history, remote-first reads, signed trust checkpoints.** Clones whose cost depends on the
 tip rather than history length; reading history from a remote with no local warehouse; and

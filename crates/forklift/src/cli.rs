@@ -483,7 +483,7 @@ pub enum Command {
     /// Manage the warehouse office: users and signing keys
     #[command(
         long_about = "Manage the warehouse office: users and signing keys, tracked as metadata on \
-                      the reserved \"office\" pallet. Without a subcommand, the users and their \
+                      the \"@office\" meta pallet. Without a subcommand, the users and their \
                       keys are listed."
     )]
     Office {
@@ -842,7 +842,7 @@ pub enum Command {
         action: Option<TagAction>,
     },
 
-    /// Undo the last stack, consolidate, cherry-pick or shift (soft — keeps your changes)
+    /// Undo the last stack, consolidate, pick, shift or pallet delete (soft — keeps your changes)
     #[command(
         long_about = "Undo the last journaled operation: a \"forklift stack\", \"forklift consolidate\", \
                       \"forklift pick\" or \"forklift shift\". A stack, consolidate or pick is \

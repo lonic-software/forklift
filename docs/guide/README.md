@@ -63,7 +63,7 @@ Two more terms you'll meet:
   a root tree. Everything is content-addressed with Blake3 and immutable.
 - A **revision** is anywhere a point in history is named: a pallet name *or* a
   parcel hash (a unique prefix, ≥ 4 hex characters). `history`, `diff`,
-  `pallet create` and `audit` all accept either.
+  `show` and `pallet create` all accept either.
 
 ## The shortest possible tour
 
