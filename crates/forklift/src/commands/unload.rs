@@ -44,8 +44,6 @@ pub fn handle_command(target: &str) -> Result<(), String> {
     unstage(&path)
 }
 
-
-
 /// Reset the inventory entries of the given path to the pallet head (unstage). The
 /// working directory is not touched; a reset entry records the working file's stat data only
 /// where the file provably holds the head's content (see `unstaged_entry`), and zeroed stat data
