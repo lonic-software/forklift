@@ -632,7 +632,7 @@ fn a_haul_lifts_only_under_the_office() {
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
     area.forklift("wh", &["stack", "signed"]);
-    area.forklift("wh", &["palletize", "feature"]);
+    area.forklift("wh", &["pallet", "create", "feature"]);
     area.write_file("wh/app.txt", "v2\n");
     area.forklift("wh", &["load", "."]);
     area.forklift("wh", &["stack", "feature"]);
@@ -725,7 +725,7 @@ fn a_haul_merge_is_admitted_only_from_a_writer_of_its_target() {
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
     area.forklift("wh", &["stack", "signed"]);
-    area.forklift("wh", &["palletize", "feat"]);
+    area.forklift("wh", &["pallet", "create", "feat"]);
     area.write_file("wh/feat.txt", "x\n");
     area.forklift("wh", &["load", "."]);
     area.forklift("wh", &["stack", "feature"]);
@@ -1418,7 +1418,7 @@ fn a_trusted_merge_lift_below_the_bound_still_audits() {
     area.forklift("wh", &["stack", "base"]);
 
     // A branch forking at `base` — below the bound the lift will later carry.
-    area.forklift("wh", &["palletize", "feature"]);
+    area.forklift("wh", &["pallet", "create", "feature"]);
     area.write_file("wh/feature.txt", "from the branch\n");
     area.forklift("wh", &["load", "."]);
     area.forklift("wh", &["stack", "on the branch"]);
@@ -3860,7 +3860,7 @@ fn feature_warehouse(area: &Area) -> (Harvest, String, String, String) {
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
     area.forklift("wh", &["stack", "first"]);
-    area.forklift("wh", &["palletize", "feature"]);
+    area.forklift("wh", &["pallet", "create", "feature"]);
     area.write_file("wh/app.txt", "v2\n");
     area.forklift("wh", &["load", "."]);
     area.forklift("wh", &["stack", "second"]);
@@ -3956,7 +3956,7 @@ fn a_delete_names_what_stands_in_its_way() {
     assert_eq!(err.status, Status::Conflict);
     assert_eq!(
         code_and_next_step(&err.message),
-        ("pallet_deleted_on_remote".to_string(), "forklift palletize --restore feature --remote".to_string())
+        ("pallet_deleted_on_remote".to_string(), "forklift pallet restore feature --remote".to_string())
     );
     assert!(err.message.contains(&feature_v2), "names the tombstone: {}", err.message);
     assert!(!err.message.contains("tombstone drop"), "this head has no drop: {}", err.message);
@@ -4006,7 +4006,7 @@ fn an_open_haul_refuses_the_delete() {
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
     area.forklift("wh", &["stack", "signed"]);
-    area.forklift("wh", &["palletize", "feature"]);
+    area.forklift("wh", &["pallet", "create", "feature"]);
     area.write_file("wh/feature.txt", "x\n");
     area.forklift("wh", &["load", "."]);
     area.forklift("wh", &["stack", "feature"]);
@@ -4233,7 +4233,7 @@ fn a_delete_of_unknown_fate_is_settled_by_the_ref() {
     assert!(err.message.contains(&format!("The delete was for \"feature\" at {}.", feature_v2)), "{}", err.message);
     assert!(err.message.contains(&format!("still live at {} when", feature_v2)), "{}", err.message);
     assert!(
-        err.message.ends_with("Check the remote's pallets (\"forklift palletize --remote --json\") before deleting \"feature\" again."),
+        err.message.ends_with("Check the remote's pallets (\"forklift pallet list --remote --json\") before deleting \"feature\" again."),
         "{}",
         err.message
     );
@@ -4314,7 +4314,7 @@ fn rostered_feature_warehouse(area: &Area) -> (Harvest, String, String, String) 
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
     area.forklift("wh", &["stack", "signed"]);
-    area.forklift("wh", &["palletize", "feature"]);
+    area.forklift("wh", &["pallet", "create", "feature"]);
     area.write_file("wh/app.txt", "v2\n");
     area.forklift("wh", &["load", "."]);
     area.forklift("wh", &["stack", "feature"]);

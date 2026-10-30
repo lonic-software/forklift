@@ -6225,8 +6225,8 @@ pub fn acknowledged_tombstone(info: &WarehouseInfo,
     }
 
     let drop = format!(
-        "To drop the local pallet instead, shift to another pallet and run \"forklift palletize \
-        --delete {}\".",
+        "To drop the local pallet instead, shift to another pallet and run \"forklift pallet \
+        delete {}\".",
         pallet
     );
     let (message, next_step) = match descends {
@@ -6238,13 +6238,13 @@ pub fn acknowledged_tombstone(info: &WarehouseInfo,
         ), "forklift lift --recreate".to_string()),
         false => (format!(
             "The remote's pallet \"{}\" was deleted at {}, and the name stays reserved for that \
-            history, which this warehouse's work does not descend from{}. \"forklift palletize \
-            --restore {} --remote\" brings the pallet back on the remote; lower it and consolidate \
+            history, which this warehouse's work does not descend from{}. \"forklift pallet restore \
+            {} --remote\" brings the pallet back on the remote; lower it and consolidate \
             it into this work, then lift. {} Nothing was lifted.",
             pallet, head,
             if recreate { ", so \"--recreate\" cannot re-create it" } else { "" },
             pallet, drop
-        ), format!("forklift palletize --restore {} --remote", pallet)),
+        ), format!("forklift pallet restore {} --remote", pallet)),
     };
 
     Err(CoreError::refusal(RefusalCode::PalletDeletedOnRemote, message, next_step).into())
@@ -6351,13 +6351,13 @@ pub fn diverged_refusal(pallet: &str, remote_head: &str) -> CoreError {
         RefusalCode::Diverged,
         format!(
             "The local pallet \"{p}\" and the remote have diverged. The remote parcels are \
-            fetched; palletize the remote head into its own pallet (\"forklift palletize {p}-remote-{s} {s}\", \
+            fetched; make the remote head its own pallet (\"forklift pallet create {p}-remote-{s} {s}\", \
             which moves this bay onto it), shift back (\"forklift shift {p}\"), consolidate it \
             (\"forklift consolidate {p}-remote-{s}\"), and lift the result.",
             p = pallet, s = short
         ),
         format!(
-            "forklift palletize {p}-remote-{s} {s}; then forklift shift {p}; then forklift \
+            "forklift pallet create {p}-remote-{s} {s}; then forklift shift {p}; then forklift \
             consolidate {p}-remote-{s}; then forklift lift",
             p = pallet, s = short
         ),
@@ -8203,7 +8203,7 @@ mod tests {
         assert_eq!(code("@office"), None);
         assert_eq!(code("@kv"), Some((RefusalCode::Diverged, "forklift lower".to_string())));
         assert!(code("main").is_some_and(|(code, step)| code == RefusalCode::Diverged
-            && step.starts_with("forklift palletize main-remote-aaaaaaaaaaaa aaaaaaaaaaaa; then forklift shift main;")));
+            && step.starts_with("forklift pallet create main-remote-aaaaaaaaaaaa aaaaaaaaaaaa; then forklift shift main;")));
     }
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -17266,7 +17266,7 @@ mod tests {
             head
         }
 
-        // Revert: skip the closure check at the head compare-and-set → the palletize lands.
+        // Revert: skip the closure check at the head compare-and-set → the pallet create lands.
         #[test]
         fn an_unservable_ledger_head_is_dropped_and_refused_as_a_new_head() {
             let _scratch = Scratch::new("expand-unwalkable");
@@ -17285,7 +17285,7 @@ mod tests {
         }
 
         // Revert: skip the closure check at the head compare-and-set → the part-way head is
-        // palletized before its fetch completes; or refuse every new head → it stays refused
+        // made a pallet before its fetch completes; or refuse every new head → it stays refused
         // after.
         #[test]
         fn a_part_way_head_is_refused_until_its_fetch_completes() {
@@ -17410,7 +17410,7 @@ mod tests {
             runtime().block_on(expansion.walk(&unreachable())).unwrap();
             assert!(expansion.unwalkable.contains(&head));
 
-            // A lower completes the head and palletizes it meanwhile.
+            // A lower completes the head and makes a pallet of it meanwhile.
             content_tree("part-way");
             pallet_utils::update_pallet_head("x", None, &head, &RefPreconditions::NONE).unwrap();
 

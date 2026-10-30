@@ -166,7 +166,7 @@ fn long_and_deep_directory_keys_load_and_stack() {
 #[test]
 fn a_store_in_another_layout_is_refused_and_left_alone() {
     let warehouse = Warehouse::new("other-layout", &[("Docs/a", "a\n")]);
-    warehouse.run_ok(&["palletize", "side"]);
+    warehouse.run_ok(&["pallet", "create", "side"]);
     warehouse.write("side.txt", "side\n");
     warehouse.run_ok(&["load", "."]);
     warehouse.run_ok(&["stack", "side"]);
@@ -214,7 +214,7 @@ fn a_store_in_another_layout_is_refused_and_left_alone() {
 #[test]
 fn a_directory_recreated_after_a_shift_stages_only_what_it_holds() {
     let warehouse = Warehouse::new("reset-sweep", &[("app.txt", "app\n")]);
-    warehouse.run_ok(&["palletize", "side"]);
+    warehouse.run_ok(&["pallet", "create", "side"]);
     warehouse.write("X/f", "f\n");
     warehouse.run_ok(&["load", "."]);
     warehouse.run_ok(&["stack", "with X"]);

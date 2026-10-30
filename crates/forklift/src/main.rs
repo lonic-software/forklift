@@ -3,7 +3,7 @@ use clap::error::ErrorKind;
 use clap::{CommandFactory, FromArgMatches};
 use forklift_core::util::{lock_utils, warehouse_utils};
 use forklift_core::util::fanout_utils::block_on_worker_stack;
-use crate::cli::{Cli, Command, GitAction, OfficeAction, ParkAction, ProfileAction, RemoteAction, StoreAction};
+use crate::cli::{Cli, Command, GitAction, OfficeAction, PalletAction, ParkAction, ProfileAction, RemoteAction, StoreAction};
 use crate::output::{ErrorCode, ForkliftError, OutputMode};
 
 pub mod cache_fetch;
@@ -152,8 +152,13 @@ fn parse_or_exit() -> Cli {
     command.build();
 
     // A unique prefix of a command name is that command (`ha rev` is `haul review`), so clap is
-    // given the full names. An ambiguous prefix is a usage error like clap's own.
-    let error = match prefix::expand(&command, &mut args) {
+    // given the full names. An ambiguous prefix is a usage error like clap's own. `branch NAME`
+    // is read before any prefix is expanded: under git's word, the word after it is a name.
+    let expanded = match branch_name_error(&command, &args) {
+        Some(error) => Err(error),
+        None => prefix::expand(&command, &mut args),
+    };
+    let error = match expanded {
         Err(error) => error,
         Ok(()) => {
             match command.try_get_matches_from_mut(&args) {
@@ -161,13 +166,7 @@ fn parse_or_exit() -> Cli {
                     output::set_command(matches.subcommand_name());
 
                     match Cli::from_arg_matches_mut(&mut matches) {
-                        Ok(cli) => match cross_argument_error(&cli) {
-                            None => return cli,
-                            // Raised on the subcommand, so the usage line clap prints is its own.
-                            Some((name, message)) => command.find_subcommand_mut(name)
-                                .expect("the parsed subcommand exists")
-                                .error(ErrorKind::MissingRequiredArgument, message),
-                        },
+                        Ok(cli) => return cli,
                         Err(error) => error,
                     }
                 }
@@ -191,18 +190,48 @@ fn parse_or_exit() -> Cli {
     report_usage_error(&error);
 }
 
-/// A combination of arguments clap's attributes cannot express, refused as a usage error like
-/// the ones they do: `palletize --remote` with a pallet name is a delete or a restore, never a
-/// listing.
-fn cross_argument_error(cli: &Cli) -> Option<(&'static str, &'static str)> {
-    match &cli.command {
-        Command::Palletize { name: Some(_), remote: true, delete: false, restore: false, .. } => Some((
-            "palletize",
-            "\"--remote\" with a pallet name needs \"--delete\" or \"--restore\"; without a name, \
-            \"forklift palletize --remote\" lists the remote's pallets"
-        )),
-        _ => None,
+/// The refusal for git's `branch NAME`. `branch` is a hidden alias of the `pallet` family, kept for
+/// git users, but git's `branch NAME` creates a branch without switching to it, and `pallet create`
+/// also shifts, so a name after `branch` is not taken as a create: it is refused with the command
+/// that creates the pallet. Only a pallet subcommand's exact name or alias is a subcommand there;
+/// `args` are read before [`prefix::expand`], so `branch cr` is the pallet "cr", not a prefix of
+/// `create`. Options are stepped over as the prefix walk steps over them, and the words after `--`
+/// are left to clap. `command` must be built.
+///
+/// # Returns
+/// * `Some(clap::Error)` - A usage error on `pallet`, naming `forklift pallet create NAME`.
+/// * `None`              - The command is not `branch`, or `branch` is given no name.
+fn branch_name_error(command: &clap::Command, args: &[OsString]) -> Option<clap::Error> {
+    let mut level = command;
+    let mut at_root = true;
+    let mut index = 1;
+    while index < args.len() {
+        let word = args[index].to_str()?;
+        if word == "--" {
+            return None;
+        }
+        if word.starts_with('-') && word != "-" {
+            index += if prefix::takes_next_word(level, word) { 2 } else { 1 };
+            continue;
+        }
+        if at_root {
+            if word != "branch" {
+                return None;
+            }
+            level = command.find_subcommand("pallet").expect("the pallet family exists");
+            at_root = false;
+            index += 1;
+            continue;
+        }
+        if level.find_subcommand(word).is_some() {
+            return None;
+        }
+        return Some(level.clone().error(ErrorKind::InvalidSubcommand, format!(
+            "\"{word}\" is not a pallet subcommand. To create the pallet \"{word}\" and shift to it, run \
+            \"forklift pallet create {word}\"."
+        )));
     }
+    None
 }
 
 /// The canonical name of the top-level command the arguments name, when the parse that would
@@ -495,7 +524,17 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
                 commands::office::accept_regenesis(confirm).await,
             Some(OfficeAction::List) | None => commands::office::list().await,
         },
-        Command::Palletize { name, revision, all, remote, delete, force, restore } => commands::palletize::handle_command(name, revision, all, remote, delete, force, restore).await,
+        Command::Pallet { action } => match action {
+            Some(PalletAction::List { all, remote: false }) => commands::pallet::list_pallets(all),
+            None => commands::pallet::list_pallets(false),
+            Some(PalletAction::List { all, remote: true }) => commands::pallet::list_remote_pallets(all).await,
+            Some(PalletAction::Create { name, revision }) =>
+                commands::pallet::create_pallet(&name, revision.as_deref()).await,
+            Some(PalletAction::Delete { name, remote: true, .. }) => commands::pallet::delete_remote_pallet(&name).await,
+            Some(PalletAction::Delete { name, force, remote: false }) => commands::pallet::delete_pallet(&name, force).await,
+            Some(PalletAction::Restore { name, remote: true }) => commands::pallet::restore_remote_pallet(&name).await,
+            Some(PalletAction::Restore { name, remote: false }) => commands::pallet::restore_pallet(&name),
+        },
         Command::Park { action } => match action {
             Some(ParkAction::Pop) => commands::park::pop_parked(),
             Some(ParkAction::List) => commands::park::list_parked(),

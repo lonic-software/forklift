@@ -48,7 +48,7 @@ into the parcel.
 
 **Pallet** (git: branch). A named, movable pointer to a parcel. Working pallets hold your project's
 history; [meta pallets](#meta-pallets-and-metadata), named with `@`, hold Forklift's own signed
-metadata. See [`palletize`](cli.md#palletize--create-a-pallet--list-pallets-pz).
+metadata. See [`pallet`](cli.md#pallet--list-create-delete-and-restore-pallets).
 
 **Head** (git: branch tip). The parcel a pallet points at. A server is also called a head; see
 [Overloaded words](#overloaded-words).
@@ -78,7 +78,7 @@ The everyday verbs map onto git like this:
 | `stocktake` | `status` | show staged and unstaged changes |
 | `stack` | `commit` | record the inventory as a new parcel |
 | `history` | `log` | walk parcels, newest first |
-| `palletize` | `branch` / `checkout -b` | create, list or delete pallets |
+| `pallet` | `branch` / `checkout -b` | list, create, delete or restore pallets |
 | `shift` | `checkout` / `switch` | switch to a pallet |
 | `consolidate` | `merge` | merge another pallet in |
 | `park` | `stash` | set work aside |

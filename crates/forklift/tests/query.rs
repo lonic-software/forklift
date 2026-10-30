@@ -218,7 +218,7 @@ fn verified_query_filters_on_the_signer_never_the_recorded_author() {
     // the human but whose *signature* is the agent's key. A cherry-pick produces exactly
     // this — the original author rides along as a recorded action; the picker signs.
     assert_success(&warehouse.run(&["config", "operator.identifier", "test@forklift"]));
-    assert_success(&warehouse.run(&["palletize", "drafts"]));
+    assert_success(&warehouse.run(&["pallet", "create", "drafts"]));
     warehouse.write_file("draft.txt", "human draft\n");
     assert_success(&warehouse.run(&["load", "draft.txt"]));
     let human_draft = extract_parcel_hash(&warehouse.run(&["stack", "human draft work"]));
@@ -599,7 +599,7 @@ fn touches_matches_the_changed_path_and_respects_first_parent_only() {
     // own prior head) already had, so the merge reads as untouched even though its *other*
     // parent (side) plainly did touch the path. This is the same "honest limit of a
     // first-parent walk" `blame` documents for merge-absorbed lines.
-    assert_success(&warehouse.run(&["palletize", "side"]));
+    assert_success(&warehouse.run(&["pallet", "create", "side"]));
     warehouse.write_file("feature/new.txt", "shared content\n");
     assert_success(&warehouse.run(&["load", "feature/new.txt"]));
     let side_parcel = extract_parcel_hash(&warehouse.run(&["stack", "side change"]));
@@ -687,12 +687,12 @@ fn signed_revoked_matches_carry_vouched_or_suspect_boundary() {
     let vouched_parcel = extract_parcel_hash(&warehouse.run(&["stack", "agent main work"]));
 
     // A second agent-signed parcel, stacked on a side pallet branched from main's current
-    // head — then immediately un-stacked with `undo`. `palletize` itself is not journaled,
+    // head — then immediately un-stacked with `undo`. `pallet create` itself is not journaled,
     // so the stack just made is the only (and therefore top) journal entry: `undo` reverses
     // exactly it, soft-resetting the side pallet's head back to its parent. The parcel
     // object and its signature sidecar stay on disk (undo never deletes them); nothing —
     // main or side — reaches this parcel anymore.
-    assert_success(&warehouse.run(&["palletize", "side"]));
+    assert_success(&warehouse.run(&["pallet", "create", "side"]));
     warehouse.write_file("side.txt", "side work\n");
     assert_success(&warehouse.run(&["load", "side.txt"]));
     let suspect_parcel = extract_parcel_hash(&warehouse.run(&["stack", "side work"]));

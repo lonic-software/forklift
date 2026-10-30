@@ -632,11 +632,11 @@ log "  OK — explicit control-plane read succeeded"
 log "step 5/5: a pallet named with '/' lifts and deletes through the gateway"
 
 SLASH_PALLET="verify-slash/$(date -u +%Y%m%d%H%M%S)-$$"
-pallets_json="$(run_in "$SRC_DIR" "$FORKLIFT_BIN" --json palletize)" || fail "forklift palletize --json failed"
+pallets_json="$(run_in "$SRC_DIR" "$FORKLIFT_BIN" --json pallet list)" || fail "forklift pallet list --json failed"
 home_pallet="$(printf '%s' "$pallets_json" | jq -r '.data.current // empty' 2>/dev/null)"
-[[ -n "$home_pallet" ]] || fail "could not read the current pallet from 'forklift --json palletize': $pallets_json"
+[[ -n "$home_pallet" ]] || fail "could not read the current pallet from 'forklift --json pallet list': $pallets_json"
 
-run_in "$SRC_DIR" "$FORKLIFT_BIN" palletize "$SLASH_PALLET" >/dev/null || fail "forklift palletize $SLASH_PALLET failed"
+run_in "$SRC_DIR" "$FORKLIFT_BIN" pallet create "$SLASH_PALLET" >/dev/null || fail "forklift pallet create $SLASH_PALLET failed"
 run_in "$SRC_DIR" "$FORKLIFT_BIN" shift "$SLASH_PALLET" >/dev/null || fail "forklift shift $SLASH_PALLET failed"
 run_in "$SRC_DIR" "$FORKLIFT_BIN" lift ||
   fail "lifting $SLASH_PALLET failed: a name with '/' does not reach the Lambda's ref-update route whole"
@@ -648,7 +648,7 @@ jq -e --arg name "$SLASH_PALLET" '.pallets[$name] != null' "$WORKDIR/handshake-s
   fail "the handshake does not list $SLASH_PALLET after its lift"
 
 run_in "$SRC_DIR" "$FORKLIFT_BIN" shift "$home_pallet" >/dev/null || fail "forklift shift $home_pallet failed"
-run_in "$SRC_DIR" "$FORKLIFT_BIN" palletize --delete "$SLASH_PALLET" --remote ||
+run_in "$SRC_DIR" "$FORKLIFT_BIN" pallet delete "$SLASH_PALLET" --remote ||
   fail "deleting $SLASH_PALLET on the remote failed: a name with '/' does not reach the Lambda's delete route whole"
 
 slash_code="$(curl_to_file "${ENDPOINT}${PREFIX}/v1/warehouse" "$WORKDIR/handshake-slash.json" \

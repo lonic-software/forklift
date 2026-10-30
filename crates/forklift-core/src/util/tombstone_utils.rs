@@ -174,7 +174,7 @@ pub fn drop_tombstone(wire: &str) -> Result<String, String> {
 }
 
 /// Bring deleted pallet `wire` back at the head its tombstone holds, in the warehouse at the
-/// current storage root (`forklift palletize --restore`): the creation acknowledges the tombstone
+/// current storage root (`forklift pallet restore`): the creation acknowledges the tombstone
 /// and clears it. Refused, as undo's restore is, while a bay stands on the name out of step with
 /// that head, or when the head's history no longer passes the warehouse's trust check or is no
 /// longer complete.
@@ -203,7 +203,7 @@ pub fn restore_pallet(wire: &str) -> Result<String, String> {
     };
 
     let closing = "Nothing was restored.";
-    let rerun = format!("forklift palletize --restore {}", wire);
+    let rerun = format!("forklift pallet restore {}", wire);
     journal_utils::refuse_a_bay_out_of_step(wire, &head, "restore", &rerun, closing)?;
     let preconditions = journal_utils::trust_preconditions(wire, &head, closing)?;
 
@@ -243,7 +243,7 @@ pub fn refuse_a_tombstoned_name(wire: &str) -> Result<(), String> {
     match read_tombstones()?.get(wire) {
         Some(head) => Err(format!(
             "Pallet \"{}\" was deleted in this served warehouse, at {}, and the name is kept for it. \
-            Choose another name, or bring the pallet back with \"forklift palletize --restore {}\". \
+            Choose another name, or bring the pallet back with \"forklift pallet restore {}\". \
             Nothing was created.",
             wire, head, wire
         )),
@@ -341,7 +341,7 @@ mod tests {
 
         assert!(mark_served(false).unwrap());
         let refused = refuse_a_tombstoned_name("gone").unwrap_err();
-        assert!(refused.contains(&head) && refused.contains("forklift palletize --restore gone"), "{}", refused);
+        assert!(refused.contains(&head) && refused.contains("forklift pallet restore gone"), "{}", refused);
         refuse_a_tombstoned_name("other").unwrap();
     }
 

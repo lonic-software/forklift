@@ -574,7 +574,7 @@ forklift undo --as rescued   # undo a pallet delete, bringing the pallet back as
 ```
 
 Reverses the **last state-changing operation**, using an undo journal — not just the
-last `stack`. Each `stack`, `consolidate`, `cherry-pick`, `shift` and `palletize --delete` records the state
+last `stack`. Each `stack`, `consolidate`, `cherry-pick`, `shift` and `pallet delete` records the state
 before and after it (the current pallet, the pallet refs it moved, and any consolidation or
 cherry-pick left in progress — all tiny, since the objects are content-addressed and already
 stored), so `undo` can walk them back one at a time. Only the refs the command itself wrote are
@@ -587,7 +587,7 @@ reverts it.
   parcels are no longer refused.
 - Reversing a **`shift`** moves back to the previous pallet and re-materializes its tree (it
   refuses on a dirty working directory, just like a forward `shift`).
-- Reversing a **`palletize --delete`** recreates the pallet at the head it was deleted at, and
+- Reversing a **`pallet delete`** recreates the pallet at the head it was deleted at, and
   touches nothing else — not the current pallet, not the working directory. If a pallet of that
   name exists again at another head, `undo` refuses rather than overwrite it, and keeps the entry:
   `undo --as <new-name>` brings the deleted pallet back under another name instead (`--as` is
@@ -608,7 +608,7 @@ exactly as it is — trust operations such as a key retirement are preserved, ne
 `undo` reverses only your *last* operation, never an older one behind it. Except for a delete,
 which changed nothing in the bay, it refuses outright when the bay no longer matches what the
 journaled operation left: the current
-pallet was switched since (`palletize` and `deliver` switch pallets without being
+pallet was switched since (`pallet create` and `deliver` switch pallets without being
 journaled), the current pallet's head moved (a merged haul, a fast-forwarding `lower`), or a
 consolidation or cherry-pick was started or finished. It also refuses to undo the `stack` that
 completed a cherry-pick once the picked parcel is gone from the warehouse (a `gc` can collect it
@@ -620,8 +620,8 @@ clones may already rely on the parcel it would take off, and with no ref holding
 other than the current one that another bay has moved on since is left alone, so it does not
 refuse the undo, and meta pallets are outside the rule. Take a change out there by stacking a
 parcel that reverts it. An older entry stays out of `undo`'s reach behind it: a pallet deleted
-since the warehouse was served comes back with `forklift palletize --restore <name>`, and one
-deleted before then with `forklift palletize <name> <head>`, the head its delete printed, while
+since the warehouse was served comes back with `forklift pallet restore <name>`, and one
+deleted before then with `forklift pallet create <name> <head>`, the head its delete printed, while
 the warehouse still holds it. Undoing a delete or a `shift` is unaffected. Working-tree
 commands in between — `load`, `remove`, `park` — change none of that and do not block it:
 after a `park`, `undo` soft-resets beneath the parked work. `park pop` then re-applies it,
@@ -1096,21 +1096,28 @@ Cross-warehouse forks come later. Requires an enrolled signing key.
 
 ## 4. Branching and merging
 
-### `palletize` — create a pallet / list pallets (`pz`)
+### `pallet` — list, create, delete and restore pallets
 
 ```sh
-forklift palletize                 # list pallets (the current one marked *)
-forklift palletize --all           # also list the meta pallets (@office, …) under a heading
-forklift palletize feature         # create "feature" at the current head and shift to it
-forklift palletize hotfix 1a2b3c   # create "hotfix" at a revision and shift to it
-forklift palletize --remote        # list the remote's pallets, against the ones here
-forklift palletize --remote --all  # also the remote's meta pallets
-forklift palletize --delete old    # delete "old" (its parcels stay; `undo` brings it back)
-forklift palletize --delete old --force  # ...even when nothing else holds its work
-forklift palletize --restore old   # bring back "old", deleted in a served warehouse
-forklift palletize --delete old --remote   # delete "old" on the remote (it keeps the history)
-forklift palletize --restore old --remote  # bring "old" back on the remote
+forklift pallet                            # list pallets (the current one marked *)
+forklift pallet list                       # the same
+forklift pallet list --all                 # also list the meta pallets (@office, …) under a heading
+forklift pallet create feature             # create "feature" at the current head and shift to it
+forklift pallet create hotfix 1a2b3c       # create "hotfix" at a revision and shift to it
+forklift pallet list --remote              # list the remote's pallets, against the ones here
+forklift pallet list --remote --all        # also the remote's meta pallets
+forklift pallet delete old                 # delete "old" (its parcels stay; `undo` brings it back)
+forklift pallet delete old --force         # ...even when nothing else holds its work
+forklift pallet restore old                # bring back "old", deleted in a served warehouse
+forklift pallet delete old --remote        # delete "old" on the remote (it keeps the history)
+forklift pallet restore old --remote       # bring "old" back on the remote
 ```
+
+`pallet create` both creates the pallet and shifts to it, so there is no separate step to start
+working on it. Git's `branch` is a hidden alias of `pallet`, for muscle memory: `branch` alone lists
+the pallets, as git's does. `branch <name>` is refused rather than read as a subcommand prefix,
+because git's `branch <name>` creates a branch *without* switching to it, and `pallet create`
+switches; the refusal names `forklift pallet create <name>`.
 
 The list shows user pallets only by default; `--all` adds the meta pallets (the office
 and other tracked metadata), each in its `@`-qualified form — the address you reach it
@@ -1147,10 +1154,10 @@ server has served, the plain list likewise carries its own deleted pallets under
 
 A command naming a pallet this warehouse does not hold (`shift`, `consolidate`, `audit`,
 `haul open`) refuses with `pallet_not_found` (exit 29), and names `lower <name>` when a remote is
-configured, `palletize <name>` otherwise. `lower <name>` for a pallet the remote does not have
-refuses the same way, before it writes anything, naming `palletize --remote`.
+configured, `pallet create <name>` otherwise. `lower <name>` for a pallet the remote does not have
+refuses the same way, before it writes anything, naming `pallet list --remote`.
 
-`--delete <name>` removes a pallet's ref and nothing else: its parcels stay, and the delete is
+`pallet delete <name>` removes a pallet's ref and nothing else: its parcels stay, and the delete is
 journaled, so [`undo`](#undo--reverse-the-last-operation) brings the pallet back at the head it
 was deleted at. It refuses:
 
@@ -1179,16 +1186,16 @@ pallet was at, kept by `gc`, repacks and `scope prune` for as long as the tombst
 clones may have freed that history because the server held it. The name stays reserved for that
 history: creating a pallet of that name is refused unless it is a re-creation that acknowledges
 the tombstone and descends from its head. `undo` of the delete is one, and so is
-`--restore <name>`, which brings the pallet back at its tombstone's head and clears the
+`pallet restore <name>`, which brings the pallet back at its tombstone's head and clears the
 tombstone. It refuses, as `undo` does, while a checkout stands on the name at another head, and
 when that history no longer passes the warehouse's trust check or is no longer complete. With
 `--json` it reports `pallet` and `head`. Only the server's operator can free the name for
 unrelated history (`forklift-server tombstone drop`).
 
-With `--remote`, `--delete <name>` deletes the remote's pallet instead, at the head the remote
+With `--remote`, `pallet delete <name>` deletes the remote's pallet instead, at the head the remote
 lists: the remote keeps that head under its tombstone, so nothing it held is lost, and no clone's
-own pallet changes — this one's included. Its owner deletes it with a plain `--delete`, which counts
-the remote's tombstone as holding its work. `--restore <name> --remote` brings the pallet back on
+own pallet changes — this one's included. Its owner deletes it with a plain `pallet delete`, which counts
+the remote's tombstone as holding its work. `pallet restore <name> --remote` brings the pallet back on
 the remote at its tombstone's head; it needs none of that history here. Neither takes `--force`, and
 a remote that cannot delete pallets (it lists no tombstones in its handshake) is refused before
 anything is sent. The server refuses its default pallet, a pallet a checkout of its own warehouse
@@ -1200,18 +1207,18 @@ only through a restore or a re-creation from its history. It runs no hooks, so i
 and `already`, and the restore `pallet`, `head` and `remote`. A delete of a pallet the remote has
 already deleted (as a rerun after a lost answer finds it) reports it done with `already` set, and
 sends nothing. A rerun deletes the pallet at the head the remote then holds, so after a lost answer
-check that head first (`palletize --remote --json`): the pallet may have moved, or been deleted and
+check that head first (`pallet list --remote --json`): the pallet may have moved, or been deleted and
 created again, meanwhile. A serverless remote whose storage could not settle a delete answers with
 an error naming the head the delete was for, and sends you to that listing before deleting again.
 
 A pallet deleted on the remote is not lowered or lifted as if it had never existed.
 `lower <name>` refuses with `pallet_not_found`, saying it was deleted and naming
-`palletize --restore <name> --remote`. A `lift` that would re-create it refuses with
+`pallet restore <name> --remote`. A `lift` that would re-create it refuses with
 `pallet_deleted_on_remote` (exit 35) before uploading anything, naming the step that fits the
 work here: when it descends from the deleted head, `lift --recreate` re-creates the pallet with it,
-acknowledging the deletion; otherwise `palletize --restore <name> --remote`, then lower and
+acknowledging the deletion; otherwise `pallet restore <name> --remote`, then lower and
 consolidate the remote's history into the work before lifting. To drop the work here instead,
-shift to another pallet and `palletize --delete` it.
+shift to another pallet and `pallet delete` it.
 
 A key revoked after a pallet was deleted on the remote does not vouch for what the tombstone
 holds: the distrust boundary takes the remote's live pallets only, since deleting a pallet is how
@@ -1228,7 +1235,7 @@ Materializes the target pallet's head tree in the working directory, repopulates
 the inventory from it, and makes it the current pallet. Refuses to run when you
 have staged or unstaged changes (they'd be overwritten) — stack, restore, or park
 them first — or while a consolidation or cherry-pick is in progress, which is
-completed on the pallet it started on (`palletize` and `deliver` refuse then too,
+completed on the pallet it started on (`pallet create` and `deliver` refuse then too,
 and `stack` refuses to complete it on any other pallet). Untracked files are left alone unless the
 target needs to write over one.
 
@@ -1385,7 +1392,7 @@ anything that redirects elsewhere (another warehouse, another bay) is left in pl
 and one it cannot read keeps the bay. It first moves the entry aside, which is the step that
 ends the bay; if that fails, the bay is kept and the error says how to remove it by hand.
 
-A bay name follows the pallet-name rules (see `palletize`) and is one folder, so it has no `/`.
+A bay name follows the pallet-name rules (see `pallet`) and is one folder, so it has no `/`.
 `bay remove <name>` matches the
 name exactly against the folders under `.forklift/bays/`, so it also removes a bay whose name
 the rules refuse (one an older version created), and it never treats `.`, `..` or a path as a
@@ -1663,7 +1670,7 @@ forklift lift --recreate   # re-create a pallet deleted on the remote, from work
 
 Uploads the current pallet's new parcels to the remote and moves the remote's ref
 with a compare-and-swap. A pallet the remote deleted is re-created only with `--recreate`; see
-[`palletize`](#palletize--create-a-pallet--list-pallets-pz). When trust is established, the office pallet and trust
+[`pallet`](#pallet--list-create-delete-and-restore-pallets). When trust is established, the office pallet and trust
 anchor are lifted first (the server verifies every signature before accepting).
 The remote only accepts **fast-forward** updates — no force push.
 
@@ -1674,7 +1681,7 @@ stacking to one pallet stops serializing through a human. It reports how many ti
 auto-merged. Only a clean warehouse qualifies (the merge materializes), and a
 **conflicting overlap** (changes the three-way merge cannot combine) still stops with
 the diverged error (`diverged`, exit 5), leaving
-the warehouse untouched: palletize the fetched remote head, shift back to your pallet,
+the warehouse untouched: create a pallet at the fetched remote head, shift back to your pallet,
 consolidate the new one, and lift the result. A remote holding parcels you have not lowered yet — its head unknown here, or moved
 since you read it — is a different refusal, `remote_ahead` (exit 28): `lower` first, which
 fast-forwards, or reports `diverged` if you moved too. A bay another bay left behind
@@ -1687,8 +1694,8 @@ remote it was franchised from — its origin, which the franchise records in `.f
 before it fetches anything. Talking to a *different* remote could lift onto one that lacks what
 this warehouse never verified there, fetch another history into what this warehouse records, or
 free content by heads the origin does not have. So every command that dials the remote from a
-partial warehouse — `lift`, `lower`, `expand`, `scope-prune`, `store evict`, `palletize --remote`
-(listing, `--delete` and `--restore`), `office enroll`, `rotate`, `retire` and
+partial warehouse — `lift`, `lower`, `expand`, `scope-prune`, `store evict`, `pallet` with `--remote`
+(`list`, `delete` and `restore`), `office enroll`, `rotate`, `retire` and
 `accept-regenesis`, and a cache's fetch of content it lacks — refuses with the
 `non_origin_remote` code (exit 11) when `remote.url` is not the origin, naming both and changing
 nothing. `heal` asks no such remote either: it does its local repair and, for what only a remote
@@ -1745,7 +1752,7 @@ for `franchise`. A remote whose anchor changed from the one held is refused with
 `office accept-regenesis --confirm <genesis>`. A remote that holds an office but declares no
 anchor had it stripped, and is refused the same way, by `franchise` and `lift` too. A diverged
 pallet is never merged implicitly: `lower` fetches the parcels and reports the
-divergence, and you consolidate deliberately (`palletize` the remote head into
+divergence, and you consolidate deliberately (`pallet create` the remote head into
 its own pallet, `consolidate` it, then `lift` the merge). Requires a clean
 warehouse. In a sparse warehouse, `lower` stays pruned — it fetches new in-scope
 content and leaves out-of-scope changes sealed by hash, exactly as the franchise did.
@@ -1763,7 +1770,7 @@ for every command that fetches (`franchise`, `lower`, `expand`, and `lift` when 
 `office accept-regenesis` adds the line to its message instead of a `batch_lane` field. A fetch
 that fails reports only its own failure, not whether the batch download had stopped first.
 
-`lower <pallet>` names a pallet other than the current one (`palletize --remote` lists the
+`lower <pallet>` names a pallet other than the current one (`pallet list --remote` lists the
 remote's). It fetches that pallet's history, then creates the pallet here at the remote's head,
 fast-forwards it, or reports it ahead or diverged, exactly as for the current pallet, but nothing
 else moves: this bay's pallet, files and inventory stay where they are, so it needs no clean
@@ -1773,7 +1780,7 @@ is fully fetched, so a lower that fails part-way leaves it as it was. Naming the
 the same as a bare `lower`.
 
 **A pallet never points at history this warehouse lacks.** Every command that moves a pallet to a
-parcel it does not already stand on (`stack`, `lower`, `consolidate`, `palletize`, `undo`, and the
+parcel it does not already stand on (`stack`, `lower`, `consolidate`, `pallet create`, `undo`, and the
 rest) first checks that the parcel's history is completely present, back to what some pallet
 already holds. In a sparse warehouse it checks only what the fetch scope holds. An object the
 warehouse holds by hash alone (see `audit`) is accepted while it is absent, with nothing beneath
@@ -1808,8 +1815,8 @@ already holds everything, so there is nothing to expand.
 
 Every history the warehouse holds is widened, not just the current pallet's: every pallet, and
 every remote head a `lower` or `lift` fetched without a pallet yet (such as the head of a
-diverged `lower`, which you may palletize later), and every head a pallet moved off that `undo`
-could bring back. If the remote can no longer serve one of those unpalletized heads, `expand`
+diverged `lower`, which you may make a pallet of later), and every head a pallet moved off that `undo`
+could bring back. If the remote can no longer serve one of those heads no pallet holds, `expand`
 still succeeds, and that head is refused as a pallet head (its history "is not completely
 present") until a `lower` from a remote that has it fetches it in full. If it
 cannot serve a pallet's history, `expand` refuses and names the pallet. When another command

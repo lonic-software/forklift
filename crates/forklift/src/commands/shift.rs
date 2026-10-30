@@ -150,7 +150,7 @@ pub async fn catch_up(position: pallet_utils::BayPosition) -> Result<CaughtUp, S
         (from parcel {} to {}), so catching up would overwrite them. Nothing was changed. Park \
         them (\"forklift park\"), run \"forklift shift {}\" again, then \"forklift park pop\". That \
         brings back only changes to paths the pallet's new parcels left alone; for changes that \
-        overlap them, palletize a new pallet here, stack them on it, and consolidate the two.",
+        overlap them, create a new pallet here, stack them on it, and consolidate the two.",
         pallet, position.base.as_deref().unwrap_or("none"), head_hash, pallet
     ))
 }
@@ -183,7 +183,7 @@ pub(crate) fn refuse_mid_merge(doing: &str) -> Result<(), String> {
 }
 
 /// Shift to the given pallet: clean-check, materialize its head tree, repopulate the
-/// inventory, and make it the current pallet. Also used by `palletize` when a new pallet
+/// inventory, and make it the current pallet. Also used by `pallet create` when a new pallet
 /// is created at a parcel other than the current head.
 ///
 /// # Arguments

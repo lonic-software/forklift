@@ -7,53 +7,6 @@ use forklift_core::util::take_utils::{FetchAt, TakeTrust};
 use forklift_core::util::pallet_utils::{self, PalletNamespace, PalletRef, PalletsPrecondition, RefPreconditions, RefUpdateError};
 use forklift_core::util::remote_utils::{self, RemoteClient};
 
-/// Handle the palletize command.
-/// * `palletize <name>`            - Create a new pallet pointing at the current pallet's
-///                                   head and shift to it (like git's "checkout -b").
-/// * `palletize <name> <revision>` - Create the new pallet at the given revision (a
-///                                   pallet name or a parcel hash / unique hash prefix)
-///                                   and shift to it.
-/// * `palletize`                   - List the pallets, marking the current one.
-/// * `palletize --remote`          - List the remote's pallets, each against the local one.
-/// * `palletize --delete <name>`   - Delete the pallet (`--force`: even when nothing else holds
-///                                   its work).
-/// * `palletize --restore <name>`  - Bring back a pallet deleted in this served warehouse.
-/// * `palletize --delete <name> --remote`, `palletize --restore <name> --remote` - The same on
-///                                   the remote, which keeps a deleted pallet's history.
-///
-/// # Arguments
-/// * `name`     - The name of the new pallet (`None` lists the pallets).
-/// * `revision` - Where the new pallet starts (`None` means the current pallet's head).
-/// * `all`      - When listing, also show the meta pallets (the office, etc.).
-/// * `remote`   - List the remote's pallets instead of the local ones; with `delete` or `restore`,
-///                act on the remote's pallet.
-/// * `delete`   - Delete pallet `name` instead of creating it.
-/// * `force`    - With `delete`: delete even when no other pallet holds its work.
-/// * `restore`  - Bring deleted pallet `name` back at its tombstone's head instead of creating it.
-///
-/// # Returns
-/// * `Ok(())`      - If the command was handled successfully.
-/// * `Err(String)` - If there was an error while handling the command.
-pub async fn handle_command(name: Option<String>,
-                            revision: Option<String>,
-                            all: bool,
-                            remote: bool,
-                            delete: bool,
-                            force: bool,
-                            restore: bool) -> Result<(), String> {
-    match name {
-        Some(name) if delete && remote => delete_remote_pallet(&name).await,
-        Some(name) if restore && remote => restore_remote_pallet(&name).await,
-        // Refused at parse time (`cross_argument_error`); never a local creation.
-        Some(_) if remote => Err("\"--remote\" with a pallet name needs \"--delete\" or \"--restore\".".to_string()),
-        Some(name) if delete => delete_pallet(&name, force).await,
-        Some(name) if restore => restore_pallet(&name),
-        Some(name) => create_pallet(&name, revision.as_deref()).await,
-        None if remote => list_remote_pallets(all).await,
-        None => list_pallets(all),
-    }
-}
-
 /// Create a new pallet and make it the current pallet.
 ///
 /// # Arguments
@@ -65,7 +18,7 @@ pub async fn handle_command(name: Option<String>,
 /// * `Ok(())`      - If the pallet was created.
 /// * `Err(String)` - If the name is invalid, the pallet already exists, or the revision
 ///                   could not be resolved (or materialized).
-async fn create_pallet(name: &str, revision: Option<&str>) -> Result<(), String> {
+pub async fn create_pallet(name: &str, revision: Option<&str>) -> Result<(), String> {
     pallet_utils::validate_pallet_name(name)?;
 
     let position = pallet_utils::read_position()?;
@@ -180,7 +133,7 @@ impl CommandOutput for Palletized {
 /// # Returns
 /// * `Ok(())`      - If the pallet was deleted.
 /// * `Err(String)` - The refusal, or why the delete failed (nothing deleted, unless it says so).
-async fn delete_pallet(name: &str, force: bool) -> Result<(), String> {
+pub async fn delete_pallet(name: &str, force: bool) -> Result<(), String> {
     let reference = PalletRef::parse(name)?;
 
     if reference.namespace == PalletNamespace::Meta {
@@ -335,7 +288,7 @@ async fn containment(pallet: &str, head: &str) -> Result<(Option<String>, RefPre
 }
 
 /// Bring pallet `name`, deleted in this served warehouse, back at the head its tombstone holds.
-fn restore_pallet(name: &str) -> Result<(), String> {
+pub fn restore_pallet(name: &str) -> Result<(), String> {
     let head = tombstone_utils::restore_pallet(name)?;
 
     output::emit(&Restored { pallet: name.to_string(), head, remote: None });
@@ -372,10 +325,10 @@ async fn remote_for_deletes(name: &str, verb: &str) -> Result<(RemoteClient, for
 }
 
 /// Delete user pallet `name` on the configured remote, at the head its handshake lists. The remote
-/// keeps that head under a tombstone, so nothing it held is lost: `palletize --restore --remote`
+/// keeps that head under a tombstone, so nothing it held is lost: `pallet restore --remote`
 /// brings the pallet back, and a re-creation must descend from that head. The local pallet of that
 /// name, and every other clone's, is left as it is.
-async fn delete_remote_pallet(name: &str) -> Result<(), String> {
+pub async fn delete_remote_pallet(name: &str) -> Result<(), String> {
     let (client, info) = remote_for_deletes(name, "delete").await?;
 
     // Read before the delete, so a local read error cannot turn a delete that landed into a failure.
@@ -386,7 +339,7 @@ async fn delete_remote_pallet(name: &str) -> Result<(), String> {
         // reported as done rather than refused.
         let Some(head) = info.tombstone(name) else {
             return Err(format!(
-                "The remote has no pallet \"{}\"; \"forklift palletize --remote\" lists them.", name
+                "The remote has no pallet \"{}\"; \"forklift pallet list --remote\" lists them.", name
             ));
         };
 
@@ -449,13 +402,13 @@ impl CommandOutput for RemoteDeleted {
             ),
         }
         println!(
-            "The remote keeps its history; \"forklift palletize --restore {} --remote\" brings it back.",
+            "The remote keeps its history; \"forklift pallet restore {} --remote\" brings it back.",
             self.pallet
         );
 
         if self.local_head.is_some() {
             println!(
-                "The pallet here is untouched; \"forklift palletize --delete {}\" deletes it here too.",
+                "The pallet here is untouched; \"forklift pallet delete {}\" deletes it here too.",
                 self.pallet
             );
         }
@@ -480,8 +433,8 @@ impl RemoteAction {
     /// The command that runs this action on remote pallet `name` again.
     fn rerun(self, name: &str) -> String {
         match self {
-            RemoteAction::Delete => format!("forklift palletize --delete {} --remote", name),
-            RemoteAction::Restore => format!("forklift palletize --restore {} --remote", name),
+            RemoteAction::Delete => format!("forklift pallet delete {} --remote", name),
+            RemoteAction::Restore => format!("forklift pallet restore {} --remote", name),
         }
     }
 }
@@ -515,7 +468,7 @@ fn moved_since_read(why: String, name: &str, action: RemoteAction) -> String {
             a head this command did not see; nothing more was changed, and the pallet stays deleted \
             there.",
             name
-        ), "forklift palletize --remote".to_string()),
+        ), "forklift pallet list --remote".to_string()),
         _ => return why,
     };
 
@@ -524,7 +477,7 @@ fn moved_since_read(why: String, name: &str, action: RemoteAction) -> String {
 
 /// Bring user pallet `name`, deleted on the configured remote, back there at the head its tombstone
 /// holds, acknowledging the deletion. Needs no history here: the remote still holds it.
-async fn restore_remote_pallet(name: &str) -> Result<(), String> {
+pub async fn restore_remote_pallet(name: &str) -> Result<(), String> {
     let (client, info) = remote_for_deletes(name, "restore").await?;
 
     let Some(head) = info.tombstone(name) else {
@@ -535,7 +488,7 @@ async fn restore_remote_pallet(name: &str) -> Result<(), String> {
                 name, head
             ),
             None => format!(
-                "The remote has no deleted pallet \"{}\"; \"forklift palletize --remote\" lists them.", name
+                "The remote has no deleted pallet \"{}\"; \"forklift pallet list --remote\" lists them.", name
             ),
         });
     };
@@ -623,7 +576,7 @@ impl CommandOutput for Deleted {
 /// # Returns
 /// * `Ok(())`      - If the pallets were listed.
 /// * `Err(String)` - If a pallets folder could not be read, or a pallet's ref could not be read.
-fn list_pallets(all: bool) -> Result<(), String> {
+pub fn list_pallets(all: bool) -> Result<(), String> {
     let current = pallet_utils::read_position()?.pallet;
     let mut names = pallet_utils::list_pallets()?;
 
@@ -684,7 +637,7 @@ pub(crate) struct PalletList {
     meta: Vec<String>,
 
     /// The pallets deleted in this warehouse since a server served it, whose tombstones still
-    /// stand; `palletize --restore <name>` brings one back. Omitted when empty.
+    /// stand; `pallet restore <name>` brings one back. Omitted when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     deleted: Vec<DeletedEntry>,
 }
@@ -736,7 +689,7 @@ impl CommandOutput for PalletList {
         }
 
         if !self.deleted.is_empty() {
-            println!("Deleted (\"forklift palletize --restore <name>\" brings one back):");
+            println!("Deleted (\"forklift pallet restore <name>\" brings one back):");
 
             for entry in &self.deleted {
                 println!("  {} (at {})", entry.name, entry.head);
@@ -757,7 +710,7 @@ impl CommandOutput for PalletList {
 /// * `Ok(())`      - If the pallets were listed.
 /// * `Err(String)` - If no remote is configured, the handshake failed, or a local ref or parcel
 ///                   could not be read.
-async fn list_remote_pallets(all: bool) -> Result<(), String> {
+pub async fn list_remote_pallets(all: bool) -> Result<(), String> {
     let client = RemoteClient::for_warehouse()?;
     let info = client.fetch_info().await?;
 
@@ -842,7 +795,7 @@ pub(crate) struct RemotePalletList {
     unnamed: Vec<String>,
 
     /// The pallets deleted on the remote whose tombstones still stand; the remote keeps each one's
-    /// history, and `palletize --restore <name> --remote` brings it back. Omitted when empty.
+    /// history, and `pallet restore <name> --remote` brings it back. Omitted when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     deleted: Vec<RemoteDeletedEntry>,
 }
@@ -924,7 +877,7 @@ impl CommandOutput for RemotePalletList {
         }
 
         if !self.deleted.is_empty() {
-            println!("Deleted on the remote (\"forklift palletize --restore <name> --remote\" brings one back):");
+            println!("Deleted on the remote (\"forklift pallet restore <name> --remote\" brings one back):");
 
             for entry in &self.deleted {
                 let here = match entry.local_head {
@@ -984,19 +937,19 @@ mod tests {
         let error: crate::output::ForkliftError = moved_since_read(moved, "feat", RemoteAction::Delete).into();
 
         assert_eq!(error.code.as_str(), "remote_ahead");
-        assert_eq!(error.next_step.as_deref(), Some("forklift palletize --delete feat --remote"));
+        assert_eq!(error.next_step.as_deref(), Some("forklift pallet delete feat --remote"));
         assert!(!error.message.contains("Lower and retry"), "{}", error.message);
 
         let deleted: String = error::CoreError::refusal(
-            error::RefusalCode::PalletDeletedOnRemote, "words for a lift", "forklift palletize --restore feat --remote"
+            error::RefusalCode::PalletDeletedOnRemote, "words for a lift", "forklift pallet restore feat --remote"
         ).into();
         let error: crate::output::ForkliftError = moved_since_read(deleted.clone(), "feat", RemoteAction::Restore).into();
         assert_eq!(error.code.as_str(), "pallet_deleted_on_remote", "a restore keeps the code");
-        assert_eq!(error.next_step.as_deref(), Some("forklift palletize --restore feat --remote"));
+        assert_eq!(error.next_step.as_deref(), Some("forklift pallet restore feat --remote"));
         assert!(!error.message.contains("words for a lift"), "{}", error.message);
         let error: crate::output::ForkliftError = moved_since_read(deleted.clone(), "feat", RemoteAction::Delete).into();
         assert_eq!(error.code.as_str(), "pallet_deleted_on_remote");
-        assert_eq!(error.next_step.as_deref(), Some("forklift palletize --remote"), "a delete is not told to restore");
+        assert_eq!(error.next_step.as_deref(), Some("forklift pallet list --remote"), "a delete is not told to restore");
 
         let other = moved_since_read("the transport failed".to_string(), "feat", RemoteAction::Restore);
         assert_eq!(other, "the transport failed", "anything else is passed on as it is");

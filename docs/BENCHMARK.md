@@ -294,7 +294,7 @@ Good candidates to add for a deeper picture:
   `forklift shift <pallet>`. Forklift rewrites the working tree and repopulates the
   inventory on a shift, so this exercises a very different code path than status.
   (Both refuse or overwrite based on a dirty tree — start clean.)
-- **Branch create** — `git branch x` vs `forklift palletize x`.
+- **Branch create** — `git branch x` vs `forklift pallet create x`.
 - **Stash** — `git stash` / `git stash pop` vs `forklift park` / `forklift park pop`.
 - **Signed history** — `forklift office enroll`, then time a signed `forklift stack`
   and an `forklift audit` (verifying the whole chain offline). Git has no direct

@@ -330,7 +330,7 @@ fn a_pallet_delete_answers_over_http() {
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
     area.forklift("wh", &["stack", "first"]);
-    area.forklift("wh", &["palletize", "feature"]);
+    area.forklift("wh", &["pallet", "create", "feature"]);
 
     let harvest = harvest(&area.path("wh"));
     let main_head = harvest.head_of("main").expect("main head");

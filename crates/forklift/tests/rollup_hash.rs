@@ -248,7 +248,7 @@ fn consolidate_fast_forward_materializes_a_stamped_tree() {
 
     // A second pallet, branched from main, that moves ahead — main stays untouched so the
     // consolidate below is a clean fast-forward.
-    warehouse.run_ok(&["palletize", "feature"]);
+    warehouse.run_ok(&["pallet", "create", "feature"]);
     warehouse.write_file("dir0/sub1/file0.txt", "feature branch change\n");
     warehouse.run_ok(&["load", "dir0/sub1/file0.txt"]);
     warehouse.run_ok(&["stack", "feature work"]);

@@ -447,9 +447,8 @@ fn fill_placeholders(hint: &str) -> String {
 }
 
 /// Why `hint` does not parse as a command the binary accepts, or `None` when it does. It is split
-/// as a shell would and parsed by clap with the binary's own tree, then held to the cross-argument
-/// rule `main` applies after clap, so the hint is accepted exactly when a user's copy of it would
-/// be. Prefix matching plays no part: clap is not asked to infer subcommands. A hint that leaves
+/// as a shell would and parsed by clap with the binary's own tree, so the hint is accepted exactly
+/// when clap accepts a user's copy of it. Prefix matching plays no part: clap is not asked to infer subcommands. A hint that leaves
 /// out a required argument (`forklift remote move`) or a flag's value (`forklift undo --as`) still
 /// names a real command and passes; one naming a command, flag or value that does not exist does
 /// not. `forklift help` takes any words, so the command a help hint names is looked up in the tree
@@ -465,7 +464,7 @@ fn hint_error(hint: &str) -> Option<String> {
     let argv = std::iter::once("forklift".to_string()).chain(words);
     let error = match Cli::command().try_get_matches_from(argv) {
         Ok(matches) => match Cli::from_arg_matches(&matches) {
-            Ok(cli) => return crate::cross_argument_error(&cli).map(|(_, message)| message.to_string()),
+            Ok(_) => return None,
             Err(error) => error,
         },
         Err(error) => error,

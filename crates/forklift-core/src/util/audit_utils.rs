@@ -516,8 +516,8 @@ pub fn verify_pallet_history(head: &str,
     // absolutely be the one thing that would have put P inside the boundary. Narrowing this to
     // interior-only gaps was tried (PR #121 round 1) and reverted (round 2): it produced false
     // tampering accusations from two ordinary sequences of shipped commands — an ordinary
-    // `office enroll` + `palletize` + `lift` to a fresh remote (the trust arm, server-side), and
-    // an ordinary `office retire` + `palletize` + `lift` that never lifts the retired signer's
+    // `office enroll` + `pallet create` + `lift` to a fresh remote (the trust arm, server-side), and
+    // an ordinary `office retire` + `pallet create` + `lift` that never lifts the retired signer's
     // side pallet (the distrust arm) — see `crates/forklift/tests/remote.rs`'s
     // `enrolling_then_lifting_to_a_fresh_remote_with_an_unlifted_other_pallet_refuses_instead_of_accusing`
     // and `retiring_a_signer_then_lifting_only_a_replacement_pallet_refuses_instead_of_accusing`,

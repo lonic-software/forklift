@@ -231,12 +231,12 @@ fn warehouse_with_a_pinned_side_head(name: &str)
     warehouse.stack("app.txt", "v1\n", "first");
 
     // The canary: built, then orphaned before the revocation snapshot, so no boundary names it.
-    warehouse.run_ok(&["palletize", "canary"]);
+    warehouse.run_ok(&["pallet", "create", "canary"]);
     let canary = warehouse.stack("canary.txt", "c1\n", "canary work");
     warehouse.run_ok(&["shift", "main"]);
     warehouse.delete_pallet_ref("canary");
 
-    warehouse.run_ok(&["palletize", "side"]);
+    warehouse.run_ok(&["pallet", "create", "side"]);
     let side_head = warehouse.stack("side.txt", "s1\n", "side work");
     warehouse.run_ok(&["shift", "main"]);
 
@@ -487,7 +487,7 @@ fn a_boundary_head_and_the_legacy_parcel_it_attested_both_survive_gc() {
 
     // A second ref at `legacy`, created AFTER the snapshot: `legacy` is ref-reachable but is not
     // itself a boundary entry — its only attestation is being an ancestor of `b`.
-    warehouse.run_ok(&["palletize", "keep", &legacy]);
+    warehouse.run_ok(&["pallet", "create", "keep", &legacy]);
 
     // Drop `main` outright. No ref reaches `b` any more; `legacy` stays alive through `keep`.
     warehouse.delete_pallet_ref("main");
@@ -548,7 +548,7 @@ fn a_boundary_head_and_the_legacy_parcel_it_attested_both_survive_gc() {
 /// (`classify_parcel_trust`'s `object_utils::load_parcel`, which every discovered parcel of the
 /// audited pallet must pass) before ever reaching the boundary-gap logic under test, which
 /// would make this leg pass for the wrong reason. So `mid` and `b` belong to `main`, and the
-/// pallet actually audited (`audit-target`) is palletized directly at `legacy`, `mid`'s
+/// pallet actually audited (`audit-target`) is created directly at `legacy`, `mid`'s
 /// ancestor — neither `mid` nor `b` is ever part of `audit-target`'s own history, only of
 /// `anchor.boundary`'s ancestry.
 #[test]
@@ -570,7 +570,7 @@ fn an_absent_interior_ancestor_behind_a_present_boundary_head_is_named_not_accus
 
     // A second pallet at `legacy` — two hops behind `b`, via `mid` — so the pallet this leg
     // actually audits never needs `mid`'s or `b`'s own body to be present.
-    warehouse.run_ok(&["palletize", "audit-target", &legacy]);
+    warehouse.run_ok(&["pallet", "create", "audit-target", &legacy]);
 
     // The interior gap: `b` (the boundary head) stays present; `mid`, reached only as a parent
     // edge from `b`, is deleted.
@@ -625,7 +625,7 @@ fn an_absent_interior_ancestor_behind_a_present_boundary_head_is_named_not_accus
 ///
 /// `side` stacks TWO unsigned parcels off `legacy` (`s0` then `s`, `side`'s new head) before
 /// enroll. `office enroll` snapshots every local pallet head, so `anchor.boundary = [b, s]` —
-/// `s`, not `s0`. A third pallet, `probe`, is palletized at `s0` itself (an ancestor of `s`, not
+/// `s`, not `s0`. A third pallet, `probe`, is created at `s0` itself (an ancestor of `s`, not
 /// `s` itself), and then `s` — one of the boundary's own two entries — is deleted directly (as
 /// if never fetched, or genuinely lost).
 ///
@@ -656,7 +656,7 @@ fn a_genuinely_pre_trust_side_pallet_parcel_behind_an_absent_boundary_head_refus
     let b = warehouse.stack("app.txt", "v2\n", "legacy two");
 
     // A second, unrelated pre-trust pallet: side, at legacy <- s0 <- s (two hops).
-    warehouse.run_ok(&["palletize", "side", &legacy]);
+    warehouse.run_ok(&["pallet", "create", "side", &legacy]);
     let s0 = warehouse.stack("side.txt", "s0\n", "side work 1");
     let s = warehouse.stack("side.txt", "s1\n", "side work 2");
     warehouse.run_ok(&["shift", "main"]);
@@ -675,7 +675,7 @@ fn a_genuinely_pre_trust_side_pallet_parcel_behind_an_absent_boundary_head_refus
 
     // A third pallet, "probe", at s0 — an ancestor of side's boundary snapshot s, not s itself
     // — so the pallet actually audited never needs s's own body to be present.
-    warehouse.run_ok(&["palletize", "probe", &s0]);
+    warehouse.run_ok(&["pallet", "create", "probe", &s0]);
 
     // The absent boundary head: s (one of anchor.boundary's own two entries) is deleted
     // directly, as if never fetched or genuinely lost. Its bytes are kept so resolution below
@@ -731,7 +731,7 @@ fn a_genuinely_pre_trust_side_pallet_parcel_behind_an_absent_boundary_head_refus
         "with s restored, the identical audit must now succeed: {}",
         resolved_out
     );
-    // `probe`'s own history is `legacy <- s0` (side was palletized from `legacy`), so the
+    // `probe`'s own history is `legacy <- s0` (side was created from `legacy`), so the
     // resolved audit reports two legacy parcels, not one — `legacy` was always present and
     // never in question; `s0` is the one this leg is actually about.
     assert!(
@@ -806,7 +806,7 @@ fn the_accusation_still_fires_with_no_gap_at_all() {
 fn warehouse_with_a_pick_of_an_orphaned_source(warehouse: &Warehouse) -> (String, String) {
     warehouse.stack("app.txt", "base\n", "base");
 
-    warehouse.run_ok(&["palletize", "canary"]);
+    warehouse.run_ok(&["pallet", "create", "canary"]);
     let canary = warehouse.stack("canary.txt", "c1\n", "canary work");
     warehouse.run_ok(&["shift", "main"]);
     warehouse.delete_pallet_ref("canary");
@@ -814,7 +814,7 @@ fn warehouse_with_a_pick_of_an_orphaned_source(warehouse: &Warehouse) -> (String
     // No shift between the stack and the undo: `shift` is journaled, and one here would make
     // `undo` revert the shift instead. `undo` is soft, so the feature content is discarded before
     // the shift back.
-    warehouse.run_ok(&["palletize", "feature"]);
+    warehouse.run_ok(&["pallet", "create", "feature"]);
     let source = warehouse.stack("app.txt", "from-feature\n", "feature work");
     warehouse.run_ok(&["undo"]);
     warehouse.run_ok(&["restore", "--staged", "."]);
@@ -991,7 +991,7 @@ fn a_torn_taint_over_an_absent_tag_subject_heals_and_names_the_tag() {
     warehouse.stack("app.txt", "v1\n", "first");
 
     // The canary, as in every other leg.
-    warehouse.run_ok(&["palletize", "canary"]);
+    warehouse.run_ok(&["pallet", "create", "canary"]);
     let canary = warehouse.stack("canary.txt", "c1\n", "canary work");
     warehouse.run_ok(&["shift", "main"]);
     warehouse.delete_pallet_ref("canary");

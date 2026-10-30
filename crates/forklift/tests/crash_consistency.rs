@@ -1126,7 +1126,7 @@ fn diverged_merge_fixture(area: &Area, files_per_dir: usize, clash: bool) -> Str
     assert!(area.run(&["config", "operator.identifier", "barrier@forklift"]).status.success());
     assert!(area.run(&["load", "."]).status.success());
     assert!(area.run(&["stack", "base"]).status.success());
-    assert!(area.run(&["palletize", "feature"]).status.success());
+    assert!(area.run(&["pallet", "create", "feature"]).status.success());
 
     for dir in 0..DIR_COUNT {
         let dir_path = warehouse.join(format!("dir{dir}"));
@@ -1297,7 +1297,7 @@ fn a_merge_conflict_clears_the_rollups_above_it() {
     assert!(area.run(&["config", "operator.identifier", "barrier@forklift"]).status.success());
     assert!(area.run(&["load", "."]).status.success());
     assert!(area.run(&["stack", "base"]).status.success());
-    assert!(area.run(&["palletize", "feature"]).status.success());
+    assert!(area.run(&["pallet", "create", "feature"]).status.success());
     std::fs::write(deep.join("f.txt"), "theirs\n").unwrap();
     assert!(area.run(&["load", "."]).status.success());
     assert!(area.run(&["stack", "feature work"]).status.success());

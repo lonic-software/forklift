@@ -4,7 +4,7 @@
 //! a ref's closure is complete at the current fetch scope. `expand` widens that scope, so it
 //! re-walks every ref head under the widened scope before recording it. A closure can outlive the
 //! command that fetched it without a ref, though: `lower` fetches the remote head and then refuses
-//! as diverged, and the refusal's own next step palletizes that head through a write that fetches
+//! as diverged, and the refusal's own next step creates a pallet at that head through a write that fetches
 //! nothing. If an `expand` ran in between, that head's newly in-scope content would never be
 //! fetched. So every scoped fetch records its head here, under the
 //! [`RefLock`](crate::util::lock_utils::RefLock), before it transfers anything, and `expand` walks

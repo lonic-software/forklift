@@ -770,13 +770,12 @@ pub(crate) const HUMAN_ONLY: &[(&str, &str)] = &[
     ("version", "meta"),
 ];
 
-/// The argument combinations no agent passes, by command path and properties, each with why: a
-/// call giving every one of the properties is refused. Each argument stays in the tool, since
-/// alone or with others it does something an agent may do. A remote pallet's restore is served:
-/// like lifting with `recreate`, it brings history back rather than removing any, and the
-/// refusal a lift to a pallet deleted on the remote gives names it as the next step.
-pub(crate) const HUMAN_ONLY_TOGETHER: &[(&str, &[&str], &str)] = &[
-    ("palletize", &["remote", "delete"], "deletes the remote's pallet, which every clone shares: an admin's call, never a sub-agent's"),
+/// The arguments no agent passes, by command path and argument id, each with why: the tool is
+/// served without them, and a call passing one is refused with the reason. A remote pallet's
+/// restore is served: like lifting with `recreate`, it brings history back rather than removing
+/// any, and the refusal a lift to a pallet deleted on the remote gives names it as the next step.
+pub(crate) const HUMAN_ONLY_ARGS: &[(&str, &str, &str)] = &[
+    ("pallet delete", "remote", "deletes the remote's pallet, which every clone shares: an admin's call, never a sub-agent's"),
 ];
 
 /// The families whose bare form runs the same operation as one of their subcommands, with that
@@ -785,6 +784,7 @@ pub(crate) const HUMAN_ONLY_TOGETHER: &[(&str, &[&str], &str)] = &[
 pub(crate) const BARE_SAME_AS: &[(&str, &str)] = &[
     ("haul", "list"),
     ("office", "list"),
+    ("pallet", "list"),
     ("scope", "status"),
     ("store", "status"),
     ("tag", "list"),
@@ -846,8 +846,9 @@ pub(crate) struct Tool {
     /// The arguments in declaration order.
     pub(crate) params: Vec<ToolParam>,
 
-    /// The [`HUMAN_ONLY_TOGETHER`] combinations of this tool's arguments, with why.
-    pub(crate) together: Vec<(&'static [&'static str], &'static str)>,
+    /// The command's [`HUMAN_ONLY_ARGS`] left out of the tool: the property an agent would pass,
+    /// the command line's spelling, and why.
+    pub(crate) withheld: Vec<(String, String, &'static str)>,
 }
 
 /// One tool argument.
@@ -919,6 +920,7 @@ pub(crate) fn tools() -> Result<&'static [Tool], String> {
 fn generate_tools(root: &clap::Command) -> Result<Vec<Tool>, String> {
     struct Used {
         human_only: Vec<bool>,
+        human_only_args: Vec<bool>,
         bare_same_as: Vec<bool>,
     }
 
@@ -947,20 +949,32 @@ fn generate_tools(root: &clap::Command) -> Result<Vec<Tool>, String> {
         }
 
         let mut params = Vec::new();
+        let mut withheld = Vec::new();
         for arg in command.get_arguments().filter(|arg| !arg.is_global_set() && !arg.is_hide_set()) {
-            params.push(tool_param(&shown, arg)?);
+            let param = tool_param(&shown, arg)?;
+            match HUMAN_ONLY_ARGS.iter().position(|(entry, id, _)| *entry == shown && *id == arg.get_id().as_str()) {
+                Some(index) => {
+                    used.human_only_args[index] = true;
+                    let spelling = arg.get_long().map_or_else(|| param.key.clone(), |long| format!("--{long}"));
+                    withheld.push((param.key, spelling, HUMAN_ONLY_ARGS[index].2));
+                }
+                None => params.push(param),
+            }
         }
         let mut keys = std::collections::HashSet::new();
         if let Some(param) = params.iter().find(|param| !keys.insert(param.key.as_str())) {
             return Err(format!("two arguments of `forklift {shown}` make the property `{}`", param.key));
         }
-        tools.push(tool_for(command, &path, params)?);
+        let mut tool = tool_for(command, &path, params)?;
+        tool.withheld = withheld;
+        tools.push(tool);
         Ok(())
     }
 
     let mut tools = Vec::new();
     let mut used = Used {
         human_only: vec![false; HUMAN_ONLY.len()],
+        human_only_args: vec![false; HUMAN_ONLY_ARGS.len()],
         bare_same_as: vec![false; BARE_SAME_AS.len()],
     };
     for command in root.get_subcommands().filter(|command| !command.is_hide_set()) {
@@ -970,7 +984,9 @@ fn generate_tools(root: &clap::Command) -> Result<Vec<Tool>, String> {
     if let Some(((entry, _), _)) = HUMAN_ONLY.iter().zip(&used.human_only).find(|(_, used)| !**used) {
         return Err(format!("HUMAN_ONLY names `{entry}`, which is not a visible command"));
     }
-    attach_together(&mut tools, HUMAN_ONLY_TOGETHER)?;
+    if let Some(((path, id, _), _)) = HUMAN_ONLY_ARGS.iter().zip(&used.human_only_args).find(|(_, used)| !**used) {
+        return Err(format!("HUMAN_ONLY_ARGS names `{id}` of `{path}`, which is not a visible argument of a tool"));
+    }
     for ((family, sub), used) in BARE_SAME_AS.iter().zip(&used.bare_same_as) {
         let path = format!("{family} {sub}");
         if !*used || !tools.iter().any(|tool| tool.path.join(" ") == path) {
@@ -989,27 +1005,6 @@ fn generate_tools(root: &clap::Command) -> Result<Vec<Tool>, String> {
         return Err(format!("two commands make the tool name `{}`", tool.name));
     }
     Ok(tools)
-}
-
-/// Attaches each combination of `table` (shaped as [`HUMAN_ONLY_TOGETHER`]) to its tool.
-///
-/// # Returns
-/// * `Ok(())`      - Every entry names a tool and two or more distinct arguments of it.
-/// * `Err(String)` - An entry names no tool, an argument its tool lacks, or fewer than two
-///   distinct arguments (which would refuse an argument alone).
-fn attach_together(tools: &mut [Tool], table: &'static [(&'static str, &'static [&'static str], &'static str)]) -> Result<(), String> {
-    for (path, keys, why) in table {
-        let tool = tools.iter_mut().find(|tool| tool.path.join(" ") == *path)
-            .ok_or_else(|| format!("HUMAN_ONLY_TOGETHER names `{path}`, which is not a tool"))?;
-        if let Some(key) = keys.iter().find(|key| !tool.params.iter().any(|param| param.key == **key)) {
-            return Err(format!("HUMAN_ONLY_TOGETHER names `{key}` of `{path}`, which is not an argument of its tool"));
-        }
-        if keys.iter().collect::<std::collections::HashSet<_>>().len() < 2 {
-            return Err(format!("HUMAN_ONLY_TOGETHER names fewer than two distinct arguments of `{path}`"));
-        }
-        tool.together.push((keys, why));
-    }
-    Ok(())
 }
 
 /// The tool for the command at `path`, with its arguments. Its description is the command's
@@ -1036,7 +1031,7 @@ fn tool_for(command: &clap::Command, path: &[String], params: Vec<ToolParam>) ->
         ));
     }
 
-    Ok(Tool { name: path.join("_").replace('-', "_"), path: path.to_vec(), description, params, together: Vec::new() })
+    Ok(Tool { name: path.join("_").replace('-', "_"), path: path.to_vec(), description, params, withheld: Vec::new() })
 }
 
 /// The tool argument for `arg` of the command `shown`.
@@ -1123,9 +1118,8 @@ impl Tool {
             }
         }
         let mut description = self.description.clone();
-        for (keys, why) in &self.together {
-            let keys: Vec<String> = keys.iter().map(|key| format!("\"{key}\"")).collect();
-            description.push_str(&format!("\n\nAn agent may not pass {} together: that {why}.", keys.join(" with ")));
+        for (_, spelling, why) in &self.withheld {
+            description.push_str(&format!("\n\nThe command's \"{spelling}\" is not served here: it {why}."));
         }
         json!({
             "name": self.name,
@@ -1140,8 +1134,8 @@ impl Tool {
     }
 
     /// Why this tool refuses these arguments, if it does: they are not a JSON object, an
-    /// argument is one the tool does not declare, a declared one has the wrong type, or a
-    /// required one is missing. A null value is an omitted argument (harnesses fill unset
+    /// argument is one of the command's that the tool withholds, or one the tool does not declare,
+    /// a declared one has the wrong type, or a required one is missing. A null value is an omitted argument (harnesses fill unset
     /// optionals with it). An injected argument is never refused: the server replaces it.
     ///
     /// Refusing rather than ignoring matters: a dropped filter would answer a broader question
@@ -1152,7 +1146,15 @@ impl Tool {
             return Some(format!("the \"{name}\" tool's arguments must be a JSON object"));
         };
 
-        let given = arguments.iter().filter(|(_, value)| !value.is_null());
+        // A switch passed as false puts nothing in the command, so it asks for nothing withheld.
+        let withheld = self.withheld.iter()
+            .find(|(key, _, _)| arguments.get(key).is_some_and(|value| !value.is_null() && *value != Value::Bool(false)));
+        if let Some((key, _, why)) = withheld {
+            return Some(format!("the \"{name}\" tool does not take \"{key}\": that {why}; a person runs it"));
+        }
+
+        let given = arguments.iter()
+            .filter(|(key, value)| !value.is_null() && !self.withheld.iter().any(|(withheld, _, _)| withheld == *key));
         for (key, value) in given {
             match self.params.iter().find(|param| param.key == *key) {
                 None => return Some(format!("the \"{name}\" tool takes no \"{key}\" argument")),
@@ -1165,18 +1167,7 @@ impl Tool {
         }
         let missing = self.params.iter()
             .find(|param| param.required && param.injected.is_none() && arguments.get(&param.key).is_none_or(Value::is_null));
-        if let Some(param) = missing {
-            return Some(format!("the \"{name}\" tool needs the \"{}\" argument", param.key));
-        }
-
-        // A switch passed as false, or an empty list, is not given: it puts nothing in the command.
-        let given = |key: &&str| arguments.get(*key)
-            .is_some_and(|value| !value.is_null() && *value != Value::Bool(false) && *value != json!([]));
-        let refused = self.together.iter().find(|(keys, _)| keys.iter().all(given));
-        refused.map(|(keys, why)| {
-            let keys: Vec<String> = keys.iter().map(|key| format!("\"{key}\"")).collect();
-            format!("the \"{name}\" tool refuses {} together: that {why}; a person runs it", keys.join(" with "))
-        })
+        missing.map(|param| format!("the \"{name}\" tool needs the \"{}\" argument", param.key))
     }
 
     /// The command's arguments for these (accepted) arguments: the path, each option as
@@ -1647,26 +1638,31 @@ mod tests {
                      "office_list", "tag_list", "haul_list", "scope_status", "kv_set", "cherry_pick"] {
             assert!(names.contains(&name), "{name} must be a tool");
         }
-        for name in ["office", "tag", "haul", "scope", "office_enroll", "office_regenesis", "prepare",
+        for name in ["office", "tag", "haul", "scope", "pallet", "office_enroll", "office_regenesis", "prepare",
                      "self_schema", "mcp", "help", "kv"] {
             assert!(!names.contains(&name), "{name} must not be a tool");
         }
         assert_eq!(tool("tag_create").path, ["tag", "create"]);
 
-        // A combination no agent passes is refused, and each of its arguments still works alone
-        // or with others; the description names it.
-        let (palletize, remote) = (tool("palletize"), "remote");
-        for allowed in [json!({ "remote": true }), json!({ "name": "p", "delete": true }),
-                        json!({ "name": "p", "restore": true }), json!({ "remote": true, "all": true }),
-                        json!({ "name": "p", "restore": true, "remote": true }),
-                        json!({ "name": "p", "delete": true, "remote": false })] {
-            assert_eq!(palletize.refusal(&allowed), None, "{allowed}");
+        // An argument no agent passes is left out of its tool, which is served without it; passing
+        // it is refused with why, the description names it, and the same argument of another
+        // command stays served.
+        let (delete, remote) = (tool("pallet_delete"), "remote");
+        assert!(delete.params.iter().all(|param| param.key != remote));
+        assert!(delete.definition()["inputSchema"]["properties"].get(remote).is_none());
+        for allowed in [json!({ "name": "p" }), json!({ "name": "p", "force": true }), json!({ "name": "p", remote: false }),
+                        json!({ "name": "p", remote: null })] {
+            assert_eq!(delete.refusal(&allowed), None, "{allowed}");
         }
-        let refusal = palletize.refusal(&json!({ "name": "p", "remote": true, "delete": true })).unwrap();
-        assert!(refusal.starts_with(&format!("the \"palletize\" tool refuses \"{remote}\" with \"delete\" together: that ")),
+        assert_eq!(delete.argv(json!({ "name": "p", remote: false }).as_object().unwrap()).unwrap(), ["pallet", "delete", "--", "p"]);
+        let refusal = delete.refusal(&json!({ "name": "p", remote: true })).unwrap();
+        assert!(refusal.starts_with(&format!("the \"pallet_delete\" tool does not take \"{remote}\": that deletes the remote's pallet")),
                 "{refusal}");
-        let description = palletize.definition()["description"].as_str().unwrap().to_string();
-        assert!(description.contains(&format!("An agent may not pass \"{remote}\" with \"delete\" together")), "{description}");
+        let description = delete.definition()["description"].as_str().unwrap().to_string();
+        assert!(description.ends_with(&format!("\n\nThe command's \"--{remote}\" is not served here: it deletes the remote's pallet, \
+                                                which every clone shares: an admin's call, never a sub-agent's.")), "{description}");
+        assert_eq!(tool("pallet_restore").refusal(&json!({ "name": "p", remote: true })), None);
+        assert_eq!(tool("pallet_list").refusal(&json!({ remote: true })), None);
 
         // The one-line description leads, so its git name survives, and the long one follows.
         let lift = tool("lift").description.clone();
@@ -1712,23 +1708,11 @@ mod tests {
         assert!(refused(cli().mut_subcommand("history", |history| history.mut_arg("limit", |limit| limit.long("max"))))
             .contains("a tool table names `limit` of"));
         assert!(refused(cli().subcommand(clap::Command::new("mute"))).ends_with("has no description"));
-        let error = refused(cli().mut_subcommand("palletize", |palletize| palletize.mut_arg("remote", |remote| remote.hide(true))));
-        assert!(error.starts_with("HUMAN_ONLY_TOGETHER names") && error.ends_with("which is not an argument of its tool"), "{error}");
-        let mut tools = super::generate_tools(&cli()).unwrap();
-        let error = super::attach_together(&mut tools, &[("palletize", &["delete", "delete"], "twice")]).unwrap_err();
-        assert!(error.contains("fewer than two distinct arguments"), "{error}");
-
-        // An empty list puts nothing in the command, so it does not complete a combination.
-        let tree = cli().subcommand(clap::Command::new("multi").about("Multi")
-            .arg(clap::Arg::new("tag").long("tag").action(clap::ArgAction::Append))
-            .arg(clap::Arg::new("flag").long("flag").action(clap::ArgAction::SetTrue)));
-        let mut tools = super::generate_tools(&tree).unwrap();
-        super::attach_together(&mut tools, &[("multi", &["tag", "flag"], "both")]).unwrap();
-        let multi = tools.iter().find(|tool| tool.name == "multi").unwrap();
-        assert_eq!(multi.refusal(&json!({ "tag": [], "flag": true })), None);
-        assert!(multi.refusal(&json!({ "tag": ["a"], "flag": true })).is_some());
-        let error = refused(cli().mut_subcommand("palletize", |palletize| palletize.hide(true)));
-        assert!(error.starts_with("HUMAN_ONLY_TOGETHER names") && error.ends_with("which is not a tool"), "{error}");
+        let (path, id, _) = super::HUMAN_ONLY_ARGS[0];
+        let stale = format!("HUMAN_ONLY_ARGS names `{id}` of `{path}`, which is not a visible argument of a tool");
+        let hide_remote = |pallet: clap::Command| pallet.mut_subcommand("delete", |delete| delete.mut_arg("remote", |remote| remote.hide(true)));
+        assert_eq!(refused(cli().mut_subcommand("pallet", hide_remote)), stale);
+        assert_eq!(refused(cli().mut_subcommand("pallet", |pallet| pallet.mut_subcommand("delete", |delete| delete.hide(true)))), stale);
         assert!(refused(cli().subcommand(clap::Command::new("signed").about("Signed")
             .arg(clap::Arg::new("depth").long("depth").value_parser(clap::value_parser!(i64)))))
             .contains("parses a number the tool schema has no type for"));
@@ -1799,7 +1783,7 @@ mod tests {
         assert_eq!(argv("undo", json!({ "as": "-x" })).unwrap(), ["undo", "--as=-x"]);
 
         // A later positional without the one before it would be read as that one.
-        assert_eq!(argv("palletize", json!({ "revision": "r" })).unwrap_err(),
+        assert_eq!(argv("pallet_create", json!({ "revision": "r" })).unwrap_err(),
                    "the \"revision\" argument needs the \"name\" argument before it");
     }
 

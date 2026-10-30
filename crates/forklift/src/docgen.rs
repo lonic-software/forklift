@@ -187,10 +187,9 @@ pub fn render_mcp_tools() -> Result<String, String> {
     for (path, why) in mcp::HUMAN_ONLY {
         out.push_str(&format!("- `forklift {path}`: {why}.\n"));
     }
-    out.push_str("\nThese arguments are refused together, though each is served alone:\n\n");
-    for (path, keys, why) in mcp::HUMAN_ONLY_TOGETHER {
-        let keys: Vec<String> = keys.iter().map(|key| format!("`{key}`")).collect();
-        out.push_str(&format!("- {} of `forklift {path}`: {why}.\n", keys.join(" with ")));
+    out.push_str("\nThese arguments are left out of their command's tool, which is served without them:\n\n");
+    for (path, id, why) in mcp::HUMAN_ONLY_ARGS {
+        out.push_str(&format!("- `{id}` of `forklift {path}`: it {why}.\n"));
     }
     out.push_str(
         "\nThese families' bare form runs the same operation as one of their subcommands, so only \
@@ -423,7 +422,7 @@ fn command_schemas(name: &str) -> Option<Vec<OutputSchema>> {
         "manifest" => commands::manifest::__docgen_schemas(),
         "narrow" => commands::narrow::__docgen_schemas(),
         "office" => commands::office::__docgen_schemas(),
-        "palletize" => commands::palletize::__docgen_schemas(),
+        "pallet" => commands::pallet::__docgen_schemas(),
         "park" => commands::park::__docgen_schemas(),
         "prepare" => commands::prepare::__docgen_schemas(),
         "profile" => commands::profile::__docgen_schemas(),
