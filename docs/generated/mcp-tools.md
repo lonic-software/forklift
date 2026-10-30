@@ -104,7 +104,6 @@ Each of these commands, and every command below it, is a tool for nobody: a pers
 These arguments are refused together, though each is served alone:
 
 - `remote` with `delete` of `forklift palletize`: deletes the remote's pallet, which every clone shares: an admin's call, never a sub-agent's.
-- `remote` with `restore` of `forklift palletize`: brings back a pallet someone deleted on the remote, which every clone shares, with no work of the caller's: an admin's call, never a sub-agent's (re-creating it under new work, by lifting with "recreate", is a push and served).
 
 These families' bare form runs the same operation as one of their subcommands, so only the subcommand is a tool:
 

@@ -774,10 +774,11 @@ pub(crate) const HUMAN_ONLY: &[(&str, &str)] = &[
 
 /// The argument combinations no agent passes, by command path and properties, each with why: a
 /// call giving every one of the properties is refused. Each argument stays in the tool, since
-/// alone or with others it does something an agent may do.
+/// alone or with others it does something an agent may do. A remote pallet's restore is served:
+/// like lifting with `recreate`, it brings history back rather than removing any, and the
+/// refusal a lift to a pallet deleted on the remote gives names it as the next step.
 pub(crate) const HUMAN_ONLY_TOGETHER: &[(&str, &[&str], &str)] = &[
     ("palletize", &["remote", "delete"], "deletes the remote's pallet, which every clone shares: an admin's call, never a sub-agent's"),
-    ("palletize", &["remote", "restore"], "brings back a pallet someone deleted on the remote, which every clone shares, with no work of the caller's: an admin's call, never a sub-agent's (re-creating it under new work, by lifting with \"recreate\", is a push and served)"),
 ];
 
 /// The families whose bare form runs the same operation as one of their subcommands, with that
@@ -1658,16 +1659,15 @@ mod tests {
         let (palletize, remote) = (tool("palletize"), "remote");
         for allowed in [json!({ "remote": true }), json!({ "name": "p", "delete": true }),
                         json!({ "name": "p", "restore": true }), json!({ "remote": true, "all": true }),
+                        json!({ "name": "p", "restore": true, "remote": true }),
                         json!({ "name": "p", "delete": true, "remote": false })] {
             assert_eq!(palletize.refusal(&allowed), None, "{allowed}");
         }
-        for combination in ["delete", "restore"] {
-            let refusal = palletize.refusal(&json!({ "name": "p", "remote": true, combination: true })).unwrap();
-            assert!(refusal.starts_with(&format!("the \"palletize\" tool refuses \"{remote}\" with \"{combination}\" together: that ")),
-                    "{refusal}");
-            let description = palletize.definition()["description"].as_str().unwrap().to_string();
-            assert!(description.contains(&format!("An agent may not pass \"{remote}\" with \"{combination}\" together")), "{description}");
-        }
+        let refusal = palletize.refusal(&json!({ "name": "p", "remote": true, "delete": true })).unwrap();
+        assert!(refusal.starts_with(&format!("the \"palletize\" tool refuses \"{remote}\" with \"delete\" together: that ")),
+                "{refusal}");
+        let description = palletize.definition()["description"].as_str().unwrap().to_string();
+        assert!(description.contains(&format!("An agent may not pass \"{remote}\" with \"delete\" together")), "{description}");
 
         // The one-line description leads, so its git name survives, and the long one follows.
         let lift = tool("lift").description.clone();
