@@ -5507,6 +5507,8 @@ fn a_cache_franchise_is_a_partial_warehouse() {
     assert!(json_of(&cached)["data"].get("bundle_objects").is_none(), "no bundle: {}", stdout(&cached));
     assert_eq!(area.read_file("cached/.forklift/warehouse"), "/forklift-warehouse 2\ncache\n");
     assert!(!area.path("cached/.forklift/config/fetch-scope").exists(), "a cache records no fetch scope");
+    assert_eq!(origin_of(&area, "cached").as_deref(), Some(server.url.as_str()), "a cache records its origin");
+    assert_eq!(origin_of(&area, "full"), None, "a full warehouse records no origin");
     assert_eq!(area.read_file("cached/one.txt"), "one signed\n");
 
     let audit = area.forklift("cached", &["--json", "audit"]);
@@ -5530,7 +5532,7 @@ fn a_cache_franchise_is_a_partial_warehouse() {
     let json = json_of(&refused);
     assert_eq!(json["error"]["code"], "non_origin_remote", "{}", json);
     assert!(json["error"]["message"].as_str().unwrap().contains(&server.url), "{}", json);
-    assert!(json["error"]["next_step"].as_str().unwrap().contains("--cache"), "{}", json);
+    assert!(json["error"]["next_step"].as_str().unwrap().contains(&server.url), "{}", json);
 
     let both = area.forklift(".", &["franchise", &server.url, "both", "--cache", "--only", "src"]);
     assert!(!both.status.success(), "{}", stdout(&both));
@@ -5801,6 +5803,12 @@ fn forklift_dir_snapshot(area: &TestArea, directory: &str) -> std::collections::
     snapshot
 }
 
+/// The origin recorded in the warehouse at `directory`, if any.
+fn origin_of(area: &TestArea, directory: &str) -> Option<String> {
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path(directory));
+    forklift_core::util::origin_utils::read_origin().unwrap()
+}
+
 /// The subtree `name` of the tree `tree`, read from `directory`.
 fn subtree_of(area: &TestArea, directory: &str, tree: &str, name: &str) -> String {
     let _scope = forklift_core::globals::StorageRootScope::enter(&area.path(directory));
@@ -5811,12 +5819,13 @@ fn subtree_of(area: &TestArea, directory: &str, tree: &str, name: &str) -> Strin
 /// Reading an older parcel's content in a cache fetches each object the read meets absent from the
 /// origin, and the record then holds what the read did not reach: the older parcel's root and its
 /// `src` subtree are fetched, while its `docs` subtree, which the root's record covered, is
-/// recorded in their place. With the remote pointed elsewhere, a read refuses to fetch from it,
-/// naming the origin. `diff` between two older parcels fetches the other root too, and `audit`
+/// recorded in their place. With the remote pointed elsewhere, a read refuses to fetch from it as
+/// `non_origin_remote` (exit 11), naming the origin and the other remote. `diff` between two older parcels fetches the other root too, and `audit`
 /// still passes over what is held.
 ///
 /// Revert: leave the read path's absent arm without the refill → `show` fails on the absent root;
-/// drop the push-down → the record misses the `docs` subtree and `audit` fails over it.
+/// drop the push-down → the record misses the `docs` subtree and `audit` fails over it; map the
+/// hook's refusal to a failed fetch → the exit is 1, not 11.
 #[test]
 fn a_cache_read_of_an_older_parcel_fetches_what_it_reads() {
     let area = TestArea::new("cache-miss-fetch");
@@ -5844,8 +5853,10 @@ fn a_cache_read_of_an_older_parcel_fetches_what_it_reads() {
     assert_success(&area.forklift("cached", &["config", "remote.url", &other.url]));
     let elsewhere = area.forklift("cached", &["show", &format!("{}:docs/two.txt", middle)]);
     assert!(!elsewhere.status.success(), "{}", stdout(&elsewhere));
-    assert_ne!(elsewhere.status.code(), Some(36), "a remote that is not the origin is not a cache miss");
-    assert!(stderr(&elsewhere).contains(&server.url), "the refusal names the origin: {}", stderr(&elsewhere));
+    assert_eq!(elsewhere.status.code(), Some(11), "a remote that is not the origin is refused, not a cache miss");
+    assert!(stderr(&elsewhere).contains(&server.url) && stderr(&elsewhere).contains(&other.url), "the refusal names both: {}", stderr(&elsewhere));
+    let as_json = area.forklift("cached", &["--json", "show", &format!("{}:docs/two.txt", middle)]);
+    assert!(stdout(&as_json).contains("\"non_origin_remote\""), "{}", stdout(&as_json));
     assert!(!object_held(&area, "cached", &middle_root));
     assert_success(&area.forklift("cached", &["config", "remote.url", &server.url]));
 
@@ -9250,6 +9261,7 @@ fn a_failed_franchise_keeps_its_directory_and_a_corrected_resume_finishes() {
     assert_eq!(area.read_file("typo/src/api/a.txt"), "api v1\n");
     assert!(!area.path("typo/src/web").exists(), "the resume franchises at its own scope");
     assert!(!area.path("typo/.forklift/franchise").exists(), "a finished franchise clears its record");
+    assert_eq!(origin_of(&area, "typo").as_deref(), Some(server.url.as_str()), "the resume records the origin again");
     assert_success(&area.forklift("typo", &["status"]));
 }
 
@@ -9267,6 +9279,7 @@ fn a_resume_keeps_the_objects_an_earlier_attempt_fetched() {
 
     let failed = area.forklift(".", &["franchise", &server.url, "kept", "--only", "src/ap"]);
     assert_eq!(failed.status.code(), Some(30), "{}{}", stdout(&failed), stderr(&failed));
+    assert_eq!(origin_of(&area, "kept").as_deref(), Some(server.url.as_str()), "the origin is recorded before the fetch");
 
     let resumed = area.forklift(".", &["--json", "franchise", &server.url, "kept"]);
     assert_success(&resumed);
@@ -9276,6 +9289,7 @@ fn a_resume_keeps_the_objects_an_earlier_attempt_fetched() {
         "the resume must not refetch what the first attempt stored: {} vs {}", resumed_fetched, fresh_fetched);
     assert_eq!(area.read_file("kept/src/api/a.txt"), "api v1\n");
     assert_eq!(area.read_file("kept/src/web/b.txt"), "web v1\n");
+    assert_eq!(origin_of(&area, "kept"), None, "a full resume of a sparse attempt leaves no origin behind");
     assert_success(&area.forklift("kept", &["status"]));
 }
 
