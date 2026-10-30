@@ -273,8 +273,8 @@ changelog), `SERVER.md` (server ops), `MACHINE_INTERFACE.md` (`--json`/MCP),
 Any message that names a command does so as `forklift <command> …`, spelled out in full. The
 same tests parse every such mention in the crates' string literals and the binary's help text
 against the binary, so a hint naming a renamed command, a flag that does not exist, or a prefix
-(`forklift palletiz`) fails CI. A command named in quotes without `forklift ` in front fails
-too, because the check could not read it.
+(`forklift palletiz`) fails CI. A top-level command named in double quotes or backticks
+without `forklift ` in front fails too, because the check could not read it.
 
 ---
 

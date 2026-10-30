@@ -294,12 +294,13 @@ fn every_covered_operation_is_still_reachable() {
 /// The words that follow "forklift " without naming a command: prose ("a newer forklift does not
 /// know", "another forklift process"), the domain tags signed records and MACs begin with
 /// ("forklift key endorsement v1", "forklift hook protocol …"), a record header ("forklift mirror
-/// roots 1"), and a test's made-up command ("dollar"). A mention is exempt when its leading words
+/// roots 1"), a test's made-up command ("dollar"), and a flag of `cargo install` written after the
+/// crate name ("--force"). A mention is exempt when its leading words
 /// are one of these. Every other mention of `forklift <word>` is a hint and is parsed, so a hint
 /// whose command is renamed fails rather than passing as prose. No entry may be a command path,
 /// or a hint naming that command could hide behind it ([`no_exemption_is_a_command`]).
 const NOT_COMMANDS: &[&str] = &[
-    "binary", "bundle", "cannot", "created", "does", "dollar", "hook", "is", "key", "knows", "left",
+    "--force", "binary", "bundle", "cannot", "created", "does", "dollar", "hook", "is", "key", "knows", "left",
     "manages", "mirror roots", "piped", "process", "records", "recognizes", "reversible", "root",
     "server", "should", "tree", "warehouse", "was", "with", "writer", "wrote",
 ];
@@ -355,9 +356,10 @@ fn string_literals(stream: TokenStream, out: &mut Vec<String>) {
 }
 
 /// Each command `text` names after "forklift ", as the words to parse. A mention is "forklift "
-/// at the start of a word, followed by a lower-case letter. Opened by a quote or a backtick, it runs
-/// to the matching one; otherwise to the first `;`, `,`, `(`, `)`, line break, or `.` that ends a
-/// sentence, outside single quotes (`forklift bay remove 'a;b'` is one hint). Mentions whose
+/// at the start of a word, followed by a lower-case letter or a `-` (`forklift --json audit`).
+/// Opened by a quote or a backtick, it runs to the matching one; otherwise to the first `;`, `,`,
+/// `(`, `)`, line break, or `.` that ends a sentence, outside single quotes (`forklift bay remove
+/// 'a;b'` is one hint). An apostrophe inside a word ("the remote's") opens no quote. Mentions whose
 /// leading words are in [`NOT_COMMANDS`] are not hints. A command formatted in at run time
 /// (`forklift {}`) cannot be read here and is not a mention.
 fn hints(text: &str) -> Vec<String> {
@@ -368,7 +370,7 @@ fn hints(text: &str) -> Vec<String> {
             continue;
         }
         let rest = &text[start + "forklift ".len()..];
-        if !rest.starts_with(|c: char| c.is_ascii_lowercase()) {
+        if !rest.starts_with(|c: char| c.is_ascii_lowercase() || c == '-') {
             continue;
         }
         let end = match before {
@@ -380,7 +382,11 @@ fn hints(text: &str) -> Vec<String> {
                 let mut quoted = false;
                 rest.char_indices()
                     .find(|&(i, c)| {
-                        quoted ^= c == '\'';
+                        if c == '\'' {
+                            let inside_word = rest[..i].ends_with(char::is_alphanumeric)
+                                && rest[i + 1..].starts_with(char::is_alphanumeric);
+                            quoted ^= !inside_word;
+                        }
                         !quoted && (";,()\n".contains(c)
                             || c == '.' && rest[i + 1..].starts_with(char::is_whitespace)
                                 && !rest[..i].ends_with(' '))
@@ -400,13 +406,24 @@ fn hints(text: &str) -> Vec<String> {
     out
 }
 
-/// `hint` with each format placeholder (`{}`, `{name}`, `{:?}`) replaced by a plain word, so a
-/// formatted hint parses as the command a user would be shown.
+/// `hint` with each format placeholder (`{}`, `{name}`, `{:?}`) replaced by a plain word and each
+/// escaped brace (`{{`, `}}`) by the brace it prints, so a formatted hint parses as the command a
+/// user would be shown.
 fn fill_placeholders(hint: &str) -> String {
     let mut out = String::new();
     let mut rest = hint;
-    while let Some(open) = rest.find('{') {
+    while let Some(open) = rest.find(['{', '}']) {
         out.push_str(&rest[..open]);
+        if rest[open..].starts_with("{{") || rest[open..].starts_with("}}") {
+            out.push_str(&rest[open..open + 1]);
+            rest = &rest[open + 2..];
+            continue;
+        }
+        if rest[open..].starts_with('}') {
+            out.push('}');
+            rest = &rest[open + 1..];
+            continue;
+        }
         match rest[open..].find('}') {
             Some(close) => {
                 out.push('x');
@@ -428,12 +445,19 @@ fn fill_placeholders(hint: &str) -> String {
 /// be. Prefix matching plays no part: clap is not asked to infer subcommands. A hint that leaves
 /// out a required argument (`forklift remote move`) or a flag's value (`forklift undo --as`) still
 /// names a real command and passes; one naming a command, flag or value that does not exist does
-/// not.
+/// not. `forklift help` takes any words, so the command a help hint names, up to a flag or a
+/// `<placeholder>`, is looked up in the tree.
 fn hint_error(hint: &str) -> Option<String> {
     let words = match shlex::split(&fill_placeholders(hint)) {
         Some(words) => words,
         None => return Some("its quoting does not close".to_string()),
     };
+    if words.first().is_some_and(|word| word == "help") {
+        let path: Vec<String> = words[1..].iter().take_while(|word| !word.starts_with(['-', '<'])).cloned().collect();
+        if find_command(&built_cli(), &path).is_none() {
+            return Some(format!("`forklift help` names no command `{}`", path.join(" ")));
+        }
+    }
     let argv = std::iter::once("forklift".to_string()).chain(words);
     let error = match Cli::command().try_get_matches_from(argv) {
         Ok(matches) => match Cli::from_arg_matches(&matches) {
