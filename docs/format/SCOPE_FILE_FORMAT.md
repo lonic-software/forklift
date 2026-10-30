@@ -2,12 +2,12 @@
 This format records a **task-scoped sparse-workspace scope** (§7.6): the subtree path
 prefixes a checkout materializes and operates on. It is used by three files:
 
-- **Bay materialization scope** — `.forklift/bays/<name>/scope` (bay-local). What a bay checks
+- **Bay checkout scope** — `.forklift/bays/<name>/scope` (bay-local). What a bay checks
   out, stages and stacks. Every bay has one, an unscoped bay's naming every path.
-- **Main-tree materialization scope** — `.forklift/scope`. The same for the warehouse's main
+- **Main-tree checkout scope** — `.forklift/scope`. The same for the warehouse's main
   working tree; only a sparse warehouse's main tree has one.
 - **Warehouse fetch scope** — `.forklift/config/fetch-scope` (shared across bays). What the
-  warehouse has fetched at all. Every materialization scope is a subset (⊆) of the fetch
+  warehouse has fetched at all. Every checkout scope is a subset (⊆) of the fetch
   scope. Only a warehouse whose [marker](STATE_RECORD_FORMAT.md#files) records it as
   `sparse` has one; see [the fetch scope and the mode](#the-fetch-scope-and-the-warehouse-mode).
 
@@ -67,7 +67,7 @@ out.
 | Bay scope | present, any scope | present, naming a prefix, ⊆ the fetch scope | remove the bay, add a new one under another name |
 
 The main tree's scope follows the mode, as the fetch scope does: only a sparse clone
-scopes the main tree, and `narrow` cannot scope a checkout that holds every path. A bay's scope
+scopes the main tree, and `scope narrow` cannot scope a checkout that holds every path. A bay's scope
 is the bay's own, since a full warehouse may hold a scoped bay, so `bay add` writes it for every
 bay, the empty file for an unscoped one, and a bay without one is refused in every mode. In a
 sparse warehouse `bay add` without `--scope` is refused before any bay state is made.
@@ -88,7 +88,7 @@ pairing:
 
 `prepare` is the only writer of the mode. When it makes a sparse warehouse, which only
 `clone --only` asks for, it writes the fetch scope and the main tree's scope before the
-marker, so no warehouse is ever marked sparse without them. `expand` and `scope-prune` rewrite
+marker, so no warehouse is ever marked sparse without them. `scope fetch` and `scope prune` rewrite
 the fetch scope afterwards; a fetch scope can be written only into a warehouse already marked
 sparse.
 

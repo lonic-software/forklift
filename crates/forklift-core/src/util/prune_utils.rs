@@ -988,7 +988,7 @@ mod tests {
     use crate::util::pack_utils::tests::{for_each_unreadable, pack_as_unreadable, Unreadable};
     use std::path::PathBuf;
 
-    /// Exclusive store access at the active storage root, as the scope-prune handler holds it.
+    /// Exclusive store access at the active storage root, as the scope prune handler holds it.
     fn store_access() -> StoreAccessExclusive {
         crate::util::lock_utils::StoreAccessLock::try_exclusive().expect("no other holder in a test root")
     }
@@ -1523,7 +1523,7 @@ mod tests {
 
     #[test]
     fn plan_prune_never_frees_parked_edits_under_the_pruned_path_yet_still_reclaims_it() {
-        // The flow `narrow` suggests: park uncommitted edits under the path, narrow, prune. The
+        // The flow `scope narrow` suggests: park uncommitted edits under the path, narrow, prune. The
         // park snapshots the whole tree, so it shares the head's own `src/web` content too.
         let _scratch = Scratch::new("parked-under-pruned");
         let f = build_fixture();

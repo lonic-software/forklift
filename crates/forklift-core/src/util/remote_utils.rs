@@ -5118,14 +5118,14 @@ async fn fetch_unscoped(client: &RemoteClient,
 ///
 /// A full warehouse delegates to [`fetch_history`] verbatim and records nothing, and a cache to
 /// [`fetch_cache`], which fetches the parcels only and records the content it skips. A full warehouse
-/// never becomes sparse (`scope-prune` refuses one, and `clone` writes a scope only into a new
+/// never becomes sparse (`scope prune` refuses one, and `clone` writes a scope only into a new
 /// warehouse), so that check needs no lock.
 ///
 /// In a sparse warehouse the fetch is recorded before anything transfers: under the
 /// [`RefLock`], in one hold, it reads the fetch scope and adds the head to the fetched-heads
-/// ledger ([`fetch_ledger`]), so an `expand` that commits while this fetch runs walks the head at
+/// ledger ([`fetch_ledger`]), so an `scope fetch` that commits while this fetch runs walks the head at
 /// the widened scope. Once the transfer completes it takes the lock again and re-reads the scope;
-/// if an `expand` widened it meanwhile, it records the head again and fetches at the new scope,
+/// if an `scope fetch` widened it meanwhile, it records the head again and fetches at the new scope,
 /// until the scope it fetched at is still current. Only then does it return and let the caller
 /// write its ref.
 ///
@@ -5158,7 +5158,7 @@ pub async fn fetch_history_scoped(client: &RemoteClient,
 /// `clone`, which fetches before it writes any scope, so that an `--only` naming nothing is
 /// refused with nothing left behind. A sparse scope records the head in the ledger the same way,
 /// under the [`RefLock`], before anything transfers. It does not re-check the scope afterwards:
-/// no scope exists on disk for an `expand` to widen until the caller writes this one.
+/// no scope exists on disk for an `scope fetch` to widen until the caller writes this one.
 ///
 /// # Arguments
 /// * `client` - The remote.
@@ -5226,7 +5226,7 @@ where
             return Ok(stats);
         }
 
-        // An `expand` committed while this fetch ran: it may have dropped or never seen this
+        // An `scope fetch` committed while this fetch ran: it may have dropped or never seen this
         // head, so record it again before fetching what the widened scope adds.
         fetch_ledger::record_fetch(&lock, head, pallet)?;
         drop(lock);
@@ -5257,7 +5257,7 @@ impl FetchStats {
     }
 }
 
-/// How many times `expand` walks and tries to commit before it gives up on a warehouse that keeps
+/// How many times `scope fetch` walks and tries to commit before it gives up on a warehouse that keeps
 /// changing under it.
 pub const EXPAND_ATTEMPTS: usize = 3;
 
@@ -5266,14 +5266,14 @@ pub enum ExpandCommit {
     /// The widened scope and the pruned ledger were written.
     Written(MaterializationScope),
 
-    /// Another `expand` already brought every added prefix into scope; nothing was written.
+    /// Another `scope fetch` already brought every added prefix into scope; nothing was written.
     Covered(MaterializationScope),
 
     /// The warehouse changed since the walk: walk again, then commit again.
     Retry,
 }
 
-/// The engine behind `expand`: widen a sparse warehouse's fetch scope, fetching the newly
+/// The engine behind `scope fetch`: widen a sparse warehouse's fetch scope, fetching the newly
 /// in-scope content of every closure the warehouse holds first.
 ///
 /// Every closure means the bay's base, every local ref head and every present head in the
@@ -5566,7 +5566,7 @@ impl Expansion {
     }
 }
 
-/// The refusal for a closure `expand` cannot widen.
+/// The refusal for a closure `scope fetch` cannot widen.
 fn unservable(pallet: &str, error: &str) -> String {
     format!(
         "Pallet \"{}\" cannot be fetched at the widened scope: {} Nothing was recorded.",
@@ -17027,7 +17027,7 @@ mod tests {
         );
     }
 
-    /// The scoped fetch's ledger record and `expand`'s engine, in a sparse warehouse whose objects
+    /// The scoped fetch's ledger record and `scope fetch`'s engine, in a sparse warehouse whose objects
     /// are all local and signed, so the walks never need the remote; the client points where
     /// nothing listens, so a walk that does reach for it fails.
     mod scoped_fetch {

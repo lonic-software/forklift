@@ -394,7 +394,7 @@ async fn forklift(cli: Cli) -> Result<(), ForkliftError> {
         // Order this command's whole decide-then-publish window against every operation that
         // deletes objects on a liveness or scope decision in any other process (FORK-150): a
         // dedup that finds an unreachable object present must never publish a reference to it
-        // while a full repack, gc or scope-prune is about to delete it. Taken after the bay lock
+        // while a full repack, gc or scope prune is about to delete it. Taken after the bay lock
         // (always that order, so no cycle) and before entry-heal, which can restage objects.
         // Waits while a deleter runs: the lock is a kernel lock, so a dead holder releases it.
         if cli.command.holds_store_access() {

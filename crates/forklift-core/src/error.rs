@@ -111,7 +111,7 @@ macro_rules! refusal_codes {
 }
 
 refusal_codes! {
-    /// A path argument is outside the bay's materialization scope (§7.6).
+    /// A path argument is outside the bay's checkout scope (§7.6).
     OutOfScope => "out_of_scope",
 
     /// A merge in a scoped bay hit an out-of-scope entry that changed on both sides: there is no
@@ -131,11 +131,11 @@ refusal_codes! {
     /// it refuses up front.
     NonOriginRemote => "non_origin_remote",
 
-    /// `narrow` was asked to drop a subtree that still holds uncommitted work (staged, unstaged or
+    /// `scope narrow` was asked to drop a subtree that still holds uncommitted work (staged, unstaged or
     /// untracked): it refuses rather than silently discard it.
     NarrowUnclean => "narrow_unclean",
 
-    /// `scope-prune` was asked to free a path a checkout still materializes: freeing it would
+    /// `scope prune` was asked to free a path a checkout still materializes: freeing it would
     /// break that checkout, so it refuses until the checkout narrows the path away.
     ScopePruneBlocked => "scope_prune_blocked",
 

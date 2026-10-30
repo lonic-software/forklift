@@ -1163,7 +1163,7 @@ impl VerifiedClosure {
 /// [`verify_new_head`]), before the lock, since the walk can be long and the hold does no walking.
 /// Objects cannot vanish between the walk and the write: every command that writes a ref holds
 /// the store-access lock shared, which every deleter needs exclusively. The fetch scope can change
-/// in between, though (an `expand` in another bay commits a widened one under the lock), so the
+/// in between, though (an `scope fetch` in another bay commits a widened one under the lock), so the
 /// hold re-reads it, and when it is no longer the scope verified against, the hold is released and
 /// the closure verified again at the new one. A verification that held an absence by the
 /// sealed-by-hash record has the hold re-read the record the same way, since its writers commit
@@ -1435,7 +1435,7 @@ fn verify_new_head(name: &str,
 
 /// The head a write of `new` over `expected` leaves no longer reached from its ref, when that
 /// matters: a user-pallet ref in a sparse warehouse moving to a parcel that does not descend from
-/// its old head. Such a head goes into the fetched-heads ledger with the write, so an `expand`
+/// its old head. Such a head goes into the fetched-heads ledger with the write, so an `scope fetch`
 /// walks it before an `undo` can write it back.
 fn left_unreached<'a>(namespace: PalletNamespace,
                       expected: Option<&'a str>,
@@ -1555,7 +1555,7 @@ pub(crate) fn update_pallet_head_locked(
 ///
 /// Under the [`RefLock`](crate::util::lock_utils::RefLock), in this order: the ref's own compare,
 /// the `preconditions`, the served mark, read fail-closed, the fetched-heads ledger (a sparse
-/// warehouse records the removed head, which this ref no longer reaches, so `expand` walks it),
+/// warehouse records the removed head, which this ref no longer reaches, so `scope fetch` walks it),
 /// then the tombstone (in a served warehouse, replacing any the name had) and `journal` appended
 /// to the bay's undo journal, each durably, before the ref file is unlinked. The unlink and every
 /// folder a nested name leaves empty are synced through the durability taint, so what is visible

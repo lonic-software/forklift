@@ -539,7 +539,7 @@ fn narrow_refuses_to_delete_a_nested_working_tree_whatever_the_rules_say() {
         let prepared = warehouse.run_at(&nested_dir, &["prepare"]);
         assert!(prepared.status.success(), "{}", stderr(&prepared));
 
-        let narrow = warehouse.run_at(&bay, &["narrow", "a"]);
+        let narrow = warehouse.run_at(&bay, &["scope", "narrow", "a"]);
         let mut problems = Vec::new();
         if narrow.status.success() {
             problems.push("it succeeded".to_string());

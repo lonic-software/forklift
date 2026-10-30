@@ -3603,7 +3603,7 @@ fn compact_bounded(all: bool,
     // here. Never waits; refused while any writer holds the store, which auto-maintenance treats
     // as any other compaction error and retries on a later command. Incremental compaction makes
     // no liveness decision, but it moves loose objects into a pack and deletes the loose copies,
-    // which must not interleave with a scope-prune or gc deleting loose objects on a keep-set; so
+    // which must not interleave with a scope prune or gc deleting loose objects on a keep-set; so
     // it shares the store with writers, refused (never waiting) while a deleter holds it.
     let (_store_exclusive, _store_shared) = if all {
         (Some(lock_utils::StoreAccessLock::try_exclusive()?), None)
@@ -10792,7 +10792,7 @@ pub(crate) mod tests {
     }
 
     /// Incremental compaction moves loose objects into a pack and deletes the loose copies, so it
-    /// must not interleave with a scope-prune or gc deleting loose objects on a keep-set: refused
+    /// must not interleave with a scope prune or gc deleting loose objects on a keep-set: refused
     /// (never waiting) while a deleter holds the store, leaving the loose object where the deleter
     /// planned to find it.
     ///
@@ -10803,12 +10803,12 @@ pub(crate) mod tests {
         let temp = fresh_root("compact-beside-deleter");
         let _scope = StorageRootScope::enter(&temp);
 
-        let content = b"loose, and planned for freeing by a scope-prune".to_vec();
+        let content = b"loose, and planned for freeing by a scope prune".to_vec();
         let hash = blake3::hash(&content).to_hex().to_string();
         store_loose(&hash, &content);
 
         let deleter = lock_utils::StoreAccessLock::try_exclusive()
-            .expect("hold the store exclusively, as a scope-prune in another bay does");
+            .expect("hold the store exclusively, as a scope prune in another bay does");
         let error = compact(false, false, false, &Progress::NONE)
             .expect_err("incremental compaction must refuse beside a deleter");
         assert!(error.contains("maintenance"), "the refusal should name the maintenance: {}", error);

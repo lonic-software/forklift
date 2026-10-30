@@ -338,7 +338,7 @@ where Forklift is least proven.
 - **Virtual filesystem / lazy fetch (EdenFS).** Sapling fetches file content on demand,
   so you can work in a giant repo without materializing it. Forklift has
   [sparse warehouses](guide/concepts.md#4-sparse-warehouses): a `clone --only` fetches
-  and materializes only the paths you ask for, and `expand` widens that later. But there is
+  and materializes only the paths you ask for, and `scope fetch` widens that later. But there is
   no virtual filesystem, and fetching history lazily, so a clone's cost is bounded by the tip
   rather than by history length, is still future work (§8). **[Forklift lacks a virtual
   filesystem.]**

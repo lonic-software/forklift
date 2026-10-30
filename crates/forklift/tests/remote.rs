@@ -562,7 +562,7 @@ fn a_sparse_franchise_keeps_the_root_ignore_file_in_scope() {
     let scope = area.forklift("sparse", &["--json", "scope"]);
     assert_success(&scope);
     let scope_json: serde_json::Value = serde_json::from_str(&stdout(&scope)).unwrap();
-    assert_eq!(scope_json["data"]["materialization_scope"], serde_json::json!(["src"]), "{}", stdout(&scope));
+    assert_eq!(scope_json["data"]["checkout_scope"], serde_json::json!(["src"]), "{}", stdout(&scope));
     assert_eq!(scope_json["data"]["implicit_scope"], serde_json::json!([".forkliftignore"]), "{}", stdout(&scope));
     assert_eq!(scope_json["data"]["fetch_scope"], serde_json::json!(["src"]), "{}", stdout(&scope));
     assert_eq!(scope_json["data"]["implicit_fetch_scope"], serde_json::json!([".forkliftignore"]), "{}", stdout(&scope));
@@ -635,7 +635,7 @@ fn a_sparse_checkout_unstages_the_root_ignore_file_and_narrows_past_an_edit_to_i
         "{}", stdout(&status));
 
     // The edit is still on disk, unstaged; narrowing "docs" away is not blocked by it.
-    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
+    assert_success(&area.forklift("sparse", &["scope", "narrow", "docs"]));
     assert!(!area.path("sparse/docs").exists(), "the narrowed prefix is de-materialized");
     assert_eq!(area.read_file("sparse/.forkliftignore"), "^src/build(/.*)?$\n\\.log$\n",
         "the unstaged edit to the rules survives the narrow");
@@ -3444,7 +3444,7 @@ fn gc_is_refused_while_another_process_writes_the_store() {
 #[test]
 fn a_warehouse_created_by_put_is_served_under_the_serve_lock() {
     // A warehouse first reached through `PUT /warehouses/W` must be served like any other: under
-    // the serve lock and the shared store-access hold, so gc, a full repack and scope-prune are
+    // the serve lock and the shared store-access hold, so gc, a full repack and scope prune are
     // refused on it while the server runs. `put_warehouse` used to register the lockless handle it
     // ran `prepare` with, and every later request reused it.
     //
@@ -4220,7 +4220,7 @@ fn a_sparse_franchise_fetches_only_the_scoped_subtree() {
     assert_success(&scope);
     let scope_json: serde_json::Value = serde_json::from_str(&stdout(&scope)).unwrap();
     assert_eq!(scope_json["data"]["fetch_scope"], serde_json::json!(["src/api"]), "{}", stdout(&scope));
-    assert_eq!(scope_json["data"]["materialization_scope"], serde_json::json!(["src/api"]), "{}", stdout(&scope));
+    assert_eq!(scope_json["data"]["checkout_scope"], serde_json::json!(["src/api"]), "{}", stdout(&scope));
 
     let stocktake = area.forklift("sparse", &["stocktake"]);
     assert_success(&stocktake);
@@ -5024,7 +5024,7 @@ fn expand_fetches_the_widened_subtree_and_a_bay_can_scope_to_it() {
     assert!(!object_present(&area, "sparse", &web_tree), "src/web is sealed after the sparse clone");
 
     // Expand fetches the newly in-scope subtree.
-    let expanded = area.forklift("sparse", &["expand", "src/web"]);
+    let expanded = area.forklift("sparse", &["scope", "fetch", "src/web"]);
     assert_success(&expanded);
     assert!(stdout(&expanded).contains("Expanded"), "{}", stdout(&expanded));
     assert!(object_present(&area, "sparse", &web_tree), "expand must fetch the widened subtree object");
@@ -5084,7 +5084,7 @@ fn expand_fetches_the_widened_content_of_a_head_a_refused_lower_fetched() {
     let server = Server::start(&area, None);
     let (up_head, web_blob) = sparse_after_a_diverged_lower(&area, &server);
 
-    assert_success(&area.forklift("sparse", &["expand", "src/web"]));
+    assert_success(&area.forklift("sparse", &["scope", "fetch", "src/web"]));
     assert_success(&area.forklift("sparse", &["pallet", "create", &format!("main-remote-{}", &up_head[..12]), &up_head]));
 
     assert!(object_present(&area, "sparse", &web_blob), "the new pallet's head's widened content is present");
@@ -5100,7 +5100,7 @@ fn expand_leaves_a_fetched_head_the_remote_can_no_longer_serve_unable_to_become_
 
     std::fs::remove_file(object_store_path(&area, "server-root", &web_blob)).unwrap();
 
-    let expanded = area.forklift("sparse", &["expand", "src/web"]);
+    let expanded = area.forklift("sparse", &["scope", "fetch", "src/web"]);
     assert_success(&expanded);
 
     let refused = area.forklift("sparse", &["pallet", "create", "x", &up_head]);
@@ -5121,7 +5121,7 @@ fn expand_checks_its_paths_before_walking_other_histories() {
     assert_success(&area.forklift("sparse", &["shift", "main"]));
     std::fs::remove_file(object_store_path(&area, "server-root", &web_blob)).unwrap();
 
-    let refused = area.forklift("sparse", &["expand", "src/web", "src/wbe"]);
+    let refused = area.forklift("sparse", &["scope", "fetch", "src/web", "src/wbe"]);
     assert!(!refused.status.success());
     assert!(stderr(&refused).contains("\"src/wbe\" is not a directory"), "{}", stderr(&refused));
 }
@@ -5179,7 +5179,7 @@ fn a_sparse_franchise_seals_an_out_of_scope_chunked_file_and_expand_fetches_it()
     assert!(!area.path("sparse/big/giant.bin").exists(), "the out-of-scope giant is not materialized");
 
     // Expand into the chunked file's scope: the recipe AND its chunks arrive.
-    let expanded = area.forklift("sparse", &["expand", "big"]);
+    let expanded = area.forklift("sparse", &["scope", "fetch", "big"]);
     assert_success(&expanded);
     assert!(object_present(&area, "sparse", &recipe), "expand fetches the recipe");
     assert!(object_present(&area, "sparse", &chunk), "expand fetches the recipe's chunks");
@@ -5195,7 +5195,7 @@ fn a_sparse_franchise_seals_an_out_of_scope_chunked_file_and_expand_fetches_it()
 
 #[test]
 fn narrow_shrinks_the_scope_and_frees_nothing() {
-    // `narrow` drops a subtree from this checkout's materialization scope and de-materializes its
+    // `narrow` drops a subtree from this checkout's scope and de-materializes its
     // files, but frees nothing in the object store — the content is still reachable history.
     let area = TestArea::new("sparse-narrow");
     let server = Server::start(&area, None);
@@ -5217,7 +5217,7 @@ fn narrow_shrinks_the_scope_and_frees_nothing() {
     assert_eq!(area.read_file("sparse/docs/guide.md"), "guide v1\n");
 
     // Narrow away docs.
-    let narrowed = area.forklift("sparse", &["narrow", "docs"]);
+    let narrowed = area.forklift("sparse", &["scope", "narrow", "docs"]);
     assert_success(&narrowed);
     assert!(stdout(&narrowed).contains("Narrowed away docs"), "{}", stdout(&narrowed));
 
@@ -5227,11 +5227,11 @@ fn narrow_shrinks_the_scope_and_frees_nothing() {
     assert!(object_present(&area, "sparse", &docs_tree), "narrow frees nothing: the subtree object stays");
     assert!(object_present(&area, "sparse", &docs_blob), "narrow frees nothing: the blob stays");
 
-    // The materialization scope shrank; a clean stocktake proves the dropped subtree is not
+    // The checkout scope shrank; a clean stocktake proves the dropped subtree is not
     // reported as a removal.
     let scope = area.forklift("sparse", &["--json", "scope"]);
     let scope_json: serde_json::Value = serde_json::from_str(&stdout(&scope)).unwrap();
-    assert_eq!(scope_json["data"]["materialization_scope"], serde_json::json!(["src/api"]), "{}", stdout(&scope));
+    assert_eq!(scope_json["data"]["checkout_scope"], serde_json::json!(["src/api"]), "{}", stdout(&scope));
 
     let stocktake = area.forklift("sparse", &["stocktake"]);
     assert_success(&stocktake);
@@ -5289,13 +5289,13 @@ fn a_sparse_workspace_refuses_to_lift_to_a_non_origin_remote() {
 
 /// Every command that talks to a remote from a partial warehouse talks only to its origin: pointed
 /// at another remote that holds the same history and more, the remote pallet listing, `office
-/// enroll` and `accept-regenesis`, `lower`, `expand`, `scope-prune`, `pallet delete` (asking
+/// enroll` and `accept-regenesis`, `lower`, `expand`, `scope prune`, `pallet delete` (asking
 /// whether the remote holds the pallet's work), and the remote `--delete` and `--restore` each
 /// refuse as `non_origin_remote` (exit 11), naming both remotes,
 /// with every file under `.forklift` as it was. A full warehouse lowers from the same remote.
 ///
 /// Revert: build any one command's client with `RemoteClient::from_config` again → that command
-/// runs against the other remote (the listing, lower, expand, scope-prune and the remote delete
+/// runs against the other remote (the listing, lower, expand, scope prune and the remote delete
 /// succeed; enroll, the regenesis check, the local delete and the restore fail with another code)
 /// → red.
 #[test]
@@ -5331,7 +5331,7 @@ fn a_partial_warehouse_talks_to_no_remote_but_its_origin() {
     assert_success(&area.forklift("sparse", &["stack", "old work"]));
     assert_success(&area.forklift("sparse", &["shift", "main"]));
     // No checkout materializes docs, so pruning it asks the remote.
-    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
+    assert_success(&area.forklift("sparse", &["scope", "narrow", "docs"]));
 
     assert_success(&area.forklift("sparse", &["config", "set", "remote.url", &server2.url]));
     let before = forklift_dir_snapshot(&area, "sparse");
@@ -5341,8 +5341,8 @@ fn a_partial_warehouse_talks_to_no_remote_but_its_origin() {
         &["office", "enroll"],
         &["office", "accept-regenesis"],
         &["lower"],
-        &["expand", "src/web"],
-        &["scope-prune", "docs"],
+        &["scope", "fetch", "src/web"],
+        &["scope", "prune", "docs"],
         &["pallet", "delete", "old"],
         &["pallet", "delete", "extra", "--remote"],
         &["pallet", "restore", "extra", "--remote"],
@@ -5395,7 +5395,7 @@ fn a_sparse_warehouse_whose_fetch_scope_is_gone_is_refused() {
 
     std::fs::remove_file(area.path("sparse/.forklift/config/fetch-scope")).unwrap();
 
-    for args in [&["lift"][..], &["expand", "docs"], &["lower"]] {
+    for args in [&["lift"][..], &["scope", "fetch", "docs"], &["lower"]] {
         let refused = area.forklift("sparse", &[&["--json"][..], args].concat());
         assert!(!refused.status.success(), "{:?} must refuse: {}", args, stdout(&refused));
         let message = json_of(&refused)["error"]["message"].as_str().unwrap().to_string();
@@ -5525,7 +5525,7 @@ fn a_cache_franchise_is_a_partial_warehouse() {
     let human = area.forklift("cached", &["audit"]);
     assert!(stdout(&human).contains("This warehouse is a cache"), "{}", stdout(&human));
 
-    let expand = area.forklift("cached", &["expand", "docs"]);
+    let expand = area.forklift("cached", &["scope", "fetch", "docs"]);
     assert!(!expand.status.success(), "{}", stdout(&expand));
     assert!(stderr(&expand).contains("--cache") || stdout(&expand).contains("--cache"),
         "{}{}", stdout(&expand), stderr(&expand));
@@ -6545,7 +6545,7 @@ fn assert_move_pending(area: &TestArea,
 
 /// While a move of a partial warehouse's origin stands, in either phase, nothing talks to a
 /// remote and nothing writes what the move checks: with `remote.url` still the origin, the remote
-/// listing, `office rotate` and `accept-regenesis`, `lower`, `lift`, `expand`, `scope-prune` and
+/// listing, `office rotate` and `accept-regenesis`, `lower`, `lift`, `expand`, `scope prune` and
 /// the remote `--delete` and `--restore` refuse up front, and so do the local writers: an `undo`
 /// that moves a pallet back, adding its head to the fetched-heads ledger, and a forced delete,
 /// which removes no pallet under a move whether or not its head is already in the ledger. In a
@@ -6579,7 +6579,7 @@ fn a_pending_move_of_the_origin_refuses_every_remote_client_and_every_writer_it_
         assert_success(&area.forklift(directory, &["stack", "old work"]));
         assert_success(&area.forklift(directory, &["shift", "main"]));
     }
-    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
+    assert_success(&area.forklift("sparse", &["scope", "narrow", "docs"]));
     area.write_file("sparse/src/code.txt", "local\n");
     assert_success(&area.forklift("sparse", &["load", "."]));
     assert_success(&area.forklift("sparse", &["stack", "local"]));
@@ -6590,8 +6590,8 @@ fn a_pending_move_of_the_origin_refuses_every_remote_client_and_every_writer_it_
         &["office", "accept-regenesis"],
         &["lower"],
         &["lift"],
-        &["expand", "notes"],
-        &["scope-prune", "docs"],
+        &["scope", "fetch", "notes"],
+        &["scope", "prune", "docs"],
         &["pallet", "delete", "old"],
         &["pallet", "delete", "extra", "--remote"],
         &["pallet", "restore", "extra", "--remote"],
@@ -6746,7 +6746,7 @@ fn a_partial_warehouse_moves_its_origin_to_a_copy_and_works_against_it() {
     assert_eq!(stdout(&read), "one\n");
 
     assert!(!object_present(&area, "sparse", &three_docs), "docs is out of the sparse warehouse's scope");
-    assert_success(&area.forklift("sparse", &["expand", "docs"]));
+    assert_success(&area.forklift("sparse", &["scope", "fetch", "docs"]));
     assert!(object_present(&area, "sparse", &three_docs), "expand fetches docs from the new origin");
 
     assert_success(&area.forklift("cached", &["shift", "local"]));
@@ -7480,7 +7480,7 @@ fn narrow_refuses_to_delete_dirty_tracked_changes() {
     // An unstaged edit blocks narrowing "docs".
     std::fs::write(area.path("sparse/docs/guide.md"), "guide v2 (unsaved)\n").unwrap();
 
-    let refused = area.forklift("sparse", &["--json", "narrow", "docs"]);
+    let refused = area.forklift("sparse", &["--json", "scope", "narrow", "docs"]);
     assert_eq!(refused.status.code(), Some(12), "narrow_unclean exits 12: {}", stderr(&refused));
     let json: serde_json::Value = serde_json::from_str(&stdout(&refused)).unwrap();
     assert_eq!(json["error"]["code"], "narrow_unclean", "{}", stdout(&refused));
@@ -7491,15 +7491,15 @@ fn narrow_refuses_to_delete_dirty_tracked_changes() {
     std::fs::write(area.path("sparse/src/api/a.txt"), "api v2 staged\n").unwrap();
     assert_success(&area.forklift("sparse", &["load", "src/api/a.txt"]));
 
-    let refused2 = area.forklift("sparse", &["--json", "narrow", "src/api"]);
+    let refused2 = area.forklift("sparse", &["--json", "scope", "narrow", "src/api"]);
     assert_eq!(refused2.status.code(), Some(12), "narrow_unclean exits 12: {}", stderr(&refused2));
     assert_eq!(area.read_file("sparse/src/api/a.txt"), "api v2 staged\n",
         "the staged edit must survive a refused narrow");
 
-    // Neither prefix was dropped: the materialization scope is unchanged.
+    // Neither prefix was dropped: the checkout scope is unchanged.
     let scope = area.forklift("sparse", &["--json", "scope"]);
     let scope_json: serde_json::Value = serde_json::from_str(&stdout(&scope)).unwrap();
-    assert_eq!(scope_json["data"]["materialization_scope"], serde_json::json!(["docs", "src/api"]),
+    assert_eq!(scope_json["data"]["checkout_scope"], serde_json::json!(["docs", "src/api"]),
         "{}", stdout(&scope));
 }
 
@@ -7523,7 +7523,7 @@ fn narrow_refuses_to_delete_an_edited_tracked_file_a_rule_covers() {
     std::fs::write(area.path("sparse/.forkliftignore"), "^docs/gen\\.txt$\n").unwrap();
     std::fs::write(area.path("sparse/docs/gen.txt"), "gen v2 (unsaved)\n").unwrap();
 
-    let refused = area.forklift("sparse", &["--json", "narrow", "docs"]);
+    let refused = area.forklift("sparse", &["--json", "scope", "narrow", "docs"]);
     assert_eq!(refused.status.code(), Some(12), "narrow_unclean exits 12: {}", stderr(&refused));
     assert_eq!(area.read_file("sparse/docs/gen.txt"), "gen v2 (unsaved)\n",
         "the edit must survive a refused narrow");
@@ -7548,7 +7548,7 @@ fn narrow_refuses_to_delete_untracked_files() {
 
     area.write_file("sparse/docs/scratch.md", "not tracked\n");
 
-    let refused = area.forklift("sparse", &["--json", "narrow", "docs"]);
+    let refused = area.forklift("sparse", &["--json", "scope", "narrow", "docs"]);
     assert_eq!(refused.status.code(), Some(12), "narrow_unclean exits 12: {}", stderr(&refused));
     let json: serde_json::Value = serde_json::from_str(&stdout(&refused)).unwrap();
     assert_eq!(json["error"]["code"], "narrow_unclean", "{}", stdout(&refused));
@@ -7583,7 +7583,7 @@ fn bay_add_scope_refuses_a_spine_ancestor_outside_the_fetch_scope() {
         &["bay", "add", "work", bay_dir.to_str().unwrap(), "--scope", "src"]);
     assert!(!refused.status.success(), "a bay scope wider than the fetch scope must be refused");
     assert!(stderr(&refused).contains("fetch scope"), "{}", stderr(&refused));
-    assert!(stderr(&refused).contains("expand"), "the refusal names expand: {}", stderr(&refused));
+    assert!(stderr(&refused).contains("scope fetch"), "the refusal names scope fetch: {}", stderr(&refused));
 
     // Nothing was left behind: no working directory, no bay registered, no pallet ref.
     assert!(!bay_dir.exists(), "a refused bay add must not create the working directory");
@@ -7616,7 +7616,7 @@ fn bay_add_scope_refuses_a_sealed_sibling_outside_the_fetch_scope() {
         &["bay", "add", "work", bay_dir.to_str().unwrap(), "--scope", "src/web"]);
     assert!(!refused.status.success(), "a bay scope outside the fetch scope must be refused");
     assert!(stderr(&refused).contains("fetch scope"), "a clean scope refusal, not a raw object error: {}", stderr(&refused));
-    assert!(stderr(&refused).contains("expand"), "the refusal names expand: {}", stderr(&refused));
+    assert!(stderr(&refused).contains("scope fetch"), "the refusal names scope fetch: {}", stderr(&refused));
 
     assert!(!bay_dir.exists(), "a refused bay add must not create the working directory");
 }
@@ -7645,7 +7645,7 @@ fn expand_recovers_after_an_unreachable_remote_leaves_the_scope_unchanged() {
 
     // Point at an unreachable remote and attempt to expand.
     assert_success(&area.forklift("sparse", &["config", "set", "remote.url", "http://127.0.0.1:9"]));
-    let failed = area.forklift("sparse", &["expand", "src/web"]);
+    let failed = area.forklift("sparse", &["scope", "fetch", "src/web"]);
     assert!(!failed.status.success(), "expand against an unreachable remote must fail");
 
     // The fetch scope must be unchanged — not left claiming "src/web" is in scope while nothing
@@ -7659,7 +7659,7 @@ fn expand_recovers_after_an_unreachable_remote_leaves_the_scope_unchanged() {
 
     // Point back at the real remote: a plain re-run completes the fetch.
     assert_success(&area.forklift("sparse", &["config", "set", "remote.url", &server.url]));
-    let recovered = area.forklift("sparse", &["expand", "src/web"]);
+    let recovered = area.forklift("sparse", &["scope", "fetch", "src/web"]);
     assert_success(&recovered);
     assert!(stdout(&recovered).contains("Expanded"), "{}", stdout(&recovered));
     assert!(object_present(&area, "sparse", &web_tree), "the re-run must complete the fetch");
@@ -7959,7 +7959,7 @@ fn a_full_store_audit_omits_the_sparse_boundary() {
 
 #[test]
 fn scope_prune_frees_a_path_no_checkout_needs_and_leaves_the_rest_intact() {
-    // The scope-prune headline: on a sparse warehouse with two bays of different scopes, prune a
+    // The scope prune headline: on a sparse warehouse with two bays of different scopes, prune a
     // fetched path no checkout materializes. Its content is freed; every other scope's content
     // survives; the store still audits (the pruned path re-enters the sealed-but-unfetched
     // state, never "missing"); and the path is re-fetchable with expand.
@@ -8000,14 +8000,14 @@ fn scope_prune_frees_a_path_no_checkout_needs_and_leaves_the_rest_intact() {
         &["bay", "add", "webbay", webbay.to_str().unwrap(), "--scope", "src/web"]));
 
     // The main checkout still materializes docs, so a prune of docs refuses until it narrows.
-    let blocked = area.forklift("sparse", &["--json", "scope-prune", "docs"]);
+    let blocked = area.forklift("sparse", &["--json", "scope", "prune", "docs"]);
     assert_eq!(blocked.status.code(), Some(13),
         "a materialized path blocks the prune: {}", stderr(&blocked));
 
     // Narrow docs away (the main checkout is the only one that had it), then prune it.
-    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
+    assert_success(&area.forklift("sparse", &["scope", "narrow", "docs"]));
 
-    let pruned = area.forklift("sparse", &["scope-prune", "docs"]);
+    let pruned = area.forklift("sparse", &["scope", "prune", "docs"]);
     assert_success(&pruned);
     assert!(stdout(&pruned).contains("Pruned docs"), "{}", stdout(&pruned));
     assert!(stdout(&pruned).contains("freed 2"),
@@ -8041,7 +8041,7 @@ fn scope_prune_frees_a_path_no_checkout_needs_and_leaves_the_rest_intact() {
     assert_success(&area.forklift("sparse", &["lift"]));
 
     // ...and the pruned path is re-fetchable from the origin, proving it was only sealed.
-    let expanded = area.forklift("sparse", &["expand", "docs"]);
+    let expanded = area.forklift("sparse", &["scope", "fetch", "docs"]);
     assert_success(&expanded);
     assert!(object_present(&area, "sparse", &docs_tree), "expand re-fetches the pruned subtree object");
     assert!(object_present(&area, "sparse", &docs_blob), "expand re-fetches the pruned blob");
@@ -8086,9 +8086,9 @@ fn scope_prune_keeps_work_never_lifted_and_frees_it_once_lifted() {
     let v2_tree = path_object_hash(&area, "sparse", &head, "docs");
     let v2_blob = path_object_hash(&area, "sparse", &head, "docs/guide.md");
 
-    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
+    assert_success(&area.forklift("sparse", &["scope", "narrow", "docs"]));
 
-    let pruned = area.forklift("sparse", &["--json", "scope-prune", "docs"]);
+    let pruned = area.forklift("sparse", &["--json", "scope", "prune", "docs"]);
     assert_success(&pruned);
     let report: serde_json::Value = serde_json::from_str(&stdout(&pruned)).unwrap();
     assert_eq!(report["data"]["freed"], 1, "{}", stdout(&pruned));
@@ -8101,15 +8101,15 @@ fn scope_prune_keeps_work_never_lifted_and_frees_it_once_lifted() {
     assert!(!object_present(&area, "sparse", &v1_blob), "the parent's blob is not read by the lift");
 
     // The fetch scope did narrow: docs is pruned, only its content stays until it is lifted.
-    let rerun = area.forklift("sparse", &["scope-prune", "--dry-run", "docs"]);
+    let rerun = area.forklift("sparse", &["scope", "prune", "--dry-run", "docs"]);
     assert_success(&rerun);
     assert!(stdout(&rerun).contains("kept because lifting history the remote does not hold"), "{}", stdout(&rerun));
     assert!(stdout(&rerun).contains("\"main\""), "the pallet to lift is named: {}", stdout(&rerun));
-    assert!(stdout(&rerun).contains("scope-prune docs\" again"), "the rerun is named: {}", stdout(&rerun));
+    assert!(stdout(&rerun).contains("scope prune docs\" again"), "the rerun is named: {}", stdout(&rerun));
 
     assert_success(&area.forklift("sparse", &["lift"]));
 
-    let freed = area.forklift("sparse", &["--json", "scope-prune", "docs"]);
+    let freed = area.forklift("sparse", &["--json", "scope", "prune", "docs"]);
     assert_success(&freed);
     let report: serde_json::Value = serde_json::from_str(&stdout(&freed)).unwrap();
     assert_eq!(report["data"]["kept_unlifted"], 0, "{}", stdout(&freed));
@@ -8117,7 +8117,7 @@ fn scope_prune_keeps_work_never_lifted_and_frees_it_once_lifted() {
         assert!(!object_present(&area, "sparse", gone), "lifted history is freed: {}", gone);
     }
 
-    assert_success(&area.forklift("sparse", &["expand", "docs"]));
+    assert_success(&area.forklift("sparse", &["scope", "fetch", "docs"]));
     assert!(object_present(&area, "sparse", &v2_blob), "expand fetches the lifted change back");
 }
 
@@ -8139,9 +8139,9 @@ fn scope_prune_frees_history_the_remote_confirms_it_still_holds() {
     assert_success(&area.forklift("dev", &["stack", "ahead"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
-    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
+    assert_success(&area.forklift("sparse", &["scope", "narrow", "docs"]));
 
-    let pruned = area.forklift("sparse", &["--json", "scope-prune", "docs"]);
+    let pruned = area.forklift("sparse", &["--json", "scope", "prune", "docs"]);
     assert_success(&pruned);
     let report: serde_json::Value = serde_json::from_str(&stdout(&pruned)).unwrap();
     assert_eq!(report["data"]["kept_unlifted"], 0, "{}", stdout(&pruned));
@@ -8165,9 +8165,9 @@ fn scope_prune_frees_work_the_remote_keeps_under_a_tombstone() {
     assert_success(&area.forklift("sparse", &["shift", "main"]));
 
     assert_success(&area.forklift("dev", &["pallet", "delete", "side", "--remote"]));
-    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
+    assert_success(&area.forklift("sparse", &["scope", "narrow", "docs"]));
 
-    let pruned = area.forklift("sparse", &["--json", "scope-prune", "docs"]);
+    let pruned = area.forklift("sparse", &["--json", "scope", "prune", "docs"]);
     assert_success(&pruned);
     let report = json_of(&pruned);
     assert_eq!(report["data"]["kept_unlifted"], 0, "{}", report);
@@ -8205,9 +8205,9 @@ fn scope_prune_asks_and_lifts_a_pallet_named_with_a_slash() {
     let header = std::fs::read_to_string(&record).unwrap().lines().next().unwrap().to_string();
     std::fs::write(&record, format!("{}\n{} feature/x\n", header, base)).unwrap();
     assert_eq!(held_heads(&area, "sparse"), vec![format!("{} feature/x", base)]);
-    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
+    assert_success(&area.forklift("sparse", &["scope", "narrow", "docs"]));
 
-    let pruned = area.forklift("sparse", &["--json", "scope-prune", "docs"]);
+    let pruned = area.forklift("sparse", &["--json", "scope", "prune", "docs"]);
     assert_success(&pruned);
     assert!(!stderr(&pruned).contains("holds_unanswered"), "the holds check was answered: {}", stderr(&pruned));
     assert!(!object_present(&area, "sparse", &docs_blob), "history the remote confirms is freed");
@@ -8270,8 +8270,8 @@ fn a_slash_named_pallet_crosses(proxy: SlashProxy, name: &str) {
     let record = area.path("sparse/.forklift/held-heads");
     let header = std::fs::read_to_string(&record).unwrap().lines().next().unwrap().to_string();
     std::fs::write(&record, format!("{}\n{} feature/x\n", header, base)).unwrap();
-    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
-    let pruned = area.forklift("sparse", &["--json", "scope-prune", "docs"]);
+    assert_success(&area.forklift("sparse", &["scope", "narrow", "docs"]));
+    let pruned = area.forklift("sparse", &["--json", "scope", "prune", "docs"]);
     assert_success(&pruned);
     assert!(!stderr(&pruned).contains("holds_unanswered"), "the holds check was answered: {}", stderr(&pruned));
     assert!(!object_present(&area, "sparse", &docs_blob), "history the remote confirms is freed");
@@ -8317,8 +8317,8 @@ fn scope_prune_frees_nothing_on_a_forged_held_head() {
     std::fs::write(&record, text).unwrap();
     assert_eq!(held_heads(&area, "sparse").last(), Some(&format!("{} main", head)));
 
-    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
-    let pruned = area.forklift("sparse", &["--json", "scope-prune", "docs"]);
+    assert_success(&area.forklift("sparse", &["scope", "narrow", "docs"]));
+    let pruned = area.forklift("sparse", &["--json", "scope", "prune", "docs"]);
     assert_success(&pruned);
     let report: serde_json::Value = serde_json::from_str(&stdout(&pruned)).unwrap();
     assert_eq!(report["data"]["kept_unlifted"], 3, "{}", stdout(&pruned));
@@ -8352,17 +8352,17 @@ fn scope_prune_frees_nothing_the_remote_moved_back_past_or_started_over() {
     assert_success(&area.forklift("sparse", &["lower"]));
     assert_eq!(held_heads(&area, "sparse"), vec![format!("{} main", ahead)]);
     let v2_blob = path_object_hash(&area, "sparse", &ahead, "docs/guide.md");
-    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
+    assert_success(&area.forklift("sparse", &["scope", "narrow", "docs"]));
 
     for (moved_to, why) in [(&base, "a head moved back"), (&side, "a re-created pallet")] {
         move_served_main(&area, moved_to);
-        let pruned = area.forklift("sparse", &["--json", "scope-prune", "--dry-run", "docs"]);
+        let pruned = area.forklift("sparse", &["--json", "scope", "prune", "--dry-run", "docs"]);
         assert_success(&pruned);
         let report: serde_json::Value = serde_json::from_str(&stdout(&pruned)).unwrap();
         assert!(report["data"]["kept_unlifted"].as_u64().unwrap() > 0, "{}: {}", why, stdout(&pruned));
     }
 
-    assert_success(&area.forklift("sparse", &["scope-prune", "docs"]));
+    assert_success(&area.forklift("sparse", &["scope", "prune", "docs"]));
     assert!(object_present(&area, "sparse", &v2_blob), "history the remote no longer holds is kept");
 }
 
@@ -8376,11 +8376,11 @@ fn scope_prune_refuses_and_changes_nothing_on_a_held_heads_record_that_does_not_
     let docs_blob = path_object_hash(&area, "sparse", &base, "docs/guide.md");
 
     std::fs::write(area.path("sparse/.forklift/held-heads"), "not a held-heads record\n").unwrap();
-    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
+    assert_success(&area.forklift("sparse", &["scope", "narrow", "docs"]));
     let scope_file = area.path("sparse/.forklift/config/fetch-scope");
     let scope_before = std::fs::read(&scope_file).unwrap();
 
-    let refused = area.forklift("sparse", &["scope-prune", "docs"]);
+    let refused = area.forklift("sparse", &["scope", "prune", "docs"]);
     assert!(!refused.status.success(), "a corrupt record refuses the prune");
     assert!(stderr(&refused).contains("held-heads") && stderr(&refused).contains("removing it is safe"),
             "the refusal names the record and the way out: {}", stderr(&refused));
@@ -8419,8 +8419,8 @@ fn scope_prune_frees_nothing_beyond_the_current_heads_when_the_remote_cannot_ans
     assert_success(&area.forklift("dev", &["stack", "ahead"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
-    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
-    let pruned = area.forklift("sparse", &["--json", "scope-prune", "docs"]);
+    assert_success(&area.forklift("sparse", &["scope", "narrow", "docs"]));
+    let pruned = area.forklift("sparse", &["--json", "scope", "prune", "docs"]);
     assert_success(&pruned);
     assert!(asked.load(std::sync::atomic::Ordering::SeqCst) > 0, "the prune asked the remote");
     let report: serde_json::Value = serde_json::from_str(&stdout(&pruned)).unwrap();
@@ -8431,7 +8431,7 @@ fn scope_prune_frees_nothing_beyond_the_current_heads_when_the_remote_cannot_ans
 
     // The way out the warning names: after a lower the remote's current head is here and reaches it.
     assert_success(&area.forklift("sparse", &["lower"]));
-    assert_success(&area.forklift("sparse", &["scope-prune", "docs"]));
+    assert_success(&area.forklift("sparse", &["scope", "prune", "docs"]));
     assert!(!object_present(&area, "sparse", &docs_blob), "after a lower the prune frees it");
 }
 
@@ -8495,13 +8495,13 @@ fn scope_prune_refuses_and_changes_nothing_when_the_remote_is_unreachable() {
     let head = pallet_head(&area, "sparse", "main");
     let docs_blob = path_object_hash(&area, "sparse", &head, "docs/guide.md");
 
-    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
+    assert_success(&area.forklift("sparse", &["scope", "narrow", "docs"]));
     let scope_file = area.path("sparse/.forklift/config/fetch-scope");
     let scope_before = std::fs::read(&scope_file).unwrap();
 
     drop(server);
 
-    let refused = area.forklift("sparse", &["scope-prune", "docs"]);
+    let refused = area.forklift("sparse", &["scope", "prune", "docs"]);
     assert!(!refused.status.success(), "an unreachable remote refuses the prune");
     assert!(stderr(&refused).contains("never frees work that exists only here; nothing was changed"),
         "{}", stderr(&refused));
@@ -8527,9 +8527,9 @@ fn scope_prune_refuses_and_changes_nothing_when_the_remote_trust_changed() {
     let head = pallet_head(&area, "sparse", "main");
     let docs_blob = path_object_hash(&area, "sparse", &head, "docs/guide.md");
 
-    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
+    assert_success(&area.forklift("sparse", &["scope", "narrow", "docs"]));
 
-    let refused = area.forklift("sparse", &["scope-prune", "docs"]);
+    let refused = area.forklift("sparse", &["scope", "prune", "docs"]);
     assert!(!refused.status.success(), "a changed remote genesis refuses the prune");
     assert!(stderr(&refused).contains("CHANGED"), "{}", stderr(&refused));
     assert!(stderr(&refused).contains("nothing was changed"), "{}", stderr(&refused));
@@ -8562,10 +8562,10 @@ fn scope_prune_refuses_while_a_bay_still_materializes_the_path() {
     let webbay = area.path("bay-web");
     assert_success(&area.forklift("sparse",
         &["bay", "add", "webbay", webbay.to_str().unwrap(), "--scope", "src/web"]));
-    assert_success(&area.forklift("sparse", &["narrow", "src/web"]));
+    assert_success(&area.forklift("sparse", &["scope", "narrow", "src/web"]));
 
     // The prune refuses: the bay still materializes src/web. Exit 13, stable code, names the bay.
-    let refused = area.forklift("sparse", &["--json", "scope-prune", "src/web"]);
+    let refused = area.forklift("sparse", &["--json", "scope", "prune", "src/web"]);
     assert_eq!(refused.status.code(), Some(13), "the bay blocks the prune: {}", stderr(&refused));
     let json: serde_json::Value = serde_json::from_str(&stdout(&refused)).unwrap();
     assert_eq!(json["error"]["code"], "scope_prune_blocked", "{}", stdout(&refused));
@@ -8599,7 +8599,7 @@ fn scope_prune_refuses_on_a_full_warehouse() {
     let head = pallet_head(&area, "full", "main");
     let web_tree = path_object_hash(&area, "full", &head, "src/web");
 
-    let refused = area.forklift("full", &["--json", "scope-prune", "src/web"]);
+    let refused = area.forklift("full", &["--json", "scope", "prune", "src/web"]);
     assert!(!refused.status.success(), "a full warehouse has nothing to prune: {}", stdout(&refused));
     let json: serde_json::Value = serde_json::from_str(&stdout(&refused)).unwrap();
     assert!(json["error"]["message"].as_str().unwrap().contains("full tree"),
@@ -8628,9 +8628,9 @@ fn scope_prune_dry_run_reports_and_frees_nothing() {
 
     assert_success(&area.forklift(".",
         &["clone", &server.url, "sparse", "--only", "src/api", "--only", "src/web"]));
-    assert_success(&area.forklift("sparse", &["narrow", "src/web"]));
+    assert_success(&area.forklift("sparse", &["scope", "narrow", "src/web"]));
 
-    let dry = area.forklift("sparse", &["--json", "scope-prune", "src/web", "--dry-run"]);
+    let dry = area.forklift("sparse", &["--json", "scope", "prune", "src/web", "--dry-run"]);
     assert_success(&dry);
     let json: serde_json::Value = serde_json::from_str(&stdout(&dry)).unwrap();
     assert_eq!(json["data"]["dry_run"], serde_json::json!(true), "{}", stdout(&dry));
@@ -8649,9 +8649,9 @@ fn scope_prune_dry_run_reports_and_frees_nothing() {
 
 #[test]
 fn scope_prune_is_refused_while_another_process_writes_the_store() {
-    // FORK-150: scope-prune computes what to keep from the fetch scope and every bay's work, then
+    // FORK-150: scope prune computes what to keep from the fetch scope and every bay's work, then
     // frees the rest. A writer in another bay — a load that dedups against a planned object, an
-    // expand widening the fetch scope — must not run between the two, so scope-prune takes the
+    // expand widening the fetch scope — must not run between the two, so scope prune takes the
     // store exclusively before it reads anything, dry run included, and is refused while any
     // writer holds it. The test process stands in for that writer with a shared hold.
     //
@@ -8673,11 +8673,11 @@ fn scope_prune_is_refused_while_another_process_writes_the_store() {
 
     assert_success(&area.forklift(".",
         &["clone", &server.url, "sparse", "--only", "src/api", "--only", "src/web"]));
-    assert_success(&area.forklift("sparse", &["narrow", "src/web"]));
+    assert_success(&area.forklift("sparse", &["scope", "narrow", "src/web"]));
 
     let writer = hold_store_access(&area.path("sparse"), false);
 
-    for args in [&["--json", "scope-prune", "src/web"][..], &["--json", "scope-prune", "src/web", "--dry-run"][..]] {
+    for args in [&["--json", "scope", "prune", "src/web"][..], &["--json", "scope", "prune", "src/web", "--dry-run"][..]] {
         let refused = area.forklift("sparse", args);
         assert!(!refused.status.success(), "{:?} must be refused while another process writes the store", args);
         let said = format!("{}{}", stdout(&refused), stderr(&refused));
@@ -8693,7 +8693,7 @@ fn scope_prune_is_refused_while_another_process_writes_the_store() {
 
     // Once the writer is done, the same prune runs and frees them.
     drop(writer);
-    assert_success(&area.forklift("sparse", &["scope-prune", "src/web"]));
+    assert_success(&area.forklift("sparse", &["scope", "prune", "src/web"]));
     assert!(!object_present(&area, "sparse", &web_blob), "with no writer, the prune frees the object");
 }
 
@@ -8726,7 +8726,7 @@ fn scope_prune_resumes_after_an_interrupted_free_and_completes() {
 
     assert_success(&area.forklift(".",
         &["clone", &server.url, "sparse", "--only", "src/api", "--only", "src/web"]));
-    assert_success(&area.forklift("sparse", &["narrow", "src/web"]));
+    assert_success(&area.forklift("sparse", &["scope", "narrow", "src/web"]));
 
     // Simulate an interrupted prune by hand: narrow the shared fetch scope directly (step one of
     // a real prune, already durable) and delete only the blob — the child, freed before its
@@ -8741,7 +8741,7 @@ fn scope_prune_resumes_after_an_interrupted_free_and_completes() {
         "the simulated interruption leaves the parent tree behind");
 
     // A bare re-run of "src/web" — no longer a fetch-scope prefix — resumes instead of refusing.
-    let resumed = area.forklift("sparse", &["--json", "scope-prune", "src/web"]);
+    let resumed = area.forklift("sparse", &["--json", "scope", "prune", "src/web"]);
     assert_success(&resumed);
     let json: serde_json::Value = serde_json::from_str(&stdout(&resumed)).unwrap();
     assert!(json["ok"].as_bool().unwrap(), "a resumed prune must not error: {}", stdout(&resumed));
@@ -8756,7 +8756,7 @@ fn scope_prune_resumes_after_an_interrupted_free_and_completes() {
     assert!(stdout(&stocktake).contains("matches the inventory"), "{}", stdout(&stocktake));
 
     // Running it again, now that nothing is left, is a clean no-op, not an error.
-    let again = area.forklift("sparse", &["--json", "scope-prune", "src/web"]);
+    let again = area.forklift("sparse", &["--json", "scope", "prune", "src/web"]);
     assert_success(&again);
     let again_json: serde_json::Value = serde_json::from_str(&stdout(&again)).unwrap();
     assert_eq!(again_json["data"]["freed"], serde_json::json!(0),
@@ -8792,11 +8792,11 @@ fn scope_prune_reports_zero_freed_as_retained_not_already_pruned() {
 
     assert_success(&area.forklift(".",
         &["clone", &server.url, "sparse", "--only", "src/api", "--only", "src/web"]));
-    assert_success(&area.forklift("sparse", &["narrow", "src/web"]));
+    assert_success(&area.forklift("sparse", &["scope", "narrow", "src/web"]));
 
     // A fresh prune (src/web was a live fetch-scope prefix until this call) that frees nothing:
     // both the tree and the blob under src/web are retained via src/api.
-    let pruned = area.forklift("sparse", &["scope-prune", "src/web"]);
+    let pruned = area.forklift("sparse", &["scope", "prune", "src/web"]);
     assert_success(&pruned);
     let report = stdout(&pruned);
     assert!(report.contains("retained by other scopes"),
@@ -8861,9 +8861,9 @@ fn scope_prune_retains_a_user_blob_that_collides_with_an_office_blob() {
 
     assert_success(&area.forklift(".",
         &["clone", &server.url, "sparse", "--only", "src/api", "--only", "src/web"]));
-    assert_success(&area.forklift("sparse", &["narrow", "src/web"]));
+    assert_success(&area.forklift("sparse", &["scope", "narrow", "src/web"]));
 
-    let pruned = area.forklift("sparse", &["scope-prune", "src/web"]);
+    let pruned = area.forklift("sparse", &["scope", "prune", "src/web"]);
     assert_success(&pruned);
 
     // The colliding object SURVIVES the prune: the office's full-closure retention protects it,
@@ -10921,7 +10921,7 @@ fn a_sparse_warehouse_lowers_another_pallet_within_scope_and_expand_widens_it() 
     assert_eq!(pallet_head(&area, "sparse", "feat"), feat);
     assert!(!object_present(&area, "sparse", &web_blob), "the out-of-scope change stays sealed");
 
-    assert_success(&area.forklift("sparse", &["expand", "src/web"]));
+    assert_success(&area.forklift("sparse", &["scope", "fetch", "src/web"]));
     assert!(object_present(&area, "sparse", &web_blob), "expand widens the lowered pallet's history too");
 }
 
@@ -10965,8 +10965,8 @@ fn scope_prune_keeps_unlifted_history_behind_a_deleted_pallet_for_its_undo() {
     assert_success(&area.forklift("sparse", &["shift", "main"]));
     assert_success(&area.forklift("sparse", &["pallet", "delete", "side", "--force"]));
 
-    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
-    let pruned = area.forklift("sparse", &["--json", "scope-prune", "docs"]);
+    assert_success(&area.forklift("sparse", &["scope", "narrow", "docs"]));
+    let pruned = area.forklift("sparse", &["--json", "scope", "prune", "docs"]);
     assert_success(&pruned);
     let report = json_of(&pruned);
     assert!(report["data"]["kept_for_deleted"].as_u64().unwrap() > 0, "{}", report);

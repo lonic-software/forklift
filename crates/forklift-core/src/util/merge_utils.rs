@@ -933,7 +933,7 @@ struct MergeJob {
 /// * `theirs_hash`  - The root tree hash of their head.
 /// * `ours_label`   - The conflict-marker label for our side (the current pallet name).
 /// * `theirs_label` - The conflict-marker label for their side.
-/// * `scope`        - The bay's materialization scope (full = today's behavior everywhere).
+/// * `scope`        - The bay's checkout scope (full = today's behavior everywhere).
 ///
 /// # Returns
 /// * `Ok(Vec<MergeAction>)` - The actions to perform.

@@ -563,7 +563,7 @@ is: [`diff`](#diff--line-by-line-changes-d) reports it changed without a line di
 
 Over the wire, chunked files travel **per object**: a `lift` uploads the recipe and every chunk
 (re-uploading only the chunks that changed — an appended-to file re-sends its new chunks and
-nothing else), and a `clone`/`lower`/`expand` fetches each in-scope chunk it doesn't already
+nothing else), and a `clone`/`lower`/`scope fetch` fetches each in-scope chunk it doesn't already
 have. A lift only advances the remote's ref once every chunk is confirmed present, so a chunked
 file is never left half-transferred. Two limits are worth knowing: a `bundle` never carries a
 chunked file (its chunks are reachable only through the recipe, which a bundle doesn't descend —
@@ -1076,7 +1076,7 @@ haul stays merged — no one can reopen or close it, on any head. `haul consolid
 progress — resolve, `stack`, then re-run `haul consolidate` to record it). A haul opened in another
 warehouse can propose a head this one never fetched; `haul consolidate` then refuses, naming the source pallet
 to `lower` first. The head an open or closed haul proposes is kept by `gc`, `store compact --all` and
-`scope-prune` even after its source pallet moves off it or is deleted. A haul id is
+`scope prune` even after its source pallet moves off it or is deleted. A haul id is
 content-addressed; use any unique prefix.
 
 Only an operator who may write the target records a merge: `haul consolidate` refuses anyone else
@@ -1496,17 +1496,24 @@ shelling out. The scope it sets is advisory local setup, not a security boundary
 ### `scope` — show the sparse-workspace scope
 
 ```sh
-forklift scope            # this bay's materialization scope + the warehouse fetch scope
+forklift scope            # this checkout's scope + the warehouse fetch scope
+forklift scope status     # the same
 forklift scope --json     # the same, as a machine envelope
 ```
 
-Read-only. In a plain bay or the main tree it reports the full tree; in a scoped bay it lists
+There are two scopes. The **checkout scope** is what one checkout (a bay, or the main tree)
+writes to disk, and the **fetch scope** is what the warehouse's store holds, shared by every
+checkout. A checkout scope never reaches outside the fetch scope. The `scope` family changes
+them in pairs: `scope narrow` shrinks this checkout's scope, and `scope fetch` and `scope prune`
+widen and shrink the fetch scope. Bare `scope` (or `scope status`) shows both.
+
+The report is read-only. In a plain bay or the main tree it reports the full tree; in a scoped bay it lists
 the in-scope subtree prefixes. The warehouse fetch scope is reported too — *full* for an
 ordinary warehouse (the store holds everything), or the fetched prefixes for a sparse
 (`clone --only`) one. A scoped checkout and a sparse fetch scope also hold the root `.forkliftignore`
 without it being a prefix; the report lists it as always in scope (`implicit_scope` and
-`implicit_fetch_scope` in `--json`). Widen the fetch scope with `expand`; shrink a checkout's
-materialization scope with `narrow`.
+`implicit_fetch_scope` in `--json`). Widen the fetch scope with `scope fetch`; shrink a checkout's
+scope with `scope narrow`.
 
 A scope recorded by a Forklift older than the one that put the ignore file in every
 scope is refused by every command that reads it. For a sparse warehouse, clone the
@@ -1629,13 +1636,13 @@ pinned by the exact hash a signed parcel already commits, so nothing can be forg
 simply not fetched. The working tree materializes only the in-scope subtree(s), and the
 remote's whole-store bundle is skipped. History, `audit`, `blame` and `diff` on in-scope paths
 all work; office and every meta pallet are always fetched in full, so a sparse clone of a
-trusted warehouse still audits offline exactly as a full clone does. Widen later with `expand`.
+trusted warehouse still audits offline exactly as a full clone does. Widen later with `scope fetch`.
 A sparse clone records its origin — see the origin-only lift rule under `lift`.
 
 **Cache clone (`--cache`).** Marks the warehouse as a cache: one that may lack content its
 history reaches, whose remote holds the rest. Like a sparse clone, it skips the bundle,
 records its origin (see the origin-only lift rule under `lift`), is never served, and refuses
-`git mirror`; `expand` refuses too, since its scope is already the whole tree. `audit` checks the
+`git mirror`; `scope fetch` refuses too, since its scope is already the whole tree. `audit` checks the
 content it holds and says the pass is a cache's. Commands that act on a sparse clone's
 *scope* (scoped bays, `query`'s scope report) do not apply to a cache. It cannot be combined with `--only`.
 A cache fetches every parcel and signature of the history, so ancestry and signatures check
@@ -1701,7 +1708,7 @@ remote it was cloned from — its origin, which the clone records in `.forklift/
 before it fetches anything. Talking to a *different* remote could lift onto one that lacks what
 this warehouse never verified there, fetch another history into what this warehouse records, or
 free content by heads the origin does not have. So every command that dials the remote from a
-partial warehouse — `lift`, `lower`, `expand`, `scope-prune`, `store evict`, `pallet` with `--remote`
+partial warehouse — `lift`, `lower`, `scope fetch`, `scope prune`, `store evict`, `pallet` with `--remote`
 (`list`, `delete` and `restore`), `office enroll`, `rotate`, `retire` and
 `accept-regenesis`, and a cache's fetch of content it lacks — refuses with the
 `non_origin_remote` code (exit 11) when `remote.url` is not the origin, naming both and changing
@@ -1773,7 +1780,7 @@ does one that runs out of time partway through a batch (`batch_lane: "out_of_tim
 sent is kept. A remote that sends only part of a batch because the objects asked for are too
 large for one answer is simply asked again for the rest. A remote
 that rate-limits its fetches is waited out, for up to 30 seconds per request. The same holds
-for every command that fetches (`clone`, `lower`, `expand`, and `lift` when it auto-merges);
+for every command that fetches (`clone`, `lower`, `scope fetch`, and `lift` when it auto-merges);
 `office accept-regenesis` adds the line to its message instead of a `batch_lane` field. A fetch
 that fails reports only its own failure, not whether the batch download had stopped first.
 
@@ -1805,11 +1812,11 @@ working pallet still lowers. A diverged `@kv`, `@manifest`, `@tags` or `@haul`
 replays your changes onto the remote's, and `--keep` resolves the paths both sides changed (see
 `manifest set`).
 
-### `expand` — widen a sparse warehouse's fetch scope
+### `scope fetch` — widen a sparse warehouse's fetch scope
 
 ```sh
-forklift expand src/web            # fetch a subtree the sparse clone left sealed
-forklift expand src/web docs       # several at once
+forklift scope fetch src/web            # fetch a subtree the sparse clone left sealed
+forklift scope fetch src/web docs       # several at once
 ```
 
 Adds subtree path(s) to what the warehouse has fetched, and downloads their content across the
@@ -1817,56 +1824,57 @@ whole history from the remote. Incremental and precise — only the newly in-sco
 fetched; what is already present is skipped, and the content is hash-verified against the seals
 the history commits. Like every remote command in a partial warehouse, it talks only to the
 origin (`non_origin_remote`).
-After expanding, a bay can be scoped to the new path (`bay add --scope`). A full warehouse
-already holds everything, so there is nothing to expand.
+Every checkout's scope stays as it is: after fetching, a bay can be scoped to the new path
+(`bay add --scope`). A full warehouse already holds everything, so there is nothing to fetch.
 
 Every history the warehouse holds is widened, not just the current pallet's: every pallet, and
 every remote head a `lower` or `lift` fetched without a pallet yet (such as the head of a
 diverged `lower`, which you may make a pallet of later), and every head a pallet moved off that `undo`
-could bring back. If the remote can no longer serve one of those heads no pallet holds, `expand`
+could bring back. If the remote can no longer serve one of those heads no pallet holds, `scope fetch`
 still succeeds, and that head is refused as a pallet head (its history "is not completely
 present") until a `lower` from a remote that has it fetches it in full. If it
-cannot serve a pallet's history, `expand` refuses and names the pallet. When another command
-changes the warehouse while `expand` runs, it walks the change and tries again, and after three
+cannot serve a pallet's history, `scope fetch` refuses and names the pallet. When another command
+changes the warehouse while `scope fetch` runs, it walks the change and tries again, and after three
 tries it asks you to run it again.
 
-### `narrow` — shrink this checkout's materialization scope
+### `scope narrow` — shrink this checkout's scope
 
 ```sh
-forklift narrow docs               # stop materializing a subtree here
+forklift scope narrow docs               # stop materializing a subtree here
 ```
 
 Drops subtree path(s) from what **this** checkout (a bay, or a sparse main tree) materializes,
 and removes those files from the working directory. This **frees nothing** in the shared object
 store — the dropped content is ordinary reachable history, not garbage — it only shrinks what
 this checkout shows. A checkout must keep at least one in-scope path; to stop scoping entirely,
-open a fresh full checkout. `narrow` is the counterpart of a bay's `--scope`, not of `expand`:
-`expand` widens what the *warehouse* fetched, `narrow` shrinks what *this checkout* materializes.
+open a fresh full checkout. `scope narrow` is the counterpart of a bay's `--scope`, not of `scope fetch`:
+`scope fetch` widens the *fetch scope* (what the warehouse fetched), `scope narrow` shrinks the
+*checkout scope* (what this checkout writes to disk), and the fetch scope stays as it is.
 It refuses (`narrow_unclean`) a subtree holding uncommitted work (staged or unstaged changes, or
 untracked files), and one holding another working
 tree (a folder with its own `.forklift`) at any depth, whatever `.forkliftignore` says.
 
-### `scope-prune` — reclaim disk from a sparse warehouse
+### `scope prune` — reclaim disk from a sparse warehouse
 
 ```sh
-forklift scope-prune docs            # forget a fetched path and free its content
-forklift scope-prune docs --dry-run  # show what it would free, change nothing
+forklift scope prune docs            # forget a fetched path and free its content
+forklift scope prune docs --dry-run  # show what it would free, change nothing
 ```
 
-The deliberate, **destructive** counterpart of `narrow`. Where `narrow` is bay-local and frees
-nothing, `scope-prune` forgets a path **warehouse-wide**: it drops the path from the shared
+The deliberate, **destructive** counterpart of `scope narrow`. Where `scope narrow` is bay-local and frees
+nothing, `scope prune` forgets a path **warehouse-wide**: it drops the path from the shared
 warehouse fetch scope and deletes the objects under it from the object store, reclaiming disk
 reachability-`gc` never could (narrowed-away content is still reachable history, so `gc`
 correctly keeps it). It is **multi-bay-aware** — it refuses (`scope_prune_blocked`, exit 13) to
 free a path any checkout (the main tree or a bay) still materializes, so narrow that path away
 everywhere first. The pruned history is sealed by hash and re-fetchable from the origin with
-`expand`, so the prune frees only history the origin holds. It asks the remote for its pallet
+`scope fetch`, so the prune frees only history the origin holds. It asks the remote for its pallet
 heads first, and which earlier heads recorded here it still holds (see below), and refuses,
 changing nothing, if the remote cannot be reached or is not trusted. History none of those heads
 reach (stacks never lifted, or lifted to a head the remote no longer confirms) keeps whatever
 lifting it would read under the path. The report counts what was kept
 (`kept_unlifted`), names the pallets (`unlifted_pallets`), and asks you to lift (or lower) and
-then run the same `scope-prune` again, which frees the rest. Other work that exists only here is
+then run the same `scope prune` again, which frees the rest. Other work that exists only here is
 never freed either, whatever its path: content loaded but not yet stacked, parked parcels, an
 unfinished consolidation, the head a haul not yet merged proposes, history the git mirror's
 roots record holds, and the history of a deleted pallet while `undo` can still bring it back, in
@@ -1876,7 +1884,7 @@ target lifted (a closed haul keeps it, since reopening proposes the same head), 
 the remote holds it again, a deleted pallet's once
 the delete leaves the undo journal. So you can park edits
 under the path, narrow and prune; the parked edits survive, and `park pop` re-applies them once
-`expand` has brought the path back. If any of that state cannot be read, the prune refuses
+`scope fetch` has brought the path back. If any of that state cannot be read, the prune refuses
 before changing anything; so does a sealed-object record that cannot be read. The prune reads
 nothing beneath an object the warehouse holds by hash alone (see `audit`). A full (non-sparse)
 warehouse has nothing to prune. Use `--dry-run` before you leap. (Objects already inside a pack
@@ -1893,7 +1901,7 @@ elsewhere is **kept** (freeing it would break that file), exactly as a shared bl
 are freed before their recipe, so a killed prune resumes cleanly on the next run.
 
 If a prune gets interrupted (killed, crashed) before it finishes freeing everything, the fetch
-scope has already narrowed but some objects are left behind. Running `scope-prune` again on the
+scope has already narrowed but some objects are left behind. Running `scope prune` again on the
 *same* path resumes rather than refusing "not a fetched path" — it finishes freeing whatever is
 left, or reports there is nothing left to free.
 
@@ -1924,7 +1932,7 @@ again from the origin as a cache miss does (see the cache clone under `clone`). 
 signatures always stay, so ancestry and signatures still check offline. A warehouse that is not a
 cache has nothing to evict and is refused.
 
-Like `scope-prune`, it asks the remote which history it holds first: the remote's pallet heads,
+Like `scope prune`, it asks the remote which history it holds first: the remote's pallet heads,
 the heads its tombstones keep, and the earlier heads recorded here that it confirms (the
 held-heads record above; a `holds_unanswered` warning works the same way). It refuses, changing
 nothing, if the remote cannot be reached or is not trusted, and if the configured remote is not
@@ -2007,7 +2015,7 @@ something this warehouse lacks, the move is refused with the `origin_move_incomp
 `details.missing_count` counts them all), and the origin is
 left where it was: copy the old origin's warehouse to the new server on the server's side, then run
 the move again. The heads recorded from earlier lowers (the fetched-heads ledger and the held-heads
-record above) are not checked: `expand` and `scope-prune` already ask the origin about each of them
+record above) are not checked: `scope fetch` and `scope prune` already ask the origin about each of them
 rather than trust it.
 
 While the move runs, everything else that talks to the remote or changes what it checks refuses
@@ -2182,7 +2190,7 @@ commands hold), so two bays or two processes never compact the same store at onc
 compaction is already running, an explicit `forklift store compact` reports it and stops; the
 automatic background compaction simply skips (the other run is doing the same work). An
 incremental compaction never blocks ordinary mutating commands; a full repack does, briefly (see
-below). Compaction of either kind is refused while a `scope-prune` or `forklift-server gc` runs
+below). Compaction of either kind is refused while a `scope prune` or `forklift-server gc` runs
 on the warehouse.
 
 Plain `store compact` is **incremental**: it packs the loose objects into a *new* pack and leaves
@@ -2222,7 +2230,7 @@ Telling garbage from live content means reading every parcel, tree and large-fil
 in use. If one of those is missing but a broken pack might hold it (a damaged part of a pack, a
 pack whose data file is missing, or a pack index that cannot be read at all), the full repack
 **refuses and deletes nothing**, naming the object: what it refers to cannot be told apart from
-garbage. `scope-prune` and `forklift-server gc` refuse the same way. `forklift store` lists the
+garbage. `scope prune` and `forklift-server gc` refuse the same way. `forklift store` lists the
 pack under `quarantined_packs`, `damaged_packs`, `unenumerable_indexes` or
 `foreign_version_indexes`; once the pack is restored or moved aside, the sweep can run. A full
 repack salvages a damaged pack before this walk, so it refuses only on what salvage could not
@@ -2234,7 +2242,7 @@ again) no longer blocks the walk on an object its index never named.
 For the same reason a full repack is **refused while a mutating command is running in another
 bay** of the same warehouse: that command may have just decided to reuse an object the repack
 was about to drop. Run it again once the other command finishes. The opposite case waits
-instead of failing. A mutating command that starts while a full repack, a `scope-prune` or a
+instead of failing. A mutating command that starts while a full repack, a `scope prune` or a
 `forklift-server gc` runs on the warehouse prints `Waiting for object-store maintenance in
 another process…` and carries on once it finishes. The coordination is a kernel lock on
 `.forklift/store-access.lock`, so a process that dies releases it and leaves nothing to clean

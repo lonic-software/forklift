@@ -99,7 +99,7 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
     std::fs::create_dir_all(&bay_dir)
         .map_err(|e| format!("Error while creating the bay directory \"{}\": {}", bay_dir.to_string_lossy(), e))?;
     file_utils::create_folder_if_not_exists(&bay_utils::bay_state_dir(name))?;
-    // The materialization scope goes in before the marker, so recovery fills in only the scope:
+    // The checkout scope goes in before the marker, so recovery fills in only the scope:
     // the materialize (and every later scope-aware verb in this bay, `forklift heal` included)
     // reads it back through `scope_utils::current_scope`. It is written for an unscoped bay too,
     // since a bay with no scope file is refused rather than read as unscoped.
@@ -193,7 +193,7 @@ fn resolve_scope(scope_paths: &[String], head_tree_hash: &str) -> Result<Materia
         if !fetch_scope.is_full() && fetch_scope.classify(&key) != ScopeClass::InScope {
             return Err(format!(
                 "\"{}\" is outside the warehouse's fetch scope ({}), so it cannot be a bay \
-                scope. Fetch it first with \"forklift expand {}\".",
+                scope. Fetch it first with \"forklift scope fetch {}\".",
                 raw, fetch_scope.prefixes().join(", "), raw
             ));
         }
@@ -364,7 +364,7 @@ pub(crate) struct BayCreated {
     pallet: String,
     head: String,
 
-    /// The bay's materialization scope prefixes (empty for a full, unscoped bay).
+    /// The bay's checkout scope prefixes (empty for a full, unscoped bay).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     scope: Vec<String>,
 }

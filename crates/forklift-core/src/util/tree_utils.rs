@@ -583,7 +583,7 @@ pub(crate) fn remedy_path_when(path: &str, windows: bool) -> Option<String> {
 /// * `head_root_hash` - The current head parcel's root tree hash (`None` for an unborn pallet).
 /// * `partial_root`   - The freshly built (sparse) root from [`build_tree_from_inventory_deferred`]:
 ///                      its in-scope subtree objects are already stored with correct hashes.
-/// * `scope`          - The bay's materialization scope (the caller gates on it not being full).
+/// * `scope`          - The bay's checkout scope (the caller gates on it not being full).
 /// * `overrides`      - The out-of-scope skeleton for a completing merge (empty for a plain stack).
 /// * `batch`          - Where every new spine tree object built here is staged. `stack`/`park`
 ///                      pass the same batch their tree build used, so these writes join the same
@@ -832,7 +832,7 @@ fn is_tree_empty(tree: &TreeItem) -> bool {
 ///   as a rollup either way.
 ///
 /// # Arguments
-/// * `scope`     - The active bay's materialization scope.
+/// * `scope`     - The active bay's checkout scope.
 /// * `key`       - The warehouse path key of the directory whose shard was just rebuilt.
 /// * `tree`      - The (loaded) tree the shard was rebuilt from.
 /// * `tree_hash` - The hash of `tree`.

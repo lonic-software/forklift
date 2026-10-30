@@ -7,9 +7,9 @@ use forklift_core::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use forklift_core::util::prune_utils;
 use crate::output::{self, CommandOutput};
 
-/// Handle the scope-prune command (§7.6): the deliberate, destructive counterpart of `narrow`.
+/// Handle `scope prune` (§7.6): the deliberate, destructive counterpart of `scope narrow`.
 /// It narrows the shared warehouse fetch scope by dropping a fetched path, then frees the
-/// content under that path from the object store — reclaiming disk a `narrow` never could,
+/// content under that path from the object store — reclaiming disk a `scope narrow` never could,
 /// because a narrowed-away object is still reachable history that reachability-`gc` correctly
 /// keeps.
 ///
@@ -20,7 +20,7 @@ use crate::output::{self, CommandOutput};
 /// correct — freed objects read as sealed-but-unfetched, never as missing. Nothing is destroyed
 /// on the origin, and nothing is freed that the origin does not hold: it asks the remote for its
 /// pallet heads first, and keeps whatever history they do not reach needs under the path — work
-/// stacked here and never lifted — so everything freed is re-fetchable with `expand` (FORK-251).
+/// stacked here and never lifted — so everything freed is re-fetchable with `scope fetch` (FORK-251).
 ///
 /// It is also **resumable**: a path already outside the fetch scope — because an earlier prune
 /// narrowed it there but was killed before it finished freeing everything — is not refused as
@@ -52,7 +52,7 @@ pub async fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), Str
     let remote_heads = remote_pallet_heads().await?;
 
     // Exclusive store access before the judgement the plan uses (FORK-150). The keep-set depends
-    // on the fetch scope `judge_request` reads and on every bay's materialization scope, not only
+    // on the fetch scope `judge_request` reads and on every bay's checkout scope, not only
     // on the plan's walk, and the fetch scope is rewritten from that read; so no writer in another
     // bay — a load that dedups against a planned object, an expand widening the fetch scope — may
     // run anywhere between this read and the last deletion. A dry run takes it too, so it reports
@@ -118,7 +118,7 @@ pub async fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), Str
     Ok(())
 }
 
-/// A scope-prune request judged against the warehouse as it stands.
+/// A scope prune request judged against the warehouse as it stands.
 struct PruneRequest {
     /// The warehouse fetch scope after the prune.
     post_prune: MaterializationScope,
@@ -143,9 +143,9 @@ fn judge_request(paths: &[String]) -> Result<PruneRequest, String> {
 
     if fetch.is_full() {
         return Err(
-            "This warehouse holds the full tree; there is nothing to prune. \"forklift scope-prune\" \
+            "This warehouse holds the full tree; there is nothing to prune. \"forklift scope prune\" \
             reclaims disk from a sparse warehouse — one cloned with \"--only\", or widened \
-            with \"forklift expand\" — by forgetting a fetched path.".to_string()
+            with \"forklift scope fetch\" — by forgetting a fetched path.".to_string()
         );
     }
 
@@ -193,7 +193,7 @@ fn judge_request(paths: &[String]) -> Result<PruneRequest, String> {
 
     // Multi-bay hazard, checked for every requested path, resumed ones included: a resumed path
     // can never actually be in a checkout's scope today (a bay can only ever be scoped inside
-    // the CURRENT fetch scope, and this path is already outside it — `bay add --scope`/`narrow`
+    // the CURRENT fetch scope, and this path is already outside it — `bay add --scope`/`scope narrow`
     // enforce that at write time), so this is provably a no-op for `resumed`. It costs nothing
     // to check anyway, and a destructive verb is exactly where redundant defense earns its keep.
     guard_materialization_scopes(&to_reclaim, &post_prune)?;
@@ -206,13 +206,13 @@ fn judge_request(paths: &[String]) -> Result<PruneRequest, String> {
 /// it before anything changes.
 async fn remote_pallet_heads() -> Result<Vec<String>, String> {
     crate::remote_heads::held_by_remote(
-        "\"forklift scope-prune\" asks the remote which history it holds, so that it never frees work that \
+        "\"forklift scope prune\" asks the remote which history it holds, so that it never frees work that \
         exists only here; nothing was changed.",
     ).await
 }
 
 /// Refuse the prune if the main tree or any bay still materializes a pruned path. Every
-/// checkout's materialization scope is always a subset of the fetch scope; after the prune the
+/// checkout's scope is always a subset of the fetch scope; after the prune the
 /// fetch scope shrinks, so a checkout whose scope is no longer a subset is one that still needs
 /// a path the prune would free. All blockers are named at once.
 fn guard_materialization_scopes(pruned: &[String], post_prune: &MaterializationScope) -> Result<(), CoreError> {
@@ -235,7 +235,7 @@ fn guard_materialization_scopes(pruned: &[String], post_prune: &MaterializationS
     Ok(())
 }
 
-/// The result of a scope-prune: what was pruned, the fetch scope that remains, and how much was
+/// The result of a scope prune: what was pruned, the fetch scope that remains, and how much was
 /// (or would be) freed.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
@@ -365,7 +365,7 @@ impl CommandOutput for PruneReport {
             println!(
                 "{} object(s) were kept because lifting history the remote does not hold yet reads \
                 them{}; some may be the only copy. Lift that work (or lower, if the remote is \
-                ahead), then run \"forklift scope-prune {}{}\" again to free them.",
+                ahead), then run \"forklift scope prune {}{}\" again to free them.",
                 self.kept_unlifted, pallets, separator, paths
             );
         }
@@ -399,9 +399,9 @@ impl CommandOutput for PruneReport {
         }
 
         if self.dry_run {
-            println!("What it frees is re-fetchable from the origin with \"forklift expand\".");
+            println!("What it frees is re-fetchable from the origin with \"forklift scope fetch\".");
         } else {
-            println!("What was freed is re-fetchable from the origin with \"forklift expand\".");
+            println!("What was freed is re-fetchable from the origin with \"forklift scope fetch\".");
         }
     }
 }

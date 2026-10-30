@@ -38,7 +38,7 @@ pub fn server_binary() -> std::path::PathBuf {
 
 /// Hold the store-access lock of the warehouse at `root` from this test process, the way another
 /// forklift process would: shared like a writer in another bay, or exclusive like a running
-/// repack, gc or scope-prune. The kernel lock is held for as long as the returned file is open.
+/// repack, gc or scope prune. The kernel lock is held for as long as the returned file is open.
 #[allow(dead_code)] // Used by only some of the test files that include this module.
 pub fn hold_store_access(root: &std::path::Path, exclusive: bool) -> std::fs::File {
     let path = root.join(".forklift").join("store-access.lock");

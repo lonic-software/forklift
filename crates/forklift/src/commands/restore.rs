@@ -605,7 +605,7 @@ fn nothing_staged_under(ledger: &inventory_utils::ShardLedger, path: &WarehouseP
 ///                 carries no hash of its own; the caller passes the resolved head subtree
 ///                 hash for the root of the walk).
 /// * `shards`    - The collected shards.
-/// * `scope`     - The active bay's materialization scope.
+/// * `scope`     - The active bay's checkout scope.
 ///
 /// Once a level is itself fully in scope (`ScopeClass::InScope`), everything below it is
 /// included without further per-entry classification — the classifier's own "nothing below

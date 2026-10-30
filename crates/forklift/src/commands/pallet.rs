@@ -121,7 +121,7 @@ impl CommandOutput for Palletized {
 
 /// Delete user pallet `name`: remove its ref and keep its parcels. The removal writes the delete's
 /// undo entry in its own ref-lock hold, so the deleted head stays rooted (gc, repack and
-/// scope-prune keep it) and `undo` can bring the pallet back, until the entry is undone, pushed out
+/// scope prune keep it) and `undo` can bring the pallet back, until the entry is undone, pushed out
 /// of this bay's journal, or the bay is removed.
 ///
 /// Refused for a meta pallet; for a pallet any checkout stands on; for the source or target of an

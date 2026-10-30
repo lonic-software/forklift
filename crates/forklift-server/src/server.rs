@@ -107,7 +107,7 @@ impl WarehouseHandle {
     ///
     /// A root that may lack content (one cloned with `--only` or `--cache`) is refused for
     /// good. Clients treat a served head as proof that the server holds its whole closure:
-    /// scope-prune frees local copies of what the remote heads reach, so such a root would let a
+    /// scope prune frees local copies of what the remote heads reach, so such a root would let a
     /// client free content the server cannot serve back. Checking once, here, is enough because a
     /// full root never turns into one: the warehouse marker records the mode when the warehouse is
     /// prepared and nothing rewrites it, and the fetch scope can be set only on a warehouse already
@@ -131,7 +131,7 @@ impl WarehouseHandle {
 
             let _scope = StorageRootScope::enter(&root);
 
-            // Before the locks, so a sparse root under a running scope-prune is told it is partial,
+            // Before the locks, so a sparse root under a running scope prune is told it is partial,
             // not busy.
             if scope_utils::content_may_be_absent().map_err(ServingRefusal::Unreadable)? {
                 return Err(ServingRefusal::Partial);
@@ -4773,7 +4773,7 @@ mod tests {
         let state = capped_state(&base, 4, &["full", "sparse"]);
         make_sparse(&base.join("sparse"));
 
-        // A scope-prune holding the store exclusively does not mask the answer as "busy".
+        // A scope prune holding the store exclusively does not mask the answer as "busy".
         let pruning = {
             let _scope = StorageRootScope::enter(&base.join("sparse"));
             StoreAccessLock::try_exclusive().expect("exclusive hold")

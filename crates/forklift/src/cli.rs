@@ -157,7 +157,7 @@ pub enum Command {
                          nothing can be forged, it is simply not fetched. The working tree \
                          materializes only the in-scope subtree(s). The remote's whole-store \
                          bundle is skipped (it would defeat the point). Repeatable to fetch \
-                         several subtrees. Widen later with \"forklift expand\"."
+                         several subtrees. Widen later with \"forklift scope fetch\"."
         )]
         only: Vec<String>,
 
@@ -168,7 +168,7 @@ pub enum Command {
             long_help = "Clone as a cache: mark the warehouse as one that may lack content its \
                          history reaches. It is then treated as partial: a server never serves \
                          it, it lifts only to the remote it was cloned from, \"forklift git mirror\" and \
-                         \"forklift expand\" refuse, and \"forklift audit\" checks the content it holds. The \
+                         \"forklift scope fetch\" refuse, and \"forklift audit\" checks the content it holds. The \
                          remote's bundle is skipped. It fetches every parcel and signature of the \
                          history, and the content of the head it checks out; the content of \
                          older history stays with the remote, recorded by hash, and is fetched \
@@ -1020,7 +1020,7 @@ pub enum BayAction {
                          scoped); the bay just checks out, stages and stacks its in-scope \
                          subtree(s), copying every out-of-scope sibling forward by the hash the \
                          signed head already commits. A bay's scope must be within what the \
-                         warehouse fetched (see \"forklift clone --only\" and \"forklift expand\"). Repeatable to \
+                         warehouse fetched (see \"forklift clone --only\" and \"forklift scope fetch\"). Repeatable to \
                          scope several subtrees. Scope is local to this bay and never tracked."
         )]
         scope: Vec<String>,

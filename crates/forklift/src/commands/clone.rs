@@ -665,7 +665,7 @@ async fn franchise_into_prepared_target(
     pallet_utils::update_pallet_head(&pallet_name, None, &remote_head, &take_utils::installed(&take_trust)?)?;
     pallet_utils::write_position(&pallet_utils::BayPosition::new(&pallet_name, Some(remote_head.clone())))?;
 
-    // The head this warehouse was filled from is one the remote held, so a scope-prune may later
+    // The head this warehouse was filled from is one the remote held, so a scope prune may later
     // ask whether it still does. Best effort: an unrecorded head only keeps history a prune
     // could have freed.
     if let Err(why) = held_heads::record_held_head(&pallet_name, &remote_head) {
@@ -921,7 +921,7 @@ impl CommandOutput for CloneReport {
         if !self.scope.is_empty() {
             println!(
                 "Sparse: fetched and materialized only {}. The rest of the tree is sealed by \
-                hash — widen with \"forklift expand\".",
+                hash — widen with \"forklift scope fetch\".",
                 self.scope.join(", ")
             );
         }

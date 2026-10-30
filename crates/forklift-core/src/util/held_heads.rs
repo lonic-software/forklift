@@ -2,7 +2,7 @@
 //! cloned from.
 //!
 //! The remote's current heads alone stop reaching this warehouse's history of a pallet once
-//! another warehouse lifts past every head held here, and `scope-prune` would keep that history
+//! another warehouse lifts past every head held here, and `scope prune` would keep that history
 //! until a `lower`. This record nominates the earlier heads the remote was seen to accept or
 //! serve, so a prune asks the remote whether it still holds them. An entry is only a candidate:
 //! a remote ref can leave history it once reached (a pallet re-created there after its tombstone

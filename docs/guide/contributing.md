@@ -196,7 +196,7 @@ forklift behaves predictably. From `DESIGN.html` §2:
   (`requires_warehouse_lock`). Every command on that list also holds the
   object store **shared** (`StoreAccessLock`, `.forklift/store-access.lock`)
   unless it deletes objects itself (`holds_store_access`); anything that deletes
-  objects on a liveness or scope decision — a full repack, `gc`, `scope-prune`, `store evict` —
+  objects on a liveness or scope decision — a full repack, `gc`, `scope prune`, `store evict` —
   takes it exclusively with a try and refuses beside a writer. Bay lock first,
   store access second.
 - **The remote is untrusted storage + thin verifiers.** Anything a client uploads

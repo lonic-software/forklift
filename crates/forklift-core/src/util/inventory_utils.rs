@@ -4162,7 +4162,7 @@ mod tests {
     }
 
     /// A registered key whose slot holds a file instead of a folder is removed like an unregistered
-    /// one, so the damage does not block `narrow` or `restore --staged` over that subtree.
+    /// one, so the damage does not block `scope narrow` or `restore --staged` over that subtree.
     #[test]
     fn removing_a_registered_key_removes_a_file_in_place_of_its_shard_folder() {
         let _scratch = Scratch::new("remove-registered-file-slot");

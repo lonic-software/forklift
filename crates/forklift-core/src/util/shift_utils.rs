@@ -255,7 +255,7 @@ fn fold_paired_names(tree: &TreeItem) -> HashSet<&str> {
 /// * `to`              - The target root tree.
 /// * `aliased_removes` - The removals to check (see [`Plan::aliased_removes`]).
 /// * `ops`             - The plan's operations, extended in place.
-/// * `scope`           - The materialization scope.
+/// * `scope`           - The checkout scope.
 ///
 /// # Returns
 /// * `Ok(())`      - If every kept file was judged.
@@ -295,7 +295,7 @@ fn keep_aliased_files(to: &TreeItem,
 /// * `tree`    - The tree the materialization leaves in place.
 /// * `removed` - The paths it removes.
 /// * `planned` - Every path it already writes or removes.
-/// * `scope`   - The materialization scope.
+/// * `scope`   - The checkout scope.
 ///
 /// # Returns
 /// * `Ok(Vec<(String, TreeItem)>)` - The kept files, each once.
@@ -1384,7 +1384,7 @@ fn verified_tree_entry(file_path: &Path,
 /// # Arguments
 /// * `root_tree`      - The (loaded) root tree.
 /// * `root_tree_hash` - The hash of `root_tree` (a loaded tree carries no hash of its own).
-/// * `scope`          - The bay's materialization scope.
+/// * `scope`          - The bay's checkout scope.
 /// * `shards`         - The collected shards, by directory key.
 /// * `files`          - The collected files, each naming its shard's index.
 ///

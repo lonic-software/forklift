@@ -2577,7 +2577,7 @@ fn is_meta_tree_root(tree: &crate::model::tree_item::TreeItem) -> bool {
 
 /// Whether a scoped walk reaching `tree` at spine path `path` walks it in full instead: a
 /// meta-shaped root tree ([`is_meta_tree_root`]) is meta history, which the fetch scope never
-/// selects from. The one rule heal's enumerating walk and scope-prune's retained walks share, so
+/// selects from. The one rule heal's enumerating walk and scope prune's retained walks share, so
 /// heal never reports lost what a prune kept, nor a prune frees what heal counts as held.
 /// Widening it widens what a prune keeps: a crafted meta-shaped user tree it matches keeps even
 /// its pruned path.

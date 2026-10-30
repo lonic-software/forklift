@@ -2275,7 +2275,7 @@ fn parents_first(segment: &[String],
 /// [`verify_parcel_closure`].
 ///
 /// Object presence is a warehouse property (what was fetched at all), so the walk is bounded by
-/// the warehouse fetch scope, never a narrower bay materialization scope: an object fetched but
+/// the warehouse fetch scope, never a narrower bay checkout scope: an object fetched but
 /// not materialized in *this* bay is still present in the shared store and is verified here.
 ///
 /// # Arguments

@@ -85,7 +85,13 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 13** (current): the `franchise_incomplete` error code is renamed `clone_incomplete`
+**Schema 14** (current): `scope` reports this checkout's scope as `checkout_scope`, not
+`materialization_scope`. The same release moves the sparse commands into the `scope` family, so an
+envelope's `command` and the MCP tool names change with them: `expand` is `scope fetch` (`expand`
+→ `scope_fetch`), `narrow` is `scope narrow` (`narrow` → `scope_narrow`), and `scope-prune` is
+`scope prune`, which agents still cannot run. Each envelope's `command` is now `scope`.
+
+**Schema 13**: the `franchise_incomplete` error code is renamed `clone_incomplete`
 (exit 30 and its `details` are unchanged), with the command it names. The same release renames
 commands, so an envelope's `command` and the MCP tool names change with them: `franchise` is
 `clone`, `cherry-pick` is `pick` (`cherry_pick` → `pick`), `kv set|get|unset|log` are `manifest
@@ -857,7 +863,7 @@ Example session:
   held-heads record (`.forklift/held-heads`, the remote heads it lifted to or was served by a lower,
   up to date or ahead included, or a clone) writes a `held_head_unrecorded` warning to the same channel; `message` names the cause. The command's own
   result stands and its exit code is unchanged.
-* A `scope-prune` or `evict` whose remote could not answer which recorded heads of a pallet it still holds
+* A `scope prune` or `evict` whose remote could not answer which recorded heads of a pallet it still holds
   (a server too old to know the check answers `404`; a busy one answers `unknown`) writes a `holds_unanswered` warning to the
   same channel, with `details` `{ "pallet": "<name>" }`; `message` names the cause. The command frees
   only what the remote's current heads allow; its result and exit code are its own.

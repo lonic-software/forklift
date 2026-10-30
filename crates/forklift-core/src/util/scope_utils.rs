@@ -1,6 +1,6 @@
 //! Task-scoped sparse workspaces (DESIGN.html §7.6) — the local scope record and the
 //! three-valued classifier every scope-aware walk branches on. Both layers are live: a bay's
-//! materialization scope, and the warehouse fetch scope a sparse clone records (empty = the
+//! checkout scope, and the warehouse fetch scope a sparse clone records (empty = the
 //! store holds everything).
 //!
 //! A scoped bay materializes and operates on only chosen path subtrees of the user
@@ -8,12 +8,12 @@
 //! *this* checkout, not the project — tracking it would push it onto collaborators, git
 //! sparse-checkout's leaky middle ground). It lives in two path-prefix files:
 //!
-//! * the **bay materialization scope** (`<bay_root>/scope`, bay-local) — what this bay
+//! * the **bay checkout scope** (`<bay_root>/scope`, bay-local) — what this bay
 //!   materializes and stacks; always a subset (⊆) of the fetch scope, and
 //! * the **warehouse fetch scope** (`config/fetch-scope`, shared) — what the warehouse
 //!   has fetched at all. A full clone leaves it unset (= full) and only the bay scope
 //!   restricts behavior; a sparse (`clone --only`) warehouse records the fetched prefixes
-//!   here, and `expand` widens them.
+//!   here, and `scope fetch` widens them.
 //!
 //! The classifier is **three-valued, not boolean**: a boolean
 //! `in_scope` conflates two situations a walk must treat differently — a *spine* directory
@@ -30,7 +30,7 @@ use crate::error::{CoreError, RefusalCode};
 use crate::util::record_utils::{self, RecordError};
 use crate::util::warehouse_utils::{self, WarehouseMode};
 
-/// The bay-local file that records a bay's materialization scope (under `<bay_root>/`).
+/// The bay-local file that records a bay's checkout scope (under `<bay_root>/`).
 const FILE_NAME_BAY_SCOPE: &str = "scope";
 
 /// The shared configuration folder (matches `config_utils`' own folder name) and the
@@ -89,7 +89,7 @@ pub const CODE_COMMIT_PAGINATION_UNSUPPORTED: &str = RefusalCode::CommitPaginati
 /// the [`crate::error`] module docs.
 pub use crate::error::{REFUSAL_PREFIX, REFUSAL_FIELD_SEPARATOR};
 
-/// Where a user-pallet content path sits relative to the materialization scope (design
+/// Where a user-pallet content path sits relative to the checkout scope (design
 /// §3.1). Every scope-aware walk branches on the three cases, never on a single predicate.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ScopeClass {
@@ -111,7 +111,7 @@ pub enum ScopeClass {
     OutOfScope,
 }
 
-/// A bay's (or the warehouse's) materialization scope: a set of in-scope path prefixes.
+/// A bay's (or the warehouse's) checkout scope: a set of in-scope path prefixes.
 ///
 /// An empty set means **full scope** — no restriction, so [`classify`](Self::classify)
 /// returns [`ScopeClass::InScope`] for every path, and every scope-aware code path collapses to
@@ -235,7 +235,7 @@ impl MaterializationScope {
     }
 
     /// Whether this scope is a subset (⊆) of `other` — every path this scope materializes is
-    /// in scope for `other`. The bay materialization scope must always be ⊆ the warehouse
+    /// in scope for `other`. The bay checkout scope must always be ⊆ the warehouse
     /// fetch scope (design §3.1): a bay can never materialize what the warehouse never fetched.
     pub fn subset_of(&self, other: &MaterializationScope) -> bool {
         if other.is_full() {
@@ -370,7 +370,7 @@ fn write_scope_file(path: &Path, scope: &MaterializationScope) -> Result<(), Str
     crate::util::file_utils::write_file_atomically(path, &scope.to_bytes())
 }
 
-/// The active checkout's materialization scope: the main tree's ([`read_main_tree_scope`]) or the
+/// The active checkout's scope: the main tree's ([`read_main_tree_scope`]) or the
 /// active bay's ([`read_bay_scope`]), checked the same way.
 pub fn current_scope() -> Result<MaterializationScope, String> {
     match globals::active_bay() {
@@ -379,7 +379,7 @@ pub fn current_scope() -> Result<MaterializationScope, String> {
     }
 }
 
-/// Whether the active bay is scoped (has a non-full materialization scope). A quick gate for
+/// Whether the active bay is scoped (has a non-full checkout scope). A quick gate for
 /// the verbs that behave differently — or refuse — in a scoped workspace.
 pub fn is_scoped() -> Result<bool, String> {
     Ok(!current_scope()?.is_full())
@@ -431,8 +431,8 @@ fn mode_kind(mode: WarehouseMode) -> &'static str {
     if mode == WarehouseMode::Full { "full" } else { "a cache" }
 }
 
-/// The materialization scope of a named bay. Read from any checkout so a warehouse-level
-/// operation — scope-prune — can intersect every bay's scope before freeing anything, not only
+/// The checkout scope of a named bay. Read from any checkout so a warehouse-level
+/// operation — scope prune — can intersect every bay's scope before freeing anything, not only
 /// the invoking bay's.
 ///
 /// A bay's scope is its own, since a full warehouse may hold a scoped bay, so every bay records
@@ -469,9 +469,9 @@ fn read_bay_scope_at(path: &Path) -> Result<MaterializationScope, String> {
     Ok(scope)
 }
 
-/// The materialization scope of the warehouse's main working tree. The main tree keeps its
+/// The checkout scope of the warehouse's main working tree. The main tree keeps its
 /// bay-local state directly under the shared root, so its scope file is at a fixed location every
-/// checkout can read — needed by scope-prune, which must intersect the main tree's scope too, not
+/// checkout can read — needed by scope prune, which must intersect the main tree's scope too, not
 /// only the invoking checkout's and the named bays'.
 ///
 /// Unlike a bay's, the main tree's scope follows the warehouse's mode: only a sparse clone
@@ -516,13 +516,13 @@ const REMEDY_REFRANCHISE: &str = "Clone the remote again, into a new directory."
 const REMEDY_READD_BAY: &str = "Remove the bay with \"forklift bay remove\" and add a new one under another name; \
     copy any uncommitted work across by hand.";
 
-/// Set the active checkout's materialization scope, refusing one the readers would refuse: a
+/// Set the active checkout's scope, refusing one the readers would refuse: a
 /// scope that is not ⊆ the warehouse fetch scope (a checkout can never materialize what the
 /// warehouse never fetched, design §3.1), a full one in a sparse warehouse, and any scope for the
 /// main tree of a warehouse that is not sparse ([`read_main_tree_scope`]).
 ///
 /// # Arguments
-/// * `scope` - The materialization scope to record for the active checkout.
+/// * `scope` - The checkout scope to record for the active checkout.
 pub fn set_bay_scope(scope: &MaterializationScope) -> Result<(), String> {
     let main_tree = globals::active_bay().is_none();
     if main_tree && warehouse_utils::warehouse_mode()? != WarehouseMode::Sparse {
@@ -549,7 +549,7 @@ fn set_bay_scope_at(path: &std::path::Path, scope: &MaterializationScope) -> Res
 
     if !scope.subset_of(&fetch) {
         return Err(
-            "The requested materialization scope is not within the warehouse's fetch scope; \
+            "The requested checkout scope is not within the warehouse's fetch scope; \
             a bay cannot materialize a path the warehouse has not fetched.".to_string()
         );
     }
@@ -561,8 +561,8 @@ fn set_bay_scope_at(path: &std::path::Path, scope: &MaterializationScope) -> Res
     write_scope_file(path, scope)
 }
 
-/// Replace a sparse warehouse's fetch scope (shared across bays): `expand` unions new prefixes
-/// into it and `scope-prune` drops some. Refused in a warehouse that is not sparse, and for a full
+/// Replace a sparse warehouse's fetch scope (shared across bays): `scope fetch` unions new prefixes
+/// into it and `scope prune` drops some. Refused in a warehouse that is not sparse, and for a full
 /// scope, which no sparse warehouse may record: whether a warehouse is sparse is its mode, fixed
 /// when it was prepared ([`warehouse_utils::prepare_warehouse`] writes the first fetch scope).
 ///
@@ -658,7 +658,7 @@ pub fn out_of_scope_refusal(path: &str) -> CoreError {
 
     refusal(
         RefusalCode::OutOfScope,
-        format!("The path \"{}\" is outside this bay's materialization scope. {}", path, next_step),
+        format!("The path \"{}\" is outside this bay's checkout scope. {}", path, next_step),
         next_step,
     )
 }
@@ -674,7 +674,7 @@ pub fn out_of_scope_conflict_refusal(path: &str) -> CoreError {
     refusal(
         RefusalCode::OutOfScopeConflict,
         format!(
-            "The path \"{}\" changed on both sides outside this bay's materialization scope; a \
+            "The path \"{}\" changed on both sides outside this bay's checkout scope; a \
             scoped bay cannot merge it without the content. {}",
             path, next_step
         ),
@@ -692,8 +692,8 @@ pub fn sparse_workspace_refusal(verb: &str, next_step: &str) -> CoreError {
     )
 }
 
-/// A ready-made `narrow_unclean` refusal: the subtree `narrow` was asked to drop still holds
-/// uncommitted work. `narrow` de-materializes files unconditionally once it decides to act — it
+/// A ready-made `narrow_unclean` refusal: the subtree `scope narrow` was asked to drop still holds
+/// uncommitted work. `scope narrow` de-materializes files unconditionally once it decides to act — it
 /// has no working-directory-preserving path the way `shift`'s target-tree walk does — so it
 /// refuses up front rather than silently discard staged, unstaged or untracked content. This
 /// matches `shift`'s own precedent for untracked collisions: never delete something the
@@ -721,7 +721,7 @@ pub fn narrow_unclean_refusal(path: &str, blocked_by: &str) -> CoreError {
     )
 }
 
-/// A ready-made `scope_prune_blocked` refusal: scope-prune would free content that a checkout
+/// A ready-made `scope_prune_blocked` refusal: scope prune would free content that a checkout
 /// still materializes. A prune narrows the shared warehouse fetch scope and deletes the freed
 /// objects, so it can never leave a checkout materializing a path the warehouse no longer
 /// fetches — that would break the checkout the next time it read the now-absent content. It
