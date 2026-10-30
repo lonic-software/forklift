@@ -5,8 +5,10 @@ git, the [terminology map](README.md#the-warehouse-model-in-one-minute) will get
 you oriented fast.
 
 Conventions in this guide:
-- `forklift <command>` — most commands have a short alias, shown in the
-  [command list](../generated/commands.md) and in each command's `forklift help <command>`.
+- `forklift <command>` — the everyday commands have a short alias, shown in the
+  [command list](../generated/commands.md) and in each command's `forklift help <command>`,
+  and any command can be typed by a unique prefix of its name
+  ([Typing less](#typing-less-unique-prefixes)): `forklift ha rev` is `forklift haul review`.
 - Four global flags apply to every command: `-v`/`--verbose` (more detail),
   `--json` (machine output — see [Machine & agent output](#8-machine--agent-output)),
   `--no-pager` (see [Paging](#paging) below) and `--color` (see [Color](#color)).
@@ -2585,6 +2587,25 @@ Every command and subcommand, with its short alias and a one-line description, i
 **[`../generated/commands.md`](../generated/commands.md)**. That page is generated from the
 command definition the binary parses its arguments with, and CI fails when the committed
 copy falls behind a new command or alias.
+
+### Typing less: unique prefixes
+
+At every level, a command can be typed by the start of its name, as long as no other command at
+that level starts the same way: `forklift ha` is `forklift haul`, `forklift haul rev` is
+`forklift haul review`, and `forklift help off adm` explains `office admit`.
+
+- An exact name or alias always wins. `s` starts stack, stocktake, store, show, shift and more,
+  but it is stack's alias, so `forklift s` stacks.
+- A prefix that starts more than one name is a usage error (exit code 2) naming every one of
+  them, never a guess: `forklift he` could be `heal` or `help`.
+- Only command names are matched. Aliases are typed whole (`cfg`, not `cf`), flags are always
+  typed in full, and so are the hidden git words below: `forklift commit` works, `forklift comm`
+  does not.
+
+**Prefixes are for typing, not for scripts.** A prefix that works today stops working the day a
+command starting with the same letters is added. Scripts, aliases in your shell configuration,
+and anything that calls forklift from another program spell every command name in full, as
+forklift's own hints, docs and agent tools do.
 
 ### Coming from git?
 

@@ -2,6 +2,7 @@ use clap::CommandFactory;
 use crate::cli::Cli;
 use crate::color;
 use crate::output::{self, ErrorCode, ForkliftError};
+use crate::prefix::{self, Resolved};
 
 /// Handle the help command: print the command list, or the detailed help of one command
 /// (following subcommands, so "help office admit" works too). This is the same help clap
@@ -22,24 +23,31 @@ pub fn handle_command(path: &[String]) -> Result<(), ForkliftError> {
     let mut command = Cli::command().color(choice);
     let mut bin_name = command.get_name().to_string();
 
+    let mut reached: Vec<String> = Vec::new();
     for name in path {
-        let subcommand = command
-            .get_subcommands()
-            .find(|sub| sub.get_name() == name || sub.get_all_aliases().any(|alias| alias == name))
-            .cloned();
-
-        command = subcommand.ok_or_else(|| ForkliftError::new(
-            ErrorCode::Usage,
-            format!(
-                "Unknown command: {}. Use \"forklift help\" for a list of available commands.",
-                path.join(" ")
-            ),
-            "Run \"forklift help\" for a list of available commands.",
-        ))?;
+        // A name is matched as on the command line: exactly, or by a unique prefix.
+        command = match prefix::subcommand(&command, name) {
+            Resolved::Command(subcommand) => subcommand.clone(),
+            Resolved::Ambiguous(names) => return Err(ForkliftError::new(
+                ErrorCode::Usage,
+                // The candidates are named as help for them, which is what the caller asked for.
+                prefix::ambiguity(name, &std::iter::once("help").chain(reached.iter().map(String::as_str)).collect::<Vec<_>>(), &names),
+                "Run \"forklift help\" for a list of available commands.",
+            )),
+            Resolved::Unknown => return Err(ForkliftError::new(
+                ErrorCode::Usage,
+                format!(
+                    "Unknown command: {}. Use \"forklift help\" for a list of available commands.",
+                    path.join(" ")
+                ),
+                "Run \"forklift help\" for a list of available commands.",
+            )),
+        };
 
         // A standalone subcommand does not know its parent chain; rebuilding the binary
         // name keeps the usage line correct (e.g. "forklift office admit ...").
         bin_name = format!("{} {}", bin_name, command.get_name());
+        reached.push(command.get_name().to_string());
         command = command.bin_name(bin_name.clone()).color(choice);
     }
 

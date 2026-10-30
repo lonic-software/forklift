@@ -1837,6 +1837,23 @@ mod tests {
         if param.repeats() { json!([one(1), one(2)]) } else { one(1) }
     }
 
+    /// clap's parse of an argv line, with the binary's tree alone: no prefix of a command name
+    /// resolves here, so a tool whose argv spelled one would fail.
+    fn matches_of(line: &[String]) -> Result<clap::ArgMatches, clap::Error> {
+        crate::cli::Cli::command().try_get_matches_from(line)
+    }
+
+    /// A prefix the binary itself would expand is no command to the argv check.
+    #[test]
+    fn the_argv_check_parses_with_prefixes_off() {
+        let line = |words: &[&str]| words.iter().map(|word| word.to_string()).collect::<Vec<_>>();
+        assert!(matches_of(&line(&["forklift", "--json", "haul", "list"])).is_ok());
+        for words in [&["forklift", "--json", "ha", "list"][..], &["forklift", "--json", "haul", "li"][..]] {
+            let error = matches_of(&line(words)).map(|_| ()).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand, "{words:?}");
+        }
+    }
+
     /// Run `arguments` through `tool`'s argv and clap, the way a call does. Only clap's own rules
     /// apply here: a cross-argument rule the binary checks after parsing still refuses some
     /// combinations clap accepts, with a usage error. `Ok` means clap
@@ -1850,7 +1867,7 @@ mod tests {
         let argv = tool.argv(arguments)?;
         let line: Vec<String> = ["forklift", "--json"].iter().map(|word| word.to_string()).chain(argv.iter().cloned()).collect();
         let root = crate::cli::Cli::command();
-        let mut matches = match root.clone().try_get_matches_from(&line) {
+        let mut matches = match matches_of(&line) {
             Ok(matches) => matches,
             Err(error) if matches!(error.kind(), clap::error::ErrorKind::ArgumentConflict
                 | clap::error::ErrorKind::MissingRequiredArgument) => return Err(error.to_string()),

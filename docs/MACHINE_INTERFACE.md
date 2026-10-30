@@ -52,10 +52,12 @@ Failure keeps the same header, with `"ok": false` and an `error` in place of `da
   4 to 6 each only added), so a consumer can pin it — and it *is* the capability-detection
   mechanism: check it before relying on a field, rather
   than sniffing for the field's presence.
-- `command` is the command as parsed — the canonical name, never the alias typed
-  (`st` reports `"stocktake"`) — on success and failure alike. It is `null` only when
-  the command line names no known command: a usage error without one, or top-level
-  `--help` / `--version`.
+- `command` is the command as parsed — the canonical name, never the alias or prefix typed
+  (`st` and `stoc` both report `"stocktake"`) — on success and failure alike. It is `null`
+  only when the command line names no known command: a usage error without one (an
+  ambiguous prefix included), or top-level `--help` / `--version`. A script spells command
+  names in full: a prefix that works today stops working when a command starting with the
+  same letters is added.
 - `ok` says whether `data` is the command's result. It does **not** report the exit
   status: a command whose result is a negative outcome may exit non-zero with
   `ok: true`. Parse stdout first and consult the exit status second.

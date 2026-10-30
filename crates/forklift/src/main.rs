@@ -18,6 +18,7 @@ mod internal_refs;
 pub mod output;
 pub mod pager;
 pub mod passphrase;
+pub mod prefix;
 mod remote_heads;
 #[cfg(test)]
 mod surface_check;
@@ -141,30 +142,38 @@ async fn async_main() {
 /// failure never returns: without `--json` clap prints and exits as it always has; with it, the
 /// failure becomes the process's one stdout document (see [`report_usage_error`]).
 fn parse_or_exit() -> Cli {
-    let args: Vec<OsString> = std::env::args_os().collect();
+    let mut args: Vec<OsString> = std::env::args_os().collect();
 
     // clap colours its own help and usage errors, so it follows `--color` as the commands do.
     let mut command = Cli::command();
     if let Some(choice) = color::from_args(&args) {
         command = command.color(choice.for_clap());
     }
+    command.build();
 
-    let error = match command.try_get_matches_from_mut(&args) {
-        Ok(mut matches) => {
-            output::set_command(matches.subcommand_name());
+    // A unique prefix of a command name is that command (`ha rev` is `haul review`), so clap is
+    // given the full names. An ambiguous prefix is a usage error like clap's own.
+    let error = match prefix::expand(&command, &mut args) {
+        Err(error) => error,
+        Ok(()) => {
+            match command.try_get_matches_from_mut(&args) {
+                Ok(mut matches) => {
+                    output::set_command(matches.subcommand_name());
 
-            match Cli::from_arg_matches_mut(&mut matches) {
-                Ok(cli) => match cross_argument_error(&cli) {
-                    None => return cli,
-                    // Raised on the subcommand, so the usage line clap prints is its own.
-                    Some((name, message)) => command.find_subcommand_mut(name)
-                        .expect("the parsed subcommand exists")
-                        .error(ErrorKind::MissingRequiredArgument, message),
-                },
+                    match Cli::from_arg_matches_mut(&mut matches) {
+                        Ok(cli) => match cross_argument_error(&cli) {
+                            None => return cli,
+                            // Raised on the subcommand, so the usage line clap prints is its own.
+                            Some((name, message)) => command.find_subcommand_mut(name)
+                                .expect("the parsed subcommand exists")
+                                .error(ErrorKind::MissingRequiredArgument, message),
+                        },
+                        Err(error) => error,
+                    }
+                }
                 Err(error) => error,
             }
         }
-        Err(error) => error,
     };
 
     // The parse failed, so `cli.json` does not exist: read the flag off the raw arguments. It is
@@ -197,9 +206,10 @@ fn cross_argument_error(cli: &Cli) -> Option<(&'static str, &'static str)> {
 }
 
 /// The canonical name of the top-level command the arguments name, when the parse that would
-/// have said so failed. The global options are flags that take no value, except `--color`, whose
-/// value is skipped when it is a separate word, so the first other argument that is not an option
-/// is the command, or an alias of one, or nothing known. A help or version flag before it, alone
+/// have said so failed. `args` have been through [`prefix::expand`], so a prefix the user typed is
+/// a full name here. An option's value given as its own word (`--color never`) is skipped, so the
+/// first other argument that is not an option is the command, or an alias of one, or nothing
+/// known. A help or version flag before it, alone
 /// or in a short-flag cluster (`-vh`), means clap answered at the top level, so no command ran.
 fn named_command(args: &[OsString]) -> Option<String> {
     let asks_help_or_version = |arg: &str| match arg.strip_prefix("--") {
@@ -207,22 +217,21 @@ fn named_command(args: &[OsString]) -> Option<String> {
         None => arg.starts_with('-') && arg.contains(['h', 'V']),
     };
 
+    let cli = Cli::command();
     let mut words = args.iter().skip(1)
         .map(|arg| arg.to_string_lossy())
         .take_while(|arg| !asks_help_or_version(arg));
     let token = loop {
         let word = words.next()?;
-        if word == "--color" {
-            words.next();
-        } else if !word.starts_with('-') {
+        if !word.starts_with('-') {
             break word;
         }
+        if prefix::takes_next_word(&cli, &word) {
+            words.next();
+        }
     };
-    let token = token.as_ref();
 
-    Cli::command().get_subcommands()
-        .find(|command| command.get_name() == token || command.get_all_aliases().any(|alias| alias == token))
-        .map(|command| command.get_name().to_string())
+    cli.find_subcommand(token.as_ref()).map(|command| command.get_name().to_string())
 }
 
 /// Report a clap parse result as the one `--json` document, then exit. Help and version are
