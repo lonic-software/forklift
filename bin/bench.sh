@@ -259,7 +259,7 @@ read -r cold mrest min _ <<< "$(stats $(time_series "$RUNS" "" "forklift diff --
 add_row "diff" "$cold" "$mrest" "$min" "$DIRTY_COUNT files dirtied"
 DIFF_MEAN=$mrest
 fl unload . >/dev/null
-fl restore . >/dev/null
+fl restore --confirm . >/dev/null
 
 # ── 3. compact --all (steady-state repack; D/P3's ~4.4x, see PARALLELIZATION_PLAN) ──
 echo "-> [3/8] compact --all (steady-state repack)…"

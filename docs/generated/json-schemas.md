@@ -4567,12 +4567,8 @@ A command not listed here either reports only the generic human-message shape `{
       "description": "Whether every requested path was already outside the fetch scope before this call — a\npure resume of an earlier, interrupted prune, rather than a path pruned for the first\ntime here.",
       "type": "boolean"
     },
-    "dry_run": {
-      "description": "Whether this was a dry run (nothing changed).",
-      "type": "boolean"
-    },
     "freed": {
-      "description": "Loose objects actually freed (`0` on a dry run).",
+      "description": "Loose objects actually freed (`0` in the preview a `confirmation_required` refusal carries).",
       "format": "uint",
       "minimum": 0,
       "type": "integer"
@@ -4635,14 +4631,13 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "array"
     },
     "would_free": {
-      "description": "Loose objects a prune would free (equals `freed` after a real run).",
+      "description": "Loose objects the prune frees (equals `freed` after a confirmed run).",
       "format": "uint",
       "minimum": 0,
       "type": "integer"
     }
   },
   "required": [
-    "dry_run",
     "pruned",
     "scope",
     "freed",

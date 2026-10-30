@@ -818,7 +818,7 @@ fn warehouse_with_a_pick_of_an_orphaned_source(warehouse: &Warehouse) -> (String
     let source = warehouse.stack("app.txt", "from-feature\n", "feature work");
     warehouse.run_ok(&["undo"]);
     warehouse.run_ok(&["unload", "."]);
-    warehouse.run_ok(&["restore", "."]);
+    warehouse.run_ok(&["restore", "--confirm", "."]);
     warehouse.run_ok(&["shift", "main"]);
 
     warehouse.stack("app.txt", "from-main\n", "main work");
@@ -1368,7 +1368,7 @@ fn staged_content_survives_collection_and_a_torn_taint_heals_over_it() {
     );
 
     std::fs::remove_file(warehouse.root.join("wip.txt")).unwrap();
-    warehouse.run_ok(&["restore", "wip.txt"]);
+    warehouse.run_ok(&["restore", "--confirm", "wip.txt"]);
     assert_eq!(
         std::fs::read_to_string(warehouse.root.join("wip.txt")).unwrap(),
         "work in progress\n",
@@ -1399,7 +1399,7 @@ fn a_full_repack_keeps_staged_content_and_the_next_stack_restores_it() {
     warehouse.run_ok(&["audit"]);
 
     std::fs::remove_file(warehouse.root.join("wip.txt")).unwrap();
-    let restored = warehouse.run(&["restore", "wip.txt"]);
+    let restored = warehouse.run(&["restore", "--confirm", "wip.txt"]);
     assert!(
         restored.status.success(),
         "a file staged before a full repack must still be restorable after it is stacked — if \
@@ -1571,7 +1571,7 @@ fn stack_and_park_refuse_a_staged_object_the_store_lost() {
             warehouse.run_ok(&["park", "pop"]);
         } else {
             std::fs::remove_file(warehouse.root.join(file)).unwrap();
-            warehouse.run_ok(&["restore", "--", file]);
+            warehouse.run_ok(&["restore", "--confirm", "--", file]);
         }
         if std::fs::read(warehouse.root.join(file)).ok().as_deref() != Some(&content[..]) {
             failures.push(format!("{}: the file did not come back after `{}`", arm, verb.join(" ")));

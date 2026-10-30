@@ -345,7 +345,7 @@ impl OperationRecovery {
         }
 
         if !self.unheld.is_empty() {
-            println!("These tracked files do not hold their recorded content and show as local changes (\"forklift restore <path>\" brings one back):");
+            println!("These tracked files do not hold their recorded content and show as local changes (\"forklift restore --confirm <path>\" brings one back):");
             for path in &self.unheld {
                 println!("  {}", path);
             }

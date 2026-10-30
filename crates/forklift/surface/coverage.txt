@@ -65,6 +65,7 @@ forklift import-git: <PATH> --no-compact
 forklift lift: --recreate
 forklift load: <PATH>
 forklift lower: [PALLET] --expect=<GENESIS> --keep=<@PALLET:PATH=SIDE>...
+    -> forklift lower: [PALLET] --expect=<GENESIS> --keep=<@PALLET:PATH=SIDE>... --confirm
 forklift kv:
     -> forklift manifest:
 forklift kv set: <REVISION> <KEY> <VALUE>
@@ -117,7 +118,7 @@ forklift profile use: <NAME>
 forklift query: [REVISION]... --from=<REVISION> --class=<CLASS> --unsupervised --supervisor=<OPERATOR> --signer=<KEYPREFIX> --author-after=<TIMESTAMP> --author-before=<TIMESTAMP> --merges --no-merges --grep=<GLOB> --model=<GLOB> --tool=<GLOB> --tag=<NAME> --touches=<PATH> --verify --recorded --where=<JSON> -n/--limit=<LIMIT> --after=<CURSOR> --oneline
 forklift remove: <PATH>
 forklift restore: -s/--staged <PATH>
-    -> forklift restore: <PATH>
+    -> forklift restore: <PATH> --confirm
     -> forklift unload: <PATH>
 forklift self-schema:
     -> forklift self:
@@ -136,7 +137,7 @@ forklift narrow: <PATH>...
 forklift scope:
 forklift scope status:
 forklift scope-prune: <PATH>... --dry-run
-    -> forklift scope prune: <PATH>... --dry-run
+    -> forklift scope prune: <PATH>... --confirm
 forklift evict: --dry-run
     -> forklift store evict: --dry-run
 forklift remote:

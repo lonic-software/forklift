@@ -443,14 +443,14 @@ fn restore_refuses_a_path_that_names_another_spellings_file() {
     warehouse.write("docs/a", "changed\n");
     warehouse.run_ok(&["load", "."]);
 
-    let staged = warehouse.run(&["restore", "Docs/a"]);
+    let staged = warehouse.run(&["restore", "--confirm", "Docs/a"]);
     assert!(!staged.status.success());
     assert!(stderr(&staged).contains("The removal of \"Docs/a\" is staged"), "{}", stderr(&staged));
     assert_eq!(warehouse.read("docs/a"), "changed\n");
 
     warehouse.run_ok(&["unload", "Docs/a"]);
 
-    let restored = warehouse.run(&["restore", "Docs/a"]);
+    let restored = warehouse.run(&["restore", "--confirm", "Docs/a"]);
     assert!(!restored.status.success());
     assert!(stderr(&restored).contains("names the same file as"), "{}", stderr(&restored));
     assert_eq!(warehouse.read("docs/a"), "changed\n");
@@ -556,7 +556,7 @@ fn restore_refuses_a_path_beneath_a_file() {
     warehouse.write("foo", "mine\n");
 
     for target in ["foo/a.txt", "foo"] {
-        let restored = warehouse.run(&["restore", target]);
+        let restored = warehouse.run(&["restore", "--confirm", target]);
         assert!(!restored.status.success(), "restore {}", target);
         assert!(stderr(&restored).contains("\"foo\" is not a directory"), "restore {}: {}", target, stderr(&restored));
         assert_eq!(warehouse.read("foo"), "mine\n");

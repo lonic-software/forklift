@@ -256,7 +256,7 @@ fn unheld_warning(unheld: &[String]) -> Option<String> {
         "{} file(s) do not hold the content imported for them, so they read as changed: {}. \
         An uncommitted edit or deletion does this, and so does git converting a file as it checks \
         it out (line endings, \"ident\", a filter). \"forklift load\" and stack a path to keep it as it is; \
-        for a file you did not edit, \"forklift restore\" writes its imported content back instead, \
+        for a file you did not edit, \"forklift restore --confirm\" writes its imported content back instead, \
         discarding what the file holds.",
         unheld.len(), named
     ))

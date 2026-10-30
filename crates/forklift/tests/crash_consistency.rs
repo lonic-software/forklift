@@ -875,7 +875,7 @@ fn restore_barrier_count_for(files_per_dir: usize) -> u64 {
         }
     }
 
-    let mut command = area.command(&["restore", "."]);
+    let mut command = area.command(&["restore", "--confirm", "."]);
     command.env("FORKLIFT_DEBUG_BARRIER_COUNT", "1");
     let output = command.output().unwrap();
     assert!(output.status.success(), "restore failed: {}", String::from_utf8_lossy(&output.stderr));

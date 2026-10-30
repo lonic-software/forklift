@@ -85,7 +85,14 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 14** (current): `scope` reports this checkout's scope as `checkout_scope`, not
+**Schema 15** (current): the `confirmation_required` error code exists (exit 39). A destructive
+command run without `--confirm` while it has something to destroy refuses with it, its preview in
+`details`: `restore` that would discard a change, `lower` with a `theirs` resolution, `scope prune`
+that would free content, and `office regenesis`, which exited 1 before. `scope prune` loses
+`--dry-run`, so its report drops `dry_run`; the preview it replaced is that refusal's `details`.
+`restore` and `lower` gain `confirm`, over MCP too.
+
+**Schema 14**: `scope` reports this checkout's scope as `checkout_scope`, not
 `materialization_scope`. The same release moves the sparse commands into the `scope` family, so an
 envelope's `command` and the MCP tool names change with them: `expand` is `scope fetch` (`expand`
 → `scope_fetch`), `narrow` is `scope narrow` (`narrow` → `scope_narrow`), and `scope-prune` is
@@ -566,6 +573,29 @@ names the first ten.
 }
 ```
 
+### A destructive command left unconfirmed: `confirmation_required`
+
+A command that destroys what this warehouse cannot get back (working-tree changes, content held
+only here, the trust guarantee) shows what it would destroy and changes nothing unless it is given
+`--confirm`. Run without it while there is something to destroy, it refuses with
+`confirmation_required` (exit 39); with nothing to destroy it simply runs. `lower` is the one
+exception: it refuses whenever a resolution names `theirs`, before the remote is asked, since an
+accepted `theirs` drops the local side; so its refusal says that `theirs` was named, not that
+something would certainly be lost. `details` is the preview, shaped by the command:
+
+| Command | When it refuses | `details` |
+|---|---|---|
+| `restore` | a file it would overwrite differs from what is staged | `{path, discards}`: the path (relative to the warehouse root) and every file whose change it would discard |
+| `lower` | a `--keep` resolution takes `theirs` | `{theirs}`: each `@<pallet>:<path>` whose local changes it would drop |
+| `scope prune` | the prune would free content | the `scope prune` report, with `freed` 0 and `would_free` counting what it would free |
+| `office regenesis` | always | `{genesis, office_head, operator}`: the anchor it would replace and the operator the new root is for |
+
+`next_step` says to check the preview, then run the same command with `--confirm`. An agent should
+put the preview in front of the person it works for and add `--confirm` only on their say-so: the
+refusal exists so that a person sees what goes. `office accept-regenesis` is not on this list; its
+`--confirm` takes the genesis it accepts, and a remote whose anchor changed refuses with
+`trust_changed`.
+
 ### An unfinished clone: `clone_incomplete`
 
 A `clone` that fails after it has claimed its directory — a dropped connection, a full disk,
@@ -624,7 +654,8 @@ both sides of it, and the working pallet that lowered with its new head:
 ```
 
 A side without `value` removed the key. Rerun `lower` with one `--keep @<pallet>:<path>=ours|theirs`
-per path, both exactly as `details` names them (`--keep @kv:<subject>/<key>=theirs`). The pallet
+per path, both exactly as `details` names them (`--keep @kv:<subject>/<key>=theirs`), and `--confirm`
+if any keep takes `theirs`. The pallet
 keeps its `@`; a bare `kv:` is refused. `theirs` on a bare `<subject>` resolves every key under
 it. A keep that names no conflict, or a pallet that did not diverge, is refused rather than
 ignored, so a stale resolution never applies to a later conflict.

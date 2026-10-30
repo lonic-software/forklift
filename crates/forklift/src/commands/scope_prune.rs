@@ -1,5 +1,5 @@
 use serde::Serialize;
-use forklift_core::error::CoreError;
+use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::util::{bay_utils, journal_utils};
 use forklift_core::util::lock_utils::StoreAccessLock;
 use forklift_core::util::path_utils::WarehousePath;
@@ -32,15 +32,16 @@ use crate::output::{self, CommandOutput};
 /// # Arguments
 /// * `paths`   - The fetched path(s) to prune. Each is either a current warehouse fetch-scope
 ///   prefix (a fresh prune) or already outside it (a resumed one).
-/// * `dry_run` - Report what would be freed and change nothing.
+/// * `confirm` - Free the content. Without it, a plan that frees anything is shown and refused
+///   (`confirmation_required`) with nothing changed; a plan that frees nothing runs.
 ///
 /// # Returns
-/// * `Ok(())`      - If the plan was reported (dry run) or carried out.
-/// * `Err(String)` - If the warehouse is not sparse, a path is a live spine ancestor or a
+/// * `Ok(())`      - If the plan was carried out.
+/// * `Err(String)` - If the plan frees content and `confirm` was not given, the warehouse is not sparse, a path is a live spine ancestor or a
 ///   sub-path of what is still fetched, the last fetched path would be dropped, a checkout
 ///   still materializes the path, another process is using the object store, or the remote cannot
 ///   be reached or is not trusted.
-pub async fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), String> {
+pub async fn handle_command(paths: Vec<String>, confirm: bool) -> Result<(), String> {
     // Judged once before the remote is asked, so a local refusal (a full warehouse, a path that is
     // not fetched, a checkout that still needs it) is reported as itself rather than masked by a
     // remote that cannot be reached, and again under the hold below, which is what the plan uses.
@@ -55,8 +56,8 @@ pub async fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), Str
     // on the fetch scope `judge_request` reads and on every bay's checkout scope, not only
     // on the plan's walk, and the fetch scope is rewritten from that read; so no writer in another
     // bay — a load that dedups against a planned object, an expand widening the fetch scope — may
-    // run anywhere between this read and the last deletion. A dry run takes it too, so it reports
-    // exactly the plan a real run would carry out. Never waits: refused while any writer holds
+    // run anywhere between this read and the last deletion. The preview takes it too, so it shows
+    // exactly the plan a confirmed run would carry out against the warehouse as it stands now. Never waits: refused while any writer holds
     // the store. `main` takes no shared hold for this command, which would refuse this try.
     let store_access = StoreAccessLock::try_exclusive()?;
     let PruneRequest { post_prune, to_reclaim, all_resumed } = judge_request(&paths)?;
@@ -69,9 +70,12 @@ pub async fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), Str
     let removed_heads = journal_utils::removed_heads()?;
     let plan = prune_utils::plan_prune(&to_reclaim, &post_prune, &remote_heads, &removed_heads, &store_access)?;
 
-    if dry_run {
-        output::emit(&ScopePruneReport {
-            dry_run: true,
+    // Rule 5: freeing content is destructive, so it needs --confirm. A plan that frees nothing
+    // only narrows the fetch scope, which "scope fetch" undoes, so it runs without it.
+    if !confirm && !plan.to_free.is_empty() {
+        let preview = ScopePruneReport {
+            preview: true,
+            rerun: rerun_args(&paths),
             pruned: to_reclaim,
             scope: post_prune.prefixes().to_vec(),
             freed: 0,
@@ -82,11 +86,26 @@ pub async fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), Str
             kept_for_hauls: plan.kept_for_hauls,
             kept_for_mirror: plan.kept_for_mirror,
             kept_for_deleted: plan.kept_for_deleted,
-            unlifted_pallets: plan.unlifted_pallets.clone(),
+            unlifted_pallets: plan.unlifted_pallets,
             all_resumed,
-        });
+        };
 
-        return Ok(());
+        if !output::is_json() {
+            preview.render_human();
+        }
+
+        return Err(CoreError::refusal_with_details(
+            RefusalCode::ConfirmationRequired,
+            format!(
+                "Pruning {} would free {} loose object(s); nothing was changed.",
+                preview.pruned.join(", "), preview.would_free
+            ),
+            format!(
+                "Check what it would free, then run \"forklift scope prune --confirm {}\" to free it.",
+                preview.rerun
+            ),
+            serde_json::json!(preview),
+        ).into());
     }
 
     // Durable before destructive: narrow the shared fetch scope FIRST (a no-op write when every
@@ -100,7 +119,8 @@ pub async fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), Str
     let stats = prune_utils::free_objects(&plan.to_free, &store_access)?;
 
     output::emit(&ScopePruneReport {
-        dry_run: false,
+        preview: false,
+        rerun: rerun_args(&paths),
         pruned: to_reclaim,
         scope: post_prune.prefixes().to_vec(),
         freed: stats.freed,
@@ -241,8 +261,15 @@ fn guard_checkout_scopes(pruned: &[String], post_prune: &PathScope) -> Result<()
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
 pub(crate) struct ScopePruneReport {
-    /// Whether this was a dry run (nothing changed).
-    dry_run: bool,
+    /// Whether this is the preview a refusal shows (human output only: the preview reaches
+    /// `--json` as a `confirmation_required` refusal's details).
+    #[serde(skip)]
+    preview: bool,
+
+    /// The paths as given, quoted for a shell, for a hint to run the prune again: they resolve
+    /// from the directory it was run in, as the pruned keys (relative to the root) would not.
+    #[serde(skip)]
+    rerun: String,
 
     /// The fetched path(s) pruned (forgotten) from the warehouse fetch scope.
     pruned: Vec<String>,
@@ -250,10 +277,10 @@ pub(crate) struct ScopePruneReport {
     /// The warehouse fetch scope after the prune.
     scope: Vec<String>,
 
-    /// Loose objects actually freed (`0` on a dry run).
+    /// Loose objects actually freed (`0` in the preview a `confirmation_required` refusal carries).
     freed: usize,
 
-    /// Loose objects a prune would free (equals `freed` after a real run).
+    /// Loose objects the prune frees (equals `freed` after a confirmed run).
     would_free: usize,
 
     /// Candidate objects present only inside a pack: a loose delete cannot reclaim them and a
@@ -301,9 +328,9 @@ pub(crate) struct ScopePruneReport {
 
 impl CommandOutput for ScopePruneReport {
     fn render_human(&self) {
-        if self.dry_run {
+        if self.preview {
             println!(
-                "Dry run: pruning {} would free {} loose object(s) and leave the fetch scope at {}.",
+                "Pruning {} would free {} loose object(s) and leave the fetch scope at {}.",
                 self.pruned.join(", "), self.would_free, self.scope.join(", ")
             );
         } else if self.freed == 0 && self.still_packed > 0 {
@@ -360,14 +387,11 @@ impl CommandOutput for ScopePruneReport {
                 format!(" (pallets {})", self.unlifted_pallets.iter()
                     .map(|name| format!("\"{}\"", name)).collect::<Vec<_>>().join(", "))
             };
-            let separator = if self.pruned.iter().any(|path| path.starts_with('-')) { "-- " } else { "" };
-            let paths = self.pruned.iter().map(|path| shell_quote(path)).collect::<Vec<_>>().join(" ");
-
             println!(
                 "{} object(s) were kept because lifting history the remote does not hold yet reads \
                 them{}; some may be the only copy. Lift that work (or lower, if the remote is \
-                ahead), then run \"forklift scope prune {}{}\" again to free them.",
-                self.kept_unlifted, pallets, separator, paths
+                ahead), then run \"forklift scope prune --confirm {}\" again to free them.",
+                self.kept_unlifted, pallets, self.rerun
             );
         }
 
@@ -399,7 +423,7 @@ impl CommandOutput for ScopePruneReport {
             );
         }
 
-        if self.dry_run {
+        if self.preview {
             println!("What it frees is re-fetchable from the origin with \"forklift scope fetch\".");
         } else {
             println!("What was freed is re-fetchable from the origin with \"forklift scope fetch\".");
@@ -413,12 +437,18 @@ impl CommandOutput for ScopePruneReport {
 ///
 /// # Arguments
 /// * `path` - The path key.
-fn shell_quote(path: &str) -> String {
+pub(crate) fn shell_quote(path: &str) -> String {
     if !path.is_empty() && path.chars().all(|c| c.is_ascii_alphanumeric() || "/._-".contains(c)) {
         return path.to_string();
     }
 
     format!("'{}'", path.replace('\'', "'\\''"))
+}
+
+/// The paths as given, quoted for a shell and led by `-- ` when one starts with a dash.
+fn rerun_args(paths: &[String]) -> String {
+    let separator = if paths.iter().any(|path| path.starts_with('-')) { "-- " } else { "" };
+    format!("{}{}", separator, paths.iter().map(|path| shell_quote(path)).collect::<Vec<_>>().join(" "))
 }
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).

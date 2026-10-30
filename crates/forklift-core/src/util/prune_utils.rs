@@ -57,8 +57,8 @@ use crate::util::{
 };
 use crate::util::lock_utils::StoreAccessExclusive;
 
-/// The reclamation a prune would carry out, computed without mutating anything (safe for a
-/// dry run).
+/// The reclamation a prune would carry out, computed without mutating anything (safe for the
+/// preview an unconfirmed prune shows).
 pub struct PrunePlan {
     /// Present, loose objects to delete: under a pruned path, and needed by no retained scope.
     pub to_free: Vec<String>,
@@ -114,7 +114,7 @@ pub struct PruneStats {
 }
 
 /// Compute a prune plan without mutating anything: the present, loose objects under the pruned
-/// path(s) that no post-prune scope still needs. Safe to call for a dry run — and safe to call
+/// path(s) that no post-prune scope still needs. Safe to call for a preview — and safe to call
 /// again over the same path after an earlier, interrupted prune: an object an earlier run
 /// already freed is simply absent from the plan, never an error (see the module doc).
 ///
