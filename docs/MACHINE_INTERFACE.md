@@ -520,9 +520,12 @@ Moving a partial warehouse (`--only` or `--cache`) to another origin records tha
 begun before it talks to the new server, and clears that record only when the move has finished or
 been abandoned. While it stands, every command that would talk to a remote, or change what the
 move checks (the heads this warehouse depends on its origin for, and the content it holds by hash
-alone), refuses with `origin_move_pending` (exit 37) and changes nothing. `next_step` names
-`remote move <url>`, which finishes the move, and, while the move has not yet started rewriting
-the origin, `remote move --abort`, which abandons it. Stacking and commands that only read this
+alone), refuses with `origin_move_pending` (exit 37). A command refused up front changes nothing;
+one whose write was refused partway, because the move began while it ran, keeps what it did
+before that write. `next_step` names `remote move` with the server the move was going to, which
+finishes the move, and, while the move has not yet started rewriting the origin,
+`remote move --abort`, which abandons it. A record of a move that cannot be read is refused the
+same way, as a move that may have started rewriting. Stacking and commands that only read this
 warehouse still run.
 
 ### An unfinished franchise: `franchise_incomplete`

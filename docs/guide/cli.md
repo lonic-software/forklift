@@ -1702,9 +1702,12 @@ that a move has begun, and it is not finished until the origin and `remote.url` 
 server. Until then, every command above refuses up front, and so do the local commands that would
 change what the move checks: an `undo` that moves a pallet back in a sparse warehouse, and
 deleting a pallet. Each refuses with the `origin_move_pending` code (exit 37),
-changing nothing. `forklift remote move <url>` finishes the move; while it is still checking the
-new server, and has not started rewriting the origin, `forklift remote move --abort` abandons it
-instead. Stacking, local reads and `heal` still run.
+changing nothing. The refusal names the server the move was going to:
+`forklift remote move <url>` finishes the move; while it is still checking the new server, and has
+not started rewriting the origin, `forklift remote move --abort` abandons it instead. A record of a
+move that cannot be read is taken as one that may have started rewriting, so only finishing the
+move clears it. Stacking and local reads still run, and so does `heal`, except that it does not
+rebuild a damaged record of the content held by hash alone until the move finishes.
 
 **Very large lifts and old remotes.** A lift touching more objects than fit in one commit batch
 (tens of thousands of distinct objects — realistic for a single maximal chunked file, or simply a

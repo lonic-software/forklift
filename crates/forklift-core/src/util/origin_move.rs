@@ -15,16 +15,18 @@
 //! go on.
 //!
 //! The intent is a [`record_utils`] file in the shared forklift root holding the move's owner
-//! token and its phase. In the checking phase nothing has been rewritten, so a failed or aborted
-//! move clears it; once the move starts rewriting, the intent is cleared only by a move that
-//! completes. The token is what lets a move tell its own intent from one a killed move left: the
-//! [`MoveLock`] says whether any move is running, and the token says which one wrote the intent.
+//! token, its phase and the server it moves to. In the checking phase nothing has been rewritten,
+//! so a failed or aborted move clears it; once the move starts rewriting, the intent is cleared
+//! only by a move that completes. The token is what lets a move tell its own intent from one a
+//! killed move left: the [`MoveLock`] says whether any move is running, and the token says which
+//! one wrote the intent. An intent file that does not parse is read as a move that may have
+//! started rewriting: every writer refuses as under one, and the next move finishes it.
 
 use std::path::PathBuf;
 use crate::error::{CoreError, RefusalCode};
 use crate::globals;
 use crate::util::lock_utils::{MoveLock, RefLock};
-use crate::util::{file_utils, record_utils};
+use crate::util::{file_utils, record_utils, sign_utils};
 
 /// The intent's file name in the shared forklift root, and its [`record_utils`] kind and version.
 pub const FILE_NAME: &str = "origin-move";
@@ -41,11 +43,17 @@ pub enum Phase {
 }
 
 impl Phase {
+    const ALL: [Phase; 2] = [Phase::Checking, Phase::Rewriting];
+
     fn as_str(self) -> &'static str {
         match self {
             Phase::Checking => "checking",
             Phase::Rewriting => "rewriting",
         }
+    }
+
+    fn parse(name: &str) -> Option<Phase> {
+        Phase::ALL.into_iter().find(|phase| phase.as_str() == name)
     }
 }
 
@@ -57,6 +65,9 @@ pub struct Intent {
 
     /// How far that move got.
     pub phase: Phase,
+
+    /// The URL of the server the move takes as the new origin.
+    pub target: String,
 }
 
 /// Proof that the holder owns the recorded intent: only [`begin`] makes one, under the
@@ -68,44 +79,71 @@ fn intent_path() -> PathBuf {
     globals::forklift_root().join(FILE_NAME)
 }
 
-/// The intent recorded in the warehouse in scope, or none when the file is absent. Lock-free: the
-/// file is replaced atomically. A file that does not parse is an error, never no intent.
-pub fn read_intent() -> Result<Option<Intent>, String> {
+/// The intent file as read: absent, an intent, or damage, described as the rest of a sentence that
+/// opens with the file's path.
+enum Recorded {
+    Absent,
+    Intent(Intent),
+    Damaged(String),
+}
+
+fn read_recorded() -> Result<Recorded, String> {
     let path = intent_path();
 
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Recorded::Absent),
         Err(e) => return Err(format!("Error while reading \"{}\": {}", path.to_string_lossy(), e)),
     };
 
-    let damaged = |what: &str| format!(
-        "The file \"{}\" {} A move of this warehouse's origin may have been interrupted; nothing \
-        was changed.",
-        path.to_string_lossy(), what
-    );
+    let entries = match record_utils::from_bytes(&bytes, RECORD, VERSION) {
+        Ok(entries) => entries,
+        Err(e) => return Ok(Recorded::Damaged(e.describe())),
+    };
 
-    let entries = record_utils::from_bytes(&bytes, RECORD, VERSION).map_err(|e| damaged(&e.describe()))?;
-
-    let [token, phase] = <[String; 2]>::try_from(entries)
-        .map_err(|entries| damaged(&format!("holds {} entries where it should hold a token and a phase.", entries.len())))?;
+    let Ok([token, phase, target]) = <[String; 3]>::try_from(entries.clone()) else {
+        return Ok(Recorded::Damaged(format!(
+            "holds {} entries where it should hold a token, a phase and a target.", entries.len()
+        )));
+    };
 
     let token = match token.strip_prefix("token ") {
         Some(hex) if !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()) => hex.to_string(),
-        _ => return Err(damaged("does not open with a move's owner token.")),
+        _ => return Ok(Recorded::Damaged("does not open with a move's owner token.".to_string())),
     };
 
-    let phase = match phase.as_str() {
-        "phase checking" => Phase::Checking,
-        "phase rewriting" => Phase::Rewriting,
-        _ => return Err(damaged("names no phase a move has.")),
+    let Some(phase) = phase.strip_prefix("phase ").and_then(Phase::parse) else {
+        return Ok(Recorded::Damaged("names no phase a move has.".to_string()));
     };
 
-    Ok(Some(Intent { token, phase }))
+    let target = match target.strip_prefix("target ") {
+        Some(url) if !url.is_empty() => url.to_string(),
+        _ => return Ok(Recorded::Damaged("names no server the move takes as the origin.".to_string())),
+    };
+
+    Ok(Recorded::Intent(Intent { token, phase, target }))
+}
+
+fn damaged_message(what: &str) -> String {
+    format!("The file \"{}\" {}", intent_path().to_string_lossy(), what)
+}
+
+/// The intent recorded in the warehouse in scope, or none when the file is absent. Lock-free: the
+/// file is replaced atomically. A file that does not parse is an error, never no intent.
+pub fn read_intent() -> Result<Option<Intent>, String> {
+    match read_recorded()? {
+        Recorded::Absent => Ok(None),
+        Recorded::Intent(intent) => Ok(Some(intent)),
+        Recorded::Damaged(what) => Err(damaged_message(&what)),
+    }
 }
 
 fn write_intent(_lock: &RefLock, intent: &Intent) -> Result<(), String> {
-    let entries = [format!("token {}", intent.token), format!("phase {}", intent.phase.as_str())];
+    let entries = [
+        format!("token {}", intent.token),
+        format!("phase {}", intent.phase.as_str()),
+        format!("target {}", intent.target),
+    ];
 
     file_utils::replace_file_atomically(&intent_path(), &record_utils::to_bytes(RECORD, VERSION, entries))
         .map_err(|e| format!("Error while recording the move of this warehouse's origin: {}", e))
@@ -127,28 +165,30 @@ fn new_token() -> String {
     let mut bytes = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
 
-    bytes.iter().map(|byte| format!("{:02x}", byte)).collect()
+    sign_utils::to_hex(&bytes)
 }
 
-/// Take ownership of the intent, for a move that holds the [`MoveLock`]: with none recorded, record
-/// one in the checking phase; one in the checking phase was left by a move that is no longer
-/// running (the lock says so), and is replaced; one in the rewriting phase is adopted with its
-/// phase, which is never downgraded, since the origin may already be partly rewritten.
+/// Take ownership of the intent, for a move to `target` that holds the [`MoveLock`]: with none
+/// recorded, record one in the checking phase; one in the checking phase was left by a move that
+/// is no longer running (the lock says so), and is replaced; one in the rewriting phase is adopted
+/// with its phase, which is never downgraded, since the origin may already be partly rewritten,
+/// and takes this move's target. A damaged one is read as rewriting and replaced by a rewriting
+/// intent, since no one can tell how far its move got. A move that starts rewriting still checks
+/// its own target first: the phase says only what may already be rewritten, not what was checked.
 ///
 /// # Returns
 /// * `Ok((MoveToken, Phase))` - This move's token, and the phase it starts in.
 /// * `Err(String)`            - If the intent cannot be read or written.
-pub fn begin(_move_lock: &MoveLock, lock: &RefLock) -> Result<(MoveToken, Phase), String> {
-    if let Some(intent) = read_intent()? {
-        if intent.phase == Phase::Rewriting {
-            return Ok((MoveToken(intent.token), Phase::Rewriting));
-        }
-    }
+pub fn begin(_move_lock: &MoveLock, lock: &RefLock, target: &str) -> Result<(MoveToken, Phase), String> {
+    let intent = match read_recorded()? {
+        Recorded::Intent(intent) if intent.phase == Phase::Rewriting => Intent { target: target.to_string(), ..intent },
+        Recorded::Damaged(_) => Intent { token: new_token(), phase: Phase::Rewriting, target: target.to_string() },
+        Recorded::Absent | Recorded::Intent(_) => Intent { token: new_token(), phase: Phase::Checking, target: target.to_string() },
+    };
 
-    let intent = Intent { token: new_token(), phase: Phase::Checking };
     write_intent(lock, &intent)?;
 
-    Ok((MoveToken(intent.token), Phase::Checking))
+    Ok((MoveToken(intent.token), intent.phase))
 }
 
 /// Read the intent and confirm `token` owns it.
@@ -206,50 +246,70 @@ pub fn abandon(lock: &RefLock, token: &MoveToken) -> Result<bool, String> {
 /// [`MoveLock`], so no move is running.
 ///
 /// # Returns
-/// * `Ok(Some(Phase::Checking))`  - The intent was cleared.
-/// * `Ok(Some(Phase::Rewriting))` - It is rewriting, and stays.
-/// * `Ok(None)`                   - No intent is recorded.
-/// * `Err(String)`                - If the intent cannot be read or removed.
-pub fn abort(_move_lock: &MoveLock, lock: &RefLock) -> Result<Option<Phase>, String> {
-    let Some(intent) = read_intent()? else {
-        return Ok(None);
+/// * `Ok(Some(intent))` - The intent found: cleared when it was checking, kept when rewriting.
+/// * `Ok(None)`         - No intent is recorded.
+/// * `Err(String)`      - If the intent cannot be read or removed, or is damaged, which is kept
+///   and named with the move that finishes it.
+pub fn abort(_move_lock: &MoveLock, lock: &RefLock) -> Result<Option<Intent>, String> {
+    let intent = match read_recorded()? {
+        Recorded::Absent => return Ok(None),
+        Recorded::Intent(intent) => intent,
+        Recorded::Damaged(what) => return Err(String::from(damaged_refusal(&what))),
     };
 
     if intent.phase == Phase::Checking {
         remove_intent(lock)?;
     }
 
-    Ok(Some(intent.phase))
+    Ok(Some(intent))
 }
 
 /// The `origin_move_pending` refusal for a command that would fetch, talk to the remote or write
-/// a record a move checks, while a move's intent is recorded.
-pub fn pending_refusal(phase: Phase) -> CoreError {
-    let next_step = match phase {
-        Phase::Checking => "Finish the move with \"forklift remote move <url>\", or abandon it with \
-            \"forklift remote move --abort\".",
-        Phase::Rewriting => "Finish the move with \"forklift remote move <url>\"; it has started \
-            rewriting the origin, so it cannot be abandoned.",
+/// a record a move checks, while `intent` is recorded.
+pub fn pending_refusal(intent: &Intent) -> CoreError {
+    let finish = format!("Finish the move with \"forklift remote move {}\"", intent.target);
+    let next_step = match intent.phase {
+        Phase::Checking => format!("{}, or abandon it with \"forklift remote move --abort\".", finish),
+        Phase::Rewriting => format!("{}; it has started rewriting the origin, so it cannot be abandoned.", finish),
     };
 
     CoreError::refusal(
         RefusalCode::OriginMovePending,
         format!(
-            "A move of this warehouse's origin to another server has not finished (it was {} when it \
-            stopped), so nothing fetches, talks to the remote or changes what the move checks until \
-            it does; nothing was changed. {}",
-            phase.as_str(), next_step
+            "A move of this warehouse's origin to \"{}\" has not finished (it was {} when it stopped), \
+            so nothing fetches, talks to the remote or changes what the move checks until it does. {}",
+            intent.target, intent.phase.as_str(), next_step
         ),
         next_step,
     )
 }
 
-/// Refuse while a move's intent is recorded, for a command about to fetch or talk to the remote,
-/// before it does. Lock-free, so a writer re-checks in its own hold ([`refuse_if_pending`]).
+/// The `origin_move_pending` refusal for a damaged intent, `what` being the rest of a sentence
+/// opening with its path: read as a move that may have started rewriting, so no abort clears it.
+fn damaged_refusal(what: &str) -> CoreError {
+    let next_step = "Finish the move with \"forklift remote move <url>\", naming the server it was \
+        moving to; it may have started rewriting the origin, so it cannot be abandoned.";
+
+    CoreError::refusal(
+        RefusalCode::OriginMovePending,
+        format!(
+            "{} It records a move of this warehouse's origin, and how far that move got cannot be \
+            told, so nothing fetches, talks to the remote or changes what the move checks until a \
+            move finishes. {}",
+            damaged_message(what), next_step
+        ),
+        next_step,
+    )
+}
+
+/// Refuse while a move's intent is recorded, or a damaged one, for a command about to fetch or
+/// talk to the remote, before it does. Lock-free, so a writer re-checks in its own hold
+/// ([`refuse_if_pending`]).
 pub fn ensure_none_pending() -> Result<(), CoreError> {
-    match read_intent()? {
-        Some(intent) => Err(pending_refusal(intent.phase)),
-        None => Ok(()),
+    match read_recorded()? {
+        Recorded::Absent => Ok(()),
+        Recorded::Intent(intent) => Err(pending_refusal(&intent)),
+        Recorded::Damaged(what) => Err(damaged_refusal(&what)),
     }
 }
 
@@ -266,7 +326,7 @@ pub fn refuse_if_pending(_lock: &RefLock) -> Result<(), String> {
 pub fn begin_for_tests(phase: Phase) -> MoveToken {
     let move_lock = MoveLock::try_acquire().unwrap().expect("no move runs in a test fixture");
     let lock = RefLock::acquire().unwrap();
-    let (token, _) = begin(&move_lock, &lock).unwrap();
+    let (token, _) = begin(&move_lock, &lock, "http://new-origin.example").unwrap();
 
     if phase == Phase::Rewriting {
         set_rewriting(&lock, &token).unwrap();
@@ -309,11 +369,13 @@ mod tests {
     }
 
     /// A move records a checking intent; a second move, once the first is gone, replaces a
-    /// checking one with its own token and adopts a rewriting one with its phase; a failure and an
-    /// abort clear only a checking intent, and a completed move clears either.
+    /// checking one with its own token and adopts a rewriting one with its phase and the second
+    /// move's target; a failure and an abort clear only a checking intent, and a completed move
+    /// clears either. A damaged intent is taken over as rewriting, and an abort keeps it.
     ///
     /// Revert: replace a rewriting intent in `begin` → the adoption row gets a new token in the
-    /// checking phase; or let `abandon`/`abort` clear a rewriting intent → it is gone.
+    /// checking phase; or let `abandon`/`abort` clear a rewriting intent → it is gone; or read a
+    /// damaged intent as checking → the takeover row starts checking.
     #[test]
     fn a_move_owns_its_intent_and_a_rewriting_one_is_never_downgraded() {
         let _scratch = Scratch::new("own");
@@ -327,7 +389,7 @@ mod tests {
         let move_lock = MoveLock::try_acquire().unwrap().unwrap();
         assert!(MoveLock::try_acquire().unwrap().is_none(), "a second move refuses on the lock");
         let lock = RefLock::acquire().unwrap();
-        let (second, phase) = begin(&move_lock, &lock).unwrap();
+        let (second, phase) = begin(&move_lock, &lock, "http://second.example").unwrap();
         assert_eq!(phase, Phase::Checking);
         assert_ne!(second, first, "a replaced intent gets a new token");
         assert!(set_rewriting(&lock, &first).is_err(), "the replaced move no longer owns it");
@@ -335,22 +397,34 @@ mod tests {
 
         set_rewriting(&lock, &second).unwrap();
         assert_eq!(abandon(&lock, &second).unwrap(), false, "a failure keeps a rewriting intent");
-        assert_eq!(abort(&move_lock, &lock).unwrap(), Some(Phase::Rewriting));
+        assert_eq!(abort(&move_lock, &lock).unwrap().map(|intent| intent.phase), Some(Phase::Rewriting));
         assert_eq!(read_intent().unwrap().unwrap().phase, Phase::Rewriting, "an abort keeps it too");
 
-        let (adopted, phase) = begin(&move_lock, &lock).unwrap();
+        let (adopted, phase) = begin(&move_lock, &lock, "http://third.example").unwrap();
         assert_eq!((adopted.0.as_str(), phase), (second.0.as_str(), Phase::Rewriting), "adopted with its phase");
+        assert_eq!(read_intent().unwrap().unwrap().target, "http://third.example", "and this move's target");
 
         finish(&lock, &adopted).unwrap();
         assert_eq!(read_intent().unwrap(), None);
 
-        let (third, _) = begin(&move_lock, &lock).unwrap();
+        let (third, _) = begin(&move_lock, &lock, "http://third.example").unwrap();
         assert_eq!(abandon(&lock, &third).unwrap(), true, "a failure clears a checking intent");
         assert_eq!(read_intent().unwrap(), None);
-        begin(&move_lock, &lock).unwrap();
-        assert_eq!(abort(&move_lock, &lock).unwrap(), Some(Phase::Checking));
+        begin(&move_lock, &lock, "http://third.example").unwrap();
+        assert_eq!(abort(&move_lock, &lock).unwrap().map(|intent| intent.phase), Some(Phase::Checking));
         assert_eq!(read_intent().unwrap(), None);
         assert_eq!(abort(&move_lock, &lock).unwrap(), None);
+
+        // No one can tell how far the move behind a damaged intent got: an abort keeps it, naming
+        // the move that finishes it, and the next move takes it over as rewriting.
+        std::fs::write(intent_path(), record_utils::to_bytes(RECORD, VERSION, ["token ab"])).unwrap();
+        let kept = abort(&move_lock, &lock).unwrap_err();
+        assert!(kept.contains("remote move <url>") && kept.contains(FILE_NAME), "{}", kept);
+        assert_eq!(refusal_code(kept), Some(RefusalCode::OriginMovePending));
+        assert!(read_intent().is_err(), "the abort keeps a damaged intent");
+        let (_, phase) = begin(&move_lock, &lock, "http://fourth.example").unwrap();
+        assert_eq!(phase, Phase::Rewriting);
+        assert_eq!(read_intent().unwrap().unwrap().phase, Phase::Rewriting);
     }
 
     /// Under an intent in either phase, every writer of a record a move checks refuses with
@@ -457,9 +531,10 @@ mod tests {
     }
 
     /// The funnel check passes with no intent and refuses with `origin_move_pending` in either
-    /// phase, through a `String`; a damaged intent is an error, never no intent.
+    /// phase, through a `String`, naming the move's target; a damaged intent refuses the same way,
+    /// naming its file, never reading as no intent.
     ///
-    /// Revert: read a file that does not parse as `Ok(None)` → the damaged rows pass the check.
+    /// Revert: read a file that does not parse as no intent → the damaged rows pass the check.
     #[test]
     fn the_funnel_check_refuses_under_any_intent_and_a_damaged_one() {
         let _scratch = Scratch::new("funnel");
@@ -471,7 +546,7 @@ mod tests {
             let token = begin_for_tests(phase);
             let lock = RefLock::acquire().unwrap();
             let error = refuse_if_pending(&lock).unwrap_err();
-            assert!(error.contains(phase.as_str()), "{}", error);
+            assert!(error.contains(phase.as_str()) && error.contains("http://new-origin.example"), "{}", error);
             assert_eq!(refusal_code(error), Some(RefusalCode::OriginMovePending), "{:?}", phase);
             assert_eq!(ensure_none_pending().map_err(|e| e.to_string()).unwrap_err().contains("has not finished"), true);
             finish(&lock, &token).unwrap();
@@ -479,16 +554,17 @@ mod tests {
 
         let path = intent_path();
         for damaged in [
-            b"token ab\nphase checking\n".to_vec(),
-            record_utils::to_bytes(RECORD, VERSION, ["token ab"]),
-            record_utils::to_bytes(RECORD, VERSION, ["token zz", "phase checking"]),
-            record_utils::to_bytes(RECORD, VERSION, ["token ab", "phase done"]),
+            b"token ab\nphase checking\ntarget http://x\n".to_vec(),
+            record_utils::to_bytes(RECORD, VERSION, ["token ab", "phase checking"]),
+            record_utils::to_bytes(RECORD, VERSION, ["token zz", "phase checking", "target http://x"]),
+            record_utils::to_bytes(RECORD, VERSION, ["token ab", "phase done", "target http://x"]),
+            record_utils::to_bytes(RECORD, VERSION, ["token ab", "phase checking", "target "]),
         ] {
             std::fs::write(&path, &damaged).unwrap();
             let lock = RefLock::acquire().unwrap();
             let error = refuse_if_pending(&lock).unwrap_err();
-            assert_eq!(refusal_code(error.clone()), None, "a damaged intent is an error: {}", error);
             assert!(error.contains(FILE_NAME), "{}", error);
+            assert_eq!(refusal_code(error), Some(RefusalCode::OriginMovePending), "a damaged intent refuses");
         }
     }
 }

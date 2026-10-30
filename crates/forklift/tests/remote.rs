@@ -6537,7 +6537,7 @@ fn assert_move_pending(area: &TestArea,
     let json = json_of(&refused);
     assert_eq!(json["error"]["code"], "origin_move_pending", "{:?}: {}", args, json);
     let message = json["error"]["message"].as_str().unwrap();
-    assert!(message.contains("remote move"), "{:?}: {}", args, message);
+    assert!(message.contains("remote move http://new-origin.example"), "{:?}: {}", args, message);
     assert_eq!(message.contains("--abort"), phase == forklift_core::util::origin_move::Phase::Checking,
         "{:?}: only a checking move can be abandoned: {}", args, message);
     assert!(forklift_dir_snapshot(area, directory) == before, "{:?} ({:?}) changes nothing", args, phase);
@@ -6551,8 +6551,8 @@ fn assert_move_pending(area: &TestArea,
 /// which removes no pallet under a move whether or not its head is already in the ledger. In a
 /// cache, `evict`, a read of a parcel it never fetched, and a forced delete refuse the same way.
 /// Each refusal is `origin_move_pending` (exit 37), changes nothing under `.forklift`, and offers
-/// `--abort` only while the move is still checking. Stacking, local reads and `heal` proceed; with
-/// the intent gone, the refused commands run again.
+/// `--abort` only while the move is still checking. Stacking, local reads and `heal` on an
+/// undamaged warehouse proceed; with the intent gone, the refused commands run again.
 ///
 /// Revert: drop the up-front check in `checked_remote` → the remote commands run (lower, the
 /// listing and the cache's read succeed) → red; drop the removal funnel → the forced delete

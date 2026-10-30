@@ -479,7 +479,7 @@ pub fn rebuild() -> Result<Option<Rebuilt>, String> {
 ///                         record's readers report, as [`rebuild`] leaves them to).
 /// * `Err(String)`       - If the rewrite fails. A rewrite that fails after its rename has still
 ///                         replaced the record, so the message says what the rewrite drops.
-fn rebuild_locked(_lock: &RefLock) -> Result<Option<Rebuilt>, String> {
+fn rebuild_locked(lock: &RefLock) -> Result<Option<Rebuilt>, String> {
     let path = sealed_path();
     let Ok(bytes) = std::fs::read(&path) else {
         return Ok(None);
@@ -489,7 +489,7 @@ fn rebuild_locked(_lock: &RefLock) -> Result<Option<Rebuilt>, String> {
         return Ok(None);
     };
 
-    origin_move::refuse_if_pending(_lock)?;
+    origin_move::refuse_if_pending(lock)?;
 
     let rebuilt = match valid_len {
         0 => header_bytes(),
@@ -526,14 +526,15 @@ pub fn append(ops: &[(SealOp, &str)]) -> Result<SealedSet, String> {
 /// crash may leave the record damaged.
 ///
 /// # Arguments
-/// * `_lock` - The held ref lock, which orders this write against every other.
-/// * `ops`   - What to record and remove, in order. None writes nothing.
+/// * `lock` - The held ref lock, which orders this write against every other.
+/// * `ops`  - What to record and remove, in order. None writes nothing.
 ///
 /// # Returns
 /// * `Ok(SealedSet)` - The set the record now replays to.
 /// * `Err(String)`   - If a hash is not an object hash, the record cannot be read or parsed, an
-///                     entry would be added where no origin is recorded, or the write fails.
-///                     Nothing is written in the first three cases. A failed
+///                     entry would be added where no origin is recorded, a move of the origin
+///                     is pending (`origin_move_pending`), or the write fails. Nothing is
+///                     written in the first four cases. A failed
 ///                     write may still have landed: some of its frames whole (and perhaps a
 ///                     torn one, which the next write drops), or the whole new record when the
 ///                     create failed after its rename. Read the record back to learn which.
@@ -619,7 +620,7 @@ enum Entries {
 /// [`append_locked`] with the ops decided from the set the record replays to when it is re-read
 /// under the lock, so a decision about what is recorded is made on what is recorded.
 fn append_decided_locked(
-    _lock: &RefLock,
+    lock: &RefLock,
     entries: Entries,
     decide: impl FnOnce(&SealedSet) -> Result<Vec<(SealOp, String)>, String>,
 ) -> Result<SealedSet, String> {
@@ -663,7 +664,7 @@ fn append_decided_locked(
         return Ok(set);
     }
 
-    origin_move::refuse_if_pending(_lock)?;
+    origin_move::refuse_if_pending(lock)?;
 
     match rewrite_from {
         Some(mut prefix) => {
@@ -729,7 +730,7 @@ pub fn compact_locked(lock: &RefLock) -> Result<SealedSet, String> {
 /// * `Ok((SealedSet, Vec<String>))` - The set the record replays to now, and the hashes of `drop`
 ///                                    it held and no longer does, sorted.
 /// * `Err(String)`                  - As [`compact_locked`].
-fn rewrite_locked(_lock: &RefLock, drop: &HashSet<String>) -> Result<(SealedSet, Vec<String>), String> {
+fn rewrite_locked(lock: &RefLock, drop: &HashSet<String>) -> Result<(SealedSet, Vec<String>), String> {
     let path = sealed_path();
     let Some((bytes, mut parsed)) = read_record(&path)? else {
         return Ok((SealedSet::default(), Vec::new()));
@@ -749,7 +750,7 @@ fn rewrite_locked(_lock: &RefLock, drop: &HashSet<String>) -> Result<(SealedSet,
     compacted.extend(encode_frames(&ops)?.concat());
 
     if compacted != bytes {
-        origin_move::refuse_if_pending(_lock)?;
+        origin_move::refuse_if_pending(lock)?;
         file_utils::replace_file_atomically(&path, &compacted)?;
     }
 
