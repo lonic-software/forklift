@@ -48,7 +48,7 @@ Every tool `forklift mcp` serves, generated from the same command definition the
 | `manifest_provenance` | `forklift manifest provenance` | Record how a parcel was produced: model, tool, session (AI provenance) | `revision` (a string, required)<br>`model` (a string, required)<br>`tool` (set by the server)<br>`session` (set by the server)<br>`transcript` (a string)<br>`message` (a string) |
 | `manifest_show` | `forklift manifest show` | Show the manifest entries attached to a parcel | `revision` (a string, required) |
 | `office_list` | `forklift office list` | List the users and their keys (the default) |  |
-| `palletize` | `forklift palletize` | Create a new pallet (branch) and shift to it; without a name, list the pallets | `name` (a string)<br>`revision` (a string)<br>`all` (a boolean)<br>`delete` (a boolean)<br>`force` (a boolean)<br>`restore` (a boolean) |
+| `palletize` | `forklift palletize` | Create a new pallet (branch) and shift to it; without a name, list the pallets | `name` (a string)<br>`revision` (a string)<br>`all` (a boolean)<br>`remote` (a boolean)<br>`delete` (a boolean)<br>`force` (a boolean)<br>`restore` (a boolean) |
 | `park` | `forklift park` | Park the work in progress and reset to the pallet head |  |
 | `park_pop` | `forklift park pop` | Re-apply the most recently parked changes (staged) and drop them from the list |  |
 | `park_list` | `forklift park list` | List the parked parcels, newest first |  |
@@ -101,9 +101,10 @@ Each of these commands, and every command below it, is a tool for nobody: a pers
 - `forklift help`: meta.
 - `forklift version`: meta.
 
-These arguments are left out of their tool:
+These arguments are refused together, though each is served alone:
 
-- `remote` of `forklift palletize`: acts on the remote's pallets, which every clone shares: an admin's call, never a sub-agent's.
+- `remote` with `delete` of `forklift palletize`: deletes the remote's pallet, which every clone shares: an admin's call, never a sub-agent's.
+- `remote` with `restore` of `forklift palletize`: restores the remote's pallet, which every clone shares: an admin's call, never a sub-agent's.
 
 These families' bare form runs the same operation as one of their subcommands, so only the subcommand is a tool:
 

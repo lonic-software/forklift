@@ -1643,7 +1643,7 @@ mod tests {
 
         // A combination no agent passes is refused, and each of its arguments still works alone
         // or with others; the description names it.
-        let palletize = tool("palletize");
+        let (palletize, remote) = (tool("palletize"), "remote");
         for allowed in [json!({ "remote": true }), json!({ "name": "p", "delete": true }),
                         json!({ "name": "p", "restore": true }), json!({ "remote": true, "all": true }),
                         json!({ "name": "p", "delete": true, "remote": false })] {
@@ -1651,10 +1651,10 @@ mod tests {
         }
         for combination in ["delete", "restore"] {
             let refusal = palletize.refusal(&json!({ "name": "p", "remote": true, combination: true })).unwrap();
-            assert!(refusal.starts_with(&format!("the \"palletize\" tool refuses \"remote\" with \"{combination}\" together: that ")),
+            assert!(refusal.starts_with(&format!("the \"palletize\" tool refuses \"{remote}\" with \"{combination}\" together: that ")),
                     "{refusal}");
             let description = palletize.definition()["description"].as_str().unwrap().to_string();
-            assert!(description.contains(&format!("An agent may not pass \"remote\" with \"{combination}\" together")), "{description}");
+            assert!(description.contains(&format!("An agent may not pass \"{remote}\" with \"{combination}\" together")), "{description}");
         }
 
         // The one-line description leads, so its git name survives, and the long one follows.
@@ -1701,10 +1701,10 @@ mod tests {
         assert!(refused(cli().mut_subcommand("history", |history| history.mut_arg("limit", |limit| limit.long("max"))))
             .contains("a tool table names `limit` of"));
         assert!(refused(cli().subcommand(clap::Command::new("mute"))).ends_with("has no description"));
-        assert!(refused(cli().mut_subcommand("palletize", |palletize| palletize.mut_arg("remote", |remote| remote.hide(true))))
-            .starts_with("HUMAN_ONLY_TOGETHER names `remote` of `palletize`"));
-        assert!(refused(cli().mut_subcommand("palletize", |palletize| palletize.hide(true)))
-            .starts_with("HUMAN_ONLY_TOGETHER names `palletize`"));
+        let error = refused(cli().mut_subcommand("palletize", |palletize| palletize.mut_arg("remote", |remote| remote.hide(true))));
+        assert!(error.starts_with("HUMAN_ONLY_TOGETHER names") && error.ends_with("which is not an argument of its tool"), "{error}");
+        let error = refused(cli().mut_subcommand("palletize", |palletize| palletize.hide(true)));
+        assert!(error.starts_with("HUMAN_ONLY_TOGETHER names") && error.ends_with("which is not a tool"), "{error}");
         assert!(refused(cli().subcommand(clap::Command::new("signed").about("Signed")
             .arg(clap::Arg::new("depth").long("depth").value_parser(clap::value_parser!(i64)))))
             .contains("parses a number the tool schema has no type for"));
