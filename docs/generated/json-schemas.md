@@ -5107,7 +5107,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "integer"
     },
     "unsealed": {
-      "description": "Kept objects an earlier eviction had recorded as held by hash, and a read had fetched again,\nwhose record this run removed (`0` on a dry run).",
+      "description": "Kept objects an earlier eviction had recorded as held by hash, and a read had fetched again,\nwhose record this run removed (on a dry run, would remove).",
       "format": "uint",
       "minimum": 0,
       "type": "integer"

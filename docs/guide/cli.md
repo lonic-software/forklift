@@ -1898,7 +1898,8 @@ a haul, a deleted pallet) stays, and the report counts it (`not_held`): lift tha
 It keeps every checkout's files (the base tree of the main checkout and of each bay,
 `kept_for_checkouts`), every meta pallet in full, the trust records, staged work, and what a parked
 stash, an unfinished consolidation or cherry-pick needs (`kept_local`). A kept object that an
-earlier eviction recorded as held by hash and a later read fetched again has that record removed.
+earlier eviction recorded as held by hash and a later read fetched again has that record removed
+(`unsealed`).
 An object the origin's history reaches that is missing here without a record is damage, not an
 eviction: `evict` refuses, changing nothing, and names it; run `heal`, then `evict` again.
 

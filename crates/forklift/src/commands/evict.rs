@@ -61,7 +61,7 @@ pub async fn handle_command(dry_run: bool) -> Result<(), String> {
         not_held: plan.not_held,
         still_packed: plan.still_packed,
         heads_not_lowered: plan.heads_not_lowered,
-        unsealed: stats.as_ref().map_or(0, |stats| stats.unsealed),
+        unsealed: stats.as_ref().map_or(plan.to_unseal.len(), |stats| stats.unsealed),
     });
 
     Ok(())
@@ -110,7 +110,7 @@ pub(crate) struct EvictReport {
     heads_not_lowered: usize,
 
     /// Kept objects an earlier eviction had recorded as held by hash, and a read had fetched again,
-    /// whose record this run removed (`0` on a dry run).
+    /// whose record this run removed (on a dry run, would remove).
     unsealed: usize,
 }
 
@@ -118,12 +118,18 @@ impl CommandOutput for EvictReport {
     fn render_human(&self) {
         if self.dry_run {
             println!("Dry run: evicting would free {} object(s).", self.would_evict);
-        } else if self.evicted == 0 && self.unsealed == 0 {
-            println!("Nothing to evict.");
         } else if self.evicted == 0 {
-            println!("Nothing to evict; {} kept object(s) are no longer recorded as held by hash.", self.unsealed);
+            println!("Nothing to evict.");
         } else {
             println!("Evicted {} object(s); reading one fetches it again from the origin.", self.evicted);
+        }
+
+        if self.unsealed > 0 {
+            println!(
+                "{} kept object(s) {} recorded as held by hash.",
+                self.unsealed,
+                if self.dry_run { "would no longer be" } else { "are no longer" }
+            );
         }
 
         if self.kept_for_checkouts > 0 {

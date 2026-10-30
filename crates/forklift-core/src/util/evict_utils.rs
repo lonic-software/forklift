@@ -366,8 +366,12 @@ fn walk_local(parcels: &[String], held: &HashSet<String>) -> Result<LocalClosure
     }
 
     while let Some((hash, root)) = queue.pop() {
-        if held.contains(&hash) || !seen.insert(hash.clone()) {
-            // A root the held walk or another parcel reached as a subtree was not checked as one.
+        if !seen.insert(hash.clone()) {
+            continue;
+        }
+
+        if held.contains(&hash) {
+            // A root the held walk reached as a subtree was not checked as one.
             if root {
                 note_meta_root(&hash, &mut closure.meta_roots)?;
             }
