@@ -236,7 +236,7 @@ fn harvest(warehouse: &Path) -> Harvest {
 /// Configure an operator in a fresh warehouse dir (prepare + identity).
 fn prepare(area: &Area, dir: &str) {
     area.forklift(dir, &["prepare"]);
-    area.forklift(dir, &["config", "--global", "operator.identifier", "tester@forklift"]);
+    area.forklift(dir, &["config", "set", "--global", "operator.identifier", "tester@forklift"]);
 }
 
 /// Upload every harvested object and signature to the head (the direct-store path
@@ -673,9 +673,9 @@ fn a_tag_is_admitted_only_from_an_admin_of_the_held_office() {
 
     // A second identity in the same warehouse, admitted as an admin, tags a release.
     let worker = "worker@forklift";
-    area.forklift("wh", &["config", "operator.identifier", worker]);
+    area.forklift("wh", &["config", "set", "operator.identifier", worker]);
     let keygen = area.forklift_stdout("wh", &["office", "keygen"]);
-    area.forklift("wh", &["config", "operator.identifier", "tester@forklift"]);
+    area.forklift("wh", &["config", "set", "operator.identifier", "tester@forklift"]);
     let mut admit: Vec<&str> = keygen.lines()
         .find(|line| line.trim_start().starts_with("office admit "))
         .expect("keygen prints the admit line")
@@ -684,9 +684,9 @@ fn a_tag_is_admitted_only_from_an_admin_of_the_held_office() {
     admit.extend(["--role", "admin"]);
     area.forklift("wh", &admit);
 
-    area.forklift("wh", &["config", "operator.identifier", worker]);
+    area.forklift("wh", &["config", "set", "operator.identifier", worker]);
     area.forklift("wh", &["tag", "create", "v1.0", "main"]);
-    area.forklift("wh", &["config", "operator.identifier", "tester@forklift"]);
+    area.forklift("wh", &["config", "set", "operator.identifier", "tester@forklift"]);
 
     let before = harvest(&area.path("wh"));
     let office_wire = format!("@{}", OFFICE_PALLET_NAME);
@@ -734,9 +734,9 @@ fn a_haul_merge_is_admitted_only_from_a_writer_of_its_target() {
     let id = serde_json::from_str::<serde_json::Value>(&opened).unwrap()["data"]["id"].as_str().unwrap().to_string();
 
     let worker = "worker@forklift";
-    area.forklift("wh", &["config", "operator.identifier", worker]);
+    area.forklift("wh", &["config", "set", "operator.identifier", worker]);
     let keygen = area.forklift_stdout("wh", &["office", "keygen"]);
-    area.forklift("wh", &["config", "operator.identifier", "tester@forklift"]);
+    area.forklift("wh", &["config", "set", "operator.identifier", "tester@forklift"]);
     let admit: Vec<&str> = keygen.lines()
         .find(|line| line.trim_start().starts_with("office admit "))
         .expect("keygen prints the admit line")
@@ -744,9 +744,9 @@ fn a_haul_merge_is_admitted_only_from_a_writer_of_its_target() {
         .collect();
     area.forklift("wh", &admit);
 
-    area.forklift("wh", &["config", "operator.identifier", worker]);
+    area.forklift("wh", &["config", "set", "operator.identifier", worker]);
     area.forklift("wh", &["haul", "consolidate", &id]);
-    area.forklift("wh", &["config", "operator.identifier", "tester@forklift"]);
+    area.forklift("wh", &["config", "set", "operator.identifier", "tester@forklift"]);
 
     let before = harvest(&area.path("wh"));
     let office_wire = format!("@{}", OFFICE_PALLET_NAME);
@@ -784,9 +784,9 @@ fn a_writer_promoting_themselves_is_forbidden_and_an_admin_promoting_them_is_not
     area.forklift("wh", &["office", "enroll"]);
 
     let worker = "worker@forklift";
-    area.forklift("wh", &["config", "operator.identifier", worker]);
+    area.forklift("wh", &["config", "set", "operator.identifier", worker]);
     let keygen = area.forklift_stdout("wh", &["office", "keygen"]);
-    area.forklift("wh", &["config", "operator.identifier", "tester@forklift"]);
+    area.forklift("wh", &["config", "set", "operator.identifier", "tester@forklift"]);
     let mut admit: Vec<&str> = keygen.lines()
         .find(|line| line.trim_start().starts_with("office admit "))
         .expect("keygen prints the admit line")
@@ -2813,9 +2813,9 @@ fn a_grant_revoked_between_the_move_gate_and_the_commit_refuses_the_move() {
     area.forklift("wh", &["office", "enroll"]);
 
     let writer = "wes@forklift";
-    area.forklift("wh", &["config", "operator.identifier", writer]);
+    area.forklift("wh", &["config", "set", "operator.identifier", writer]);
     let keygen = area.forklift_stdout("wh", &["office", "keygen"]);
-    area.forklift("wh", &["config", "operator.identifier", "tester@forklift"]);
+    area.forklift("wh", &["config", "set", "operator.identifier", "tester@forklift"]);
     let admit: Vec<&str> = keygen.lines()
         .find(|line| line.trim_start().starts_with("office admit "))
         .expect("keygen prints the admit line")
@@ -4286,9 +4286,9 @@ fn a_delete_of_unknown_fate_is_settled_by_the_ref() {
 /// Enroll `identifier` in `dir`'s office with `role_args` (`office role`'s arguments after the
 /// identifier), from a key generated under that identifier, then switch back to the admin.
 fn enroll(area: &Area, dir: &str, identifier: &str, role_args: &[&str]) {
-    area.forklift(dir, &["config", "operator.identifier", identifier]);
+    area.forklift(dir, &["config", "set", "operator.identifier", identifier]);
     let keygen = area.forklift_stdout(dir, &["office", "keygen"]);
-    area.forklift(dir, &["config", "operator.identifier", "tester@forklift"]);
+    area.forklift(dir, &["config", "set", "operator.identifier", "tester@forklift"]);
 
     let admit: Vec<&str> = keygen.lines()
         .find(|line| line.trim_start().starts_with("office admit "))

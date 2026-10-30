@@ -234,7 +234,7 @@ impl Fixture {
 
         let git = area.path("git.git");
         git_ok(&area.root, &["init", "-q", "--bare", "git.git"]);
-        area.forklift_ok("a", &["config", "mirror.url", git.to_str().unwrap()]);
+        area.forklift_ok("a", &["config", "set", "mirror.url", git.to_str().unwrap()]);
 
         Fixture { area, server, git, first }
     }
@@ -257,8 +257,8 @@ fn prepare_warehouse(area: &TestArea, name: &str, remote_url: &str) {
     std::fs::create_dir_all(area.path(name)).unwrap();
 
     area.forklift_ok(name, &["prepare"]);
-    area.forklift_ok(name, &["config", "--global", "operator.identifier", "tester@forklift"]);
-    area.forklift_ok(name, &["config", "remote.url", remote_url]);
+    area.forklift_ok(name, &["config", "set", "--global", "operator.identifier", "tester@forklift"]);
+    area.forklift_ok(name, &["config", "set", "remote.url", remote_url]);
 }
 
 /// The one outcome of a `--json mirror` run that succeeded, for `pallet`.
@@ -424,13 +424,13 @@ fn git_already_ahead_after_a_race_the_mirror_lacks_ends_already_ahead() {
     let area = &fixture.area;
 
     fixture.franchise("b");
-    area.forklift_ok("b", &["config", "mirror.url", fixture.git.to_str().unwrap()]);
+    area.forklift_ok("b", &["config", "set", "mirror.url", fixture.git.to_str().unwrap()]);
     area.stack("b", "code.txt", "from b\n", "later");
 
     // Create the mirror repository, with nothing yet on git.
-    area.forklift_ok("a", &["config", "mirror.pallets", "none-yet"]);
+    area.forklift_ok("a", &["config", "set", "mirror.pallets", "none-yet"]);
     area.forklift_ok("a", &["git", "mirror"]);
-    area.forklift_ok("a", &["config", "mirror.pallets", "main"]);
+    area.forklift_ok("a", &["config", "set", "mirror.pallets", "main"]);
 
     install_hook(&fixture.mirror_dir("a"), "reference-transaction", &format!(
         "[ \"$1\" = committed ] || exit 0\ngrep -q refs/forklift/exported/main || exit 0\n\
@@ -468,9 +468,9 @@ fn a_race_to_a_tip_the_mirror_holds_ends_already_ahead() {
     area.lift("a");
     area.forklift_ok("a", &["shift", "main"]);
 
-    area.forklift_ok("a", &["config", "mirror.pallets", "feat"]);
+    area.forklift_ok("a", &["config", "set", "mirror.pallets", "feat"]);
     area.forklift_ok("a", &["git", "mirror"]);
-    area.forklift_ok("a", &["config", "mirror.pallets", "main"]);
+    area.forklift_ok("a", &["config", "set", "mirror.pallets", "main"]);
 
     // B moves the remote's main to feat's head, ready to lift.
     fixture.franchise("b");
@@ -636,9 +636,9 @@ fn a_repeated_parent_mirrors_on_every_run() {
     git_ok(&source, &["branch", "feat", &a]);
 
     area.forklift_ok("source", &["prepare"]);
-    area.forklift_ok("source", &["config", "--global", "operator.identifier", "tester@forklift"]);
+    area.forklift_ok("source", &["config", "set", "--global", "operator.identifier", "tester@forklift"]);
     area.forklift_ok("source", &["git", "import", "."]);
-    area.forklift_ok("source", &["config", "remote.url", &server.url]);
+    area.forklift_ok("source", &["config", "set", "remote.url", &server.url]);
     let main = area.lift("source")["head"].as_str().unwrap().to_string();
     area.forklift_ok("source", &["shift", "feat"]);
     area.lift("source");
@@ -652,12 +652,12 @@ fn a_repeated_parent_mirrors_on_every_run() {
 
     let git = area.path("git.git");
     git_ok(&area.root, &["init", "-q", "--bare", "git.git"]);
-    area.forklift_ok("source", &["config", "mirror.url", git.to_str().unwrap()]);
-    area.forklift_ok("source", &["config", "mirror.pallets", "main"]);
+    area.forklift_ok("source", &["config", "set", "mirror.url", git.to_str().unwrap()]);
+    area.forklift_ok("source", &["config", "set", "mirror.pallets", "main"]);
     area.forklift_ok("source", &["git", "mirror"]);
 
     // feat's head lies below the merge, so this run descends through it from main's export.
-    area.forklift_ok("source", &["config", "mirror.pallets", "main,feat"]);
+    area.forklift_ok("source", &["config", "set", "mirror.pallets", "main,feat"]);
     let report = area.json("source", &["git", "mirror"]);
     assert_eq!(outcome(&report, "feat")["status"], "pushed", "{}", report);
     assert_eq!(outcome(&report, "feat")["exported"], 0, "{}", report);
@@ -763,7 +763,7 @@ fn a_lift_reports_an_unreachable_mirror_without_failing() {
     let area = &fixture.area;
 
     let missing = area.path("missing.git");
-    area.forklift_ok("a", &["config", "mirror.url", missing.to_str().unwrap()]);
+    area.forklift_ok("a", &["config", "set", "mirror.url", missing.to_str().unwrap()]);
     area.stack("a", "code.txt", "v2\n", "second");
     let lifted = area.lift("a");
     assert_eq!(lifted["mirror"]["status"], "failed", "{}", lifted);
@@ -783,7 +783,7 @@ fn a_lift_reports_an_unreachable_mirror_without_failing() {
         }
     });
 
-    area.forklift_ok("a", &["config", "mirror.url", &url]);
+    area.forklift_ok("a", &["config", "set", "mirror.url", &url]);
     area.stack("a", "code.txt", "v3\n", "third");
     let started = std::time::Instant::now();
     let lifted = area.lift("a");
@@ -882,7 +882,7 @@ fn a_failed_meta_pallet_lift_runs_no_mirror() {
     let proxy = RefusingProxy::start(&fixture.server.url, |request| {
         request.starts_with("POST ") && (request.contains("/v1/pallets/@manifest") || request.contains("/v1/pallets/%40manifest"))
     });
-    area.forklift_ok("a", &["config", "remote.url", &proxy.url]);
+    area.forklift_ok("a", &["config", "set", "remote.url", &proxy.url]);
 
     let lifted = area.forklift("a", &["lift"]);
     assert!(!lifted.status.success(), "{}", stdout(&lifted));
@@ -928,7 +928,7 @@ fn a_busy_mirror_is_reported_and_a_killed_holder_releases_it() {
     let area = &fixture.area;
 
     area.forklift_ok("a", &["git", "mirror"]);
-    area.forklift_ok("a", &["config", "mirror.auto", "off"]);
+    area.forklift_ok("a", &["config", "set", "mirror.auto", "off"]);
     area.stack("a", "code.txt", "v2\n", "second");
     area.lift("a");
     let bay = area.path("bay");
@@ -975,7 +975,7 @@ fn unmirrorable_pallets_are_skipped_without_refs() {
     area.lift("a");
     area.forklift_ok("a", &["shift", "main"]);
 
-    area.forklift_ok("a", &["config", "mirror.pallets", "ghost,feature.lock"]);
+    area.forklift_ok("a", &["config", "set", "mirror.pallets", "ghost,feature.lock"]);
     let report = area.json("a", &["git", "mirror"]);
     assert_eq!(outcome(&report, "ghost")["status"], "skipped", "{}", report);
     assert_eq!(outcome(&report, "feature.lock")["status"], "skipped", "{}", report);
@@ -1003,7 +1003,7 @@ fn a_fast_forward_to_another_pallet_is_a_divergence() {
     let feat = tip(&fixture.git, "feat").unwrap();
     git_ok(&fixture.git, &["push", "-q", ".", "refs/heads/feat:refs/heads/main"]);
 
-    area.forklift_ok("a", &["config", "mirror.pallets", "main"]);
+    area.forklift_ok("a", &["config", "set", "mirror.pallets", "main"]);
     let refused = area.forklift("a", &["git", "mirror"]);
     assert!(!refused.status.success(), "{}", stdout(&refused));
     assert!(stderr(&refused).contains(&feat) && stderr(&refused).contains("not part of this warehouse's export"),
@@ -1048,11 +1048,11 @@ fn a_relative_url_is_read_from_the_warehouse_root() {
     let fixture = Fixture::new("relative");
     let area = &fixture.area;
 
-    area.forklift_ok("a", &["config", "mirror.url", "../git.git"]);
+    area.forklift_ok("a", &["config", "set", "mirror.url", "../git.git"]);
     let report = area.json("a", &["git", "mirror"]);
     assert_eq!(outcome(&report, "main")["status"], "pushed", "{}", report);
 
-    area.forklift_ok("a", &["config", "mirror.auto", "off"]);
+    area.forklift_ok("a", &["config", "set", "mirror.auto", "off"]);
     area.stack("a", "code.txt", "v2\n", "second");
     let second = area.lift("a")["head"].as_str().unwrap().to_string();
     let bay = area.path("bay");
@@ -1095,7 +1095,7 @@ fn a_race_that_ends_at_the_export_is_up_to_date() {
     let area = &fixture.area;
 
     area.forklift_ok("a", &["git", "mirror"]);
-    area.forklift_ok("a", &["config", "mirror.auto", "off"]);
+    area.forklift_ok("a", &["config", "set", "mirror.auto", "off"]);
     for version in ["v2", "v3", "v4"] {
         area.stack("a", "code.txt", &format!("{}\n", version), version);
         area.lift("a");
@@ -1104,11 +1104,11 @@ fn a_race_that_ends_at_the_export_is_up_to_date() {
     // Export the three new parcels elsewhere, and give git their commits off its branch.
     let scratch = area.path("scratch.git");
     git_ok(&area.root, &["init", "-q", "--bare", "scratch.git"]);
-    area.forklift_ok("a", &["config", "mirror.url", scratch.to_str().unwrap()]);
+    area.forklift_ok("a", &["config", "set", "mirror.url", scratch.to_str().unwrap()]);
     area.forklift_ok("a", &["git", "mirror"]);
     let export = tip(&scratch, "main").unwrap();
     git_ok(&scratch, &["push", "-q", fixture.git.to_str().unwrap(), "main:refs/held/main"]);
-    area.forklift_ok("a", &["config", "mirror.url", fixture.git.to_str().unwrap()]);
+    area.forklift_ok("a", &["config", "set", "mirror.url", fixture.git.to_str().unwrap()]);
 
     // Every push is declined while main moves one step closer, reaching the export on the third.
     install_hook(&fixture.git, "pre-receive", &format!(
@@ -1138,17 +1138,17 @@ fn an_exported_parcel_fetched_by_the_run_is_built_on() {
     let area = &fixture.area;
 
     fixture.franchise("b");
-    area.forklift_ok("a", &["config", "mirror.auto", "off"]);
+    area.forklift_ok("a", &["config", "set", "mirror.auto", "off"]);
     area.forklift_ok("a", &["pallet", "create", "feat"]);
     area.stack("a", "feat.txt", "feat\n", "feat only");
     area.lift("a");
-    area.forklift_ok("a", &["config", "mirror.pallets", "main,feat"]);
+    area.forklift_ok("a", &["config", "set", "mirror.pallets", "main,feat"]);
     let report = area.json("a", &["git", "mirror"]);
     assert_eq!(outcome(&report, "feat")["status"], "pushed", "{}", report);
 
     copy_dir(&fixture.mirror_dir("a"), &fixture.mirror_dir("b"));
-    area.forklift_ok("b", &["config", "mirror.url", fixture.git.to_str().unwrap()]);
-    area.forklift_ok("b", &["config", "mirror.pallets", "main,feat"]);
+    area.forklift_ok("b", &["config", "set", "mirror.url", fixture.git.to_str().unwrap()]);
+    area.forklift_ok("b", &["config", "set", "mirror.pallets", "main,feat"]);
 
     let report = area.json("b", &["git", "mirror"]);
     assert_eq!(outcome(&report, "feat")["status"], "up_to_date", "{}", report);
@@ -1177,12 +1177,12 @@ fn a_damaged_export_refuses_only_its_own_pallet() {
     let fixture = Fixture::new("damaged-one");
     let area = &fixture.area;
 
-    area.forklift_ok("a", &["config", "mirror.auto", "off"]);
+    area.forklift_ok("a", &["config", "set", "mirror.auto", "off"]);
     area.forklift_ok("a", &["pallet", "create", "feat"]);
     area.stack("a", "feat.txt", "feat\n", "feat only");
     area.lift("a");
     area.forklift_ok("a", &["shift", "main"]);
-    area.forklift_ok("a", &["config", "mirror.pallets", "main,feat"]);
+    area.forklift_ok("a", &["config", "set", "mirror.pallets", "main,feat"]);
     area.forklift_ok("a", &["git", "mirror"]);
 
     let mirror = fixture.mirror_dir("a");
@@ -1239,7 +1239,7 @@ fn a_head_the_anchor_does_not_vouch_for_is_never_exported() {
     area.lift("a");
 
     fixture.franchise("b");
-    area.forklift_ok("b", &["config", "mirror.url", fixture.git.to_str().unwrap()]);
+    area.forklift_ok("b", &["config", "set", "mirror.url", fixture.git.to_str().unwrap()]);
     area.forklift_ok("b", &["git", "mirror"]);
     let mirrored = tip(&fixture.git, "main").unwrap();
 

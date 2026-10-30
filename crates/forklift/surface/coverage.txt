@@ -27,6 +27,11 @@ forklift cherry-pick: <REVISION> -m/--message=<MESSAGE>
 forklift compact: --all --redelta
     -> forklift store compact: --all --redelta
 forklift config: -g/--global --unset [KEY] [VALUE]
+    -> forklift config:
+    -> forklift config list: -g/--global
+    -> forklift config get: -g/--global <KEY>
+    -> forklift config set: -g/--global <KEY> <VALUE>
+    -> forklift config unset: -g/--global <KEY>
 forklift conflicts:
 forklift consolidate: <PALLET>
 forklift deliver: <TARGET> -m/--message=<MESSAGE>
@@ -77,7 +82,8 @@ forklift mirror:
     -> forklift git mirror:
 forklift office:
 forklift office enroll: --offline --passphrase
-forklift office keygen: --passphrase
+forklift profile keygen: --passphrase
+    -> forklift profile keygen: [NAME] --passphrase
 forklift office admit: <OPERATOR_UUID> <PUBLIC_KEY_HEX> <PROOF_OF_POSSESSION_HEX> --role=<ROLE> --pallet=<PALLET>... --agent --bot --service --supervisor=<OPERATOR>
 forklift office link: <PUBLIC_KEY_HEX> <PROOF_OF_POSSESSION_HEX>
 forklift office authorize: <OPERATOR_UUID> <PUBLIC_KEY_HEX> <PROOF_OF_POSSESSION_HEX>
@@ -121,6 +127,8 @@ forklift evict: --dry-run
     -> forklift store evict: --dry-run
 forklift remote:
 forklift remote move: [URL] --token=<TOKEN> --abort
+    -> forklift remote move: <URL> --token=<TOKEN>
+    -> forklift remote abort:
 forklift store:
     -> forklift store:
     -> forklift store status:

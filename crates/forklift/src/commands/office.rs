@@ -26,7 +26,7 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
     if office_utils::read_trust_anchor()?.is_some() {
         return Err(
             "Trust is already established for this warehouse. Ask an enrolled operator \
-            to admit you: generate a keypair with \"forklift office keygen\" and hand them the \
+            to admit you: generate a keypair with \"forklift profile keygen\" and hand them the \
             public key.".to_string()
         );
     }
@@ -131,30 +131,6 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
         From now on every parcel stacked in this warehouse must be signed. This cannot \
         be undone (a lockout is handled by archiving and re-preparing the warehouse).",
         operator.identifier, genesis, key_id
-    ));
-
-    Ok(())
-}
-
-/// Generate a keypair locally and print the public half plus its proof-of-possession
-/// (the CSR of the enrollment flow, §8.6): the new key signs for the operator id
-/// itself, so an admission cannot enroll a key the operator does not control — nor
-/// attribute a consenting key to someone else.
-pub fn keygen(passphrase: bool) -> Result<(), String> {
-    let operator = config_utils::get_operator()?;
-    let (key_id, public_key) = generate_operator_key(&operator.identifier, passphrase)?;
-    let pop = office_utils::sign_key_pop(&key_id, &public_key, &operator.identifier)?;
-
-    output::message(format!(
-        "Generated a new keypair; the private key stays on this machine.\n\
-        Key id:      {key_id}\n\
-        Operator id: {identifier}\n\n\
-        To be admitted, hand an office admin this line:\n\
-        \x20 office admit {identifier} {public_key} {pop}\n\n\
-        To link this as another device of an identity already enrolled as {identifier}, run\n\
-        on a machine that holds one of its keys:\n\
-        \x20 office link {public_key} {pop}",
-        key_id = key_id, identifier = operator.identifier, public_key = public_key, pop = pop
     ));
 
     Ok(())
@@ -956,7 +932,7 @@ pub async fn accept_regenesis(confirm: Option<String>) -> Result<(), String> {
 /// # Returns
 /// * `Ok((String, String))` - The key id and public key (hex).
 /// * `Err(String)`          - If the passphrase could not be read, or the key stored.
-fn generate_operator_key(owner: &str, passphrase: bool) -> Result<(String, String), String> {
+pub(crate) fn generate_operator_key(owner: &str, passphrase: bool) -> Result<(String, String), String> {
     if passphrase {
         let passphrase = crate::passphrase::prompt_new()?;
         sign_utils::generate_keypair_encrypted(owner, &passphrase)

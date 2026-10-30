@@ -446,7 +446,7 @@ impl MirrorLock {
     }
 }
 
-/// The lock a move of a partial warehouse's origin holds for its whole run, and that its `--abort`
+/// The lock a move of a partial warehouse's origin holds for its whole run, and that `remote abort`
 /// takes too: the move's intent ([`origin_move`](crate::util::origin_move)) names one owner at a
 /// time, and a holder of this lock knows that any intent it finds belongs to a move that is no
 /// longer running.

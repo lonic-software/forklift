@@ -108,16 +108,16 @@ fn json(output: &Output) -> serde_json::Value {
 }
 
 fn configure_operator(warehouse: &TestWarehouse) {
-    assert_success(&warehouse.run(&["config", "--global", "operator.identifier", "test@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "--global", "operator.identifier", "test@forklift"]));
 }
 
 /// Generate a keypair for `operator_id` (switching the warehouse operator to it and back
 /// to the "test@forklift" admin) and return the printed admit args:
 /// `[operator_id, public_key, pop]`.
 fn keygen_admit_args(warehouse: &TestWarehouse, operator_id: &str) -> Vec<String> {
-    assert_success(&warehouse.run(&["config", "operator.identifier", operator_id]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", operator_id]));
     let keygen = stdout(&warehouse.run(&["office", "keygen"]));
-    assert_success(&warehouse.run(&["config", "operator.identifier", "test@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "test@forklift"]));
 
     keygen.lines()
         .find(|line| line.trim_start().starts_with("office admit "))
@@ -209,7 +209,7 @@ fn verified_query_filters_on_the_signer_never_the_recorded_author() {
     let warehouse = signed_warehouse_with_agent("query-two-phase");
 
     // An ordinary agent parcel: authored, stacked and signed by the agent.
-    assert_success(&warehouse.run(&["config", "operator.identifier", "agent@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "agent@forklift"]));
     warehouse.write_file("agent.txt", "by the agent\n");
     assert_success(&warehouse.run(&["load", "agent.txt"]));
     let agent_parcel = extract_parcel_hash(&warehouse.run(&["stack", "agent work"]));
@@ -217,14 +217,14 @@ fn verified_query_filters_on_the_signer_never_the_recorded_author() {
     // The forgery shape (the design's crux finding): a parcel whose *recorded* author is
     // the human but whose *signature* is the agent's key. A cherry-pick produces exactly
     // this — the original author rides along as a recorded action; the picker signs.
-    assert_success(&warehouse.run(&["config", "operator.identifier", "test@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "test@forklift"]));
     assert_success(&warehouse.run(&["pallet", "create", "drafts"]));
     warehouse.write_file("draft.txt", "human draft\n");
     assert_success(&warehouse.run(&["load", "draft.txt"]));
     let human_draft = extract_parcel_hash(&warehouse.run(&["stack", "human draft work"]));
     assert_success(&warehouse.run(&["shift", "main"]));
 
-    assert_success(&warehouse.run(&["config", "operator.identifier", "agent@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "agent@forklift"]));
     let pick = warehouse.run(&["pick", &human_draft]);
     assert_success(&pick);
     let picked = stdout(&pick)
@@ -235,7 +235,7 @@ fn verified_query_filters_on_the_signer_never_the_recorded_author() {
         .next()
         .unwrap()
         .to_string();
-    assert_success(&warehouse.run(&["config", "operator.identifier", "test@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "test@forklift"]));
 
     // Verified (the default): --class agent resolves the SIGNER. The picked parcel is
     // agent-signed, so it matches — even though its recorded author is the human. Pruning
@@ -681,7 +681,7 @@ fn signed_revoked_matches_carry_vouched_or_suspect_boundary() {
 
     // An agent-signed parcel that stays reachable from main's head straight through the
     // retirement below: this one will read "vouched".
-    assert_success(&warehouse.run(&["config", "operator.identifier", "agent@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "agent@forklift"]));
     warehouse.write_file("agent-main.txt", "agent main work\n");
     assert_success(&warehouse.run(&["load", "agent-main.txt"]));
     let vouched_parcel = extract_parcel_hash(&warehouse.run(&["stack", "agent main work"]));
@@ -701,7 +701,7 @@ fn signed_revoked_matches_carry_vouched_or_suspect_boundary() {
     // Retire the agent's key as the admin: the distrust boundary is every pallet head
     // vouched for right now — main and side both sit at `vouched_parcel` (side was just
     // reset back to it), so `suspect_parcel` (side's un-stacked child) falls outside it.
-    assert_success(&warehouse.run(&["config", "operator.identifier", "test@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "test@forklift"]));
     assert_success(&warehouse.run(&["office", "retire", &agent_key, "--offline"]));
 
     // The reachable agent-signed parcel: signed-revoked, and vouched.

@@ -717,7 +717,7 @@ impl ErrorCode {
                  origin to fetch it; the command works once the origin can be reached",
             ErrorCode::OriginMovePending =>
                 "A move of a partial warehouse's origin has not finished; \"forklift remote move <url>\" \
-                 finishes it, \"forklift remote move --abort\" abandons one that has not started rewriting",
+                 finishes it, \"forklift remote abort\" abandons one that has not started rewriting",
             ErrorCode::OriginMoveIncomplete =>
                 "The server a partial warehouse's origin was to move to lacks content the warehouse \
                  relies on its origin to hold; the origin was left where it was, and copying the old \

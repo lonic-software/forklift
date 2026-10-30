@@ -396,8 +396,8 @@ fn prepare_warehouse(area: &TestArea, name: &str, remote_url: &str) {
     std::fs::create_dir_all(area.path(name)).unwrap();
 
     assert_success(&area.forklift(name, &["prepare"]));
-    assert_success(&area.forklift(name, &["config", "--global", "operator.identifier", "tester@forklift"]));
-    assert_success(&area.forklift(name, &["config", "remote.url", remote_url]));
+    assert_success(&area.forklift(name, &["config", "set", "--global", "operator.identifier", "tester@forklift"]));
+    assert_success(&area.forklift(name, &["config", "set", "remote.url", remote_url]));
 }
 
 /// FORK-109, at the site the bug actually lived: `lift_pallet_inner`'s candidate loop.
@@ -892,7 +892,7 @@ fn lower_names_a_closed_batch_lane_and_a_healthy_lower_does_not() {
     assert_success(&area.forklift("a", &["lift"]));
 
     let proxy = BatchlessProxy::start(&server.url);
-    assert_success(&area.forklift("proxied", &["config", "remote.url", &proxy.url]));
+    assert_success(&area.forklift("proxied", &["config", "set", "remote.url", &proxy.url]));
 
     let fallback = "does not serve batch downloads";
 
@@ -1572,7 +1572,7 @@ fn tags_sync_hold_the_admin_rule_at_admission_and_never_move() {
     let server = Server::start_with_tokens(&area, Some("root"), "tokens.toml");
 
     prepare_warehouse(&area, "a", &server.url);
-    assert_success(&area.forklift("a", &["config", "remote.token", "root"]));
+    assert_success(&area.forklift("a", &["config", "set", "remote.token", "root"]));
     area.write_file("a/code.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "base"]));
@@ -1591,7 +1591,7 @@ fn tags_sync_hold_the_admin_rule_at_admission_and_never_move() {
 
     // The worker, an admin for now, tags and publishes a release; a second tag stays local.
     assert_success(&area.forklift(".", &["clone", &server.url, "b", "--token", "w-token"]));
-    assert_success(&area.forklift("b", &["config", "operator.identifier", worker_id]));
+    assert_success(&area.forklift("b", &["config", "set", "operator.identifier", worker_id]));
     assert_success(&area.forklift("b", &["tag", "create", "v1.0", "main", "-m", "release"]));
 
     // Before its first lift the remote has no @tags at all, so there is no side to keep.
@@ -2049,9 +2049,9 @@ fn a_rehost_refuses_a_merge_by_a_writer_since_ungranted_until_regranted() {
 
     let dev = keygen_admit_args(&area, "dev@forklift");
     assert_success(&area.forklift("a", &["office", "admit", &dev[0], &dev[1], &dev[2], "--role", "writer"]));
-    assert_success(&area.forklift("a", &["config", "operator.identifier", "dev@forklift"]));
+    assert_success(&area.forklift("a", &["config", "set", "operator.identifier", "dev@forklift"]));
     assert_success(&area.forklift("a", &["haul", "consolidate", &id]));
-    assert_success(&area.forklift("a", &["config", "operator.identifier", "tester@forklift"]));
+    assert_success(&area.forklift("a", &["config", "set", "operator.identifier", "tester@forklift"]));
     assert_success(&area.forklift("a", &["office", "role", "dev@forklift", "writer", "--pallet", "feat"]));
 
     let refused = area.forklift("a", &["lift"]);
@@ -2494,7 +2494,7 @@ fn a_token_protected_remote_requires_the_token() {
     assert!(!refused.status.success());
     assert!(stderr(&refused).contains("401"), "{}", stderr(&refused));
 
-    assert_success(&area.forklift("a", &["config", "remote.token", "sesame"]));
+    assert_success(&area.forklift("a", &["config", "set", "remote.token", "sesame"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     // Clone takes the token as a flag and remembers it in the configuration.
@@ -2502,7 +2502,7 @@ fn a_token_protected_remote_requires_the_token() {
     assert_success(&franchised);
     assert_eq!(area.read_file("b/secret.txt"), "locked\n");
 
-    let token_value = area.forklift("b", &["config", "remote.token"]);
+    let token_value = area.forklift("b", &["config", "get", "remote.token"]);
     assert_success(&token_value);
     assert!(stdout(&token_value).contains("sesame"));
 }
@@ -2596,14 +2596,14 @@ fn multi_warehouse_serving_isolates_warehouses() {
 
     // Two warehouses on one server: the id travels inside remote.url.
     prepare_warehouse(&area, "a", &format!("{}/warehouses/alpha", server.url));
-    assert_success(&area.forklift("a", &["config", "remote.token", "admin"]));
+    assert_success(&area.forklift("a", &["config", "set", "remote.token", "admin"]));
     area.write_file("a/alpha.txt", "alpha content\n");
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "alpha parcel"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     prepare_warehouse(&area, "b", &format!("{}/warehouses/beta", server.url));
-    assert_success(&area.forklift("b", &["config", "remote.token", "admin"]));
+    assert_success(&area.forklift("b", &["config", "set", "remote.token", "admin"]));
     area.write_file("b/beta.txt", "beta content\n");
     assert_success(&area.forklift("b", &["load", "."]));
     assert_success(&area.forklift("b", &["stack", "beta parcel"]));
@@ -2619,7 +2619,7 @@ fn multi_warehouse_serving_isolates_warehouses() {
 
     // Lifting to a warehouse that was never created is refused, with the remedy named.
     prepare_warehouse(&area, "d", &format!("{}/warehouses/gamma", server.url));
-    assert_success(&area.forklift("d", &["config", "remote.token", "admin"]));
+    assert_success(&area.forklift("d", &["config", "set", "remote.token", "admin"]));
     area.write_file("d/doc.txt", "content\n");
     assert_success(&area.forklift("d", &["load", "."]));
     assert_success(&area.forklift("d", &["stack", "parcel"]));
@@ -2674,7 +2674,7 @@ fn operator_tokens_enforce_roles_and_pallet_grants() {
     // The admin (the area's default operator) establishes trust and lifts with the
     // static token.
     prepare_warehouse(&area, "a", &server.url);
-    assert_success(&area.forklift("a", &["config", "remote.token", "root"]));
+    assert_success(&area.forklift("a", &["config", "set", "remote.token", "root"]));
     area.write_file("a/code.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "base"]));
@@ -2710,7 +2710,7 @@ fn operator_tokens_enforce_roles_and_pallet_grants() {
     ]);
     assert_success(&franchised);
     // The worker's identity on this "machine": the warehouse-scoped override.
-    assert_success(&area.forklift("b", &["config", "operator.identifier", worker_id]));
+    assert_success(&area.forklift("b", &["config", "set", "operator.identifier", worker_id]));
 
     area.write_file("b/code.txt", "v2 by worker\n");
     assert_success(&area.forklift("b", &["load", "code.txt"]));
@@ -2748,7 +2748,7 @@ fn operator_tokens_enforce_roles_and_pallet_grants() {
     assert_success(&franchised);
     assert_eq!(area.read_file("c/code.txt"), "v2 by worker\n");
 
-    assert_success(&area.forklift("c", &["config", "operator.identifier", reader_id]));
+    assert_success(&area.forklift("c", &["config", "set", "operator.identifier", reader_id]));
 
     area.write_file("c/code.txt", "v4 by reader\n");
     assert_success(&area.forklift("c", &["load", "code.txt"]));
@@ -2777,7 +2777,7 @@ fn regenesis_is_gated_by_the_static_token_and_accepted_consciously() {
 
     // The admin sets up warehouse A, enrolls, admits a worker, and lifts.
     prepare_warehouse(&area, "a", &server.url);
-    assert_success(&area.forklift("a", &["config", "remote.token", "root"]));
+    assert_success(&area.forklift("a", &["config", "set", "remote.token", "root"]));
     area.write_file("a/code.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "base"]));
@@ -2789,7 +2789,7 @@ fn regenesis_is_gated_by_the_static_token_and_accepted_consciously() {
 
     // The worker clones B before the reset.
     assert_success(&area.forklift(".", &["clone", &server.url, "b", "--token", "w-token"]));
-    assert_success(&area.forklift("b", &["config", "operator.identifier", "worker@forklift"]));
+    assert_success(&area.forklift("b", &["config", "set", "operator.identifier", "worker@forklift"]));
 
     // Total key loss on A's side: nobody can extend the chain anymore.
     std::fs::remove_dir_all(area.path("shared-keys")).unwrap();
@@ -2797,12 +2797,12 @@ fn regenesis_is_gated_by_the_static_token_and_accepted_consciously() {
 
     // Pushing the reset with a per-operator token is refused: its authority comes
     // from exactly the chain being replaced. Only the static token may sanction it.
-    assert_success(&area.forklift("a", &["config", "remote.token", "w-token"]));
+    assert_success(&area.forklift("a", &["config", "set", "remote.token", "w-token"]));
     let refused = area.forklift("a", &["lift"]);
     assert!(!refused.status.success());
     assert!(stderr(&refused).contains("static token"), "{}", stderr(&refused));
 
-    assert_success(&area.forklift("a", &["config", "remote.token", "root"]));
+    assert_success(&area.forklift("a", &["config", "set", "remote.token", "root"]));
     let lifted = area.forklift("a", &["lift"]);
     assert_success(&lifted);
 
@@ -2876,7 +2876,7 @@ fn regenesis_on_remote(area: &TestArea, before_reset: impl FnOnce(&Server)) -> S
     let server = Server::start_with_tokens(area, Some("root"), "tokens.toml");
 
     prepare_warehouse(area, "a", &server.url);
-    assert_success(&area.forklift("a", &["config", "remote.token", "root"]));
+    assert_success(&area.forklift("a", &["config", "set", "remote.token", "root"]));
     area.write_file("a/code.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "base"]));
@@ -2966,7 +2966,7 @@ fn a_regenesis_lifted_to_a_fresh_remote_carries_its_adopted_history() {
     let server = Server::start(&area, Some("root"));
 
     prepare_warehouse(&area, "a", &server.url);
-    assert_success(&area.forklift("a", &["config", "remote.token", "root"]));
+    assert_success(&area.forklift("a", &["config", "set", "remote.token", "root"]));
     area.write_file("a/code.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "base"]));
@@ -2992,7 +2992,7 @@ fn a_torn_taint_in_a_sparse_franchise_heals_over_its_sealed_objects() {
     let server = Server::start(&area, Some("root"));
 
     prepare_warehouse(&area, "dev", &server.url);
-    assert_success(&area.forklift("dev", &["config", "remote.token", "root"]));
+    assert_success(&area.forklift("dev", &["config", "set", "remote.token", "root"]));
     area.write_file("dev/README", "readme\n");
     area.write_file("dev/src/a.txt", "a\n");
     area.write_file("dev/docs/guide.md", "guide\n");
@@ -3176,7 +3176,7 @@ fn a_compromised_key_cannot_sign_beyond_its_distrust_boundary() {
     let server = Server::start_with_tokens(&area, Some("root"), "tokens.toml");
 
     prepare_warehouse(&area, "a", &server.url);
-    assert_success(&area.forklift("a", &["config", "remote.token", "root"]));
+    assert_success(&area.forklift("a", &["config", "set", "remote.token", "root"]));
     area.write_file("a/code.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "base"]));
@@ -3188,7 +3188,7 @@ fn a_compromised_key_cannot_sign_beyond_its_distrust_boundary() {
 
     // The worker lifts legitimate work before the compromise is noticed…
     assert_success(&area.forklift(".", &["clone", &server.url, "b", "--token", "w-token"]));
-    assert_success(&area.forklift("b", &["config", "operator.identifier", "worker@forklift"]));
+    assert_success(&area.forklift("b", &["config", "set", "operator.identifier", "worker@forklift"]));
     area.write_file("b/code.txt", "v2 by worker\n");
     assert_success(&area.forklift("b", &["load", "code.txt"]));
     assert_success(&area.forklift("b", &["stack", "lifted before revocation"]));
@@ -3245,7 +3245,7 @@ fn a_revocation_does_not_vouch_for_work_the_remote_keeps_under_a_tombstone() {
     let server = Server::start_with_tokens(&area, Some("root"), "tokens.toml");
 
     prepare_warehouse(&area, "a", &server.url);
-    assert_success(&area.forklift("a", &["config", "remote.token", "root"]));
+    assert_success(&area.forklift("a", &["config", "set", "remote.token", "root"]));
     area.write_file("a/code.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "base"]));
@@ -3258,7 +3258,7 @@ fn a_revocation_does_not_vouch_for_work_the_remote_keeps_under_a_tombstone() {
     // The worker lifts a side pallet, which is then deleted on the remote: only its tombstone
     // holds the worker's parcel there.
     assert_success(&area.forklift(".", &["clone", &server.url, "b", "--token", "w-token"]));
-    assert_success(&area.forklift("b", &["config", "operator.identifier", "worker@forklift"]));
+    assert_success(&area.forklift("b", &["config", "set", "operator.identifier", "worker@forklift"]));
     assert_success(&area.forklift("b", &["pallet", "create", "feat"]));
     area.write_file("b/code.txt", "v2 by worker\n");
     assert_success(&area.forklift("b", &["load", "code.txt"]));
@@ -3289,14 +3289,14 @@ fn a_revocation_does_not_vouch_for_work_the_remote_keeps_under_a_tombstone() {
 /// The keygen runs under the target operator's id (warehouse-scope override), then
 /// the admin's identity is restored.
 fn keygen_admit_args(area: &TestArea, operator_id: &str) -> Vec<String> {
-    let admin_output = area.forklift("a", &["config", "--global", "operator.identifier"]);
+    let admin_output = area.forklift("a", &["config", "get", "--global", "operator.identifier"]);
     assert_success(&admin_output);
     let admin_id = stdout(&admin_output).trim().to_string();
 
-    assert_success(&area.forklift("a", &["config", "operator.identifier", operator_id]));
+    assert_success(&area.forklift("a", &["config", "set", "operator.identifier", operator_id]));
     let output = area.forklift("a", &["office", "keygen"]);
     assert_success(&output);
-    assert_success(&area.forklift("a", &["config", "operator.identifier", &admin_id]));
+    assert_success(&area.forklift("a", &["config", "set", "operator.identifier", &admin_id]));
 
     stdout(&output).lines()
         .find(|line| line.trim_start().starts_with("office admit "))
@@ -3759,12 +3759,12 @@ fn hooks_authenticate_admit_and_notify() {
     let refused = area.forklift("a", &["lift"]);
     assert!(!refused.status.success(), "an unauthenticated lift must fail");
 
-    assert_success(&area.forklift("a", &["config", "remote.token", "wrong-token"]));
+    assert_success(&area.forklift("a", &["config", "set", "remote.token", "wrong-token"]));
     let refused = area.forklift("a", &["lift"]);
     assert!(!refused.status.success(), "a token the hook refuses must fail");
 
     // The hook-known credential authenticates, admission admits, the lift lands.
-    assert_success(&area.forklift("a", &["config", "remote.token", "hook-token"]));
+    assert_success(&area.forklift("a", &["config", "set", "remote.token", "hook-token"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     // Every hook request is signed with the shared secret, and the admission saw the
@@ -3892,7 +3892,7 @@ fn an_unreachable_authentication_hook_fails_closed() {
     ], None);
 
     prepare_warehouse(&area, "a", &server.url);
-    assert_success(&area.forklift("a", &["config", "remote.token", "any-token"]));
+    assert_success(&area.forklift("a", &["config", "set", "remote.token", "any-token"]));
     area.write_file("a/readme.txt", "hello\n");
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "parcel"]));
@@ -3989,7 +3989,7 @@ fn resolution_is_server_mediated_and_degrades_to_pseudonyms() {
 
     // Resolution never fails a command: point the remote at a dead port and history
     // degrades to the pseudonymous id instead of erroring.
-    assert_success(&area.forklift("a", &["config", "remote.url", "http://127.0.0.1:9"]));
+    assert_success(&area.forklift("a", &["config", "set", "remote.url", "http://127.0.0.1:9"]));
     let history = area.forklift("a", &["history"]);
     assert_success(&history);
     assert!(!stdout(&history).contains("Remote Tester"), "{}", stdout(&history));
@@ -4369,7 +4369,7 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_reads_signer_boundar
     assert_success(&area.forklift("dev", &["office", "enroll"]));
 
     // Admit an agent.
-    assert_success(&area.forklift("dev", &["config", "operator.identifier", "agent@forklift"]));
+    assert_success(&area.forklift("dev", &["config", "set", "operator.identifier", "agent@forklift"]));
     let keygen = area.forklift("dev", &["office", "keygen"]);
     assert_success(&keygen);
     let admit_args: Vec<String> = stdout(&keygen)
@@ -4380,7 +4380,7 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_reads_signer_boundar
         .skip(2)
         .map(str::to_string)
         .collect();
-    assert_success(&area.forklift("dev", &["config", "operator.identifier", "tester@forklift"]));
+    assert_success(&area.forklift("dev", &["config", "set", "operator.identifier", "tester@forklift"]));
     assert_success(&area.forklift("dev", &[
         "office", "admit", &admit_args[0], &admit_args[1], &admit_args[2],
         "--agent", "--supervisor", "tester@forklift",
@@ -4388,7 +4388,7 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_reads_signer_boundar
 
     // The agent's main-line parcel — this is the one whose boundary classification the test
     // actually checks. It stays reachable from `main` throughout.
-    assert_success(&area.forklift("dev", &["config", "operator.identifier", "agent@forklift"]));
+    assert_success(&area.forklift("dev", &["config", "set", "operator.identifier", "agent@forklift"]));
     area.write_file("dev/agent-main.txt", "agent main work\n");
     assert_success(&area.forklift("dev", &["load", "agent-main.txt"]));
     let agent_stack = area.forklift("dev", &["--json", "stack", "agent main work"]);
@@ -4405,7 +4405,7 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_reads_signer_boundar
 
     // Retire the agent's key: the distrust boundary snapshots every current pallet head —
     // main's and side's alike, published or not.
-    assert_success(&area.forklift("dev", &["config", "operator.identifier", "tester@forklift"]));
+    assert_success(&area.forklift("dev", &["config", "set", "operator.identifier", "tester@forklift"]));
     // `office list` does not print users in enrollment order (it groups/sorts by
     // identifier), so the agent's key is found by identifier, not by line position.
     let listing = area.forklift("dev", &["--json", "office", "list"]);
@@ -4532,7 +4532,7 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_audits_the_vouched_p
     assert_success(&area.forklift("dev", &["office", "enroll"]));
 
     // Admit an agent.
-    assert_success(&area.forklift("dev", &["config", "operator.identifier", "agent@forklift"]));
+    assert_success(&area.forklift("dev", &["config", "set", "operator.identifier", "agent@forklift"]));
     let keygen = area.forklift("dev", &["office", "keygen"]);
     assert_success(&keygen);
     let admit_args: Vec<String> = stdout(&keygen)
@@ -4543,7 +4543,7 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_audits_the_vouched_p
         .skip(2)
         .map(str::to_string)
         .collect();
-    assert_success(&area.forklift("dev", &["config", "operator.identifier", "tester@forklift"]));
+    assert_success(&area.forklift("dev", &["config", "set", "operator.identifier", "tester@forklift"]));
     assert_success(&area.forklift("dev", &[
         "office", "admit", &admit_args[0], &admit_args[1], &admit_args[2],
         "--agent", "--supervisor", "tester@forklift",
@@ -4551,7 +4551,7 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_audits_the_vouched_p
 
     // The agent's main-line parcel: it stays reachable from `main` throughout, and is the one
     // whose revoked-key signature `audit` must resolve against the distrust boundary.
-    assert_success(&area.forklift("dev", &["config", "operator.identifier", "agent@forklift"]));
+    assert_success(&area.forklift("dev", &["config", "set", "operator.identifier", "agent@forklift"]));
     area.write_file("dev/agent-main.txt", "agent main work\n");
     assert_success(&area.forklift("dev", &["load", "agent-main.txt"]));
     assert_success(&area.forklift("dev", &["stack", "agent main work"]));
@@ -4569,7 +4569,7 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_audits_the_vouched_p
 
     // Retire the agent's key: the distrust boundary snapshots every current pallet head —
     // main's and side's alike, published or not.
-    assert_success(&area.forklift("dev", &["config", "operator.identifier", "tester@forklift"]));
+    assert_success(&area.forklift("dev", &["config", "set", "operator.identifier", "tester@forklift"]));
     let listing = area.forklift("dev", &["--json", "office", "list"]);
     assert_success(&listing);
     let listing: serde_json::Value = serde_json::from_str(&stdout(&listing)).unwrap();
@@ -4654,7 +4654,7 @@ fn enrolling_then_lifting_to_a_fresh_remote_with_an_unlifted_other_pallet_refuse
     // remote and skip the remote-heads union entirely, so the boundary is exactly `[U3]`.
     std::fs::create_dir_all(area.path("w")).unwrap();
     assert_success(&area.forklift("w", &["prepare"]));
-    assert_success(&area.forklift("w", &["config", "--global", "operator.identifier", "tester@forklift"]));
+    assert_success(&area.forklift("w", &["config", "set", "--global", "operator.identifier", "tester@forklift"]));
 
     // U1, U2, U3: three unsigned, pre-office stacks on `main`.
     area.write_file("w/app.txt", "v1\n");
@@ -4684,7 +4684,7 @@ fn enrolling_then_lifting_to_a_fresh_remote_with_an_unlifted_other_pallet_refuse
     assert_success(&area.forklift("w", &["pallet", "create", "feature", &u1]));
 
     // The remote is configured only now, AFTER enroll: it plays no part in the boundary.
-    assert_success(&area.forklift("w", &["config", "remote.url", &server.url]));
+    assert_success(&area.forklift("w", &["config", "set", "remote.url", &server.url]));
 
     let first_lift = area.forklift("w", &["lift"]);
     let out = format!("{}{}", stdout(&first_lift), stderr(&first_lift));
@@ -4768,7 +4768,7 @@ fn retiring_a_signer_then_lifting_only_a_replacement_pallet_refuses_instead_of_a
     let server = Server::start(&area, None);
 
     prepare_warehouse(&area, "w", &server.url);
-    assert_success(&area.forklift("w", &["config", "--global", "operator.identifier", "admin@forklift"]));
+    assert_success(&area.forklift("w", &["config", "set", "--global", "operator.identifier", "admin@forklift"]));
 
     area.write_file("w/base.txt", "base\n");
     assert_success(&area.forklift("w", &["load", "."]));
@@ -4778,7 +4778,7 @@ fn retiring_a_signer_then_lifting_only_a_replacement_pallet_refuses_instead_of_a
     let m1 = pallet_head(&area, "w", "main");
 
     // Admit the agent.
-    assert_success(&area.forklift("w", &["config", "--global", "operator.identifier", "agent@forklift"]));
+    assert_success(&area.forklift("w", &["config", "set", "--global", "operator.identifier", "agent@forklift"]));
     let keygen = area.forklift("w", &["office", "keygen"]);
     assert_success(&keygen);
     let admit_args: Vec<String> = stdout(&keygen)
@@ -4789,7 +4789,7 @@ fn retiring_a_signer_then_lifting_only_a_replacement_pallet_refuses_instead_of_a
         .skip(2)
         .map(str::to_string)
         .collect();
-    assert_success(&area.forklift("w", &["config", "--global", "operator.identifier", "admin@forklift"]));
+    assert_success(&area.forklift("w", &["config", "set", "--global", "operator.identifier", "admin@forklift"]));
     assert_success(&area.forklift("w", &[
         "office", "admit", &admit_args[0], &admit_args[1], &admit_args[2],
         "--agent", "--supervisor", "admin@forklift",
@@ -4797,7 +4797,7 @@ fn retiring_a_signer_then_lifting_only_a_replacement_pallet_refuses_instead_of_a
 
     // "side" starts at M1 (main's current head). As the agent, stack A0 then A1 on it.
     assert_success(&area.forklift("w", &["pallet", "create", "side"]));
-    assert_success(&area.forklift("w", &["config", "--global", "operator.identifier", "agent@forklift"]));
+    assert_success(&area.forklift("w", &["config", "set", "--global", "operator.identifier", "agent@forklift"]));
     area.write_file("w/side.txt", "a0\n");
     assert_success(&area.forklift("w", &["load", "."]));
     assert_success(&area.forklift("w", &["stack", "A0"]));
@@ -4811,7 +4811,7 @@ fn retiring_a_signer_then_lifting_only_a_replacement_pallet_refuses_instead_of_a
     // Back on `main` (still exactly M1 — untouched since it was lifted above), retire the
     // agent's key: the distrust boundary snapshots every LOCAL pallet head right now, main's
     // and side's alike.
-    assert_success(&area.forklift("w", &["config", "--global", "operator.identifier", "admin@forklift"]));
+    assert_success(&area.forklift("w", &["config", "set", "--global", "operator.identifier", "admin@forklift"]));
     assert_success(&area.forklift("w", &["shift", "main"]));
     assert_eq!(pallet_head(&area, "w", "main"), m1, "main must be untouched since its own lift");
 
@@ -5257,7 +5257,7 @@ fn a_sparse_workspace_refuses_to_lift_to_a_non_origin_remote() {
 
     // A second, independent remote (empty).
     let server2 = Server::start_at(&origin, "server-root-2", None);
-    assert_success(&origin.forklift("sparse", &["config", "remote.url", &server2.url]));
+    assert_success(&origin.forklift("sparse", &["config", "set", "remote.url", &server2.url]));
 
     // The client refuses before touching the wire, with the stable code and exit 11.
     let refused = origin.forklift("sparse", &["--json", "lift"]);
@@ -5268,7 +5268,7 @@ fn a_sparse_workspace_refuses_to_lift_to_a_non_origin_remote() {
         "the refusal names the origin: {}", stdout(&refused));
 
     // The origin is not configuration: `config` cannot change it to agree with the remote.
-    let set = origin.forklift("sparse", &["config", "remote.origin", &server2.url]);
+    let set = origin.forklift("sparse", &["config", "set", "remote.origin", &server2.url]);
     assert!(!set.status.success() && stderr(&set).contains("Unknown configuration key"), "{}", stderr(&set));
 
     // A missing origin record is refused at the client the same way, never read as the configured
@@ -5277,7 +5277,7 @@ fn a_sparse_workspace_refuses_to_lift_to_a_non_origin_remote() {
     // Revert: let a partial warehouse with no origin dial `remote.url` → the lift reaches the
     // remote and fails there, with another code → red.
     std::fs::remove_file(origin.path("sparse/.forklift/origin")).unwrap();
-    assert_success(&origin.forklift("sparse", &["config", "remote.url", &server1.url]));
+    assert_success(&origin.forklift("sparse", &["config", "set", "remote.url", &server1.url]));
     let forced = origin.forklift("sparse", &["--json", "lift"]);
     assert_eq!(forced.status.code(), Some(11), "an originless sparse lift exits 11: {}", stderr(&forced));
     let json: serde_json::Value = serde_json::from_str(&stdout(&forced)).unwrap();
@@ -5319,7 +5319,7 @@ fn a_partial_warehouse_talks_to_no_remote_but_its_origin() {
     area.write_file("dev/src/api/a.txt", "api v2\n");
     assert_success(&area.forklift("dev", &["load", "."]));
     assert_success(&area.forklift("dev", &["stack", "second"]));
-    assert_success(&area.forklift("dev", &["config", "remote.url", &server2.url]));
+    assert_success(&area.forklift("dev", &["config", "set", "remote.url", &server2.url]));
     assert_success(&area.forklift("dev", &["lift"]));
     assert_success(&area.forklift("dev", &["pallet", "create", "extra"]));
     assert_success(&area.forklift("dev", &["lift"]));
@@ -5333,7 +5333,7 @@ fn a_partial_warehouse_talks_to_no_remote_but_its_origin() {
     // No checkout materializes docs, so pruning it asks the remote.
     assert_success(&area.forklift("sparse", &["narrow", "docs"]));
 
-    assert_success(&area.forklift("sparse", &["config", "remote.url", &server2.url]));
+    assert_success(&area.forklift("sparse", &["config", "set", "remote.url", &server2.url]));
     let before = forklift_dir_snapshot(&area, "sparse");
 
     let commands: [&[&str]; 9] = [
@@ -5363,7 +5363,7 @@ fn a_partial_warehouse_talks_to_no_remote_but_its_origin() {
     let listed = json_of(&area.forklift("dev", &["--json", "pallet", "list", "--remote"]));
     assert!(listed.to_string().contains("extra"), "{}", listed);
 
-    assert_success(&area.forklift("full", &["config", "remote.url", &server2.url]));
+    assert_success(&area.forklift("full", &["config", "set", "remote.url", &server2.url]));
     assert_success(&area.forklift("full", &["lower"]));
     assert_eq!(area.read_file("full/src/api/a.txt"), "api v2\n");
 }
@@ -5531,7 +5531,7 @@ fn a_cache_franchise_is_a_partial_warehouse() {
         "{}{}", stdout(&expand), stderr(&expand));
 
     let other = Server::start_at(&area, "server-root-2", None);
-    assert_success(&area.forklift("cached", &["config", "remote.url", &other.url]));
+    assert_success(&area.forklift("cached", &["config", "set", "remote.url", &other.url]));
     let refused = area.forklift("cached", &["--json", "lift"]);
     assert_eq!(refused.status.code(), Some(11), "{}", stdout(&refused));
     let json = json_of(&refused);
@@ -5855,7 +5855,7 @@ fn a_cache_read_of_an_older_parcel_fetches_what_it_reads() {
     assert_record_is(&area, "cached", &[&middle_root, &oldest_docs]);
 
     let other = Server::start_at(&area, "server-root-2", None);
-    assert_success(&area.forklift("cached", &["config", "remote.url", &other.url]));
+    assert_success(&area.forklift("cached", &["config", "set", "remote.url", &other.url]));
     let elsewhere = area.forklift("cached", &["show", &format!("{}:docs/two.txt", middle)]);
     assert!(!elsewhere.status.success(), "{}", stdout(&elsewhere));
     assert_eq!(elsewhere.status.code(), Some(11), "a remote that is not the origin is refused, not a cache miss");
@@ -5864,7 +5864,7 @@ fn a_cache_read_of_an_older_parcel_fetches_what_it_reads() {
     assert!(stdout(&as_json).contains("\"non_origin_remote\""), "{}", stdout(&as_json));
     assert!(stdout(&as_json).contains("not in this cache warehouse"), "the refusal names the read's miss: {}", stdout(&as_json));
     assert!(!object_held(&area, "cached", &middle_root));
-    assert_success(&area.forklift("cached", &["config", "remote.url", &server.url]));
+    assert_success(&area.forklift("cached", &["config", "set", "remote.url", &server.url]));
 
     let diffed = area.forklift("cached", &["diff", &oldest, &middle]);
     assert_success(&diffed);
@@ -6538,7 +6538,7 @@ fn assert_move_pending(area: &TestArea,
     assert_eq!(json["error"]["code"], "origin_move_pending", "{:?}: {}", args, json);
     let message = json["error"]["message"].as_str().unwrap();
     assert!(message.contains("remote move http://new-origin.example"), "{:?}: {}", args, message);
-    assert_eq!(message.contains("--abort"), phase == forklift_core::util::origin_move::Phase::Checking,
+    assert_eq!(message.contains("remote abort"), phase == forklift_core::util::origin_move::Phase::Checking,
         "{:?}: only a checking move can be abandoned: {}", args, message);
     assert!(forklift_dir_snapshot(area, directory) == before, "{:?} ({:?}) changes nothing", args, phase);
 }
@@ -6551,7 +6551,7 @@ fn assert_move_pending(area: &TestArea,
 /// which removes no pallet under a move whether or not its head is already in the ledger. In a
 /// cache, `evict`, a read of a parcel it never fetched, and a forced delete refuse the same way.
 /// Each refusal is `origin_move_pending` (exit 37), changes nothing under `.forklift`, and offers
-/// `--abort` only while the move is still checking. Stacking, local reads and `heal` on an
+/// `remote abort` only while the move is still checking. Stacking, local reads and `heal` on an
 /// undamaged warehouse proceed; with the intent gone, the refused commands run again.
 ///
 /// Revert: drop the up-front check in `checked_remote` → the remote commands run (lower, the
@@ -6625,7 +6625,7 @@ fn a_pending_move_of_the_origin_refuses_every_remote_client_and_every_writer_it_
         // fixture's server does not exist.
         for directory in ["sparse", "cached"] {
             if phase == Phase::Checking {
-                assert_success(&area.forklift(directory, &["remote", "move", "--abort"]));
+                assert_success(&area.forklift(directory, &["remote", "abort"]));
             } else {
                 std::fs::remove_file(area.path(&format!("{}/.forklift/origin-move", directory))).unwrap();
             }
@@ -6636,7 +6636,7 @@ fn a_pending_move_of_the_origin_refuses_every_remote_client_and_every_writer_it_
     area.write_file("sparse/src/code.txt", "under a move\n");
     assert_success(&area.forklift("sparse", &["load", "."]));
     assert_success(&area.forklift("sparse", &["stack", "under a move"]));
-    assert_success(&area.forklift("sparse", &["remote", "move", "--abort"]));
+    assert_success(&area.forklift("sparse", &["remote", "abort"]));
 
     // With the intent gone, what it refused runs.
     assert_success(&area.forklift("sparse", &["lift"]));
@@ -6674,7 +6674,7 @@ fn serve_copy(area: &TestArea, from: &str, to: &str) -> Server {
 
 /// The `remote.url` `directory` dials.
 fn configured_remote(area: &TestArea, directory: &str) -> String {
-    let read = area.forklift(directory, &["config", "remote.url"]);
+    let read = area.forklift(directory, &["config", "get", "remote.url"]);
     assert_success(&read);
     stdout(&read).trim().to_string()
 }
@@ -6884,28 +6884,28 @@ fn bare_remote_shows_the_remote_the_origin_and_what_stops_it() {
 
     // Another remote than the origin is what every command dialing it would refuse.
     let before = forklift_dir_snapshot(&area, "cached");
-    assert_success(&area.forklift("cached", &["config", "remote.url", "http://elsewhere.example"]));
+    assert_success(&area.forklift("cached", &["config", "set", "remote.url", "http://elsewhere.example"]));
     let other = show("cached");
     assert_eq!(other["remote"], "http://elsewhere.example", "{}", other);
     assert_eq!(other["origin"], server.url.as_str(), "{}", other);
     assert_eq!(other["blocked"]["code"], "non_origin_remote", "{}", other);
     assert!(other["blocked"]["next_step"].as_str().unwrap().contains(server.url.as_str()), "{}", other);
     assert!(stdout(&area.forklift("cached", &["remote"])).contains("Only the origin was proved"));
-    assert_success(&area.forklift("cached", &["config", "remote.url", &server.url]));
+    assert_success(&area.forklift("cached", &["config", "set", "remote.url", &server.url]));
     assert_eq!(forklift_dir_snapshot(&area, "cached"), before, "showing changes nothing");
 
     // A missing origin record is damage whether or not a remote is configured.
     let origin = area.path("cached/.forklift/origin");
     let recorded = std::fs::read(&origin).unwrap();
     std::fs::remove_file(&origin).unwrap();
-    assert_success(&area.forklift("cached", &["config", "--unset", "remote.url"]));
+    assert_success(&area.forklift("cached", &["config", "unset", "remote.url"]));
     let lost = show("cached");
     assert_eq!(lost["remote"], serde_json::Value::Null, "{}", lost);
     assert_eq!(lost["origin"], serde_json::Value::Null, "{}", lost);
     assert_eq!(lost["blocked"]["code"], "non_origin_remote", "{}", lost);
     assert!(stdout(&area.forklift("cached", &["remote"])).contains("origin record"));
     std::fs::write(&origin, recorded).unwrap();
-    assert_success(&area.forklift("cached", &["config", "remote.url", &server.url]));
+    assert_success(&area.forklift("cached", &["config", "set", "remote.url", &server.url]));
 
     record_move_intent(&area, "cached", Phase::Rewriting);
     let moving = show("cached");
@@ -6914,7 +6914,7 @@ fn bare_remote_shows_the_remote_the_origin_and_what_stops_it() {
     assert!(move_stands(&area, "cached"));
 
     // A standing move stops clients whether or not a remote is configured.
-    assert_success(&area.forklift("cached", &["config", "--unset", "remote.url"]));
+    assert_success(&area.forklift("cached", &["config", "unset", "remote.url"]));
     let unset = show("cached");
     assert_eq!(unset["remote"], serde_json::Value::Null, "{}", unset);
     assert_eq!(unset["blocked"]["code"], "origin_move_pending", "{}", unset);
@@ -6925,15 +6925,15 @@ fn sealed_bytes(area: &TestArea, directory: &str) -> Option<Vec<u8>> {
     std::fs::read(area.path(&format!("{}/.forklift/sealed", directory))).ok()
 }
 
-/// A move killed while checking leaves its intent; `remote move --abort` clears it, leaving the
+/// A move killed while checking leaves its intent; `remote abort` clears it, leaving the
 /// origin, and a move started over one replaces it and completes. A move killed while rewriting
 /// cannot be abandoned (`origin_move_pending`, the intent kept), and the next move finishes it,
 /// checking its own server first; so does a move over an intent that does not parse, which may
-/// have started rewriting. With no move standing, `--abort` says so. While another move holds the
+/// have started rewriting. With no move standing, `remote abort` says so. While another move holds the
 /// move lock, a move and an abort refuse as `origin_move_pending` and change nothing. A cache
 /// whose origin record went missing records it again through a move.
 ///
-/// Revert: let `--abort` clear a rewriting intent → its refusal goes green; skip the move lock →
+/// Revert: let `remote abort` clear a rewriting intent → its refusal goes green; skip the move lock →
 /// the held-lock rows run; report a finished stopped move as fresh → `finished_stopped_move`
 /// reads false.
 #[test]
@@ -6945,12 +6945,12 @@ fn a_stopped_move_is_abandoned_only_while_checking_and_finished_by_the_next() {
     assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
     let copy = serve_copy(&area, "server-root", "copy-root");
 
-    let quiet = area.forklift("cached", &["--json", "remote", "move", "--abort"]);
+    let quiet = area.forklift("cached", &["--json", "remote", "abort"]);
     assert_success(&quiet);
     assert_eq!(json_of(&quiet)["data"]["abandoned"], serde_json::Value::Null);
 
     record_move_intent(&area, "cached", Phase::Checking);
-    let aborted = area.forklift("cached", &["--json", "remote", "move", "--abort"]);
+    let aborted = area.forklift("cached", &["--json", "remote", "abort"]);
     assert_success(&aborted);
     assert_eq!(json_of(&aborted)["data"]["abandoned"], "http://new-origin.example");
     assert!(!move_stands(&area, "cached"));
@@ -6966,7 +6966,7 @@ fn a_stopped_move_is_abandoned_only_while_checking_and_finished_by_the_next() {
 
     record_move_intent(&area, "cached", Phase::Rewriting);
     let before = forklift_dir_snapshot(&area, "cached");
-    let kept = area.forklift("cached", &["--json", "remote", "move", "--abort"]);
+    let kept = area.forklift("cached", &["--json", "remote", "abort"]);
     assert_eq!(kept.status.code(), Some(37), "{}{}", stdout(&kept), stderr(&kept));
     assert_eq!(json_of(&kept)["error"]["code"], "origin_move_pending");
     assert!(forklift_dir_snapshot(&area, "cached") == before, "a rewriting move is not abandoned");
@@ -6978,7 +6978,7 @@ fn a_stopped_move_is_abandoned_only_while_checking_and_finished_by_the_next() {
     assert!(!move_stands(&area, "cached"));
 
     std::fs::write(area.path("cached/.forklift/origin-move"), "not a record\n").unwrap();
-    assert_eq!(area.forklift("cached", &["--json", "remote", "move", "--abort"]).status.code(), Some(37));
+    assert_eq!(area.forklift("cached", &["--json", "remote", "abort"]).status.code(), Some(37));
     let taken_over = area.forklift("cached", &["--json", "remote", "move", &copy.url]);
     assert_success(&taken_over);
     assert_eq!(json_of(&taken_over)["data"]["finished_stopped_move"], true);
@@ -6990,7 +6990,7 @@ fn a_stopped_move_is_abandoned_only_while_checking_and_finished_by_the_next() {
         let _held = forklift_core::util::lock_utils::MoveLock::try_acquire().unwrap().unwrap();
         let before = forklift_dir_snapshot(&area, "cached");
 
-        for args in [&["remote", "move", server.url.as_str()][..], &["remote", "move", "--abort"]] {
+        for args in [&["remote", "move", server.url.as_str()][..], &["remote", "abort"]] {
             let refused = area.forklift("cached", &[&["--json"][..], args].concat());
             assert_eq!(refused.status.code(), Some(37), "{:?}: {}{}", args, stdout(&refused), stderr(&refused));
             assert!(json_of(&refused)["error"]["message"].as_str().unwrap().contains("Another move"), "{:?}", args);
@@ -7043,14 +7043,14 @@ fn evict_refuses_a_remote_that_is_not_the_origin_and_an_unreachable_origin() {
     let before = forklift_dir_snapshot(&area, "cached");
 
     let other = Server::start_at(&area, "server-root-2", None);
-    assert_success(&area.forklift("cached", &["config", "remote.url", &other.url]));
+    assert_success(&area.forklift("cached", &["config", "set", "remote.url", &other.url]));
     let elsewhere = area.forklift("cached", &["--json", "store", "evict"]);
     assert_eq!(elsewhere.status.code(), Some(11), "{}", stderr(&elsewhere));
     let json = json_of(&elsewhere);
     assert_eq!(json["error"]["code"], "non_origin_remote", "{}", json);
     let message = json["error"]["message"].as_str().unwrap();
     assert!(message.contains(&server.url) && message.contains(&other.url), "{}", message);
-    assert_success(&area.forklift("cached", &["config", "remote.url", &server.url]));
+    assert_success(&area.forklift("cached", &["config", "set", "remote.url", &server.url]));
 
     server.stop();
     let unreachable = area.forklift("cached", &["store", "evict"]);
@@ -7644,7 +7644,7 @@ fn expand_recovers_after_an_unreachable_remote_leaves_the_scope_unchanged() {
     assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
 
     // Point at an unreachable remote and attempt to expand.
-    assert_success(&area.forklift("sparse", &["config", "remote.url", "http://127.0.0.1:9"]));
+    assert_success(&area.forklift("sparse", &["config", "set", "remote.url", "http://127.0.0.1:9"]));
     let failed = area.forklift("sparse", &["expand", "src/web"]);
     assert!(!failed.status.success(), "expand against an unreachable remote must fail");
 
@@ -7658,7 +7658,7 @@ fn expand_recovers_after_an_unreachable_remote_leaves_the_scope_unchanged() {
     assert!(!object_present(&area, "sparse", &web_tree), "nothing was fetched by the failed attempt");
 
     // Point back at the real remote: a plain re-run completes the fetch.
-    assert_success(&area.forklift("sparse", &["config", "remote.url", &server.url]));
+    assert_success(&area.forklift("sparse", &["config", "set", "remote.url", &server.url]));
     let recovered = area.forklift("sparse", &["expand", "src/web"]);
     assert_success(&recovered);
     assert!(stdout(&recovered).contains("Expanded"), "{}", stdout(&recovered));
@@ -7686,7 +7686,7 @@ fn lift_from_a_sparse_workspace_with_no_remote_configured_reports_the_plain_erro
     assert_success(&area.forklift("dev", &["lift"]));
 
     assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
-    assert_success(&area.forklift("sparse", &["config", "--unset", "remote.url"]));
+    assert_success(&area.forklift("sparse", &["config", "unset", "remote.url"]));
 
     let failed = area.forklift("sparse", &["--json", "lift"]);
     assert!(!failed.status.success(), "lift with no remote configured must fail");
@@ -9503,7 +9503,7 @@ fn heal_driven_refetch_leaves_the_taint_intact_on_a_failed_fetch() {
 
     // Point at an unreachable remote (a closed local port) so the fetch itself fails, before any
     // taint exists yet — planting the taint against an already-broken remote configuration.
-    assert_success(&area.forklift("dev", &["config", "remote.url", "http://127.0.0.1:9"]));
+    assert_success(&area.forklift("dev", &["config", "set", "remote.url", "http://127.0.0.1:9"]));
     plant_taint(&area, "dev", &[&relative]);
 
     let status = area.forklift("dev", &["--json", "heal"]);
@@ -9694,7 +9694,7 @@ fn a_retry_after_a_failed_handshake_succeeds_into_the_same_directory() {
     let server = Server::start(&area, Some("right-token"));
 
     prepare_warehouse(&area, "dev", &server.url);
-    assert_success(&area.forklift("dev", &["config", "remote.token", "right-token"]));
+    assert_success(&area.forklift("dev", &["config", "set", "remote.token", "right-token"]));
     area.write_file("dev/code.txt", "v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
     assert_success(&area.forklift("dev", &["stack", "base"]));
@@ -9984,8 +9984,8 @@ fn franchise_ignores_an_unrelated_ambient_warehouses_tor_setting() {
 
     std::fs::create_dir_all(area.path("outer")).unwrap();
     assert_success(&area.forklift("outer", &["prepare"]));
-    assert_success(&area.forklift("outer", &["config", "remote.tor", "on"]));
-    assert_success(&area.forklift("outer", &["config", "remote.torProxy", "socks5h://127.0.0.1:9"]));
+    assert_success(&area.forklift("outer", &["config", "set", "remote.tor", "on"]));
+    assert_success(&area.forklift("outer", &["config", "set", "remote.torProxy", "socks5h://127.0.0.1:9"]));
 
     // Run from inside "outer": the plain http:// test server must still be reached directly.
     let franchised = area.forklift("outer", &["clone", &server.url, "sub"]);
@@ -10215,7 +10215,7 @@ fn kv_needs_an_office_and_refuses_readers() {
     ]));
     assert_success(&area.forklift("a", &["manifest", "set", "main", "ci", "green"]));
 
-    assert_success(&area.forklift("a", &["config", "operator.identifier", "reader@forklift"]));
+    assert_success(&area.forklift("a", &["config", "set", "operator.identifier", "reader@forklift"]));
     let refused = area.forklift("a", &["manifest", "set", "main", "ci", "red"]);
     assert!(!refused.status.success(), "a reader's kv write must be refused");
     assert!(stderr(&refused).contains("reader"), "{}", stderr(&refused));
@@ -10224,14 +10224,14 @@ fn kv_needs_an_office_and_refuses_readers() {
     assert_eq!(stdout(&area.forklift("a", &["manifest", "get", "main", "ci"])).trim(), "green");
 
     // Nor may it deliver, which writes a pallet and a manifest entry: the target stays put.
-    assert_success(&area.forklift("a", &["config", "--unset", "operator.identifier"]));
+    assert_success(&area.forklift("a", &["config", "unset", "operator.identifier"]));
     assert_success(&area.forklift("a", &["pallet", "create", "draft"]));
     area.write_file("a/code.txt", "v2\n");
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "draft work"]));
     let main_head = pallet_head(&area, "a", "main");
 
-    assert_success(&area.forklift("a", &["config", "operator.identifier", "reader@forklift"]));
+    assert_success(&area.forklift("a", &["config", "set", "operator.identifier", "reader@forklift"]));
     let refused = area.forklift("a", &["deliver", "main"]);
     assert!(!refused.status.success(), "a reader's deliver must be refused");
     assert!(stderr(&refused).contains("reader cannot deliver"), "{}", stderr(&refused));
@@ -10719,7 +10719,7 @@ fn a_remote_whose_handshake_lists_no_tombstones_is_never_sent_a_delete() {
             handshake.len(), handshake
         ).into_bytes())
     });
-    assert_success(&area.forklift("a", &["config", "remote.url", &proxy.url]));
+    assert_success(&area.forklift("a", &["config", "set", "remote.url", &proxy.url]));
 
     for verb in ["delete", "restore"] {
         let refused = area.forklift("a", &["pallet", verb, "feat", "--remote"]);
@@ -11333,7 +11333,7 @@ fn worker_feat(area: &TestArea) -> (Server, String, String) {
     let server = Server::start_with_tokens(area, Some("root"), "tokens.toml");
 
     prepare_warehouse(area, "a", &server.url);
-    assert_success(&area.forklift("a", &["config", "remote.token", "root"]));
+    assert_success(&area.forklift("a", &["config", "set", "remote.token", "root"]));
     stack_file(area, "a", "code.txt", "v1\n");
     assert_success(&area.forklift("a", &["office", "enroll"]));
     let worker = keygen_admit_args(area, "worker@forklift");
@@ -11341,7 +11341,7 @@ fn worker_feat(area: &TestArea) -> (Server, String, String) {
     assert_success(&area.forklift("a", &["lift"]));
 
     assert_success(&area.forklift(".", &["clone", &server.url, "b", "--token", "w-token"]));
-    assert_success(&area.forklift("b", &["config", "operator.identifier", "worker@forklift"]));
+    assert_success(&area.forklift("b", &["config", "set", "operator.identifier", "worker@forklift"]));
     assert_success(&area.forklift("b", &["pallet", "create", "feat"]));
     stack_file(area, "b", "code.txt", "worker\n");
     assert_success(&area.forklift("b", &["lift"]));

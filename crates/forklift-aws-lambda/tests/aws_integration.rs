@@ -1572,7 +1572,7 @@ fn harvest(warehouse: &Path) -> Harvest {
 
 fn prepare(area: &Area, dir: &str) {
     area.forklift(dir, &["prepare"]);
-    area.forklift(dir, &["config", "--global", "operator.identifier", "tester@forklift"]);
+    area.forklift(dir, &["config", "set", "--global", "operator.identifier", "tester@forklift"]);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1750,7 +1750,7 @@ async fn the_cli_lifts_and_lowers_through_the_staging_flow_over_s3_and_dynamodb(
     area.write_file("wh/src/main.txt", "fn main\n");
     area.forklift("wh", &["load", "."]);
     area.forklift("wh", &["stack", "first"]);
-    area.forklift("wh", &["config", "remote.url", &head.url]);
+    area.forklift("wh", &["config", "set", "remote.url", &head.url]);
 
     // The money shot: lift through the staging flow (a failed staging PUT, commit, or ref update
     // would make `forklift lift` exit non-zero, which `Area::forklift` turns into a panic).
@@ -2223,7 +2223,7 @@ async fn the_cli_lifts_and_franchises_a_chunked_file_over_s3_and_dynamodb() {
     area.write_large_file("wh/big.bin", 0xBADA55, CHUNK_THRESHOLD + 5 * 1024 * 1024);
     area.forklift("wh", &["load", "."]);
     area.forklift("wh", &["stack", "a giant"]);
-    area.forklift("wh", &["config", "remote.url", &head.url]);
+    area.forklift("wh", &["config", "set", "remote.url", &head.url]);
 
     // The money shot: lift a chunked file through the staging flow (a failed staging PUT, a
     // rejected commit, or a refused ref update would make `forklift lift` exit non-zero, which

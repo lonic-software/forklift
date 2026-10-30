@@ -101,7 +101,7 @@ pub fn checked_remote() -> Result<(String, Option<String>), CoreError> {
     let url = config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)?
         .map(|(value, _)| value)
         .ok_or_else(|| format!(
-            "No remote is configured for this warehouse. Set one with \"forklift config {} <url>\".",
+            "No remote is configured for this warehouse. Set one with \"forklift config set {} <url>\".",
             config_utils::KEY_REMOTE_URL
         ))?;
 
@@ -133,7 +133,7 @@ pub fn same_remote(a: &str, b: &str) -> bool {
 /// * `other`  - The configured remote.
 pub fn non_origin_remote_refusal(origin: &str, other: &str) -> CoreError {
     let next_step = format!(
-        "Point \"{}\" back at \"{}\" with \"forklift config {} {}\", or clone \"{}\" into a new \
+        "Point \"{}\" back at \"{}\" with \"forklift config set {} {}\", or clone \"{}\" into a new \
         directory.",
         config_utils::KEY_REMOTE_URL, origin, config_utils::KEY_REMOTE_URL, origin, other
     );

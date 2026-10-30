@@ -627,3 +627,111 @@ fn every_quoted_command_says_forklift() {
     assert!(failures.is_empty(),
         "these name a command without `forklift `, so the hint check cannot read them:\n{}", failures.join("\n"));
 }
+
+/// Every way a command declares a boolean flag to conflict with one of its positional arguments,
+/// and every pair the check could not test, one line each. A boolean flag that excludes a
+/// positional is a flag selecting a different operation (`config --unset KEY`, the old
+/// `palletize --delete NAME`), and such an operation is a subcommand of its own.
+///
+/// The check parses rather than reads the declarations, so a conflict declared on either
+/// argument, through a group or by an exclusive argument is found alike: for each pair it parses
+/// the positionals up to that one, then the same line with the flag added, and only a declared
+/// conflict turns the first parse's success into an `ArgumentConflict`. Clap checks conflicts
+/// before required arguments, so the line need not carry them; it must carry values a parser
+/// accepts, and a pair whose first parse fails any other way is reported as untested.
+///
+/// It is a necessary check, not a complete one: a flag that changes the operation without
+/// declaring a conflict (`restore --staged`) passes it, and is left to the spec review.
+fn boolean_positional_conflicts(cli: &clap::Command) -> Vec<String> {
+    fn value(arg: &clap::Arg) -> String {
+        arg.get_possible_values().first().map(|value| value.get_name().to_string()).unwrap_or_else(|| "1".to_string())
+    }
+    let mut failures = Vec::new();
+    for (path, command) in command_paths(cli) {
+        let name = std::iter::once(cli.get_name().to_string()).chain(path).collect::<Vec<_>>().join(" ");
+        let positionals: Vec<&clap::Arg> = command.get_positionals().collect();
+        let flags = command.get_arguments().filter(|arg| !arg.is_positional() && matches!(
+            arg.get_action(), clap::ArgAction::SetTrue | clap::ArgAction::SetFalse | clap::ArgAction::Count));
+        for flag in flags {
+            let spelling = match (flag.get_long(), flag.get_short()) {
+                (Some(long), _) => format!("--{long}"),
+                (None, Some(short)) => format!("-{short}"),
+                (None, None) => continue,
+            };
+            for (index, positional) in positionals.iter().enumerate() {
+                let mut line = vec![command.get_name().to_string()];
+                for earlier in &positionals[..=index] {
+                    if earlier.is_last_set() {
+                        line.push("--".to_string());
+                    }
+                    line.push(value(earlier));
+                }
+                let pair = format!("`{name}`: {spelling} and <{}>", positional.get_id());
+                match command.clone().try_get_matches_from(&line) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == ErrorKind::MissingRequiredArgument => {}
+                    Err(error) => {
+                        failures.push(format!("{pair}: untested, {line:?} does not parse ({:?})", error.kind()));
+                        continue;
+                    }
+                }
+                line.insert(1, spelling.clone());
+                if let Err(error) = command.clone().try_get_matches_from(&line) {
+                    if error.kind() == ErrorKind::ArgumentConflict {
+                        failures.push(format!("{pair} are declared to conflict"));
+                    }
+                }
+            }
+        }
+    }
+    failures
+}
+
+/// Rule 3: no boolean flag is declared to conflict with a positional argument.
+#[test]
+fn no_boolean_flag_conflicts_with_a_positional() {
+    let failures = boolean_positional_conflicts(&built_cli());
+    assert!(failures.is_empty(),
+        "a boolean flag that excludes a positional selects another operation; make it a subcommand:\n{}",
+        failures.join("\n"));
+}
+
+/// The conflict check finds a conflict however it is declared, and nothing else.
+#[test]
+fn the_conflict_check_finds_every_declaration() {
+    use clap::{Arg, ArgAction, ArgGroup, Command};
+    let flag = || Arg::new("unset").long("unset").action(ArgAction::SetTrue);
+    let key = || Arg::new("key");
+    let probe = |sub: Command| {
+        let mut root = Command::new("probe").subcommand(sub);
+        root.build();
+        boolean_positional_conflicts(&root)
+    };
+    let conflicting = [
+        Command::new("on-flag").arg(flag().conflicts_with("key")).arg(key()),
+        Command::new("on-positional").arg(flag()).arg(key().conflicts_with("unset")),
+        Command::new("by-group").arg(flag()).arg(key()).group(ArgGroup::new("one").args(["unset", "key"])),
+        Command::new("exclusive").arg(flag().exclusive(true)).arg(key()),
+        Command::new("second").arg(flag().conflicts_with("value")).arg(key().required(true)).arg(Arg::new("value")),
+        Command::new("counted").arg(Arg::new("unset").short('u').action(ArgAction::Count).conflicts_with("key")).arg(key()),
+    ];
+    for sub in conflicting {
+        let name = sub.get_name().to_string();
+        let failures = probe(sub);
+        assert_eq!(failures.len(), 1, "{name}: {failures:?}");
+        assert!(failures[0].ends_with("are declared to conflict"), "{name}: {failures:?}");
+    }
+    let clean = [
+        Command::new("clean").arg(flag()).arg(key().required(true)),
+        Command::new("valued").arg(Arg::new("into").long("into").conflicts_with("key")).arg(key()),
+        Command::new("chosen").arg(flag()).arg(key().value_parser(["remote.url"])),
+    ];
+    for sub in clean {
+        let name = sub.get_name().to_string();
+        assert_eq!(probe(sub), Vec::<String>::new(), "{name}");
+    }
+    // A positional no placeholder value satisfies is reported, never passed silently.
+    let untested = probe(Command::new("typed").arg(flag()).arg(key().value_parser(clap::value_parser!(u8).range(5..))));
+    assert_eq!(untested.len(), 1, "{untested:?}");
+    assert!(untested[0].contains("untested"), "{untested:?}");
+}

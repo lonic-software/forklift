@@ -1715,8 +1715,8 @@ server. Until then, every command above refuses up front, and so do the local co
 change what the move checks: an `undo` that moves a pallet back in a sparse warehouse, and deleting
 a pallet. Each refuses with the `origin_move_pending` code (exit 37), changing nothing. The refusal
 names the server the move was going to: `forklift remote move <url>` finishes the move; while it is
-still checking the new server, and has not started rewriting the origin, `forklift remote move
---abort` abandons it instead. A record of a move that cannot be read is taken as one that may have
+still checking the new server, and has not started rewriting the origin, `forklift remote abort`
+abandons it instead. A record of a move that cannot be read is taken as one that may have
 started rewriting, so only finishing the move clears it; such a refusal cannot name the server, so
 finish the move naming one that holds this warehouse's content. Stacking and local reads still run,
 and so does `heal`, except that it does not rebuild a damaged record of the content held by hash
@@ -1974,12 +1974,12 @@ from here, it says what and how to clear it: a remote that is not the origin
 `--json`, `blocked` carries that refusal's `code`, `message` and `next_step`, and is null when
 nothing stops it. It only reads, so it runs while a move stands.
 
-### `remote move` — move a partial warehouse to another origin
+### `remote move` and `remote abort` — move a partial warehouse to another origin
 
 ```sh
 forklift remote move https://new.example.com                  # check the new server, then move
 forklift remote move https://new.example.com --token <token>  # and set remote.token with it
-forklift remote move --abort                                  # abandon a move that stopped while checking
+forklift remote abort                                         # abandon a move that stopped while checking
 ```
 
 A sparse or cache warehouse talks only to its origin (above), because it never verified the content
@@ -2009,10 +2009,10 @@ While the move runs, everything else that talks to the remote or changes what it
 with `origin_move_pending` (above), and a second `remote move` refuses the same way. A move that fails
 before it starts rewriting the origin leaves the origin as it was and no record of the move; the parcels and
 signatures it fetched stay, unreferenced, until `gc`. One that is killed partway leaves its
-record: if it was still checking, `remote move --abort` abandons it, as does any later failed move;
+record: if it was still checking, `remote abort` abandons it, as does any later failed move;
 if it had started rewriting, only a completed move clears it, so run `remote move` again, naming a
-server that holds this warehouse's content (`finished_stopped_move` says a run did so). `--abort`
-refuses a move that had started rewriting, and reports `abandoned` as the server an abandoned move
+server that holds this warehouse's content (`finished_stopped_move` says a run did so). `remote
+abort` refuses a move that had started rewriting, and reports `abandoned` as the server an abandoned move
 was going to, or none when no move had stopped.
 
 ---

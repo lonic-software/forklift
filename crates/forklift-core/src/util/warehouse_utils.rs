@@ -18,6 +18,24 @@ static CWD_RELATIVE_TO_ROOT: OnceLock<PathBuf> = OnceLock::new();
 /// * `Err(String)`  - A framed `not_a_warehouse` refusal if the current directory is not inside a
 ///                    working tree, or the current directory could not be read.
 pub fn find_warehouse_root() -> Result<PathBuf, String> {
+    enclosing_working_tree_root()?.ok_or_else(|| String::from(CoreError::refusal(
+        RefusalCode::NotAWarehouse,
+        format!(
+            "Not a forklift warehouse (no \"{}\" found in this directory or any of its parents).",
+            FOLDER_NAME_FORKLIFT_ROOT
+        ),
+        "Run \"forklift prepare\" to create a warehouse here, or change into one.",
+    )))
+}
+
+/// [`find_warehouse_root`]'s walk, with "none found" as `None` rather than a refusal.
+///
+/// # Returns
+/// * `Ok(Some(PathBuf))` - The nearest directory at or above the current one holding a
+///                         `.forklift` folder.
+/// * `Ok(None)`          - If there is none.
+/// * `Err(String)`       - If the current directory could not be read.
+fn enclosing_working_tree_root() -> Result<Option<PathBuf>, String> {
     let cwd = std::env::current_dir()
         .map_err(|e| format!("Error while getting the current directory: {}", e))?;
 
@@ -27,21 +45,33 @@ pub fn find_warehouse_root() -> Result<PathBuf, String> {
         // A warehouse and a bay (§7.5) both mark the root of their working tree with a
         // `.forklift` folder; `enter_warehouse` tells them apart.
         if dir.join(FOLDER_NAME_FORKLIFT_ROOT).exists() {
-            return Ok(dir.to_path_buf());
+            return Ok(Some(dir.to_path_buf()));
         }
 
         match dir.parent() {
             Some(parent) => dir = parent,
-            None => return Err(String::from(CoreError::refusal(
-                RefusalCode::NotAWarehouse,
-                format!(
-                    "Not a forklift warehouse (no \"{}\" found in this directory or any of its parents).",
-                    FOLDER_NAME_FORKLIFT_ROOT
-                ),
-                "Run \"forklift prepare\" to create a warehouse here, or change into one.",
-            ))),
+            None => return Ok(None),
         }
     }
+}
+
+/// [`enter_warehouse`] when the current directory is inside a working tree, and nothing
+/// otherwise: for a command that runs anywhere but must read a warehouse's configuration when
+/// it runs inside one. A working tree that is found but cannot be entered fails, as it would
+/// for any warehouse command; it is never treated as "not inside one".
+///
+/// # Returns
+/// * `Ok(true)`    - The warehouse was entered.
+/// * `Ok(false)`   - The current directory is inside no working tree.
+/// * `Err(String)` - As [`enter_warehouse`].
+pub fn enter_warehouse_if_inside() -> Result<bool, String> {
+    if enclosing_working_tree_root()?.is_none() {
+        return Ok(false);
+    }
+
+    enter_warehouse()?;
+
+    Ok(true)
 }
 
 /// Whether `dir` is the root of a working tree: it holds a `.forklift` entry (a warehouse's or a

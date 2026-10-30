@@ -48,7 +48,7 @@ pub async fn handle_command() -> Result<(), String> {
     refuse_partial_view()?;
 
     let url = mirror_url()?.ok_or(format!(
-        "No git mirror is configured. Set one with \"forklift config {} <url>\".",
+        "No git mirror is configured. Set one with \"forklift config set {} <url>\".",
         config_utils::KEY_MIRROR_URL
     ))?;
     let client = RemoteClient::from_config()?;

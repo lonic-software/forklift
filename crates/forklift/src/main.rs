@@ -472,12 +472,12 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
         Command::Alias { action } => commands::alias::handle_command(action),
         Command::Audit { pallet, full } => commands::audit::handle_command(pallet, full),
         Command::Blame { path, rev } => commands::blame::handle_command(&path, rev).await,
-        Command::Config { global, unset, key, value } =>
-            commands::config::handle_command(global, unset, key, value),
+        Command::Config { action } => commands::config::handle_command(action),
         Command::Profile { action } => match action {
             Some(ProfileAction::Create { name, identifier }) =>
                 commands::profile::create(&name, identifier),
             Some(ProfileAction::Use { name }) => commands::profile::use_profile(&name),
+            Some(ProfileAction::Keygen { name, passphrase }) => commands::profile::keygen(name.as_deref(), passphrase),
             Some(ProfileAction::List) | None => commands::profile::list(),
         },
         Command::Store { action } => match action {
@@ -522,7 +522,6 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
         Command::Office { action } => match action {
             Some(OfficeAction::Enroll { offline, passphrase }) =>
                 commands::office::enroll(offline, passphrase).await,
-            Some(OfficeAction::Keygen { passphrase }) => commands::office::keygen(passphrase),
             Some(OfficeAction::Admit { operator_id, public_key, pop, role, pallets, agent, bot, service, supervisor }) => {
                 let class = if agent {
                     forklift_core::util::office_utils::IdentityClass::Agent
@@ -574,10 +573,11 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
         Command::ScopePrune { paths, dry_run } => commands::scope_prune::handle_command(paths, dry_run).await,
         Command::Remote { action } => match action {
             None => commands::remote::show(),
-            Some(RemoteAction::Move { url, token, abort }) => {
+            Some(RemoteAction::Move { url, token }) => {
                 let store_access = store_access.ok_or("remote move ran without its store-access hold.")?;
-                commands::remote::move_origin(url, token, abort, store_access).await
+                commands::remote::move_origin(url, token, store_access).await
             }
+            Some(RemoteAction::Abort) => commands::remote::abort_move(),
         },
         Command::Shift { pallet } => commands::shift::handle_command(&pallet).await,
         Command::Show { target } => commands::show::handle_command(&target),

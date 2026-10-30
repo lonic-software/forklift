@@ -1,29 +1,31 @@
 use serde::Serialize;
 use forklift_core::enums::config_scope::ConfigScope;
 use forklift_core::util::{config_utils, warehouse_utils};
+use crate::cli::ConfigAction;
 use crate::output::{self, CommandOutput};
 
-/// Handle the config command.
-/// * `config`                 - List the known configuration keys and their values.
-/// * `config <key>`           - Print the value of a key.
-/// * `config <key> <value>`   - Set the value of a key.
+/// Handle the config family.
+/// * `config [list]`            - List the known configuration keys and their values.
+/// * `config get <key>`         - Print the value of a key.
+/// * `config set <key> <value>` - Set the value of a key.
+/// * `config unset <key>`       - Remove a key.
 ///
-/// The warehouse configuration is targeted by default; the `--global` flag targets the
-/// per-user configuration instead. When reading without `--global`, the warehouse value
-/// wins over the global one.
+/// The warehouse configuration is targeted by default; each subcommand's `--global` flag
+/// targets the per-user configuration instead. When reading without `--global`, the warehouse
+/// value wins over the global one.
 ///
 /// # Arguments
-/// * `global` - Whether to target the global (per-user) configuration.
-/// * `key`    - The key to read or write (`None` lists the configuration).
-/// * `value`  - The value to set the key to (`None` prints the current value).
+/// * `action` - The subcommand (`None` lists the effective configuration).
 ///
 /// # Returns
 /// * `Ok(())`      - If the command was handled successfully.
 /// * `Err(String)` - If there was an error while handling the command.
-pub fn handle_command(global: bool,
-                      unset: bool,
-                      key: Option<String>,
-                      value: Option<String>) -> Result<(), String> {
+pub fn handle_command(action: Option<ConfigAction>) -> Result<(), String> {
+    let global = match &action {
+        None => false,
+        Some(ConfigAction::List { global } | ConfigAction::Get { global, .. }
+             | ConfigAction::Set { global, .. } | ConfigAction::Unset { global, .. }) => *global,
+    };
     let scope = if global { ConfigScope::Global } else { ConfigScope::Warehouse };
 
     // Global-only operations must work outside a warehouse (e.g. configuring the operator
@@ -33,23 +35,9 @@ pub fn handle_command(global: bool,
         warehouse_utils::enter_warehouse()?;
     }
 
-    if unset {
-        let Some(key) = &key else {
-            return Err(
-                "Specify the key to remove, e.g. \"forklift config --unset remote.token\".".to_string()
-            );
-        };
-
-        config_utils::unset_value(key, scope)?;
-
-        output::message(format!("Unset \"{}\".", key));
-
-        return Ok(());
-    }
-
-    match (&key, &value) {
-        (Some(key), Some(value)) => {
-            let stored = config_utils::set_value(key, value, scope)?;
+    match action {
+        Some(ConfigAction::Set { key, value, .. }) => {
+            let stored = config_utils::set_value(&key, &value, scope)?;
 
             // Setting a value has always been silent in human mode; keep it so, but
             // give `--json` a confirmation envelope.
@@ -58,16 +46,23 @@ pub fn handle_command(global: bool,
             // is stored normalized, so echoing the argument would answer `"  ON  "` for a file
             // that holds `on` — a disagreement a consumer caching the echo would carry until its
             // next read. `set_value` returns the stored spelling so this cannot be got wrong.
-            output::emit(&ConfigSet { key: key.clone(), value: stored });
+            output::emit(&ConfigSet { key, value: stored });
 
             Ok(())
         }
-        (Some(key), None) => print_value(key, scope),
-        _                 => list_configuration(scope),
+        Some(ConfigAction::Unset { key, .. }) => {
+            config_utils::unset_value(&key, scope)?;
+
+            output::message(format!("Unset \"{}\".", key));
+
+            Ok(())
+        }
+        Some(ConfigAction::Get { key, .. }) => print_value(&key, scope),
+        Some(ConfigAction::List { .. }) | None => list_configuration(scope),
     }
 }
 
-/// A `config <key> <value>` set (human output stays silent).
+/// A `config set` (human output stays silent).
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
 pub(crate) struct ConfigSet {
@@ -75,7 +70,7 @@ pub(crate) struct ConfigSet {
 
     /// The value as written to the file, which is not always the argument given: a key with a
     /// fixed set of values (`remote.tor`) is stored in its documented spelling, so `"  ON  "` is
-    /// reported, and stored, as `"on"`. A later `config <key>` read returns this same string.
+    /// reported, and stored, as `"on"`. A later `config get` returns this same string.
     value: String,
 }
 
@@ -108,7 +103,7 @@ fn print_value(key: &str, scope: ConfigScope) -> Result<(), String> {
     }
 }
 
-/// A `config <key>` read.
+/// A `config get` read.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
 pub(crate) struct ConfigValue {

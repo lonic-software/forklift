@@ -1,7 +1,7 @@
 use std::fmt::Display;
 
 /// The configuration file a configuration operation targets.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfigScope {
     /// The per-user configuration file in the user's home directory (`.forkliftconfig`).
     /// Values set here apply to every warehouse of the user.

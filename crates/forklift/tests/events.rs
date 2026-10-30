@@ -69,7 +69,7 @@ impl TestWarehouse {
     /// to compact.
     fn prepare_with_a_parcel(&self) {
         assert_success(&self.run(&["prepare"]));
-        assert_success(&self.run(&["config", "--global", "operator.identifier", "test@forklift"]));
+        assert_success(&self.run(&["config", "set", "--global", "operator.identifier", "test@forklift"]));
 
         for index in 0..20 {
             self.write_file(&format!("src/file-{}.txt", index), &format!("content {}\n", index));
@@ -207,7 +207,7 @@ fn import_git_reports_its_phases_on_the_channel() {
     git(&["commit", "-qm", "second commit"]);
 
     assert_success(&warehouse.run(&["prepare"]));
-    assert_success(&warehouse.run(&["config", "--global", "operator.identifier", "test@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "--global", "operator.identifier", "test@forklift"]));
 
     let (output, lines) = run_and_collect(&warehouse, &["git", "import", "."]);
     assert_success(&output);

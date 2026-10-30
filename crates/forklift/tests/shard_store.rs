@@ -28,7 +28,7 @@ impl Warehouse {
 
         let warehouse = Warehouse { base, root, home };
         warehouse.run_ok(&["prepare"]);
-        warehouse.run_ok(&["config", "operator.identifier", "spike@forklift"]);
+        warehouse.run_ok(&["config", "set", "operator.identifier", "spike@forklift"]);
 
         for (path, content) in files {
             warehouse.write(path, content);

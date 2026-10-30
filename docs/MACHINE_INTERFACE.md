@@ -534,11 +534,11 @@ checks (the heads this warehouse depends on its origin for, and the content it h
 refuses with `origin_move_pending` (exit 37). A command refused up front changes nothing; one whose
 write was refused partway, because the move began while it ran, keeps what it did before that write.
 `next_step` names `remote move` with the server the move was going to, which finishes the move, and,
-while the move has not yet started rewriting the origin, `remote move --abort`, which abandons it. A
+while the move has not yet started rewriting the origin, `remote abort`, which abandons it. A
 record of a move that cannot be read is refused the same way, as a move that may have started
 rewriting, and `next_step` names `remote move <url>`, since the record no longer says which server
 the move was going to. Stacking and commands that only read this warehouse still run. A second
-`remote move`, or a `remote move --abort`, while a move is running refuses with the same code.
+`remote move`, or a `remote abort`, while a move is running refuses with the same code.
 
 ### A new origin that lacks content: `origin_move_incomplete`
 
