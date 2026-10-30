@@ -1710,6 +1710,7 @@ mod tests {
         "self-schema", // describes the CLI for Pult; agents get the MCP tool list instead
         "scope-prune", // destructive, warehouse-wide disk reclamation — an admin verb, never a sub-agent's
         "evict",       // warehouse-wide disk reclamation in a cache — an admin verb, like scope-prune
+        "remote",      // repoints a partial warehouse at another server (setup)
         "mcp",         // this server itself
         "help",        // meta
         "version",     // meta

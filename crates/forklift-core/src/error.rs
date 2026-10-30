@@ -272,6 +272,11 @@ refusal_codes! {
     /// against the new server. The next step finishes the move (`remote move <url>`), or abandons
     /// one that has not started rewriting (`remote move --abort`).
     OriginMovePending => "origin_move_pending",
+
+    /// A move of a partial warehouse's origin found the new server lacking content this warehouse
+    /// relies on its origin to hold, so it left the origin where it was. The next step copies the
+    /// old server's warehouse to the new one, server-side, and runs the move again.
+    OriginMoveIncomplete => "origin_move_incomplete",
 }
 
 impl RefusalCode {

@@ -269,6 +269,7 @@ Forklift has several locks, each guarding a different thing.
 | Config lock | one config file |
 | Serve lock (`serve.lock`) | a warehouse a server is serving; gc and `compact --all` also take it while they run |
 | Server base lock (`.forklift-server.lock`) | a server's base folder |
+| Move lock (`origin-move.lock`) | a move of a partial warehouse's origin, against a second move or abort |
 | Build lock | a warehouse still being created |
 
 ## Remotes
@@ -284,6 +285,11 @@ Forklift has several locks, each guarding a different thing.
 
 **Lower** (git: `pull --ff-only`). Fetches and fast-forwards. A diverged working pallet is
 reported, never merged on its own. See [`lower`](cli.md#lower--pull-lo).
+
+**Origin.** The remote a sparse or cache warehouse was franchised from, recorded with the
+warehouse rather than in config; such a warehouse talks to no other remote. See
+[`remote move`](cli.md#remote-move--move-a-partial-warehouse-to-another-origin), the one way to
+change it.
 
 **Diverged, remote ahead.** Refusals meaning the remote's history moved: *diverged* when both sides
 have parcels the other lacks, *remote ahead* when you need to lower first.

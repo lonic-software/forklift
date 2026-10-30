@@ -2,11 +2,12 @@
 //! verifies makes against it.
 //!
 //! A move points a partial warehouse at a new origin. Before it rewrites the origin it checks that
-//! the new server holds everything this warehouse leans on the origin for: every head in the
-//! fetched-heads ledger, every entry of the held-heads record and every parcel of the sealed-object
-//! record. That check talks to the network, so it runs without the
-//! [`RefLock`](crate::util::lock_utils::RefLock), and a write to one of those records meanwhile
-//! could add something the check never saw. So the move first writes an intent, under the ref
+//! the new server holds everything this warehouse leans on the origin for: every object it lacks
+//! that something present references ([`origin_check`](crate::util::origin_check)). That check
+//! talks to the network, so it runs without the [`RefLock`](crate::util::lock_utils::RefLock), and
+//! a write meanwhile could make this warehouse lean on the origin for something the check never
+//! saw: a fetch, a sealed record write, or a ledger or held-heads entry naming history only the old
+//! origin was seen to hold. So the move first writes an intent, under the ref
 //! lock, and from then until it clears the intent every writer of those records refuses, checking
 //! in the same hold as its write: the ledger's writer, the held-heads writer and every write of the
 //! sealed-object record (an append, a compaction or bound, a rebuild), and a pallet's removal.

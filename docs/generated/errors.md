@@ -50,4 +50,5 @@ Exit code 17 is reserved for a future feature and is not yet assigned to any cod
 | `pallet_deleted_on_remote` | 35 | The remote has the pallet only as a tombstone: it was deleted there, and the name stays reserved for that history; "palletize --restore <name> --remote" brings it back, "lift --recreate" re-creates it from work that descends from it |
 | `cache_miss` | 36 | A cache warehouse does not hold content the command reads, and could not reach its origin to fetch it; the command works once the origin can be reached |
 | `origin_move_pending` | 37 | A move of a partial warehouse's origin has not finished; "remote move <url>" finishes it, "remote move --abort" abandons one that has not started rewriting |
+| `origin_move_incomplete` | 38 | The server a partial warehouse's origin was to move to lacks content the warehouse relies on its origin to hold; the origin was left where it was, and copying the old server's warehouse to the new one, server-side, lets the move run again |
 

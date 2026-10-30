@@ -4864,6 +4864,24 @@ pub async fn fetch_history_within(client: &RemoteClient,
     Ok(walk_history(client, head, roots, true, progress).await?.0)
 }
 
+/// The parcels and signatures of `head`'s history, bounded as [`fetch_history`] bounds them, and
+/// none of their content, recording nothing: for a move of the origin, which reads the new server's
+/// history to judge it and adopts nothing from it. The parcels it stores no ref reaches until a
+/// fetch takes their head, so they are what any interrupted fetch leaves.
+///
+/// # Arguments
+/// * `client` - The remote.
+/// * `head`   - The parcel hash to fetch from.
+///
+/// # Returns
+/// * `Ok(FetchStats)` - What was actually transferred, and how many parcels were walked.
+/// * `Err(String)`    - If a transfer or verification failed.
+pub async fn fetch_parcels_only(client: &RemoteClient,
+                                head: &str,
+                                progress: &Progress) -> Result<FetchStats, String> {
+    Ok(walk_history(client, head, &[], false, progress).await?.0)
+}
+
 /// The bounded parcel walk of [`fetch_history_within`]: every parcel and signature from `head` down
 /// to what is already known complete, and with `content`, every walked parcel's closure as well.
 /// Without it, nothing below a parcel is fetched and the walked parcels' root trees are returned
@@ -5968,6 +5986,38 @@ async fn fetch_loose_objects(client: &RemoteClient, missing: &[String]) -> Resul
     join_all(tasks).await?;
 
     Ok(missing.len())
+}
+
+/// Read the given objects concurrently, one GET each, into memory: each verified against its hash
+/// and none stored.
+///
+/// # Returns
+/// * `Ok(Vec<(String, Vec<u8>)>)` - Each hash with its bytes, in no particular order.
+/// * `Err(String)`                - If a transfer failed or the remote answered with other bytes.
+pub async fn read_objects_verified(client: &RemoteClient,
+                                   hashes: &[String]) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let semaphore = Arc::new(Semaphore::new(CONCURRENT_TRANSFERS));
+    let mut tasks: JoinSet<Result<(String, Vec<u8>), String>> = JoinSet::new();
+
+    for hash in hashes {
+        let client = client.clone();
+        let hash = hash.clone();
+        let semaphore = Arc::clone(&semaphore);
+
+        tasks.spawn(async move {
+            let _permit = semaphore.acquire().await
+                .map_err(|_| "The transfer pool was closed unexpectedly.".to_string())?;
+
+            let bytes = client.fetch_object(&hash).await
+                .map_err(|e| format!("Object {} could not be read from the remote: {}", hash, e))?;
+            object_utils::verify_object_bytes(&hash, &bytes)
+                .map_err(|_| format!("The remote answered object {} with other bytes.", hash))?;
+
+            Ok((hash, bytes))
+        });
+    }
+
+    join_all(tasks).await
 }
 
 /// D4's dedicated corrupt-candidate fetch (DESIGN.html §3.1.1): one loose `GET` per flagged hash,

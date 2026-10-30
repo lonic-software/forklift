@@ -5283,7 +5283,7 @@ fn a_sparse_workspace_refuses_to_lift_to_a_non_origin_remote() {
     let json: serde_json::Value = serde_json::from_str(&stdout(&forced)).unwrap();
     assert_eq!(json["error"]["code"], "non_origin_remote", "{}", stdout(&forced));
     let message = json["error"]["message"].as_str().unwrap();
-    assert!(message.contains("origin record") && message.contains("Franchise the remote again"),
+    assert!(message.contains("origin record") && message.contains("remote move <url>"),
         "the refusal names the missing record and the way out: {}", message);
 }
 
@@ -6621,21 +6621,306 @@ fn a_pending_move_of_the_origin_refuses_every_remote_client_and_every_writer_it_
         assert_success(&area.forklift("sparse", &["heal"]));
         assert_success(&area.forklift("cached", &["heal"]));
 
-        std::fs::remove_file(area.path("sparse/.forklift/origin-move")).unwrap();
-        std::fs::remove_file(area.path("cached/.forklift/origin-move")).unwrap();
+        // A checking move is abandoned; a rewriting one only a completed move clears, and the
+        // fixture's server does not exist.
+        for directory in ["sparse", "cached"] {
+            if phase == Phase::Checking {
+                assert_success(&area.forklift(directory, &["remote", "move", "--abort"]));
+            } else {
+                std::fs::remove_file(area.path(&format!("{}/.forklift/origin-move", directory))).unwrap();
+            }
+        }
     }
 
     record_move_intent(&area, "sparse", Phase::Checking);
     area.write_file("sparse/src/code.txt", "under a move\n");
     assert_success(&area.forklift("sparse", &["load", "."]));
     assert_success(&area.forklift("sparse", &["stack", "under a move"]));
-    std::fs::remove_file(area.path("sparse/.forklift/origin-move")).unwrap();
+    assert_success(&area.forklift("sparse", &["remote", "move", "--abort"]));
 
     // With the intent gone, what it refused runs.
     assert_success(&area.forklift("sparse", &["lift"]));
     assert_success(&area.forklift("cached", &["show", &format!("{}:src/code.txt", oldest)]));
     assert_success(&area.forklift("cached", &["palletize", "--delete", "old", "--force"]));
     assert_success(&area.forklift("cached", &["evict"]));
+}
+
+/// Copy the warehouse `from` to `to`, as an operator copies a server's warehouse on the server's
+/// side, and serve the copy. The copied serve lock is a file a kill would have left; it holds no
+/// lock.
+fn serve_copy(area: &TestArea, from: &str, to: &str) -> Server {
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &to.join(entry.file_name()));
+            } else {
+                std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+            }
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(area.path(to));
+    copy_dir(&area.path(from), &area.path(to));
+    let _ = std::fs::remove_file(area.path(&format!("{}/.forklift/serve.lock", to)));
+
+    Server::spawn(vec![
+        "serve".to_string(),
+        "--root".to_string(), area.path(to).to_str().unwrap().to_string(),
+        "--addr".to_string(), "127.0.0.1:0".to_string(),
+    ], None)
+}
+
+/// The `remote.url` `directory` dials.
+fn configured_remote(area: &TestArea, directory: &str) -> String {
+    let read = area.forklift(directory, &["config", "remote.url"]);
+    assert_success(&read);
+    stdout(&read).trim().to_string()
+}
+
+/// Whether a move of the origin stands in `directory`.
+fn move_stands(area: &TestArea, directory: &str) -> bool {
+    area.path(&format!("{}/.forklift/origin-move", directory)).exists()
+}
+
+/// A cache and a sparse warehouse move their origin to a copy of it, named with a trailing slash,
+/// and from then on read, expand and lift against the copy alone, the old origin stopped: the cache
+/// reads an older parcel's content it never fetched, the sparse warehouse fetches content it left
+/// out by expanding, and the cache lifts unlifted work. The cache's checkout is not its unlifted work, so an
+/// eviction freed a subtree that work shares with the origin's history only beneath a root this
+/// warehouse does not hold, which the move finds by reading that root from the copy. The origin
+/// record and `remote.url` both name the copy in one spelling, and no move stands.
+///
+/// Revert: stop descending an absent tree the check finds → the shared subtree is never met and
+/// the cache's move refuses; rewrite `remote.url` but not the origin → the recorded origin is
+/// still the old one; drop the slash trim → the reported origin keeps the slash.
+#[test]
+fn a_partial_warehouse_moves_its_origin_to_a_copy_and_works_against_it() {
+    let area = TestArea::new("origin-move-copy");
+    let (mut server, head) = three_signed_parcels(&area);
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src"]));
+    let oldest = history_with_roots(&area, "cached", &head)[2].0.clone();
+
+    // Unlifted work on its own pallet, stacked on "three", whose docs subtree only it and three's
+    // root name; then the checkout moves past three and the eviction frees that subtree.
+    assert_success(&area.forklift("cached", &["palletize", "local"]));
+    area.write_file("cached/src/local.txt", "local\n");
+    assert_success(&area.forklift("cached", &["load", "."]));
+    assert_success(&area.forklift("cached", &["stack", "local work"]));
+    assert_success(&area.forklift("cached", &["shift", "main"]));
+    area.write_file("a/src/code.txt", "four\n");
+    area.write_file("a/docs/four.txt", "notes\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "four"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_success(&area.forklift("cached", &["lower"]));
+    assert_success(&area.forklift("cached", &["evict"]));
+    let three_docs = subtree_of(&area, "server-root", &history_with_roots(&area, "server-root", &head)[0].1, "docs");
+    assert!(recorded(&area, "cached", &three_docs), "the eviction freed three's docs subtree");
+
+    let copy = serve_copy(&area, "server-root", "copy-root");
+    server.stop();
+
+    for directory in ["cached", "sparse"] {
+        let moved = area.forklift(directory, &["--json", "remote", "move", &format!("{}/", copy.url)]);
+        assert_success(&moved);
+        let json = json_of(&moved);
+        assert_eq!(json["data"]["origin"], copy.url.as_str(), "{}", json);
+        assert_eq!(json["data"]["previous_origin"], server.url.as_str(), "{}", json);
+        assert_eq!(json["data"]["finished_stopped_move"], false, "{}", json);
+        assert!(json["data"]["absent_objects"].as_u64().unwrap() > 0, "{}", json);
+        assert_eq!(origin_of(&area, directory).as_deref(), Some(copy.url.as_str()), "{}", directory);
+        assert_eq!(configured_remote(&area, directory), copy.url, "{}", directory);
+        assert!(!move_stands(&area, directory), "{}", directory);
+
+        if directory == "cached" {
+            assert!(json["data"]["read_objects"].as_u64().unwrap() > 0, "three's root was read from the copy: {}", json);
+        }
+    }
+
+    let read = area.forklift("cached", &["show", &format!("{}:src/code.txt", oldest)]);
+    assert_success(&read);
+    assert_eq!(stdout(&read), "one\n");
+
+    assert!(!object_present(&area, "sparse", &three_docs), "docs is out of the sparse warehouse's scope");
+    assert_success(&area.forklift("sparse", &["expand", "docs"]));
+    assert!(object_present(&area, "sparse", &three_docs), "expand fetches docs from the new origin");
+
+    assert_success(&area.forklift("cached", &["shift", "local"]));
+    assert_success(&area.forklift("cached", &["lift"]));
+    assert_eq!(pallet_head(&area, "copy-root", "local"), pallet_head(&area, "cached", "local"));
+}
+
+/// A move to a server whose history does not reach what a cache lacks refuses as
+/// `origin_move_incomplete` (exit 38), naming the missing root and the server-side copy, and leaves
+/// the origin, `remote.url` and the record as they were with no move standing; once the server
+/// holds a fresh copy of the origin's warehouse, the same move goes through. A server under another
+/// trust anchor is refused as `trust_changed` before anything is fetched, and a full warehouse has
+/// no origin to move.
+///
+/// Revert: skip the coverage check → the stale copy becomes the origin; keep the intent on a
+/// failed check → a move stands after the refusal; skip the trust check → the other server's
+/// history is walked and the refusal is another one.
+#[test]
+fn a_move_to_a_server_lacking_content_refuses_and_leaves_the_origin() {
+    let area = TestArea::new("origin-move-incomplete");
+    let (server, _) = three_signed_parcels(&area);
+    let stale = serve_copy(&area, "server-root", "stale-root");
+
+    // Two more parcels, so the cache holds the last and records the root of the one before it,
+    // which only the origin holds.
+    for version in ["four", "five"] {
+        area.write_file("a/src/code.txt", &format!("{}\n", version));
+        assert_success(&area.forklift("a", &["load", "."]));
+        assert_success(&area.forklift("a", &["stack", version]));
+    }
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    let head = pallet_head(&area, "server-root", "main");
+    let four_root = history_with_roots(&area, "cached", &head)[1].1.clone();
+    assert!(recorded(&area, "cached", &four_root));
+
+    let sealed_before = sealed_bytes(&area, "cached");
+    let refused = area.forklift("cached", &["--json", "remote", "move", &stale.url]);
+    assert_eq!(refused.status.code(), Some(38), "{}{}", stdout(&refused), stderr(&refused));
+    let json = json_of(&refused);
+    assert_eq!(json["error"]["code"], "origin_move_incomplete", "{}", json);
+    assert!(json["error"]["details"]["missing"].as_array().unwrap().contains(&serde_json::json!(four_root)), "{}", json);
+    assert_eq!(json["error"]["details"]["missing_count"], json["error"]["details"]["missing"].as_array().unwrap().len());
+    let message = json["error"]["message"].as_str().unwrap();
+    assert!(message.contains(&four_root) && message.contains("server's side"), "{}", message);
+    assert!(!move_stands(&area, "cached"));
+    assert_eq!(origin_of(&area, "cached").as_deref(), Some(server.url.as_str()));
+    assert_eq!(configured_remote(&area, "cached"), server.url);
+    assert_eq!(sealed_bytes(&area, "cached"), sealed_before, "the record is as it was");
+
+    // Another trust anchor is refused as such.
+    let other = Server::start_at(&area, "other-root", None);
+    prepare_warehouse(&area, "b", &other.url);
+    assert_success(&area.forklift("b", &["office", "enroll"]));
+    area.write_file("b/src/code.txt", "other\n");
+    assert_success(&area.forklift("b", &["load", "."]));
+    assert_success(&area.forklift("b", &["stack", "other"]));
+    assert_success(&area.forklift("b", &["lift"]));
+    let untrusted = area.forklift("cached", &["--json", "remote", "move", &other.url]);
+    assert_eq!(json_of(&untrusted)["error"]["code"], "trust_changed", "{}", stdout(&untrusted));
+    assert!(!move_stands(&area, "cached"));
+    assert_eq!(origin_of(&area, "cached").as_deref(), Some(server.url.as_str()));
+
+    // Finishing a move that stopped while rewriting refuses the same way, its code and details
+    // whole, and says the move still stands.
+    record_move_intent(&area, "cached", forklift_core::util::origin_move::Phase::Rewriting);
+    let resumed = area.forklift("cached", &["--json", "remote", "move", &stale.url]);
+    assert_eq!(resumed.status.code(), Some(38), "{}{}", stdout(&resumed), stderr(&resumed));
+    let json = json_of(&resumed);
+    assert_eq!(json["error"]["code"], "origin_move_incomplete", "{}", json);
+    assert!(json["error"]["details"]["missing"].as_array().unwrap().contains(&serde_json::json!(four_root)), "{}", json);
+    assert!(json["error"]["message"].as_str().unwrap().contains("before this run"), "{}", json);
+    assert!(move_stands(&area, "cached"));
+    assert_eq!(origin_of(&area, "cached").as_deref(), Some(server.url.as_str()));
+
+    // A fresh server-side copy holds it all, and finishes that move.
+    let mut stale = stale;
+    stale.stop();
+    let fresh = serve_copy(&area, "server-root", "stale-root");
+    assert_success(&area.forklift("cached", &["remote", "move", &fresh.url]));
+    assert_eq!(origin_of(&area, "cached").as_deref(), Some(fresh.url.as_str()));
+    assert!(!move_stands(&area, "cached"));
+
+    // A full warehouse has no origin.
+    assert_success(&area.forklift(".", &["franchise", &server.url, "full"]));
+    let full = area.forklift("full", &["remote", "move", &fresh.url]);
+    assert!(!full.status.success() && stderr(&full).contains("config remote.url"), "{}", stderr(&full));
+    assert_eq!(configured_remote(&area, "full"), server.url);
+}
+
+/// The sealed record's bytes in `directory`, or none.
+fn sealed_bytes(area: &TestArea, directory: &str) -> Option<Vec<u8>> {
+    std::fs::read(area.path(&format!("{}/.forklift/sealed", directory))).ok()
+}
+
+/// A move killed while checking leaves its intent; `remote move --abort` clears it, leaving the
+/// origin, and a move started over one replaces it and completes. A move killed while rewriting
+/// cannot be abandoned (`origin_move_pending`, the intent kept), and the next move finishes it,
+/// checking its own server first; so does a move over an intent that does not parse, which may
+/// have started rewriting. With no move standing, `--abort` says so. While another move holds the
+/// move lock, a move and an abort refuse as `origin_move_pending` and change nothing. A cache
+/// whose origin record went missing records it again through a move.
+///
+/// Revert: let `--abort` clear a rewriting intent → its refusal goes green; skip the move lock →
+/// the held-lock rows run; report a finished stopped move as fresh → `finished_stopped_move`
+/// reads false.
+#[test]
+fn a_stopped_move_is_abandoned_only_while_checking_and_finished_by_the_next() {
+    use forklift_core::util::origin_move::Phase;
+
+    let area = TestArea::new("origin-move-stopped");
+    let (server, _) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    let copy = serve_copy(&area, "server-root", "copy-root");
+
+    let quiet = area.forklift("cached", &["--json", "remote", "move", "--abort"]);
+    assert_success(&quiet);
+    assert_eq!(json_of(&quiet)["data"]["abandoned"], serde_json::Value::Null);
+
+    record_move_intent(&area, "cached", Phase::Checking);
+    let aborted = area.forklift("cached", &["--json", "remote", "move", "--abort"]);
+    assert_success(&aborted);
+    assert_eq!(json_of(&aborted)["data"]["abandoned"], "http://new-origin.example");
+    assert!(!move_stands(&area, "cached"));
+    assert_eq!(origin_of(&area, "cached").as_deref(), Some(server.url.as_str()));
+    assert_success(&area.forklift("cached", &["lower"]));
+
+    record_move_intent(&area, "cached", Phase::Checking);
+    let replaced = area.forklift("cached", &["--json", "remote", "move", &copy.url]);
+    assert_success(&replaced);
+    assert_eq!(json_of(&replaced)["data"]["finished_stopped_move"], false);
+    assert_eq!(origin_of(&area, "cached").as_deref(), Some(copy.url.as_str()));
+    assert!(!move_stands(&area, "cached"));
+
+    record_move_intent(&area, "cached", Phase::Rewriting);
+    let before = forklift_dir_snapshot(&area, "cached");
+    let kept = area.forklift("cached", &["--json", "remote", "move", "--abort"]);
+    assert_eq!(kept.status.code(), Some(37), "{}{}", stdout(&kept), stderr(&kept));
+    assert_eq!(json_of(&kept)["error"]["code"], "origin_move_pending");
+    assert!(forklift_dir_snapshot(&area, "cached") == before, "a rewriting move is not abandoned");
+    let finished = area.forklift("cached", &["--json", "remote", "move", &server.url]);
+    assert_success(&finished);
+    assert_eq!(json_of(&finished)["data"]["finished_stopped_move"], true);
+    assert_eq!(origin_of(&area, "cached").as_deref(), Some(server.url.as_str()));
+    assert_eq!(configured_remote(&area, "cached"), server.url);
+    assert!(!move_stands(&area, "cached"));
+
+    std::fs::write(area.path("cached/.forklift/origin-move"), "not a record\n").unwrap();
+    assert_eq!(area.forklift("cached", &["--json", "remote", "move", "--abort"]).status.code(), Some(37));
+    let taken_over = area.forklift("cached", &["--json", "remote", "move", &copy.url]);
+    assert_success(&taken_over);
+    assert_eq!(json_of(&taken_over)["data"]["finished_stopped_move"], true);
+    assert_eq!(origin_of(&area, "cached").as_deref(), Some(copy.url.as_str()));
+    assert!(!move_stands(&area, "cached"));
+
+    {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("cached"));
+        let _held = forklift_core::util::lock_utils::MoveLock::try_acquire().unwrap().unwrap();
+        let before = forklift_dir_snapshot(&area, "cached");
+
+        for args in [&["remote", "move", server.url.as_str()][..], &["remote", "move", "--abort"]] {
+            let refused = area.forklift("cached", &[&["--json"][..], args].concat());
+            assert_eq!(refused.status.code(), Some(37), "{:?}: {}{}", args, stdout(&refused), stderr(&refused));
+            assert!(json_of(&refused)["error"]["message"].as_str().unwrap().contains("Another move"), "{:?}", args);
+        }
+        assert!(forklift_dir_snapshot(&area, "cached") == before, "a held move lock leaves everything as it was");
+    }
+
+    std::fs::remove_file(area.path("cached/.forklift/origin")).unwrap();
+    let missing = area.forklift("cached", &["--json", "lower"]);
+    assert!(json_of(&missing)["error"]["message"].as_str().unwrap().contains("remote move <url>"), "{}", stdout(&missing));
+    assert_success(&area.forklift("cached", &["remote", "move", &copy.url]));
+    assert_eq!(origin_of(&area, "cached").as_deref(), Some(copy.url.as_str()));
+    assert_success(&area.forklift("cached", &["lower"]));
 }
 
 /// `evict` frees only a cache: a full and a sparse warehouse refuse it as a plain failure, before

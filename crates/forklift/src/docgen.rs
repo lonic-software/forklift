@@ -351,6 +351,7 @@ fn command_schemas(name: &str) -> Option<Vec<OutputSchema>> {
         "scope" => commands::scope::__docgen_schemas(),
         "scope-prune" => commands::scope_prune::__docgen_schemas(),
         "evict" => commands::evict::__docgen_schemas(),
+        "remote" => commands::remote::__docgen_schemas(),
         "self-schema" => commands::self_schema::__docgen_schemas(),
         "self-update" => commands::self_update::__docgen_schemas(),
         "shift" => commands::shift::__docgen_schemas(),

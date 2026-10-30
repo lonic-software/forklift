@@ -1691,11 +1691,12 @@ partial warehouse — `lift`, `lower`, `expand`, `scope-prune`, `evict`, `pallet
 `non_origin_remote` code (exit 11) when `remote.url` is not the origin, naming both and changing
 nothing. `heal` asks no such remote either: it does its local repair and, for what only a remote
 could restore, carries that refusal's message in its own report. Point `remote.url` back at the
-origin, or franchise the other remote into a new directory. The origin record is not
-configuration: no `config` key reaches it. A partial
+origin, franchise the other remote into a new directory, or move the origin to it with
+`forklift remote move <url>` (below), which first checks that it holds what this warehouse lacks.
+The origin record is not configuration: no `config` key reaches it. A partial
 warehouse whose record is missing (only a damaged `.forklift` can be) is refused with the same
-code; franchise the remote again. A full warehouse records no origin, holds the whole closure and
-can talk to any remote.
+code; record the origin with `remote move`, or franchise the remote again. A full warehouse records
+no origin, holds the whole closure and can talk to any remote.
 
 **While a move of the origin stands.** Moving a partial warehouse to another origin first records
 that a move has begun, and it is not finished until the origin and `remote.url` both name the new
@@ -1947,6 +1948,47 @@ though the record may still have shrunk. Either way the eviction itself still st
 object here is one only local history names (the origin's history was checked before anything was
 freed), so the record keeps everything until that content is back, for example by restoring it from
 a copy that has it.
+
+### `remote move` — move a partial warehouse to another origin
+
+```sh
+forklift remote move https://new.example.com                  # check the new server, then move
+forklift remote move https://new.example.com --token <token>  # and set remote.token with it
+forklift remote move --abort                                  # abandon a move that stopped while checking
+```
+
+A sparse or cache warehouse talks only to its origin (above), because it never verified the content
+it lacks anywhere else. `remote move` is the one way to change that origin, for example when a
+warehouse has been copied to a new server: it checks that the new server holds every tree, file and
+chunk that something here references and this warehouse does not hold, and only then rewrites the
+origin record and `remote.url` (and `remote.token`, given `--token`; without it the current token is
+used to talk to the new server). The URL is recorded as given, less a trailing `/`. A full warehouse
+has no origin to move and is refused: point it at another remote with
+`forklift config remote.url <url>`.
+
+The check judges the new server's trust as `lower` does, without adopting anything, fetches the
+parcels and signatures of its pallets' and tombstones' history that are missing here (no content),
+and walks the trees that history names until it has met every object this warehouse lacks; the
+trees and recipes it must read from the new server for that are hash-checked in memory and not
+stored. The report counts what it fetched (`fetched_objects`, `fetched_signatures`), what it found
+(`absent_objects`) and what it read (`read_objects`). If the new server's history does not reach
+something this warehouse lacks, the move is refused with the `origin_move_incomplete` code (exit
+38), naming up to ten of the missing objects (`details.missing` lists up to a thousand,
+`details.missing_count` counts them all), and the origin is
+left where it was: copy the old origin's warehouse to the new server on the server's side, then run
+the move again. The heads recorded from earlier lowers (the fetched-heads ledger and the held-heads
+record above) are not checked: `expand` and `scope-prune` already ask the origin about each of them
+rather than trust it.
+
+While the move runs, everything else that talks to the remote or changes what it checks refuses
+with `origin_move_pending` (above), and a second `remote move` refuses the same way. A move that fails
+before it starts rewriting the origin leaves the origin as it was and no record of the move; the parcels and
+signatures it fetched stay, unreferenced, until `gc`. One that is killed partway leaves its
+record: if it was still checking, `remote move --abort` abandons it, as does any later failed move;
+if it had started rewriting, only a completed move clears it, so run `remote move` again, naming a
+server that holds this warehouse's content (`finished_stopped_move` says a run did so). `--abort`
+refuses a move that had started rewriting, and reports `abandoned` as the server an abandoned move
+was going to, or none when no move had stopped.
 
 ---
 

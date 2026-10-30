@@ -791,17 +791,19 @@ pub fn bound(_hold: &StoreAccessExclusive, parcels: &[String]) -> Result<Bounded
         return Ok(Bounded::default());
     }
 
-    let (drop, skipped) = match referenced(parcels, &sealed)? {
-        Ok(referenced) => {
+    let (drop, skipped) = match walk(parcels, &sealed, Unrecorded::Damage)? {
+        Ok(walked) => {
             let mut drop = HashSet::new();
             for hash in &sealed.hashes {
-                if !referenced.contains(hash) && !is_present(hash)? {
+                if !walked.referenced.contains(hash) && !is_present(hash)? {
                     drop.insert(hash.clone());
                 }
             }
             (drop, None)
         }
-        Err(damage) => (HashSet::new(), Some(damage)),
+        Err(damage) => (HashSet::new(), Some(damage.describe(
+            "so no eviction shrinks the record until that content is back"
+        ))),
     };
 
     let lock = RefLock::acquire()?;
@@ -816,36 +818,96 @@ enum Met {
     Again,
     /// In the store, to descend.
     Present,
-    /// Absent and recorded: a boundary.
-    Recorded,
-    /// Absent and not recorded: damage.
+    /// Absent and recorded, or absent where the walk takes that as a boundary.
+    Absent,
+    /// Absent and not recorded, where the walk takes that as damage.
     Unrecorded,
 }
 
-/// Note `hash` as referenced and say what it was met as.
-fn meet(hash: &str, sealed: &SealedSet, referenced: &mut HashSet<String>) -> Result<Met, String> {
-    if !referenced.insert(hash.to_string()) {
-        return Ok(Met::Again);
+/// How a [`walk`] takes an absent object the record does not hold: as damage in a cache, where the
+/// record holds every absence, or as one more boundary in a sparse warehouse, which records none.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Unrecorded {
+    Damage,
+    Boundary,
+}
+
+/// The first absent object a [`walk`] met that the record does not hold, where that is damage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WalkDamage {
+    /// The absent object.
+    pub hash: String,
+    /// What references it: an object, or "staged work".
+    pub named_by: String,
+}
+
+impl WalkDamage {
+    /// The damage as a sentence fragment, `consequence` saying what it stops.
+    pub fn describe(&self, consequence: &str) -> String {
+        format!(
+            "object {} is missing, and the record does not say the origin holds it ({} references it), {}",
+            self.hash, self.named_by, consequence
+        )
+    }
+}
+
+/// What a [`walk`] met.
+#[derive(Default)]
+pub struct Walked {
+    /// Every object referenced, present or absent, absent parcels included.
+    pub referenced: HashSet<String>,
+    /// The absent trees, files and chunks among them: the boundaries the walk stopped at. Absent
+    /// parcels are not among them.
+    pub absent: HashSet<String>,
+}
+
+impl Walked {
+    /// Note `hash` as referenced and say what it was met as.
+    fn meet(&mut self, hash: &str, sealed: &SealedSet, unrecorded: Unrecorded) -> Result<Met, String> {
+        if !self.referenced.insert(hash.to_string()) {
+            return Ok(Met::Again);
+        }
+
+        if is_present(hash)? {
+            return Ok(Met::Present);
+        }
+
+        if unrecorded == Unrecorded::Damage && !sealed.contains(hash) {
+            return Ok(Met::Unrecorded);
+        }
+
+        self.absent.insert(hash.to_string());
+        Ok(Met::Absent)
     }
 
-    Ok(if is_present(hash)? {
-        Met::Present
-    } else if sealed.contains(hash) {
-        Met::Recorded
-    } else {
-        Met::Unrecorded
-    })
+    /// Note every chunk of the present recipe `hash` as referenced, and name the first one absent
+    /// and not recorded, where that is damage, if any.
+    fn meet_chunks(&mut self, hash: &str, sealed: &SealedSet, unrecorded: Unrecorded) -> Result<Option<String>, String> {
+        for chunk in object_utils::recipe_chunk_hashes(hash)? {
+            if let Met::Unrecorded = self.meet(&chunk, sealed, unrecorded)? {
+                return Ok(Some(chunk));
+            }
+        }
+
+        Ok(None)
+    }
 }
 
 /// Every object a present object or a root references, walked from the roots a sweep keeps and
 /// `parcels` (see Bounding in the module doc comment). An absent parcel a root or a parent names
 /// is referenced but never judged: a haul, mirror or pin may name history this warehouse never had.
 ///
+/// # Arguments
+/// * `parcels`    - Parcels to root the walk at beyond the ones a sweep keeps.
+/// * `sealed`     - The record.
+/// * `unrecorded` - How to take an absent object the record does not hold.
+///
 /// # Returns
-/// * `Ok(Ok(HashSet<String>))` - Every object referenced.
-/// * `Ok(Err(String))`         - The walk met an absent object the record does not hold, named.
-/// * `Err(String)`             - If a root source or a present object could not be read.
-fn referenced(parcels: &[String], sealed: &SealedSet) -> Result<Result<HashSet<String>, String>, String> {
+/// * `Ok(Ok(Walked))`       - Every object referenced, and the absent ones.
+/// * `Ok(Err(WalkDamage))`  - The walk met an absent object the record does not hold, where that is
+///                            damage.
+/// * `Err(String)`          - If a root source or a present object could not be read.
+pub fn walk(parcels: &[String], sealed: &SealedSet, unrecorded: Unrecorded) -> Result<Result<Walked, WalkDamage>, String> {
     let bay_dirs = bay_utils::all_bay_state_dirs()?;
     let sources = recovery_utils::gc_root_sources(
         &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed,
@@ -855,16 +917,12 @@ fn referenced(parcels: &[String], sealed: &SealedSet) -> Result<Result<HashSet<S
     heads.extend(sources.heads());
 
     let (present_parcels, gaps) = audit_utils::collect_reachable_noting_gaps(&heads, is_present)?;
-    let mut referenced: HashSet<String> = gaps.into_iter().collect();
-    let damage = |hash: &str, named_by: &str| Ok(Err(format!(
-        "object {} is missing, and the record does not say the origin holds it ({} references it), so \
-        no eviction shrinks the record until that content is back",
-        hash, named_by
-    )));
+    let mut walked = Walked { referenced: gaps.into_iter().collect(), absent: HashSet::new() };
+    let damage = |hash: &str, named_by: &str| Ok(Err(WalkDamage { hash: hash.to_string(), named_by: named_by.to_string() }));
 
     let mut trees: Vec<(String, String)> = Vec::new();
     for parcel in &present_parcels {
-        referenced.insert(parcel.clone());
+        walked.referenced.insert(parcel.clone());
         trees.push((object_utils::load_parcel(parcel)?.tree_hash, parcel.clone()));
     }
 
@@ -875,10 +933,10 @@ fn referenced(parcels: &[String], sealed: &SealedSet) -> Result<Result<HashSet<S
             continue;
         }
 
-        match meet(hash, sealed, &mut referenced)? {
+        match walked.meet(hash, sealed, unrecorded)? {
             Met::Unrecorded => return damage(hash, "staged work"),
             Met::Present if item_type.is_chunked() => {
-                if let Some(chunk) = unrecorded_chunk(hash, sealed, &mut referenced)? {
+                if let Some(chunk) = walked.meet_chunks(hash, sealed, unrecorded)? {
                     return damage(&chunk, hash);
                 }
             }
@@ -888,19 +946,19 @@ fn referenced(parcels: &[String], sealed: &SealedSet) -> Result<Result<HashSet<S
 
     // A tree is noted and judged when it is popped, with the object that named it for the message.
     while let Some((hash, named_by)) = trees.pop() {
-        match meet(&hash, sealed, &mut referenced)? {
+        match walked.meet(&hash, sealed, unrecorded)? {
             Met::Present => {}
             Met::Unrecorded => return damage(&hash, &named_by),
-            Met::Again | Met::Recorded => continue,
+            Met::Again | Met::Absent => continue,
         }
 
         let tree = object_utils::load_tree(&hash)?;
 
         for (_, file) in tree.get_files() {
-            match meet(&file.hash, sealed, &mut referenced)? {
+            match walked.meet(&file.hash, sealed, unrecorded)? {
                 Met::Unrecorded => return damage(&file.hash, &hash),
                 Met::Present if file.item_type.is_chunked() => {
-                    if let Some(chunk) = unrecorded_chunk(&file.hash, sealed, &mut referenced)? {
+                    if let Some(chunk) = walked.meet_chunks(&file.hash, sealed, unrecorded)? {
                         return damage(&chunk, &file.hash);
                     }
                 }
@@ -913,19 +971,7 @@ fn referenced(parcels: &[String], sealed: &SealedSet) -> Result<Result<HashSet<S
         }
     }
 
-    Ok(Ok(referenced))
-}
-
-/// Note every chunk of the present recipe `hash` as referenced, and name the first one absent and
-/// not recorded, if any.
-fn unrecorded_chunk(hash: &str, sealed: &SealedSet, referenced: &mut HashSet<String>) -> Result<Option<String>, String> {
-    for chunk in object_utils::recipe_chunk_hashes(hash)? {
-        if let Met::Unrecorded = meet(&chunk, sealed, referenced)? {
-            return Ok(Some(chunk));
-        }
-    }
-
-    Ok(None)
+    Ok(Ok(walked))
 }
 
 /// A hold on the store-access lock: the shared [`StoreAccessLock`], or the [`StoreAccessExclusive`]
@@ -1235,7 +1281,7 @@ fn recipe_absences(hash: &str, closed: &HashSet<String>, walk: &mut ClosureAbsen
 
 /// Whether the store holds `hash`. An object only an unreadable pack index might hold is neither:
 /// its bytes may be on disk, and what it references may be present, so the walk cannot go on.
-fn is_present(hash: &str) -> Result<bool, String> {
+pub(crate) fn is_present(hash: &str) -> Result<bool, String> {
     if file_utils::raw_object_present(hash)? {
         return Ok(true);
     }

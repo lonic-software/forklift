@@ -5169,6 +5169,99 @@ A command not listed here either reports only the generic human-message shape `{
 }
 ```
 
+## `remote`
+
+### `RemoteMoveReport`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The result of a move of the origin.",
+  "properties": {
+    "absent_objects": {
+      "description": "Objects this warehouse lacks and leans on its origin for, each found in the new server's\nhistory.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "fetched_objects": {
+      "description": "Parcels fetched from the new server, and stored; no content is fetched.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "fetched_signatures": {
+      "description": "Signatures fetched with them.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "finished_stopped_move": {
+      "description": "Whether this run finished a move that had stopped while rewriting the origin.",
+      "type": "boolean"
+    },
+    "origin": {
+      "description": "The origin now, as `remote.url` names it.",
+      "type": "string"
+    },
+    "previous_origin": {
+      "description": "The origin before this run; none when the record was missing or could not be read, which a\nmove repairs. A run finishing a stopped move may find it already rewritten to the new origin.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "read_objects": {
+      "description": "Trees and recipes read from the new server, and not stored, to find them.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "walked_parcels": {
+      "description": "Parcels of the new server's history walked to fetch what was missing here.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "origin",
+    "previous_origin",
+    "finished_stopped_move",
+    "walked_parcels",
+    "fetched_objects",
+    "fetched_signatures",
+    "absent_objects",
+    "read_objects"
+  ],
+  "title": "RemoteMoveReport",
+  "type": "object"
+}
+```
+
+### `RemoteAbortReport`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The result of `remote move --abort`.",
+  "properties": {
+    "abandoned": {
+      "description": "The server the abandoned move was going to; none when no move had stopped.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "abandoned"
+  ],
+  "title": "RemoteAbortReport",
+  "type": "object"
+}
+```
+
 ## `store`
 
 ### `StoreReport`

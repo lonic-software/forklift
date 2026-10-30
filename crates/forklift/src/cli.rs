@@ -1039,6 +1039,18 @@ pub enum Command {
         dry_run: bool,
     },
 
+    /// Manage the remote of a partial warehouse: move its origin to another server
+    #[command(
+        long_about = "Manage the remote of a partial warehouse (one franchised with \"--only\" or \
+                      \"--cache\"). Such a warehouse talks only to its origin, the remote it was \
+                      franchised from, because only the origin was proved to hold the content it \
+                      lacks; \"remote move\" is the one way to change it."
+    )]
+    Remote {
+        #[command(subcommand)]
+        action: RemoteAction,
+    },
+
     /// Report object-store health: loose vs packed objects, packs, and whether compaction is due
     #[command(
         long_about = "Report the health of the object store — the counterpart of \"stocktake\" \
@@ -1493,6 +1505,40 @@ pub enum HaulAction {
 }
 
 #[derive(Subcommand)]
+pub enum RemoteAction {
+    /// Move a partial warehouse's origin to another server that holds its content
+    #[command(
+        long_about = "Point a partial warehouse at a new origin. The move first records that it is \
+                      under way, so nothing fetches, lifts or changes what it checks until it ends. \
+                      It then asks the new server for its pallets, judges its trust anchor as \
+                      \"lower\" would, fetches the parcels and signatures it lacks (no content), \
+                      and checks that the new server holds everything this warehouse leans on its \
+                      origin for: every tree, file and chunk that something here references and \
+                      this warehouse does not hold. Only then does it rewrite the origin and \"remote.url\" (and \
+                      \"remote.token\" with --token). If the check fails, nothing is rewritten and \
+                      the origin stays; when the new server lacks content, copy the old server's \
+                      warehouse to it server-side and run the move again. A move that stopped \
+                      before it started rewriting can be abandoned with --abort; one that stopped \
+                      while rewriting is finished by running the move again. A full warehouse has \
+                      no origin: set \"remote.url\" with \"config\" instead."
+    )]
+    Move {
+        /// The new origin's URL
+        #[arg(required_unless_present = "abort")]
+        url: Option<String>,
+
+        /// The bearer token for the new origin, stored as remote.token when the move completes
+        /// (default: the current remote.token)
+        #[arg(long, conflicts_with = "abort")]
+        token: Option<String>,
+
+        /// Abandon a move that stopped before it started rewriting the origin
+        #[arg(long, conflicts_with = "url")]
+        abort: bool,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum OfficeAction {
     /// Enroll the configured operator and establish trust — one-way!
     #[command(
@@ -1804,6 +1850,7 @@ impl Command {
                 | Command::Peek { .. }
                 | Command::Query { .. }
                 | Command::Remove { .. }
+                | Command::Remote { .. }
                 | Command::Restore { .. }
                 | Command::Scope { .. }
                 | Command::ScopePrune { .. }
@@ -1913,6 +1960,7 @@ impl Command {
                 | Command::Palletize { .. }
                 | Command::Park { .. }
                 | Command::Remove { .. }
+                | Command::Remote { .. }
                 | Command::Restore { .. }
                 | Command::ScopePrune { .. }
                 | Command::Evict { .. }
