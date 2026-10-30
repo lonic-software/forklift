@@ -525,7 +525,8 @@ one whose write was refused partway, because the move began while it ran, keeps 
 before that write. `next_step` names `remote move` with the server the move was going to, which
 finishes the move, and, while the move has not yet started rewriting the origin,
 `remote move --abort`, which abandons it. A record of a move that cannot be read is refused the
-same way, as a move that may have started rewriting. Stacking and commands that only read this
+same way, as a move that may have started rewriting, and `next_step` names `remote move <url>`,
+since the record no longer says which server the move was going to. Stacking and commands that only read this
 warehouse still run.
 
 ### An unfinished franchise: `franchise_incomplete`

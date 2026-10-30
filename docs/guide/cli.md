@@ -1706,7 +1706,8 @@ changing nothing. The refusal names the server the move was going to:
 `forklift remote move <url>` finishes the move; while it is still checking the new server, and has
 not started rewriting the origin, `forklift remote move --abort` abandons it instead. A record of a
 move that cannot be read is taken as one that may have started rewriting, so only finishing the
-move clears it. Stacking and local reads still run, and so does `heal`, except that it does not
+move clears it; such a refusal cannot name the server, so finish the move naming one that holds
+this warehouse's content. Stacking and local reads still run, and so does `heal`, except that it does not
 rebuild a damaged record of the content held by hash alone until the move finishes.
 
 **Very large lifts and old remotes.** A lift touching more objects than fit in one commit batch
