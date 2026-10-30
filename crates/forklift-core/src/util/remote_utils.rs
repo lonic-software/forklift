@@ -5988,6 +5988,38 @@ async fn fetch_loose_objects(client: &RemoteClient, missing: &[String]) -> Resul
     Ok(missing.len())
 }
 
+/// Read the given objects concurrently, one GET each, into memory: each verified against its hash
+/// and none stored.
+///
+/// # Returns
+/// * `Ok(Vec<(String, Vec<u8>)>)` - Each hash with its bytes, in no particular order.
+/// * `Err(String)`                - If a transfer failed or the remote answered with other bytes.
+pub async fn read_objects_verified(client: &RemoteClient,
+                                   hashes: &[String]) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let semaphore = Arc::new(Semaphore::new(CONCURRENT_TRANSFERS));
+    let mut tasks: JoinSet<Result<(String, Vec<u8>), String>> = JoinSet::new();
+
+    for hash in hashes {
+        let client = client.clone();
+        let hash = hash.clone();
+        let semaphore = Arc::clone(&semaphore);
+
+        tasks.spawn(async move {
+            let _permit = semaphore.acquire().await
+                .map_err(|_| "The transfer pool was closed unexpectedly.".to_string())?;
+
+            let bytes = client.fetch_object(&hash).await
+                .map_err(|e| format!("Object {} could not be read from the remote: {}", hash, e))?;
+            object_utils::verify_object_bytes(&hash, &bytes)
+                .map_err(|_| format!("The remote answered object {} with other bytes.", hash))?;
+
+            Ok((hash, bytes))
+        });
+    }
+
+    join_all(tasks).await
+}
+
 /// D4's dedicated corrupt-candidate fetch (DESIGN.html §3.1.1): one loose `GET` per flagged hash,
 /// verified and force-stored via [`object_utils::force_store_object_bytes`] — the corrupt copy is
 /// superseded by an atomic rename, never deleted first.

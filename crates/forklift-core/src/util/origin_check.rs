@@ -30,8 +30,11 @@ use crate::util::remote_utils::{self, RemoteClient};
 use crate::util::sealed_utils::{self, StoreAccessHold, Unrecorded};
 use crate::util::{audit_utils, object_utils};
 
-/// The most missing objects a refusal names.
+/// The most missing objects a refusal's message names.
 const NAMED_MISSING: usize = 10;
+
+/// The most missing objects a refusal's details list.
+const LISTED_MISSING: usize = 1000;
 
 /// What [`check_new_origin`] found and fetched.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -101,7 +104,8 @@ pub async fn check_new_origin(client: &RemoteClient,
     }
 
     // Trees held here first, then trees read from the server, then recipes read from it: a chunk
-    // only an absent recipe names is the rarest thing to look for, and the dearest.
+    // only an absent recipe names is the rarest thing to look for, and the dearest. What is read
+    // from the server is read a wave at a time, concurrently.
     loop {
         if missing.is_empty() {
             return Ok(checked);
@@ -109,15 +113,19 @@ pub async fn check_new_origin(client: &RemoteClient,
 
         if let Some(hash) = walk.local.pop() {
             walk.meet_tree(&hash, &mut missing)?;
-        } else if let Some(hash) = walk.trees.pop() {
-            let tree = object_utils::parse_tree_bytes(&hash, &read_verified(client, &hash).await?)?;
-            checked.read_objects += 1;
-            walk.descend(&tree, &mut missing)?;
-        } else if let Some(hash) = walk.recipes.pop() {
-            let recipe = object_utils::parse_recipe_bytes(&hash, &read_verified(client, &hash).await?)?;
-            checked.read_objects += 1;
-            for chunk in recipe.chunks {
-                missing.remove(&chunk.hash);
+        } else if !walk.trees.is_empty() {
+            let wave = std::mem::take(&mut walk.trees);
+            for (hash, bytes) in remote_utils::read_objects_verified(client, &wave).await? {
+                checked.read_objects += 1;
+                walk.descend(&object_utils::parse_tree_bytes(&hash, &bytes)?, &mut missing)?;
+            }
+        } else if !walk.recipes.is_empty() {
+            let wave = std::mem::take(&mut walk.recipes);
+            for (hash, bytes) in remote_utils::read_objects_verified(client, &wave).await? {
+                checked.read_objects += 1;
+                for chunk in object_utils::parse_recipe_bytes(&hash, &bytes)?.chunks {
+                    missing.remove(&chunk.hash);
+                }
             }
         } else {
             return Err(incomplete_refusal(client.url(), &missing));
@@ -179,18 +187,6 @@ impl ServerWalk {
     }
 }
 
-/// Read the object `hash` from the new server into memory, and refuse bytes that are not it.
-async fn read_verified(client: &RemoteClient, hash: &str) -> Result<Vec<u8>, String> {
-    let bytes = client.fetch_object(hash).await
-        .map_err(|e| format!("The new server could not serve object {}, which its history names: {}", hash, e))?;
-
-    if object_utils::hash_object_bytes(&bytes) != hash {
-        return Err(format!("The new server answered object {} with other bytes; nothing was changed.", hash));
-    }
-
-    Ok(bytes)
-}
-
 /// The `origin_move_incomplete` refusal for a new server at `url` whose history does not reach
 /// `missing`.
 fn incomplete_refusal(url: &str, missing: &HashSet<String>) -> CoreError {
@@ -215,6 +211,9 @@ fn incomplete_refusal(url: &str, missing: &HashSet<String>) -> CoreError {
             url, named.len(), shown.join(", "), more, next_step
         ),
         next_step,
-        serde_json::json!({ "missing": named }),
+        serde_json::json!({
+            "missing": named.iter().take(LISTED_MISSING).collect::<Vec<_>>(),
+            "missing_count": named.len(),
+        }),
     )
 }

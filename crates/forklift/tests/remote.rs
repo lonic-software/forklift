@@ -6789,6 +6789,7 @@ fn a_move_to_a_server_lacking_content_refuses_and_leaves_the_origin() {
     let json = json_of(&refused);
     assert_eq!(json["error"]["code"], "origin_move_incomplete", "{}", json);
     assert!(json["error"]["details"]["missing"].as_array().unwrap().contains(&serde_json::json!(four_root)), "{}", json);
+    assert_eq!(json["error"]["details"]["missing_count"], json["error"]["details"]["missing"].as_array().unwrap().len());
     let message = json["error"]["message"].as_str().unwrap();
     assert!(message.contains(&four_root) && message.contains("server's side"), "{}", message);
     assert!(!move_stands(&area, "cached"));
@@ -6809,12 +6810,25 @@ fn a_move_to_a_server_lacking_content_refuses_and_leaves_the_origin() {
     assert!(!move_stands(&area, "cached"));
     assert_eq!(origin_of(&area, "cached").as_deref(), Some(server.url.as_str()));
 
-    // A fresh server-side copy holds it all.
+    // Finishing a move that stopped while rewriting refuses the same way, its code and details
+    // whole, and says the move still stands.
+    record_move_intent(&area, "cached", forklift_core::util::origin_move::Phase::Rewriting);
+    let resumed = area.forklift("cached", &["--json", "remote", "move", &stale.url]);
+    assert_eq!(resumed.status.code(), Some(38), "{}{}", stdout(&resumed), stderr(&resumed));
+    let json = json_of(&resumed);
+    assert_eq!(json["error"]["code"], "origin_move_incomplete", "{}", json);
+    assert!(json["error"]["details"]["missing"].as_array().unwrap().contains(&serde_json::json!(four_root)), "{}", json);
+    assert!(json["error"]["message"].as_str().unwrap().contains("before this run"), "{}", json);
+    assert!(move_stands(&area, "cached"));
+    assert_eq!(origin_of(&area, "cached").as_deref(), Some(server.url.as_str()));
+
+    // A fresh server-side copy holds it all, and finishes that move.
     let mut stale = stale;
     stale.stop();
     let fresh = serve_copy(&area, "server-root", "stale-root");
     assert_success(&area.forklift("cached", &["remote", "move", &fresh.url]));
     assert_eq!(origin_of(&area, "cached").as_deref(), Some(fresh.url.as_str()));
+    assert!(!move_stands(&area, "cached"));
 
     // A full warehouse has no origin.
     assert_success(&area.forklift(".", &["franchise", &server.url, "full"]));

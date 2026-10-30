@@ -1,6 +1,6 @@
 use serde::Serialize;
 use forklift_core::enums::config_scope::ConfigScope;
-use forklift_core::error::{CoreError, RefusalCode};
+use forklift_core::error::{self, CoreError, RefusalCode};
 use forklift_core::util::lock_utils::{MoveLock, RefLock, StoreAccessLock};
 use forklift_core::util::origin_move::{self, Phase};
 use forklift_core::util::remote_utils::{self, RemoteClient};
@@ -55,6 +55,7 @@ pub async fn move_origin(url: Option<String>,
         return Err("The new origin must be a remote URL.".to_string());
     }
 
+    // A damaged or missing record is what a move repairs, so it reads as no previous origin.
     let previous = origin_utils::read_origin().ok().flatten();
     let (move_token, phase) = {
         let lock = RefLock::acquire()?;
@@ -68,15 +69,27 @@ pub async fn move_origin(url: Option<String>,
         Err(why) => {
             let lock = RefLock::acquire()?;
 
+            // Appended, not formatted: a refusal keeps its code, next step and details.
             return Err(match origin_move::abandon(&lock, &move_token) {
                 Ok(true) => why,
-                Ok(false) => format!(
-                    "{} The move had started rewriting the origin before this run, so it still stands; \
+                Ok(false) if phase == Phase::Rewriting => error::append_to_message(
+                    why,
+                    "The move had started rewriting the origin before this run, so it still stands; \
                     run \"forklift remote move <url>\" again, naming a server that holds this \
-                    warehouse's content.",
-                    why
+                    warehouse's content."
                 ),
-                Err(stuck) => format!("{} The move's record could not be cleared either: {}", why, stuck),
+                Ok(false) => error::append_to_message(
+                    why,
+                    &format!(
+                        "This run had started rewriting the origin, so the move still stands; run \
+                        \"forklift remote move {}\" again once that is fixed.",
+                        target
+                    )
+                ),
+                Err(stuck) => error::append_to_message(
+                    why,
+                    &format!("The move's record could not be cleared either: {}", stuck)
+                ),
             });
         }
     };
@@ -161,7 +174,8 @@ pub(crate) struct RemoteMoveReport {
     /// The origin now, as `remote.url` names it.
     origin: String,
 
-    /// The origin before the move; none when the record was missing.
+    /// The origin before this run; none when the record was missing or could not be read, which a
+    /// move repairs. A run finishing a stopped move may find it already rewritten to the new origin.
     previous_origin: Option<String>,
 
     /// Whether this run finished a move that had stopped while rewriting the origin.
@@ -190,7 +204,7 @@ impl CommandOutput for RemoteMoveReport {
             println!("Finished the move of this warehouse's origin that had stopped.");
         }
 
-        match &self.previous_origin {
+        match self.previous_origin.as_ref().filter(|previous| !origin_utils::same_remote(previous, &self.origin)) {
             Some(previous) => println!("The origin moved from \"{}\" to \"{}\".", previous, self.origin),
             None => println!("The origin is now \"{}\".", self.origin),
         }

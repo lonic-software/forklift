@@ -1973,7 +1973,8 @@ trees and recipes it must read from the new server for that are hash-checked in 
 stored. The report counts what it fetched (`fetched_objects`, `fetched_signatures`), what it found
 (`absent_objects`) and what it read (`read_objects`). If the new server's history does not reach
 something this warehouse lacks, the move is refused with the `origin_move_incomplete` code (exit
-38), naming up to ten of the missing objects (`details.missing` lists them all), and the origin is
+38), naming up to ten of the missing objects (`details.missing` lists up to a thousand,
+`details.missing_count` counts them all), and the origin is
 left where it was: copy the old origin's warehouse to the new server on the server's side, then run
 the move again. The heads recorded from earlier lowers (the fetched-heads ledger and the held-heads
 record above) are not checked: `expand` and `scope-prune` already ask the origin about each of them
@@ -1981,7 +1982,8 @@ rather than trust it.
 
 While the move runs, everything else that talks to the remote or changes what it checks refuses
 with `origin_move_pending` (above), and a second `remote move` refuses the same way. A move that fails
-before it starts rewriting the origin leaves nothing behind. One that is killed partway leaves its
+before it starts rewriting the origin leaves the origin as it was and no record of the move; the parcels and
+signatures it fetched stay, unreferenced, until `gc`. One that is killed partway leaves its
 record: if it was still checking, `remote move --abort` abandons it, as does any later failed move;
 if it had started rewriting, only a completed move clears it, so run `remote move` again, naming a
 server that holds this warehouse's content (`finished_stopped_move` says a run did so). `--abort`

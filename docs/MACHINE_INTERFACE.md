@@ -539,12 +539,14 @@ When it does not, the move refuses with `origin_move_incomplete` (exit 38) and l
 `remote.url` where they were. It clears its record, unless it was finishing a move that had already
 started rewriting the origin: that one still stands, and the message says so. The parcels and signatures it fetched to look
 stay, and change nothing a command reads. `next_step` says to copy the old origin's warehouse to the
-new server, on the server's side, and run the move again. `details.missing` lists every object not
-found, sorted; the message names the first ten.
+new server, on the server's side, and run the move again. `details.missing` lists the objects not
+found, sorted, up to the first thousand, and `details.missing_count` counts them all; the message
+names the first ten.
 
 ```json
 "details": {
-  "missing": ["3f0c…", "9ab1…"]
+  "missing": ["3f0c…", "9ab1…"],
+  "missing_count": 2
 }
 ```
 
