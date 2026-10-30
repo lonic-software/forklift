@@ -154,7 +154,9 @@ fn handle_message(line: &str, state: &mut ServerState, notify: &mut dyn FnMut(&V
 
     let result = match method {
         "initialize" => Ok(initialize(&params, state)),
-        "tools/list" => Ok(json!({ "tools": tool_definitions() })),
+        "tools/list" => tools()
+            .map(|tools| json!({ "tools": tools.iter().map(Tool::definition).collect::<Vec<_>>() }))
+            .map_err(|reason| JsonRpcError::internal(&reason)),
         "tools/call" => call_tool(&params, state, notify),
         other => Err(JsonRpcError::method_not_found(other)),
     };
@@ -199,33 +201,32 @@ fn call_tool(params: &Value, state: &ServerState, notify: &mut dyn FnMut(&Value)
     let name = params.get("name").and_then(Value::as_str)
         .ok_or_else(|| JsonRpcError::invalid_params("the tool name is required"))?;
 
-    let mut arguments = params.get("arguments").filter(|value| !value.is_null()).cloned().unwrap_or(json!({}));
+    let tool = tools().map_err(|reason| JsonRpcError::internal(&reason))?
+        .iter().find(|tool| tool.name == name)
+        .ok_or_else(|| JsonRpcError::invalid_params(&format!("unknown tool \"{}\"", name)))?;
 
-    // An argument the tool does not declare, or one of the wrong type, is refused, never
-    // ignored: a dropped filter would answer a broader question than the one asked, still with
-    // ok:true. The provenance keys the server sets itself (below) are the exception: an agent's
-    // value for them is discarded.
-    let server_set: &[&str] = if name == "manifest_provenance" { &["tool", "session"] } else { &[] };
-    if let Some(reason) = argument_refusal(name, &arguments, server_set) {
+    let arguments = params.get("arguments").filter(|value| !value.is_null()).cloned().unwrap_or(json!({}));
+    if let Some(reason) = tool.refusal(&arguments) {
         return Err(JsonRpcError::invalid_params(&reason));
     }
 
-    // Provenance hardening (§7.2): the `tool` and `session` are set from this MCP connection,
+    // Provenance hardening (§7.2): an injected argument is set from this MCP connection,
     // overriding anything the agent supplied — the harness identifies the tool, not the
     // model's own output. `model` stays the agent's attestation (MCP carries no model id).
-    if name == "manifest_provenance" {
-        if let Some(object) = arguments.as_object_mut() {
-            object.insert("session".to_string(), json!(state.session));
-            if let Some(client) = &state.client {
-                object.insert("tool".to_string(), json!(client));
-            } else {
-                object.remove("tool");
-            }
-        }
+    let mut arguments = arguments.as_object().cloned().unwrap_or_default();
+    for param in &tool.params {
+        let Some(source) = param.injected else { continue };
+        let value = match source {
+            Injected::Client => state.client.clone(),
+            Injected::Session => Some(state.session.clone()),
+        };
+        match value {
+            Some(value) => arguments.insert(param.key.clone(), json!(value)),
+            None => arguments.remove(&param.key),
+        };
     }
 
-    let args = build_args(name, &arguments)
-        .map_err(|reason| JsonRpcError::invalid_params(&reason))?;
+    let args = tool.argv(&arguments).map_err(|reason| JsonRpcError::invalid_params(&reason))?;
 
     // MCP allows a string or an integer; anything else names no request a client could match.
     let token = params.get("_meta").and_then(|meta| meta.get("progressToken"))
@@ -345,13 +346,15 @@ fn run_forklift(args: &[String]) -> Result<std::process::Output, String> {
         .map_err(|e| format!("Error while running \"forklift {}\": {}", args.join(" "), e))
 }
 
-/// The command for one tool call: this same binary, the given arguments, and `--json`.
+/// The command for one tool call: this same binary, `--json`, and the given arguments. `--json`
+/// goes first because the arguments may end in `--` and positionals, after which it would be a
+/// positional too.
 fn forklift_command(args: &[String]) -> Result<std::process::Command, String> {
     let exe = std::env::current_exe()
         .map_err(|e| format!("Cannot locate the forklift binary: {}", e))?;
 
     let mut command = std::process::Command::new(exe);
-    command.args(args).arg("--json");
+    command.arg("--json").args(args);
 
     Ok(command)
 }
@@ -730,606 +733,484 @@ fn progress_notification(token: &Value, progress: f64, message: Option<String>) 
     json!({ "jsonrpc": "2.0", "method": "notifications/progress", "params": params })
 }
 
-/// Map an MCP tool name and its arguments to the forklift CLI arguments. Keeping the
-/// mapping here (not a per-command concern) means the tool surface is one auditable
-/// list, and every tool inherits the CLI's own validation.
-fn build_args(name: &str, arguments: &Value) -> Result<Vec<String>, String> {
-    let string_arg = |key: &str| arguments.get(key).and_then(Value::as_str).map(str::to_string);
-    let bool_arg = |key: &str| arguments.get(key).and_then(Value::as_bool).unwrap_or(false);
+/// The command paths no agent drives, each with why. A path keeps itself and every command
+/// below it off the agent surface; every other visible command is a tool, so a new command
+/// is an agent tool unless it is listed here.
+///
+/// `bay` is deliberately absent even though it manages a host working directory: an
+/// orchestrator agent hands a sub-agent a task-scoped sandbox by adding a bay. The scope a bay
+/// records is advisory local setup, not the agent's security boundary (what an identity may
+/// touch is enforced remote-side), and every bay operation is non-destructive: `add` refuses a
+/// non-empty directory, and `remove` deletes only the bay's own `.forklift` entry and its
+/// bay-state folder, never the materialized working tree.
+const HUMAN_ONLY: &[(&str, &str)] = &[
+    ("alias", "manages the `fl` shell alias next to this binary, a host concern"),
+    ("prepare", "creates a warehouse, which is setup"),
+    ("config", "reads and sets configuration, which is setup"),
+    ("profile", "manages identity profiles, which is setup"),
+    ("franchise", "clones a remote, which is setup"),
+    ("import-git", "migrates a git repository in, which is setup"),
+    ("export-git", "migrates out to git, which is setup"),
+    ("mirror", "pushes to an external git remote under the user's own git credentials"),
+    ("office enroll", "establishes the operator's trust, a one-way setup step"),
+    ("office keygen", "creates a signing key, which is setup"),
+    ("office admit", "enrolls another operator: trust administration"),
+    ("office link", "links another device's key: trust administration"),
+    ("office authorize", "authorizes a key for another operator: trust administration"),
+    ("office role", "changes a user's role and grants: trust administration"),
+    ("office rotate", "replaces the operator's keys: trust administration"),
+    ("office retire", "revokes a key: trust administration"),
+    ("office regenesis", "resets trust, a recovery step"),
+    ("office accept-regenesis", "accepts a remote's trust reset, a recovery step"),
+    ("self-update", "updates the binary, a host concern"),
+    ("self-schema", "describes the CLI for Pult; agents get the tool list instead"),
+    ("scope-prune", "destructive, warehouse-wide disk reclamation: an admin verb, never a sub-agent's"),
+    ("evict", "warehouse-wide disk reclamation in a cache: an admin verb, like scope-prune"),
+    ("remote", "repoints a partial warehouse at another server, which is setup"),
+    ("mcp", "this server itself"),
+    ("help", "meta"),
+    ("version", "meta"),
+];
 
-    let require = |key: &str| string_arg(key)
-        .ok_or_else(|| format!("the \"{}\" argument is required", key));
+/// The families whose bare form runs the same operation as one of their subcommands, with that
+/// subcommand. The subcommand is the tool; the bare form gets none, so an agent sees one tool
+/// per operation.
+const BARE_SAME_AS: &[(&str, &str)] = &[
+    ("haul", "list"),
+    ("office", "list"),
+    ("scope", "status"),
+    ("tag", "list"),
+];
 
-    let mut args = Vec::new();
+/// The arguments the server sets itself, from the connection: absent from the tool's schema
+/// (an agent's value is discarded), present in the command's arguments. A machine-authorship
+/// record's harness and session identify the tool that drove the model, which the model's own
+/// output cannot be trusted to report.
+const INJECTED: &[(&str, &str, Injected)] = &[
+    ("manifest provenance", "tool", Injected::Client),
+    ("manifest provenance", "session", Injected::Session),
+];
 
-    match name {
-        "stocktake" => {
-            args.push("stocktake".to_string());
-            if bool_arg("summary") {
-                args.push("--summary".to_string());
-            }
-        }
-        "stack" => {
-            args.push("stack".to_string());
-            if let Some(description) = string_arg("description") {
-                args.push(description);
-            }
-        }
-        "load" => {
-            args.push("load".to_string());
-            args.push(require("path")?);
-        }
-        "remove" => {
-            args.push("remove".to_string());
-            args.push(require("path")?);
-        }
-        "unload" => {
-            args.push("unload".to_string());
-            args.push(require("path")?);
-        }
-        "diff" => {
-            args.push("diff".to_string());
-            if bool_arg("staged") {
-                args.push("--staged".to_string());
-            }
-            if let Some(targets) = arguments.get("targets").and_then(Value::as_array) {
-                for target in targets {
-                    if let Some(target) = target.as_str() {
-                        args.push(target.to_string());
-                    }
-                }
-            }
-        }
-        "history" => {
-            args.push("history".to_string());
-            if let Some(revision) = string_arg("revision") {
-                args.push(revision);
-            }
-            // Bounded, cursor-pageable walk: `limit` caps the page, and `after` (the
-            // `next` cursor from a previous page's data) resumes — so an agent reads
-            // history in batches instead of the whole graph.
-            if let Some(limit) = arguments.get("limit").and_then(Value::as_u64) {
-                args.push("--limit".to_string());
-                args.push(limit.to_string());
-            }
-            if let Some(after) = string_arg("after") {
-                args.push("--after".to_string());
-                args.push(after);
-            }
-        }
-        "query" => {
-            args.push("query".to_string());
-            if let Some(revision) = string_arg("revision") {
-                args.push(revision);
-            }
-            for flag in [
-                "from", "class", "supervisor", "signer", "grep", "model", "tool", "tag",
-                "touches", "after",
-            ] {
-                if let Some(value) = string_arg(flag) {
-                    args.push(format!("--{}", flag));
-                    args.push(value);
-                }
-            }
-            // The predicate tree arrives as a JSON object (the natural MCP form; the schema refuses
-            // any other); it is re-serialized into the same --where the CLI takes.
-            if let Some(predicate) = arguments.get("where").filter(|value| value.is_object()) {
-                args.push("--where".to_string());
-                args.push(predicate.to_string());
-            }
-            for flag in ["unsupervised", "recorded", "merges", "no_merges"] {
-                if arguments.get(flag).and_then(Value::as_bool).unwrap_or(false) {
-                    args.push(format!("--{}", flag.replace('_', "-")));
-                }
-            }
-            if let Some(limit) = arguments.get("limit").and_then(Value::as_u64) {
-                args.push("--limit".to_string());
-                args.push(limit.to_string());
-            }
-        }
-        "conflicts" => args.push("conflicts".to_string()),
-        "scope" => args.push("scope".to_string()),
-        "expand" => {
-            args.push("expand".to_string());
-            let paths = arguments.get("paths").and_then(Value::as_array)
-                .ok_or("the \"paths\" argument is required")?;
-            for path in paths {
-                if let Some(path) = path.as_str() {
-                    args.push(path.to_string());
-                }
-            }
-        }
-        "narrow" => {
-            args.push("narrow".to_string());
-            let paths = arguments.get("paths").and_then(Value::as_array)
-                .ok_or("the \"paths\" argument is required")?;
-            for path in paths {
-                if let Some(path) = path.as_str() {
-                    args.push(path.to_string());
-                }
-            }
-        }
-        "store" => args.push("store".to_string()),
-        "compact" => {
-            args.push("compact".to_string());
-            if bool_arg("all") {
-                args.push("--all".to_string());
-            }
-        }
-        "audit" => {
-            args.push("audit".to_string());
-            if let Some(pallet) = string_arg("pallet") {
-                args.push(pallet);
-            }
-        }
-        "shift" => {
-            args.push("shift".to_string());
-            args.push(require("pallet")?);
-        }
-        "consolidate" => {
-            args.push("consolidate".to_string());
-            args.push(require("pallet")?);
-        }
-        "palletize" => {
-            args.push("palletize".to_string());
-            if let Some(pallet) = string_arg("name") {
-                args.push(pallet);
-                if let Some(revision) = string_arg("revision") {
-                    args.push(revision);
-                }
-            } else if bool_arg("all") {
-                // Listing: include the meta pallets (@office, …).
-                args.push("--all".to_string());
-            }
-        }
-        "restore" => {
-            args.push("restore".to_string());
-            if bool_arg("staged") {
-                args.push("--staged".to_string());
-            }
-            args.push(require("path")?);
-        }
-        "undo" => args.push("undo".to_string()),
-        "heal" => args.push("heal".to_string()),
-        "lift" => args.push("lift".to_string()),
-        "lower" => {
-            args.push("lower".to_string());
-            if let Some(genesis) = string_arg("expect") {
-                args.push("--expect".to_string());
-                args.push(genesis);
-            }
-            if let Some(keep) = arguments.get("keep").and_then(Value::as_array) {
-                for resolution in keep {
-                    if let Some(resolution) = resolution.as_str() {
-                        args.push("--keep".to_string());
-                        args.push(resolution.to_string());
-                    }
-                }
-            }
-        }
-        "office_list" => args.push("office".to_string()),
-        "bay_add" => {
-            args.push("bay".to_string());
-            args.push("add".to_string());
-            args.push(require("name")?);
-            if let Some(path) = string_arg("path") {
-                args.push(path);
-            }
-            if let Some(scope) = arguments.get("scope").and_then(Value::as_array) {
-                for prefix in scope {
-                    if let Some(prefix) = prefix.as_str() {
-                        args.push("--scope".to_string());
-                        args.push(prefix.to_string());
-                    }
-                }
-            }
-        }
-        "bay_list" => args.push("bay".to_string()),
-        "bay_remove" => {
-            args.push("bay".to_string());
-            args.push("remove".to_string());
-            args.push(require("name")?);
-        }
-        "peek" => {
-            args.push("peek".to_string());
-            match (string_arg("object"), string_arg("inventory")) {
-                (Some(object), _) => args.push(object),
-                (None, Some(inventory)) => {
-                    args.push("--inventory".to_string());
-                    args.push(inventory);
-                }
-                (None, None) => return Err("pass either \"object\" or \"inventory\"".to_string()),
-            }
-        }
-        "blame" => {
-            args.push("blame".to_string());
-            args.push(require("path")?);
-            if let Some(rev) = string_arg("rev") {
-                args.push("--rev".to_string());
-                args.push(rev);
-            }
-        }
-        "show" => {
-            args.push("show".to_string());
-            args.push(require("target")?);
-        }
-        "cherry_pick" => {
-            args.push("cherry-pick".to_string());
-            args.push(require("revision")?);
-            if let Some(message) = string_arg("message") {
-                args.push("--message".to_string());
-                args.push(message);
-            }
-        }
-        "deliver" => {
-            args.push("deliver".to_string());
-            args.push(require("target")?);
-            if let Some(message) = string_arg("message") {
-                args.push("--message".to_string());
-                args.push(message);
-            }
-        }
-        "park" => args.push("park".to_string()),
-        "park_list" => {
-            args.push("park".to_string());
-            args.push("list".to_string());
-        }
-        "park_pop" => {
-            args.push("park".to_string());
-            args.push("pop".to_string());
-        }
-        "tag_create" => {
-            args.push("tag".to_string());
-            args.push("create".to_string());
-            args.push(require("name")?);
-            if let Some(revision) = string_arg("revision") {
-                args.push(revision);
-            }
-            if let Some(message) = string_arg("message") {
-                args.push("--message".to_string());
-                args.push(message);
-            }
-        }
-        "tag_show" => {
-            args.push("tag".to_string());
-            args.push("show".to_string());
-            args.push(require("name")?);
-        }
-        "tag_list" => {
-            args.push("tag".to_string());
-            args.push("list".to_string());
-        }
-        "manifest_note" => {
-            args.push("manifest".to_string());
-            args.push("note".to_string());
-            args.push(require("revision")?);
-            args.push("--message".to_string());
-            args.push(require("message")?);
-        }
-        "manifest_approve" => {
-            args.push("manifest".to_string());
-            args.push("approve".to_string());
-            args.push(require("revision")?);
-            if let Some(message) = string_arg("message") {
-                args.push("--message".to_string());
-                args.push(message);
-            }
-        }
-        "manifest_provenance" => {
-            args.push("manifest".to_string());
-            args.push("provenance".to_string());
-            args.push(require("revision")?);
-            args.push("--model".to_string());
-            args.push(require("model")?);
-            if let Some(tool) = string_arg("tool") {
-                args.push("--tool".to_string());
-                args.push(tool);
-            }
-            if let Some(session) = string_arg("session") {
-                args.push("--session".to_string());
-                args.push(session);
-            }
-            if let Some(transcript) = string_arg("transcript") {
-                args.push("--transcript".to_string());
-                args.push(transcript);
-            }
-            if let Some(message) = string_arg("message") {
-                args.push("--message".to_string());
-                args.push(message);
-            }
-        }
-        "kv_set" => {
-            args.push("kv".to_string());
-            args.push("set".to_string());
-            args.push(require("revision")?);
-            args.push(require("key")?);
-            args.push(require("value")?);
-        }
-        "kv_get" | "kv_unset" | "kv_log" => {
-            args.push("kv".to_string());
-            args.push(name.trim_start_matches("kv_").to_string());
-            args.push(require("revision")?);
-            args.push(require("key")?);
-        }
-        "kv_list" => {
-            args.push("kv".to_string());
-            args.push("list".to_string());
-            if let Some(revision) = string_arg("revision") {
-                args.push(revision);
-            }
-        }
-        "manifest_show" => {
-            args.push("manifest".to_string());
-            args.push("show".to_string());
-            args.push(require("revision")?);
-        }
-        "haul_open" => {
-            args.push("haul".to_string());
-            args.push("open".to_string());
-            args.push("--target".to_string());
-            args.push(require("target")?);
-            if let Some(source) = string_arg("source") {
-                args.push("--source".to_string());
-                args.push(source);
-            }
-            args.push("--title".to_string());
-            args.push(require("title")?);
-            if let Some(message) = string_arg("message") {
-                args.push("--message".to_string());
-                args.push(message);
-            }
-        }
-        "haul_list" => {
-            args.push("haul".to_string());
-            args.push("list".to_string());
-            if let Some(state) = string_arg("state") {
-                args.push("--state".to_string());
-                args.push(state);
-            }
-        }
-        "haul_show" => {
-            args.push("haul".to_string());
-            args.push("show".to_string());
-            args.push(require("id")?);
-        }
-        "haul_update" => {
-            args.push("haul".to_string());
-            args.push("update".to_string());
-            args.push(require("id")?);
-        }
-        "haul_comment" => {
-            args.push("haul".to_string());
-            args.push("comment".to_string());
-            args.push(require("id")?);
-            args.push("--message".to_string());
-            args.push(require("message")?);
-        }
-        "haul_review" => {
-            args.push("haul".to_string());
-            args.push("review".to_string());
-            args.push(require("id")?);
-            if bool_arg("request_changes") {
-                args.push("--request-changes".to_string());
-            }
-            if bool_arg("comment") {
-                args.push("--comment".to_string());
-            }
-            if let Some(message) = string_arg("message") {
-                args.push("--message".to_string());
-                args.push(message);
-            }
-        }
-        "haul_merge" => {
-            args.push("haul".to_string());
-            args.push("merge".to_string());
-            args.push(require("id")?);
-        }
-        "haul_close" => {
-            args.push("haul".to_string());
-            args.push("close".to_string());
-            args.push(require("id")?);
-        }
-        "haul_reopen" => {
-            args.push("haul".to_string());
-            args.push("reopen".to_string());
-            args.push(require("id")?);
-        }
-        other => return Err(format!("unknown tool \"{}\"", other)),
+/// Where the server takes an [`INJECTED`] argument's value from.
+#[derive(Clone, Copy)]
+enum Injected {
+    /// The client application `initialize` named; the argument is left out when it named none.
+    Client,
+
+    /// This connection's session id.
+    Session,
+}
+
+/// The arguments whose JSON type is not the one their parser implies. Clap reads every value
+/// as a word; these take a richer JSON value that is written back into that word.
+const TYPED: &[(&str, &str, Typed)] = &[
+    ("query", "where", Typed::Object),
+    ("history", "limit", Typed::Positive),
+    ("query", "limit", Typed::Positive),
+];
+
+/// A JSON type [`TYPED`] gives an argument.
+#[derive(Clone, Copy)]
+enum Typed {
+    /// A JSON object, passed as its serialization.
+    Object,
+
+    /// An integer of at least 1.
+    Positive,
+}
+
+/// One tool: the command it runs and the arguments it takes.
+struct Tool {
+    /// The command path joined by `_` (hyphens too), so a family run bare is its own name.
+    name: String,
+
+    /// The command path below the binary (`["tag", "create"]`).
+    path: Vec<String>,
+
+    /// The command's long description, else its one-line one.
+    description: String,
+
+    /// The arguments in declaration order.
+    params: Vec<ToolParam>,
+}
+
+/// One tool argument.
+struct ToolParam {
+    /// The property name: an option's long name with `_` for `-`, a positional's id.
+    key: String,
+
+    /// Where its words go in the command.
+    form: Form,
+
+    /// The JSON type of one value.
+    value: ValueKind,
+
+    /// Whether the command refuses to run without it.
+    required: bool,
+
+    /// Set by the server rather than the agent, from this source.
+    injected: Option<Injected>,
+
+    /// The argument's help text.
+    help: Option<String>,
+}
+
+/// Where an argument's words go in the command.
+enum Form {
+    /// `--long`, when the value is true.
+    Switch(String),
+
+    /// `--long=value`, once per value when it repeats. The attached form keeps a value that
+    /// begins with `-` a value.
+    Option { long: String, repeats: bool },
+
+    /// After `--`, in declaration order, so no value is read as an option.
+    Positional { variadic: bool },
+}
+
+/// The JSON type of one value (an array of them when the argument repeats).
+enum ValueKind {
+    Boolean,
+    String,
+    Choice(Vec<String>),
+    Integer(u64),
+    Object,
+}
+
+/// Every tool, generated once from the command tree.
+///
+/// # Returns
+/// * `Ok(&[Tool])`  - The tools, in the tree's declaration order.
+/// * `Err(String)`  - The tree has a command or argument with no tool shape (see [`generate_tools`]).
+fn tools() -> Result<&'static [Tool], String> {
+    use clap::CommandFactory;
+
+    static TOOLS: std::sync::OnceLock<Result<Vec<Tool>, String>> = std::sync::OnceLock::new();
+    TOOLS.get_or_init(|| generate_tools(&crate::cli::Cli::command())).as_deref().map_err(Clone::clone)
+}
+
+/// Every tool, generated from the command tree: each visible command path outside
+/// [`HUMAN_ONLY`], a family run bare included when it runs without a subcommand and is not in
+/// [`BARE_SAME_AS`].
+///
+/// # Arguments
+/// * `root` - The unbuilt command tree.
+///
+/// # Returns
+/// * `Ok(Vec<Tool>)` - The tools, in the tree's declaration order.
+/// * `Err(String)`   - A command or argument has no tool shape, two commands make one tool
+///   name, or a table entry names nothing.
+fn generate_tools(root: &clap::Command) -> Result<Vec<Tool>, String> {
+    struct Used {
+        human_only: Vec<bool>,
+        bare_same_as: Vec<bool>,
     }
 
-    Ok(args)
+    fn walk(command: &clap::Command, path: Vec<String>, tools: &mut Vec<Tool>, used: &mut Used) -> Result<(), String> {
+        let shown = path.join(" ");
+        if let Some(index) = HUMAN_ONLY.iter().position(|(entry, _)| *entry == shown) {
+            used.human_only[index] = true;
+            return Ok(());
+        }
+        if command.has_subcommands() {
+            if let Some(arg) = command.get_arguments().find(|arg| !arg.is_global_set()) {
+                return Err(format!("`forklift {shown}` has subcommands and its own argument `{}`", arg.get_id()));
+            }
+            if !command.is_subcommand_required_set() {
+                match BARE_SAME_AS.iter().position(|(family, _)| *family == shown) {
+                    Some(index) => used.bare_same_as[index] = true,
+                    None => tools.push(tool_for(command, &path, Vec::new())?),
+                }
+            }
+            for sub in command.get_subcommands().filter(|sub| !sub.is_hide_set()) {
+                let mut sub_path = path.clone();
+                sub_path.push(sub.get_name().to_string());
+                walk(sub, sub_path, tools, used)?;
+            }
+            return Ok(());
+        }
+
+        let mut params = Vec::new();
+        for arg in command.get_arguments().filter(|arg| !arg.is_global_set() && !arg.is_hide_set()) {
+            params.push(tool_param(&shown, arg)?);
+        }
+        let mut keys = std::collections::HashSet::new();
+        if let Some(param) = params.iter().find(|param| !keys.insert(param.key.as_str())) {
+            return Err(format!("two arguments of `forklift {shown}` make the property `{}`", param.key));
+        }
+        tools.push(tool_for(command, &path, params)?);
+        Ok(())
+    }
+
+    let mut tools = Vec::new();
+    let mut used = Used { human_only: vec![false; HUMAN_ONLY.len()], bare_same_as: vec![false; BARE_SAME_AS.len()] };
+    for command in root.get_subcommands().filter(|command| !command.is_hide_set()) {
+        walk(command, vec![command.get_name().to_string()], &mut tools, &mut used)?;
+    }
+
+    if let Some(((entry, _), _)) = HUMAN_ONLY.iter().zip(&used.human_only).find(|(_, used)| !**used) {
+        return Err(format!("HUMAN_ONLY names `{entry}`, which is not a visible command"));
+    }
+    for ((family, sub), used) in BARE_SAME_AS.iter().zip(&used.bare_same_as) {
+        let path = format!("{family} {sub}");
+        if !*used || !tools.iter().any(|tool| tool.path.join(" ") == path) {
+            return Err(format!("BARE_SAME_AS names `{family}` as `{path}`, which is not a family run bare and its tool"));
+        }
+    }
+    let tabled = INJECTED.iter().map(|(path, key, _)| (*path, *key)).chain(TYPED.iter().map(|(path, key, _)| (*path, *key)));
+    for (path, key) in tabled {
+        let found = tools.iter().any(|tool| tool.path.join(" ") == path && tool.params.iter().any(|param| param.key == key));
+        if !found {
+            return Err(format!("a tool table names `{key}` of `{path}`, which is not an argument of a tool"));
+        }
+    }
+    let mut names = std::collections::HashSet::new();
+    if let Some(tool) = tools.iter().find(|tool| !names.insert(tool.name.as_str())) {
+        return Err(format!("two commands make the tool name `{}`", tool.name));
+    }
+    Ok(tools)
 }
 
-/// The tool definitions returned by `tools/list`: name, one-line description, and a
-/// JSON Schema for the arguments. The set mirrors the read/act commands agents drive.
-fn tool_definitions() -> Value {
-    let object = |properties: Value, required: Value| json!({
-        "type": "object",
-        "properties": properties,
-        "required": required,
-        "additionalProperties": false,
-    });
+/// The tool for the command at `path`, with its arguments. Its description is the command's
+/// long description (else its one-line one), followed by which arguments the server sets.
+fn tool_for(command: &clap::Command, path: &[String], params: Vec<ToolParam>) -> Result<Tool, String> {
+    let text = |styled: Option<&clap::builder::StyledStr>| styled.map(|text| text.to_string())
+        .filter(|text| !text.trim().is_empty());
+    let mut description = text(command.get_long_about()).or_else(|| text(command.get_about()))
+        .ok_or_else(|| format!("`forklift {}` has no description", path.join(" ")))?;
 
-    let string = json!({ "type": "string" });
-    let boolean = json!({ "type": "boolean" });
-    let integer = json!({ "type": "integer", "minimum": 1 });
+    let injected: Vec<String> = params.iter().filter(|param| param.injected.is_some())
+        .map(|param| format!("\"{}\"", param.key))
+        .collect();
+    if !injected.is_empty() {
+        description.push_str(&format!(
+            "\n\nThe server sets {} itself, from this connection; a value passed for {} is discarded.",
+            injected.join(" and "),
+            if injected.len() == 1 { "it" } else { "them" },
+        ));
+    }
 
-    json!([
-        tool("stocktake", "Report the current pallet and the staged/unstaged changes. Pass summary=true for counts only.",
-            object(json!({ "summary": boolean }), json!([]))),
-        tool("stack", "Stack the inventory as a new parcel (commit) on the current pallet.",
-            object(json!({ "description": string }), json!([]))),
-        tool("load", "Stage a file or directory (its changes) into the inventory.",
-            object(json!({ "path": string }), json!(["path"]))),
-        tool("remove", "Stage a file or directory for removal (the working directory is not touched).",
-            object(json!({ "path": string }), json!(["path"]))),
-        tool("unload", "Unstage a file or directory: reset it to the pallet head, keeping the working directory as it is (the inverse of load).",
-            object(json!({ "path": string }), json!(["path"]))),
-        tool("diff", "Show changed files. Default: working directory vs inventory. staged=true: inventory vs head. targets: two revisions to compare, optionally plus a path.",
-            object(json!({ "staged": boolean, "targets": { "type": "array", "items": string } }), json!([]))),
-        tool("history", "Walk the parcel history newest first from a revision (default: the current pallet). Read it in pages with limit (max parcels) plus after (the data.next cursor from the previous page). To filter by author identity class, use query.",
-            object(json!({ "revision": string, "limit": integer, "after": string }), json!([]))),
-        tool("query", "Query parcel history on its signed dimensions - identity class, supervisor, signing key, recorded machine-authorship provenance (model/tool), signed tags - plus parcel facts (dates, description glob, merge-ness, touched paths). Identity answers are verified by default (the signature is checked; the office is joined off the verified signer, never the parcel's own claim); recorded=true opts into the cheap self-declared reading, labeled. A signed-revoked match carries signer.boundary - vouched (inside the revocation's vouched history), suspect (outside it: a forged backdate, or the key's holder kept signing after the revocation), or unresolved (a partial clone is missing a boundary head or an ancestor of one, so the question cannot be answered here - never treat this as suspect) - filterable via a where leaf on signer.boundary (values vouched or suspect only). A parcel with no provenance recorded at all never matches model/tool in either direction; an untagged parcel plainly does not carry tag. touches compares against the first parent only, so a merge whose result at the path already matches its first parent does not match even if its other parent touched it. Compose or/not/nesting via `where` (a JSON predicate tree: {all|any|not} over {field,op,value}). Scope the walk with revision and from - that, not limit, bounds verification work. Page with limit plus after (the data.next cursor).",
-            object(json!({ "revision": string, "from": string, "class": string, "unsupervised": boolean, "supervisor": string, "signer": string, "grep": string, "model": string, "tool": string, "tag": string, "touches": string, "recorded": boolean, "merges": boolean, "no_merges": boolean, "where": { "type": "object" }, "limit": integer, "after": string }), json!([]))),
-        tool("conflicts", "List the files an unresolved consolidation left in conflict, with each side as a content address.",
-            object(json!({}), json!([]))),
-        tool("compact", "Compact the object store: pack loose objects (delta-compressed) into a few dense pack files. Safe to run anytime; worth running after a large import. Pass all=true for a full repack that also rewrites existing packs, dropping unreachable garbage and consolidating.",
-            object(json!({ "all": boolean }), json!([]))),
-        tool("store", "Report object-store health: loose vs packed object counts, pack files and how delta-dense they are, on-disk sizes, and whether an incremental compaction or a repack is due. Read-only (the counterpart of compact).",
-            object(json!({}), json!([]))),
-        tool("scope", "Report the sparse-workspace scope: this bay's materialization scope (the subtrees it works on) and the warehouse fetch scope. Read-only.",
-            object(json!({}), json!([]))),
-        tool("expand", "Widen a sparse warehouse's fetch scope and download the newly in-scope subtree(s) across history from the remote. A full warehouse already holds everything.",
-            object(json!({ "paths": { "type": "array", "items": string } }), json!(["paths"]))),
-        tool("narrow", "Shrink this checkout's materialization scope: drop subtree path(s) and de-materialize their files. Frees nothing in the object store — the content stays reachable history.",
-            object(json!({ "paths": { "type": "array", "items": string } }), json!(["paths"]))),
-        tool("audit", "Verify the warehouse's signed history offline (a pallet, default: the current one).",
-            object(json!({ "pallet": string }), json!([]))),
-        tool("shift", "Switch the working directory to another pallet (checkout).",
-            object(json!({ "pallet": string }), json!(["pallet"]))),
-        tool("consolidate", "Merge another pallet into the current one.",
-            object(json!({ "pallet": string }), json!(["pallet"]))),
-        tool("palletize", "Create a pallet (branch) at an optional revision, or list pallets when name is omitted (all=true also lists the meta pallets).",
-            object(json!({ "name": string, "revision": string, "all": boolean }), json!([]))),
-        tool("restore", "Restore a path from the inventory (or, with staged=true, unstage it).",
-            object(json!({ "path": string, "staged": boolean }), json!(["path"]))),
-        tool("undo", "Undo the last stack, consolidate, cherry-pick or shift. A stack, consolidate or cherry-pick is a soft reset that keeps the changes staged (like git reset --soft HEAD~1); a shift shifts back. Refuses when the bay has moved past that operation.",
-            object(json!({}), json!([]))),
-        tool("heal", "Resolve a standing durability taint (durability_taint refusals, exit 21) that automatic recovery could not clear on its own: restage what it can, then walk every durable ref source to tell a vanished-but-unreferenced object (dropped) from one still referenced (reported, with remedies). A torn taint cannot be resolved this way and needs heavyweight recovery instead.",
-            object(json!({}), json!([]))),
-        tool("lift", "Push the current pallet's new parcels to the configured remote.",
-            object(json!({}), json!([]))),
-        tool("lower", "Pull and fast-forward the current pallet from the configured remote. expect pins the genesis the remote's trust anchor must have, checked before anything is fetched; a mismatch refuses with trust_changed. A diverged meta pallet (@kv, @tags, @manifest, @haul) replays the local changes onto the remote's; paths both sides changed refuse with meta_conflict (exit 24, every pallet, path and both sides in error.details) until each is resolved with a keep entry \"@<pallet>:<path>=ours|theirs\", the pallet as details names it, e.g. \"@kv:<subject>/<key>=theirs\".",
-            object(json!({ "expect": string, "keep": { "type": "array", "items": string } }), json!([]))),
-        tool("office_list", "List the enrolled operators and their keys.",
-            object(json!({}), json!([]))),
-        tool("bay_add", "Open a bay: a new working directory bound to this warehouse, checked out to a new pallet named after it (branched from the current head). Pass scope to open a scoped (sparse) bay materializing only those subtree(s) — the tool for an orchestrator to hand a sub-agent a task-scoped sandbox. path defaults to a sibling of the warehouse.",
-            object(json!({ "name": string, "path": string, "scope": { "type": "array", "items": string } }), json!(["name"]))),
-        tool("bay_list", "List the bays: their names, working directories and current pallets.",
-            object(json!({}), json!([]))),
-        tool("bay_remove", "De-register a bay: remove its local bookkeeping (the redirect and bay state forklift created). The bay's pallet and materialized files are kept.",
-            object(json!({ "name": string }), json!(["name"]))),
-        tool("peek", "Inspect an object by hash (object), or a folder's inventory (inventory).",
-            object(json!({ "object": string, "inventory": string }), json!([]))),
-        tool("blame", "Attribute each line of a file to the parcel that last changed it (rev: at a revision, default the current head).",
-            object(json!({ "path": string, "rev": string }), json!(["path"]))),
-        tool("show", "Print a file's content at a revision in one call. target is \"<revision>:<path>\" (a pallet name, an @-qualified meta pallet, or a parcel hash, then a colon, then the path). Reports binary content or a chunked large file's metadata (content hash, size, chunk count) instead of raw bytes.",
-            object(json!({ "target": string }), json!(["target"]))),
-        tool("cherry_pick", "Apply a single parcel's change onto the current pallet as a new parcel.",
-            object(json!({ "revision": string, "message": string }), json!(["revision"]))),
-        tool("deliver", "Squash the current draft pallet onto a target pallet as one clean signed parcel, keeping the trail. Needs an enrolled key.",
-            object(json!({ "target": string, "message": string }), json!(["target"]))),
-        tool("park", "Park the work in progress (tracked staged + unstaged changes) and reset to the pallet head.",
-            object(json!({}), json!([]))),
-        tool("park_list", "List the parked parcels, newest first.",
-            object(json!({}), json!([]))),
-        tool("park_pop", "Re-apply the most recently parked changes (staged) and drop them from the list.",
-            object(json!({}), json!([]))),
-        tool("tag_create", "Create a signed tag at a revision (admin only); tag names are immutable.",
-            object(json!({ "name": string, "revision": string, "message": string }), json!(["name"]))),
-        tool("tag_show", "Show one tag in full (subject, tagger, message).",
-            object(json!({ "name": string }), json!(["name"]))),
-        tool("tag_list", "List every tag.",
-            object(json!({}), json!([]))),
-        tool("manifest_note", "Record a signed free-form note about a parcel. Needs an enrolled key.",
-            object(json!({ "revision": string, "message": string }), json!(["revision", "message"]))),
-        tool("manifest_approve", "Record a signed approval (sign-off) of a parcel. Needs an enrolled key.",
-            object(json!({ "revision": string, "message": string }), json!(["revision"]))),
-        tool("manifest_provenance", "Record signed machine-authorship provenance for a parcel: which model produced it (the AI-traceability record). The tool and session are set by the MCP server from this connection — you cannot self-report them; model is your attestation. Needs an enrolled key.",
-            object(json!({ "revision": string, "model": string, "transcript": string, "message": string }), json!(["revision", "model"]))),
-        tool("kv_set", "Set a custom-metadata key on a parcel (revision: a pallet name or parcel hash) to a text value, signed as you. Needs an enrolled key and a writer or admin role.",
-            object(json!({ "revision": string, "key": string, "value": string }), json!(["revision", "key", "value"]))),
-        tool("kv_get", "Show a custom-metadata key's value on a parcel, with the key id that wrote it.",
-            object(json!({ "revision": string, "key": string }), json!(["revision", "key"]))),
-        tool("kv_unset", "Remove a custom-metadata key from a parcel. Needs an enrolled key and a writer or admin role.",
-            object(json!({ "revision": string, "key": string }), json!(["revision", "key"]))),
-        tool("kv_list", "List every custom-metadata value, or only a parcel's (revision).",
-            object(json!({ "revision": string }), json!([]))),
-        tool("kv_log", "Every change to a custom-metadata key on a parcel, newest first, with who signed each.",
-            object(json!({ "revision": string, "key": string }), json!(["revision", "key"]))),
-        tool("manifest_show", "Show the manifest entries (approvals, notes, provenance) attached to a parcel.",
-            object(json!({ "revision": string }), json!(["revision"]))),
-        tool("haul_open", "Open a merge proposal (pull request) from a source pallet into a target.",
-            object(json!({ "target": string, "source": string, "title": string, "message": string }), json!(["target", "title"]))),
-        tool("haul_list", "List merge proposals (state: open (default) | merged | closed | all).",
-            object(json!({ "state": string }), json!([]))),
-        tool("haul_show", "Show one merge proposal in full.",
-            object(json!({ "id": string }), json!(["id"]))),
-        tool("haul_update", "Move an open merge proposal to its source pallet's current head (reviews of an earlier head stop counting).",
-            object(json!({ "id": string }), json!(["id"]))),
-        tool("haul_comment", "Add a comment to a merge proposal.",
-            object(json!({ "id": string, "message": string }), json!(["id", "message"]))),
-        tool("haul_review", "Record a signed review of a haul's current head (approves by default; request_changes or comment for the other verdicts). Needs an enrolled key.",
-            object(json!({ "id": string, "request_changes": boolean, "comment": boolean, "message": string }), json!(["id"]))),
-        tool("haul_merge", "Merge a proposal (consolidate its source into the target).",
-            object(json!({ "id": string }), json!(["id"]))),
-        tool("haul_close", "Close a merge proposal without merging.",
-            object(json!({ "id": string }), json!(["id"]))),
-        tool("haul_reopen", "Reopen a closed merge proposal.",
-            object(json!({ "id": string }), json!(["id"]))),
-    ])
+    Ok(Tool { name: path.join("_").replace('-', "_"), path: path.to_vec(), description, params })
 }
 
-/// Why the named tool refuses these arguments, if it does: they are not a JSON object, or an
-/// argument is one its input schema does not declare (and `server_set` does not name), or a
-/// declared argument's value does not have the declared type. A null value is an omitted
-/// argument (harnesses fill unset optionals with it) and `build_args` reads it as absent. An
-/// unknown tool declares nothing to check against; `build_args` refuses it on its own.
-fn argument_refusal(name: &str, arguments: &Value, server_set: &[&str]) -> Option<String> {
-    static DEFINITIONS: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
-    let properties = DEFINITIONS.get_or_init(tool_definitions).as_array()?.iter()
-        .find(|definition| definition["name"] == name)?
-        .pointer("/inputSchema/properties")?
-        .as_object()?;
-
-    let Some(arguments) = arguments.as_object() else {
-        return Some(format!("the \"{}\" tool's arguments must be a JSON object", name));
+/// The tool argument for `arg` of the command `shown`.
+fn tool_param(shown: &str, arg: &clap::Arg) -> Result<ToolParam, String> {
+    let refuse = |why: &str| format!("argument `{}` of `forklift {shown}` has no tool shape: {why}", arg.get_id());
+    let append = match arg.get_action() {
+        clap::ArgAction::SetTrue | clap::ArgAction::Set => false,
+        clap::ArgAction::Append => true,
+        other => return Err(refuse(&format!("its action is {other:?}"))),
     };
 
-    let mut given = arguments.iter().filter(|(_, value)| !value.is_null());
-    given.find_map(|(key, value)| match properties.get(key) {
-        None if server_set.contains(&key.as_str()) => None,
-        None => Some(format!("the \"{}\" tool takes no \"{}\" argument", name, key)),
-        Some(schema) if !matches_schema(value, schema) => Some(format!(
-            "the \"{}\" tool's \"{}\" argument must be {}", name, key, describe_schema(schema)
-        )),
-        Some(_) => None,
+    let (key, form) = if arg.is_positional() {
+        (arg.get_id().to_string(), Form::Positional { variadic: append })
+    } else {
+        let long = arg.get_long().ok_or_else(|| refuse("it has no long name"))?.to_string();
+        let key = long.replace('-', "_");
+        if matches!(arg.get_action(), clap::ArgAction::SetTrue) {
+            (key, Form::Switch(long))
+        } else {
+            (key, Form::Option { long, repeats: append })
+        }
+    };
+
+    let typed = TYPED.iter().find(|(path, id, _)| *path == shown && *id == key).map(|(_, _, typed)| *typed);
+    let parser = arg.get_value_parser().type_id();
+    let choices: Vec<String> = arg.get_possible_values().iter()
+        .filter(|value| !value.is_hide_set())
+        .map(|value| value.get_name().to_string())
+        .collect();
+    let value = match (&form, typed) {
+        (Form::Switch(_), _) => ValueKind::Boolean,
+        (_, Some(Typed::Object)) => ValueKind::Object,
+        (_, Some(Typed::Positive)) => ValueKind::Integer(1),
+        _ if !choices.is_empty() => ValueKind::Choice(choices),
+        _ if [std::any::TypeId::of::<usize>(), std::any::TypeId::of::<u64>(), std::any::TypeId::of::<u32>()]
+            .iter().any(|id| parser == *id) => ValueKind::Integer(0),
+        _ => ValueKind::String,
+    };
+
+    let injected = INJECTED.iter().find(|(path, id, _)| *path == shown && *id == key).map(|(_, _, source)| *source);
+    Ok(ToolParam {
+        key,
+        form,
+        value,
+        required: arg.is_required_set(),
+        injected,
+        help: arg.get_long_help().or_else(|| arg.get_help()).map(|text| text.to_string()),
     })
 }
 
-/// A property's type in words, for a refusal ("a string", "an array of strings", "an integer of
-/// at least 1").
-fn describe_schema(schema: &Value) -> String {
-    match schema["type"].as_str() {
-        Some("array") => format!("an array of {}s", describe_schema(&schema["items"]).trim_start_matches("a ")),
-        Some("integer") => match schema["minimum"].as_u64() {
-            Some(minimum) => format!("an integer of at least {}", minimum),
-            None => "an integer".to_string(),
-        },
-        Some("object") => "an object".to_string(),
-        Some(kind) => format!("a {}", kind),
-        None => "any value".to_string(),
+impl Tool {
+    /// The definition `tools/list` returns: name, description and a closed input schema with
+    /// the arguments the agent passes (an injected one is not among them).
+    fn definition(&self) -> Value {
+        let mut properties = serde_json::Map::new();
+        let mut required = Vec::new();
+        for param in self.params.iter().filter(|param| param.injected.is_none()) {
+            let one = match &param.value {
+                ValueKind::Boolean => json!({ "type": "boolean" }),
+                ValueKind::String => json!({ "type": "string" }),
+                ValueKind::Choice(choices) => json!({ "type": "string", "enum": choices }),
+                ValueKind::Integer(minimum) => json!({ "type": "integer", "minimum": minimum }),
+                ValueKind::Object => json!({ "type": "object" }),
+            };
+            let mut schema = if param.repeats() { json!({ "type": "array", "items": one }) } else { one };
+            if let Some(help) = &param.help {
+                schema["description"] = json!(help);
+            }
+            properties.insert(param.key.clone(), schema);
+            if param.required {
+                required.push(param.key.clone());
+            }
+        }
+        json!({
+            "name": self.name,
+            "description": self.description,
+            "inputSchema": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+                "additionalProperties": false,
+            },
+        })
+    }
+
+    /// Why this tool refuses these arguments, if it does: they are not a JSON object, an
+    /// argument is one the tool does not declare, a declared one has the wrong type, or a
+    /// required one is missing. A null value is an omitted argument (harnesses fill unset
+    /// optionals with it). An injected argument is never refused: the server replaces it.
+    ///
+    /// Refusing rather than ignoring matters: a dropped filter would answer a broader question
+    /// than the one asked, still with ok:true.
+    fn refusal(&self, arguments: &Value) -> Option<String> {
+        let name = &self.name;
+        let Some(arguments) = arguments.as_object() else {
+            return Some(format!("the \"{name}\" tool's arguments must be a JSON object"));
+        };
+
+        let given = arguments.iter().filter(|(_, value)| !value.is_null());
+        for (key, value) in given {
+            match self.params.iter().find(|param| param.key == *key) {
+                None => return Some(format!("the \"{name}\" tool takes no \"{key}\" argument")),
+                Some(param) if param.injected.is_some() => {}
+                Some(param) if !param.accepts(value) => {
+                    return Some(format!("the \"{name}\" tool's \"{key}\" argument must be {}", param.describe()));
+                }
+                Some(_) => {}
+            }
+        }
+        let missing = self.params.iter()
+            .find(|param| param.required && param.injected.is_none() && arguments.get(&param.key).is_none_or(Value::is_null));
+        missing.map(|param| format!("the \"{name}\" tool needs the \"{}\" argument", param.key))
+    }
+
+    /// The command's arguments for these (accepted) arguments: the path, each option as
+    /// `--long=value` and each true switch as `--long`, then `--` and the positionals in
+    /// declaration order.
+    ///
+    /// # Returns
+    /// * `Ok(Vec<String>)` - The arguments, without `--json`.
+    /// * `Err(String)`     - A positional is given while one before it is not: the command
+    ///   would read it as the earlier one.
+    fn argv(&self, arguments: &serde_json::Map<String, Value>) -> Result<Vec<String>, String> {
+        let mut words = self.path.clone();
+        let mut positionals = Vec::new();
+        let mut absent: Option<&str> = None;
+        for param in &self.params {
+            let items: Vec<&Value> = match arguments.get(&param.key).filter(|value| !value.is_null()) {
+                None => Vec::new(),
+                Some(Value::Array(items)) if param.repeats() => items.iter().collect(),
+                Some(value) => vec![value],
+            };
+            match &param.form {
+                Form::Switch(long) => {
+                    if items.first().and_then(|value| value.as_bool()) == Some(true) {
+                        words.push(format!("--{long}"));
+                    }
+                }
+                Form::Option { long, .. } => {
+                    for item in items {
+                        words.push(format!("--{long}={}", word(item)));
+                    }
+                }
+                Form::Positional { .. } if items.is_empty() => {
+                    absent.get_or_insert(&param.key);
+                }
+                Form::Positional { .. } => {
+                    if let Some(absent) = absent {
+                        return Err(format!("the \"{}\" argument needs the \"{absent}\" argument before it", param.key));
+                    }
+                    positionals.extend(items.into_iter().map(word));
+                }
+            }
+        }
+        if !positionals.is_empty() {
+            words.push("--".to_string());
+            words.extend(positionals);
+        }
+        Ok(words)
     }
 }
 
-/// Whether a value has the type a tool property declares (with an array's item type and an
-/// integer's minimum). A property with no type accepts anything.
-fn matches_schema(value: &Value, schema: &Value) -> bool {
-    match schema["type"].as_str() {
-        Some("string") => value.is_string(),
-        Some("boolean") => value.is_boolean(),
-        Some("object") => value.is_object(),
-        Some("integer") => value.as_u64()
-            .is_some_and(|number| schema["minimum"].as_u64().is_none_or(|minimum| number >= minimum)),
-        Some("array") => value.as_array()
-            .is_some_and(|items| items.iter().all(|item| matches_schema(item, &schema["items"]))),
-        _ => true,
+impl ToolParam {
+    /// Whether the argument takes an array of values.
+    fn repeats(&self) -> bool {
+        matches!(self.form, Form::Option { repeats: true, .. } | Form::Positional { variadic: true })
+    }
+
+    /// Whether a (non-null) value has this argument's type.
+    fn accepts(&self, value: &Value) -> bool {
+        match value.as_array() {
+            Some(items) if self.repeats() => items.iter().all(|item| self.value.accepts(item)),
+            _ if self.repeats() => false,
+            _ => self.value.accepts(value),
+        }
+    }
+
+    /// The argument's type in words, for a refusal ("a string", "an array of strings").
+    fn describe(&self) -> String {
+        if self.repeats() {
+            format!("an array of {}", self.value.describe(true))
+        } else {
+            self.value.describe(false)
+        }
     }
 }
 
-/// One tool definition.
-fn tool(name: &str, description: &str, input_schema: Value) -> Value {
-    json!({ "name": name, "description": description, "inputSchema": input_schema })
+impl ValueKind {
+    fn accepts(&self, value: &Value) -> bool {
+        match self {
+            ValueKind::Boolean => value.is_boolean(),
+            ValueKind::String => value.is_string(),
+            ValueKind::Choice(choices) => value.as_str().is_some_and(|value| choices.iter().any(|choice| choice == value)),
+            ValueKind::Integer(minimum) => value.as_u64().is_some_and(|number| number >= *minimum),
+            ValueKind::Object => value.is_object(),
+        }
+    }
+
+    /// The type in words: "a string", or "strings" when `plural`.
+    fn describe(&self, plural: bool) -> String {
+        let (one, many) = match self {
+            ValueKind::Boolean => ("a boolean".to_string(), "booleans".to_string()),
+            ValueKind::String => ("a string".to_string(), "strings".to_string()),
+            ValueKind::Choice(choices) => {
+                let among = choices.iter().map(|choice| format!("\"{choice}\"")).collect::<Vec<_>>().join(", ");
+                (format!("one of {among}"), format!("strings among {among}"))
+            }
+            ValueKind::Integer(minimum) => (format!("an integer of at least {minimum}"), format!("integers of at least {minimum}")),
+            ValueKind::Object => ("an object".to_string(), "objects".to_string()),
+        };
+        if plural { many } else { one }
+    }
+}
+
+/// One value as a command word: a string as itself, anything else as its JSON.
+fn word(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// A JSON-RPC error (a subset of the codes; enough for this server's surface).
@@ -1680,64 +1561,63 @@ mod tests {
         assert_eq!(notification["params"], json!({ "progressToken": "t", "progress": 1.0 }));
     }
 
-    /// CLI commands intentionally **not** exposed as MCP tools: warehouse/identity setup,
-    /// host-machine concerns, and meta commands an agent does not drive through the tool
-    /// surface. Every other CLI command MUST have a matching tool — the test below enforces
-    /// it, so adding a CLI command without an MCP tool (or an allow-list entry) fails CI.
-    ///
-    /// `bay` is deliberately **not** on this list even though it manages a host working
-    /// directory: §7.6's agent story is an orchestrator agent creating task-scoped sandboxes
-    /// for sub-agents over MCP, and `bay` (`bay_add`/`bay_list`/`bay_remove`) is how it does
-    /// that. The scope a bay records is advisory local setup, not the agent's own security
-    /// boundary — enforcement of what an identity may touch lives remote-side (the server's
-    /// role-and-transport authorization), not in the client's bay bookkeeping. Every bay
-    /// operation is non-destructive: `add` refuses
-    /// onto a non-empty directory, and `remove` only deletes the bay's own `.forklift` entry (one
-    /// whose redirect names that bay of this warehouse, left in place otherwise; a link is
-    /// deleted as a link, never followed) and its bay-state folder, never the materialized working tree
-    /// or anything the agent didn't create — so nothing here needs a tighter gate than the rest
-    /// of the surface.
-    const HUMAN_ONLY: &[&str] = &[
-        "alias",       // manage the `fl` shell alias next to this binary (host concern)
-        "prepare",     // create a warehouse (setup)
-        "config",      // read/set configuration (setup)
-        "profile",     // manage identity profiles (setup)
-        "franchise",   // clone a remote (setup)
-        "import-git",  // migrate a git repo in (setup)
-        "export-git",  // migrate out to git (setup)
-        "mirror",      // pushes to an external git remote under the user's own git credentials
-        "self-update", // update the binary (host concern)
-        "self-schema", // describes the CLI for Pult; agents get the MCP tool list instead
-        "scope-prune", // destructive, warehouse-wide disk reclamation — an admin verb, never a sub-agent's
-        "evict",       // warehouse-wide disk reclamation in a cache — an admin verb, like scope-prune
-        "remote",      // repoints a partial warehouse at another server (setup)
-        "mcp",         // this server itself
-        "help",        // meta
-        "version",     // meta
-    ];
-
-    #[test]
-    fn kv_tools_and_lower_keeps_build_their_cli_arguments() {
-        let args = |name: &str, arguments: serde_json::Value| super::build_args(name, &arguments).unwrap();
-
-        assert_eq!(args("kv_set", json!({ "revision": "main", "key": "ci", "value": "green" })),
-                   ["kv", "set", "main", "ci", "green"]);
-        assert_eq!(args("kv_log", json!({ "revision": "main", "key": "ci" })), ["kv", "log", "main", "ci"]);
-        assert_eq!(args("kv_unset", json!({ "revision": "main", "key": "ci" })), ["kv", "unset", "main", "ci"]);
-        assert_eq!(args("kv_list", json!({})), ["kv", "list"]);
-        assert_eq!(args("lower", json!({ "keep": ["@kv:a/b=ours", "@kv:c=theirs"] })),
-                   ["lower", "--keep", "@kv:a/b=ours", "--keep", "@kv:c=theirs"]);
-        assert!(super::build_args("kv_get", &json!({ "revision": "main" })).is_err(), "key is required");
+    /// The tool named `name`.
+    fn tool(name: &str) -> &'static super::Tool {
+        super::tools().unwrap().iter().find(|tool| tool.name == name).unwrap_or_else(|| panic!("no tool {name}"))
     }
 
     #[test]
-    fn an_argument_the_tool_does_not_declare_or_of_the_wrong_type_is_refused() {
-        let refused = |name: &str, arguments: serde_json::Value| super::argument_refusal(name, &arguments, &[]);
+    fn every_visible_command_path_is_a_tool_unless_it_is_human_only_or_the_same_as_a_subcommand() {
+        let names: Vec<&str> = super::tools().unwrap().iter().map(|tool| tool.name.as_str()).collect();
+        for name in ["stocktake", "bay", "bay_add", "park", "park_pop", "manifest", "manifest_provenance",
+                     "office_list", "tag_list", "haul_list", "scope_status", "kv_set", "cherry_pick"] {
+            assert!(names.contains(&name), "{name} must be a tool");
+        }
+        for name in ["office", "tag", "haul", "scope", "office_enroll", "office_regenesis", "prepare",
+                     "self_schema", "mcp", "help", "kv"] {
+            assert!(!names.contains(&name), "{name} must not be a tool");
+        }
+        assert_eq!(tool("tag_create").path, ["tag", "create"]);
+
+        // A command added to the tree is a tool without anything else to do.
+        let tree = crate::cli::Cli::command()
+            .subcommand(clap::Command::new("brand-new").about("New").arg(clap::Arg::new("thing").long("the-thing")));
+        let tools = super::generate_tools(&tree).unwrap();
+        let added = tools.iter().find(|tool| tool.name == "brand_new").unwrap();
+        assert_eq!(added.params[0].key, "the_thing");
+    }
+
+    #[test]
+    fn a_tree_the_tables_or_the_tool_shape_cannot_describe_is_refused() {
+        let refused = |tree: clap::Command| super::generate_tools(&tree).err().unwrap();
+        let cli = crate::cli::Cli::command;
+
+        assert!(refused(cli().mut_subcommand("alias", |alias| alias.hide(true))).contains("HUMAN_ONLY names `alias`"));
+        assert!(refused(cli().mut_subcommand("haul", |haul| haul.subcommand_required(true))).contains("BARE_SAME_AS names `haul`"));
+        assert!(refused(cli().mut_subcommand("kv", |kv| kv.arg(clap::Arg::new("x").long("x"))))
+            .contains("`forklift kv` has subcommands and its own argument"));
+        assert!(refused(cli().subcommand(clap::Command::new("cherry_pick").about("Twin")))
+            .contains("two commands make the tool name `cherry_pick`"));
+        assert!(refused(cli().subcommand(clap::Command::new("twin").about("Twin")
+            .arg(clap::Arg::new("a-b").long("a-b"))
+            .arg(clap::Arg::new("a_b").required(true))))
+            .contains("make the property `a_b`"));
+        assert!(refused(cli().subcommand(clap::Command::new("counted").about("Counted")
+            .arg(clap::Arg::new("n").short('n').action(clap::ArgAction::Count))))
+            .contains("has no tool shape"));
+        assert!(refused(cli().mut_subcommand("history", |history| history.mut_arg("limit", |limit| limit.long("max"))))
+            .contains("a tool table names `limit` of `history`"));
+        assert!(refused(cli().subcommand(clap::Command::new("mute"))).contains("`forklift mute` has no description"));
+    }
+
+    #[test]
+    fn an_argument_the_tool_does_not_declare_of_the_wrong_type_or_missing_is_refused() {
+        let refused = |name: &str, arguments: serde_json::Value| tool(name).refusal(&arguments);
 
         assert!(refused("history", json!({ "class": "agent", "limit": 5 })).unwrap().contains("\"class\""));
         assert_eq!(refused("query", json!({ "class": "agent", "limit": 5 })), None);
         assert_eq!(refused("history", json!({})), None);
-        assert_eq!(super::argument_refusal("manifest_provenance", &json!({ "tool": "t" }), &["tool"]), None);
+        assert_eq!(refused("manifest_provenance", json!({ "revision": "r", "model": "m", "tool": 5, "session": "s" })), None);
 
         // A declared argument of the wrong type would otherwise be dropped just the same.
         for (name, arguments) in [
@@ -1745,69 +1625,204 @@ mod tests {
             ("query", json!({ "where": "{}" })),
             ("lower", json!({ "expect": 123 })),
             ("lower", json!({ "keep": ["@kv:a=ours", 1] })),
+            ("lower", json!({ "keep": "@kv:a=ours" })),
             ("bay_add", json!({ "name": "b", "scope": "src" })),
             ("history", json!({ "limit": "5" })),
             ("history", json!({ "limit": 0 })),
             ("stocktake", json!({ "summary": "yes" })),
             ("history", json!(["class", "agent"])),
+            ("kv_get", json!({ "revision": "main" })),
+            ("blame", json!({})),
         ] {
             assert!(refused(name, arguments.clone()).is_some(), "{} {} must be refused", name, arguments);
         }
         assert_eq!(refused("query", json!({ "where": { "field": "class", "op": "eq", "value": "agent" } })), None);
         assert_eq!(refused("lower", json!({ "keep": ["@kv:a=ours"] })), None);
 
-        // A null is an omitted optional, which build_args reads as absent: nothing is dropped.
+        // A null is an omitted optional, and a required one stays missing.
         assert_eq!(refused("history", json!({ "revision": null, "limit": null, "after": null })), None);
-        assert_eq!(refused("lower", json!({ "expect": null, "keep": null })), None);
+        assert_eq!(refused("kv_get", json!({ "revision": "main", "key": null })).unwrap(),
+                   "the \"kv_get\" tool needs the \"key\" argument");
         assert_eq!(refused("history", json!({ "limit": "5" })).unwrap(),
                    "the \"history\" tool's \"limit\" argument must be an integer of at least 1");
         assert_eq!(refused("lower", json!({ "keep": "x" })).unwrap(),
                    "the \"lower\" tool's \"keep\" argument must be an array of strings");
+
+        // An argument with fixed values takes only those.
+        let tree = crate::cli::Cli::command().subcommand(clap::Command::new("pick").about("Pick")
+            .arg(clap::Arg::new("side").long("side").value_parser(["ours", "theirs"])));
+        let tools = super::generate_tools(&tree).unwrap();
+        let pick = tools.iter().find(|tool| tool.name == "pick").unwrap();
+        assert_eq!(pick.refusal(&json!({ "side": "ours" })), None);
+        assert_eq!(pick.refusal(&json!({ "side": "both" })).unwrap(),
+                   "the \"pick\" tool's \"side\" argument must be one of \"ours\", \"theirs\"");
     }
 
     #[test]
-    fn every_cli_command_is_an_mcp_tool_or_explicitly_human_only() {
-        let definitions = super::tool_definitions();
-        let tools: Vec<&str> = definitions
-            .as_array().unwrap()
-            .iter()
-            .map(|tool| tool["name"].as_str().unwrap())
-            .collect();
+    fn the_arguments_become_options_attached_and_positionals_after_a_double_dash() {
+        let argv = |name: &str, arguments: serde_json::Value| tool(name).argv(arguments.as_object().unwrap());
 
-        let cli = crate::cli::Cli::command();
+        assert_eq!(argv("kv_set", json!({ "revision": "main", "key": "ci", "value": "-green" })).unwrap(),
+                   ["kv", "set", "--", "main", "ci", "-green"]);
+        assert_eq!(argv("kv_list", json!({})).unwrap(), ["kv", "list"]);
+        assert_eq!(argv("lower", json!({ "keep": ["@kv:a/b=ours", "@kv:c=theirs"] })).unwrap(),
+                   ["lower", "--keep=@kv:a/b=ours", "--keep=@kv:c=theirs"]);
+        assert_eq!(argv("history", json!({ "limit": 5, "oneline": true, "after": null })).unwrap(),
+                   ["history", "--limit=5", "--oneline"]);
+        assert_eq!(argv("history", json!({ "oneline": false })).unwrap(), ["history"]);
+        assert_eq!(argv("query", json!({ "where": { "field": "class" } })).unwrap(),
+                   ["query", r#"--where={"field":"class"}"#]);
+        assert_eq!(argv("undo", json!({ "as": "-x" })).unwrap(), ["undo", "--as=-x"]);
 
-        // Every CLI command is exposed as a tool (named for it, or a `<command>_<sub>` tool)
-        // or is on the human-only allow-list — but never neither, and never both.
-        for command in cli.get_subcommands() {
-            let name = command.get_name();
+        // A later positional without the one before it would be read as that one.
+        assert_eq!(argv("palletize", json!({ "revision": "r" })).unwrap_err(),
+                   "the \"revision\" argument needs the \"name\" argument before it");
+    }
 
-            // Hidden dev-only diagnostics (e.g. `__docgen`, feature-gated and never part of a
-            // release build) are not part of the CLI/MCP contract this test enforces.
-            if name.starts_with("__") {
-                continue;
-            }
+    #[test]
+    fn an_injected_argument_is_absent_from_the_schema_and_named_in_the_description() {
+        let provenance = tool("manifest_provenance").definition();
+        let properties = provenance["inputSchema"]["properties"].as_object().unwrap();
+        assert!(properties.contains_key("model"));
+        assert!(!properties.contains_key("tool") && !properties.contains_key("session"));
+        assert!(provenance["description"].as_str().unwrap()
+            .ends_with("The server sets \"tool\" and \"session\" itself, from this connection; a value passed for them is discarded."));
+        assert_eq!(tool("manifest_provenance").argv(json!({ "revision": "r", "model": "m", "tool": "t", "session": "s" })
+            .as_object().unwrap()).unwrap(),
+                   ["manifest", "provenance", "--model=m", "--tool=t", "--session=s", "--", "r"]);
+    }
 
-            let prefix = name.replace('-', "_");
-            let covered = tools.iter().any(|tool| *tool == prefix || tool.starts_with(&format!("{}_", prefix)));
-            let human_only = HUMAN_ONLY.contains(&name);
+    /// What one tool argument binds to when the line parses.
+    #[derive(Debug, PartialEq)]
+    enum Bound {
+        On,
+        Values(Vec<String>),
+    }
 
-            assert!(
-                covered || human_only,
-                "CLI command `{name}` has no MCP tool and is not in HUMAN_ONLY. The MCP is the \
-                 agent surface and must match the CLI: add a tool (build_args + tool_definitions) \
-                 or, if it is genuinely human-only, add `{name}` to HUMAN_ONLY with a reason."
-            );
-            assert!(
-                !(covered && human_only),
-                "CLI command `{name}` is both an MCP tool and human-only — remove it from HUMAN_ONLY."
-            );
+    /// A value for `param` that a careless argv would misread: a string that spells an option and
+    /// a global, two of them when the argument repeats.
+    fn hostile(param: &super::ToolParam) -> serde_json::Value {
+        let one = |n: u32| match &param.value {
+            super::ValueKind::Boolean => json!(true),
+            super::ValueKind::String => json!(format!("-{}{n} --verbose", param.key)),
+            super::ValueKind::Choice(choices) => json!(choices[n as usize % choices.len()]),
+            super::ValueKind::Integer(minimum) => json!(minimum + 7 + n as u64),
+            super::ValueKind::Object => json!({ "field": "class", "op": "eq", "value": format!("-{n} --verbose") }),
+        };
+        if param.repeats() { json!([one(1), one(2)]) } else { one(1) }
+    }
+
+    /// Run `arguments` through `tool`'s argv and clap, the way a call does. `Ok` means clap
+    /// accepted the line and every argument bound exactly to the clap argument it names, with
+    /// nothing else and no global set (anything else panics); `Err` is a refusal by argv or by
+    /// clap for a combination the command does not accept.
+    fn parse(tool: &super::Tool, arguments: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+        use clap::FromArgMatches;
+        use clap::parser::ValueSource;
+
+        let argv = tool.argv(arguments)?;
+        let line: Vec<String> = ["forklift", "--json"].iter().map(|word| word.to_string()).chain(argv.iter().cloned()).collect();
+        let root = crate::cli::Cli::command();
+        let mut matches = match root.clone().try_get_matches_from(&line) {
+            Ok(matches) => matches,
+            Err(error) if matches!(error.kind(), clap::error::ErrorKind::ArgumentConflict
+                | clap::error::ErrorKind::MissingRequiredArgument) => return Err(error.to_string()),
+            Err(error) => panic!("{line:?}: {error}"),
+        };
+        crate::cli::Cli::from_arg_matches(&matches).unwrap_or_else(|error| panic!("{line:?}: {error}"));
+
+        for global in root.get_arguments().filter(|arg| arg.get_id() != "json") {
+            assert_ne!(matches.value_source(global.get_id().as_str()), Some(ValueSource::CommandLine),
+                       "{line:?}: set the global {}", global.get_id());
         }
 
-        // No stale allow-list entries: each names a real CLI command.
-        let names: std::collections::HashSet<&str> =
-            cli.get_subcommands().map(|command| command.get_name()).collect();
-        for entry in HUMAN_ONLY {
-            assert!(names.contains(entry), "HUMAN_ONLY lists `{entry}`, which is not a CLI command");
+        let mut leaf = &root;
+        for name in &tool.path {
+            let (got, sub) = matches.remove_subcommand().unwrap_or_else(|| panic!("{line:?}: no subcommand {name}"));
+            assert_eq!(&got, name, "{line:?}");
+            matches = sub;
+            leaf = leaf.find_subcommand(name).unwrap();
+        }
+        assert!(matches.subcommand_name().is_none(), "{line:?}: ran a deeper command");
+        for global in root.get_arguments().filter(|arg| arg.get_id() != "json") {
+            assert_ne!(matches.value_source(global.get_id().as_str()), Some(ValueSource::CommandLine),
+                       "{line:?}: a value set the global {}", global.get_id());
+        }
+
+        let mut bound = std::collections::BTreeMap::new();
+        for arg in leaf.get_arguments().filter(|arg| !arg.is_global_set()) {
+            let id = arg.get_id().as_str();
+            if matches.value_source(id) != Some(ValueSource::CommandLine) {
+                continue;
+            }
+            let value = if matches!(arg.get_action(), clap::ArgAction::SetTrue) {
+                Bound::On
+            } else {
+                Bound::Values(matches.get_raw(id).unwrap().map(|value| value.to_string_lossy().into_owned()).collect())
+            };
+            bound.insert(id.to_string(), value);
+        }
+
+        // What the arguments name, judged from the clap leaf: an option or switch by its long
+        // name, a positional by its id.
+        let mut expected = std::collections::BTreeMap::new();
+        for (key, value) in arguments.iter().filter(|(_, value)| !value.is_null()) {
+            let arg = leaf.get_arguments()
+                .find(|arg| match arg.get_long() {
+                    Some(long) => long.replace('-', "_") == *key,
+                    None => arg.get_id() == key,
+                })
+                .unwrap_or_else(|| panic!("{line:?}: no clap argument for {key}"));
+            let words = |value: &serde_json::Value| match value {
+                serde_json::Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            let value = match value {
+                serde_json::Value::Bool(true) => Bound::On,
+                serde_json::Value::Bool(false) => continue,
+                serde_json::Value::Array(items) => Bound::Values(items.iter().map(words).collect()),
+                other => Bound::Values(vec![words(other)]),
+            };
+            expected.insert(arg.get_id().to_string(), value);
+        }
+        assert_eq!(bound, expected, "{line:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn every_tool_argument_parses_against_clap_and_binds_where_it_names() {
+        for tool in super::tools().unwrap() {
+            let required: serde_json::Map<String, serde_json::Value> = tool.params.iter()
+                .filter(|param| param.required)
+                .map(|param| (param.key.clone(), hostile(param)))
+                .collect();
+            // The required arguments alone may still need one of a set of others (`peek` takes a
+            // hash or `--inventory`); the optional ones below bind with them then.
+            let alone = parse(tool, &required);
+            if tool.params.iter().all(|param| param.required) {
+                alone.unwrap_or_else(|error| panic!("{}: the required arguments alone: {error}", tool.name));
+            }
+
+            // Each optional argument binds on its own, or with up to two others it needs (an
+            // option that requires another, a positional after an optional one).
+            for param in tool.params.iter().filter(|param| !param.required) {
+                let with = |others: &[&super::ToolParam]| {
+                    let mut arguments = required.clone();
+                    for other in others {
+                        arguments.insert(other.key.clone(), hostile(other));
+                    }
+                    parse(tool, &arguments)
+                };
+                let alone = with(&[param]);
+                let others: Vec<&super::ToolParam> = tool.params.iter()
+                    .filter(|other| other.key != param.key && !other.required)
+                    .collect();
+                let paired = || others.iter().enumerate().any(|(index, other)| {
+                    with(&[other, param]).is_ok()
+                        || others[index + 1..].iter().any(|third| with(&[other, third, param]).is_ok())
+                });
+                assert!(alone.is_ok() || paired(), "{}: \"{}\" binds in no combination: {:?}", tool.name, param.key, alone);
+            }
         }
     }
 }
