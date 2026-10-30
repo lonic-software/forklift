@@ -970,9 +970,8 @@ mod tests {
         let (folder, file) = file_utils::get_path_for_object(&h.a).unwrap();
         let loose = PathBuf::from(folder).join(file);
         let bytes = std::fs::read(&loose).unwrap();
-        let incremental = pack_utils::compact(false, false, false, &Progress::NONE).unwrap();
+        pack_utils::compact(false, false, false, &Progress::NONE).unwrap();
         assert!(!loose.exists(), "sanity: compaction moved it into a pack");
-        assert_eq!(incremental.pack_bytes_freed, 0, "an incremental compaction frees no pack");
         std::fs::write(&loose, &bytes).unwrap();
         let hold = store_access();
 
@@ -1013,6 +1012,27 @@ mod tests {
         let stats = carry(&plan, &hold).unwrap();
         assert!(stats.bytes_freed * 2 >= pack_bytes, "{} freed, the dropped pack held {}", stats.bytes_freed, pack_bytes);
         assert!(present(&local_blob) && !file_utils::loose_dentry_exists(&local_blob).unwrap(), "sanity: packed");
+    }
+
+    /// An incremental compaction reports no pack bytes freed, though the pack it writes holds less
+    /// than the loose files it packed: it frees no pack.
+    ///
+    /// Revert: count packed loose files on the old side for every compaction → it reports the
+    /// delta's saving as freed pack bytes.
+    #[test]
+    fn an_incremental_compaction_frees_no_pack_bytes() {
+        let _scratch = Scratch::new("incremental");
+        let mut parents = Vec::new();
+        for tail in ["zero", "one", "two", "three"] {
+            let root = store_tree(&[("f.txt", &store_blob(&version(tail)), DirEntryType::Normal)]);
+            parents = vec![store_parcel(&root, parents)];
+        }
+        set_main(&parents[0]);
+        position(None);
+
+        let stats = pack_utils::compact(false, false, false, &Progress::NONE).unwrap();
+        assert!(stats.loose_removed > 0, "sanity: it packed the loose versions");
+        assert_eq!(stats.pack_bytes_freed, 0);
     }
 
     /// A damaged pack refuses the plan before anything changes, whether or not a pack holds an
