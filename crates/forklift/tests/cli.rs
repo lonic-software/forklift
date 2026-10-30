@@ -5816,6 +5816,10 @@ fn branch_with_a_pallet_name_is_refused_naming_pallet_create() {
         assert_eq!(refused.status.code(), Some(2), "{:?}", args);
         assert!(stderr(&refused).contains("unexpected argument") && !stderr(&refused).contains("create"), "{:?}: {}", args, stderr(&refused));
     }
+    // A help flag asks for the help, not for the name to be judged.
+    let help = warehouse.run(&["branch", "-h", "feature"]);
+    assert!(!stderr(&help).contains("forklift pallet create feature"), "{}", stderr(&help));
+    assert!(stdout(&help).contains("Usage: forklift pallet"), "{}", stdout(&help));
 }
 
 #[test]

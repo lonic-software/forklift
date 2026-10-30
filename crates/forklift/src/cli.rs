@@ -1974,7 +1974,8 @@ impl Command {
     /// position, or commits staged content. The staging such an operation leaves may be
     /// incomplete, and committing it could record the removal of every tracked file. `heal` is
     /// the way out; commands that touch only refs of other pallets, the shared store or
-    /// metadata stay usable.
+    /// metadata stay usable. Of the pallet family only the listing runs: `pallet delete` writes
+    /// the bay's undo journal, and `pallet restore` re-creates a ref a checkout may stand on.
     ///
     /// # Returns
     /// * `true`  - The command refuses while such an operation is recorded.

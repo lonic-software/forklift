@@ -214,7 +214,7 @@ fn knows_option(level: &clap::Command, word: &str) -> bool {
 /// git users, but git's `branch NAME` creates a branch without switching to it, and `pallet create`
 /// also shifts, so a name after `branch` is not taken as a create: it is refused with the command
 /// that creates the pallet. A flag the pallet level lacks (git's `-d`, `-m`) leaves the name to
-/// clap, which refuses the flag. Only a pallet subcommand's exact name or alias is a subcommand there;
+/// clap, which refuses the flag, and so does a help flag, so the help asked for is printed. Only a pallet subcommand's exact name or alias is a subcommand there;
 /// `args` are read before [`prefix::expand`], so `branch cr` is the pallet "cr", not a prefix of
 /// `create`. Options are stepped over as the prefix walk steps over them, and the words after `--`
 /// are left to clap. `command` must be built.
@@ -234,7 +234,7 @@ fn branch_name_error(command: &clap::Command, args: &[OsString]) -> Option<clap:
         if word.starts_with('-') && word != "-" {
             // A flag the pallet level does not have is git's (`branch -d NAME`, `branch -m OLD NEW`),
             // which says what the name is for: not a create, so clap refuses the flag instead.
-            if !at_root && !knows_option(level, word) {
+            if !at_root && (!knows_option(level, word) || word == "-h" || word == "--help") {
                 return None;
             }
             index += if prefix::takes_next_word(level, word) { 2 } else { 1 };
