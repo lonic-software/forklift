@@ -501,8 +501,9 @@ proposed, but not built.
 
 **Holds request.** A remote request asking whether it still holds a given head.
 
-**Cache mode.** A warehouse that keeps every parcel but may evict content, fetching it back on
-demand.
+**Cache mode.** A warehouse franchised with `--cache`: it keeps every parcel and signature, but
+content only for what a bay has checked out or a command has read. It holds the rest by hash and
+fetches it from its origin on demand.
 
 **Lazy history, remote-first reads, signed trust checkpoints.** Clones whose cost depends on the
 tip rather than history length; reading history from a remote with no local warehouse; and

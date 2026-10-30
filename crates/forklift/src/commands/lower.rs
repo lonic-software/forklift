@@ -950,7 +950,7 @@ async fn replay(client: &RemoteClient,
         }
     }
 
-    remote_utils::lift_pallet(client, &wire, &parcel, Some(remote_head), None, info.chunking, &Progress::NONE).await?;
+    remote_utils::lift_pallet(client, &wire, &parcel, Some(remote_head), None, info, &Progress::NONE).await?;
     // Conditioned on the office the replay was signed and checked under, as every meta write is.
     // The remote already holds the replay, so a refusal says so rather than "nothing was written".
     match pallet_utils::update_meta_pallet_head(name, Some(&local), &parcel, &office.preconditions()) {

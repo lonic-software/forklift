@@ -1629,9 +1629,12 @@ files whole. Every other file stays with the remote, recorded by hash (`audit` c
 held by hash): an older parcel's, and the head's of a pallet `lower <pallet>` moves without
 checking it out. A command that reads content the cache lacks (`show` or `diff` of an older
 parcel, `shift` to a pallet lowered that way) fetches each object it meets from the origin as it
-reads it, and keeps it. A command that changes the bay's files (`shift`, `consolidate`,
-`cherry-pick`, `park`, `lower`, `restore`, `bay add`) fetches every file it is about to write
-in one batch first, before it changes anything. The configured remote must be the origin. When
+reads it, and keeps it. A command that writes the bay's files (`franchise`, `shift`,
+`consolidate`, `cherry-pick`, `park`, `lower`, `restore`, `bay add`) fetches every file it is
+about to write in one batch first, before it changes anything. When a new pallet branched off a
+pallet the origin has, or the work merged in another pallet's head as the origin has it, a `lift`
+reads only the work being lifted and the parent parcel's version of each directory it changed,
+fetching that version if the cache lacks it. The configured remote must be the origin. When
 the origin cannot be reached, answers that it is unavailable (`502`–`504`), or keeps throttling,
 the command refuses with exit 36 (`cache_miss`) and names the origin: run it again once the
 origin is back. Some commands report it as a plain error that names the origin instead. What a

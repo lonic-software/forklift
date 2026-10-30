@@ -6200,6 +6200,45 @@ fn a_cache_lift_auto_merges_a_diverged_remote() {
     assert_success(&area.forklift("cached", &["audit"]));
 }
 
+/// A new pallet's first lift stops its walk where the pallet branched off another the remote
+/// holds, since the remote holds every head's closure: it uploads the one new parcel, not the
+/// history beneath it. In a cache that walk would also have read every older root the cache holds
+/// only by record, fetching the history one object at a time; both recorded roots stay absent. The
+/// lift lands a pallet a full franchise of the remote checks out and audits.
+///
+/// Revert: stop the walk only at the lifted pallet's own remote head → three more parcels are sent
+/// and the recorded roots are fetched.
+#[test]
+fn a_new_pallets_first_lift_stops_at_the_history_the_remote_holds() {
+    let area = TestArea::new("lift-new-pallet");
+    let (server, head) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+
+    let history = history_with_roots(&area, "cached", &head);
+    let (middle_root, oldest_root) = (history[1].1.clone(), history[2].1.clone());
+    assert_record_is(&area, "cached", &[&middle_root, &oldest_root]);
+
+    for warehouse in ["a", "cached"] {
+        assert_success(&area.forklift(warehouse, &["palletize", &format!("feature-{}", warehouse)]));
+        area.write_file(&format!("{}/src/feature.txt", warehouse), &format!("{}\n", warehouse));
+        assert_success(&area.forklift(warehouse, &["load", "."]));
+        assert_success(&area.forklift(warehouse, &["stack", "the feature"]));
+
+        let lifted = area.forklift(warehouse, &["--json", "lift"]);
+        assert_success(&lifted);
+        let value: serde_json::Value = serde_json::from_str(&stdout(&lifted)).unwrap();
+        assert_eq!(value["data"]["new_parcels"], 1, "{}: {}", warehouse, value);
+    }
+
+    assert!(!object_held(&area, "cached", &oldest_root), "the lift fetched a root it holds by record");
+    assert!(!object_held(&area, "cached", &middle_root), "the lift fetched a root it holds by record");
+    assert_success(&area.forklift("cached", &["audit"]));
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "full", "--pallet", "feature-cached"]));
+    assert_eq!(area.read_file("full/src/feature.txt"), "cached\n");
+    assert_success(&area.forklift("full", &["audit"]));
+}
+
 /// Fetch `head` into `directory` in-process, as a cache fetch that no ref write follows.
 fn cache_fetch_in_process(area: &TestArea, directory: &str, url: &str, head: &str) {
     // A current-thread runtime: the fetch spawns its transfers, and the storage scope is a

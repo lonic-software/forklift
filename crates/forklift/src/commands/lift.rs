@@ -131,7 +131,7 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
         };
 
         let lifted = remote_utils::lift_pallet(
-            &client, &pallet, &head, remote_head.as_deref(), tombstone.as_deref(), info.chunking, &progress
+            &client, &pallet, &head, remote_head.as_deref(), tombstone.as_deref(), &info, &progress
         ).await;
 
         let landed = lifted.is_ok().then_some((pallet.as_str(), head.as_str()));
