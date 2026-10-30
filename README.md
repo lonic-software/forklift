@@ -65,7 +65,7 @@ irm https://raw.githubusercontent.com/lonic-software/forklift/main/install.ps1 |
 forklift prepare                          # create a warehouse here
 echo "hello" > readme.txt
 forklift load .                            # stage everything
-forklift stack "first parcel"             # commit
+forklift stack -m "first parcel"          # commit
 forklift history                           # see it
 ```
 
@@ -180,7 +180,7 @@ agent, under whose supervision" — blame git cannot express.
 
 #### Restore
 Git counterpart: Restore\
-Discard changes in the working directory (or, with `--staged`, unstage changes from the inventory).
+Discard changes in the working directory. Unstaging is `unload`.
 
 #### Lift
 Git counterpart: Push\

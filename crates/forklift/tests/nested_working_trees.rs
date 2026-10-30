@@ -48,7 +48,7 @@ impl Warehouse {
         let warehouse = Warehouse::empty(name);
         warehouse.write("app.txt", "payload\n");
         warehouse.run_ok(&["load", "."]);
-        warehouse.run_ok(&["stack", "first"]);
+        warehouse.run_ok(&["stack", "-m", "first"]);
 
         warehouse
     }
@@ -237,7 +237,7 @@ fn every_materializer_refuses_a_metadata_folder_below_the_top_level_and_writes_n
     warehouse.craft_pallet("evil", |blob| vec![tree("sub", vec![tree(".forklift", vec![file("config", blob)])])]);
     warehouse.write("zzz.txt", "ours\n");
     warehouse.run_ok(&["load", "zzz.txt"]);
-    warehouse.run_ok(&["stack", "ours"]);
+    warehouse.run_ok(&["stack", "-m", "ours"]);
     let merge = warehouse.run(&["consolidate", "evil"]);
     if let Some(problem) = refused_and_untouched(&warehouse, &merge, "\".forklift\"", "sub") {
         failures.push(format!("merge consolidate: {}", problem));
@@ -276,7 +276,7 @@ fn stack_refuses_a_metadata_folder_name_below_the_top_level() {
         warehouse.write("zzz.txt", "also staged\n");
         warehouse.run_ok(&["load", "."]);
 
-        let stack = warehouse.run(&["stack", "nested"]);
+        let stack = warehouse.run(&["stack", "-m", "nested"]);
         assert!(!stack.status.success(), "stack accepted {}", written);
         assert!(stderr(&stack).contains(&format!("{:?}", refused)), "the refusal must name {}: {}", refused, stderr(&stack));
         assert!(stderr(&stack).contains("unload it and add it to .forkliftignore"), "{}", stderr(&stack));
@@ -285,7 +285,7 @@ fn stack_refuses_a_metadata_folder_name_below_the_top_level() {
         warehouse.run_ok(&["unload", refused]);
         warehouse.write(".forkliftignore", &format!("^{}$\n", refused.replace('.', "\\.")));
         warehouse.run_ok(&["load", "."]);
-        warehouse.run_ok(&["stack", "without it"]);
+        warehouse.run_ok(&["stack", "-m", "without it"]);
         assert_ne!(warehouse.head("main"), head);
         assert_eq!(warehouse.changes("staged"), Vec::<(String, String)>::new());
     }
@@ -333,7 +333,7 @@ fn a_tracked_folder_that_becomes_a_nested_working_tree_refuses_until_it_is_remov
         let warehouse = Warehouse::new(&format!("walk-tracked-{}", after_load));
         warehouse.write("sub/x.txt", "tracked\n");
         warehouse.run_ok(&["load", "."]);
-        warehouse.run_ok(&["stack", "track sub"]);
+        warehouse.run_ok(&["stack", "-m", "track sub"]);
         warehouse.prepare_nested("sub");
 
         let mut refusing: Vec<&[&str]> = vec![&["stocktake"], &["load", "sub/x.txt"]];
@@ -355,7 +355,7 @@ fn a_tracked_folder_that_becomes_a_nested_working_tree_refuses_until_it_is_remov
         if after_load {
             warehouse.run_ok(&["load", "."]);
         }
-        warehouse.run_ok(&["stack", "leave sub"]);
+        warehouse.run_ok(&["stack", "-m", "leave sub"]);
 
         warehouse.run_ok(&["load", "."]);
         assert_eq!(warehouse.changes("staged"), Vec::<(String, String)>::new(), "after_load {}", after_load);
@@ -374,7 +374,7 @@ fn a_shift_into_an_untracked_nested_working_tree_refuses_and_writes_nothing() {
     warehouse.write("app.txt", "changed\n");
     warehouse.write("sub/x.txt", "feature\n");
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "feature"]);
+    warehouse.run_ok(&["stack", "-m", "feature"]);
     warehouse.run_ok(&["shift", "main"]);
     assert!(!warehouse.path("sub").exists());
 
@@ -408,7 +408,7 @@ fn replacing_a_folder_holding_a_nested_working_tree_refuses_whatever_the_rules_s
         warehouse.write("a/x", "tracked\n");
         warehouse.write("app.txt", "payload\n");
         warehouse.run_ok(&["load", "."]);
-        warehouse.run_ok(&["stack", "dir"]);
+        warehouse.run_ok(&["stack", "-m", "dir"]);
         warehouse.run_ok(&["pallet", "create", "flip"]);
         warehouse.run_ok(&["shift", "flip"]);
         warehouse.run_ok(&["remove", "a"]);
@@ -416,7 +416,7 @@ fn replacing_a_folder_holding_a_nested_working_tree_refuses_whatever_the_rules_s
         warehouse.write("a", "now a file\n");
         warehouse.write("0.txt", "changed\n");
         warehouse.run_ok(&["load", "."]);
-        warehouse.run_ok(&["stack", "file"]);
+        warehouse.run_ok(&["stack", "-m", "file"]);
         warehouse.run_ok(&["shift", "main"]);
 
         if let Some(ignore) = &ignore {
@@ -454,7 +454,7 @@ fn replacing_a_folder_holding_an_ignored_file_refuses_and_writes_nothing() {
     warehouse.write("0.txt", "zero\n");
     warehouse.write("a/x", "tracked\n");
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "dir"]);
+    warehouse.run_ok(&["stack", "-m", "dir"]);
     warehouse.run_ok(&["pallet", "create", "flip"]);
     warehouse.run_ok(&["shift", "flip"]);
     warehouse.run_ok(&["remove", "a"]);
@@ -462,7 +462,7 @@ fn replacing_a_folder_holding_an_ignored_file_refuses_and_writes_nothing() {
     warehouse.write("a", "now a file\n");
     warehouse.write("0.txt", "changed\n");
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "file"]);
+    warehouse.run_ok(&["stack", "-m", "file"]);
     warehouse.run_ok(&["shift", "main"]);
 
     warehouse.write(".forkliftignore", "^a/junk$\n");
@@ -527,7 +527,7 @@ fn narrow_refuses_to_delete_a_nested_working_tree_whatever_the_rules_say() {
         warehouse.write("a/x.txt", "a\n");
         warehouse.write("b/y.txt", "b\n");
         warehouse.run_ok(&["load", "."]);
-        warehouse.run_ok(&["stack", "base"]);
+        warehouse.run_ok(&["stack", "-m", "base"]);
 
         let bay = warehouse.base.join("scoped");
         warehouse.run_ok(&["bay", "add", "scoped", bay.to_str().unwrap(), "--scope", "a", "--scope", "b"]);

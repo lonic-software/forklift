@@ -97,7 +97,7 @@ impl Warehouse {
         }
 
         self.run_ok(&["load", "."]);
-        self.run_ok(&["stack", message]);
+        self.run_ok(&["stack", "-m", message]);
 
         self.head(&self.current_pallet())
     }
@@ -122,7 +122,7 @@ impl Warehouse {
         std::fs::write(path, bytes).unwrap();
 
         self.run_ok(&["load", "."]);
-        self.run_ok(&["stack", message]);
+        self.run_ok(&["stack", "-m", message]);
         self.head(&self.current_pallet())
     }
 

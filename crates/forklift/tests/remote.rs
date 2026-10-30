@@ -433,7 +433,7 @@ fn a_lift_uploads_a_subtree_introduced_by_a_parent_of_both_merge_sides() {
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/base.txt", "base\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "base"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
     assert_success(&area.forklift("a", &["office", "enroll"]));
     assert_success(&area.forklift("a", &["lift"]));
 
@@ -441,20 +441,20 @@ fn a_lift_uploads_a_subtree_introduced_by_a_parent_of_both_merge_sides() {
     // part of the push under test.
     area.write_file("a/shared/s.txt", "introduced by P\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "P adds shared/"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "P adds shared/"]));
     let p = pallet_head(&area, "a", "main");
 
     // B — a second line off P, touching only a root file.
     assert_success(&area.forklift("a", &["pallet", "create", "side", &p])); // pallet create also shifts
     area.write_file("a/b.txt", "b\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "B edits b.txt"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "B edits b.txt"]));
 
     // A — back on main, also off P, also touching only a root file.
     assert_success(&area.forklift("a", &["shift", "main"]));
     area.write_file("a/a.txt", "a\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "A edits a.txt"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "A edits a.txt"]));
 
     // M — the merge. Its ancestry re-reaches P through both sides.
     assert_success(&area.forklift("a", &["consolidate", "side"]));
@@ -486,7 +486,7 @@ fn the_ignore_file_travels_with_the_pallet() {
     area.write_file("a/src.txt", "src\n");
     area.write_file("a/build/out.txt", "generated\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "track the ignore rules"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "track the ignore rules"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     // Route 1: clone into a new directory.
@@ -504,7 +504,7 @@ fn the_ignore_file_travels_with_the_pallet() {
     let widened = "# build output\n^build(/.*)?$\n\\.log$\n";
     area.write_file("a/.forkliftignore", widened);
     assert_success(&area.forklift("a", &["load", ".forkliftignore"]));
-    assert_success(&area.forklift("a", &["stack", "ignore logs"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "ignore logs"]));
     assert_success(&area.forklift("a", &["lift"]));
     assert_success(&area.forklift("b", &["lower"]));
     assert_eq!(area.read_file("b/.forkliftignore"), widened);
@@ -522,7 +522,7 @@ fn a_prepared_warehouse_lowers_the_tracked_ignore_file() {
     area.write_file("a/.forkliftignore", rules);
     area.write_file("a/src.txt", "src\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "track the ignore rules"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "track the ignore rules"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     prepare_warehouse(&area, "c", &server.url);
@@ -550,7 +550,7 @@ fn a_sparse_franchise_keeps_the_root_ignore_file_in_scope() {
     area.write_file("dev/src/a.txt", "a v1\n");
     area.write_file("dev/docs/guide.md", "guide v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src"]));
@@ -577,7 +577,7 @@ fn a_sparse_franchise_keeps_the_root_ignore_file_in_scope() {
     let widened = "^src/build(/.*)?$\n\\.log$\n";
     area.write_file("sparse/.forkliftignore", widened);
     assert_success(&area.forklift("sparse", &["load", ".forkliftignore"]));
-    assert_success(&area.forklift("sparse", &["stack", "ignore logs"]));
+    assert_success(&area.forklift("sparse", &["stack", "-m", "ignore logs"]));
     assert_success(&area.forklift("sparse", &["lift"]));
     assert_success(&area.forklift("dev", &["lower"]));
     assert_eq!(area.read_file("dev/.forkliftignore"), widened);
@@ -589,7 +589,7 @@ fn a_sparse_franchise_keeps_the_root_ignore_file_in_scope() {
     area.write_file("dev/.forkliftignore", narrowed);
     area.write_file("dev/README", "readme v2\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "drop the log rule"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "drop the log rule"]));
     assert_success(&area.forklift("dev", &["lift"]));
     assert_success(&area.forklift("sparse", &["lower"]));
     assert_eq!(area.read_file("sparse/.forkliftignore"), narrowed);
@@ -614,7 +614,7 @@ fn a_sparse_checkout_unstages_the_root_ignore_file_and_narrows_past_an_edit_to_i
     area.write_file("dev/src/a.txt", "a v1\n");
     area.write_file("dev/docs/guide.md", "guide v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     assert_success(&area.forklift(".",
@@ -624,9 +624,9 @@ fn a_sparse_checkout_unstages_the_root_ignore_file_and_narrows_past_an_edit_to_i
     // the root folder — the folder form rebuilds the root shard, whose files are on the spine.
     area.write_file("sparse/.forkliftignore", "^src/build(/.*)?$\n\\.log$\n");
     assert_success(&area.forklift("sparse", &["load", ".forkliftignore"]));
-    assert_success(&area.forklift("sparse", &["restore", "--staged", ".forkliftignore"]));
+    assert_success(&area.forklift("sparse", &["unload", ".forkliftignore"]));
     assert_success(&area.forklift("sparse", &["load", ".forkliftignore"]));
-    assert_success(&area.forklift("sparse", &["restore", "--staged", "."]));
+    assert_success(&area.forklift("sparse", &["unload", "."]));
     let status = area.forklift("sparse", &["--json", "stocktake"]);
     assert_success(&status);
     let json: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
@@ -653,7 +653,7 @@ fn a_sparse_warehouse_with_an_unversioned_scope_file_is_refused() {
     area.write_file("dev/.forkliftignore", "^src/build(/.*)?$\n");
     area.write_file("dev/src/a.txt", "a v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src"]));
@@ -664,7 +664,7 @@ fn a_sparse_warehouse_with_an_unversioned_scope_file_is_refused() {
         std::fs::write(area.path(file), "src\n").unwrap();
     }
 
-    for verb in [&["stocktake"][..], &["stack", "nothing"][..]] {
+    for verb in [&["stocktake"][..], &["stack", "-m", "nothing"][..]] {
         let refused = area.forklift("sparse", verb);
         assert!(!refused.status.success(), "{:?} must refuse: {}", verb, stdout(&refused));
         assert!(stderr(&refused).contains("older version of Forklift"), "{:?}: {}", verb, stderr(&refused));
@@ -682,11 +682,11 @@ fn lift_franchise_lower_round_trip() {
     area.write_file("a/src/main.txt", "fn main\n");
 
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "first parcel"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "first parcel"]));
 
     area.write_file("a/readme.txt", "hello remote, twice\n");
     assert_success(&area.forklift("a", &["load", "readme.txt"]));
-    assert_success(&area.forklift("a", &["stack", "second parcel"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "second parcel"]));
 
     let lifted = area.forklift("a", &["lift"]);
     assert_success(&lifted);
@@ -719,7 +719,7 @@ fn lift_franchise_lower_round_trip() {
     // New work in A flows to B through the remote.
     area.write_file("a/src/main.txt", "fn main v2\n");
     assert_success(&area.forklift("a", &["load", "src/main.txt"]));
-    assert_success(&area.forklift("a", &["stack", "third parcel"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "third parcel"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     let lowered = area.forklift("b", &["lower"]);
@@ -877,7 +877,7 @@ fn lower_names_a_closed_batch_lane_and_a_healthy_lower_does_not() {
     area.write_file("a/docs/readme.txt", "hello\n");
     area.write_file("a/src/main.txt", "fn main\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "first"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "first"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     assert_success(&area.forklift(".", &["clone", &server.url, "direct"]));
@@ -888,7 +888,7 @@ fn lower_names_a_closed_batch_lane_and_a_healthy_lower_does_not() {
     area.write_file("a/docs/readme.txt", "hello again\n");
     area.write_file("a/src/main.txt", "fn main v2\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "second"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "second"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     let proxy = BatchlessProxy::start(&server.url);
@@ -917,7 +917,7 @@ fn lower_names_a_closed_batch_lane_and_a_healthy_lower_does_not() {
     area.write_file("a/docs/readme.txt", "hello a third time\n");
     area.write_file("a/src/main.txt", "fn main v3\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "third"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "third"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     let human = area.forklift("proxied", &["lower"]);
@@ -942,13 +942,13 @@ fn a_lower_refused_over_an_untracked_file_leaves_nothing_standing() {
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/readme.txt", "hello\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "first"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "first"]));
     assert_success(&area.forklift("a", &["lift"]));
     assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
 
     area.write_file("a/added.txt", "theirs\n");
     assert_success(&area.forklift("a", &["load", "added.txt"]));
-    assert_success(&area.forklift("a", &["stack", "second"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "second"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     area.write_file("b/added.txt", "mine\n");
@@ -956,7 +956,7 @@ fn a_lower_refused_over_an_untracked_file_leaves_nothing_standing() {
     assert!(!lowered.status.success(), "the untracked file must refuse the lower");
     assert_eq!(area.read_file("b/added.txt"), "mine\n");
 
-    let stacked = area.forklift("b", &["stack", "nothing"]);
+    let stacked = area.forklift("b", &["stack", "-m", "nothing"]);
     assert!(stderr(&stacked).contains("Nothing to stack"), "no operation may stand: {}", stderr(&stacked));
 }
 
@@ -971,7 +971,7 @@ fn lowering_in_a_bay_another_bay_already_lowered_names_the_catch_up() {
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/f.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "first"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "first"]));
     assert_success(&area.forklift("a", &["lift"]));
     assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
 
@@ -981,7 +981,7 @@ fn lowering_in_a_bay_another_bay_already_lowered_names_the_catch_up() {
 
     area.write_file("a/f.txt", "v2\n");
     assert_success(&area.forklift("a", &["load", "f.txt"]));
-    assert_success(&area.forklift("a", &["stack", "second"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "second"]));
     assert_success(&area.forklift("a", &["lift"]));
     assert_success(&area.forklift("b", &["lower"]));
 
@@ -1005,7 +1005,7 @@ fn the_direct_head_answers_upload_targets_all_direct() {
     area.write_file("a/doc.txt", "content\n");
     assert_success(&area.forklift("a", &["load", "."]));
 
-    let stacked = area.forklift("a", &["stack", "first"]);
+    let stacked = area.forklift("a", &["stack", "-m", "first"]);
     assert_success(&stacked);
     let head = stdout(&stacked)
         .split_whitespace()
@@ -1063,7 +1063,7 @@ fn every_hash_taking_endpoint_refuses_an_uppercase_spelling_as_client_error() {
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/doc.txt", "content\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    let stacked = area.forklift("a", &["stack", "first"]);
+    let stacked = area.forklift("a", &["stack", "-m", "first"]);
     assert_success(&stacked);
     let head = stdout(&stacked)
         .split_whitespace()
@@ -1112,7 +1112,7 @@ fn the_holds_endpoint_answers_held_for_lifted_history_and_not_held_for_the_rest(
     for (round, content) in ["one\n", "two\n"].iter().enumerate() {
         area.write_file("a/doc.txt", content);
         assert_success(&area.forklift("a", &["load", "."]));
-        let stacked = area.forklift("a", &["stack", &format!("round {}", round)]);
+        let stacked = area.forklift("a", &["stack", "-m", &format!("round {}", round)]);
         assert_success(&stacked);
         parcels.push(stdout(&stacked)
             .split_whitespace()
@@ -1156,7 +1156,7 @@ fn diverged_pallets_are_refused_not_merged() {
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/base.txt", "base\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "base"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
@@ -1164,7 +1164,7 @@ fn diverged_pallets_are_refused_not_merged() {
     // A and B both stack on top of the same base; A lifts first.
     area.write_file("a/base.txt", "a's version\n");
     assert_success(&area.forklift("a", &["load", "base.txt"]));
-    assert_success(&area.forklift("a", &["stack", "a work"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "a work"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     // B has nothing of its own yet: the remote is strictly ahead, which is not a divergence.
@@ -1176,7 +1176,7 @@ fn diverged_pallets_are_refused_not_merged() {
 
     area.write_file("b/base.txt", "b's version\n");
     assert_success(&area.forklift("b", &["load", "base.txt"]));
-    assert_success(&area.forklift("b", &["stack", "b work"]));
+    assert_success(&area.forklift("b", &["stack", "-m", "b work"]));
 
     // B's lift must be refused: the remote moved. Nothing may be overwritten.
     let refused = area.forklift("b", &["lift"]);
@@ -1209,13 +1209,13 @@ fn a_stale_ref_update_is_a_remote_ahead_refusal_on_the_wire() {
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/f.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "first"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "first"]));
     assert_success(&area.forklift("a", &["lift"]));
     let first = area.read_file("a/.forklift/pallets/main").trim().to_string();
 
     area.write_file("a/f.txt", "v2\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "second"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "second"]));
     assert_success(&area.forklift("a", &["lift"]));
     let second = area.read_file("a/.forklift/pallets/main").trim().to_string();
     assert_ne!(first, second);
@@ -1248,7 +1248,7 @@ fn a_scoped_merge_lifts_without_reading_the_out_of_scope_object() {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/src/web/w.txt", "web v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let work_dir = area.path("dev-work");
@@ -1261,14 +1261,14 @@ fn a_scoped_merge_lifts_without_reading_the_out_of_scope_object() {
     assert_success(&area.forklift(".", &["clone", &server.url, "up", "--pallet", "work"]));
     area.write_file("up/src/web/w.txt", "web v2 from up\n");
     assert_success(&area.forklift("up", &["load", "."]));
-    assert_success(&area.forklift("up", &["stack", "up edits web (out of scope for dev)"]));
+    assert_success(&area.forklift("up", &["stack", "-m", "up edits web (out of scope for dev)"]));
     assert_success(&area.forklift("up", &["lift"]));
     let remote_web_head = area.read_file("up/.forklift/pallets/work").trim().to_string();
 
     // dev's scoped bay makes an in-scope edit, diverging its "work" head from the server's.
     std::fs::write(work_dir.join("src/api/a.txt"), "api v2 from dev\n").unwrap();
     assert_success(&area.forklift("dev-work", &["load", "."]));
-    assert_success(&area.forklift("dev-work", &["stack", "dev edits api"]));
+    assert_success(&area.forklift("dev-work", &["stack", "-m", "dev edits api"]));
 
     // Lower fetches the diverged remote head (with its out-of-scope object) and reports the
     // divergence; make that head a pallet and consolidate it into work — the scoped bay adopts the
@@ -1340,14 +1340,14 @@ fn signed_history_round_trips_and_the_server_audits() {
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/code.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "pre-trust parcel"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "pre-trust parcel"]));
 
     // Trust: from here on every parcel is signed, and the remote enforces it.
     assert_success(&area.forklift("a", &["office", "enroll"]));
 
     area.write_file("a/code.txt", "v2 signed\n");
     assert_success(&area.forklift("a", &["load", "code.txt"]));
-    assert_success(&area.forklift("a", &["stack", "signed parcel"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "signed parcel"]));
 
     let lifted = area.forklift("a", &["lift"]);
     assert_success(&lifted);
@@ -1366,7 +1366,7 @@ fn signed_history_round_trips_and_the_server_audits() {
     // The same operator works from B (the key directory is shared): signed lift works.
     area.write_file("b/code.txt", "v3 from b\n");
     assert_success(&area.forklift("b", &["load", "code.txt"]));
-    assert_success(&area.forklift("b", &["stack", "signed from b"]));
+    assert_success(&area.forklift("b", &["stack", "-m", "signed from b"]));
     assert_success(&area.forklift("b", &["lift"]));
 
     let lowered = area.forklift("a", &["lower"]);
@@ -1378,7 +1378,7 @@ fn signed_history_round_trips_and_the_server_audits() {
     // the audit at the ref update is the server-side guarantee.
     area.write_file("a/code.txt", "v4 tampered\n");
     assert_success(&area.forklift("a", &["load", "code.txt"]));
-    let stacked = area.forklift("a", &["stack", "to be tampered"]);
+    let stacked = area.forklift("a", &["stack", "-m", "to be tampered"]);
     assert_success(&stacked);
 
     let line = stdout(&stacked);
@@ -1404,7 +1404,7 @@ fn optimistic_lift_auto_merges_a_disjoint_divergence_but_stops_on_overlap() {
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/shared.txt", "base\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "initial"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "initial"]));
     assert_success(&area.forklift("a", &["office", "enroll"]));
     assert_success(&area.forklift("a", &["lift"]));
 
@@ -1413,7 +1413,7 @@ fn optimistic_lift_auto_merges_a_disjoint_divergence_but_stops_on_overlap() {
     // A publishes a change to a file only it touches.
     area.write_file("a/from_a.txt", "a\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "a's file"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "a's file"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     // B, still at the base, stacks a change to a *different* file and lifts. The remote has
@@ -1421,7 +1421,7 @@ fn optimistic_lift_auto_merges_a_disjoint_divergence_but_stops_on_overlap() {
     // instead of stopping (optimistic lift, §7.7).
     area.write_file("b/from_b.txt", "b\n");
     assert_success(&area.forklift("b", &["load", "."]));
-    assert_success(&area.forklift("b", &["stack", "b's file"]));
+    assert_success(&area.forklift("b", &["stack", "-m", "b's file"]));
     let lifted = area.forklift("b", &["lift"]);
     assert_success(&lifted);
     assert!(stdout(&lifted).contains("auto-merged"), "{}", stdout(&lifted));
@@ -1435,14 +1435,14 @@ fn optimistic_lift_auto_merges_a_disjoint_divergence_but_stops_on_overlap() {
     // Overlap: both edit the *same* file. A publishes first.
     area.write_file("a/shared.txt", "from a\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "a edits shared"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "a edits shared"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     // B (now behind) edits the same file differently and lifts — the merge would conflict,
     // so the lift refuses instead of auto-merging, and the warehouse stays clean.
     area.write_file("b/shared.txt", "from b\n");
     assert_success(&area.forklift("b", &["load", "."]));
-    assert_success(&area.forklift("b", &["stack", "b edits shared"]));
+    assert_success(&area.forklift("b", &["stack", "-m", "b edits shared"]));
     let refused = area.forklift("b", &["lift"]);
     assert!(!refused.status.success(), "an overlapping divergence must not auto-merge");
     assert!(stderr(&refused).contains("diverged") && stderr(&refused).contains("pallet create"), "{}", stderr(&refused));
@@ -1464,7 +1464,7 @@ fn optimistic_lift_refuses_on_an_incomplete_load_before_writing_consolidation_st
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/shared.txt", "base\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "initial"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "initial"]));
     assert_success(&area.forklift("a", &["office", "enroll"]));
     assert_success(&area.forklift("a", &["lift"]));
 
@@ -1473,14 +1473,14 @@ fn optimistic_lift_refuses_on_an_incomplete_load_before_writing_consolidation_st
     // A publishes a change to a file only it touches.
     area.write_file("a/from_a.txt", "a\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "a's file"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "a's file"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     // B, still at the base, stacks a disjoint change of its own — the remote has diverged, and
     // the change is disjoint, so an ordinary lift would auto-merge (optimistic lift, §7.7).
     area.write_file("b/from_b.txt", "b\n");
     assert_success(&area.forklift("b", &["load", "."]));
-    assert_success(&area.forklift("b", &["stack", "b's file"]));
+    assert_success(&area.forklift("b", &["stack", "-m", "b's file"]));
 
     // Simulate a load killed outright partway through its walk in B's warehouse (see
     // `load_guard_utils::marker_path_under`'s doc comment for why this is a faithful stand-in
@@ -1518,7 +1518,7 @@ fn manifest_syncs_across_remotes_and_replays_when_diverged() {
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/code.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "first parcel"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "first parcel"]));
     assert_success(&area.forklift("a", &["office", "enroll"]));
 
     // Record an approval, then lift — the @manifest meta pallet rides along.
@@ -1575,11 +1575,11 @@ fn tags_sync_hold_the_admin_rule_at_admission_and_never_move() {
     assert_success(&area.forklift("a", &["config", "set", "remote.token", "root"]));
     area.write_file("a/code.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "base"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
     let base = pallet_head(&area, "a", "main");
     area.write_file("a/code.txt", "v2\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "second"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "second"]));
     assert_success(&area.forklift("a", &["office", "enroll"]));
 
     let worker_id = "worker@forklift";
@@ -1691,14 +1691,14 @@ fn hauls_sync_across_remotes_and_replay_when_diverged() {
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/base.txt", "base\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "base"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
     assert_success(&area.forklift("a", &["office", "enroll"]));
 
     // Open a haul (feat → main) and lift — the @haul meta pallet rides along.
     assert_success(&area.forklift("a", &["pallet", "create", "feat"]));
     area.write_file("a/feat.txt", "x\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "feat work"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "feat work"]));
     assert_success(&area.forklift("a", &["lift"]));
     let first_head = pallet_head(&area, "a", "feat");
     assert_success(&area.forklift("a", &["shift", "main"]));
@@ -1749,7 +1749,7 @@ fn hauls_sync_across_remotes_and_replay_when_diverged() {
     assert_success(&area.forklift("a", &["shift", "feat"]));
     area.write_file("a/more.txt", "y\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "more feat work"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "more feat work"]));
     assert_success(&area.forklift("a", &["shift", "main"]));
     assert_success(&area.forklift("a", &["haul", "update", &id]));
 
@@ -1773,7 +1773,7 @@ fn hauls_sync_across_remotes_and_replay_when_diverged() {
     assert_success(&area.forklift("b", &["pallet", "create", "feat"]));
     area.write_file("b/other.txt", "z\n");
     assert_success(&area.forklift("b", &["load", "."]));
-    assert_success(&area.forklift("b", &["stack", "other feat work"]));
+    assert_success(&area.forklift("b", &["stack", "-m", "other feat work"]));
     let other_head = pallet_head(&area, "b", "feat");
     assert_success(&area.forklift("b", &["shift", "main"]));
     assert_success(&area.forklift("b", &["haul", "update", &id]));
@@ -1845,7 +1845,7 @@ fn open_haul(area: &TestArea, dir: &str, title: &str) -> String {
 fn stack_file(area: &TestArea, dir: &str, path: &str, content: &str) {
     area.write_file(&format!("{}/{}", dir, path), content);
     assert_success(&area.forklift(dir, &["load", "."]));
-    assert_success(&area.forklift(dir, &["stack", path]));
+    assert_success(&area.forklift(dir, &["stack", "-m", path]));
 }
 
 /// A warehouse "a" on `server` with an enrolled office, `main` and `feat` lifted, standing on main.
@@ -2078,7 +2078,7 @@ fn bundles_speed_up_franchising() {
     area.write_file("a/one.txt", "one\n");
     area.write_file("a/two.txt", "two\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "bundled history"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "bundled history"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     server.rebuild_bundle(&area);
@@ -2107,14 +2107,14 @@ fn a_bundle_that_lags_the_remote_heads_still_imports_with_its_signatures() {
     assert_success(&area.forklift("a", &["office", "enroll"]));
     area.write_file("a/one.txt", "one\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "bundled"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "bundled"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     server.rebuild_bundle(&area);
 
     area.write_file("a/two.txt", "two\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "lifted after the bundle"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "lifted after the bundle"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     let franchised = area.forklift(".", &["clone", &server.url, "c"]);
@@ -2145,7 +2145,7 @@ fn a_bundle_in_another_version_is_refused_and_franchise_falls_back_to_the_walk()
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/one.txt", "one\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "walked"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "walked"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     for (name, foreign) in [("record-stream", "forklift-bundle 2026-07-11\nnever read"),
@@ -2184,7 +2184,7 @@ fn a_server_holding_a_previous_version_bundle_still_franchises() {
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/one.txt", "one\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "walked"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "walked"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     server.rebuild_bundle(&area);
@@ -2273,7 +2273,7 @@ fn warehouse_with_a_bundle(area: &TestArea) -> (Server, Vec<u8>) {
     area.write_large_file("a/large.bin", 266, 96 * 1024);
     area.write_file("a/one.txt", "one\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "bundled"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "bundled"]));
     assert_success(&area.forklift("a", &["lift"]));
     server.rebuild_bundle(area);
 
@@ -2487,7 +2487,7 @@ fn a_token_protected_remote_requires_the_token() {
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/secret.txt", "locked\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "guarded parcel"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "guarded parcel"]));
 
     // Without the token the remote answers 401 to everything.
     let refused = area.forklift("a", &["lift"]);
@@ -2519,13 +2519,13 @@ fn enroll_covers_the_remote_history_in_the_trust_boundary() {
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/doc.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "first"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "first"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
     area.write_file("b/doc.txt", "v2, unsigned, only on the remote\n");
     assert_success(&area.forklift("b", &["load", "doc.txt"]));
-    assert_success(&area.forklift("b", &["stack", "second"]));
+    assert_success(&area.forklift("b", &["stack", "-m", "second"]));
     assert_success(&area.forklift("b", &["lift"]));
 
     // A enrolls while behind the remote: the remote's heads join the boundary.
@@ -2536,7 +2536,7 @@ fn enroll_covers_the_remote_history_in_the_trust_boundary() {
     assert_success(&area.forklift("a", &["lower"]));
     area.write_file("a/doc.txt", "v3 signed\n");
     assert_success(&area.forklift("a", &["load", "doc.txt"]));
-    assert_success(&area.forklift("a", &["stack", "signed on top"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "signed on top"]));
 
     let lifted = area.forklift("a", &["lift"]);
     assert_success(&lifted);
@@ -2553,7 +2553,7 @@ fn enroll_refuses_when_the_remote_already_has_trust() {
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/doc.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "first"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "first"]));
     assert_success(&area.forklift("a", &["office", "enroll"]));
     assert_success(&area.forklift("a", &["lift"]));
 
@@ -2575,7 +2575,7 @@ fn enroll_needs_the_remote_or_the_offline_flag() {
     prepare_warehouse(&area, "a", "http://127.0.0.1:1");
     area.write_file("a/doc.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "first"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "first"]));
 
     let refused = area.forklift("a", &["office", "enroll"]);
     assert!(!refused.status.success());
@@ -2599,14 +2599,14 @@ fn multi_warehouse_serving_isolates_warehouses() {
     assert_success(&area.forklift("a", &["config", "set", "remote.token", "admin"]));
     area.write_file("a/alpha.txt", "alpha content\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "alpha parcel"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "alpha parcel"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     prepare_warehouse(&area, "b", &format!("{}/warehouses/beta", server.url));
     assert_success(&area.forklift("b", &["config", "set", "remote.token", "admin"]));
     area.write_file("b/beta.txt", "beta content\n");
     assert_success(&area.forklift("b", &["load", "."]));
-    assert_success(&area.forklift("b", &["stack", "beta parcel"]));
+    assert_success(&area.forklift("b", &["stack", "-m", "beta parcel"]));
     assert_success(&area.forklift("b", &["lift"]));
 
     // A clone of alpha gets alpha's history and nothing of beta's.
@@ -2622,7 +2622,7 @@ fn multi_warehouse_serving_isolates_warehouses() {
     assert_success(&area.forklift("d", &["config", "set", "remote.token", "admin"]));
     area.write_file("d/doc.txt", "content\n");
     assert_success(&area.forklift("d", &["load", "."]));
-    assert_success(&area.forklift("d", &["stack", "parcel"]));
+    assert_success(&area.forklift("d", &["stack", "-m", "parcel"]));
 
     let refused = area.forklift("d", &["lift"]);
     assert!(!refused.status.success());
@@ -2677,7 +2677,7 @@ fn operator_tokens_enforce_roles_and_pallet_grants() {
     assert_success(&area.forklift("a", &["config", "set", "remote.token", "root"]));
     area.write_file("a/code.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "base"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
     assert_success(&area.forklift("a", &["office", "enroll"]));
 
     // Admit a writer (granted "main" only) and a reader; the keys land in the area's
@@ -2714,7 +2714,7 @@ fn operator_tokens_enforce_roles_and_pallet_grants() {
 
     area.write_file("b/code.txt", "v2 by worker\n");
     assert_success(&area.forklift("b", &["load", "code.txt"]));
-    assert_success(&area.forklift("b", &["stack", "worker change"]));
+    assert_success(&area.forklift("b", &["stack", "-m", "worker change"]));
     assert_success(&area.forklift("b", &["lift"]));
 
     // The worker may not admit anyone (admin move), locally refused up front.
@@ -2726,7 +2726,7 @@ fn operator_tokens_enforce_roles_and_pallet_grants() {
     assert_success(&area.forklift("b", &["pallet", "create", "side"]));
     area.write_file("b/code.txt", "v3 on side\n");
     assert_success(&area.forklift("b", &["load", "code.txt"]));
-    assert_success(&area.forklift("b", &["stack", "side change"]));
+    assert_success(&area.forklift("b", &["stack", "-m", "side change"]));
 
     let refused = area.forklift("b", &["lift"]);
     assert!(!refused.status.success());
@@ -2752,7 +2752,7 @@ fn operator_tokens_enforce_roles_and_pallet_grants() {
 
     area.write_file("c/code.txt", "v4 by reader\n");
     assert_success(&area.forklift("c", &["load", "code.txt"]));
-    assert_success(&area.forklift("c", &["stack", "reader change"]));
+    assert_success(&area.forklift("c", &["stack", "-m", "reader change"]));
 
     let refused = area.forklift("c", &["lift"]);
     assert!(!refused.status.success());
@@ -2780,7 +2780,7 @@ fn regenesis_is_gated_by_the_static_token_and_accepted_consciously() {
     assert_success(&area.forklift("a", &["config", "set", "remote.token", "root"]));
     area.write_file("a/code.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "base"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
     assert_success(&area.forklift("a", &["office", "enroll"]));
 
     let worker = keygen_admit_args(&area, "worker@forklift");
@@ -2879,7 +2879,7 @@ fn regenesis_on_remote(area: &TestArea, before_reset: impl FnOnce(&Server)) -> S
     assert_success(&area.forklift("a", &["config", "set", "remote.token", "root"]));
     area.write_file("a/code.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "base"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
     assert_success(&area.forklift("a", &["office", "enroll"]));
     assert_success(&area.forklift("a", &["lift"]));
 
@@ -2969,7 +2969,7 @@ fn a_regenesis_lifted_to_a_fresh_remote_carries_its_adopted_history() {
     assert_success(&area.forklift("a", &["config", "set", "remote.token", "root"]));
     area.write_file("a/code.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "base"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
     assert_success(&area.forklift("a", &["office", "enroll"]));
     std::fs::remove_dir_all(area.path("shared-keys")).unwrap();
     assert_success(&area.forklift("a", &["office", "regenesis", "--confirm"]));
@@ -2998,7 +2998,7 @@ fn a_torn_taint_in_a_sparse_franchise_heals_over_its_sealed_objects() {
     area.write_file("dev/docs/guide.md", "guide\n");
     area.write_file("dev/docs/deep/notes.md", "notes\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["office", "enroll"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
@@ -3076,7 +3076,7 @@ fn an_expect_pin_is_checked_before_anything_is_fetched_and_first_contact_is_anno
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/code.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "base"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
     assert_success(&area.forklift("a", &["office", "enroll"]));
     assert_success(&area.forklift("a", &["lift"]));
 
@@ -3129,7 +3129,7 @@ fn a_remote_whose_anchor_was_stripped_is_refused_before_anything_is_fetched() {
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/code.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "base"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
     assert_success(&area.forklift("a", &["office", "enroll"]));
     assert_success(&area.forklift("a", &["lift"]));
     let genesis = std::fs::read_to_string(area.path("a/.forklift/trust")).unwrap();
@@ -3179,7 +3179,7 @@ fn a_compromised_key_cannot_sign_beyond_its_distrust_boundary() {
     assert_success(&area.forklift("a", &["config", "set", "remote.token", "root"]));
     area.write_file("a/code.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "base"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
     assert_success(&area.forklift("a", &["office", "enroll"]));
 
     let worker = keygen_admit_args(&area, "worker@forklift");
@@ -3191,13 +3191,13 @@ fn a_compromised_key_cannot_sign_beyond_its_distrust_boundary() {
     assert_success(&area.forklift("b", &["config", "set", "operator.identifier", "worker@forklift"]));
     area.write_file("b/code.txt", "v2 by worker\n");
     assert_success(&area.forklift("b", &["load", "code.txt"]));
-    assert_success(&area.forklift("b", &["stack", "lifted before revocation"]));
+    assert_success(&area.forklift("b", &["stack", "-m", "lifted before revocation"]));
     assert_success(&area.forklift("b", &["lift"]));
 
     // …and stacks more that never reaches the remote before the revocation.
     area.write_file("b/code.txt", "v3 by worker\n");
     assert_success(&area.forklift("b", &["load", "code.txt"]));
-    assert_success(&area.forklift("b", &["stack", "signed after the boundary"]));
+    assert_success(&area.forklift("b", &["stack", "-m", "signed after the boundary"]));
 
     // The admin revokes the worker's key as compromised: the distrust boundary is the
     // current heads — the remote's included, so the lifted v2 stays vouched for.
@@ -3248,7 +3248,7 @@ fn a_revocation_does_not_vouch_for_work_the_remote_keeps_under_a_tombstone() {
     assert_success(&area.forklift("a", &["config", "set", "remote.token", "root"]));
     area.write_file("a/code.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "base"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
     assert_success(&area.forklift("a", &["office", "enroll"]));
 
     let worker = keygen_admit_args(&area, "worker@forklift");
@@ -3262,7 +3262,7 @@ fn a_revocation_does_not_vouch_for_work_the_remote_keeps_under_a_tombstone() {
     assert_success(&area.forklift("b", &["pallet", "create", "feat"]));
     area.write_file("b/code.txt", "v2 by worker\n");
     assert_success(&area.forklift("b", &["load", "code.txt"]));
-    assert_success(&area.forklift("b", &["stack", "side work"]));
+    assert_success(&area.forklift("b", &["stack", "-m", "side work"]));
     assert_success(&area.forklift("b", &["lift"]));
     assert_success(&area.forklift("a", &["pallet", "delete", "feat", "--remote"]));
 
@@ -3345,7 +3345,7 @@ fn gc_is_refused_while_serving_then_sweeps_orphans_once_the_server_stops() {
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/keep.txt", "live content\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "live parcel"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "live parcel"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     // Plant an orphan object on the server (what an abandoned lift leaves behind).
@@ -3523,11 +3523,11 @@ fn franchising_an_unborn_default_pallet_starts_unborn() {
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/doc.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "base"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
     assert_success(&area.forklift("a", &["pallet", "create", "feature"]));
     area.write_file("a/doc.txt", "v2 on feature\n");
     assert_success(&area.forklift("a", &["load", "doc.txt"]));
-    assert_success(&area.forklift("a", &["stack", "feature work"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "feature work"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     // Cloning the remote's default pallet starts unborn instead of erroring.
@@ -3752,7 +3752,7 @@ fn hooks_authenticate_admit_and_notify() {
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/readme.txt", "hello hooks\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "first parcel"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "first parcel"]));
 
     // Without a credential the hook knows, nothing moves (the server has no static
     // token — the authentication hook is the whole gate).
@@ -3794,7 +3794,7 @@ fn hooks_authenticate_admit_and_notify() {
     assert_success(&area.forklift("a", &["office", "enroll"]));
     area.write_file("a/readme.txt", "hello trust\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "signed parcel"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "signed parcel"]));
     assert_success(&area.forklift("a", &["lift"]));
     hooks.wait_for("/events", "\"event\":\"trust_established\"");
 
@@ -3809,7 +3809,7 @@ fn hooks_authenticate_admit_and_notify() {
     hooks.admit.store(false, std::sync::atomic::Ordering::SeqCst);
     area.write_file("a/readme.txt", "hello denial\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "denied parcel"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "denied parcel"]));
     let denied = area.forklift("a", &["lift"]);
     assert!(!denied.status.success(), "a lift the admission hook denies must fail");
     assert!(stderr(&denied).contains("quota is exhausted"), "{}", stderr(&denied));
@@ -3895,7 +3895,7 @@ fn an_unreachable_authentication_hook_fails_closed() {
     assert_success(&area.forklift("a", &["config", "set", "remote.token", "any-token"]));
     area.write_file("a/readme.txt", "hello\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "parcel"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "parcel"]));
 
     let refused = area.forklift("a", &["lift"]);
     assert!(!refused.status.success(), "an unreachable authentication hook must fail closed");
@@ -3937,7 +3937,7 @@ fn resolution_is_server_mediated_and_degrades_to_pseudonyms() {
     assert_success(&area.forklift("a", &["office", "enroll"]));
     area.write_file("a/readme.txt", "hello\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "a parcel"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "a parcel"]));
 
     // The display name never touches the chain — it can only come from the directory,
     // reached through the server.
@@ -4037,12 +4037,12 @@ fn delta_bundle_reconstructs_a_files_many_versions() {
 
     area.write_file("a/big.txt", &version(1));
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "v1"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "v1"]));
 
     for v in 2..=8 {
         area.write_file("a/big.txt", &version(v));
         assert_success(&area.forklift("a", &["load", "big.txt"]));
-        assert_success(&area.forklift("a", &["stack", &format!("v{}", v)]));
+        assert_success(&area.forklift("a", &["stack", "-m", &format!("v{}", v)]));
     }
 
     assert_success(&area.forklift("a", &["lift"]));
@@ -4094,7 +4094,7 @@ fn a_sync_walks_the_gap_between_the_heads_not_the_history() {
     for version in 0..6 {
         area.write_file("a/code.txt", &format!("v{}\n", version));
         assert_success(&area.forklift("a", &["load", "."]));
-        assert_success(&area.forklift("a", &["stack", &format!("parcel {}", version)]));
+        assert_success(&area.forklift("a", &["stack", "-m", &format!("parcel {}", version)]));
     }
 
     assert_success(&area.forklift("a", &["lift"]));
@@ -4105,7 +4105,7 @@ fn a_sync_walks_the_gap_between_the_heads_not_the_history() {
     // One more parcel on the remote.
     area.write_file("a/code.txt", "the new segment\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "the new segment"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "the new segment"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     let remote_head = std::fs::read_to_string(area.path("server-root/.forklift/pallets/main"))
@@ -4184,7 +4184,7 @@ fn a_sparse_franchise_fetches_only_the_scoped_subtree() {
     area.write_file("dev/src/web/w.txt", "web v1\n");
     area.write_file("dev/top.txt", "top v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -4233,7 +4233,7 @@ fn a_sparse_franchise_fetches_only_the_scoped_subtree() {
     assert!(stdout(&diff).contains("api v2"), "{}", stdout(&diff));
 
     assert_success(&area.forklift("sparse", &["load", "."]));
-    assert_success(&area.forklift("sparse", &["stack", "sparse edits api"]));
+    assert_success(&area.forklift("sparse", &["stack", "-m", "sparse edits api"]));
 
     let lifted = area.forklift("sparse", &["lift"]);
     assert_success(&lifted);
@@ -4258,18 +4258,18 @@ fn a_sparse_franchise_degrades_touches_to_unknown_out_of_scope() {
     prepare_warehouse(&area, "dev", &server.url);
     area.write_file("dev/src/api/a.txt", "api v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
 
     area.write_file("dev/docs/readme.md", "docs v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    let docs_stack = area.forklift("dev", &["--json", "stack", "touch docs"]);
+    let docs_stack = area.forklift("dev", &["--json", "stack", "-m", "touch docs"]);
     assert_success(&docs_stack);
     let docs_parcel: serde_json::Value = serde_json::from_str(&stdout(&docs_stack)).unwrap();
     let docs_parcel = docs_parcel["data"]["parcel"].as_str().unwrap().to_string();
 
     area.write_file("dev/src/api/b.txt", "api v2\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    let src_stack = area.forklift("dev", &["--json", "stack", "touch src"]);
+    let src_stack = area.forklift("dev", &["--json", "stack", "-m", "touch src"]);
     assert_success(&src_stack);
     let src_parcel: serde_json::Value = serde_json::from_str(&stdout(&src_stack)).unwrap();
     let src_parcel = src_parcel["data"]["parcel"].as_str().unwrap().to_string();
@@ -4365,7 +4365,7 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_reads_signer_boundar
     prepare_warehouse(&area, "dev", &server.url);
     area.write_file("dev/base.txt", "base\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["office", "enroll"]));
 
     // Admit an agent.
@@ -4391,7 +4391,7 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_reads_signer_boundar
     assert_success(&area.forklift("dev", &["config", "set", "operator.identifier", "agent@forklift"]));
     area.write_file("dev/agent-main.txt", "agent main work\n");
     assert_success(&area.forklift("dev", &["load", "agent-main.txt"]));
-    let agent_stack = area.forklift("dev", &["--json", "stack", "agent main work"]);
+    let agent_stack = area.forklift("dev", &["--json", "stack", "-m", "agent main work"]);
     assert_success(&agent_stack);
     let agent_parcel: serde_json::Value = serde_json::from_str(&stdout(&agent_stack)).unwrap();
     let agent_parcel = agent_parcel["data"]["parcel"].as_str().unwrap().to_string();
@@ -4401,7 +4401,7 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_reads_signer_boundar
     assert_success(&area.forklift("dev", &["pallet", "create", "side"]));
     area.write_file("dev/side.txt", "side work\n");
     assert_success(&area.forklift("dev", &["load", "side.txt"]));
-    assert_success(&area.forklift("dev", &["stack", "side work"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "side work"]));
 
     // Retire the agent's key: the distrust boundary snapshots every current pallet head —
     // main's and side's alike, published or not.
@@ -4528,7 +4528,7 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_audits_the_vouched_p
     prepare_warehouse(&area, "dev", &server.url);
     area.write_file("dev/base.txt", "base\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["office", "enroll"]));
 
     // Admit an agent.
@@ -4554,14 +4554,14 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_audits_the_vouched_p
     assert_success(&area.forklift("dev", &["config", "set", "operator.identifier", "agent@forklift"]));
     area.write_file("dev/agent-main.txt", "agent main work\n");
     assert_success(&area.forklift("dev", &["load", "agent-main.txt"]));
-    assert_success(&area.forklift("dev", &["stack", "agent main work"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "agent main work"]));
 
     // A second, local-only pallet: its head will sit in the retirement's boundary below but
     // will never reach the remote — nothing ever lifts `side`.
     assert_success(&area.forklift("dev", &["pallet", "create", "side"]));
     area.write_file("dev/side.txt", "side work\n");
     assert_success(&area.forklift("dev", &["load", "side.txt"]));
-    assert_success(&area.forklift("dev", &["stack", "side work"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "side work"]));
     let side_head = std::fs::read_to_string(area.path("dev/.forklift/pallets/side"))
         .expect("the side pallet has a head")
         .trim()
@@ -4659,16 +4659,16 @@ fn enrolling_then_lifting_to_a_fresh_remote_with_an_unlifted_other_pallet_refuse
     // U1, U2, U3: three unsigned, pre-office stacks on `main`.
     area.write_file("w/app.txt", "v1\n");
     assert_success(&area.forklift("w", &["load", "."]));
-    assert_success(&area.forklift("w", &["stack", "U1"]));
+    assert_success(&area.forklift("w", &["stack", "-m", "U1"]));
     let u1 = pallet_head(&area, "w", "main");
 
     area.write_file("w/app.txt", "v2\n");
     assert_success(&area.forklift("w", &["load", "."]));
-    assert_success(&area.forklift("w", &["stack", "U2"]));
+    assert_success(&area.forklift("w", &["stack", "-m", "U2"]));
 
     area.write_file("w/app.txt", "v3\n");
     assert_success(&area.forklift("w", &["load", "."]));
-    assert_success(&area.forklift("w", &["stack", "U3"]));
+    assert_success(&area.forklift("w", &["stack", "-m", "U3"]));
     let u3 = pallet_head(&area, "w", "main");
 
     assert_success(&area.forklift("w", &["office", "enroll"]));
@@ -4772,7 +4772,7 @@ fn retiring_a_signer_then_lifting_only_a_replacement_pallet_refuses_instead_of_a
 
     area.write_file("w/base.txt", "base\n");
     assert_success(&area.forklift("w", &["load", "."]));
-    assert_success(&area.forklift("w", &["stack", "base"]));
+    assert_success(&area.forklift("w", &["stack", "-m", "base"]));
     assert_success(&area.forklift("w", &["office", "enroll"]));
     assert_success(&area.forklift("w", &["lift"]));
     let m1 = pallet_head(&area, "w", "main");
@@ -4800,12 +4800,12 @@ fn retiring_a_signer_then_lifting_only_a_replacement_pallet_refuses_instead_of_a
     assert_success(&area.forklift("w", &["config", "set", "--global", "operator.identifier", "agent@forklift"]));
     area.write_file("w/side.txt", "a0\n");
     assert_success(&area.forklift("w", &["load", "."]));
-    assert_success(&area.forklift("w", &["stack", "A0"]));
+    assert_success(&area.forklift("w", &["stack", "-m", "A0"]));
     let a0 = pallet_head(&area, "w", "side");
 
     area.write_file("w/side.txt", "a1\n");
     assert_success(&area.forklift("w", &["load", "."]));
-    assert_success(&area.forklift("w", &["stack", "A1"]));
+    assert_success(&area.forklift("w", &["stack", "-m", "A1"]));
     let a1 = pallet_head(&area, "w", "side");
 
     // Back on `main` (still exactly M1 — untouched since it was lifted above), retire the
@@ -4943,13 +4943,13 @@ fn a_sparse_franchise_still_audits() {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/src/web/w.txt", "web v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "pre-trust base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "pre-trust base"]));
 
     // Establish trust: every parcel from here is signed, and the office pallet carries the keys.
     assert_success(&area.forklift("dev", &["office", "enroll"]));
     area.write_file("dev/src/api/a.txt", "api v2 signed\n");
     assert_success(&area.forklift("dev", &["load", "src/api/a.txt"]));
-    assert_success(&area.forklift("dev", &["stack", "signed parcel"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "signed parcel"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let franchised = area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]);
@@ -4975,7 +4975,7 @@ fn lower_into_a_sparse_store_stays_pruned() {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/src/web/w.txt", "web v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
@@ -4985,7 +4985,7 @@ fn lower_into_a_sparse_store_stays_pruned() {
     area.write_file("up/src/api/a.txt", "api v2 from up\n");
     area.write_file("up/src/web/w.txt", "web v2 from up\n");
     assert_success(&area.forklift("up", &["load", "."]));
-    assert_success(&area.forklift("up", &["stack", "up edits both"]));
+    assert_success(&area.forklift("up", &["stack", "-m", "up edits both"]));
     assert_success(&area.forklift("up", &["lift"]));
 
     let up_head = pallet_head(&area, "up", "main");
@@ -5013,7 +5013,7 @@ fn expand_fetches_the_widened_subtree_and_a_bay_can_scope_to_it() {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/src/web/w.txt", "web v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -5049,7 +5049,7 @@ fn sparse_after_a_diverged_lower(area: &TestArea, server: &Server) -> (String, S
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/src/web/w.txt", "web v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
@@ -5058,7 +5058,7 @@ fn sparse_after_a_diverged_lower(area: &TestArea, server: &Server) -> (String, S
     area.write_file("up/src/api/a.txt", "api v2 from up\n");
     area.write_file("up/src/web/w.txt", "web v2 from up\n");
     assert_success(&area.forklift("up", &["load", "."]));
-    assert_success(&area.forklift("up", &["stack", "up edits both"]));
+    assert_success(&area.forklift("up", &["stack", "-m", "up edits both"]));
     assert_success(&area.forklift("up", &["lift"]));
 
     let up_head = pallet_head(area, "up", "main");
@@ -5066,7 +5066,7 @@ fn sparse_after_a_diverged_lower(area: &TestArea, server: &Server) -> (String, S
 
     area.write_file("sparse/src/api/a.txt", "api v2 from sparse\n");
     assert_success(&area.forklift("sparse", &["load", "."]));
-    assert_success(&area.forklift("sparse", &["stack", "sparse edits api"]));
+    assert_success(&area.forklift("sparse", &["stack", "-m", "sparse edits api"]));
 
     let lowered = area.forklift("sparse", &["lower"]);
     assert!(!lowered.status.success() && stderr(&lowered).contains("diverged"), "{}", stderr(&lowered));
@@ -5137,7 +5137,7 @@ fn a_sparse_franchise_records_its_head_and_fetches_only_its_scope() {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/src/web/w.txt", "web v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -5163,7 +5163,7 @@ fn a_sparse_franchise_seals_an_out_of_scope_chunked_file_and_expand_fetches_it()
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_large_file("dev/big/giant.bin", 0xBEEF, CHUNK_THRESHOLD + 50_000);
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -5205,7 +5205,7 @@ fn narrow_shrinks_the_scope_and_frees_nothing() {
     area.write_file("dev/docs/guide.md", "guide v1\n");
     area.write_file("dev/src/web/w.txt", "web v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -5250,7 +5250,7 @@ fn a_sparse_workspace_refuses_to_lift_to_a_non_origin_remote() {
     origin.write_file("dev/src/api/a.txt", "api v1\n");
     origin.write_file("dev/src/web/w.txt", "web v1\n");
     assert_success(&origin.forklift("dev", &["load", "."]));
-    assert_success(&origin.forklift("dev", &["stack", "base"]));
+    assert_success(&origin.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&origin.forklift("dev", &["lift"]));
 
     assert_success(&origin.forklift(".", &["clone", &server1.url, "sparse", "--only", "src/api"]));
@@ -5309,7 +5309,7 @@ fn a_partial_warehouse_talks_to_no_remote_but_its_origin() {
     area.write_file("dev/src/web/w.txt", "web v1\n");
     area.write_file("dev/docs/d.txt", "docs v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     assert_success(&area.forklift(".", &["clone", &server1.url, "sparse", "--only", "src/api", "--only", "docs"]));
@@ -5318,7 +5318,7 @@ fn a_partial_warehouse_talks_to_no_remote_but_its_origin() {
     // The other remote holds the same history, a newer head and another pallet.
     area.write_file("dev/src/api/a.txt", "api v2\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "second"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "second"]));
     assert_success(&area.forklift("dev", &["config", "set", "remote.url", &server2.url]));
     assert_success(&area.forklift("dev", &["lift"]));
     assert_success(&area.forklift("dev", &["pallet", "create", "extra"]));
@@ -5328,7 +5328,7 @@ fn a_partial_warehouse_talks_to_no_remote_but_its_origin() {
     assert_success(&area.forklift("sparse", &["pallet", "create", "old"]));
     area.write_file("sparse/src/api/old.txt", "old\n");
     assert_success(&area.forklift("sparse", &["load", "."]));
-    assert_success(&area.forklift("sparse", &["stack", "old work"]));
+    assert_success(&area.forklift("sparse", &["stack", "-m", "old work"]));
     assert_success(&area.forklift("sparse", &["shift", "main"]));
     // No checkout materializes docs, so pruning it asks the remote.
     assert_success(&area.forklift("sparse", &["scope", "narrow", "docs"]));
@@ -5384,14 +5384,14 @@ fn a_sparse_warehouse_whose_fetch_scope_is_gone_is_refused() {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/docs/d.txt", "docs v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
     assert_eq!(area.read_file("sparse/.forklift/warehouse"), "/forklift-warehouse 2\nsparse\n");
     area.write_file("sparse/src/api/a.txt", "api v2\n");
     assert_success(&area.forklift("sparse", &["load", "."]));
-    assert_success(&area.forklift("sparse", &["stack", "second"]));
+    assert_success(&area.forklift("sparse", &["stack", "-m", "second"]));
 
     std::fs::remove_file(area.path("sparse/.forklift/config/fetch-scope")).unwrap();
 
@@ -5423,7 +5423,7 @@ fn a_sparse_main_tree_whose_scope_is_gone_is_refused() {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/docs/d.txt", "docs v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
@@ -5431,7 +5431,7 @@ fn a_sparse_main_tree_whose_scope_is_gone_is_refused() {
     assert_success(&area.forklift("sparse", &["load", "."]));
     std::fs::remove_file(area.path("sparse/.forklift/scope")).unwrap();
 
-    for args in [&["stocktake"][..], &["stack", "second"]] {
+    for args in [&["stocktake"][..], &["stack", "-m", "second"]] {
         let refused = area.forklift("sparse", &[&["--json"][..], args].concat());
         assert!(!refused.status.success(), "{:?} must refuse: {}", args, stdout(&refused));
         let message = json_of(&refused)["error"]["message"].as_str().unwrap().to_string();
@@ -5457,7 +5457,7 @@ fn an_unscoped_bay_in_a_sparse_warehouse_is_refused_up_front() {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/docs/d.txt", "docs v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
     assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
 
@@ -5497,7 +5497,7 @@ fn a_cache_franchise_is_a_partial_warehouse() {
     assert_success(&area.forklift("a", &["office", "enroll"]));
     area.write_file("a/one.txt", "one signed\n");
     assert_success(&area.forklift("a", &["load", "one.txt"]));
-    assert_success(&area.forklift("a", &["stack", "signed"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "signed"]));
     assert_success(&area.forklift("a", &["lift"]));
     server.rebuild_bundle(&area);
 
@@ -5647,10 +5647,10 @@ fn a_fetch_tables_the_signatures_of_its_walk_and_a_dead_one_stores_none() {
     // storing the parcels and before their content is whole.
     area.write_file("a/src/code.txt", "four\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "four"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "four"]));
     area.write_file("a/lost.txt", "the remote loses this for a while\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "five"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "five"]));
     assert_success(&area.forklift("a", &["lift"]));
     let new_head = pallet_head(&area, "server-root", "main");
     let new_parcels: Vec<String> = history_with_roots(&area, "a", &new_head).into_iter()
@@ -5715,7 +5715,7 @@ fn three_signed_parcels(area: &TestArea) -> (Server, String) {
         area.write_file("a/src/code.txt", &format!("{}\n", version));
         area.write_file(&format!("a/docs/{}.txt", version), "notes\n");
         assert_success(&area.forklift("a", &["load", "."]));
-        assert_success(&area.forklift("a", &["stack", version]));
+        assert_success(&area.forklift("a", &["stack", "-m", version]));
     }
     assert_success(&area.forklift("a", &["lift"]));
 
@@ -5924,7 +5924,7 @@ fn a_cache_shift_to_a_pallet_lowered_elsewhere_fetches_its_head() {
     assert_success(&area.forklift("a", &["pallet", "create", "feature"]));
     area.write_file("a/src/feature.txt", "feature\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "a feature"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "a feature"]));
     assert_success(&area.forklift("a", &["lift"]));
     let feature = pallet_head(&area, "server-root", "feature");
 
@@ -5975,7 +5975,7 @@ fn lift_feature(area: &TestArea) -> (String, String, [String; 2]) {
     area.write_file("a/src/more.txt", "more\n");
     std::fs::remove_file(area.path("a/docs/one.txt")).unwrap();
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "a feature"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "a feature"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     let head = pallet_head(area, "server-root", "feature");
@@ -6031,7 +6031,7 @@ fn a_cache_shift_with_its_origin_unreachable_refuses_before_it_changes_anything(
     // Diverged, the same consolidate is a merge, which takes the two blobs from `feature`.
     area.write_file("cached/local.txt", "local\n");
     assert_success(&area.forklift("cached", &["load", "."]));
-    assert_success(&area.forklift("cached", &["stack", "local"]));
+    assert_success(&area.forklift("cached", &["stack", "-m", "local"]));
     refuses_unchanged(&["consolidate", "feature"]);
 
     server.restart(&area);
@@ -6117,7 +6117,7 @@ fn a_cache_merge_fetches_its_trees_by_level_and_its_blobs_in_one_batch() {
         area.write_file(&format!("a/{}", file), content);
     }
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "a feature"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "a feature"]));
     assert_success(&area.forklift("a", &["lift"]));
     let feature = pallet_head(&area, "server-root", "feature");
     let root = history_with_roots(&area, "a", &feature)[0].1.clone();
@@ -6133,7 +6133,7 @@ fn a_cache_merge_fetches_its_trees_by_level_and_its_blobs_in_one_batch() {
     area.write_file("cached/docs/two.txt", "local two\n");
     std::fs::remove_file(area.path("cached/docs/three.txt")).unwrap();
     assert_success(&area.forklift("cached", &["load", "."]));
-    assert_success(&area.forklift("cached", &["stack", "local"]));
+    assert_success(&area.forklift("cached", &["stack", "-m", "local"]));
     for hash in &theirs {
         assert!(!object_held(&area, "cached", hash), "their side is absent: {}", hash);
     }
@@ -6188,7 +6188,7 @@ fn a_cache_shift_over_absent_trees_with_its_origin_unreachable_refuses_unchanged
 
     area.write_file("cached/local.txt", "local\n");
     assert_success(&area.forklift("cached", &["load", "."]));
-    assert_success(&area.forklift("cached", &["stack", "local"]));
+    assert_success(&area.forklift("cached", &["stack", "-m", "local"]));
     refuses_unchanged(&["consolidate", "feature"]);
 
     server.restart(&area);
@@ -6213,7 +6213,7 @@ fn a_cache_lower_fetches_the_new_tip_and_records_what_it_skips() {
     for version in ["four", "five"] {
         area.write_file("a/src/code.txt", &format!("{}\n", version));
         assert_success(&area.forklift("a", &["load", "."]));
-        assert_success(&area.forklift("a", &["stack", version]));
+        assert_success(&area.forklift("a", &["stack", "-m", version]));
     }
     assert_success(&area.forklift("a", &["lift"]));
     let new_head = pallet_head(&area, "server-root", "main");
@@ -6247,7 +6247,7 @@ fn a_cache_fetch_records_before_it_returns() {
 
     area.write_file("a/src/code.txt", "four\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "four"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "four"]));
     assert_success(&area.forklift("a", &["lift"]));
     let new_head = pallet_head(&area, "server-root", "main");
 
@@ -6275,13 +6275,13 @@ fn a_cache_lift_auto_merges_a_diverged_remote() {
 
     area.write_file("a/from_a.txt", "a\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "a's file"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "a's file"]));
     assert_success(&area.forklift("a", &["lift"]));
     let theirs = pallet_head(&area, "server-root", "main");
 
     area.write_file("cached/from_cache.txt", "cache\n");
     assert_success(&area.forklift("cached", &["load", "."]));
-    assert_success(&area.forklift("cached", &["stack", "the cache's file"]));
+    assert_success(&area.forklift("cached", &["stack", "-m", "the cache's file"]));
     let lifted = area.forklift("cached", &["lift"]);
     assert_success(&lifted);
     assert!(stdout(&lifted).contains("auto-merged"), "{}", stdout(&lifted));
@@ -6314,7 +6314,7 @@ fn a_new_pallets_first_lift_stops_at_the_history_the_remote_holds() {
         assert_success(&area.forklift(warehouse, &["pallet", "create", &format!("feature-{}", warehouse)]));
         area.write_file(&format!("{}/src/feature.txt", warehouse), &format!("{}\n", warehouse));
         assert_success(&area.forklift(warehouse, &["load", "."]));
-        assert_success(&area.forklift(warehouse, &["stack", "the feature"]));
+        assert_success(&area.forklift(warehouse, &["stack", "-m", "the feature"]));
 
         let lifted = area.forklift(warehouse, &["--json", "lift"]);
         assert_success(&lifted);
@@ -6357,7 +6357,7 @@ fn a_cache_auto_merge_fetches_a_held_parcels_content() {
 
     area.write_file("a/from_a.txt", "a\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "a's file"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "a's file"]));
     assert_success(&area.forklift("a", &["lift"]));
     let theirs = pallet_head(&area, "server-root", "main");
 
@@ -6367,7 +6367,7 @@ fn a_cache_auto_merge_fetches_a_held_parcels_content() {
 
     area.write_file("cached/from_cache.txt", "cache\n");
     assert_success(&area.forklift("cached", &["load", "."]));
-    assert_success(&area.forklift("cached", &["stack", "the cache's file"]));
+    assert_success(&area.forklift("cached", &["stack", "-m", "the cache's file"]));
     let lifted = area.forklift("cached", &["lift"]);
     assert_success(&lifted);
     assert!(stdout(&lifted).contains("auto-merged"), "{}", stdout(&lifted));
@@ -6389,13 +6389,13 @@ fn a_diverged_cache_lower_leaves_its_next_step_workable() {
 
     area.write_file("a/from_a.txt", "a\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "a's file"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "a's file"]));
     assert_success(&area.forklift("a", &["lift"]));
     let theirs = pallet_head(&area, "server-root", "main");
 
     area.write_file("cached/from_cache.txt", "cache\n");
     assert_success(&area.forklift("cached", &["load", "."]));
-    assert_success(&area.forklift("cached", &["stack", "the cache's file"]));
+    assert_success(&area.forklift("cached", &["stack", "-m", "the cache's file"]));
     let lowered = area.forklift("cached", &["lower"]);
     assert!(!lowered.status.success(), "a diverged lower is refused: {}", stdout(&lowered));
 
@@ -6422,13 +6422,13 @@ fn a_dirty_cache_lift_fetches_the_diverged_heads_content() {
 
     area.write_file("a/from_a.txt", "a\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "a's file"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "a's file"]));
     assert_success(&area.forklift("a", &["lift"]));
     let theirs = pallet_head(&area, "server-root", "main");
 
     area.write_file("cached/from_cache.txt", "cache\n");
     assert_success(&area.forklift("cached", &["load", "."]));
-    assert_success(&area.forklift("cached", &["stack", "the cache's file"]));
+    assert_success(&area.forklift("cached", &["stack", "-m", "the cache's file"]));
     area.write_file("cached/src/code.txt", "edited, not loaded\n");
     let lifted = area.forklift("cached", &["lift"]);
     assert!(!lifted.status.success(), "a dirty diverged lift is refused: {}", stdout(&lifted));
@@ -6450,7 +6450,7 @@ fn a_failed_cache_fill_records_what_it_left_absent() {
 
     area.write_file("a/docs/deep/lost.txt", "the remote loses this\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "four"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "four"]));
     assert_success(&area.forklift("a", &["lift"]));
     let new_head = pallet_head(&area, "server-root", "main");
 
@@ -6576,13 +6576,13 @@ fn a_pending_move_of_the_origin_refuses_every_remote_client_and_every_writer_it_
         assert_success(&area.forklift(directory, &["pallet", "create", "old"]));
         area.write_file(&format!("{}/src/old.txt", directory), "old\n");
         assert_success(&area.forklift(directory, &["load", "."]));
-        assert_success(&area.forklift(directory, &["stack", "old work"]));
+        assert_success(&area.forklift(directory, &["stack", "-m", "old work"]));
         assert_success(&area.forklift(directory, &["shift", "main"]));
     }
     assert_success(&area.forklift("sparse", &["scope", "narrow", "docs"]));
     area.write_file("sparse/src/code.txt", "local\n");
     assert_success(&area.forklift("sparse", &["load", "."]));
-    assert_success(&area.forklift("sparse", &["stack", "local"]));
+    assert_success(&area.forklift("sparse", &["stack", "-m", "local"]));
 
     let sparse_commands: [&[&str]; 12] = [
         &["pallet", "list", "--remote"],
@@ -6635,7 +6635,7 @@ fn a_pending_move_of_the_origin_refuses_every_remote_client_and_every_writer_it_
     record_move_intent(&area, "sparse", Phase::Checking);
     area.write_file("sparse/src/code.txt", "under a move\n");
     assert_success(&area.forklift("sparse", &["load", "."]));
-    assert_success(&area.forklift("sparse", &["stack", "under a move"]));
+    assert_success(&area.forklift("sparse", &["stack", "-m", "under a move"]));
     assert_success(&area.forklift("sparse", &["remote", "abort"]));
 
     // With the intent gone, what it refused runs.
@@ -6709,12 +6709,12 @@ fn a_partial_warehouse_moves_its_origin_to_a_copy_and_works_against_it() {
     assert_success(&area.forklift("cached", &["pallet", "create", "local"]));
     area.write_file("cached/src/local.txt", "local\n");
     assert_success(&area.forklift("cached", &["load", "."]));
-    assert_success(&area.forklift("cached", &["stack", "local work"]));
+    assert_success(&area.forklift("cached", &["stack", "-m", "local work"]));
     assert_success(&area.forklift("cached", &["shift", "main"]));
     area.write_file("a/src/code.txt", "four\n");
     area.write_file("a/docs/four.txt", "notes\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "four"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "four"]));
     assert_success(&area.forklift("a", &["lift"]));
     assert_success(&area.forklift("cached", &["lower"]));
     assert_success(&area.forklift("cached", &["store", "evict"]));
@@ -6775,7 +6775,7 @@ fn a_move_to_a_server_lacking_content_refuses_and_leaves_the_origin() {
     for version in ["four", "five"] {
         area.write_file("a/src/code.txt", &format!("{}\n", version));
         assert_success(&area.forklift("a", &["load", "."]));
-        assert_success(&area.forklift("a", &["stack", version]));
+        assert_success(&area.forklift("a", &["stack", "-m", version]));
     }
     assert_success(&area.forklift("a", &["lift"]));
     assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
@@ -6803,7 +6803,7 @@ fn a_move_to_a_server_lacking_content_refuses_and_leaves_the_origin() {
     assert_success(&area.forklift("b", &["office", "enroll"]));
     area.write_file("b/src/code.txt", "other\n");
     assert_success(&area.forklift("b", &["load", "."]));
-    assert_success(&area.forklift("b", &["stack", "other"]));
+    assert_success(&area.forklift("b", &["stack", "-m", "other"]));
     assert_success(&area.forklift("b", &["lift"]));
     let untrusted = area.forklift("cached", &["--json", "remote", "move", &other.url]);
     assert_eq!(json_of(&untrusted)["error"]["code"], "trust_changed", "{}", stdout(&untrusted));
@@ -7087,7 +7087,7 @@ fn evict_frees_what_the_origin_holds_and_a_read_fetches_it_again() {
     area.write_file("cached/src/code.txt", "one\n");
     area.write_file("cached/src/mine.txt", "mine\n");
     assert_success(&area.forklift("cached", &["load", "."]));
-    assert_success(&area.forklift("cached", &["stack", "four"]));
+    assert_success(&area.forklift("cached", &["stack", "-m", "four"]));
     let four = pallet_head(&area, "cached", "main");
     let four_src = subtree_of(&area, "cached", &history_with_roots(&area, "cached", &four)[0].1, "src");
     let mine = file_of(&area, "cached", &four_src, "mine.txt");
@@ -7096,7 +7096,7 @@ fn evict_frees_what_the_origin_holds_and_a_read_fetches_it_again() {
     area.write_file("cached/src/code.txt", "five\n");
     area.write_file("cached/src/mine.txt", "mine, five\n");
     assert_success(&area.forklift("cached", &["load", "."]));
-    assert_success(&area.forklift("cached", &["stack", "five"]));
+    assert_success(&area.forklift("cached", &["stack", "-m", "five"]));
     let base_root = history_with_roots(&area, "cached", &pallet_head(&area, "cached", "main"))[0].1.clone();
 
     let evicted = area.forklift("cached", &["--json", "store", "evict"]);
@@ -7154,7 +7154,7 @@ fn evict_keeps_a_staged_blob_that_history_shares() {
     assert!(!object_held(&area, "cached", &oldest_root), "the oldest root is evicted");
     assert!(object_held(&area, "cached", &one), "the staged blob stays");
 
-    assert_success(&area.forklift("cached", &["stack", "staged"]));
+    assert_success(&area.forklift("cached", &["stack", "-m", "staged"]));
     assert_success(&area.forklift("cached", &["audit"]));
 }
 
@@ -7173,14 +7173,14 @@ fn evict_keeps_an_in_progress_consolidation_and_it_finishes() {
     assert_success(&area.forklift("a", &["pallet", "create", "feature"]));
     area.write_file("a/src/code.txt", "feature\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "feature"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "feature"]));
     assert_success(&area.forklift("a", &["lift"]));
     let feature = pallet_head(&area, "server-root", "feature");
 
     assert_success(&area.forklift("cached", &["lower", "feature"]));
     area.write_file("cached/src/code.txt", "mine\n");
     assert_success(&area.forklift("cached", &["load", "."]));
-    assert_success(&area.forklift("cached", &["stack", "mine"]));
+    assert_success(&area.forklift("cached", &["stack", "-m", "mine"]));
     let consolidated = area.forklift("cached", &["consolidate", "feature"]);
     assert!(stdout(&consolidated).contains("conflict: src/code.txt"), "the consolidation stops on the conflict: {}", stdout(&consolidated));
     assert!(area.path("cached/.forklift/consolidation").exists(), "a consolidation is in progress: {}{}", stdout(&consolidated), stderr(&consolidated));
@@ -7192,7 +7192,7 @@ fn evict_keeps_an_in_progress_consolidation_and_it_finishes() {
 
     area.write_file("cached/src/code.txt", "resolved\n");
     assert_success(&area.forklift("cached", &["load", "."]));
-    assert_success(&area.forklift("cached", &["stack", "merged"]));
+    assert_success(&area.forklift("cached", &["stack", "-m", "merged"]));
     assert!(!area.path("cached/.forklift/consolidation").exists(), "the consolidation finished");
 }
 
@@ -7362,7 +7362,7 @@ fn lift_and_franchise_round_trip_a_chunked_file() {
     prepare_warehouse(&area, "dev", &server.url);
     area.write_file("dev/small.txt", "a normal file\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "plain work"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "plain work"]));
 
     // The plain work lifts fine — the chunk path must not touch an ordinary lift.
     let lifted = area.forklift("dev", &["lift"]);
@@ -7372,7 +7372,7 @@ fn lift_and_franchise_round_trip_a_chunked_file() {
     // A chunked giant now lifts too — no refusal against a chunk-aware remote.
     area.write_large_file("dev/big.bin", 0xC0FFEE, CHUNK_THRESHOLD + 50_000);
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "with a giant"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "with a giant"]));
 
     let lifted_giant = area.forklift("dev", &["lift"]);
     assert_success(&lifted_giant);
@@ -7404,7 +7404,7 @@ fn a_merge_second_parent_below_the_remote_head_lifts_from_a_sparse_store() {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/src/web/w.txt", "web v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     // The sparse workspace under test.
@@ -7414,7 +7414,7 @@ fn a_merge_second_parent_below_the_remote_head_lifts_from_a_sparse_store() {
     assert_success(&area.forklift(".", &["clone", &server.url, "up"]));
     area.write_file("up/src/web/w.txt", "web v2 (out of scope)\n");
     assert_success(&area.forklift("up", &["load", "."]));
-    assert_success(&area.forklift("up", &["stack", "up edits web (1)"]));
+    assert_success(&area.forklift("up", &["stack", "-m", "up edits web (1)"]));
     assert_success(&area.forklift("up", &["lift"]));
     let p2 = pallet_head(&area, "up", "main");
     let sealed_web = path_object_hash(&area, "up", &p2, "src/web");
@@ -7422,7 +7422,7 @@ fn a_merge_second_parent_below_the_remote_head_lifts_from_a_sparse_store() {
     // The sparse workspace makes an in-scope edit, then merges the diverged remote head p2.
     std::fs::write(area.path("sparse/src/api/a.txt"), "api v2 from sparse\n").unwrap();
     assert_success(&area.forklift("sparse", &["load", "."]));
-    assert_success(&area.forklift("sparse", &["stack", "sparse edits api (1)"]));
+    assert_success(&area.forklift("sparse", &["stack", "-m", "sparse edits api (1)"]));
 
     let lowered = area.forklift("sparse", &["lower"]);
     assert!(!lowered.status.success(), "the first divergence must be reported");
@@ -7435,7 +7435,7 @@ fn a_merge_second_parent_below_the_remote_head_lifts_from_a_sparse_store() {
     assert_success(&area.forklift("up", &["lower"]));
     area.write_file("up/src/web/w.txt", "web v3 (out of scope)\n");
     assert_success(&area.forklift("up", &["load", "."]));
-    assert_success(&area.forklift("up", &["stack", "up edits web (2)"]));
+    assert_success(&area.forklift("up", &["stack", "-m", "up edits web (2)"]));
     assert_success(&area.forklift("up", &["lift"]));
     let p3 = pallet_head(&area, "up", "main");
 
@@ -7471,7 +7471,7 @@ fn narrow_refuses_to_delete_dirty_tracked_changes() {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/docs/guide.md", "guide v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     assert_success(&area.forklift(".",
@@ -7514,7 +7514,7 @@ fn narrow_refuses_to_delete_an_edited_tracked_file_a_rule_covers() {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/docs/gen.txt", "gen v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     assert_success(&area.forklift(".",
@@ -7540,7 +7540,7 @@ fn narrow_refuses_to_delete_untracked_files() {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/docs/guide.md", "guide v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     assert_success(&area.forklift(".",
@@ -7573,7 +7573,7 @@ fn bay_add_scope_refuses_a_spine_ancestor_outside_the_fetch_scope() {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/src/web/w.txt", "web v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
@@ -7606,7 +7606,7 @@ fn bay_add_scope_refuses_a_sealed_sibling_outside_the_fetch_scope() {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/src/web/w.txt", "web v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
@@ -7635,7 +7635,7 @@ fn expand_recovers_after_an_unreachable_remote_leaves_the_scope_unchanged() {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/src/web/w.txt", "web v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -7682,7 +7682,7 @@ fn lift_from_a_sparse_workspace_with_no_remote_configured_reports_the_plain_erro
     prepare_warehouse(&area, "dev", &server.url);
     area.write_file("dev/src/api/a.txt", "api v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
@@ -7711,11 +7711,11 @@ fn a_sparse_audit_names_its_scope_boundary() {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/src/web/w.txt", "web v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "pre-trust base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "pre-trust base"]));
     assert_success(&area.forklift("dev", &["office", "enroll"]));
     area.write_file("dev/src/api/a.txt", "api v2 signed\n");
     assert_success(&area.forklift("dev", &["load", "src/api/a.txt"]));
-    assert_success(&area.forklift("dev", &["stack", "signed parcel"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "signed parcel"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -7760,11 +7760,11 @@ fn a_sparse_audit_fails_on_a_tampered_in_scope_tree() {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/src/web/w.txt", "web v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "pre-trust base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "pre-trust base"]));
     assert_success(&area.forklift("dev", &["office", "enroll"]));
     area.write_file("dev/src/api/a.txt", "api v2 signed\n");
     assert_success(&area.forklift("dev", &["load", "src/api/a.txt"]));
-    assert_success(&area.forklift("dev", &["stack", "signed parcel"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "signed parcel"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -7801,11 +7801,11 @@ fn a_sparse_audit_checks_each_path_of_a_shared_spine_tree() {
         area.write_file(&format!("dev/{}/y/y.txt", dir), "y\n");
     }
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "pre-trust base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "pre-trust base"]));
     assert_success(&area.forklift("dev", &["office", "enroll"]));
     area.write_file("dev/note.txt", "signed\n");
     assert_success(&area.forklift("dev", &["load", "note.txt"]));
-    assert_success(&area.forklift("dev", &["stack", "signed parcel"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "signed parcel"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -7839,11 +7839,11 @@ fn a_content_corrupted_in_scope_blob_passes_closure_but_fails_on_read() {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/src/web/w.txt", "web v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "pre-trust base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "pre-trust base"]));
     assert_success(&area.forklift("dev", &["office", "enroll"]));
     area.write_file("dev/src/api/a.txt", "api v2 signed\n");
     assert_success(&area.forklift("dev", &["load", "src/api/a.txt"]));
-    assert_success(&area.forklift("dev", &["stack", "signed parcel"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "signed parcel"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -7880,14 +7880,14 @@ fn path_maybe_changed_absorbs_an_absent_out_of_scope_object() {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/src/web/w.txt", "web v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     // A second parcel changes ONLY the out-of-scope subtree, so a filter diff must descend into
     // it to be computed at all.
     area.write_file("dev/src/web/w.txt", "web v2\n");
     assert_success(&area.forklift("dev", &["load", "src/web/w.txt"]));
-    assert_success(&area.forklift("dev", &["stack", "web only"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "web only"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -7934,11 +7934,11 @@ fn a_full_store_audit_omits_the_sparse_boundary() {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/src/web/w.txt", "web v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "pre-trust base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "pre-trust base"]));
     assert_success(&area.forklift("dev", &["office", "enroll"]));
     area.write_file("dev/src/api/a.txt", "api v2 signed\n");
     assert_success(&area.forklift("dev", &["load", "src/api/a.txt"]));
-    assert_success(&area.forklift("dev", &["stack", "signed parcel"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "signed parcel"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     assert_success(&area.forklift(".", &["clone", &server.url, "full"]));
@@ -7971,14 +7971,14 @@ fn scope_prune_frees_a_path_no_checkout_needs_and_leaves_the_rest_intact() {
     area.write_file("dev/src/web/w.txt", "web v1\n");
     area.write_file("dev/docs/guide.md", "guide v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
 
     // Establish trust so a later audit verifies a real office chain — and so the office/meta
     // carve-out (never scoped, never pruned) is exercised end to end.
     assert_success(&area.forklift("dev", &["office", "enroll"]));
     area.write_file("dev/src/api/a.txt", "api v2 signed\n");
     assert_success(&area.forklift("dev", &["load", "src/api/a.txt"]));
-    assert_success(&area.forklift("dev", &["stack", "signed"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "signed"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -8037,7 +8037,7 @@ fn scope_prune_frees_a_path_no_checkout_needs_and_leaves_the_rest_intact() {
     // ...an in-scope edit still stacks and lifts (the sealed docs are never needed)...
     std::fs::write(area.path("sparse/src/api/a.txt"), "api v3 after prune\n").unwrap();
     assert_success(&area.forklift("sparse", &["load", "."]));
-    assert_success(&area.forklift("sparse", &["stack", "edit after prune"]));
+    assert_success(&area.forklift("sparse", &["stack", "-m", "edit after prune"]));
     assert_success(&area.forklift("sparse", &["lift"]));
 
     // ...and the pruned path is re-fetchable from the origin, proving it was only sealed.
@@ -8056,7 +8056,7 @@ fn sparse_with_docs(area: &TestArea) -> Server {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/docs/guide.md", "guide v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     assert_success(&area.forklift(".", &["clone", &server.url, "sparse",
@@ -8080,7 +8080,7 @@ fn scope_prune_keeps_work_never_lifted_and_frees_it_once_lifted() {
 
     std::fs::write(area.path("sparse/docs/guide.md"), "guide v2, never lifted\n").unwrap();
     assert_success(&area.forklift("sparse", &["load", "."]));
-    assert_success(&area.forklift("sparse", &["stack", "local docs edit"]));
+    assert_success(&area.forklift("sparse", &["stack", "-m", "local docs edit"]));
 
     let head = pallet_head(&area, "sparse", "main");
     let v2_tree = path_object_hash(&area, "sparse", &head, "docs");
@@ -8136,7 +8136,7 @@ fn scope_prune_frees_history_the_remote_confirms_it_still_holds() {
 
     area.write_file("dev/src/api/a.txt", "api v2\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "ahead"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "ahead"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     assert_success(&area.forklift("sparse", &["scope", "narrow", "docs"]));
@@ -8158,7 +8158,7 @@ fn scope_prune_frees_work_the_remote_keeps_under_a_tombstone() {
     assert_success(&area.forklift("sparse", &["pallet", "create", "side"]));
     std::fs::write(area.path("sparse/docs/guide.md"), "guide on side\n").unwrap();
     assert_success(&area.forklift("sparse", &["load", "."]));
-    assert_success(&area.forklift("sparse", &["stack", "side docs edit"]));
+    assert_success(&area.forklift("sparse", &["stack", "-m", "side docs edit"]));
     let side = pallet_head(&area, "sparse", "side");
     let side_blob = path_object_hash(&area, "sparse", &side, "docs/guide.md");
     assert_success(&area.forklift("sparse", &["lift"]));
@@ -8188,13 +8188,13 @@ fn scope_prune_asks_and_lifts_a_pallet_named_with_a_slash() {
     // Both remote heads move past anything the sparse warehouse holds.
     area.write_file("dev/src/api/a.txt", "api v2\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "ahead"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "ahead"]));
     assert_success(&area.forklift("dev", &["lift"]));
     assert_success(&area.forklift("dev", &["pallet", "create", "feature/x"]));
     assert_success(&area.forklift("dev", &["shift", "feature/x"]));
     area.write_file("dev/src/api/a.txt", "api v3\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "feature work"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "feature work"]));
     let feature = pallet_head(&area, "dev", "feature/x");
     assert_success(&area.forklift("dev", &["lift"]));
     assert_eq!(remote_pallet_head(&server, "feature/x").as_deref(), Some(feature.as_str()));
@@ -8245,7 +8245,7 @@ fn a_slash_named_pallet_crosses(proxy: SlashProxy, name: &str) {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/docs/guide.md", "guide v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
     assert_success(&area.forklift(".", &["clone", &proxy.url, "sparse", "--only", "src/api", "--only", "docs"]));
     let base = pallet_head(&area, "sparse", "main");
@@ -8254,13 +8254,13 @@ fn a_slash_named_pallet_crosses(proxy: SlashProxy, name: &str) {
     // The lift moves `feature/x` on the remote, not some prefix of it.
     area.write_file("dev/src/api/a.txt", "api v2\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "ahead"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "ahead"]));
     assert_success(&area.forklift("dev", &["lift"]));
     assert_success(&area.forklift("dev", &["pallet", "create", "feature/x"]));
     assert_success(&area.forklift("dev", &["shift", "feature/x"]));
     area.write_file("dev/src/api/a.txt", "api v3\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "feature work"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "feature work"]));
     let feature = pallet_head(&area, "dev", "feature/x");
     assert_success(&area.forklift("dev", &["lift"]));
     assert_eq!(remote_pallet_head(&server, "feature/x").as_deref(), Some(feature.as_str()));
@@ -8307,7 +8307,7 @@ fn scope_prune_frees_nothing_on_a_forged_held_head() {
 
     std::fs::write(area.path("sparse/docs/guide.md"), "guide v2, never lifted\n").unwrap();
     assert_success(&area.forklift("sparse", &["load", "."]));
-    assert_success(&area.forklift("sparse", &["stack", "local docs edit"]));
+    assert_success(&area.forklift("sparse", &["stack", "-m", "local docs edit"]));
     let head = pallet_head(&area, "sparse", "main");
     let v2_blob = path_object_hash(&area, "sparse", &head, "docs/guide.md");
 
@@ -8338,14 +8338,14 @@ fn scope_prune_frees_nothing_the_remote_moved_back_past_or_started_over() {
     area.write_file("dev/src/api/a.txt", "api v2\n");
     area.write_file("dev/docs/guide.md", "guide v2\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "ahead"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "ahead"]));
     assert_success(&area.forklift("dev", &["lift"]));
     let ahead = pallet_head(&area, "dev", "main");
 
     assert_success(&area.forklift("dev", &["pallet", "create", "side", &base]));
     area.write_file("dev/src/api/a.txt", "api side\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "side"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "side"]));
     assert_success(&area.forklift("dev", &["lift"]));
     let side = pallet_head(&area, "dev", "side");
 
@@ -8398,7 +8398,7 @@ fn scope_prune_frees_nothing_beyond_the_current_heads_when_the_remote_cannot_ans
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/docs/guide.md", "guide v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -8416,7 +8416,7 @@ fn scope_prune_frees_nothing_beyond_the_current_heads_when_the_remote_cannot_ans
 
     area.write_file("dev/src/api/a.txt", "api v2\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "ahead"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "ahead"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     assert_success(&area.forklift("sparse", &["scope", "narrow", "docs"]));
@@ -8459,7 +8459,7 @@ fn a_landed_lift_lower_or_franchise_records_its_head_and_a_refused_lift_records_
 
     area.write_file("dev/src/api/a.txt", "api v2\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "ahead"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "ahead"]));
     assert_success(&area.forklift("dev", &["lift"]));
     let ahead = pallet_head(&area, "dev", "main");
     assert_ne!(ahead, base);
@@ -8468,7 +8468,7 @@ fn a_landed_lift_lower_or_franchise_records_its_head_and_a_refused_lift_records_
     // The same file as dev's change, so the lift cannot auto-merge past the remote's head.
     area.write_file("sparse/src/api/a.txt", "api local\n");
     assert_success(&area.forklift("sparse", &["load", "."]));
-    assert_success(&area.forklift("sparse", &["stack", "local"]));
+    assert_success(&area.forklift("sparse", &["stack", "-m", "local"]));
     let refused = area.forklift("sparse", &["lift"]);
     assert!(!refused.status.success(), "the remote diverged, so the lift is refused: {}", stdout(&refused));
     assert_eq!(held_heads(&area, "sparse"), vec![format!("{} main", base)],
@@ -8518,7 +8518,7 @@ fn scope_prune_refuses_and_changes_nothing_when_the_remote_trust_changed() {
         area.write_file("a/docs/guide.md", "guide v1\n");
         area.write_file("a/src/x.txt", "x v1\n");
         assert_success(&area.forklift("a", &["load", "."]));
-        assert_success(&area.forklift("a", &["stack", "paths"]));
+        assert_success(&area.forklift("a", &["stack", "-m", "paths"]));
         assert_success(&area.forklift("a", &["lift"]));
         assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--token", "root",
             "--only", "docs", "--only", "src"]));
@@ -8548,7 +8548,7 @@ fn scope_prune_refuses_while_a_bay_still_materializes_the_path() {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/src/web/w.txt", "web v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -8606,7 +8606,7 @@ fn scope_prune_blocked_by_the_main_trees_whole_scope_says_there_is_no_way_out() 
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/docs/guide.md", "guide\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     assert_success(&area.forklift(".",
@@ -8635,7 +8635,7 @@ fn scope_prune_refuses_on_a_full_warehouse() {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/src/web/w.txt", "web v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     assert_success(&area.forklift(".", &["clone", &server.url, "full"]));
@@ -8662,7 +8662,7 @@ fn scope_prune_dry_run_reports_and_frees_nothing() {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/src/web/w.txt", "web v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -8707,7 +8707,7 @@ fn scope_prune_is_refused_while_another_process_writes_the_store() {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/src/web/w.txt", "web v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -8754,13 +8754,13 @@ fn scope_prune_resumes_after_an_interrupted_free_and_completes() {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/src/web/w.txt", "web v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
 
     // Trust, so the audit at the end verifies something real, not just "nothing to check."
     assert_success(&area.forklift("dev", &["office", "enroll"]));
     area.write_file("dev/src/api/a.txt", "api v2 signed\n");
     assert_success(&area.forklift("dev", &["load", "src/api/a.txt"]));
-    assert_success(&area.forklift("dev", &["stack", "signed"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "signed"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -8824,7 +8824,7 @@ fn scope_prune_reports_zero_freed_as_retained_not_already_pruned() {
     area.write_file("dev/src/api/same.txt", "identical bytes\n");
     area.write_file("dev/src/web/same.txt", "identical bytes\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -8869,7 +8869,7 @@ fn scope_prune_retains_a_user_blob_that_collides_with_an_office_blob() {
     prepare_warehouse(&area, "dev", &server.url);
     area.write_file("dev/src/api/a.txt", "api v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
 
     // Establish trust, which writes at least one tracked-key record under the office pallet.
     assert_success(&area.forklift("dev", &["office", "enroll"]));
@@ -8895,7 +8895,7 @@ fn scope_prune_retains_a_user_blob_that_collides_with_an_office_blob() {
     // collides with the office's — proving retention is keyed by hash, not by pallet or path.
     area.write_file("dev/src/web/w.txt", &key_blob_content);
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "web collides with an office key record"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "web collides with an office key record"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -8936,7 +8936,7 @@ fn the_path_addressed_subtree_endpoint_serves_a_subtree_and_signals_fallback_on_
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/src/web/w.txt", "web v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -8987,7 +8987,7 @@ fn a_subtree_response_imports_in_full_when_the_client_already_holds_a_tree_insid
     area.write_file("dev/src/web/w.txt", "web v1\n");
     area.write_file("dev/src/web/inner/x.txt", "inner v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -9026,7 +9026,7 @@ fn the_path_addressed_subtree_endpoint_round_trips_a_path_with_reserved_characte
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/src/a dir#1/100%/w.txt", "reserved-char dir v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -9225,7 +9225,7 @@ fn heal_driven_refetch_recovers_a_dangling_object_the_remote_has() {
     prepare_warehouse(&area, "dev", &server.url);
     area.write_file("dev/a.txt", "hello, this is durable content\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base parcel"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base parcel"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -9267,7 +9267,7 @@ fn heal_driven_refetch_clears_only_the_hash_the_remote_actually_has() {
     area.write_file("dev/a.txt", "recoverable content\n");
     area.write_file("dev/b.txt", "unrecoverable content\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "two files"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "two files"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -9329,7 +9329,7 @@ fn heal_driven_refetch_recovers_every_object_when_more_than_one_is_missing() {
     area.write_file("dev/a.txt", "first recoverable content\n");
     area.write_file("dev/b.txt", "second recoverable content\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "two files"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "two files"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -9416,7 +9416,7 @@ fn heal_pass_one_restoring_a_missing_ancestor_keeps_the_closure_walk_from_falsel
     prepare_warehouse(&area, "dev", &server.url);
     area.write_file("dev/a.txt", "the leaf: referenced only by the older ancestor's tree\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base with the leaf"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base with the leaf"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let h1 = pallet_head(&area, "dev", "main");
@@ -9425,7 +9425,7 @@ fn heal_pass_one_restoring_a_missing_ancestor_keeps_the_closure_walk_from_falsel
     std::fs::remove_file(area.path("dev/a.txt")).unwrap();
     area.write_file("dev/c.txt", "unrelated newer content\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "drop the leaf, add something else"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "drop the leaf, add something else"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let h2 = pallet_head(&area, "dev", "main");
@@ -9486,7 +9486,7 @@ fn heal_driven_refetch_treats_a_locally_repacked_object_as_recovered() {
     prepare_warehouse(&area, "dev", &server.url);
     area.write_file("dev/a.txt", "content that gets repacked locally\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base parcel"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base parcel"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -9535,7 +9535,7 @@ fn heal_driven_refetch_leaves_the_taint_intact_on_a_failed_fetch() {
     prepare_warehouse(&area, "dev", &server.url);
     area.write_file("dev/a.txt", "content the remote genuinely has\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base parcel"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base parcel"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -9573,13 +9573,13 @@ fn heal_names_an_unreadable_fetch_scope_instead_of_blaming_connectivity() {
     prepare_warehouse(&area, "dev", &server.url);
     area.write_file("dev/a.txt", "content the remote has\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base parcel"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base parcel"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     // A second parcel the remote never saw, so no pass can bring its blob back.
     area.write_file("dev/b.txt", "content only this warehouse ever had\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "local parcel"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "local parcel"]));
 
     let head = pallet_head(&area, "dev", "main");
     let blob = path_object_hash(&area, "dev", &head, "b.txt");
@@ -9621,7 +9621,7 @@ fn heal_driven_refetch_recovers_a_hash_referenced_only_by_a_non_current_pallet()
     prepare_warehouse(&area, "dev", &server.url);
     area.write_file("dev/main.txt", "main content\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "main parcel"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "main parcel"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     // A second, published pallet: its head is a durable ref (a closure-walk root) exactly like
@@ -9629,7 +9629,7 @@ fn heal_driven_refetch_recovers_a_hash_referenced_only_by_a_non_current_pallet()
     assert_success(&area.forklift("dev", &["pallet", "create", "other"]));
     area.write_file("dev/other.txt", "other content\n");
     assert_success(&area.forklift("dev", &["load", "other.txt"]));
-    assert_success(&area.forklift("dev", &["stack", "other parcel"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "other parcel"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let other_head = pallet_head(&area, "dev", "other");
@@ -9669,7 +9669,7 @@ fn heal_driven_refetch_force_fetches_a_corrupt_present_object() {
     let genuine_content = "the genuine content, already published to the remote\n";
     area.write_file("dev/a.txt", genuine_content);
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base parcel"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base parcel"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -9740,7 +9740,7 @@ fn a_retry_after_a_failed_handshake_succeeds_into_the_same_directory() {
     assert_success(&area.forklift("dev", &["config", "set", "remote.token", "right-token"]));
     area.write_file("dev/code.txt", "v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let dir = area.path("attempt1");
@@ -9767,7 +9767,7 @@ fn remote_with_two_subtrees(area: &TestArea, server: &Server) {
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/src/web/b.txt", "web v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 }
 
@@ -9948,7 +9948,7 @@ fn a_pallet_typo_is_refused_before_anything_is_created() {
     prepare_warehouse(&area, "dev", &server.url);
     area.write_file("dev/code.txt", "v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let dir = area.path("typo-pallet");
@@ -9980,7 +9980,7 @@ fn a_pallet_typo_is_refused_before_a_broken_bundle_would_otherwise_fail_first() 
     prepare_warehouse(&area, "dev", &server.url);
     area.write_file("dev/code.txt", "v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     server.rebuild_bundle(&area);
@@ -10022,7 +10022,7 @@ fn franchise_ignores_an_unrelated_ambient_warehouses_tor_setting() {
     prepare_warehouse(&area, "dev", &server.url);
     area.write_file("dev/code.txt", "v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     std::fs::create_dir_all(area.path("outer")).unwrap();
@@ -10050,7 +10050,7 @@ fn a_failure_after_the_bundle_install_keeps_it_and_the_resume_skips_the_download
     prepare_warehouse(&area, "dev", &server.url);
     area.write_file("dev/a.txt", "first parcel\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "pre-trust base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "pre-trust base"]));
     assert_success(&area.forklift("dev", &["office", "enroll"]));
 
     // Built now: covers the office enrollment and this first parcel only.
@@ -10059,7 +10059,7 @@ fn a_failure_after_the_bundle_install_keeps_it_and_the_resume_skips_the_download
     // A second parcel, lifted after the bundle was built — the bundle cannot cover it.
     area.write_file("dev/b.txt", "second parcel, not in the bundle\n");
     assert_success(&area.forklift("dev", &["load", "b.txt"]));
-    assert_success(&area.forklift("dev", &["stack", "second parcel"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "second parcel"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let head = pallet_head(&area, "dev", "main");
@@ -10114,7 +10114,7 @@ fn franchise_into_an_absolute_target_path_succeeds() {
     prepare_warehouse(&area, "dev", &server.url);
     area.write_file("dev/code.txt", "v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     let absolute_target = area.path("cloned-absolute");
@@ -10162,7 +10162,7 @@ mod progress_events {
         prepare_warehouse(&area, "a", &server.url);
         area.write_file("a/readme.txt", "hello\n");
         assert_success(&area.forklift("a", &["load", "."]));
-        assert_success(&area.forklift("a", &["stack", "first parcel"]));
+        assert_success(&area.forklift("a", &["stack", "-m", "first parcel"]));
 
         // Uploading is followed by per-object progress, and updating the remote ends the run, so
         // neither can be replaced by the status after it.
@@ -10177,7 +10177,7 @@ mod progress_events {
         area.write_file("a/readme.txt", "hello, twice\n");
         area.write_file("a/new.txt", "new\n");
         assert_success(&area.forklift("a", &["load", "."]));
-        assert_success(&area.forklift("a", &["stack", "second parcel"]));
+        assert_success(&area.forklift("a", &["stack", "-m", "second parcel"]));
         assert_success(&area.forklift("a", &["lift"]));
 
         // Writing files is followed by per-file progress and the rebuild ends the run, so
@@ -10202,14 +10202,14 @@ fn a_lower_across_a_case_only_rename_keeps_the_file() {
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/foo", "lower\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "first"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "first"]));
     assert_success(&area.forklift("a", &["lift"]));
     assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
 
     std::fs::remove_file(area.path("a/foo")).unwrap();
     area.write_file("a/Foo", "upper\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "rename foo to Foo"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "rename foo to Foo"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     assert_success(&area.forklift("b", &["lower"]));
@@ -10241,7 +10241,7 @@ fn kv_needs_an_office_and_refuses_readers() {
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/code.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "base"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
 
     // No office: a write is refused before anything is stacked.
     let refused = area.forklift("a", &["manifest", "set", "main", "ci", "green"]);
@@ -10271,7 +10271,7 @@ fn kv_needs_an_office_and_refuses_readers() {
     assert_success(&area.forklift("a", &["pallet", "create", "draft"]));
     area.write_file("a/code.txt", "v2\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "draft work"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "draft work"]));
     let main_head = pallet_head(&area, "a", "main");
 
     assert_success(&area.forklift("a", &["config", "set", "operator.identifier", "reader@forklift"]));
@@ -10289,7 +10289,7 @@ fn kv_syncs_replays_disjoint_changes_and_resolves_conflicts_with_keep() {
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/code.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "base"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
     assert_success(&area.forklift("a", &["office", "enroll"]));
 
     let subject = parcel_hash(&area, "a", "main");
@@ -10414,7 +10414,7 @@ fn a_conflicted_kv_pallet_does_not_hold_back_the_working_pallet() {
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/code.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "base"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
     assert_success(&area.forklift("a", &["office", "enroll"]));
     assert_success(&area.forklift("a", &["manifest", "set", "main", "ci", "green"]));
     assert_success(&area.forklift("a", &["lift"]));
@@ -10424,7 +10424,7 @@ fn a_conflicted_kv_pallet_does_not_hold_back_the_working_pallet() {
     // B moves the working pallet and @kv; A changes the same key without lowering.
     area.write_file("b/code.txt", "v2\n");
     assert_success(&area.forklift("b", &["load", "."]));
-    assert_success(&area.forklift("b", &["stack", "second"]));
+    assert_success(&area.forklift("b", &["stack", "-m", "second"]));
     assert_success(&area.forklift("b", &["manifest", "set", &base, "ci", "red"]));
     assert_success(&area.forklift("b", &["lift"]));
     assert_success(&area.forklift("a", &["manifest", "set", "main", "ci", "amber"]));
@@ -10914,7 +10914,7 @@ fn a_bay_on_a_pallet_another_bay_lowered_is_behind_until_it_shifts() {
 
     area.write_file("b-bay/other.txt", "other\n");
     assert_success(&area.forklift("b-bay", &["load", "."]));
-    let behind = area.forklift("b-bay", &["stack", "behind"]);
+    let behind = area.forklift("b-bay", &["stack", "-m", "behind"]);
     assert_eq!(behind.status.code(), Some(26), "{}{}", stdout(&behind), stderr(&behind));
     assert!(stderr(&behind).contains("forklift shift feat"), "{}", stderr(&behind));
 
@@ -10948,14 +10948,14 @@ fn a_sparse_warehouse_lowers_another_pallet_within_scope_and_expand_widens_it() 
     area.write_file("dev/src/api/a.txt", "api v1\n");
     area.write_file("dev/src/web/w.txt", "web v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
     assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
 
     assert_success(&area.forklift("dev", &["pallet", "create", "feat"]));
     area.write_file("dev/src/web/w.txt", "web v2 on feat\n");
     assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "feat edits web"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "feat edits web"]));
     assert_success(&area.forklift("dev", &["lift"]));
     let feat = pallet_head(&area, "dev", "feat");
     let web_blob = path_object_hash(&area, "dev", &feat, "src/web/w.txt");
@@ -11002,7 +11002,7 @@ fn scope_prune_keeps_unlifted_history_behind_a_deleted_pallet_for_its_undo() {
     assert_success(&area.forklift("sparse", &["pallet", "create", "side"]));
     std::fs::write(area.path("sparse/docs/guide.md"), "guide on side, never lifted\n").unwrap();
     assert_success(&area.forklift("sparse", &["load", "."]));
-    assert_success(&area.forklift("sparse", &["stack", "side docs edit"]));
+    assert_success(&area.forklift("sparse", &["stack", "-m", "side docs edit"]));
     let head = pallet_head(&area, "sparse", "side");
     let blob = path_object_hash(&area, "sparse", &head, "docs/guide.md");
     assert_success(&area.forklift("sparse", &["shift", "main"]));
@@ -11434,7 +11434,7 @@ fn a_conflicted_consolidation_is_judged_under_the_office_its_stack_signs_under()
 
     area.write_file("a/code.txt", "resolved\n");
     assert_success(&area.forklift("a", &["load", "code.txt"]));
-    let stacked = area.forklift("a", &["--json", "stack", "resolved"]);
+    let stacked = area.forklift("a", &["--json", "stack", "-m", "resolved"]);
     let message = history_unverified_message(&stacked);
     assert!(message.contains(&worked), "{}", message);
     assert!(message.contains("Nothing was stacked."), "{}", message);

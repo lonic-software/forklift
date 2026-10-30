@@ -272,7 +272,7 @@ pub(super) fn publish_shards(ledger: &mut ShardLedger, publish: ShardPublish) ->
 impl ShardLedger {
     /// Replace the staging area below the given directory with the given shards: the existing
     /// inventory folders under the key are removed, the given shards are written, and the
-    /// metadata file is updated accordingly. Used by `restore --staged` (and `unload`) to reset a
+    /// metadata file is updated accordingly. Used by `unload` to reset a
     /// subtree of the inventory to the pallet head.
     ///
     /// The subtree at `key` is now rebuilt wholesale from `shards` — a known-good source — so any

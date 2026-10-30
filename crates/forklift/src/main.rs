@@ -565,7 +565,7 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
         },
         Command::Prepare => commands::prepare::handle_command(cli.verbose),
         Command::Remove { path } => commands::remove::handle_command(&path),
-        Command::Restore { staged, path } => commands::restore::handle_command(staged, &path),
+        Command::Restore { path } => commands::restore::handle_command(&path),
         Command::Scope { action } => match action {
             Some(ScopeAction::Status) | None => commands::scope::handle_command(),
             Some(ScopeAction::Fetch { paths }) => commands::scope_fetch::handle_command(paths).await,
@@ -582,7 +582,7 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
         },
         Command::Shift { pallet } => commands::shift::handle_command(&pallet).await,
         Command::Show { target } => commands::show::handle_command(&target),
-        Command::Stack { description } => commands::stack::handle_command(description).await,
+        Command::Stack { message } => commands::stack::handle_command(message).await,
         Command::Tag { action } => commands::tag::handle_command(action).await,
         Command::Stocktake { summary } => commands::stocktake::handle_command(summary).await,
         Command::Undo { as_name } => commands::undo::handle_command(as_name.as_deref()).await,

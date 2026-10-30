@@ -52,9 +52,9 @@ unload
 version
 
 [daily-loop]
-# The commands a person runs every day, kept top-level and short. The surface being built gives
-# a visible short alias to these only, at most one each; today's binary does not yet keep that
-# rule, and no check holds it until the change that removes its last violation.
+# The commands a person runs every day, kept top-level and short. Only these have a visible short
+# alias, at most one each; unique prefixes shorten every other command. Hidden aliases (git's
+# words) are not counted.
 load
 unload
 remove
@@ -85,7 +85,8 @@ lower --keep …=theirs
 # The commands that record text: free-form prose a person writes to describe a record (a
 # parcel's description, a note, a comment, a review, a tag or delivery message, a haul's longer
 # description). A keyed value (manifest set VALUE, config set VALUE) and a short title (haul open --title)
-# are not recorded text.
+# are not recorded text. Each of these takes its text as -m/--message, and no other command has
+# --message or -m.
 stack
 pick
 deliver

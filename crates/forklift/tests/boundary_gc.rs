@@ -120,7 +120,7 @@ impl Warehouse {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, content).unwrap();
         self.run_ok(&["load", "."]);
-        self.run_ok(&["stack", message]);
+        self.run_ok(&["stack", "-m", message]);
 
         self.head(&self.current_pallet())
     }
@@ -817,7 +817,7 @@ fn warehouse_with_a_pick_of_an_orphaned_source(warehouse: &Warehouse) -> (String
     warehouse.run_ok(&["pallet", "create", "feature"]);
     let source = warehouse.stack("app.txt", "from-feature\n", "feature work");
     warehouse.run_ok(&["undo"]);
-    warehouse.run_ok(&["restore", "--staged", "."]);
+    warehouse.run_ok(&["unload", "."]);
     warehouse.run_ok(&["restore", "."]);
     warehouse.run_ok(&["shift", "main"]);
 
@@ -858,7 +858,7 @@ fn a_cherry_pick_in_progress_roots_its_source_and_the_completing_stack_succeeds(
 
     std::fs::write(warehouse.root.join("app.txt"), "resolved\n").unwrap();
     warehouse.run_ok(&["load", "."]);
-    let completing = warehouse.run(&["stack", "completed pick"]);
+    let completing = warehouse.run(&["stack", "-m", "completed pick"]);
 
     assert!(
         completing.status.success(),
@@ -880,7 +880,7 @@ fn undoing_a_completed_pick_whose_source_was_collected_is_refused_and_changes_no
 
     std::fs::write(warehouse.root.join("app.txt"), "resolved\n").unwrap();
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "completed pick"]);
+    warehouse.run_ok(&["stack", "-m", "completed pick"]);
     assert!(!pick_state_file(&warehouse).exists(), "the completing stack must clear the pick state");
 
     let stats = warehouse.scoped(|| gc_utils::collect_garbage(0).expect("gc runs"));
@@ -914,7 +914,7 @@ fn undoing_a_completed_pick_whose_source_was_collected_is_refused_and_changes_no
 
     std::fs::write(warehouse.root.join("app.txt"), "on top\n").unwrap();
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "on top"]);
+    warehouse.run_ok(&["stack", "-m", "on top"]);
 }
 
 /// The stack-time half: a pick in progress whose source the store lost anyway (damage; gc can no
@@ -930,7 +930,7 @@ fn a_pick_whose_source_was_lost_refuses_naming_the_pick_and_the_abort_works() {
     warehouse.run_ok(&["load", "."]);
     let head = warehouse.head("main");
 
-    let completing = warehouse.run(&["stack", "completed pick"]);
+    let completing = warehouse.run(&["stack", "-m", "completed pick"]);
     let err = String::from_utf8_lossy(&completing.stderr).to_string();
 
     assert_eq!(warehouse.head("main"), head, "a refused stack must leave the pallet where it was");
@@ -947,7 +947,7 @@ fn a_pick_whose_source_was_lost_refuses_naming_the_pick_and_the_abort_works() {
     );
 
     std::fs::remove_file(pick_state_file(&warehouse)).unwrap();
-    warehouse.run_ok(&["stack", "completed pick"]);
+    warehouse.run_ok(&["stack", "-m", "completed pick"]);
 
     // As the refusal says, the stacked changes record the operator as their only author. With the
     // source gone its authors cannot be preserved, so the claim's whole content is one Author,
@@ -1004,7 +1004,7 @@ fn a_torn_taint_over_an_absent_tag_subject_heals_and_names_the_tag() {
 
     // A soft `undo` leaves the undone content staged. Unstaging keeps the tag subject the only
     // absent root this leg is about.
-    warehouse.run_ok(&["restore", "--staged", "."]);
+    warehouse.run_ok(&["unload", "."]);
 
     let stats = warehouse.scoped(|| gc_utils::collect_garbage(0).expect("gc runs"));
     let present = warehouse.scoped(|| file_utils::does_object_exist(&tagged).unwrap());
@@ -1093,7 +1093,7 @@ fn a_recorded_taint_over_a_collected_tag_subject_clears() {
     let tagged = warehouse.stack("app.txt", "v2\n", "second");
     warehouse.run_ok(&["tag", "create", "v1.0", &tagged, "-m", "release"]);
     warehouse.run_ok(&["undo"]);
-    warehouse.run_ok(&["restore", "--staged", "."]);
+    warehouse.run_ok(&["unload", "."]);
     warehouse.scoped(|| gc_utils::collect_garbage(0).expect("gc runs"));
     assert!(
         !warehouse.scoped(|| file_utils::does_object_exist(&tagged).unwrap()),
@@ -1310,7 +1310,7 @@ fn a_torn_taint_alone_on_an_untouched_warehouse_is_the_control() {
 /// rooted them, and the asymmetry was recorded as accepted. It was not harmless: collection
 /// deleted the staged blob, and a later torn taint then wedged the whole warehouse, because the
 /// rescan folds every referenced-but-absent hash into its remainder and entry-heal blocks
-/// `restore --staged`, the one command that would have dropped the reference.
+/// `unload`, the one command that would have dropped the reference.
 ///
 /// With staged shards rooted, the blob survives collection, so a torn taint over this store heals
 /// like the untouched control and the staged work is still restorable. Names the blob `load`
@@ -1395,7 +1395,7 @@ fn a_full_repack_keeps_staged_content_and_the_next_stack_restores_it() {
     warehouse.run_ok(&["store", "compact"]);
     warehouse.run_ok(&["store", "compact", "--all"]);
 
-    warehouse.run_ok(&["stack", "second"]);
+    warehouse.run_ok(&["stack", "-m", "second"]);
     warehouse.run_ok(&["audit"]);
 
     std::fs::remove_file(warehouse.root.join("wip.txt")).unwrap();
@@ -1483,7 +1483,7 @@ fn chunkable_content() -> Vec<u8> {
 /// Each arm asserts the `staged_content_missing` refusal (exit 25) names the path and the missing
 /// hash and moves nothing; that loading again alone does not clear it (the stat cache proves the
 /// file unchanged and stores nothing, so the fixture really is in the state the named remedy is
-/// for); and that the named remedy, `restore --staged` then `load`, lets the verb through with the
+/// for); and that the named remedy, `unload` then `load`, lets the verb through with the
 /// file restorable afterwards. The blob arm's file starts with `-`, so the remedy as printed (the
 /// path after `--`) is what gets run.
 ///
@@ -1524,7 +1524,7 @@ fn stack_and_park_refuse_a_staged_object_the_store_lost() {
         }
 
         warehouse.delete_object(&missing);
-        let verb: &[&str] = if arm == "park" { &["park"] } else { &["stack", "second"] };
+        let verb: &[&str] = if arm == "park" { &["park"] } else { &["stack", "-m", "second"] };
 
         let refused = warehouse.run(verb);
         let stderr = String::from_utf8_lossy(&refused.stderr).to_string();
@@ -1551,16 +1551,16 @@ fn stack_and_park_refuse_a_staged_object_the_store_lost() {
 
         // The remedy the refusal names, as printed.
         let remedy = if file.starts_with('-') { format!("-- {}", file) } else { file.to_string() };
-        let printed = format!("\"forklift restore --staged {}\", then \"forklift load {}\"", remedy, remedy);
+        let printed = format!("\"forklift unload {}\", then \"forklift load {}\"", remedy, remedy);
         if !stderr.contains(&printed) {
             failures.push(format!("{}: the refusal must name the remedy {}; got: {}", arm, printed, stderr));
         }
-        let unstaged = warehouse.run(&["restore", "--staged", "--", file]);
+        let unstaged = warehouse.run(&["unload", "--", file]);
         let reloaded = warehouse.run(&["load", "--", file]);
         let again = warehouse.run(verb);
         if !unstaged.status.success() || !reloaded.status.success() || !again.status.success() {
             failures.push(format!(
-                "{}: `restore --staged` then `load` must let `{}` through; restore: {} / load: {} / {}",
+                "{}: `unload` then `load` must let `{}` through; unload: {} / load: {} / {}",
                 arm, verb.join(" "), String::from_utf8_lossy(&unstaged.stderr),
                 String::from_utf8_lossy(&reloaded.stderr), String::from_utf8_lossy(&again.stderr)
             ));
@@ -1583,7 +1583,7 @@ fn stack_and_park_refuse_a_staged_object_the_store_lost() {
 
 /// FORK-157 — the check covers staged work only. A file the head already holds, unchanged, is not
 /// this bay's to vouch for: losing its object must not block a stack of something else, since
-/// neither remedy could clear it (`restore --staged` resets to the same lost hash). The control:
+/// neither remedy could clear it (`unload` resets to the same lost hash). The control:
 /// the same loss on the staged file itself does refuse. Red with the head comparison removed from
 /// `require_staged_content_present` (the head file's loss refuses the stack).
 #[test]
@@ -1601,7 +1601,7 @@ fn stack_ignores_a_lost_object_the_head_already_names() {
     let staged = load_and_name_staged(&warehouse, "wip.txt", b"work in progress\n");
     warehouse.delete_object(&app_blob[0]);
 
-    let stacked = warehouse.run(&["stack", "second"]);
+    let stacked = warehouse.run(&["stack", "-m", "second"]);
     assert!(stacked.status.success(), "a lost head-only object blocked the stack: {}", String::from_utf8_lossy(&stacked.stderr));
 
     // Control: the same loss on staged work refuses.
@@ -1611,7 +1611,7 @@ fn stack_ignores_a_lost_object_the_head_already_names() {
     }));
     assert_eq!(more.len(), 1, "staged {:?} then {:?}", staged, more);
     warehouse.delete_object(&more[0]);
-    assert_eq!(warehouse.run(&["stack", "third"]).status.code(), Some(25));
+    assert_eq!(warehouse.run(&["stack", "-m", "third"]).status.code(), Some(25));
 }
 
 /// FORK-157 — damage the remedy cannot repair is not reported as lost staged content. A head tree
@@ -1619,7 +1619,7 @@ fn stack_ignores_a_lost_object_the_head_already_names() {
 /// sits inside it, since an unchanged subtree is pruned by hash and never read); a recipe that is
 /// present but unreadable would be "re-stored" by a load that skips writing a hash already there.
 /// Each fails the stack with an error naming the damaged object, not exit 25, and a next step that
-/// works where one exists: `restore --staged` on the file with the damaged recipe lets the rest
+/// works where one exists: `unload` on the file with the damaged recipe lets the rest
 /// stack (no command repairs a damaged head tree, so that error only names it). Red with the head
 /// tree read made tolerant again (the head arm stacks over the damage without a word), and with an
 /// unreadable recipe reported as missing (the recipe arm refuses with exit 25 and the false remedy).
@@ -1659,7 +1659,7 @@ fn stack_names_an_unreadable_head_tree_or_recipe_as_itself() {
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, b"not an object").unwrap();
 
-        let stacked = warehouse.run(&["stack", "second"]);
+        let stacked = warehouse.run(&["stack", "-m", "second"]);
         let stderr = String::from_utf8_lossy(&stacked.stderr).to_string();
         if stacked.status.success() || stacked.status.code() == Some(25) || !stderr.contains(&damaged) || !stderr.contains(named) {
             failures.push(format!(
@@ -1671,12 +1671,12 @@ fn stack_names_an_unreadable_head_tree_or_recipe_as_itself() {
 
         if arm == "recipe" {
             std::fs::write(warehouse.root.join("other.txt"), b"other\n").unwrap();
-            let unstaged = warehouse.run(&["restore", "--staged", "big.bin"]);
+            let unstaged = warehouse.run(&["unload", "big.bin"]);
             let loaded = warehouse.run(&["load", "other.txt"]);
-            let again = warehouse.run(&["stack", "the rest"]);
+            let again = warehouse.run(&["stack", "-m", "the rest"]);
             if !unstaged.status.success() || !loaded.status.success() || !again.status.success() {
                 failures.push(format!(
-                    "{}: `restore --staged big.bin` must let the rest stack; restore: {} / load: {} / stack: {}",
+                    "{}: `unload big.bin` must let the rest stack; unload: {} / load: {} / stack: {}",
                     arm, String::from_utf8_lossy(&unstaged.stderr), String::from_utf8_lossy(&loaded.stderr),
                     String::from_utf8_lossy(&again.stderr)
                 ));

@@ -209,7 +209,7 @@ fl config set --global operator.identifier "bench@forklift" >/dev/null
 
 gen_initial_files
 fl load . >/dev/null
-fl stack "initial import" >/dev/null
+fl stack -m "initial import" >/dev/null
 
 echo "-> office enroll (passphraseless — a CI/bench identity, not a human one)…"
 fl office enroll >/dev/null
@@ -218,7 +218,7 @@ echo "-> stacking $((N_PARCELS - 1)) further signed parcels…"
 for ((i=1; i<N_PARCELS; i++)); do
     touch_files "$i" "$TOUCH_PER_COMMIT" 0
     fl load . >/dev/null
-    fl stack "parcel $i" >/dev/null
+    fl stack -m "parcel $i" >/dev/null
 done
 
 echo "-> fresh compact (loose -> packed)…"
@@ -229,7 +229,7 @@ echo "-> building the diverging shift-target pallet…"
 fl pallet create bench-shift-b >/dev/null
 touch_files 0 40 5000
 fl load . >/dev/null
-fl stack "diverge for shift bench" >/dev/null
+fl stack -m "diverge for shift bench" >/dev/null
 fl shift main >/dev/null
 
 # Rows are stored field-delimited (US, 0x1f), like bin/benchmark, so the report can
@@ -258,7 +258,7 @@ fl load . >/dev/null
 read -r cold mrest min _ <<< "$(stats $(time_series "$RUNS" "" "forklift diff --staged"))"
 add_row "diff" "$cold" "$mrest" "$min" "$DIRTY_COUNT files dirtied"
 DIFF_MEAN=$mrest
-fl restore --staged . >/dev/null
+fl unload . >/dev/null
 fl restore . >/dev/null
 
 # ── 3. compact --all (steady-state repack; D/P3's ~4.4x, see PARALLELIZATION_PLAN) ──
@@ -277,7 +277,7 @@ SHIFT_MEAN=$mrest
 #    signed; there is no unsigned escape hatch once trust is established) ──
 echo "-> [5/8] signed stack…"
 SETUP='printf "\n// commit bench\n" >> '"$CORPUS/$(file_path 0)"'; forklift load '"$(file_path 0)"
-read -r cold mrest min _ <<< "$(stats $(time_series "$COMMIT_RUNS" "$SETUP" "forklift stack 'bench commit'"))"
+read -r cold mrest min _ <<< "$(stats $(time_series "$COMMIT_RUNS" "$SETUP" "forklift stack -m 'bench commit'"))"
 add_row "signed stack" "$cold" "$mrest" "$min" "load + signed stack, 1 file"
 STACK_MEAN=$mrest
 

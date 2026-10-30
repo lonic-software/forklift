@@ -35,7 +35,7 @@ vocabulary, forklift uses shipping-yard words — the concepts map one-to-one:
 | repository | **warehouse** | the project and all its history (a `.forklift/` folder) |
 | commit | **parcel** | an immutable snapshot: a tree + parents + authorship + description |
 | branch | **pallet** | a movable pointer to a head parcel |
-| the index / staging area | the **inventory** (a.k.a. the **dock**) | what the next parcel will contain |
+| the index / staging area | the **inventory** | what the next parcel will contain |
 | `commit` | **stack** | record the inventory as a new parcel |
 | `checkout <branch>` | **shift** | switch the working directory to a pallet |
 | `checkout -b` | **pallet create** | create a new pallet and shift to it |
@@ -72,11 +72,11 @@ forklift prepare                          # create a warehouse here
 
 echo "hello" > readme.txt
 forklift load .                            # stage everything
-forklift stack "first parcel"             # commit
+forklift stack -m "first parcel"          # commit
 
 forklift pallet create feature             # branch and switch to it
 echo "more" >> readme.txt
-forklift load . && forklift stack "work"
+forklift load . && forklift stack -m "work"
 
 forklift shift main                        # back to main
 forklift consolidate feature               # merge feature in

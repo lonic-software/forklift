@@ -190,7 +190,7 @@ fn skip_on_and_off_agree_after_every_step_of_a_varied_script() {
 
     twin.run_ok(&["load", "."]);
     twin.assert_equivalent();
-    twin.run_ok(&["stack", "base"]);
+    twin.run_ok(&["stack", "-m", "base"]);
     twin.assert_tree_matches("main");
     twin.assert_equivalent();
 
@@ -198,7 +198,7 @@ fn skip_on_and_off_agree_after_every_step_of_a_varied_script() {
     twin.write_file("dir_a/sub/deep/file1.txt", "deep file1 v2\n");
     twin.run_ok(&["load", "dir_a/sub/deep/file1.txt"]);
     twin.assert_equivalent();
-    twin.run_ok(&["stack", "modify deep"]);
+    twin.run_ok(&["stack", "-m", "modify deep"]);
     twin.assert_tree_matches("main");
     twin.assert_equivalent();
 
@@ -206,7 +206,7 @@ fn skip_on_and_off_agree_after_every_step_of_a_varied_script() {
     twin.write_file("dir_a/sub/deep/file3.txt", "deep file3 v1\n");
     twin.run_ok(&["load", "dir_a/sub/deep/file3.txt"]);
     twin.assert_equivalent();
-    twin.run_ok(&["stack", "add deep"]);
+    twin.run_ok(&["stack", "-m", "add deep"]);
     twin.assert_tree_matches("main");
     twin.assert_equivalent();
 
@@ -214,11 +214,11 @@ fn skip_on_and_off_agree_after_every_step_of_a_varied_script() {
     twin.remove_file("dir_c/only.txt");
     twin.run_ok(&["load", "."]);
     twin.assert_equivalent();
-    twin.run_ok(&["stack", "remove dir_c"]);
+    twin.run_ok(&["stack", "-m", "remove dir_c"]);
     twin.assert_tree_matches("main");
     twin.assert_equivalent();
 
-    // Stage a change, unload it (restore --staged) instead of stacking, and confirm the walk
+    // Stage a change, unload it instead of stacking, and confirm the walk
     // agrees at every point along the way.
     twin.write_file("dir_b/file.txt", "dir_b v2 (about to be unloaded)\n");
     twin.run_ok(&["load", "dir_b/file.txt"]);
@@ -233,7 +233,7 @@ fn skip_on_and_off_agree_after_every_step_of_a_varied_script() {
     twin.assert_equivalent();
     twin.run_ok(&["park", "pop"]);
     twin.assert_equivalent();
-    twin.run_ok(&["stack", "modify dir_b"]);
+    twin.run_ok(&["stack", "-m", "modify dir_b"]);
     twin.assert_tree_matches("main");
     twin.assert_equivalent();
 }
@@ -247,7 +247,7 @@ fn a_deep_mutation_after_a_stamped_stack_is_reported_by_stocktake_and_diff() {
     warehouse.write_file("a/b/c/deep.txt", "deep v1\n");
     warehouse.write_file("sibling/other.txt", "sibling v1\n");
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "base"]);
+    warehouse.run_ok(&["stack", "-m", "base"]);
 
     // Everything is stamped and matches head; a stocktake right after a stack must be clean.
     let clean = warehouse.run_ok(&["--json", "stocktake"]);
@@ -294,7 +294,7 @@ fn a_second_stack_preserves_an_untouched_subtrees_rollup_and_a_later_walk_skips_
     warehouse.write_file("subtree_a/file.txt", "a v1\n");
     warehouse.write_file("subtree_b/deep/file.txt", "b v1\n");
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "base"]);
+    warehouse.run_ok(&["stack", "-m", "base"]);
 
     let rollup_before = shard_rollup(&warehouse, "subtree_b/deep");
     assert!(rollup_before.is_some(), "subtree_b/deep must be stamped after the base stack");
@@ -302,7 +302,7 @@ fn a_second_stack_preserves_an_untouched_subtrees_rollup_and_a_later_walk_skips_
     // Touch only subtree_a and stack again.
     warehouse.write_file("subtree_a/file.txt", "a v2\n");
     warehouse.run_ok(&["load", "subtree_a/file.txt"]);
-    warehouse.run_ok(&["stack", "touch a"]);
+    warehouse.run_ok(&["stack", "-m", "touch a"]);
 
     // subtree_b's rollup must be byte-for-byte the same as before — cleanup left it untouched
     // rather than clearing (or redundantly re-stamping) it.
@@ -340,7 +340,7 @@ fn a_narrowed_sparse_bay_still_produces_correct_stocktake_and_stack_with_skips_a
     trunk.write_file("scope/other.txt", "other v1\n");
     trunk.write_file("outside/x.txt", "outside v1\n");
     trunk.run_ok(&["load", "."]);
-    trunk.run_ok(&["stack", "base"]);
+    trunk.run_ok(&["stack", "-m", "base"]);
 
     let full_dir = trunk.home.join("bay-full");
     let scoped_dir = trunk.home.join("bay-scoped");
@@ -366,8 +366,8 @@ fn a_narrowed_sparse_bay_still_produces_correct_stocktake_and_stack_with_skips_a
     let off_value: serde_json::Value = serde_json::from_slice(&off_output.stdout).unwrap();
     assert_eq!(on_value, off_value, "a scoped bay's stocktake must agree whether the skip is active or not");
 
-    trunk.run_ok_at(&scoped_dir, &["stack", "scoped change"]);
-    trunk.run_ok_at(&full_dir, &["stack", "full change"]);
+    trunk.run_ok_at(&scoped_dir, &["stack", "-m", "scoped change"]);
+    trunk.run_ok_at(&full_dir, &["stack", "-m", "full change"]);
 
     // The scoped bay's pallet's tree at "scope/deep" must match the full bay's — a scoped
     // stack with the skip active is still byte-identical to a full stack of the same content.
@@ -399,7 +399,7 @@ fn a_narrowed_sparse_bay_still_produces_correct_stocktake_and_stack_with_skips_a
     // and a later stocktake still agrees between skip on and off.
     std::fs::write(scoped_dir.join("scope/deep/b.txt"), "b v2\n").unwrap();
     trunk.run_ok_at(&scoped_dir, &["load", "scope/deep/b.txt"]);
-    trunk.run_ok_at(&scoped_dir, &["stack", "scoped change 2"]);
+    trunk.run_ok_at(&scoped_dir, &["stack", "-m", "scoped change 2"]);
 
     let mut off_command2 = trunk.command_at(&scoped_dir, &["--json", "stocktake"]);
     off_command2.env("FORKLIFT_DISABLE_ROLLUP_SKIP", "1");
@@ -425,7 +425,7 @@ fn a_no_op_load_dot_preserves_every_rollup_and_a_later_stack_still_skips() {
     warehouse.write_file("a/b/c/file.txt", "deep v1\n");
     warehouse.write_file("sibling/file.txt", "sibling v1\n");
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "base"]);
+    warehouse.run_ok(&["stack", "-m", "base"]);
 
     let root_rollup_before = shard_rollup(&warehouse, "");
     let deep_rollup_before = shard_rollup(&warehouse, "a/b/c");
@@ -450,7 +450,7 @@ fn a_no_op_load_dot_preserves_every_rollup_and_a_later_stack_still_skips() {
     warehouse.write_file("a/b/c/file.txt", "deep v2\n");
     warehouse.run_ok(&["load", "a/b/c/file.txt"]);
 
-    let mut command = warehouse.command(&["stack", "touch deep"]);
+    let mut command = warehouse.command(&["stack", "-m", "touch deep"]);
     command.env("FORKLIFT_DEBUG_ROLLUP_SKIP_COUNT", "1");
     let output = command.output().unwrap();
     assert!(output.status.success());
@@ -469,7 +469,7 @@ fn restore_dot_preserves_every_rollup_and_a_later_stocktake_still_skips() {
     warehouse.write_file("a/b/c/other.txt", "other v1\n");
     warehouse.write_file("sibling/file.txt", "sibling v1\n");
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "base"]);
+    warehouse.run_ok(&["stack", "-m", "base"]);
 
     let keys = ["", "a", "a/b", "a/b/c", "sibling"];
     let before: Vec<Option<String>> = keys.iter().map(|key| shard_rollup(&warehouse, key)).collect();
@@ -510,7 +510,7 @@ fn load_dot_after_a_deep_edit_invalidates_only_the_changed_spine() {
     warehouse.write_file("a/b/c/file.txt", "deep v1\n");
     warehouse.write_file("sibling/file.txt", "sibling v1\n");
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "base"]);
+    warehouse.run_ok(&["stack", "-m", "base"]);
 
     let sibling_rollup_before = shard_rollup(&warehouse, "sibling");
     assert!(sibling_rollup_before.is_some());
@@ -540,12 +540,12 @@ fn skip_count_is_unaffected_by_an_interposed_no_op_load_dot() {
     warehouse.write_file("sibling1/file.txt", "s1 v1\n");
     warehouse.write_file("sibling2/file.txt", "s2 v1\n");
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "base"]);
+    warehouse.run_ok(&["stack", "-m", "base"]);
 
     // A: touch the deep file, narrow-load it, stack — no interposed no-op load.
     warehouse.write_file("a/b/c/file.txt", "deep v2\n");
     warehouse.run_ok(&["load", "a/b/c/file.txt"]);
-    let mut command_a = warehouse.command(&["stack", "touch a"]);
+    let mut command_a = warehouse.command(&["stack", "-m", "touch a"]);
     command_a.env("FORKLIFT_DEBUG_ROLLUP_SKIP_COUNT", "1");
     let output_a = command_a.output().unwrap();
     assert!(output_a.status.success());
@@ -555,7 +555,7 @@ fn skip_count_is_unaffected_by_an_interposed_no_op_load_dot() {
     warehouse.write_file("a/b/c/file.txt", "deep v3\n");
     warehouse.run_ok(&["load", "a/b/c/file.txt"]);
     warehouse.run_ok(&["load", "."]);
-    let mut command_b = warehouse.command(&["stack", "touch b"]);
+    let mut command_b = warehouse.command(&["stack", "-m", "touch b"]);
     command_b.env("FORKLIFT_DEBUG_ROLLUP_SKIP_COUNT", "1");
     let output_b = command_b.output().unwrap();
     assert!(output_b.status.success());
@@ -581,7 +581,7 @@ fn a_shard_that_vanishes_out_from_under_load_still_invalidates_its_ancestors() {
     warehouse.write_file("a/b/c/file.txt", "deep v1\n");
     warehouse.write_file("sibling/file.txt", "sibling v1\n");
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "base"]);
+    warehouse.run_ok(&["stack", "-m", "base"]);
 
     assert!(shard_rollup(&warehouse, "").is_some(), "the root must be stamped after the base stack");
     assert!(shard_rollup(&warehouse, "a").is_some(), "\"a\" must be stamped after the base stack");
@@ -620,7 +620,7 @@ fn a_shard_that_vanishes_out_from_under_load_still_invalidates_its_ancestors() {
 
     // A subsequent stack must not include the deleted subtree — the old (pre-deletion) subtree
     // must never be reused via a stale-but-still-matching rollup.
-    warehouse.run_ok(&["stack", "remove a/b/c"]);
+    warehouse.run_ok(&["stack", "-m", "remove a/b/c"]);
     let tree_hash = warehouse.head_tree_hash("main");
 
     let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
@@ -643,7 +643,7 @@ fn park_gets_the_rollup_based_skip_stack_already_had() {
     warehouse.write_file("subtree_a/file.txt", "a v1\n");
     warehouse.write_file("subtree_b/deep/file.txt", "b v1\n");
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "base"]);
+    warehouse.run_ok(&["stack", "-m", "base"]);
 
     let rollup_before = shard_rollup(&warehouse, "subtree_b/deep");
     assert!(rollup_before.is_some(), "subtree_b/deep must be stamped after the base stack");
@@ -695,7 +695,7 @@ fn park_never_restamps_a_stale_rollup_over_a_same_pass_ancestor_clear() {
     warehouse.write_file("(marketing)/page.tsx", "page v1\n");
     warehouse.write_file("README.md", "readme v1\n");
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "base"]);
+    warehouse.run_ok(&["stack", "-m", "base"]);
 
     let head_before = warehouse.head_tree_hash("main");
     let root_rollup_before = shard_rollup(&warehouse, "");
@@ -741,7 +741,7 @@ fn stack_never_reads_a_shard_beneath_a_rollup_that_matches_the_head() {
         warehouse.write_file("touched/file.txt", "v1\n");
         warehouse.write_file("untouched/deep/file.txt", "deep\n");
         warehouse.run_ok(&["load", "."]);
-        warehouse.run_ok(&["stack", "base"]);
+        warehouse.run_ok(&["stack", "-m", "base"]);
 
         let head_untouched = {
             let output = warehouse.run_ok(&["--json", "store", "peek", &warehouse.head_tree_hash("main")]);
@@ -761,7 +761,7 @@ fn stack_never_reads_a_shard_beneath_a_rollup_that_matches_the_head() {
 
         warehouse.write_file("touched/file.txt", "v2\n");
         warehouse.run_ok(&["load", "touched/file.txt"]);
-        let output = warehouse.run(&["stack", "touch"]);
+        let output = warehouse.run(&["stack", "-m", "touch"]);
 
         if disable_skip {
             assert!(!output.status.success(),
@@ -785,7 +785,7 @@ fn a_directory_removed_without_a_load_survives_the_stacks_that_follow() {
     twin.write_file("kept/file.txt", "kept\n");
     twin.write_file("top.txt", "v1\n");
     twin.run_ok(&["load", "."]);
-    twin.run_ok(&["stack", "base"]);
+    twin.run_ok(&["stack", "-m", "base"]);
 
     for warehouse in [&twin.on, &twin.off] {
         std::fs::remove_dir_all(warehouse.root.join("gone")).unwrap();
@@ -794,7 +794,7 @@ fn a_directory_removed_without_a_load_survives_the_stacks_that_follow() {
     for (round, content) in [("second", "v2\n"), ("third", "v3\n")] {
         twin.write_file("top.txt", content);
         twin.run_ok(&["load", "top.txt"]);
-        twin.run_ok(&["stack", round]);
+        twin.run_ok(&["stack", "-m", round]);
         twin.assert_tree_matches("main");
         twin.assert_equivalent();
 

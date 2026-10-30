@@ -288,7 +288,7 @@ A/B tests against saved binaries on a quiet machine.
 
 The memory rise does not depend on the window: a window of 32 measured the same. Remaining
 work, a stat-clean worktree read and the other commands' serial loads, was FORK-192 (below),
-except `restore`'s and `restore --staged`'s serial loops, which are FORK-246.
+except `restore`'s and `unload`'s serial loops, which are FORK-246.
 
 ## FORK-188: delta chains hash only the object asked for (2026-10-18)
 
@@ -843,7 +843,7 @@ itself as well as the findings.
    FORK-162 — see "Best-effort state" below.)
 
 **Confirmed already-batched (class a).** The `load` join point, `cleanup_after_stack_with`,
-`replace_all`/`subtree_inventories`, and `stack`'s tree+parcel batch. `restore --staged`
+`replace_all`/`subtree_inventories`, and `stack`'s tree+parcel batch. `unload`
 measured flat (30→36 ms, N=1→20), confirming the shipped batching already works.
 
 **No-go list** — batching may share barrier *cost*, it must never drop a

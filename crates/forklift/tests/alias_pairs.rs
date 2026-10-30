@@ -43,7 +43,7 @@ impl Warehouse {
             warehouse.write(path, content);
         }
         warehouse.run_ok(&["load", "."]);
-        warehouse.run_ok(&["stack", "first"]);
+        warehouse.run_ok(&["stack", "-m", "first"]);
 
         warehouse
     }
@@ -252,7 +252,7 @@ fn states() -> Vec<State> {
             reach: |w| {
                 w.rename("README", "readme");
                 w.run_ok(&["load", "."]);
-                w.run_ok(&["restore", "--staged", "README"]);
+                w.run_ok(&["unload", "README"]);
             },
             pair: ("README", "readme"),
             remedy: &[&["remove", "README"]],
@@ -335,7 +335,7 @@ fn stack_and_park_refuse_a_pair_and_its_remedy_clears_it() {
         let (head, parked, stocktake, disk) =
             (warehouse.head(), warehouse.parked(), warehouse.stocktake(), warehouse.disk());
 
-        for command in [&["stack", "pair"][..], &["park"][..]] {
+        for command in [&["stack", "-m", "pair"][..], &["park"][..]] {
             let output = warehouse.run(command);
             assert_pair_refusal(&output, state.pair, state.remedy);
 
@@ -375,7 +375,7 @@ fn a_pair_remedy_stages_only_what_it_says() {
         (state.reach)(&warehouse);
         warehouse.leave_other_work();
 
-        let message = assert_pair_refusal(&warehouse.run(&["stack", "pair"]), state.pair, state.remedy);
+        let message = assert_pair_refusal(&warehouse.run(&["stack", "-m", "pair"]), state.pair, state.remedy);
         for args in state.remedy {
             warehouse.run_ok(args);
         }
@@ -394,7 +394,7 @@ fn a_pair_remedy_stages_only_what_it_says() {
             assert!(not_staged.contains(&"untracked: stray.txt"), "{}: {}", state.name, stocktake);
         }
 
-        warehouse.run_ok(&["stack", "cleared"]);
+        warehouse.run_ok(&["stack", "-m", "cleared"]);
     }
 }
 
@@ -414,7 +414,7 @@ fn a_pair_with_neither_spelling_on_disk_is_refused_and_removed() {
     warehouse.leave_other_work();
 
     let head = warehouse.head();
-    assert_pair_refusal(&warehouse.run(&["stack", "pair"]), ("README", "readme"),
+    assert_pair_refusal(&warehouse.run(&["stack", "-m", "pair"]), ("README", "readme"),
                         &[&["remove", "README"], &["remove", "readme"]]);
     assert_eq!(warehouse.head(), head);
 
@@ -425,7 +425,7 @@ fn a_pair_with_neither_spelling_on_disk_is_refused_and_removed() {
     assert!(section(&stocktake, NOT_STAGED).contains(&"modified:  unstaged.txt"), "{}", stocktake);
     assert!(section(&stocktake, NOT_STAGED).contains(&"untracked: stray.txt"), "{}", stocktake);
 
-    warehouse.run_ok(&["stack", "cleared"]);
+    warehouse.run_ok(&["stack", "-m", "cleared"]);
     let files = warehouse.head_files();
     assert!(!files.contains("README") && !files.contains("readme"), "{:?}", files);
     assert!(files.contains("staged.txt"), "{:?}", files);
@@ -447,12 +447,12 @@ fn a_pair_beneath_a_spelling_that_became_a_file_is_refused_not_unreadable() {
     warehouse.write("docs", "x\n");
 
     let head = warehouse.head();
-    let message = assert_pair_refusal(&warehouse.run(&["stack", "pair"]), ("Docs", "docs"), LOAD_ALL);
+    let message = assert_pair_refusal(&warehouse.run(&["stack", "-m", "pair"]), ("Docs", "docs"), LOAD_ALL);
     assert!(!message.contains("Error while"), "{}", message);
     assert_eq!(warehouse.head(), head);
 
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "cleared"]);
+    warehouse.run_ok(&["stack", "-m", "cleared"]);
 }
 
 /// The listed occupant of a file pair is a directory: removing the unlisted spelling would mark
@@ -472,11 +472,11 @@ fn a_file_pair_whose_listed_occupant_is_a_directory_is_cleared_by_loading_the_tr
     std::fs::remove_file(warehouse.path("Readme")).unwrap();
     std::fs::create_dir(warehouse.path("readme")).unwrap();
 
-    let message = assert_pair_refusal(&warehouse.run(&["stack", "pair"]), ("README", "Readme"), LOAD_ALL);
+    let message = assert_pair_refusal(&warehouse.run(&["stack", "-m", "pair"]), ("README", "Readme"), LOAD_ALL);
     assert!(message.contains(LOAD_ALL_WARNING), "{}", message);
 
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "cleared"]);
+    warehouse.run_ok(&["stack", "-m", "cleared"]);
 }
 
 /// Two names both listed under their own spelling are two entries, even when they are one file:
@@ -493,7 +493,7 @@ fn hard_links_listed_under_both_spellings_are_not_a_pair() {
     std::fs::hard_link(warehouse.path("README"), warehouse.path("readme")).unwrap();
     warehouse.run_ok(&["load", "README"]);
     warehouse.run_ok(&["load", "readme"]);
-    warehouse.run_ok(&["stack", "links"]);
+    warehouse.run_ok(&["stack", "-m", "links"]);
 
     warehouse.write("staged.txt", "edited\n");
     warehouse.run_ok(&["load", "staged.txt"]);

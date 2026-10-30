@@ -12,9 +12,13 @@
 //! - **The hint check** parses every next-step hint that names a `forklift` command, in every
 //!   string literal of the crates' sources, against the real command tree.
 //!
-//! Beside them, the shape lint holds the tree to the surface's rules that a parse can test: no
-//! boolean flag is declared to conflict with a positional argument, because a flag never switches a
-//! command into a different operation.
+//! Beside them, the shape lints hold the tree to the surface's rules that a parse can test:
+//!
+//! - no boolean flag is declared to conflict with a positional argument, because a flag never
+//!   switches a command into a different operation;
+//! - a visible hyphenated name sits only below the top level;
+//! - recorded text is always `-m/--message`, on exactly the commands of the `[recorded-text]` list;
+//! - a visible alias sits only on a command of the `[daily-loop]` list, at most one each.
 //!
 //! `docs/generated/commands.md` is generated from the same tree and checked by `bin/gen-docs
 //! --check`; it follows the binary wherever it goes. These files do not: they change only when
@@ -720,7 +724,7 @@ fn every_quoted_command_says_forklift() {
 /// accepts, and a pair whose first parse fails any other way is reported as untested.
 ///
 /// It is a necessary check, not a complete one: a flag that changes the operation without
-/// declaring a conflict (`restore --staged`) passes it, and is left to the spec review.
+/// declaring a conflict (as `restore --staged` once did) passes it, and is left to the spec review.
 fn boolean_positional_conflicts(cli: &clap::Command) -> Vec<String> {
     fn value(arg: &clap::Arg) -> String {
         arg.get_possible_values().first().map(|value| value.get_name().to_string()).unwrap_or_else(|| "1".to_string())
@@ -853,4 +857,163 @@ fn the_hyphen_check_finds_only_visible_top_level_hyphens() {
         vec!["`scope-prune` (a visible alias of `prune`)"]);
     assert_eq!(probe(Command::new("pick").alias("cherry-pick")), Vec::<String>::new());
     assert_eq!(probe(Command::new("office").subcommand(Command::new("accept-regenesis"))), Vec::<String>::new());
+}
+
+/// The paths a list of the spec names. A destructive entry's mode is not part of its path.
+fn spec_list(spec: &Spec, list: &str) -> BTreeSet<Vec<String>> {
+    spec.lists[list].iter()
+        .map(|(_, words)| words.iter().take_while(|word| !word.starts_with('-')).cloned().collect())
+        .collect()
+}
+
+/// Every command that breaks the recorded-text rule, given the paths of the [recorded-text] list.
+/// A listed command takes its text as `-m/--message`, an option with one value, and has no
+/// positional named for that text (`description` or `message`: the shape `stack` had); a command
+/// off the list has neither `--message` nor `-m`, so recorded text is never taken unlisted. Which
+/// of a command's other positionals hold prose is left to the spec review: the check reads names.
+fn recorded_text_violations(cli: &clap::Command, listed: &BTreeSet<Vec<String>>) -> Vec<String> {
+    let mut failures = Vec::new();
+    for (path, command) in command_paths(cli) {
+        if path.is_empty() {
+            continue;
+        }
+        let name = path.join(" ");
+        let message = command.get_arguments().find(|arg| arg.get_long() == Some("message"));
+        let takes_m = |arg: &&clap::Arg| arg.get_short() == Some('m')
+            || arg.get_all_short_aliases().is_some_and(|aliases| aliases.contains(&'m'));
+        let short_m = command.get_arguments().find(takes_m);
+        let other_m = command.get_arguments().filter(takes_m).find(|arg| arg.get_long() != Some("message"));
+        if !listed.contains(&path) {
+            if let Some(arg) = message.or(short_m) {
+                failures.push(format!("`{name}` is not on the [recorded-text] list but has `{}`", arg.get_id()));
+            }
+            continue;
+        }
+        match message {
+            None => failures.push(format!("`{name}` records text but has no --message")),
+            Some(arg) => {
+                if arg.get_short() != Some('m') {
+                    failures.push(format!("`{name}`: --message is not also -m"));
+                }
+                if !matches!(arg.get_action(), clap::ArgAction::Set) || arg.get_num_args().is_some_and(|range| range.max_values() != 1) {
+                    failures.push(format!("`{name}`: --message does not take exactly one value"));
+                }
+            }
+        }
+        if other_m.is_some() {
+            failures.push(format!("`{name}`: -m is not --message"));
+        }
+        for positional in command.get_positionals().filter(|arg| ["description", "message"].contains(&arg.get_id().as_str())) {
+            failures.push(format!("`{name}` takes its text as the positional <{}> too", positional.get_id()));
+        }
+    }
+    failures
+}
+
+/// Every command on the [recorded-text] list takes `-m/--message`, and no command off it does.
+#[test]
+fn recorded_text_is_always_the_message_option() {
+    let listed = spec_list(&parse_spec(SPEC).unwrap(), "recorded-text");
+    let failures = recorded_text_violations(&built_cli(), &listed);
+    assert!(failures.is_empty(),
+        "recorded text is always -m/--message, on exactly the commands surface/spec.txt lists under \
+         [recorded-text]:\n{}", failures.join("\n"));
+}
+
+/// The recorded-text check finds every way a command can break the rule, and nothing else.
+#[test]
+fn the_recorded_text_check_finds_each_violation() {
+    use clap::{Arg, ArgAction, Command};
+    let message = || Arg::new("message").short('m').long("message");
+    let probe = |sub: Command, listed: bool| {
+        let mut root = Command::new("probe").subcommand(Command::new("haul").subcommand(sub));
+        root.build();
+        let name = root.find_subcommand("haul").unwrap().get_subcommands().next().unwrap().get_name().to_string();
+        let listed = match listed {
+            true => BTreeSet::from([vec!["haul".to_string(), name]]),
+            false => BTreeSet::new(),
+        };
+        recorded_text_violations(&root, &listed)
+    };
+    let broken = [
+        (Command::new("positional").arg(Arg::new("description")), true, "has no --message"),
+        (Command::new("long-only").arg(Arg::new("message").long("message")), true, "is not also -m"),
+        (Command::new("switch").arg(message().action(ArgAction::SetTrue)), true, "exactly one value"),
+        (Command::new("many").arg(message().num_args(1..)), true, "exactly one value"),
+        (Command::new("both").arg(message()).arg(Arg::new("description")), true, "positional <description>"),
+        (Command::new("other-m").arg(Arg::new("message").long("message")).arg(Arg::new("mode").short('m')), true, "-m is not --message"),
+        (Command::new("unlisted").arg(message()), false, "is not on the [recorded-text] list"),
+        (Command::new("unlisted-m").arg(Arg::new("mode").short('m')), false, "has `mode`"),
+        (Command::new("aliased-m").arg(Arg::new("mode").short('o').short_alias('m')), false, "has `mode`"),
+    ];
+    for (sub, listed, expected) in broken {
+        let name = sub.get_name().to_string();
+        let failures = probe(sub, listed);
+        assert!(failures.iter().any(|failure| failure.contains(expected)), "{name}: {failures:?}");
+    }
+    assert_eq!(probe(Command::new("review").arg(Arg::new("id")).arg(message()), true), Vec::<String>::new());
+    assert_eq!(probe(Command::new("show").arg(Arg::new("id")), false), Vec::<String>::new());
+}
+
+/// Every command that breaks the alias rule, given the [daily-loop] list: a visible alias (a name,
+/// a short-flag or a long-flag alias) sits only on a top-level command of the daily loop, and on
+/// it at most once. Hidden aliases are exempt: Rule 6 keeps git's words, which are invisible.
+fn visible_alias_violations(cli: &clap::Command, daily: &BTreeSet<Vec<String>>) -> Vec<String> {
+    let mut failures = Vec::new();
+    for (path, command) in command_paths(cli) {
+        let aliases: Vec<String> = command.get_visible_aliases().map(str::to_string)
+            .chain(command.get_visible_short_flag_aliases().map(|alias| format!("-{alias}")))
+            .chain(command.get_visible_long_flag_aliases().map(|alias| format!("--{alias}")))
+            .collect();
+        if aliases.is_empty() {
+            continue;
+        }
+        let name = path.join(" ");
+        if path.len() > 1 {
+            failures.push(format!("`{name}` is below the top level but has the visible alias {aliases:?}"));
+        } else if !daily.contains(&path) {
+            failures.push(format!("`{name}` is not on the [daily-loop] list but has the visible alias {aliases:?}"));
+        } else if aliases.len() > 1 {
+            failures.push(format!("`{name}` has more than one visible alias: {aliases:?}"));
+        }
+    }
+    failures
+}
+
+/// Visible aliases sit only on the daily loop's commands, at most one each.
+#[test]
+fn only_the_daily_loop_has_visible_aliases() {
+    let daily = spec_list(&parse_spec(SPEC).unwrap(), "daily-loop");
+    let failures = visible_alias_violations(&built_cli(), &daily);
+    assert!(failures.is_empty(),
+        "a visible short alias is something to remember, kept for the commands of the [daily-loop] \
+         list in surface/spec.txt, one each; unique prefixes shorten the rest:\n{}", failures.join("\n"));
+}
+
+/// The alias check finds a visible alias off the daily loop, or a second one on it, and nothing
+/// else.
+#[test]
+fn the_alias_check_finds_each_violation() {
+    use clap::Command;
+    let daily = BTreeSet::from([vec!["stack".to_string()], vec!["group".to_string(), "fetch".to_string()]]);
+    let probe = |sub: Command| {
+        let mut root = Command::new("probe").subcommand(sub);
+        root.build();
+        visible_alias_violations(&root, &daily)
+    };
+    let broken = [
+        (Command::new("query").visible_alias("q"), "is not on the [daily-loop] list"),
+        (Command::new("query").visible_short_flag_alias('q'), "is not on the [daily-loop] list"),
+        (Command::new("query").visible_long_flag_alias("q"), "is not on the [daily-loop] list"),
+        (Command::new("stack").visible_aliases(["s", "st"]), "more than one visible alias"),
+        (Command::new("stack").visible_alias("s").visible_short_flag_alias('s'), "more than one visible alias"),
+        (Command::new("group").subcommand(Command::new("fetch").visible_alias("gf")), "`group fetch` is below the top level"),
+        (Command::new("group").subcommand(Command::new("stack").visible_alias("s")), "`group stack` is below the top level"),
+    ];
+    for (sub, expected) in broken {
+        let failures = probe(sub);
+        assert!(failures.len() == 1 && failures[0].contains(expected), "{expected}: {failures:?}");
+    }
+    assert_eq!(probe(Command::new("stack").visible_alias("s").aliases(["commit", "ci"])), Vec::<String>::new());
+    assert_eq!(probe(Command::new("pick").alias("cherry-pick")), Vec::<String>::new());
 }

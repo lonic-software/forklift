@@ -19,13 +19,13 @@ use crate::output::{self, CommandOutput};
 /// rolling it back would destroy the user's resolutions; the error names the way out.
 ///
 /// # Arguments
-/// * `description` - The (optional) parcel description.
+/// * `message` - The (optional) parcel description, from `-m/--message`.
 ///
 /// # Returns
 /// * `Ok(())`      - If the parcel was stacked successfully.
 /// * `Err(String)` - If there was an error while handling the command.
-pub async fn handle_command(description: Option<String>) -> Result<(), String> {
-    let (parcel, pallet) = match stack_utils::stack_parcel(description, None).await {
+pub async fn handle_command(message: Option<String>) -> Result<(), String> {
+    let (parcel, pallet) = match stack_utils::stack_parcel(message, None).await {
         Ok(stacked) => stacked,
         Err(StackError::HeadWrite { error: RefUpdateError::Moved(moved), .. }) => {
             let pallet = moved.reference.to_wire();
@@ -87,7 +87,7 @@ async fn moved_under_merge(pallet: &str, found: Option<&str>) -> Result<Option<S
     };
 
     let way_out = format!(
-        "To redo it on the new head: abort it ({}); discard its output with \"forklift restore --staged .\" \
+        "To redo it on the new head: abort it ({}); discard its output with \"forklift unload .\" \
         and then \"forklift restore .\";{} catch up with \"forklift shift {}\"; then {}.",
         abort,
         left,
@@ -114,7 +114,7 @@ async fn moved_under_merge(pallet: &str, found: Option<&str>) -> Result<Option<S
     ).into()))
 }
 
-/// The staged paths `base`'s tree does not hold: once `restore --staged .` resets the inventory
+/// The staged paths `base`'s tree does not hold: once `unload .` resets the inventory
 /// to the parcel this bay stands on, these are the files left behind as untracked.
 async fn left_untracked(base: &str) -> Result<Vec<String>, String> {
     let tree = object_utils::load_parcel(base)?.tree_hash;
@@ -194,7 +194,7 @@ mod tests {
             .expect_err("completing a merge over a moved pallet must be refused");
         assert!(error.contains("consolidation is kept") && error.contains("forklift shift main"), "{}", error);
         assert!(error.contains(&our_head) && error.contains(&elsewhere), "{}", error);
-        assert!(error.contains("restore --staged"), "{}", error);
+        assert!(error.contains("unload"), "{}", error);
         assert!(error.contains("\"new.txt\"") && error.contains("\"both.txt\""),
             "the files restore leaves untracked against the base must be listed: {}", error);
 

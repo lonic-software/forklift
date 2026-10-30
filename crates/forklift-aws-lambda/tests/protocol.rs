@@ -265,10 +265,10 @@ fn untrusted_lift_and_the_cas_guards() {
     area.write_file("wh/readme.txt", "hello\n");
     area.write_file("wh/src/main.txt", "fn main\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "first"]);
+    area.forklift("wh", &["stack", "-m", "first"]);
     area.write_file("wh/readme.txt", "hello again\n");
     area.forklift("wh", &["load", "readme.txt"]);
-    area.forklift("wh", &["stack", "second"]);
+    area.forklift("wh", &["stack", "-m", "second"]);
 
     let harvest = harvest(&area.path("wh"));
     let main_head = harvest.head_of("main").expect("main has a head");
@@ -326,10 +326,10 @@ fn a_holds_walk_stops_short_of_the_invocation_deadline() {
     prepare(&area, "wh");
     area.write_file("wh/readme.txt", "hello\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "first"]);
+    area.forklift("wh", &["stack", "-m", "first"]);
     area.write_file("wh/readme.txt", "hello again\n");
     area.forklift("wh", &["load", "readme.txt"]);
-    area.forklift("wh", &["stack", "second"]);
+    area.forklift("wh", &["stack", "-m", "second"]);
 
     let harvest = harvest(&area.path("wh"));
     let main_head = harvest.head_of("main").expect("main has a head");
@@ -363,7 +363,7 @@ fn a_ref_update_with_a_missing_blob_is_refused() {
     area.write_file("wh/a.txt", "alpha\n");
     area.write_file("wh/b.txt", "beta\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "two files"]);
+    area.forklift("wh", &["stack", "-m", "two files"]);
 
     let harvest = harvest(&area.path("wh"));
     let main_head = harvest.head_of("main").expect("main head");
@@ -430,7 +430,7 @@ fn a_ref_update_to_a_meta_shaped_user_history_is_refused() {
     prepare(&area, "wh");
     area.write_file("wh/a.txt", "alpha\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "first"]);
+    area.forklift("wh", &["stack", "-m", "first"]);
     let main_head = harvest(&area.path("wh")).head_of("main").expect("main head");
     let crafted = store_meta_shaped_parcel(&area.path("wh"), &main_head);
 
@@ -469,7 +469,7 @@ fn a_ref_update_with_a_missing_chunk_is_refused() {
     prepare(&area, "wh");
     area.write_large_file("wh/big.bin", 0xD00D, CHUNK_THRESHOLD + 50_000);
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "a giant"]);
+    area.forklift("wh", &["stack", "-m", "a giant"]);
 
     let harvest = harvest(&area.path("wh"));
     let main_head = harvest.head_of("main").expect("main head");
@@ -535,10 +535,10 @@ fn trusted_lift_audits_the_office_and_the_pallet() {
     area.forklift("wh", &["office", "enroll"]);
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "signed one"]);
+    area.forklift("wh", &["stack", "-m", "signed one"]);
     area.write_file("wh/app.txt", "v2\n");
     area.forklift("wh", &["load", "app.txt"]);
-    area.forklift("wh", &["stack", "signed two"]);
+    area.forklift("wh", &["stack", "-m", "signed two"]);
 
     let harvest = harvest(&area.path("wh"));
     let anchor = harvest.trust.clone().expect("trust established");
@@ -584,7 +584,7 @@ fn kv_lifts_under_the_office_and_unknown_meta_names_are_refused() {
     area.forklift("wh", &["office", "enroll"]);
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "signed"]);
+    area.forklift("wh", &["stack", "-m", "signed"]);
     area.forklift("wh", &["manifest", "set", "main", "ci", "green"]);
     let first = harvest(&area.path("wh")).head_of("@kv").expect("kv head");
     area.forklift("wh", &["manifest", "set", "main", "review", "done"]);
@@ -631,11 +631,11 @@ fn a_haul_lifts_only_under_the_office() {
     area.forklift("wh", &["office", "enroll"]);
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "signed"]);
+    area.forklift("wh", &["stack", "-m", "signed"]);
     area.forklift("wh", &["pallet", "create", "feature"]);
     area.write_file("wh/app.txt", "v2\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "feature"]);
+    area.forklift("wh", &["stack", "-m", "feature"]);
     area.forklift("wh", &["haul", "open", "--target", "main", "--title", "Feature"]);
 
     let harvest = harvest(&area.path("wh"));
@@ -669,7 +669,7 @@ fn a_tag_is_admitted_only_from_an_admin_of_the_held_office() {
     area.forklift("wh", &["office", "enroll"]);
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "signed"]);
+    area.forklift("wh", &["stack", "-m", "signed"]);
 
     // A second identity in the same warehouse, admitted as an admin, tags a release.
     let worker = "worker@forklift";
@@ -724,11 +724,11 @@ fn a_haul_merge_is_admitted_only_from_a_writer_of_its_target() {
     area.forklift("wh", &["office", "enroll"]);
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "signed"]);
+    area.forklift("wh", &["stack", "-m", "signed"]);
     area.forklift("wh", &["pallet", "create", "feat"]);
     area.write_file("wh/feat.txt", "x\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "feature"]);
+    area.forklift("wh", &["stack", "-m", "feature"]);
     area.forklift("wh", &["shift", "main"]);
     let opened = area.forklift_stdout("wh", &["--json", "haul", "open", "--target", "main", "--source", "feat", "--title", "Feat"]);
     let id = serde_json::from_str::<serde_json::Value>(&opened).unwrap()["data"]["id"].as_str().unwrap().to_string();
@@ -913,7 +913,7 @@ fn a_user_lift_before_the_office_is_refused() {
     area.forklift("wh", &["office", "enroll"]);
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "signed"]);
+    area.forklift("wh", &["stack", "-m", "signed"]);
 
     let harvest = harvest(&area.path("wh"));
     let anchor = harvest.trust.clone().expect("trust");
@@ -940,7 +940,7 @@ fn an_office_and_an_anchor_never_exist_apart() {
     area.forklift("wh", &["office", "enroll"]);
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "signed"]);
+    area.forklift("wh", &["stack", "-m", "signed"]);
 
     let harvest = harvest(&area.path("wh"));
     let anchor = harvest.trust.clone().expect("trust");
@@ -988,7 +988,7 @@ fn a_conflicting_signature_is_refused() {
     area.forklift("wh", &["office", "enroll"]);
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "signed"]);
+    area.forklift("wh", &["stack", "-m", "signed"]);
 
     let harvest = harvest(&area.path("wh"));
     let (parcel, sidecar) = harvest.signatures.iter().next().expect("a signed parcel");
@@ -1320,12 +1320,12 @@ fn layered_warehouse(area: &Area, dirs: usize, touches: usize) {
     }
 
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "create"]);
+    area.forklift("wh", &["stack", "-m", "create"]);
 
     for touch in 0..touches {
         area.write_file("wh/d0/f.txt", &format!("v{}\n", touch + 1));
         area.forklift("wh", &["load", "."]);
-        area.forklift("wh", &["stack", &format!("touch {}", touch)]);
+        area.forklift("wh", &["stack", "-m", &format!("touch {}", touch)]);
     }
 }
 
@@ -1341,7 +1341,7 @@ fn mirror_reads(touches: usize) -> (usize, usize) {
     // The segment the incremental update actually audits.
     area.write_file("wh/d0/f.txt", "the new segment\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "the new segment"]);
+    area.forklift("wh", &["stack", "-m", "the new segment"]);
 
     let latest = harvest(&area.path("wh"));
     let new_head = latest.head_of("main").expect("main head");
@@ -1415,19 +1415,19 @@ fn a_trusted_merge_lift_below_the_bound_still_audits() {
 
     area.write_file("wh/app.txt", "base\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "base"]);
+    area.forklift("wh", &["stack", "-m", "base"]);
 
     // A branch forking at `base` — below the bound the lift will later carry.
     area.forklift("wh", &["pallet", "create", "feature"]);
     area.write_file("wh/feature.txt", "from the branch\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "on the branch"]);
+    area.forklift("wh", &["stack", "-m", "on the branch"]);
 
     // main moves on, and that head becomes the remote's `old_head`.
     area.forklift("wh", &["shift", "main"]);
     area.write_file("wh/app.txt", "moved on\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "on main"]);
+    area.forklift("wh", &["stack", "-m", "on main"]);
 
     let before = harvest(&area.path("wh"));
     let old_head = before.head_of("main").expect("main head");
@@ -1485,7 +1485,7 @@ fn a_pooled_scratch_amortizes_the_mirror_and_is_keyed_by_warehouse() {
 
     area.write_file("wh/d0/f.txt", "v2\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "the new segment"]);
+    area.forklift("wh", &["stack", "-m", "the new segment"]);
 
     let latest = harvest(&area.path("wh"));
     let new_head = latest.head_of("main").expect("main head");
@@ -1549,7 +1549,7 @@ fn batch_returns_a_bundle_stream() {
     prepare(&area, "wh");
     area.write_file("wh/a.txt", "alpha\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "one"]);
+    area.forklift("wh", &["stack", "-m", "one"]);
 
     let harvest = harvest(&area.path("wh"));
     let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
@@ -1578,7 +1578,7 @@ fn batch_offloads_the_bundle_to_a_presigned_url() {
     prepare(&area, "wh");
     area.write_file("wh/a.txt", "alpha\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "one"]);
+    area.forklift("wh", &["stack", "-m", "one"]);
 
     let harvest = harvest(&area.path("wh"));
     let hashes: Vec<String> = harvest.objects.keys().cloned().collect();
@@ -2104,7 +2104,7 @@ async fn a_trusted_lift_runs_over_async_backed_stores_from_a_blocking_thread() {
     area.forklift("wh", &["office", "enroll"]);
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "signed one"]);
+    area.forklift("wh", &["stack", "-m", "signed one"]);
 
     let harvested = harvest(&area.path("wh"));
     let office_head = harvested.head_of("@office").expect("office head");
@@ -2564,7 +2564,7 @@ fn uploaded_first_push<R: RefStore>(area_name: &str, refs: R) -> (Area, Head<Mem
     prepare(&area, "wh");
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "first"]);
+    area.forklift("wh", &["stack", "-m", "first"]);
 
     let harvested = harvest(&area.path("wh"));
     let main_head = harvested.head_of("main").expect("main head");
@@ -2728,13 +2728,13 @@ fn a_concurrent_office_move_refuses_the_commit_as_office_moved_not_pallet_moved(
     area.forklift("wh", &["office", "enroll"]);
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "signed one"]);
+    area.forklift("wh", &["stack", "-m", "signed one"]);
 
     let main_v1 = harvest(&area.path("wh")).head_of("main").expect("main v1");
 
     area.write_file("wh/app.txt", "v2\n");
     area.forklift("wh", &["load", "app.txt"]);
-    area.forklift("wh", &["stack", "signed two"]);
+    area.forklift("wh", &["stack", "-m", "signed two"]);
 
     let latest = harvest(&area.path("wh"));
     let anchor = latest.trust.clone().expect("trust established");
@@ -2826,7 +2826,7 @@ fn a_grant_revoked_between_the_move_gate_and_the_commit_refuses_the_move() {
 
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "signed one"]);
+    area.forklift("wh", &["stack", "-m", "signed one"]);
 
     let granted = harvest(&area.path("wh"));
     let office_granted = granted.head_of(&format!("@{}", OFFICE_PALLET_NAME)).expect("office head");
@@ -2834,7 +2834,7 @@ fn a_grant_revoked_between_the_move_gate_and_the_commit_refuses_the_move() {
 
     area.write_file("wh/app.txt", "v2\n");
     area.forklift("wh", &["load", "app.txt"]);
-    area.forklift("wh", &["stack", "signed two"]);
+    area.forklift("wh", &["stack", "-m", "signed two"]);
 
     // The revocation: the writer keeps their role and key, but not main.
     area.forklift("wh", &["office", "role", writer, "writer", "--pallet", "side"]);
@@ -2929,13 +2929,13 @@ fn an_untrusted_warehouses_concurrent_office_move_does_not_refuse_the_commit() {
     area.forklift("wh", &["office", "enroll"]);
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "first"]);
+    area.forklift("wh", &["stack", "-m", "first"]);
 
     let main_v1 = harvest(&area.path("wh")).head_of("main").expect("main v1");
 
     area.write_file("wh/app.txt", "v2\n");
     area.forklift("wh", &["load", "app.txt"]);
-    area.forklift("wh", &["stack", "second"]);
+    area.forklift("wh", &["stack", "-m", "second"]);
 
     let latest = harvest(&area.path("wh"));
     let office_head = latest.head_of(&format!("@{}", OFFICE_PALLET_NAME)).expect("office head");
@@ -3005,13 +3005,13 @@ fn a_concurrent_trust_anchor_change_refuses_the_commit_as_anchor_moved_not_palle
     area.forklift("wh", &["office", "enroll"]);
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "signed one"]);
+    area.forklift("wh", &["stack", "-m", "signed one"]);
 
     let main_v1 = harvest(&area.path("wh")).head_of("main").expect("main v1");
 
     area.write_file("wh/app.txt", "v2\n");
     area.forklift("wh", &["load", "app.txt"]);
-    area.forklift("wh", &["stack", "signed two"]);
+    area.forklift("wh", &["stack", "-m", "signed two"]);
 
     let latest = harvest(&area.path("wh"));
     let anchor = latest.trust.clone().expect("trust established");
@@ -3091,13 +3091,13 @@ fn a_concurrently_moved_unrelated_pallet_does_not_refuse_the_commit() {
     area.forklift("wh", &["office", "enroll"]);
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "signed one"]);
+    area.forklift("wh", &["stack", "-m", "signed one"]);
 
     let main_v1 = harvest(&area.path("wh")).head_of("main").expect("main v1");
 
     area.write_file("wh/app.txt", "v2\n");
     area.forklift("wh", &["load", "app.txt"]);
-    area.forklift("wh", &["stack", "signed two"]);
+    area.forklift("wh", &["stack", "-m", "signed two"]);
 
     let latest = harvest(&area.path("wh"));
     let anchor = latest.trust.clone().expect("trust established");
@@ -3814,7 +3814,7 @@ fn a_first_anchor_adopting_history_the_head_does_not_hold_is_refused() {
     area.forklift("wh", &["office", "enroll"]);
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "signed"]);
+    area.forklift("wh", &["stack", "-m", "signed"]);
 
     let harvest = harvest(&area.path("wh"));
     let office_head = harvest.head_of(&format!("@{}", OFFICE_PALLET_NAME)).expect("office head");
@@ -3859,15 +3859,15 @@ fn feature_warehouse(area: &Area) -> (Harvest, String, String, String) {
     prepare(area, "wh");
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "first"]);
+    area.forklift("wh", &["stack", "-m", "first"]);
     area.forklift("wh", &["pallet", "create", "feature"]);
     area.write_file("wh/app.txt", "v2\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "second"]);
+    area.forklift("wh", &["stack", "-m", "second"]);
     let feature_v2 = harvest(&area.path("wh")).head_of("feature").expect("feature v2");
     area.write_file("wh/app.txt", "v3\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "third"]);
+    area.forklift("wh", &["stack", "-m", "third"]);
 
     let harvested = harvest(&area.path("wh"));
     let main_head = harvested.head_of("main").expect("main head");
@@ -4005,11 +4005,11 @@ fn an_open_haul_refuses_the_delete() {
     area.forklift("wh", &["office", "enroll"]);
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "signed"]);
+    area.forklift("wh", &["stack", "-m", "signed"]);
     area.forklift("wh", &["pallet", "create", "feature"]);
     area.write_file("wh/feature.txt", "x\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "feature"]);
+    area.forklift("wh", &["stack", "-m", "feature"]);
     area.forklift("wh", &["shift", "main"]);
     area.forklift("wh", &["haul", "open", "--target", "main", "--source", "feature", "--title", "Feature"]);
 
@@ -4313,11 +4313,11 @@ fn rostered_feature_warehouse(area: &Area) -> (Harvest, String, String, String) 
     enroll(area, "wh", "rea@forklift", &["reader"]);
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "signed"]);
+    area.forklift("wh", &["stack", "-m", "signed"]);
     area.forklift("wh", &["pallet", "create", "feature"]);
     area.write_file("wh/app.txt", "v2\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "feature"]);
+    area.forklift("wh", &["stack", "-m", "feature"]);
     let office_wire = format!("@{}", OFFICE_PALLET_NAME);
     let first_office = harvest(&area.path("wh")).head_of(&office_wire).expect("office head");
 

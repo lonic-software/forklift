@@ -261,7 +261,7 @@ du -sh .forklift                             # densified — the state the table
 
 # 2c. git import leaves an untracked .forkliftignore (the .git rule) and asks you to
 #     record it; do, so that a later `load .` stages only your edits.
-forklift load .forkliftignore && forklift stack "Keep the .git ignore rule"
+forklift load .forkliftignore && forklift stack -m "Keep the .git ignore rule"
 
 # 3. Compare, running each tool in its own copy.
 # status:
@@ -275,7 +275,7 @@ forklift load .forkliftignore && forklift stack "Keep the .git ignore rule"
 # commit (stage a change, then commit/stack; only the commit is timed). Run this
 # before the diff step, while both trees are still clean:
 ( cd ~/bench/A && echo x >> README.md && git add README.md   && time git commit -q -m bench )
-( cd ~/bench/B && echo x >> README.md && forklift load README.md && time forklift stack bench )
+( cd ~/bench/B && echo x >> README.md && forklift load README.md && time forklift stack -m bench )
 
 # diff (dirty the same files in both, then diff unstaged and staged):
 for f in README.md Makefile; do printf '\n// edit\n' >> ~/bench/A/$f; printf '\n// edit\n' >> ~/bench/B/$f; done

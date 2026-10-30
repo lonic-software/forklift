@@ -76,7 +76,7 @@ impl TestWarehouse {
         }
 
         assert_success(&self.run(&["load", "."]));
-        assert_success(&self.run(&["stack", "first parcel"]));
+        assert_success(&self.run(&["stack", "-m", "first parcel"]));
     }
 }
 

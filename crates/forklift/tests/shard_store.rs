@@ -34,7 +34,7 @@ impl Warehouse {
             warehouse.write(path, content);
         }
         warehouse.run_ok(&["load", "."]);
-        warehouse.run_ok(&["stack", "first"]);
+        warehouse.run_ok(&["stack", "-m", "first"]);
 
         warehouse
     }
@@ -154,7 +154,7 @@ fn long_and_deep_directory_keys_load_and_stack() {
         warehouse.write(&file, "deep\n");
 
         warehouse.run_ok(&["load", "."]);
-        warehouse.run_ok(&["stack", "deep"]);
+        warehouse.run_ok(&["stack", "-m", "deep"]);
 
         warehouse.assert_clean();
         assert_eq!(warehouse.read(&file), "deep\n");
@@ -169,7 +169,7 @@ fn a_store_in_another_layout_is_refused_and_left_alone() {
     warehouse.run_ok(&["pallet", "create", "side"]);
     warehouse.write("side.txt", "side\n");
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "side"]);
+    warehouse.run_ok(&["stack", "-m", "side"]);
 
     let inventory = warehouse.root.join(".forklift/inventory");
     std::fs::remove_dir_all(inventory.join("inv_")).unwrap();
@@ -217,7 +217,7 @@ fn a_directory_recreated_after_a_shift_stages_only_what_it_holds() {
     warehouse.run_ok(&["pallet", "create", "side"]);
     warehouse.write("X/f", "f\n");
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "with X"]);
+    warehouse.run_ok(&["stack", "-m", "with X"]);
 
     warehouse.run_ok(&["shift", "main"]);
     assert!(!warehouse.root.join("X").exists(), "the shift removed X");
@@ -262,7 +262,7 @@ fn restore_never_reads_a_shard_of_an_unregistered_directory() {
     let shard = inventory.join(forklift_core::util::file_utils::shard_folder_relative("docs")).join("data");
     let saved = std::fs::read(&shard).unwrap();
 
-    warehouse.run_ok(&["restore", "--staged", "."]);
+    warehouse.run_ok(&["unload", "."]);
     assert!(!shard.exists(), "the reset unregistered docs and removed its shard");
 
     std::fs::create_dir_all(shard.parent().unwrap()).unwrap();
@@ -294,7 +294,7 @@ fn a_linked_shard_folder_is_refused_and_the_named_way_out_works() {
 
     let output = warehouse.run(&["stocktake"]);
     assert!(!output.status.success(), "stocktake read through the link: {}", stdout(&output));
-    assert!(stderr(&output).contains("a link is never followed") && stderr(&output).contains("restore --staged ."),
+    assert!(stderr(&output).contains("a link is never followed") && stderr(&output).contains("unload ."),
             "{}", stderr(&output));
 
     if cfg!(windows) {
@@ -302,7 +302,7 @@ fn a_linked_shard_folder_is_refused_and_the_named_way_out_works() {
     } else {
         std::fs::remove_file(&slot).unwrap();
     }
-    warehouse.run_ok(&["restore", "--staged", "."]);
+    warehouse.run_ok(&["unload", "."]);
 
     warehouse.assert_clean();
     assert!(std::fs::symlink_metadata(&slot).unwrap().is_dir(), "the shard is back in a real folder");

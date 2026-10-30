@@ -81,7 +81,7 @@ impl TestArea {
     fn stack(&self, dir: &str, file: &str, content: &str, description: &str) {
         self.write_file(&format!("{}/{}", dir, file), content);
         self.forklift_ok(dir, &["load", "."]);
-        self.forklift_ok(dir, &["stack", description]);
+        self.forklift_ok(dir, &["stack", "-m", description]);
     }
 
     /// Lift under `--json`, returning lift's `data`.

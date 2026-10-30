@@ -141,7 +141,7 @@ See [`store compact`](cli.md#store-compact--pack-the-object-store).
 
 ## Staging and working directories
 
-**Inventory**, also called the **dock** (git: index, staging area). What the next parcel will
+**Inventory** (git: index, staging area). What the next parcel will
 contain. Unlike git's single index file, it is split into one **shard** per directory.
 
 **Stat cache** (git: the index's stat data). File metadata kept with each inventory entry, so
@@ -181,7 +181,7 @@ parcel. See [`pick`](cli.md#pick--apply-one-parcels-change-onto-the-current-pall
 
 **Deliver** (git: squash merge, but git loses the trail). Squashes a draft pallet onto a target as
 one signed parcel, keeping a link back to the draft. See
-[`deliver`](cli.md#deliver--squash-a-draft-onto-a-target-keeping-the-trail-dv).
+[`deliver`](cli.md#deliver--squash-a-draft-onto-a-target-keeping-the-trail).
 
 **Draft pallet, checkpoint, trail.** A convention for `deliver`: checkpoints are stacked on a draft
 pallet, and after delivery the draft's history (the trail) stays browsable.
@@ -406,7 +406,7 @@ the old history kept as **attested** but no longer verified. See
 [Recovery: re-genesis](trust-and-identity.md#9-recovery-re-genesis).
 
 **Audit** (git: none; loosely `verify-commit`). Checks signed history offline. See
-[`audit`](cli.md#audit--verify-signed-history-offline-a).
+[`audit`](cli.md#audit--verify-signed-history-offline).
 
 **Parcel signature.** An Ed25519 signature over a parcel's hash, stored beside the parcel rather
 than inside it.
@@ -432,7 +432,7 @@ A meta pallet that has not diverged fast-forwards like any other. See
 [`lower`](cli.md#lower--pull-lo).
 
 **Manifest** (`@manifest`) (git: notes, or a host's reviews). Signed statements about a parcel, such
-as approvals and provenance. See [`manifest`](cli.md#manifest--signed-post-metadata-on-parcels-mf).
+as approvals and provenance. See [`manifest`](cli.md#manifest--signed-post-metadata-on-parcels).
 
 **Provenance.** A manifest entry recording which model, tool and session produced a parcel.
 
@@ -459,7 +459,7 @@ stored on `@haul`. See [`haul`](cli.md#haul--pull-requests-reviewable-merge-prop
 
 **Query** (git: `log` filters; jj revsets). Filters history, above all on signed facts such as who
 signed a parcel and what produced it. See
-[`query`](cli.md#query--filter-history-on-signed-identity-q).
+[`query`](cli.md#query--filter-history-on-signed-identity).
 
 **Verified by default.** `query` checks a parcel's signature before matching it on identity.
 

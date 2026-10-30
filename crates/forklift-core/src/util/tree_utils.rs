@@ -364,9 +364,9 @@ const PARALLEL_PROBE_THRESHOLD: usize = 256;
 /// the barrier) and loads the head's trees from the store. A head tree that cannot be read fails
 /// the call with that error: without it, files that only mirror the head would be blamed as lost
 /// staged work under a remedy that cannot clear them. A recipe that is present but unreadable
-/// fails the same way, unclassified: `restore --staged` then `load` cannot repair it, because a
+/// fails the same way, unclassified: `unload` then `load` cannot repair it, because a
 /// store skips writing an object whose hash is already present, so its error names only
-/// `restore --staged` to leave the file out. The check is for presence: see
+/// `unload` to leave the file out. The check is for presence: see
 /// [`probe_staged_object`] for what a present but damaged object gets.
 ///
 /// # Arguments
@@ -423,11 +423,11 @@ pub fn require_staged_content_present(root: &TreeItem, head_tree_hash: Option<&s
             ),
             match remedy_path(first_path) {
                 Some(quoted) => format!(
-                    "Run \"forklift restore --staged {}\", then \"forklift load {}\" to stage it again \
+                    "Run \"forklift unload {}\", then \"forklift load {}\" to stage it again \
                     from its working copy.",
                     quoted, quoted
                 ),
-                None => "Run \"forklift restore --staged -- <path>\", then \"forklift load -- <path>\", \
+                None => "Run \"forklift unload -- <path>\", then \"forklift load -- <path>\", \
                     with that path quoted for your shell, to stage it again from its working copy.".to_string(),
             },
         )
@@ -444,7 +444,7 @@ pub fn require_staged_content_present(root: &TreeItem, head_tree_hash: Option<&s
                 since one naming them could not be restored.",
                 lost.len(), named.join("; "), and_more
             ),
-            "Run \"forklift restore --staged -- <path>\", then \"forklift load -- <path>\", for each, \
+            "Run \"forklift unload -- <path>\", then \"forklift load -- <path>\", for each, \
             to stage it again from its working copy.".to_string(),
         )
     };
@@ -525,7 +525,7 @@ fn probe_staged_object(path: &str, hash: &str, chunked: bool) -> Result<StagedOb
     object_utils::recipe_chunk_hashes(hash).map(StagedObject::Chunked).map_err(|e| format!(
         "\"{}\" is staged, but its recipe {} is in the store and cannot be read: {}. No parcel was made. \
         Loading the file again will not replace it while the damaged object stays in place; run \
-        \"forklift restore --staged {}\"{} to leave it out and stack the rest.",
+        \"forklift unload {}\"{} to leave it out and stack the rest.",
         path, hash, e.trim_end_matches('.'),
         remedy.as_deref().unwrap_or("-- <path>"),
         if remedy.is_some() { "" } else { " with that path quoted for your shell" }
@@ -562,7 +562,7 @@ pub(crate) fn remedy_path_when(path: &str, windows: bool) -> Option<String> {
 /// root tree of a *scoped* (sparse) stack (design §3.2).
 ///
 /// A scoped bay materializes only its in-scope subtree(s); a plain
-/// [`build_tree_from_inventory_deferred`] over that dock would emit a root that has *only* the
+/// [`build_tree_from_inventory_deferred`] over that inventory would emit a root that has *only* the
 /// in-scope path, with every out-of-scope sibling silently gone. This overlay instead walks the
 /// head's spine, copies each out-of-scope sibling's hash **verbatim** (present, by definition of
 /// spine, in the spine tree objects it already holds — no blob load, no descent) and splices in
@@ -617,18 +617,17 @@ pub fn build_scoped_root_tree(head_root_hash: Option<&str>,
     }
 }
 
-/// Splice one spine directory level: emit a new tree whose entries are the head's
-/// out-of-scope siblings copied verbatim and the continuing in-scope / spine children rebuilt
-/// from the dock. Returns `None` when the level ends up empty (pruned from its parent), exactly
-/// as the tree build's own bottom-up build prunes an empty child (see
-/// [`build_tree_for_inventory_key`]).
+/// Splice one spine directory level: emit a new tree whose entries are the head's out-of-scope
+/// siblings copied verbatim and the continuing in-scope / spine children rebuilt from the built
+/// tree. Returns `None` when the level ends up empty (pruned from its parent), exactly as the tree
+/// build's own bottom-up build prunes an empty child (see [`build_tree_for_inventory_key`]).
 ///
 /// The `head` tree is one level deep (its subtree children carry hashes; descending requires a
-/// load), while the `dock` tree is the fully in-memory partial root — so out-of-scope siblings
+/// load), while the `built` tree is the fully in-memory partial root — so out-of-scope siblings
 /// are copied by hash off `head` with no load, and in-scope subtrees are taken straight off
-/// `dock`.
+/// `built`.
 fn splice_spine_level(head: Option<&TreeItem>,
-                      dock: Option<&TreeItem>,
+                      built: Option<&TreeItem>,
                       key: &str,
                       scope: &PathScope,
                       overrides: &BTreeMap<String, Option<(String, DirEntryType)>>,
@@ -642,10 +641,10 @@ fn splice_spine_level(head: Option<&TreeItem>,
     let head_subtrees: BTreeMap<&String, &TreeItem> = head
         .map(|tree| tree.get_subtrees().collect())
         .unwrap_or_default();
-    let dock_files: BTreeMap<&String, &TreeItem> = dock
+    let built_files: BTreeMap<&String, &TreeItem> = built
         .map(|tree| tree.get_files().collect())
         .unwrap_or_default();
-    let dock_subtrees: BTreeMap<&String, &TreeItem> = dock
+    let built_subtrees: BTreeMap<&String, &TreeItem> = built
         .map(|tree| tree.get_subtrees().collect())
         .unwrap_or_default();
 
@@ -660,9 +659,9 @@ fn splice_spine_level(head: Option<&TreeItem>,
 
     // A spine level's own files are out of scope, and copied verbatim — or resolved by the merge
     // skeleton where it changed them — except the root ignore file, which every scope holds in
-    // scope and which the dock pass below takes. A file where the scope expects a directory (a
-    // spine ancestor, or an in-scope prefix itself) flipped from a directory at this revision:
-    // a spine-path type change.
+    // scope and which the pass over the built tree below takes. A file where the scope expects a
+    // directory (a spine ancestor, or an in-scope prefix itself) flipped from a directory at this
+    // revision: a spine-path type change.
     for (name, item) in &head_files {
         let child_key = join_key(key, name);
 
@@ -671,17 +670,18 @@ fn splice_spine_level(head: Option<&TreeItem>,
         }
     }
 
-    // The dock's files at this level: an in-scope one is taken as the dock has it, the same way
-    // an in-scope subtree is below, so a head file the dock no longer holds is deleted. A file
-    // where the scope expects a directory is the type change again, from the working-tree side:
-    // without the refusal it would land in no branch below and be silently dropped from the
-    // signed tree, so a scoped stack would diverge from a full stack of the same content.
-    for (name, item) in &dock_files {
+    // The built tree's files at this level: an in-scope one is taken as the built tree has it, the
+    // same way an in-scope subtree is below, so a head file the built tree no longer holds is
+    // deleted. A file where the scope expects a directory is the type change again, from the
+    // working-tree side: without the refusal it would land in no branch below and be silently
+    // dropped from the signed tree, so a scoped stack would diverge from a full stack of the same
+    // content.
+    for (name, item) in &built_files {
         let child_key = join_key(key, name);
 
-        // An out-of-scope dock file is not producible by the current materialize/load model (the
-        // working tree only ever holds in-scope content) — refused defensively rather than
-        // silently spliced into a signed tree unsealed.
+        // An out-of-scope file of the built tree is not producible by the current materialize/load
+        // model (the working tree only ever holds in-scope content) — refused defensively rather
+        // than silently spliced into a signed tree unsealed.
         if scope.spine_file_is_sealed(&child_key)? {
             // Frontier: reframe the typed refusal for this still-String walker (bridge shim).
             return Err(scope_utils::out_of_scope_refusal(&child_key).into());
@@ -690,8 +690,8 @@ fn splice_spine_level(head: Option<&TreeItem>,
         tree.add_child(shallow_entry(item));
     }
 
-    // Head subtrees: out-of-scope ones are copied verbatim (or resolved by the merge skeleton);
-    // the in-scope subtree is taken fresh from the dock (pruned when empty or deleted); a deeper
+    // Head subtrees: out-of-scope ones are copied verbatim (or resolved by the merge skeleton); the
+    // in-scope subtree is taken fresh from the built tree (pruned when empty or deleted); a deeper
     // spine recurses.
     for (name, item) in &head_subtrees {
         let child_key = join_key(key, name);
@@ -700,18 +700,18 @@ fn splice_spine_level(head: Option<&TreeItem>,
             ScopeClass::OutOfScope =>
                 splice_out_of_scope_entry(&mut tree, name, item, overrides.get(&child_key)),
             ScopeClass::InScope => {
-                if let Some(dock_subtree) = dock_subtrees.get(name) {
-                    if !is_tree_empty(dock_subtree) {
-                        tree.add_child(shallow_entry(dock_subtree));
+                if let Some(built_subtree) = built_subtrees.get(name) {
+                    if !is_tree_empty(built_subtree) {
+                        tree.add_child(shallow_entry(built_subtree));
                     }
                 }
             }
             ScopeClass::Spine => {
                 let head_subtree = object_utils::load_tree(&item.hash)?;
-                let dock_subtree = dock_subtrees.get(name).copied();
+                let built_subtree = built_subtrees.get(name).copied();
 
                 if let Some(spliced) =
-                    splice_spine_level(Some(&head_subtree), dock_subtree, &child_key, scope, overrides, batch)?
+                    splice_spine_level(Some(&head_subtree), built_subtree, &child_key, scope, overrides, batch)?
                 {
                     tree.add_child(spliced);
                 }
@@ -719,11 +719,11 @@ fn splice_spine_level(head: Option<&TreeItem>,
         }
     }
 
-    // In-scope / spine subtrees the dock has but the head does not — a newly added in-scope
+    // In-scope / spine subtrees the built tree has but the head does not — a newly added in-scope
     // directory (or the spine leading to one). A head *file* of the same name was either refused
-    // above as a type change or, being in scope, left out for the dock to supply, so nothing
+    // above as a type change or, being in scope, left out for the built tree to supply, so nothing
     // here can collide with one.
-    for (name, dock_subtree) in &dock_subtrees {
+    for (name, built_subtree) in &built_subtrees {
         if head_subtrees.contains_key(*name) {
             continue;
         }
@@ -732,18 +732,18 @@ fn splice_spine_level(head: Option<&TreeItem>,
 
         match scope.classify(&child_key) {
             ScopeClass::InScope => {
-                if !is_tree_empty(dock_subtree) {
-                    tree.add_child(shallow_entry(dock_subtree));
+                if !is_tree_empty(built_subtree) {
+                    tree.add_child(shallow_entry(built_subtree));
                 }
             }
             ScopeClass::Spine => {
                 if let Some(spliced) =
-                    splice_spine_level(None, Some(dock_subtree), &child_key, scope, overrides, batch)?
+                    splice_spine_level(None, Some(built_subtree), &child_key, scope, overrides, batch)?
                 {
                     tree.add_child(spliced);
                 }
             }
-            // The dock never holds an out-of-scope subtree; ignore defensively.
+            // The built tree never holds an out-of-scope subtree; ignore defensively.
             ScopeClass::OutOfScope => {}
         }
     }
@@ -813,7 +813,7 @@ fn is_tree_empty(tree: &TreeItem) -> bool {
 /// The rollup a directory's inventory shard, just rebuilt wholesale from `tree`, may carry: `tree`'s
 /// hash, or `None` when the rebuild may not be trusted to name it. The only way a tree-to-shard
 /// builder gets a [`RollupStamp`], so none can stamp without this check. Shared by
-/// `restore --staged`'s and `shift`'s tree-to-shard builders (`build_unstaged_shards`,
+/// `unload`'s and `shift`'s tree-to-shard builders (`build_unstaged_shards`,
 /// `shift_utils::build_inventories_for_tree`), which each independently rebuild every shard of a
 /// subtree straight from a resolved tree and must decide the same way whether the shard they just
 /// wrote is a trustworthy rollup — kept as one function so the (subtle) rule can never drift
