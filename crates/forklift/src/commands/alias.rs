@@ -15,11 +15,11 @@ pub const DEFAULT_NAME: &str = "fl";
 /// doubles as an escape hatch when the binary's own directory is not writable.
 const ENV_ALIAS_DIR: &str = "FORKLIFT_ALIAS_DIR";
 
-/// Handle the "alias" command: manage the `fl` short alias next to this binary.
+/// Handle the "self alias" command: manage the `fl` short alias next to this binary.
 ///
-/// * `alias` / `alias status`      - Report whether the alias exists and where it points.
-/// * `alias install [name]`       - Create the alias (default name: "fl").
-/// * `alias uninstall [name]`     - Remove the alias.
+/// * `self alias` / `self alias status`  - Report whether the alias exists and where it points.
+/// * `self alias install [name]`        - Create the alias (default name: "fl").
+/// * `self alias uninstall [name]`      - Remove the alias.
 ///
 /// # Arguments
 /// * `action` - The alias subcommand (`None` reports status).
@@ -141,7 +141,7 @@ fn status() -> Result<(), String> {
 }
 
 /// Whether `name` currently exists next to this binary (any recognized alias, not
-/// necessarily pointing here) — used by `self-update` to decide whether to restore it after
+/// necessarily pointing here) — used by `self update` to decide whether to restore it after
 /// an in-place update. Best-effort: any resolution failure reads as "not installed".
 pub(crate) fn exists(name: &str) -> bool {
     match (alias_dir(), this_binary()) {
@@ -154,10 +154,10 @@ pub(crate) fn exists(name: &str) -> bool {
 }
 
 /// Silently (re)create `name` next to this binary if it is currently missing. Used by
-/// `self-update`: if the alias existed before an in-place update, make sure it still does
+/// `self update`: if the alias existed before an in-place update, make sure it still does
 /// afterwards. Never overwrites a foreign file or an alias pointing elsewhere — same
 /// conservative rule as `install` — and never fails the update it's called from; a failure
-/// here is swallowed, since self-update already reported its own result.
+/// here is swallowed, since self update already reported its own result.
 pub(crate) fn reinstall_silently(name: &str) {
     if let (Ok(dir), Ok(target)) = (alias_dir(), this_binary()) {
         let alias_path = platform_alias_path(&dir, name);
@@ -266,7 +266,7 @@ fn remove_alias(alias_path: &Path) -> io::Result<()> {
 // ── Windows: symlinks need elevated privilege, so drop a `.cmd` shim instead ──────────────
 
 #[cfg(windows)]
-const SHIM_MARKER: &str = "rem forklift-alias: managed by \"forklift alias\" \u{2014} do not edit by hand";
+const SHIM_MARKER: &str = "rem forklift-alias: managed by \"forklift self alias\" \u{2014} do not edit by hand";
 
 #[cfg(windows)]
 fn platform_alias_path(dir: &Path, name: &str) -> PathBuf {
@@ -433,7 +433,7 @@ impl CommandOutput for StatusReport {
         match &self.target {
             Some(target) => println!("\"{}\" -> \"{}\"", self.path, target),
             None => println!(
-                "No \"{}\" alias installed at \"{}\". Run \"forklift alias install\" to create it.",
+                "No \"{}\" alias installed at \"{}\". Run \"forklift self alias install\" to create it.",
                 self.name, self.path
             ),
         }

@@ -3,7 +3,7 @@ use clap::error::ErrorKind;
 use clap::{CommandFactory, FromArgMatches};
 use forklift_core::util::{lock_utils, warehouse_utils};
 use forklift_core::util::fanout_utils::block_on_worker_stack;
-use crate::cli::{Cli, Command, GitAction, OfficeAction, PalletAction, ParkAction, ProfileAction, RemoteAction, StoreAction};
+use crate::cli::{Cli, Command, GitAction, OfficeAction, PalletAction, ParkAction, ProfileAction, RemoteAction, SelfAction, StoreAction};
 use crate::output::{ErrorCode, ForkliftError, OutputMode};
 
 pub mod cache_fetch;
@@ -469,7 +469,6 @@ fn announce_store_access_wait() {
 /// the command's shared store-access hold, when it takes one ([`Command::holds_store_access`]).
 async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) -> Result<(), String> {
     match cli.command {
-        Command::Alias { action } => commands::alias::handle_command(action),
         Command::Audit { pallet, full } => commands::audit::handle_command(pallet, full),
         Command::Blame { path, rev } => commands::blame::handle_command(&path, rev).await,
         Command::Config { action } => commands::config::handle_command(action),
@@ -587,8 +586,11 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
         Command::Undo { as_name } => commands::undo::handle_command(as_name.as_deref()).await,
         Command::Unload { path } => commands::unload::handle_command(&path),
         Command::Version => commands::version::handle_command(),
-        Command::SelfSchema => commands::self_schema::handle_command(),
-        Command::SelfUpdate { check } => commands::self_update::handle_command(check).await,
+        Command::SelfCommand { action } => match action {
+            SelfAction::Alias { action } => commands::alias::handle_command(action),
+            SelfAction::Schema => commands::self_schema::handle_command(),
+            SelfAction::Update { check } => commands::self_update::handle_command(check).await,
+        },
         #[cfg(feature = "docgen")]
         Command::Docgen { target } => {
             use crate::cli::DocgenTarget;

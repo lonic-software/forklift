@@ -394,7 +394,6 @@ fn command_schemas(name: &str) -> Option<Vec<OutputSchema>> {
     use crate::commands;
 
     Some(match name {
-        "alias" => commands::alias::__docgen_schemas(),
         "audit" => commands::audit::__docgen_schemas(),
         "bay" => commands::bay::__docgen_schemas(),
         "blame" => commands::blame::__docgen_schemas(),
@@ -432,8 +431,11 @@ fn command_schemas(name: &str) -> Option<Vec<OutputSchema>> {
         "scope" => commands::scope::__docgen_schemas(),
         "scope-prune" => commands::scope_prune::__docgen_schemas(),
         "remote" => commands::remote::__docgen_schemas(),
-        "self-schema" => commands::self_schema::__docgen_schemas(),
-        "self-update" => commands::self_update::__docgen_schemas(),
+        "self" => [
+            commands::self_update::__docgen_schemas(),
+            commands::alias::__docgen_schemas(),
+            commands::self_schema::__docgen_schemas(),
+        ].into_iter().flatten().collect(),
         "shift" => commands::shift::__docgen_schemas(),
         "show" => commands::show::__docgen_schemas(),
         "stack" => commands::stack::__docgen_schemas(),

@@ -306,7 +306,7 @@ revocation by more than about a day.
 
 ## Updating
 
-There is **no `self-update` for the server**, by design — a network service that rewrites its
+There is **no `self update` for the server**, by design — a network service that rewrites its
 own binary is an anti-pattern and an attack surface. A server is a deployed artifact, so you
 **redeploy** it: fetch the new release and restart. The install script installs to a fixed
 location and defaults to the latest release, so re-running it *is* the update — just stop the

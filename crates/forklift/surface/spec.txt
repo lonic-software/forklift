@@ -7,8 +7,8 @@
 # The coverage map beside this file (coverage.txt) records what every earlier command became.
 
 [commands]
-# One top-level name per line. A family is written `name: subcommand subcommand …`.
-alias: install uninstall status
+# One top-level name per line. A family is written `name: subcommand subcommand …`, and a family
+# inside a family as its full path on a line after its parent's: `self alias: install …`.
 audit
 bay: add remove
 blame
@@ -42,8 +42,8 @@ remove
 restore
 scope: status
 scope-prune
-self-schema
-self-update
+self: alias schema update
+self alias: install uninstall status
 shift
 show
 stack

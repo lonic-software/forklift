@@ -291,7 +291,7 @@ inside that folder. Nothing under `.forklift/` can be loaded at all.
 Anchor a folder rule at both ends. `^target\/?.*$` also matches `targets.txt` and
 `target-notes/`, so an unanchored rule can hide new files you meant to load.
 
-### `alias` — the `fl` short name
+### `self alias` — the `fl` short name
 
 Forklift ships a short `fl` alias (`f` and `l` are both left-hand home row —
 quicker to type than `git`). It is a **shell-agnostic symlink** next to the
@@ -299,15 +299,15 @@ quicker to type than `git`). It is a **shell-agnostic symlink** next to the
 privilege), not a per-shell alias — it works from scripts, non-interactive
 shells and every shell dialect alike, and one `ls`/`rm` finds or removes it.
 
-Every installer (the curl script, `pult install`, and self-update — see
-[`self-update`](#self-update--check-for-and-apply-a-newer-release)) creates it
+Every installer (the curl script, `pult install`, and `self update` — see
+[`self update`](#self-update--check-for-and-apply-a-newer-release)) creates it
 by default, calling the same command under the hood:
 
 ```sh
-forklift alias install            # create "fl" next to this binary
-forklift alias install fl2        # create a differently-named alias instead
-forklift alias uninstall          # remove it
-forklift alias                    # (or "forklift alias status") report whether it's installed, and where
+forklift self alias install       # create "fl" next to this binary
+forklift self alias install fl2   # create a differently-named alias instead
+forklift self alias uninstall     # remove it
+forklift self alias               # (or "forklift self alias status") report whether it's installed, and where
 ```
 
 `install` is idempotent (an alias that already points at this binary succeeds
@@ -2070,11 +2070,11 @@ forklift stack "x" --json
 forklift mcp --root /path/to/warehouse    # run the MCP server against a warehouse
 ```
 
-### `self-update` — check for and apply a newer release
+### `self update` — check for and apply a newer release
 
 ```sh
-forklift self-update            # update in place if you installed via the script
-forklift self-update --check    # only report; change nothing
+forklift self update            # update in place if you installed via the script
+forklift self update --check    # only report; change nothing
 ```
 
 Compares this binary against the latest published release. If you installed via the
@@ -2084,15 +2084,15 @@ right upgrade command instead (`cargo install … --force`, `brew upgrade forkli
 can't fight your package manager. `--check` (and `--json`) just reports `{current, latest,
 update_available, install_method, update_command}`. There is **no server self-update** by
 design: a server is redeployed (new container / Lambda version / package), never
-self-mutated. If the [`fl` alias](#alias--the-fl-short-name) was already installed, self-update
-keeps it working — the binary is replaced at the same path, and self-update also restores the
+self-mutated. If the [`fl` alias](#self-alias--the-fl-short-name) was already installed, `self update`
+keeps it working — the binary is replaced at the same path, and `self update` also restores the
 alias if it ever goes missing.
 
-### `self-schema` — describe the command surface for Pult
+### `self schema` — describe the command surface for Pult
 
 ```sh
-forklift self-schema           # the document, pretty-printed
-forklift self-schema --json    # the same document as the envelope's data
+forklift self schema           # the document, pretty-printed
+forklift self schema --json    # the same document as the envelope's data
 ```
 
 Prints Forklift's command surface in [Pult](https://github.com/lonic-software/pult)'s
@@ -2111,7 +2111,7 @@ prefixes the path of the binary it found; the document is not a runnable `pult.y
 own.
 
 The global `--json`, `--verbose`, `--no-pager` and `--color` are not params: they are the caller's
-choice of rendering. `help`, `mcp` and `self-schema` itself are left out. The bearer token
+choice of rendering. `help`, `mcp` and `self schema` itself are left out. The bearer token
 of `clone --token` and a `config` value are marked secret. An argument shape the
 document cannot express exactly is refused with an error naming the command and argument,
 never dropped: you get the whole surface or none of it.

@@ -161,6 +161,9 @@ mod tests {
         expands_to("pi", "pick");
         expands_to("ma k", "manifest keys");
         expands_to("haul cons", "haul consolidate");
+        // Two levels of families: `self alias install`.
+        expands_to("se up --check", "self update --check");
+        expands_to("sel al i fl2", "self alias install fl2");
     }
 
     /// An exact name or alias wins over the longer names it starts, hidden aliases included.

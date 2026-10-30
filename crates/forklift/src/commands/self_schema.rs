@@ -1,4 +1,4 @@
-//! `forklift self-schema`: this binary's command surface, described in Pult's manifest
+//! `forklift self schema`: this binary's command surface, described in Pult's manifest
 //! vocabulary, so `pult tool` can offer Forklift's commands as Pult commands.
 //!
 //! The document is generated from the clap definitions of the running binary, so it cannot
@@ -50,7 +50,8 @@ const CREDENTIAL_WORDS: &[&str] = &[
 /// What the emitter needs to know that clap cannot hold. Every entry is checked against the
 /// tree it describes: one that names nothing is an error, never dead weight.
 pub(crate) struct Tables {
-    /// Top-level commands that are not emitted, each with its reason.
+    /// Commands that are not emitted, by full command path (`self schema`), each with its
+    /// reason. Everything below an excluded family is left out with it.
     excluded: &'static [(&'static str, &'static str)],
 
     /// Value-taking arguments whose value is a credential, as (command path, clap id).
@@ -66,7 +67,7 @@ const FORKLIFT: Tables = Tables {
     excluded: &[
         ("help", "clap meta: it repeats the descriptions this document already carries"),
         ("mcp", "a long-running stdio JSON-RPC server, not a one-shot invocation"),
-        ("self-schema", "the describer itself"),
+        ("self schema", "the describer itself"),
     ],
     secret: &[
         ("clone", "token"),     // the bearer token, remembered as remote.token
@@ -88,7 +89,7 @@ const FORKLIFT: Tables = Tables {
     ],
 };
 
-/// Handle the self-schema command: describe the command surface and emit the document.
+/// Handle the self schema command: describe the command surface and emit the document.
 ///
 /// # Returns
 /// * `Ok(())`      - The document was emitted.
@@ -252,10 +253,10 @@ fn describe(root: &Command, tables: &Tables) -> Result<SelfSchema, String> {
     let description = about(root, &[])?;
     command_settings(&[], root)?;
 
-    for (name, _) in tables.excluded {
-        if !root.get_subcommands().any(|command| command.get_name() == *name) {
+    for (path, _) in tables.excluded {
+        if path.split(' ').try_fold(root, |command, name| command.find_subcommand(name)).is_none() {
             return Err(format!(
-                "self-schema: the exclusion list names `{name}`, which is not a command"
+                "self schema: the exclusion list names `{path}`, which is not a command"
             ));
         }
     }
@@ -268,16 +269,13 @@ fn describe(root: &Command, tables: &Tables) -> Result<SelfSchema, String> {
     };
 
     for command in root.get_subcommands().filter(|command| !command.is_hide_set()) {
-        if tables.excluded.iter().any(|(name, _)| *name == command.get_name()) {
-            continue;
-        }
         walk.command(command, vec![command.get_name()])?;
     }
 
     for (index, (path, id)) in tables.secret.iter().enumerate() {
         if !walk.secret_used[index] {
             return Err(format!(
-                "self-schema: the secret list names `{id}` of `{path}`, which is not a \
+                "self schema: the secret list names `{id}` of `{path}`, which is not a \
                  value-taking argument of a described command"
             ));
         }
@@ -285,7 +283,7 @@ fn describe(root: &Command, tables: &Tables) -> Result<SelfSchema, String> {
     for (index, (path, id, _)) in tables.not_secret.iter().enumerate() {
         if !walk.not_secret_used[index] {
             return Err(format!(
-                "self-schema: the not-secret list names `{id}` of `{path}`, which is not a \
+                "self schema: the not-secret list names `{id}` of `{path}`, which is not a \
                  value-taking argument of a described command"
             ));
         }
@@ -323,6 +321,9 @@ impl Walk<'_> {
     /// Describe `command` at `path`: a group contributes its bare form when it runs without a
     /// subcommand, then each visible subcommand; a leaf contributes itself.
     fn command(&mut self, command: &Command, path: Vec<&str>) -> Result<(), String> {
+        if self.tables.excluded.iter().any(|(excluded, _)| *excluded == path.join(" ")) {
+            return Ok(());
+        }
         command_settings(&path, command)?;
         if command.has_subcommands() {
             // A group's own arguments would have no place in its children's commands.
@@ -401,10 +402,10 @@ impl Walk<'_> {
         let id = path.join("-");
         let shown = path.join(" ");
         if RESERVED_IDS.contains(&id.as_str()) {
-            return Err(format!("self-schema: `forklift {shown}` would have the id `{id}`, which Pult reserves"));
+            return Err(format!("self schema: `forklift {shown}` would have the id `{id}`, which Pult reserves"));
         }
         if self.commands.iter().any(|command| command.id == id) {
-            return Err(format!("self-schema: `forklift {shown}` would have the id `{id}`, which another command already has"));
+            return Err(format!("self schema: `forklift {shown}` would have the id `{id}`, which another command already has"));
         }
 
         let mut keys = std::collections::HashSet::new();
@@ -412,14 +413,14 @@ impl Walk<'_> {
             let valid = !key.is_empty()
                 && key.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
             if !valid {
-                return Err(format!("self-schema: `forklift {shown}` has a param `{key}` whose name Pult does not accept"));
+                return Err(format!("self schema: `forklift {shown}` has a param `{key}` whose name Pult does not accept"));
             }
             if RESERVED_PARAMS.contains(&key.as_str()) {
-                return Err(format!("self-schema: `forklift {shown}` has a param `{key}`, a name Pult reserves"));
+                return Err(format!("self schema: `forklift {shown}` has a param `{key}`, a name Pult reserves"));
             }
             if !keys.insert(key.as_str()) {
                 return Err(format!(
-                    "self-schema: `forklift {shown}` has two params named `{key}` (a positional and \
+                    "self schema: `forklift {shown}` has two params named `{key}` (a positional and \
                      an option sharing a name); Pult would keep only one"
                 ));
             }
@@ -434,7 +435,7 @@ impl Walk<'_> {
         for (what, text) in [("title", Some(&title)), ("description", long_about.as_ref())] {
             if text.is_some_and(|text| text.contains("${")) {
                 return Err(format!(
-                    "self-schema: `forklift {shown}` has a {what} containing `${{`, which Pult would \
+                    "self schema: `forklift {shown}` has a {what} containing `${{`, which Pult would \
                      read as a variable"
                 ));
             }
@@ -515,7 +516,7 @@ fn command_settings(path: &[&str], command: &Command) -> Result<(), String> {
     } else {
         return Ok(());
     };
-    Err(format!("self-schema cannot describe `forklift {}`: {why}", path.join(" ")))
+    Err(format!("self schema cannot describe `forklift {}`: {why}", path.join(" ")))
 }
 
 /// A command's one-line description, which Pult requires as its title.
@@ -523,7 +524,7 @@ fn about(command: &Command, path: &[&str]) -> Result<String, String> {
     command.get_about()
         .map(|text| text.to_string())
         .filter(|text| !text.trim().is_empty())
-        .ok_or_else(|| format!("self-schema: `forklift {}` has no one-line description", path.join(" ")))
+        .ok_or_else(|| format!("self schema: `forklift {}` has no one-line description", path.join(" ")))
 }
 
 /// The refusal for an argument outside the whitelist.
@@ -534,7 +535,7 @@ fn refusal(path: &[&str], arg: &Arg, why: &str) -> String {
 /// [`refusal`], for an argument known by its clap id.
 fn refusal_of(path: &[&str], id: &str, why: &str) -> String {
     let shown = if path.is_empty() { String::new() } else { format!(" {}", path.join(" ")) };
-    format!("self-schema cannot describe argument `{id}` of `forklift{shown}`: {why}")
+    format!("self schema cannot describe argument `{id}` of `forklift{shown}`: {why}")
 }
 
 /// Refuse the argument settings no Pult param can carry, then classify a positional.
@@ -630,7 +631,7 @@ fn layout(path: &[&str], positionals: Vec<Positional>) -> Result<Vec<(String, Pa
 
     for (index, positional) in positionals.iter().enumerate() {
         if positional.variadic && index + 1 != positionals.len() {
-            return Err(format!("self-schema: `forklift {shown}` has a variadic positional `{}` before another", positional.key));
+            return Err(format!("self schema: `forklift {shown}` has a variadic positional `{}` before another", positional.key));
         }
     }
 
@@ -641,7 +642,7 @@ fn layout(path: &[&str], positionals: Vec<Positional>) -> Result<Vec<(String, Pa
         }
         if let Some(earlier) = optional.first() {
             return Err(format!(
-                "self-schema: `forklift {shown}` has an optional positional `{}` before the \
+                "self schema: `forklift {shown}` has an optional positional `{}` before the \
                  required `{}`",
                 earlier.key, positional.key
             ));
@@ -715,14 +716,21 @@ mod tests {
         describe(&Cli::command(), &FORKLIFT).unwrap_or_else(|error| panic!("{error}"))
     }
 
-    /// The runnable command paths of `command`, counted by a walk of its own: a leaf, or a
-    /// group that runs without a subcommand, plus every visible subcommand below a group.
-    fn runnable(command: &Command) -> usize {
+    /// The runnable command paths of `command` at `path`, counted by a walk of its own: a leaf,
+    /// or a group that runs without a subcommand, plus every visible subcommand below a group;
+    /// nothing at or below a path in `left_out`.
+    fn runnable(command: &Command, path: &str, left_out: &[&str]) -> usize {
+        if left_out.contains(&path) {
+            return 0;
+        }
         if !command.has_subcommands() {
             return 1;
         }
         let bare = usize::from(!command.is_subcommand_required_set());
-        bare + command.get_subcommands().filter(|sub| !sub.is_hide_set()).map(runnable).sum::<usize>()
+        bare + command.get_subcommands()
+            .filter(|sub| !sub.is_hide_set())
+            .map(|sub| runnable(sub, &format!("{path} {}", sub.get_name()), left_out))
+            .sum::<usize>()
     }
 
     // (a) The whole tree is described, and the document passes Pult's id and key rules.
@@ -732,10 +740,11 @@ mod tests {
         let root = Cli::command();
         let doc = forklift();
 
+        // Written out rather than read from the table, so a wrong table entry shows up here.
+        let left_out = ["help", "mcp", "self schema"];
         let expected: usize = root.get_subcommands()
             .filter(|command| !command.is_hide_set())
-            .filter(|command| !FORKLIFT.excluded.iter().any(|(name, _)| *name == command.get_name()))
-            .map(runnable)
+            .map(|command| runnable(command, command.get_name(), &left_out))
             .sum();
         assert_eq!(doc.commands.len(), expected);
 
@@ -757,10 +766,11 @@ mod tests {
             }
         }
 
-        for anchor in ["office", "office-admit", "config", "diff"] {
+        // A family member is left out by its path alone: its siblings are still described.
+        for anchor in ["office", "office-admit", "config", "diff", "self-update", "self-alias", "self-alias-install"] {
             assert!(ids.contains(anchor), "missing {anchor}");
         }
-        for excluded in ["help", "mcp", "self-schema"] {
+        for excluded in ["help", "mcp", "self-schema", "self"] {
             assert!(!ids.contains(excluded), "{excluded} must not be described");
         }
         assert_eq!(doc.version, 1);
@@ -1410,6 +1420,32 @@ mod tests {
             not_secret: &[("creds", "api_token", "both")],
         };
         assert!(describe(&probe("creds"), &BOTH).err().unwrap().contains("both"));
+    }
+
+    // An exclusion names a full command path: it leaves out that command alone, never a
+    // sibling, nor another command of the same name elsewhere in the tree.
+
+    #[test]
+    fn an_exclusion_is_a_command_path() {
+        let root = Command::new("probe").about("Probe")
+            .subcommand(Command::new("fam").about("Fam").subcommand_required(true)
+                .subcommand(Command::new("keep").about("Keep"))
+                .subcommand(Command::new("drop").about("Drop")))
+            .subcommand(Command::new("drop").about("Drop at the top"));
+        let ids = |tables: &Tables| -> Vec<String> {
+            describe(&root, tables).unwrap().commands.into_iter().map(|command| command.id).collect()
+        };
+
+        assert_eq!(ids(&NO_TABLES), ["fam-keep", "fam-drop", "drop"]);
+        const NESTED: Tables = Tables { excluded: &[("fam drop", "")], secret: &[], not_secret: &[] };
+        assert_eq!(ids(&NESTED), ["fam-keep", "drop"]);
+        const TOP: Tables = Tables { excluded: &[("drop", "")], secret: &[], not_secret: &[] };
+        assert_eq!(ids(&TOP), ["fam-keep", "fam-drop"]);
+        const FAMILY: Tables = Tables { excluded: &[("fam", "")], secret: &[], not_secret: &[] };
+        assert_eq!(ids(&FAMILY), ["drop"]);
+
+        const STALE: Tables = Tables { excluded: &[("fam gone", "")], secret: &[], not_secret: &[] };
+        assert!(describe(&root, &STALE).err().unwrap().contains("`fam gone`"));
     }
 
     // (e) A table entry that names nothing is an error.

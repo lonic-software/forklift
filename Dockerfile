@@ -8,7 +8,7 @@
 #
 # Serves every prepared warehouse under /data (multi-warehouse mode). Create warehouses via
 # the admin API and set a token — see docs/SERVER.md. There is deliberately no server
-# self-update: to upgrade, pull a new image and restart (docs/SERVER.md § Updating).
+# self update: to upgrade, pull a new image and restart (docs/SERVER.md § Updating).
 #
 # The default CMD below carries no token and refuses to start on its own (see docs/SERVER.md,
 # "Authentication"): forklift-server requires an explicit token/tokens/authentication-hook

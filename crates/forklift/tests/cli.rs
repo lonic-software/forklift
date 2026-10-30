@@ -5553,7 +5553,7 @@ fn self_update_check_reports_without_mutating() {
     // release" so the check never touches the network.
     let run = |latest: &str| -> Output {
         forklift_command()
-            .args(["--json", "self-update", "--check"])
+            .args(["--json", "self", "update", "--check"])
             .env("FORKLIFT_SELFUPDATE_LATEST", latest)
             .output()
             .expect("forklift binary runs")
@@ -5571,7 +5571,7 @@ fn self_update_check_reports_without_mutating() {
     assert_eq!(json(&none)["data"]["update_available"], false);
 }
 
-/// `self-schema --json` keeps the document's key order, unlike other envelopes' `data`: Pult
+/// `self schema --json` keeps the document's key order, unlike other envelopes' `data`: Pult
 /// binds positional params in the order they are listed, so a sorted `clone` would take
 /// the directory for the url. Human mode prints the same document, so the keys of both, in
 /// order, must agree past the envelope's header.
@@ -5584,8 +5584,8 @@ fn self_schema_json_keeps_the_document_order() {
             .collect()
     };
 
-    let enveloped = forklift_command().args(["--json", "self-schema"]).output().expect("forklift binary runs");
-    let human = forklift_command().args(["self-schema"]).output().expect("forklift binary runs");
+    let enveloped = forklift_command().args(["--json", "self", "schema"]).output().expect("forklift binary runs");
+    let human = forklift_command().args(["self", "schema"]).output().expect("forklift binary runs");
     assert_success(&enveloped);
     assert_success(&human);
 
@@ -5651,7 +5651,7 @@ impl Drop for AliasScratch {
 fn alias_install_creates_a_symlink_next_to_the_binary_and_is_idempotent() {
     let scratch = AliasScratch::new("install");
 
-    let created = scratch.run(&["--json", "alias", "install"]);
+    let created = scratch.run(&["--json", "self", "alias", "install"]);
     assert_success(&created);
     assert_eq!(json(&created)["data"]["already_installed"], false);
     assert_eq!(json(&created)["data"]["name"], "fl");
@@ -5664,7 +5664,7 @@ fn alias_install_creates_a_symlink_next_to_the_binary_and_is_idempotent() {
     }
 
     // Installing again is a no-op success: an alias that already points here is left alone.
-    let again = scratch.run(&["--json", "alias", "install"]);
+    let again = scratch.run(&["--json", "self", "alias", "install"]);
     assert_success(&again);
     assert_eq!(json(&again)["data"]["already_installed"], true);
 }
@@ -5673,10 +5673,10 @@ fn alias_install_creates_a_symlink_next_to_the_binary_and_is_idempotent() {
 fn alias_uninstall_removes_it_and_is_a_noop_when_absent() {
     let scratch = AliasScratch::new("uninstall");
 
-    assert_success(&scratch.run(&["alias", "install"]));
+    assert_success(&scratch.run(&["self", "alias", "install"]));
     assert!(std::fs::symlink_metadata(scratch.alias_path("fl")).is_ok());
 
-    let removed = scratch.run(&["--json", "alias", "uninstall"]);
+    let removed = scratch.run(&["--json", "self", "alias", "uninstall"]);
     assert_success(&removed);
     assert_eq!(json(&removed)["data"]["removed"], true);
     assert!(
@@ -5685,7 +5685,7 @@ fn alias_uninstall_removes_it_and_is_a_noop_when_absent() {
     );
 
     // Uninstalling again when nothing is there succeeds without doing anything.
-    let again = scratch.run(&["--json", "alias", "uninstall"]);
+    let again = scratch.run(&["--json", "self", "alias", "uninstall"]);
     assert_success(&again);
     assert_eq!(json(&again)["data"]["removed"], false);
 }
@@ -5695,7 +5695,7 @@ fn alias_install_refuses_a_foreign_file() {
     let scratch = AliasScratch::new("foreign-install");
     std::fs::write(scratch.alias_path("fl"), "not a forklift alias\n").unwrap();
 
-    let result = scratch.run(&["--json", "alias", "install"]);
+    let result = scratch.run(&["--json", "self", "alias", "install"]);
     assert!(!result.status.success());
     assert_eq!(json(&result)["error"]["code"], "error");
     assert!(stdout(&result).contains("Refusing"));
@@ -5712,7 +5712,7 @@ fn alias_uninstall_refuses_a_foreign_file() {
     let scratch = AliasScratch::new("foreign-uninstall");
     std::fs::write(scratch.alias_path("fl"), "not a forklift alias\n").unwrap();
 
-    let result = scratch.run(&["--json", "alias", "uninstall"]);
+    let result = scratch.run(&["--json", "self", "alias", "uninstall"]);
     assert!(!result.status.success());
     assert!(stdout(&result).contains("Refusing"));
     assert!(scratch.alias_path("fl").exists(), "the foreign file must not be removed");
@@ -5726,13 +5726,13 @@ fn alias_install_refuses_when_the_name_points_elsewhere_but_uninstall_may_remove
     std::fs::write(&other, "x").unwrap();
     std::os::unix::fs::symlink(&other, scratch.alias_path("fl")).unwrap();
 
-    let install = scratch.run(&["--json", "alias", "install"]);
+    let install = scratch.run(&["--json", "self", "alias", "install"]);
     assert!(!install.status.success());
     assert!(stdout(&install).contains("Refusing"));
 
     // A symlink pointing elsewhere is still recognized as an alias, so uninstall may remove
     // it — deleting a symlink can never lose data, unlike a real file.
-    let uninstall = scratch.run(&["--json", "alias", "uninstall"]);
+    let uninstall = scratch.run(&["--json", "self", "alias", "uninstall"]);
     assert_success(&uninstall);
     assert_eq!(json(&uninstall)["data"]["removed"], true);
 }
@@ -5741,13 +5741,13 @@ fn alias_install_refuses_when_the_name_points_elsewhere_but_uninstall_may_remove
 fn alias_status_reports_installed_state() {
     let scratch = AliasScratch::new("status");
 
-    let before = scratch.run(&["--json", "alias", "status"]);
+    let before = scratch.run(&["--json", "self", "alias", "status"]);
     assert_success(&before);
     assert_eq!(json(&before)["data"]["installed"], false);
 
-    assert_success(&scratch.run(&["alias", "install"]));
+    assert_success(&scratch.run(&["self", "alias", "install"]));
 
-    let after = scratch.run(&["--json", "alias", "status"]);
+    let after = scratch.run(&["--json", "self", "alias", "status"]);
     assert_success(&after);
     assert_eq!(json(&after)["data"]["installed"], true);
 }
@@ -5755,7 +5755,7 @@ fn alias_status_reports_installed_state() {
 #[test]
 fn the_fl_alias_behaves_identically_to_forklift() {
     let scratch = AliasScratch::new("behaves-identically");
-    assert_success(&scratch.run(&["alias", "install"]));
+    assert_success(&scratch.run(&["self", "alias", "install"]));
 
     // Direct execution of a `.cmd` file via `CreateProcess` is unreliable — Windows needs
     // the command interpreter to run a batch shim. Unix executes the symlink directly.

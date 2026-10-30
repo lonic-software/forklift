@@ -64,21 +64,6 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
 
-    /// Manage the `fl` short alias for this binary
-    #[command(
-        long_about = "Manage the `fl` short alias: a shell-agnostic symlink \
-                      (a shim on Windows) placed next to this binary, not a per-shell alias — it \
-                      works in scripts, non-interactive shells and every shell dialect alike, and \
-                      is trivially discoverable and removable. This is the one implementation \
-                      every install method (the curl script, pult, `cargo install`) calls, so the \
-                      alias never drifts between install paths. Without a subcommand, reports \
-                      whether the alias is installed and where."
-    )]
-    Alias {
-        #[command(subcommand)]
-        action: Option<AliasAction>,
-    },
-
     /// Verify the warehouse's signed history offline
     #[command(
         visible_alias = "a",
@@ -728,29 +713,19 @@ pub enum Command {
         path: String,
     },
 
-    /// Describe this binary's command surface as a Pult manifest
+    /// Manage this binary itself: its update, its short alias and its self-description
     #[command(
-        long_about = "Print Forklift's command surface in Pult's manifest vocabulary, generated \
-                      from this binary's own argument definitions: one command per runnable \
-                      command path, each with its params and the argument tail to run. Under \
-                      --json the document is the envelope's data. It is input for `pult tool`, \
-                      which prefixes the binary's path; it is not a runnable pult.yaml on its \
-                      own, because its runs omit the program name."
+        name = "self",
+        subcommand_required = true,
+        arg_required_else_help = true,
+        long_about = "Manage this forklift binary itself rather than a warehouse. \"forklift self \
+                      update\" checks for a newer release and installs it, \"forklift self alias\" \
+                      manages the `fl` short name next to the binary, and \"forklift self schema\" \
+                      describes the command surface for Pult."
     )]
-    SelfSchema,
-
-    /// Check for a newer release and update this binary (client only)
-    #[command(
-        long_about = "Check the latest published release against this binary and, for a \
-                      script/manual install, update in place by re-running the verified install \
-                      script. A package-manager install (cargo/brew) is never overwritten — \
-                      self-update shows the right upgrade command instead. There is deliberately \
-                      no server self-update: a server is redeployed, not self-mutated."
-    )]
-    SelfUpdate {
-        /// Only report whether an update is available and how to get it; change nothing
-        #[arg(long)]
-        check: bool,
+    SelfCommand {
+        #[command(subcommand)]
+        action: SelfAction,
     },
 
     /// Shift to another pallet
@@ -998,6 +973,49 @@ pub enum DocgenTarget {
     /// Every MCP tool with its command and arguments, and the commands no agent drives
     /// (`docs/generated/mcp-tools.md`).
     McpTools,
+}
+
+#[derive(Subcommand)]
+pub enum SelfAction {
+    /// Manage the `fl` short alias for this binary
+    #[command(
+        long_about = "Manage the `fl` short alias: a shell-agnostic symlink \
+                      (a shim on Windows) placed next to this binary, not a per-shell alias — it \
+                      works in scripts, non-interactive shells and every shell dialect alike, and \
+                      is trivially discoverable and removable. This is the one implementation \
+                      every install method (the curl script, pult, `cargo install`) calls, so the \
+                      alias never drifts between install paths. Without a subcommand, reports \
+                      whether the alias is installed and where."
+    )]
+    Alias {
+        #[command(subcommand)]
+        action: Option<AliasAction>,
+    },
+
+    /// Describe this binary's command surface as a Pult manifest
+    #[command(
+        long_about = "Print Forklift's command surface in Pult's manifest vocabulary, generated \
+                      from this binary's own argument definitions: one command per runnable \
+                      command path, each with its params and the argument tail to run. Under \
+                      --json the document is the envelope's data. It is input for `pult tool`, \
+                      which prefixes the binary's path; it is not a runnable pult.yaml on its \
+                      own, because its runs omit the program name."
+    )]
+    Schema,
+
+    /// Check for a newer release and update this binary (client only)
+    #[command(
+        long_about = "Check the latest published release against this binary and, for a \
+                      script/manual install, update in place by re-running the verified install \
+                      script. A package-manager install (cargo/brew) is never overwritten — \
+                      self update shows the right upgrade command instead. There is deliberately \
+                      no server self update: a server is redeployed, not self-mutated."
+    )]
+    Update {
+        /// Only report whether an update is available and how to get it; change nothing
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Subcommand)]

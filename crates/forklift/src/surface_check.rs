@@ -77,7 +77,8 @@ struct Spec {
 const SPEC_LISTS: [&str; 3] = ["daily-loop", "destructive", "recorded-text"];
 
 /// Parse `surface/spec.txt`: a `[commands]` section, one top-level name per line, a family
-/// written as `name: sub sub …`; then the [`SPEC_LISTS`] sections, one command path per line.
+/// written as `name: sub sub …` and a family inside a family as its full path after its parent's
+/// line (`self alias: install …`); then the [`SPEC_LISTS`] sections, one command path per line.
 fn parse_spec(text: &str) -> Result<Spec, String> {
     let mut spec = Spec { commands: Vec::new(), lists: BTreeMap::new() };
     let mut section: Option<String> = None;
@@ -102,12 +103,22 @@ fn parse_spec(text: &str) -> Result<Spec, String> {
                     Some((name, subs)) => (name.trim(), Some(subs)),
                     None => (line, None),
                 };
-                if name.contains(char::is_whitespace) {
-                    return Err(format!("spec.txt:{number}: `{name}` is not one command name"));
+                let path: Vec<String> = name.split_whitespace().map(str::to_string).collect();
+                if path.len() > 1 {
+                    // A nested family: its parent's line has already listed the family itself.
+                    if subs.is_none() || !spec.commands.contains(&path) {
+                        return Err(format!(
+                            "spec.txt:{number}: `{name}` is a path, which is written only as a family \
+                             (`{name}: sub …`) after the line that lists it"
+                        ));
+                    }
+                } else {
+                    spec.commands.push(path.clone());
                 }
-                spec.commands.push(vec![name.to_string()]);
                 for sub in subs.into_iter().flat_map(str::split_whitespace) {
-                    spec.commands.push(vec![name.to_string(), sub.to_string()]);
+                    let mut sub_path = path.clone();
+                    sub_path.push(sub.to_string());
+                    spec.commands.push(sub_path);
                 }
             }
             Some(list) => {
@@ -117,6 +128,23 @@ fn parse_spec(text: &str) -> Result<Spec, String> {
         }
     }
     Ok(spec)
+}
+
+/// A family inside a family is listed by its parent's line and gives its own members on a line
+/// of its own; written anywhere else, the path is refused rather than read as something else.
+#[test]
+fn a_nested_family_is_written_after_its_parent() {
+    let paths = |text: &str| parse_spec(text).map(|spec| {
+        spec.commands.into_iter().map(|path| path.join(" ")).collect::<Vec<_>>()
+    });
+    assert_eq!(
+        paths("[commands]\nfam: one inner\nfam inner: deep\n").unwrap(),
+        ["fam", "fam one", "fam inner", "fam inner deep"]
+    );
+    for refused in ["[commands]\nfam inner: deep\nfam: one inner\n", "[commands]\nfam: one inner\nfam inner\n"] {
+        let error = paths(refused).err().unwrap_or_else(|| panic!("accepted {refused:?}"));
+        assert!(error.contains("`fam inner` is a path"), "{error}");
+    }
 }
 
 /// The spec and the binary name the same commands, and every list entry names one of them.

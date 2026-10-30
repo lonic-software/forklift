@@ -744,7 +744,6 @@ fn progress_notification(token: &Value, progress: f64, message: Option<String>) 
 /// non-empty directory, and `remove` deletes only the bay's own `.forklift` entry and its
 /// bay-state folder, never the materialized working tree.
 pub(crate) const HUMAN_ONLY: &[(&str, &str)] = &[
-    ("alias", "manages the `fl` shell alias next to this binary, a host concern"),
     ("prepare", "creates a warehouse, which is setup"),
     ("config", "reads and sets configuration, which is setup"),
     ("profile", "manages identity profiles, which is setup"),
@@ -759,8 +758,7 @@ pub(crate) const HUMAN_ONLY: &[(&str, &str)] = &[
     ("office retire", "revokes a key: trust administration"),
     ("office regenesis", "resets trust, a recovery step"),
     ("office accept-regenesis", "accepts a remote's trust reset, a recovery step"),
-    ("self-update", "updates the binary, a host concern"),
-    ("self-schema", "describes the CLI for Pult; agents get the tool list instead"),
+    ("self", "manages this binary itself: its updates and its `fl` alias are host concerns, and the description it gives Pult is the tool list agents already have"),
     ("scope-prune", "destructive, warehouse-wide disk reclamation: an admin verb, never a sub-agent's"),
     ("store evict", "warehouse-wide disk reclamation in a cache: an admin verb, like scope-prune"),
     ("remote", "shows the remote configuration, like config, and repoints a partial warehouse at another server: setup"),
@@ -1639,7 +1637,7 @@ mod tests {
             assert!(names.contains(&name), "{name} must be a tool");
         }
         for name in ["office", "tag", "haul", "scope", "pallet", "office_enroll", "office_regenesis", "prepare",
-                     "self_schema", "mcp", "help", "clone"] {
+                     "self_schema", "self_update", "self_alias", "self_alias_install", "mcp", "help", "clone"] {
             assert!(!names.contains(&name), "{name} must not be a tool");
         }
         assert_eq!(tool("tag_create").path, ["tag", "create"]);
@@ -1693,7 +1691,7 @@ mod tests {
         let refused = |tree: clap::Command| super::generate_tools(&tree).err().unwrap();
         let cli = crate::cli::Cli::command;
 
-        assert!(refused(cli().mut_subcommand("alias", |alias| alias.hide(true))).contains("HUMAN_ONLY names"));
+        assert!(refused(cli().mut_subcommand("self", |family| family.hide(true))).contains("HUMAN_ONLY names"));
         assert!(refused(cli().mut_subcommand("haul", |haul| haul.subcommand_required(true))).contains("BARE_SAME_AS names"));
         assert!(refused(cli().mut_subcommand("tag", |tag| tag.arg(clap::Arg::new("x").long("x"))))
             .contains("`forklift tag` has subcommands and its own argument"));

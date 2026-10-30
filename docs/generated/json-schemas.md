@@ -12,101 +12,6 @@ Every command's `--json` result is `{ "lonic_json", "tool", "schema", "command",
 
 A command not listed here either reports only the generic human-message shape `{ "message": string }`, or produces no `--json` data at all — see the command's entry in `docs/guide/cli.md`.
 
-## `alias`
-
-### `Installed`
-
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "The result of creating (or confirming) the alias.",
-  "properties": {
-    "already_installed": {
-      "description": "Whether the alias already existed and pointed here (idempotent no-op) vs. was just\ncreated by this run.",
-      "type": "boolean"
-    },
-    "name": {
-      "type": "string"
-    },
-    "path": {
-      "type": "string"
-    },
-    "target": {
-      "type": "string"
-    }
-  },
-  "required": [
-    "name",
-    "path",
-    "target",
-    "already_installed"
-  ],
-  "title": "Installed",
-  "type": "object"
-}
-```
-
-### `Uninstalled`
-
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "The result of removing (or confirming the absence of) the alias.",
-  "properties": {
-    "name": {
-      "type": "string"
-    },
-    "path": {
-      "type": "string"
-    },
-    "removed": {
-      "description": "Whether anything was actually removed (`false` if it was already absent).",
-      "type": "boolean"
-    }
-  },
-  "required": [
-    "name",
-    "path",
-    "removed"
-  ],
-  "title": "Uninstalled",
-  "type": "object"
-}
-```
-
-### `StatusReport`
-
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "Whether the alias exists, and where it points.",
-  "properties": {
-    "installed": {
-      "type": "boolean"
-    },
-    "name": {
-      "type": "string"
-    },
-    "path": {
-      "type": "string"
-    },
-    "target": {
-      "type": [
-        "string",
-        "null"
-      ]
-    }
-  },
-  "required": [
-    "name",
-    "path",
-    "installed"
-  ],
-  "title": "StatusReport",
-  "type": "object"
-}
-```
-
 ## `audit`
 
 ### `AuditReport`
@@ -3859,7 +3764,145 @@ A command not listed here either reports only the generic human-message shape `{
 }
 ```
 
-## `self-schema`
+## `self`
+
+### `SelfUpdate`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The result of a self update check (or update).",
+  "properties": {
+    "applied": {
+      "description": "Whether this run actually applied the update.",
+      "type": "boolean"
+    },
+    "current": {
+      "type": "string"
+    },
+    "install_method": {
+      "description": "How this binary was installed (`cargo`, `homebrew`, `script`).",
+      "type": "string"
+    },
+    "latest": {
+      "description": "The latest published release, or `None` if there are none yet / GitHub was silent.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "update_available": {
+      "type": "boolean"
+    },
+    "update_command": {
+      "description": "The command that updates a binary installed this way.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "current",
+    "update_available",
+    "install_method",
+    "update_command",
+    "applied"
+  ],
+  "title": "SelfUpdate",
+  "type": "object"
+}
+```
+
+### `Installed`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The result of creating (or confirming) the alias.",
+  "properties": {
+    "already_installed": {
+      "description": "Whether the alias already existed and pointed here (idempotent no-op) vs. was just\ncreated by this run.",
+      "type": "boolean"
+    },
+    "name": {
+      "type": "string"
+    },
+    "path": {
+      "type": "string"
+    },
+    "target": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "name",
+    "path",
+    "target",
+    "already_installed"
+  ],
+  "title": "Installed",
+  "type": "object"
+}
+```
+
+### `Uninstalled`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The result of removing (or confirming the absence of) the alias.",
+  "properties": {
+    "name": {
+      "type": "string"
+    },
+    "path": {
+      "type": "string"
+    },
+    "removed": {
+      "description": "Whether anything was actually removed (`false` if it was already absent).",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "name",
+    "path",
+    "removed"
+  ],
+  "title": "Uninstalled",
+  "type": "object"
+}
+```
+
+### `StatusReport`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Whether the alias exists, and where it points.",
+  "properties": {
+    "installed": {
+      "type": "boolean"
+    },
+    "name": {
+      "type": "string"
+    },
+    "path": {
+      "type": "string"
+    },
+    "target": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "name",
+    "path",
+    "installed"
+  ],
+  "title": "StatusReport",
+  "type": "object"
+}
+```
 
 ### `SelfSchema`
 
@@ -4053,53 +4096,6 @@ A command not listed here either reports only the generic human-message shape `{
     "commands"
   ],
   "title": "SelfSchema",
-  "type": "object"
-}
-```
-
-## `self-update`
-
-### `SelfUpdate`
-
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "The result of a self-update check (or update).",
-  "properties": {
-    "applied": {
-      "description": "Whether this run actually applied the update.",
-      "type": "boolean"
-    },
-    "current": {
-      "type": "string"
-    },
-    "install_method": {
-      "description": "How this binary was installed (`cargo`, `homebrew`, `script`).",
-      "type": "string"
-    },
-    "latest": {
-      "description": "The latest published release, or `None` if there are none yet / GitHub was silent.",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "update_available": {
-      "type": "boolean"
-    },
-    "update_command": {
-      "description": "The command that updates a binary installed this way.",
-      "type": "string"
-    }
-  },
-  "required": [
-    "current",
-    "update_available",
-    "install_method",
-    "update_command",
-    "applied"
-  ],
-  "title": "SelfUpdate",
   "type": "object"
 }
 ```
