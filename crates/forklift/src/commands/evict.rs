@@ -1,7 +1,8 @@
 use serde::Serialize;
 use forklift_core::util::evict_utils;
-use forklift_core::util::lock_utils::StoreAccessLock;
+use forklift_core::util::lock_utils::{ServeLock, StoreAccessLock, StoreLock};
 use forklift_core::util::scope_utils;
+use crate::events;
 use crate::output::{self, CommandOutput};
 
 /// Handle the evict command (§7.6.1): free the content of a cache warehouse that its origin holds
@@ -13,6 +14,8 @@ use crate::output::{self, CommandOutput};
 /// minus every meta pallet, each checkout's base tree, the parcels a parked, consolidating or
 /// cherry-picking bay names, the trust pins, and staged work. Every object it frees is recorded
 /// first, so an interrupted eviction leaves a readable warehouse and running it again finishes.
+/// Loose copies are deleted; packed objects go by a full repack that keeps everything else, so
+/// like `compact --all` it refuses while the warehouse root is served.
 ///
 /// # Arguments
 /// * `dry_run` - Report what would be freed and change nothing.
@@ -20,8 +23,9 @@ use crate::output::{self, CommandOutput};
 /// # Returns
 /// * `Ok(())`      - If the plan was reported (dry run) or carried out.
 /// * `Err(String)` - If the warehouse is not a cache, the configured remote is not its origin, the
-///   origin cannot be reached or is not trusted, another process is using the object store, or an
-///   object the origin's history reaches is missing here and unrecorded (`heal` first).
+///   origin cannot be reached or is not trusted, the root is being served, another process is using
+///   the object store, or an object the origin's history reaches is missing here and unrecorded
+///   (`heal` first).
 pub async fn handle_command(dry_run: bool) -> Result<(), String> {
     if !scope_utils::is_cache_mode()? {
         return Err(
@@ -39,27 +43,38 @@ pub async fn handle_command(dry_run: bool) -> Result<(), String> {
         refill; nothing was changed.",
     ).await?;
 
-    // Exclusive store access from the plan to the last delete: no writer in any bay may dedup
-    // against a planned object, or move a checkout or stage work the keep set reads, in between. A
-    // dry run takes it too, so it reports the plan a real run would carry out. Never waits. `main`
-    // takes no shared hold for this command, which would refuse this try.
+    // The locks a full repack takes, in its order, held from the plan to the last delete: the store
+    // lock keeps out other maintenance, the serve lock a server answering "present" for an object
+    // about to go, and exclusive store access every writer that could dedup against a planned
+    // object or move a checkout or stage work the keep set reads. A dry run takes them too, so it
+    // reports the plan a real run would carry out. None waits. `main` takes no shared hold for
+    // this command, which would refuse the last.
+    let store_lock = StoreLock::acquire()?;
+    let serve_lock = ServeLock::acquire().map_err(|e| format!(
+        "\"evict\" cannot run while this warehouse root is being served; stop the server first. If \
+        no server is running, the lock below was left by a server, gc or full repack that was killed \
+        and can be removed. {}", e
+    ))?;
     let store_access = StoreAccessLock::try_exclusive()?;
     let plan = evict_utils::plan_evict(&held_heads, &store_access)?;
 
     let stats = if dry_run {
         None
     } else {
-        Some(evict_utils::carry_out(&plan, &store_access)?)
+        Some(evict_utils::carry_out(&plan, &store_lock, &serve_lock, &store_access, &events::progress())?)
     };
 
     output::emit(&EvictReport {
         dry_run,
         evicted: stats.as_ref().map_or(0, |stats| stats.evicted),
-        would_evict: plan.to_free.len(),
+        would_evict: plan.to_evict.len(),
+        would_drop: plan.to_drop.len(),
+        repack: plan.repack,
+        bytes_freed: stats.as_ref().map_or(0, |stats| stats.bytes_freed),
         kept_for_checkouts: plan.kept_for_checkouts,
         kept_local: plan.kept_local,
         not_held: plan.not_held,
-        still_packed: plan.still_packed,
+        still_packed: stats.as_ref().map_or(0, |stats| stats.still_packed),
         heads_not_lowered: plan.heads_not_lowered,
         unsealed: stats.as_ref().map_or(plan.to_unseal.len(), |stats| stats.unsealed),
     });
@@ -84,12 +99,23 @@ pub(crate) struct EvictReport {
     /// Whether this was a dry run (nothing changed).
     dry_run: bool,
 
-    /// Loose objects freed (`0` on a dry run). A read of one fetches it again from the origin.
+    /// Objects freed, loose or packed (`0` on a dry run). A read of one fetches it again from the
+    /// origin.
     evicted: usize,
 
-    /// Loose objects the plan frees. After a real run, `evicted` is less only by objects already
-    /// gone when it came to delete them.
+    /// Objects the plan frees. After a real run, `evicted` is less only by `still_packed`.
     would_evict: usize,
+
+    /// Of `would_evict`, the objects a pack holds, which a full repack drops.
+    would_drop: usize,
+
+    /// Whether the run rewrites every pack (on a dry run, would): when `would_drop` is not `0`, and
+    /// also when a packed delta stands on a loose copy it frees, which the repack re-encodes first.
+    repack: bool,
+
+    /// Bytes freed on disk: loose files deleted, plus what the old packs held beyond the packs the
+    /// repack wrote (`0` on a dry run).
+    bytes_freed: u64,
 
     /// Objects the origin holds that stay because a checkout's base tree needs them.
     kept_for_checkouts: usize,
@@ -102,7 +128,9 @@ pub(crate) struct EvictReport {
     /// the origin is not known to hold. Lifting that work lets a later eviction free them.
     not_held: usize,
 
-    /// Evictable objects held only inside a pack, which this eviction does not free.
+    /// Objects the plan frees that are still inside a pack after the repack: one found damaged only
+    /// during it, which a repack leaves as found (`0` on a dry run; a pack already damaged refuses
+    /// the run). `compact --all` salvages it.
     still_packed: usize,
 
     /// Origin heads this warehouse does not hold yet; their history frees nothing until a `lower`
@@ -118,10 +146,19 @@ impl CommandOutput for EvictReport {
     fn render_human(&self) {
         if self.dry_run {
             println!("Dry run: evicting would free {} object(s).", self.would_evict);
+            if self.would_drop > 0 {
+                println!("{} of them are inside packs, which would be rewritten without them.", self.would_drop);
+            } else if self.repack {
+                println!("Packed content stands on some of them, so the packs would be rewritten first.");
+            }
         } else if self.evicted == 0 {
             println!("Nothing to evict.");
         } else {
-            println!("Evicted {} object(s); reading one fetches it again from the origin.", self.evicted);
+            println!(
+                "Evicted {} object(s), freeing {}; reading one fetches it again from the origin.",
+                self.evicted,
+                output::human_bytes(self.bytes_freed)
+            );
         }
 
         if self.unsealed > 0 {
@@ -154,8 +191,8 @@ impl CommandOutput for EvictReport {
 
         if self.still_packed > 0 {
             println!(
-                "{} object(s) are inside packs and were not freed; evicting packed objects is not \
-                built yet.",
+                "{} object(s) are inside a damaged pack and were not freed; run \"compact --all\" to \
+                salvage it, then \"evict\" again.",
                 self.still_packed
             );
         }

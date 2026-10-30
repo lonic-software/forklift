@@ -2824,7 +2824,7 @@ pub(crate) fn is_present_for_sweep(hash: &str) -> Result<bool, String> {
 }
 
 /// Whether the loose fan-out path for `hash` has a dentry (no content check).
-fn loose_dentry_exists(hash: &str) -> Result<bool, String> {
+pub(crate) fn loose_dentry_exists(hash: &str) -> Result<bool, String> {
     let (path, file_name) = get_path_for_object(hash)?;
     let file_path = path.add(PATH_SEPARATOR).add(&file_name);
 

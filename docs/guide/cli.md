@@ -1905,10 +1905,14 @@ eviction: `evict` refuses, changing nothing, and names it; run `heal`, then `evi
 
 Every object is recorded before it is deleted, and an object's children go before it, so an
 interrupted eviction leaves a readable warehouse, and running `evict` again finishes the job.
-Objects already inside a pack are counted (`still_packed`) but not freed yet. An eviction, dry run
-included, is refused while another command in another bay uses the object store, since that
-command could reuse an object the eviction is about to free; run it again once the other command
-finishes. Nothing frees content on its own yet: `evict` runs only when you run it.
+Loose copies are deleted; objects inside a pack are dropped by rewriting the packs without them,
+as `compact --all` does (`would_drop` counts them; `repack` says whether the packs are rewritten,
+which also happens when packed content stands on a loose copy being freed), and the report says how
+many bytes that freed (`bytes_freed`). A damaged pack refuses the eviction before anything changes:
+run `compact --all` to salvage it, then `evict` again. An eviction, dry run included, is refused while the
+warehouse root is being served, and while another command in another bay uses the object store,
+since either could rely on an object the eviction is about to free; run it again once the other
+command finishes. Nothing frees content on its own yet: `evict` runs only when you run it.
 
 ---
 

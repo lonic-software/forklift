@@ -108,6 +108,9 @@ pub struct PrunePlan {
 pub struct PruneStats {
     /// Loose objects actually deleted.
     pub freed: usize,
+
+    /// The on-disk bytes of the files deleted.
+    pub bytes: u64,
 }
 
 /// Compute a prune plan without mutating anything: the present, loose objects under the pruned
@@ -473,19 +476,24 @@ fn leading_to_touching(unlifted: &HashSet<String>, touching: &HashSet<String>) -
 /// * `_store_access` - The exclusive store access the plan was computed under, still held.
 pub fn free_objects(to_free: &[String], _store_access: &StoreAccessExclusive) -> Result<PruneStats, String> {
     let mut freed = 0usize;
+    let mut bytes = 0u64;
 
     for hash in to_free {
         let (folder, file_name) = file_utils::get_path_for_object(hash)?;
         let path = std::path::Path::new(&folder).join(file_name);
+        let size = std::fs::symlink_metadata(&path).map_or(0, |metadata| metadata.len());
 
         match std::fs::remove_file(&path) {
-            Ok(()) => freed += 1,
+            Ok(()) => {
+                freed += 1;
+                bytes += size;
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(format!("Error while freeing object {}: {}", hash, e)),
         }
     }
 
-    Ok(PruneStats { freed })
+    Ok(PruneStats { freed, bytes })
 }
 
 /// The reachable user- and meta-pallet parcels, kept apart because the carve-out scopes only
