@@ -65,7 +65,7 @@ pub async fn park_changes() -> Result<(), String> {
 
     inventory_utils::refresh_tracked_entries()?;
 
-    // In a scoped (sparse) bay the dock only materializes the in-scope subtree(s); splice it
+    // In a scoped (sparse) bay the inventory holds only the in-scope subtree(s); splice it
     // onto the head's spine exactly like `stack` does (§3.2), so the parked parcel commits the
     // same root a full bay would — `park` is documented to inherit the overlay, and a truncated
     // parked tree would silently break that. The "nothing to park" check below must compare the

@@ -846,12 +846,19 @@ pub(crate) struct Tool {
     /// The command's [`HUMAN_ONLY_ARGS`] left out of the tool: the property an agent would pass,
     /// the command line's spelling, and why.
     pub(crate) withheld: Vec<(String, String, &'static str)>,
+
+    /// The command's required argument groups, each as its members' property names: the
+    /// command runs only with at least one of each (`haul review` states its verdict).
+    pub(crate) one_of: Vec<Vec<String>>,
 }
 
 /// One tool argument.
 pub(crate) struct ToolParam {
     /// The property name: an option's long name with `_` for `-`, a positional's id.
     pub(crate) key: String,
+
+    /// The clap id of the argument it passes.
+    id: String,
 
     /// Where its words go in the command.
     form: Form,
@@ -1028,7 +1035,18 @@ fn tool_for(command: &clap::Command, path: &[String], params: Vec<ToolParam>) ->
         ));
     }
 
-    Ok(Tool { name: path.join("_").replace('-', "_"), path: path.to_vec(), description, params, withheld: Vec::new() })
+    let mut one_of = Vec::new();
+    for group in command.get_groups().filter(|group| group.is_required_set()) {
+        let mut keys = Vec::new();
+        for id in group.get_args() {
+            let key = params.iter().find(|param| param.id == id.as_str()).map(|param| param.key.clone())
+                .ok_or_else(|| format!("`forklift {}` requires one of a group whose `{id}` is no argument of its tool", path.join(" ")))?;
+            keys.push(key);
+        }
+        one_of.push(keys);
+    }
+
+    Ok(Tool { name: path.join("_").replace('-', "_"), path: path.to_vec(), description, params, withheld: Vec::new(), one_of })
 }
 
 /// The tool argument for `arg` of the command `shown`.
@@ -1079,6 +1097,7 @@ fn tool_param(shown: &str, arg: &clap::Arg) -> Result<ToolParam, String> {
 
     let injected = INJECTED.iter().find(|(path, id, _)| *path == shown && *id == key).map(|(_, _, source)| *source);
     Ok(ToolParam {
+        id: arg.get_id().to_string(),
         key,
         form,
         value,
@@ -1118,21 +1137,40 @@ impl Tool {
         for (_, spelling, why) in &self.withheld {
             description.push_str(&format!("\n\nThe command's \"{spelling}\" is not served here: it {why}."));
         }
+        let mut input = json!({
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": false,
+        });
+        // A required group: at least one member given, and a switch counts only when true.
+        let groups: Vec<Value> = self.one_of.iter().map(|keys| {
+            let members: Vec<Value> = keys.iter().map(|key| match self.param(key).value {
+                ValueKind::Boolean => json!({ "properties": { key: { "const": true } }, "required": [key] }),
+                _ => json!({ "required": [key] }),
+            }).collect();
+            json!({ "anyOf": members })
+        }).collect();
+        match groups.len() {
+            0 => {}
+            1 => input["anyOf"] = groups[0]["anyOf"].clone(),
+            _ => input["allOf"] = json!(groups),
+        }
         json!({
             "name": self.name,
             "description": description,
-            "inputSchema": {
-                "type": "object",
-                "properties": properties,
-                "required": required,
-                "additionalProperties": false,
-            },
+            "inputSchema": input,
         })
+    }
+
+    /// The param with this property name, which the caller knows to exist.
+    fn param(&self, key: &str) -> &ToolParam {
+        self.params.iter().find(|param| param.key == key).expect("a property of the tool")
     }
 
     /// Why this tool refuses these arguments, if it does: they are not a JSON object, an
     /// argument is one of the command's that the tool withholds, or one the tool does not declare,
-    /// a declared one has the wrong type, or a required one is missing. A null value is an omitted argument (harnesses fill unset
+    /// a declared one has the wrong type, a required one is missing, or no member of a required group is given. A null value is an omitted argument (harnesses fill unset
     /// optionals with it). An injected argument is never refused: the server replaces it.
     ///
     /// Refusing rather than ignoring matters: a dropped filter would answer a broader question
@@ -1165,7 +1203,16 @@ impl Tool {
         }
         let missing = self.params.iter()
             .find(|param| param.required && param.injected.is_none() && arguments.get(&param.key).is_none_or(Value::is_null));
-        missing.map(|param| format!("the \"{name}\" tool needs the \"{}\" argument", param.key))
+        if let Some(param) = missing {
+            return Some(format!("the \"{name}\" tool needs the \"{}\" argument", param.key));
+        }
+        // A switch passed as false, or an empty list, puts nothing in the command.
+        let given = |key: &String| arguments.get(key).is_some_and(|value|
+            !value.is_null() && *value != Value::Bool(false) && value.as_array().is_none_or(|list| !list.is_empty()));
+        let unmet = self.one_of.iter().find(|keys| !keys.iter().any(given))?;
+        let quoted: Vec<String> = unmet.iter().map(|key| format!("\"{key}\"")).collect();
+        let (last, rest) = quoted.split_last().expect("a group has members");
+        Some(format!("the \"{name}\" tool needs one of {} or {last}", rest.join(", ")))
     }
 
     /// The command's arguments for these (accepted) arguments: the path, each option as
@@ -1715,6 +1762,23 @@ mod tests {
         assert!(refused(cli().subcommand(clap::Command::new("signed").about("Signed")
             .arg(clap::Arg::new("depth").long("depth").value_parser(clap::value_parser!(i64)))))
             .contains("parses a number the tool schema has no type for"));
+    }
+
+    /// A required group is in the schema, and a call that gives no member of it is refused by
+    /// name before it runs: a false switch counts as not given.
+    #[test]
+    fn a_required_group_is_declared_and_held() {
+        let review = tool("haul_review");
+        assert_eq!(review.one_of, vec![vec!["approve".to_string(), "request_changes".to_string(), "comment".to_string()]]);
+        let schema = review.definition()["inputSchema"].clone();
+        assert_eq!(schema["anyOf"][0], json!({ "properties": { "approve": { "const": true } }, "required": ["approve"] }));
+        assert_eq!(schema["anyOf"].as_array().unwrap().len(), 3);
+        assert!(tool("history").definition()["inputSchema"].get("anyOf").is_none());
+
+        let needs = "the \"haul_review\" tool needs one of \"approve\", \"request_changes\" or \"comment\"";
+        assert_eq!(review.refusal(&json!({ "id": "h" })).as_deref(), Some(needs));
+        assert_eq!(review.refusal(&json!({ "id": "h", "approve": false, "comment": null })).as_deref(), Some(needs));
+        assert_eq!(review.refusal(&json!({ "id": "h", "comment": true })), None);
     }
 
     #[test]

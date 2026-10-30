@@ -147,7 +147,7 @@ in one step. Forklift stages whole files: there is no interactive hunk staging.
   - [`pick`](guide/cli.md#pick--apply-one-parcels-change-onto-the-current-pallet)
     — apply one parcel's change onto the current pallet as a new parcel. The original authors
     are preserved and the pick is freshly signed.
-  - [`blame`](guide/cli.md#blame--who-wrote-each-line-bl-annotate) — attribute each line to
+  - [`blame`](guide/cli.md#blame--who-wrote-each-line-git-annotate) — attribute each line to
     the parcel that last changed it, along the first-parent chain (Git's
     `blame --first-parent`). Because authorship is signed, each line also carries the author's
     identity class, so blame can say whether an agent wrote it.

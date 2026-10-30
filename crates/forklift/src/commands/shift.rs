@@ -5,7 +5,7 @@ use forklift_core::util::operation_utils::{Operation, OperationKind};
 use crate::output::{self, CommandOutput};
 
 /// Handle the shift command (git's "checkout"): materialize the head tree of the target
-/// pallet in the working directory, repopulate the inventory from it (the dock's
+/// pallet in the working directory, repopulate the inventory from it (the inventory's
 /// "repopulate on shift" behavior), and make the target the current pallet.
 ///
 /// Shifting refuses to run when there are staged or unstaged changes (they would be

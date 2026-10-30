@@ -3024,7 +3024,7 @@ fn restore_rewrites_a_matching_file_of_another_kind() {
 /// content, so the next comparison trusts the stat cache instead of rehashing; a file that does
 /// not hold it keeps stale, unproven stat data, so it still shows as modified.
 #[test]
-fn restore_staged_keeps_the_stat_data_of_files_that_match_the_head() {
+fn unload_keeps_the_stat_data_of_files_that_match_the_head() {
     let warehouse = TestWarehouse::new("restore-staged-stat");
     warehouse.write_file("a.txt", "original a\n");
     warehouse.write_file("dir/b.txt", "original b\n");
@@ -3094,7 +3094,7 @@ fn restore_staged_keeps_the_stat_data_of_files_that_match_the_head() {
 }
 
 #[test]
-fn restore_staged_resets_the_inventory_to_the_head() {
+fn unload_resets_the_inventory_to_the_head() {
     let warehouse = TestWarehouse::new("restore-staged");
     warehouse.write_file("a.txt", "original\n");
 
@@ -8402,7 +8402,7 @@ fn haul_merge_refuses_on_an_incomplete_load_before_writing_consolidation_state()
 /// incomplete load by resetting it to head must also be a clean, working recovery path.
 #[cfg(unix)]
 #[test]
-fn restore_staged_over_the_recorded_root_heals_the_marker() {
+fn unload_over_the_recorded_root_heals_the_marker() {
     use std::os::unix::fs::PermissionsExt;
 
     let warehouse = TestWarehouse::new("incomplete-load-restore-heals");
@@ -8442,7 +8442,7 @@ fn restore_staged_over_the_recorded_root_heals_the_marker() {
 /// unrelated path must never silently clear a broader recorded root it never touched.
 #[cfg(unix)]
 #[test]
-fn restore_staged_of_a_narrower_path_does_not_heal_a_broader_recorded_root() {
+fn unload_of_a_narrower_path_does_not_heal_a_broader_recorded_root() {
     use std::os::unix::fs::PermissionsExt;
 
     let warehouse = TestWarehouse::new("incomplete-load-restore-partial");
@@ -8482,7 +8482,7 @@ fn restore_staged_of_a_narrower_path_does_not_heal_a_broader_recorded_root() {
 /// has nothing to reset (it was never staged) and nothing to abandon (nothing landed there) — it
 /// must succeed as a heal-no-op instead of failing with "neither in the inventory nor in the
 /// pallet head" while leaving the marker (and the guard) stuck forever. See
-/// `restore_staged_of_a_narrower_path_does_not_heal_a_broader_recorded_root` above for the
+/// `unload_of_a_narrower_path_does_not_heal_a_broader_recorded_root` above for the
 /// guard: restoring a path that *does* carry real staged content keeps today's ordinary
 /// real-restore behavior (the marker survives) rather than taking this no-op path.
 ///
@@ -8491,7 +8491,7 @@ fn restore_staged_of_a_narrower_path_does_not_heal_a_broader_recorded_root() {
 /// validation actually covers (see `load_guard_utils::clear_recorded_under`'s governing
 /// invariant); the reverse — clearing a broader record because a narrower, unrelated path under
 /// it happens to be empty — is the live regression
-/// `restore_staged_of_an_unrelated_path_never_clears_a_broader_recorded_root` below exists to
+/// `unload_of_an_unrelated_path_never_clears_a_broader_recorded_root` below exists to
 /// keep closed. This shape also, as a side effect, has no sibling task to race: `bigdir` is the
 /// *only* directory `load bigdir` ever walks, so unlike an earlier version of this test, nothing
 /// here depends on `TaskExecutor` scheduling. The survivor directory ("good") is still staged by
@@ -8499,7 +8499,7 @@ fn restore_staged_of_a_narrower_path_does_not_heal_a_broader_recorded_root() {
 /// is healed away, not to avoid a race.
 #[cfg(unix)]
 #[test]
-fn restore_staged_of_a_vacuous_failed_directory_heals_as_a_no_op() {
+fn unload_of_a_vacuous_failed_directory_heals_as_a_no_op() {
     use std::os::unix::fs::PermissionsExt;
 
     let warehouse = TestWarehouse::new("incomplete-load-restore-vacuous");
@@ -8549,7 +8549,7 @@ fn restore_staged_of_a_vacuous_failed_directory_heals_as_a_no_op() {
 /// to prevent, reopened through its own heal path.
 #[cfg(unix)]
 #[test]
-fn restore_staged_of_an_unrelated_path_never_clears_a_broader_recorded_root() {
+fn unload_of_an_unrelated_path_never_clears_a_broader_recorded_root() {
     use std::os::unix::fs::PermissionsExt;
 
     let warehouse = TestWarehouse::new("incomplete-load-restore-unrelated");
@@ -11068,9 +11068,9 @@ fn a_scoped_bay_refuses_a_spine_path_type_flip() {
 #[test]
 fn a_scoped_stack_refuses_when_the_dock_replaces_an_in_scope_directory_with_a_file() {
     // The working tree flips the scoped subtree itself from a directory to a
-    // file. The overlay's dock-side files pass must catch this — without it, the file lands in
+    // file. The overlay's pass over the built tree's files must catch this — without it, the file lands in
     // no branch of the splice and is silently dropped from the signed (!) tree.
-    let warehouse = scoped_fixture("scoped-dock-flip");
+    let warehouse = scoped_fixture("scoped-inventory-flip");
 
     let full_dir = warehouse.home.join("bay-full-flip");
     let scoped_dir = warehouse.home.join("bay-scoped-flip");
@@ -11130,7 +11130,7 @@ fn a_scoped_park_produces_a_byte_identical_tree_and_a_clean_park_refuses() {
 }
 
 #[test]
-fn a_scoped_restore_staged_root_leaves_stocktake_clean_and_the_shards_scope_bounded() {
+fn a_scoped_unload_root_leaves_stocktake_clean_and_the_shards_scope_bounded() {
     // `unload` must not resurrect out-of-scope shards into a scoped bay's
     // inventory — those paths were never materialized here.
     let warehouse = scoped_fixture("scoped-restore-staged");

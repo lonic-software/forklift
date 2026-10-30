@@ -556,7 +556,7 @@ actually touched, and two files (or two revisions) that share content share thei
 Chunking is content-addressed like everything else, so a chunked file's authorship is signed and
 offline-verifiable down to every byte. Two commands treat a chunked file as the opaque binary it
 is: [`diff`](#diff--line-by-line-changes-d) reports it changed without a line diff, and
-[`blame`](#blame--who-wrote-each-line-bl-annotate) refuses it (there are no lines to attribute).
+[`blame`](#blame--who-wrote-each-line-git-annotate) refuses it (there are no lines to attribute).
 
 Over the wire, chunked files travel **per object**: a `lift` uploads the recipe and every chunk
 (re-uploading only the chunks that changed — an appended-to file re-sends its new chunks and
@@ -829,7 +829,7 @@ File content (`show`, `store peek` of a blob, `blame`'s lines) prints as-is, the
 git do. The hashes a parcel names are checked when it is read, and a parcel naming
 anything that is not a hash is refused.
 
-### `blame` — who wrote each line (`bl`, `annotate`)
+### `blame` — who wrote each line (git: `annotate`)
 
 ```sh
 forklift blame src/main.rs            # each line, attributed to the parcel that introduced it

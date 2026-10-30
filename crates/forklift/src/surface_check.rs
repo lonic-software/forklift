@@ -879,7 +879,10 @@ fn recorded_text_violations(cli: &clap::Command, listed: &BTreeSet<Vec<String>>)
         }
         let name = path.join(" ");
         let message = command.get_arguments().find(|arg| arg.get_long() == Some("message"));
-        let short_m = command.get_arguments().find(|arg| arg.get_short() == Some('m'));
+        let takes_m = |arg: &&clap::Arg| arg.get_short() == Some('m')
+            || arg.get_all_short_aliases().is_some_and(|aliases| aliases.contains(&'m'));
+        let short_m = command.get_arguments().find(takes_m);
+        let other_m = command.get_arguments().filter(takes_m).find(|arg| arg.get_long() != Some("message"));
         if !listed.contains(&path) {
             if let Some(arg) = message.or(short_m) {
                 failures.push(format!("`{name}` is not on the [recorded-text] list but has `{}`", arg.get_id()));
@@ -897,7 +900,7 @@ fn recorded_text_violations(cli: &clap::Command, listed: &BTreeSet<Vec<String>>)
                 }
             }
         }
-        if short_m.is_some_and(|arg| arg.get_long() != Some("message")) {
+        if other_m.is_some() {
             failures.push(format!("`{name}`: -m is not --message"));
         }
         for positional in command.get_positionals().filter(|arg| ["description", "message"].contains(&arg.get_id().as_str())) {
@@ -941,6 +944,7 @@ fn the_recorded_text_check_finds_each_violation() {
         (Command::new("other-m").arg(Arg::new("message").long("message")).arg(Arg::new("mode").short('m')), true, "-m is not --message"),
         (Command::new("unlisted").arg(message()), false, "is not on the [recorded-text] list"),
         (Command::new("unlisted-m").arg(Arg::new("mode").short('m')), false, "has `mode`"),
+        (Command::new("aliased-m").arg(Arg::new("mode").short('o').short_alias('m')), false, "has `mode`"),
     ];
     for (sub, listed, expected) in broken {
         let name = sub.get_name().to_string();
@@ -965,7 +969,9 @@ fn visible_alias_violations(cli: &clap::Command, daily: &BTreeSet<Vec<String>>) 
             continue;
         }
         let name = path.join(" ");
-        if !daily.contains(&path) {
+        if path.len() > 1 {
+            failures.push(format!("`{name}` is below the top level but has the visible alias {aliases:?}"));
+        } else if !daily.contains(&path) {
             failures.push(format!("`{name}` is not on the [daily-loop] list but has the visible alias {aliases:?}"));
         } else if aliases.len() > 1 {
             failures.push(format!("`{name}` has more than one visible alias: {aliases:?}"));
@@ -989,7 +995,7 @@ fn only_the_daily_loop_has_visible_aliases() {
 #[test]
 fn the_alias_check_finds_each_violation() {
     use clap::Command;
-    let daily = BTreeSet::from([vec!["stack".to_string()]]);
+    let daily = BTreeSet::from([vec!["stack".to_string()], vec!["group".to_string(), "fetch".to_string()]]);
     let probe = |sub: Command| {
         let mut root = Command::new("probe").subcommand(sub);
         root.build();
@@ -1001,7 +1007,8 @@ fn the_alias_check_finds_each_violation() {
         (Command::new("query").visible_long_flag_alias("q"), "is not on the [daily-loop] list"),
         (Command::new("stack").visible_aliases(["s", "st"]), "more than one visible alias"),
         (Command::new("stack").visible_alias("s").visible_short_flag_alias('s'), "more than one visible alias"),
-        (Command::new("group").subcommand(Command::new("stack").visible_alias("s")), "`group stack` is not on"),
+        (Command::new("group").subcommand(Command::new("fetch").visible_alias("gf")), "`group fetch` is below the top level"),
+        (Command::new("group").subcommand(Command::new("stack").visible_alias("s")), "`group stack` is below the top level"),
     ];
     for (sub, expected) in broken {
         let failures = probe(sub);

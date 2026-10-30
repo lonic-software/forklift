@@ -94,7 +94,7 @@
 //!   head, so every recorded root that subtree covers is now known-consistent — call
 //!   [`clear_recorded_under`]. The same call also covers `unload`'s vacuous case (a
 //!   target neither in the inventory nor the head, but with zero staged entries anywhere beneath
-//!   it either — see `restore::restore_staged`'s doc comment): the region it validated is exactly
+//!   it either — see `unload::unstage`'s doc comment): the region it validated is exactly
 //!   `<path>`'s own subtree, so the same "only what `R` covers" rule already gives the right
 //!   answer with no separate function needed. `shift`, `park`'s post-push reset, a `consolidate`
 //!   fast-forward, `git import`'s initial checkout, and `lower`/`clone`'s materialization all
@@ -183,7 +183,7 @@ pub fn mark_load_completed(root_key: &str) {
 /// Record that region `root_key` is now known-consistent — because a load rooted there just
 /// finished cleanly, because some other operation rebuilt exactly that subtree from a known-good
 /// source (`unload`), or because `unload`'s vacuous-heal case (see
-/// `restore::restore_staged`'s doc comment) has already confirmed `root_key`'s own subtree has
+/// `unload::unstage`'s doc comment) has already confirmed `root_key`'s own subtree has
 /// zero staged entries anywhere beneath it — that confirmation *is* `root_key`'s validation, so
 /// the same "only clear what was actually validated" rule applies unchanged.
 ///

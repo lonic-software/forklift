@@ -337,7 +337,7 @@ pub async fn stack_parcel(description: Option<String>,
     // parcel naming it would pass `audit` and fail only at a later `restore`.
     tree_utils::require_staged_content_present(&partial_root, head_root_hash.as_deref())?;
 
-    // In a scoped (sparse) bay the dock materializes only the in-scope subtree(s), so the freshly
+    // In a scoped (sparse) bay the inventory holds only the in-scope subtree(s), so the freshly
     // built root above is a sparse partial that would drop every out-of-scope sibling. The overlay
     // splices it onto the head's spine — copying out-of-scope siblings verbatim by hash — so the
     // stacked root tree is byte-identical to what a full workspace would produce (§3.2).
