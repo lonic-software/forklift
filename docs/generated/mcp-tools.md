@@ -26,7 +26,7 @@ Every tool `forklift mcp` serves, generated from the same command definition the
 | `haul_show` | `forklift haul show` | Show one proposal in full | `id` (a string, required) |
 | `haul_update` | `forklift haul update` | Propose the source pallet's current head | `id` (a string, required) |
 | `haul_comment` | `forklift haul comment` | Add a comment | `id` (a string, required)<br>`message` (a string, required) |
-| `haul_review` | `forklift haul review` | Record a signed review (approve by default) | `id` (a string, required)<br>`request_changes` (a boolean)<br>`comment` (a boolean)<br>`message` (a string) |
+| `haul_review` | `forklift haul review` | Record a signed review: approve, request changes or comment | `id` (a string, required)<br>`approve` (a boolean)<br>`request_changes` (a boolean)<br>`comment` (a boolean)<br>`message` (a string) |
 | `haul_consolidate` | `forklift haul consolidate` | Land a proposal: consolidate its source into the target | `id` (a string, required) |
 | `haul_close` | `forklift haul close` | Close a proposal without merging | `id` (a string, required) |
 | `haul_reopen` | `forklift haul reopen` | Reopen a closed proposal | `id` (a string, required) |
@@ -56,10 +56,10 @@ Every tool `forklift mcp` serves, generated from the same command definition the
 | `pick` | `forklift pick` | Apply a parcel's changes onto the current pallet as a new, author-preserving parcel | `revision` (a string, required)<br>`message` (a string) |
 | `query` | `forklift query` | Query parcel history by signed identity, signer and parcel facts | `revisions` (an array of strings)<br>`from` (a string)<br>`class` (a string)<br>`unsupervised` (a boolean)<br>`supervisor` (a string)<br>`signer` (a string)<br>`author_after` (a string)<br>`author_before` (a string)<br>`merges` (a boolean)<br>`no_merges` (a boolean)<br>`grep` (a string)<br>`model` (a string)<br>`tool` (a string)<br>`tag` (a string)<br>`touches` (a string)<br>`verify` (a boolean)<br>`recorded` (a boolean)<br>`where` (an object)<br>`limit` (an integer of at least 1)<br>`after` (a string)<br>`oneline` (a boolean) |
 | `remove` | `forklift remove` | Stage a file or directory for removal | `path` (a string, required) |
-| `restore` | `forklift restore` | Restore a file or directory from the inventory (discard unstaged changes) | `staged` (a boolean)<br>`path` (a string, required) |
+| `restore` | `forklift restore` | Restore a file or directory from the inventory (discard unstaged changes) | `path` (a string, required) |
 | `shift` | `forklift shift` | Shift to another pallet | `pallet` (a string, required) |
 | `show` | `forklift show` | Print a file's content at a revision, as git show does for REV:PATH | `target` (a string, required) |
-| `stack` | `forklift stack` | Stack the inventory as a new parcel (commit) on the current pallet | `description` (a string) |
+| `stack` | `forklift stack` | Stack the inventory as a new parcel (commit) on the current pallet | `message` (a string) |
 | `stocktake` | `forklift stocktake` | Report the staged and unstaged changes of the warehouse | `summary` (a boolean) |
 | `scope_status` | `forklift scope status` | Show this checkout's scope and the warehouse fetch scope (the default) |  |
 | `scope_fetch` | `forklift scope fetch` | Widen a sparse warehouse's fetch scope and download the newly in-scope subtree(s) | `paths` (an array of strings, required) |

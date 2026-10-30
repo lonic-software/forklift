@@ -66,7 +66,6 @@ pub enum Command {
 
     /// Verify the warehouse's signed history offline
     #[command(
-        visible_alias = "a",
         long_about = "Verify the warehouse's signed history offline: the office chain back to the \
                       genesis parcel, then the given pallet (the current one by default). Requires \
                       established trust (\"forklift office enroll\").\n\n\
@@ -101,7 +100,6 @@ pub enum Command {
 
     /// Show, for each line of a file, the parcel and author that last changed it
     #[command(
-        visible_alias = "bl",
         alias = "annotate",
         long_about = "Attribute every line of a file to the parcel that introduced it — and, \
                       because authorship is signed and classed, to the author's identity \
@@ -191,7 +189,6 @@ pub enum Command {
 
     /// Read or change configuration values
     #[command(
-        visible_alias = "cfg",
         long_about = "Read or change configuration values (e.g. \"remote.url\"): list every known \
                       key, get one, set one or unset one. Values are stored in the current \
                       warehouse by default, and each subcommand's --global targets the per-user \
@@ -230,7 +227,6 @@ pub enum Command {
 
     /// Squash the current draft pallet onto a target as one clean parcel, keeping the trail
     #[command(
-        visible_alias = "dv",
         long_about = "Deliver the current (draft) pallet's checkpoint trail onto a target pallet \
                       as a single clean signed parcel — the squash agents need, without \
                       losing the trail. The delivered parcel carries the draft head's tree with \
@@ -327,7 +323,6 @@ pub enum Command {
     Heal,
 
     /// Print the command list, or detailed help about one command
-    #[command(visible_alias = "h")]
     Help {
         /// The command to explain (subcommands work too, e.g. "forklift help office admit")
         #[arg(value_name = "COMMAND")]
@@ -446,7 +441,6 @@ pub enum Command {
 
     /// Facts recorded about a parcel after the fact: notes, approvals, provenance, keyed values
     #[command(
-        visible_alias = "mf",
         long_about = "Record and read the manifest — signed facts attached to a parcel after the \
                       fact. Notes, approvals and machine-authorship provenance are entries on the \
                       \"@manifest\" meta pallet (subcommands note, approve, provenance and \
@@ -482,7 +476,6 @@ pub enum Command {
 
     /// Manage the warehouse office: users and signing keys
     #[command(
-        visible_alias = "o",
         long_about = "Manage the warehouse office: users and signing keys, tracked as metadata on \
                       the reserved \"office\" pallet. Without a subcommand, the users and their \
                       keys are listed."
@@ -538,7 +531,6 @@ pub enum Command {
 
     /// Prepare a new warehouse in the current directory
     #[command(
-        visible_alias = "p",
         alias = "init",
         long_about = "Prepare a new warehouse in the current directory: the \".forklift\" folder \
                       with the object store, the staging area and the configuration template. No \
@@ -563,7 +555,6 @@ pub enum Command {
 
     /// Query parcel history by signed identity, signer and parcel facts
     #[command(
-        visible_alias = "q",
         long_about = "Filter parcel history on its signed dimensions — identity class, \
                       supervisor, role, signing key, recorded machine-authorship provenance, \
                       signed tags — plus parcel-local facts (dates, description, merge-ness, \
@@ -701,14 +692,10 @@ pub enum Command {
     #[command(
         visible_alias = "r",
         long_about = "Restore a file or directory in the working directory from the inventory \
-                      (discard unstaged changes). With --staged, reset the inventory entries to \
-                      the pallet head instead (unstage), leaving the working directory untouched."
+                      (discard unstaged changes). To unstage instead, leaving the working \
+                      directory untouched, use \"forklift unload\"."
     )]
     Restore {
-        /// Reset the inventory entries to the pallet head instead (unstage)
-        #[arg(short, long)]
-        staged: bool,
-
         /// The file or directory to restore
         path: String,
     },
@@ -769,8 +756,9 @@ pub enum Command {
                       completed by this command."
     )]
     Stack {
-        /// The description of the parcel
-        description: Option<String>,
+        /// The parcel's description
+        #[arg(short = 'm', long)]
+        message: Option<String>,
     },
 
     /// Report the staged and unstaged changes of the warehouse
@@ -874,9 +862,8 @@ pub enum Command {
     #[command(
         visible_alias = "ul",
         long_about = "Unstage a file or directory: reset its inventory entries to the pallet \
-                      head, leaving the working directory untouched — the inverse of \"forklift load\", \
-                      and the same as \"forklift restore --staged\". To stage a removal instead, use \
-                      \"forklift remove\"."
+                      head, leaving the working directory untouched — the inverse of \"forklift load\". \
+                      To stage a removal instead, use \"forklift remove\"."
     )]
     Unload {
         /// The file or directory to unstage
@@ -884,7 +871,6 @@ pub enum Command {
     },
 
     /// Print the version of Forklift
-    #[command(visible_alias = "v")]
     Version,
 
     /// [internal] Print a generated documentation fragment (`bin/gen-docs` only)
@@ -1542,19 +1528,25 @@ pub enum HaulAction {
         message: String,
     },
 
-    /// Record a signed review (approve by default)
+    /// Record a signed review: approve, request changes or comment
     #[command(
-        long_about = "Record a signed review of a haul's current head. Approves by default; pass --request-changes \
-                      or --comment for the other verdicts. Because the review is signed, the approval \
-                      carries your identity class — an agent's approval is distinguishable from a \
-                      human's. Requires an enrolled signing key."
+        group = clap::ArgGroup::new("verdict").required(true).args(["approve", "request_changes", "comment"]),
+        long_about = "Record a signed review of a haul's current head. The verdict is always \
+                      stated: exactly one of --approve, --request-changes or --comment, so a review \
+                      never records an approval its reviewer did not give. Because the review is \
+                      signed, the approval carries your identity class — an agent's approval is \
+                      distinguishable from a human's. Requires an enrolled signing key."
     )]
     Review {
         /// The haul id (or a unique prefix)
         id: String,
 
-        /// Request changes instead of approving
-        #[arg(long, conflicts_with = "comment")]
+        /// Approve the haul's current head
+        #[arg(long)]
+        approve: bool,
+
+        /// Request changes
+        #[arg(long)]
         request_changes: bool,
 
         /// A plain review comment (no approval)

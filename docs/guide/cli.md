@@ -352,17 +352,17 @@ over different paths are all recorded at once — healing one never silently cle
 another. `stack` and `park` both check for these markers and refuse while any is
 present (see below), rather than silently commit whatever happened to make it into the
 inventory. Two remedies clear an affected marker: re-running `load` over the same
-path, or `restore --staged` (or `unload`) over a path that covers it — the second one
+path, or `unload` over a path that covers it — the second one
 abandons the incomplete load instead of finishing it. Any command that resets the
 whole staging area (`shift`, `park`'s own reset back to the pallet head, and the
 like) clears every recorded marker at once, the same way. A directory that failed
-before anything of its own ever got staged has nothing to reset — `restore --staged`
+before anything of its own ever got staged has nothing to reset — `unload`
 over it still succeeds, as a no-op that just clears the marker.
 
 A load refuses outright when a folder's stored inventory cannot be read (a truncated file
 after a crash, say), rather than rebuilding it: the inventory is what says which files are
 tracked, and a rebuild would quietly stop tracking any file an ignore rule covers.
-`restore --staged <folder>` resets the inventory of that folder and every folder below it to
+`unload <folder>` resets the inventory of that folder and every folder below it to
 the pallet head, unstaging everything staged there; the error names the exact command. Then
 load the folder again, and load by name any file an ignore rule covers that you had loaded by
 name: a folder load never adds those.
@@ -373,7 +373,7 @@ at any folder above that, or in place of the inventory metadata file, is treated
 never followed, even when what it points at looks valid: following it would take another folder's
 state, or another staging area's list of folders, for this one's, or write outside the staging
 area. Every command that reads it refuses and names the link. Remove the link, then run
-`restore --staged .` to reset the staging area to the pallet head. When the refusal comes from
+`unload .` to reset the staging area to the pallet head. When the refusal comes from
 `gc` or `heal`, which read every bay's staging area, it names the checkout the staging area
 belongs to; run the reset there.
 
@@ -422,9 +422,8 @@ forklift unload src/main.rs
 
 The inverse of `load`: resets the path's inventory entries to the pallet head,
 so the next parcel won't record the staged change. The working directory is
-**not** touched — your edits stay, they're just no longer staged. (`restore
---staged` does the same thing; `unload` is its natural name.) To stage a
-removal instead, use `remove`.
+**not** touched — your edits stay, they're just no longer staged. (git spells this
+`restore --staged`.) To stage a removal instead, use `remove`.
 
 ### `remove` — stage a removal (`rm`)
 
@@ -494,24 +493,22 @@ digits only, so neither grammar can ever contain a `:`.
 ### `restore` — discard changes (`r`)
 
 ```sh
-forklift restore path            # rewrite path from the inventory (drop unstaged edits)
-forklift restore --staged path   # reset the inventory entry to the pallet head (unstage)
+forklift restore path   # rewrite path from the inventory (drop unstaged edits)
 ```
 
 `restore path` overwrites the working file(s) from what's staged — it throws away
 unstaged edits, so use it deliberately. Outside a conflict, a file that already holds the
 staged content is left alone, so its modification time does not change and build tools don't
-see it as edited. `restore --staged path` leaves the
-working directory alone and only un-stages (the inverse of `load`) — the same
-operation as `unload`. Files that already hold the pallet head's content usually keep counting
+see it as edited. To un-stage instead, leaving the working directory alone, use
+[`unload`](#unload--unstage-ul). Files that already hold the pallet head's content usually keep counting
 as unchanged without being re-read on the next `stocktake`; one edited moments before is
 re-read once.
 
 ### `stack` — commit (`s`)
 
 ```sh
-forklift stack "a clear description"
-forklift stack                       # opens nothing; a description is optional but recommended
+forklift stack -m "a clear description"
+forklift stack                           # opens nothing; a description is optional but recommended
 ```
 
 Builds tree objects from the inventory (bottom-up, staged removals excluded,
@@ -528,7 +525,7 @@ and add it to `.forkliftignore`. Below the top level it refuses the same spellin
 checking one out would plant another working tree inside this one. It also
 refuses if a previous `load` over any recorded path never finished cleanly
 (`incomplete_load`, exit 20) — see the note under `load` above; either re-run the
-named `load`(s), or `restore --staged` the affected path(s) to abandon them, then
+named `load`(s), or `unload` the affected path(s) to abandon them, then
 stack again. The same code covers a command that rewrites the whole staging area (a shift, park,
 merge, pick, fast-forward, `lower`, `git import` or bay creation) and was interrupted
 before it finished: then the message names that command, and `forklift heal` is the way out (see
@@ -537,13 +534,13 @@ hash, when the store no longer holds the content of a file staged since the head
 file, its recipe or any of its chunks) — lost after the `load`, say to a crash or a manual
 deletion. A parcel signed over it would pass `audit` and fail only at a later `restore`. Loading
 the file again is not enough while it is unchanged on disk, because `load` then stores nothing:
-run `restore --staged` on it, then `load` it again from its working copy. Files the head already
+run `unload` on it, then `load` it again from its working copy. Files the head already
 holds unchanged are not checked here; a lost object of theirs surfaces at `restore` (or at
 `audit --full`). The check is for presence, not integrity: content that is in the store but
 damaged is not re-read, and surfaces the same way. Two kinds of damage do stop the stack, with an
 error naming the object rather than `staged_content_missing`, since loading again cannot replace
 an object already in the store: a head tree that cannot be read, and a staged large file's recipe
-that cannot be read. For the recipe, `restore --staged` on that file leaves it out so the rest
+that cannot be read. For the recipe, `unload` on that file leaves it out so the rest
 can be stacked.
 
 ### Large files
@@ -725,7 +722,7 @@ One trust note: the class `history` shows is the **recorded** (self-declared) id
 each action in `--json` says so with `"trust": "recorded"`. `query --class` is the
 verified reading.
 
-### `query` — filter history on signed identity (`q`)
+### `query` — filter history on signed identity
 
 ```sh
 forklift query --class agent                    # parcels verifiably signed by an agent
@@ -859,7 +856,7 @@ line by line: all of its lines are credited to the parcel that made it.
 blame refuses a large binary file (one stored in chunks — see below): there are no lines to
 attribute, so it fails with a clear message rather than assembling gigabytes to guess.
 
-### `audit` — verify signed history offline (`a`)
+### `audit` — verify signed history offline
 
 ```sh
 forklift audit          # verify the office chain, then the current pallet
@@ -938,7 +935,7 @@ unchanged large files. A self-hosted `forklift-server` has no audit subcommand o
 periodic `forklift audit --full` against a clone is the recommended way to catch on-disk bit-rot
 that pushing quietly stopped surfacing for you.
 
-### `manifest` — signed post-metadata on parcels (`mf`)
+### `manifest` — signed post-metadata on parcels
 
 ```sh
 forklift manifest approve 1a2b3c -m "LGTM"   # a signed sign-off on a parcel
@@ -1056,7 +1053,7 @@ forklift haul list [--state open|merged|closed|all]
 forklift haul show <id>
 forklift haul update <id>                                          # propose the source's new head
 forklift haul comment <id> -m "…"
-forklift haul review <id> [--request-changes | --comment] -m "…"   # approves by default
+forklift haul review <id> --approve | --request-changes | --comment -m "…"   # one verdict, always stated
 forklift shift main && forklift haul consolidate <id>              # merge lands on the target
 forklift haul close <id> | reopen <id>
 ```
@@ -1301,7 +1298,7 @@ binary and large files too.
 
 Requires a clean warehouse before it starts.
 
-### `deliver` — squash a draft onto a target, keeping the trail (`dv`)
+### `deliver` — squash a draft onto a target, keeping the trail
 
 ```sh
 forklift deliver main -m "add the feature"   # run from the draft pallet
@@ -1428,7 +1425,7 @@ that completes on its own is stacked on the head it merged against; if that head
 merge is undone in the working tree and inventory and nothing is left in progress, so running
 the command again is safe. A merge or pick you resolved by hand is stacked on the head it
 started from too, but there a refused `stack` keeps it in progress, since putting the tree back
-would throw your resolutions away. To redo it on the new head: abort it, `restore --staged .`
+would throw your resolutions away. To redo it on the new head: abort it, `unload .`
 then `restore .`, delete the files the merge added (they are left untracked), catch up with
 `shift <pallet>`, and merge again. Stacking the merge output instead is refused while the bay is
 behind. And `undo` only ever reverses refs your own command moved; a move another bay made in
@@ -2078,7 +2075,7 @@ it. An fd that is not a pipe, FIFO or socket is ignored. See
 
 ```sh
 forklift stocktake --json
-forklift stack "x" --json
+forklift stack -m "x" --json
 forklift mcp --root /path/to/warehouse    # run the MCP server against a warehouse
 ```
 
@@ -2626,7 +2623,8 @@ dependency** — it flips on the SOCKS5 client already vendored in the HTTP stac
 
 ## 10. Command & alias reference
 
-Every command and subcommand, with its short alias and a one-line description, is listed in
+Every command and subcommand, with its one-line description and, for the daily loop's commands,
+its short alias, is listed in
 **[`../generated/commands.md`](../generated/commands.md)**. That page is generated from the
 command definition the binary parses its arguments with, and CI fails when the committed
 copy falls behind a new command or alias.
@@ -2641,7 +2639,9 @@ that level starts the same way: `forklift ha` is `forklift haul`, `forklift haul
   but it is stack's alias, so `forklift s` stacks.
 - A prefix that starts more than one name is a usage error (exit code 2) naming every one of
   them, never a guess: `forklift he` could be `heal` or `help`.
-- Only command names are matched. Aliases are typed whole (`cfg`, not `cf`), flags are always
+- Only the daily loop's commands (load, stack, diff, lift and the rest) have a short alias,
+  at most one each; prefixes shorten everything else (`forklift q` is `forklift query`).
+- Only command names are matched. Aliases are typed whole (`con`, not `co`), flags are always
   typed in full, and so are the hidden git words below: `forklift commit` works, `forklift comm`
   does not.
 
@@ -2658,8 +2658,8 @@ shows forklift's own names; the generated page lists each one in its "Hidden ali
 
 The mapping isn't always one-to-one in *behavior*: `commit` runs `stack`, which commits what
 you've `load`ed; it doesn't stage for you. `diff`, `restore`, `tag`, `show` and `clone` keep
-their git names outright, and git's `cherry-pick` runs `pick`. git's `restore --staged` works as
-it is (or use `unload`), and git's `rm --cached` is `remove`, which takes no `--cached` flag
+their git names outright, and git's `cherry-pick` runs `pick`. git's `restore --staged` is
+`unload`, and git's `rm --cached` is `remove`, which takes no `--cached` flag
 because it only ever stages the removal. For the review workflow, git's "pull request" is
 [`haul`](#haul--pull-requests-reviewable-merge-proposals). The
 [glossary](glossary.md) maps the concepts behind the names.

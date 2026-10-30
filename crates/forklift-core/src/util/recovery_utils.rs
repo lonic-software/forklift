@@ -1759,7 +1759,7 @@ fn walk_shard_files(folder: &Path, hashes: &mut Vec<(String, DirEntryType)>) -> 
     walk_shard_data_files(folder, &mut data_files)?;
 
     for path in data_files {
-        // A shard removed between listing and reading (a concurrent `stack` or `restore --staged`)
+        // A shard removed between listing and reading (a concurrent `stack` or `unload`)
         // references nothing any more. Any other read error, and every parse error, stays fatal.
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
@@ -7657,7 +7657,7 @@ mod tests {
             let walked = walk_shard_files(&PathBuf::from(file_utils::get_path_inventory_root()), &mut hashes);
 
             let error = walked.expect_err(level);
-            assert!(error.contains("is a link") && error.contains("restore --staged ."), "{level}: {error}");
+            assert!(error.contains("is a link") && error.contains("unload ."), "{level}: {error}");
             assert!(error.contains(&format!("belongs to the checkout \"{}\"", root.to_string_lossy())), "{level}: {error}");
 
             std::fs::remove_dir_all(&root).ok();

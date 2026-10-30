@@ -165,7 +165,7 @@ fn calibrate_stack_duration(area: &Area, file: &Path, base_line: &str, label: &s
         assert!(load.status.success(), "calibration load failed: {}", String::from_utf8_lossy(&load.stderr));
 
         let start = Instant::now();
-        let stack = area.run(&["stack", &format!("{label} {i}")]);
+        let stack = area.run(&["stack", "-m", &format!("{label} {i}")]);
         let elapsed = start.elapsed();
         assert!(stack.status.success(),
             "calibration stack failed: {}", String::from_utf8_lossy(&stack.stderr));
@@ -268,7 +268,7 @@ fn run_kill_spread(
         assert!(load.status.success(), "load failed: {}", String::from_utf8_lossy(&load.stderr));
 
         // 3. Spawn the stack and SIGKILL it mid-flight.
-        let mut child = area.command(&["stack", &format!("{commit_tag} commit {i}")])
+        let mut child = area.command(&["stack", "-m", &format!("{commit_tag} commit {i}")])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -336,7 +336,7 @@ fn killing_stack_midway_never_corrupts_the_store() {
     let caught_up = area.run(&["shift", "main"]);
     assert!(caught_up.status.success(), "the final catch-up failed: {}", String::from_utf8_lossy(&caught_up.stderr));
     assert!(area.run(&["load", "."]).status.success());
-    let recover = area.run(&["stack", "recover"]);
+    let recover = area.run(&["stack", "-m", "recover"]);
     let recovered_ok = recover.status.success()
         || String::from_utf8_lossy(&recover.stderr).contains("Nothing to stack");
     assert!(recovered_ok, "the store must accept a write after the crashes, stderr: {}",
@@ -485,7 +485,7 @@ fn settle(area: &Area, context: &str) {
 /// Run `stack` with `message` and return whether it committed. Anything other than a commit or
 /// "nothing to stack" fails the test.
 fn stack_or_nothing(area: &Area, message: &str) -> bool {
-    let stack = area.run(&["stack", message]);
+    let stack = area.run(&["stack", "-m", message]);
     let nothing_to_stack = String::from_utf8_lossy(&stack.stderr).to_lowercase().contains("nothing to stack");
     assert!(stack.status.success() || nothing_to_stack,
         "{message}: stack must either succeed or report nothing staged, stderr: {}",
@@ -730,7 +730,7 @@ fn killing_park_midway_never_leaves_a_parked_parcel_referencing_a_missing_or_tor
 
     // A pallet head to park onto — `park` refuses when the pallet has nothing stacked yet.
     assert!(area.run(&["load", "."]).status.success());
-    assert!(area.run(&["stack", "base"]).status.success());
+    assert!(area.run(&["stack", "-m", "base"]).status.success());
 
     const DELAY_COUNT: usize = 20;
 
@@ -803,7 +803,7 @@ fn load_barrier_count_for(files_per_dir: usize) -> u64 {
     assert!(area.run(&["prepare"]).status.success());
     assert!(area.run(&["config", "set", "operator.identifier", "barrier@forklift"]).status.success());
     assert!(area.run(&["load", "."]).status.success());
-    assert!(area.run(&["stack", "base"]).status.success());
+    assert!(area.run(&["stack", "-m", "base"]).status.success());
 
     // A real content change to every already-tracked file: every one of the `DIR_COUNT`
     // directories has a genuine content change, so the same single ancestor (the root) needs
@@ -866,7 +866,7 @@ fn restore_barrier_count_for(files_per_dir: usize) -> u64 {
     assert!(area.run(&["prepare"]).status.success());
     assert!(area.run(&["config", "set", "operator.identifier", "barrier@forklift"]).status.success());
     assert!(area.run(&["load", "."]).status.success());
-    assert!(area.run(&["stack", "base"]).status.success());
+    assert!(area.run(&["stack", "-m", "base"]).status.success());
 
     for dir in 0..DIR_COUNT {
         let dir_path = warehouse.join(format!("dir{dir}"));
@@ -927,7 +927,7 @@ fn park_pop_barrier_count_for(files_per_dir: usize) -> u64 {
     assert!(area.run(&["prepare"]).status.success());
     assert!(area.run(&["config", "set", "operator.identifier", "barrier@forklift"]).status.success());
     assert!(area.run(&["load", "."]).status.success());
-    assert!(area.run(&["stack", "base"]).status.success());
+    assert!(area.run(&["stack", "-m", "base"]).status.success());
 
     for dir in 0..DIR_COUNT {
         let dir_path = warehouse.join(format!("dir{dir}"));
@@ -993,7 +993,7 @@ fn park_pop_whose_staging_fails_keeps_the_parcel_parked() {
     assert!(area.run(&["prepare"]).status.success());
     assert!(area.run(&["config", "set", "operator.identifier", "barrier@forklift"]).status.success());
     assert!(area.run(&["load", "."]).status.success());
-    assert!(area.run(&["stack", "base"]).status.success());
+    assert!(area.run(&["stack", "-m", "base"]).status.success());
 
     for dir in 0..2 {
         std::fs::write(warehouse.join(format!("dir{dir}")).join("file.txt"), "parked\n").unwrap();
@@ -1125,7 +1125,7 @@ fn diverged_merge_fixture(area: &Area, files_per_dir: usize, clash: bool) -> Str
     assert!(area.run(&["prepare"]).status.success());
     assert!(area.run(&["config", "set", "operator.identifier", "barrier@forklift"]).status.success());
     assert!(area.run(&["load", "."]).status.success());
-    assert!(area.run(&["stack", "base"]).status.success());
+    assert!(area.run(&["stack", "-m", "base"]).status.success());
     assert!(area.run(&["pallet", "create", "feature"]).status.success());
 
     for dir in 0..DIR_COUNT {
@@ -1141,7 +1141,7 @@ fn diverged_merge_fixture(area: &Area, files_per_dir: usize, clash: bool) -> Str
     }
 
     assert!(area.run(&["load", "."]).status.success());
-    assert!(area.run(&["stack", "feature work"]).status.success());
+    assert!(area.run(&["stack", "-m", "feature work"]).status.success());
     let feature = std::fs::read_to_string(warehouse.join(".forklift").join("pallets").join("feature"))
         .unwrap().trim().to_string();
 
@@ -1157,7 +1157,7 @@ fn diverged_merge_fixture(area: &Area, files_per_dir: usize, clash: bool) -> Str
         }
     }
     assert!(area.run(&["load", "."]).status.success());
-    assert!(area.run(&["stack", "main work"]).status.success());
+    assert!(area.run(&["stack", "-m", "main work"]).status.success());
 
     // The merge below applies every edit and every removal.
     assert_eq!(std::fs::read_to_string(warehouse.join("dir0").join("file0.txt")).unwrap(), "v1 0 0\n");
@@ -1296,15 +1296,15 @@ fn a_merge_conflict_clears_the_rollups_above_it() {
     assert!(area.run(&["prepare"]).status.success());
     assert!(area.run(&["config", "set", "operator.identifier", "barrier@forklift"]).status.success());
     assert!(area.run(&["load", "."]).status.success());
-    assert!(area.run(&["stack", "base"]).status.success());
+    assert!(area.run(&["stack", "-m", "base"]).status.success());
     assert!(area.run(&["pallet", "create", "feature"]).status.success());
     std::fs::write(deep.join("f.txt"), "theirs\n").unwrap();
     assert!(area.run(&["load", "."]).status.success());
-    assert!(area.run(&["stack", "feature work"]).status.success());
+    assert!(area.run(&["stack", "-m", "feature work"]).status.success());
     assert!(area.run(&["shift", "main"]).status.success());
     std::fs::write(deep.join("f.txt"), "ours\n").unwrap();
     assert!(area.run(&["load", "."]).status.success());
-    assert!(area.run(&["stack", "main work"]).status.success());
+    assert!(area.run(&["stack", "-m", "main work"]).status.success());
 
     // A clean warehouse whose rollups stocktake trusts, before the merge.
     let before = area.run(&["--json", "stocktake"]);
@@ -1443,7 +1443,7 @@ fn building_the_commit_graph_pays_no_durability_barrier() {
     for i in 0..8 {
         std::fs::write(warehouse.join("f.txt"), format!("line {i}\n").repeat(i + 1)).unwrap();
         assert!(area.run(&["load", "f.txt"]).status.success());
-        let mut stack = area.command(&["stack", &format!("change {i}")]);
+        let mut stack = area.command(&["stack", "-m", &format!("change {i}")]);
         stack.env("FORKLIFT_DEBUG_BARRIER_COUNT", "1");
         let output = stack.output().unwrap();
         assert!(output.status.success(), "stack failed: {}", String::from_utf8_lossy(&output.stderr));

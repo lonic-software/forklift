@@ -105,7 +105,7 @@ its everyday commands as hidden aliases (`add`, `commit`, `status`, `log`, `bran
 | Addressing | SHA-1 (SHA-256 opt-in, migration ongoing) | **Blake3** (fast, parallel, keyed-hashing capable) |
 | Content model | Snapshots (trees), delta-compressed in packs | Snapshots (trees), delta-compressed in packs |
 | On-disk compression | zlib; delta chains in packfiles | zstd; bounded delta chains in native packs |
-| Staging area | The index (single file) | **Sharded per-directory inventory** ("the dock") |
+| Staging area | The index (single file) | **Sharded per-directory inventory** |
 | Large files | Whole objects, or the Git LFS add-on | **Native content-defined chunking** from 8 MiB |
 
 Both are snapshot systems: identical content yields an identical hash and is stored
@@ -129,7 +129,7 @@ once (dedup). The meaningful divergences:
 
 ### 2.2 The staging area
 
-Both keep a staging step (Git's index, Forklift's inventory/dock) — a deliberate
+Both keep a staging step (Git's index, Forklift's inventory) — a deliberate
 similarity, and a deliberate *difference* from jj and Sapling, which drop it. Forklift's
 `load` = `git add`, `stack` = `git commit`. The behavioral wrinkle: Forklift's `commit`
 alias runs `stack`, which commits what you've `load`ed — it does **not** stage-and-commit
@@ -158,7 +158,7 @@ in one step. Forklift stages whole files: there is no interactive hunk staging.
     back `stack`, `consolidate`, `pick`, `shift` and pallet deletes one at a time.
     Simpler than choosing among Git's kinds of reset, but shallower than Git's reflog for
     arbitrary recovery.
-  - [`deliver`](guide/cli.md#deliver--squash-a-draft-onto-a-target-keeping-the-trail-dv) —
+  - [`deliver`](guide/cli.md#deliver--squash-a-draft-onto-a-target-keeping-the-trail) —
     squash a draft pallet's checkpoint trail into one clean signed parcel *while keeping the
     trail* as signed evidence. Unlike `git rebase -i` squash, the trail is not destroyed;
     but it is narrower in scope.
@@ -180,7 +180,7 @@ in [Trust and identity](guide/trust-and-identity.md).
 | Commit signing | Optional per author (GPG, SSH or X.509) | **Mandatory once you enroll** — a one-way door, no unsigned escape hatch |
 | Who can contribute | Whoever the host lets push | On a trusted warehouse, **only holders of admitted keys** |
 | User registry | None (hosts keep one outside the repo) | **In-repo `office`** — users, roles, keys, all signed |
-| Offline verification | `git verify-commit` against a keyring you supply | [`audit`](guide/cli.md#audit--verify-signed-history-offline-a) — verifies the chain from a **genesis trust anchor** offline |
+| Offline verification | `git verify-commit` against a keyring you supply | [`audit`](guide/cli.md#audit--verify-signed-history-offline) — verifies the chain from a **genesis trust anchor** offline |
 | Key management | Out of band | `profile keygen` / `office admit` / `authorize` / `rotate` / `retire`, with revocation decided by ancestry |
 | Privacy | Name + email baked into immutable history forever | **Pseudonymous: history has no name or email fields**, only an operator id |
 
@@ -197,7 +197,7 @@ Git has signed tags and `git notes`, but pull requests, reviews and approvals li
 **GitHub's or GitLab's database**: not in the repo, not portable, not signed, and left behind
 if you change hosts. Forklift puts them *in the warehouse* as signed records on meta pallets:
 
-- [`manifest`](guide/cli.md#manifest--signed-post-metadata-on-parcels-mf) — signed
+- [`manifest`](guide/cli.md#manifest--signed-post-metadata-on-parcels) — signed
   notes, approvals and **AI provenance** attached to parcels.
 - [`manifest set`](guide/cli.md#manifest-set--keyed-values-on-parcels) — your own signed keys and values on
   any parcel (CI status, for example).
@@ -302,7 +302,7 @@ jj is the most direct "modern VCS" comparison, and in several areas jj is ahead.
   standout. Forklift has no rebase. **[Forklift lacks this.]**
 - **Stable change IDs + revsets.** jj gives every change a stable ID that survives
   rewrites, plus a `revset` query language. Forklift identifies parcels by hash, and its
-  [`query`](guide/cli.md#query--filter-history-on-signed-identity-q) filters history by
+  [`query`](guide/cli.md#query--filter-history-on-signed-identity) filters history by
   signed identity, provenance, tags and paths, but is not a revset algebra. **[Forklift lacks
   stable change IDs and revsets.]**
 

@@ -366,7 +366,7 @@ if [ -f "$B/.forkliftignore" ]; then
     run_in "$B" 'forklift load .forkliftignore'
     if ( cd "$B" && forklift --json stocktake --summary ) 2>/dev/null \
         | grep -q '"staged_count": *[1-9]'; then
-        run_in "$B" 'forklift stack "Keep the .git ignore rule"'
+        run_in "$B" 'forklift stack -m "Keep the .git ignore rule"'
     fi
 fi
 
@@ -483,7 +483,7 @@ GIT_SETUP="printf '\n// commit bench %s\n' \"\$RANDOM\" >> '$BENCH_FILE' && git 
 FORK_SETUP="printf '\n// commit bench %s\n' \"\$RANDOM\" >> '$BENCH_FILE' && forklift load '$BENCH_FILE'"
 GM=$(time_cmd "$COMMIT_RUNS" "$A" "$GIT_SETUP"  'git commit -q -m bench')
 GDM=$(time_cmd "$COMMIT_RUNS" "$A" "$GIT_SETUP" 'git -c core.fsync=all -c core.fsyncMethod=fsync commit -q -m bench')
-FM=$(time_cmd "$COMMIT_RUNS" "$B" "$FORK_SETUP" 'forklift stack bench')
+FM=$(time_cmd "$COMMIT_RUNS" "$B" "$FORK_SETUP" 'forklift stack -m bench')
 expect_clean "after the commit step (a timed commit left something behind)"
 add_row "commit (1 file)" "$GM" "$FM" "git commit vs forklift stack, staging untimed"
 add_row "commit, git fsync=all" "$GDM" "$FM" "same, git with core.fsync=all core.fsyncMethod=fsync"

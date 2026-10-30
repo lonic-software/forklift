@@ -156,7 +156,7 @@ fn identical_worktrees_produce_identical_tree_hashes() {
         warehouse.prepare();
         populate(&warehouse);
         warehouse.run_ok(&["load", "."]);
-        warehouse.run_ok(&["stack", "layout"]);
+        warehouse.run_ok(&["stack", "-m", "layout"]);
         hashes.push(warehouse.head_tree_hash());
     }
     assert!(hashes.iter().all(|h| *h == hashes[0]),
@@ -176,7 +176,7 @@ fn a_scoped_stack_is_byte_reproducible_and_matches_a_full_stack() {
         warehouse.prepare();
         populate(&warehouse);
         warehouse.run_ok(&["load", "."]);
-        warehouse.run_ok(&["stack", "base"]);
+        warehouse.run_ok(&["stack", "-m", "base"]);
 
         let siblings = warehouse.root.parent().unwrap();
         let full_dir = siblings.join("full-bay");
@@ -198,9 +198,9 @@ fn a_scoped_stack_is_byte_reproducible_and_matches_a_full_stack() {
         }
 
         warehouse.run_ok_at(&full_dir, &["load", "."]);
-        warehouse.run_ok_at(&full_dir, &["stack", "edit in full"]);
+        warehouse.run_ok_at(&full_dir, &["stack", "-m", "edit in full"]);
         warehouse.run_ok_at(&scoped_dir, &["load", "."]);
-        warehouse.run_ok_at(&scoped_dir, &["stack", "edit in scoped"]);
+        warehouse.run_ok_at(&scoped_dir, &["stack", "-m", "edit in scoped"]);
 
         let full_tree = warehouse.parcel_tree_hash("full");
         let scoped_tree = warehouse.parcel_tree_hash("scoped");
@@ -225,7 +225,7 @@ fn stocktake_output_is_stable_across_runs() {
     warehouse.prepare();
     populate(&warehouse);
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "base"]);
+    warehouse.run_ok(&["stack", "-m", "base"]);
 
     // A mix of staged and unstaged changes so the walk has real work to order.
     for dir in 0..8 {
@@ -258,7 +258,7 @@ fn repacking_is_byte_reproducible() {
             );
         }
         warehouse.run_ok(&["load", "."]);
-        warehouse.run_ok(&["stack", &format!("revision {revision}")]);
+        warehouse.run_ok(&["stack", "-m", &format!("revision {revision}")]);
     }
 
     // Pack the loose objects, then consolidate into a single steady-state pack set.
@@ -285,7 +285,7 @@ fn a_mutating_command_is_refused_while_the_warehouse_lock_is_held() {
     warehouse.prepare();
     warehouse.write_file("a.txt", "hello\n");
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "base"]);
+    warehouse.run_ok(&["stack", "-m", "base"]);
 
     // Simulate the other process holding the lock.
     let lock = warehouse.root.join(".forklift").join("lock");
@@ -306,7 +306,7 @@ fn a_mutating_command_is_refused_while_the_warehouse_lock_is_held() {
     // the mutating command works again.
     std::fs::remove_file(&lock).unwrap();
     warehouse.run_ok(&["load", "a.txt"]);
-    warehouse.run_ok(&["stack", "after the lock cleared"]);
+    warehouse.run_ok(&["stack", "-m", "after the lock cleared"]);
 }
 
 #[test]
@@ -317,7 +317,7 @@ fn lift_takes_the_warehouse_lock() {
     warehouse.prepare();
     warehouse.write_file("a.txt", "hello\n");
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "base"]);
+    warehouse.run_ok(&["stack", "-m", "base"]);
 
     std::fs::write(warehouse.root.join(".forklift").join("lock"), "424242\n").unwrap();
 

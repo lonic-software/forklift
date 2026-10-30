@@ -1059,7 +1059,7 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
                     format!("'{}'", folder.replace('\'', "'\\''"))
                 };
                 let unreadable = |e: String| format!(
-                    "The inventory of folder \"{}\" cannot be read: {}. \"forklift restore --staged {}\" \
+                    "The inventory of folder \"{}\" cannot be read: {}. \"forklift unload {}\" \
                     resets it, and every folder below it, to the pallet head, unstaging everything staged \
                     there. Then load the folder again, naming any file an ignore rule covers that you had \
                     loaded by name.",
@@ -1957,7 +1957,7 @@ pub fn list_conflict_paths() -> Result<Vec<String>, String> {
 /// but the stat fields are zeroed and its mtime is [`UNPROVEN_MTIME`] on purpose, so the stat
 /// cache can never trust the entry
 /// — the next comparison against the working directory always rehashes the file. Used by
-/// `restore --staged`, where the file on disk may not match the recorded hash.
+/// `unload`, where the file on disk may not match the recorded hash.
 ///
 /// # Arguments
 /// * `name`      - The name of the file.
@@ -2470,7 +2470,7 @@ fn clear_new_addresses(new_entries: &BTreeSet<String>) -> Result<(), String> {
         Ok(metadata) if metadata.is_dir() => true,
         Ok(_) => return Err(format!(
             "The staging area's store \"{}\" is not a folder, so nothing can be staged. Remove it, then \
-            run \"forklift restore --staged .\" to reset the staging area to the pallet head.",
+            run \"forklift unload .\" to reset the staging area to the pallet head.",
             store_root.to_string_lossy()
         )),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
@@ -4162,7 +4162,7 @@ mod tests {
     }
 
     /// A registered key whose slot holds a file instead of a folder is removed like an unregistered
-    /// one, so the damage does not block `scope narrow` or `restore --staged` over that subtree.
+    /// one, so the damage does not block `scope narrow` or `unload` over that subtree.
     #[test]
     fn removing_a_registered_key_removes_a_file_in_place_of_its_shard_folder() {
         let _scratch = Scratch::new("remove-registered-file-slot");
@@ -4991,7 +4991,7 @@ mod tests {
         assert!(!outside.join(&fan_out_name).join(&slot_name).join("data").exists(), "nothing behind the link is written");
         assert!(!is_registered("new"));
         let error = result.unwrap_err();
-        assert!(error.contains("is not a folder") && error.contains("restore --staged ."), "{error}");
+        assert!(error.contains("is not a folder") && error.contains("unload ."), "{error}");
 
         // The way out: remove the link, then reset the staging area to the head (here, empty).
         std::fs::remove_file(&store_root).unwrap();
@@ -5035,7 +5035,7 @@ mod tests {
             assert!(written.is_err(), "{level}: a write through the link is refused");
             assert!(updated.is_err(), "{level}: an update through the link is refused");
             let error = read.expect_err(level);
-            assert!(error.contains("a link is never followed") && error.contains("restore --staged ."), "{level}: {error}");
+            assert!(error.contains("a link is never followed") && error.contains("unload ."), "{level}: {error}");
 
             // The way out: remove the link, then reset the staging area to the head (here, empty).
             unlink(&linked, is_dir);
@@ -5087,7 +5087,7 @@ mod tests {
         link_to(&outside, &metadata, false);
 
         let error = ShardLedger::read().map(|_| ()).expect_err("a linked metadata file");
-        assert!(error.contains("is not a file (a link is never followed)") && error.contains("restore --staged ."), "{error}");
+        assert!(error.contains("is not a file (a link is never followed)") && error.contains("unload ."), "{error}");
 
         // The way out: remove the link, then reset the staging area to the head (here, empty).
         unlink(&metadata, false);

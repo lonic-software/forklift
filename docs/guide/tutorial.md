@@ -68,7 +68,7 @@ commit. `.forkliftignore` is ordinary tracked content, so its rules travel with 
 
 ```console
 $ forklift load .
-$ forklift stack "First parcel"
+$ forklift stack -m "First parcel"
 Stacked parcel … on pallet "main".
 ```
 
@@ -88,7 +88,7 @@ modified: readme.md
   1   - Hello, world!
     1 + Hello, forklift!
 $ forklift load readme.md
-$ forklift stack "Greet forklift"
+$ forklift stack -m "Greet forklift"
 Stacked parcel … on pallet "main".
 ```
 
@@ -120,7 +120,7 @@ $ forklift pallet create shout
 Created pallet "shout" and shifted to it.
 $ echo 'HELLO, FORKLIFT!' > readme.md
 $ forklift load readme.md
-$ forklift stack "Shout the greeting"
+$ forklift stack -m "Shout the greeting"
 Stacked parcel … on pallet "shout".
 ```
 
@@ -133,7 +133,7 @@ $ cat readme.md
 Hello, forklift!
 $ echo 'Hello, forklift and friends!' > readme.md
 $ forklift load readme.md
-$ forklift stack "Greet friends too"
+$ forklift stack -m "Greet friends too"
 Stacked parcel … on pallet "main".
 ```
 
@@ -167,7 +167,7 @@ consolidation as a parcel with two parents:
 ```console
 $ echo 'HELLO, FORKLIFT AND FRIENDS!' > readme.md
 $ forklift load readme.md
-$ forklift stack "Consolidate shout"
+$ forklift stack -m "Consolidate shout"
 Stacked parcel … on pallet "main".
 $ forklift history --limit 1
 parcel …
@@ -203,7 +203,7 @@ Suppose you stack the half-finished idea by mistake. `undo` reverses the last op
 undoing a stack, the parcel's changes are staged again:
 
 ```console
-$ forklift stack "Half-finished idea"
+$ forklift stack -m "Half-finished idea"
 Stacked parcel … on pallet "main".
 $ forklift undo
 Undid stack on pallet "main".
@@ -238,7 +238,7 @@ Identity root key: …
 From now on every parcel stacked in this warehouse must be signed. This cannot be undone (a lockout is handled by archiving and re-preparing the warehouse).
 $ echo 'Signed from here on.' > notes.md
 $ forklift load notes.md
-$ forklift stack "Add notes"
+$ forklift stack -m "Add notes"
 Stacked parcel … on pallet "main".
 ```
 
@@ -300,7 +300,7 @@ Make a change in the copy and lift it:
 $ cd hello-copy
 $ echo 'Edited in the copy.' >> notes.md
 $ forklift load notes.md
-$ forklift stack "Edit notes in the copy"
+$ forklift stack -m "Edit notes in the copy"
 Stacked parcel … on pallet "main".
 $ forklift lift
 Lifted pallet "main" to …: 1 new parcel(s), … object(s) and 1 signature(s) uploaded.

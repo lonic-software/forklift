@@ -51,6 +51,7 @@ forklift haul show: <ID>
 forklift haul update: <ID>
 forklift haul comment: <ID> -m/--message=<MESSAGE>
 forklift haul review: <ID> --request-changes --comment -m/--message=<MESSAGE>
+    -> forklift haul review: <ID> --approve --request-changes --comment -m/--message=<MESSAGE>
 forklift haul merge: <ID>
     -> forklift haul consolidate: <ID>
 forklift haul close: <ID>
@@ -116,6 +117,8 @@ forklift profile use: <NAME>
 forklift query: [REVISION]... --from=<REVISION> --class=<CLASS> --unsupervised --supervisor=<OPERATOR> --signer=<KEYPREFIX> --author-after=<TIMESTAMP> --author-before=<TIMESTAMP> --merges --no-merges --grep=<GLOB> --model=<GLOB> --tool=<GLOB> --tag=<NAME> --touches=<PATH> --verify --recorded --where=<JSON> -n/--limit=<LIMIT> --after=<CURSOR> --oneline
 forklift remove: <PATH>
 forklift restore: -s/--staged <PATH>
+    -> forklift restore: <PATH>
+    -> forklift unload: <PATH>
 forklift self-schema:
     -> forklift self:
     -> forklift self schema:
@@ -124,6 +127,7 @@ forklift self-update: --check
 forklift shift: <PALLET>
 forklift show: <REVISION:PATH>
 forklift stack: [DESCRIPTION]
+    -> forklift stack: -m/--message=<MESSAGE>
 forklift stocktake: --summary
 forklift expand: <PATH>...
     -> forklift scope fetch: <PATH>...

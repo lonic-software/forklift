@@ -576,7 +576,7 @@ fn every_command_on_the_page_is_one_the_test_runs() {
 fn only_commands_a_shell_runs_unchanged_are_run() {
     let runs = |command: &str| shell_divergence(command).is_none();
 
-    assert!(runs("forklift stack \"First parcel\""));
+    assert!(runs("forklift stack -m \"First parcel\""));
     assert!(runs("echo 'Hello, world!' > readme.md"));
     assert!(runs("echo \"text\" >> notes.md"));
     assert!(runs("echo '^build(/.*)?$' > .forkliftignore"));
@@ -587,14 +587,14 @@ fn only_commands_a_shell_runs_unchanged_are_run() {
     assert!(!runs("cd ~"));
     assert!(!runs("echo $HOME > f"));
     assert!(!runs("echo \"$HOME\" > f"));
-    assert!(!runs("forklift load a && forklift stack m"));
+    assert!(!runs("forklift load a && forklift stack -m m"));
     assert!(!runs("forklift history | head"));
-    assert!(!runs("forklift load a; forklift stack m"));
+    assert!(!runs("forklift load a; forklift stack -m m"));
     assert!(!runs("echo -n x > f"));
     assert!(!runs("echo a>f"));
     assert!(!runs("echo a > f > g"));
-    assert!(!runs("forklift stack \"unclosed"));
-    assert!(!runs("forklift stack m # a comment"));
+    assert!(!runs("forklift stack -m \"unclosed"));
+    assert!(!runs("forklift stack -m m # a comment"));
     assert!(!runs("echo 'a\\nb' > f"));
     assert!(!runs("forklift config set operator.identifier =ada"));
     assert!(runs("forklift config set remote.url --opt=a=b"));

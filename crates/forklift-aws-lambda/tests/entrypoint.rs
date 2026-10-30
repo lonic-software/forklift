@@ -264,7 +264,7 @@ fn the_untrusted_lift_walk_maps_every_status() {
     area.write_file("wh/readme.txt", "hello\n");
     area.write_file("wh/src/main.txt", "fn main\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "first"]);
+    area.forklift("wh", &["stack", "-m", "first"]);
 
     let harvest = harvest(&area.path("wh"));
     let main_head = harvest.head_of("main").expect("main has a head");
@@ -329,7 +329,7 @@ fn a_pallet_delete_answers_over_http() {
     prepare(&area, "wh");
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "first"]);
+    area.forklift("wh", &["stack", "-m", "first"]);
     area.forklift("wh", &["pallet", "create", "feature"]);
 
     let harvest = harvest(&area.path("wh"));
@@ -373,10 +373,10 @@ fn the_holds_endpoint_walks_the_stored_history() {
     prepare(&area, "wh");
     area.write_file("wh/readme.txt", "hello\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "first"]);
+    area.forklift("wh", &["stack", "-m", "first"]);
     area.write_file("wh/readme.txt", "hello again\n");
     area.forklift("wh", &["load", "readme.txt"]);
-    area.forklift("wh", &["stack", "second"]);
+    area.forklift("wh", &["stack", "-m", "second"]);
 
     let harvest = harvest(&area.path("wh"));
     let main_head = harvest.head_of("main").expect("main has a head");
@@ -421,7 +421,7 @@ fn a_pallet_named_with_a_slash_routes_as_literal_segments() {
     prepare(&area, "wh");
     area.write_file("wh/readme.txt", "hello\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "first"]);
+    area.forklift("wh", &["stack", "-m", "first"]);
 
     let harvest = harvest(&area.path("wh"));
     let main_head = harvest.head_of("main").expect("main has a head");
@@ -466,7 +466,7 @@ fn a_tail_naming_no_valid_pallet_is_refused_on_every_route() {
     prepare(&area, "wh");
     area.write_file("wh/readme.txt", "hello\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "first"]);
+    area.forklift("wh", &["stack", "-m", "first"]);
     let harvest = harvest(&area.path("wh"));
     let head = harvest.head_of("main").expect("main has a head");
 
@@ -602,7 +602,7 @@ fn signature_endpoints_map_created_idempotent_and_conflict() {
     area.forklift("wh", &["office", "enroll"]);
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "signed"]);
+    area.forklift("wh", &["stack", "-m", "signed"]);
 
     let harvest = harvest(&area.path("wh"));
     let (parcel, sidecar) = harvest.signatures.iter().next().expect("a signed parcel");
@@ -837,7 +837,7 @@ fn batch_offloads_or_streams_by_store() {
     prepare(&area, "wh");
     area.write_file("wh/a.txt", "alpha\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "one"]);
+    area.forklift("wh", &["stack", "-m", "one"]);
 
     let harvest = harvest(&area.path("wh"));
     let hashes: Vec<String> = harvest.objects.keys().cloned().collect();
@@ -935,7 +935,7 @@ fn a_trusted_lift_runs_the_audit_through_http() {
     area.forklift("wh", &["office", "enroll"]);
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "signed one"]);
+    area.forklift("wh", &["stack", "-m", "signed one"]);
 
     let harvest = harvest(&area.path("wh"));
     let anchor = harvest.trust.clone().expect("trust established");
@@ -1008,7 +1008,7 @@ fn a_shared_bearer_holder_may_move_any_pallet_including_the_office() {
     area.forklift("wh", &["office", "enroll"]);
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "signed"]);
+    area.forklift("wh", &["stack", "-m", "signed"]);
 
     let harvest = harvest(&area.path("wh"));
     let anchor = harvest.trust.clone().expect("trust established");
@@ -1153,7 +1153,7 @@ fn rostered_warehouse(area: &Area) -> (Harvest, String, String) {
     enroll(area, "wh", "rea@forklift", &["reader"]);
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "signed"]);
+    area.forklift("wh", &["stack", "-m", "signed"]);
 
     let harvest = harvest(&area.path("wh"));
     let office_head = harvest.head_of(&format!("@{}", OFFICE_PALLET_NAME)).expect("office head");
@@ -1300,7 +1300,7 @@ fn an_untrusted_warehouse_admits_any_operator() {
     prepare(&area, "wh");
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "unsigned"]);
+    area.forklift("wh", &["stack", "-m", "unsigned"]);
 
     let harvest = harvest(&area.path("wh"));
     let main_head = harvest.head_of("main").expect("main head");

@@ -89,10 +89,10 @@
 //! * **At clean completion** ([`mark_load_completed`]): every recorded root the completed load's
 //!   own root covers is cleared. A narrower, or disjoint, load leaves everything else alone — it
 //!   never re-walked what it does not cover.
-//! * **At a staging reset** ([`clear_recorded_under`], [`clear_all_recorded`]): `restore
-//!   --staged <path>` (and `unload`) rebuild exactly the subtree at `<path>` from the pallet
+//! * **At a staging reset** ([`clear_recorded_under`], [`clear_all_recorded`]): `unload
+//!   <path>` rebuilds exactly the subtree at `<path>` from the pallet
 //!   head, so every recorded root that subtree covers is now known-consistent — call
-//!   [`clear_recorded_under`]. The same call also covers `restore --staged`'s vacuous case (a
+//!   [`clear_recorded_under`]. The same call also covers `unload`'s vacuous case (a
 //!   target neither in the inventory nor the head, but with zero staged entries anywhere beneath
 //!   it either — see `restore::restore_staged`'s doc comment): the region it validated is exactly
 //!   `<path>`'s own subtree, so the same "only what `R` covers" rule already gives the right
@@ -105,7 +105,7 @@
 //! Removal is always best-effort (`marker_utils::remove_covered_by`/`clear` swallow every error):
 //! a marker that resurrects after a crash right after a successful removal fails in the safe
 //! direction — the next check still refuses, and the remedy is one cheap re-load or
-//! `restore --staged`.
+//! `unload`.
 //!
 //! ## Malformed marker
 //!
@@ -182,7 +182,7 @@ pub fn mark_load_completed(root_key: &str) {
 
 /// Record that region `root_key` is now known-consistent — because a load rooted there just
 /// finished cleanly, because some other operation rebuilt exactly that subtree from a known-good
-/// source (`restore --staged`, `unload`), or because `restore --staged`'s vacuous-heal case (see
+/// source (`unload`), or because `unload`'s vacuous-heal case (see
 /// `restore::restore_staged`'s doc comment) has already confirmed `root_key`'s own subtree has
 /// zero staged entries anywhere beneath it — that confirmation *is* `root_key`'s validation, so
 /// the same "only clear what was actually validated" rule applies unchanged.
@@ -194,7 +194,7 @@ pub fn mark_load_completed(root_key: &str) {
 ///
 /// # Returns
 /// The recorded root(s) actually cleared — empty when `root_key` did not cover any recorded root
-/// at all (a caller like `restore --staged`'s vacuous-heal case uses this to fall back to its
+/// at all (a caller like `unload`'s vacuous-heal case uses this to fall back to its
 /// ordinary, unrelated-path handling instead of reporting a heal).
 pub fn clear_recorded_under(root_key: &str) -> BTreeSet<String> {
     marker_utils::remove_covered_by(&marker_path(), root_key)
@@ -243,13 +243,13 @@ fn incomplete_load_refusal(recorded: &BTreeSet<String>) -> CoreError {
     let next_step = if recorded.len() == 1 {
         let path = display_path(recorded.iter().next().expect("len == 1"));
         format!(
-            "Run \"forklift load {}\" again, or \"forklift restore --staged {}\" to abandon it.",
+            "Run \"forklift load {}\" again, or \"forklift unload {}\" to abandon it.",
             path, path
         )
     } else {
         format!(
-            "Re-run \"forklift load\" over each affected path ({}), or \"forklift restore \
-            --staged <path>\" to abandon it, for each.",
+            "Re-run \"forklift load\" over each affected path ({}), or \"forklift unload <path>\" to \
+            abandon it, for each.",
             format_roots(recorded)
         )
     };

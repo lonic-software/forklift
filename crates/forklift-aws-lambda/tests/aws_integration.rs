@@ -1163,7 +1163,7 @@ async fn a_head_untrusted_lift_commits_over_s3_and_dynamodb() {
     area.write_file("wh/readme.txt", "hello\n");
     area.write_file("wh/src/main.txt", "fn main\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "first"]);
+    area.forklift("wh", &["stack", "-m", "first"]);
 
     let harvest = harvest(&area.path("wh"));
     let main_head = harvest.head_of("main").expect("main has a head");
@@ -1281,7 +1281,7 @@ async fn the_http_edge_drives_a_staged_lift_over_s3_and_dynamodb_following_307s(
     area.write_file("wh/readme.txt", "hello\n");
     area.write_file("wh/src/main.txt", "fn main\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "first"]);
+    area.forklift("wh", &["stack", "-m", "first"]);
 
     let harvest = harvest(&area.path("wh"));
     let main_head = harvest.head_of("main").expect("main has a head");
@@ -1749,7 +1749,7 @@ async fn the_cli_lifts_and_lowers_through_the_staging_flow_over_s3_and_dynamodb(
     area.write_file("wh/readme.txt", "hello staging\n");
     area.write_file("wh/src/main.txt", "fn main\n");
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "first"]);
+    area.forklift("wh", &["stack", "-m", "first"]);
     area.forklift("wh", &["config", "set", "remote.url", &head.url]);
 
     // The money shot: lift through the staging flow (a failed staging PUT, commit, or ref update
@@ -1770,7 +1770,7 @@ async fn the_cli_lifts_and_lowers_through_the_staging_flow_over_s3_and_dynamodb(
     // Incremental: new work in `wh` lifts through staging and lowers into `clone`.
     area.write_file("wh/readme.txt", "hello staging, twice\n");
     area.forklift("wh", &["load", "readme.txt"]);
-    area.forklift("wh", &["stack", "second"]);
+    area.forklift("wh", &["stack", "-m", "second"]);
     area.forklift("wh", &["lift"]);
 
     area.forklift("clone", &["lower"]);
@@ -1841,7 +1841,7 @@ fn build_chunked_warehouse(
     prepare(&area, "wh");
     area.write_large_file("wh/big.bin", 0xC0FFEE, size);
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "a giant"]);
+    area.forklift("wh", &["stack", "-m", "a giant"]);
 
     let harvest = harvest(&area.path("wh"));
     let main_head = harvest.head_of("main").expect("main has a head");
@@ -2222,7 +2222,7 @@ async fn the_cli_lifts_and_franchises_a_chunked_file_over_s3_and_dynamodb() {
     prepare(&area, "wh");
     area.write_large_file("wh/big.bin", 0xBADA55, CHUNK_THRESHOLD + 5 * 1024 * 1024);
     area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "a giant"]);
+    area.forklift("wh", &["stack", "-m", "a giant"]);
     area.forklift("wh", &["config", "set", "remote.url", &head.url]);
 
     // The money shot: lift a chunked file through the staging flow (a failed staging PUT, a

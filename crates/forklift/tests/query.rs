@@ -144,7 +144,7 @@ fn signed_warehouse_with_agent(name: &str) -> TestWarehouse {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base parcel"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base parcel"]));
     assert_success(&warehouse.run(&["office", "enroll"]));
 
     let agent = keygen_admit_args(&warehouse, "agent@forklift");
@@ -212,7 +212,7 @@ fn verified_query_filters_on_the_signer_never_the_recorded_author() {
     assert_success(&warehouse.run(&["config", "set", "operator.identifier", "agent@forklift"]));
     warehouse.write_file("agent.txt", "by the agent\n");
     assert_success(&warehouse.run(&["load", "agent.txt"]));
-    let agent_parcel = extract_parcel_hash(&warehouse.run(&["stack", "agent work"]));
+    let agent_parcel = extract_parcel_hash(&warehouse.run(&["stack", "-m", "agent work"]));
 
     // The forgery shape (the design's crux finding): a parcel whose *recorded* author is
     // the human but whose *signature* is the agent's key. A cherry-pick produces exactly
@@ -221,7 +221,7 @@ fn verified_query_filters_on_the_signer_never_the_recorded_author() {
     assert_success(&warehouse.run(&["pallet", "create", "drafts"]));
     warehouse.write_file("draft.txt", "human draft\n");
     assert_success(&warehouse.run(&["load", "draft.txt"]));
-    let human_draft = extract_parcel_hash(&warehouse.run(&["stack", "human draft work"]));
+    let human_draft = extract_parcel_hash(&warehouse.run(&["stack", "-m", "human draft work"]));
     assert_success(&warehouse.run(&["shift", "main"]));
 
     assert_success(&warehouse.run(&["config", "set", "operator.identifier", "agent@forklift"]));
@@ -308,7 +308,7 @@ fn predicate_bounds_and_malformed_predicates_refuse_with_exit_18() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base parcel"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base parcel"]));
 
     // Depth: 17 nested "not"s. Leaves: 129 in an "all". In-array: 257 values. Glob: 257
     // chars. Payload: over 64 KiB. Malformed: not JSON / unknown field / wrong op.
@@ -378,7 +378,7 @@ fn query_pages_deterministically_with_a_cursor() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "parcel 0"]));
+    assert_success(&warehouse.run(&["stack", "-m", "parcel 0"]));
 
     for index in 1..6 {
         warehouse.write_file("a.txt", &format!("content {}\n", index));
@@ -424,11 +424,11 @@ fn a_missing_parcel_body_errors_the_whole_query() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    let first = extract_parcel_hash(&warehouse.run(&["stack", "first parcel"]));
+    let first = extract_parcel_hash(&warehouse.run(&["stack", "-m", "first parcel"]));
 
     warehouse.write_file("a.txt", "two\n");
     assert_success(&warehouse.run(&["load", "a.txt"]));
-    assert_success(&warehouse.run(&["stack", "second parcel"]));
+    assert_success(&warehouse.run(&["stack", "-m", "second parcel"]));
 
     // A parcel body is spine, not sparse content: deleting it must hard-error the query
     // (like audit), never degrade to a soft count an attacker could hide a deletion in.
@@ -462,18 +462,18 @@ fn provenance_matches_and_absence_is_not_negation() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    let base = extract_parcel_hash(&warehouse.run(&["stack", "base parcel"]));
+    let base = extract_parcel_hash(&warehouse.run(&["stack", "-m", "base parcel"]));
     assert_success(&warehouse.run(&["office", "enroll"])); // test@forklift gets a signing key
 
     // A parcel with no provenance recorded at all.
     warehouse.write_file("bare.txt", "no provenance\n");
     assert_success(&warehouse.run(&["load", "bare.txt"]));
-    let bare = extract_parcel_hash(&warehouse.run(&["stack", "bare work"]));
+    let bare = extract_parcel_hash(&warehouse.run(&["stack", "-m", "bare work"]));
 
     // A parcel attributed to claude-opus-4-8 via claude-code.
     warehouse.write_file("attributed.txt", "generated\n");
     assert_success(&warehouse.run(&["load", "attributed.txt"]));
-    let attributed = extract_parcel_hash(&warehouse.run(&["stack", "attributed work"]));
+    let attributed = extract_parcel_hash(&warehouse.run(&["stack", "-m", "attributed work"]));
     assert_success(&warehouse.run(&[
         "manifest", "provenance", &attributed,
         "--model", "claude-opus-4-8", "--tool", "claude-code", "--session", "sess-1",
@@ -483,7 +483,7 @@ fn provenance_matches_and_absence_is_not_negation() {
     // A parcel attributed to a different model, to pin the negation-match direction.
     warehouse.write_file("other.txt", "different model\n");
     assert_success(&warehouse.run(&["load", "other.txt"]));
-    let other_model = extract_parcel_hash(&warehouse.run(&["stack", "other model work"]));
+    let other_model = extract_parcel_hash(&warehouse.run(&["stack", "-m", "other model work"]));
     assert_success(&warehouse.run(&[
         "manifest", "provenance", &other_model, "--model", "gpt-5", "-m", "not claude",
     ]));
@@ -520,7 +520,7 @@ fn a_query_on_a_warehouse_with_no_manifest_reports_the_absence_honestly() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base parcel"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base parcel"]));
 
     // No `@manifest` was ever created: a --model query is an honest empty answer, not an
     // error, and the scope block says exactly why (absent, not "we looked and found none").
@@ -537,7 +537,7 @@ fn tags_are_membership_and_an_absent_pallet_is_unknown_not_false() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    let untagged = extract_parcel_hash(&warehouse.run(&["stack", "base parcel"]));
+    let untagged = extract_parcel_hash(&warehouse.run(&["stack", "-m", "base parcel"]));
     assert_success(&warehouse.run(&["office", "enroll"])); // test@forklift becomes admin
 
     // Before any tag is ever created, the pallet has no head at all: the omission of `tags`
@@ -547,7 +547,7 @@ fn tags_are_membership_and_an_absent_pallet_is_unknown_not_false() {
 
     warehouse.write_file("b.txt", "two\n");
     assert_success(&warehouse.run(&["load", "b.txt"]));
-    let tagged = extract_parcel_hash(&warehouse.run(&["stack", "release work"]));
+    let tagged = extract_parcel_hash(&warehouse.run(&["stack", "-m", "release work"]));
     assert_success(&warehouse.run(&["tag", "create", "v1", &tagged, "-m", "release"]));
 
     // --tag matches exactly the tagged parcel.
@@ -574,16 +574,16 @@ fn touches_matches_the_changed_path_and_respects_first_parent_only() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    let base = extract_parcel_hash(&warehouse.run(&["stack", "base parcel"]));
+    let base = extract_parcel_hash(&warehouse.run(&["stack", "-m", "base parcel"]));
 
     // A parcel touching src/, and one touching a different path.
     warehouse.write_file("src/a.rs", "fn a() {}\n");
     assert_success(&warehouse.run(&["load", "src/a.rs"]));
-    let src_touch = extract_parcel_hash(&warehouse.run(&["stack", "add src"]));
+    let src_touch = extract_parcel_hash(&warehouse.run(&["stack", "-m", "add src"]));
 
     warehouse.write_file("docs/readme.md", "hi\n");
     assert_success(&warehouse.run(&["load", "docs/readme.md"]));
-    let docs_touch = extract_parcel_hash(&warehouse.run(&["stack", "add docs"]));
+    let docs_touch = extract_parcel_hash(&warehouse.run(&["stack", "-m", "add docs"]));
 
     let matched = json(&warehouse.run(&["--json", "query", "--touches", "src"]));
     let hashes = matched_hashes(&matched);
@@ -602,14 +602,14 @@ fn touches_matches_the_changed_path_and_respects_first_parent_only() {
     assert_success(&warehouse.run(&["pallet", "create", "side"]));
     warehouse.write_file("feature/new.txt", "shared content\n");
     assert_success(&warehouse.run(&["load", "feature/new.txt"]));
-    let side_parcel = extract_parcel_hash(&warehouse.run(&["stack", "side change"]));
+    let side_parcel = extract_parcel_hash(&warehouse.run(&["stack", "-m", "side change"]));
 
     // main independently adds the exact same file+content, so consolidate resolves cleanly
     // (no conflict) and the merge's tree at feature/ is identical to main's own.
     assert_success(&warehouse.run(&["shift", "main"]));
     warehouse.write_file("feature/new.txt", "shared content\n");
     assert_success(&warehouse.run(&["load", "feature/new.txt"]));
-    let main_work = extract_parcel_hash(&warehouse.run(&["stack", "main also adds feature"]));
+    let main_work = extract_parcel_hash(&warehouse.run(&["stack", "-m", "main also adds feature"]));
 
     let merge_output = warehouse.run(&["consolidate", "side"]);
     assert_success(&merge_output);
@@ -639,7 +639,7 @@ fn new_predicate_fields_refuse_bad_ops_and_over_long_globs_with_exit_18() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base parcel"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base parcel"]));
 
     let long_model = "x".repeat(257);
     for args in [
@@ -684,7 +684,7 @@ fn signed_revoked_matches_carry_vouched_or_suspect_boundary() {
     assert_success(&warehouse.run(&["config", "set", "operator.identifier", "agent@forklift"]));
     warehouse.write_file("agent-main.txt", "agent main work\n");
     assert_success(&warehouse.run(&["load", "agent-main.txt"]));
-    let vouched_parcel = extract_parcel_hash(&warehouse.run(&["stack", "agent main work"]));
+    let vouched_parcel = extract_parcel_hash(&warehouse.run(&["stack", "-m", "agent main work"]));
 
     // A second agent-signed parcel, stacked on a side pallet branched from main's current
     // head — then immediately un-stacked with `undo`. `pallet create` itself is not journaled,
@@ -695,7 +695,7 @@ fn signed_revoked_matches_carry_vouched_or_suspect_boundary() {
     assert_success(&warehouse.run(&["pallet", "create", "side"]));
     warehouse.write_file("side.txt", "side work\n");
     assert_success(&warehouse.run(&["load", "side.txt"]));
-    let suspect_parcel = extract_parcel_hash(&warehouse.run(&["stack", "side work"]));
+    let suspect_parcel = extract_parcel_hash(&warehouse.run(&["stack", "-m", "side work"]));
     assert_success(&warehouse.run(&["undo"]));
 
     // Retire the agent's key as the admin: the distrust boundary is every pallet head

@@ -48,7 +48,7 @@ impl Warehouse {
             warehouse.write(path, content);
         }
         warehouse.run_ok(&["load", "."]);
-        warehouse.run_ok(&["stack", "first"]);
+        warehouse.run_ok(&["stack", "-m", "first"]);
 
         warehouse
     }
@@ -384,7 +384,7 @@ fn a_merge_adding_a_second_spelling_beside_a_staying_entry_is_refused() {
                                      ("docs/c", "theirs\n")]);
     warehouse.write("app.txt", "app, changed on main\n");
     warehouse.run_ok(&["load", "app.txt"]);
-    warehouse.run_ok(&["stack", "diverge"]);
+    warehouse.run_ok(&["stack", "-m", "diverge"]);
 
     let file = warehouse.run(&["consolidate", "file"]);
 
@@ -571,7 +571,7 @@ fn a_new_directory_pair_replacing_a_removed_symlink_is_refused_or_materialized_w
     let warehouse = Warehouse::new("pair-replacing-link", &[("app.txt", "app\n"), ("real/x", "x\n")]);
     std::os::unix::fs::symlink("real", warehouse.root.join("lib")).unwrap();
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "link"]);
+    warehouse.run_ok(&["stack", "-m", "link"]);
     warehouse.craft("pair", "main", &[("app.txt", "app\n"), ("real/x", "x\n"), ("LIB/a", "a\n"), ("lib/b", "b\n")]);
 
     let shifted = warehouse.run(&["shift", "pair"]);
@@ -601,7 +601,7 @@ fn a_pair_beneath_a_replaced_symlink_is_probed_in_the_working_directory() {
     std::fs::create_dir_all(&outside).unwrap();
     std::os::unix::fs::symlink(&outside, warehouse.root.join("lib")).unwrap();
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "link"]);
+    warehouse.run_ok(&["stack", "-m", "link"]);
     warehouse.craft("pair", "main", &[("app.txt", "app\n"), ("lib/d/x", "x\n"), ("lib/D/y", "y\n")]);
 
     std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o555)).unwrap();
@@ -1030,7 +1030,7 @@ fn a_named_load_into_a_tracked_folder_turned_working_tree_offers_its_way_out_und
         \"forklift remove sub\""), "{}", stderr(&loaded));
 
     warehouse.run_ok(&["remove", "sub"]);
-    warehouse.run_ok(&["stack", "leave sub"]);
+    warehouse.run_ok(&["stack", "-m", "leave sub"]);
     assert!(warehouse.root.join("sub/x").exists(), "the folder's files stay on disk");
 }
 

@@ -33,8 +33,8 @@ pub async fn handle_command(action: Option<HaulAction>) -> Result<(), String> {
         Some(HaulAction::Show { id }) => show(&id),
         Some(HaulAction::Update { id }) => update(&id),
         Some(HaulAction::Comment { id, message }) => comment(&id, &message),
-        Some(HaulAction::Review { id, request_changes, comment, message }) =>
-            review(&id, request_changes, comment, message.unwrap_or_default()),
+        Some(HaulAction::Review { id, approve, request_changes, comment, message }) =>
+            review(&id, verdict(approve, request_changes, comment), message.unwrap_or_default()),
         Some(HaulAction::Consolidate { id }) => consolidate(&id).await,
         Some(HaulAction::Close { id }) => set_status(&id, HaulStatus::Closed),
         Some(HaulAction::Reopen { id }) => set_status(&id, HaulStatus::Open),
@@ -166,17 +166,18 @@ fn comment(id: &str, message: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Record a review of the haul's current head (approve by default; `--request-changes` or
-/// `--comment` otherwise).
-fn review(id: &str, request_changes: bool, comment: bool, message: String) -> Result<(), String> {
-    let verdict = if request_changes {
-        ReviewVerdict::RequestChanges
-    } else if comment {
-        ReviewVerdict::Comment
-    } else {
-        ReviewVerdict::Approve
-    };
+/// The verdict a review states. Clap's `verdict` group requires exactly one of the three flags.
+fn verdict(approve: bool, request_changes: bool, comment: bool) -> ReviewVerdict {
+    match (approve, request_changes, comment) {
+        (true, false, false) => ReviewVerdict::Approve,
+        (false, true, false) => ReviewVerdict::RequestChanges,
+        (false, false, true) => ReviewVerdict::Comment,
+        _ => unreachable!("clap requires exactly one verdict"),
+    }
+}
 
+/// Record a review of the haul's current head.
+fn review(id: &str, verdict: ReviewVerdict, message: String) -> Result<(), String> {
     let haul = haul_utils::find_haul(id)?;
     let (office, actor, signer) = signing()?;
 

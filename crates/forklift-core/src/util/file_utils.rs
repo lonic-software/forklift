@@ -2536,7 +2536,7 @@ pub fn judge_shard_address(key: &str) -> Result<(PathBuf, bool), String> {
 /// What a user does about damage Forklift never makes in the staging area, such as a link: remove
 /// the entry, then reset the staging area to the pallet head.
 pub const STAGING_DAMAGE_REMEDY: &str =
-    "Remove it, then run \"forklift restore --staged .\" to reset the staging area to the pallet head.";
+    "Remove it, then run \"forklift unload .\" to reset the staging area to the pallet head.";
 
 /// The refusal for an inventory root that is there but does not resolve to a folder. It may be a
 /// link to an inventory moved elsewhere whose target is out of reach, such as an unmounted drive:

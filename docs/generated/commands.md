@@ -12,20 +12,20 @@ Every `forklift` command and subcommand, generated from the same command definit
 
 | Command | Alias | Hidden alias | Does |
 |---|---|---|---|
-| `audit` | `a` |  | Verify the warehouse's signed history offline |
+| `audit` |  |  | Verify the warehouse's signed history offline |
 | `bay` |  |  | Manage bays: parallel working directories bound to this warehouse |
 | `bay add` |  |  | Open a new bay (a new working directory on a new pallet) |
 | `bay remove` |  |  | De-register a bay (its pallet ref and materialized files are kept) |
-| `blame` | `bl` | `annotate` | Show, for each line of a file, the parcel and author that last changed it |
+| `blame` |  | `annotate` | Show, for each line of a file, the parcel and author that last changed it |
 | `clone` |  |  | Clone a remote warehouse into a new directory |
-| `config` | `cfg` |  | Read or change configuration values |
+| `config` |  |  | Read or change configuration values |
 | `config list` |  |  | List every known key and its value (the default) |
 | `config get` |  |  | Print the value of a key |
 | `config set` |  |  | Set a key to a value |
 | `config unset` |  |  | Remove a key (e.g. clearing a "remote.token") |
 | `conflicts` |  |  | List the files left in conflict by an unresolved consolidation |
 | `consolidate` | `con` | `merge` | Consolidate (merge) another pallet into the current one |
-| `deliver` | `dv` |  | Squash the current draft pallet onto a target as one clean parcel, keeping the trail |
+| `deliver` |  |  | Squash the current draft pallet onto a target as one clean parcel, keeping the trail |
 | `diff` | `d` |  | Show line-by-line changes |
 | `git` |  |  | Move history between this warehouse and git: import, export and mirror |
 | `git import` |  |  | Import a git repository's history into this warehouse (one-way migration) |
@@ -37,17 +37,17 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `haul show` |  |  | Show one proposal in full |
 | `haul update` |  |  | Propose the source pallet's current head |
 | `haul comment` |  |  | Add a comment |
-| `haul review` |  |  | Record a signed review (approve by default) |
+| `haul review` |  |  | Record a signed review: approve, request changes or comment |
 | `haul consolidate` |  | `merge` | Land a proposal: consolidate its source into the target |
 | `haul close` |  |  | Close a proposal without merging |
 | `haul reopen` |  |  | Reopen a closed proposal |
 | `heal` |  |  | Resolve a standing durability taint, or finish or undo an interrupted operation |
-| `help` | `h` |  | Print the command list, or detailed help about one command |
+| `help` |  |  | Print the command list, or detailed help about one command |
 | `history` | `hi` | `log` | Print the parcels of a revision, newest first |
 | `lift` | `li` | `push` | Upload the current pallet's new parcels to the remote (push) |
 | `load` | `l` | `add` | Take the current state of a file or directory into the inventory (stage) |
 | `lower` | `lo` | `pull` | Download the remote's new parcels and fast-forward the current pallet, or another (pull) |
-| `manifest` | `mf` |  | Facts recorded about a parcel after the fact: notes, approvals, provenance, keyed values |
+| `manifest` |  |  | Facts recorded about a parcel after the fact: notes, approvals, provenance, keyed values |
 | `manifest note` |  |  | Attach a free-form note to a parcel |
 | `manifest approve` |  |  | Record a signed approval (sign-off) of a parcel |
 | `manifest provenance` |  |  | Record how a parcel was produced: model, tool, session (AI provenance) |
@@ -58,7 +58,7 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `manifest keys` |  |  | List every keyed value, or a parcel's |
 | `manifest log` |  |  | Show every change to a key, newest first, with who made it |
 | `mcp` |  |  | Serve the command surface to an AI agent as MCP tools (stdio) |
-| `office` | `o` |  | Manage the warehouse office: users and signing keys |
+| `office` |  |  | Manage the warehouse office: users and signing keys |
 | `office enroll` |  |  | Enroll the configured operator and establish trust — one-way! |
 | `office admit` |  |  | Enroll another operator with their public key — admins only |
 | `office link` |  |  | Link another device's key to your own identity |
@@ -78,13 +78,13 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `park pop` |  |  | Re-apply the most recently parked changes (staged) and drop them from the list |
 | `park list` |  |  | List the parked parcels, newest first |
 | `pick` |  | `cherry-pick` | Apply a parcel's changes onto the current pallet as a new, author-preserving parcel |
-| `prepare` | `p` | `init` | Prepare a new warehouse in the current directory |
+| `prepare` |  | `init` | Prepare a new warehouse in the current directory |
 | `profile` |  |  | Manage identity profiles (named operator ids) and select one per warehouse |
 | `profile list` |  |  | List the profiles and the local keys each one holds (the default) |
 | `profile create` |  |  | Create a named profile (mints an operator id unless one is given) |
 | `profile use` |  |  | Act as this profile in the current warehouse |
 | `profile keygen` |  |  | Generate a keypair locally and print its public half + proof-of-possession |
-| `query` | `q` |  | Query parcel history by signed identity, signer and parcel facts |
+| `query` |  |  | Query parcel history by signed identity, signer and parcel facts |
 | `remote` |  |  | Show the remote and the origin, or move a partial warehouse's origin to another server |
 | `remote move` |  |  | Move a partial warehouse's origin to another server that holds its content |
 | `remote abort` |  |  | Abandon a move that stopped before it started rewriting the origin |
@@ -117,5 +117,5 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `tag list` |  |  | List every tag (the default) |
 | `undo` |  |  | Undo the last stack, consolidate, cherry-pick or shift (soft — keeps your changes) |
 | `unload` | `ul` |  | Unstage a file or directory (keep your changes) |
-| `version` | `v` |  | Print the version of Forklift |
+| `version` |  |  | Print the version of Forklift |
 

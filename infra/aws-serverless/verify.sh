@@ -480,7 +480,7 @@ printf 'FORK-60 Layer 3 verify run — small file B\n' >"$SRC_DIR/small-b.txt"
 dd if=/dev/urandom of="$SRC_DIR/big.bin" bs=1M count=9 status=none
 
 run_in "$SRC_DIR" "$FORKLIFT_BIN" load . >/dev/null || fail "forklift load failed"
-run_in "$SRC_DIR" "$FORKLIFT_BIN" stack "FORK-60 Layer 3 verify run ($(date -u +%FT%TZ))" >/dev/null ||
+run_in "$SRC_DIR" "$FORKLIFT_BIN" stack -m "FORK-60 Layer 3 verify run ($(date -u +%FT%TZ))" >/dev/null ||
   fail "forklift stack failed"
 
 log "  lifting (small files promote synchronously; big.bin promotes asynchronously via the verifier)..."

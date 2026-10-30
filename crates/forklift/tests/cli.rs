@@ -853,7 +853,7 @@ fn identity_is_zero_configuration_an_id_is_minted_on_first_use() {
     // No operator configuration at all: the first stack mints a pseudonymous id
     // (a UUID) into the global configuration and authors the parcel with it.
     assert_success(&warehouse.run(&["load", "."]));
-    let stacked = warehouse.run(&["stack", "first"]);
+    let stacked = warehouse.run(&["stack", "-m", "first"]);
     assert_success(&stacked);
 
     let minted = operator_id(&warehouse);
@@ -870,7 +870,7 @@ fn identity_is_zero_configuration_an_id_is_minted_on_first_use() {
     // The mint is stable: a second stack reuses the same id.
     warehouse.write_file("file.txt", "more\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "second"]));
+    assert_success(&warehouse.run(&["stack", "-m", "second"]));
     assert_eq!(operator_id(&warehouse), minted);
 }
 
@@ -884,7 +884,7 @@ fn stack_creates_a_parcel_and_advances_the_pallet_head() {
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
 
-    let first_stack = warehouse.run(&["stack", "Initial layout"]);
+    let first_stack = warehouse.run(&["stack", "-m", "Initial layout"]);
     assert_success(&first_stack);
     let first_hash = extract_parcel_hash(&first_stack);
 
@@ -903,14 +903,14 @@ fn stack_creates_a_parcel_and_advances_the_pallet_head() {
     assert!(peek_output.contains("Initial layout"));
 
     // Stacking again without changes is rejected.
-    let noop = warehouse.run(&["stack", "nothing changed"]);
+    let noop = warehouse.run(&["stack", "-m", "nothing changed"]);
     assert!(!noop.status.success());
     assert!(stderr(&noop).contains("Nothing to stack"));
 
     // A new change produces a parcel with the first one as its parent.
     warehouse.write_file("readme.txt", "hello again\n");
     assert_success(&warehouse.run(&["load", "readme.txt"]));
-    let second_stack = warehouse.run(&["stack", "Update readme"]);
+    let second_stack = warehouse.run(&["stack", "-m", "Update readme"]);
     assert_success(&second_stack);
     let second_hash = extract_parcel_hash(&second_stack);
     assert_ne!(first_hash, second_hash);
@@ -933,7 +933,7 @@ fn store_reports_loose_then_packed_object_counts() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
 
     // Loose: objects are unpacked, no packs, compaction not due (well under the threshold).
     let loose = warehouse.run(&["--json", "store"]);
@@ -978,7 +978,7 @@ fn stocktake_leaves_an_ignored_tracked_directory_alone_instead_of_reporting_it_r
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
 
     // Ignore build/ *after* it was already tracked (a build-output dir added to
     // .forkliftignore late). It stays tracked, so stocktake walks it like any tracked directory:
@@ -1038,12 +1038,12 @@ fn warehouse_with_a_diverged_pallet(name: &str) -> TestWarehouse {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "one"]));
+    assert_success(&warehouse.run(&["stack", "-m", "one"]));
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("notes.txt", "v2\n");
     warehouse.write_file("build/out.txt", "b2\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "two"]));
+    assert_success(&warehouse.run(&["stack", "-m", "two"]));
     assert_success(&warehouse.run(&["shift", "main"]));
 
     warehouse
@@ -1136,7 +1136,7 @@ fn a_volume_without_the_executable_bit_shifts_twice_and_keeps_each_entry_s_bit()
     built.write_file("tool.sh", "#!/bin/sh\n");
     std::fs::set_permissions(built.root.join("tool.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_success(&built.run(&["load", "tool.sh"]));
-    assert_success(&built.run(&["stack", "tool"]));
+    assert_success(&built.run(&["stack", "-m", "tool"]));
 
     let root = volume.mount.join("warehouse");
     copy(&built.root, &root);
@@ -1158,7 +1158,7 @@ fn a_volume_without_the_executable_bit_shifts_twice_and_keeps_each_entry_s_bit()
     warehouse.write_file("new.txt", "new\n");
     warehouse.write_file("tool.sh", "#!/bin/sh\necho\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "on exfat"]));
+    assert_success(&warehouse.run(&["stack", "-m", "on exfat"]));
     assert!(changes(&warehouse, "unstaged").is_empty());
     assert!(changes(&warehouse, "staged").is_empty());
 
@@ -1212,7 +1212,7 @@ fn a_bay_on_another_volume_proves_its_entries_against_its_own_clock() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
 
     let bay_dir = volume.mount.join("bay");
     assert_success(&warehouse.run(&["bay", "add", "feature", bay_dir.to_str().unwrap()]));
@@ -1244,7 +1244,7 @@ fn a_bay_on_a_volume_without_the_executable_bit_reads_clean() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
 
     let bay_dir = volume.mount.join("bay");
     assert_success(&warehouse.run(&["bay", "add", "feature", bay_dir.to_str().unwrap()]));
@@ -1310,7 +1310,7 @@ fn a_mode_only_change_is_reported_staged_and_unstaged_and_blocks_shift() {
     let staged = stdout(&warehouse.run(&["diff", "--staged"]));
     assert!(staged.contains("(mode: normal -> executable)"), "{}", staged);
 
-    assert_success(&warehouse.run(&["stack", "chmod"]));
+    assert_success(&warehouse.run(&["stack", "-m", "chmod"]));
     assert!(changes(&warehouse, "staged").is_empty());
     let pallets = stdout(&warehouse.run(&["diff", "feature", "main"]));
     assert!(pallets.contains("modified: notes.txt") && pallets.contains("(mode: normal -> executable)"), "{}", pallets);
@@ -1322,7 +1322,7 @@ fn a_mode_only_change_is_reported_staged_and_unstaged_and_blocks_shift() {
     assert_success(&warehouse.run(&["load", "."]));
     let staged = stdout(&warehouse.run(&["diff", "--staged"]));
     assert!(staged.contains("notes.txt -> moved.txt") && staged.contains("(mode: executable -> normal)"), "{}", staged);
-    assert_success(&warehouse.run(&["stack", "move and chmod -x"]));
+    assert_success(&warehouse.run(&["stack", "-m", "move and chmod -x"]));
     let pallets = stdout(&warehouse.run(&["diff", "main", "executable"]));
     assert!(pallets.contains("notes.txt -> moved.txt") && pallets.contains("(mode: executable -> normal)"), "{}", pallets);
 }
@@ -1341,18 +1341,18 @@ fn a_consolidate_keeps_the_side_that_changed_the_executable_bit() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("run.sh", "a\nb\nc\nd\nE\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "theirs edits"]));
+    assert_success(&warehouse.run(&["stack", "-m", "theirs edits"]));
     assert_success(&warehouse.run(&["shift", "main"]));
 
     warehouse.write_file("run.sh", "A\nb\nc\nd\ne\n");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "ours edits and drops the bit"]));
+    assert_success(&warehouse.run(&["stack", "-m", "ours edits and drops the bit"]));
 
     assert_success(&warehouse.run(&["consolidate", "feature"]));
     assert_eq!(read(&warehouse, "run.sh"), "A\nb\nc\nd\nE\n");
@@ -1375,17 +1375,17 @@ fn a_consolidate_takes_their_chmod_over_our_binary_edit() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "theirs drops the bit"]));
+    assert_success(&warehouse.run(&["stack", "-m", "theirs drops the bit"]));
     assert_success(&warehouse.run(&["shift", "main"]));
 
     std::fs::write(&path, b"\0ours\0").unwrap();
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "ours edits"]));
+    assert_success(&warehouse.run(&["stack", "-m", "ours edits"]));
 
     let consolidate = warehouse.run(&["consolidate", "feature"]);
     assert_success(&consolidate);
@@ -1420,7 +1420,7 @@ fn removing_a_tracked_file_a_rule_covers_untracks_it_and_the_rule_then_hides_it(
 
     assert_success(&warehouse.run(&["remove", "notes.txt"]));
     assert_success(&warehouse.run(&["load", ".forkliftignore"]));
-    assert_success(&warehouse.run(&["stack", "untrack notes"]));
+    assert_success(&warehouse.run(&["stack", "-m", "untrack notes"]));
 
     assert_eq!(read(&warehouse, "notes.txt"), "v1\n", "remove never touches the working directory");
     assert!(!changes(&warehouse, "unstaged").iter().any(|(_, path)| path == "notes.txt"),
@@ -1451,7 +1451,7 @@ fn a_folder_load_of_an_untracked_folder_a_rule_covers_stages_nothing() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
 
     warehouse.write_file(".forkliftignore", "^build(/.*)?$\n");
     warehouse.write_file("build/out.txt", "generated\n");
@@ -1485,7 +1485,7 @@ fn warehouse_with_a_nested_single_file_load(name: &str) -> TestWarehouse {
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "root.txt"]));
     assert_success(&warehouse.run(&["load", "a/b/c.txt"]));
-    assert_success(&warehouse.run(&["stack", "nested"]));
+    assert_success(&warehouse.run(&["stack", "-m", "nested"]));
 
     warehouse
 }
@@ -1497,18 +1497,18 @@ fn an_edit_under_a_nested_single_file_load_is_visible_and_blocks_shift() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("a/b/c.txt", "feature\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "feature"]));
+    assert_success(&warehouse.run(&["stack", "-m", "feature"]));
     assert_success(&warehouse.run(&["shift", "main"]));
 
     // A shift rebuilds every shard from the tree, so the single-file load and the edit come
     // after it: the load registers only a/b itself.
     warehouse.write_file("a/b/c.txt", "c\n");
     assert_success(&warehouse.run(&["load", "a/b/c.txt"]));
-    assert_success(&warehouse.run(&["stack", "nested"]));
+    assert_success(&warehouse.run(&["stack", "-m", "nested"]));
     warehouse.write_file("a/b/c.txt", "local\n");
     assert!(changes(&warehouse, "unstaged").contains(&("modified".to_string(), "a/b/c.txt".to_string())));
 
@@ -1524,16 +1524,16 @@ fn an_edit_under_a_cherry_picked_nested_folder_is_visible_and_blocks_shift() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("x/y/z.txt", "z\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "add x/y/z.txt"]));
+    assert_success(&warehouse.run(&["stack", "-m", "add x/y/z.txt"]));
     let source = pallet_head_hash(&warehouse, "feature");
     warehouse.write_file("x/y/z.txt", "feature only\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "change x/y/z.txt"]));
+    assert_success(&warehouse.run(&["stack", "-m", "change x/y/z.txt"]));
 
     assert_success(&warehouse.run(&["shift", "main"]));
     assert_success(&warehouse.run(&["pick", &source]));
@@ -1554,16 +1554,16 @@ fn a_directory_only_its_descendant_registered_is_tracked_for_replace_and_remove(
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
     assert_success(&warehouse.run(&["pallet", "create", "flat"]));
     warehouse.write_file("a", "a file\n");
     assert_success(&warehouse.run(&["load", "a"]));
-    assert_success(&warehouse.run(&["stack", "a is a file"]));
+    assert_success(&warehouse.run(&["stack", "-m", "a is a file"]));
     assert_success(&warehouse.run(&["shift", "main"]));
 
     warehouse.write_file("a/b/c.txt", "c\n");
     assert_success(&warehouse.run(&["load", "a/b/c.txt"]));
-    assert_success(&warehouse.run(&["stack", "nested"]));
+    assert_success(&warehouse.run(&["stack", "-m", "nested"]));
 
     // `a` holds only tracked content, so replacing it with the file is safe.
     assert_success(&warehouse.run(&["shift", "flat"]));
@@ -1597,7 +1597,7 @@ fn restore_follows_a_file_replaced_by_a_directory() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "a"]));
-    assert_success(&warehouse.run(&["stack", "a is a file"]));
+    assert_success(&warehouse.run(&["stack", "-m", "a is a file"]));
 
     std::fs::remove_file(warehouse.root.join("a")).unwrap();
     warehouse.write_file("a/b.txt", "b\n");
@@ -1627,7 +1627,7 @@ fn a_tracked_file_a_rule_covers_replaced_by_a_folder_still_shows_its_removal() {
     let staged = changes(&warehouse, "staged");
     assert!(staged.contains(&("removed".to_string(), "notes.txt".to_string())), "{:?}", staged);
     assert!(!staged.iter().any(|(_, path)| path.starts_with("notes.txt/")), "{:?}", staged);
-    assert_success(&warehouse.run(&["stack", "notes.txt is gone"]));
+    assert_success(&warehouse.run(&["stack", "-m", "notes.txt is gone"]));
     let remove = warehouse.run(&["remove", "notes.txt"]);
     assert!(!remove.status.success(), "notes.txt must be untracked: {}", stdout(&remove));
 }
@@ -1657,7 +1657,7 @@ fn a_rule_on_a_tracked_folder_covers_new_files_in_its_tracked_subfolders() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "a"]));
-    assert_success(&warehouse.run(&["stack", "a"]));
+    assert_success(&warehouse.run(&["stack", "-m", "a"]));
 
     warehouse.write_file(".forkliftignore", "^a$\n");
     warehouse.write_file("a/sub/new.txt", "new\n");
@@ -1676,7 +1676,7 @@ fn a_folder_load_refuses_an_unreadable_shard_instead_of_dropping_a_tracked_file_
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "x.log"]));
-    assert_success(&warehouse.run(&["stack", "x.log"]));
+    assert_success(&warehouse.run(&["stack", "-m", "x.log"]));
     warehouse.write_file(".forkliftignore", "\\.log$\n");
 
     // The root's shard: a rebuild of it without the old entries would not know x.log is
@@ -1690,10 +1690,10 @@ fn a_folder_load_refuses_an_unreadable_shard_instead_of_dropping_a_tracked_file_
     assert!(stderr(&load).contains("cannot be read"), "{}", stderr(&load));
 
     // The way out the message names works, and x.log is still tracked afterwards.
-    let suggested = if cfg!(windows) { "forklift restore --staged \".\"" } else { "forklift restore --staged '.'" };
+    let suggested = if cfg!(windows) { "forklift unload \".\"" } else { "forklift unload '.'" };
     assert!(stderr(&load).contains(suggested), "{}", stderr(&load));
     assert!(stderr(&load).contains("every folder below it"), "the reset's scope must be named: {}", stderr(&load));
-    assert_success(&warehouse.run(&["restore", "--staged", "."]));
+    assert_success(&warehouse.run(&["unload", "."]));
     assert_success(&warehouse.run(&["load", "."]));
     warehouse.write_file("x.log", "edited\n");
     assert!(changes(&warehouse, "unstaged").contains(&("modified".to_string(), "x.log".to_string())));
@@ -1737,7 +1737,7 @@ fn an_ancestor_registered_only_for_removed_content_stops_being_tracked() {
     warehouse.write_file("a/untracked.txt", "u\n");
     std::fs::remove_dir_all(warehouse.root.join("a/b")).unwrap();
     assert_success(&warehouse.run(&["remove", "a/b"]));
-    assert_success(&warehouse.run(&["stack", "drop a/b"]));
+    assert_success(&warehouse.run(&["stack", "-m", "drop a/b"]));
 
     // "a" was registered only as the parent of a/b: with a/b gone it holds nothing tracked, so
     // it must leave the registered keys (no command reports registration as such).
@@ -1756,7 +1756,7 @@ fn stack_consumes_staged_removals() {
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["remove", "remove.txt"]));
 
-    let stack = warehouse.run(&["stack", "Drop remove.txt"]);
+    let stack = warehouse.run(&["stack", "-m", "Drop remove.txt"]);
     assert_success(&stack);
     let parcel_hash = extract_parcel_hash(&stack);
 
@@ -1791,7 +1791,7 @@ fn stack_requires_staged_changes() {
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["unload", "."]));
-    let nothing = warehouse.run(&["stack", "empty"]);
+    let nothing = warehouse.run(&["stack", "-m", "empty"]);
     assert!(!nothing.status.success());
     assert!(stderr(&nothing).contains("stack"));
 }
@@ -1809,7 +1809,7 @@ fn pallet_create_creates_pallets_at_the_current_head() {
     assert!(unborn_listing.contains("* main (unborn)"));
 
     assert_success(&warehouse.run(&["load", "."]));
-    let stack = warehouse.run(&["stack", "first"]);
+    let stack = warehouse.run(&["stack", "-m", "first"]);
     assert_success(&stack);
     let main_head = extract_parcel_hash(&stack);
 
@@ -1827,7 +1827,7 @@ fn pallet_create_creates_pallets_at_the_current_head() {
     // Stacking on the new pallet must not move "main".
     warehouse.write_file("file.txt", "changed\n");
     assert_success(&warehouse.run(&["load", "file.txt"]));
-    assert_success(&warehouse.run(&["stack", "on feature"]));
+    assert_success(&warehouse.run(&["stack", "-m", "on feature"]));
 
     let main_ref = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap();
     assert_eq!(main_ref.trim(), main_head);
@@ -1861,7 +1861,7 @@ fn pallet_list_json_listing_reports_head_hashes() {
     assert_eq!(pallets[0]["head"], serde_json::Value::Null);
 
     assert_success(&warehouse.run(&["load", "."]));
-    let main_head = extract_parcel_hash(&warehouse.run(&["stack", "first"]));
+    let main_head = extract_parcel_hash(&warehouse.run(&["stack", "-m", "first"]));
     assert_success(&warehouse.run(&["pallet", "create", "feature/x"]));
 
     // Once born, each pallet's listed `head` is its actual head parcel hash.
@@ -1894,7 +1894,7 @@ fn stocktake_reports_staged_and_unstaged_changes() {
     assert!(unborn.contains("added:"));
     assert!(unborn.contains("a.txt"));
 
-    let stack = warehouse.run(&["stack", "first"]);
+    let stack = warehouse.run(&["stack", "-m", "first"]);
     assert_success(&stack);
     let head = extract_parcel_hash(&stack);
 
@@ -1946,14 +1946,14 @@ fn shift_switches_pallets_and_materializes_the_target_tree() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "on main"]));
+    assert_success(&warehouse.run(&["stack", "-m", "on main"]));
 
     // Build a diverging state on a feature pallet.
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("a.txt", "feature content\n");
     warehouse.write_file("dir/new.txt", "only on feature\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "on feature"]));
+    assert_success(&warehouse.run(&["stack", "-m", "on feature"]));
 
     // Shifting back to main restores its tree: the modified file reverts, the new file
     // and its (now empty) directory disappear.
@@ -2000,12 +2000,12 @@ fn shift_refuses_dirty_warehouses_and_untracked_collisions() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "on main"]));
+    assert_success(&warehouse.run(&["stack", "-m", "on main"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("extra.txt", "tracked on feature\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "on feature"]));
+    assert_success(&warehouse.run(&["stack", "-m", "on feature"]));
 
     assert_success(&warehouse.run(&["shift", "main"]));
     assert!(!warehouse.root.join("extra.txt").exists());
@@ -2054,7 +2054,7 @@ fn shift_preserves_executables_and_symlinks() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "with modes"]));
+    assert_success(&warehouse.run(&["stack", "-m", "with modes"]));
 
     // An empty pallet state to shift away to: remove everything on a feature pallet.
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
@@ -2062,7 +2062,7 @@ fn shift_preserves_executables_and_symlinks() {
     std::fs::remove_file(warehouse.root.join("run.sh")).unwrap();
     std::fs::remove_file(warehouse.root.join("link")).unwrap();
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "without modes"]));
+    assert_success(&warehouse.run(&["stack", "-m", "without modes"]));
 
     assert!(!warehouse.root.join("run.sh").exists());
 
@@ -2113,7 +2113,7 @@ fn a_wide_shift_writes_every_file_its_own_content_mode_and_type() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "main's files"]));
+    assert_success(&warehouse.run(&["stack", "-m", "main's files"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     for (index, path) in paths.iter().enumerate() {
@@ -2124,7 +2124,7 @@ fn a_wide_shift_writes_every_file_its_own_content_mode_and_type() {
     std::fs::remove_file(warehouse.root.join("d0/sub0/link")).unwrap();
     std::fs::remove_file(warehouse.root.join("d1/big.bin")).unwrap();
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "feature's files"]));
+    assert_success(&warehouse.run(&["stack", "-m", "feature's files"]));
 
     assert_success(&warehouse.run(&["shift", "main"]));
 
@@ -2157,7 +2157,7 @@ fn a_wide_consolidate_writes_every_file_theirs_takes_its_own_content() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     for (index, path) in paths.iter().enumerate() {
@@ -2171,12 +2171,12 @@ fn a_wide_consolidate_writes_every_file_theirs_takes_its_own_content() {
         std::os::unix::fs::symlink("f2.txt", warehouse.root.join("d2/sub2/link")).unwrap();
     }
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "feature's files"]));
+    assert_success(&warehouse.run(&["stack", "-m", "feature's files"]));
 
     assert_success(&warehouse.run(&["shift", "main"]));
     warehouse.write_file("main-only.txt", "changed on main\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "main's change"]));
+    assert_success(&warehouse.run(&["stack", "-m", "main's change"]));
 
     assert_success(&warehouse.run(&["consolidate", "feature"]));
 
@@ -2206,7 +2206,7 @@ fn restore_discards_unstaged_changes() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "baseline"]));
+    assert_success(&warehouse.run(&["stack", "-m", "baseline"]));
 
     // A single modified file reverts to its staged content.
     warehouse.write_file("a.txt", "scribbled over\n");
@@ -2293,7 +2293,7 @@ fn restore_leaves_files_that_already_match_untouched() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "baseline"]));
+    assert_success(&warehouse.run(&["stack", "-m", "baseline"]));
 
     let a_before = file_identity(&warehouse.root.join("a.txt"));
     let c_before = file_identity(&warehouse.root.join("dir/c.txt"));
@@ -2352,7 +2352,7 @@ fn restore_records_a_racily_matching_file_as_unproven() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "baseline"]));
+    assert_success(&warehouse.run(&["stack", "-m", "baseline"]));
 
     // A future mtime stands in for "edited in the same second as the stat".
     let path = warehouse.root.join("a.txt");
@@ -2470,7 +2470,7 @@ fn an_import_git_that_cannot_build_its_inventory_is_refused_until_heal() {
     assert!(!import.status.success(), "the inventory build must fail on the unreadable file");
 
     let create = ["--json", "pallet", "create", "side"];
-    for args in [&["--json", "stack", "after import"][..], &["--json", "load", "."][..], &create[..]] {
+    for args in [&["--json", "stack", "-m", "after import"][..], &["--json", "load", "."][..], &create[..]] {
         let refused = json(&warehouse.run(args));
         assert_eq!(refused["error"]["code"], "incomplete_load", "{:?}: {}", args, refused);
         assert_eq!(refused["error"]["next_step"], "forklift heal", "{:?}: {}", args, refused);
@@ -2492,7 +2492,7 @@ fn an_import_git_that_cannot_build_its_inventory_is_refused_until_heal() {
     // folder stays ignored and the new ignore file is the only untracked path.
     assert_eq!(unstaged_changes(&warehouse), vec![("untracked".to_string(), ".forkliftignore".to_string())]);
     assert!(std::fs::read_to_string(root.join(".forkliftignore")).unwrap().contains(r"^\.git(/.*)?$"));
-    let stack = warehouse.run(&["stack", "after heal"]);
+    let stack = warehouse.run(&["stack", "-m", "after heal"]);
     assert!(stderr(&stack).contains("Nothing to stack"), "the bay is no longer refused: {}", stderr(&stack));
 }
 
@@ -2597,7 +2597,7 @@ fn import_git_reports_a_file_git_converted_on_checkout_from_the_start() {
     assert_success(&warehouse.run(&["restore", "run.bat"]));
     assert_eq!(std::fs::read(root.join("run.bat")).unwrap(), b"echo one\necho two\n");
     assert_success(&warehouse.run(&["load", "id.txt"]));
-    assert_success(&warehouse.run(&["stack", "Track the expanded ident"]));
+    assert_success(&warehouse.run(&["stack", "-m", "Track the expanded ident"]));
     assert_eq!(unstaged_changes(&warehouse), vec![ignore, modified("auto.txt"), modified("shout.up")]);
 }
 
@@ -2692,7 +2692,7 @@ fn checkout_scopes_in_a_full_warehouse_are_recorded_and_checked() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     let plain_dir = warehouse.home.join("bay-plain");
     let scoped_dir = warehouse.home.join("bay-scoped");
@@ -2707,21 +2707,21 @@ fn checkout_scopes_in_a_full_warehouse_are_recorded_and_checked() {
     warehouse.write_file("src/web/w.txt", "web v2\n");
     assert_success(&warehouse.run(&["load", "."]));
     std::fs::write(warehouse.root.join(".forklift").join("scope"), "/forklift-scope 3\nsrc/api\n").unwrap();
-    for args in [&["stocktake"][..], &["stack", "second"]] {
+    for args in [&["stocktake"][..], &["stack", "-m", "second"]] {
         let refused = warehouse.run(args);
         assert!(!refused.status.success(), "{:?} must refuse: {}", args, stdout(&refused));
         assert!(stderr(&refused).contains("its main tree holds a scope") && stderr(&refused).contains("Delete that file"),
             "{:?}: {}", args, stderr(&refused));
     }
     std::fs::remove_file(warehouse.root.join(".forklift").join("scope")).unwrap();
-    assert_success(&warehouse.run(&["stack", "second"]));
+    assert_success(&warehouse.run(&["stack", "-m", "second"]));
 
     // A scoped bay whose scope file is gone is refused the same way, naming its removal, instead of
     // recording src/web, which it never checked out, as removed.
     std::fs::write(scoped_dir.join("src/api/a.txt"), "api v2\n").unwrap();
     assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
     std::fs::remove_file(bays.join("scoped").join("scope")).unwrap();
-    for args in [&["stocktake"][..], &["stack", "third"]] {
+    for args in [&["stocktake"][..], &["stack", "-m", "third"]] {
         let refused = warehouse.run_at(&scoped_dir, args);
         assert!(!refused.status.success(), "{:?} must refuse: {}", args, stdout(&refused));
         assert!(stderr(&refused).contains("The bay's scope") && stderr(&refused).contains("is missing")
@@ -2732,10 +2732,10 @@ fn checkout_scopes_in_a_full_warehouse_are_recorded_and_checked() {
     // reads the scope.
     std::fs::write(plain_dir.join("src/web/w.txt"), "web v3\n").unwrap();
     assert_success(&warehouse.run_at(&plain_dir, &["load", "."]));
-    assert_success(&warehouse.run_at(&plain_dir, &["stack", "plain"]));
+    assert_success(&warehouse.run_at(&plain_dir, &["stack", "-m", "plain"]));
     warehouse.write_file("src/web/w.txt", "web v4\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "fourth"]));
+    assert_success(&warehouse.run(&["stack", "-m", "fourth"]));
 }
 
 /// A scoped bay over a tree large enough for the inventory build to fan out inventories its scope
@@ -2766,7 +2766,7 @@ fn a_scoped_bay_over_a_large_tree_inventories_only_its_scope() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     let scoped_dir = warehouse.home.join("bay-scoped");
     assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
@@ -2864,11 +2864,11 @@ fn an_edit_in_the_second_of_a_shift_survives_a_sibling_load() {
         assert_success(&warehouse.run(&["prepare"]));
         configure_operator(&warehouse);
         assert_success(&warehouse.run(&["load", "."]));
-        assert_success(&warehouse.run(&["stack", "base"]));
+        assert_success(&warehouse.run(&["stack", "-m", "base"]));
         assert_success(&warehouse.run(&["pallet", "create", "feature"]));
         warehouse.write_file("a.txt", "two\n");
         assert_success(&warehouse.run(&["load", "a.txt"]));
-        assert_success(&warehouse.run(&["stack", "second"]));
+        assert_success(&warehouse.run(&["stack", "-m", "second"]));
 
         assert_success(&warehouse.run(&["shift", "main"]));
         let path = warehouse.root.join("a.txt");
@@ -2981,7 +2981,7 @@ fn a_bay_stamps_its_own_clock_probe() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
 
     let bay_dir = warehouse.home.join("bay-clock");
     assert_success(&warehouse.run(&["bay", "add", "feature", bay_dir.to_str().unwrap()]));
@@ -3010,7 +3010,7 @@ fn restore_rewrites_a_matching_file_of_another_kind() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "baseline"]));
+    assert_success(&warehouse.run(&["stack", "-m", "baseline"]));
 
     let path = warehouse.root.join("run.sh");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -3020,7 +3020,7 @@ fn restore_rewrites_a_matching_file_of_another_kind() {
     assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o111, 0, "the staged mode must come back");
 }
 
-/// `restore --staged` records the stat data of a working file that provably holds the head's
+/// `unload` records the stat data of a working file that provably holds the head's
 /// content, so the next comparison trusts the stat cache instead of rehashing; a file that does
 /// not hold it keeps stale, unproven stat data, so it still shows as modified.
 #[test]
@@ -3037,7 +3037,7 @@ fn restore_staged_keeps_the_stat_data_of_files_that_match_the_head() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "baseline"]));
+    assert_success(&warehouse.run(&["stack", "-m", "baseline"]));
 
     let mtime = |path: &str| {
         file_identity(&warehouse.root.join(path)).0.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
@@ -3051,7 +3051,7 @@ fn restore_staged_keeps_the_stat_data_of_files_that_match_the_head() {
     warehouse.write_file("dir/c.txt", "original c\n");
     backdate(&warehouse.root.join("dir/c.txt"), 7200);
 
-    assert_success(&warehouse.run(&["restore", "--staged", "."]));
+    assert_success(&warehouse.run(&["unload", "."]));
 
     assert_eq!(inventory_entry(&warehouse, "", "a.txt").content_change_timestamp, mtime("a.txt"),
         "a stat-clean file must keep its stat data");
@@ -3070,13 +3070,13 @@ fn restore_staged_keeps_the_stat_data_of_files_that_match_the_head() {
     assert_success(&warehouse.run(&["load", "a.txt"]));
     warehouse.write_file("a.txt", "original a\n");
     backdate(&warehouse.root.join("a.txt"), 7200);
-    assert_success(&warehouse.run(&["restore", "--staged", "a.txt"]));
+    assert_success(&warehouse.run(&["unload", "a.txt"]));
     assert_eq!(inventory_entry(&warehouse, "", "a.txt").content_change_timestamp, mtime("a.txt"),
         "a file whose content matches the head must record its stat data");
     // A staged removal is never a witness, even where its entry still proves the untouched
     // file by stat: the file comes back as a live entry.
     assert_success(&warehouse.run(&["remove", "a.txt"]));
-    assert_success(&warehouse.run(&["restore", "--staged", "a.txt"]));
+    assert_success(&warehouse.run(&["unload", "a.txt"]));
     let a_entry = inventory_entry(&warehouse, "", "a.txt");
     assert!(a_entry.state == forklift_core::enums::inventory_item_state::InventoryItemState::Normal,
         "an unstaged removal must come back as a live entry");
@@ -3084,12 +3084,12 @@ fn restore_staged_keeps_the_stat_data_of_files_that_match_the_head() {
 
     // Unstaging a file whose entry already matches the head changes no content, so it keeps
     // the rollups a stack stamped.
-    assert_success(&warehouse.run(&["restore", "--staged", "."]));
+    assert_success(&warehouse.run(&["unload", "."]));
     assert_success(&warehouse.run(&["load", "dir/b.txt"]));
-    assert_success(&warehouse.run(&["stack", "second"]));
+    assert_success(&warehouse.run(&["stack", "-m", "second"]));
     let rollup = shard_rollup(&warehouse, "");
     assert!(rollup.is_some(), "the stack must stamp the root's rollup");
-    assert_success(&warehouse.run(&["restore", "--staged", "a.txt"]));
+    assert_success(&warehouse.run(&["unload", "a.txt"]));
     assert_eq!(shard_rollup(&warehouse, ""), rollup, "unstaging an unchanged file must keep the rollups");
 }
 
@@ -3101,13 +3101,13 @@ fn restore_staged_resets_the_inventory_to_the_head() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "baseline"]));
+    assert_success(&warehouse.run(&["stack", "-m", "baseline"]));
 
     // Unstage a staged modification: the worktree keeps the change, the staged section
     // clears, and the change reappears as unstaged.
     warehouse.write_file("a.txt", "modified\n");
     assert_success(&warehouse.run(&["load", "a.txt"]));
-    assert_success(&warehouse.run(&["restore", "--staged", "a.txt"]));
+    assert_success(&warehouse.run(&["unload", "a.txt"]));
 
     let status = stdout(&warehouse.run(&["stocktake"]));
     assert!(status.contains("The inventory matches the pallet head"), "status: {}", status);
@@ -3120,7 +3120,7 @@ fn restore_staged_resets_the_inventory_to_the_head() {
     // Unstage a staged addition: the entry is dropped, the file becomes untracked.
     warehouse.write_file("new.txt", "new\n");
     assert_success(&warehouse.run(&["load", "new.txt"]));
-    assert_success(&warehouse.run(&["restore", "--staged", "new.txt"]));
+    assert_success(&warehouse.run(&["unload", "new.txt"]));
     let after_add = stdout(&warehouse.run(&["stocktake"]));
     assert!(after_add.contains("untracked: new.txt"), "status: {}", after_add);
 
@@ -3129,12 +3129,12 @@ fn restore_staged_resets_the_inventory_to_the_head() {
     let with_removal = stdout(&warehouse.run(&["stocktake"]));
     assert!(with_removal.contains("removed:"), "status: {}", with_removal);
 
-    assert_success(&warehouse.run(&["restore", "--staged", "a.txt"]));
+    assert_success(&warehouse.run(&["unload", "a.txt"]));
     let after_unstage = stdout(&warehouse.run(&["stocktake"]));
     assert!(!after_unstage.contains("removed:"), "status: {}", after_unstage);
 
     // Unstaging a path unknown to both the inventory and the head is an error.
-    let unknown = warehouse.run(&["restore", "--staged", "ghost.txt"]);
+    let unknown = warehouse.run(&["unload", "ghost.txt"]);
     assert!(!unknown.status.success());
     assert!(stderr(&unknown).contains("neither in the inventory nor in the pallet head"));
 }
@@ -3147,7 +3147,7 @@ fn unload_unstages_instead_of_staging_a_removal() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "baseline"]));
+    assert_success(&warehouse.run(&["stack", "-m", "baseline"]));
 
     // unload is the inverse of load: the staged modification is unstaged (back to the
     // head), the worktree keeps the change — and crucially no removal is staged.
@@ -3166,7 +3166,7 @@ fn unload_unstages_instead_of_staging_a_removal() {
 
     // Stacking now records no change to the file: a mistaken load undone by unload can
     // never turn into a deletion in the next parcel.
-    let nothing = warehouse.run(&["stack", "empty"]);
+    let nothing = warehouse.run(&["stack", "-m", "empty"]);
     assert!(!nothing.status.success(), "nothing must be staged after unload");
 
     // The JSON envelope carries the verb the user ran, not the shared implementation's.
@@ -3197,12 +3197,12 @@ fn consolidate_fast_forwards_when_possible() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("b.txt", "b\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let feature_stack = warehouse.run(&["stack", "feature work"]);
+    let feature_stack = warehouse.run(&["stack", "-m", "feature work"]);
     assert_success(&feature_stack);
     let feature_head = extract_parcel_hash(&feature_stack);
 
@@ -3241,14 +3241,14 @@ fn consolidate_merges_divergent_pallets_cleanly() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     // Diverge: feature changes the last line and adds a file...
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("file.txt", "one\ntwo\nthree\nfour\nFIVE\n");
     warehouse.write_file("feat.txt", "feature file\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let feature_stack = warehouse.run(&["stack", "feature work"]);
+    let feature_stack = warehouse.run(&["stack", "-m", "feature work"]);
     assert_success(&feature_stack);
     let feature_head = extract_parcel_hash(&feature_stack);
 
@@ -3256,7 +3256,7 @@ fn consolidate_merges_divergent_pallets_cleanly() {
     assert_success(&warehouse.run(&["shift", "main"]));
     warehouse.write_file("file.txt", "ONE\ntwo\nthree\nfour\nfive\n");
     assert_success(&warehouse.run(&["load", "file.txt"]));
-    let main_stack = warehouse.run(&["stack", "main work"]);
+    let main_stack = warehouse.run(&["stack", "-m", "main work"]);
     assert_success(&main_stack);
     let main_head = extract_parcel_hash(&main_stack);
 
@@ -3295,20 +3295,20 @@ fn commit_graph_is_built_by_compact_and_ancestry_stays_correct() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     // Diverge two pallets off the base so a merge base has to be found.
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("file.txt", "one\ntwo\nthree\nfour\nFIVE\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let feature_stack = warehouse.run(&["stack", "feature work"]);
+    let feature_stack = warehouse.run(&["stack", "-m", "feature work"]);
     assert_success(&feature_stack);
     let feature_head = extract_parcel_hash(&feature_stack);
 
     assert_success(&warehouse.run(&["shift", "main"]));
     warehouse.write_file("file.txt", "ONE\ntwo\nthree\nfour\nfive\n");
     assert_success(&warehouse.run(&["load", "file.txt"]));
-    assert_success(&warehouse.run(&["stack", "main work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "main work"]));
 
     // Compact builds and persists the commit-graph (sharded by parcel-hash prefix).
     assert_success(&warehouse.run(&["store", "compact"]));
@@ -3348,17 +3348,17 @@ fn a_corrupted_commit_graph_shard_is_ignored_and_rewritten() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("file.txt", "one\ntwo\nthree\nfour\nFIVE\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "feature work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "feature work"]));
 
     assert_success(&warehouse.run(&["shift", "main"]));
     warehouse.write_file("file.txt", "ONE\ntwo\nthree\nfour\nfive\n");
     assert_success(&warehouse.run(&["load", "file.txt"]));
-    assert_success(&warehouse.run(&["stack", "main work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "main work"]));
 
     assert_success(&warehouse.run(&["store", "compact"]));
     let graph_root = warehouse.root.join(".forklift/graph");
@@ -3450,7 +3450,7 @@ fn compact_rebuilds_lost_ancestor_shards_behind_a_recorded_head() {
     for i in 0..12 {
         warehouse.write_file("file.txt", &format!("{}\n", i));
         assert_success(&warehouse.run(&["load", "."]));
-        assert_success(&warehouse.run(&["stack", &format!("c{}", i)]));
+        assert_success(&warehouse.run(&["stack", "-m", &format!("c{}", i)]));
     }
     assert_success(&warehouse.run(&["store", "compact"]));
 
@@ -3506,15 +3506,15 @@ fn an_unwritable_commit_graph_never_fails_a_query() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("file.txt", "one\ntwo\nthree\nfour\nFIVE\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "feature work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "feature work"]));
     assert_success(&warehouse.run(&["shift", "main"]));
     warehouse.write_file("file.txt", "ONE\ntwo\nthree\nfour\nfive\n");
     assert_success(&warehouse.run(&["load", "file.txt"]));
-    assert_success(&warehouse.run(&["stack", "main work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "main work"]));
 
     let graph_root = warehouse.root.join(".forklift/graph");
     let _ = std::fs::remove_dir_all(&graph_root);
@@ -3613,20 +3613,20 @@ fn consolidate_conflicts_are_marked_and_resolved_by_stacking() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     // Both pallets change the same line differently.
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("file.txt", "one\nTHEIRS\nthree\n");
     assert_success(&warehouse.run(&["load", "file.txt"]));
-    let feature_stack = warehouse.run(&["stack", "theirs"]);
+    let feature_stack = warehouse.run(&["stack", "-m", "theirs"]);
     assert_success(&feature_stack);
     let feature_head = extract_parcel_hash(&feature_stack);
 
     assert_success(&warehouse.run(&["shift", "main"]));
     warehouse.write_file("file.txt", "one\nOURS\nthree\n");
     assert_success(&warehouse.run(&["load", "file.txt"]));
-    assert_success(&warehouse.run(&["stack", "ours"]));
+    assert_success(&warehouse.run(&["stack", "-m", "ours"]));
 
     let merge = warehouse.run(&["consolidate", "feature"]);
     assert_success(&merge);
@@ -3648,14 +3648,14 @@ fn consolidate_conflicts_are_marked_and_resolved_by_stacking() {
     assert!(status.contains("conflict:"));
 
     // Stacking with unresolved conflicts is refused.
-    let blocked = warehouse.run(&["stack", "too early"]);
+    let blocked = warehouse.run(&["stack", "-m", "too early"]);
     assert!(!blocked.status.success());
     assert!(stderr(&blocked).contains("unresolved conflicts"));
 
     // Resolve, load, stack: the merge parcel records both parents.
     warehouse.write_file("file.txt", "one\nresolved\nthree\n");
     assert_success(&warehouse.run(&["load", "file.txt"]));
-    let resolved = warehouse.run(&["stack", "Consolidated feature (resolved by hand)"]);
+    let resolved = warehouse.run(&["stack", "-m", "Consolidated feature (resolved by hand)"]);
     assert_success(&resolved);
     let merge_hash = extract_parcel_hash(&resolved);
 
@@ -3677,7 +3677,7 @@ fn park_saves_and_reapplies_work_in_progress() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     // Dirty the warehouse: an unstaged modification, a staged-then-modified file, a
     // deleted tracked file, and an untracked file that must survive untouched.
@@ -3727,7 +3727,7 @@ fn park_saves_and_reapplies_work_in_progress() {
     assert!(stderr(&empty).contains("no parked changes"));
 
     // The re-applied state stacks cleanly.
-    assert_success(&warehouse.run(&["stack", "finished the parked work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "finished the parked work"]));
     let final_status = stdout(&warehouse.run(&["stocktake"]));
     assert!(final_status.contains("The inventory matches the pallet head"));
 }
@@ -3740,7 +3740,7 @@ fn park_pop_refuses_conflicting_head_changes() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     // Park a change to a.txt...
     warehouse.write_file("a.txt", "parked change\n");
@@ -3749,7 +3749,7 @@ fn park_pop_refuses_conflicting_head_changes() {
     // ...then move the head by changing the same file.
     warehouse.write_file("a.txt", "head moved\n");
     assert_success(&warehouse.run(&["load", "a.txt"]));
-    assert_success(&warehouse.run(&["stack", "head change"]));
+    assert_success(&warehouse.run(&["stack", "-m", "head change"]));
 
     let pop = warehouse.run(&["park", "pop"]);
     assert!(!pop.status.success());
@@ -3824,7 +3824,7 @@ fn a_dangling_symlink_loads_and_reads_clean() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "links"]));
+    assert_success(&warehouse.run(&["stack", "-m", "links"]));
 
     let status = json(&warehouse.run(&["--json", "stocktake"]));
     assert_eq!(status["data"]["staged_count"], 0, "{}", status);
@@ -3840,7 +3840,7 @@ fn diff_reports_unstaged_and_staged_line_changes() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["stack", "-m", "first"]));
 
     // A fresh stack leaves both comparisons clean.
     assert!(stdout(&warehouse.run(&["diff"]))
@@ -3894,7 +3894,7 @@ fn diff_renders_many_files_in_path_order_in_every_mode() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["stack", "-m", "first"]));
     assert_success(&warehouse.run(&["store", "compact"]));
 
     for name in &names {
@@ -3937,13 +3937,13 @@ fn piped_output_is_plain_unless_colour_is_forced() {
     configure_operator(&warehouse);
     warehouse.write_file("a.txt", "old\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["stack", "-m", "first"]));
     assert_success(&warehouse.run(&["office", "enroll"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("b.txt", "feature\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "feature work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "feature work"]));
     assert_success(&warehouse.run(&["shift", "main"]));
     assert_success(&warehouse.run(&["haul", "open", "--target", "main", "--source", "feature",
                                     "--title", "t", "-m", "m"]));
@@ -4055,7 +4055,7 @@ fn reading_a_pack_validates_only_the_index_buckets_it_touches() {
             configure_operator(&warehouse);
         }
         assert_success(&warehouse.run(&["load", "."]));
-        assert_success(&warehouse.run(&["stack", &format!("round {}", round)]));
+        assert_success(&warehouse.run(&["stack", "-m", &format!("round {}", round)]));
         assert_success(&warehouse.run(&["store", "compact"]));
     }
     let counts = [("FORKLIFT_DEBUG_PACK_COUNTS", "1")];
@@ -4086,7 +4086,7 @@ fn diff_preloads_the_pack_set_only_for_a_change_it_renders() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["stack", "-m", "first"]));
     assert_success(&warehouse.run(&["store", "compact"]));
     let counts = [("FORKLIFT_DEBUG_PACK_COUNTS", "1")];
 
@@ -4175,7 +4175,7 @@ fn diff_reports_removals_added_files_and_binary_content() {
     assert!(unborn.contains("added: keep.txt"), "unexpected diff output: {}", unborn);
     assert!(unborn.contains("+ kept"));
 
-    assert_success(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["stack", "-m", "first"]));
 
     // A file deleted from disk is an unstaged removal with its lines shown.
     std::fs::remove_file(warehouse.root.join("gone.txt")).unwrap();
@@ -4203,14 +4203,14 @@ fn diff_compares_the_heads_of_two_pallets() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("src/app.rs", "shared\nfeature line\n");
     warehouse.write_file("new.txt", "extra\n");
     std::fs::remove_file(warehouse.root.join("notes.txt")).unwrap();
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "feature work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "feature work"]));
 
     // From main to feature: the edit, the addition and the removal all show up.
     let forward = warehouse.run(&["diff", "main", "feature"]);
@@ -4258,11 +4258,11 @@ fn history_walks_the_parcel_graph_newest_first() {
     assert!(stderr(&unborn).contains("nothing stacked"));
 
     assert_success(&warehouse.run(&["load", "."]));
-    let first = extract_parcel_hash(&warehouse.run(&["stack", "first parcel"]));
+    let first = extract_parcel_hash(&warehouse.run(&["stack", "-m", "first parcel"]));
 
     warehouse.write_file("a.txt", "two\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let second = extract_parcel_hash(&warehouse.run(&["stack", "second parcel"]));
+    let second = extract_parcel_hash(&warehouse.run(&["stack", "-m", "second parcel"]));
 
     let history = stdout(&warehouse.run(&["history"]));
     assert!(history.contains(&format!("parcel {}", first)), "unexpected history: {}", history);
@@ -4287,12 +4287,12 @@ fn history_walks_the_parcel_graph_newest_first() {
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("b.txt", "feature\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let feature = extract_parcel_hash(&warehouse.run(&["stack", "feature parcel"]));
+    let feature = extract_parcel_hash(&warehouse.run(&["stack", "-m", "feature parcel"]));
 
     assert_success(&warehouse.run(&["shift", "main"]));
     warehouse.write_file("c.txt", "main\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let main_parcel = extract_parcel_hash(&warehouse.run(&["stack", "main parcel"]));
+    let main_parcel = extract_parcel_hash(&warehouse.run(&["stack", "-m", "main parcel"]));
     assert_success(&warehouse.run(&["consolidate", "feature"]));
 
     let merged = stdout(&warehouse.run(&["history"]));
@@ -4339,10 +4339,10 @@ fn history_oneline_prints_one_terse_line_per_parcel_newest_first() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    let first = extract_parcel_hash(&warehouse.run(&["stack", "first subject\n\nbody paragraph"]));
+    let first = extract_parcel_hash(&warehouse.run(&["stack", "-m", "first subject\n\nbody paragraph"]));
     warehouse.write_file("a.txt", "two\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let second = extract_parcel_hash(&warehouse.run(&["stack", "second subject"]));
+    let second = extract_parcel_hash(&warehouse.run(&["stack", "-m", "second subject"]));
 
     let oneline = stdout(&warehouse.run(&["history", "--oneline"]));
 
@@ -4375,7 +4375,7 @@ fn moves_are_detected_as_a_post_pass_and_reported_as_one_change() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     // A file moved on disk (not loaded yet) pairs by inode + hash: one unstaged move
     // instead of a removal and an untracked file.
@@ -4416,7 +4416,7 @@ fn moves_are_detected_as_a_post_pass_and_reported_as_one_change() {
     assert!(edited.contains("added:     src/renamed.txt"));
 
     // Pallet-to-pallet comparisons pair moves by blob hash too.
-    assert_success(&warehouse.run(&["stack", "renamed"]));
+    assert_success(&warehouse.run(&["stack", "-m", "renamed"]));
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     std::fs::create_dir_all(warehouse.root.join("sub")).unwrap();
     forklift_core::util::file_utils::rename(
@@ -4424,7 +4424,7 @@ fn moves_are_detected_as_a_post_pass_and_reported_as_one_change() {
         warehouse.root.join("sub/beta.txt"),
     ).unwrap();
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "moved beta"]));
+    assert_success(&warehouse.run(&["stack", "-m", "moved beta"]));
 
     let pallet_diff = stdout(&warehouse.run(&["diff", "main", "feature"]));
     assert!(
@@ -4442,11 +4442,11 @@ fn revisions_resolve_pallets_and_parcel_hash_prefixes() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    let first = extract_parcel_hash(&warehouse.run(&["stack", "first"]));
+    let first = extract_parcel_hash(&warehouse.run(&["stack", "-m", "first"]));
 
     warehouse.write_file("a.txt", "v2\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "second"]));
+    assert_success(&warehouse.run(&["stack", "-m", "second"]));
 
     // pallet create <name> <revision> creates the pallet at that parcel and materializes it.
     let prefix = &first[0..8];
@@ -4564,7 +4564,7 @@ fn manifest_records_signed_post_metadata_on_a_meta_pallet() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "first parcel"]));
+    assert_success(&warehouse.run(&["stack", "-m", "first parcel"]));
 
     // Recording requires an enrolled signing key — before enrollment it is refused.
     let before = warehouse.run(&["manifest", "approve", "main", "-m", "ok"]);
@@ -4601,7 +4601,7 @@ fn manifest_provenance_records_forge_proof_machine_authorship() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse); // enrolls test@forklift
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "first parcel"]));
+    assert_success(&warehouse.run(&["stack", "-m", "first parcel"]));
     assert_success(&warehouse.run(&["office", "enroll"]));
 
     // The flagship §7.2 case: an *agent* records how it produced the parcel. Admit an
@@ -4662,7 +4662,7 @@ fn mcp_provenance_takes_tool_and_session_from_the_connection_not_the_agent() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    let parcel = extract_parcel_hash(&warehouse.run(&["stack", "first parcel"]));
+    let parcel = extract_parcel_hash(&warehouse.run(&["stack", "-m", "first parcel"]));
     assert_success(&warehouse.run(&["office", "enroll"]));
 
     // Record provenance THROUGH the MCP: the client identifies itself at initialize, and in
@@ -5246,16 +5246,16 @@ fn a_conflicted_ignore_file_is_refused_not_read_as_rules() {
     warehouse.write_file(".forkliftignore", "^build(/.*)?$\n");
     warehouse.write_file("a.txt", "a\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file(".forkliftignore", "^out(/.*)?$\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "feature rules"]));
+    assert_success(&warehouse.run(&["stack", "-m", "feature rules"]));
     assert_success(&warehouse.run(&["shift", "main"]));
     warehouse.write_file(".forkliftignore", "^tmp(/.*)?$\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "main rules"]));
+    assert_success(&warehouse.run(&["stack", "-m", "main rules"]));
 
     warehouse.run(&["consolidate", "feature"]);
     let conflicted = std::fs::read_to_string(warehouse.root.join(".forkliftignore")).unwrap();
@@ -5421,10 +5421,10 @@ fn export_git_writes_the_history_into_a_git_repo() {
     warehouse.write_file("README.md", "one\n");
     warehouse.write_file("src/main.rs", "fn main() {}\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "first commit"]));
+    assert_success(&warehouse.run(&["stack", "-m", "first commit"]));
     warehouse.write_file("README.md", "one\ntwo\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "second commit"]));
+    assert_success(&warehouse.run(&["stack", "-m", "second commit"]));
 
     let out = warehouse.root.join("exported");
     let out_str = out.to_str().unwrap();
@@ -5475,7 +5475,7 @@ fn export_git_writes_the_same_tip_under_a_hostile_git_environment() {
     warehouse.write_file("README.md", "one\r\n");
     warehouse.write_file("big.txt", &"a line of text\r\n".repeat(600_000));
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "Cafe\u{301}"]));
+    assert_success(&warehouse.run(&["stack", "-m", "Cafe\u{301}"]));
 
     let clean_home = warehouse.root.join("clean-home");
     let hostile_home = warehouse.root.join("hostile-home");
@@ -5524,7 +5524,7 @@ fn export_git_keeps_tree_names_with_line_breaks_tabs_and_quotes() {
         warehouse.write_file(name, "content\n");
     }
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "hostile names"]));
+    assert_success(&warehouse.run(&["stack", "-m", "hostile names"]));
 
     let out = warehouse.root.join("exported");
     assert_success(&warehouse.run(&["git", "export", out.to_str().unwrap()]));
@@ -5824,7 +5824,7 @@ fn branch_with_a_pallet_name_is_refused_naming_pallet_create() {
     configure_operator(&warehouse);
     warehouse.write_file("a.txt", "x\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["stack", "-m", "first"]));
 
     // git's `branch NAME` creates without switching; pallet create switches, so the name is
     // refused rather than guessed at — even one that is a prefix of a subcommand.
@@ -5895,22 +5895,32 @@ fn haul_reviews_carry_signed_identity_and_merges() {
     configure_operator(&warehouse);
     warehouse.write_file("base.txt", "base\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
     assert_success(&warehouse.run(&["office", "enroll"]));
 
     // A feature pallet with work to propose.
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("feature.txt", "feat\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "feature work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "feature work"]));
     assert_success(&warehouse.run(&["shift", "main"]));
 
     // Open a haul, then find its id.
     assert_success(&warehouse.run(&["haul", "open", "--target", "main", "--source", "feature", "--title", "Add feature", "-m", "please review"]));
     let id = json(&warehouse.run(&["haul", "list", "--json"]))["data"]["hauls"][0]["id"].as_str().unwrap().to_string();
 
+    // A review states its verdict: with none, or with two, it is a usage error and records nothing.
+    for verdicts in [&[][..], &["--approve", "--comment"][..]] {
+        let mut args = vec!["haul", "review", id.as_str(), "-m", "unstated"];
+        args.extend_from_slice(verdicts);
+        let refused = warehouse.run(&args);
+        assert_eq!(refused.status.code(), Some(2), "{:?}: {}", verdicts, stderr(&refused));
+    }
+    let unreviewed = json(&warehouse.run(&["haul", "show", &id, "--json"]));
+    assert_eq!(unreviewed["data"]["reviews"], serde_json::json!([]), "{}", unreviewed);
+
     // The human opener approves.
-    assert_success(&warehouse.run(&["haul", "review", &id, "-m", "LGTM"]));
+    assert_success(&warehouse.run(&["haul", "review", &id, "--approve", "-m", "LGTM"]));
 
     // An admitted agent requests changes — its review is tagged with its identity class,
     // so the approval/verdict is cryptographically attributable to a human vs an agent.
@@ -5939,7 +5949,7 @@ fn haul_reviews_carry_signed_identity_and_merges() {
     assert_success(&warehouse.run(&["shift", "feature"]));
     warehouse.write_file("feature.txt", "feat 2\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "more feature work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "more feature work"]));
     assert_success(&warehouse.run(&["shift", "main"]));
 
     let old_head = shown["data"]["head"].as_str().unwrap().to_string();
@@ -5955,7 +5965,7 @@ fn haul_reviews_carry_signed_identity_and_merges() {
     );
     assert_eq!(approvals(&warehouse), 0, "an approval of an earlier head does not count");
 
-    assert_success(&warehouse.run(&["haul", "review", &id, "-m", "still good"]));
+    assert_success(&warehouse.run(&["haul", "review", &id, "--approve", "-m", "still good"]));
     assert_eq!(approvals(&warehouse), 1);
 
     // Only a merged haul carries a merge proof.
@@ -6007,13 +6017,13 @@ fn haul_merge_by_a_writer_not_granted_the_target_is_refused_before_merging() {
     configure_operator(&warehouse);
     warehouse.write_file("base.txt", "base\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
     assert_success(&warehouse.run(&["office", "enroll"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("feature.txt", "feat\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "feature work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "feature work"]));
     assert_success(&warehouse.run(&["shift", "main"]));
 
     assert_success(&warehouse.run(&["haul", "open", "--target", "main", "--source", "feature", "--title", "Add feature"]));
@@ -6057,13 +6067,13 @@ fn record_text_renders_inert_for_humans_and_verbatim_in_json() {
     warehouse.write_file("base.txt", "base\n");
     assert_success(&warehouse.run(&["load", "."]));
     let description = format!("subject {}\nbody {}", ESCAPE, OVERRIDE);
-    assert_success(&warehouse.run(&["stack", &description]));
+    assert_success(&warehouse.run(&["stack", "-m", &description]));
     assert_success(&warehouse.run(&["office", "enroll"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("feature.txt", "feat\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "feature work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "feature work"]));
     assert_success(&warehouse.run(&["shift", "main"]));
 
     let title = format!("title {}", ESCAPE);
@@ -6074,7 +6084,7 @@ fn record_text_renders_inert_for_humans_and_verbatim_in_json() {
     let id = json(&warehouse.run(&["haul", "list", "--json"]))["data"]["hauls"][0]["id"]
         .as_str().unwrap().to_string();
     assert_success(&warehouse.run(&["haul", "comment", &id, "-m", &message]));
-    assert_success(&warehouse.run(&["haul", "review", &id, "-m", &message]));
+    assert_success(&warehouse.run(&["haul", "review", &id, "--approve", "-m", &message]));
 
     let parcel = json(&warehouse.run(&["history", "--json"]))["data"]["entries"]
         .as_array().unwrap().iter()
@@ -6135,7 +6145,7 @@ fn record_text_renders_inert_for_humans_and_verbatim_in_json() {
     let undo_description = format!("undone {}", ESCAPE);
     warehouse.write_file("undo.txt", "undo\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", &undo_description]));
+    assert_success(&warehouse.run(&["stack", "-m", &undo_description]));
     let undone = warehouse.run(&["undo"]);
     assert_success(&undone);
     assert!(
@@ -6166,7 +6176,7 @@ fn history_limit_bounds_the_walk_to_the_newest_parcels() {
     for i in 1..=5 {
         warehouse.write_file("a.txt", &format!("v{}\n", i));
         assert_success(&warehouse.run(&["load", "."]));
-        hashes.push(extract_parcel_hash(&warehouse.run(&["stack", &format!("parcel {}", i)])));
+        hashes.push(extract_parcel_hash(&warehouse.run(&["stack", "-m", &format!("parcel {}", i)])));
     }
 
     // `--limit`/`-n` shows only the newest N (newest first), not the whole history.
@@ -6191,7 +6201,7 @@ fn history_json_pages_through_the_whole_log_with_a_cursor() {
     for i in 1..=5 {
         warehouse.write_file("a.txt", &format!("v{}\n", i));
         assert_success(&warehouse.run(&["load", "."]));
-        hashes.push(extract_parcel_hash(&warehouse.run(&["stack", &format!("p{}", i)])));
+        hashes.push(extract_parcel_hash(&warehouse.run(&["stack", "-m", &format!("p{}", i)])));
     }
 
     // Walk the whole log in pages of two, following the `next` cursor each time.
@@ -6240,7 +6250,7 @@ fn history_shows_identity_class_and_query_filters_by_it() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse); // enrolls test@forklift (a human)
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "human work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "human work"]));
     assert_success(&warehouse.run(&["office", "enroll"]));
 
     // Admit an agent supervised by the human, and let it stack a parcel.
@@ -6251,7 +6261,7 @@ fn history_shows_identity_class_and_query_filters_by_it() {
     assert_success(&warehouse.run(&["config", "set", "operator.identifier", "agent@forklift"]));
     warehouse.write_file("a.txt", "v2\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "agent work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "agent work"]));
     assert_success(&warehouse.run(&["config", "set", "operator.identifier", "test@forklift"]));
 
     // The log calls out the agent's authorship and supervisor (from the signed record).
@@ -6283,7 +6293,7 @@ fn bays_are_parallel_working_directories_sharing_the_warehouse() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
 
     // Open a bay in a directory outside the warehouse.
     let bay_dir = warehouse.home.join("bay-feature");
@@ -6298,7 +6308,7 @@ fn bays_are_parallel_working_directories_sharing_the_warehouse() {
     // Work in the bay stacks onto its pallet, using the bay's own inventory.
     std::fs::write(bay_dir.join("code.txt"), "shared v1\nbay change\n").unwrap();
     assert_success(&warehouse.run_at(&bay_dir, &["load", "."]));
-    assert_success(&warehouse.run_at(&bay_dir, &["stack", "work in the bay"]));
+    assert_success(&warehouse.run_at(&bay_dir, &["stack", "-m", "work in the bay"]));
 
     // The main tree is untouched (its own working file and current pallet), but it shares
     // the refs — it sees the bay's pallet and history.
@@ -6311,7 +6321,7 @@ fn bays_are_parallel_working_directories_sharing_the_warehouse() {
     // other (and the lock releases cleanly despite the bay's mid-command cwd switch).
     warehouse.write_file("code.txt", "shared v1\nmain change\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "work in main"]));
+    assert_success(&warehouse.run(&["stack", "-m", "work in main"]));
 
     // Listing and removing the bay.
     assert!(stdout(&warehouse.run(&["bay"])).contains("feature"));
@@ -6332,7 +6342,7 @@ fn two_bays_on_main(name: &str) -> (TestWarehouse, std::path::PathBuf) {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
 
     let bay_dir = warehouse.home.join("bay-b");
     assert_success(&warehouse.run(&["bay", "add", "b", bay_dir.to_str().unwrap()]));
@@ -6345,7 +6355,7 @@ fn two_bays_on_main(name: &str) -> (TestWarehouse, std::path::PathBuf) {
 fn stack_at(warehouse: &TestWarehouse, dir: &std::path::Path, file: &str, content: &str, message: &str) -> String {
     std::fs::write(dir.join(file), content).unwrap();
     assert_success(&warehouse.run_at(dir, &["load", file]));
-    assert_success(&warehouse.run_at(dir, &["stack", message]));
+    assert_success(&warehouse.run_at(dir, &["stack", "-m", message]));
     pallet_head_hash(warehouse, "main")
 }
 
@@ -6377,7 +6387,7 @@ fn a_stale_bays_stack_is_refused_and_catching_up_keeps_the_other_bays_parcel() {
 
     std::fs::write(bay.join("g.txt"), "g v2 from B\n").unwrap();
     assert_success(&warehouse.run_at(&bay, &["load", "g.txt"]));
-    let stacked = warehouse.run_at(&bay, &["stack", "B changes g"]);
+    let stacked = warehouse.run_at(&bay, &["stack", "-m", "B changes g"]);
 
     assert!(!stacked.status.success(), "a stale bay's stack must be refused: {}", stdout(&stacked));
     let refusal = stderr(&stacked);
@@ -6386,7 +6396,7 @@ fn a_stale_bays_stack_is_refused_and_catching_up_keeps_the_other_bays_parcel() {
     assert_eq!(pallet_head_hash(&warehouse, "main"), a_head, "the refusal moved nothing");
 
     // A machine reads the condition from the code and the remedy from the next step.
-    let refused = warehouse.run_at(&bay, &["--json", "stack", "B changes g"]);
+    let refused = warehouse.run_at(&bay, &["--json", "stack", "-m", "B changes g"]);
     assert_eq!(refused.status.code(), Some(26), "{}", stdout(&refused));
     assert_eq!(json(&refused)["error"]["code"], "behind", "{}", stdout(&refused));
     assert_eq!(json(&refused)["error"]["next_step"], "forklift shift main", "{}", stdout(&refused));
@@ -6399,7 +6409,7 @@ fn a_stale_bays_stack_is_refused_and_catching_up_keeps_the_other_bays_parcel() {
     assert_success(&warehouse.run_at(&bay, &["shift", "main"]));
     assert_success(&warehouse.run_at(&bay, &["park", "pop"]));
     assert_success(&warehouse.run_at(&bay, &["load", "g.txt"]));
-    assert_success(&warehouse.run_at(&bay, &["stack", "B changes g"]));
+    assert_success(&warehouse.run_at(&bay, &["stack", "-m", "B changes g"]));
 
     assert!(stdout(&warehouse.run(&["show", "main:f.txt"])).contains("f v2 from A"));
     assert!(stdout(&warehouse.run(&["show", "main:g.txt"])).contains("g v2 from B"));
@@ -6431,7 +6441,7 @@ fn deliver_from_a_bay_behind_its_draft_pallet_is_refused() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
     assert_success(&warehouse.run(&["office", "enroll"]));
     assert_success(&warehouse.run(&["pallet", "create", "draft"]));
 
@@ -6441,7 +6451,7 @@ fn deliver_from_a_bay_behind_its_draft_pallet_is_refused() {
 
     warehouse.write_file("code.txt", "v2\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "A drafts v2"]));
+    assert_success(&warehouse.run(&["stack", "-m", "A drafts v2"]));
     let main_head = pallet_head_hash(&warehouse, "main");
 
     let delivered = warehouse.run_at(&bay, &["deliver", "main", "-m", "stale"]);
@@ -6464,19 +6474,19 @@ fn deliver_over_a_target_change_the_draft_has_not_seen_is_refused_with_its_code(
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
     assert_success(&warehouse.run(&["office", "enroll"]));
     assert_success(&warehouse.run(&["pallet", "create", "draft"]));
 
     warehouse.write_file("code.txt", "v2\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "draft work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "draft work"]));
 
     // main moves on with a change the draft never consolidated.
     assert_success(&warehouse.run(&["shift", "main"]));
     warehouse.write_file("other.txt", "main only\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "main moves on"]));
+    assert_success(&warehouse.run(&["stack", "-m", "main moves on"]));
     let main_head = pallet_head_hash(&warehouse, "main");
     assert_success(&warehouse.run(&["shift", "draft"]));
 
@@ -6535,7 +6545,7 @@ fn bay_mid_consolidation(name: &str) -> (TestWarehouse, std::path::PathBuf, Stri
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
     assert_success(&warehouse.run(&["pallet", "create", "side"]));
     stack_at(&warehouse, &warehouse.root, "f.txt", "side\n", "side changes f");
     assert_success(&warehouse.run(&["shift", "main"]));
@@ -6570,7 +6580,7 @@ fn a_consolidation_started_before_the_pallet_moved_never_lands() {
     let a_head = stack_at(&warehouse, &warehouse.root, "f.txt", "resolved\n", "A resolves f the same way");
 
     let _ = warehouse.run_at(&bay, &["shift", "main"]);
-    let stacked = warehouse.run_at(&bay, &["stack", "B completes the merge"]);
+    let stacked = warehouse.run_at(&bay, &["stack", "-m", "B completes the merge"]);
     assert!(!stacked.status.success(), "{}", stdout(&stacked));
     assert_eq!(pallet_head_hash(&warehouse, "main"), a_head);
 }
@@ -6586,7 +6596,7 @@ fn catching_up_mid_consolidation_is_refused() {
     let catch_up = warehouse.run_at(&bay, &["shift", "main"]);
     assert!(!catch_up.status.success() && stderr(&catch_up).contains("consolidation is in progress"), "{}", stderr(&catch_up));
 
-    let stacked = warehouse.run_at(&bay, &["stack", "B completes the merge"]);
+    let stacked = warehouse.run_at(&bay, &["stack", "-m", "B completes the merge"]);
     assert!(stderr(&stacked).contains("consolidation is kept") && stderr(&stacked).contains("forklift shift main"),
         "{}", stderr(&stacked));
 }
@@ -6608,7 +6618,7 @@ fn undoing_a_conflicted_consolidate_after_another_bay_stacked_leaves_the_bay_beh
     // stale rather than landing on A's parcel without it.
     std::fs::write(bay.join("f.txt"), "resolved\n").unwrap();
     assert_success(&warehouse.run_at(&bay, &["load", "f.txt"]));
-    let stacked = warehouse.run_at(&bay, &["stack", "B after undo"]);
+    let stacked = warehouse.run_at(&bay, &["stack", "-m", "B after undo"]);
     assert!(!stacked.status.success(), "{}", stdout(&stacked));
     assert!(stderr(&stacked).contains("behind pallet \"main\""), "{}", stderr(&stacked));
     assert!(stdout(&warehouse.run(&["show", "main:k.txt"])).contains("k from A"));
@@ -6700,7 +6710,7 @@ fn a_bay_whose_path_file_cannot_be_read_is_neither_listed_blank_nor_half_removed
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
 
     let bay_dir = warehouse.home.join("bay-unreadable");
     assert_success(&warehouse.run(&["bay", "add", "feature", bay_dir.to_str().unwrap()]));
@@ -6728,7 +6738,7 @@ fn a_bay_whose_path_file_is_missing_still_lists_and_removes() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
 
     let bay_dir = warehouse.home.join("bay-missing");
     assert_success(&warehouse.run(&["bay", "add", "feature", bay_dir.to_str().unwrap()]));
@@ -6755,7 +6765,7 @@ fn deliver_squashes_a_draft_trail_and_keeps_it_as_post_metadata() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
     assert_success(&warehouse.run(&["office", "enroll"]));
 
     // A draft pallet with a messy checkpoint trail.
@@ -6763,7 +6773,7 @@ fn deliver_squashes_a_draft_trail_and_keeps_it_as_post_metadata() {
     for v in ["v2", "v3", "v4"] {
         warehouse.write_file("code.txt", &format!("{}\n", v));
         assert_success(&warehouse.run(&["load", "."]));
-        assert_success(&warehouse.run(&["stack", &format!("wip {}", v)]));
+        assert_success(&warehouse.run(&["stack", "-m", &format!("wip {}", v)]));
     }
 
     // Deliver squashes the trail onto main as one clean parcel.
@@ -6800,19 +6810,19 @@ fn deliver_onto_a_target_that_moved_after_the_draft_forked_is_refused() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
     assert_success(&warehouse.run(&["office", "enroll"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "draft"]));
     warehouse.write_file("code.txt", "v2\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "draft work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "draft work"]));
 
     // main moves on after the draft forked from it.
     assert_success(&warehouse.run(&["shift", "main"]));
     warehouse.write_file("other.txt", "v2\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "main work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "main work"]));
     let main_head = stdout(&warehouse.run(&["history", "-n", "1"]));
 
     // Delivering the draft would squash its tree, which still has other.txt at v1, over main.
@@ -6838,20 +6848,20 @@ fn a_draft_delivered_once_can_deliver_its_later_work() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
     assert_success(&warehouse.run(&["office", "enroll"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "draft"]));
     warehouse.write_file("code.txt", "v2\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "wip v2"]));
+    assert_success(&warehouse.run(&["stack", "-m", "wip v2"]));
     assert_success(&warehouse.run(&["deliver", "main", "-m", "first"]));
 
     // The draft keeps going; main holds only the first delivery, whose tree the draft has seen.
     assert_success(&warehouse.run(&["shift", "draft"]));
     warehouse.write_file("code.txt", "v3\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "wip v3"]));
+    assert_success(&warehouse.run(&["stack", "-m", "wip v3"]));
 
     let second = warehouse.run(&["deliver", "main", "-m", "second"]);
     assert_success(&second);
@@ -6866,7 +6876,7 @@ fn a_draft_delivered_once_can_deliver_its_later_work() {
     assert_success(&warehouse.run(&["pallet", "create", "branch"]));
     warehouse.write_file("code.txt", "v4\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "wip v4"]));
+    assert_success(&warehouse.run(&["stack", "-m", "wip v4"]));
     assert_success(&warehouse.run(&["deliver", "main", "-m", "third"]));
     assert_eq!(std::fs::read_to_string(warehouse.root.join("code.txt")).unwrap(), "v4\n");
 }
@@ -6881,14 +6891,14 @@ fn deliver_over_a_target_rolled_back_to_a_checkpoints_content_is_refused() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
     assert_success(&warehouse.run(&["office", "enroll"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "draft"]));
     for v in ["v2", "v3"] {
         warehouse.write_file("code.txt", &format!("{}\n", v));
         assert_success(&warehouse.run(&["load", "."]));
-        assert_success(&warehouse.run(&["stack", &format!("wip {}", v)]));
+        assert_success(&warehouse.run(&["stack", "-m", &format!("wip {}", v)]));
     }
     assert_success(&warehouse.run(&["deliver", "main", "-m", "first"]));
 
@@ -6896,12 +6906,12 @@ fn deliver_over_a_target_rolled_back_to_a_checkpoints_content_is_refused() {
     // but not a delivery.
     warehouse.write_file("code.txt", "v2\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "roll back"]));
+    assert_success(&warehouse.run(&["stack", "-m", "roll back"]));
 
     assert_success(&warehouse.run(&["shift", "draft"]));
     warehouse.write_file("code.txt", "v4\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "wip v4"]));
+    assert_success(&warehouse.run(&["stack", "-m", "wip v4"]));
 
     let refused = warehouse.run(&["deliver", "main", "-m", "over the rollback"]);
     assert!(!refused.status.success(), "{}", stdout(&refused));
@@ -6917,7 +6927,7 @@ fn regenesis_resets_trust_and_pins_prior_history_as_attested() {
     assert_success(&warehouse.run(&["office", "enroll"]));
 
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "signed work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "signed work"]));
 
     // A working admin is refused: re-genesis is recovery, not management.
     let refused = warehouse.run(&["office", "regenesis", "--confirm"]);
@@ -6928,7 +6938,7 @@ fn regenesis_resets_trust_and_pins_prior_history_as_attested() {
     std::fs::remove_dir_all(warehouse.home.join("test-keys")).unwrap();
     warehouse.write_file("a.txt", "two\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let locked = warehouse.run(&["stack", "locked out"]);
+    let locked = warehouse.run(&["stack", "-m", "locked out"]);
     assert!(!locked.status.success());
     assert!(stderr(&locked).contains("No active key"), "{}", stderr(&locked));
 
@@ -6948,7 +6958,7 @@ fn regenesis_resets_trust_and_pins_prior_history_as_attested() {
 
     // The new chain works, and the old signed work degrades to attested (legacy):
     // its signing key is gone from the office, but it sits inside the new boundary.
-    assert_success(&warehouse.run(&["stack", "after reset"]));
+    assert_success(&warehouse.run(&["stack", "-m", "after reset"]));
     let audit = warehouse.run(&["audit"]);
     assert_success(&audit);
     let report = stdout(&audit);
@@ -6993,7 +7003,7 @@ fn profiles_select_the_identity_a_warehouse_acts_under() {
 
     // Work in this warehouse is now authored by the profile's id, not the global one.
     assert_success(&warehouse.run(&["load", "."]));
-    let stacked = warehouse.run(&["stack", "as work"]);
+    let stacked = warehouse.run(&["stack", "-m", "as work"]);
     assert_success(&stacked);
     let peek = stdout(&warehouse.run(&["store", "peek", &extract_parcel_hash(&stacked)]));
     assert!(peek.contains(&work_id), "unexpected peek: {}", peek);
@@ -7514,7 +7524,7 @@ fn office_link_endorses_a_second_device_key() {
     // The endorsement chain is real: signed work audits clean (the audit verifies
     // the sigchain endorsements along the office chain).
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "work"]));
     assert_success(&warehouse.run(&["audit"]));
 
     // A proof-of-possession bound to another operator's id cannot be linked.
@@ -7616,7 +7626,7 @@ fn office_authorize_recovers_an_enrolled_operator_who_lost_all_keys() {
     assert_eq!(bob_keys, 2, "unexpected list: {}", list);
 
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "work"]));
     assert_success(&warehouse.run(&["audit"]));
 }
 
@@ -7630,7 +7640,7 @@ fn parcels_are_signed_after_enrollment_and_audit_verifies_them() {
 
     // A parcel stacked before trust exists is legal (and later counts as legacy).
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "legacy work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "legacy work"]));
 
     // No trust yet: audit refuses.
     let no_trust = warehouse.run(&["audit"]);
@@ -7642,7 +7652,7 @@ fn parcels_are_signed_after_enrollment_and_audit_verifies_them() {
     // Every parcel stacked from now on carries a signature sidecar.
     warehouse.write_file("a.txt", "signed\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let signed = extract_parcel_hash(&warehouse.run(&["stack", "signed work"]));
+    let signed = extract_parcel_hash(&warehouse.run(&["stack", "-m", "signed work"]));
 
     let sidecar = warehouse.root
         .join(".forklift/objects")
@@ -7682,7 +7692,7 @@ fn parcels_are_signed_after_enrollment_and_audit_verifies_them() {
     assert_success(&warehouse.run(&["config", "set", "operator.identifier", "eve@evil"]));
     warehouse.write_file("a.txt", "evil\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let refused = warehouse.run(&["stack", "evil work"]);
+    let refused = warehouse.run(&["stack", "-m", "evil work"]);
     assert!(!refused.status.success());
     assert!(stderr(&refused).contains("not enrolled"));
 }
@@ -7711,7 +7721,7 @@ fn json_mode_wraps_every_result_in_a_versioned_envelope() {
     // Stack reports the parcel and pallet as fields, not prose.
     warehouse.write_file("a.txt", "hello\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let stacked = warehouse.run(&["stack", "first", "--json"]);
+    let stacked = warehouse.run(&["stack", "-m", "first", "--json"]);
     assert_success(&stacked);
     let value = json(&stacked);
     assert_eq!(value["command"], "stack");
@@ -7953,8 +7963,8 @@ fn help_and_version_under_json_are_success_documents() {
 fn the_help_command_under_json_answers_like_the_help_flag() {
     let warehouse = TestWarehouse::new("json-help-command");
 
-    // `help <command>` (alias `h`) is the same result as `<command> --help`: one success document.
-    let help = warehouse.run(&["--json", "h", "history"]);
+    // `help <command>` is the same result as `<command> --help`: one success document.
+    let help = warehouse.run(&["--json", "help", "history"]);
     assert_eq!(help.status.code(), Some(0));
     let value = json(&help);
     assert_eq!(value["ok"], true);
@@ -8042,7 +8052,7 @@ fn a_load_that_hits_an_unreadable_file_leaves_a_marker_and_stack_refuses() {
         "a failed load must leave the incomplete-load marker behind"
     );
 
-    let stacked = warehouse.run(&["stack", "attempt", "--json"]);
+    let stacked = warehouse.run(&["stack", "-m", "attempt", "--json"]);
     assert_eq!(stacked.status.code(), Some(20));
     let value = json(&stacked);
     assert_eq!(value["ok"], false);
@@ -8085,7 +8095,7 @@ fn a_clean_reload_of_the_same_root_clears_the_marker_and_stack_succeeds() {
         !incomplete_load_marker_path(&warehouse).exists(),
         "a clean re-load of the same root must clear the marker"
     );
-    assert_success(&warehouse.run(&["stack", "clean"]));
+    assert_success(&warehouse.run(&["stack", "-m", "clean"]));
 }
 
 #[cfg(unix)]
@@ -8114,7 +8124,7 @@ fn a_narrower_clean_load_does_not_heal_a_broader_failed_root() {
         "a narrower clean load must not clear a broader failed root's marker"
     );
 
-    let stacked = warehouse.run(&["stack", "attempt", "--json"]);
+    let stacked = warehouse.run(&["stack", "-m", "attempt", "--json"]);
     assert_eq!(stacked.status.code(), Some(20));
     assert_eq!(json(&stacked)["error"]["code"], "incomplete_load");
 
@@ -8134,7 +8144,7 @@ fn a_hand_written_marker_refuses_stack_even_without_a_reported_load_failure() {
 
     warehouse.write_file("a.txt", "x\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["stack", "-m", "first"]));
 
     warehouse.write_file("a.txt", "changed\n");
     assert_success(&warehouse.run(&["load", "."]));
@@ -8143,7 +8153,7 @@ fn a_hand_written_marker_refuses_stack_even_without_a_reported_load_failure() {
     std::fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
     forklift_core::util::marker_utils::add(&marker_path, "").unwrap();
 
-    let stacked = warehouse.run(&["stack", "second", "--json"]);
+    let stacked = warehouse.run(&["stack", "-m", "second", "--json"]);
     assert_eq!(stacked.status.code(), Some(20));
     let value = json(&stacked);
     assert_eq!(value["error"]["code"], "incomplete_load");
@@ -8153,7 +8163,7 @@ fn a_hand_written_marker_refuses_stack_even_without_a_reported_load_failure() {
     // reading as no incomplete load at all.
     std::fs::write(&marker_path, "./\n").unwrap();
 
-    let stacked = warehouse.run(&["stack", "second", "--json"]);
+    let stacked = warehouse.run(&["stack", "-m", "second", "--json"]);
     assert_eq!(stacked.status.code(), Some(20));
     let value = json(&stacked);
     assert_eq!(value["error"]["code"], "incomplete_load");
@@ -8189,7 +8199,7 @@ fn two_disjoint_failed_loads_both_stay_recorded_until_each_heals() {
     assert!(incomplete_load_marker_path(&warehouse).exists());
 
     // Both roots are recorded: stack names both.
-    let stacked = warehouse.run(&["stack", "attempt", "--json"]);
+    let stacked = warehouse.run(&["stack", "-m", "attempt", "--json"]);
     assert_eq!(stacked.status.code(), Some(20));
     let message = json(&stacked)["error"]["message"].as_str().unwrap().to_string();
     assert!(message.contains("dirfirst"), "names the first outstanding root: {}", message);
@@ -8199,7 +8209,7 @@ fn two_disjoint_failed_loads_both_stay_recorded_until_each_heals() {
     std::fs::set_permissions(&first_blocked, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert_success(&warehouse.run(&["load", "dirfirst"]));
 
-    let stacked = warehouse.run(&["stack", "attempt", "--json"]);
+    let stacked = warehouse.run(&["stack", "-m", "attempt", "--json"]);
     assert_eq!(stacked.status.code(), Some(20));
     let message = json(&stacked)["error"]["message"].as_str().unwrap().to_string();
     assert!(!message.contains("dirfirst"), "dirfirst healed, must not still be named: {}", message);
@@ -8209,7 +8219,7 @@ fn two_disjoint_failed_loads_both_stay_recorded_until_each_heals() {
     std::fs::set_permissions(&second_blocked, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert_success(&warehouse.run(&["load", "dirsecond"]));
     assert!(!incomplete_load_marker_path(&warehouse).exists());
-    assert_success(&warehouse.run(&["stack", "clean"]));
+    assert_success(&warehouse.run(&["stack", "-m", "clean"]));
 }
 
 /// `park`'s push durably commits the staged inventory into a parked parcel exactly like `stack`
@@ -8223,7 +8233,7 @@ fn park_push_refuses_on_an_incomplete_load_exactly_like_stack() {
 
     warehouse.write_file("a.txt", "x\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["stack", "-m", "first"]));
 
     warehouse.write_file("a.txt", "changed\n");
     assert_success(&warehouse.run(&["load", "."]));
@@ -8259,18 +8269,18 @@ fn consolidate_refuses_on_an_incomplete_load_before_writing_consolidation_state(
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     // Diverge with non-overlapping changes so the merge would otherwise complete cleanly.
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("file.txt", "one\ntwo\nthree\nfour\nFIVE\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "feature work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "feature work"]));
 
     assert_success(&warehouse.run(&["shift", "main"]));
     warehouse.write_file("file.txt", "ONE\ntwo\nthree\nfour\nfive\n");
     assert_success(&warehouse.run(&["load", "file.txt"]));
-    assert_success(&warehouse.run(&["stack", "main work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "main work"]));
 
     // Simulate a load killed outright partway through its walk (see the hand-written-marker
     // test above for why this is a faithful stand-in).
@@ -8308,12 +8318,12 @@ fn cherry_pick_refuses_on_an_incomplete_load_before_writing_state() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("feat.txt", "feature file\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let source = extract_parcel_hash(&warehouse.run(&["stack", "feature work"]));
+    let source = extract_parcel_hash(&warehouse.run(&["stack", "-m", "feature work"]));
 
     assert_success(&warehouse.run(&["shift", "main"]));
 
@@ -8349,13 +8359,13 @@ fn haul_merge_refuses_on_an_incomplete_load_before_writing_consolidation_state()
     configure_operator(&warehouse);
     warehouse.write_file("base.txt", "base\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
     assert_success(&warehouse.run(&["office", "enroll"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("feature.txt", "feat\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "feature work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "feature work"]));
     assert_success(&warehouse.run(&["shift", "main"]));
 
     assert_success(&warehouse.run(&[
@@ -8408,23 +8418,23 @@ fn restore_staged_over_the_recorded_root_heals_the_marker() {
     assert!(!warehouse.run(&["load", "."]).status.success());
     assert!(incomplete_load_marker_path(&warehouse).exists());
 
-    let stacked = warehouse.run(&["stack", "attempt", "--json"]);
+    let stacked = warehouse.run(&["stack", "-m", "attempt", "--json"]);
     assert_eq!(stacked.status.code(), Some(20));
 
-    // "restore --staged ." fully covers the recorded root — this abandons the incomplete load
+    // "unload ." fully covers the recorded root — this abandons the incomplete load
     // (rather than healing it by re-reading the files) but is an equally valid remedy: the
     // guard's own next_step names it explicitly.
-    assert_success(&warehouse.run(&["restore", "--staged", "."]));
+    assert_success(&warehouse.run(&["unload", "."]));
     assert!(
         !incomplete_load_marker_path(&warehouse).exists(),
-        "restore --staged over the recorded root must heal the marker"
+        "unload over the recorded root must heal the marker"
     );
 
     // A fresh, clean load now stacks normally.
     std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o644)).unwrap();
     warehouse.write_file("clean.txt", "clean\n");
     assert_success(&warehouse.run(&["load", "clean.txt"]));
-    assert_success(&warehouse.run(&["stack", "clean"]));
+    assert_success(&warehouse.run(&["stack", "-m", "clean"]));
 }
 
 /// The conservative half of the same recovery path: a staging reset must only heal the marker
@@ -8442,7 +8452,7 @@ fn restore_staged_of_a_narrower_path_does_not_heal_a_broader_recorded_root() {
     // An initial clean stack establishes a head with a real, shard-backed directory.
     warehouse.write_file("existing/a.txt", "a\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     // A later whole-warehouse load fails on an unrelated unreadable file: the marker records
     // the root ("./"), not just the directory that actually failed.
@@ -8454,13 +8464,13 @@ fn restore_staged_of_a_narrower_path_does_not_heal_a_broader_recorded_root() {
 
     // Restoring only "existing" (already consistent with head) does not cover the broader
     // recorded root ("./") — the marker survives.
-    assert_success(&warehouse.run(&["restore", "--staged", "existing"]));
+    assert_success(&warehouse.run(&["unload", "existing"]));
     assert!(
         incomplete_load_marker_path(&warehouse).exists(),
         "restoring a narrower path must not heal a broader recorded root"
     );
 
-    let stacked = warehouse.run(&["stack", "attempt", "--json"]);
+    let stacked = warehouse.run(&["stack", "-m", "attempt", "--json"]);
     assert_eq!(stacked.status.code(), Some(20));
 
     std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -8468,7 +8478,7 @@ fn restore_staged_of_a_narrower_path_does_not_heal_a_broader_recorded_root() {
 
 /// The vacuous corner of the same recovery path: a directory whose only file is unreadable never
 /// gets a shard at all (its own per-directory task publishes nothing — see
-/// `load_guard_utils::clear_recorded_under`'s doc comment). Abandoning it via `restore --staged`
+/// `load_guard_utils::clear_recorded_under`'s doc comment). Abandoning it via `unload`
 /// has nothing to reset (it was never staged) and nothing to abandon (nothing landed there) — it
 /// must succeed as a heal-no-op instead of failing with "neither in the inventory nor in the
 /// pallet head" while leaving the marker (and the guard) stuck forever. See
@@ -8508,7 +8518,7 @@ fn restore_staged_of_a_vacuous_failed_directory_heals_as_a_no_op() {
     assert!(!warehouse.run(&["load", "bigdir"]).status.success());
     assert!(incomplete_load_marker_path(&warehouse).exists());
 
-    let restored = warehouse.run(&["restore", "--staged", "bigdir", "--json"]);
+    let restored = warehouse.run(&["unload", "bigdir", "--json"]);
     assert_success(&restored);
     let value = json(&restored);
     assert!(
@@ -8521,7 +8531,7 @@ fn restore_staged_of_a_vacuous_failed_directory_heals_as_a_no_op() {
         "restoring the vacuous failed directory must clear its own recorded root"
     );
 
-    assert_success(&warehouse.run(&["stack", "clean"]));
+    assert_success(&warehouse.run(&["stack", "-m", "clean"]));
 
     std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o644)).unwrap();
 }
@@ -8561,13 +8571,13 @@ fn restore_staged_of_an_unrelated_path_never_clears_a_broader_recorded_root() {
     // "typo-path" itself. The command may error or no-op (it currently errors, the same
     // "neither in the inventory nor in the pallet head" a genuinely unrelated path always gets);
     // either is fine — the marker surviving is what this test actually checks.
-    let _ = warehouse.run(&["restore", "--staged", "typo-path"]);
+    let _ = warehouse.run(&["unload", "typo-path"]);
     assert!(
         incomplete_load_marker_path(&warehouse).exists(),
         "restoring an unrelated path must never clear a broader recorded root"
     );
 
-    let stacked = warehouse.run(&["stack", "attempt", "--json"]);
+    let stacked = warehouse.run(&["stack", "-m", "attempt", "--json"]);
     assert_eq!(stacked.status.code(), Some(20));
 
     std::fs::set_permissions(&blocked_path, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -8593,18 +8603,18 @@ fn a_malformed_marker_reads_as_the_whole_warehouse_until_a_full_load_and_refuses
     // whole warehouse: a load of one file does not clear it, a load of the root does.
     std::fs::write(&marker_path, [0xFF, 0xFE, 0x00, 0xFF]).unwrap();
     assert_success(&warehouse.run(&["load", "a.txt"]));
-    let refused = warehouse.run(&["stack", "first", "--json"]);
+    let refused = warehouse.run(&["stack", "-m", "first", "--json"]);
     assert_eq!(refused.status.code(), Some(20));
     assert!(json(&refused)["error"]["message"].as_str().unwrap().contains("./"), "{}", json(&refused));
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["stack", "-m", "first"]));
 
     // Corrupt it again, with no load in between this time: the check side must refuse
     // conservatively rather than silently treat unreadable content as "nothing recorded", and
     // point at a recovery path.
     std::fs::write(&marker_path, [0xFF, 0xFE, 0x00, 0xFF]).unwrap();
 
-    let stacked = warehouse.run(&["stack", "second", "--json"]);
+    let stacked = warehouse.run(&["stack", "-m", "second", "--json"]);
     assert_eq!(stacked.status.code(), Some(20));
     let value = json(&stacked);
     assert_eq!(value["error"]["code"], "incomplete_load");
@@ -8616,7 +8626,7 @@ fn a_malformed_marker_reads_as_the_whole_warehouse_until_a_full_load_and_refuses
     // The way out it names works.
     warehouse.write_file("a.txt", "y\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "second"]));
+    assert_success(&warehouse.run(&["stack", "-m", "second"]));
 }
 
 #[test]
@@ -8646,15 +8656,15 @@ fn conflicts_json_exposes_the_three_sides_as_content_addresses() {
     // Two pallets change the same line differently → a real merge conflict.
     warehouse.write_file("f.txt", "line1\nline2\nline3\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
     assert_success(&warehouse.run(&["pallet", "create", "other"]));
     warehouse.write_file("f.txt", "line1\nTHEIRS\nline3\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "theirs"]));
+    assert_success(&warehouse.run(&["stack", "-m", "theirs"]));
     assert_success(&warehouse.run(&["shift", "main"]));
     warehouse.write_file("f.txt", "line1\nOURS\nline3\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "ours"]));
+    assert_success(&warehouse.run(&["stack", "-m", "ours"]));
 
     // A conflicting consolidation is not a command failure — it reports the conflict.
     assert_success(&warehouse.run(&["consolidate", "other"]));
@@ -8733,7 +8743,7 @@ fn mcp_reports_a_failing_command_as_a_tool_error() {
     // Stacking with nothing staged fails; the MCP tool surfaces it as isError with
     // the error envelope, not a crashed session.
     let input = concat!(
-        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stack","arguments":{"description":"nothing"}}}"#, "\n",
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stack","arguments":{"message":"nothing"}}}"#, "\n",
     );
 
     let output = warehouse.run_with_stdin(&["mcp"], input);
@@ -8753,7 +8763,7 @@ fn mcp_exposes_and_runs_the_parity_pass_tools() {
     assert_success(&warehouse.run(&["prepare"]));
     warehouse.write_file("a.txt", "one\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["stack", "-m", "first"]));
 
     // The formerly-missing agent tools are now advertised…
     let list = warehouse.run_with_stdin(
@@ -8798,7 +8808,7 @@ fn an_mcp_value_that_spells_an_option_reaches_the_command_as_a_value() {
     assert_success(&warehouse.run(&["office", "enroll"]));
     warehouse.write_file("a.txt", "one\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["stack", "-m", "first"]));
 
     let call = |name: &str, arguments: &str| -> serde_json::Value {
         let input = format!(
@@ -8817,7 +8827,7 @@ fn an_mcp_value_that_spells_an_option_reaches_the_command_as_a_value() {
     assert_eq!(got["data"]["value"], "--json -x", "{}", got);
     warehouse.write_file("a.txt", "two\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let stacked = call("stack", r#"{"description":"--verbose -m"}"#);
+    let stacked = call("stack", r#"{"message":"--verbose -m"}"#);
     assert_eq!(stacked["ok"], true, "{}", stacked);
     let history = call("history", r#"{"limit":1}"#);
     assert_eq!(history["data"]["entries"][0]["description"], "--verbose -m", "{}", history);
@@ -8832,7 +8842,7 @@ fn mcp_history_tool_paginates_with_limit_and_after_like_the_cli() {
     for i in 1..=5 {
         warehouse.write_file("a.txt", &format!("v{}\n", i));
         assert_success(&warehouse.run(&["load", "."]));
-        assert_success(&warehouse.run(&["stack", &format!("p{}", i)]));
+        assert_success(&warehouse.run(&["stack", "-m", &format!("p{}", i)]));
     }
 
     let call = |arguments: &str| -> serde_json::Value {
@@ -8878,13 +8888,13 @@ fn undo_soft_resets_the_last_stack_and_restages_its_changes() {
 
     warehouse.write_file("a.txt", "one\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let first = warehouse.run(&["stack", "first"]);
+    let first = warehouse.run(&["stack", "-m", "first"]);
     assert_success(&first);
     let first_hash = extract_parcel_hash(&first);
 
     warehouse.write_file("b.txt", "two\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let second = warehouse.run(&["stack", "second"]);
+    let second = warehouse.run(&["stack", "-m", "second"]);
     assert_success(&second);
     let second_hash = extract_parcel_hash(&second);
 
@@ -8905,7 +8915,7 @@ fn undo_soft_resets_the_last_stack_and_restages_its_changes() {
     assert_eq!(json(&staged)["data"]["staged_count"], 1);
 
     // Re-stack to redo (e.g. with a corrected message).
-    assert_success(&warehouse.run(&["stack", "second, corrected"]));
+    assert_success(&warehouse.run(&["stack", "-m", "second, corrected"]));
 
     // Undo down to the first parcel, then once more: nothing left to undo (no parent).
     assert_success(&warehouse.run(&["undo"]));
@@ -8922,17 +8932,17 @@ fn undo_reverses_a_consolidate_and_a_shift() {
 
     warehouse.write_file("base.txt", "base\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     // A side pallet changes one file; main changes another → a clean two-parent merge.
     assert_success(&warehouse.run(&["pallet", "create", "side"]));
     warehouse.write_file("side.txt", "side\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "side work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "side work"]));
     assert_success(&warehouse.run(&["shift", "main"]));
     warehouse.write_file("main.txt", "main\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let main_head = extract_parcel_hash(&warehouse.run(&["stack", "main work"]));
+    let main_head = extract_parcel_hash(&warehouse.run(&["stack", "-m", "main work"]));
 
     // Reverse a shift first (while the warehouse is clean): move to side, undo → back on
     // main, re-materialized.
@@ -8976,12 +8986,12 @@ fn undo_never_reverts_a_key_retirement_that_happened_after_the_journaled_stack()
     // (there is no ref to restore back to), so this one has to precede the one under test.
     warehouse.write_file("a.txt", "one\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "genesis"]));
+    assert_success(&warehouse.run(&["stack", "-m", "genesis"]));
 
     // The journaled operation: a stack, undo-able on its own.
     warehouse.write_file("b.txt", "two\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["stack", "-m", "first"]));
 
     // Un-journaled, in between: an admin retires bob's key. This advances `@office`.
     let list_json = json(&warehouse.run(&["office", "list", "--json"]));
@@ -9025,20 +9035,20 @@ fn undo_refuses_rather_than_silently_no_opping_when_the_pallet_moved_on() {
     // Born onto main.
     warehouse.write_file("base.txt", "base\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     // "feature"'s own divergent work is set up *before* the op under test, so it doesn't
     // end up on top of the journal (a stack there would be the next thing undo reverses).
     assert_success(&warehouse.run(&["pallet", "create", "feature"])); // switches onto feature
     warehouse.write_file("feature.txt", "feat\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "feature work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "feature work"]));
     assert_success(&warehouse.run(&["shift", "main"]));
 
     // The journaled operation under test — the last thing on the journal from here on.
     warehouse.write_file("main.txt", "v1\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "second"]));
+    assert_success(&warehouse.run(&["stack", "-m", "second"]));
 
     // Un-journaled: a haul merge advances main's head past "second" with a real merge
     // parcel (haul is not in the journaled command set).
@@ -9060,7 +9070,7 @@ fn undo_refuses_rather_than_silently_no_opping_when_the_pallet_moved_on() {
     // The journal entry is untouched too: a fresh legitimate stack/undo cycle still works.
     warehouse.write_file("main.txt", "v2\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "third"]));
+    assert_success(&warehouse.run(&["stack", "-m", "third"]));
     let undone = warehouse.run(&["undo", "--json"]);
     assert_success(&undone);
     assert_eq!(json(&undone)["data"]["op"], "stack");
@@ -9078,13 +9088,13 @@ fn undo_refuses_a_stale_consolidation_after_the_pallet_moved_on() {
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["office", "enroll"])); // haul needs a signing actor
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     // "feature" diverges on the very line "main" will also change (a guaranteed conflict).
     assert_success(&warehouse.run(&["pallet", "create", "feature"])); // switches onto feature
     warehouse.write_file("file.txt", "one\nTHEIRS\nthree\n");
     assert_success(&warehouse.run(&["load", "file.txt"]));
-    assert_success(&warehouse.run(&["stack", "theirs"]));
+    assert_success(&warehouse.run(&["stack", "-m", "theirs"]));
 
     // "extra" is the un-journaled advance's future source — set up now, before the op
     // under test, so its own stack doesn't land on top of the journal.
@@ -9092,12 +9102,12 @@ fn undo_refuses_a_stale_consolidation_after_the_pallet_moved_on() {
     assert_success(&warehouse.run(&["pallet", "create", "extra"])); // switches onto extra
     warehouse.write_file("extra.txt", "extra work\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "extra work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "extra work"]));
 
     assert_success(&warehouse.run(&["shift", "main"]));
     warehouse.write_file("file.txt", "one\nOURS\nthree\n");
     assert_success(&warehouse.run(&["load", "file.txt"]));
-    assert_success(&warehouse.run(&["stack", "ours"]));
+    assert_success(&warehouse.run(&["stack", "-m", "ours"]));
 
     // A conflicting consolidate: leaves an in-progress consolidation record, main unmoved.
     let merge = warehouse.run(&["consolidate", "feature"]);
@@ -9108,7 +9118,7 @@ fn undo_refuses_a_stale_consolidation_after_the_pallet_moved_on() {
     // carries the in-progress consolidation record, which clears once the merge lands.
     warehouse.write_file("file.txt", "one\nresolved\nthree\n");
     assert_success(&warehouse.run(&["load", "file.txt"]));
-    assert_success(&warehouse.run(&["stack", "resolved"]));
+    assert_success(&warehouse.run(&["stack", "-m", "resolved"]));
     assert!(!warehouse.root.join(".forklift/consolidation").exists());
 
     // Un-journaled: haul merges "extra" into main, advancing it past the resolved merge.
@@ -9134,7 +9144,7 @@ fn undo_refuses_a_stale_consolidation_after_the_pallet_moved_on() {
     // A subsequent legitimate undo-able op still works.
     warehouse.write_file("file.txt", "one\nresolved\nfour\n");
     assert_success(&warehouse.run(&["load", "file.txt"]));
-    assert_success(&warehouse.run(&["stack", "fourth"]));
+    assert_success(&warehouse.run(&["stack", "-m", "fourth"]));
     assert_success(&warehouse.run(&["undo"]));
 }
 
@@ -9149,10 +9159,10 @@ fn undo_refuses_to_reach_past_a_pallet_create() {
 
     warehouse.write_file("a.txt", "one\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["stack", "-m", "first"]));
     warehouse.write_file("b.txt", "two\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "second"]));
+    assert_success(&warehouse.run(&["stack", "-m", "second"]));
 
     // Un-journaled: a new pallet at the same head, made current.
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
@@ -9179,14 +9189,14 @@ fn undo_refuses_to_reach_past_a_deliver() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
     assert_success(&warehouse.run(&["office", "enroll"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "draft/feature"]));
     for v in ["v2", "v3"] {
         warehouse.write_file("code.txt", &format!("{}\n", v));
         assert_success(&warehouse.run(&["load", "."]));
-        assert_success(&warehouse.run(&["stack", &format!("wip {}", v)]));
+        assert_success(&warehouse.run(&["stack", "-m", &format!("wip {}", v)]));
     }
     assert_success(&warehouse.run(&["deliver", "main", "-m", "add the feature"]));
 
@@ -9215,11 +9225,11 @@ fn undo_refuses_to_reverse_a_shift_past_a_pallet_create() {
 
     warehouse.write_file("base.txt", "base\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
     assert_success(&warehouse.run(&["pallet", "create", "side"]));
     warehouse.write_file("side.txt", "side\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "side work"]));
+    assert_success(&warehouse.run(&["stack", "-m", "side work"]));
 
     // Journaled: side → main. Un-journaled after it: a new pallet at main's head, made current.
     assert_success(&warehouse.run(&["shift", "main"]));
@@ -9245,10 +9255,10 @@ fn undo_refuses_a_corrupt_journal_by_name() {
 
     warehouse.write_file("a.txt", "one\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["stack", "-m", "first"]));
     warehouse.write_file("b.txt", "two\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "second"]));
+    assert_success(&warehouse.run(&["stack", "-m", "second"]));
 
     let journal = warehouse.root.join(".forklift/journal.json");
     assert!(journal.is_file(), "the second stack must have been journaled");
@@ -9265,14 +9275,14 @@ fn undo_refuses_a_corrupt_journal_by_name() {
 
     warehouse.write_file("c.txt", "three\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "third"]));
+    assert_success(&warehouse.run(&["stack", "-m", "third"]));
     assert_eq!(std::fs::read_to_string(&journal).unwrap(), "{\"version\":1,\"entr", "a refused journal is never rewritten");
 
     // The remedy the message names works.
     std::fs::remove_file(&journal).unwrap();
     warehouse.write_file("d.txt", "four\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "fourth"]));
+    assert_success(&warehouse.run(&["stack", "-m", "fourth"]));
     assert_success(&warehouse.run(&["undo"]));
 }
 
@@ -9326,16 +9336,16 @@ fn a_merge_that_cannot_be_signed_is_left_for_stack_to_complete() {
     let pass = [("FORKLIFT_KEY_PASSPHRASE", "correct horse")];
     assert_success(&warehouse.run_with_env(&["office", "enroll", "--passphrase"], &pass));
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run_with_env(&["stack", "base"], &pass));
+    assert_success(&warehouse.run_with_env(&["stack", "-m", "base"], &pass));
 
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("b.txt", "theirs\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run_with_env(&["stack", "theirs"], &pass));
+    assert_success(&warehouse.run_with_env(&["stack", "-m", "theirs"], &pass));
     assert_success(&warehouse.run(&["shift", "main"]));
     warehouse.write_file("a.txt", "ours\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run_with_env(&["stack", "ours"], &pass));
+    assert_success(&warehouse.run_with_env(&["stack", "-m", "ours"], &pass));
 
     let wrong = warehouse.run_with_env(&["consolidate", "feature"], &[("FORKLIFT_KEY_PASSPHRASE", "wrong")]);
     assert!(!wrong.status.success(), "a merge that cannot be signed must not land");
@@ -9375,14 +9385,14 @@ fn a_passphrase_protected_key_needs_the_passphrase_to_sign() {
 
     // With the passphrase, signing works and the parcel audits clean.
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run_with_env(&["stack", "signed with the passphrase"], &pass));
+    assert_success(&warehouse.run_with_env(&["stack", "-m", "signed with the passphrase"], &pass));
     assert_success(&warehouse.run_with_env(&["audit"], &pass));
 
     // Without the right passphrase, the protected key cannot sign — a wrong passphrase
     // fails the decryption, so `stack` cannot forge a signature.
     warehouse.write_file("b.txt", "two\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let wrong = warehouse.run_with_env(&["stack", "should not sign"], &[("FORKLIFT_KEY_PASSPHRASE", "wrong")]);
+    let wrong = warehouse.run_with_env(&["stack", "-m", "should not sign"], &[("FORKLIFT_KEY_PASSPHRASE", "wrong")]);
     assert!(!wrong.status.success(), "a wrong passphrase must not sign");
     assert!(stderr(&wrong).contains("passphrase is incorrect"), "{}", stderr(&wrong));
 
@@ -9394,7 +9404,7 @@ fn a_passphrase_protected_key_needs_the_passphrase_to_sign() {
     configure_operator(&plain);
     assert_success(&plain.run(&["office", "enroll"]));
     assert_success(&plain.run(&["load", "."]));
-    assert_success(&plain.run(&["stack", "signed, no passphrase"]));
+    assert_success(&plain.run(&["stack", "-m", "signed, no passphrase"]));
     assert_success(&plain.run(&["audit"]));
 }
 
@@ -9459,12 +9469,12 @@ fn blame_attributes_each_line_to_the_parcel_that_introduced_it() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    let first = extract_parcel_hash(&warehouse.run(&["stack", "first"]));
+    let first = extract_parcel_hash(&warehouse.run(&["stack", "-m", "first"]));
 
     // A second parcel changes line 2 and appends line 4; lines 1 and 3 are untouched.
     warehouse.write_file("f.txt", "one\ntwo CHANGED\nthree\nfour\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let second = extract_parcel_hash(&warehouse.run(&["stack", "second"]));
+    let second = extract_parcel_hash(&warehouse.run(&["stack", "-m", "second"]));
 
     // Unchanged lines keep the first parcel; the changed and new lines are the second's.
     let blame = json(&warehouse.run(&["--json", "blame", "f.txt"]));
@@ -9495,20 +9505,20 @@ fn blame_skips_untouched_parcels_via_the_changed_path_filter_and_stays_correct()
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    let c1 = extract_parcel_hash(&warehouse.run(&["stack", "introduce target"]));
+    let c1 = extract_parcel_hash(&warehouse.run(&["stack", "-m", "introduce target"]));
 
     // Two parcels that touch only other.txt — the filter must skip these for target.txt.
     warehouse.write_file("other.txt", "x2\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "other only 1"]));
+    assert_success(&warehouse.run(&["stack", "-m", "other only 1"]));
     warehouse.write_file("other.txt", "x3\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "other only 2"]));
+    assert_success(&warehouse.run(&["stack", "-m", "other only 2"]));
 
     // A parcel that changes L2 and adds L3 in target.txt.
     warehouse.write_file("target.txt", "L1\nL2 CHANGED\nL3\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let c4 = extract_parcel_hash(&warehouse.run(&["stack", "change target"]));
+    let c4 = extract_parcel_hash(&warehouse.run(&["stack", "-m", "change target"]));
 
     // Compact builds the changed-path filters, so the blame below reads them (the fast path).
     assert_success(&warehouse.run(&["store", "compact"]));
@@ -9528,7 +9538,7 @@ fn blame_reads_the_identity_class_of_an_agent_authored_line() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse); // test@forklift
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "human parcel"]));
+    assert_success(&warehouse.run(&["stack", "-m", "human parcel"]));
     assert_success(&warehouse.run(&["office", "enroll"])); // test@forklift becomes admin
 
     // Admit an agent supervised by the human, and author a line under the agent's identity.
@@ -9539,7 +9549,7 @@ fn blame_reads_the_identity_class_of_an_agent_authored_line() {
     assert_success(&warehouse.run(&["config", "set", "operator.identifier", "agent@forklift"]));
     warehouse.write_file("f.txt", "human line\nagent line\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "agent parcel"]));
+    assert_success(&warehouse.run(&["stack", "-m", "agent parcel"]));
     assert_success(&warehouse.run(&["config", "set", "operator.identifier", "test@forklift"]));
 
     // The agent-authored line carries the identity class and supervisor — blame git cannot
@@ -9566,7 +9576,7 @@ fn tags_are_signed_admin_only_and_verify_offline() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "first parcel"]));
+    assert_success(&warehouse.run(&["stack", "-m", "first parcel"]));
 
     // A tag is signed, so before trust it is refused.
     let before = warehouse.run(&["tag", "create", "v1.0", "main", "-m", "first"]);
@@ -9608,14 +9618,14 @@ fn cherry_pick_applies_a_parcel_diff_preserving_authorship() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse); // the picker: test@forklift
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     // A feature pallet whose parcel is authored by *bob* (a different operator).
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     assert_success(&warehouse.run(&["config", "set", "operator.identifier", "bob@forklift"]));
     warehouse.write_file("bob.txt", "bob's work\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let source = extract_parcel_hash(&warehouse.run(&["stack", "bob's change"]));
+    let source = extract_parcel_hash(&warehouse.run(&["stack", "-m", "bob's change"]));
     assert_success(&warehouse.run(&["config", "set", "operator.identifier", "test@forklift"]));
 
     // test cherry-picks bob's parcel onto main.
@@ -9647,19 +9657,19 @@ fn cherry_pick_conflicts_are_marked_and_completed_by_stacking() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     // feature changes line 2 one way.
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("f.txt", "alpha\nbeta-FEATURE\ngamma\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let source = extract_parcel_hash(&warehouse.run(&["stack", "feature edits beta"]));
+    let source = extract_parcel_hash(&warehouse.run(&["stack", "-m", "feature edits beta"]));
 
     // main changes the same line the other way — an overlap the pick cannot merge.
     assert_success(&warehouse.run(&["shift", "main"]));
     warehouse.write_file("f.txt", "alpha\nbeta-MAIN\ngamma\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "main edits beta"]));
+    assert_success(&warehouse.run(&["stack", "-m", "main edits beta"]));
 
     // The pick reports a conflict and leaves markers.
     let picked = json(&warehouse.run(&["--json", "pick", &source]));
@@ -9668,12 +9678,12 @@ fn cherry_pick_conflicts_are_marked_and_completed_by_stacking() {
     assert!(std::fs::read_to_string(warehouse.root.join("f.txt")).unwrap().contains("<<<<<<<"));
 
     // A stack is refused while the conflict is unresolved.
-    assert!(!warehouse.run(&["stack", "premature"]).status.success());
+    assert!(!warehouse.run(&["stack", "-m", "premature"]).status.success());
 
     // Resolving, loading and stacking completes the pick as a single-parent parcel.
     warehouse.write_file("f.txt", "alpha\nbeta-RESOLVED\ngamma\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "resolved pick"]));
+    assert_success(&warehouse.run(&["stack", "-m", "resolved pick"]));
 
     let head = json(&warehouse.run(&["--json", "history"]));
     let top = &head["data"]["entries"][0];
@@ -9691,17 +9701,17 @@ fn undo_reverses_a_conflicted_cherry_pick_and_its_completion() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("f.txt", "alpha\nbeta-FEATURE\ngamma\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let source = extract_parcel_hash(&warehouse.run(&["stack", "feature edits beta"]));
+    let source = extract_parcel_hash(&warehouse.run(&["stack", "-m", "feature edits beta"]));
 
     assert_success(&warehouse.run(&["shift", "main"]));
     warehouse.write_file("f.txt", "alpha\nbeta-MAIN\ngamma\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "main edits beta"]));
+    assert_success(&warehouse.run(&["stack", "-m", "main edits beta"]));
     let main_head = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap();
     let pick_state = warehouse.root.join(".forklift/cherry-pick");
 
@@ -9722,7 +9732,7 @@ fn undo_reverses_a_conflicted_cherry_pick_and_its_completion() {
     assert_eq!(picked["data"]["outcome"], "conflicts");
     warehouse.write_file("f.txt", "alpha\nbeta-RESOLVED\ngamma\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "resolved pick"]));
+    assert_success(&warehouse.run(&["stack", "-m", "resolved pick"]));
     assert!(!pick_state.exists());
 
     let undone = json(&warehouse.run(&["--json", "undo"]));
@@ -9730,7 +9740,7 @@ fn undo_reverses_a_conflicted_cherry_pick_and_its_completion() {
     assert!(pick_state.exists(), "undoing the completing stack must put the pick back in progress");
     assert_eq!(std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap(), main_head);
 
-    assert_success(&warehouse.run(&["stack", "resolved pick again"]));
+    assert_success(&warehouse.run(&["stack", "-m", "resolved pick again"]));
     assert!(!pick_state.exists(), "the re-stack completes the pick");
 }
 
@@ -9749,14 +9759,14 @@ fn shift_flips_a_tracked_directory_into_a_file_and_back() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     // "flipped" replaces the tracked directory "foo" with a plain file.
     assert_success(&warehouse.run(&["pallet", "create", "flipped"]));
     std::fs::remove_dir_all(warehouse.root.join("foo")).unwrap();
     warehouse.write_file("foo", "foo is a file now\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "flip foo to a file"]));
+    assert_success(&warehouse.run(&["stack", "-m", "flip foo to a file"]));
 
     // Shifting to "flipped" from "main" (where "foo" is still a tracked, clean directory) must
     // not refuse: it is exactly the tracked dir->file flip, not an untracked collision.
@@ -9794,13 +9804,13 @@ fn shift_still_refuses_a_directory_to_file_flip_when_untracked_content_is_beneat
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "flipped"]));
     std::fs::remove_dir_all(warehouse.root.join("foo")).unwrap();
     warehouse.write_file("foo", "foo is a file now\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "flip foo to a file"]));
+    assert_success(&warehouse.run(&["stack", "-m", "flip foo to a file"]));
 
     assert_success(&warehouse.run(&["shift", "main"]));
 
@@ -9830,21 +9840,21 @@ fn consolidate_flips_a_tracked_directory_into_a_file_and_back() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     // "feature" one-sidedly replaces the tracked directory "foo" with a file.
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     std::fs::remove_dir_all(warehouse.root.join("foo")).unwrap();
     warehouse.write_file("foo", "foo is a file now\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "feature flips foo to a file"]));
+    assert_success(&warehouse.run(&["stack", "-m", "feature flips foo to a file"]));
 
     // "main" diverges the other way (an unrelated, non-overlapping change), so the merge is a
     // genuine three-way merge — not a fast-forward.
     assert_success(&warehouse.run(&["shift", "main"]));
     warehouse.write_file("root.txt", "root v2\n");
     assert_success(&warehouse.run(&["load", "root.txt"]));
-    assert_success(&warehouse.run(&["stack", "main edits root"]));
+    assert_success(&warehouse.run(&["stack", "-m", "main edits root"]));
 
     let merge = warehouse.run(&["consolidate", "feature"]);
     assert_success(&merge);
@@ -9875,18 +9885,18 @@ fn consolidate_flips_a_tracked_file_into_a_directory() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     std::fs::remove_file(warehouse.root.join("foo")).unwrap();
     warehouse.write_file("foo/inner.txt", "inner v1\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "feature flips foo to a directory"]));
+    assert_success(&warehouse.run(&["stack", "-m", "feature flips foo to a directory"]));
 
     assert_success(&warehouse.run(&["shift", "main"]));
     warehouse.write_file("root.txt", "root v2\n");
     assert_success(&warehouse.run(&["load", "root.txt"]));
-    assert_success(&warehouse.run(&["stack", "main edits root"]));
+    assert_success(&warehouse.run(&["stack", "-m", "main edits root"]));
 
     let merge = warehouse.run(&["consolidate", "feature"]);
     assert_success(&merge);
@@ -9911,18 +9921,18 @@ fn consolidate_still_refuses_a_directory_to_file_flip_when_untracked_content_is_
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     std::fs::remove_dir_all(warehouse.root.join("foo")).unwrap();
     warehouse.write_file("foo", "foo is a file now\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "feature flips foo to a file"]));
+    assert_success(&warehouse.run(&["stack", "-m", "feature flips foo to a file"]));
 
     assert_success(&warehouse.run(&["shift", "main"]));
     warehouse.write_file("root.txt", "root v2\n");
     assert_success(&warehouse.run(&["load", "root.txt"]));
-    assert_success(&warehouse.run(&["stack", "main edits root"]));
+    assert_success(&warehouse.run(&["stack", "-m", "main edits root"]));
 
     // An untracked file left inside "foo" must still block the merge.
     warehouse.write_file("foo/untracked.txt", "never loaded\n");
@@ -9947,14 +9957,14 @@ fn cherry_pick_flips_a_tracked_directory_into_a_file_and_back() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     // "feature" replaces the tracked directory "foo" with a file, in a single parcel.
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     std::fs::remove_dir_all(warehouse.root.join("foo")).unwrap();
     warehouse.write_file("foo", "foo is a file now\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let source = extract_parcel_hash(&warehouse.run(&["stack", "flip foo to a file"]));
+    let source = extract_parcel_hash(&warehouse.run(&["stack", "-m", "flip foo to a file"]));
 
     // Cherry-pick that parcel onto "main", where "foo" is still a tracked, clean directory.
     assert_success(&warehouse.run(&["shift", "main"]));
@@ -9983,13 +9993,13 @@ fn cherry_pick_flips_a_tracked_file_into_a_directory() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     std::fs::remove_file(warehouse.root.join("foo")).unwrap();
     warehouse.write_file("foo/inner.txt", "inner v1\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let source = extract_parcel_hash(&warehouse.run(&["stack", "flip foo to a directory"]));
+    let source = extract_parcel_hash(&warehouse.run(&["stack", "-m", "flip foo to a directory"]));
 
     assert_success(&warehouse.run(&["shift", "main"]));
     let picked = json(&warehouse.run(&["--json", "pick", &source]));
@@ -10052,11 +10062,11 @@ fn compact_packs_the_object_store_and_reads_survive() {
     warehouse.write_file("a.txt", "one\n");
     warehouse.write_file("b.txt", "two\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["stack", "-m", "first"]));
 
     warehouse.write_file("a.txt", "one changed\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let head = extract_parcel_hash(&warehouse.run(&["stack", "second"]));
+    let head = extract_parcel_hash(&warehouse.run(&["stack", "-m", "second"]));
 
     let objects = warehouse.root.join(".forklift/objects");
     let loose_before = count_loose_objects(&objects);
@@ -10099,7 +10109,7 @@ fn compact_preserves_signed_history_for_audit() {
 
     warehouse.write_file("f.txt", "v2\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let signed = extract_parcel_hash(&warehouse.run(&["stack", "signed"]));
+    let signed = extract_parcel_hash(&warehouse.run(&["stack", "-m", "signed"]));
 
     // Audit verifies the signed chain before compaction.
     assert!(stdout(&warehouse.run(&["audit"])).contains("verified"));
@@ -10145,7 +10155,7 @@ fn compact_path_aware_delta_chains_reconstruct() {
     for v in 0..12 {
         warehouse.write_file("data.txt", &format!("{}unique tail for version {}\n", body, v));
         assert_success(&warehouse.run(&["load", "."]));
-        assert_success(&warehouse.run(&["stack", &format!("v{}", v)]));
+        assert_success(&warehouse.run(&["stack", "-m", &format!("v{}", v)]));
     }
 
     // The oldest and newest parcels, for a diff that spans the whole chain.
@@ -10182,7 +10192,7 @@ fn compact_all_repacks_consolidates_and_drops_garbage() {
     for v in 0..4 {
         warehouse.write_file("f.txt", &format!("content {} xyzzy\n", v));
         assert_success(&warehouse.run(&["load", "."]));
-        assert_success(&warehouse.run(&["stack", &format!("v{}", v)]));
+        assert_success(&warehouse.run(&["stack", "-m", &format!("v{}", v)]));
         assert_success(&warehouse.run(&["store", "compact"]));
     }
 
@@ -10190,7 +10200,7 @@ fn compact_all_repacks_consolidates_and_drops_garbage() {
     // the orphan lands in a pack — where only a repack can reach it.
     warehouse.write_file("g.txt", "garbage\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let orphan = extract_parcel_hash(&warehouse.run(&["stack", "garbage"]));
+    let orphan = extract_parcel_hash(&warehouse.run(&["stack", "-m", "garbage"]));
     assert_success(&warehouse.run(&["undo"]));
     assert_success(&warehouse.run(&["store", "compact"]));
     // The orphan is packed but not yet collected, so it is still retrievable.
@@ -10234,7 +10244,7 @@ fn compact_all_salvages_a_pack_with_a_corrupt_index_bucket() {
     for v in 0..3 {
         warehouse.write_file("f.txt", &format!("salvaged content {}\n", v));
         assert_success(&warehouse.run(&["load", "."]));
-        assert_success(&warehouse.run(&["stack", &format!("v{}", v)]));
+        assert_success(&warehouse.run(&["stack", "-m", &format!("v{}", v)]));
     }
     assert_success(&warehouse.run(&["store", "compact"]));
 
@@ -10338,7 +10348,7 @@ fn redelta_fixture(name: &str) -> TestWarehouse {
     for v in 0..4 {
         warehouse.write_file("data/a.txt", &format!("{}unique tail v{}\n", body, v));
         assert_success(&warehouse.run(&["load", "."]));
-        assert_success(&warehouse.run(&["stack", &format!("v{}", v)]));
+        assert_success(&warehouse.run(&["stack", "-m", &format!("v{}", v)]));
         assert_success(&warehouse.run(&["store", "compact"]));
     }
 
@@ -10348,7 +10358,7 @@ fn redelta_fixture(name: &str) -> TestWarehouse {
     // incremental compact, whose window starts empty) both miss.
     warehouse.write_file("data/b-renamed.txt", &format!("{}unique tail v3 renamed copy tweak\n", body));
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "renamed"]));
+    assert_success(&warehouse.run(&["stack", "-m", "renamed"]));
     assert_success(&warehouse.run(&["store", "compact"]));
 
     warehouse
@@ -10362,7 +10372,7 @@ fn compact_redelta_without_all_is_refused() {
 
     warehouse.write_file("f.txt", "content\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["stack", "-m", "first"]));
 
     let refused = warehouse.run(&["store", "compact", "--redelta"]);
     assert!(!refused.status.success(), "--redelta without --all must be refused");
@@ -10509,13 +10519,13 @@ fn redelta_tree_fixture(name: &str) -> TestWarehouse {
         warehouse.write_file(&format!("data/sub/f{:02}.txt", f), &format!("file {} v0 filler content\n", f));
     }
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "setup"]));
+    assert_success(&warehouse.run(&["stack", "-m", "setup"]));
     assert_success(&warehouse.run(&["store", "compact"]));
 
     for v in 0..REDELTA_TREE_FIXTURE_FILES_PER_DIR {
         warehouse.write_file(&format!("data/sub/f{:02}.txt", v), &format!("file {} v1 filler content\n", v));
         assert_success(&warehouse.run(&["load", "."]));
-        assert_success(&warehouse.run(&["stack", &format!("v{}", v)]));
+        assert_success(&warehouse.run(&["stack", "-m", &format!("v{}", v)]));
         assert_success(&warehouse.run(&["store", "compact"]));
     }
 
@@ -10654,7 +10664,7 @@ fn a_mutating_command_runs_maintenance_when_due() {
     for v in 0..2 {
         warehouse.write_file("f.txt", &format!("v{}\n", v));
         assert_success(&warehouse.run(&["load", "."]));
-        assert_success(&warehouse.run(&["stack", &format!("v{}", v)]));
+        assert_success(&warehouse.run(&["stack", "-m", &format!("v{}", v)]));
         assert_success(&warehouse.run(&["store", "compact"]));
     }
     assert!(count_packs(&objects) > 1, "there should be several packs to consolidate");
@@ -10662,7 +10672,7 @@ fn a_mutating_command_runs_maintenance_when_due() {
     // A mutating command with auto still OFF must not consolidate.
     warehouse.write_file("f.txt", "suppressed\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "suppressed"]));
+    assert_success(&warehouse.run(&["stack", "-m", "suppressed"]));
     assert!(count_packs(&objects) > 1, "maintenance.auto=false must suppress the repack");
 
     // Enable it: the next mutating command runs `compact --all` synchronously (under its own
@@ -10673,7 +10683,7 @@ fn a_mutating_command_runs_maintenance_when_due() {
     assert_success(&warehouse.run(&["config", "set", "maintenance.auto", "true"]));
     warehouse.write_file("f.txt", "trigger\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "trigger"]));
+    assert_success(&warehouse.run(&["stack", "-m", "trigger"]));
     assert_eq!(count_packs(&objects), 1, "maintenance should have consolidated the packs to one");
 
     // And it must not have corrupted anything: the full history still reads (v0, v1, suppressed,
@@ -10775,7 +10785,7 @@ fn store_never_suggests_densify_for_ordinary_incremental_use() {
 
     warehouse.write_file("f.txt", "content\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["stack", "-m", "first"]));
     assert_success(&warehouse.run(&["store", "compact"]));
 
     let store_json = warehouse.run(&["--json", "store"]);
@@ -10821,7 +10831,7 @@ fn scoped_fixture(name: &str) -> TestWarehouse {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
     warehouse
 }
 
@@ -10913,9 +10923,9 @@ fn a_scoped_stack_produces_a_byte_identical_root_tree_to_a_full_stack() {
     std::fs::write(full_dir.join("src/api/a.txt"), "api a v2\n").unwrap();
     std::fs::write(scoped_dir.join("src/api/a.txt"), "api a v2\n").unwrap();
     assert_success(&warehouse.run_at(&full_dir, &["load", "."]));
-    assert_success(&warehouse.run_at(&full_dir, &["stack", "edit in full"]));
+    assert_success(&warehouse.run_at(&full_dir, &["stack", "-m", "edit in full"]));
     assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
-    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "edit in scoped"]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "-m", "edit in scoped"]));
 
     // The stage-1 invariant: the scoped overlay spliced the out-of-scope siblings back by hash,
     // so the two roots are byte-for-byte the same content address.
@@ -10937,7 +10947,7 @@ fn a_scoped_stack_prunes_an_emptied_subtree_identically_to_a_full_stack() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     let full_dir = warehouse.home.join("bay-full");
     let scoped_dir = warehouse.home.join("bay-scoped");
@@ -10948,9 +10958,9 @@ fn a_scoped_stack_prunes_an_emptied_subtree_identically_to_a_full_stack() {
     std::fs::remove_file(full_dir.join("lonely/deep/only.txt")).unwrap();
     std::fs::remove_file(scoped_dir.join("lonely/deep/only.txt")).unwrap();
     assert_success(&warehouse.run_at(&full_dir, &["load", "."]));
-    assert_success(&warehouse.run_at(&full_dir, &["stack", "drop it (full)"]));
+    assert_success(&warehouse.run_at(&full_dir, &["stack", "-m", "drop it (full)"]));
     assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
-    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "drop it (scoped)"]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "-m", "drop it (scoped)"]));
 
     let full_tree = parcel_tree_hash(&warehouse, &pallet_head_hash(&warehouse, "full"));
     let scoped_tree = parcel_tree_hash(&warehouse, &pallet_head_hash(&warehouse, "scoped"));
@@ -11041,7 +11051,7 @@ fn a_scoped_bay_refuses_a_spine_path_type_flip() {
     std::fs::remove_dir_all(warehouse.root.join("src")).unwrap();
     std::fs::write(warehouse.root.join("src"), "src is a file now\n").unwrap();
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "src becomes a file"]));
+    assert_success(&warehouse.run(&["stack", "-m", "src becomes a file"]));
 
     // Shifting the scoped bay onto that revision must refuse — the sparse scope is no longer valid
     // (a spine path flipped between a directory and a file), not guess.
@@ -11072,13 +11082,13 @@ fn a_scoped_stack_refuses_when_the_dock_replaces_an_in_scope_directory_with_a_fi
     std::fs::remove_dir_all(full_dir.join("src/api")).unwrap();
     std::fs::write(full_dir.join("src/api"), "api is a file now\n").unwrap();
     assert_success(&warehouse.run_at(&full_dir, &["load", "."]));
-    assert_success(&warehouse.run_at(&full_dir, &["stack", "api becomes a file"]));
+    assert_success(&warehouse.run_at(&full_dir, &["stack", "-m", "api becomes a file"]));
 
     // Scoped bay: the same edit must refuse rather than silently drop the file from the tree.
     std::fs::remove_dir_all(scoped_dir.join("src/api")).unwrap();
     std::fs::write(scoped_dir.join("src/api"), "api is a file now\n").unwrap();
     assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
-    let stacked = warehouse.run_at(&scoped_dir, &["--json", "stack", "api becomes a file"]);
+    let stacked = warehouse.run_at(&scoped_dir, &["--json", "stack", "-m", "api becomes a file"]);
     assert_eq!(stacked.status.code(), Some(8), "stdout/err: {}", stdout(&stacked));
     assert_eq!(json(&stacked)["error"]["code"], "scope_path_type_changed");
 }
@@ -11121,21 +11131,21 @@ fn a_scoped_park_produces_a_byte_identical_tree_and_a_clean_park_refuses() {
 
 #[test]
 fn a_scoped_restore_staged_root_leaves_stocktake_clean_and_the_shards_scope_bounded() {
-    // `restore --staged` must not resurrect out-of-scope shards into a scoped bay's
+    // `unload` must not resurrect out-of-scope shards into a scoped bay's
     // inventory — those paths were never materialized here.
     let warehouse = scoped_fixture("scoped-restore-staged");
 
     let scoped_dir = warehouse.home.join("bay-scoped");
     assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
 
-    // Stage an in-scope edit, then reset it via `restore --staged .` (the root) — and revert
+    // Stage an in-scope edit, then reset it via `unload .` (the root) — and revert
     // the working file too, so the working tree, inventory and head all agree again
-    // afterwards (isolating this assertion from `restore --staged`'s ordinary "working
+    // afterwards (isolating this assertion from `unload`'s ordinary "working
     // directory untouched" semantics, which would otherwise still show the edited file as
     // unstaged and drown out the out-of-scope-leakage signal this test checks for).
     std::fs::write(scoped_dir.join("src/api/a.txt"), "api a v2\n").unwrap();
     assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
-    assert_success(&warehouse.run_at(&scoped_dir, &["restore", "--staged", "."]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["unload", "."]));
     std::fs::write(scoped_dir.join("src/api/a.txt"), "api a v1\n").unwrap();
 
     // The out-of-scope subtree must never be smuggled into the inventory by the restore walk —
@@ -11143,14 +11153,14 @@ fn a_scoped_restore_staged_root_leaves_stocktake_clean_and_the_shards_scope_boun
     let status = warehouse.run_at(&scoped_dir, &["--json", "stocktake"]);
     assert_success(&status);
     let value = json(&status);
-    assert_eq!(value["data"]["staged_count"], 0, "restore --staged must have unstaged the edit");
+    assert_eq!(value["data"]["staged_count"], 0, "unload must have unstaged the edit");
     assert_eq!(value["data"]["unstaged_count"], 0,
         "the restore walk must not smuggle out-of-scope shards into the inventory: {}", stdout(&status));
-    assert!(!scoped_dir.join("src/web").exists(), "restore --staged must never materialize out-of-scope content");
+    assert!(!scoped_dir.join("src/web").exists(), "unload must never materialize out-of-scope content");
 
     // A direct restore of an out-of-scope path refuses too (closing the gap when the target
     // itself, not just a descendant, is out of scope).
-    let refused = warehouse.run_at(&scoped_dir, &["--json", "restore", "--staged", "src/web"]);
+    let refused = warehouse.run_at(&scoped_dir, &["--json", "unload", "src/web"]);
     assert_eq!(refused.status.code(), Some(7), "stdout/err: {}", stdout(&refused));
     assert_eq!(json(&refused)["error"]["code"], "out_of_scope");
 }
@@ -11176,9 +11186,9 @@ fn a_multi_path_scoped_stack_produces_a_byte_identical_root_tree() {
     std::fs::write(scoped_dir.join("src/web/w.txt"), "web v2\n").unwrap();
 
     assert_success(&warehouse.run_at(&full_dir, &["load", "."]));
-    assert_success(&warehouse.run_at(&full_dir, &["stack", "edit both (full)"]));
+    assert_success(&warehouse.run_at(&full_dir, &["stack", "-m", "edit both (full)"]));
     assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
-    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "edit both (scoped)"]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "-m", "edit both (scoped)"]));
 
     let full_tree = parcel_tree_hash(&warehouse, &pallet_head_hash(&warehouse, "full"));
     let scoped_tree = parcel_tree_hash(&warehouse, &pallet_head_hash(&warehouse, "scoped"));
@@ -11244,14 +11254,14 @@ fn a_scoped_merge_resolves_one_sided_out_of_scope_changes_by_hash_without_readin
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     // "theirs" changes only out-of-scope content: a subtree (src/web) and a root file (README).
     assert_success(&warehouse.run(&["pallet", "create", "theirs"]));
     warehouse.write_file("src/web/w.txt", "web v2 from theirs\n");
     warehouse.write_file("README.md", "readme v2 from theirs\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "theirs edits out-of-scope content"]));
+    assert_success(&warehouse.run(&["stack", "-m", "theirs edits out-of-scope content"]));
     let theirs_head = pallet_head_hash(&warehouse, "theirs");
     assert_success(&warehouse.run(&["shift", "main"]));
 
@@ -11265,7 +11275,7 @@ fn a_scoped_merge_resolves_one_sided_out_of_scope_changes_by_hash_without_readin
     // merge tree is the reference the scoped merge must reproduce byte-for-byte.
     std::fs::write(full_dir.join("src/api/a.txt"), "api a v2\n").unwrap();
     assert_success(&warehouse.run_at(&full_dir, &["load", "."]));
-    assert_success(&warehouse.run_at(&full_dir, &["stack", "edit api (full)"]));
+    assert_success(&warehouse.run_at(&full_dir, &["stack", "-m", "edit api (full)"]));
     assert_success(&warehouse.run_at(&full_dir, &["consolidate", "theirs"]));
     let full_tree = parcel_tree_hash(&warehouse, &pallet_head_hash(&warehouse, "full"));
 
@@ -11282,7 +11292,7 @@ fn a_scoped_merge_resolves_one_sided_out_of_scope_changes_by_hash_without_readin
     // The scoped bay makes the same in-scope edit and consolidates theirs. It must succeed...
     std::fs::write(scoped_dir.join("src/api/a.txt"), "api a v2\n").unwrap();
     assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
-    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "edit api (scoped)"]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "-m", "edit api (scoped)"]));
     let consolidated = warehouse.run_at(&scoped_dir, &["consolidate", "theirs"]);
     assert_success(&consolidated);
 
@@ -11302,20 +11312,20 @@ fn a_scoped_merge_refuses_a_two_sided_out_of_scope_conflict() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     // theirs branches from the base and changes src/web one way...
     assert_success(&warehouse.run(&["pallet", "create", "theirs"]));
     warehouse.write_file("src/web/w.txt", "web from theirs\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "theirs edits web"]));
+    assert_success(&warehouse.run(&["stack", "-m", "theirs edits web"]));
     assert_success(&warehouse.run(&["shift", "main"]));
 
     // ...and main changes the same out-of-scope file differently, so the scoped bay's head carries
     // an out-of-scope change of its own — a genuine two-sided out-of-scope divergence.
     warehouse.write_file("src/web/w.txt", "web from main\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "main edits web"]));
+    assert_success(&warehouse.run(&["stack", "-m", "main edits web"]));
 
     let scoped_dir = warehouse.home.join("bay-scoped");
     assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
@@ -11344,14 +11354,14 @@ fn a_scoped_merge_resolves_a_one_sided_out_of_scope_symlink_by_hash() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     // theirs re-points the out-of-scope symlink one-sided.
     assert_success(&warehouse.run(&["pallet", "create", "theirs"]));
     std::fs::remove_file(warehouse.root.join("shortcut")).unwrap();
     symlink("src/api/a.txt", warehouse.root.join("shortcut")).unwrap();
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "theirs re-points the symlink"]));
+    assert_success(&warehouse.run(&["stack", "-m", "theirs re-points the symlink"]));
     assert_success(&warehouse.run(&["shift", "main"]));
 
     let full_dir = warehouse.home.join("bay-full");
@@ -11361,13 +11371,13 @@ fn a_scoped_merge_resolves_a_one_sided_out_of_scope_symlink_by_hash() {
 
     std::fs::write(full_dir.join("src/api/a.txt"), "api a v2\n").unwrap();
     assert_success(&warehouse.run_at(&full_dir, &["load", "."]));
-    assert_success(&warehouse.run_at(&full_dir, &["stack", "edit api (full)"]));
+    assert_success(&warehouse.run_at(&full_dir, &["stack", "-m", "edit api (full)"]));
     assert_success(&warehouse.run_at(&full_dir, &["consolidate", "theirs"]));
     let full_tree = parcel_tree_hash(&warehouse, &pallet_head_hash(&warehouse, "full"));
 
     std::fs::write(scoped_dir.join("src/api/a.txt"), "api a v2\n").unwrap();
     assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
-    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "edit api (scoped)"]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "-m", "edit api (scoped)"]));
     assert_success(&warehouse.run_at(&scoped_dir, &["consolidate", "theirs"]));
     let scoped_tree = parcel_tree_hash(&warehouse, &pallet_head_hash(&warehouse, "scoped"));
 
@@ -11427,7 +11437,7 @@ fn a_scoped_merge_resolves_an_out_of_scope_directory_to_file_flip_by_hash() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     // theirs one-sidedly replaces the out-of-scope directory src/web with a FILE. This is the
     // exact construction that emits a "set" (file loop) then a "delete" (subtree loop) for the
@@ -11436,7 +11446,7 @@ fn a_scoped_merge_resolves_an_out_of_scope_directory_to_file_flip_by_hash() {
     std::fs::remove_dir_all(warehouse.root.join("src/web")).unwrap();
     warehouse.write_file("src/web", "web is a file now\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "theirs turns src/web into a file"]));
+    assert_success(&warehouse.run(&["stack", "-m", "theirs turns src/web into a file"]));
     let theirs_head = pallet_head_hash(&warehouse, "theirs");
     let (theirs_web_hash, theirs_web_type) = path_object_entry(&warehouse, &theirs_head, "src/web");
     assert_eq!(theirs_web_type, "normal", "sanity: theirs' src/web really is a file");
@@ -11448,7 +11458,7 @@ fn a_scoped_merge_resolves_an_out_of_scope_directory_to_file_flip_by_hash() {
 
     std::fs::write(scoped_dir.join("src/api/a.txt"), "api a v2\n").unwrap();
     assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
-    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "edit api (scoped)"]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "-m", "edit api (scoped)"]));
     assert_success(&warehouse.run_at(&scoped_dir, &["consolidate", "theirs"]));
 
     let scoped_head = pallet_head_hash(&warehouse, "scoped");
@@ -11475,7 +11485,7 @@ fn a_scoped_merge_resolves_an_out_of_scope_file_to_directory_flip_by_hash() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     // Author "theirs" in its own bay (branched from main's current head) rather than switching
     // the warehouse root onto it — the warehouse root stays on "main" throughout.
@@ -11485,7 +11495,7 @@ fn a_scoped_merge_resolves_an_out_of_scope_file_to_directory_flip_by_hash() {
     std::fs::create_dir_all(theirs_dir.join("src/web")).unwrap();
     std::fs::write(theirs_dir.join("src/web/inner.txt"), "inner v1\n").unwrap();
     assert_success(&warehouse.run_at(&theirs_dir, &["load", "."]));
-    assert_success(&warehouse.run_at(&theirs_dir, &["stack", "theirs turns src/web into a directory"]));
+    assert_success(&warehouse.run_at(&theirs_dir, &["stack", "-m", "theirs turns src/web into a directory"]));
 
     let full_dir = warehouse.home.join("bay-full");
     let scoped_dir = warehouse.home.join("bay-scoped");
@@ -11494,13 +11504,13 @@ fn a_scoped_merge_resolves_an_out_of_scope_file_to_directory_flip_by_hash() {
 
     std::fs::write(full_dir.join("src/api/a.txt"), "api a v2\n").unwrap();
     assert_success(&warehouse.run_at(&full_dir, &["load", "."]));
-    assert_success(&warehouse.run_at(&full_dir, &["stack", "edit api (full)"]));
+    assert_success(&warehouse.run_at(&full_dir, &["stack", "-m", "edit api (full)"]));
     assert_success(&warehouse.run_at(&full_dir, &["consolidate", "theirs"]));
     let full_tree = parcel_tree_hash(&warehouse, &pallet_head_hash(&warehouse, "full"));
 
     std::fs::write(scoped_dir.join("src/api/a.txt"), "api a v2\n").unwrap();
     assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
-    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "edit api (scoped)"]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "-m", "edit api (scoped)"]));
     assert_success(&warehouse.run_at(&scoped_dir, &["consolidate", "theirs"]));
     let scoped_tree = parcel_tree_hash(&warehouse, &pallet_head_hash(&warehouse, "scoped"));
 
@@ -11532,7 +11542,7 @@ fn a_stack_refuses_when_consolidation_state_exists_but_the_skeleton_file_is_gone
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     // theirs changes both the out-of-scope subtree one-sidedly (so the merge produces a
     // skeleton) and the in-scope file (so the scoped bay's own edit below conflicts with it).
@@ -11540,7 +11550,7 @@ fn a_stack_refuses_when_consolidation_state_exists_but_the_skeleton_file_is_gone
     warehouse.write_file("src/web/w.txt", "web v2 from theirs\n");
     warehouse.write_file("src/api/a.txt", "api a v2 from theirs\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "theirs edits web and api"]));
+    assert_success(&warehouse.run(&["stack", "-m", "theirs edits web and api"]));
     assert_success(&warehouse.run(&["shift", "main"]));
 
     let scoped_dir = warehouse.home.join("bay-scoped");
@@ -11549,7 +11559,7 @@ fn a_stack_refuses_when_consolidation_state_exists_but_the_skeleton_file_is_gone
     // A conflicting in-scope edit: the scoped bay changes a.txt differently than theirs did.
     std::fs::write(scoped_dir.join("src/api/a.txt"), "api a v2 from scoped\n").unwrap();
     assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
-    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "edit api"]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "-m", "edit api"]));
 
     let consolidated = warehouse.run_at(&scoped_dir, &["--json", "consolidate", "theirs"]);
     assert_success(&consolidated);
@@ -11571,7 +11581,7 @@ fn a_stack_refuses_when_consolidation_state_exists_but_the_skeleton_file_is_gone
     assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
 
     let head_before = pallet_head_hash(&warehouse, "scoped");
-    let refused = warehouse.run_at(&scoped_dir, &["--json", "stack", "complete the merge"]);
+    let refused = warehouse.run_at(&scoped_dir, &["--json", "stack", "-m", "complete the merge"]);
 
     assert!(!refused.status.success(), "a stack with state-present/skeleton-absent must refuse");
     assert!(
@@ -11594,13 +11604,13 @@ fn a_scoped_merge_resumed_after_a_conflict_keeps_an_out_of_scope_name_holding_a_
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     assert_success(&warehouse.run(&["pallet", "create", "theirs"]));
     warehouse.write_file("src/web\nold/w.txt", "web v2 from theirs\n");
     warehouse.write_file("src/api/a.txt", "api a v2 from theirs\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "theirs edits web and api"]));
+    assert_success(&warehouse.run(&["stack", "-m", "theirs edits web and api"]));
     assert_success(&warehouse.run(&["shift", "main"]));
 
     let full_dir = warehouse.home.join("bay-full");
@@ -11612,7 +11622,7 @@ fn a_scoped_merge_resumed_after_a_conflict_keeps_an_out_of_scope_name_holding_a_
     for (bay, dir) in [("full", &full_dir), ("scoped", &scoped_dir)] {
         std::fs::write(dir.join("src/api/a.txt"), format!("api a v2 from {}\n", bay)).unwrap();
         assert_success(&warehouse.run_at(dir, &["load", "."]));
-        assert_success(&warehouse.run_at(dir, &["stack", "edit api"]));
+        assert_success(&warehouse.run_at(dir, &["stack", "-m", "edit api"]));
 
         let consolidated = warehouse.run_at(dir, &["--json", "consolidate", "theirs"]);
         assert_success(&consolidated);
@@ -11620,7 +11630,7 @@ fn a_scoped_merge_resumed_after_a_conflict_keeps_an_out_of_scope_name_holding_a_
 
         std::fs::write(dir.join("src/api/a.txt"), "api a resolved\n").unwrap();
         assert_success(&warehouse.run_at(dir, &["load", "."]));
-        assert_success(&warehouse.run_at(dir, &["stack", "complete the merge"]));
+        assert_success(&warehouse.run_at(dir, &["stack", "-m", "complete the merge"]));
         trees.push(parcel_tree_hash(&warehouse, &pallet_head_hash(&warehouse, bay)));
     }
 
@@ -11650,7 +11660,7 @@ fn compact_all_tolerates_a_sparse_store_and_a_later_scoped_stack_still_works() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     let head = pallet_head_hash(&warehouse, "main");
 
@@ -11695,7 +11705,7 @@ fn compact_all_tolerates_a_sparse_store_and_a_later_scoped_stack_still_works() {
     assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
     std::fs::write(scoped_dir.join("src/api/a.txt"), "api a v2\n").unwrap();
     assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
-    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "edit api after a sparse repack"]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "-m", "edit api after a sparse repack"]));
 
     // The new head still commits the out-of-scope sibling at its original, never-fetched hash — the
     // seal survived both the compaction and the scoped stack, with the object absent throughout.
@@ -11756,7 +11766,7 @@ fn large_file_threshold_classifies_by_hashed_length() {
 
     assert_success(&warehouse.run(&["load", "."]));
     let parcel = extract_parcel_hash(&{
-        let out = warehouse.run(&["stack", "large files"]);
+        let out = warehouse.run(&["stack", "-m", "large files"]);
         assert_success(&out);
         out
     });
@@ -11784,14 +11794,14 @@ fn chunked_file_round_trips_byte_identical_through_shift() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "with the giant"]));
+    assert_success(&warehouse.run(&["stack", "-m", "with the giant"]));
 
     // Diverge on a feature pallet that does not have the giant.
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     std::fs::remove_file(warehouse.root.join("big.bin")).unwrap();
     warehouse.write_file("small.txt", "on feature\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "without the giant"]));
+    assert_success(&warehouse.run(&["stack", "-m", "without the giant"]));
 
     // `pallet create` already switched us to feature, whose tree has no giant on disk.
     assert!(!warehouse.root.join("big.bin").exists(), "the giant is gone on feature");
@@ -11820,14 +11830,14 @@ fn identical_chunked_files_dedup_their_chunks() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "first"]));
+    assert_success(&warehouse.run(&["stack", "-m", "first"]));
     let objects_root = warehouse.root.join(".forklift").join("objects");
     let after_first = count_loose_objects(&objects_root);
 
     // Second: a byte-identical copy at a different path. It shares the same recipe and every chunk.
     write_bytes(&warehouse, "second.bin", &content);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "second copy"]));
+    assert_success(&warehouse.run(&["stack", "-m", "second copy"]));
     let after_second = count_loose_objects(&objects_root);
 
     // The only new objects are the tree(s) and the parcel — no new chunk or recipe objects, since
@@ -11848,7 +11858,7 @@ fn compact_leaves_chunks_loose_and_the_file_still_materializes() {
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
     let parcel = extract_parcel_hash(&{
-        let out = warehouse.run(&["stack", "the giant"]);
+        let out = warehouse.run(&["stack", "-m", "the giant"]);
         assert_success(&out);
         out
     });
@@ -11875,7 +11885,7 @@ fn compact_leaves_chunks_loose_and_the_file_still_materializes() {
     assert_success(&warehouse.run(&["pallet", "create", "empty"]));
     std::fs::remove_file(warehouse.root.join("big.bin")).unwrap();
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "no giant"]));
+    assert_success(&warehouse.run(&["stack", "-m", "no giant"]));
     assert_success(&warehouse.run(&["shift", "main"]));
     assert_eq!(std::fs::read(warehouse.root.join("big.bin")).unwrap(), big,
                "the chunked file must still assemble after compact");
@@ -11891,7 +11901,7 @@ fn a_corrupt_chunk_makes_materialization_fail_loudly() {
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
     let parcel = extract_parcel_hash(&{
-        let out = warehouse.run(&["stack", "the giant"]);
+        let out = warehouse.run(&["stack", "-m", "the giant"]);
         assert_success(&out);
         out
     });
@@ -11911,7 +11921,7 @@ fn a_corrupt_chunk_makes_materialization_fail_loudly() {
     assert_success(&warehouse.run(&["pallet", "create", "other"]));
     write_bytes(&warehouse, "big.bin", b"sentinel content\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "sentinel"]));
+    assert_success(&warehouse.run(&["stack", "-m", "sentinel"]));
 
     // Shift back to main: re-materializing the giant must fail loudly (the corrupt chunk no
     // longer verifies), and — durable-before-destructive — the working copy is left intact rather
@@ -11930,7 +11940,7 @@ fn blame_refuses_a_chunked_file() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "the giant"]));
+    assert_success(&warehouse.run(&["stack", "-m", "the giant"]));
 
     let blame = warehouse.run(&["blame", "big.bin"]);
     assert!(!blame.status.success(), "blame must refuse a chunked file");
@@ -11952,12 +11962,12 @@ fn blame_succeeds_at_a_plain_head_with_a_chunked_ancestor() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "chunked version"]));
+    assert_success(&warehouse.run(&["stack", "-m", "chunked version"]));
 
     // Second version: plain text (a chunked -> plain flip at this path).
     warehouse.write_file("f.txt", "one\ntwo\nthree\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let second = extract_parcel_hash(&warehouse.run(&["stack", "text version"]));
+    let second = extract_parcel_hash(&warehouse.run(&["stack", "-m", "text version"]));
 
     let blame = warehouse.run(&["--json", "blame", "f.txt"]);
     assert_success(&blame);
@@ -11983,7 +11993,7 @@ fn diff_reports_a_changed_chunked_file_as_binary() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "v1"]));
+    assert_success(&warehouse.run(&["stack", "-m", "v1"]));
 
     // Change the giant's content; the unstaged diff must report it as binary, never crash.
     write_bytes(&warehouse, "big.bin", &large_bytes(12, CHUNK_THRESHOLD + 20_000));
@@ -12001,7 +12011,7 @@ fn a_file_flips_between_chunked_and_plain_across_revisions() {
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
     let chunked_parcel = extract_parcel_hash(&{
-        let out = warehouse.run(&["stack", "chunked"]);
+        let out = warehouse.run(&["stack", "-m", "chunked"]);
         assert_success(&out);
         out
     });
@@ -12012,7 +12022,7 @@ fn a_file_flips_between_chunked_and_plain_across_revisions() {
     write_bytes(&warehouse, "x.bin", b"now i am small\n");
     assert_success(&warehouse.run(&["load", "."]));
     let plain_parcel = extract_parcel_hash(&{
-        let out = warehouse.run(&["stack", "plain"]);
+        let out = warehouse.run(&["stack", "-m", "plain"]);
         assert_success(&out);
         out
     });
@@ -12043,14 +12053,14 @@ fn a_chunked_file_directory_flip_shift_succeeds() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "node is a chunked file"]));
+    assert_success(&warehouse.run(&["stack", "-m", "node is a chunked file"]));
 
     // On a branch, "node" becomes a directory. `pallet create` switches to the new pallet.
     assert_success(&warehouse.run(&["pallet", "create", "asdir"]));
     std::fs::remove_file(warehouse.root.join("node")).unwrap();
     warehouse.write_file("node/inside.txt", "now a directory\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "node is a directory"]));
+    assert_success(&warehouse.run(&["stack", "-m", "node is a directory"]));
 
     // Shifting back to "main" (where "node" is still a tracked, clean chunked file) must not
     // refuse: it is exactly the tracked dir->file flip, and the file materializes from its
@@ -12076,14 +12086,14 @@ fn show_prints_a_files_content_at_head_and_at_an_older_revision() {
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
     let v1 = extract_parcel_hash(&{
-        let out = warehouse.run(&["stack", "v1"]);
+        let out = warehouse.run(&["stack", "-m", "v1"]);
         assert_success(&out);
         out
     });
 
     warehouse.write_file("src/app.rs", "v2\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "v2"]));
+    assert_success(&warehouse.run(&["stack", "-m", "v2"]));
 
     // The current head, by pallet name.
     let head = warehouse.run(&["show", "main:src/app.rs"]);
@@ -12116,7 +12126,7 @@ fn show_reports_binary_content_honestly_never_mangling_it() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "binary"]));
+    assert_success(&warehouse.run(&["stack", "-m", "binary"]));
 
     let json_out = warehouse.run(&["--json", "show", "main:blob.bin"]);
     assert_success(&json_out);
@@ -12141,7 +12151,7 @@ fn show_reports_nul_free_invalid_utf8_content_as_binary() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "invalid utf8"]));
+    assert_success(&warehouse.run(&["stack", "-m", "invalid utf8"]));
 
     let json_out = warehouse.run(&["--json", "show", "main:blob.bin"]);
     assert_success(&json_out);
@@ -12160,7 +12170,7 @@ fn show_reports_chunked_metadata_without_assembling_the_file() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "chunked"]));
+    assert_success(&warehouse.run(&["stack", "-m", "chunked"]));
 
     let json_out = warehouse.run(&["--json", "show", "main:big.bin"]);
     assert_success(&json_out);
@@ -12185,7 +12195,7 @@ fn show_resolves_a_subdirectory_path() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "paths"]));
+    assert_success(&warehouse.run(&["stack", "-m", "paths"]));
 
     let nested = warehouse.run(&["show", "main:src/data/nested.txt"]);
     assert_success(&nested);
@@ -12204,7 +12214,7 @@ fn show_resolves_a_path_containing_a_colon() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "paths"]));
+    assert_success(&warehouse.run(&["stack", "-m", "paths"]));
 
     // Only the *first* ":" splits revision from path — the rest belongs to the path.
     let colon_path = warehouse.run(&["show", "main:note:with:colons.txt"]);
@@ -12220,7 +12230,7 @@ fn show_reports_a_clean_error_for_a_missing_path_or_revision() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     let missing_path = warehouse.run(&["show", "main:nope.txt"]);
     assert!(!missing_path.status.success());
@@ -12247,7 +12257,7 @@ fn peek_json_reports_a_binary_blob_honestly() {
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
     let parcel = extract_parcel_hash(&{
-        let out = warehouse.run(&["stack", "binary"]);
+        let out = warehouse.run(&["stack", "-m", "binary"]);
         assert_success(&out);
         out
     });
@@ -12271,7 +12281,7 @@ fn peek_json_reports_nul_free_invalid_utf8_content_as_binary() {
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
     let parcel = extract_parcel_hash(&{
-        let out = warehouse.run(&["stack", "invalid utf8"]);
+        let out = warehouse.run(&["stack", "-m", "invalid utf8"]);
         assert_success(&out);
         out
     });
@@ -12293,7 +12303,7 @@ fn diff_empty_token_lists_every_file_of_a_root_parcel_as_added() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "root"]));
+    assert_success(&warehouse.run(&["stack", "-m", "root"]));
 
     // A root parcel has no real "before" — diffing it against ":empty" reports every
     // tracked file as added, rather than refusing for want of a second real revision.
@@ -12461,7 +12471,7 @@ fn heal_reaches_a_tainted_root_and_clears_a_vanished_unreferenced_object() {
     // protect — not just a read-only command.
     warehouse.write_file("src/app.rs", "after heal");
     assert_success(&warehouse.run(&["load", "src/app.rs"]));
-    assert_success(&warehouse.run(&["stack", "after heal"]));
+    assert_success(&warehouse.run(&["stack", "-m", "after heal"]));
 }
 
 #[test]
@@ -12472,7 +12482,7 @@ fn heal_reports_a_vanished_but_referenced_object_and_everything_still_refuses() 
 
     warehouse.write_file("src/app.rs", "referenced content");
     assert_success(&warehouse.run(&["load", "src/app.rs"]));
-    let stack_out = warehouse.run(&["stack", "referenced parcel"]);
+    let stack_out = warehouse.run(&["stack", "-m", "referenced parcel"]);
     assert_success(&stack_out);
     let parcel_hash = extract_parcel_hash(&stack_out);
 
@@ -12514,7 +12524,7 @@ fn heal_reports_a_vanished_but_referenced_object_and_everything_still_refuses() 
     assert_eq!(blocked_read.status.code(), Some(21));
     assert_eq!(json(&blocked_read)["error"]["code"], "durability_taint");
 
-    let blocked_stack = warehouse.run(&["stack", "should not land", "--json"]);
+    let blocked_stack = warehouse.run(&["stack", "-m", "should not land", "--json"]);
     assert_eq!(blocked_stack.status.code(), Some(21));
     assert_eq!(json(&blocked_stack)["error"]["code"], "durability_taint");
 }
@@ -12527,7 +12537,7 @@ fn heal_partial_clear_leaves_exactly_the_unresolved_remainder_recorded() {
 
     warehouse.write_file("src/app.rs", "referenced content");
     assert_success(&warehouse.run(&["load", "src/app.rs"]));
-    let stack_out = warehouse.run(&["stack", "referenced parcel"]);
+    let stack_out = warehouse.run(&["stack", "-m", "referenced parcel"]);
     assert_success(&stack_out);
     let parcel_hash = extract_parcel_hash(&stack_out);
     let referenced_relative = loose_object_relative_path(&parcel_hash);
@@ -12584,7 +12594,7 @@ fn heal_on_a_torn_taint_over_an_intact_store_rescans_and_clears() {
 
     warehouse.write_file("src/app.rs", "intact content, never torn-tainted itself");
     assert_success(&warehouse.run(&["load", "src/app.rs"]));
-    assert_success(&warehouse.run(&["stack", "intact parcel"]));
+    assert_success(&warehouse.run(&["stack", "-m", "intact parcel"]));
 
     let dir = taint_dir_path(&warehouse);
     std::fs::create_dir_all(&dir).unwrap();
@@ -12603,7 +12613,7 @@ fn heal_on_a_torn_taint_over_an_intact_store_rescans_and_clears() {
     // protect.
     warehouse.write_file("src/more.rs", "after the torn rescan");
     assert_success(&warehouse.run(&["load", "src/more.rs"]));
-    assert_success(&warehouse.run(&["stack", "after torn rescan"]));
+    assert_success(&warehouse.run(&["stack", "-m", "after torn rescan"]));
 }
 
 #[test]
@@ -12620,7 +12630,7 @@ fn heal_on_a_torn_taint_with_a_dangling_reference_rescans_into_a_named_remainder
 
     warehouse.write_file("src/app.rs", "referenced content");
     assert_success(&warehouse.run(&["load", "src/app.rs"]));
-    let stack_out = warehouse.run(&["stack", "referenced parcel"]);
+    let stack_out = warehouse.run(&["stack", "-m", "referenced parcel"]);
     assert_success(&stack_out);
     let parcel_hash = extract_parcel_hash(&stack_out);
 
@@ -12767,7 +12777,7 @@ fn entry_heal_still_restages_a_content_addressed_object_inline_with_no_escalatio
 
     warehouse.write_file("src/app.rs", "content for the loose-object heal");
     assert_success(&warehouse.run(&["load", "src/app.rs"]));
-    let stack_out = warehouse.run(&["stack", "loose object for heal"]);
+    let stack_out = warehouse.run(&["stack", "-m", "loose object for heal"]);
     assert_success(&stack_out);
     let parcel_hash = extract_parcel_hash(&stack_out);
     let relative = loose_object_relative_path(&parcel_hash);
@@ -12816,7 +12826,7 @@ fn heal_is_never_serialized_against_another_bays_warehouse_lock_or_the_shared_st
     configure_operator(&warehouse);
     // A bay can only be opened once the pallet it checks out has something stacked.
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
 
     // Bay B: a second bay sharing this warehouse's object store and refs.
     let bay_dir = warehouse.home.join("bay-other");
@@ -12892,7 +12902,7 @@ fn heal_resurrecting_a_compact_superseded_pack_only_duplicates_content_the_new_p
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "parcel one"]));
+    assert_success(&warehouse.run(&["stack", "-m", "parcel one"]));
 
     // Pack parcel one's loose objects into a first pack (P1).
     assert_success(&warehouse.run(&["store", "compact"]));
@@ -12907,7 +12917,7 @@ fn heal_resurrecting_a_compact_superseded_pack_only_duplicates_content_the_new_p
     // reachable from the (advancing) pallet head.
     warehouse.write_file("a.txt", "first parcel content\nsecond parcel content\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "parcel two"]));
+    assert_success(&warehouse.run(&["stack", "-m", "parcel two"]));
 
     // A full repack: every reachable object (parcel one's included) consolidates into ONE new,
     // content-distinct pack; P1 — now fully redundant — is physically deleted.
@@ -12966,7 +12976,7 @@ fn a_stack_in_a_named_bay_locks_the_shared_refs() {
     configure_operator(&warehouse);
     warehouse.write_file("a.txt", "a\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "base"]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
 
     let bay_dir = warehouse.home.join("bay-ref-lock-feature");
     assert_success(&warehouse.run(&["bay", "add", "feature", bay_dir.to_str().unwrap()]));
@@ -12977,7 +12987,7 @@ fn a_stack_in_a_named_bay_locks_the_shared_refs() {
 
     std::fs::write(bay_dir.join("b.txt"), "b\n").unwrap();
     assert_success(&warehouse.run_at(&bay_dir, &["load", "."]));
-    assert_success(&warehouse.run_at(&bay_dir, &["stack", "in the bay"]));
+    assert_success(&warehouse.run_at(&bay_dir, &["stack", "-m", "in the bay"]));
 
     assert!(shared.is_file(), "the bay's stack must lock the shared refs");
     assert!(!warehouse.root.join(".forklift").join("bays").join("feature").join("refs.lock").exists(),
@@ -12997,7 +13007,7 @@ fn warehouse_with_a_bay(name: &str) -> (TestWarehouse, PathBuf) {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
 
     let bay_dir = warehouse.home.join("bay-b1");
     assert_success(&warehouse.run(&["bay", "add", "b1", bay_dir.to_str().unwrap()]));
@@ -13340,7 +13350,7 @@ fn import_git_refuses_an_unmappable_branch_set_before_writing_anything() {
     // A branch that maps onto a pallet the warehouse already has.
     warehouse.write_file("code.txt", "v1\n");
     assert_success(&warehouse.run(&["load", "code.txt"]));
-    assert_success(&warehouse.run(&["stack", "initial"]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
     let dir = warehouse.home.join("repo-existing");
     git_repo_with_branches(&dir, &[]);
     let objects_before = metadata_listing(&warehouse, "objects");
@@ -13405,7 +13415,7 @@ fn scope_prune_reports_a_local_refusal_before_asking_the_remote() {
 fn stack_one(warehouse: &TestWarehouse, path: &str, content: &str) -> String {
     warehouse.write_file(path, content);
     assert_success(&warehouse.run(&["load", "."]));
-    let stacked = warehouse.run(&["stack", path]);
+    let stacked = warehouse.run(&["stack", "-m", path]);
     assert_success(&stacked);
     extract_parcel_hash(&stacked)
 }

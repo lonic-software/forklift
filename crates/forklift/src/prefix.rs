@@ -168,6 +168,10 @@ mod tests {
         // Two levels of families: `self alias install`.
         expands_to("se up --check", "self update --check");
         expands_to("sel al i fl2", "self alias install fl2");
+        // Commands off the daily loop have no short alias; a prefix shortens them instead.
+        expands_to("q", "query");
+        expands_to("bl", "blame");
+        expands_to("au", "audit");
     }
 
     /// An exact name or alias wins over the longer names it starts, hidden aliases included.
@@ -212,6 +216,10 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::InvalidSubcommand);
         let text = error.render().to_string();
         assert!(text.contains("\"he\" could be \"forklift heal\" or \"forklift help\";"), "{text}");
+
+        // `h` was help's alias once; now it starts four names.
+        let text = expand("h").unwrap_err().render().to_string();
+        assert!(text.contains("\"h\" could be \"forklift haul\", \"forklift heal\", \"forklift help\" or \"forklift history\";"), "{text}");
 
         let error = expand("haul re").unwrap_err();
         let text = error.render().to_string();

@@ -70,7 +70,7 @@ impl Area {
         self.run_ok(&root, &["config", "set", "operator.identifier", "marker@forklift"]);
         std::fs::write(root.join("app.txt"), "payload\n").unwrap();
         self.run_ok(&root, &["load", "."]);
-        self.run_ok(&root, &["stack", "first"]);
+        self.run_ok(&root, &["stack", "-m", "first"]);
         root
     }
 
@@ -258,7 +258,7 @@ fn a_bay_of_an_unmarked_warehouse_is_refused_and_nothing_is_written() {
     area.run_ok(&root, &["prepare"]);
     area.run_ok(&root, &["config", "set", "operator.identifier", "marker@forklift"]);
     area.run_ok(&root, &["load", "app.txt"]);
-    area.run_ok(&root, &["stack", "again"]);
+    area.run_ok(&root, &["stack", "-m", "again"]);
     forklift_core::util::file_utils::rename(&bay, area.path("bay.old")).unwrap();
     area.run_ok(&root, &["bay", "add", "feature", bay.to_str().unwrap()]);
     area.run_ok(&bay, &["stocktake"]);
@@ -313,7 +313,7 @@ fn an_unreadable_marker_is_not_answered_with_prepare() {
         std::fs::write(&marker, bad).unwrap();
         let before = listing(&root);
 
-        for args in [&["stocktake"][..], &["stack", "again"], &["prepare"]] {
+        for args in [&["stocktake"][..], &["stack", "-m", "again"], &["prepare"]] {
             let output = area.run(&root, &[&["--json"][..], args].concat());
             assert!(!output.status.success(), "{:?} over {:?}", args, bad);
             let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -342,7 +342,7 @@ fn a_full_warehouse_with_a_fetch_scope_is_refused() {
 
     // Load reads the main tree's scope, which is checked against the mode too, so it refuses as
     // stack does.
-    for args in [&["load", "."][..], &["stack", "second"]] {
+    for args in [&["load", "."][..], &["stack", "-m", "second"]] {
         let output = area.run(&root, &[&["--json"][..], args].concat());
         assert!(!output.status.success(), "{:?}: {}", args, text(&output.stdout));
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -356,7 +356,7 @@ fn a_full_warehouse_with_a_fetch_scope_is_refused() {
     // The named way out works.
     std::fs::remove_file(config.join("fetch-scope")).unwrap();
     area.run_ok(&root, &["load", "."]);
-    area.run_ok(&root, &["stack", "second"]);
+    area.run_ok(&root, &["stack", "-m", "second"]);
 }
 
 /// `forklift-server prepare` prints a refusal as its message and next step, never the frame

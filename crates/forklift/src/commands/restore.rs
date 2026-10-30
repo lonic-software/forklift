@@ -22,26 +22,17 @@ enum HeadEntry {
     Tree { tree: TreeItem, hash: String },
 }
 
-/// Handle the restore command.
-/// * `restore <path>`          - Rewrite the file (or every tracked file of the directory
-///                               that differs from its entry) in the working directory from
-///                               the inventory, discarding unstaged changes.
-/// * `restore --staged <path>` - Reset the inventory entries of the path to the pallet
-///                               head (unstage), leaving the working directory untouched.
+/// Handle the restore command: rewrite the file (or every tracked file of the directory that
+/// differs from its entry) in the working directory from the inventory, discarding unstaged
+/// changes. Unstaging is `unload`'s ([`handle_unstage`]).
 ///
 /// # Arguments
-/// * `staged` - Whether to reset the inventory entries to the pallet head (unstage)
-///              instead of restoring the working directory from the inventory.
 /// * `target` - The path of the file or directory to restore.
 ///
 /// # Returns
 /// * `Ok(())`      - If the restore completed successfully.
 /// * `Err(String)` - If there was an error while handling the command.
-pub fn handle_command(staged: bool, target: &str) -> Result<(), String> {
-    if staged {
-        return handle_unstage(target);
-    }
-
+pub fn handle_command(target: &str) -> Result<(), String> {
     let path = WarehousePath::from_user_input(target)?;
 
     // An out-of-scope path is sealed by hash in a scoped bay and was never materialized;
@@ -53,7 +44,7 @@ pub fn handle_command(staged: bool, target: &str) -> Result<(), String> {
 }
 
 /// Unstage a file or directory: reset its inventory entries to the pallet head, leaving
-/// the working directory untouched. Shared by `restore --staged` and `unload`.
+/// the working directory untouched: the `unload` command.
 ///
 /// # Arguments
 /// * `target` - The path of the file or directory to unstage.
@@ -505,7 +496,7 @@ fn restore_staged(path: &WarehousePath) -> Result<(), String> {
             // `path` *itself covers* (never a broader one merely entangled with `path` — this
             // check only ever validated `path`'s own subtree, so that is the only region it may
             // ever clear; see `load_guard_utils::clear_recorded_under`'s doc comment). Calling
-            // the very same function `restore --staged`'s ordinary directory-reset branch above
+            // the very same function `unload`'s ordinary directory-reset branch above
             // already relies on is deliberate: it is the one place this invariant is enforced,
             // not a rule this call site has to uphold on its own. `nothing_staged_under` is worth
             // paying even when no marker turns out to be involved (`healed` then comes back empty
@@ -671,7 +662,7 @@ fn build_unstaged_shards(ledger: &inventory_utils::ShardLedger,
     Ok(())
 }
 
-/// The entry `restore --staged` resets the file `name` in the directory `parent_key` to: the
+/// The entry `unload` resets the file `name` in the directory `parent_key` to: the
 /// head's content, with the stat data of the working file when it provably holds that content,
 /// and zeroed stat data (see `build_stale_inventory_item`) otherwise, so the next comparison
 /// rehashes it. A file the current entry already proves by stat keeps that entry; any other is
@@ -813,12 +804,12 @@ mod tests {
         // One read by the command, and one by its batch's publish, which re-reads under the lock.
         for target in ["dir/a.txt", "dir", "."] {
             std::fs::write(warehouse.root.join("dir/a.txt"), b"changed\n").unwrap();
-            assert_eq!(ledger_reads(|| handle_command(false, target).unwrap()), 2, "restore {}", target);
+            assert_eq!(ledger_reads(|| handle_command(target).unwrap()), 2, "restore {}", target);
         }
 
         // One read, which the unstage's own metadata write goes through.
         for target in ["dir/sub/b.txt", "dir"] {
-            assert_eq!(ledger_reads(|| handle_command(true, target).unwrap()), 1, "restore --staged {}", target);
+            assert_eq!(ledger_reads(|| handle_unstage(target).unwrap()), 1, "unload {}", target);
         }
     }
 }

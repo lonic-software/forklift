@@ -137,7 +137,7 @@ fn stack_stamps_every_shard_rollup_to_exactly_match_the_new_head() {
     populate(&warehouse);
 
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "layout"]);
+    warehouse.run_ok(&["stack", "-m", "layout"]);
 
     let head_tree = warehouse.head_tree_hash("main");
     assert_rollups_match_head(&warehouse, &head_tree);
@@ -156,7 +156,7 @@ fn load_after_a_deep_change_clears_ancestors_but_spares_an_unrelated_sibling() {
     populate(&warehouse);
 
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "layout"]);
+    warehouse.run_ok(&["stack", "-m", "layout"]);
 
     // Every shard on the changed file's chain (and the root) was stamped by the stack above.
     assert!(shard_rollup(&warehouse, "").is_some());
@@ -187,10 +187,10 @@ fn single_file_unload_leaves_every_shard_matching_head_or_unstamped() {
     populate(&warehouse);
 
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "layout"]);
+    warehouse.run_ok(&["stack", "-m", "layout"]);
     let head_tree = warehouse.head_tree_hash("main");
 
-    // Stage a change, then unstage it again (`restore --staged`, a.k.a. `unload`) — the net
+    // Stage a change, then unstage it again (`unload`) — the net
     // staged state ends up matching head exactly.
     warehouse.write_file("dir0/sub1/file0.txt", "changed then unloaded\n");
     warehouse.run_ok(&["load", "dir0/sub1/file0.txt"]);
@@ -210,7 +210,7 @@ fn park_materializes_a_stamped_reset_and_pop_reinvalidates_only_the_touched_chai
     populate(&warehouse);
 
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "layout"]);
+    warehouse.run_ok(&["stack", "-m", "layout"]);
     let head_tree = warehouse.head_tree_hash("main");
 
     let sibling_rollup_before = shard_rollup(&warehouse, "sibling");
@@ -244,14 +244,14 @@ fn consolidate_fast_forward_materializes_a_stamped_tree() {
     populate(&warehouse);
 
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "layout"]);
+    warehouse.run_ok(&["stack", "-m", "layout"]);
 
     // A second pallet, branched from main, that moves ahead — main stays untouched so the
     // consolidate below is a clean fast-forward.
     warehouse.run_ok(&["pallet", "create", "feature"]);
     warehouse.write_file("dir0/sub1/file0.txt", "feature branch change\n");
     warehouse.run_ok(&["load", "dir0/sub1/file0.txt"]);
-    warehouse.run_ok(&["stack", "feature work"]);
+    warehouse.run_ok(&["stack", "-m", "feature work"]);
     let feature_tree = warehouse.head_tree_hash("feature");
 
     warehouse.run_ok(&["shift", "main"]);

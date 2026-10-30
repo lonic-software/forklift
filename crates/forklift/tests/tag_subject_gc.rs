@@ -87,7 +87,7 @@ impl Warehouse {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, content).unwrap();
         self.run_ok(&["load", "."]);
-        self.run_ok(&["stack", message]);
+        self.run_ok(&["stack", "-m", message]);
 
         self.head(&self.current_pallet())
     }

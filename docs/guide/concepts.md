@@ -25,7 +25,7 @@ $ echo 'fn main() {}' > src/main.rs
 $ mkdir docs
 $ echo '# Shop' > docs/readme.md
 $ forklift load .
-$ forklift stack "First parcel"
+$ forklift stack -m "First parcel"
 Stacked parcel … on pallet "main".
 ```
 
@@ -50,7 +50,7 @@ Identity root key: …
 From now on every parcel stacked in this warehouse must be signed. This cannot be undone (a lockout is handled by archiving and re-preparing the warehouse).
 $ echo 'Prices in euros.' > docs/pricing.md
 $ forklift load docs
-$ forklift stack "Add pricing"
+$ forklift stack -m "Add pricing"
 Stacked parcel … on pallet "main".
 ```
 
@@ -80,7 +80,7 @@ Two more properties follow from keeping trust in the warehouse:
   make a later signature look earlier.
 
 Reference: [Trust and identity](trust-and-identity.md), and
-[`audit`](cli.md#audit--verify-signed-history-offline-a).
+[`audit`](cli.md#audit--verify-signed-history-offline).
 
 ## 2. Pseudonymous identity
 
@@ -138,7 +138,7 @@ concurrently, `lower` replays your changes onto the remote's instead of merging,
 entries are independent signed records; only two writes to the same entry conflict, and
 `lower --keep` settles which one stays.
 
-Reference: [`manifest`](cli.md#manifest--signed-post-metadata-on-parcels-mf),
+Reference: [`manifest`](cli.md#manifest--signed-post-metadata-on-parcels),
 [`manifest set`](cli.md#manifest-set--keyed-values-on-parcels), [`tag`](cli.md#tag--signed-tags--releases) and
 [`haul`](cli.md#haul--pull-requests-reviewable-merge-proposals).
 

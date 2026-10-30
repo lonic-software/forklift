@@ -364,9 +364,9 @@ const PARALLEL_PROBE_THRESHOLD: usize = 256;
 /// the barrier) and loads the head's trees from the store. A head tree that cannot be read fails
 /// the call with that error: without it, files that only mirror the head would be blamed as lost
 /// staged work under a remedy that cannot clear them. A recipe that is present but unreadable
-/// fails the same way, unclassified: `restore --staged` then `load` cannot repair it, because a
+/// fails the same way, unclassified: `unload` then `load` cannot repair it, because a
 /// store skips writing an object whose hash is already present, so its error names only
-/// `restore --staged` to leave the file out. The check is for presence: see
+/// `unload` to leave the file out. The check is for presence: see
 /// [`probe_staged_object`] for what a present but damaged object gets.
 ///
 /// # Arguments
@@ -423,11 +423,11 @@ pub fn require_staged_content_present(root: &TreeItem, head_tree_hash: Option<&s
             ),
             match remedy_path(first_path) {
                 Some(quoted) => format!(
-                    "Run \"forklift restore --staged {}\", then \"forklift load {}\" to stage it again \
+                    "Run \"forklift unload {}\", then \"forklift load {}\" to stage it again \
                     from its working copy.",
                     quoted, quoted
                 ),
-                None => "Run \"forklift restore --staged -- <path>\", then \"forklift load -- <path>\", \
+                None => "Run \"forklift unload -- <path>\", then \"forklift load -- <path>\", \
                     with that path quoted for your shell, to stage it again from its working copy.".to_string(),
             },
         )
@@ -444,7 +444,7 @@ pub fn require_staged_content_present(root: &TreeItem, head_tree_hash: Option<&s
                 since one naming them could not be restored.",
                 lost.len(), named.join("; "), and_more
             ),
-            "Run \"forklift restore --staged -- <path>\", then \"forklift load -- <path>\", for each, \
+            "Run \"forklift unload -- <path>\", then \"forklift load -- <path>\", for each, \
             to stage it again from its working copy.".to_string(),
         )
     };
@@ -525,7 +525,7 @@ fn probe_staged_object(path: &str, hash: &str, chunked: bool) -> Result<StagedOb
     object_utils::recipe_chunk_hashes(hash).map(StagedObject::Chunked).map_err(|e| format!(
         "\"{}\" is staged, but its recipe {} is in the store and cannot be read: {}. No parcel was made. \
         Loading the file again will not replace it while the damaged object stays in place; run \
-        \"forklift restore --staged {}\"{} to leave it out and stack the rest.",
+        \"forklift unload {}\"{} to leave it out and stack the rest.",
         path, hash, e.trim_end_matches('.'),
         remedy.as_deref().unwrap_or("-- <path>"),
         if remedy.is_some() { "" } else { " with that path quoted for your shell" }
@@ -813,7 +813,7 @@ fn is_tree_empty(tree: &TreeItem) -> bool {
 /// The rollup a directory's inventory shard, just rebuilt wholesale from `tree`, may carry: `tree`'s
 /// hash, or `None` when the rebuild may not be trusted to name it. The only way a tree-to-shard
 /// builder gets a [`RollupStamp`], so none can stamp without this check. Shared by
-/// `restore --staged`'s and `shift`'s tree-to-shard builders (`build_unstaged_shards`,
+/// `unload`'s and `shift`'s tree-to-shard builders (`build_unstaged_shards`,
 /// `shift_utils::build_inventories_for_tree`), which each independently rebuild every shard of a
 /// subtree straight from a resolved tree and must decide the same way whether the shard they just
 /// wrote is a trustworthy rollup — kept as one function so the (subtle) rule can never drift

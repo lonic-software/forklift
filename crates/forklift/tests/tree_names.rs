@@ -46,7 +46,7 @@ impl Warehouse {
 
         std::fs::write(warehouse.root.join("app.txt"), "payload\n").unwrap();
         warehouse.run_ok(&["load", "."]);
-        warehouse.run_ok(&["stack", "first"]);
+        warehouse.run_ok(&["stack", "-m", "first"]);
 
         warehouse
     }
@@ -375,7 +375,7 @@ fn a_symlink_at_the_chunked_assembly_temp_path_is_not_written_through() {
     let big: Vec<u8> = (0..9 * 1024 * 1024u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
     std::fs::write(warehouse.root.join("big.bin"), &big).unwrap();
     warehouse.run_ok(&["load", "big.bin"]);
-    warehouse.run_ok(&["stack", "big"]);
+    warehouse.run_ok(&["stack", "-m", "big"]);
 
     let outside = warehouse.base.join("outside.txt");
     std::fs::write(&outside, "untouched\n").unwrap();
@@ -409,7 +409,7 @@ fn stacking_a_top_level_alias_of_the_metadata_folder_is_refused() {
     std::fs::write(warehouse.root.join(".forklift.").join("notes.txt"), "notes\n").unwrap();
     warehouse.run_ok(&["load", "."]);
 
-    let output = warehouse.run(&["stack", "alias"]);
+    let output = warehouse.run(&["stack", "-m", "alias"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(!output.status.success(), "stack accepted the alias; stderr: {}", stderr);
@@ -427,7 +427,7 @@ fn with_chunked_file(warehouse: &Warehouse, big: &str) -> Vec<u8> {
     let content: Vec<u8> = (0..9 * 1024 * 1024u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
     std::fs::write(warehouse.root.join(big), &content).unwrap();
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "big"]);
+    warehouse.run_ok(&["stack", "-m", "big"]);
 
     {
         let _scope = StorageRootScope::enter(&warehouse.root);
@@ -548,7 +548,7 @@ fn a_tracked_file_named_like_an_assembly_temp_file_survives_checkout() {
     std::fs::write(warehouse.root.join("big.bin"), &big).unwrap();
     std::fs::write(warehouse.root.join(".big.bin.forklift-assemble.tmp"), "tracked\n").unwrap();
     warehouse.run_ok(&["load", "."]);
-    warehouse.run_ok(&["stack", "big"]);
+    warehouse.run_ok(&["stack", "-m", "big"]);
 
     {
         let _scope = StorageRootScope::enter(&warehouse.root);
