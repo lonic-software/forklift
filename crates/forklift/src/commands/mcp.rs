@@ -772,6 +772,12 @@ pub(crate) const HUMAN_ONLY: &[(&str, &str)] = &[
     ("version", "meta"),
 ];
 
+/// The arguments no agent passes, by command path and property, each with why. The tool keeps
+/// its other arguments.
+pub(crate) const HUMAN_ONLY_ARGS: &[(&str, &str, &str)] = &[
+    ("palletize", "remote", "acts on the remote's pallets, which every clone shares: an admin's call, never a sub-agent's"),
+];
+
 /// The families whose bare form runs the same operation as one of their subcommands, with that
 /// subcommand. The subcommand is the tool; the bare form gets none, so an agent sees one tool
 /// per operation.
@@ -804,7 +810,11 @@ pub(crate) enum Injected {
 /// The arguments whose JSON type is not the one their parser implies. Clap reads every value
 /// as a word; these take a richer JSON value that is written back into that word.
 const TYPED: &[(&str, &str, Typed)] = &[
-    ("query", "where", Typed::Object),
+    ("query", "where", Typed::Object(
+        "A JSON predicate tree AND-ed with the other arguments. A node is {\"all\": [nodes]}, \
+         {\"any\": [nodes]}, {\"not\": node} or a leaf {\"field\", \"op\", \"value\"}; an \
+         unknown field is refused with the list of fields.",
+    )),
     ("history", "limit", Typed::Positive),
     ("query", "limit", Typed::Positive),
 ];
@@ -812,8 +822,9 @@ const TYPED: &[(&str, &str, Typed)] = &[
 /// A JSON type [`TYPED`] gives an argument.
 #[derive(Clone, Copy)]
 enum Typed {
-    /// A JSON object, passed as its serialization.
-    Object,
+    /// A JSON object, passed as its serialization, with the help an agent reads in place of the
+    /// command's (which describes the word, not the object).
+    Object(&'static str),
 
     /// An integer of at least 1.
     Positive,
@@ -903,6 +914,7 @@ pub(crate) fn tools() -> Result<&'static [Tool], String> {
 fn generate_tools(root: &clap::Command) -> Result<Vec<Tool>, String> {
     struct Used {
         human_only: Vec<bool>,
+        human_only_args: Vec<bool>,
         bare_same_as: Vec<bool>,
     }
 
@@ -932,7 +944,11 @@ fn generate_tools(root: &clap::Command) -> Result<Vec<Tool>, String> {
 
         let mut params = Vec::new();
         for arg in command.get_arguments().filter(|arg| !arg.is_global_set() && !arg.is_hide_set()) {
-            params.push(tool_param(&shown, arg)?);
+            let param = tool_param(&shown, arg)?;
+            match HUMAN_ONLY_ARGS.iter().position(|(path, key, _)| *path == shown && *key == param.key) {
+                Some(index) => used.human_only_args[index] = true,
+                None => params.push(param),
+            }
         }
         let mut keys = std::collections::HashSet::new();
         if let Some(param) = params.iter().find(|param| !keys.insert(param.key.as_str())) {
@@ -943,13 +959,20 @@ fn generate_tools(root: &clap::Command) -> Result<Vec<Tool>, String> {
     }
 
     let mut tools = Vec::new();
-    let mut used = Used { human_only: vec![false; HUMAN_ONLY.len()], bare_same_as: vec![false; BARE_SAME_AS.len()] };
+    let mut used = Used {
+        human_only: vec![false; HUMAN_ONLY.len()],
+        human_only_args: vec![false; HUMAN_ONLY_ARGS.len()],
+        bare_same_as: vec![false; BARE_SAME_AS.len()],
+    };
     for command in root.get_subcommands().filter(|command| !command.is_hide_set()) {
         walk(command, vec![command.get_name().to_string()], &mut tools, &mut used)?;
     }
 
     if let Some(((entry, _), _)) = HUMAN_ONLY.iter().zip(&used.human_only).find(|(_, used)| !**used) {
         return Err(format!("HUMAN_ONLY names `{entry}`, which is not a visible command"));
+    }
+    if let Some(((path, key, _), _)) = HUMAN_ONLY_ARGS.iter().zip(&used.human_only_args).find(|(_, used)| !**used) {
+        return Err(format!("HUMAN_ONLY_ARGS names `{key}` of `{path}`, which is not an argument of a tool"));
     }
     for ((family, sub), used) in BARE_SAME_AS.iter().zip(&used.bare_same_as) {
         let path = format!("{family} {sub}");
@@ -972,12 +995,17 @@ fn generate_tools(root: &clap::Command) -> Result<Vec<Tool>, String> {
 }
 
 /// The tool for the command at `path`, with its arguments. Its description is the command's
-/// long description (else its one-line one), followed by which arguments the server sets.
+/// one-line description, then its long one when it has one (the one-liner carries the git
+/// name, "(push)", that the long one does not repeat), then which arguments the server sets.
 fn tool_for(command: &clap::Command, path: &[String], params: Vec<ToolParam>) -> Result<Tool, String> {
     let text = |styled: Option<&clap::builder::StyledStr>| styled.map(|text| text.to_string())
         .filter(|text| !text.trim().is_empty());
-    let mut description = text(command.get_long_about()).or_else(|| text(command.get_about()))
+    let mut description = text(command.get_about())
         .ok_or_else(|| format!("`forklift {}` has no description", path.join(" ")))?;
+    if let Some(long) = text(command.get_long_about()) {
+        description.push_str("\n\n");
+        description.push_str(&long);
+    }
 
     let injected: Vec<String> = params.iter().filter(|param| param.injected.is_some())
         .map(|param| format!("\"{}\"", param.key))
@@ -1016,13 +1044,22 @@ fn tool_param(shown: &str, arg: &clap::Arg) -> Result<ToolParam, String> {
 
     let typed = TYPED.iter().find(|(path, id, _)| *path == shown && *id == key).map(|(_, _, typed)| *typed);
     let parser = arg.get_value_parser().type_id();
+    let other_numbers = [
+        std::any::TypeId::of::<u8>(), std::any::TypeId::of::<u16>(), std::any::TypeId::of::<u128>(),
+        std::any::TypeId::of::<i8>(), std::any::TypeId::of::<i16>(), std::any::TypeId::of::<i32>(),
+        std::any::TypeId::of::<i64>(), std::any::TypeId::of::<i128>(), std::any::TypeId::of::<isize>(),
+        std::any::TypeId::of::<f32>(), std::any::TypeId::of::<f64>(),
+    ];
+    if typed.is_none() && other_numbers.iter().any(|id| parser == *id) {
+        return Err(refuse("it parses a number the tool schema has no type for; give it a TYPED entry or a usize, u64 or u32 parser"));
+    }
     let choices: Vec<String> = arg.get_possible_values().iter()
         .filter(|value| !value.is_hide_set())
         .map(|value| value.get_name().to_string())
         .collect();
     let value = match (&form, typed) {
         (Form::Switch(_), _) => ValueKind::Boolean,
-        (_, Some(Typed::Object)) => ValueKind::Object,
+        (_, Some(Typed::Object(_))) => ValueKind::Object,
         (_, Some(Typed::Positive)) => ValueKind::Integer(1),
         _ if !choices.is_empty() => ValueKind::Choice(choices),
         _ if [std::any::TypeId::of::<usize>(), std::any::TypeId::of::<u64>(), std::any::TypeId::of::<u32>()]
@@ -1037,7 +1074,10 @@ fn tool_param(shown: &str, arg: &clap::Arg) -> Result<ToolParam, String> {
         value,
         required: arg.is_required_set(),
         injected,
-        help: arg.get_long_help().or_else(|| arg.get_help()).map(|text| text.to_string()),
+        help: match typed {
+            Some(Typed::Object(help)) => Some(help.to_string()),
+            _ => arg.get_long_help().or_else(|| arg.get_help()).map(|text| text.to_string()),
+        },
     })
 }
 
@@ -1579,6 +1619,26 @@ mod tests {
         }
         assert_eq!(tool("tag_create").path, ["tag", "create"]);
 
+        // An argument no agent passes is left out, and the rest of its tool stays.
+        let palletize = tool("palletize");
+        assert!(palletize.params.iter().any(|param| param.key == "delete"));
+        assert!(!palletize.params.iter().any(|param| param.key == "remote"));
+
+        // The one-line description leads, so its git name survives, and the long one follows.
+        let lift = tool("lift").description.clone();
+        assert!(lift.starts_with("Upload the current pallet's new parcels to the remote (push)\n\n"), "{lift}");
+
+        // An object argument describes the object, not the command line's word.
+        let query = tool("query").definition();
+        let where_help = query["inputSchema"]["properties"]["where"]["description"].as_str().unwrap();
+        assert!(where_help.starts_with("A JSON predicate tree AND-ed with the other arguments."), "{where_help}");
+
+        // The command line agrees with the tools that a page holds at least one parcel.
+        for command in ["history", "query"] {
+            assert!(crate::cli::Cli::command().try_get_matches_from(["forklift", command, "--limit", "0"]).is_err());
+            assert!(crate::cli::Cli::command().try_get_matches_from(["forklift", command, "--limit", "1"]).is_ok());
+        }
+
         // A command added to the tree is a tool without anything else to do.
         let tree = crate::cli::Cli::command()
             .subcommand(clap::Command::new("brand-new").about("New").arg(clap::Arg::new("thing").long("the-thing")));
@@ -1608,6 +1668,11 @@ mod tests {
         assert!(refused(cli().mut_subcommand("history", |history| history.mut_arg("limit", |limit| limit.long("max"))))
             .contains("a tool table names `limit` of"));
         assert!(refused(cli().subcommand(clap::Command::new("mute"))).ends_with("has no description"));
+        assert!(refused(cli().mut_subcommand("palletize", |palletize| palletize.mut_arg("remote", |remote| remote.hide(true))))
+            .starts_with("HUMAN_ONLY_ARGS names"));
+        assert!(refused(cli().subcommand(clap::Command::new("signed").about("Signed")
+            .arg(clap::Arg::new("depth").long("depth").value_parser(clap::value_parser!(i64)))))
+            .contains("parses a number the tool schema has no type for"));
     }
 
     #[test]
@@ -1712,7 +1777,9 @@ mod tests {
         if param.repeats() { json!([one(1), one(2)]) } else { one(1) }
     }
 
-    /// Run `arguments` through `tool`'s argv and clap, the way a call does. `Ok` means clap
+    /// Run `arguments` through `tool`'s argv and clap, the way a call does. Only clap's own rules
+    /// apply here: a cross-argument rule the binary checks after parsing still refuses some
+    /// combinations clap accepts, with a usage error. `Ok` means clap
     /// accepted the line and every argument bound exactly to the clap argument it names, with
     /// nothing else and no global set (anything else panics); `Err` is a refusal by argv or by
     /// clap for a combination the command does not accept.

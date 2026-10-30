@@ -144,7 +144,8 @@ pub fn render_mcp_tools() -> Result<String, String> {
          parses its arguments with, as the server's own tool list is; CI fails when this page \
          falls behind it. A tool is a command path joined by `_` (`forklift tag create` is \
          `tag_create`, `forklift cherry-pick` is `cherry_pick`), \
-         and its description is the command's full help, which `forklift help <command>` prints. \
+         and its description is the command's one-line description followed by its long one; \
+         each argument's own help is that argument's description in the tool's input schema. \
          An argument is an option's long name (with `_` for `-`) or a positional's name. \
          `docs/MACHINE_INTERFACE.md` describes the server.\n\n",
     );
@@ -186,6 +187,10 @@ pub fn render_mcp_tools() -> Result<String, String> {
     for (path, why) in mcp::HUMAN_ONLY {
         out.push_str(&format!("- `forklift {path}`: {why}.\n"));
     }
+    out.push_str("\nThese arguments are left out of their tool:\n\n");
+    for (path, key, why) in mcp::HUMAN_ONLY_ARGS {
+        out.push_str(&format!("- `{key}` of `forklift {path}`: {why}.\n"));
+    }
     out.push_str(
         "\nThese families' bare form runs the same operation as one of their subcommands, so only \
          the subcommand is a tool:\n\n",
@@ -207,8 +212,7 @@ fn code_list(names: &[&str]) -> String {
 /// or no structured data (or no `--json` output) at all — deliberately outside the schema
 /// registry, with the reason. Every *other* CLI command must be in [`command_schemas`]:
 /// [`render_json_schemas`] checks the two lists are exhaustive and disjoint over the real CLI
-/// surface, the same shape as `mcp.rs`'s `HUMAN_ONLY`, which the tool generator checks against
-/// the tree — except this check runs *inside the generator itself* (`bin/gen-docs`, so CI and `bin/check`),
+/// surface. It runs *inside the generator itself* (`bin/gen-docs`, so CI and `bin/check`),
 /// because `cargo test --workspace` never compiles the `docgen` feature and so could never run a
 /// `#[cfg(test)]` version of it. A command with a JSON output struct that never got wired into
 /// the registry now fails the build instead of silently missing from json-schemas.md — the exact

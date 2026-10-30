@@ -774,7 +774,8 @@ and progress needs macOS or Linux, as the channel does.
 The tools are **generated from the CLI**: every command path is a tool named for it, joined
 by `_` (`tag create` is `tag_create`, a family run bare is its own name, such as `bay`), unless
 it is on a short list of commands a person runs (setup, trust administration, host concerns and
-meta). A tool's description is the command's full help, and its arguments are the command's: an
+meta), less any argument no agent passes. A tool's description is the command's one-line and
+long descriptions, and its arguments are the command's: an
 option by its long name with `_` for `-`, a positional by its name. The list, with every
 argument and the commands left out and why, is
 [`docs/generated/mcp-tools.md`](generated/mcp-tools.md); CI fails when it falls behind the CLI.

@@ -432,7 +432,7 @@ pub enum Command {
 
         /// Show at most this many parcels (newest first) — a bounded walk that never loads
         /// the whole history
-        #[arg(long, short = 'n')]
+        #[arg(long, short = 'n', value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
         limit: Option<usize>,
 
         /// Resume paging from a cursor returned as `next` by a previous `--json` page
@@ -840,7 +840,7 @@ pub enum Command {
 
         /// Show at most this many matches (bounds the output page, never the verification
         /// work — scope the walk with revisions or --from for that)
-        #[arg(long, short = 'n')]
+        #[arg(long, short = 'n', value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
         limit: Option<usize>,
 
         /// Resume paging from a cursor returned as `next` by a previous `--json` page

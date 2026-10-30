@@ -270,10 +270,11 @@ changelog), `SERVER.md` (server ops), `MACHINE_INTERFACE.md` (`--json`/MCP),
    its old row instead of deleting it. The surface tests (`cargo test -p forklift --bin forklift
    surface_check`) fail until both agree with the binary.
 9. **Decide whether agents drive it.** `forklift mcp` generates its tools from the command
-   definition, so a new command is an agent tool with nothing more to do: its full help is the
-   tool's description (put anything an agent needs to know in the help, not elsewhere) and its
-   arguments are the tool's. A command only a person should run goes on `HUMAN_ONLY` in
-   `crates/forklift/src/commands/mcp.rs`, with the reason. The MCP unit tests (`cargo test -p
+   definition, so a new command is an agent tool with nothing more to do: its one-line and long
+   descriptions are the tool's description and each argument's help is that argument's (put
+   anything an agent needs to know in the help, not elsewhere). A command only a person should
+   run goes on `HUMAN_ONLY` in `crates/forklift/src/commands/mcp.rs`, with the reason, and an
+   argument no agent should pass on `HUMAN_ONLY_ARGS`. The MCP unit tests (`cargo test -p
    forklift --bin forklift commands::mcp`) parse every tool's arguments against the command and
    fail when one would be misread.
 
