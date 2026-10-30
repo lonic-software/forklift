@@ -1724,8 +1724,8 @@ fn resolve_warehouse(state: &AppState,
 
     // Acquire this warehouse's serve lock as it is served, and hold it in the registry's handle
     // until the handle is let go. Refuses (503) if a `gc` or full repack is running against this
-    // warehouse, or another server already serves it — serving it then would be unsafe. A sparse
-    // warehouse stays refused (409) until it is replaced, and an unfinished franchise (503) until
+    // warehouse, or another server already serves it — serving it then would be unsafe. A partial
+    // or sealed warehouse stays refused (409) until it is replaced, and an unfinished franchise (503) until
     // it is resumed or deleted.
     let handle = Arc::new(
         WarehouseHandle::serving(root, false).map_err(|refusal| match refusal {

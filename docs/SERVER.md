@@ -49,11 +49,14 @@ forklift-server serve --root /srv/forklift/wh --addr 127.0.0.1:9418 --token <sec
 Clients configure `forklift config remote.url http://…` (plus `remote.token`), or just
 `forklift franchise <url> <dir> --token <secret>`.
 
-A served root must hold the full tree. A sparse warehouse (one franchised with `--only`) is
-refused: `serve --root` will not start on it, and a `--warehouses` server answers `409` for it.
-Clients trust a server to hold every object its pallet heads reach, and `scope-prune` frees local
-copies on that basis, so a sparse root could lead a client to free content it can never fetch back.
-To serve a franchised copy, franchise it without `--only`. A franchise that has not finished is
+A served root must hold the full tree. A partial warehouse (one franchised with `--only` or
+`--cache`) is refused: `serve --root` will not start on it, and a `--warehouses` server answers
+`409` for it. So is any root whose sealed-object record (`.forklift/sealed`) holds an object, since
+it holds that object by hash alone, without its content, whatever its marker says; a record that
+cannot be read is refused too (a `500` from a `--warehouses` server). Clients trust a server to
+hold every object its pallet heads reach, and `scope-prune`, `evict` and `remote move` rely on that,
+so such a root could lead a client to free content it can never fetch back. To serve a franchised
+copy, franchise it without `--only` or `--cache`. A franchise that has not finished is
 not served either (`503` from a `--warehouses` server) until it is resumed or deleted.
 
 A root is a warehouse only once `prepare` has marked it: its `.forklift` folder holds the
