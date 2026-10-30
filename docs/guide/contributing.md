@@ -266,10 +266,9 @@ changelog), `SERVER.md` (server ops), `MACHINE_INTERFACE.md` (`--json`/MCP),
 8. **Approve it in `crates/forklift/surface/`.** `spec.txt` is the reviewed list of every
    command: place the new one there and classify it against each list's definition (the daily
    loop, destructive, recorded text). A family nested inside another (`self alias`) gets its own
-   `self alias: install uninstall status` line, written after the line that lists it. `coverage.txt` records what every earlier command became;
-   a new command gets its own row, and renaming or reshaping one adds `-> forklift …` lines under
-   its old row instead of deleting it. The surface tests (`cargo test -p forklift --bin forklift
-   surface_check`) fail until both agree with the binary. A new name may make a prefix people
+   `self alias: install uninstall status` line, written after the line that lists it. The
+   surface tests (`cargo test -p forklift --bin forklift surface_check`) fail until it agrees
+   with the binary. A new name may make a prefix people
    type ambiguous (`pi` stops meaning `pick` once `pin` exists); that is expected, because
    prefixes are only for typing. A command with subcommands takes no positional argument, and
    each of its options takes no value or exactly one, so the prefix expansion in
