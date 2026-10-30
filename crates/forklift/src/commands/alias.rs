@@ -61,6 +61,7 @@ fn install(name: &str) -> Result<(), String> {
             overwrite it — remove it yourself first if that's what you want.",
             display(&alias_path), display(&other), display(&target)
         )),
+        Existing::Unreadable(e) => return Err(unreadable(&alias_path, &e)),
         Existing::Foreign => return Err(format!(
             "\"{}\" already exists and is not an alias forklift manages (not a symlink to a \
             forklift binary). Refusing to overwrite it — remove it yourself first if that's what \
@@ -101,6 +102,7 @@ fn uninstall(name: &str) -> Result<(), String> {
 
             Ok(())
         }
+        Existing::Unreadable(e) => Err(unreadable(&alias_path, &e)),
         Existing::Foreign => Err(format!(
             "\"{}\" exists but is not an alias forklift manages. Refusing to remove it — remove \
             it yourself if that's what you want (a shim an older release wrote is one this release \
@@ -128,9 +130,12 @@ fn status() -> Result<(), String> {
     let alias_path = platform_alias_path(&dir, DEFAULT_NAME);
 
     let existing = inspect(&alias_path, &target);
+    if let Existing::Unreadable(e) = &existing {
+        return Err(unreadable(&alias_path, e));
+    }
     let foreign = matches!(existing, Existing::Foreign);
     let (installed, target_display) = match existing {
-        Existing::None | Existing::Foreign => (false, None),
+        Existing::None | Existing::Foreign | Existing::Unreadable(_) => (false, None),
         Existing::PointsHere => (true, Some(display(&target))),
         Existing::PointsElsewhere(other) => (true, Some(display(&other))),
     };
@@ -188,6 +193,19 @@ enum Existing {
     /// Something is there, but it is not an alias forklift recognizes as its own (a real
     /// file, a directory, or unrecognized content) — never touched.
     Foreign,
+
+    /// Something may be there, but it could not be read, so whose it is is unknown — never
+    /// touched, and never reported as foreign.
+    Unreadable(io::Error),
+}
+
+/// Why nothing was done to an alias path that could not be read.
+fn unreadable(alias_path: &Path, error: &io::Error) -> String {
+    format!(
+        "Could not read \"{}\" to tell whether it is an alias forklift manages: {}. Leaving it \
+         as it is.",
+        display(alias_path), error
+    )
 }
 
 /// The directory the alias is created next to: `FORKLIFT_ALIAS_DIR` when set, otherwise this
@@ -242,7 +260,7 @@ fn inspect(alias_path: &Path, target: &Path) -> Existing {
     let metadata = match std::fs::symlink_metadata(alias_path) {
         Ok(metadata) => metadata,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Existing::None,
-        Err(_) => return Existing::Foreign,
+        Err(e) => return Existing::Unreadable(e),
     };
 
     if !metadata.file_type().is_symlink() {
@@ -305,7 +323,9 @@ fn inspect(alias_path: &Path, target: &Path) -> Existing {
     let content = match std::fs::read_to_string(alias_path) {
         Ok(content) => content,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Existing::None,
-        Err(_) => return Existing::Foreign,
+        // A directory or non-UTF-8 content was read well enough to know it is no shim.
+        Err(e) if e.kind() == io::ErrorKind::InvalidData || alias_path.is_dir() => return Existing::Foreign,
+        Err(e) => return Existing::Unreadable(e),
     };
 
     if !content.contains(SHIM_MARKER) {

@@ -315,8 +315,12 @@ without change) and refuses — deliberately, with no `--force` — to overwrite
 anything it did not create: a real file already named `fl`, or a symlink
 pointing somewhere else. `uninstall` is a no-op if nothing is installed, and
 also refuses a foreign real file, though it does remove a symlink/shim
-pointing elsewhere (deleting a symlink can never lose data). Set
-`FORKLIFT_NO_ALIAS=1` before installing to skip alias creation — there is no
+pointing elsewhere (deleting a symlink can never lose data). A file it does not
+manage is never touched by any of the three: `status` names it (`"foreign": true`
+in `--json`) and you remove it by hand. On Windows that includes a `fl.cmd` shim
+written by a release before the `self` family, whose marker line this release no
+longer recognizes. A path that cannot be read at all is reported as an error,
+never guessed at. Set `FORKLIFT_NO_ALIAS=1` before installing to skip alias creation — there is no
 interactive prompt (`curl … | sh` has no TTY to answer one).
 
 ---

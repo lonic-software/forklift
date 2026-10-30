@@ -5745,6 +5745,35 @@ fn alias_install_refuses_when_the_name_points_elsewhere_but_uninstall_may_remove
     assert_eq!(json(&uninstall)["data"]["removed"], true);
 }
 
+/// A path that cannot be read is neither "not installed" nor a foreign file: all three
+/// operations say they could not read it and leave it as it is.
+#[cfg(unix)]
+#[test]
+fn alias_commands_refuse_a_path_they_cannot_read() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let scratch = AliasScratch::new("unreadable");
+    std::fs::write(scratch.alias_path("fl"), "not a forklift alias\n").unwrap();
+    std::fs::set_permissions(&scratch.dir, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // Root reads through permissions, so there is nothing to test there.
+    if std::fs::symlink_metadata(scratch.alias_path("fl")).is_ok() {
+        std::fs::set_permissions(&scratch.dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let results = ["status", "install", "uninstall"].map(|op| scratch.run(&["--json", "self", "alias", op]));
+    std::fs::set_permissions(&scratch.dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for result in &results {
+        assert!(!result.status.success(), "{}", stdout(result));
+        let message = json(result)["error"]["message"].as_str().unwrap_or_default().to_string();
+        assert!(message.contains("Could not read"), "{message}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(scratch.alias_path("fl")).unwrap(),
+        "not a forklift alias\n"
+    );
+}
+
 #[test]
 fn alias_status_reports_installed_state() {
     let scratch = AliasScratch::new("status");
