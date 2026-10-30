@@ -1117,9 +1117,9 @@ fn bearing(token: &str, mut request: Request<Vec<u8>>) -> Request<Vec<u8>> {
 /// Enroll `identifier` in `dir`'s office with `role_args` (`office role`'s arguments after the
 /// identifier), from a key generated under that identifier, then switch back to the admin.
 fn enroll(area: &Area, dir: &str, identifier: &str, role_args: &[&str]) {
-    area.forklift(dir, &["config", "operator.identifier", identifier]);
-    let keygen = area.forklift_stdout(dir, &["office", "keygen"]);
-    area.forklift(dir, &["config", "operator.identifier", "tester@forklift"]);
+    area.forklift(dir, &["config", "set", "operator.identifier", identifier]);
+    let keygen = area.forklift_stdout(dir, &["profile", "keygen"]);
+    area.forklift(dir, &["config", "set", "operator.identifier", "tester@forklift"]);
 
     let admit: Vec<&str> = keygen.lines()
         .find(|line| line.trim_start().starts_with("office admit "))
@@ -1757,5 +1757,5 @@ fn harvest(warehouse: &Path) -> Harvest {
 
 fn prepare(area: &Area, dir: &str) {
     area.forklift(dir, &["prepare"]);
-    area.forklift(dir, &["config", "--global", "operator.identifier", "tester@forklift"]);
+    area.forklift(dir, &["config", "set", "--global", "operator.identifier", "tester@forklift"]);
 }

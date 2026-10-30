@@ -81,7 +81,7 @@ impl Warehouse {
 
     fn prepare(&self) {
         self.run_ok(&["prepare"]);
-        self.run_ok(&["config", "operator.identifier", "rollup-skip@forklift"]);
+        self.run_ok(&["config", "set", "operator.identifier", "rollup-skip@forklift"]);
     }
 
     fn head_tree_hash(&self, pallet: &str) -> String {

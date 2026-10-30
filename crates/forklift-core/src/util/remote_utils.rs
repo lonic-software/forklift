@@ -2540,7 +2540,7 @@ impl RemoteClient {
             .map(|(value, _)| value)
             .ok_or(format!(
                 "No remote is configured for this warehouse. Set one with \
-                \"forklift config {} <url>\".",
+                \"forklift config set {} <url>\".",
                 config_utils::KEY_REMOTE_URL
             ))?;
 

@@ -571,8 +571,8 @@ const WAREHOUSE_CONFIG_TEMPLATE: &str = r#"# Forklift warehouse configuration.
 # Values set here apply to this warehouse only and override the global
 # configuration (the ".forkliftconfig" file in your home directory).
 #
-# Set values with "forklift config <key> <value>", e.g.:
-#   forklift config remote.url "https://forklift.example.com"
+# Set values with "forklift config set <key> <value>", e.g.:
+#   forklift config set remote.url "https://forklift.example.com"
 #
 # operator.identifier is the on-chain operator id. Leave it unset to stay
 # pseudonymous (a UUID is minted automatically on first use); a hosting provider
@@ -712,7 +712,7 @@ pub fn get_effective_value(key: &str) -> Result<Option<(String, ConfigScope)>, S
 ///                   key is stored normalized (see [`storable_value`]). It is returned rather
 ///                   than left for the caller to re-derive because a caller that echoes the
 ///                   value it passed in reports something the file does not contain — which is
-///                   exactly what `forklift config --json remote.tor "  ON  "` did, answering
+///                   exactly what `forklift config set --json remote.tor "  ON  "` did, answering
 ///                   `"  ON  "` while the file held `on`. A consumer caching that echo
 ///                   disagreed with the next read.
 /// * `Err(String)` - If the key is unknown, or the file could not be read, parsed
@@ -782,8 +782,27 @@ pub fn unset_value(key: &str, scope: ConfigScope) -> Result<(), String> {
 /// * `Err(String)`  - If a configuration file could not be read or written, or the
 ///                    selected profile does not exist.
 pub fn get_operator() -> Result<Operator, String> {
-    if let Some((profile, _)) = get_effective_value(KEY_OPERATOR_PROFILE)? {
-        let Some(mut identity) = get_profile(&profile)? else {
+    resolve_operator().map(|(operator, _)| operator)
+}
+
+/// Where [`resolve_operator`] found the operator identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorSource {
+    /// The profile `operator.profile` selects, in the scope that selects it.
+    Profile { name: String, selected_in: ConfigScope },
+    /// `operator.identifier`, in the scope that holds it (the global one when it was just minted).
+    Identifier { set_in: ConfigScope },
+}
+
+/// [`get_operator`], also saying where the identity came from, for a command that reports which
+/// identity it acted as.
+///
+/// # Returns
+/// * `Ok((Operator, OperatorSource))` - The resolved operator and its source.
+/// * `Err(String)`                    - As [`get_operator`].
+pub fn resolve_operator() -> Result<(Operator, OperatorSource), String> {
+    if let Some((profile, selected_in)) = get_effective_value(KEY_OPERATOR_PROFILE)? {
+        let Some(identity) = profile_identity(&profile)? else {
             return Err(format!(
                 "The selected profile \"{}\" does not exist in the global configuration. \
                 Create it with \"forklift profile create {}\".",
@@ -791,19 +810,45 @@ pub fn get_operator() -> Result<Operator, String> {
             ));
         };
 
-        if identity.identifier.is_empty() {
-            identity.identifier = mint_profile_identifier(&profile)?;
-        }
-
-        return Ok(identity);
+        return Ok((identity, OperatorSource::Profile { name: profile, selected_in }));
     }
 
-    let identifier = match get_effective_value(KEY_OPERATOR_IDENTIFIER)? {
-        Some((identifier, _)) => identifier,
-        None => mint_global_identifier()?,
+    let (identifier, set_in) = match get_effective_value(KEY_OPERATOR_IDENTIFIER)? {
+        Some(found) => found,
+        None => (mint_global_identifier()?, ConfigScope::Global),
     };
 
-    Ok(Operator { identifier })
+    Ok((Operator { identifier }, OperatorSource::Identifier { set_in }))
+}
+
+/// A named profile's identity, its identifier minted on first use as [`get_operator`] would.
+///
+/// # Arguments
+/// * `profile` - The profile name.
+///
+/// # Returns
+/// * `Ok(Operator)` - The profile's identity.
+/// * `Err(String)`  - If the profile does not exist (naming `forklift profile create`), or the
+///                    global configuration could not be read or written.
+pub fn get_profile_operator(profile: &str) -> Result<Operator, String> {
+    profile_identity(profile)?.ok_or_else(|| format!(
+        "The profile \"{}\" does not exist. Create it with \"forklift profile create {}\".",
+        profile, profile
+    ))
+}
+
+/// A named profile's identity with its identifier minted on first use, or `None` when the
+/// profile does not exist (each caller words that itself).
+fn profile_identity(profile: &str) -> Result<Option<Operator>, String> {
+    let Some(mut identity) = get_profile(profile)? else {
+        return Ok(None);
+    };
+
+    if identity.identifier.is_empty() {
+        identity.identifier = mint_profile_identifier(profile)?;
+    }
+
+    Ok(Some(identity))
 }
 
 /// The global `operator.identifier`, minted and written if the global file still has none.
@@ -850,7 +895,7 @@ fn mint_profile_identifier(profile: &str) -> Result<String, String> {
 
         let Some(record) = parse_config(&document, path)?.profile(profile).cloned() else {
             return Err(format!(
-                "The selected profile \"{}\" does not exist in the global configuration. \
+                "The profile \"{}\" does not exist in the global configuration. \
                 Create it with \"forklift profile create {}\".",
                 profile, profile
             ));
@@ -930,12 +975,13 @@ fn set_profile_identifier_in_document(document: &mut DocumentMut,
     // understood, and refusing it on load would turn someone else's harmless litter into a file
     // that no command can read. The strict parse is for values that would be *misread*.
     //
-    // Both checks are preconditions, not live defences: both callers already exclude every
+    // Both checks are preconditions, not live defences: every caller already excludes every
     // case — `create_profile` validates its inputs with its own wording before calling, and
-    // `mint_profile_identifier` is reached with an `operator.profile` that `validate_value`
-    // refuses when empty, with a freshly minted identifier. No caller can reach them, so a unit
-    // test calls this function directly on an in-memory document. Re-check this if a third caller
-    // appears.
+    // `mint_profile_identifier` is reached with a freshly minted identifier and a profile name
+    // that is either an `operator.profile` value, which `validate_value` refuses when empty, or
+    // the NAME of `profile keygen`, which `commands::profile::keygen` refuses when blank before
+    // resolving it. No caller can reach them, so a unit test calls this function directly on an
+    // in-memory document. Re-check this if another caller appears.
     if is_blank(profile) {
         return Err(EMPTY_PROFILE_NAME.to_string());
     }
@@ -1144,7 +1190,7 @@ fn require_non_empty(label: &str, value: &str) -> Result<(), String> {
 ///
 /// A constrained key is stored normalized, so what lands on disk is literally one of the
 /// spellings the guide enumerates ([`REMOTE_TOR_VALUES`], [`SWITCH_ON`] /
-/// [`SWITCH_OFF`]), or a bare number. `forklift config remote.tor
+/// [`SWITCH_OFF`]), or a bare number. `forklift config set remote.tor
 /// "  ON  "` otherwise left `tor = "  ON  "` in the file: admissible, correctly understood, and
 /// not a member of the documented set — a value whose correctness rested on every reader
 /// applying the same normalization forever. Normalizing once, here, means the stored value
@@ -1228,7 +1274,7 @@ fn dangling_link_in(path: &Path) -> Option<PathBuf> {
 ///
 /// Validating after the edit rather than before it is what lets `forklift config` repair the
 /// very entry that is refusing. A pre-edit check turned `remote.tor = "onn"` into a trap: the
-/// file refused every write, so `config remote.tor on` — the command that fixes it, at the one
+/// file refused every write, so `config set remote.tor on` — the command that fixes it, at the one
 /// moment it is most needed — was refused by the value it was correcting, and a text editor was
 /// the only way out. A post-edit check accepts that write, because the file it is about to
 /// leave on disk is valid.

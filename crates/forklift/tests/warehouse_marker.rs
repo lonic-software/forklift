@@ -67,7 +67,7 @@ impl Area {
     fn warehouse(&self, relative: &str) -> PathBuf {
         let root = self.dir(relative);
         self.run_ok(&root, &["prepare"]);
-        self.run_ok(&root, &["config", "operator.identifier", "marker@forklift"]);
+        self.run_ok(&root, &["config", "set", "operator.identifier", "marker@forklift"]);
         std::fs::write(root.join("app.txt"), "payload\n").unwrap();
         self.run_ok(&root, &["load", "."]);
         self.run_ok(&root, &["stack", "first"]);
@@ -145,7 +145,7 @@ fn an_empty_forklift_folder_is_refused_before_anything_is_written() {
 
     // Following the step makes it one.
     area.run_ok(&root, &["prepare"]);
-    area.run_ok(&root, &["config", "operator.identifier", "marker@forklift"]);
+    area.run_ok(&root, &["config", "set", "operator.identifier", "marker@forklift"]);
     area.run_ok(&root, &["load", "."]);
 }
 
@@ -159,7 +159,7 @@ fn an_unmarked_folder_is_refused_and_prepare_will_not_take_it() {
     std::fs::remove_file(forklift.join("warehouse")).unwrap();
     let before = listing(&forklift);
 
-    for args in [&["stocktake"][..], &["load", "."], &["prepare"], &["config", "operator.identifier", "x@y"], &["profile", "use", "work"]] {
+    for args in [&["stocktake"][..], &["load", "."], &["prepare"], &["config", "set", "operator.identifier", "x@y"], &["profile", "use", "work"]] {
         let refusal = area.refused(&root, args);
         assert!(refusal.message.contains("holds no warehouse marker"), "{:?}: {}", args, refusal.message);
         assert!(
@@ -231,7 +231,7 @@ fn a_bay_of_an_unmarked_warehouse_is_refused_and_nothing_is_written() {
     std::fs::remove_file(root.join(FOLDER_NAME_FORKLIFT_ROOT).join("warehouse")).unwrap();
     let (shared, own) = (listing(&root.join(FOLDER_NAME_FORKLIFT_ROOT)), listing(&bay.join(FOLDER_NAME_FORKLIFT_ROOT)));
 
-    for args in [&["load", "."][..], &["config", "operator.identifier", "x@y"], &["profile", "use", "work"]] {
+    for args in [&["load", "."][..], &["config", "set", "operator.identifier", "x@y"], &["profile", "use", "work"]] {
         let refusal = area.refused(&bay, args);
         assert_eq!(
             refusal.message,
@@ -256,7 +256,7 @@ fn a_bay_of_an_unmarked_warehouse_is_refused_and_nothing_is_written() {
     // The steps give a working bay (the history coming back as a fresh stack of the same files).
     forklift_core::util::file_utils::rename(root.join(FOLDER_NAME_FORKLIFT_ROOT), root.join(".forklift.old")).unwrap();
     area.run_ok(&root, &["prepare"]);
-    area.run_ok(&root, &["config", "operator.identifier", "marker@forklift"]);
+    area.run_ok(&root, &["config", "set", "operator.identifier", "marker@forklift"]);
     area.run_ok(&root, &["load", "app.txt"]);
     area.run_ok(&root, &["stack", "again"]);
     forklift_core::util::file_utils::rename(&bay, area.path("bay.old")).unwrap();

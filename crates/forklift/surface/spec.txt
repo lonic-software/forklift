@@ -13,7 +13,7 @@ audit
 bay: add remove
 blame
 clone
-config
+config: list get set unset
 conflicts
 consolidate
 deliver
@@ -30,14 +30,14 @@ lower
 manifest: note approve provenance show set get unset keys log
 mcp
 narrow
-office: enroll keygen admit link authorize role rotate retire regenesis accept-regenesis list
+office: enroll admit link authorize role rotate retire regenesis accept-regenesis list
 pallet: list create delete restore
 park: pop list
 pick
 prepare
-profile: list create use
+profile: list create use keygen
 query
-remote: move
+remote: move abort
 remove
 restore
 scope: status
@@ -87,7 +87,7 @@ lower --keep …=theirs
 [recorded-text]
 # The commands that record text: free-form prose a person writes to describe a record (a
 # parcel's description, a note, a comment, a review, a tag or delivery message, a haul's longer
-# description). A keyed value (manifest set VALUE, config VALUE) and a short title (haul open --title)
+# description). A keyed value (manifest set VALUE, config set VALUE) and a short title (haul open --title)
 # are not recorded text.
 stack
 pick

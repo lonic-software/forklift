@@ -46,7 +46,7 @@ forklift-server prepare --root /srv/forklift/wh
 forklift-server serve --root /srv/forklift/wh --addr 127.0.0.1:9418 --token <secret>
 ```
 
-Clients configure `forklift config remote.url http://…` (plus `remote.token`), or just
+Clients configure `forklift config set remote.url http://…` (plus `remote.token`), or just
 `forklift clone <url> <dir> --token <secret>`.
 
 A served root must hold the full tree. A partial warehouse (one cloned with `--only` or

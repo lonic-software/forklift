@@ -296,7 +296,7 @@ fn killing_stack_midway_never_corrupts_the_store() {
     rewrite_corpus(&file, base_line, STACK_CORPUS_LINES, "seed");
 
     assert!(area.run(&["prepare"]).status.success());
-    assert!(area.run(&["config", "operator.identifier", "crash@forklift"]).status.success());
+    assert!(area.run(&["config", "set", "operator.identifier", "crash@forklift"]).status.success());
 
     const DELAY_COUNT: usize = 24;
 
@@ -528,7 +528,7 @@ fn killing_load_midway_never_leaves_a_shard_referencing_a_missing_or_torn_blob()
     }
 
     assert!(area.run(&["prepare"]).status.success());
-    assert!(area.run(&["config", "operator.identifier", "crash@forklift"]).status.success());
+    assert!(area.run(&["config", "set", "operator.identifier", "crash@forklift"]).status.success());
 
     const DELAY_COUNT: usize = 20;
 
@@ -726,7 +726,7 @@ fn killing_park_midway_never_leaves_a_parked_parcel_referencing_a_missing_or_tor
     }
 
     assert!(area.run(&["prepare"]).status.success());
-    assert!(area.run(&["config", "operator.identifier", "crash@forklift"]).status.success());
+    assert!(area.run(&["config", "set", "operator.identifier", "crash@forklift"]).status.success());
 
     // A pallet head to park onto — `park` refuses when the pallet has nothing stacked yet.
     assert!(area.run(&["load", "."]).status.success());
@@ -801,7 +801,7 @@ fn load_barrier_count_for(files_per_dir: usize) -> u64 {
     }
 
     assert!(area.run(&["prepare"]).status.success());
-    assert!(area.run(&["config", "operator.identifier", "barrier@forklift"]).status.success());
+    assert!(area.run(&["config", "set", "operator.identifier", "barrier@forklift"]).status.success());
     assert!(area.run(&["load", "."]).status.success());
     assert!(area.run(&["stack", "base"]).status.success());
 
@@ -864,7 +864,7 @@ fn restore_barrier_count_for(files_per_dir: usize) -> u64 {
     }
 
     assert!(area.run(&["prepare"]).status.success());
-    assert!(area.run(&["config", "operator.identifier", "barrier@forklift"]).status.success());
+    assert!(area.run(&["config", "set", "operator.identifier", "barrier@forklift"]).status.success());
     assert!(area.run(&["load", "."]).status.success());
     assert!(area.run(&["stack", "base"]).status.success());
 
@@ -925,7 +925,7 @@ fn park_pop_barrier_count_for(files_per_dir: usize) -> u64 {
     }
 
     assert!(area.run(&["prepare"]).status.success());
-    assert!(area.run(&["config", "operator.identifier", "barrier@forklift"]).status.success());
+    assert!(area.run(&["config", "set", "operator.identifier", "barrier@forklift"]).status.success());
     assert!(area.run(&["load", "."]).status.success());
     assert!(area.run(&["stack", "base"]).status.success());
 
@@ -991,7 +991,7 @@ fn park_pop_whose_staging_fails_keeps_the_parcel_parked() {
     }
 
     assert!(area.run(&["prepare"]).status.success());
-    assert!(area.run(&["config", "operator.identifier", "barrier@forklift"]).status.success());
+    assert!(area.run(&["config", "set", "operator.identifier", "barrier@forklift"]).status.success());
     assert!(area.run(&["load", "."]).status.success());
     assert!(area.run(&["stack", "base"]).status.success());
 
@@ -1123,7 +1123,7 @@ fn diverged_merge_fixture(area: &Area, files_per_dir: usize, clash: bool) -> Str
     std::fs::write(warehouse.join("main.txt"), "base\n").unwrap();
 
     assert!(area.run(&["prepare"]).status.success());
-    assert!(area.run(&["config", "operator.identifier", "barrier@forklift"]).status.success());
+    assert!(area.run(&["config", "set", "operator.identifier", "barrier@forklift"]).status.success());
     assert!(area.run(&["load", "."]).status.success());
     assert!(area.run(&["stack", "base"]).status.success());
     assert!(area.run(&["pallet", "create", "feature"]).status.success());
@@ -1294,7 +1294,7 @@ fn a_merge_conflict_clears_the_rollups_above_it() {
     std::fs::write(deep.join("f.txt"), "base\n").unwrap();
 
     assert!(area.run(&["prepare"]).status.success());
-    assert!(area.run(&["config", "operator.identifier", "barrier@forklift"]).status.success());
+    assert!(area.run(&["config", "set", "operator.identifier", "barrier@forklift"]).status.success());
     assert!(area.run(&["load", "."]).status.success());
     assert!(area.run(&["stack", "base"]).status.success());
     assert!(area.run(&["pallet", "create", "feature"]).status.success());
@@ -1392,7 +1392,7 @@ fn a_small_directory_load_pays_no_extra_barrier_for_the_incomplete_load_marker()
     std::fs::write(warehouse.join("dir0").join("file0.txt"), "v1\n").unwrap();
 
     assert!(area.run(&["prepare"]).status.success());
-    assert!(area.run(&["config", "operator.identifier", "barrier@forklift"]).status.success());
+    assert!(area.run(&["config", "set", "operator.identifier", "barrier@forklift"]).status.success());
 
     let mut command = area.command(&["load", "."]);
     command.env("FORKLIFT_DEBUG_BARRIER_COUNT", "1");
@@ -1418,7 +1418,7 @@ fn a_small_single_file_load_pays_no_extra_barrier_for_the_incomplete_load_marker
     std::fs::write(warehouse.join("a.txt"), "v1\n").unwrap();
 
     assert!(area.run(&["prepare"]).status.success());
-    assert!(area.run(&["config", "operator.identifier", "barrier@forklift"]).status.success());
+    assert!(area.run(&["config", "set", "operator.identifier", "barrier@forklift"]).status.success());
 
     let mut command = area.command(&["load", "a.txt"]);
     command.env("FORKLIFT_DEBUG_BARRIER_COUNT", "1");
@@ -1438,7 +1438,7 @@ fn building_the_commit_graph_pays_no_durability_barrier() {
     let warehouse = area.warehouse();
 
     assert!(area.run(&["prepare"]).status.success());
-    assert!(area.run(&["config", "operator.identifier", "graph@forklift"]).status.success());
+    assert!(area.run(&["config", "set", "operator.identifier", "graph@forklift"]).status.success());
 
     for i in 0..8 {
         std::fs::write(warehouse.join("f.txt"), format!("line {i}\n").repeat(i + 1)).unwrap();

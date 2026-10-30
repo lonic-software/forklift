@@ -20,36 +20,22 @@ use crate::output::{self, CommandOutput};
 /// next move finishes it.
 ///
 /// # Arguments
-/// * `url`          - The new server; `None` only with `abort`.
+/// * `url`          - The new server.
 /// * `token`        - The new server's bearer token, set as `remote.token` with the URL; without
 ///                    it the current `remote.token` is used.
-/// * `abort`        - Abandon a move that stopped before rewriting instead.
 /// * `store_access` - The command's shared store-access hold, so nothing is evicted while the
 ///                    absent content is counted.
 ///
 /// # Returns
-/// * `Ok(())`      - The origin is the new server, or the abort was reported.
+/// * `Ok(())`      - The origin is the new server.
 /// * `Err(String)` - The warehouse is full, another move is running, the new server cannot be
 ///   reached, is not trusted or lacks content (`origin_move_incomplete`), or a write failed.
-pub async fn move_origin(url: Option<String>,
+pub async fn move_origin(url: String,
                          token: Option<String>,
-                         abort: bool,
                          store_access: &StoreAccessLock) -> Result<(), String> {
-    if !scope_utils::content_may_be_absent()? {
-        return Err(
-            "This warehouse holds its whole history, so it has no origin to move: it may talk to any \
-            remote. Point it at another one with \"forklift config remote.url <url>\".".to_string()
-        );
-    }
-
-    let move_lock = MoveLock::try_acquire()?.ok_or_else(running_refusal)?;
-
-    if abort {
-        return abort_move(&move_lock);
-    }
+    let move_lock = acquire_move_lock()?;
 
     // One spelling for the intent, the origin record and the config alike, as the client dials it.
-    let url = url.ok_or("Name the server to move the origin to, or pass --abort.")?;
     let target = url.trim_end_matches('/').to_string();
     if target.is_empty() {
         return Err("The new origin must be a remote URL.".to_string());
@@ -178,11 +164,17 @@ fn block_of(error: CoreError) -> Result<RemoteBlock, String> {
     }
 }
 
-/// `remote move --abort`: clear an intent a move left before rewriting, and report one it left
-/// while rewriting, which only a completed move clears.
-fn abort_move(move_lock: &MoveLock) -> Result<(), String> {
+/// Handle `remote abort`: clear an intent a move left before rewriting, and refuse over one it
+/// left while rewriting, which only a completed move clears.
+///
+/// # Returns
+/// * `Ok(())`      - The intent was cleared, or there was none.
+/// * `Err(String)` - The warehouse is full, a move is running or stopped while rewriting
+///   (`origin_move_pending`), or the intent could not be cleared.
+pub fn abort_move() -> Result<(), String> {
+    let move_lock = acquire_move_lock()?;
     let lock = RefLock::acquire()?;
-    let intent = origin_move::abort(move_lock, &lock)?;
+    let intent = origin_move::abort(&move_lock, &lock)?;
 
     if let Some(intent) = &intent {
         if intent.phase == Phase::Rewriting {
@@ -195,6 +187,19 @@ fn abort_move(move_lock: &MoveLock) -> Result<(), String> {
     });
 
     Ok(())
+}
+
+/// The move lock, for a move or an abort of a partial warehouse's origin. A full warehouse has no
+/// origin, and a move already running holds the lock (`origin_move_pending`).
+fn acquire_move_lock() -> Result<MoveLock, String> {
+    if !scope_utils::content_may_be_absent()? {
+        return Err(
+            "This warehouse holds its whole history, so it has no origin to move: it may talk to any \
+            remote. Point it at another one with \"forklift config set remote.url <url>\".".to_string()
+        );
+    }
+
+    MoveLock::try_acquire()?.ok_or_else(running_refusal)
 }
 
 /// The `origin_move_pending` refusal for a move or an abort while another move holds the lock.
@@ -248,7 +253,7 @@ impl CommandOutput for RemoteReport {
         match &self.remote {
             Some(remote) => println!("Remote: {}", remote),
             None => println!(
-                "No remote is configured. Set one with \"forklift config {} <url>\".",
+                "No remote is configured. Set one with \"forklift config set {} <url>\".",
                 config_utils::KEY_REMOTE_URL
             ),
         }
@@ -315,7 +320,7 @@ impl CommandOutput for RemoteMoveReport {
     }
 }
 
-/// The result of `remote move --abort`.
+/// The result of `remote abort`.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
 pub(crate) struct RemoteAbortReport {

@@ -84,7 +84,6 @@ Each of these commands, and every command below it, is a tool for nobody: a pers
 - `forklift clone`: clones a remote, which is setup.
 - `forklift git`: migrates a repository in or out, which is setup, or mirrors to an external git remote under the user's own git credentials.
 - `forklift office enroll`: establishes the operator's trust, a one-way setup step.
-- `forklift office keygen`: creates a signing key, which is setup.
 - `forklift office admit`: enrolls another operator: trust administration.
 - `forklift office link`: links another device's key: trust administration.
 - `forklift office authorize`: authorizes a key for another operator: trust administration.

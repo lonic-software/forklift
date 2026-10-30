@@ -70,11 +70,13 @@ const FORKLIFT: Tables = Tables {
     ],
     secret: &[
         ("clone", "token"),     // the bearer token, remembered as remote.token
-        ("config", "value"),    // a configuration value may be that token
+        ("config set", "value"), // a configuration value may be that token
         ("remote move", "token"), // the new origin's bearer token, remembered as remote.token
     ],
     not_secret: &[
-        ("config", "key", "a key name; masked anyway, as part of config's collapsed key/value repeat"),
+        ("config get", "key", "a configuration key name, not key material"),
+        ("config set", "key", "a configuration key name, not key material"),
+        ("config unset", "key", "a configuration key name, not key material"),
         ("office admit", "public_key", "the public half of a key pair"),
         ("office link", "public_key", "the public half of a key pair"),
         ("office authorize", "public_key", "the public half of a key pair"),
@@ -784,12 +786,11 @@ mod tests {
             r#""targets":{"repeat":{},"description":"[path], or <revision-a> <revision-b> [path] — \":empty\" is the empty tree"}"#
         ), "{diff}");
 
-        let config = json("config");
-        assert!(config.contains(concat!(
-            r#""key-value":{"repeat":{"max":2,"secret":true},"description":"#,
-            r#""key: The configuration key (e.g. \"remote.url\"); omit it to list every key | "#,
-            r#"value: The value to set the key to; omit it to print the current value"}"#,
-        )), "{config}");
+        // A configuration value may be a token; its key is a name, never key material.
+        let config = json("config-set");
+        assert!(config.contains(r#""value":{"input":{"secret":true},"description":"The value to set the key to"}"#), "{config}");
+        assert!(config.contains(r#""key":{"input":{},"#), "{config}");
+        assert!(config.contains(r#""run":"config set {global} -- {key} {value}""#), "{config}");
 
         let franchise = json("clone");
         assert!(franchise.contains(concat!(
@@ -1190,7 +1191,7 @@ mod tests {
     }
 
     /// The base `key = value` lands on: `base` itself, or, when clap refuses the pair as a
-    /// conflict (`peek --inventory` with a hash, `config --unset` with a value), `base` with
+    /// conflict (`peek --inventory` with a hash), `base` with
     /// optional positional words dropped from the end until it parses. Whatever base is
     /// returned, `value` was parsed on it and landed; any other refusal fails the test.
     fn fit(built: &Command, command: &SchemaCommand, base: &BTreeMap<String, Value>, key: &str, value: Value) -> BTreeMap<String, Value> {

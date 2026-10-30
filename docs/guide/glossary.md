@@ -289,7 +289,7 @@ reported, never merged on its own. See [`lower`](cli.md#lower--pull-lo).
 
 **Origin.** The remote a sparse or cache warehouse was cloned from, recorded with the
 warehouse rather than in config; such a warehouse talks to no other remote. See
-[`remote move`](cli.md#remote-move--move-a-partial-warehouse-to-another-origin), the one way to
+[`remote move`](cli.md#remote-move-and-remote-abort--move-a-partial-warehouse-to-another-origin), the one way to
 change it.
 
 **Diverged, remote ahead.** Refusals meaning the remote's history moved: *diverged* when both sides

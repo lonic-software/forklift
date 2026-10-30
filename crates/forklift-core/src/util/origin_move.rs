@@ -277,7 +277,7 @@ pub fn abandon(lock: &RefLock, token: &MoveToken) -> Result<bool, String> {
     }
 }
 
-/// Clear an intent a move left in the checking phase, for `--abort`, which holds the
+/// Clear an intent a move left in the checking phase, for `remote abort`, which holds the
 /// [`MoveLock`], so no move is running.
 ///
 /// # Returns
@@ -308,7 +308,7 @@ pub fn pending_refusal(intent: &Intent) -> CoreError {
     };
     let finish = format!("Finish the move with \"forklift remote move {}\"", target);
     let next_step = match intent.phase {
-        Phase::Checking => format!("{}, or abandon it with \"forklift remote move --abort\".", finish),
+        Phase::Checking => format!("{}, or abandon it with \"forklift remote abort\".", finish),
         Phase::Rewriting => format!("{}; it has started rewriting the origin, so it cannot be abandoned.", finish),
     };
 

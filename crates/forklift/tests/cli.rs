@@ -151,13 +151,13 @@ fn assert_only_the_ignore_file_is_untracked(warehouse: &TestWarehouse) {
 /// Configure the operator identity (in the test-scoped global configuration), which
 /// stacking parcels requires.
 fn configure_operator(warehouse: &TestWarehouse) {
-    assert_success(&warehouse.run(&["config", "--global", "operator.identifier", "test@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "--global", "operator.identifier", "test@forklift"]));
 }
 
 /// Read the operator id from the test-scoped global configuration (set explicitly by
 /// `configure_operator`, or minted by the first command that resolved the identity).
 fn operator_id(warehouse: &TestWarehouse) -> String {
-    let output = warehouse.run(&["config", "--global", "operator.identifier"]);
+    let output = warehouse.run(&["config", "get", "--global", "operator.identifier"]);
     assert_success(&output);
     stdout(&output).trim().to_string()
 }
@@ -166,9 +166,9 @@ fn operator_id(warehouse: &TestWarehouse) -> String {
 /// back to the "test@forklift" admin) and return the printed admit args:
 /// `[operator_id, public_key, pop]`.
 fn keygen_admit_args(warehouse: &TestWarehouse, operator_id: &str) -> Vec<String> {
-    assert_success(&warehouse.run(&["config", "operator.identifier", operator_id]));
-    let keygen = stdout(&warehouse.run(&["office", "keygen"]));
-    assert_success(&warehouse.run(&["config", "operator.identifier", "test@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", operator_id]));
+    let keygen = stdout(&warehouse.run(&["profile", "keygen"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "test@forklift"]));
 
     keygen.lines()
         .find(|line| line.trim_start().starts_with("office admit "))
@@ -421,21 +421,21 @@ fn config_values_are_scoped_and_the_warehouse_overrides_the_global_scope() {
     assert!(warehouse.root.join(".forklift/config/warehouse.toml").exists());
 
     // Global values work without a warehouse and act as the fallback.
-    assert_success(&warehouse.run(&["config", "--global", "remote.url", "https://global.example"]));
-    assert_success(&warehouse.run(&["config", "--global", "operator.identifier", "global@id"]));
+    assert_success(&warehouse.run(&["config", "set", "--global", "remote.url", "https://global.example"]));
+    assert_success(&warehouse.run(&["config", "set", "--global", "operator.identifier", "global@id"]));
 
-    let effective_url = warehouse.run(&["config", "remote.url"]);
+    let effective_url = warehouse.run(&["config", "get", "remote.url"]);
     assert_success(&effective_url);
     assert_eq!(stdout(&effective_url).trim(), "https://global.example");
 
     // A warehouse-level value overrides the global one...
-    assert_success(&warehouse.run(&["config", "remote.url", "https://warehouse.example"]));
-    let overridden = warehouse.run(&["config", "remote.url"]);
+    assert_success(&warehouse.run(&["config", "set", "remote.url", "https://warehouse.example"]));
+    let overridden = warehouse.run(&["config", "get", "remote.url"]);
     assert_success(&overridden);
     assert_eq!(stdout(&overridden).trim(), "https://warehouse.example");
 
     // ...but reading the global scope explicitly still returns the global value.
-    let global_url = warehouse.run(&["config", "--global", "remote.url"]);
+    let global_url = warehouse.run(&["config", "get", "--global", "remote.url"]);
     assert_success(&global_url);
     assert_eq!(stdout(&global_url).trim(), "https://global.example");
 
@@ -454,14 +454,14 @@ fn config_values_are_scoped_and_the_warehouse_overrides_the_global_scope() {
     assert!(listing_output.contains("operator.identifier = global@id (global)"));
 
     // Unknown keys are rejected instead of silently doing nothing.
-    let unknown = warehouse.run(&["config", "operator.typo", "x"]);
+    let unknown = warehouse.run(&["config", "set", "operator.typo", "x"]);
     assert!(!unknown.status.success());
     assert!(stderr(&unknown).contains("Unknown configuration key"));
 
     // An unset key is an error on read.
     std::fs::remove_file(warehouse.home.join("global-config.toml")).unwrap();
-    assert_success(&warehouse.run(&["config", "remote.url"]));
-    let unset = warehouse.run(&["config", "operator.identifier"]);
+    assert_success(&warehouse.run(&["config", "get", "remote.url"]));
+    let unset = warehouse.run(&["config", "get", "operator.identifier"]);
     assert!(!unset.status.success());
     assert!(stderr(&unset).contains("not set"));
 }
@@ -494,7 +494,7 @@ fn a_config_file_that_sets_a_name_is_refused() {
     }
     std::fs::write(&local, &template).unwrap();
 
-    let set = warehouse.run(&["config", "operator.name", "Ada"]);
+    let set = warehouse.run(&["config", "set", "operator.name", "Ada"]);
     assert!(!set.status.success());
     assert!(stderr(&set).contains("Unknown configuration key"), "{}", stderr(&set));
 }
@@ -505,8 +505,8 @@ fn a_config_file_that_sets_a_name_is_refused() {
 /// Before this, `get_value_from_document` collapsed three states — absent, section-is-not-a-table,
 /// field-is-the-wrong-type — into `None`, and each caller decided for itself what `None` meant.
 /// The two reads below took that decision in opposite directions on the very same broken file:
-/// `config operator.identifier` fell through to the global scope and exited **0**, printing a
-/// value from a file the user was not configuring; `config remote.url` had nothing to fall
+/// `config get operator.identifier` fell through to the global scope and exited **0**, printing a
+/// value from a file the user was not configuring; `config get remote.url` had nothing to fall
 /// through to and exited **1** saying the key was "not set". One file, one defect, two answers,
 /// neither of them the truth.
 ///
@@ -536,8 +536,8 @@ fn a_configuration_file_either_parses_completely_or_every_read_of_it_refuses() {
         "[operator]\nidentifier = 12345\n",
     ).unwrap();
 
-    let identifier = warehouse.run(&["config", "operator.identifier"]);
-    let url = warehouse.run(&["config", "remote.url"]);
+    let identifier = warehouse.run(&["config", "get", "operator.identifier"]);
+    let url = warehouse.run(&["config", "get", "remote.url"]);
 
     assert_eq!(
         identifier.status.code(), url.status.code(),
@@ -564,7 +564,7 @@ fn a_configuration_file_either_parses_completely_or_every_read_of_it_refuses() {
 
 /// A bad value must not block its own repair. Validating the file *before*
 /// the edit meant `remote.tor = "onn"` refused every write to that file — including
-/// `config remote.tor on`, the command that corrects it. The value blocked its own repair, and a
+/// `config set remote.tor on`, the command that corrects it. The value blocked its own repair, and a
 /// text editor was the only way out. `write_validated` now parses the document **as edited**, so
 /// the question is whether the file you are about to leave on disk is valid.
 ///
@@ -583,18 +583,18 @@ fn a_write_that_repairs_the_offending_entry_is_allowed_where_one_that_leaves_it_
 
     // 1. Overwriting the offending key repairs the file.
     std::fs::write(&config, broken).unwrap();
-    assert_success(&warehouse.run(&["config", "remote.tor", "on"]));
+    assert_success(&warehouse.run(&["config", "set", "remote.tor", "on"]));
     assert!(
         std::fs::read_to_string(&config).unwrap().contains("tor = \"on\""),
         "the corrected value must be on disk: {}", std::fs::read_to_string(&config).unwrap()
     );
 
     // 2. And the file is ordinary again afterwards.
-    assert_success(&warehouse.run(&["config", "remote.token", "abc"]));
+    assert_success(&warehouse.run(&["config", "set", "remote.token", "abc"]));
 
     // 3. Unsetting the offending key repairs it too — it removes exactly what was refusing.
     std::fs::write(&config, broken).unwrap();
-    assert_success(&warehouse.run(&["config", "--unset", "remote.tor"]));
+    assert_success(&warehouse.run(&["config", "unset", "remote.tor"]));
     assert!(
         !std::fs::read_to_string(&config).unwrap().contains("onn"),
         "the offending entry must be gone"
@@ -602,7 +602,7 @@ fn a_write_that_repairs_the_offending_entry_is_allowed_where_one_that_leaves_it_
 
     // 4. A write that leaves the bad value in place is still refused, and still names it.
     std::fs::write(&config, broken).unwrap();
-    let refused = warehouse.run(&["config", "remote.token", "abc"]);
+    let refused = warehouse.run(&["config", "set", "remote.token", "abc"]);
     assert!(!refused.status.success(), "unrelated writes must not land beside a bad value");
     let error = stderr(&refused);
     assert!(error.contains("remote.tor"), "the refusal must name the offending key: {}", error);
@@ -752,15 +752,15 @@ fn a_mistyped_maintenance_value_is_refused_rather_than_read_as_a_default() {
     std::fs::write(&config, "").unwrap();
 
     for (key, value) in [("maintenance.auto", "flase"), ("maintenance.loose", "10k")] {
-        let set = warehouse.run(&["config", key, value]);
+        let set = warehouse.run(&["config", "set", key, value]);
         assert!(!set.status.success(), "config must refuse {key} = {value:?}");
         assert!(stderr(&set).contains(&format!("is not a valid value for {key}")), "{}", stderr(&set));
     }
     assert_eq!(std::fs::read_to_string(&config).unwrap(), "", "a refused set must not touch the file");
 
     // The documented spellings are accepted, and stored the documented way.
-    assert_success(&warehouse.run(&["config", "maintenance.auto", " OFF "]));
-    assert_eq!(stdout(&warehouse.run(&["config", "maintenance.auto"])).trim(), "off");
+    assert_success(&warehouse.run(&["config", "set", "maintenance.auto", " OFF "]));
+    assert_eq!(stdout(&warehouse.run(&["config", "get", "maintenance.auto"])).trim(), "off");
 }
 
 /// A warehouse configuration that is present but cannot be read is an error, never "absent".
@@ -771,13 +771,13 @@ fn a_mistyped_maintenance_value_is_refused_rather_than_read_as_a_default() {
 fn a_dangling_warehouse_config_link_is_an_error_not_a_fallback_to_global() {
     let warehouse = TestWarehouse::new("config-dangling-link");
     assert_success(&warehouse.run(&["prepare"]));
-    assert_success(&warehouse.run(&["config", "--global", "remote.url", "http://global.example/"]));
+    assert_success(&warehouse.run(&["config", "set", "--global", "remote.url", "http://global.example/"]));
 
     let config = warehouse.root.join(".forklift/config/warehouse.toml");
     let _ = std::fs::remove_file(&config);
     std::os::unix::fs::symlink(warehouse.root.join("gone.toml"), &config).unwrap();
 
-    let read = warehouse.run(&["config", "remote.url"]);
+    let read = warehouse.run(&["config", "get", "remote.url"]);
     assert!(
         !read.status.success(),
         "a dangling warehouse config must refuse, not answer with the global value: {}", stdout(&read)
@@ -796,7 +796,7 @@ fn a_dangling_warehouse_config_link_is_an_error_not_a_fallback_to_global() {
     std::os::unix::fs::symlink(warehouse.root.join("gone.toml"), warehouse.root.join("middle.toml")).unwrap();
     std::os::unix::fs::symlink(warehouse.root.join("middle.toml"), &config).unwrap();
 
-    let read = warehouse.run(&["config", "remote.url"]);
+    let read = warehouse.run(&["config", "get", "remote.url"]);
     assert!(!read.status.success(), "a dangling chain must refuse: {}", stdout(&read));
     assert!(stderr(&read).contains("symbolic link"), "the refusal must say why: {}", stderr(&read));
 
@@ -808,7 +808,7 @@ fn a_dangling_warehouse_config_link_is_an_error_not_a_fallback_to_global() {
     std::fs::remove_dir_all(&folder).unwrap();
     std::os::unix::fs::symlink(warehouse.root.join("unmounted"), &folder).unwrap();
 
-    let read = warehouse.run(&["config", "remote.url"]);
+    let read = warehouse.run(&["config", "get", "remote.url"]);
     assert!(
         !read.status.success(),
         "a dangling config folder must refuse, not answer with the global value: {}", stdout(&read)
@@ -817,7 +817,7 @@ fn a_dangling_warehouse_config_link_is_an_error_not_a_fallback_to_global() {
 
     // With nothing at the path at all, the global value applies — that is what absent means.
     std::fs::remove_file(&folder).unwrap();
-    let read = warehouse.run(&["config", "remote.url"]);
+    let read = warehouse.run(&["config", "get", "remote.url"]);
     assert_success(&read);
     assert_eq!(stdout(&read).trim(), "http://global.example/");
 }
@@ -830,7 +830,7 @@ fn a_config_file_that_is_not_toml_is_refused_like_any_invalid_file() {
     assert_success(&warehouse.run(&["prepare"]));
     std::fs::write(warehouse.root.join(".forklift/config/warehouse.toml"), "[remote\n").unwrap();
 
-    let read = warehouse.run(&["config", "remote.url"]);
+    let read = warehouse.run(&["config", "get", "remote.url"]);
     assert!(!read.status.success(), "a file that is not TOML must refuse: {}", stdout(&read));
 
     let error = stderr(&read);
@@ -4502,8 +4502,8 @@ fn office_manages_users_and_keys_as_signed_tracked_metadata() {
     // Admitting a second user: keygen prints the exact admit line (operator id,
     // public key and proof-of-possession — the CSR pattern). Bob runs keygen under
     // his own id (the warehouse scope overrides the global one).
-    assert_success(&warehouse.run(&["config", "operator.identifier", "bob@forklift"]));
-    let keygen = stdout(&warehouse.run(&["office", "keygen"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "bob@forklift"]));
+    let keygen = stdout(&warehouse.run(&["profile", "keygen"]));
     let admit_args: Vec<&str> = keygen.lines()
         .find(|line| line.trim_start().starts_with("office admit "))
         .expect("keygen must print the admit line")
@@ -4513,7 +4513,7 @@ fn office_manages_users_and_keys_as_signed_tracked_metadata() {
     assert_eq!(admit_args[0], "bob@forklift");
 
     // Back to the admin's identity: the admission is the admin's move.
-    assert_success(&warehouse.run(&["config", "operator.identifier", "test@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "test@forklift"]));
 
     // A proof-of-possession binds the key to its operator: admitting the same key
     // under a different id is refused.
@@ -4611,7 +4611,7 @@ fn manifest_provenance_records_forge_proof_machine_authorship() {
         "office", "admit", &agent[0], &agent[1], &agent[2], "--agent", "--supervisor", "test@forklift",
     ]));
 
-    assert_success(&warehouse.run(&["config", "operator.identifier", "agent@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "agent@forklift"]));
     assert_success(&warehouse.run(&[
         "manifest", "provenance", "main",
         "--model", "claude-opus-4-8", "--tool", "claude-code", "--session", "sess-42",
@@ -4630,7 +4630,7 @@ fn manifest_provenance_records_forge_proof_machine_authorship() {
     assert!(json.contains("\"model\"") && json.contains("claude-opus-4-8"), "unexpected json: {}", json);
 
     // The model is the compliance-critical field, so it is required.
-    assert_success(&warehouse.run(&["config", "operator.identifier", "test@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "test@forklift"]));
     let no_model = warehouse.run(&["manifest", "provenance", "main", "--tool", "x"]);
     assert!(!no_model.status.success(), "provenance must require --model");
 }
@@ -5880,9 +5880,9 @@ fn haul_reviews_carry_signed_identity_and_merges() {
     assert_success(&warehouse.run(&[
         "office", "admit", &agent[0], &agent[1], &agent[2], "--agent", "--supervisor", "test@forklift",
     ]));
-    assert_success(&warehouse.run(&["config", "operator.identifier", "agent@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "agent@forklift"]));
     assert_success(&warehouse.run(&["haul", "review", &id, "--request-changes", "-m", "needs tests"]));
-    assert_success(&warehouse.run(&["config", "operator.identifier", "test@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "test@forklift"]));
 
     let shown = json(&warehouse.run(&["haul", "show", &id, "--json"]));
     let reviews = shown["data"]["reviews"].as_array().unwrap().clone();
@@ -5985,7 +5985,7 @@ fn haul_merge_by_a_writer_not_granted_the_target_is_refused_before_merging() {
     assert_success(&warehouse.run(&["office", "admit", &dev[0], &dev[1], &dev[2], "--role", "writer", "--pallet", "feature"]));
     let main = pallet_head_hash(&warehouse, "main");
 
-    assert_success(&warehouse.run(&["config", "operator.identifier", "dev@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "dev@forklift"]));
     let refused = warehouse.run(&["haul", "consolidate", &id]);
     assert!(
         stderr(&refused).contains("Operator dev@forklift may not write \"main\", and only its writers record a merge into it. Nothing was merged."),
@@ -5998,9 +5998,9 @@ fn haul_merge_by_a_writer_not_granted_the_target_is_refused_before_merging() {
     assert_eq!(json(&warehouse.run(&["haul", "show", &id, "--json"]))["data"]["status"], "open");
 
     // Granted the target, the same writer merges.
-    assert_success(&warehouse.run(&["config", "operator.identifier", "test@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "test@forklift"]));
     assert_success(&warehouse.run(&["office", "role", "dev@forklift", "writer", "--pallet", "feature", "--pallet", "main"]));
-    assert_success(&warehouse.run(&["config", "operator.identifier", "dev@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "dev@forklift"]));
     assert_success(&warehouse.run(&["haul", "consolidate", &id]));
     assert_eq!(json(&warehouse.run(&["haul", "show", &id, "--json"]))["data"]["status"], "merged");
 }
@@ -6210,11 +6210,11 @@ fn history_shows_identity_class_and_query_filters_by_it() {
     assert_success(&warehouse.run(&[
         "office", "admit", &agent[0], &agent[1], &agent[2], "--agent", "--supervisor", "test@forklift",
     ]));
-    assert_success(&warehouse.run(&["config", "operator.identifier", "agent@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "agent@forklift"]));
     warehouse.write_file("a.txt", "v2\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "agent work"]));
-    assert_success(&warehouse.run(&["config", "operator.identifier", "test@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "test@forklift"]));
 
     // The log calls out the agent's authorship and supervisor (from the signed record).
     let history = stdout(&warehouse.run(&["history"]));
@@ -6969,6 +6969,68 @@ fn profiles_select_the_identity_a_warehouse_acts_under() {
     assert!(work_line.contains("1 local key(s)"), "unexpected profile list: {}", list);
 }
 
+/// `profile keygen` binds the key to an identity the command names: the profile given, else the
+/// profile the enclosing warehouse selects, else the globally selected one, else the default
+/// identity. It runs outside a warehouse and records nothing in one; `office keygen` is gone.
+///
+/// Revert: bind a named keygen to the current identity → the admit line carries the default id →
+/// red; drop the outside-a-warehouse entry → keygen in the home refuses → red.
+#[test]
+fn profile_keygen_binds_to_the_named_or_current_identity_inside_or_outside_a_warehouse() {
+    let warehouse = TestWarehouse::new("profile-keygen");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["profile", "create", "work"]));
+    let admitted = |output: &Output| -> String {
+        assert_success(output);
+        stdout(output).lines()
+            .find(|line| line.trim_start().starts_with("office admit "))
+            .expect("keygen prints the admit line")
+            .split_whitespace().nth(2).unwrap().to_string()
+    };
+
+    // Outside a warehouse, with nothing selected: the default identity.
+    let outside = warehouse.home.join("elsewhere");
+    std::fs::create_dir_all(&outside).unwrap();
+    let default = warehouse.run_at(&outside, &["profile", "keygen"]);
+    assert_eq!(admitted(&default), "test@forklift");
+    assert!(stdout(&default).contains("for the default identity (the global operator.identifier)"), "{}", stdout(&default));
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0, "keygen outside a warehouse writes nothing there");
+
+    // Inside the warehouse, an operator.identifier it sets wins over the global one.
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "local@forklift"]));
+    let local = warehouse.run(&["profile", "keygen"]);
+    assert_eq!(admitted(&local), "local@forklift");
+    assert!(stdout(&local).contains("this warehouse's operator.identifier"), "{}", stdout(&local));
+
+    // A named profile, wherever it runs, is that profile's id.
+    let selected = warehouse.run(&["profile", "use", "work"]);
+    assert_success(&selected);
+    let work_id = stdout(&selected).split("operator id ").nth(1).unwrap().trim_end_matches([')', '.', '\n']).to_string();
+    let named = warehouse.run_at(&outside, &["profile", "keygen", "work"]);
+    assert_eq!(admitted(&named), work_id);
+    assert!(stdout(&named).contains("for profile \"work\""), "{}", stdout(&named));
+
+    // Inside the warehouse that selects it, and from a subdirectory of it.
+    warehouse.write_file("sub/a.txt", "one\n");
+    let inside = warehouse.run_in("sub", &["profile", "keygen"]);
+    assert_eq!(admitted(&inside), work_id);
+    assert!(stdout(&inside).contains("profile \"work\", which this warehouse selects"), "{}", stdout(&inside));
+
+    // Outside it, the global selection applies, and says so.
+    assert_success(&warehouse.run(&["config", "set", "--global", "operator.profile", "work"]));
+    let global = warehouse.run_at(&outside, &["profile", "keygen"]);
+    assert_eq!(admitted(&global), work_id);
+    assert!(stdout(&global).contains("selected in the global configuration"), "{}", stdout(&global));
+
+    let missing = warehouse.run_at(&outside, &["profile", "keygen", "nope"]);
+    assert!(!missing.status.success());
+    assert!(stderr(&missing).contains("The profile \"nope\" does not exist"), "{}", stderr(&missing));
+
+    let gone = warehouse.run(&["office", "keygen"]);
+    assert_eq!(gone.status.code(), Some(2), "{}", stderr(&gone));
+}
+
 /// The end-to-end regression the strict
 /// parse exists to prevent. `get_operator` must refuse outright on a malformed selected profile
 /// — and, the part that was unpinned, it must never mint a replacement identifier and write it
@@ -6986,7 +7048,7 @@ fn a_malformed_selected_profile_refuses_without_writing_back_to_the_global_confi
 
     // Select it via the plain "config" key (not "profile use", which itself calls
     // get_profile and would already refuse before ever setting operator.profile).
-    assert_success(&warehouse.run(&["config", "operator.profile", "work"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.profile", "work"]));
 
     let before = std::fs::read(&global_config).unwrap();
 
@@ -7024,7 +7086,7 @@ fn an_empty_identifier_refuses_rather_than_minting_a_replacement_over_it() {
 
     let global_config = warehouse.home.join("global-config.toml");
     std::fs::write(&global_config, "[profile.work]\nidentifier = \"\"\n").unwrap();
-    assert_success(&warehouse.run(&["config", "operator.profile", "work"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.profile", "work"]));
 
     let before = std::fs::read(&global_config).unwrap();
 
@@ -7066,7 +7128,7 @@ fn a_fixed_value_key_is_written_to_disk_in_its_documented_spelling() {
     let warehouse = TestWarehouse::new("config-normalizes-fixed-values");
     assert_success(&warehouse.run(&["prepare"]));
 
-    assert_success(&warehouse.run(&["config", "remote.tor", "  ON  "]));
+    assert_success(&warehouse.run(&["config", "set", "remote.tor", "  ON  "]));
 
     let config = warehouse.root.join(".forklift/config/warehouse.toml");
     let content = std::fs::read_to_string(&config).unwrap();
@@ -7081,7 +7143,7 @@ fn a_fixed_value_key_is_written_to_disk_in_its_documented_spelling() {
 
     // And the file is an ordinary one afterwards — the stored value is admissible on the way
     // back in, which is the whole reason for normalizing it on the way out.
-    let read = warehouse.run(&["config", "remote.tor"]);
+    let read = warehouse.run(&["config", "get", "remote.tor"]);
     assert_success(&read);
     assert!(stdout(&read).contains("on"), "unexpected read-back: {}", stdout(&read));
 }
@@ -7097,7 +7159,7 @@ fn the_json_set_envelope_reports_the_value_that_reached_the_file() {
     let warehouse = TestWarehouse::new("config-json-echo-is-the-stored-value");
     assert_success(&warehouse.run(&["prepare"]));
 
-    let set = warehouse.run(&["--json", "config", "remote.tor", "  ON  "]);
+    let set = warehouse.run(&["--json", "config", "set", "remote.tor", "  ON  "]);
     assert_success(&set);
 
     let envelope = json(&set);
@@ -7111,7 +7173,7 @@ fn the_json_set_envelope_reports_the_value_that_reached_the_file() {
     let content = std::fs::read_to_string(warehouse.root.join(".forklift/config/warehouse.toml"))
         .unwrap();
     assert!(content.contains("tor = \"on\""), "unexpected file content: {content}");
-    assert!(stdout(&warehouse.run(&["config", "remote.tor"])).contains("on"));
+    assert!(stdout(&warehouse.run(&["config", "get", "remote.tor"])).contains("on"));
 }
 
 /// An empty value is refused with the fact alone wherever no advice is true on every path, and with
@@ -7128,12 +7190,12 @@ fn an_empty_value_is_refused_with_advice_only_where_the_advice_is_always_true() 
     // `config`, both scopes, a key that is set and one that is not: the same bare fact. The
     // global case runs inside a warehouse, where an `--unset` without `--global` used to be
     // suggested and would have targeted the wrong file.
-    assert_success(&warehouse.run(&["config", "--global", "operator.identifier", "ada"]));
+    assert_success(&warehouse.run(&["config", "set", "--global", "operator.identifier", "ada"]));
 
     for (args, key) in [
-        (vec!["config", "--global", "operator.identifier", ""], "operator.identifier"),
-        (vec!["config", "operator.identifier", "   "], "operator.identifier"),
-        (vec!["config", "remote.token", ""], "remote.token"),
+        (vec!["config", "set", "--global", "operator.identifier", ""], "operator.identifier"),
+        (vec!["config", "set", "operator.identifier", "   "], "operator.identifier"),
+        (vec!["config", "set", "remote.token", ""], "remote.token"),
     ] {
         let refused = warehouse.run(&args);
         assert!(!refused.status.success(), "{args:?} must refuse: {}", stdout(&refused));
@@ -7141,11 +7203,11 @@ fn an_empty_value_is_refused_with_advice_only_where_the_advice_is_always_true() 
     }
 
     // The refused write left the value it would have replaced.
-    let read = warehouse.run(&["config", "--global", "operator.identifier"]);
+    let read = warehouse.run(&["config", "get", "--global", "operator.identifier"]);
     assert_eq!(stdout(&read).trim(), "ada", "a refused write must leave the file as it was");
 
     // An unknown key is reported as unknown, not as empty: the key is checked first.
-    let refused = warehouse.run(&["config", "operator.nmae", ""]);
+    let refused = warehouse.run(&["config", "set", "operator.nmae", ""]);
     assert!(
         stderr(&refused).contains("Unknown configuration key"),
         "unexpected: {}", stderr(&refused)
@@ -7170,7 +7232,7 @@ fn an_empty_value_is_refused_with_advice_only_where_the_advice_is_always_true() 
     // and could not succeed while another entry in the file was also bad.
     std::fs::write(&global_config, "[operator]\nidentifier = \"op-1\"\n[remote]\nurl = \"\"\n").unwrap();
 
-    let read = warehouse.run(&["config", "remote.url"]);
+    let read = warehouse.run(&["config", "get", "remote.url"]);
     assert!(!read.status.success(), "a file holding an empty value must refuse");
 
     let message = stderr(&read);
@@ -7211,7 +7273,7 @@ fn franchise_and_profile_use_refuse_an_empty_value_in_their_own_words() {
     assert!(message.contains("A profile name cannot be empty."), "unexpected: {message}");
     assert!(!message.contains("--unset"), "there is no entry to remove: {message}");
 
-    let read = warehouse.run(&["config", "operator.profile"]);
+    let read = warehouse.run(&["config", "get", "operator.profile"]);
     assert!(!read.status.success(), "nothing may be selected: {}", stdout(&read));
     assert!(stderr(&read).contains("is not set"), "unexpected read: {}", stderr(&read));
 }
@@ -7394,7 +7456,7 @@ fn office_link_endorses_a_second_device_key() {
 
     // "Device 2": a fresh keypair under the same operator UUID (the shared test key
     // directory stands in for the second machine). Keygen prints the exact link line.
-    let keygen = stdout(&warehouse.run(&["office", "keygen"]));
+    let keygen = stdout(&warehouse.run(&["profile", "keygen"]));
     let link_args: Vec<&str> = keygen.lines()
         .find(|line| line.trim_start().starts_with("office link "))
         .expect("keygen must print the link line")
@@ -7418,8 +7480,8 @@ fn office_link_endorses_a_second_device_key() {
     assert_success(&warehouse.run(&["audit"]));
 
     // A proof-of-possession bound to another operator's id cannot be linked.
-    assert_success(&warehouse.run(&["config", "operator.identifier", "other@forklift"]));
-    let foreign_keygen = stdout(&warehouse.run(&["office", "keygen"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "other@forklift"]));
+    let foreign_keygen = stdout(&warehouse.run(&["profile", "keygen"]));
     let foreign_args: Vec<String> = foreign_keygen.lines()
         .find(|line| line.trim_start().starts_with("office link "))
         .expect("keygen must print the link line")
@@ -7427,7 +7489,7 @@ fn office_link_endorses_a_second_device_key() {
         .skip(2)
         .map(|s| s.to_string())
         .collect();
-    assert_success(&warehouse.run(&["config", "operator.identifier", "test@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "test@forklift"]));
 
     let refused = warehouse.run(&["office", "link", &foreign_args[0], &foreign_args[1]]);
     assert!(!refused.status.success());
@@ -7443,8 +7505,8 @@ fn office_authorize_recovers_an_enrolled_operator_who_lost_all_keys() {
     assert_success(&warehouse.run(&["office", "enroll"]));
 
     // Bob is admitted as a writer.
-    assert_success(&warehouse.run(&["config", "operator.identifier", "bob@forklift"]));
-    let keygen = stdout(&warehouse.run(&["office", "keygen"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "bob@forklift"]));
+    let keygen = stdout(&warehouse.run(&["profile", "keygen"]));
     let admit_args: Vec<String> = keygen.lines()
         .find(|line| line.trim_start().starts_with("office admit "))
         .expect("keygen must print the admit line")
@@ -7452,13 +7514,13 @@ fn office_authorize_recovers_an_enrolled_operator_who_lost_all_keys() {
         .skip(2)
         .map(|s| s.to_string())
         .collect();
-    assert_success(&warehouse.run(&["config", "operator.identifier", "test@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "test@forklift"]));
     assert_success(&warehouse.run(&["office", "admit", &admit_args[0], &admit_args[1], &admit_args[2]]));
 
     // Bob "lost every device": he generates a fresh key on a new machine and hands
     // the admin the keygen line — he cannot link it himself (no surviving key signs).
-    assert_success(&warehouse.run(&["config", "operator.identifier", "bob@forklift"]));
-    let recovery_keygen = stdout(&warehouse.run(&["office", "keygen"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "bob@forklift"]));
+    let recovery_keygen = stdout(&warehouse.run(&["profile", "keygen"]));
     let recovery_args: Vec<String> = recovery_keygen.lines()
         .find(|line| line.trim_start().starts_with("office admit "))
         .expect("keygen must print the admit line")
@@ -7474,7 +7536,7 @@ fn office_authorize_recovers_an_enrolled_operator_who_lost_all_keys() {
     assert!(!unauthorized.status.success());
     assert!(stderr(&unauthorized).contains("not an office admin"), "{}", stderr(&unauthorized));
 
-    assert_success(&warehouse.run(&["config", "operator.identifier", "test@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "test@forklift"]));
 
     // Your own devices go through "link", not an admin authorization.
     let own = warehouse.run(
@@ -7579,7 +7641,7 @@ fn parcels_are_signed_after_enrollment_and_audit_verifies_them() {
 
     // An operator who is not enrolled cannot stack: no unsigned escape hatch.
     // (The warehouse scope overrides the global one.)
-    assert_success(&warehouse.run(&["config", "operator.identifier", "eve@evil"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "eve@evil"]));
     warehouse.write_file("a.txt", "evil\n");
     assert_success(&warehouse.run(&["load", "."]));
     let refused = warehouse.run(&["stack", "evil work"]);
@@ -9182,31 +9244,31 @@ fn config_unset_removes_a_value() {
     assert_success(&warehouse.run(&["prepare"]));
 
     // Set a warehouse value, confirm it reads back, then unset it.
-    assert_success(&warehouse.run(&["config", "remote.token", "sekret"]));
-    assert_eq!(stdout(&warehouse.run(&["config", "remote.token"])).trim(), "sekret");
+    assert_success(&warehouse.run(&["config", "set", "remote.token", "sekret"]));
+    assert_eq!(stdout(&warehouse.run(&["config", "get", "remote.token"])).trim(), "sekret");
 
-    let unset = warehouse.run(&["config", "--unset", "remote.token"]);
+    let unset = warehouse.run(&["config", "unset", "remote.token"]);
     assert_success(&unset);
     assert!(stdout(&unset).contains("Unset"), "{}", stdout(&unset));
 
     // It is gone now: reading it fails (not set), and the file no longer holds it.
-    let read = warehouse.run(&["config", "remote.token"]);
+    let read = warehouse.run(&["config", "get", "remote.token"]);
     assert!(!read.status.success());
     assert!(stderr(&read).contains("not set"), "{}", stderr(&read));
 
     // Unsetting an already-absent key reports "not set" (non-zero).
-    let again = warehouse.run(&["config", "--unset", "remote.token"]);
+    let again = warehouse.run(&["config", "unset", "remote.token"]);
     assert!(!again.status.success());
     assert!(stderr(&again).contains("not set"), "{}", stderr(&again));
 
     // An unknown key is rejected, not silently ignored.
-    let unknown = warehouse.run(&["config", "--unset", "bogus.key"]);
+    let unknown = warehouse.run(&["config", "unset", "bogus.key"]);
     assert!(!unknown.status.success());
     assert!(stderr(&unknown).contains("Unknown configuration key"), "{}", stderr(&unknown));
 
     // --json emits the envelope for a successful unset.
-    assert_success(&warehouse.run(&["config", "remote.token", "temp"]));
-    let json_unset = warehouse.run(&["config", "--unset", "remote.token", "--json"]);
+    assert_success(&warehouse.run(&["config", "set", "remote.token", "temp"]));
+    let json_unset = warehouse.run(&["config", "unset", "remote.token", "--json"]);
     assert_success(&json_unset);
     assert_eq!(json(&json_unset)["ok"], true);
     assert_eq!(json(&json_unset)["command"], "config");
@@ -9436,11 +9498,11 @@ fn blame_reads_the_identity_class_of_an_agent_authored_line() {
     assert_success(&warehouse.run(&[
         "office", "admit", &agent[0], &agent[1], &agent[2], "--agent", "--supervisor", "test@forklift",
     ]));
-    assert_success(&warehouse.run(&["config", "operator.identifier", "agent@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "agent@forklift"]));
     warehouse.write_file("f.txt", "human line\nagent line\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "agent parcel"]));
-    assert_success(&warehouse.run(&["config", "operator.identifier", "test@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "test@forklift"]));
 
     // The agent-authored line carries the identity class and supervisor — blame git cannot
     // express (§7.1). The human-authored line carries neither.
@@ -9496,7 +9558,7 @@ fn tags_are_signed_admin_only_and_verify_offline() {
     // Only an admin may cut a tag (the release convention, §9.4d): a writer is refused.
     let writer = keygen_admit_args(&warehouse, "writer@forklift");
     assert_success(&warehouse.run(&["office", "admit", &writer[0], &writer[1], &writer[2]]));
-    assert_success(&warehouse.run(&["config", "operator.identifier", "writer@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "writer@forklift"]));
     let refused = warehouse.run(&["tag", "create", "v2.0", "main"]);
     assert!(!refused.status.success() && stderr(&refused).contains("admin"), "{}", stderr(&refused));
 }
@@ -9512,11 +9574,11 @@ fn cherry_pick_applies_a_parcel_diff_preserving_authorship() {
 
     // A feature pallet whose parcel is authored by *bob* (a different operator).
     assert_success(&warehouse.run(&["pallet", "create", "feature"]));
-    assert_success(&warehouse.run(&["config", "operator.identifier", "bob@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "bob@forklift"]));
     warehouse.write_file("bob.txt", "bob's work\n");
     assert_success(&warehouse.run(&["load", "."]));
     let source = extract_parcel_hash(&warehouse.run(&["stack", "bob's change"]));
-    assert_success(&warehouse.run(&["config", "operator.identifier", "test@forklift"]));
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "test@forklift"]));
 
     // test cherry-picks bob's parcel onto main.
     assert_success(&warehouse.run(&["shift", "main"]));
@@ -10545,12 +10607,12 @@ fn a_mutating_command_runs_maintenance_when_due() {
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     // Lower the pack threshold so a couple of packs is "too many" (git's gc.autoPackLimit).
-    assert_success(&warehouse.run(&["config", "maintenance.packs", "1"]));
+    assert_success(&warehouse.run(&["config", "set", "maintenance.packs", "1"]));
     let objects = warehouse.root.join(".forklift/objects");
 
     // Make two packs (two rounds of stack + incremental compact) with auto off, so the setup
     // itself never triggers maintenance.
-    assert_success(&warehouse.run(&["config", "maintenance.auto", "false"]));
+    assert_success(&warehouse.run(&["config", "set", "maintenance.auto", "false"]));
     for v in 0..2 {
         warehouse.write_file("f.txt", &format!("v{}\n", v));
         assert_success(&warehouse.run(&["load", "."]));
@@ -10570,7 +10632,7 @@ fn a_mutating_command_runs_maintenance_when_due() {
     // The command must have released its shared store-access hold first: a full repack takes the
     // store exclusively, and a process's own shared hold would refuse it — quietly, on the
     // auto-maintenance path, leaving the packs unconsolidated.
-    assert_success(&warehouse.run(&["config", "maintenance.auto", "true"]));
+    assert_success(&warehouse.run(&["config", "set", "maintenance.auto", "true"]));
     warehouse.write_file("f.txt", "trigger\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "trigger"]));

@@ -416,7 +416,7 @@ passphrase, not a live attacker on the machine.
 
 ## Key lifecycle rules
 - **enroll** — genesis only; later users are admitted by an enrolled operator.
-- **admit** — the newcomer runs `office keygen` locally and hands over the *public* key;
+- **admit** — the newcomer runs `profile keygen` locally and hands over the *public* key;
   an enrolled operator records user + key, signed with their own active key.
 - **rotate** — issues a fresh key and retires the operator's active ones in one office
   parcel, signed with the **old** key: the continuity proof.

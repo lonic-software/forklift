@@ -273,7 +273,9 @@ changelog), `SERVER.md` (server ops), `MACHINE_INTERFACE.md` (`--json`/MCP),
    prefixes are only for typing. A command with subcommands takes no positional argument, and
    each of its options takes no value or exactly one, so the prefix expansion in
    `crates/forklift/src/prefix.rs` can tell its subcommand from its arguments; that module's
-   tests hold it.
+   tests hold it. A flag never switches a command into a different operation: an on/off flag
+   declared to conflict with a positional argument (`--abort` against a URL) is a second
+   operation, and the surface tests refuse it, so make it a subcommand of its own.
 9. **Decide whether agents drive it.** `forklift mcp` generates its tools from the command
    definition, so a new command is an agent tool with nothing more to do: its one-line and long
    descriptions are the tool's description and each argument's help is that argument's (put

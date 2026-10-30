@@ -270,7 +270,7 @@ refusal_codes! {
     /// A move of a partial warehouse's origin was started and has not finished: until it does,
     /// nothing fetches, lifts, reads the remote's heads or writes the records the move checks
     /// against the new server. The next step finishes the move (`remote move <url>`), or abandons
-    /// one that has not started rewriting (`remote move --abort`).
+    /// one that has not started rewriting (`remote abort`).
     OriginMovePending => "origin_move_pending",
 
     /// A move of a partial warehouse's origin found the new server lacking content this warehouse

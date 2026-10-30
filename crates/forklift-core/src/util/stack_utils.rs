@@ -137,7 +137,7 @@ pub fn resolve_signing_key(operator: &Operator) -> Result<Signing, String> {
         return Err(format!(
             "Trust is established for this warehouse, and \"{}\" is not enrolled: \
             parcels cannot be stacked without a signature. Ask an enrolled operator to \
-            admit you (\"forklift office keygen\", then \"forklift office admit\").",
+            admit you (\"forklift profile keygen\", then \"forklift office admit\").",
             operator.identifier
         ));
     }

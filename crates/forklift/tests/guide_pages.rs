@@ -596,7 +596,7 @@ fn only_commands_a_shell_runs_unchanged_are_run() {
     assert!(!runs("forklift stack \"unclosed"));
     assert!(!runs("forklift stack m # a comment"));
     assert!(!runs("echo 'a\\nb' > f"));
-    assert!(!runs("forklift config operator.identifier =ada"));
-    assert!(runs("forklift config remote.url --opt=a=b"));
+    assert!(!runs("forklift config set operator.identifier =ada"));
+    assert!(runs("forklift config set remote.url --opt=a=b"));
     assert!(!runs("  "));
 }

@@ -751,7 +751,6 @@ pub(crate) const HUMAN_ONLY: &[(&str, &str)] = &[
     ("clone", "clones a remote, which is setup"),
     ("git", "migrates a repository in or out, which is setup, or mirrors to an external git remote under the user's own git credentials"),
     ("office enroll", "establishes the operator's trust, a one-way setup step"),
-    ("office keygen", "creates a signing key, which is setup"),
     ("office admit", "enrolls another operator: trust administration"),
     ("office link", "links another device's key: trust administration"),
     ("office authorize", "authorizes a key for another operator: trust administration"),

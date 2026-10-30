@@ -207,26 +207,16 @@ pub enum Command {
     /// Read or change configuration values
     #[command(
         visible_alias = "cfg",
-        long_about = "Read or change configuration values (e.g. \"remote.url\"). Without a key, \
-                      every known key is listed; with a key, its value is printed; with a key and a \
-                      value, the value is set; with --unset, the key is removed (e.g. clearing a \
-                      \"remote.token\"). Values are stored in the current warehouse by default; \
-                      when reading, the warehouse value wins over the global one."
+        long_about = "Read or change configuration values (e.g. \"remote.url\"): list every known \
+                      key, get one, set one or unset one. Values are stored in the current \
+                      warehouse by default, and each subcommand's --global targets the per-user \
+                      configuration that applies to all warehouses; when reading, the warehouse value wins over the \
+                      global one. Without a subcommand, every known key is listed with its \
+                      effective value."
     )]
     Config {
-        /// Operate on the per-user configuration that applies to all warehouses
-        #[arg(short, long)]
-        global: bool,
-
-        /// Remove the key from the configuration (e.g. "forklift config --unset remote.token")
-        #[arg(long, conflicts_with = "value")]
-        unset: bool,
-
-        /// The configuration key (e.g. "remote.url"); omit it to list every key
-        key: Option<String>,
-
-        /// The value to set the key to; omit it to print the current value
-        value: Option<String>,
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
     },
 
     /// List the files left in conflict by an unresolved consolidation
@@ -578,7 +568,8 @@ pub enum Command {
                       configuration. A warehouse selects one \
                       with \"forklift profile use\", so one machine can act as different operators in \
                       different warehouses — e.g. a personal identity and one per organization. \
-                      Without a subcommand, the profiles are listed."
+                      \"forklift profile keygen\" generates a signing key for one. Without a \
+                      subcommand, the profiles are listed."
     )]
     Profile {
         #[command(subcommand)]
@@ -1585,24 +1576,29 @@ pub enum RemoteAction {
                       \"remote.token\" with --token). If the check fails, nothing is rewritten and \
                       the origin stays; when the new server lacks content, copy the old server's \
                       warehouse to it server-side and run the move again. A move that stopped \
-                      before it started rewriting can be abandoned with --abort; one that stopped \
-                      while rewriting is finished by running the move again. A full warehouse has \
-                      no origin: set \"remote.url\" with \"forklift config\" instead."
+                      before it started rewriting can be abandoned with \"forklift remote abort\"; \
+                      one that stopped while rewriting is finished by running the move again. A full warehouse has \
+                      no origin: set \"remote.url\" with \"forklift config set\" instead."
     )]
     Move {
         /// The new origin's URL
-        #[arg(required_unless_present = "abort")]
-        url: Option<String>,
+        url: String,
 
         /// The bearer token for the new origin, stored as remote.token when the move completes
         /// (default: the current remote.token)
-        #[arg(long, conflicts_with = "abort")]
+        #[arg(long)]
         token: Option<String>,
-
-        /// Abandon a move that stopped before it started rewriting the origin
-        #[arg(long, conflicts_with = "url")]
-        abort: bool,
     },
+
+    /// Abandon a move that stopped before it started rewriting the origin
+    #[command(
+        long_about = "Abandon a move of the origin that stopped before it started rewriting: the \
+                      origin and \"remote.url\" stay as they were, and fetching and lifting work \
+                      again. A move that stopped while rewriting cannot be abandoned, because part \
+                      of this warehouse already points at the new server; run the move again to \
+                      finish it. With no move under way, it reports that and changes nothing."
+    )]
+    Abort,
 }
 
 #[derive(Subcommand)]
@@ -1638,24 +1634,10 @@ pub enum OfficeAction {
         passphrase: bool,
     },
 
-    /// Generate a keypair locally and print its public half + proof-of-possession
-    #[command(
-        long_about = "Generate a keypair locally and print its public half plus a \
-                      proof-of-possession (a self-signature binding the key to your operator \
-                      UUID). The private key stays on this machine. Hand the printed admit line \
-                      to an office admin to be enrolled, or the printed link line to a machine \
-                      that already holds one of your keys to add this as another device."
-    )]
-    Keygen {
-        /// Protect the new key with a passphrase (recommended for human operators)
-        #[arg(long)]
-        passphrase: bool,
-    },
-
     /// Enroll another operator with their public key — admins only
     #[command(
         long_about = "Enroll another operator: their UUID, public key and proof-of-possession, \
-                      exactly as printed by their \"forklift office keygen\" run. The key becomes \
+                      exactly as printed by their \"forklift profile keygen\" run. The key becomes \
                       their identity root, endorsed by your admin key. Office records are \
                       pseudonymous — no names or emails ever go on-chain. Mark automated \
                       principals with --agent / --bot / --service: the class rides in the \
@@ -1665,7 +1647,7 @@ pub enum OfficeAction {
                       sign autonomously under their own marked identity, never as a human)."
     )]
     Admit {
-        /// The operator's UUID (printed by their "forklift office keygen")
+        /// The operator's UUID (printed by their "forklift profile keygen")
         #[arg(value_name = "OPERATOR_UUID")]
         operator_id: String,
 
@@ -1673,7 +1655,7 @@ pub enum OfficeAction {
         #[arg(value_name = "PUBLIC_KEY_HEX")]
         public_key: String,
 
-        /// The key's proof-of-possession (printed by their "forklift office keygen")
+        /// The key's proof-of-possession (printed by their "forklift profile keygen")
         #[arg(value_name = "PROOF_OF_POSSESSION_HEX")]
         pop: String,
 
@@ -1707,7 +1689,7 @@ pub enum OfficeAction {
         long_about = "Link another device's key to your own identity: a sigchain endorsement — \
                       the new key is trusted because a key you already hold signs for it, so \
                       every warehouse that trusts your identity accepts it automatically. Run \
-                      \"forklift office keygen\" on the other device (configured with the same \
+                      \"forklift profile keygen\" on the other device (configured with the same \
                       operator.uuid) and pass the printed public key and proof-of-possession \
                       here."
     )]
@@ -1716,7 +1698,7 @@ pub enum OfficeAction {
         #[arg(value_name = "PUBLIC_KEY_HEX")]
         public_key: String,
 
-        /// The new key's proof-of-possession (printed by "forklift office keygen")
+        /// The new key's proof-of-possession (printed by "forklift profile keygen")
         #[arg(value_name = "PROOF_OF_POSSESSION_HEX")]
         pop: String,
     },
@@ -1727,14 +1709,14 @@ pub enum OfficeAction {
                       someone who lost every device (the scope of a key-authorization \
                       equals the scope of the authorizer's authority, so an admin's endorsement \
                       is valid exactly here, in the office they administer). The operator runs \
-                      \"forklift office keygen\" on their new machine and hands you the printed \
+                      \"forklift profile keygen\" on their new machine and hands you the printed \
                       line over a channel where you can confirm it is really them; their \
                       proof-of-possession still co-signs the record, so you cannot attribute a \
                       key they do not hold. For your own devices use \"forklift office link\"; for a new \
                       operator use \"forklift office admit\"."
     )]
     Authorize {
-        /// The enrolled operator's UUID (printed by their "forklift office keygen")
+        /// The enrolled operator's UUID (printed by their "forklift profile keygen")
         #[arg(value_name = "OPERATOR_UUID")]
         operator_id: String,
 
@@ -1742,7 +1724,7 @@ pub enum OfficeAction {
         #[arg(value_name = "PUBLIC_KEY_HEX")]
         public_key: String,
 
-        /// The new key's proof-of-possession (printed by "forklift office keygen")
+        /// The new key's proof-of-possession (printed by "forklift profile keygen")
         #[arg(value_name = "PROOF_OF_POSSESSION_HEX")]
         pop: String,
     },
@@ -1844,6 +1826,49 @@ pub enum OfficeAction {
 }
 
 #[derive(Subcommand)]
+pub enum ConfigAction {
+    /// List every known key and its value (the default)
+    List {
+        /// List the per-user configuration that applies to all warehouses
+        #[arg(short, long)]
+        global: bool,
+    },
+
+    /// Print the value of a key
+    Get {
+        /// Read the per-user configuration that applies to all warehouses
+        #[arg(short, long)]
+        global: bool,
+
+        /// The configuration key (e.g. "remote.url")
+        key: String,
+    },
+
+    /// Set a key to a value
+    Set {
+        /// Write the per-user configuration that applies to all warehouses
+        #[arg(short, long)]
+        global: bool,
+
+        /// The configuration key (e.g. "remote.url")
+        key: String,
+
+        /// The value to set the key to
+        value: String,
+    },
+
+    /// Remove a key (e.g. clearing a "remote.token")
+    Unset {
+        /// Remove the key from the per-user configuration that applies to all warehouses
+        #[arg(short, long)]
+        global: bool,
+
+        /// The configuration key (e.g. "remote.token")
+        key: String,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum ProfileAction {
     /// List the profiles and the local keys each one holds (the default)
     List,
@@ -1863,6 +1888,29 @@ pub enum ProfileAction {
         /// The profile name
         name: String,
     },
+
+    /// Generate a keypair locally and print its public half + proof-of-possession
+    #[command(
+        long_about = "Generate a keypair locally and print its public half plus a \
+                      proof-of-possession (a self-signature binding the key to an operator id). \
+                      The private key stays on this machine. Hand the printed admit line to an \
+                      office admin to be enrolled, or the printed link line to a machine that \
+                      already holds one of your keys to add this as another device. With a \
+                      profile name, the key belongs to that profile's operator id. Without one, \
+                      it belongs to the identity this directory acts as: the profile the \
+                      enclosing warehouse selects, else the globally selected profile, else the \
+                      warehouse's operator.identifier, else the global one (the default \
+                      identity). It says which one it used. Runs outside a warehouse \
+                      too, and records nothing in one."
+    )]
+    Keygen {
+        /// The profile whose operator id the key belongs to; omit it for the current identity
+        name: Option<String>,
+
+        /// Protect the new key with a passphrase (recommended for human operators)
+        #[arg(long)]
+        passphrase: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1879,9 +1927,9 @@ impl Command {
     /// For these commands, the warehouse root is discovered (walking up from the current
     /// directory) and the process switches to it before the command runs.
     ///
-    /// `config` is missing deliberately: it enters the warehouse itself, and only when
-    /// the warehouse scope is actually involved (global reads and writes must work
-    /// outside a warehouse).
+    /// `config` and `profile` are missing deliberately: they enter the warehouse themselves, and
+    /// only when the warehouse is actually involved (global reads and writes, creating a profile
+    /// and generating a key must work outside a warehouse).
     ///
     /// # Returns
     /// * `true`  - If the command requires an existing warehouse.

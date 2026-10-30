@@ -55,7 +55,7 @@ impl Warehouse {
 
     fn prepare(&self) {
         self.run_ok(&["prepare"]);
-        self.run_ok(&["config", "operator.identifier", "rollup-hash@forklift"]);
+        self.run_ok(&["config", "set", "operator.identifier", "rollup-hash@forklift"]);
     }
 
     fn head(&self, pallet: &str) -> String {
