@@ -7603,7 +7603,7 @@ fn json_mode_wraps_every_result_in_a_versioned_envelope() {
     let value = json(&prepared);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 12);
+    assert_eq!(value["schema"], 13);
     assert_eq!(value["command"], "prepare");
     assert_eq!(value["ok"], true);
     assert!(value["data"]["created"].is_array());
@@ -7645,7 +7645,7 @@ fn json_errors_carry_a_stable_code_and_a_deterministic_exit_code() {
     // failed, so a consumer classifies by the same header on either outcome.
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 12);
+    assert_eq!(value["schema"], 13);
     assert_eq!(value["command"], "stocktake");
     assert!(value.get("data").is_none(), "a failure carries no data: {}", value);
 }
@@ -7674,7 +7674,7 @@ fn a_usage_error_under_json_is_one_failure_document_with_exit_2() {
     let value = json(&unknown);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 12);
+    assert_eq!(value["schema"], 13);
     assert_eq!(value["ok"], false);
     assert!(value["command"].is_null(), "no known command was named: {}", value);
     assert_eq!(value["error"]["code"], "usage");
@@ -7880,7 +7880,7 @@ fn every_json_document_starts_with_the_header_in_its_documented_order() {
     let warehouse = TestWarehouse::new("json-key-order");
 
     // The order is checked on the raw text: a parsed `Value` would hide it.
-    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 12,\n  \"command\": ";
+    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 13,\n  \"command\": ";
 
     for args in [&["--json", "version"][..], &["--json", "bogus"], &["--json", "stocktake"]] {
         let output = warehouse.run(args);
@@ -8663,7 +8663,7 @@ fn mcp_exposes_and_runs_the_parity_pass_tools() {
     let reply: serde_json::Value = serde_json::from_str(stdout(&list).lines().next().unwrap()).unwrap();
     let names: std::collections::HashSet<&str> = reply["result"]["tools"]
         .as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    for expected in ["blame", "deliver", "cherry_pick", "manifest_provenance", "haul_open", "park_pop", "tag_list", "store_status", "store_compact", "store_peek"] {
+    for expected in ["blame", "deliver", "pick", "manifest_provenance", "haul_open", "park_pop", "tag_list", "store_status", "store_compact", "store_peek"] {
         assert!(names.contains(expected), "MCP must advertise `{}`", expected);
     }
     // A family whose bare form is one of its subcommands is that subcommand's tool alone.
@@ -8712,8 +8712,8 @@ fn an_mcp_value_that_spells_an_option_reaches_the_command_as_a_value() {
     };
 
     // A positional value and an option value, each spelling options and a global.
-    call("kv_set", r#"{"revision":"main","key":"ci","value":"--json -x"}"#);
-    let got = call("kv_get", r#"{"revision":"main","key":"ci"}"#);
+    call("manifest_set", r#"{"revision":"main","key":"ci","value":"--json -x"}"#);
+    let got = call("manifest_get", r#"{"revision":"main","key":"ci"}"#);
     assert_eq!(got["data"]["value"], "--json -x", "{}", got);
     warehouse.write_file("a.txt", "two\n");
     assert_success(&warehouse.run(&["load", "."]));
