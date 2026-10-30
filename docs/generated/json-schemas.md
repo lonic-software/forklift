@@ -5106,6 +5106,19 @@ A command not listed here either reports only the generic human-message shape `{
       "minimum": 0,
       "type": "integer"
     },
+    "record_bound_skipped": {
+      "description": "Why no record was dropped: the run met an object missing here that the record does not hold,\nor could not finish, in which case the record may have shrunk though `record_dropped` is `0`\n(`null` otherwise, and on a dry run). A missing object keeps every later `evict` from\nshrinking the record until that content is back.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "record_dropped": {
+      "description": "Records of evicted objects this run dropped because nothing present names them any more: an\nobject under an evicted tree is reached only through that tree, whose own record stays\n(`0` on a dry run).",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
     "repack": {
       "description": "Whether the run rewrites every pack (on a dry run, would): when `would_drop` is not `0`, and\nalso when a packed delta stands on a loose copy it frees, which the repack re-encodes first.",
       "type": "boolean"
@@ -5147,7 +5160,9 @@ A command not listed here either reports only the generic human-message shape `{
     "not_held",
     "still_packed",
     "heads_not_lowered",
-    "unsealed"
+    "unsealed",
+    "record_dropped",
+    "record_bound_skipped"
   ],
   "title": "EvictReport",
   "type": "object"

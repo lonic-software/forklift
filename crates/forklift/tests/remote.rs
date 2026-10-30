@@ -6525,10 +6525,16 @@ fn evict_frees_what_the_origin_holds_and_a_read_fetches_it_again() {
     assert!(report["evicted"].as_u64().unwrap() >= 3, "{}", report);
     assert!(report["not_held"].as_u64().unwrap() >= 1, "{}", report);
     assert!(report["kept_for_checkouts"].as_u64().unwrap() >= 1, "{}", report);
+    assert!(report["record_dropped"].as_u64().unwrap() >= 1, "{}", report);
+    assert_eq!(report["record_bound_skipped"], serde_json::Value::Null, "{}", report);
 
-    for hash in [&oldest_root, &oldest_src, &one] {
+    for hash in [&oldest_root, &one] {
         assert!(!object_held(&area, "cached", hash) && recorded(&area, "cached", hash), "{} is evicted and recorded", hash);
     }
+    assert!(
+        !object_held(&area, "cached", &oldest_src) && !recorded(&area, "cached", &oldest_src),
+        "the evicted directory only the evicted root names loses its record"
+    );
     assert!(object_held(&area, "cached", &mine), "content only unlifted history reaches stays");
     assert!(closure_present(&area, "cached", &base_root), "the checkout's base stays whole");
     assert!(object_held(&area, "cached", &oldest) && object_held(&area, "cached", &four), "parcels stay");
@@ -6719,9 +6725,11 @@ fn evict_frees_packed_content_and_a_read_fetches_it_again() {
     assert!(report["evicted"].as_u64().unwrap() >= 3, "{}", report);
     assert!(report["bytes_freed"].as_u64().unwrap() > 0, "{}", report);
     assert_eq!(report["still_packed"], 0, "{}", report);
+    assert!(report["record_dropped"].as_u64().unwrap() >= 2, "{}", report);
 
-    for hash in [&oldest_root, &oldest_src, &one] {
-        assert!(!object_held(&area, "cached", hash) && recorded(&area, "cached", hash), "{} is evicted and recorded", hash);
+    assert!(!object_held(&area, "cached", &oldest_root) && recorded(&area, "cached", &oldest_root), "the root is evicted and recorded");
+    for hash in [&oldest_src, &one] {
+        assert!(!object_held(&area, "cached", hash) && !recorded(&area, "cached", hash), "{} is evicted, and only the root names it", hash);
     }
     for (parcel, _) in &history {
         assert!(object_held(&area, "cached", parcel) && signature_held(&area, "cached", parcel), "{} and its signature stay", parcel);

@@ -35,6 +35,10 @@
 //! ([`pack_utils::repack_evicting`]), and loose copies are deleted after it: the repack re-encodes
 //! every kept delta whose base is evicted, so it must still be able to read that base. Each one is
 //! recorded by then, so the order the old packs and loose files go in does not matter.
+//!
+//! Last, the record is bounded ([`sealed_utils::bound`]): an evicted object whose every parent is
+//! evicted too is never met by a walk, so its record is dropped, and a whole evicted history leaves
+//! only the records of its root trees and of what a kept tree still names.
 
 use std::collections::HashSet;
 use crate::util::lock_utils::{ServeLock, StoreAccessExclusive, StoreLock};
@@ -83,6 +87,10 @@ pub struct EvictPlan {
     /// Kept objects the record still holds although they are present (an interrupted refill or
     /// eviction left them so), unsealed once the eviction is done.
     pub to_unseal: Vec<String>,
+
+    /// The heads the origin holds, which root the record's bound beside the local roots: the
+    /// parcels they reach name the trees evicted under them.
+    pub held_heads: Vec<String>,
 }
 
 /// What a carried-out eviction did.
@@ -99,6 +107,13 @@ pub struct EvictStats {
 
     /// Kept objects whose records were removed.
     pub unsealed: usize,
+
+    /// Records dropped by the bound: absent objects nothing present references any more.
+    pub record_dropped: usize,
+
+    /// Why the bound dropped nothing: it met an absent object the record does not hold. Or why it
+    /// could not finish, in which case `record_dropped` is `0` though the record may have shrunk.
+    pub record_bound_skipped: Option<String>,
 }
 
 /// Plan an eviction under the exclusive store access the caller keeps until [`carry_out`] returns:
@@ -138,12 +153,7 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
         &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed,
     )?;
 
-    let mut local_heads: Vec<String> = sources.parcels;
-    local_heads.extend(sources.haul_heads);
-    local_heads.extend(sources.tombstone_heads);
-    local_heads.extend(sources.mirror_roots);
-    local_heads.extend(sources.pin_parcels.iter().map(|(hash, _)| hash.clone()));
-    let local_parcels = sorted(gc_utils::collect_reachable_for_sweep(&local_heads)?);
+    let local_parcels = sorted(gc_utils::collect_reachable_for_sweep(&sources.heads())?);
     let local = walk_local(&local_parcels, &held.seen)?;
 
     let mut checkout_roots: Vec<String> = Vec::new();
@@ -191,6 +201,7 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
         not_held: local.present,
         heads_not_lowered,
         to_unseal: Vec::new(),
+        held_heads: held_heads.to_vec(),
     };
 
     for hash in held.present {
@@ -241,10 +252,12 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
 }
 
 /// Carry out `plan`: record every object it evicts, repack without them, free the loose copies in
-/// the plan's order, then unseal the kept objects the record still held. Records first: a crash
-/// after them leaves recorded objects still present, which seal nothing and read as they did, and
-/// the next eviction frees them. The repack before the frees: it re-encodes every kept delta whose
-/// base is evicted, and reads that base from whichever copy holds it, loose or packed.
+/// the plan's order, unseal the kept objects the record still held, then bound the record. Records
+/// first: a crash after them leaves recorded objects still present, which seal nothing and read as
+/// they did, and the next eviction frees them. The repack before the frees: it re-encodes every
+/// kept delta whose base is evicted, and reads that base from whichever copy holds it, loose or
+/// packed. The bound last, once every object it judges absent is gone; it only shrinks the record,
+/// so a bound that fails is reported as skipped rather than failing a run that already freed.
 ///
 /// Holds the locks a full repack takes, which the plan was computed under too: a repack keeps only
 /// what is live when it runs, so nothing may change what is live between the plan and the delete.
@@ -257,7 +270,7 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
 /// * `progress`     - Where the repack reports its phases.
 ///
 /// # Returns
-/// * `Ok(EvictStats)` - What was evicted, freed and unsealed.
+/// * `Ok(EvictStats)` - What was evicted, freed, unsealed and dropped from the record.
 /// * `Err(String)`    - If the record could not be written (nothing was freed), or a free, the
 ///                      repack or the unseal failed. Either way, running `evict` again finishes.
 pub fn carry_out(plan: &EvictPlan,
@@ -293,7 +306,17 @@ pub fn carry_out(plan: &EvictPlan,
         sealed_utils::unseal(store_access, &plan.to_unseal)?.removed.len()
     };
 
-    Ok(EvictStats { evicted: plan.to_evict.len() - still_packed, still_packed, bytes_freed, unsealed })
+    let bounded = sealed_utils::bound(store_access, &plan.held_heads)
+        .unwrap_or_else(|error| sealed_utils::Bounded { dropped: Vec::new(), skipped: Some(error) });
+
+    Ok(EvictStats {
+        evicted: plan.to_evict.len() - still_packed,
+        still_packed,
+        bytes_freed,
+        unsealed,
+        record_dropped: bounded.dropped.len(),
+        record_bound_skipped: bounded.skipped,
+    })
 }
 
 /// Record every object `plan` frees that the record does not hold yet, synced before this returns.
@@ -702,9 +725,8 @@ mod tests {
 
         let stats = carry(&plan, &hold).unwrap();
         assert_eq!(stats.evicted, 4);
-        let record = sealed_utils::read_sealed().unwrap();
         for hash in [&h.held_root, &h.a, &h.dir, &h.shared] {
-            assert!(!present(hash) && record.contains(hash), "{} is evicted and recorded", hash);
+            assert!(!present(hash), "{} is evicted", hash);
         }
         assert!(present(&h.local_root) && present(&h.b) && present(&h.held) && present(&h.local));
 
@@ -917,7 +939,9 @@ mod tests {
         let record = sealed_utils::read_sealed().unwrap();
         for evicted in [&f.v[0], &f.v[1]] {
             assert!(!pack_utils::is_in_packs(evicted).unwrap() && read_fresh(evicted).is_err(), "{} is gone", evicted);
-            assert!(record.contains(evicted), "{} is recorded", evicted);
+        }
+        for root in &f.roots[..2] {
+            assert!(record.contains(root), "the evicted root {} stays recorded under its parcel", root);
         }
         for kept in [2, 3] {
             let bytes = read_fresh(&f.v[kept]).unwrap_or_else(|e| panic!("v{} reads: {}", kept, e));
@@ -1083,5 +1107,153 @@ mod tests {
         for (parcel, seed) in [(&h.held, 1), (&h.local, 2)] {
             assert_eq!(crate::util::sign_utils::load_raw_parcel_signature(parcel).unwrap(), Some(signature(seed)), "{}", parcel);
         }
+    }
+
+    /// Whether the record holds exactly `hashes`.
+    fn assert_record(hashes: &[&String], why: &str) {
+        let record = sealed_utils::read_sealed().unwrap();
+        for hash in hashes {
+            assert!(record.contains(hash), "{}: {} is recorded", why, hash);
+        }
+        assert_eq!(record.len(), hashes.len(), "{}: nothing else is recorded", why);
+    }
+
+    /// Evicting the lifted history leaves the records of its root tree, which its parcel names, and
+    /// of `dir`, which the local root tree still names; `a.txt` and `dir/shared.txt` sit under
+    /// evicted parents only and their records go.
+    ///
+    /// Revert: note no child of a present tree as referenced → `dir`'s record goes; root the walk at
+    /// the origin's heads only → so does it, since only the local parcel reaches the local root;
+    /// note no parcel's tree → the root tree's record goes.
+    #[test]
+    fn the_bound_keeps_only_what_a_present_object_names() {
+        let _scratch = Scratch::new("bound");
+        let h = history();
+        let hold = store_access();
+
+        let plan = plan_evict(&[h.held.clone()], &hold).unwrap();
+        let stats = carry(&plan, &hold).unwrap();
+
+        assert_eq!((stats.record_dropped, stats.record_bound_skipped.as_deref()), (2, None));
+        assert_record(&[&h.held_root, &h.dir], "after the bound");
+        let bytes = std::fs::read(sealed_utils::sealed_path()).unwrap();
+        assert_eq!(bytes.len(), sealed_utils::header_bytes().len() + sealed_utils::frame_len(2), "one compacted frame of two entries");
+    }
+
+    /// A bound that cannot run fails nothing the run already did: the bay's position is unreadable
+    /// once the plan is made, so the bound's root read fails, and the eviction still reports what
+    /// it freed.
+    ///
+    /// Revert: let the bound's error fail the run → `carry_out` returns it.
+    #[test]
+    fn a_bound_that_cannot_run_is_reported_and_the_eviction_stands() {
+        let _scratch = Scratch::new("bound-fails");
+        let h = history();
+        let hold = store_access();
+        let plan = plan_evict(&[h.held.clone()], &hold).unwrap();
+        assert!(!plan.repack, "sanity: no repack reads the bays after the plan");
+
+        let mut broken = 0;
+        for dir in bay_utils::all_bay_state_dirs().unwrap() {
+            let position = dir.join(pallet_utils::FILE_NAME_POSITION);
+            if position.exists() {
+                std::fs::write(&position, b"garbage").unwrap();
+                broken += 1;
+            }
+        }
+        assert!(broken > 0, "sanity: a bay position was broken");
+
+        let stats = carry(&plan, &hold).expect("the eviction stands");
+
+        assert_eq!(stats.evicted, plan.to_evict.len());
+        assert_eq!(stats.record_dropped, 0);
+        let skipped = stats.record_bound_skipped.expect("the bound reports why it did not run");
+        assert!(skipped.contains("position"), "{}", skipped);
+        assert!(!file_utils::is_present_for_sweep(&h.held_root).unwrap(), "the root tree is still freed");
+    }
+
+    /// A refill of the evicted root tree records its children again before its own record goes:
+    /// `a.txt`, whose record the bound dropped, is held by hash once more under the present root.
+    ///
+    /// Revert: skip the push-down for a child the record does not hold → `a.txt` is absent under a
+    /// present tree and unrecorded.
+    #[test]
+    fn a_refill_after_the_bound_records_the_dropped_children_again() {
+        let _scratch = Scratch::new("bound-refill");
+        let h = history();
+        let root_bytes = file_utils::retrieve_object_by_hash(&h.held_root).unwrap();
+        let hold = store_access();
+
+        carry(&plan_evict(&[h.held.clone()], &hold).unwrap(), &hold).unwrap();
+        assert_record(&[&h.held_root, &h.dir], "sanity: bounded");
+
+        sealed_utils::refill_all(&hold, &[(h.held_root.as_str(), root_bytes.as_slice())]).unwrap();
+
+        assert!(present(&h.held_root));
+        assert_record(&[&h.a, &h.dir], "after the refill");
+    }
+
+    /// An absent object the record does not hold, met under a present tree, stops the bound from
+    /// dropping anything; the record is still compacted.
+    ///
+    /// Revert: walk past an unrecorded absence as a recorded one → `a.txt` and `dir/shared.txt`
+    /// lose their records.
+    #[test]
+    fn the_bound_drops_nothing_past_an_unrecorded_absence() {
+        let _scratch = Scratch::new("bound-damage");
+        let h = history();
+        // Only local history reaches `b.txt`, so the plan never meets its absence.
+        let (folder, file) = file_utils::get_path_for_object(&h.b).unwrap();
+        std::fs::remove_file(PathBuf::from(folder).join(file)).unwrap();
+        let hold = store_access();
+
+        let stats = carry(&plan_evict(&[h.held.clone()], &hold).unwrap(), &hold).unwrap();
+
+        let skipped = stats.record_bound_skipped.expect("the bound is skipped");
+        assert!(skipped.contains(&h.b) && skipped.contains(&h.local_root), "{}", skipped);
+        assert_eq!(stats.record_dropped, 0);
+        assert_record(&[&h.held_root, &h.a, &h.dir, &h.shared], "nothing dropped");
+    }
+
+    /// The bound keeps the record of an absent object a staged entry names, an absent parent a
+    /// present parcel names, and a present object nothing names (unsealing it is `heal`'s and the
+    /// plan's job, with its push-down), and drops one nothing names.
+    ///
+    /// Revert: leave the staged leaves out of the roots → the staged blob's record goes; leave the
+    /// parcels' absent parents out → the parent's; drop unreferenced records whatever the store
+    /// holds → the present blob's. The dropped one shows the walk drops at all.
+    #[test]
+    fn the_bound_keeps_what_staged_work_or_a_parcel_names_and_whatever_is_present() {
+        let _scratch = Scratch::new("bound-roots");
+        let staged = store_blob("staged\n");
+        let (folder, file) = file_utils::get_path_for_object(&staged).unwrap();
+        std::fs::remove_file(PathBuf::from(folder).join(file)).unwrap();
+        let kid = store_blob("kid\n");
+        let (folder, file) = file_utils::get_path_for_object(&kid).unwrap();
+        std::fs::remove_file(PathBuf::from(folder).join(file)).unwrap();
+        let staged_dir = store_tree(&[("kid.txt", &kid, DirEntryType::Normal)]);
+        crate::util::gc_utils::tests::plant_staged_shard(
+            "b", &[("s.txt", &staged, DirEntryType::Normal), ("d", &staged_dir, DirEntryType::Tree)],
+        );
+
+        // Named by the caller: a ref refuses a head whose history is incomplete.
+        let parent = "e".repeat(64);
+        let parcel = store_parcel(&store_tree(&[]), vec![parent.clone()]);
+
+        let stray = store_blob("stray\n");
+        let gone = "f".repeat(64);
+        sealed_utils::append(&[
+            (SealOp::Record, staged.as_str()),
+            (SealOp::Record, kid.as_str()),
+            (SealOp::Record, parent.as_str()),
+            (SealOp::Record, stray.as_str()),
+            (SealOp::Record, gone.as_str()),
+        ]).unwrap();
+        let hold = store_access();
+
+        let bounded = sealed_utils::bound(&hold, &[parcel]).unwrap();
+
+        assert_eq!((bounded.dropped, bounded.skipped), (vec![gone.clone()], None));
+        assert_record(&[&staged, &kid, &parent, &stray], "kept");
     }
 }

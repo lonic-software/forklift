@@ -1525,6 +1525,19 @@ pub(crate) struct GcRootSources {
     pub degraded: Vec<String>,
 }
 
+impl GcRootSources {
+    /// Every parcel a walk starts from: [`Self::parcels`], the haul, tombstone and mirror heads,
+    /// and the trust-pin parcels.
+    pub fn heads(&self) -> Vec<String> {
+        let mut heads = self.parcels.clone();
+        heads.extend(self.haul_heads.iter().cloned());
+        heads.extend(self.tombstone_heads.iter().cloned());
+        heads.extend(self.mirror_roots.iter().cloned());
+        heads.extend(self.pin_parcels.iter().map(|(hash, _)| hash.clone()));
+        heads
+    }
+}
+
 /// The pallet-head, bay-scoped-parcel, trust-pin and staged-shard root sources shared, hash for
 /// hash, between [`gc_utils::collect_live_set`](crate::util::gc_utils::collect_live_set), this
 /// module's own [`collect_walk_roots`], and `prune_utils`' retained set. Assembling all four in
