@@ -290,7 +290,7 @@ async fn consolidate(id: &str) -> Result<(), String> {
         }
         MergeStatus::Conflicts(paths) => {
             // The consolidation is left in progress; the haul stays open. Resolving and
-            // stacking creates the merge parcel — re-run `haul merge` to record it.
+            // stacking creates the merge parcel — re-run `haul consolidate` to record it.
             output::emit(&MergeConflicts { id: haul.id.clone(), conflicts: paths });
         }
     }

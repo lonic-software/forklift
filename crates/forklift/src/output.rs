@@ -35,7 +35,9 @@ pub const TOOL: &str = "forklift";
 /// `data` shape or the error-code registry changes incompatibly, so an agent can pin it and
 /// detect drift.
 ///
-/// Version 9 (this one): `batch_lane` may be `out_of_time`, when the remote ran out of time for a
+/// Version 13 (this one): the `franchise_incomplete` error code is renamed `clone_incomplete`.
+/// Versions 10–12 are recorded in docs/MACHINE_INTERFACE.md.
+/// Version 9: `batch_lane` may be `out_of_time`, when the remote ran out of time for a
 /// batch download and the rest of the command fetched one object at a time.
 /// Version 8: the `pallet_deleted_on_remote` error code exists; `palletize --remote`
 /// lists the remote's deleted pallets as `deleted`, and `palletize` lists this served warehouse's

@@ -86,7 +86,11 @@ exit status alone. Forklift has no prompt that handles a cancellation itself, so
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
 **Schema 13** (current): the `franchise_incomplete` error code is renamed `clone_incomplete`
-(exit 30 and its `details` are unchanged), with the command it names.
+(exit 30 and its `details` are unchanged), with the command it names. The same release renames
+commands, so an envelope's `command` and the MCP tool names change with them: `franchise` is
+`clone`, `cherry-pick` is `pick` (`cherry_pick` → `pick`), `kv set|get|unset|log` are `manifest
+set|get|unset|log` and `kv list` is `manifest keys` (`kv_set` → `manifest_set`, and so on), and
+`haul merge` is `haul consolidate` (`haul_merge` → `haul_consolidate`).
 
 **Schema 12**: the `origin_move_incomplete` error code exists.
 

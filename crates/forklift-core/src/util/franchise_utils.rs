@@ -9,7 +9,7 @@
 //!
 //! ## Storage
 //!
-//! One [`record_utils`] record, `clone`, in the warehouse's `.forklift` folder, replaced
+//! One [`record_utils`] record, `franchise`, in the warehouse's `.forklift` folder, replaced
 //! atomically. Each entry is `key=value`; a list repeats its key. A record this build cannot read
 //! is never taken for "no clone in progress": the gate refuses, and a resume admits it only as
 //! the debris of a run killed before its first write was durable.

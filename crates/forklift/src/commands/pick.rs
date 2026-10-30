@@ -7,7 +7,7 @@ use forklift_core::util::operation_utils::OperationKind;
 use crate::commands::consolidate;
 use crate::output::{self, CommandOutput};
 
-/// Handle the cherry-pick command (§9.1 #8): apply a parcel's diff onto the current pallet
+/// Handle the pick command (§9.1 #8): apply a parcel's diff onto the current pallet
 /// as a new, author-preserving, freshly-signed parcel.
 ///
 /// The source parcel's change — its diff against its first parent — is three-way merged
@@ -48,7 +48,7 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
     if merge_utils::read_consolidation_state()?.is_some() {
         return Err(
             "A consolidation is in progress. Complete it (resolve, \"forklift load\", \"forklift stack\") or abort \
-            it before cherry-picking.".to_string()
+            it before picking.".to_string()
         );
     }
 
@@ -231,7 +231,7 @@ impl CommandOutput for Picked {
             }
             PickOutcome::Conflicts => {
                 println!(
-                    "Cherry-picking {} onto \"{}\" produced {} conflict(s):",
+                    "Picking {} onto \"{}\" produced {} conflict(s):",
                     short, self.pallet, self.conflicts.len()
                 );
 

@@ -15,7 +15,7 @@
 //! - every meta pallet, in full: trust and metadata reads must never need the network;
 //! - each checkout's base parcel tree, in the main tree and in every bay: the next `stocktake`
 //!   reads it, so freeing it only buys a refetch (the base itself, not its ancestry);
-//! - the parcels a parked, consolidating or cherry-picking bay names, and the trust pins: their
+//! - the parcels a parked, consolidating or picking bay names, and the trust pins: their
 //!   own trees, not their ancestry;
 //! - every staged inventory leaf, and a chunked one's chunks: staged work must never depend on the
 //!   network, even when it shares a blob with history the origin holds.
@@ -74,7 +74,7 @@ pub struct EvictPlan {
     pub kept_for_checkouts: usize,
 
     /// Objects the origin holds that stay for a meta pallet, a parked, consolidating or
-    /// cherry-picking bay, a trust pin, or staged work.
+    /// picking bay, a trust pin, or staged work.
     pub kept_local: usize,
 
     /// Present content only local history reaches, which the origin is not known to hold.

@@ -8,7 +8,7 @@ or a `--json` output struct).
 
 # MCP tools
 
-Every tool `forklift mcp` serves, generated from the same command definition the binary parses its arguments with, as the server's own tool list is; CI fails when this page falls behind it. A tool is a command path joined by `_` (`forklift tag create` is `tag_create`, `forklift pick` is `cherry_pick`), and its description is the command's one-line description followed by its long one; each argument's own help is that argument's description in the tool's input schema. An argument is an option's long name (with `_` for `-`) or a positional's name. `docs/MACHINE_INTERFACE.md` describes the server.
+Every tool `forklift mcp` serves, generated from the same command definition the binary parses its arguments with, as the server's own tool list is; CI fails when this page falls behind it. A tool is a command path joined by `_` (`forklift tag create` is `tag_create`, `forklift manifest set` is `manifest_set`), and its description is the command's one-line description followed by its long one; each argument's own help is that argument's description in the tool's input schema. An argument is an option's long name (with `_` for `-`) or a positional's name. `docs/MACHINE_INTERFACE.md` describes the server.
 
 | Tool | Runs | Does | Arguments |
 |---|---|---|---|
