@@ -66,13 +66,27 @@
 //! without the ref lock, under the caller's store-access hold, so nothing it found present is
 //! deleted under it; the commit re-reads the record under the ref lock and removes only what is
 //! still recorded. An object the walk could not finish keeps its record.
+//!
+//! ## Bounding
+//!
+//! An eviction records every object it frees, so the record would grow by each one. [`bound`]
+//! gives that back: it drops the record of an absent object that nothing present references, since
+//! a walk only meets an object through a parent, and one whose every parent is absent and recorded
+//! is never met. "Present" is judged from the roots a sweep keeps (every pallet, haul, tombstone,
+//! mirror and trust-pin head, every bay's checkout and in-progress parcels, every staged leaf),
+//! plus the parcels the caller names: every parcel they reach references its tree and its parents,
+//! and the walk descends every present tree and recipe from there. A present object nothing reaches
+//! is garbage a sweep deletes, so what only it references is dropped with it in view. A walk that
+//! meets an absent object the record does not hold drops nothing: that is damage, and `heal`'s to
+//! judge, not a boundary to compact past.
 
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
+use crate::enums::dir_entry_type::DirEntryType;
 use crate::enums::object_type::ObjectType;
 use crate::globals;
-use crate::util::{file_utils, object_utils, pack_utils, record_utils, sign_utils};
+use crate::util::{audit_utils, bay_utils, file_utils, object_utils, office_utils, pack_utils, record_utils, recovery_utils, sign_utils};
 use crate::util::lock_utils::{RefLock, StoreAccessExclusive, StoreAccessLock};
 
 /// The record's file name under the shared forklift root.
@@ -141,6 +155,11 @@ impl SealedSet {
     /// Whether nothing is recorded.
     pub fn is_empty(&self) -> bool {
         self.hashes.is_empty()
+    }
+
+    /// How many hashes are recorded.
+    pub fn len(&self) -> usize {
+        self.hashes.len()
     }
 
     /// Whether every hash `earlier` holds is still recorded here: only an entry's removal can
@@ -663,11 +682,28 @@ pub fn compact() -> Result<SealedSet, String> {
 /// * `Err(String)`   - If the record cannot be read or parsed, which leaves it as it was, or the
 ///                     rewrite fails. A rewrite that fails after its rename has still replaced
 ///                     the record (with the same set): read it back to learn which.
-pub fn compact_locked(_lock: &RefLock) -> Result<SealedSet, String> {
+pub fn compact_locked(lock: &RefLock) -> Result<SealedSet, String> {
+    rewrite_locked(lock, &HashSet::new()).map(|(set, _)| set)
+}
+
+/// Rewrite the record, atomically, as the set it replays to without `drop`: one record entry per
+/// hash, sorted. Nothing is written when that is the record as it stands.
+///
+/// # Returns
+/// * `Ok((SealedSet, Vec<String>))` - The set the record replays to now, and the hashes of `drop`
+///                                    it held and no longer does, sorted.
+/// * `Err(String)`                  - As [`compact_locked`].
+fn rewrite_locked(_lock: &RefLock, drop: &HashSet<String>) -> Result<(SealedSet, Vec<String>), String> {
     let path = sealed_path();
-    let Some((bytes, parsed)) = read_record(&path)? else {
-        return Ok(SealedSet::default());
+    let Some((bytes, mut parsed)) = read_record(&path)? else {
+        return Ok((SealedSet::default(), Vec::new()));
     };
+
+    let mut dropped: Vec<String> = parsed.set.hashes.iter().filter(|hash| drop.contains(*hash)).cloned().collect();
+    dropped.sort();
+    for hash in &dropped {
+        parsed.set.hashes.remove(hash);
+    }
 
     let mut hashes: Vec<&String> = parsed.set.hashes.iter().collect();
     hashes.sort();
@@ -680,7 +716,176 @@ pub fn compact_locked(_lock: &RefLock) -> Result<SealedSet, String> {
         file_utils::replace_file_atomically(&path, &compacted)?;
     }
 
-    Ok(parsed.set)
+    Ok((parsed.set, dropped))
+}
+
+/// What [`bound`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Bounded {
+    /// The records dropped: absent objects nothing present references, sorted.
+    pub dropped: Vec<String>,
+
+    /// Why nothing was dropped, when the walk met an absent object the record does not hold. The
+    /// record was still compacted.
+    pub skipped: Option<String>,
+}
+
+/// Compact the record of a cache warehouse down to what a walk can meet: drop the record of every
+/// absent object that nothing present references, then rewrite the rest as [`compact`] does (see
+/// Bounding in the module doc comment).
+///
+/// Exclusive store access, so nothing is fetched or stored while the walk runs: a refill landing
+/// mid-walk could make a dropped record's object referenced again, from a parent the walk had
+/// already judged absent.
+///
+/// # Arguments
+/// * `_hold`   - Exclusive store access, spanning the call.
+/// * `parcels` - Parcels to root the walk at beyond the ones a sweep keeps (an eviction names the
+///               heads its origin holds).
+///
+/// # Returns
+/// * `Ok(Bounded)` - What was dropped, or why nothing was.
+/// * `Err(String)` - If a root source, a present object or the store cannot be read, or as
+///                   [`compact_locked`]. Nothing is dropped then.
+pub fn bound(_hold: &StoreAccessExclusive, parcels: &[String]) -> Result<Bounded, String> {
+    let sealed = read_sealed()?;
+    if sealed.is_empty() {
+        return Ok(Bounded::default());
+    }
+
+    let (drop, skipped) = match referenced(parcels, &sealed)? {
+        Ok(referenced) => {
+            let mut drop = HashSet::new();
+            for hash in &sealed.hashes {
+                if !referenced.contains(hash) && !is_present(hash)? {
+                    drop.insert(hash.clone());
+                }
+            }
+            (drop, None)
+        }
+        Err(damage) => (HashSet::new(), Some(damage)),
+    };
+
+    let lock = RefLock::acquire()?;
+    let (_, dropped) = rewrite_locked(&lock, &drop)?;
+
+    Ok(Bounded { dropped, skipped })
+}
+
+/// What a walk met an object as.
+enum Met {
+    /// Met before.
+    Again,
+    /// In the store, to descend.
+    Present,
+    /// Absent and recorded: a boundary.
+    Recorded,
+    /// Absent and not recorded: damage.
+    Unrecorded,
+}
+
+/// Note `hash` as referenced and say what it was met as.
+fn meet(hash: &str, sealed: &SealedSet, referenced: &mut HashSet<String>) -> Result<Met, String> {
+    if !referenced.insert(hash.to_string()) {
+        return Ok(Met::Again);
+    }
+
+    Ok(if is_present(hash)? {
+        Met::Present
+    } else if sealed.contains(hash) {
+        Met::Recorded
+    } else {
+        Met::Unrecorded
+    })
+}
+
+/// Every object a present object or a root references, walked from the roots a sweep keeps and
+/// `parcels` (see Bounding in the module doc comment). An absent parcel a root or a parent names
+/// is referenced but never judged: a haul, mirror or pin may name history this warehouse never had.
+///
+/// # Returns
+/// * `Ok(Ok(HashSet<String>))` - Every object referenced.
+/// * `Ok(Err(String))`         - The walk met an absent object the record does not hold, named.
+/// * `Err(String)`             - If a root source or a present object could not be read.
+fn referenced(parcels: &[String], sealed: &SealedSet) -> Result<Result<HashSet<String>, String>, String> {
+    let bay_dirs = bay_utils::all_bay_state_dirs()?;
+    let sources = recovery_utils::gc_root_sources(
+        &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed,
+    )?;
+
+    let mut heads: Vec<String> = parcels.to_vec();
+    heads.extend(sources.parcels);
+    heads.extend(sources.haul_heads);
+    heads.extend(sources.tombstone_heads);
+    heads.extend(sources.mirror_roots);
+    heads.extend(sources.pin_parcels.into_iter().map(|(hash, _)| hash));
+
+    let (present_parcels, gaps) = audit_utils::collect_reachable_noting_gaps(&heads, is_present)?;
+    let mut referenced: HashSet<String> = gaps.into_iter().collect();
+    let damage = |hash: &str, named_by: &str| Ok(Err(format!(
+        "object {} is missing, and the record does not say the origin holds it ({} references it)",
+        hash, named_by
+    )));
+
+    let mut trees: Vec<(String, String)> = Vec::new();
+    for parcel in &present_parcels {
+        referenced.insert(parcel.clone());
+        trees.push((object_utils::load_parcel(parcel)?.tree_hash, parcel.clone()));
+    }
+
+    for (hash, item_type) in &sources.shard_leaves {
+        match meet(hash, sealed, &mut referenced)? {
+            Met::Unrecorded => return damage(hash, "staged work"),
+            Met::Present if *item_type == DirEntryType::Tree => trees.push((hash.clone(), "staged work".to_string())),
+            Met::Present if item_type.is_chunked() => {
+                if let Some(chunk) = unrecorded_chunk(hash, sealed, &mut referenced)? {
+                    return damage(&chunk, hash);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // A tree is noted and judged when it is popped, with the object that named it for the message.
+    while let Some((hash, named_by)) = trees.pop() {
+        match meet(&hash, sealed, &mut referenced)? {
+            Met::Present => {}
+            Met::Unrecorded => return damage(&hash, &named_by),
+            Met::Again | Met::Recorded => continue,
+        }
+
+        let tree = object_utils::load_tree_shared(&hash)?;
+
+        for (_, file) in tree.get_files() {
+            match meet(&file.hash, sealed, &mut referenced)? {
+                Met::Unrecorded => return damage(&file.hash, &hash),
+                Met::Present if file.item_type.is_chunked() => {
+                    if let Some(chunk) = unrecorded_chunk(&file.hash, sealed, &mut referenced)? {
+                        return damage(&chunk, &file.hash);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for (_, subtree) in tree.get_subtrees() {
+            trees.push((subtree.hash.clone(), hash.clone()));
+        }
+    }
+
+    Ok(Ok(referenced))
+}
+
+/// Note every chunk of the present recipe `hash` as referenced, and name the first one absent and
+/// not recorded, if any.
+fn unrecorded_chunk(hash: &str, sealed: &SealedSet, referenced: &mut HashSet<String>) -> Result<Option<String>, String> {
+    for chunk in object_utils::recipe_chunk_hashes(hash)? {
+        if let Met::Unrecorded = meet(&chunk, sealed, referenced)? {
+            return Ok(Some(chunk));
+        }
+    }
+
+    Ok(None)
 }
 
 /// A hold on the store-access lock: the shared [`StoreAccessLock`], or the [`StoreAccessExclusive`]
