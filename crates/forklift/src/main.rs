@@ -18,6 +18,7 @@ mod internal_refs;
 pub mod output;
 pub mod pager;
 pub mod passphrase;
+mod remote_heads;
 #[cfg(test)]
 mod test_support;
 
@@ -489,6 +490,7 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
         Command::Restore { staged, path } => commands::restore::handle_command(staged, &path),
         Command::Scope { action } => commands::scope::handle_command(action),
         Command::ScopePrune { paths, dry_run } => commands::scope_prune::handle_command(paths, dry_run).await,
+        Command::Evict { dry_run } => commands::evict::handle_command(dry_run).await,
         Command::Shift { pallet } => commands::shift::handle_command(&pallet).await,
         Command::Show { target } => commands::show::handle_command(&target),
         Command::Stack { description } => commands::stack::handle_command(description).await,

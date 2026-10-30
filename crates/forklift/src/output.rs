@@ -629,7 +629,7 @@ impl ErrorCode {
             ErrorCode::OutOfScopeConflict =>
                 "A scoped bay merge hit an out-of-scope entry changed on both sides",
             ErrorCode::NonOriginLift =>
-                "A partial (--only or --cache) warehouse tried to lift to a remote other than its origin",
+                "A partial (--only or --cache) warehouse tried to lift to, or a cache to evict against, a remote other than its origin",
             ErrorCode::NarrowUnclean =>
                 "\"narrow\" would delete a subtree that still holds uncommitted work",
             ErrorCode::ScopePruneBlocked =>
@@ -972,8 +972,8 @@ pub fn warn_holds_unanswered(pallet: &str, error: &str) {
 /// The pure half of [`warn_holds_unanswered`], asserted in both modes without capturing stderr.
 fn holds_unanswered_warning_text(mode: OutputMode, pallet: &str, error: &str) -> String {
     let next_step = "History only the unconfirmed heads reach was kept. Lowering that pallet (shift to \
-        it first) lets a later prune free what the remote's current head reaches; if the remote was \
-        busy or out of time, running the prune again may free more.";
+        it first) lets a later run free what the remote's current head reaches; if the remote was busy \
+        or out of time, running the command again may free more.";
     match mode {
         OutputMode::Human => format!(
             "Warning: recorded heads of pallet \"{}\" were not confirmed by the remote. {} {}",

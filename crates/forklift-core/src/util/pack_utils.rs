@@ -5491,10 +5491,12 @@ fn walk_tree_for_bases(tree_hash: &str, path_prefix: &str, walk: &mut PathBaseWa
 
     // Presence-tolerant descent, matching the live-set walk (`gc_utils::collect_live_set`). A
     // subtree object can be legitimately absent — sealed by hash in a signed parcel but never
-    // fetched into this warehouse. There is no path base to compute for content we do not hold,
-    // and by the store invariant nothing beneath an absent subtree is present here either, so
-    // stopping loses no base for any object that will actually be packed (every pack target is a
-    // present object). This guard does not fire on a full store in the only flow that reaches it:
+    // fetched into this warehouse, or evicted from a cache. There is no path base to compute for
+    // content we do not hold. An object present beneath an absent subtree is one an eviction kept
+    // because a present path from a root reaches it, and this walk reaches it along that path, or
+    // it is reached by nothing; stopping only loses the absent version as a candidate base, so
+    // every object that will be packed still gets one where a path offers it (every pack target is
+    // a present object). This guard does not fire on a full store in the only flow that reaches it:
     // `compact` holds the store lock for its entire run, so no external repack can move an object
     // mid-walk, and `compact` runs only inside a short-lived, single-shot CLI process, so the pack
     // registry this walk reads was populated fresh by this same run, never carried over stale from

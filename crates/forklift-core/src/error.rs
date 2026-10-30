@@ -125,9 +125,10 @@ refusal_codes! {
     /// A whole-tree verb is not (yet) supported in a scoped (sparse) bay (§7.6).
     SparseWorkspace => "sparse_workspace",
 
-    /// A lift from a partial warehouse (franchised with `--only` or `--cache`) was aimed at a
-    /// remote other than its origin: the closure it does not hold was only ever proved present on
-    /// the origin, so it refuses up front.
+    /// A lift from a partial warehouse (franchised with `--only` or `--cache`), or an eviction
+    /// from a cache, was aimed at a remote other than its origin, or the origin is not recorded:
+    /// the closure it does not hold was only ever proved present on the origin, so it refuses up
+    /// front.
     NonOriginLift => "non_origin_lift",
 
     /// `narrow` was asked to drop a subtree that still holds uncommitted work (staged, unstaged or

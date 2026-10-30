@@ -791,6 +791,41 @@ pub fn unrecorded_origin_lift_refusal() -> CoreError {
     )
 }
 
+/// A ready-made `non_origin_lift` refusal for an `evict` while the configured remote is not the
+/// cache's origin: only the origin was proved to hold what this warehouse lacks, so only its heads
+/// may decide what a refill can fetch back.
+pub fn non_origin_evict_refusal(origin: &str, other: &str) -> CoreError {
+    let next_step = format!("Point \"remote.url\" back at \"{}\", then run \"forklift evict\" again.", origin);
+
+    refusal(
+        RefusalCode::NonOriginLift,
+        format!(
+            "This cache warehouse was franchised from \"{}\", and the configured remote is \"{}\"; \
+            evicting asks the origin which history it holds, since only the origin can refill what \
+            is freed. Nothing was changed. {}",
+            origin, other, next_step
+        ),
+        next_step,
+    )
+}
+
+/// A ready-made `non_origin_lift` refusal for an `evict` in a cache whose origin is not recorded.
+pub fn unrecorded_origin_evict_refusal() -> CoreError {
+    let next_step = "Record the remote this warehouse was franchised from with \"forklift config \
+        remote.origin <url>\", then run \"forklift evict\" again.";
+
+    refusal(
+        RefusalCode::NonOriginLift,
+        format!(
+            "The remote this cache warehouse was franchised from (\"remote.origin\") is not recorded, \
+            so Forklift cannot tell which remote can refill what an eviction frees. Nothing was \
+            changed. {}",
+            next_step
+        ),
+        next_step,
+    )
+}
+
 /// A ready-made `chunked_transport_unsupported` refusal for writing a large file stored in chunks
 /// **into a bundle**. Chunk transport ships per object (a chunked file's chunks ride the loose
 /// GET/PUT byte plane, negotiated one hash at a time), but **no bundle ever carries a chunk** by

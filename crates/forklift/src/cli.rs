@@ -1021,6 +1021,24 @@ pub enum Command {
         dry_run: bool,
     },
 
+    /// Free cached content the origin holds, to be fetched again when read
+    #[command(
+        long_about = "Free disk in a cache warehouse (one franchised with \"--cache\"): delete the \
+                      content its origin holds and nothing here needs, so that a later read fetches \
+                      it again. Parcels and signatures always stay. It asks the origin which history \
+                      it holds first, and refuses, changing nothing, when the configured remote is \
+                      not the origin or the origin cannot be reached; work never lifted keeps its \
+                      content. It keeps every checkout's files, metadata and trust records, staged \
+                      work, and anything a parked or in-progress operation needs. If it is \
+                      interrupted, running it again finishes the job. Objects inside packs are not \
+                      freed yet. Use --dry-run to see what it would free without changing anything."
+    )]
+    Evict {
+        /// Report what would be freed and change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Report object-store health: loose vs packed objects, packs, and whether compaction is due
     #[command(
         long_about = "Report the health of the object store — the counterpart of \"stocktake\" \
@@ -1789,6 +1807,7 @@ impl Command {
                 | Command::Restore { .. }
                 | Command::Scope { .. }
                 | Command::ScopePrune { .. }
+                | Command::Evict { .. }
                 | Command::Shift { .. }
                 | Command::Show { .. }
                 | Command::Stack { .. }
@@ -1854,6 +1873,7 @@ impl Command {
                 | Command::Remove { .. }
                 | Command::Restore { .. }
                 | Command::ScopePrune { .. }
+                | Command::Evict { .. }
                 | Command::Shift { .. }
                 | Command::Stack { .. }
                 | Command::Undo { .. }
@@ -1895,6 +1915,7 @@ impl Command {
                 | Command::Remove { .. }
                 | Command::Restore { .. }
                 | Command::ScopePrune { .. }
+                | Command::Evict { .. }
                 | Command::Shift { .. }
                 | Command::Stack { .. }
                 | Command::Tag { .. }
@@ -1913,17 +1934,17 @@ impl Command {
     /// that list that sets a pallet head, and it writes into a store it has just created, which
     /// no other process uses yet.
     ///
-    /// `compact` and `scope-prune` are excluded because they host deleters, which take the
-    /// exclusive side; their own shared hold would refuse them. They take the side they need
-    /// themselves: a full repack and scope-prune the exclusive one, incremental compaction the
-    /// shared one, tried.
+    /// `compact`, `scope-prune` and `evict` are excluded because they host deleters, which take
+    /// the exclusive side; their own shared hold would refuse them. They take the side they need
+    /// themselves: a full repack, scope-prune and evict the exclusive one, incremental compaction
+    /// the shared one, tried.
     ///
     /// # Returns
     /// * `true`  - Take the shared hold right after the warehouse lock.
     /// * `false` - A read-only command, or one that hosts a deleter.
     pub fn holds_store_access(&self) -> bool {
         self.requires_warehouse_lock()
-            && !matches!(self, Command::Compact { .. } | Command::ScopePrune { .. })
+            && !matches!(self, Command::Compact { .. } | Command::ScopePrune { .. } | Command::Evict { .. })
     }
 
     /// Whether finishing this command should kick off background object-store maintenance

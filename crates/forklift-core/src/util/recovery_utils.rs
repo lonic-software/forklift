@@ -2490,9 +2490,9 @@ fn walk_tree(
         // by the caller (`corrupt` — step 1's hash-verify found this exact hash present but
         // wrong) — either way, record it (if a sink is listening, and unless the sealed record
         // holds the absent hash by hash alone; a corrupt one it never holds) and stop; nothing
-        // beneath it is trustworthy either way (the store invariant a warehouse never holds a
-        // child without its parent tree, mirrored from `gc_utils::collect_live_set`'s own tree
-        // descent, extends to "nor a child whose parent's own bytes cannot be trusted").
+        // beneath it is reached through it either way (what is present beneath an absent tree is
+        // reached by another, present path from a root, as `gc_utils::collect_live_set`'s own tree
+        // descent states, and a corrupt parent's bytes cannot be trusted to name anything).
         // Unconditional in both modes — a descent guard, not a sink-feeding-only stat. Without
         // the corrupt half of this check, a corrupt reachable tree would instead hit
         // `load_tree`'s bare `?` below and abort the whole rescan (I5) — see

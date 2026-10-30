@@ -19,6 +19,7 @@ pub mod diff;
 pub mod restore;
 pub mod scope;
 pub mod scope_prune;
+pub mod evict;
 pub mod shift;
 pub mod stocktake;
 pub mod stack;
