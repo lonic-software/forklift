@@ -6842,9 +6842,8 @@ fn a_move_to_a_server_lacking_content_refuses_and_leaves_the_origin() {
 /// (`non_origin_remote`), or a move of the origin standing (`origin_move_pending`), which it runs
 /// through. A full warehouse has no origin, and one with no remote says so. Nothing changes.
 ///
-/// Revert: report no refusal → `blocked` reads null under the other remote and the move; read the
-/// origin for a full warehouse too → nothing changes, since only a partial one records it, so the
-/// full rows hold `partial` instead; drop the no-remote arm → the bare warehouse's show fails.
+/// Revert: report no refusal → `blocked` reads null under the other remote; drop the no-remote
+/// arm → the bare warehouse's show fails.
 #[test]
 fn bare_remote_shows_the_remote_the_origin_and_what_stops_it() {
     use forklift_core::util::origin_move::Phase;

@@ -7709,12 +7709,10 @@ fn a_unique_prefix_runs_the_command_and_an_ambiguous_one_is_a_usage_error() {
                "\"re\" could be \"forklift help haul review\" or \"forklift help haul reopen\"; type more of the name");
 }
 
-/// The families that hold only operations print their help run bare, and run nothing: `git`,
-/// whose subcommands each name a different direction, and not `store`, whose bare form reports
-/// as `store status` does.
+/// Bare `git` runs nothing and prints its help, listing its subcommands, since each names a
+/// different direction; bare `store` reports as `store status` does.
 ///
-/// Revert: drop `arg_required_else_help` from `git` → the bare run is clap's missing-subcommand
-/// error, with no subcommand list; give `store` a required subcommand → its bare run fails.
+/// Revert: run another subcommand for bare `store` (compact) → its data is not the status's.
 #[test]
 fn bare_git_prints_its_help_and_bare_store_reports() {
     let warehouse = TestWarehouse::new("bare-families");
