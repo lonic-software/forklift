@@ -21,7 +21,7 @@ use forklift_core::util::taint_utils;
 ///
 /// Never redeltas: `redelta` re-reads and re-compresses the whole live set (CPU-bound, minutes
 /// at scale), which is never appropriate for a background trigger a routine command incurs
-/// without asking. Only the explicit CLI `compact --all --redelta` can request it.
+/// without asking. Only the explicit CLI `store compact --all --redelta` can request it.
 ///
 /// **A `compact` failure is not automatically quiet.** Most `compact` failures here are exactly
 /// the best-effort no-op this function documents (nothing due after all, a transient failure

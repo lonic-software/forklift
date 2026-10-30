@@ -965,6 +965,7 @@ pub enum Command {
         #[command(subcommand)]
         action: Option<RemoteAction>,
     },
+
     /// Inspect and maintain the object store: its health, packing, raw records and cached content
     #[command(
         long_about = "Inspect and maintain the object store. Without a subcommand, report its \

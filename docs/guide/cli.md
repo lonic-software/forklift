@@ -188,7 +188,7 @@ three times. A push git declines for any other reason (a protected branch, a hoo
 with git's own message.
 
 After a successful `lift`, the lifted pallet is mirrored too when `mirror.url` is set and
-`mirror.auto` is on (the default), and the outcome is a line of lift's report (the `git mirror`
+`mirror.auto` is on (the default), and the outcome is a line of lift's report (the `mirror`
 field under `--json`). A mirror failure never fails the lift: the lift has already landed, and
 the next lift of that pallet or `forklift git mirror` catches git up. Inside a lift, git may not
 prompt for credentials; one that would fails at once and is reported.

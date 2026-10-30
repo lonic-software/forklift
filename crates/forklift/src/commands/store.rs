@@ -4,7 +4,7 @@ use crate::output::{self, human_bytes, CommandOutput};
 
 /// Handle the `store` command: report the object store's health — loose vs packed object
 /// counts, per-pack delta density, on-disk sizes, and whether an incremental compaction or a
-/// consolidating repack is due. Read-only; the counterpart of `compact` (which acts).
+/// consolidating repack is due. Read-only; the counterpart of `store compact` (which acts).
 ///
 /// # Returns
 /// * `Ok(())`      - The census was reported.
@@ -39,7 +39,7 @@ pub(crate) struct StoreReport {
     /// The maintenance thresholds and the current verdict.
     maintenance: Maintenance,
     /// Whether this store was bulk-ingested (`git import`, or a franchise's native bundle
-    /// install) and would still benefit from a one-shot `compact --all --redelta` pass.
+    /// install) and would still benefit from a one-shot `store compact --all --redelta` pass.
     /// Additive field; never acted on automatically.
     densify_suggested: bool,
     /// Pack indexes that parsed but whose data file could not be loaded — their

@@ -293,7 +293,7 @@ fn every_covered_operation_is_still_reachable() {
 
 /// The words that follow "forklift " without naming a command: prose ("a newer forklift does not
 /// know", "another forklift process"), the domain tags signed records and MACs begin with
-/// ("forklift key endorsement v1", "forklift hook protocol …"), a record header ("forklift git mirror
+/// ("forklift key endorsement v1", "forklift hook protocol …"), a record header ("forklift mirror
 /// roots 1"), and a test's made-up command ("dollar"). A mention is exempt when its leading words
 /// are one of these. Every other mention of `forklift <word>` is a hint and is parsed, so a hint
 /// whose command is renamed fails rather than passing as prose. No entry may be a command path,

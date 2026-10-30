@@ -15,7 +15,7 @@ use crate::output::{self, CommandOutput};
 /// cherry-picking bay names, the trust pins, and staged work. Every object it frees is recorded
 /// first, so an interrupted eviction leaves a readable warehouse and running it again finishes.
 /// Loose copies are deleted; packed objects go by a full repack that keeps everything else, so
-/// like `compact --all` it refuses while the warehouse root is served. Last, the record is bounded:
+/// like `store compact --all` it refuses while the warehouse root is served. Last, the record is bounded:
 /// the record of an evicted object nothing present names any more is dropped.
 ///
 /// # Arguments
@@ -121,7 +121,7 @@ pub(crate) struct EvictReport {
 
     /// Objects the plan frees that are still inside a pack after the repack: one found damaged only
     /// during it, which a repack leaves as found (`0` on a dry run; a pack already damaged refuses
-    /// the run). `compact --all` salvages it.
+    /// the run). `store compact --all` salvages it.
     still_packed: usize,
 
     /// Origin heads this warehouse does not hold yet; their history frees nothing until a `lower`
@@ -139,7 +139,7 @@ pub(crate) struct EvictReport {
 
     /// Why no record was dropped: the run met an object missing here that the record does not hold,
     /// or could not finish, in which case the record may have shrunk though `record_dropped` is `0`
-    /// (`null` otherwise, and on a dry run). A missing object keeps every later `evict` from
+    /// (`null` otherwise, and on a dry run). A missing object keeps every later `store evict` from
     /// shrinking the record until that content is back.
     record_bound_skipped: Option<String>,
 }

@@ -6839,11 +6839,13 @@ fn a_move_to_a_server_lacking_content_refuses_and_leaves_the_origin() {
 
 /// Bare `remote` reports the configured remote and, for a partial warehouse, its origin, and names
 /// the refusal a command dialing the remote would meet from here: a remote that is not the origin
-/// (`non_origin_remote`), or a move of the origin standing (`origin_move_pending`), which it runs
-/// through. A full warehouse has no origin, and one with no remote says so. Nothing changes.
+/// (`non_origin_remote`, also for a missing origin record with no remote configured), or a move
+/// of the origin standing (`origin_move_pending`), which it runs through. A full warehouse has no
+/// origin, and one with no remote says so. Nothing changes.
 ///
 /// Revert: report no refusal → `blocked` reads null under the other remote; drop the no-remote
-/// arm → the bare warehouse's show fails.
+/// arm → the bare warehouse's show fails; drop the missing-origin arm → `blocked` reads null with
+/// the record and the remote gone.
 #[test]
 fn bare_remote_shows_the_remote_the_origin_and_what_stops_it() {
     use forklift_core::util::origin_move::Phase;
@@ -6890,6 +6892,19 @@ fn bare_remote_shows_the_remote_the_origin_and_what_stops_it() {
     assert!(stdout(&area.forklift("cached", &["remote"])).contains("Only the origin was proved"));
     assert_success(&area.forklift("cached", &["config", "remote.url", &server.url]));
     assert_eq!(forklift_dir_snapshot(&area, "cached"), before, "showing changes nothing");
+
+    // A missing origin record is damage whether or not a remote is configured.
+    let origin = area.path("cached/.forklift/origin");
+    let recorded = std::fs::read(&origin).unwrap();
+    std::fs::remove_file(&origin).unwrap();
+    assert_success(&area.forklift("cached", &["config", "--unset", "remote.url"]));
+    let lost = show("cached");
+    assert_eq!(lost["remote"], serde_json::Value::Null, "{}", lost);
+    assert_eq!(lost["origin"], serde_json::Value::Null, "{}", lost);
+    assert_eq!(lost["blocked"]["code"], "non_origin_remote", "{}", lost);
+    assert!(stdout(&area.forklift("cached", &["remote"])).contains("origin record"));
+    std::fs::write(&origin, recorded).unwrap();
+    assert_success(&area.forklift("cached", &["config", "remote.url", &server.url]));
 
     record_move_intent(&area, "cached", Phase::Rewriting);
     let moving = show("cached");

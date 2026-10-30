@@ -286,7 +286,7 @@ fn report_usage_error(error: &clap::Error) -> ! {
 /// [`Command::requires_warehouse_lock`] commands acquire
 /// [`lock_utils::WarehouseLock`] *before* entry-heal runs, not after: a lock-*waiting* mutating
 /// command must never restage a recorded path concurrently with the current lock-holder's own
-/// deletions (e.g. a `stack` consuming a staged inventory shard, or a `compact --all` dropping a
+/// deletions (e.g. a `stack` consuming a staged inventory shard, or a `store compact --all` dropping a
 /// superseded pack) — after this reorder it can't, because it only reaches entry-heal once it
 /// *is* the lock-holder, the same way `heal` itself has always healed under the lock it holds. A
 /// read-only command never takes this lock at all, so its entry-heal still runs lock-free exactly

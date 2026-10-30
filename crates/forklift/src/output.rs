@@ -236,7 +236,7 @@ pub fn is_zero(value: &usize) -> bool {
 }
 
 /// Render a byte count in a human-friendly binary unit (B/KiB/MiB/GiB/TiB). The object store's
-/// scale makes raw byte counts noise, so the size-reporting commands (`compact`, `store`) show
+/// scale makes raw byte counts noise, so the size-reporting commands (`store compact`, `store status`) show
 /// this instead. JSON output always carries the exact byte count, never this string.
 pub fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -255,7 +255,7 @@ pub fn human_bytes(bytes: u64) -> String {
     }
 }
 
-/// Classify blob bytes as safely displayable text, for the commands (`show`, `peek`) that
+/// Classify blob bytes as safely displayable text, for the commands (`show`, `store peek`) that
 /// report a `binary` signal instead of printing raw bytes. Text means **both** NUL-free
 /// (`merge_utils::is_mergeable_text`, the same test `diff`'s line-by-line display uses) **and**
 /// valid UTF-8 — a NUL-free blob can still be invalid UTF-8, and a NUL byte is itself valid

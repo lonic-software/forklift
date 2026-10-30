@@ -4978,7 +4978,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "integer"
     },
     "densify_suggested": {
-      "description": "Whether this store was bulk-ingested (`git import`, or a franchise's native bundle\ninstall) and would still benefit from a one-shot `compact --all --redelta` pass.\nAdditive field; never acted on automatically.",
+      "description": "Whether this store was bulk-ingested (`git import`, or a franchise's native bundle\ninstall) and would still benefit from a one-shot `store compact --all --redelta` pass.\nAdditive field; never acted on automatically.",
       "type": "boolean"
     },
     "foreign_version_indexes": {
@@ -5537,7 +5537,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "integer"
     },
     "record_bound_skipped": {
-      "description": "Why no record was dropped: the run met an object missing here that the record does not hold,\nor could not finish, in which case the record may have shrunk though `record_dropped` is `0`\n(`null` otherwise, and on a dry run). A missing object keeps every later `evict` from\nshrinking the record until that content is back.",
+      "description": "Why no record was dropped: the run met an object missing here that the record does not hold,\nor could not finish, in which case the record may have shrunk though `record_dropped` is `0`\n(`null` otherwise, and on a dry run). A missing object keeps every later `store evict` from\nshrinking the record until that content is back.",
       "type": [
         "string",
         "null"
@@ -5554,7 +5554,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "boolean"
     },
     "still_packed": {
-      "description": "Objects the plan frees that are still inside a pack after the repack: one found damaged only\nduring it, which a repack leaves as found (`0` on a dry run; a pack already damaged refuses\nthe run). `compact --all` salvages it.",
+      "description": "Objects the plan frees that are still inside a pack after the repack: one found damaged only\nduring it, which a repack leaves as found (`0` on a dry run; a pack already damaged refuses\nthe run). `store compact --all` salvages it.",
       "format": "uint",
       "minimum": 0,
       "type": "integer"

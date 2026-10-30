@@ -151,15 +151,22 @@ pub fn show() -> Result<(), String> {
 
     // What `checked_remote` refuses is what every client that dials the remote would refuse; with
     // no remote configured its unclassified error is only that, which the report already says.
-    let blocked = match origin_utils::checked_remote() {
+    let refusal = match origin_utils::checked_remote() {
         Ok(_) => None,
-        Err(CoreError::Refusal { code, message, next_step, .. }) => Some(RemoteBlock {
+        Err(refusal @ CoreError::Refusal { .. }) => Some(refusal),
+        // A partial warehouse's missing origin is met only past the remote's URL; it is damage
+        // whether or not a remote is configured.
+        Err(_) if remote.is_none() && partial && origin.is_none() => Some(origin_utils::missing_origin_refusal()),
+        Err(_) if remote.is_none() => None,
+        Err(other) => return Err(other.into()),
+    };
+    let blocked = match refusal {
+        Some(CoreError::Refusal { code, message, next_step, .. }) => Some(RemoteBlock {
             code: code.as_str(),
             message,
             next_step,
         }),
-        Err(_) if remote.is_none() => None,
-        Err(other) => return Err(other.into()),
+        _ => None,
     };
 
     output::emit(&RemoteReport { remote, partial, origin, blocked });
