@@ -69,10 +69,10 @@ pub(crate) fn write_origin(forklift: &Path, url: &str) -> Result<(), String> {
 }
 
 /// Rewrite the origin of the warehouse in scope as `url`, for the move that owns the recorded
-/// intent once it is rewriting ([`origin_move::require_rewriting`]): the only writer after
-/// `prepare_warehouse`.
+/// intent once it is rewriting to `url` ([`origin_move::require_rewriting`]): the only writer
+/// after `prepare_warehouse`.
 pub fn write_locked(lock: &RefLock, token: &origin_move::MoveToken, url: &str) -> Result<(), String> {
-    origin_move::require_rewriting(lock, token)?;
+    origin_move::require_rewriting(lock, token, url)?;
     write_origin(&globals::forklift_root(), url)
 }
 
