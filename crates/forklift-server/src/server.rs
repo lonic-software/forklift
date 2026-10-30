@@ -184,7 +184,8 @@ enum ServingRefusal {
     Sealed(usize),
 
     /// It records an origin, as only a partial warehouse does, so its files may come from one that
-    /// lacks content, and it is never served.
+    /// lacks content, and it is never served. The message does not name the origin: a
+    /// `--warehouses` server sends it to clients, and a URL can carry credentials.
     Origin,
 }
 
@@ -205,18 +206,19 @@ impl ServingRefusal {
             ServingRefusal::Sealed(count) => format!(
                 "{} records {} object{} it holds by hash alone, without the content, so it may lack \
                 content its pallets reach. A client trusts a server to hold the whole history it \
-                serves, and could free local copies this one cannot send back. Its files may come from a \
-                cache: franchise the remote again into a new root, without --only or --cache, and \
-                serve that.",
+                serves, and could free local copies this one cannot send back. A full warehouse records \
+                nothing by hash, so this root may be a copy of a sparse warehouse or a cache: franchise \
+                the warehouse it was copied from again, from its server, into a new root, without \
+                --only or --cache, and serve that.",
                 name,
                 count,
                 if count == 1 { "" } else { "s" }
             ),
             ServingRefusal::Origin => format!(
-                "{} records an origin, which only a warehouse franchised with --only or --cache has, \
-                so its files may come from one that lacks content its pallets reach. A client trusts \
-                a server to hold the whole history it serves. Franchise the remote again into a new \
-                root, without --only or --cache, and serve that.",
+                "{} records an origin (.forklift/origin), which only a warehouse franchised with \
+                --only or --cache has, so its files may come from one that lacks content its pallets \
+                reach. A client trusts a server to hold the whole history it serves. Franchise that \
+                origin again into a new root, without --only or --cache, and serve that.",
                 name
             ),
         }
@@ -4891,7 +4893,7 @@ mod tests {
         assert!(matches!(refused, ServingRefusal::Sealed(1)), "{:?}", refused);
         let message = refused.message("\"/srv/wh\"");
         assert!(message.starts_with("\"/srv/wh\" records 1 object it holds by hash alone"), "{}", message);
-        assert!(message.contains("franchise the remote again into a new root"), "{}", message);
+        assert!(message.contains("franchise the warehouse it was copied from again, from its server, into a new root"), "{}", message);
         assert!(!sealed.join(FOLDER_NAME_FORKLIFT_ROOT).join("serve.lock").exists(), "a refused root keeps no serve lock");
 
         let emptied = base.join("emptied");
@@ -4926,24 +4928,38 @@ mod tests {
         }
         let refused = WarehouseHandle::serving(origined, false).err().expect("a root recording an origin is refused");
         assert!(matches!(refused, ServingRefusal::Origin), "{:?}", refused);
+        let message = refused.message("Warehouse \"origined\"");
+        assert!(message.starts_with("Warehouse \"origined\" records an origin (.forklift/origin)"), "{}", message);
+        assert!(message.contains("Franchise that origin again into a new root"), "{}", message);
+        assert!(!message.contains("origin.example"), "the origin URL never reaches a client: {}", message);
 
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A multi-warehouse server refuses a sealed root with the 409 a partial one gets, keeps no
-    /// serve lock for it and does not make it live; a full one beside it is served.
+    /// A multi-warehouse server refuses a sealed root, and one that records an origin, with the 409
+    /// a partial one gets, keeps no serve lock for either and makes neither live; a full one beside
+    /// them is served.
     ///
-    /// Revert: map `Sealed` to the 500 of an unreadable root → red on the status.
+    /// Revert: map `Sealed` (or `Origin`) to the 500 of an unreadable root → red on its status.
     #[test]
     fn a_multi_server_refuses_a_sealed_warehouse_with_a_409() {
         let base = scratch_dir("sealed-multi");
-        let state = capped_state(&base, 4, &["full", "sealed"]);
+        let state = capped_state(&base, 4, &["full", "sealed", "origined"]);
         write_sealed(&base.join("sealed"), &[(sealed_utils::SealOp::Record, &"3".repeat(64))]);
+        {
+            let _scope = StorageRootScope::enter(&base.join("origined"));
+            origin_utils::write_for_tests("http://origin.example");
+        }
 
         let refused = resolve_warehouse(&state, &warehouse_params("sealed")).err().expect("refused");
         assert_eq!(refused.0, StatusCode::CONFLICT, "{}", refused.1);
         assert!(refused.1.starts_with("Warehouse \"sealed\" records 1 object it holds by hash alone"), "{}", refused.1);
         assert!(!serve_lock_exists(&base, "sealed"), "a refused warehouse keeps no serve lock");
+
+        let refused = resolve_warehouse(&state, &warehouse_params("origined")).err().expect("refused");
+        assert_eq!(refused.0, StatusCode::CONFLICT, "{}", refused.1);
+        assert!(refused.1.starts_with("Warehouse \"origined\" records an origin (.forklift/origin)"), "{}", refused.1);
+        assert!(!serve_lock_exists(&base, "origined"), "a refused warehouse keeps no serve lock");
 
         drop(resolve_warehouse(&state, &warehouse_params("full")).unwrap());
         assert_eq!(live_ids(&state), ["full"].map(String::from).into());
