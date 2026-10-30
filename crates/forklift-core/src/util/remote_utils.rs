@@ -6299,9 +6299,11 @@ pub fn diverged_refusal(pallet: &str, remote_head: &str) -> CoreError {
 
 /// The other heads a user pallet's lift stops its parcel walk at ([`new_parcels_parents_first`]):
 /// the remote's other live user pallet heads whose parcel is present here. A meta pallet's history
-/// never branches off a user pallet's, so it gets none. A tombstone's head is left out: the remote
-/// may drop it mid-lift, and the walk would have stopped at history nothing roots any more. Like
-/// the stop itself, this is only a shortcut, so a head whose presence cannot be read is left out.
+/// never branches off a user pallet's, so it gets none. A tombstone's head is left out: dropping
+/// one is an operator's routine cleanup, so stopping at it would make a lift refused for history
+/// the remote no longer roots far likelier than a live head's deletion would (either fails closed,
+/// at the remote's closure check). Like the stop itself, this is only a shortcut, so a head whose
+/// presence cannot be read is left out.
 fn held_elsewhere(info: &WarehouseInfo, pallet: &str) -> Vec<String> {
     let mut heads = Vec::new();
 
@@ -6412,17 +6414,17 @@ async fn upload_history(client: &RemoteClient,
 /// The new parcels of a lift — everything reachable from the local head that the remote does
 /// not already have — **ordered parents-first**.
 ///
-/// The walk stops at the remote head and any ancestor of it (a merge's other side rejoins below
-/// the remote head), so a linear lift touches O(new parcels) and a merge never re-walks the shared
+/// The walk stops at the remote head and any ancestor of it (a merge's other side rejoins below the
+/// remote head), so a linear lift touches O(new parcels) and a merge never re-walks the shared
 /// slice. The remote holds the whole closure of every head it lists, not only the lifted pallet's,
 /// so the walk also stops at every head in `elsewhere`, and on a first lift (no remote head) at
 /// their ancestors too: a new pallet branched off another one stops where it branched instead of
 /// walking, negotiating and uploading the whole history, and work that merged in another pallet's
-/// head stops there. Pruning at every
-/// ancestor — not just the head hashes — is also what keeps a partial warehouse liftable: an
-/// interior parcel the remote already has may carry content this warehouse never fetched (out of a
-/// sparse scope, or held by a cache only by hash), and re-walking it would try to load it. The
-/// remote provably has it, so it is correctly never uploaded and never walked.
+/// head stops there. Pruning at every ancestor — not just the head hashes — is also what keeps a
+/// partial warehouse liftable: an interior parcel the remote already has may carry content this
+/// warehouse never fetched (out of a sparse scope, or held by a cache only by hash), and re-walking
+/// it would try to load it. The remote provably has it, so it is correctly never uploaded and never
+/// walked.
 ///
 /// The order is the caller's whole reason for this being one function. The candidate walk
 /// prunes each parcel's subtrees against its parents' trees, and it may only do so once those
@@ -6484,7 +6486,8 @@ fn new_parcels_parents_first(local_head: &str,
         // at: on every other lift that would cost an ancestry walk per parcel per head, and a
         // merged-in head still stops the walk by its hash above. Only a shortcut: a head whose
         // ancestry cannot be read here answers "not known", and the parcel is walked.
-        if remote_head.is_none() && elsewhere.iter().any(|head| merge_utils::is_ancestor(&hash, head).unwrap_or(false)) {
+        if remote_head.is_none()
+            && elsewhere.iter().any(|head| merge_utils::is_ancestor(&hash, head).unwrap_or(false)) {
             continue;
         }
 
