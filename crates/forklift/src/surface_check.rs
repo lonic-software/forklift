@@ -12,6 +12,10 @@
 //! - **The hint check** parses every next-step hint that names a `forklift` command, in every
 //!   string literal of the crates' sources, against the real command tree.
 //!
+//! Beside them, the shape lint holds the tree to the surface's rules that a parse can test: no
+//! boolean flag is declared to conflict with a positional argument, because a flag never switches a
+//! command into a different operation.
+//!
 //! `docs/generated/commands.md` is generated from the same tree and checked by `bin/gen-docs
 //! --check`; it follows the binary wherever it goes. These files do not: they change only when
 //! someone edits them, which is what makes them a guard.
@@ -687,7 +691,7 @@ fn boolean_positional_conflicts(cli: &clap::Command) -> Vec<String> {
     failures
 }
 
-/// Rule 3: no boolean flag is declared to conflict with a positional argument.
+/// No boolean flag is declared to conflict with a positional argument.
 #[test]
 fn no_boolean_flag_conflicts_with_a_positional() {
     let failures = boolean_positional_conflicts(&built_cli());
