@@ -24,7 +24,7 @@ use crate::globals;
 use crate::model::remote::HoldAnswer;
 use crate::util::lock_utils::RefLock;
 use crate::util::remote_utils::RemoteClient;
-use crate::util::{file_utils, merge_utils, object_utils, pallet_utils, record_utils};
+use crate::util::{file_utils, merge_utils, object_utils, origin_move, pallet_utils, record_utils};
 
 /// The record's file name in the shared forklift root, and its [`record_utils`] kind and version.
 const FILE_NAME: &str = "held-heads";
@@ -130,6 +130,7 @@ pub fn record_held_head(pallet: &str, head: &str) -> Result<(), String> {
         return Ok(());
     }
 
+    origin_move::refuse_if_pending(&lock)?;
     write_held_heads(&lock, &entries)
 }
 

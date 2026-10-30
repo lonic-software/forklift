@@ -49,4 +49,5 @@ Exit code 17 is reserved for a future feature and is not yet assigned to any cod
 | `history_unverified` | 34 | History about to be adopted as a pallet's does not verify against the trust anchor it was judged against (the one held here, or at first contact the one the remote serves); nothing was adopted |
 | `pallet_deleted_on_remote` | 35 | The remote has the pallet only as a tombstone: it was deleted there, and the name stays reserved for that history; "palletize --restore <name> --remote" brings it back, "lift --recreate" re-creates it from work that descends from it |
 | `cache_miss` | 36 | A cache warehouse does not hold content the command reads, and could not reach its origin to fetch it; the command works once the origin can be reached |
+| `origin_move_pending` | 37 | A move of a partial warehouse's origin has not finished; "remote move <url>" finishes it, "remote move --abort" abandons one that has not started rewriting |
 

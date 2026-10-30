@@ -59,6 +59,7 @@ pub mod tombstone_utils;
 pub mod take_utils;
 pub mod held_heads;
 pub mod origin_utils;
+pub mod origin_move;
 pub mod progress_utils;
 pub mod hook_utils;
 pub mod fanout_utils;

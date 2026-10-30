@@ -23,7 +23,7 @@
 use std::path::PathBuf;
 use crate::globals;
 use crate::util::lock_utils::RefLock;
-use crate::util::{file_utils, object_utils, record_utils};
+use crate::util::{file_utils, object_utils, origin_move, record_utils};
 
 /// The ledger file's name in the shared forklift root, and its [`record_utils`] kind and version.
 const FILE_NAME_LEDGER: &str = "fetched-heads";
@@ -79,7 +79,9 @@ pub fn read_ledger() -> Result<Vec<LedgerEntry>, String> {
 }
 
 /// Replace the ledger. Only under the ref lock.
-pub fn write_ledger(_lock: &RefLock, entries: &[LedgerEntry]) -> Result<(), String> {
+pub fn write_ledger(lock: &RefLock, entries: &[LedgerEntry]) -> Result<(), String> {
+    origin_move::refuse_if_pending(lock)?;
+
     let lines = entries.iter().map(|entry| format!("{} {}", entry.head, entry.pallet));
 
     file_utils::write_file_atomically(&ledger_path(), &record_utils::to_bytes(LEDGER_RECORD, LEDGER_VERSION, lines))

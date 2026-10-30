@@ -6518,6 +6518,126 @@ fn recorded(area: &TestArea, directory: &str, hash: &str) -> bool {
     forklift_core::util::sealed_utils::read_sealed().unwrap().contains(hash)
 }
 
+/// Record a move of the origin in `directory` as standing in `phase`, as the move command's first
+/// step would, through the core API.
+fn record_move_intent(area: &TestArea, directory: &str, phase: forklift_core::util::origin_move::Phase) {
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path(directory));
+    forklift_core::util::origin_move::begin_for_tests(phase);
+}
+
+/// Assert that `args`, run in `directory`, refuses as `origin_move_pending` (exit 37) in `phase`,
+/// naming the way out, and leaves every file under `.forklift` as it was.
+fn assert_move_pending(area: &TestArea,
+                       directory: &str,
+                       args: &[&str],
+                       phase: forklift_core::util::origin_move::Phase) {
+    let before = forklift_dir_snapshot(area, directory);
+    let refused = area.forklift(directory, &[&["--json"][..], args].concat());
+    assert_eq!(refused.status.code(), Some(37), "{:?} ({:?}): {}{}", args, phase, stdout(&refused), stderr(&refused));
+    let json = json_of(&refused);
+    assert_eq!(json["error"]["code"], "origin_move_pending", "{:?}: {}", args, json);
+    let message = json["error"]["message"].as_str().unwrap();
+    assert!(message.contains("remote move http://new-origin.example"), "{:?}: {}", args, message);
+    assert_eq!(message.contains("--abort"), phase == forklift_core::util::origin_move::Phase::Checking,
+        "{:?}: only a checking move can be abandoned: {}", args, message);
+    assert!(forklift_dir_snapshot(area, directory) == before, "{:?} ({:?}) changes nothing", args, phase);
+}
+
+/// While a move of a partial warehouse's origin stands, in either phase, nothing talks to a
+/// remote and nothing writes what the move checks: with `remote.url` still the origin, the remote
+/// listing, `office rotate` and `accept-regenesis`, `lower`, `lift`, `expand`, `scope-prune` and
+/// the remote `--delete` and `--restore` refuse up front, and so do the local writers: an `undo`
+/// that moves a pallet back, adding its head to the fetched-heads ledger, and a forced delete,
+/// which removes no pallet under a move whether or not its head is already in the ledger. In a
+/// cache, `evict`, a read of a parcel it never fetched, and a forced delete refuse the same way.
+/// Each refusal is `origin_move_pending` (exit 37), changes nothing under `.forklift`, and offers
+/// `--abort` only while the move is still checking. Stacking, local reads and `heal` on an
+/// undamaged warehouse proceed; with the intent gone, the refused commands run again.
+///
+/// Revert: drop the up-front check in `checked_remote` → the remote commands run (lower, the
+/// listing and the cache's read succeed) → red; drop the removal funnel → the forced delete
+/// removes its pallet (the sparse one too: its head is in the ledger already, so nothing is
+/// written there) → red; drop the ledger funnel → the undo runs → red.
+#[test]
+fn a_pending_move_of_the_origin_refuses_every_remote_client_and_every_writer_it_checks() {
+    use forklift_core::util::origin_move::Phase;
+
+    let area = TestArea::new("origin-move-pending");
+    let (server, head) = three_signed_parcels(&area);
+    assert_success(&area.forklift("a", &["palletize", "extra"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src", "--only", "docs"]));
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    let oldest = history_with_roots(&area, "cached", &head)[2].0.clone();
+
+    // Local work for the deletes and the undo to act on, and a scope path no checkout holds.
+    for directory in ["sparse", "cached"] {
+        assert_success(&area.forklift(directory, &["palletize", "old"]));
+        area.write_file(&format!("{}/src/old.txt", directory), "old\n");
+        assert_success(&area.forklift(directory, &["load", "."]));
+        assert_success(&area.forklift(directory, &["stack", "old work"]));
+        assert_success(&area.forklift(directory, &["shift", "main"]));
+    }
+    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
+    area.write_file("sparse/src/code.txt", "local\n");
+    assert_success(&area.forklift("sparse", &["load", "."]));
+    assert_success(&area.forklift("sparse", &["stack", "local"]));
+
+    let sparse_commands: [&[&str]; 12] = [
+        &["palletize", "--remote"],
+        &["office", "rotate"],
+        &["office", "accept-regenesis"],
+        &["lower"],
+        &["lift"],
+        &["expand", "notes"],
+        &["scope-prune", "docs"],
+        &["palletize", "--delete", "old"],
+        &["palletize", "--delete", "extra", "--remote"],
+        &["palletize", "--restore", "extra", "--remote"],
+        &["undo"],
+        &["palletize", "--delete", "old", "--force"],
+    ];
+    let cache_commands: [&[&str]; 3] = [
+        &["evict"],
+        &["show", &format!("{}:src/code.txt", oldest)],
+        &["palletize", "--delete", "old", "--force"],
+    ];
+
+    for phase in [Phase::Checking, Phase::Rewriting] {
+        record_move_intent(&area, "sparse", phase);
+        record_move_intent(&area, "cached", phase);
+
+        for command in sparse_commands {
+            assert_move_pending(&area, "sparse", command, phase);
+        }
+        for command in cache_commands {
+            assert_move_pending(&area, "cached", command, phase);
+        }
+
+        // What reads only this bay, or stacks onto it, still runs.
+        assert_success(&area.forklift("sparse", &["history"]));
+        assert_success(&area.forklift("sparse", &["show", "main:src/code.txt"]));
+        assert_success(&area.forklift("sparse", &["heal"]));
+        assert_success(&area.forklift("cached", &["heal"]));
+
+        std::fs::remove_file(area.path("sparse/.forklift/origin-move")).unwrap();
+        std::fs::remove_file(area.path("cached/.forklift/origin-move")).unwrap();
+    }
+
+    record_move_intent(&area, "sparse", Phase::Checking);
+    area.write_file("sparse/src/code.txt", "under a move\n");
+    assert_success(&area.forklift("sparse", &["load", "."]));
+    assert_success(&area.forklift("sparse", &["stack", "under a move"]));
+    std::fs::remove_file(area.path("sparse/.forklift/origin-move")).unwrap();
+
+    // With the intent gone, what it refused runs.
+    assert_success(&area.forklift("sparse", &["lift"]));
+    assert_success(&area.forklift("cached", &["show", &format!("{}:src/code.txt", oldest)]));
+    assert_success(&area.forklift("cached", &["palletize", "--delete", "old", "--force"]));
+    assert_success(&area.forklift("cached", &["evict"]));
+}
+
 /// `evict` frees only a cache: a full and a sparse warehouse refuse it as a plain failure, before
 /// asking any remote, and change nothing.
 ///
