@@ -1146,9 +1146,10 @@ impl Tool {
             return Some(format!("the \"{name}\" tool's arguments must be a JSON object"));
         };
 
-        // A switch passed as false puts nothing in the command, so it asks for nothing withheld.
-        let withheld = self.withheld.iter()
-            .find(|(key, _, _)| arguments.get(key).is_some_and(|value| !value.is_null() && *value != Value::Bool(false)));
+        // A switch passed as false, or an empty list, puts nothing in the command, so it asks for
+        // nothing withheld.
+        let withheld = self.withheld.iter().find(|(key, _, _)| arguments.get(key).is_some_and(|value|
+            !value.is_null() && *value != Value::Bool(false) && value.as_array().is_none_or(|list| !list.is_empty())));
         if let Some((key, _, why)) = withheld {
             return Some(format!("the \"{name}\" tool does not take \"{key}\": that {why}; a person runs it"));
         }
@@ -1651,10 +1652,11 @@ mod tests {
         assert!(delete.params.iter().all(|param| param.key != remote));
         assert!(delete.definition()["inputSchema"]["properties"].get(remote).is_none());
         for allowed in [json!({ "name": "p" }), json!({ "name": "p", "force": true }), json!({ "name": "p", remote: false }),
-                        json!({ "name": "p", remote: null })] {
+                        json!({ "name": "p", remote: null }), json!({ "name": "p", remote: [] })] {
             assert_eq!(delete.refusal(&allowed), None, "{allowed}");
         }
         assert_eq!(delete.argv(json!({ "name": "p", remote: false }).as_object().unwrap()).unwrap(), ["pallet", "delete", "--", "p"]);
+        assert!(delete.refusal(&json!({ "name": "p", remote: ["x"] })).unwrap().contains("does not take"));
         let refusal = delete.refusal(&json!({ "name": "p", remote: true })).unwrap();
         assert!(refusal.starts_with(&format!("the \"pallet_delete\" tool does not take \"{remote}\": that deletes the remote's pallet")),
                 "{refusal}");
@@ -1837,9 +1839,7 @@ mod tests {
         }
     }
 
-    /// Run `arguments` through `tool`'s argv and clap, the way a call does. Only clap's own rules
-    /// apply here: a cross-argument rule the binary checks after parsing still refuses some
-    /// combinations clap accepts, with a usage error. `Ok` means clap
+    /// Run `arguments` through `tool`'s argv and clap, the way a call does. `Ok` means clap
     /// accepted the line and every argument bound exactly to the clap argument it names, with
     /// nothing else and no global set (anything else panics); `Err` is a refusal by argv or by
     /// clap for a combination the command does not accept.

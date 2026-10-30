@@ -74,7 +74,7 @@ echo "hello" > readme.txt
 forklift load .                            # stage everything
 forklift stack "first parcel"             # commit
 
-forklift pallet create feature # branch and switch to it
+forklift pallet create feature             # branch and switch to it
 echo "more" >> readme.txt
 forklift load . && forklift stack "work"
 

@@ -1991,7 +1991,7 @@ impl Command {
                 | Command::Lower { .. }
                 | Command::Haul { .. }
                 | Command::Narrow { .. }
-                | Command::Pallet { .. }
+                | Command::Pallet { action: Some(PalletAction::Create { .. } | PalletAction::Delete { .. } | PalletAction::Restore { .. }) }
                 | Command::Park { .. }
                 | Command::Remove { .. }
                 | Command::Restore { .. }

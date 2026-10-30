@@ -2469,12 +2469,17 @@ fn an_import_git_that_cannot_build_its_inventory_is_refused_until_heal() {
     std::fs::set_permissions(root.join("locked.txt"), std::fs::Permissions::from_mode(0o644)).unwrap();
     assert!(!import.status.success(), "the inventory build must fail on the unreadable file");
 
-    for args in [&["--json", "stack", "after import"][..], &["--json", "load", "."][..]] {
+    let create = ["--json", "pallet", "create", "side"];
+    for args in [&["--json", "stack", "after import"][..], &["--json", "load", "."][..], &create[..]] {
         let refused = json(&warehouse.run(args));
         assert_eq!(refused["error"]["code"], "incomplete_load", "{:?}: {}", args, refused);
         assert_eq!(refused["error"]["next_step"], "forklift heal", "{:?}: {}", args, refused);
         assert!(refused["error"]["message"].as_str().unwrap().contains("git import"), "{}", refused);
     }
+    // Listing the pallets touches nothing, so it shows where the bay is before the heal.
+    // Revert: refuse the whole pallet family again → the listing is refused.
+    assert_success(&warehouse.run(&["pallet", "list"]));
+    assert_success(&warehouse.run(&["pallet"]));
 
     let healed = json(&warehouse.run(&["--json", "heal"]));
     assert_eq!(healed["data"]["operation"]["operation"], "git import", "{}", healed);
@@ -5803,6 +5808,14 @@ fn branch_with_a_pallet_name_is_refused_naming_pallet_create() {
     assert_eq!(refused.status.code(), Some(2));
     assert!(stderr(&refused).contains("forklift pallet create feature"), "{}", stderr(&refused));
     assert!(stdout(&warehouse.run(&["branch", "list", "--all"])).contains("main"));
+
+    // git's delete and rename flags say the name is not for a create: clap refuses the flag.
+    // Revert: step over flags the pallet level lacks → the refusal tells a delete to create.
+    for args in [&["branch", "-d", "main"][..], &["branch", "-m", "main", "trunk"][..], &["branch", "--delete=x", "main"][..]] {
+        let refused = warehouse.run(args);
+        assert_eq!(refused.status.code(), Some(2), "{:?}", args);
+        assert!(stderr(&refused).contains("unexpected argument") && !stderr(&refused).contains("create"), "{:?}: {}", args, stderr(&refused));
+    }
 }
 
 #[test]
