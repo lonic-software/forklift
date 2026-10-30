@@ -2,10 +2,9 @@ use serde::Serialize;
 use forklift_core::error::CoreError;
 use forklift_core::globals;
 use forklift_core::util::scope_utils::{self, ScopeClass};
-use crate::cli::ScopeAction;
 use crate::output::{self, CommandOutput};
 
-/// Refuse a path argument that is outside the active bay's materialization scope (§7.6),
+/// Refuse a path argument that is outside the active checkout's scope (§7.6),
 /// with the stable `out_of_scope` code. A no-op in a full (unscoped) bay or the main tree.
 ///
 /// # Arguments
@@ -33,30 +32,20 @@ pub fn refuse_in_scoped_bay(verb: &str, next_step: &str) -> Result<(), CoreError
     Ok(())
 }
 
-/// Handle the scope command (§7.6): report the sparse-workspace scope — this bay's
-/// materialization scope and the warehouse fetch scope. Read-only.
-///
-/// # Arguments
-/// * `action` - The subcommand (`None` shows the status, same as `status`).
+/// Handle `scope status` and bare `scope` (§7.6): report this checkout's scope and the
+/// warehouse fetch scope. Read-only.
 ///
 /// # Returns
 /// * `Ok(())`      - If the status was reported.
 /// * `Err(String)` - If a scope file could not be read.
-pub fn handle_command(action: Option<ScopeAction>) -> Result<(), String> {
-    match action {
-        Some(ScopeAction::Status) | None => status(),
-    }
-}
-
-/// Report the active bay's materialization scope and the warehouse fetch scope.
-fn status() -> Result<(), String> {
+pub fn handle_command() -> Result<(), String> {
     let bay_scope = scope_utils::current_scope()?;
     let fetch_scope = scope_utils::read_fetch_scope()?;
 
     output::emit(&ScopeStatus {
         bay: globals::active_bay(),
         scoped: !bay_scope.is_full(),
-        materialization_scope: bay_scope.prefixes().to_vec(),
+        checkout_scope: bay_scope.prefixes().to_vec(),
         implicit_scope: bay_scope.implicit_members().iter().map(|path| path.to_string()).collect(),
         fetch_scope: fetch_scope.prefixes().to_vec(),
         implicit_fetch_scope: fetch_scope.implicit_members().iter().map(|path| path.to_string()).collect(),
@@ -74,11 +63,11 @@ pub(crate) struct ScopeStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     bay: Option<String>,
 
-    /// Whether this bay is scoped (has a non-full materialization scope).
+    /// Whether this bay is scoped (has a non-full checkout scope).
     scoped: bool,
 
     /// The bay's in-scope prefixes (empty = the full tree).
-    materialization_scope: Vec<String>,
+    checkout_scope: Vec<String>,
 
     /// The paths a scoped bay holds in scope without listing them as prefixes: the root ignore
     /// file, so its rules apply to the checkout. Empty when the bay is not scoped.
@@ -101,10 +90,10 @@ impl CommandOutput for ScopeStatus {
         };
 
         if !self.scoped {
-            println!("{} materializes the full tree (not a scoped bay).", where_);
+            println!("{} checks out the full tree (not a scoped bay).", where_);
         } else {
-            println!("{} is a scoped (sparse) bay. Materialization scope:", where_);
-            for prefix in &self.materialization_scope {
+            println!("{} is a scoped (sparse) bay. Checkout scope:", where_);
+            for prefix in &self.checkout_scope {
                 println!("  {}", prefix);
             }
             for path in &self.implicit_scope {

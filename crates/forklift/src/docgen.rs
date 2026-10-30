@@ -403,7 +403,6 @@ fn command_schemas(name: &str) -> Option<Vec<OutputSchema>> {
         "consolidate" => commands::consolidate::__docgen_schemas(),
         "deliver" => commands::deliver::__docgen_schemas(),
         "diff" => commands::diff::__docgen_schemas(),
-        "expand" => commands::expand::__docgen_schemas(),
         "git" => [
             commands::import_git::__docgen_schemas(),
             commands::export_git::__docgen_schemas(),
@@ -420,7 +419,6 @@ fn command_schemas(name: &str) -> Option<Vec<OutputSchema>> {
             commands::manifest::__docgen_schemas(),
             commands::kv::__docgen_schemas(),
         ].into_iter().flatten().collect(),
-        "narrow" => commands::narrow::__docgen_schemas(),
         "office" => commands::office::__docgen_schemas(),
         "pallet" => commands::pallet::__docgen_schemas(),
         "park" => commands::park::__docgen_schemas(),
@@ -428,8 +426,12 @@ fn command_schemas(name: &str) -> Option<Vec<OutputSchema>> {
         "prepare" => commands::prepare::__docgen_schemas(),
         "profile" => commands::profile::__docgen_schemas(),
         "remove" => commands::remove::__docgen_schemas(),
-        "scope" => commands::scope::__docgen_schemas(),
-        "scope-prune" => commands::scope_prune::__docgen_schemas(),
+        "scope" => [
+            commands::scope::__docgen_schemas(),
+            commands::expand::__docgen_schemas(),
+            commands::narrow::__docgen_schemas(),
+            commands::scope_prune::__docgen_schemas(),
+        ].into_iter().flatten().collect(),
         "remote" => commands::remote::__docgen_schemas(),
         "self" => [
             commands::self_update::__docgen_schemas(),

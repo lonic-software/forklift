@@ -18,7 +18,6 @@ conflicts
 consolidate
 deliver
 diff
-expand
 git: import export mirror
 haul: open list show update comment review consolidate close reopen
 heal
@@ -29,7 +28,6 @@ load
 lower
 manifest: note approve provenance show set get unset keys log
 mcp
-narrow
 office: enroll admit link authorize role rotate retire regenesis accept-regenesis list
 pallet: list create delete restore
 park: pop list
@@ -40,8 +38,7 @@ query
 remote: move abort
 remove
 restore
-scope: status
-scope-prune
+scope: status fetch narrow prune
 self: alias schema update
 self alias: install uninstall status
 shift
@@ -79,7 +76,7 @@ park
 # guarantee that exists now, and no Forklift command can bring it back from this warehouse alone.
 # When only one mode of a command is destructive, the entry names the flag and value selecting it.
 restore
-scope-prune
+scope prune
 office regenesis
 office accept-regenesis
 lower --keep …=theirs

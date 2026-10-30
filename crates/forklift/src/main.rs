@@ -3,7 +3,7 @@ use clap::error::ErrorKind;
 use clap::{CommandFactory, FromArgMatches};
 use forklift_core::util::{lock_utils, warehouse_utils};
 use forklift_core::util::fanout_utils::block_on_worker_stack;
-use crate::cli::{Cli, Command, GitAction, OfficeAction, PalletAction, ParkAction, ProfileAction, RemoteAction, SelfAction, StoreAction};
+use crate::cli::{Cli, Command, GitAction, OfficeAction, PalletAction, ParkAction, ProfileAction, RemoteAction, ScopeAction, SelfAction, StoreAction};
 use crate::output::{ErrorCode, ForkliftError, OutputMode};
 
 pub mod cache_fetch;
@@ -492,8 +492,6 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
         Command::Deliver { target, message } => commands::deliver::handle_command(&target, message),
         Command::Diff { staged, targets } => commands::diff::handle_command(staged, &targets, cli.verbose).await,
         Command::Help { .. } => unreachable!("help is answered in `forklift`, before dispatch"),
-        Command::Expand { paths } => commands::expand::handle_command(paths).await,
-        Command::Narrow { paths } => commands::narrow::handle_command(paths).await,
         Command::Clone { url, directory, pallet, token, only, cache, expect } =>
             commands::clone::handle_command(&url, &directory, pallet, token, only, cache, expect).await,
         Command::Heal => {
@@ -568,8 +566,12 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
         Command::Prepare => commands::prepare::handle_command(cli.verbose),
         Command::Remove { path } => commands::remove::handle_command(&path),
         Command::Restore { staged, path } => commands::restore::handle_command(staged, &path),
-        Command::Scope { action } => commands::scope::handle_command(action),
-        Command::ScopePrune { paths, dry_run } => commands::scope_prune::handle_command(paths, dry_run).await,
+        Command::Scope { action } => match action {
+            Some(ScopeAction::Status) | None => commands::scope::handle_command(),
+            Some(ScopeAction::Fetch { paths }) => commands::expand::handle_command(paths).await,
+            Some(ScopeAction::Narrow { paths }) => commands::narrow::handle_command(paths).await,
+            Some(ScopeAction::Prune { paths, dry_run }) => commands::scope_prune::handle_command(paths, dry_run).await,
+        },
         Command::Remote { action } => match action {
             None => commands::remote::show(),
             Some(RemoteAction::Move { url, token }) => {

@@ -788,78 +788,18 @@ pub enum Command {
         summary: bool,
     },
 
-    /// Widen a sparse warehouse's fetch scope and download the newly in-scope subtree(s)
+    /// Show and change the sparse scopes: this checkout's scope and the warehouse fetch scope
     #[command(
-        long_about = "Widen a sparse warehouse's fetch scope: add subtree path(s) to what the \
-                      store fetches, then download their content across the whole history from the \
-                      remote. Cheap and incremental — only the newly in-scope objects are fetched; \
-                      what is already present is skipped. After expanding, a bay can be scoped to \
-                      the new path (\"forklift bay add --scope\"). A full (non-sparse) warehouse already \
-                      holds everything, so there is nothing to expand."
-    )]
-    Expand {
-        /// The subtree path(s) to add to the fetch scope. Repeatable.
-        #[arg(value_name = "PATH", required = true)]
-        paths: Vec<String>,
-    },
-
-    /// Narrow this checkout's materialization scope and de-materialize the dropped subtree(s)
-    #[command(
-        long_about = "Narrow this checkout's materialization scope: drop subtree path(s) from what \
-                      this bay (or the main tree) materializes, and remove the now out-of-scope \
-                      files from the working directory. This frees nothing in the shared object \
-                      store — the dropped content is still ordinary reachable history, not garbage \
-                      — it only shrinks what this checkout shows. A checkout must keep at least one \
-                      in-scope path; to stop scoping entirely, open a fresh full checkout."
-    )]
-    Narrow {
-        /// The in-scope subtree path(s) to drop. Repeatable.
-        #[arg(value_name = "PATH", required = true)]
-        paths: Vec<String>,
-    },
-
-    /// Show this bay's sparse materialization scope, and the warehouse fetch scope
-    #[command(
-        long_about = "Show the sparse-workspace scope: this bay's materialization scope \
-                      (the subtree path(s) it checks out, stages and stacks) and the warehouse's \
-                      fetch scope (what the store has fetched at all). An \
-                      unscoped bay (or the main tree) reports a full scope: the whole tree. Scope \
-                      is local to the checkout and never tracked. Read-only."
+        long_about = "Show and change the two sparse scopes. The checkout scope is what one \
+                      checkout (a bay or the main tree) writes to disk; the fetch scope is what \
+                      the warehouse's store holds, shared by every checkout. Without a \
+                      subcommand, show both, as \"forklift scope status\" does. \"forklift scope \
+                      narrow\" shrinks the checkout scope; \"forklift scope fetch\" widens the \
+                      fetch scope and \"forklift scope prune\" shrinks it."
     )]
     Scope {
         #[command(subcommand)]
         action: Option<ScopeAction>,
-    },
-
-    /// Reclaim disk from a sparse warehouse: forget a fetched path and free its content
-    #[command(
-        name = "scope-prune",
-        long_about = "Reclaim disk from a sparse warehouse: drop a fetched path from the shared \
-                      warehouse fetch scope and free the objects under it from the object store. \
-                      This is the deliberate, destructive counterpart of \"forklift narrow\" — narrow is \
-                      bay-local and frees nothing, because narrowed-away content is still \
-                      reachable history that garbage collection correctly keeps; scope-prune \
-                      forgets a path warehouse-wide and reclaims its disk. It is multi-bay-aware: \
-                      it refuses to free a path any checkout (the main tree or a bay) still \
-                      materializes. It frees only history the remote holds, so it asks the remote \
-                      first and refuses, changing nothing, when it cannot; work never lifted keeps \
-                      its content until it is lifted and the prune is run again. What it frees is \
-                      sealed by hash afterwards — re-fetchable from the origin with \"forklift expand\". A \
-                      full (non-sparse) warehouse has nothing to \
-                      prune. If an earlier prune was interrupted before it finished freeing \
-                      everything, running it again on the same path resumes and finishes the job \
-                      rather than refusing. Use --dry-run to see what it would free without \
-                      changing anything."
-    )]
-    ScopePrune {
-        /// The fetched path(s) to prune. Repeatable; also accepts a path an earlier, interrupted
-        /// prune already dropped from the fetch scope, to resume and finish freeing it.
-        #[arg(value_name = "PATH", required = true)]
-        paths: Vec<String>,
-
-        /// Report what would be freed and change nothing
-        #[arg(long)]
-        dry_run: bool,
     },
 
     /// Show the remote and the origin, or move a partial warehouse's origin to another server
@@ -1100,8 +1040,74 @@ pub enum BayAction {
 
 #[derive(Subcommand)]
 pub enum ScopeAction {
-    /// Show the current bay's materialization scope and the warehouse fetch scope (the default)
+    /// Show this checkout's scope and the warehouse fetch scope (the default)
+    #[command(
+        long_about = "Show the two sparse scopes: this checkout's scope (the subtree path(s) the \
+                      bay or the main tree checks out, stages and stacks) and the warehouse's \
+                      fetch scope (what the store has fetched at all). An unscoped bay (or the \
+                      main tree) reports a full checkout scope: the whole tree. A checkout scope \
+                      is local to the checkout and never tracked. Read-only."
+    )]
     Status,
+    /// Widen a sparse warehouse's fetch scope and download the newly in-scope subtree(s)
+    #[command(
+        long_about = "Widen a sparse warehouse's fetch scope: add subtree path(s) to what the \
+                      store fetches, then download their content across the whole history from the \
+                      remote. Cheap and incremental — only the newly in-scope objects are fetched; \
+                      what is already present is skipped. Every checkout's scope stays as it is: \
+                      after fetching, a bay can be scoped to the new path (\"forklift bay add \
+                      --scope\"). A full (non-sparse) warehouse already holds everything, so there \
+                      is nothing to fetch."
+    )]
+    Fetch {
+        /// The subtree path(s) to add to the fetch scope. Repeatable.
+        #[arg(value_name = "PATH", required = true)]
+        paths: Vec<String>,
+    },
+    /// Narrow this checkout's scope and remove the dropped subtree(s) from the working directory
+    #[command(
+        long_about = "Narrow this checkout's scope: drop subtree path(s) from what this bay (or \
+                      the main tree) checks out, and remove the now out-of-scope files from the \
+                      working directory. This frees nothing in the shared object store — the \
+                      dropped content is still ordinary reachable history, not garbage — it only \
+                      shrinks what this checkout shows, and the fetch scope stays as it is. A \
+                      checkout must keep at least one in-scope path; to stop scoping entirely, \
+                      open a fresh full checkout."
+    )]
+    Narrow {
+        /// The in-scope subtree path(s) to drop. Repeatable.
+        #[arg(value_name = "PATH", required = true)]
+        paths: Vec<String>,
+    },
+    /// Reclaim disk from a sparse warehouse: shrink its fetch scope and free the content
+    #[command(
+        long_about = "Reclaim disk from a sparse warehouse: drop a fetched path from the shared \
+                      warehouse fetch scope and free the objects under it from the object store. \
+                      This is the deliberate, destructive counterpart of \"forklift scope narrow\": \
+                      narrow shrinks one checkout's scope and frees nothing, because narrowed-away \
+                      content is still reachable history that garbage collection correctly keeps; \
+                      prune shrinks the fetch scope warehouse-wide and reclaims its disk. It is \
+                      multi-bay-aware: it refuses to free a path any checkout (the main tree or a \
+                      bay) still has in its scope. It frees only history the remote holds, so it \
+                      asks the remote first and refuses, changing nothing, when it cannot; work \
+                      never lifted keeps its content until it is lifted and the prune is run \
+                      again. What it frees is sealed by hash afterwards — fetched again from the \
+                      origin with \"forklift scope fetch\". A full (non-sparse) warehouse has \
+                      nothing to prune. If an earlier prune was interrupted before it finished \
+                      freeing everything, running it again on the same path resumes and finishes \
+                      the job rather than refusing. Use --dry-run to see what it would free \
+                      without changing anything."
+    )]
+    Prune {
+        /// The fetched path(s) to prune. Repeatable; also accepts a path an earlier, interrupted
+        /// prune already dropped from the fetch scope, to resume and finish freeing it.
+        #[arg(value_name = "PATH", required = true)]
+        paths: Vec<String>,
+
+        /// Report what would be freed and change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1963,7 +1969,6 @@ impl Command {
                 | Command::Consolidate { .. }
                 | Command::Deliver { .. }
                 | Command::Diff { .. }
-                | Command::Expand { .. }
                 | Command::Git { .. }
                 | Command::Heal
                 | Command::History { .. }
@@ -1972,7 +1977,6 @@ impl Command {
                 | Command::Lower { .. }
                 | Command::Haul { .. }
                 | Command::Manifest { .. }
-                | Command::Narrow { .. }
                 | Command::Office { .. }
                 | Command::Pallet { .. }
                 | Command::Park { .. }
@@ -1981,7 +1985,6 @@ impl Command {
                 | Command::Remote { .. }
                 | Command::Restore { .. }
                 | Command::Scope { .. }
-                | Command::ScopePrune { .. }
                 | Command::Shift { .. }
                 | Command::Show { .. }
                 | Command::Stack { .. }
@@ -2036,18 +2039,16 @@ impl Command {
             self,
             Command::Pick { .. }
                 | Command::Consolidate { .. }
-                | Command::Expand { .. }
                 | Command::Git { action: GitAction::Import { .. } }
                 | Command::Lift { .. }
                 | Command::Load { .. }
                 | Command::Lower { .. }
                 | Command::Haul { .. }
-                | Command::Narrow { .. }
                 | Command::Pallet { action: Some(PalletAction::Create { .. } | PalletAction::Delete { .. } | PalletAction::Restore { .. }) }
                 | Command::Park { .. }
                 | Command::Remove { .. }
                 | Command::Restore { .. }
-                | Command::ScopePrune { .. }
+                | Command::Scope { action: Some(ScopeAction::Fetch { .. } | ScopeAction::Narrow { .. } | ScopeAction::Prune { .. }) }
                 | Command::Store { action: Some(StoreAction::Evict { .. }) }
                 | Command::Shift { .. }
                 | Command::Stack { .. }
@@ -2072,7 +2073,6 @@ impl Command {
                 | Command::Pick { .. }
                 | Command::Consolidate { .. }
                 | Command::Deliver { .. }
-                | Command::Expand { .. }
                 | Command::Heal
                 | Command::Git { action: GitAction::Import { .. } | GitAction::Mirror }
                 | Command::Lift { .. }
@@ -2080,14 +2080,13 @@ impl Command {
                 | Command::Lower { .. }
                 | Command::Haul { .. }
                 | Command::Manifest { .. }
-                | Command::Narrow { .. }
                 | Command::Office { .. }
                 | Command::Pallet { .. }
                 | Command::Park { .. }
                 | Command::Remove { .. }
                 | Command::Remote { action: Some(_) }
                 | Command::Restore { .. }
-                | Command::ScopePrune { .. }
+                | Command::Scope { action: Some(ScopeAction::Fetch { .. } | ScopeAction::Narrow { .. } | ScopeAction::Prune { .. }) }
                 | Command::Store { action: Some(StoreAction::Compact { .. } | StoreAction::Evict { .. }) }
                 | Command::Shift { .. }
                 | Command::Stack { .. }
@@ -2107,9 +2106,9 @@ impl Command {
     /// that list that sets a pallet head, and it writes into a store it has just created, which
     /// no other process uses yet.
     ///
-    /// `store compact`, `store evict` and `scope-prune` are excluded because they host deleters,
+    /// `store compact`, `store evict` and `scope prune` are excluded because they host deleters,
     /// which take the exclusive side; their own shared hold would refuse them. They take the side
-    /// they need themselves: a full repack, evict and scope-prune the exclusive one, incremental
+    /// they need themselves: a full repack, evict and scope prune the exclusive one, incremental
     /// compaction the shared one, tried.
     ///
     /// # Returns
@@ -2120,7 +2119,7 @@ impl Command {
             && !matches!(
                 self,
                 Command::Store { action: Some(StoreAction::Compact { .. } | StoreAction::Evict { .. }) }
-                    | Command::ScopePrune { .. }
+                    | Command::Scope { action: Some(ScopeAction::Prune { .. }) }
             )
     }
 
