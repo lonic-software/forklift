@@ -1697,6 +1697,15 @@ warehouse whose record is missing (only a damaged `.forklift` can be) is refused
 code; franchise the remote again. A full warehouse records no origin, holds the whole closure and
 can talk to any remote.
 
+**While a move of the origin stands.** Moving a partial warehouse to another origin first records
+that a move has begun, and it is not finished until the origin and `remote.url` both name the new
+server. Until then, every command above refuses up front, and so do the local commands that would
+change what the move checks: an `undo` that moves a pallet back in a sparse warehouse, and
+deleting a pallet. Each refuses with the `origin_move_pending` code (exit 37),
+changing nothing. `forklift remote move <url>` finishes the move; while it is still checking the
+new server, and has not started rewriting the origin, `forklift remote move --abort` abandons it
+instead. Stacking, local reads and `heal` still run.
+
 **Very large lifts and old remotes.** A lift touching more objects than fit in one commit batch
 (tens of thousands of distinct objects — realistic for a single maximal chunked file, or simply a
 lot of small tracked files at once) needs a remote that understands paginated commits. Against a

@@ -83,7 +83,9 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 10** (current): the `cache_miss` error code exists.
+**Schema 11** (current): the `origin_move_pending` error code exists.
+
+**Schema 10**: the `cache_miss` error code exists.
 
 **Schema 9**: `batch_lane` may also be `out_of_time`, when the remote ran out of time for
 a batch download and the rest of the command fetched one object at a time.
@@ -511,6 +513,17 @@ it can refuse partway through, with part of its change made.
 
 A remote that answers but does not hand the object over, or a configured remote that is not the
 origin, is a plain failure, not `cache_miss`: running the command again would not help.
+
+### A move of the origin that has not finished: `origin_move_pending`
+
+Moving a partial warehouse (`--only` or `--cache`) to another origin records that the move has
+begun before it talks to the new server, and clears that record only when the move has finished or
+been abandoned. While it stands, every command that would talk to a remote, or change what the
+move checks (the heads this warehouse depends on its origin for, and the content it holds by hash
+alone), refuses with `origin_move_pending` (exit 37) and changes nothing. `next_step` names
+`remote move <url>`, which finishes the move, and, while the move has not yet started rewriting
+the origin, `remote move --abort`, which abandons it. Stacking and commands that only read this
+warehouse still run.
 
 ### An unfinished franchise: `franchise_incomplete`
 
