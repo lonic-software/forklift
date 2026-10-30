@@ -21,6 +21,10 @@ const FILE_NAME_REF_LOCK: &str = "refs.lock";
 /// The name of the mirror lock sidecar (inside the shared forklift root folder). Never deleted.
 pub const FILE_NAME_MIRROR_LOCK: &str = "mirror.lock";
 
+/// The name of the origin-move lock sidecar (inside the shared forklift root folder). Never
+/// deleted, read or written.
+pub const FILE_NAME_MOVE_LOCK: &str = "origin-move.lock";
+
 /// The name of the base-folder lock sidecar of a multi-warehouse server (inside the base folder).
 /// Never deleted. It starts with a dot, which no warehouse id may, so it is never served as one.
 pub const FILE_NAME_BASE_SERVE_LOCK: &str = ".forklift-server.lock";
@@ -436,6 +440,38 @@ impl MirrorLock {
 
         match file.try_lock() {
             Ok(()) => Ok(Some(MirrorLock { _file: file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(lock_error(&path, &e)),
+        }
+    }
+}
+
+/// The lock a move of a partial warehouse's origin holds for its whole run, and that its `--abort`
+/// takes too: the move's intent ([`origin_move`](crate::util::origin_move)) names one owner at a
+/// time, and a holder of this lock knows that any intent it finds belongs to a move that is no
+/// longer running.
+///
+/// A *kernel* lock on a sidecar in the shared forklift root that is never deleted, read or
+/// written, like [`MirrorLock`], so a killed move leaves nothing stale. A move that finds it held
+/// does not wait: another move is running.
+pub struct MoveLock {
+    // Held only to keep the lock: closing the handle releases it.
+    _file: std::fs::File,
+}
+
+impl MoveLock {
+    /// Take the move lock without waiting.
+    ///
+    /// # Returns
+    /// * `Ok(Some(MoveLock))` - The lock (released when dropped).
+    /// * `Ok(None)`           - Another move holds it.
+    /// * `Err(String)`        - If the sidecar could not be opened or locked.
+    pub fn try_acquire() -> Result<Option<MoveLock>, String> {
+        let path = absolute(forklift_root().join(FILE_NAME_MOVE_LOCK));
+        let file = open_lock_sidecar(&path)?;
+
+        match file.try_lock() {
+            Ok(()) => Ok(Some(MoveLock { _file: file })),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(e)) => Err(lock_error(&path, &e)),
         }

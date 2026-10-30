@@ -12,12 +12,14 @@
 //! is not configuration: no `config` command reaches it, so the origin cannot be edited to agree
 //! with whatever remote is configured. `prepare_warehouse` writes it before the marker of a partial
 //! warehouse, so no partial marker stands without an origin, and before the franchise fetches
-//! anything. A full warehouse has none: it holds its whole closure and may talk to any remote.
+//! anything; afterwards only a move of the origin rewrites it ([`write_locked`]). A full warehouse
+//! has none: it holds its whole closure and may talk to any remote.
 
 use std::path::{Path, PathBuf};
 use crate::error::{CoreError, RefusalCode};
 use crate::globals;
-use crate::util::{config_utils, file_utils, record_utils, scope_utils};
+use crate::util::lock_utils::RefLock;
+use crate::util::{config_utils, file_utils, origin_move, record_utils, scope_utils};
 
 /// The record's file name in the shared forklift root, and its [`record_utils`] kind and version.
 pub const FILE_NAME: &str = "origin";
@@ -52,9 +54,9 @@ pub fn read_origin() -> Result<Option<String>, String> {
     }
 }
 
-/// Record `url` as the origin of the warehouse being prepared in `forklift`, atomically and synced
-/// with its folder. Only `prepare_warehouse` calls it, before the marker, so no other writer can
-/// exist yet and no lock is needed.
+/// Record `url` as the origin of the warehouse in `forklift`, atomically and synced with its
+/// folder: for `prepare_warehouse`, before the marker, so no other writer can exist yet and no
+/// lock is needed, and through [`write_locked`] for a move.
 pub(crate) fn write_origin(forklift: &Path, url: &str) -> Result<(), String> {
     if url.is_empty() {
         return Err("A partial warehouse's origin must be a remote URL.".to_string());
@@ -64,6 +66,14 @@ pub(crate) fn write_origin(forklift: &Path, url: &str) -> Result<(), String> {
 
     file_utils::replace_file_atomically(&path, &record_utils::to_bytes(RECORD, VERSION, [url]))
         .map_err(|e| format!("Error while recording the origin \"{}\": {}", path.to_string_lossy(), e))
+}
+
+/// Rewrite the origin of the warehouse in scope as `url`, for the move that owns the recorded
+/// intent once it is rewriting ([`origin_move::require_rewriting`]): the only writer after
+/// `prepare_warehouse`.
+pub fn write_locked(lock: &RefLock, token: &origin_move::MoveToken, url: &str) -> Result<(), String> {
+    origin_move::require_rewriting(lock, token)?;
+    write_origin(&globals::forklift_root(), url)
 }
 
 /// Record `url` as the origin of the warehouse in scope, for a test fixture that builds a partial
@@ -78,10 +88,15 @@ pub fn write_for_tests(url: &str) {
 ///
 /// # Returns
 /// * `Ok((url, token))` - The remote to dial.
-/// * `Err(CoreError)`   - No remote is configured; in a partial warehouse, a `non_origin_remote`
+/// * `Err(CoreError)`   - An `origin_move_pending` refusal while a move of the origin has not
+///   finished; no remote is configured; in a partial warehouse, a `non_origin_remote`
 ///   refusal when the configured remote is not the origin or no origin is recorded; or the config,
 ///   the mode or the origin record cannot be read.
 pub fn checked_remote() -> Result<(String, Option<String>), CoreError> {
+    // A move of the origin is checking the new server against what this warehouse holds, or has
+    // started rewriting which remote that is: no client talks to either until it finishes.
+    origin_move::ensure_none_pending()?;
+
     let url = config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)?
         .map(|(value, _)| value)
         .ok_or_else(|| format!(

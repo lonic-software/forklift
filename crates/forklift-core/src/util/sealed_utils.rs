@@ -86,7 +86,7 @@ use std::path::{Path, PathBuf};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::enums::object_type::ObjectType;
 use crate::globals;
-use crate::util::{audit_utils, bay_utils, file_utils, object_utils, office_utils, origin_utils, pack_utils, record_utils, recovery_utils, sign_utils};
+use crate::util::{audit_utils, bay_utils, file_utils, object_utils, office_utils, origin_move, origin_utils, pack_utils, record_utils, recovery_utils, sign_utils};
 use crate::util::lock_utils::{RefLock, StoreAccessExclusive, StoreAccessLock};
 
 /// The record's file name under the shared forklift root.
@@ -489,6 +489,8 @@ fn rebuild_locked(_lock: &RefLock) -> Result<Option<Rebuilt>, String> {
         return Ok(None);
     };
 
+    origin_move::refuse_if_pending(_lock)?;
+
     let rebuilt = match valid_len {
         0 => header_bytes(),
         _ => bytes[..valid_len].to_vec(),
@@ -661,6 +663,8 @@ fn append_decided_locked(
         return Ok(set);
     }
 
+    origin_move::refuse_if_pending(_lock)?;
+
     match rewrite_from {
         Some(mut prefix) => {
             prefix.extend(frames.concat());
@@ -745,6 +749,7 @@ fn rewrite_locked(_lock: &RefLock, drop: &HashSet<String>) -> Result<(SealedSet,
     compacted.extend(encode_frames(&ops)?.concat());
 
     if compacted != bytes {
+        origin_move::refuse_if_pending(_lock)?;
         file_utils::replace_file_atomically(&path, &compacted)?;
     }
 

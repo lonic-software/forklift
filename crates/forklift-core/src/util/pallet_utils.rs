@@ -1636,6 +1636,11 @@ pub fn remove_pallet_head_in(
 
     let lock = crate::util::lock_utils::RefLock::acquire()?;
 
+    // Under a move of the origin no pallet is removed: a sparse removal adds its head to the
+    // ledger the move checks, which refuses there too, and a cache's removal, which adds nothing,
+    // is held to the same rule here.
+    crate::util::origin_move::refuse_if_pending(&lock)?;
+
     require_head(namespace, name, Some(expected))?;
     check_preconditions(&lock, preconditions)?;
 

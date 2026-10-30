@@ -59,7 +59,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -519,6 +519,10 @@ error_codes! {
     /// A cache warehouse does not hold content the command reads, and could not reach its origin
     /// to fetch it.
     CacheMiss,
+
+    /// A move of a partial warehouse's origin has not finished; the command refused before it
+    /// changed anything.
+    OriginMovePending,
 }
 
 impl ErrorCode {
@@ -560,6 +564,7 @@ impl ErrorCode {
             ErrorCode::HistoryUnverified => RefusalCode::HistoryUnverified.as_str(),
             ErrorCode::PalletDeletedOnRemote => RefusalCode::PalletDeletedOnRemote.as_str(),
             ErrorCode::CacheMiss => RefusalCode::CacheMiss.as_str(),
+            ErrorCode::OriginMovePending => RefusalCode::OriginMovePending.as_str(),
         }
     }
 
@@ -604,6 +609,7 @@ impl ErrorCode {
             ErrorCode::HistoryUnverified => 34,
             ErrorCode::PalletDeletedOnRemote => 35,
             ErrorCode::CacheMiss => 36,
+            ErrorCode::OriginMovePending => 37,
         }
     }
 
@@ -701,6 +707,9 @@ impl ErrorCode {
             ErrorCode::CacheMiss =>
                 "A cache warehouse does not hold content the command reads, and could not reach its \
                  origin to fetch it; the command works once the origin can be reached",
+            ErrorCode::OriginMovePending =>
+                "A move of a partial warehouse's origin has not finished; \"remote move <url>\" \
+                 finishes it, \"remote move --abort\" abandons one that has not started rewriting",
         }
     }
 
@@ -742,6 +751,7 @@ impl ErrorCode {
             RefusalCode::NotAWarehouse => ErrorCode::NotAWarehouse,
             RefusalCode::PalletDeletedOnRemote => ErrorCode::PalletDeletedOnRemote,
             RefusalCode::CacheMiss => ErrorCode::CacheMiss,
+            RefusalCode::OriginMovePending => ErrorCode::OriginMovePending,
         }
     }
 }
@@ -1242,6 +1252,7 @@ mod tests {
             (RefusalCode::NotAWarehouse, "not_a_warehouse", 3),
             (RefusalCode::PalletDeletedOnRemote, "pallet_deleted_on_remote", 35),
             (RefusalCode::CacheMiss, "cache_miss", 36),
+            (RefusalCode::OriginMovePending, "origin_move_pending", 37),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

@@ -266,6 +266,12 @@ refusal_codes! {
     /// could not fetch it because its origin could not be reached. The next step names the origin
     /// to wait for.
     CacheMiss => "cache_miss",
+
+    /// A move of a partial warehouse's origin was started and has not finished: until it does,
+    /// nothing fetches, lifts, reads the remote's heads or writes the records the move checks
+    /// against the new server. The next step finishes the move (`remote move <url>`), or abandons
+    /// one that has not started rewriting (`remote move --abort`).
+    OriginMovePending => "origin_move_pending",
 }
 
 impl RefusalCode {
