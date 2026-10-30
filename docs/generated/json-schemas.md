@@ -5205,7 +5205,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "string"
     },
     "previous_origin": {
-      "description": "The origin before the move; none when the record was missing.",
+      "description": "The origin before this run; none when the record was missing or could not be read, which a\nmove repairs. A run finishing a stopped move may find it already rewritten to the new origin.",
       "type": [
         "string",
         "null"
