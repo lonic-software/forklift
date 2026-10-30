@@ -6662,6 +6662,8 @@ fn an_interrupted_evict_leaves_a_readable_warehouse_and_a_rerun_finishes() {
     let held = origin_heads(&area);
     let (plan, stuck) = {
         let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("cached"));
+        let store_lock = forklift_core::util::lock_utils::StoreLock::acquire().unwrap();
+        let serve_lock = forklift_core::util::lock_utils::ServeLock::acquire().unwrap();
         let hold = forklift_core::util::lock_utils::StoreAccessLock::try_exclusive().unwrap();
         let plan = evict_utils::plan_evict(&held, &hold).unwrap();
         assert!(plan.to_free.len() >= 3, "the oldest parcel's content is planned");
@@ -6670,7 +6672,8 @@ fn an_interrupted_evict_leaves_a_readable_warehouse_and_a_rerun_finishes() {
         let stuck = plan.to_free.last().unwrap().clone();
         let folder = object_store_path(&area, "cached", &stuck).parent().unwrap().to_path_buf();
         std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let outcome = evict_utils::carry_out(&plan, &hold);
+        let progress = forklift_core::util::progress_utils::Progress::NONE;
+        let outcome = evict_utils::carry_out(&plan, &store_lock, &serve_lock, &hold, &progress);
         std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(outcome.is_err(), "the delete of {} fails", stuck);
         (plan, stuck)
@@ -6686,6 +6689,75 @@ fn an_interrupted_evict_leaves_a_readable_warehouse_and_a_rerun_finishes() {
     assert_success(&area.forklift("cached", &["evict"]));
     assert!(!object_held(&area, "cached", &oldest_root));
     assert_success(&area.forklift("cached", &["audit"]));
+}
+
+/// Packed content is evicted too: after a `compact` moves everything the cache read into a pack,
+/// `evict` rewrites the packs without what the origin holds, reports the bytes it freed, keeps
+/// every parcel's signature, and a read fetches the evicted content again.
+///
+/// Revert: skip the repack → the oldest parcel's content stays present.
+#[test]
+fn evict_frees_packed_content_and_a_read_fetches_it_again() {
+    let area = TestArea::new("evict-packed");
+    let (server, head) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    let history = history_with_roots(&area, "cached", &head);
+    let (oldest, oldest_root) = history[2].clone();
+    assert_success(&area.forklift("cached", &["show", &format!("{}:src/code.txt", oldest)]));
+    let oldest_src = subtree_of(&area, "cached", &oldest_root, "src");
+    let one = file_of(&area, "cached", &oldest_src, "code.txt");
+    assert_success(&area.forklift("cached", &["compact"]));
+    assert!(!object_store_path(&area, "cached", &oldest_root).exists(), "sanity: the root is packed");
+
+    let dry = area.forklift("cached", &["--json", "evict", "--dry-run"]);
+    assert_success(&dry);
+    assert!(json_of(&dry)["data"]["would_repack"].as_u64().unwrap() >= 3, "{}", json_of(&dry));
+
+    let evicted = area.forklift("cached", &["--json", "evict"]);
+    assert_success(&evicted);
+    let report = &json_of(&evicted)["data"];
+    assert!(report["evicted"].as_u64().unwrap() >= 3, "{}", report);
+    assert!(report["bytes_freed"].as_u64().unwrap() > 0, "{}", report);
+    assert_eq!(report["still_packed"], 0, "{}", report);
+
+    for hash in [&oldest_root, &oldest_src, &one] {
+        assert!(!object_held(&area, "cached", hash) && recorded(&area, "cached", hash), "{} is evicted and recorded", hash);
+    }
+    for (parcel, _) in &history {
+        assert!(object_held(&area, "cached", parcel) && signature_held(&area, "cached", parcel), "{} and its signature stay", parcel);
+    }
+
+    let shown = area.forklift("cached", &["show", &format!("{}:src/code.txt", oldest)]);
+    assert_success(&shown);
+    assert_eq!(stdout(&shown), "one\n");
+    assert_success(&area.forklift("cached", &["audit"]));
+}
+
+/// `evict` refuses while the warehouse root is served, before planning, and changes nothing: a
+/// server answering "present" for an object about to be dropped would let a client skip sending
+/// it.
+///
+/// Revert: take no serve lock → the eviction runs.
+#[test]
+fn evict_refuses_while_the_root_is_served() {
+    let area = TestArea::new("evict-served");
+    let (server, head) = three_signed_parcels(&area);
+    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    let oldest = history_with_roots(&area, "cached", &head)[2].0.clone();
+    assert_success(&area.forklift("cached", &["show", &format!("{}:src/code.txt", oldest)]));
+
+    let scope = forklift_core::globals::StorageRootScope::enter(&area.path("cached"));
+    let served = forklift_core::util::lock_utils::ServeLock::acquire().unwrap();
+    drop(scope);
+    let before = forklift_dir_snapshot(&area, "cached");
+
+    let refused = area.forklift("cached", &["evict"]);
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("being served"), "{}", stderr(&refused));
+    assert!(forklift_dir_snapshot(&area, "cached") == before, "a refused evict changes nothing");
+
+    drop(served);
+    assert_success(&area.forklift("cached", &["evict"]));
 }
 
 #[test]

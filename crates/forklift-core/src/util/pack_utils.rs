@@ -634,6 +634,10 @@ pub struct CompactStats {
     /// index file. Always empty for a run with salvage, and for an incremental compaction.
     pub damaged_packs_skipped: Vec<String>,
 
+    /// Bytes the old pack files a full repack deleted held beyond the packs it wrote. Always 0 for
+    /// an incremental compaction.
+    pub pack_bytes_freed: u64,
+
     /// Signature tables written (FORK-333).
     pub signature_tables_written: usize,
 
@@ -3407,10 +3411,10 @@ enum Source {
     /// byte-identical, and demotes to `Source::Reconstruct` otherwise, so a duplicate is never
     /// carried forward unverified.
     CopyRecord { pack_index: usize, offset: u64, len: u64, is_delta: bool },
-    /// A packed object whose delta base is being dropped as garbage, a duplicated hash whose
-    /// surviving copy `collect_targets` could not trust verbatim (FORK-55), or a delta whose base
-    /// is itself one of these (so its record may have been encoded against a copy the repack
-    /// does not keep — see the pass at the end of `collect_targets`): reconstruct it
+    /// A packed object whose delta base is being dropped (as garbage, or evicted), a duplicated
+    /// hash whose surviving copy `collect_targets` could not trust verbatim (FORK-55), or a delta
+    /// whose base is itself one of these (so its record may have been encoded against a copy the
+    /// repack does not keep — see the pass at the end of `collect_targets`): reconstruct it
     /// (through the exhaustive verified read, `retrieve_object_by_hash`) and re-pack it
     /// path-aware, so nothing is left pointing at a dropped base and no unverified duplicate is
     /// ever carried forward. `loose_source` is `Some(path)` when this target was demoted from a
@@ -3563,6 +3567,48 @@ fn compact_bounded(all: bool,
         (None, Some(lock_utils::StoreAccessLock::try_shared()?))
     };
 
+    compact_held(all, redelta, salvage, progress, table_bound, &HashSet::new())
+}
+
+/// A full repack for an eviction (DESIGN.html §7.6.1): [`compact`] with `all`, keeping the live set
+/// minus `evicted`, so the objects of `evicted` a pack holds are gone once the old packs are
+/// deleted. The caller already holds every lock a full repack takes, in the order [`compact`]
+/// takes them, from before it chose `evicted` until this returns: an eviction plans under the same
+/// hold that deletes.
+///
+/// No kept object is left depending on an evicted one: a delta whose base is evicted is
+/// reconstructed and re-encoded, and an evicted object is never offered as a new delta base (see
+/// [`compute_path_bases`]). Damaged packs are left exactly as found, without salvage, so an evicted
+/// object one holds stays present.
+///
+/// # Arguments
+/// * `evicted`       - The objects to drop from the packs.
+/// * `_store_lock`   - The object-store lock, held.
+/// * `_serve_lock`   - The serve lock, held: a repack keeps no grace period.
+/// * `_store_access` - Exclusive store access, held.
+/// * `progress`      - Where to report the run's phases.
+///
+/// # Returns
+/// * `Ok(CompactStats)` - What was repacked and how many pack bytes it freed.
+/// * `Err(String)`      - As [`compact`]: no object outside `evicted` is lost on failure.
+pub fn repack_evicting(evicted: &HashSet<String>,
+                       _store_lock: &lock_utils::StoreLock,
+                       _serve_lock: &lock_utils::ServeLock,
+                       _store_access: &lock_utils::StoreAccessExclusive,
+                       progress: &Progress) -> Result<CompactStats, String> {
+    file_utils::create_folder_if_not_exists(&pack_folder())?;
+    compact_held(true, false, false, progress, signature_table::MAX_TABLE_ENTRIES, evicted)
+}
+
+/// The body of [`compact_bounded`] and [`repack_evicting`], once the caller holds the locks the run
+/// needs. `evicted` is subtracted from a full repack's live set; it must be empty unless `all`.
+fn compact_held(all: bool,
+                redelta: bool,
+                salvage: bool,
+                progress: &Progress,
+                table_bound: usize,
+                evicted: &HashSet<String>) -> Result<CompactStats, String> {
+    let pack_folder = pack_folder();
     remove_stale_temp_files(&pack_folder);
 
     // A repack rewrites every signature table, so one it cannot read would be lost with the rest
@@ -3591,14 +3637,14 @@ fn compact_bounded(all: bool,
         let CollectedTargets {
             targets, old_packs, source_packs, damaged_packs_dropped, damaged_packs_kept, damaged_packs_skipped,
             salvage_registration,
-        } = collect_targets(all, redelta, salvage)?;
+        } = collect_targets(all, redelta, salvage, evicted)?;
 
         // Path-aware base selection (phase 2b) is only needed to *build* new deltas — for loose
         // objects and for the rare object whose base is dropped. A repack that only copies existing
         // records (the common case) skips the whole DAG walk.
         let needs_delta = targets.iter().any(|t| !matches!(t.source, Source::CopyRecord { .. }));
         let path_bases = if needs_delta {
-            compute_path_bases()?
+            compute_path_bases(evicted)?
         } else {
             PathBases { base_of: HashMap::new(), sequence: HashMap::new() }
         };
@@ -3642,8 +3688,9 @@ fn compact_bounded(all: bool,
     let mut stats = CompactStats {
         objects_packed: 0, packs_written: 0, loose_removed: 0, deltas: 0, bytes_packed: 0,
         corrupt_skipped: 0, over_ceiling_skipped: 0, damaged_packs_dropped, damaged_packs_kept,
-        damaged_packs_skipped, signature_tables_written: 0, signatures_moved: 0, signature_leftovers_removed: 0, signatures_dropped: 0,
-        signature_conflicts: Vec::new(), signature_tables_unreadable: Vec::new(),
+        damaged_packs_skipped, pack_bytes_freed: 0, signature_tables_written: 0, signatures_moved: 0,
+        signature_leftovers_removed: 0, signatures_dropped: 0, signature_conflicts: Vec::new(),
+        signature_tables_unreadable: Vec::new(),
     };
     let mut writer: Option<PackWriter> = None;
 
@@ -3963,6 +4010,13 @@ fn compact_bounded(all: bool,
     }
 
     invalidate_cache();
+
+    // Sized before the sweep, which a new pack of the same name (an unchanged layout) survives: it
+    // is then counted on both sides.
+    let file_bytes = |files: &mut dyn Iterator<Item = &PathBuf>| -> u64 {
+        files.filter_map(|path| std::fs::metadata(path).ok()).map(|metadata| metadata.len()).sum()
+    };
+    stats.pack_bytes_freed = file_bytes(&mut old_packs.iter()).saturating_sub(file_bytes(&mut new_pack_files.iter()));
 
     for old_pack in &old_packs {
         // A layout-derived pack id means an unchanged repack writes the same filename it is
@@ -4915,7 +4969,11 @@ struct CollectedTargets {
 /// length: an import-produced store is mostly deltas, so using their on-disk length here would
 /// sort (and so window-batch) objects by how well they happened to already compress, not by how
 /// big they are, which is close to meaningless for grouping similar-sized objects together.
-fn collect_targets(all: bool, redelta: bool, salvage: bool) -> Result<CollectedTargets, String> {
+///
+/// A repack's live set excludes `evicted` (an eviction's drop set, empty otherwise): an evicted
+/// object is dropped like garbage, and a delta against one is reconstructed like any delta whose
+/// base is dropped.
+fn collect_targets(all: bool, redelta: bool, salvage: bool, evicted: &HashSet<String>) -> Result<CollectedTargets, String> {
     if !all {
         return Ok(CollectedTargets {
             targets: enumerate_loose_objects()?,
@@ -4940,7 +4998,8 @@ fn collect_targets(all: bool, redelta: bool, salvage: bool) -> Result<CollectedT
         (HashSet::new(), None)
     };
 
-    let live = crate::util::gc_utils::collect_live_set()?;
+    let mut live = crate::util::gc_utils::collect_live_set()?;
+    live.retain(|hash| !evicted.contains(hash));
     let mut targets = Vec::new();
     // Hash -> index of its already-pushed target in `targets` (FORK-55): a later duplicate of a
     // live hash resolves against the target already selected instead of being skipped outright,
@@ -5392,7 +5451,13 @@ impl Bloom {
 /// so reconstruction recursion stays bounded. Every "seen" set is a Bloom filter, so the walk's
 /// memory is bounded (a bit budget) rather than one entry per object — what keeps it viable at
 /// kernel scale (see [`Bloom`]).
-fn compute_path_bases() -> Result<PathBases, String> {
+///
+/// No object of `evicted` (an eviction's drop set) is ever offered as a base: the repack deletes
+/// the packs that hold it, so a kept object encoded against it would no longer decode. An evicted
+/// object is not recorded at its path at all, so the next version there takes the previous kept
+/// version as its base instead; an evicted tree is still descended, since a kept object can sit
+/// beneath it.
+fn compute_path_bases(evicted: &HashSet<String>) -> Result<PathBases, String> {
     let heads: Vec<String> = pallet_utils::all_pallet_refs()?
         .into_iter().map(|(_, head)| head).collect();
 
@@ -5413,6 +5478,7 @@ fn compute_path_bases() -> Result<PathBases, String> {
         base_of: HashMap::new(),
         sequence: HashMap::new(),
         next_sequence: 0,
+        evicted,
     };
 
     for parcel_hash in &order {
@@ -5442,7 +5508,7 @@ struct PathBases {
 }
 
 /// Mutable state threaded through [`walk_tree_for_bases`] (see [`compute_path_bases`]).
-struct PathBaseWalk {
+struct PathBaseWalk<'a> {
     /// Skips re-descending into an already-fully-walked (unchanged) subtree's *children* — a
     /// pure recursion dedup (an identical subtree carries no new blob or tree versions beneath
     /// it), orthogonal to `seen_blobs`/`seen_trees` below, which decide which objects a path
@@ -5473,6 +5539,8 @@ struct PathBaseWalk {
     /// it matters for their own chains, which never cross kinds, but a single counter is simpler
     /// than two and costs nothing).
     next_sequence: u64,
+    /// Objects never recorded as a path's version, so never a base (see [`compute_path_bases`]).
+    evicted: &'a HashSet<String>,
 }
 
 /// Walk one tree's closure, recording the tree's *own* path base and then each blob's (see
@@ -5483,7 +5551,7 @@ struct PathBaseWalk {
 /// dedup is *only* about children — the tree's own path base is fixed on every occurrence, same
 /// as a blob's, since even a repeated (reverted) directory is a legitimate base for whatever
 /// comes next at that path.
-fn walk_tree_for_bases(tree_hash: &str, path_prefix: &str, walk: &mut PathBaseWalk) -> Result<(), String> {
+fn walk_tree_for_bases(tree_hash: &str, path_prefix: &str, walk: &mut PathBaseWalk<'_>) -> Result<(), String> {
     let already_expanded = walk.seen_subtrees.contains(tree_hash.as_bytes());
     if !already_expanded {
         walk.seen_subtrees.insert(tree_hash.as_bytes());
@@ -5514,7 +5582,7 @@ fn walk_tree_for_bases(tree_hash: &str, path_prefix: &str, walk: &mut PathBaseWa
     // unparseable case (a corrupt tree) simply gets no path base here rather than aborting the
     // walk — the same fallback a Bloom false positive already causes, and the object read/verify
     // path is what actually guards against corruption.
-    if let Some(tree_hash_bytes) = hash_to_bytes(tree_hash) {
+    if let Some(tree_hash_bytes) = hash_to_bytes(tree_hash).filter(|_| !walk.evicted.contains(tree_hash)) {
         record_path_base(tree_hash_bytes, tree_hash, path_prefix,
                          &mut walk.seen_trees, &mut walk.latest_tree_at_path, &mut walk.base_of,
                          &mut walk.sequence, &mut walk.next_sequence);
@@ -5527,6 +5595,10 @@ fn walk_tree_for_bases(tree_hash: &str, path_prefix: &str, walk: &mut PathBaseWa
     let tree = object_utils::load_tree(tree_hash)?;
 
     for (name, file) in tree.get_files() {
+        if walk.evicted.contains(&file.hash) {
+            continue;
+        }
+
         let path = join_path(path_prefix, name);
         if let Some(blob_hash) = hash_to_bytes(&file.hash) {
             // The Bloom filter is keyed on the *hex string* bytes, not the raw digest — pinned
