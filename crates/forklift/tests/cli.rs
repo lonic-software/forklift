@@ -7696,7 +7696,7 @@ fn a_unique_prefix_runs_the_command_and_an_ambiguous_one_is_a_usage_error() {
     assert!(help["data"]["message"].as_str().unwrap().contains(" haul review "), "{}", help);
     let help = json(&warehouse.run(&["--json", "help", "hau", "re"]));
     assert_eq!(help["error"]["message"],
-               "\"re\" could be \"forklift haul review\" or \"forklift haul reopen\"; type more of the name");
+               "\"re\" could be \"forklift help haul review\" or \"forklift help haul reopen\"; type more of the name");
 }
 
 #[test]

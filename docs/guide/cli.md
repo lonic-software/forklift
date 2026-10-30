@@ -2598,7 +2598,7 @@ that level starts the same way: `forklift ha` is `forklift haul`, `forklift haul
   but it is stack's alias, so `forklift s` stacks.
 - A prefix that starts more than one name is a usage error (exit code 2) naming every one of
   them, never a guess: `forklift he` could be `heal` or `help`.
-- Only command names are matched. Aliases are typed whole (`con`, not `co`), flags are always
+- Only command names are matched. Aliases are typed whole (`cfg`, not `cf`), flags are always
   typed in full, and so are the hidden git words below: `forklift commit` works, `forklift comm`
   does not.
 

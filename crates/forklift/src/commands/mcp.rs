@@ -1837,12 +1837,6 @@ mod tests {
         if param.repeats() { json!([one(1), one(2)]) } else { one(1) }
     }
 
-    /// Run `arguments` through `tool`'s argv and clap, the way a call does. Only clap's own rules
-    /// apply here: a cross-argument rule the binary checks after parsing still refuses some
-    /// combinations clap accepts, with a usage error. `Ok` means clap
-    /// accepted the line and every argument bound exactly to the clap argument it names, with
-    /// nothing else and no global set (anything else panics); `Err` is a refusal by argv or by
-    /// clap for a combination the command does not accept.
     /// clap's parse of an argv line, with the binary's tree alone: no prefix of a command name
     /// resolves here, so a tool whose argv spelled one would fail.
     fn matches_of(line: &[String]) -> Result<clap::ArgMatches, clap::Error> {
@@ -1860,6 +1854,12 @@ mod tests {
         }
     }
 
+    /// Run `arguments` through `tool`'s argv and clap, the way a call does. Only clap's own rules
+    /// apply here: a cross-argument rule the binary checks after parsing still refuses some
+    /// combinations clap accepts, with a usage error. `Ok` means clap
+    /// accepted the line and every argument bound exactly to the clap argument it names, with
+    /// nothing else and no global set (anything else panics); `Err` is a refusal by argv or by
+    /// clap for a combination the command does not accept.
     fn parse(tool: &super::Tool, arguments: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
         use clap::FromArgMatches;
         use clap::parser::ValueSource;

@@ -30,7 +30,8 @@ pub fn handle_command(path: &[String]) -> Result<(), ForkliftError> {
             Resolved::Command(subcommand) => subcommand.clone(),
             Resolved::Ambiguous(names) => return Err(ForkliftError::new(
                 ErrorCode::Usage,
-                prefix::ambiguity(name, &reached.iter().map(String::as_str).collect::<Vec<_>>(), &names),
+                // The candidates are named as help for them, which is what the caller asked for.
+                prefix::ambiguity(name, &std::iter::once("help").chain(reached.iter().map(String::as_str)).collect::<Vec<_>>(), &names),
                 "Run \"forklift help\" for a list of available commands.",
             )),
             Resolved::Unknown => return Err(ForkliftError::new(
