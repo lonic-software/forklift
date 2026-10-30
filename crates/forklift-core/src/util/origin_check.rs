@@ -137,12 +137,14 @@ struct ServerWalk {
 }
 
 impl ServerWalk {
-    /// Meet the tree `hash` of the new server's history: an absent one this warehouse leans on is
-    /// found and not descended, one present here is descended, and any other is queued to read.
+    /// Meet the tree `hash` of the new server's history: one present here is descended, and an
+    /// absent one is found and queued to read, since something present may name an absent object
+    /// beneath it too.
     fn meet_tree(&mut self, hash: &str, missing: &mut HashSet<String>) -> Result<(), String> {
-        if !self.seen.insert(hash.to_string()) || missing.remove(hash) {
+        if !self.seen.insert(hash.to_string()) {
             return Ok(());
         }
+        missing.remove(hash);
 
         if sealed_utils::is_present(hash)? {
             self.descend(&object_utils::load_tree(hash)?, missing)
@@ -155,7 +157,8 @@ impl ServerWalk {
     /// Find what the tree `tree` names, and queue its subtrees and the recipes it names.
     fn descend(&mut self, tree: &TreeItem, missing: &mut HashSet<String>) -> Result<(), String> {
         for (_, file) in tree.get_files() {
-            if !self.seen.insert(file.hash.clone()) || missing.remove(&file.hash) || !file.item_type.is_chunked() {
+            missing.remove(&file.hash);
+            if !file.item_type.is_chunked() || !self.seen.insert(file.hash.clone()) {
                 continue;
             }
 
