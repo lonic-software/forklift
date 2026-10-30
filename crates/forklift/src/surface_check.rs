@@ -371,7 +371,8 @@ fn hints(text: &str) -> Vec<String> {
         }
         let line = &text[text[..start].rfind('\n').map_or(0, |i| i + 1)..start];
         if line.rfind("cargo install ")
-            .is_some_and(|install| !line[install..].split_whitespace().any(|word| word == "forklift"))
+            .is_some_and(|install| !line[install..].split_whitespace()
+                .any(|word| word.trim_end_matches(|c: char| !c.is_alphanumeric()) == "forklift"))
         {
             continue;
         }
