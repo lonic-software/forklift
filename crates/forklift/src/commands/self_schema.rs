@@ -71,6 +71,7 @@ const FORKLIFT: Tables = Tables {
     secret: &[
         ("franchise", "token"), // the bearer token, remembered as remote.token
         ("config", "value"),    // a configuration value may be that token
+        ("remote move", "token"), // the new origin's bearer token, remembered as remote.token
     ],
     not_secret: &[
         ("config", "key", "a key name; masked anyway, as part of config's collapsed key/value repeat"),

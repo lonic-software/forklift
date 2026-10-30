@@ -6621,15 +6621,22 @@ fn a_pending_move_of_the_origin_refuses_every_remote_client_and_every_writer_it_
         assert_success(&area.forklift("sparse", &["heal"]));
         assert_success(&area.forklift("cached", &["heal"]));
 
-        std::fs::remove_file(area.path("sparse/.forklift/origin-move")).unwrap();
-        std::fs::remove_file(area.path("cached/.forklift/origin-move")).unwrap();
+        // A checking move is abandoned; a rewriting one only a completed move clears, and the
+        // fixture's server does not exist.
+        for directory in ["sparse", "cached"] {
+            if phase == Phase::Checking {
+                assert_success(&area.forklift(directory, &["remote", "move", "--abort"]));
+            } else {
+                std::fs::remove_file(area.path(&format!("{}/.forklift/origin-move", directory))).unwrap();
+            }
+        }
     }
 
     record_move_intent(&area, "sparse", Phase::Checking);
     area.write_file("sparse/src/code.txt", "under a move\n");
     assert_success(&area.forklift("sparse", &["load", "."]));
     assert_success(&area.forklift("sparse", &["stack", "under a move"]));
-    std::fs::remove_file(area.path("sparse/.forklift/origin-move")).unwrap();
+    assert_success(&area.forklift("sparse", &["remote", "move", "--abort"]));
 
     // With the intent gone, what it refused runs.
     assert_success(&area.forklift("sparse", &["lift"]));
@@ -6686,8 +6693,8 @@ fn move_stands(area: &TestArea, directory: &str) -> bool {
 /// record and `remote.url` both name the copy in one spelling, and no move stands.
 ///
 /// Revert: stop descending an absent tree the check finds → the shared subtree is never met and
-/// the cache's move refuses; rewrite `remote.url` but not the origin → the cache's read refuses as
-/// `non_origin_remote`; drop the slash trim → the recorded origin keeps the slash.
+/// the cache's move refuses; rewrite `remote.url` but not the origin → the recorded origin is
+/// still the old one; drop the slash trim → the reported origin keeps the slash.
 #[test]
 fn a_partial_warehouse_moves_its_origin_to_a_copy_and_works_against_it() {
     let area = TestArea::new("origin-move-copy");

@@ -86,6 +86,8 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `profile create` |  |  | Create a named profile (mints an operator id unless one is given) |
 | `profile use` |  |  | Act as this profile in the current warehouse |
 | `query` | `q` |  | Query parcel history by signed identity, signer and parcel facts |
+| `remote` |  |  | Manage the remote of a partial warehouse: move its origin to another server |
+| `remote move` |  |  | Move a partial warehouse's origin to another server that holds its content |
 | `remove` | `rm` |  | Stage a file or directory for removal |
 | `restore` | `r` |  | Restore a file or directory from the inventory (discard unstaged changes) |
 | `scope` |  |  | Show this bay's sparse materialization scope, and the warehouse fetch scope |
