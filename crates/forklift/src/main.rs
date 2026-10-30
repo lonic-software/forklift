@@ -517,6 +517,7 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
                 DocgenTarget::Errors => docgen::render_errors().map(|out| print!("{}", out)),
                 DocgenTarget::JsonSchemas => docgen::render_json_schemas().map(|out| print!("{}", out)),
                 DocgenTarget::Commands => docgen::render_commands().map(|out| print!("{}", out)),
+                DocgenTarget::McpTools => docgen::render_mcp_tools().map(|out| print!("{}", out)),
             }
         }
     }

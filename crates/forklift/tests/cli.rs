@@ -8507,6 +8507,10 @@ fn mcp_exposes_and_runs_the_parity_pass_tools() {
     for expected in ["blame", "deliver", "cherry_pick", "manifest_provenance", "haul_open", "park_pop", "tag_list", "compact"] {
         assert!(names.contains(expected), "MCP must advertise `{}`", expected);
     }
+    // A family whose bare form is one of its subcommands is that subcommand's tool alone.
+    for absent in ["tag", "haul", "office", "scope", "office_enroll", "prepare"] {
+        assert!(!names.contains(absent), "MCP must not advertise `{}`", absent);
+    }
 
     // …and their argument mappings drive the real CLI: read tools that need no trust run.
     let call = |name: &str, arguments: &str| -> serde_json::Value {
@@ -8525,6 +8529,39 @@ fn mcp_exposes_and_runs_the_parity_pass_tools() {
     // A missing required argument is surfaced as a JSON-RPC error, not a panic.
     let missing = call("blame", "{}");
     assert!(missing["error"].is_object(), "a missing required arg must be an error: {}", missing);
+}
+
+#[test]
+fn an_mcp_value_that_spells_an_option_reaches_the_command_as_a_value() {
+    let warehouse = TestWarehouse::new("mcp-hostile-value");
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["prepare"]));
+    assert_success(&warehouse.run(&["office", "enroll"]));
+    warehouse.write_file("a.txt", "one\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "first"]));
+
+    let call = |name: &str, arguments: &str| -> serde_json::Value {
+        let input = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{{\"name\":\"{}\",\"arguments\":{}}}}}\n",
+            name, arguments,
+        );
+        let output = warehouse.run_with_stdin(&["mcp"], &input);
+        let reply: serde_json::Value = serde_json::from_str(stdout(&output).lines().next().unwrap()).unwrap();
+        assert_eq!(reply["result"]["isError"], false, "{}", reply);
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    };
+
+    // A positional value and an option value, each spelling options and a global.
+    call("kv_set", r#"{"revision":"main","key":"ci","value":"--json -x"}"#);
+    let got = call("kv_get", r#"{"revision":"main","key":"ci"}"#);
+    assert_eq!(got["data"]["value"], "--json -x", "{}", got);
+    warehouse.write_file("a.txt", "two\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    let stacked = call("stack", r#"{"description":"--verbose -m"}"#);
+    assert_eq!(stacked["ok"], true, "{}", stacked);
+    let history = call("history", r#"{"limit":1}"#);
+    assert_eq!(history["data"]["entries"][0]["description"], "--verbose -m", "{}", history);
 }
 
 #[test]

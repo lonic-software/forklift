@@ -123,6 +123,87 @@ fn render_command_rows(out: &mut String, parent: &str, command: &clap::Command) 
     Ok(())
 }
 
+/// Render `docs/generated/mcp-tools.md`: every tool `forklift mcp` serves, with the command it
+/// runs and its arguments, then the commands no agent drives. Both come from the tool list the
+/// server itself generates from the command tree.
+///
+/// # Returns
+/// * `Ok(String)`  - The rendered markdown.
+/// * `Err(String)` - The tree has no tool shape (the server would refuse `tools/list` too), a
+///                   tool's command has no one-line description, or a description cites a
+///                   reference only the project's own trackers can resolve (see
+///                   [`check_no_internal_refs`]).
+pub fn render_mcp_tools() -> Result<String, String> {
+    use crate::commands::mcp;
+
+    let mut out = String::new();
+    out.push_str(GENERATED_BANNER);
+    out.push_str("# MCP tools\n\n");
+    out.push_str(
+        "Every tool `forklift mcp` serves, generated from the same command definition the binary \
+         parses its arguments with, as the server's own tool list is; CI fails when this page \
+         falls behind it. A tool is a command path joined by `_` (`forklift tag create` is \
+         `tag_create`, `forklift cherry-pick` is `cherry_pick`), \
+         and its description is the command's one-line description followed by its long one; \
+         each argument's own help is that argument's description in the tool's input schema. \
+         An argument is an option's long name (with `_` for `-`) or a positional's name. \
+         `docs/MACHINE_INTERFACE.md` describes the server.\n\n",
+    );
+    out.push_str("| Tool | Runs | Does | Arguments |\n");
+    out.push_str("|---|---|---|---|\n");
+    let cli = Cli::command();
+    for tool in mcp::tools()? {
+        let mut command = &cli;
+        for name in &tool.path {
+            command = command.find_subcommand(name)
+                .ok_or_else(|| format!("docgen: no command `{}`", tool.path.join(" ")))?;
+        }
+        let about = command.get_about().map(|about| about.to_string()).unwrap_or_default();
+        if about.trim().is_empty() || about.contains('\n') {
+            return Err(format!(
+                "docgen: command `{}` needs a one-line description for its row in mcp-tools.md",
+                tool.path.join(" ")
+            ));
+        }
+        let arguments: Vec<String> = tool.params.iter().map(|param| {
+            let kind = if param.injected.is_some() { "set by the server".to_string() } else { param.describe() };
+            let required = if param.required && param.injected.is_none() { ", required" } else { "" };
+            format!("`{}` ({kind}{required})", param.key)
+        }).collect();
+        out.push_str(&format!(
+            "| `{}` | `forklift {}` | {} | {} |\n",
+            tool.name,
+            tool.path.join(" "),
+            about.trim().replace('|', "\\|"),
+            arguments.join("<br>").replace('|', "\\|"),
+        ));
+    }
+
+    out.push_str("\n## Not served\n\n");
+    out.push_str(
+        "Each of these commands, and every command below it, is a tool for nobody: a person \
+         runs it.\n\n",
+    );
+    for (path, why) in mcp::HUMAN_ONLY {
+        out.push_str(&format!("- `forklift {path}`: {why}.\n"));
+    }
+    out.push_str("\nThese arguments are refused together, though each is served alone:\n\n");
+    for (path, keys, why) in mcp::HUMAN_ONLY_TOGETHER {
+        let keys: Vec<String> = keys.iter().map(|key| format!("`{key}`")).collect();
+        out.push_str(&format!("- {} of `forklift {path}`: {why}.\n", keys.join(" with ")));
+    }
+    out.push_str(
+        "\nThese families' bare form runs the same operation as one of their subcommands, so only \
+         the subcommand is a tool:\n\n",
+    );
+    for (family, sub) in mcp::BARE_SAME_AS {
+        out.push_str(&format!("- `forklift {family}` is `{family}_{sub}`.\n"));
+    }
+    out.push('\n');
+    check_no_internal_refs("mcp-tools.md", &out)?;
+    Ok(out)
+}
+
 /// `a`, `b` as inline code, or nothing for an empty list.
 fn code_list(names: &[&str]) -> String {
     names.iter().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", ")
@@ -132,8 +213,7 @@ fn code_list(names: &[&str]) -> String {
 /// or no structured data (or no `--json` output) at all — deliberately outside the schema
 /// registry, with the reason. Every *other* CLI command must be in [`command_schemas`]:
 /// [`render_json_schemas`] checks the two lists are exhaustive and disjoint over the real CLI
-/// surface, the same shape as `mcp.rs`'s `every_cli_command_is_an_mcp_tool_or_explicitly_human_only`
-/// test — except this check runs *inside the generator itself* (`bin/gen-docs`, so CI and `bin/check`),
+/// surface. It runs *inside the generator itself* (`bin/gen-docs`, so CI and `bin/check`),
 /// because `cargo test --workspace` never compiles the `docgen` feature and so could never run a
 /// `#[cfg(test)]` version of it. A command with a JSON output struct that never got wired into
 /// the registry now fails the build instead of silently missing from json-schemas.md — the exact

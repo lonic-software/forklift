@@ -771,40 +771,22 @@ notifications:
 Only `compact`, `lift` and `lower` report progress. Other tools send no notifications,
 and progress needs macOS or Linux, as the channel does.
 
-The tool surface **mirrors the CLI** — every CLI command is exposed as a tool (a
-multi-subcommand command becomes `<command>_<subcommand>` tools) or is on a small
-human-only allow-list; a unit test (`every_cli_command_is_an_mcp_tool_or_explicitly_human_only`)
-fails CI if that ever drifts. Each tool's `inputSchema` is closed
-(`additionalProperties: false`), and the server enforces it: a `tools/call` whose
-`arguments` are not an object, name an argument the tool does not declare, or give a
-declared one the wrong type is refused with JSON-RPC `invalid_params` rather than run
-with the argument dropped. A `null` value counts as the argument omitted. (`manifest_provenance`'s `tool` and `session` are the one
-exception: the server sets them from the connection and discards an agent's value.)
-Tools (arguments in parentheses):
+The tools are **generated from the CLI**: every command path is a tool named for it, joined
+by `_` (`tag create` is `tag_create`, a family run bare is its own name, such as `bay`), unless
+it is on a short list of commands a person runs (setup, trust administration, host concerns and
+meta). A combination of arguments no agent passes is refused, and the tool's description
+names it. A tool's description is the command's one-line and
+long descriptions, and its arguments are the command's: an
+option by its long name with `_` for `-`, a positional by its name. The list, with every
+argument and the commands left out and why, is
+[`docs/generated/mcp-tools.md`](generated/mcp-tools.md); CI fails when it falls behind the CLI.
 
-- **Inspect:** `stocktake` (summary?), `history` (revision?, limit?, after?),
-  `diff` (staged?, targets?), `peek` (object | inventory), `show` (target — a single
-  "<revision>:<path>" string), `blame` (path, rev?), `audit` (pallet?), `conflicts`.
-- **Change:** `load` (path), `remove` (path — stage a removal), `unload` (path — unstage),
-  `stack` (description?), `restore` (path,
-  staged?), `undo`, `park` / `park_list` / `park_pop`, `cherry_pick` (revision, message?),
-  `deliver` (target, message?).
-- **Maintain:** `compact` (all?) — pack the loose object store into a few dense pack files
-  (safe to run anytime; worth running after a large import). `all=true` is a full repack:
-  also rewrite existing packs, dropping unreachable garbage and consolidating.
-- **Branch / merge:** `shift` (pallet), `consolidate` (pallet), `palletize` (name?,
-  revision?, all?).
-- **Remote:** `lift`, `lower` (expect?, keep?).
-- **Review & metadata:** `manifest_note` / `manifest_approve` / `manifest_provenance`
-  (model, transcript?, message?) / `manifest_show`, `haul_open` / `haul_list` / `haul_show` /
-  `haul_comment` / `haul_review` / `haul_merge` / `haul_close` / `haul_reopen`,
-  `tag_create` / `tag_show` / `tag_list`, `kv_set` (revision, key, value) / `kv_get` / `kv_unset` /
-  `kv_log` (revision, key) / `kv_list` (revision?), `office_list`.
-- **Sandboxing:** `bay_add` (name, path?, scope?), `bay_list`, `bay_remove`
-  (name), `scope` — an orchestrator agent opens task-scoped (optionally sparse) sandboxes for
-  its sub-agents directly. The scope a bay records is advisory local setup, not the agent's
-  own security boundary; enforcement of what an identity may touch lives remote-side, on the
-  server.
+Each tool's `inputSchema` is closed (`additionalProperties: false`), and the server enforces it:
+a `tools/call` whose `arguments` are not an object, name an argument the tool does not declare,
+give a declared one the wrong type, or leave out a required one is refused with JSON-RPC
+`invalid_params` rather than run with the argument dropped. A `null` value counts as the
+argument omitted. The arguments become the command's own: an option as `--name=value` and a
+positional after `--`, so no value is ever read as an option.
 
 **Pagination:** `history` reads in pages — pass `limit`, and the result's `data.next`
 cursor back as `after` for the following page (absent once exhausted). This is the
@@ -819,14 +801,7 @@ no model identity, so nothing at the transport can supply or verify it. As alway
 is *signed*, so who recorded it is forge-proof; the transport-derivation just removes the
 model's own output from the `tool`/`session` it can't be trusted to report about itself.
 
-**Not exposed** (deliberately human-only): warehouse/identity setup (`prepare`, `config`,
-`profile`, `franchise`, `import-git`, `export-git`), the host-machine concerns `alias` and
-`self-update`, and meta (`mcp`, `help`, `version`). `config` in particular can rewrite
-`remote.url` / `remote.token`, which is not an agent-workflow action; the `office`
-*mutations* (enrol/admit/rotate/…) are likewise held back — an agent operates within a
-warehouse whose trust is already set up. (`office_list` is exposed, read-only.)
-
-`bay` **is** exposed, despite also being a host working directory: an
+`bay` **is** a tool, despite managing a host working directory: an
 orchestrator agent creating task-scoped sandboxes for sub-agents over MCP is how it uses
 `bay`. Every bay operation is non-destructive — `bay_add` refuses onto a non-empty directory,
 `bay_remove` only deletes forklift's own bookkeeping, never the materialized files.
