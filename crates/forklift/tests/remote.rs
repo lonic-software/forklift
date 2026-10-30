@@ -6845,7 +6845,8 @@ fn a_move_to_a_server_lacking_content_refuses_and_leaves_the_origin() {
 ///
 /// Revert: report no refusal → `blocked` reads null under the other remote; drop the no-remote
 /// arm → the bare warehouse's show fails; drop the missing-origin arm → `blocked` reads null with
-/// the record and the remote gone.
+/// the record and the remote gone; check the move only through the remote → `blocked` reads null
+/// with the move standing and the remote gone.
 #[test]
 fn bare_remote_shows_the_remote_the_origin_and_what_stops_it() {
     use forklift_core::util::origin_move::Phase;
@@ -6911,6 +6912,12 @@ fn bare_remote_shows_the_remote_the_origin_and_what_stops_it() {
     assert_eq!(moving["blocked"]["code"], "origin_move_pending", "{}", moving);
     assert_eq!(moving["origin"], server.url.as_str(), "{}", moving);
     assert!(move_stands(&area, "cached"));
+
+    // A standing move stops clients whether or not a remote is configured.
+    assert_success(&area.forklift("cached", &["config", "--unset", "remote.url"]));
+    let unset = show("cached");
+    assert_eq!(unset["remote"], serde_json::Value::Null, "{}", unset);
+    assert_eq!(unset["blocked"]["code"], "origin_move_pending", "{}", unset);
 }
 
 /// The sealed record's bytes in `directory`, or none.
