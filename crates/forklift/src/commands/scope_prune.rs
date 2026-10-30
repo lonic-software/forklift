@@ -75,6 +75,7 @@ pub async fn handle_command(paths: Vec<String>, confirm: bool) -> Result<(), Str
     if !confirm && !plan.to_free.is_empty() {
         let preview = ScopePruneReport {
             preview: true,
+            rerun: rerun_args(&paths),
             pruned: to_reclaim,
             scope: post_prune.prefixes().to_vec(),
             freed: 0,
@@ -93,9 +94,6 @@ pub async fn handle_command(paths: Vec<String>, confirm: bool) -> Result<(), Str
             preview.render_human();
         }
 
-        let separator = if preview.pruned.iter().any(|path| path.starts_with('-')) { "-- " } else { "" };
-        let paths = preview.pruned.iter().map(|path| shell_quote(path)).collect::<Vec<_>>().join(" ");
-
         return Err(CoreError::refusal_with_details(
             RefusalCode::ConfirmationRequired,
             format!(
@@ -103,8 +101,8 @@ pub async fn handle_command(paths: Vec<String>, confirm: bool) -> Result<(), Str
                 preview.pruned.join(", "), preview.would_free
             ),
             format!(
-                "Check what it would free, then run \"forklift scope prune --confirm {}{}\" to free it.",
-                separator, paths
+                "Check what it would free, then run \"forklift scope prune --confirm {}\" to free it.",
+                preview.rerun
             ),
             serde_json::json!(preview),
         ).into());
@@ -122,6 +120,7 @@ pub async fn handle_command(paths: Vec<String>, confirm: bool) -> Result<(), Str
 
     output::emit(&ScopePruneReport {
         preview: false,
+        rerun: rerun_args(&paths),
         pruned: to_reclaim,
         scope: post_prune.prefixes().to_vec(),
         freed: stats.freed,
@@ -267,6 +266,11 @@ pub(crate) struct ScopePruneReport {
     #[serde(skip)]
     preview: bool,
 
+    /// The paths as given, quoted for a shell, for a hint to run the prune again: they resolve
+    /// from the directory it was run in, as the pruned keys (relative to the root) would not.
+    #[serde(skip)]
+    rerun: String,
+
     /// The fetched path(s) pruned (forgotten) from the warehouse fetch scope.
     pruned: Vec<String>,
 
@@ -383,14 +387,11 @@ impl CommandOutput for ScopePruneReport {
                 format!(" (pallets {})", self.unlifted_pallets.iter()
                     .map(|name| format!("\"{}\"", name)).collect::<Vec<_>>().join(", "))
             };
-            let separator = if self.pruned.iter().any(|path| path.starts_with('-')) { "-- " } else { "" };
-            let paths = self.pruned.iter().map(|path| shell_quote(path)).collect::<Vec<_>>().join(" ");
-
             println!(
                 "{} object(s) were kept because lifting history the remote does not hold yet reads \
                 them{}; some may be the only copy. Lift that work (or lower, if the remote is \
-                ahead), then run \"forklift scope prune --confirm {}{}\" again to free them.",
-                self.kept_unlifted, pallets, separator, paths
+                ahead), then run \"forklift scope prune --confirm {}\" again to free them.",
+                self.kept_unlifted, pallets, self.rerun
             );
         }
 
@@ -436,12 +437,18 @@ impl CommandOutput for ScopePruneReport {
 ///
 /// # Arguments
 /// * `path` - The path key.
-fn shell_quote(path: &str) -> String {
+pub(crate) fn shell_quote(path: &str) -> String {
     if !path.is_empty() && path.chars().all(|c| c.is_ascii_alphanumeric() || "/._-".contains(c)) {
         return path.to_string();
     }
 
     format!("'{}'", path.replace('\'', "'\\''"))
+}
+
+/// The paths as given, quoted for a shell and led by `-- ` when one starts with a dash.
+fn rerun_args(paths: &[String]) -> String {
+    let separator = if paths.iter().any(|path| path.starts_with('-')) { "-- " } else { "" };
+    format!("{}{}", separator, paths.iter().map(|path| shell_quote(path)).collect::<Vec<_>>().join(" "))
 }
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).

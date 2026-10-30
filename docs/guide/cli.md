@@ -1436,7 +1436,7 @@ merge is undone in the working tree and inventory and nothing is left in progres
 the command again is safe. A merge or pick you resolved by hand is stacked on the head it
 started from too, but there a refused `stack` keeps it in progress, since putting the tree back
 would throw your resolutions away. To redo it on the new head: abort it, `unload .`
-then `restore .`, delete the files the merge added (they are left untracked), catch up with
+then `restore --confirm .`, delete the files the merge added (they are left untracked), catch up with
 `shift <pallet>`, and merge again. Stacking the merge output instead is refused while the bay is
 behind. And `undo` only ever reverses refs your own command moved; a move another bay made in
 the meantime is never undone.
@@ -1881,7 +1881,7 @@ changing nothing, if the remote cannot be reached or is not trusted. History non
 reach (stacks never lifted, or lifted to a head the remote no longer confirms) keeps whatever
 lifting it would read under the path. The report counts what was kept
 (`kept_unlifted`), names the pallets (`unlifted_pallets`), and asks you to lift (or lower) and
-then run the same `scope prune` again, which frees the rest. Other work that exists only here is
+then run the same `scope prune --confirm` again, which frees the rest. Other work that exists only here is
 never freed either, whatever its path: content loaded but not yet stacked, parked parcels, an
 unfinished consolidation, the head a haul not yet merged proposes, history the git mirror's
 roots record holds, and the history of a deleted pallet while `undo` can still bring it back, in

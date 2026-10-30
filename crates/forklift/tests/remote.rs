@@ -8663,7 +8663,8 @@ fn scope_prune_refuses_on_a_full_warehouse() {
 fn scope_prune_previews_without_confirm_and_frees_nothing() {
     // Without --confirm a prune that would free content states what it would free and changes
     // nothing — no object deleted, no fetch scope narrowed — refusing with confirmation_required.
-    // The rerun its next step names frees it.
+    // The rerun its next step names frees it, run from the subdirectory the preview was run in:
+    // it names the path as given, which the root-relative "src/web" would not be from there.
     let area = TestArea::new("scope-prune-preview");
     let server = Server::start(&area, None);
 
@@ -8682,13 +8683,14 @@ fn scope_prune_previews_without_confirm_and_frees_nothing() {
         &["clone", &server.url, "sparse", "--only", "src/api", "--only", "src/web"]));
     assert_success(&area.forklift("sparse", &["scope", "narrow", "src/web"]));
 
-    let preview = area.forklift("sparse", &["--json", "scope", "prune", "src/web"]);
+    let preview = area.forklift("sparse/src", &["--json", "scope", "prune", "web"]);
     assert_eq!(preview.status.code(), Some(39), "{}", stdout(&preview));
     let json: serde_json::Value = serde_json::from_str(&stdout(&preview)).unwrap();
     assert_eq!(json["error"]["code"], "confirmation_required", "{}", json);
     let details = &json["error"]["details"];
     assert_eq!(details["would_free"], serde_json::json!(2), "the preview counts the freeable objects: {}", json);
     assert_eq!(details["freed"], serde_json::json!(0), "the preview frees nothing: {}", json);
+    assert_eq!(details["pruned"], serde_json::json!(["src/web"]), "{}", json);
     assert!(details.get("dry_run").is_none(), "{}", json);
     let next_step = json["error"]["next_step"].as_str().unwrap().to_string();
 
@@ -8707,8 +8709,8 @@ fn scope_prune_previews_without_confirm_and_frees_nothing() {
     // The command the next step names, run as written, frees them.
     let quoted = next_step.split('"').nth(1).expect("the next step quotes a command");
     let named: Vec<&str> = quoted.split(' ').skip(1).collect();
-    assert_eq!(named, ["scope", "prune", "--confirm", "src/web"], "{}", next_step);
-    let freed = area.forklift("sparse", &named);
+    assert_eq!(named, ["scope", "prune", "--confirm", "web"], "{}", next_step);
+    let freed = area.forklift("sparse/src", &named);
     assert_success(&freed);
     assert!(!object_present(&area, "sparse", &web_blob), "the confirmed prune frees the object");
 }

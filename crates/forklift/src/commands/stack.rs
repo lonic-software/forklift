@@ -88,7 +88,7 @@ async fn moved_under_merge(pallet: &str, found: Option<&str>) -> Result<Option<S
 
     let way_out = format!(
         "To redo it on the new head: abort it ({}); discard its output with \"forklift unload .\" \
-        and then \"forklift restore .\";{} catch up with \"forklift shift {}\"; then {}.",
+        and then \"forklift restore --confirm .\";{} catch up with \"forklift shift {}\"; then {}.",
         abort,
         left,
         pallet,

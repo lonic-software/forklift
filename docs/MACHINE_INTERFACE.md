@@ -578,12 +578,14 @@ names the first ten.
 A command that destroys what this warehouse cannot get back (working-tree changes, content held
 only here, the trust guarantee) shows what it would destroy and changes nothing unless it is given
 `--confirm`. Run without it while there is something to destroy, it refuses with
-`confirmation_required` (exit 39); with nothing to destroy it simply runs. `details` is the preview,
-shaped by the command:
+`confirmation_required` (exit 39); with nothing to destroy it simply runs. `lower` is the one
+exception: it refuses whenever a resolution names `theirs`, before the remote is asked, since an
+accepted `theirs` drops the local side; so its refusal says that `theirs` was named, not that
+something would certainly be lost. `details` is the preview, shaped by the command:
 
 | Command | When it refuses | `details` |
 |---|---|---|
-| `restore` | a file it would overwrite differs from what is staged | `{path, discards}`: the path given and every file whose change it would discard |
+| `restore` | a file it would overwrite differs from what is staged | `{path, discards}`: the path (relative to the warehouse root) and every file whose change it would discard |
 | `lower` | a `--keep` resolution takes `theirs` | `{theirs}`: each `@<pallet>:<path>` whose local changes it would drop |
 | `scope prune` | the prune would free content | the `scope prune` report, with `freed` 0 and `would_free` counting what it would free |
 | `office regenesis` | always | `{genesis, office_head, operator}`: the anchor it would replace and the operator the new root is for |

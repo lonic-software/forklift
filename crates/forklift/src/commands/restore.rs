@@ -34,7 +34,7 @@ pub fn handle_command(target: &str, confirm: bool) -> Result<(), String> {
     // walk below silently do the wrong thing.
     crate::commands::scope::ensure_path_in_scope(path.as_key())?;
 
-    restore_worktree(&path, confirm)
+    restore_worktree(&path, target, confirm)
 }
 
 /// Restore the working directory from the inventory: rewrite the file (or, for a
@@ -43,22 +43,23 @@ pub fn handle_command(target: &str, confirm: bool) -> Result<(), String> {
 ///
 /// # Arguments
 /// * `path`    - The path to restore.
+/// * `target`  - The path as given, which a hint names to run the restore again.
 /// * `confirm` - Whether changes the restore would discard may be discarded.
 ///
 /// # Returns
 /// * `Ok(())`      - If the restore completed.
 /// * `Err(String)` - If the path is not in the inventory, the restore would discard a change
 ///   without `confirm`, or a write failed.
-fn restore_worktree(path: &WarehousePath, confirm: bool) -> Result<(), String> {
+fn restore_worktree(path: &WarehousePath, target: &str, confirm: bool) -> Result<(), String> {
     // Read once: nothing below writes the metadata before the batch publishes.
     let ledger = inventory_utils::ShardLedger::read()?;
 
     if path.is_root() {
-        return restore_worktree_directory(&ledger, path.as_key(), confirm);
+        return restore_worktree_directory(&ledger, path.as_key(), target, confirm);
     }
 
     match inventory_utils::tracked_kind(&ledger, path)? {
-        TrackedKind::Directory => return restore_worktree_directory(&ledger, path.as_key(), confirm),
+        TrackedKind::Directory => return restore_worktree_directory(&ledger, path.as_key(), target, confirm),
         TrackedKind::UntrackedDirectory => return Err(format!("No inventory found for folder \"{}\".", path.as_key())),
         TrackedKind::File => {}
     }
@@ -66,10 +67,7 @@ fn restore_worktree(path: &WarehousePath, confirm: bool) -> Result<(), String> {
     // A tracked file replaced by a folder: writing the file back would have to delete the
     // folder and whatever untracked content it holds, so refuse instead.
     if std::fs::symlink_metadata(path.to_fs_path()).is_ok_and(|metadata| metadata.is_dir()) {
-        return Err(format!(
-            "Cannot restore \"{}\": the tracked file was replaced by a folder. Move or delete the folder first.",
-            path.as_key()
-        ));
+        return Err(folder_refusal(path.as_key()));
     }
 
     let (parent, file_name) = path.split_parent()?;
@@ -95,7 +93,7 @@ fn restore_worktree(path: &WarehousePath, confirm: bool) -> Result<(), String> {
     let anchor = file_utils::take_stat_anchor()?;
 
     if !confirm && would_discard(path.as_key(), &item, anchor)? {
-        return Err(discard_refusal(&[path.as_key().to_string()], path.as_key()));
+        return Err(discard_refusal(&[path.as_key().to_string()], path.as_key(), target));
     }
 
     // Recording only stat data keeps the rollups (see `ShardMutationBatch`).
@@ -151,19 +149,20 @@ fn ensure_directory_present(ledger: &inventory_utils::ShardLedger, key: &str) ->
 /// # Arguments
 /// * `ledger` - The registered set.
 /// * `key`     - The warehouse path key of the directory.
+/// * `target`  - The path as given, which a hint names to run the restore again.
 /// * `confirm` - Whether changes the restore would discard may be discarded.
 ///
 /// # Returns
 /// * `Ok(())`      - If the restore completed.
 /// * `Err(String)` - If the directory has no inventory, a file was refused, the restore would
 ///   discard a change without `confirm`, or a write failed.
-fn restore_worktree_directory(ledger: &inventory_utils::ShardLedger, key: &str, confirm: bool) -> Result<(), String> {
+fn restore_worktree_directory(ledger: &inventory_utils::ShardLedger, key: &str, target: &str, confirm: bool) -> Result<(), String> {
     // Every file is judged before any is written, so a refusal (a change to discard without
     // --confirm, an alias, a folder where a file was) leaves the whole directory as it was.
-    let discards = plan_directory(ledger, key)?;
+    let discards = plan_directory(ledger, key, confirm)?;
 
     if !confirm && !discards.is_empty() {
-        return Err(discard_refusal(&discards, &load_guard_utils::display_path(key)));
+        return Err(discard_refusal(&discards, load_guard_utils::display_path(key), target));
     }
 
     let mut restored_any = false;
@@ -188,7 +187,8 @@ fn restore_worktree_directory(ledger: &inventory_utils::ShardLedger, key: &str, 
         };
 
         for (_, item) in inventory.get_items() {
-            if item.state == InventoryItemState::Deleted {
+            // The plan judged no folder entry, so none is written either.
+            if item.state == InventoryItemState::Deleted || item.item_type == DirEntryType::Tree {
                 continue;
             }
 
@@ -254,11 +254,13 @@ fn restore_worktree_directory(ledger: &inventory_utils::ShardLedger, key: &str, 
 /// # Arguments
 /// * `ledger` - The registered set.
 /// * `key`    - The warehouse path key of the directory.
+/// * `confirm` - Whether the restore was confirmed: its discards need not be listed, so files are
+///   only checked for the refusals, not compared.
 ///
 /// # Returns
-/// * `Ok(Vec<String>)` - The warehouse paths whose changes would be discarded.
+/// * `Ok(Vec<String>)` - The warehouse paths whose changes would be discarded (none when confirmed).
 /// * `Err(String)`     - If a file was refused or could not be read.
-fn plan_directory(ledger: &inventory_utils::ShardLedger, key: &str) -> Result<Vec<String>, String> {
+fn plan_directory(ledger: &inventory_utils::ShardLedger, key: &str, confirm: bool) -> Result<Vec<String>, String> {
     let anchor = file_utils::take_stat_anchor()?;
     let mut discards: Vec<String> = Vec::new();
 
@@ -277,7 +279,9 @@ fn plan_directory(ledger: &inventory_utils::ShardLedger, key: &str) -> Result<Ve
             let file_path = tracked_path(shard_key, &item.name);
             ensure_restorable(&file_path)?;
 
-            if would_discard(&file_path, item, anchor)? {
+            if confirm {
+                refuse_folder(&file_path)?;
+            } else if would_discard(&file_path, item, anchor)? {
                 discards.push(file_path);
             }
         }
@@ -304,18 +308,34 @@ fn would_discard(file_path: &str, item: &InventoryItem, anchor: file_utils::Stat
     };
 
     if metadata.is_dir() {
-        return Err(format!(
-            "Cannot restore \"{}\": the tracked file was replaced by a folder. Move or delete the folder first.",
-            file_path
-        ));
+        return Err(folder_refusal(file_path));
     }
 
     Ok(matching_content(file_path, item, anchor).is_none())
 }
 
-/// The `confirmation_required` refusal for a restore of `target` that would discard the changes
-/// to `files`, which its details list.
-fn discard_refusal(files: &[String], target: &str) -> String {
+/// Refuse the tracked file at `file_path` if a folder replaced it: restoring it would delete the
+/// folder and whatever untracked content it holds.
+fn refuse_folder(file_path: &str) -> Result<(), String> {
+    match std::fs::symlink_metadata(file_path) {
+        Ok(metadata) if metadata.is_dir() => Err(folder_refusal(file_path)),
+        _ => Ok(()),
+    }
+}
+
+/// The refusal for a tracked file a folder replaced.
+fn folder_refusal(file_path: &str) -> String {
+    format!(
+        "Cannot restore \"{}\": the tracked file was replaced by a folder. Move or delete the folder first.",
+        file_path
+    )
+}
+
+/// The `confirmation_required` refusal for a restore of `shown_path` that would discard the
+/// changes to `files`, which its details list. The hint names `target`, the path as given: it
+/// resolves from the directory the restore was run in, as `shown_path` (relative to the root)
+/// would not.
+fn discard_refusal(files: &[String], shown_path: &str, target: &str) -> String {
     let shown: Vec<String> = files.iter().take(20).map(|file| format!("  {}", file)).collect();
     let more = match files.len() > shown.len() {
         true => format!("\n  ... and {} more", files.len() - shown.len()),
@@ -323,16 +343,16 @@ fn discard_refusal(files: &[String], target: &str) -> String {
     };
     let separator = if target.starts_with('-') { "-- " } else { "" };
 
-    crate::human!("Restoring \"{}\" would discard the changes to:\n{}{}", target, shown.join("\n"), more);
+    crate::human!("Restoring \"{}\" would discard the changes to:\n{}{}", shown_path, shown.join("\n"), more);
 
     CoreError::refusal_with_details(
         RefusalCode::ConfirmationRequired,
-        format!("Restoring \"{}\" would discard the changes to {} file(s); nothing was changed.", target, files.len()),
+        format!("Restoring \"{}\" would discard the changes to {} file(s); nothing was changed.", shown_path, files.len()),
         format!(
             "Keep any change you want first (load it, or copy it aside), then run \"forklift restore --confirm {}{}\" to discard the rest.",
-            separator, target
+            separator, crate::commands::scope_prune::shell_quote(target)
         ),
-        serde_json::json!({ "path": target, "discards": files }),
+        serde_json::json!({ "path": shown_path, "discards": files }),
     ).into()
 }
 
@@ -379,18 +399,23 @@ fn restore_entry(parent_key: &str, item: &InventoryItem, fetch: bool, discard: b
 
     let anchor = file_utils::take_stat_anchor()?;
     let present = std::fs::symlink_metadata(&file_path).is_ok();
-    let matched = if present { matching_content(&file_path, item, anchor) } else { None };
 
-    if item.state == InventoryItemState::Normal {
-        if let Some(restored) = matched {
-            return Ok(restored);
+    // Compared only where the answer matters: a confirmed restore of a conflict entry rewrites
+    // the file whatever it holds.
+    if present && (item.state == InventoryItemState::Normal || !discard) {
+        let matched = matching_content(&file_path, item, anchor);
+
+        if item.state == InventoryItemState::Normal {
+            if let Some(restored) = matched {
+                return Ok(restored);
+            }
         }
-    }
 
-    // A conflict entry is rewritten even when its file matches, which loses nothing; a file that
-    // differs is lost unless the caller allowed it.
-    if present && matched.is_none() && !discard {
-        return Err(changed_since(&file_path));
+        // A conflict entry is rewritten even when its file matches, which loses nothing; a file
+        // that differs is lost unless the caller allowed it.
+        if matched.is_none() && !discard {
+            return Err(changed_since(&file_path));
+        }
     }
 
     // A directory's restore fetched every file's content already (`ensure_directory_present`); a

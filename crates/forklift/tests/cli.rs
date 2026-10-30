@@ -2274,8 +2274,22 @@ fn restore_needs_confirm_to_discard_a_change() {
     let next_step = value["error"]["next_step"].as_str().unwrap();
     let quoted = next_step.split('"').nth(1).expect("the next step quotes a command");
     let named: Vec<&str> = quoted.split(' ').skip(1).collect();
-    assert_eq!(named, ["restore", "--confirm", "./"], "{}", next_step);
+    assert_eq!(named, ["restore", "--confirm", "."], "{}", next_step);
     assert_success(&warehouse.run(&named));
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("dir/b.txt")).unwrap(), "original b\n");
+
+    // Run from a subdirectory, the command it names resolves from there, as the path given did:
+    // the root-relative "dir/b.txt" would name dir/dir/b.txt.
+    warehouse.write_file("dir/b.txt", "wanted?\n");
+    let refused = warehouse.run_at(&warehouse.root.join("dir"), &["--json", "restore", "b.txt"]);
+    assert_eq!(refused.status.code(), Some(39), "{}", stdout(&refused));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&refused)).unwrap();
+    assert_eq!(value["error"]["details"]["path"], "dir/b.txt", "{}", value);
+    let next_step = value["error"]["next_step"].as_str().unwrap();
+    let quoted = next_step.split('"').nth(1).expect("the next step quotes a command");
+    let named: Vec<&str> = quoted.split(' ').skip(1).collect();
+    assert_eq!(named, ["restore", "--confirm", "b.txt"], "{}", next_step);
+    assert_success(&warehouse.run_at(&warehouse.root.join("dir"), &named));
     assert_eq!(std::fs::read_to_string(warehouse.root.join("dir/b.txt")).unwrap(), "original b\n");
 }
 
