@@ -222,11 +222,14 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
     let delta_on_loose = if plan.to_evict.is_empty() {
         false
     } else {
-        pack_utils::any_packed_delta_against(&loose_only).map_err(|e| format!(
-            "\"evict\" cannot run while a pack in this warehouse is damaged, since it cannot tell \
-            which packed content stands on what it would free; nothing was changed. Run \"compact \
-            --all\" to salvage the pack, then \"evict\" again. {}", e
-        ))?
+        pack_utils::any_packed_delta_against(&loose_only).map_err(|error| match error {
+            pack_utils::PackScanError::Damaged(e) => format!(
+                "\"evict\" cannot run while a pack in this warehouse is damaged, since it cannot tell \
+                which packed content stands on what it would free; nothing was changed. Run \
+                \"compact --all\" to salvage the pack, then \"evict\" again. {}", e
+            ),
+            pack_utils::PackScanError::Registry(e) => e,
+        })?
     };
     plan.repack = !plan.to_drop.is_empty() || delta_on_loose;
     plan.to_unseal = sealed_utils::present_recorded(&sealed)?
@@ -967,8 +970,9 @@ mod tests {
         let (folder, file) = file_utils::get_path_for_object(&h.a).unwrap();
         let loose = PathBuf::from(folder).join(file);
         let bytes = std::fs::read(&loose).unwrap();
-        pack_utils::compact(false, false, false, &Progress::NONE).unwrap();
+        let incremental = pack_utils::compact(false, false, false, &Progress::NONE).unwrap();
         assert!(!loose.exists(), "sanity: compaction moved it into a pack");
+        assert_eq!(incremental.pack_bytes_freed, 0, "an incremental compaction frees no pack");
         std::fs::write(&loose, &bytes).unwrap();
         let hold = store_access();
 

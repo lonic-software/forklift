@@ -3380,6 +3380,15 @@ pub fn is_in_packs(hash: &str) -> Result<bool, String> {
     })
 }
 
+/// Why [`any_packed_delta_against`] could not answer.
+#[derive(Debug)]
+pub enum PackScanError {
+    /// A pack's index or one of its record headers could not be read.
+    Damaged(String),
+    /// The pack registry could not be loaded.
+    Registry(String),
+}
+
 /// Whether a pack holds a delta whose base is one of `bases`: a record that stops decoding once
 /// its base is deleted, unless a repack re-encodes it first. Every pack's index is validated even
 /// when `bases` is empty, so a caller about to delete objects learns of a damaged pack first.
@@ -3388,22 +3397,24 @@ pub fn is_in_packs(hash: &str) -> Result<bool, String> {
 /// * `bases` - Object hashes about to be deleted.
 ///
 /// # Returns
-/// * `Ok(bool)`    - Whether any pack has such a delta.
-/// * `Err(String)` - If the pack registry could not be loaded, or a pack's index or a record header
-///   could not be read: nothing can then say which deltas stand on `bases`, and a repack without
-///   salvage would leave that pack, and any such delta in it, as found.
-pub fn any_packed_delta_against(bases: &HashSet<String>) -> Result<bool, String> {
+/// * `Ok(bool)`              - Whether any pack has such a delta.
+/// * `Err(PackScanError)`    - [`PackScanError::Damaged`] if a pack's index or a record header could
+///   not be read: nothing can then say which deltas stand on `bases`, and a repack without salvage
+///   would leave that pack, and any such delta in it, as found. [`PackScanError::Registry`] if the
+///   pack registry could not be loaded.
+pub fn any_packed_delta_against(bases: &HashSet<String>) -> Result<bool, PackScanError> {
     let wanted: HashSet<[u8; HASH_LEN]> = bases.iter().filter_map(|hash| hash_to_bytes(hash)).collect();
 
-    let packs = loaded_packs()?;
+    let packs = loaded_packs().map_err(PackScanError::Registry)?;
     let mut found = false;
     for pack in packs.packs.iter() {
-        let records = pack.records()?;
+        let records = pack.records().map_err(PackScanError::Damaged)?;
         if found || wanted.is_empty() {
             continue;
         }
         for record in records.iter() {
-            if read_record_header(pack, record.offset, record.length)?.base.is_some_and(|base| wanted.contains(&base)) {
+            let header = read_record_header(pack, record.offset, record.length).map_err(PackScanError::Damaged)?;
+            if header.base.is_some_and(|base| wanted.contains(&base)) {
                 found = true;
                 break;
             }
@@ -4033,8 +4044,10 @@ fn compact_held(all: bool,
     // source first — the post-condition ("it is not loose") already holds, so tolerate NotFound.
     progress.status("Removing packed originals");
 
-    // The new packs hold the loose objects packed here too, so their bytes count on the old side.
+    // A repack's new packs hold the loose objects packed here too, so their bytes count on the old
+    // side. An incremental compaction frees no pack and reports nothing.
     let loose_bytes_packed: u64 = packed_sources.iter()
+        .filter(|_| all)
         .filter_map(|source| std::fs::metadata(source).ok())
         .map(|metadata| metadata.len())
         .sum();
