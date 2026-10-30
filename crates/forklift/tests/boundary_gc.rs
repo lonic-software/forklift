@@ -395,7 +395,7 @@ fn an_undone_boundary_head_survives_the_sweep_and_audit_passes() {
     // actually rooted. This step is what makes the leg a falsifier at all: it is what makes `b`'s
     // survival below actually depend on the fix under test, rather than passing vacuously either
     // way (stuck-green).
-    warehouse.run_ok(&["compact"]);
+    warehouse.run_ok(&["store", "compact"]);
 
     // Soft undo moves `main` back off `b`, orphaning it (no pallet ref reaches `b` any more).
     // No second ref is needed: `main` itself lands on `legacy`, keeping it alive.
@@ -407,7 +407,7 @@ fn an_undone_boundary_head_survives_the_sweep_and_audit_passes() {
     warehouse.run_ok(&["undo"]);
 
     // The shipped client-side collector.
-    warehouse.run_ok(&["compact", "--all"]);
+    warehouse.run_ok(&["store", "compact", "--all"]);
 
     let (b_present, legacy_present) = warehouse.scoped(|| {
         (
@@ -1392,8 +1392,8 @@ fn a_full_repack_keeps_staged_content_and_the_next_stack_restores_it() {
     warehouse.run_ok(&["load", "."]);
 
     // Pack the staged blob first, so the full repack below has to decide whether to carry it.
-    warehouse.run_ok(&["compact"]);
-    warehouse.run_ok(&["compact", "--all"]);
+    warehouse.run_ok(&["store", "compact"]);
+    warehouse.run_ok(&["store", "compact", "--all"]);
 
     warehouse.run_ok(&["stack", "second"]);
     warehouse.run_ok(&["audit"]);

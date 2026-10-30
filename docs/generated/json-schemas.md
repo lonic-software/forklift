@@ -501,188 +501,6 @@ A command not listed here either reports only the generic human-message shape `{
 }
 ```
 
-## `compact`
-
-### `Compacted`
-
-```json
-{
-  "$defs": {
-    "KeptDamagedPack": {
-      "description": "A damaged pack a full repack kept.",
-      "properties": {
-        "error": {
-          "description": "Why the index failed validation.",
-          "type": "string"
-        },
-        "index_path": {
-          "description": "The pack's index file.",
-          "type": "string"
-        },
-        "unaccounted": {
-          "description": "The live objects the pack might hold that no other copy serves verified: they cannot be\nrecovered from this store.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "index_path",
-        "error",
-        "unaccounted"
-      ],
-      "type": "object"
-    },
-    "SignatureConflict": {
-      "description": "A loose signature file a compaction left loose.",
-      "properties": {
-        "parcel": {
-          "description": "The parcel the file signs.",
-          "type": "string"
-        },
-        "reason": {
-          "description": "Why it was left loose.",
-          "type": "string"
-        },
-        "sidecar_path": {
-          "description": "The file's path.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "parcel",
-        "sidecar_path",
-        "reason"
-      ],
-      "type": "object"
-    }
-  },
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "The result of a compaction.",
-  "properties": {
-    "all": {
-      "description": "Whether this was a full repack (existing packs rewritten, garbage dropped).",
-      "type": "boolean"
-    },
-    "bytes_packed": {
-      "description": "Total bytes written into the packs (delta-compressed where deltas were used).",
-      "format": "uint64",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "corrupt_skipped": {
-      "description": "Loose objects skipped because their bytes did not decode or did not hash to their\nfilename address; left in place rather than packed or removed.",
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "damaged_packs_dropped": {
-      "description": "Damaged packs (an index that failed validation) a full repack salvaged and removed: every\nlive object they might have held reads verified from another copy. Each entry is the\nindex file's path. Always empty without `--all`.",
-      "items": {
-        "type": "string"
-      },
-      "type": "array"
-    },
-    "damaged_packs_kept": {
-      "description": "Damaged packs a full repack salvaged what it could from but kept, because some live\nobject they might hold has no other verified copy. Always empty without `--all`.",
-      "items": {
-        "$ref": "#/$defs/KeptDamagedPack"
-      },
-      "type": "array"
-    },
-    "deltas": {
-      "description": "Of the packed objects, how many were stored as deltas against a similar base.",
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "loose_removed": {
-      "description": "Original files removed after their pack was durably written.",
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "objects_packed": {
-      "description": "Objects packed.",
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "over_ceiling_skipped": {
-      "description": "Loose objects skipped because decoding them would exceed the 64 MiB object ceiling —\nlegitimate objects authored before that ceiling existed, not corruption; left in place\nrather than packed or removed.",
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "packs_written": {
-      "description": "Packs written (more than one when the set crossed a rollover threshold).",
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "signature_conflicts": {
-      "description": "Loose signature files left loose: one that differs from the signature already in a table\nfor its parcel (the tabled one is what reads return), or one that is malformed.",
-      "items": {
-        "$ref": "#/$defs/SignatureConflict"
-      },
-      "type": "array"
-    },
-    "signature_leftovers_removed": {
-      "description": "Loose signature files removed because a table already held the same signature: leftover\ncopies, not signatures this run moved.",
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "signature_tables_unreadable": {
-      "description": "Signature tables that could not be read, left as found. Each entry names the table and\nwhat to do about it.",
-      "items": {
-        "type": "string"
-      },
-      "type": "array"
-    },
-    "signature_tables_written": {
-      "description": "Signature tables written: loose signatures moved into tables (a repack rewrites them all).",
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "signatures_dropped": {
-      "description": "Signatures a full repack dropped because their parcel is no longer in the store. Always 0\nwithout `--all`.",
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "signatures_moved": {
-      "description": "Loose signature files moved into a signature table this run wrote.",
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
-    }
-  },
-  "required": [
-    "all",
-    "objects_packed",
-    "packs_written",
-    "loose_removed",
-    "deltas",
-    "bytes_packed",
-    "corrupt_skipped",
-    "over_ceiling_skipped",
-    "damaged_packs_dropped",
-    "damaged_packs_kept",
-    "signature_tables_written",
-    "signatures_moved",
-    "signature_leftovers_removed",
-    "signatures_dropped",
-    "signature_conflicts",
-    "signature_tables_unreadable"
-  ],
-  "title": "Compacted",
-  "type": "object"
-}
-```
-
 ## `config`
 
 ### `ConfigSet`
@@ -1039,62 +857,6 @@ A command not listed here either reports only the generic human-message shape `{
 }
 ```
 
-## `export-git`
-
-### `ExportReport`
-
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "The result of a git export.",
-  "properties": {
-    "blobs": {
-      "description": "The git blobs written. A file unchanged from its parcel's first parent is reused, not\nwritten again.",
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "branches": {
-      "description": "The branches created (one per user pallet).",
-      "items": {
-        "type": "string"
-      },
-      "type": "array"
-    },
-    "commits": {
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "current": {
-      "description": "The branch checked out (the current pallet).",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "path": {
-      "type": "string"
-    },
-    "trees": {
-      "description": "The git trees written. A tree unchanged from its parcel's first parent is reused, not\nwritten again.",
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
-    }
-  },
-  "required": [
-    "path",
-    "commits",
-    "trees",
-    "blobs",
-    "branches"
-  ],
-  "title": "ExportReport",
-  "type": "object"
-}
-```
-
 ## `franchise`
 
 ### `FranchiseReport`
@@ -1211,6 +973,324 @@ A command not listed here either reports only the generic human-message shape `{
     "fetched_objects"
   ],
   "title": "FranchiseReport",
+  "type": "object"
+}
+```
+
+## `git`
+
+### `ImportReport`
+
+```json
+{
+  "$defs": {
+    "ExistingRule": {
+      "description": "A rule of the ignore file, by where it stands.",
+      "properties": {
+        "line": {
+          "description": "The line number, counting from 1.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pattern": {
+          "description": "The pattern, as written on that line.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "line",
+        "pattern"
+      ],
+      "type": "object"
+    },
+    "Packed": {
+      "description": "The packed-store summary (a slim view of `pack_utils::IngestStats`).",
+      "properties": {
+        "deltas": {
+          "description": "Of the objects, blobs delta-compressed against the previous version at their path.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "objects": {
+          "description": "Objects written into packs.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "packs": {
+          "description": "Packs written.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "objects",
+        "packs",
+        "deltas"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The result of a git import.",
+  "properties": {
+    "blobs": {
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "commits": {
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "compacted": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Packed"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "What the pack-direct import wrote (absent with `--no-compact`). The field keeps its\noriginal name: it reports the same fact — the imported store is packed — that the old\npost-import compaction pass did."
+    },
+    "current": {
+      "description": "The pallet checked out (git's HEAD branch).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "git_already_ignored": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ExistingRule"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The rule already in `.forkliftignore` that covers `.git`, when one did and so none was\nadded."
+    },
+    "ignored_git": {
+      "description": "Whether a `.git` ignore pattern was added to `.forkliftignore`.",
+      "type": "boolean"
+    },
+    "pallets": {
+      "description": "The pallets created (one per local branch).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "trees": {
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "unheld": {
+      "description": "Every checked-out file that does not hold the content imported for it (an uncommitted\nedit or deletion, or a file git converted as it checked it out), in tree order. Each reads\nas an unstaged change. The warning names only the first few. A tracked `.forkliftignore`\nthe import appended the `.git` rule to is not listed, although it reads as changed, even\nwhen it also held an edit of its own before the import.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "warnings": {
+      "description": "Anything skipped or worth flagging (e.g. submodules).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "commits",
+    "trees",
+    "blobs",
+    "pallets",
+    "ignored_git"
+  ],
+  "title": "ImportReport",
+  "type": "object"
+}
+```
+
+### `ExportReport`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The result of a git export.",
+  "properties": {
+    "blobs": {
+      "description": "The git blobs written. A file unchanged from its parcel's first parent is reused, not\nwritten again.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "branches": {
+      "description": "The branches created (one per user pallet).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "commits": {
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "current": {
+      "description": "The branch checked out (the current pallet).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "path": {
+      "type": "string"
+    },
+    "trees": {
+      "description": "The git trees written. A tree unchanged from its parcel's first parent is reused, not\nwritten again.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "path",
+    "commits",
+    "trees",
+    "blobs",
+    "branches"
+  ],
+  "title": "ExportReport",
+  "type": "object"
+}
+```
+
+### `MirrorReport`
+
+```json
+{
+  "$defs": {
+    "MirrorStatus": {
+      "description": "What the mirror did with one pallet.",
+      "oneOf": [
+        {
+          "const": "pushed",
+          "description": "The export was pushed to git.",
+          "type": "string"
+        },
+        {
+          "const": "up_to_date",
+          "description": "Git's branch already held the export.",
+          "type": "string"
+        },
+        {
+          "const": "already_ahead",
+          "description": "Git's branch was already past the export, at a later lift another warehouse mirrored.",
+          "type": "string"
+        },
+        {
+          "const": "skipped",
+          "description": "The pallet cannot be mirrored (the remote lacks it, or git refuses its name as a branch).",
+          "type": "string"
+        },
+        {
+          "const": "busy",
+          "description": "Another mirror run held the mirror.",
+          "type": "string"
+        },
+        {
+          "const": "raced",
+          "description": "Git's branch kept moving while the push was retried.",
+          "type": "string"
+        },
+        {
+          "const": "diverged",
+          "description": "Git's branch holds a commit that is not part of the export; nothing was pushed.",
+          "type": "string"
+        },
+        {
+          "const": "layout_skew",
+          "description": "Git's branch was written in another export layout; nothing was pushed.",
+          "type": "string"
+        },
+        {
+          "const": "damaged",
+          "description": "The mirror's own repository holds something this build did not write.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "A fetch, export or push failed.",
+          "type": "string"
+        }
+      ]
+    },
+    "PalletMirror": {
+      "description": "One pallet's mirror outcome.",
+      "properties": {
+        "commit": {
+          "description": "The git commit the branch is at, when it is in step with the export.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "exported": {
+          "description": "The parcels this run wrote as new git commits.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "message": {
+          "description": "Why the pallet was skipped or not mirrored, with the step that clears it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pallet": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/MirrorStatus"
+        }
+      },
+      "required": [
+        "pallet",
+        "status",
+        "exported"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The result of a mirror run.",
+  "properties": {
+    "pallets": {
+      "description": "Each mirrored pallet's outcome.",
+      "items": {
+        "$ref": "#/$defs/PalletMirror"
+      },
+      "type": "array"
+    },
+    "url": {
+      "description": "The git remote mirrored to (`mirror.url`).",
+      "type": "string"
+    }
+  },
+  "required": [
+    "url",
+    "pallets"
+  ],
+  "title": "MirrorReport",
   "type": "object"
 }
 ```
@@ -1698,7 +1778,7 @@ A command not listed here either reports only the generic human-message shape `{
           ]
         },
         "operation": {
-          "description": "The operation: shift, park, fast-forward, lower, bay creation, import-git, merge or\ncherry-pick.",
+          "description": "The operation: shift, park, fast-forward, lower, bay creation, git import, merge or\ncherry-pick.",
           "type": "string"
         },
         "outcome": {
@@ -1945,148 +2025,6 @@ A command not listed here either reports only the generic human-message shape `{
     "entries"
   ],
   "title": "History",
-  "type": "object"
-}
-```
-
-## `import-git`
-
-### `ImportReport`
-
-```json
-{
-  "$defs": {
-    "ExistingRule": {
-      "description": "A rule of the ignore file, by where it stands.",
-      "properties": {
-        "line": {
-          "description": "The line number, counting from 1.",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "pattern": {
-          "description": "The pattern, as written on that line.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "line",
-        "pattern"
-      ],
-      "type": "object"
-    },
-    "Packed": {
-      "description": "The packed-store summary (a slim view of `pack_utils::IngestStats`).",
-      "properties": {
-        "deltas": {
-          "description": "Of the objects, blobs delta-compressed against the previous version at their path.",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "objects": {
-          "description": "Objects written into packs.",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "packs": {
-          "description": "Packs written.",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "objects",
-        "packs",
-        "deltas"
-      ],
-      "type": "object"
-    }
-  },
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "The result of a git import.",
-  "properties": {
-    "blobs": {
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "commits": {
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "compacted": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/Packed"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "What the pack-direct import wrote (absent with `--no-compact`). The field keeps its\noriginal name: it reports the same fact — the imported store is packed — that the old\npost-import compaction pass did."
-    },
-    "current": {
-      "description": "The pallet checked out (git's HEAD branch).",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "git_already_ignored": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/ExistingRule"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "The rule already in `.forkliftignore` that covers `.git`, when one did and so none was\nadded."
-    },
-    "ignored_git": {
-      "description": "Whether a `.git` ignore pattern was added to `.forkliftignore`.",
-      "type": "boolean"
-    },
-    "pallets": {
-      "description": "The pallets created (one per local branch).",
-      "items": {
-        "type": "string"
-      },
-      "type": "array"
-    },
-    "trees": {
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "unheld": {
-      "description": "Every checked-out file that does not hold the content imported for it (an uncommitted\nedit or deletion, or a file git converted as it checked it out), in tree order. Each reads\nas an unstaged change. The warning names only the first few. A tracked `.forkliftignore`\nthe import appended the `.git` rule to is not listed, although it reads as changed, even\nwhen it also held an edit of its own before the import.",
-      "items": {
-        "type": "string"
-      },
-      "type": "array"
-    },
-    "warnings": {
-      "description": "Anything skipped or worth flagging (e.g. submodules).",
-      "items": {
-        "type": "string"
-      },
-      "type": "array"
-    }
-  },
-  "required": [
-    "commits",
-    "trees",
-    "blobs",
-    "pallets",
-    "ignored_git"
-  ],
-  "title": "ImportReport",
   "type": "object"
 }
 ```
@@ -3006,130 +2944,6 @@ A command not listed here either reports only the generic human-message shape `{
 }
 ```
 
-## `mirror`
-
-### `MirrorReport`
-
-```json
-{
-  "$defs": {
-    "MirrorStatus": {
-      "description": "What the mirror did with one pallet.",
-      "oneOf": [
-        {
-          "const": "pushed",
-          "description": "The export was pushed to git.",
-          "type": "string"
-        },
-        {
-          "const": "up_to_date",
-          "description": "Git's branch already held the export.",
-          "type": "string"
-        },
-        {
-          "const": "already_ahead",
-          "description": "Git's branch was already past the export, at a later lift another warehouse mirrored.",
-          "type": "string"
-        },
-        {
-          "const": "skipped",
-          "description": "The pallet cannot be mirrored (the remote lacks it, or git refuses its name as a branch).",
-          "type": "string"
-        },
-        {
-          "const": "busy",
-          "description": "Another mirror run held the mirror.",
-          "type": "string"
-        },
-        {
-          "const": "raced",
-          "description": "Git's branch kept moving while the push was retried.",
-          "type": "string"
-        },
-        {
-          "const": "diverged",
-          "description": "Git's branch holds a commit that is not part of the export; nothing was pushed.",
-          "type": "string"
-        },
-        {
-          "const": "layout_skew",
-          "description": "Git's branch was written in another export layout; nothing was pushed.",
-          "type": "string"
-        },
-        {
-          "const": "damaged",
-          "description": "The mirror's own repository holds something this build did not write.",
-          "type": "string"
-        },
-        {
-          "const": "failed",
-          "description": "A fetch, export or push failed.",
-          "type": "string"
-        }
-      ]
-    },
-    "PalletMirror": {
-      "description": "One pallet's mirror outcome.",
-      "properties": {
-        "commit": {
-          "description": "The git commit the branch is at, when it is in step with the export.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "exported": {
-          "description": "The parcels this run wrote as new git commits.",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "message": {
-          "description": "Why the pallet was skipped or not mirrored, with the step that clears it.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "pallet": {
-          "type": "string"
-        },
-        "status": {
-          "$ref": "#/$defs/MirrorStatus"
-        }
-      },
-      "required": [
-        "pallet",
-        "status",
-        "exported"
-      ],
-      "type": "object"
-    }
-  },
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "The result of a mirror run.",
-  "properties": {
-    "pallets": {
-      "description": "Each mirrored pallet's outcome.",
-      "items": {
-        "$ref": "#/$defs/PalletMirror"
-      },
-      "type": "array"
-    },
-    "url": {
-      "description": "The git remote mirrored to (`mirror.url`).",
-      "type": "string"
-    }
-  },
-  "required": [
-    "url",
-    "pallets"
-  ],
-  "title": "MirrorReport",
-  "type": "object"
-}
-```
-
 ## `office`
 
 ### `OfficeListing`
@@ -3649,209 +3463,6 @@ A command not listed here either reports only the generic human-message shape `{
     "parked"
   ],
   "title": "ParkedList",
-  "type": "object"
-}
-```
-
-## `peek`
-
-### `PeekInventory`
-
-```json
-{
-  "$defs": {
-    "PeekInventoryItem": {
-      "description": "One inventory entry.",
-      "properties": {
-        "hash": {
-          "type": "string"
-        },
-        "name": {
-          "type": "string"
-        },
-        "state": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "state",
-        "hash",
-        "name"
-      ],
-      "type": "object"
-    }
-  },
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "A `--json` inventory peek.",
-  "properties": {
-    "items": {
-      "items": {
-        "$ref": "#/$defs/PeekInventoryItem"
-      },
-      "type": "array"
-    }
-  },
-  "required": [
-    "items"
-  ],
-  "title": "PeekInventory",
-  "type": "object"
-}
-```
-
-### `PeekObject`
-
-```json
-{
-  "$defs": {
-    "PeekAction": {
-      "description": "One action of a parcel object.",
-      "properties": {
-        "action": {
-          "type": "string"
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "operator": {
-          "type": "string"
-        },
-        "timestamp": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "action",
-        "operator",
-        "timestamp"
-      ],
-      "type": "object"
-    },
-    "PeekChunk": {
-      "description": "One chunk of a recipe object.",
-      "properties": {
-        "hash": {
-          "type": "string"
-        },
-        "size": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "hash",
-        "size"
-      ],
-      "type": "object"
-    },
-    "PeekTreeEntry": {
-      "description": "One entry of a tree object.",
-      "properties": {
-        "hash": {
-          "type": "string"
-        },
-        "item_type": {
-          "type": "string"
-        },
-        "name": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "item_type",
-        "hash",
-        "name"
-      ],
-      "type": "object"
-    }
-  },
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "A `--json` object peek: the fields relevant to the object's type are set.",
-  "properties": {
-    "actions": {
-      "description": "A parcel's actions.",
-      "items": {
-        "$ref": "#/$defs/PeekAction"
-      },
-      "type": "array"
-    },
-    "binary": {
-      "description": "Whether a blob is binary — contains a NUL byte, or is not valid UTF-8 (see\n`output::blob_text`) — `content` is then omitted rather than carrying lossily-mangled\nbytes. Absent for every other object type.",
-      "type": [
-        "boolean",
-        "null"
-      ]
-    },
-    "chunks": {
-      "description": "A recipe's ordered chunk list.",
-      "items": {
-        "$ref": "#/$defs/PeekChunk"
-      },
-      "type": "array"
-    },
-    "content": {
-      "description": "A blob's content as text.",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "content_hash": {
-      "description": "A recipe's whole-file content hash.",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "description": {
-      "description": "A parcel's description.",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "entries": {
-      "description": "A tree's entries.",
-      "items": {
-        "$ref": "#/$defs/PeekTreeEntry"
-      },
-      "type": "array"
-    },
-    "object_type": {
-      "type": "string"
-    },
-    "parents": {
-      "description": "A parcel's parent hashes.",
-      "items": {
-        "type": "string"
-      },
-      "type": "array"
-    },
-    "total_size": {
-      "description": "A recipe's total assembled size, or a chunk's payload size.",
-      "format": "uint64",
-      "minimum": 0,
-      "type": [
-        "integer",
-        "null"
-      ]
-    },
-    "tree": {
-      "description": "A parcel's root tree hash.",
-      "type": [
-        "string",
-        "null"
-      ]
-    }
-  },
-  "required": [
-    "object_type"
-  ],
-  "title": "PeekObject",
   "type": "object"
 }
 ```
@@ -5057,119 +4668,80 @@ A command not listed here either reports only the generic human-message shape `{
 }
 ```
 
-## `evict`
+## `remote`
 
-### `EvictReport`
+### `RemoteReport`
 
 ```json
 {
+  "$defs": {
+    "RemoteBlock": {
+      "description": "A refusal that stops clients talking to the remote.",
+      "properties": {
+        "code": {
+          "description": "The stable refusal code, such as `non_origin_remote` or `origin_move_pending`.",
+          "type": "string"
+        },
+        "message": {
+          "description": "The refusal's explanation.",
+          "type": "string"
+        },
+        "next_step": {
+          "description": "The step that clears it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "next_step"
+      ],
+      "type": "object"
+    }
+  },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "The result of an eviction: how much was (or would be) freed, and why the rest stays.",
+  "description": "What bare `remote` reports.",
   "properties": {
-    "bytes_freed": {
-      "description": "Bytes freed on disk: loose files deleted, plus what the old packs held beyond the packs the\nrepack wrote (`0` on a dry run).",
-      "format": "uint64",
-      "minimum": 0,
-      "type": "integer"
+    "blocked": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RemoteBlock"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The refusal a command that dials the remote would meet from here; none when nothing stops\nit. With no remote configured, only a move of the origin standing or a partial warehouse's\nmissing origin record is reported."
     },
-    "dry_run": {
-      "description": "Whether this was a dry run (nothing changed).",
-      "type": "boolean"
-    },
-    "evicted": {
-      "description": "Objects freed, loose or packed (`0` on a dry run). A read of one fetches it again from the\norigin.",
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "heads_not_lowered": {
-      "description": "Origin heads this warehouse does not hold yet; their history frees nothing until a `lower`\nbrings it in.",
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "kept_for_checkouts": {
-      "description": "Objects the origin holds that stay because a checkout's base tree needs them.",
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "kept_local": {
-      "description": "Objects the origin holds that stay for a meta pallet, a parked, consolidating or\ncherry-picking bay, a trust pin, or staged work.",
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "not_held": {
-      "description": "Present objects only local history reaches (unlifted work, a haul, a deleted pallet), which\nthe origin is not known to hold. Lifting that work lets a later eviction free them.",
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "record_bound_skipped": {
-      "description": "Why no record was dropped: the run met an object missing here that the record does not hold,\nor could not finish, in which case the record may have shrunk though `record_dropped` is `0`\n(`null` otherwise, and on a dry run). A missing object keeps every later `evict` from\nshrinking the record until that content is back.",
+    "origin": {
+      "description": "A partial warehouse's origin, the one server proved to hold what it lacks; none for a full\nwarehouse, which may talk to any remote, and for a partial one whose record is missing.",
       "type": [
         "string",
         "null"
       ]
     },
-    "record_dropped": {
-      "description": "Records of evicted objects this run dropped because nothing present names them any more: an\nobject under an evicted tree is reached only through that tree, whose own record stays\n(`0` on a dry run).",
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "repack": {
-      "description": "Whether the run rewrites every pack (on a dry run, would): when `would_drop` is not `0`, and\nalso when a packed delta stands on a loose copy it frees, which the repack re-encodes first.",
+    "partial": {
+      "description": "Whether this is a partial warehouse (franchised with `--only` or `--cache`), which talks\nonly to its origin.",
       "type": "boolean"
     },
-    "still_packed": {
-      "description": "Objects the plan frees that are still inside a pack after the repack: one found damaged only\nduring it, which a repack leaves as found (`0` on a dry run; a pack already damaged refuses\nthe run). `compact --all` salvages it.",
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "unsealed": {
-      "description": "Kept objects an earlier eviction had recorded as held by hash, and a read had fetched again,\nwhose record this run removed (on a dry run, would remove).",
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "would_drop": {
-      "description": "Of `would_evict`, the objects a pack holds, which a full repack drops.",
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "would_evict": {
-      "description": "Objects the plan frees. After a real run, `evicted` is less only by `still_packed`.",
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
+    "remote": {
+      "description": "The configured `remote.url`; none when no remote is configured.",
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "required": [
-    "dry_run",
-    "evicted",
-    "would_evict",
-    "would_drop",
-    "repack",
-    "bytes_freed",
-    "kept_for_checkouts",
-    "kept_local",
-    "not_held",
-    "still_packed",
-    "heads_not_lowered",
-    "unsealed",
-    "record_dropped",
-    "record_bound_skipped"
+    "remote",
+    "partial",
+    "origin",
+    "blocked"
   ],
-  "title": "EvictReport",
+  "title": "RemoteReport",
   "type": "object"
 }
 ```
-
-## `remote`
 
 ### `RemoteMoveReport`
 
@@ -5393,7 +4965,7 @@ A command not listed here either reports only the generic human-message shape `{
   "description": "The object-store census. The `Serialize` shape is the public `--json` schema; byte counts\nare exact integers there (the human view renders them in binary units).",
   "properties": {
     "damaged_packs": {
-      "description": "Packs that load but whose index is damaged in places: their sound parts are still read,\nand an object in a damaged part reads as unverifiable. `forklift compact --all` salvages\nwhat the pack's data file still holds, and removes the pack when every live object it may\nhold reads from another copy. Empty on a healthy store.",
+      "description": "Packs that load but whose index is damaged in places: their sound parts are still read,\nand an object in a damaged part reads as unverifiable. `forklift store compact --all` salvages\nwhat the pack's data file still holds, and removes the pack when every live object it may\nhold reads from another copy. Empty on a healthy store.",
       "items": {
         "$ref": "#/$defs/PackIndexIssue"
       },
@@ -5406,7 +4978,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "integer"
     },
     "densify_suggested": {
-      "description": "Whether this store was bulk-ingested (`import-git`, or a franchise's native bundle\ninstall) and would still benefit from a one-shot `compact --all --redelta` pass.\nAdditive field; never acted on automatically.",
+      "description": "Whether this store was bulk-ingested (`git import`, or a franchise's native bundle\ninstall) and would still benefit from a one-shot `store compact --all --redelta` pass.\nAdditive field; never acted on automatically.",
       "type": "boolean"
     },
     "foreign_version_indexes": {
@@ -5532,6 +5104,497 @@ A command not listed here either reports only the generic human-message shape `{
     "signature_conflicts"
   ],
   "title": "StoreReport",
+  "type": "object"
+}
+```
+
+### `Compacted`
+
+```json
+{
+  "$defs": {
+    "KeptDamagedPack": {
+      "description": "A damaged pack a full repack kept.",
+      "properties": {
+        "error": {
+          "description": "Why the index failed validation.",
+          "type": "string"
+        },
+        "index_path": {
+          "description": "The pack's index file.",
+          "type": "string"
+        },
+        "unaccounted": {
+          "description": "The live objects the pack might hold that no other copy serves verified: they cannot be\nrecovered from this store.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "index_path",
+        "error",
+        "unaccounted"
+      ],
+      "type": "object"
+    },
+    "SignatureConflict": {
+      "description": "A loose signature file a compaction left loose.",
+      "properties": {
+        "parcel": {
+          "description": "The parcel the file signs.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why it was left loose.",
+          "type": "string"
+        },
+        "sidecar_path": {
+          "description": "The file's path.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "parcel",
+        "sidecar_path",
+        "reason"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The result of a compaction.",
+  "properties": {
+    "all": {
+      "description": "Whether this was a full repack (existing packs rewritten, garbage dropped).",
+      "type": "boolean"
+    },
+    "bytes_packed": {
+      "description": "Total bytes written into the packs (delta-compressed where deltas were used).",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "corrupt_skipped": {
+      "description": "Loose objects skipped because their bytes did not decode or did not hash to their\nfilename address; left in place rather than packed or removed.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "damaged_packs_dropped": {
+      "description": "Damaged packs (an index that failed validation) a full repack salvaged and removed: every\nlive object they might have held reads verified from another copy. Each entry is the\nindex file's path. Always empty without `--all`.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "damaged_packs_kept": {
+      "description": "Damaged packs a full repack salvaged what it could from but kept, because some live\nobject they might hold has no other verified copy. Always empty without `--all`.",
+      "items": {
+        "$ref": "#/$defs/KeptDamagedPack"
+      },
+      "type": "array"
+    },
+    "deltas": {
+      "description": "Of the packed objects, how many were stored as deltas against a similar base.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "loose_removed": {
+      "description": "Original files removed after their pack was durably written.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "objects_packed": {
+      "description": "Objects packed.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "over_ceiling_skipped": {
+      "description": "Loose objects skipped because decoding them would exceed the 64 MiB object ceiling —\nlegitimate objects authored before that ceiling existed, not corruption; left in place\nrather than packed or removed.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "packs_written": {
+      "description": "Packs written (more than one when the set crossed a rollover threshold).",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "signature_conflicts": {
+      "description": "Loose signature files left loose: one that differs from the signature already in a table\nfor its parcel (the tabled one is what reads return), or one that is malformed.",
+      "items": {
+        "$ref": "#/$defs/SignatureConflict"
+      },
+      "type": "array"
+    },
+    "signature_leftovers_removed": {
+      "description": "Loose signature files removed because a table already held the same signature: leftover\ncopies, not signatures this run moved.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "signature_tables_unreadable": {
+      "description": "Signature tables that could not be read, left as found. Each entry names the table and\nwhat to do about it.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "signature_tables_written": {
+      "description": "Signature tables written: loose signatures moved into tables (a repack rewrites them all).",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "signatures_dropped": {
+      "description": "Signatures a full repack dropped because their parcel is no longer in the store. Always 0\nwithout `--all`.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "signatures_moved": {
+      "description": "Loose signature files moved into a signature table this run wrote.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "all",
+    "objects_packed",
+    "packs_written",
+    "loose_removed",
+    "deltas",
+    "bytes_packed",
+    "corrupt_skipped",
+    "over_ceiling_skipped",
+    "damaged_packs_dropped",
+    "damaged_packs_kept",
+    "signature_tables_written",
+    "signatures_moved",
+    "signature_leftovers_removed",
+    "signatures_dropped",
+    "signature_conflicts",
+    "signature_tables_unreadable"
+  ],
+  "title": "Compacted",
+  "type": "object"
+}
+```
+
+### `PeekInventory`
+
+```json
+{
+  "$defs": {
+    "PeekInventoryItem": {
+      "description": "One inventory entry.",
+      "properties": {
+        "hash": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "state",
+        "hash",
+        "name"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "A `--json` inventory peek.",
+  "properties": {
+    "items": {
+      "items": {
+        "$ref": "#/$defs/PeekInventoryItem"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "items"
+  ],
+  "title": "PeekInventory",
+  "type": "object"
+}
+```
+
+### `PeekObject`
+
+```json
+{
+  "$defs": {
+    "PeekAction": {
+      "description": "One action of a parcel object.",
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operator": {
+          "type": "string"
+        },
+        "timestamp": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "operator",
+        "timestamp"
+      ],
+      "type": "object"
+    },
+    "PeekChunk": {
+      "description": "One chunk of a recipe object.",
+      "properties": {
+        "hash": {
+          "type": "string"
+        },
+        "size": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "hash",
+        "size"
+      ],
+      "type": "object"
+    },
+    "PeekTreeEntry": {
+      "description": "One entry of a tree object.",
+      "properties": {
+        "hash": {
+          "type": "string"
+        },
+        "item_type": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "item_type",
+        "hash",
+        "name"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "A `--json` object peek: the fields relevant to the object's type are set.",
+  "properties": {
+    "actions": {
+      "description": "A parcel's actions.",
+      "items": {
+        "$ref": "#/$defs/PeekAction"
+      },
+      "type": "array"
+    },
+    "binary": {
+      "description": "Whether a blob is binary — contains a NUL byte, or is not valid UTF-8 (see\n`output::blob_text`) — `content` is then omitted rather than carrying lossily-mangled\nbytes. Absent for every other object type.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "chunks": {
+      "description": "A recipe's ordered chunk list.",
+      "items": {
+        "$ref": "#/$defs/PeekChunk"
+      },
+      "type": "array"
+    },
+    "content": {
+      "description": "A blob's content as text.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "content_hash": {
+      "description": "A recipe's whole-file content hash.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "description": {
+      "description": "A parcel's description.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "entries": {
+      "description": "A tree's entries.",
+      "items": {
+        "$ref": "#/$defs/PeekTreeEntry"
+      },
+      "type": "array"
+    },
+    "object_type": {
+      "type": "string"
+    },
+    "parents": {
+      "description": "A parcel's parent hashes.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "total_size": {
+      "description": "A recipe's total assembled size, or a chunk's payload size.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "tree": {
+      "description": "A parcel's root tree hash.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "object_type"
+  ],
+  "title": "PeekObject",
+  "type": "object"
+}
+```
+
+### `EvictReport`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The result of an eviction: how much was (or would be) freed, and why the rest stays.",
+  "properties": {
+    "bytes_freed": {
+      "description": "Bytes freed on disk: loose files deleted, plus what the old packs held beyond the packs the\nrepack wrote (`0` on a dry run).",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "dry_run": {
+      "description": "Whether this was a dry run (nothing changed).",
+      "type": "boolean"
+    },
+    "evicted": {
+      "description": "Objects freed, loose or packed (`0` on a dry run). A read of one fetches it again from the\norigin.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "heads_not_lowered": {
+      "description": "Origin heads this warehouse does not hold yet; their history frees nothing until a `lower`\nbrings it in.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "kept_for_checkouts": {
+      "description": "Objects the origin holds that stay because a checkout's base tree needs them.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "kept_local": {
+      "description": "Objects the origin holds that stay for a meta pallet, a parked, consolidating or\ncherry-picking bay, a trust pin, or staged work.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "not_held": {
+      "description": "Present objects only local history reaches (unlifted work, a haul, a deleted pallet), which\nthe origin is not known to hold. Lifting that work lets a later eviction free them.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "record_bound_skipped": {
+      "description": "Why no record was dropped: the run met an object missing here that the record does not hold,\nor could not finish, in which case the record may have shrunk though `record_dropped` is `0`\n(`null` otherwise, and on a dry run). A missing object keeps every later `store evict` from\nshrinking the record until that content is back.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "record_dropped": {
+      "description": "Records of evicted objects this run dropped because nothing present names them any more: an\nobject under an evicted tree is reached only through that tree, whose own record stays\n(`0` on a dry run).",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "repack": {
+      "description": "Whether the run rewrites every pack (on a dry run, would): when `would_drop` is not `0`, and\nalso when a packed delta stands on a loose copy it frees, which the repack re-encodes first.",
+      "type": "boolean"
+    },
+    "still_packed": {
+      "description": "Objects the plan frees that are still inside a pack after the repack: one found damaged only\nduring it, which a repack leaves as found (`0` on a dry run; a pack already damaged refuses\nthe run). `store compact --all` salvages it.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "unsealed": {
+      "description": "Kept objects an earlier eviction had recorded as held by hash, and a read had fetched again,\nwhose record this run removed (on a dry run, would remove).",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "would_drop": {
+      "description": "Of `would_evict`, the objects a pack holds, which a full repack drops.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "would_evict": {
+      "description": "Objects the plan frees. After a real run, `evicted` is less only by `still_packed`.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "dry_run",
+    "evicted",
+    "would_evict",
+    "would_drop",
+    "repack",
+    "bytes_freed",
+    "kept_for_checkouts",
+    "kept_local",
+    "not_held",
+    "still_packed",
+    "heads_not_lowered",
+    "unsealed",
+    "record_dropped",
+    "record_bound_skipped"
+  ],
+  "title": "EvictReport",
   "type": "object"
 }
 ```

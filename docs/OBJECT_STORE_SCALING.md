@@ -10,7 +10,7 @@ commits, ~402k objects). See [`BENCHMARK.md`](BENCHMARK.md) to reproduce.
 | On-disk store | `.forklift` = **4.8 GB** | `.git` = 316 MB | **~15×** |
 | `history` (whole log) | **3.59 s** | 0.93 s | ~3.9× |
 
-> **Update — resolved.** These were the *loose* baseline. `forklift compact` (phases 1,
+> **Update — resolved.** These were the *loose* baseline. `forklift store compact` (phases 1,
 > 2 and 2b, below) packs git.git to **~230 MB — smaller than git's own 316 MB pack** — and
 > the `history` walk is now **0.90 s** — at parity with `git log`'s verbose default (0.88 s),
 > the fair like-for-like comparison. The rest of this note is the design as built.
@@ -71,7 +71,7 @@ object is its own zstd-compressed file (`loose_object.rs:store`); git.git become
 
 ## What already shipped from this investigation
 
-- **`import-git` batching** — one `git cat-file --batch` pipe instead of a process
+- **`git import` batching** — one `git cat-file --batch` pipe instead of a process
   per object (~30× faster import).
 - **`history -n`/`--limit`** — a bounded walk. Because the walk is a max-heap on
   timestamp, a limit loads only the newest N parcels and their frontier, not the
@@ -80,7 +80,7 @@ object is its own zstd-compressed file (`loose_object.rs:store`); git.git become
   below) worthwhile.
 - **Timestamp round-trip removed** in `history` rendering (micro).
 - **`compact` — packing with path-aware delta compression (A phases 1, 2 & 2b, shipped).**
-  `forklift compact` sweeps the loose store into a few bounded packs and stores each blob
+  `forklift store compact` sweeps the loose store into a few bounded packs and stores each blob
   as a delta against the previous version of the same file. Both structural signals move:
   **git.git packs 4.8 GB → 261 MB, smaller than git's own 310 MB pack, and faster than the
   size-only heuristic.** See the section below for the design as built.
@@ -94,7 +94,7 @@ object is its own zstd-compressed file (`loose_object.rs:store`); git.git become
 
 ## A. Packing + delta compression (the strategic fix — both signals)
 
-### Phase 1 — the pack substrate (shipped as `forklift compact`)
+### Phase 1 — the pack substrate (shipped as `forklift store compact`)
 
 The packing mechanism deltas ride on: implemented in
 `forklift-core/src/util/pack_utils.rs`, driven by the `compact` command (and MCP
@@ -166,7 +166,7 @@ random loose reads in a `history` walk into a few packs. What it does **not** do
 its own is close the version-to-version size gap — that is the delta records phase 2
 adds, below.
 
-**Automatic on import; not (yet) on a recurring trigger.** `import-git` runs
+**Automatic on import; not (yet) on a recurring trigger.** `git import` runs
 `compact` on the way out (`--no-compact` opts out), because that is the one
 operation that dumps a huge loose set in a single shot — the case a user would most
 need to remember to pack, and one that produces a single clean pack. A *recurring*
@@ -426,15 +426,15 @@ outright *without* lever G.
 
 ## Sequencing
 
-1. **Shipped:** `import-git` batching, `history -n`, timestamp micro-fix.
-2. **Shipped — A phase 1** — `forklift compact`: pack objects without deltas
+1. **Shipped:** `git import` batching, `history -n`, timestamp micro-fix.
+2. **Shipped — A phase 1** — `forklift store compact`: pack objects without deltas
    (concatenate + sorted resident index + loose fallback). Removes per-file slack
    and the open-per-object history cost. Highest structural payoff for the effort.
 3. **Shipped — A phase 2** — delta records (reuse the bundle zstd-dictionary encoder).
 4. **Shipped — A phase 2b** — path-aware base selection (walk the DAG, delta each blob
    against its previous version at path). git.git: 1.1 GB → **261 MB, past git's 310 MB**,
    and faster than the size heuristic.
-5. **Shipped — A phase 3 (repack)** — `forklift compact --all` rewrites existing packs:
+5. **Shipped — A phase 3 (repack)** — `forklift store compact --all` rewrites existing packs:
    it keeps only the **live** set (so packed garbage is dropped) and **consolidates** many
    packs into few, **reusing** each object's existing delta record (a byte-copy, not a
    reconstruct-and-re-delta) — so it is fast and never balloons the store. Incremental
@@ -495,7 +495,7 @@ file a new pack was just written to (it skips new-pack paths).
 
 Compacting on import handles the big one-time case; ongoing use accumulates loose objects a
 few at a time. So after any *mutating* command (`stack`, `consolidate`, `lower`, … — not
-`compact` itself, or `import-git`, which already compacts), forklift checks — **cheaply, no
+`compact` itself, or `git import`, which already compacts), forklift checks — **cheaply, no
 full scan** — whether maintenance is due: it estimates the loose count from one fan-out folder
 × 256 (git's trick) and counts packs. Over `maintenance.loose` (default 6700) it runs an
 incremental `compact`; over `maintenance.packs` (default 20) it runs a consolidating

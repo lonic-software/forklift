@@ -34,7 +34,7 @@ pub const FILE_NAME_BASE_SERVE_LOCK: &str = ".forklift-server.lock";
 /// This is the staging-area atomicity story (see the design document): commands that
 /// mutate the inventory, the object store bookkeeping or pallet refs take this lock, so
 /// that e.g. `stack` can never read a staging area that another forklift process is
-/// halfway through rewriting. Read-only commands (`peek`, `stocktake`) do not take it —
+/// halfway through rewriting. Read-only commands (`store peek`, `stocktake`) do not take it —
 /// at worst they report an in-flight intermediate state. Every process that fills a bay's
 /// working directory holds that bay's lock, which is what lets [`WarehouseLock::acquire`] clear
 /// the bay's assembly folder.

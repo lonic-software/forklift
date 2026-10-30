@@ -390,7 +390,7 @@ pub fn load_tree_shared(hash: &str) -> Result<std::sync::Arc<TreeItem>, String> 
 /// `TreeItem` clone off the lock — cheap, since only one tree level is ever loaded, see the
 /// type's doc comment). A cache *miss*, though, is parsed and returned directly without ever
 /// entering the parsed-tree cache: this owned form is also the one every one-shot walk uses (gc
-/// reachability, `export-git`, `merge`, `audit`), and those never revisit a tree they load, so
+/// reachability, `git export`, `merge`, `audit`), and those never revisit a tree they load, so
 /// caching it here would only evict the shared-ancestor working set `load_tree_shared`'s
 /// revisit-heavy callers actually rely on, for a cache entry that would never be hit again.
 ///
@@ -1337,7 +1337,7 @@ pub fn ingest_file(file_name: &str,
 /// The representation comes from the entry, not from the file's size: a symlink entry hashes its
 /// link target, a `*Chunked` entry its recipe, and any other entry a plain blob of the whole file,
 /// at any size. Size-based chunking (see [`ingest_file`]) must not decide this, since an entry
-/// can hold a plain blob of any size (`import-git` stores every git blob plain), and comparing a
+/// can hold a plain blob of any size (`git import` stores every git blob plain), and comparing a
 /// recipe hash with it would report an unchanged file as modified.
 ///
 /// A file that became a symlink, or a symlink that became a file, never matches: a link's
@@ -1682,7 +1682,7 @@ mod tests {
 
     /// A plain entry is re-proved as a plain blob at any size: the streamed hash of a file at or
     /// above the chunk threshold is exactly the hash `build_blob` gives its bytes, so an entry
-    /// `import-git` stored plain matches its unedited file.
+    /// `git import` stored plain matches its unedited file.
     #[test]
     fn a_large_plain_entry_rehashes_to_the_blob_hash_build_blob_gives() {
         let scratch = Scratch::new("hash-as-plain");

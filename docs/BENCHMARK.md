@@ -91,9 +91,9 @@ in copy `B`:
 | **diff, staged** (same 20, staged) | `git diff --staged` | `forklift diff --staged` |
 | **commit** (1 file) | `git commit` | `forklift stack` |
 | **commit, git fsync=all** | `git -c core.fsync=all -c core.fsyncMethod=fsync commit` | `forklift stack` |
-| **onboard** *(separate)* | `git clone --local` | `forklift import-git .` |
+| **onboard** *(separate)* | `git clone --local` | `forklift git import .` |
 
-`import-git` writes straight into native packs as it imports — there is no loose store
+`git import` writes straight into native packs as it imports — there is no loose store
 and no separate compaction pass, so the forklift copy is already packed the moment the
 import finishes. The harness then records that as-imported size and runs the one-shot
 **`compact --all --redelta`** densify pass import itself suggests (import's per-path
@@ -137,12 +137,12 @@ faster), and a per-row note. Example shape:
 
   Onboarding — measured separately; NOT a ratio (different operations):
     git clone --local     420 ms     (copies an existing packfile)
-    forklift import-git   60.43 s    (re-encodes every commit/tree/blob straight into packs; store lands at 445M)
+    forklift git import   60.43 s    (re-encodes every commit/tree/blob straight into packs; store lands at 445M)
     Packed the imported store: 409297 object(s) into 5 pack(s), 315500 delta-compressed.
     compact --all --redelta  179.16 s (one-shot densify: 445M -> 240M)
 ```
 
-**Two sizes, one store.** `import-git` writes straight into native packs as it imports
+**Two sizes, one store.** `git import` writes straight into native packs as it imports
 (delta-compressing successive file/tree versions on the way in), but its per-path delta
 chains don't see the cross-path similarity (renames, moved files) that a global repack
 ordering does — on git.git the as-imported store lands **~1.3x larger** than git's own
@@ -151,7 +151,7 @@ and more: **240M, ~1.4x smaller than git**, for ~179 s of one-time CPU on this c
 The harness reports both sizes and times the comparison rows on the densified store;
 redelta itself did not measurably change the timing rows. On
 repos whose `.git` carries unreachable refs or stale
-remote-tracking branches, `.forklift` often lands far smaller still — `import-git` only
+remote-tracking branches, `.forklift` often lands far smaller still — `git import` only
 pulls branch-reachable history — but that reflects the source repo's ref clutter, not a
 general "forklift packs tighter" result; git.git above (a repo with little such clutter)
 is the representative case. See
@@ -159,7 +159,7 @@ is the representative case. See
 Apple-Silicon Mac, warm cache — re-run for your own repo/hardware.)*
 
 **Onboarding is deliberately kept out of the ratio table.** `git clone --local` and
-`forklift import-git` do fundamentally different work (see §3), so pitting them in a
+`forklift git import` do fundamentally different work (see §3), so pitting them in a
 ratio ("290× slower!") is misleading — the harness reports the two timings side by
 side and lets you read them as what they are. *(Illustrative numbers — run it to get
 your own.)*
@@ -171,12 +171,12 @@ your own.)*
 These matter. A benchmark that hides them is a sales pitch, not a measurement.
 
 - **Onboard is not a like-for-like race.** `git clone --local` hardlinks/copies an
-  existing pack; `forklift import-git` *re-encodes* every git commit, tree and blob
+  existing pack; `forklift git import` *re-encodes* every git commit, tree and blob
   into Forklift objects and signs nothing (imported history is legacy/unsigned). So
   onboard measures the *one-time migration cost*, and git will look dramatically
   faster because it is doing dramatically less work. The honest question it answers
   is "how long to bring this history under Forklift", not "who clones faster".
-  Two things to expect from `import-git` today:
+  Two things to expect from `git import` today:
   - **Import speed.** The importer streams every object through one long-lived
     `git cat-file --batch` pipe rather than forking git per object, so it stays fast
     at scale, and it writes straight into native packs as it goes — delta-compressing
@@ -190,7 +190,7 @@ These matter. A benchmark that hides them is a sales pitch, not a measurement.
     rather than aborting. If you see U+FFFD (`�`) in an imported name, that's why —
     the author's email (the stable id) is preserved exactly.
   - **The table is measured packed (and densified), because git is packed.**
-    `import-git` writes straight into native packs — there's no loose store — and the
+    `git import` writes straight into native packs — there's no loose store — and the
     harness then runs the one-shot `compact --all --redelta` densify pass before the
     comparison table (skip it with `--no-redelta`). Every `status`/`log`/`diff`/`commit`
     row is packed-vs-packed, the same way git is always measured packed (`clone --local`
@@ -247,19 +247,19 @@ git clone --local ~/bench/git-src ~/bench/A          # git measured here
 cp -a ~/bench/A ~/bench/B                             # forklift measured here
 
 # 2. Import history into the forklift copy (this is the 'onboard' number).
-#    import-git writes straight into native packs as it goes — the store is
+#    git import writes straight into native packs as it goes — the store is
 #    already packed the moment this finishes, same as git is always packed.
 cd ~/bench/B
 forklift prepare
-time forklift import-git .
+time forklift git import .
 du -sh .forklift                             # packed, as imported
 
 # 2b. Densify — the one-shot pass import suggests. Import's per-path delta
 #     chains miss cross-path similarity; this re-delta-compresses globally.
-time forklift compact --all --redelta
+time forklift store compact --all --redelta
 du -sh .forklift                             # densified — the state the table compares
 
-# 2c. import-git leaves an untracked .forkliftignore (the .git rule) and asks you to
+# 2c. git import leaves an untracked .forkliftignore (the .git rule) and asks you to
 #     record it; do, so that a later `load .` stages only your edits.
 forklift load .forkliftignore && forklift stack "Keep the .git ignore rule"
 

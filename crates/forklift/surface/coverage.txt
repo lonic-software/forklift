@@ -24,12 +24,14 @@ forklift bay remove: <NAME>
 forklift blame: <PATH> -r/--rev=<REV>
 forklift cherry-pick: <REVISION> -m/--message=<MESSAGE>
 forklift compact: --all --redelta
+    -> forklift store compact: --all --redelta
 forklift config: -g/--global --unset [KEY] [VALUE]
 forklift conflicts:
 forklift consolidate: <PALLET>
 forklift deliver: <TARGET> -m/--message=<MESSAGE>
 forklift diff: -s/--staged [REVISION|PATH]...
 forklift export-git: <PATH>
+    -> forklift git export: <PATH>
 forklift franchise: <URL> <DIRECTORY> -p/--pallet=<PALLET> -t/--token=<TOKEN> --only=<PATH>... --cache --expect=<GENESIS>
 forklift haul:
 forklift haul open: --target=<TARGET> --source=<SOURCE> --title=<TITLE> -m/--message=<MESSAGE>
@@ -45,6 +47,8 @@ forklift heal:
 forklift help: [COMMAND]...
 forklift history: [REVISION] -n/--limit=<LIMIT> --after=<CURSOR> --oneline
 forklift import-git: <PATH> --no-compact
+    -> forklift git:
+    -> forklift git import: <PATH> --no-compact
 forklift lift: --recreate
 forklift load: <PATH>
 forklift lower: [PALLET] --expect=<GENESIS> --keep=<@PALLET:PATH=SIDE>...
@@ -61,6 +65,7 @@ forklift manifest provenance: <REVISION> --model=<MODEL> --tool=<TOOL> --session
 forklift manifest show: <REVISION>
 forklift mcp: --root=<ROOT>
 forklift mirror:
+    -> forklift git mirror:
 forklift office:
 forklift office enroll: --offline --passphrase
 forklift office keygen: --passphrase
@@ -78,6 +83,7 @@ forklift park:
 forklift park pop:
 forklift park list:
 forklift peek: -i/--inventory=<PATH> [HASH]
+    -> forklift store peek: -i/--inventory=<PATH> [HASH]
 forklift prepare:
 forklift profile:
 forklift profile list:
@@ -98,9 +104,12 @@ forklift scope:
 forklift scope status:
 forklift scope-prune: <PATH>... --dry-run
 forklift evict: --dry-run
+    -> forklift store evict: --dry-run
 forklift remote:
 forklift remote move: [URL] --token=<TOKEN> --abort
 forklift store:
+    -> forklift store:
+    -> forklift store status:
 forklift tag:
 forklift tag create: <NAME> [REVISION] -m/--message=<MESSAGE>
 forklift tag show: <NAME>

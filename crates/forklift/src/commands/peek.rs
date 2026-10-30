@@ -18,7 +18,7 @@ const PARCEL_FIELD_TREE: &str =   "tree  ";
 const PARCEL_FIELD_PARENT: &str = "parent";
 const PARCEL_FIELD_ACTION: &str = "action";
 
-/// Handle the `peek` command.
+/// Handle the `store peek` command.
 ///
 /// # Arguments
 /// * `inventory` - The folder whose inventory to peek into (instead of an object).
@@ -311,7 +311,7 @@ fn print_header(object_type: &ObjectType) {
 
 /// Print the content of the given blob to stdout — or, for a binary blob, a short
 /// notice instead of raw bytes (the same NUL-free-and-valid-UTF-8 text test `show` and
-/// `peek --json` use — see `output::blob_text`).
+/// `store peek --json` use — see `output::blob_text`).
 ///
 /// # Arguments
 /// * `object` - The blob to print.

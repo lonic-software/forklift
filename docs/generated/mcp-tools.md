@@ -18,7 +18,6 @@ Every tool `forklift mcp` serves, generated from the same command definition the
 | `bay_remove` | `forklift bay remove` | De-register a bay (its pallet ref and materialized files are kept) | `name` (a string, required) |
 | `blame` | `forklift blame` | Show, for each line of a file, the parcel and author that last changed it | `path` (a string, required)<br>`rev` (a string) |
 | `cherry_pick` | `forklift cherry-pick` | Apply a parcel's changes onto the current pallet as a new, author-preserving parcel | `revision` (a string, required)<br>`message` (a string) |
-| `compact` | `forklift compact` | Compact the object store: pack loose objects into a few dense pack files | `all` (a boolean)<br>`redelta` (a boolean) |
 | `conflicts` | `forklift conflicts` | List the files left in conflict by an unresolved consolidation |  |
 | `consolidate` | `forklift consolidate` | Consolidate (merge) another pallet into the current one | `pallet` (a string, required) |
 | `deliver` | `forklift deliver` | Squash the current draft pallet onto a target as one clean parcel, keeping the trail | `target` (a string, required)<br>`message` (a string) |
@@ -52,18 +51,19 @@ Every tool `forklift mcp` serves, generated from the same command definition the
 | `park` | `forklift park` | Park the work in progress and reset to the pallet head |  |
 | `park_pop` | `forklift park pop` | Re-apply the most recently parked changes (staged) and drop them from the list |  |
 | `park_list` | `forklift park list` | List the parked parcels, newest first |  |
-| `peek` | `forklift peek` | Peek into an object (print its content) | `inventory` (a string)<br>`object` (a string) |
 | `query` | `forklift query` | Query parcel history by signed identity, signer and parcel facts | `revisions` (an array of strings)<br>`from` (a string)<br>`class` (a string)<br>`unsupervised` (a boolean)<br>`supervisor` (a string)<br>`signer` (a string)<br>`author_after` (a string)<br>`author_before` (a string)<br>`merges` (a boolean)<br>`no_merges` (a boolean)<br>`grep` (a string)<br>`model` (a string)<br>`tool` (a string)<br>`tag` (a string)<br>`touches` (a string)<br>`verify` (a boolean)<br>`recorded` (a boolean)<br>`where` (an object)<br>`limit` (an integer of at least 1)<br>`after` (a string)<br>`oneline` (a boolean) |
 | `remove` | `forklift remove` | Stage a file or directory for removal | `path` (a string, required) |
 | `restore` | `forklift restore` | Restore a file or directory from the inventory (discard unstaged changes) | `staged` (a boolean)<br>`path` (a string, required) |
 | `shift` | `forklift shift` | Shift to another pallet | `pallet` (a string, required) |
-| `show` | `forklift show` | Print a file's content at a revision (`git show <rev>:<path>`'s equivalent) | `target` (a string, required) |
+| `show` | `forklift show` | Print a file's content at a revision, as git show does for REV:PATH | `target` (a string, required) |
 | `stack` | `forklift stack` | Stack the inventory as a new parcel (commit) on the current pallet | `description` (a string) |
 | `stocktake` | `forklift stocktake` | Report the staged and unstaged changes of the warehouse | `summary` (a boolean) |
 | `expand` | `forklift expand` | Widen a sparse warehouse's fetch scope and download the newly in-scope subtree(s) | `paths` (an array of strings, required) |
 | `narrow` | `forklift narrow` | Narrow this checkout's materialization scope and de-materialize the dropped subtree(s) | `paths` (an array of strings, required) |
 | `scope_status` | `forklift scope status` | Show the current bay's materialization scope and the warehouse fetch scope (the default) |  |
-| `store` | `forklift store` | Report object-store health: loose vs packed objects, packs, and whether compaction is due |  |
+| `store_status` | `forklift store status` | Report object-store health: loose vs packed objects, packs, and whether compaction is due (the default) |  |
+| `store_compact` | `forklift store compact` | Compact the object store: pack loose objects into a few dense pack files | `all` (a boolean)<br>`redelta` (a boolean) |
+| `store_peek` | `forklift store peek` | Peek into an object (print its content) | `inventory` (a string)<br>`object` (a string) |
 | `tag_create` | `forklift tag create` | Create a signed tag pointing at a revision (admin only) | `name` (a string, required)<br>`revision` (a string)<br>`message` (a string) |
 | `tag_show` | `forklift tag show` | Show one tag in full (subject, tagger, message) | `name` (a string, required) |
 | `tag_list` | `forklift tag list` | List every tag (the default) |  |
@@ -79,9 +79,7 @@ Each of these commands, and every command below it, is a tool for nobody: a pers
 - `forklift config`: reads and sets configuration, which is setup.
 - `forklift profile`: manages identity profiles, which is setup.
 - `forklift franchise`: clones a remote, which is setup.
-- `forklift import-git`: migrates a git repository in, which is setup.
-- `forklift export-git`: migrates out to git, which is setup.
-- `forklift mirror`: pushes to an external git remote under the user's own git credentials.
+- `forklift git`: migrates a repository in or out, which is setup, or mirrors to an external git remote under the user's own git credentials.
 - `forklift office enroll`: establishes the operator's trust, a one-way setup step.
 - `forklift office keygen`: creates a signing key, which is setup.
 - `forklift office admit`: enrolls another operator: trust administration.
@@ -95,8 +93,8 @@ Each of these commands, and every command below it, is a tool for nobody: a pers
 - `forklift self-update`: updates the binary, a host concern.
 - `forklift self-schema`: describes the CLI for Pult; agents get the tool list instead.
 - `forklift scope-prune`: destructive, warehouse-wide disk reclamation: an admin verb, never a sub-agent's.
-- `forklift evict`: warehouse-wide disk reclamation in a cache: an admin verb, like scope-prune.
-- `forklift remote`: repoints a partial warehouse at another server, which is setup.
+- `forklift store evict`: warehouse-wide disk reclamation in a cache: an admin verb, like scope-prune.
+- `forklift remote`: shows the remote configuration, like config, and repoints a partial warehouse at another server: setup.
 - `forklift mcp`: this server itself.
 - `forklift help`: meta.
 - `forklift version`: meta.
@@ -110,5 +108,6 @@ These families' bare form runs the same operation as one of their subcommands, s
 - `forklift haul` is `haul_list`.
 - `forklift office` is `office_list`.
 - `forklift scope` is `scope_status`.
+- `forklift store` is `store_status`.
 - `forklift tag` is `tag_list`.
 

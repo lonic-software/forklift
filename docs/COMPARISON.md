@@ -121,7 +121,7 @@ once (dedup). The meaningful divergences:
 - **Delta compression.** Both systems delta-compress packed history, and Forklift finds delta
   bases the way Git does, by walking history to pair each version of a file with the one
   before it. New objects stay loose until automatic or explicit
-  [`compact`](guide/cli.md#compact--pack-the-object-store); the measured result on git.git is
+  [`store compact`](guide/cli.md#store-compact--pack-the-object-store); the measured result on git.git is
   in [the benchmark guide](BENCHMARK.md).
 - **Large files.** Forklift chunks large files natively, with no pointer files and no second
   tool: an edit re-stores only the chunks it touched. See
@@ -241,7 +241,7 @@ server or deploy the AWS head yourself.]**
 Against Git's ecosystem, this is lopsided the other way: GitHub, GitLab, Gitea, Bitbucket,
 CI everywhere, IDE integration everywhere, an ocean of Stack Overflow answers. Forklift has
 none of that yet. The bridge it offers is
-[`mirror`](guide/cli.md#mirror--keep-a-git-remote-in-step), which keeps a Git remote in step
+[`git mirror`](guide/cli.md#git-mirror--keep-a-git-remote-in-step), which keeps a Git remote in step
 with a Forklift remote, one way. **[Forklift's ecosystem is essentially nonexistent by
 comparison — this is the honest, dominant practical gap.]**
 
@@ -397,8 +397,8 @@ mostly about data model.
   storage-centric architecture with object bytes on presigned URLs.
 - **In-repo collaboration metadata (haul/manifest/tags) and the whole AI-agent track.**
 - **Git interoperability** — Forklift ships
-  [`import-git`](guide/cli.md#import-git--migrate-a-git-repository),
-  [`export-git`](guide/cli.md#export-git--migrate-back-to-git) and `mirror`. Pijul's Git
+  [`git import`](guide/cli.md#git-import--migrate-a-git-repository),
+  [`git export`](guide/cli.md#git-export--migrate-back-to-git) and `git mirror`. Pijul's Git
   interop is more limited.
 
 **Shared ground:** both are Rust, both make conflicts and signing serious concerns, both

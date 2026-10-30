@@ -92,7 +92,7 @@ impl Warehouse {
     /// The pallet head's tree hash — pure content, no timestamp, so it is deterministic (unlike the
     /// parcel hash, which embeds the wall clock).
     fn head_tree_hash(&self) -> String {
-        let output = self.run_ok(&["--json", "peek", &self.head()]);
+        let output = self.run_ok(&["--json", "store", "peek", &self.head()]);
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         value["data"]["tree"].as_str().unwrap().to_string()
     }
@@ -102,7 +102,7 @@ impl Warehouse {
     fn parcel_tree_hash(&self, pallet: &str) -> String {
         let head = std::fs::read_to_string(self.root.join(".forklift").join("pallets").join(pallet))
             .unwrap().trim().to_string();
-        let output = self.run_ok(&["--json", "peek", &head]);
+        let output = self.run_ok(&["--json", "store", "peek", &head]);
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         value["data"]["tree"].as_str().unwrap().to_string()
     }
@@ -262,13 +262,13 @@ fn repacking_is_byte_reproducible() {
     }
 
     // Pack the loose objects, then consolidate into a single steady-state pack set.
-    warehouse.run_ok(&["compact"]);
-    warehouse.run_ok(&["compact", "--all"]);
+    warehouse.run_ok(&["store", "compact"]);
+    warehouse.run_ok(&["store", "compact", "--all"]);
     let first = warehouse.pack_snapshot();
     assert!(!first.is_empty(), "compaction should have produced pack files");
 
     // A second consolidation of the same object set must land byte-for-byte on the same files.
-    warehouse.run_ok(&["compact", "--all"]);
+    warehouse.run_ok(&["store", "compact", "--all"]);
     let second = warehouse.pack_snapshot();
 
     assert_eq!(second.keys().collect::<Vec<_>>(), first.keys().collect::<Vec<_>>(),

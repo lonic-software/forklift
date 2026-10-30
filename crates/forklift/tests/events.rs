@@ -166,7 +166,7 @@ fn compact_reports_its_phases_on_the_channel() {
     let warehouse = TestWarehouse::new("compact");
     warehouse.prepare_with_a_parcel();
 
-    let (output, lines) = run_and_collect(&warehouse, &["--json", "compact"]);
+    let (output, lines) = run_and_collect(&warehouse, &["--json", "store", "compact"]);
     assert_success(&output);
 
     assert_protocol(&lines);
@@ -209,7 +209,7 @@ fn import_git_reports_its_phases_on_the_channel() {
     assert_success(&warehouse.run(&["prepare"]));
     assert_success(&warehouse.run(&["config", "--global", "operator.identifier", "test@forklift"]));
 
-    let (output, lines) = run_and_collect(&warehouse, &["import-git", "."]);
+    let (output, lines) = run_and_collect(&warehouse, &["git", "import", "."]);
     assert_success(&output);
 
     assert_protocol(&lines);
@@ -229,7 +229,7 @@ fn a_reader_that_has_gone_away_never_kills_the_operation() {
     let (read_end, write_end) = channel::pipe();
     drop(read_end);
 
-    let output = warehouse.run_with_channel(&["--json", "compact"], write_end);
+    let output = warehouse.run_with_channel(&["--json", "store", "compact"], write_end);
 
     assert_eq!(output.status.signal(), None, "the process was killed by a signal: {:?}", output.status);
     assert_success(&output);
@@ -245,7 +245,7 @@ fn a_socket_whose_peer_has_gone_never_kills_the_operation() {
     let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
     drop(theirs);
 
-    let output = warehouse.run_with_channel(&["--json", "compact"], OwnedFd::from(ours));
+    let output = warehouse.run_with_channel(&["--json", "store", "compact"], OwnedFd::from(ours));
 
     assert_eq!(output.status.signal(), None, "the process was killed by a signal: {:?}", output.status);
     assert_success(&output);
@@ -262,7 +262,7 @@ fn children_never_write_into_the_channel() {
     std::fs::write(&input_path, concat!(
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}"#, "\n",
         r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#, "\n",
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"compact","arguments":{}}}"#, "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"store_compact","arguments":{}}}"#, "\n",
     )).unwrap();
 
     let mut command = warehouse.command(&["mcp"]);
@@ -287,7 +287,7 @@ fn mcp_compact(warehouse: &TestWarehouse, protocol: &str, meta: &str) -> Vec<ser
         "{}\n{}\n{}\n",
         format_args!(r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"{}"}}}}"#, protocol),
         r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
-        format_args!(r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"compact","arguments":{{}}{}}}}}"#, meta),
+        format_args!(r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"store_compact","arguments":{{}}{}}}}}"#, meta),
     )).unwrap();
 
     let mut command = warehouse.command(&["mcp"]);
@@ -375,7 +375,7 @@ fn a_regular_file_is_never_written_as_a_channel() {
     let path = warehouse.home.join("not-a-channel");
     let file = std::fs::File::create(&path).unwrap();
 
-    let output = warehouse.run_with_channel(&["compact"], OwnedFd::from(file));
+    let output = warehouse.run_with_channel(&["store", "compact"], OwnedFd::from(file));
     assert_success(&output);
 
     assert_eq!(std::fs::read(&path).unwrap(), b"", "the emitter wrote to a regular file");
@@ -387,7 +387,7 @@ fn a_standard_stream_is_never_used_as_a_channel() {
     warehouse.prepare_with_a_parcel();
 
     for value in ["0", "1", "2"] {
-        let output = warehouse.command(&["--json", "compact"])
+        let output = warehouse.command(&["--json", "store", "compact"])
             .env("PULT_EVENTS", value)
             .output()
             .unwrap();
@@ -411,7 +411,7 @@ fn an_unusable_variable_leaves_the_command_unaffected() {
 
     // Not digits, a sign, whitespace, and a number with nothing open behind it.
     for value in ["", "seven", "+7", " 7", "7 ", "-1", "99999999999999999999", "200"] {
-        let output = warehouse.command(&["--json", "compact"])
+        let output = warehouse.command(&["--json", "store", "compact"])
             .env("PULT_EVENTS", value)
             .output()
             .unwrap();
@@ -446,7 +446,7 @@ fn an_mcp_call_reporting_progress_finishes_after_its_client_has_gone() {
 
     // The client is gone before the call: every progress notification and the response fail.
     drop(child.stdout.take());
-    stdin.write_all(br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"compact","arguments":{},"_meta":{"progressToken":"p1"}}}"#).unwrap();
+    stdin.write_all(br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"store_compact","arguments":{},"_meta":{"progressToken":"p1"}}}"#).unwrap();
     stdin.write_all(b"\n").unwrap();
     drop(stdin);
 

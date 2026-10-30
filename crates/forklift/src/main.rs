@@ -3,7 +3,7 @@ use clap::error::ErrorKind;
 use clap::{CommandFactory, FromArgMatches};
 use forklift_core::util::{lock_utils, warehouse_utils};
 use forklift_core::util::fanout_utils::block_on_worker_stack;
-use crate::cli::{Cli, Command, OfficeAction, ParkAction, ProfileAction, RemoteAction};
+use crate::cli::{Cli, Command, GitAction, OfficeAction, ParkAction, ProfileAction, RemoteAction, StoreAction};
 use crate::output::{ErrorCode, ForkliftError, OutputMode};
 
 pub mod cache_fetch;
@@ -286,7 +286,7 @@ fn report_usage_error(error: &clap::Error) -> ! {
 /// [`Command::requires_warehouse_lock`] commands acquire
 /// [`lock_utils::WarehouseLock`] *before* entry-heal runs, not after: a lock-*waiting* mutating
 /// command must never restage a recorded path concurrently with the current lock-holder's own
-/// deletions (e.g. a `stack` consuming a staged inventory shard, or a `compact --all` dropping a
+/// deletions (e.g. a `stack` consuming a staged inventory shard, or a `store compact --all` dropping a
 /// superseded pack) — after this reorder it can't, because it only reaches entry-heal once it
 /// *is* the lock-holder, the same way `heal` itself has always healed under the lock it holds. A
 /// read-only command never takes this lock at all, so its entry-heal still runs lock-free exactly
@@ -424,8 +424,12 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
             Some(ProfileAction::Use { name }) => commands::profile::use_profile(&name),
             Some(ProfileAction::List) | None => commands::profile::list(),
         },
-        Command::Compact { all, redelta } => commands::compact::handle_command(all, redelta),
-        Command::Store => commands::store::handle_command(),
+        Command::Store { action } => match action {
+            Some(StoreAction::Status) | None => commands::store::handle_command(),
+            Some(StoreAction::Compact { all, redelta }) => commands::compact::handle_command(all, redelta),
+            Some(StoreAction::Peek { inventory, object }) => commands::peek::handle_command(inventory, object, cli.verbose),
+            Some(StoreAction::Evict { dry_run }) => commands::evict::handle_command(dry_run).await,
+        },
         Command::Conflicts => commands::conflicts::handle_command(),
         Command::Bay { action } => commands::bay::handle_command(action),
         Command::Consolidate { pallet } => commands::consolidate::handle_command(&pallet).await,
@@ -448,15 +452,17 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
                 author_before, merges, no_merges, grep, recorded, model, tool, tag, touches,
                 r#where, limit, after, oneline,
             }).await,
-        Command::ImportGit { path, no_compact } => commands::import_git::handle_command(&path, no_compact),
-        Command::ExportGit { path } => commands::export_git::handle_command(&path),
+        Command::Git { action } => match action {
+            GitAction::Import { path, no_compact } => commands::import_git::handle_command(&path, no_compact),
+            GitAction::Export { path } => commands::export_git::handle_command(&path),
+            GitAction::Mirror => commands::mirror::handle_command().await,
+        },
         Command::Lift { recreate } => commands::lift::handle_command(recreate).await,
         Command::Load { path } => commands::load::handle_command(&path).await,
         Command::Lower { pallet, expect, keep } => commands::lower::handle_command(pallet, expect, keep).await,
         Command::Manifest { action } => commands::manifest::handle_command(action),
         Command::Haul { action } => commands::haul::handle_command(action).await,
         Command::Mcp { root } => commands::mcp::handle_command(root),
-        Command::Mirror => commands::mirror::handle_command().await,
         Command::Office { action } => match action {
             Some(OfficeAction::Enroll { offline, passphrase }) =>
                 commands::office::enroll(offline, passphrase).await,
@@ -495,15 +501,14 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
             Some(ParkAction::List) => commands::park::list_parked(),
             None => commands::park::park_changes().await,
         },
-        Command::Peek { inventory, object } => commands::peek::handle_command(inventory, object, cli.verbose),
         Command::Prepare => commands::prepare::handle_command(cli.verbose),
         Command::Remove { path } => commands::remove::handle_command(&path),
         Command::Restore { staged, path } => commands::restore::handle_command(staged, &path),
         Command::Scope { action } => commands::scope::handle_command(action),
         Command::ScopePrune { paths, dry_run } => commands::scope_prune::handle_command(paths, dry_run).await,
-        Command::Evict { dry_run } => commands::evict::handle_command(dry_run).await,
         Command::Remote { action } => match action {
-            RemoteAction::Move { url, token, abort } => {
+            None => commands::remote::show(),
+            Some(RemoteAction::Move { url, token, abort }) => {
                 let store_access = store_access.ok_or("remote move ran without its store-access hold.")?;
                 commands::remote::move_origin(url, token, abort, store_access).await
             }

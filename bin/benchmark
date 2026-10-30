@@ -29,8 +29,8 @@ fi
 # What it does, end to end:
 #   1. Clones the target repo once (a local mirror), then makes two working copies:
 #        A/  a plain `git clone --local`   (git is measured here)
-#        B/  a copy of A, then `forklift import-git .`   (forklift is measured here)
-#      `import-git` writes straight into native packs as it imports — there is no
+#        B/  a copy of A, then `forklift git import .`   (forklift is measured here)
+#      `git import` writes straight into native packs as it imports — there is no
 #      loose store and no separate compaction pass. B is packed the moment the
 #      import finishes, same as A is packed the moment the clone finishes.
 #   2. Densifies B with a one-shot `compact --all --redelta` (the pass import itself
@@ -55,7 +55,7 @@ fi
 # one, else the tracked file the last 1,000 first-parent commits changed most).
 #
 # Output is an aligned text table by default; pass --markdown for a table you can paste
-# into a doc. Onboarding (clone vs import-git) is reported separately, never as a ratio.
+# into a doc. Onboarding (clone vs git import) is reported separately, never as a ratio.
 set -euo pipefail
 
 # ── defaults ────────────────────────────────────────────────────────────────
@@ -168,7 +168,7 @@ MAIN_REF=$(git -C "$A" symbolic-ref --short HEAD)
 echo "→ building the forklift working copy (B = copy of A)…"
 cp -a "$A" "$B"
 ( cd "$B" && forklift prepare >/dev/null )
-# forklift import-git itself is timed below, in step [1/6] — that IS the onboard cost.
+# forklift git import itself is timed below, in step [1/6] — that IS the onboard cost.
 
 # ── repo shape (context for the report) ─────────────────────────────────────
 N_COMMITS=$(git -C "$A" rev-list --count HEAD)
@@ -287,7 +287,7 @@ render_table_markdown() {
 
 # ── 1. onboard cost (single run; one-shot by nature) ────────────────────────
 echo "→ [1/6] onboard cost…"
-# git: a fresh local clone from the mirror. forklift: import-git on an existing
+# git: a fresh local clone from the mirror. forklift: git import on an existing
 # checkout. Different work, same question — "time to bring this history under the
 # VCS" — so the note flags that they are not byte-identical operations.
 t0=$(_now_ms)
@@ -295,7 +295,7 @@ git clone --quiet --local "$MIRROR" "$WORK/_gc" >/dev/null 2>&1 \
     || { echo "error: git clone --local of $MIRROR into $WORK/_gc failed" >&2; exit 1; }
 t1=$(_now_ms)
 GIT_ONBOARD=$(( t1 - t0 )); rm -rf "$WORK/_gc"
-# import-git can legitimately fail (e.g. a git object git itself accepts but the importer
+# git import can legitimately fail (e.g. a git object git itself accepts but the importer
 # rejects). Capture its output and surface it — a swallowed error here reads as a silent
 # crash, and every later benchmark would run against a half-imported warehouse.
 #
@@ -303,8 +303,8 @@ GIT_ONBOARD=$(( t1 - t0 )); rm -rf "$WORK/_gc"
 # (delta-compressing successive file/tree versions on the way in), so the timed number
 # IS the real onboarding cost — there is no separate loose store or compaction pass.
 t0=$(_now_ms)
-if ! import_log=$( cd "$B" && forklift import-git . 2>&1 ); then
-    echo "error: 'forklift import-git .' failed — the benchmark cannot continue." >&2
+if ! import_log=$( cd "$B" && forklift git import . 2>&1 ); then
+    echo "error: 'forklift git import .' failed — the benchmark cannot continue." >&2
     echo "── forklift said ──────────────────────────────────────────────" >&2
     echo "$import_log" | tail -20 >&2
     echo "───────────────────────────────────────────────────────────────" >&2
@@ -317,12 +317,12 @@ FORK_ONBOARD=$(( t1 - t0 ))
 # into M pack(s), D delta-compressed."); surface it verbatim in the onboarding report.
 IMPORT_PACK_SUMMARY=$(printf '%s\n' "$import_log" | grep -m1 'Packed the imported store' || true)
 # Onboarding is NOT added to the ratio table: `git clone --local` (copy a pack) and
-# `forklift import-git` (re-encode every object) are different operations, so a ratio
+# `forklift git import` (re-encode every object) are different operations, so a ratio
 # between them is misleading. They are reported on their own, below the table.
 GIT_SIZE_K=$(du -sk "$A/.git" 2>/dev/null | cut -f1)
 
 # The store arrives packed straight from the import; record that size before anything
-# else touches it — it is the honest "what import-git alone gives you" number.
+# else touches it — it is the honest "what git import alone gives you" number.
 FORK_SIZE_IMPORT=$(du -sh "$B/.forklift" 2>/dev/null | cut -f1 | tr -d ' ')
 
 # Densify. Import's per-path delta chains never see cross-path similarity (renames,
@@ -339,11 +339,11 @@ FORK_REDELTA_MS=""
 if [ "$REDELTA" -eq 1 ]; then
     echo "→ densifying the imported store (compact --all --redelta; one-shot, timed as onboarding)…"
     t0=$(_now_ms)
-    if ( cd "$B" && forklift compact --all --redelta ) >/dev/null 2>&1; then
+    if ( cd "$B" && forklift store compact --all --redelta ) >/dev/null 2>&1; then
         t1=$(_now_ms)
         FORK_REDELTA_MS=$(( t1 - t0 ))
     else
-        echo "error: 'forklift compact --all --redelta' failed partway through — the store in" >&2
+        echo "error: 'forklift store compact --all --redelta' failed partway through — the store in" >&2
         echo "  $B/.forklift" >&2
         echo "is now in an indeterminate, partially-repacked state (compact is durable-before-" >&2
         echo "destructive, so a mid-flight failure can leave old and new pack generations mixed" >&2
@@ -357,7 +357,7 @@ fi
 FORK_SIZE_K=$(du -sk "$B/.forklift" 2>/dev/null | cut -f1)
 FORK_SIZE=$(du -sh "$B/.forklift" 2>/dev/null | cut -f1 | tr -d ' ')
 
-# import-git adds a `.git` rule to `.forkliftignore` and asks for it to be loaded and
+# git import adds a `.git` rule to `.forkliftignore` and asks for it to be loaded and
 # stacked. Do that (untimed), like the redelta it suggests: left untracked, the file
 # would join the diff step's `forklift load .` and give forklift one more change than git.
 # A repo that already tracks a .forkliftignore with that rule gets nothing added, and
@@ -548,12 +548,12 @@ build_report() {
         echo
         echo "**Onboarding** — different operations, reported without a ratio:"
         echo "- \`git clone --local\`: $(fmt_ms "$GIT_ONBOARD") (copies an existing packfile)"
-        echo "- \`forklift import-git\`: $(fmt_ms "$FORK_ONBOARD") (re-encodes every commit/tree/blob straight into packs; store lands at ${FORK_SIZE_IMPORT:-?})"
+        echo "- \`forklift git import\`: $(fmt_ms "$FORK_ONBOARD") (re-encodes every commit/tree/blob straight into packs; store lands at ${FORK_SIZE_IMPORT:-?})"
         if [ -n "$IMPORT_PACK_SUMMARY" ]; then
             echo "- \`$IMPORT_PACK_SUMMARY\`"
         fi
         if [ -n "$FORK_REDELTA_MS" ]; then
-            echo "- \`forklift compact --all --redelta\`: $(fmt_ms "$FORK_REDELTA_MS") (one-shot densify: ${FORK_SIZE_IMPORT:-?} → ${FORK_SIZE:-?})"
+            echo "- \`forklift store compact --all --redelta\`: $(fmt_ms "$FORK_REDELTA_MS") (one-shot densify: ${FORK_SIZE_IMPORT:-?} → ${FORK_SIZE:-?})"
         fi
         echo
         if [ "$HYPERFINE" -eq 1 ]; then
@@ -577,7 +577,7 @@ build_report() {
         echo
         echo "  Onboarding — measured separately; NOT a ratio (different operations):"
         printf '    git clone --local     %-10s (copies an existing packfile)\n' "$(fmt_ms "$GIT_ONBOARD")"
-        printf '    forklift import-git   %-10s (re-encodes every commit/tree/blob straight into packs; store lands at %s)\n' "$(fmt_ms "$FORK_ONBOARD")" "${FORK_SIZE_IMPORT:-?}"
+        printf '    forklift git import   %-10s (re-encodes every commit/tree/blob straight into packs; store lands at %s)\n' "$(fmt_ms "$FORK_ONBOARD")" "${FORK_SIZE_IMPORT:-?}"
         if [ -n "$IMPORT_PACK_SUMMARY" ]; then
             printf '    %s\n' "$IMPORT_PACK_SUMMARY"
         fi

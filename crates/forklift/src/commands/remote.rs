@@ -137,6 +137,47 @@ async fn check_and_rewrite(target: &str,
     Ok(checked)
 }
 
+/// Handle bare `remote`: report the configured remote, whether this is a partial warehouse and,
+/// for one, its origin, and what would stop a client talking to the remote from here (a move of
+/// the origin standing, a remote that is not the origin, or a partial warehouse's missing origin
+/// record). Reads only; takes no lock.
+///
+/// # Returns
+/// * `Ok(())`      - The report was emitted.
+/// * `Err(String)` - The configuration, the fetch state, the origin record or a move's intent
+///   could not be read.
+pub fn show() -> Result<(), String> {
+    let remote = config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)?.map(|(value, _)| value);
+    let partial = scope_utils::content_may_be_absent()?;
+    let origin = if partial { origin_utils::read_origin()? } else { None };
+
+    // A move of the origin standing stops every client first, remote or none. Past it, what
+    // `checked_remote` refuses is what every client dialing the remote would; with no remote
+    // there is nothing to dial, and only a partial warehouse's missing origin is still damage.
+    let blocked = if let Err(pending) = origin_move::ensure_none_pending() {
+        Some(block_of(pending)?)
+    } else if remote.is_none() {
+        if partial && origin.is_none() { Some(block_of(origin_utils::missing_origin_refusal())?) } else { None }
+    } else {
+        match origin_utils::checked_remote() {
+            Ok(_) => None,
+            Err(refused) => Some(block_of(refused)?),
+        }
+    };
+
+    output::emit(&RemoteReport { remote, partial, origin, blocked });
+
+    Ok(())
+}
+
+/// A refusal as what bare `remote` reports; any other error is the show's own failure.
+fn block_of(error: CoreError) -> Result<RemoteBlock, String> {
+    match error {
+        CoreError::Refusal { code, message, next_step, .. } => Ok(RemoteBlock { code: code.as_str(), message, next_step }),
+        other => Err(other.into()),
+    }
+}
+
 /// `remote move --abort`: clear an intent a move left before rewriting, and report one it left
 /// while rewriting, which only a completed move clears.
 fn abort_move(move_lock: &MoveLock) -> Result<(), String> {
@@ -165,6 +206,63 @@ fn running_refusal() -> String {
         format!("Another move of this warehouse's origin is running; nothing was changed. {}", next_step),
         next_step,
     ).into()
+}
+
+/// What bare `remote` reports.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct RemoteReport {
+    /// The configured `remote.url`; none when no remote is configured.
+    remote: Option<String>,
+
+    /// Whether this is a partial warehouse (franchised with `--only` or `--cache`), which talks
+    /// only to its origin.
+    partial: bool,
+
+    /// A partial warehouse's origin, the one server proved to hold what it lacks; none for a full
+    /// warehouse, which may talk to any remote, and for a partial one whose record is missing.
+    origin: Option<String>,
+
+    /// The refusal a command that dials the remote would meet from here; none when nothing stops
+    /// it. With no remote configured, only a move of the origin standing or a partial warehouse's
+    /// missing origin record is reported.
+    blocked: Option<RemoteBlock>,
+}
+
+/// A refusal that stops clients talking to the remote.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct RemoteBlock {
+    /// The stable refusal code, such as `non_origin_remote` or `origin_move_pending`.
+    code: &'static str,
+
+    /// The refusal's explanation.
+    message: String,
+
+    /// The step that clears it.
+    next_step: String,
+}
+
+impl CommandOutput for RemoteReport {
+    fn render_human(&self) {
+        match &self.remote {
+            Some(remote) => println!("Remote: {}", remote),
+            None => println!(
+                "No remote is configured. Set one with \"forklift config {} <url>\".",
+                config_utils::KEY_REMOTE_URL
+            ),
+        }
+
+        if !self.partial {
+            println!("This warehouse holds its whole history, so it has no origin and may talk to any remote.");
+        } else if let Some(origin) = &self.origin {
+            println!("Origin: {} (this partial warehouse fetches what it lacks from there alone)", origin);
+        }
+
+        if let Some(blocked) = &self.blocked {
+            println!("{}", blocked.message);
+        }
+    }
 }
 
 /// The result of a move of the origin.
@@ -240,6 +338,7 @@ impl CommandOutput for RemoteAbortReport {
 #[cfg(feature = "docgen")]
 pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
+        crate::docgen::OutputSchema::of::<RemoteReport>(),
         crate::docgen::OutputSchema::of::<RemoteMoveReport>(),
         crate::docgen::OutputSchema::of::<RemoteAbortReport>(),
     ]

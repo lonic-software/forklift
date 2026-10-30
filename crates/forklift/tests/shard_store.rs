@@ -188,12 +188,12 @@ fn a_store_in_another_layout_is_refused_and_left_alone() {
         .is_ok_and(|status| status.success());
     std::fs::create_dir_all(&git).unwrap();
     std::fs::write(git.join("g.txt"), "g\n").unwrap();
-    // import-git is the one command here that resets the store without reading its metadata, so
+    // git import is the one command here that resets the store without reading its metadata, so
     // only the layout gate refuses it: the case is required, never skipped.
     assert!(git_run(&["init", "-q"]) && git_run(&["add", "g.txt"]) && git_run(&["commit", "-qm", "g"]),
             "the git source repository could not be created");
 
-    let commands = [vec!["stocktake"], vec!["load", "."], vec!["shift", "main"], vec!["import-git", "git-source"]];
+    let commands = [vec!["stocktake"], vec!["load", "."], vec!["shift", "main"], vec!["git", "import", "git-source"]];
 
     for command in &commands {
         let output = warehouse.run(command);

@@ -164,7 +164,7 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
         }
 
         // Only a lift that ends in its success result mirrors (§9.8), and its outcome never fails
-        // the lift: a pallet left behind is caught up by the next lift or `forklift mirror`.
+        // the lift: a pallet left behind is caught up by the next lift or `forklift git mirror`.
         report.mirror = mirror::after_lift(&client, &pallet, &head).await;
 
         output::emit(&report);

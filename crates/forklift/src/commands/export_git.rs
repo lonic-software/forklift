@@ -16,7 +16,7 @@ use crate::output::{self, CommandOutput};
 /// a change to any of those rules bumps it (the golden tip-hash test fails until it does).
 pub(crate) const EXPORT_LAYOUT: u32 = 1;
 
-/// Handle the export-git command (§7.8): one-way export of this warehouse's history into a
+/// Handle the git export command (§7.8): one-way export of this warehouse's history into a
 /// new git repository — the escape hatch that makes trying forklift reversible. Parcels
 /// become commits, trees become trees, blobs become blobs, and each *user* pallet becomes
 /// a branch.
@@ -38,11 +38,11 @@ pub(crate) const EXPORT_LAYOUT: u32 = 1;
 /// * `Err(String)` - If `path` is a non-empty/existing repo, there is nothing to export,
 ///                   or git could not be written.
 pub fn handle_command(path: &str) -> Result<(), String> {
-    // export-git walks the whole tree of every parcel; a scoped bay must not silently export a
+    // git export walks the whole tree of every parcel; a scoped bay must not silently export a
     // truncated view. Refuse cleanly and point at a full workspace.
     crate::commands::scope::refuse_in_scoped_bay(
-        "export-git",
-        "Run export-git from a full workspace (or the main tree), not a scoped bay.",
+        "git export",
+        "Run \"forklift git export\" from a full workspace (or the main tree), not a scoped bay.",
     )?;
 
     let target = Path::new(path);

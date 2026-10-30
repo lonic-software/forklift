@@ -13,33 +13,28 @@ audit
 bay: add remove
 blame
 cherry-pick
-compact
 config
 conflicts
 consolidate
 deliver
 diff
-evict
 expand
-export-git
 franchise
+git: import export mirror
 haul: open list show update comment review merge close reopen
 heal
 help
 history
-import-git
 kv: set get unset list log
 lift
 load
 lower
 manifest: note approve provenance show
 mcp
-mirror
 narrow
 office: enroll keygen admit link authorize role rotate retire regenesis accept-regenesis list
 palletize
 park: pop list
-peek
 prepare
 profile: list create use
 query
@@ -54,7 +49,7 @@ shift
 show
 stack
 stocktake
-store
+store: status compact peek evict
 tag: create show list
 undo
 unload

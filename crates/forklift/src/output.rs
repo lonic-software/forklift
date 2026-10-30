@@ -197,11 +197,11 @@ pub fn message(text: impl Into<String>) {
 }
 
 /// The densify suggestion (§ densify-pending marker, `forklift_core::util::pack_utils`): shown
-/// by `store`, `import-git` and `franchise` whenever the object store carries content a bulk
+/// by `store`, `git import` and `franchise` whenever the object store carries content a bulk
 /// ingest wrote without ever seeing cross-path similarity. One shared string so the three
 /// commands never drift apart in wording. Never phrased as "recommended" — redelta is an
 /// optional, opt-in, CPU-bound pass, not something owed to every store.
-pub const DENSIFY_TIP: &str = "Tip: \"forklift compact --all --redelta\" can significantly \
+pub const DENSIFY_TIP: &str = "Tip: \"forklift store compact --all --redelta\" can significantly \
     shrink this store (one-shot, takes a few minutes on large histories).";
 
 /// The line `franchise`, `lower`, `expand`, `lift` and `office accept-regenesis` print when their
@@ -236,7 +236,7 @@ pub fn is_zero(value: &usize) -> bool {
 }
 
 /// Render a byte count in a human-friendly binary unit (B/KiB/MiB/GiB/TiB). The object store's
-/// scale makes raw byte counts noise, so the size-reporting commands (`compact`, `store`) show
+/// scale makes raw byte counts noise, so the size-reporting commands (`store compact`, `store status`) show
 /// this instead. JSON output always carries the exact byte count, never this string.
 pub fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -255,7 +255,7 @@ pub fn human_bytes(bytes: u64) -> String {
     }
 }
 
-/// Classify blob bytes as safely displayable text, for the commands (`show`, `peek`) that
+/// Classify blob bytes as safely displayable text, for the commands (`show`, `store peek`) that
 /// report a `binary` signal instead of printing raw bytes. Text means **both** NUL-free
 /// (`merge_utils::is_mergeable_text`, the same test `diff`'s line-by-line display uses) **and**
 /// valid UTF-8 — a NUL-free blob can still be invalid UTF-8, and a NUL byte is itself valid
@@ -856,7 +856,7 @@ impl From<String> for ForkliftError {
 /// agent that just saw the triggering command exit 0 and has no way to know a *later*, unrelated
 /// command may exit 21 (`durability_taint`) for a reason it never caused. This codebase has no
 /// existing machine-visible side-channel for a non-fatal diagnostic (the closest precedent,
-/// `import-git`'s per-command `warnings` field, is baked into that command's own `data` before it
+/// `git import`'s per-command `warnings` field, is baked into that command's own `data` before it
 /// ever emits — not available here, since `run_if_due` runs after the triggering command's own
 /// `output::emit`/`output::message` call already printed). Stderr, structured the same way in
 /// both modes, is the least-bad channel available: never shares stdout, so the invariant above

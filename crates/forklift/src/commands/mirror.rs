@@ -24,11 +24,11 @@ const EXPORTED_PREFIX: &str = "refs/forklift/exported/";
 const REMOTE_PREFIX: &str = "refs/forklift/remote/";
 
 /// The step every refusal over the mirror's own repository names.
-const DELETE_STEP: &str = "Delete .forklift/mirror.git and run \"forklift mirror\": it exports again from \
+const DELETE_STEP: &str = "Delete .forklift/mirror.git and run \"forklift git mirror\": it exports again from \
     scratch, and git receives nothing it already holds.";
 
 /// The step every git failure that is not a race names.
-const GIT_STEP: &str = "Fix the cause git reports, then run \"forklift mirror\".";
+const GIT_STEP: &str = "Fix the cause git reports, then run \"forklift git mirror\".";
 
 /// Handle the mirror command (§9.8): keep the git remote at `mirror.url` in step with the pallets
 /// the Forklift remote holds. Each mirrored pallet's remote head is fetched, exported
@@ -107,7 +107,7 @@ pub async fn handle_command() -> Result<(), String> {
     Err(CoreError::refusal_with_details(
         RefusalCode::MirrorIncomplete,
         message,
-        "Follow the step each pallet's message names, then run \"forklift mirror\" again.",
+        "Follow the step each pallet's message names, then run \"forklift git mirror\" again.",
         serde_json::json!(report),
     ).into())
 }
@@ -115,7 +115,7 @@ pub async fn handle_command() -> Result<(), String> {
 /// Mirror the pallet a lift just landed, at the head it landed (the lift trigger). Runs only when
 /// `mirror.url` is set, `mirror.auto` is on and the pallet is in the mirrored set. The outcome is
 /// reported in the lift's result and never fails the lift; a pallet left behind is caught up by
-/// the next lift or `forklift mirror`.
+/// the next lift or `forklift git mirror`.
 ///
 /// # Returns
 /// * `Some(PalletMirror)` - What the mirror did.
@@ -148,7 +148,7 @@ pub(crate) async fn after_lift(client: &RemoteClient, pallet: &str, head: &str) 
         Ok(false) => {}
         Ok(true) => return Some(PalletMirror::new(pallet, MirrorStatus::Skipped,
             "The mirror needs every file of the pallet, and this bay or warehouse may hold only \
-            part of it. Run \"forklift mirror\" from a full workspace.".to_string())),
+            part of it. Run \"forklift git mirror\" from a full workspace.".to_string())),
         Err(why) => return Some(PalletMirror::new(pallet, MirrorStatus::Failed, why)),
     }
 
@@ -192,16 +192,16 @@ async fn mirror_trust(client: &RemoteClient, info: &forklift_core::model::remote
 /// different commit.
 fn refuse_partial_view() -> Result<(), CoreError> {
     crate::commands::scope::refuse_in_scoped_bay(
-        "mirror",
-        "Run \"forklift mirror\" from a full workspace (or the main tree), not a scoped bay.",
+        "git mirror",
+        "Run \"forklift git mirror\" from a full workspace (or the main tree), not a scoped bay.",
     )?;
 
     if scope_utils::content_may_be_absent()? {
         return Err(CoreError::refusal(
             RefusalCode::SparseWorkspace,
-            "\"forklift mirror\" needs every file of each mirrored pallet, and this warehouse was franchised \
+            "\"forklift git mirror\" needs every file of each mirrored pallet, and this warehouse was franchised \
             with --only or --cache, so it may lack some of them.",
-            "Run \"forklift mirror\" from a franchise made without --only or --cache.",
+            "Run \"forklift git mirror\" from a franchise made without --only or --cache.",
         ));
     }
 
@@ -217,7 +217,7 @@ fn mirror_url() -> Result<Option<String>, String> {
 }
 
 fn busy_message() -> String {
-    "Another mirror run is using this warehouse's mirror. Run \"forklift mirror\" again \
+    "Another mirror run is using this warehouse's mirror. Run \"forklift git mirror\" again \
     once it finishes.".to_string()
 }
 
@@ -593,7 +593,7 @@ impl<'a> Run<'a> {
                 Verdict::Diverged(foreign) => return Ok(PalletMirror::new(pallet, MirrorStatus::Diverged, format!(
                     "git's branch \"{}\" holds commit {}, which is not part of this warehouse's export. \
                     Nothing was pushed. Return the branch to an ancestor of {} (move {} to another \
-                    branch, for instance), then run \"forklift mirror\".",
+                    branch, for instance), then run \"forklift git mirror\".",
                     pallet, foreign, commit, foreign
                 ))),
                 Verdict::LayoutSkew(foreign, layout) => return Ok(PalletMirror::new(pallet, MirrorStatus::LayoutSkew, format!(
@@ -627,7 +627,7 @@ impl<'a> Run<'a> {
 
         Ok(PalletMirror::new(pallet, MirrorStatus::Raced, format!(
             "git's branch \"{}\" kept moving while the mirror pushed ({} attempts). Run \"forklift \
-            mirror\" again.",
+            git mirror\" again.",
             pallet, PUSH_ATTEMPTS
         )))
     }

@@ -222,7 +222,7 @@ for ((i=1; i<N_PARCELS; i++)); do
 done
 
 echo "-> fresh compact (loose -> packed)…"
-t0=$(_now_ms); fl compact >/dev/null; t1=$(_now_ms)
+t0=$(_now_ms); fl store compact >/dev/null; t1=$(_now_ms)
 FRESH_COMPACT_MS=$(( t1 - t0 ))
 
 echo "-> building the diverging shift-target pallet…"
@@ -263,7 +263,7 @@ fl restore . >/dev/null
 
 # ── 3. compact --all (steady-state repack; D/P3's ~4.4x, see PARALLELIZATION_PLAN) ──
 echo "-> [3/8] compact --all (steady-state repack)…"
-read -r cold mrest min _ <<< "$(stats $(time_series "$RUNS" "" "forklift compact --all"))"
+read -r cold mrest min _ <<< "$(stats $(time_series "$RUNS" "" "forklift store compact --all"))"
 add_row "compact --all" "$cold" "$mrest" "$min" "steady-state repack; fresh compact was $(fmt_ms "$FRESH_COMPACT_MS")"
 REPACK_MEAN=$mrest
 
@@ -290,7 +290,7 @@ AUDIT_MEAN=$mrest
 # ── 7. RSS on a couple of the heavier ops ────────────────────────────────────
 echo "-> [7/8] peak RSS…"
 RSS_AUDIT=$(measure_rss_kb "forklift audit main")
-RSS_COMPACT_ALL=$(measure_rss_kb "forklift compact --all")
+RSS_COMPACT_ALL=$(measure_rss_kb "forklift store compact --all")
 RSS_STOCKTAKE=$(measure_rss_kb "forklift stocktake --summary")
 
 # ── 8. core-count scaling — audit pinned to 1 core vs unrestricted ──────────

@@ -1,6 +1,6 @@
 //! A `.forklift` below the top level of a working directory is the root of another working tree:
 //! warehouse discovery from inside it stops there. These tests check that no tree can plant one
-//! (stack, import-git and every materializer refuse the name at any depth, before anything is
+//! (stack, git import and every materializer refuse the name at any depth, before anything is
 //! written), that the walks leave a nested working tree to itself, and that neither command that
 //! deletes a directory destroys one, whatever the ignore rules say.
 
@@ -481,7 +481,7 @@ fn replacing_a_folder_holding_an_ignored_file_refuses_and_writes_nothing() {
     assert_eq!(warehouse.read("a"), "now a file\n");
 }
 
-/// import-git refuses a git history whose tree names a metadata folder below the top level.
+/// git import refuses a git history whose tree names a metadata folder below the top level.
 #[test]
 fn import_git_refuses_a_metadata_folder_below_the_top_level() {
     let base = std::env::temp_dir().join(format!("forklift-nested-import-{}", std::process::id()));
@@ -509,9 +509,9 @@ fn import_git_refuses_a_metadata_folder_below_the_top_level() {
     assert!(run(&["prepare"]).status.success());
     assert!(run(&["config", "operator.identifier", "nested@forklift"]).status.success());
 
-    let import = run(&["import-git", "."]);
+    let import = run(&["git", "import", "."]);
     let _ = std::fs::remove_dir_all(&base);
-    assert!(!import.status.success(), "import-git accepted the planted folder");
+    assert!(!import.status.success(), "git import accepted the planted folder");
     assert!(stderr(&import).contains("\"sub\"") && stderr(&import).contains("\".forklift\""),
         "the refusal must name where: {}", stderr(&import));
 }

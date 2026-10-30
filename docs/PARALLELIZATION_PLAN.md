@@ -26,7 +26,7 @@ contention.** Two things decide almost every row:
 |-----------|-----------|-------------------|-----------|--------------------|--------------|--------|
 | **stocktake** | very hot | hash working file, per dir | tree recursion | brief `changes` mutex; barrier before move-detect | **Already** (`TaskExecutor`) | — |
 | **inventory build** | hot (part of stack) | stat/hash file, per dir | tree recursion | per-shard write (distinct files) | **Already** (`TaskExecutor`) | — |
-| **tree-to-shard rebuild** (`import-git`, `shift`, `lower`, `franchise`, `bay`, `park`, `consolidate`) | hot–rare | stat (or, for `import-git`, read and hash) a file, per tree file | a tree descent, then independent per file | the file system: open + read + lstat of many small files floors at ~30 ms on git.git past 4 threads (APFS, measured with a bare probe) | **Done** — each tree level's subtrees load in parallel, then the files are recorded on workers (`prefetch_in_order`) and gathered into their shards on one thread. git.git: `import-git`'s verify 125–129 → 67 ms; a `shift` between two pallets on one parcel (which writes nothing and rebuilds every shard) 120 → 115 ms, the rebuild now 13 ms | — |
+| **tree-to-shard rebuild** (`git import`, `shift`, `lower`, `franchise`, `bay`, `park`, `consolidate`) | hot–rare | stat (or, for `git import`, read and hash) a file, per tree file | a tree descent, then independent per file | the file system: open + read + lstat of many small files floors at ~30 ms on git.git past 4 threads (APFS, measured with a bare probe) | **Done** — each tree level's subtrees load in parallel, then the files are recorded on workers (`prefetch_in_order`) and gathered into their shards on one thread. git.git: `git import`'s verify 125–129 → 67 ms; a `shift` between two pallets on one parcel (which writes nothing and rebuilds every shard) 120 → 115 ms, the rebuild now 13 ms | — |
 | **park push** (stage the work in progress) | occasional | read + parse a shard, then stat (and, on a stat miss, hash) its tracked files, per dir | independent per shard; taken up in key order | none left: the whole-inventory rewrite that follows wiped and rewrote every shard (~5.2 s of 5.9 s on 20k directories) until FORK-248 made `replace_all_inventories` write only the shards whose bytes differ: same corpus, 5.9 → 0.92 s | **Done** — the conflict check and the refresh decide fan out (`fanout_map`), answers judged in key order: 20×20×50 corpus, one changed file, 6.4 → 5.9 s | — |
 | **tree build (stack)** | hot | build+store tree, per dir | bottom-up join (parent waits on children) | `built`/`pending` mutexes | **Already** (`TaskExecutor`) | — |
 | **fetch / franchise / lift / lower** | occasional | GET+store object, per object | parallel within a wave, barrier between waves | `Semaphore(24)`; wave ordering; lift's serial negotiate + signature-upload loop | **Already** (network `JoinSet`) | — |
@@ -36,8 +36,8 @@ contention.** Two things decide almost every row:
 | **consolidate / merge** | occasional | 3-way LCS, per *divergent* file | **independent per file** | walk records deferred jobs; end-to-end diluted by the sequential apply-writes + stack | **Done — 6.4× merge / 2.5× end-to-end** (18 cores; compute-bound; only wide merges) | — |
 | **compact** | occasional (auto) | zstd delta-compress, per object | path-deltas independent; window + `PackWriter` sequential | the sliding delta `window` (each object deltas against just-packed neighbours) and the single-file append stay serial | **Done — ~2.1×** (18 cores; **byte-identical output**; read-cache-bound below the CPU ceiling) | — |
 | **compact --all** (repack) | occasional (auto) | reachability walk + verbatim record copy, per object | one shared reachability pass (D/P3, below); `CopyRecord` targets need no CPU, only a memory copy | the steady-state case (no garbage, no loose) is **not** CPU-bound at all — it is walk-reads and small memcpys | **Done — steady-state repack ~4.5×** (238 ms → 53 ms on a 401-parcel/7442-object corpus; **byte-identical output**; see D/P3 below). `--redelta` (opt-in, 2026-07-13) is the exception: it forces every live object through recompression instead of `CopyRecord`, trading the copy-bound steady state for a one-shot CPU-bound re-encode — the unflagged repack above is unaffected. | — |
-| **import-git** | rare (once) | read pipe → build → **append to native pack** | serial pipe source | *measured (pre-fix)*: **71% was writing loose object files** — solved structurally (pack-direct ingest, 2026-07-13), not with threads; pipe read 21% (serial source) is the remaining floor | **Not worth it** — the store wall is gone; the pipe is serial | — |
-| **export-git** | rare | spawn a `git` subprocess per object | DAG-ordered; subprocess per unit | one `git` process per commit/tree/blob, invoked serially; `&mut` memo | **Low** — commits are DAG-ordered; only independent blob `hash-object`s could overlap | med |
+| **git import** | rare (once) | read pipe → build → **append to native pack** | serial pipe source | *measured (pre-fix)*: **71% was writing loose object files** — solved structurally (pack-direct ingest, 2026-07-13), not with threads; pipe read 21% (serial source) is the remaining floor | **Not worth it** — the store wall is gone; the pipe is serial | — |
+| **git export** | rare | spawn a `git` subprocess per object | DAG-ordered; subprocess per unit | one `git` process per commit/tree/blob, invoked serially; `&mut` memo | **Low** — commits are DAG-ordered; only independent blob `hash-object`s could overlap | med |
 | **bundle build** | occasional (server) | read + verify + compress object into bounded native pack | independent record loads and compression; the walk's tree reads prefetched per parcel | the closure walk (which records are new) and the delta-chain depth stay serial, as does the one writer per pack | **Done — 3.8×** (git.git 61.8 s → 16.3 s, 18 cores; **byte-identical output**; `prefetch_in_order` twice: tree loads ahead of the walk, record loads ahead of the append) | — |
 | **history** (full log) | hot | decode+render parcel | **sequential heap walk** | must read every parcel to display it; ordering dependency; read/graph mutexes | **None** — see the blame lesson | — |
 | **blame** | hot | changed-path filter check + LCS | **sequential chain + LCS** | first-parent chain (linked list), LCS attribution (oldest→newest); filter checks too small a fraction | **None** — *measured*: no speedup even with an `RwLock` cache (below) | — |
@@ -299,7 +299,7 @@ contention.** Two things decide almost every row:
   depth is decided at append time, so the output is byte-identical to the serial build's. git.git:
   61.8 s → 16.3 s, at a higher peak memory (0.77 → 1.2–1.7 GB); see `PERFORMANCE_BACKLOG.md`.
 
-- **`import-git` — was filesystem-metadata-bound (measured), fixed structurally.** The guess was
+- **`git import` — was filesystem-metadata-bound (measured), fixed structurally.** The guess was
   "input-bound on the `git cat-file` pipe"; the profile said otherwise: of a ~915 ms import,
   **71% was `store` — writing the thousands of small loose object files** (the same APFS metadata
   wall as `materialize`), 21% the pipe read (a serial source that cannot be parallelized), and the
@@ -320,7 +320,7 @@ contention.** Two things decide almost every row:
   correctness surface, contradicting the deliberate shell-out design). Accepted as the floor
   until then.
 
-- **`export-git` — bound by an external boundary** (a `git` subprocess per object), not CPU.
+- **`git export` — bound by an external boundary** (a `git` subprocess per object), not CPU.
 
 ## The canonical fan-out idiom (shipped, milestone D/P4)
 
@@ -403,7 +403,7 @@ outside the cache lock), or many concurrent ancestry queries on one warehouse (e
 read/flush is now off the global lock). What the rework still does **not** help is unchanged:
 `checkout`/`materialize` (bound by the *filesystem* metadata wall) and `consolidate`'s write tail
 (that same wall) — a storage-format change (writing packs directly) is the only lever there, and
-`import-git` proved it: its pack-direct ingest (2026-07-13) removed that wall structurally where
+`git import` proved it: its pack-direct ingest (2026-07-13) removed that wall structurally where
 threads had regressed. The two ceilings remain cleanly separated; this change lifted the object-cache
 one to pointer-sized locks, and a genuinely read-*hit*-bound parallel consumer is what would now
 turn that into a measured near-linear win.

@@ -247,7 +247,7 @@ pub(crate) enum OperationOutcome {
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
 pub(crate) struct OperationRecovery {
-    /// The operation: shift, park, fast-forward, lower, bay creation, import-git, merge or
+    /// The operation: shift, park, fast-forward, lower, bay creation, git import, merge or
     /// cherry-pick.
     operation: String,
 

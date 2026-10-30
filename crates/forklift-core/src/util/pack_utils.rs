@@ -164,7 +164,7 @@ pub enum AutoCompaction {
 }
 
 /// Decide, cheaply, whether background object-store maintenance is due — the recurring
-/// counterpart of `import-git`'s one-shot compaction (git's `gc --auto`). It does **not** scan
+/// counterpart of `git import`'s one-shot compaction (git's `gc --auto`). It does **not** scan
 /// the whole store: it estimates the loose count from one fan-out folder × 256 and counts
 /// packs. The caller runs the returned action in the background. Opt out with
 /// `maintenance.auto = false`.
@@ -264,7 +264,7 @@ pub struct StoreStatus {
     pub incremental_due: bool,
     /// Whether a consolidating repack is due now (pack files over the threshold).
     pub repack_due: bool,
-    /// Whether this store was bulk-ingested (`import-git`'s pack-direct path, or a franchise's
+    /// Whether this store was bulk-ingested (`git import`'s pack-direct path, or a franchise's
     /// native bundle install) and has not since been through a `compact --all --redelta` pass —
     /// see `mark_densify_pending`. A suggestion only; nothing ever acts on it automatically.
     pub densify_pending: bool,
@@ -2076,8 +2076,8 @@ const DENSIFY_MARKER_NAME: &str = "densify-pending";
 fn mark_densify_pending(pack_folder: &Path) {
     let _ = std::fs::write(
         pack_folder.join(DENSIFY_MARKER_NAME),
-        "This store was bulk-ingested (import-git or a franchise bundle install) and has not \
-        been through a full delta-compress pass yet. Run \"forklift compact --all --redelta\" \
+        "This store was bulk-ingested (git import or a franchise bundle install) and has not \
+        been through a full delta-compress pass yet. Run \"forklift store compact --all --redelta\" \
         to shrink it further. Safe to delete; it is only a hint.\n",
     );
 }
@@ -3491,7 +3491,7 @@ struct WindowEntry {
 /// The caller must hold the warehouse lock (this deletes objects). Two modes:
 ///
 /// * **Incremental** (`all = false`): pack the *loose* objects into new packs and leave
-///   existing packs untouched — the cheap, common case (used after `import-git`).
+///   existing packs untouched — the cheap, common case (used after `git import`).
 /// * **Repack** (`all = true`): rewrite everything — loose *and* every existing pack — into
 ///   fresh packs, keeping only the **live** set (objects reachable from the GC roots) and so
 ///   dropping unreachable garbage that was stuck in packs, and consolidating many packs into
@@ -6114,7 +6114,7 @@ pub struct IngestStats {
     pub packs: usize,
 }
 
-/// Direct-to-pack ingestion for bulk imports (`import-git`): objects append straight into
+/// Direct-to-pack ingestion for bulk imports (`git import`): objects append straight into
 /// native packs in the store's pack folder, publishing on rollover — never touching the loose
 /// store. Landing hundreds of thousands of individually-written loose files (and then compacting
 /// them straight back out) is the measured wall of a large import; this writes the dense form
