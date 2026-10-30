@@ -51,7 +51,7 @@ Where:
   commit the removal. A header naming any other version is refused too, format 2 included,
   which wrote prefixes raw, so a prefix holding a line break read back as two. Nothing is
   migrated.
-  The way out depends on the file: for the fetch scope or the main tree's scope, franchise
+  The way out depends on the file: for the fetch scope or the main tree's scope, clone
   the remote again, into a new directory; for a bay's scope, remove the bay with `bay remove`
   and add a new one under another name (a removed bay keeps its pallet, so its name stays
   taken; copy any uncommitted work across by hand).
@@ -62,11 +62,11 @@ out.
 
 | File | Full or cache warehouse | Sparse warehouse | Way out |
 |---|---|---|---|
-| Fetch scope | absent | present, naming a prefix | absent where required: franchise again; present where not: delete it |
+| Fetch scope | absent | present, naming a prefix | absent where required: clone again; present where not: delete it |
 | Main-tree scope | absent | present, naming a prefix, ⊆ the fetch scope | the same |
 | Bay scope | present, any scope | present, naming a prefix, ⊆ the fetch scope | remove the bay, add a new one under another name |
 
-The main tree's scope follows the mode, as the fetch scope does: only a sparse franchise
+The main tree's scope follows the mode, as the fetch scope does: only a sparse clone
 scopes the main tree, and `narrow` cannot scope a checkout that holds every path. A bay's scope
 is the bay's own, since a full warehouse may hold a scoped bay, so `bay add` writes it for every
 bay, the empty file for an unscoped one, and a bay without one is refused in every mode. In a
@@ -80,14 +80,14 @@ must have one, naming at least one prefix. Reading the fetch scope refuses every
 pairing:
 
 - A sparse warehouse whose file is missing or empty is never read as full, since it would then
-  claim content it never fetched. The way out is to franchise the remote again, into a new
+  claim content it never fetched. The way out is to clone the remote again, into a new
   directory.
 - A full warehouse or a cache with a fetch-scope file is refused whatever the file holds. Only
   a hand edit puts one there, and the way out is to delete it: the mode, not the file, says
   what the warehouse holds.
 
 `prepare` is the only writer of the mode. When it makes a sparse warehouse, which only
-`franchise --only` asks for, it writes the fetch scope and the main tree's scope before the
+`clone --only` asks for, it writes the fetch scope and the main tree's scope before the
 marker, so no warehouse is ever marked sparse without them. `expand` and `scope-prune` rewrite
 the fetch scope afterwards; a fetch scope can be written only into a warehouse already marked
 sparse.

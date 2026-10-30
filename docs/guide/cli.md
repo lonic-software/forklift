@@ -47,17 +47,17 @@ running it in an existing warehouse only creates what's missing. `-v` lists each
 piece created.
 
 The last thing `prepare` writes is `.forklift/warehouse`, a marker saying the folder
-is a complete warehouse and what it holds: everything (`full`), or, for a franchise
+is a complete warehouse and what it holds: everything (`full`), or, for a clone
 made with `--only` or `--cache`, only part of it (`sparse` or `cache`). Nothing changes
 the mode afterwards. A marker written by an older Forklift, before it recorded the
-mode, is refused: make the warehouse again, by franchising it again or by preparing a
+mode, is refused: make the warehouse again, by cloning it again or by preparing a
 new one and lowering its history into it. Every command needs the marker: a
 `.forklift/` without it is no warehouse, and commands run there refuse with
 `not_a_warehouse` (exit 3) and a next step that names the folder. An empty `.forklift/` is one `prepare` can take; when it
 sits inside another warehouse, the next step says to remove it first, so the folder
 uses that warehouse. `prepare` refuses a `.forklift/` with something in it but no
 marker, such as one made by a Forklift that did not mark warehouses yet: move it
-aside, run `prepare`, then import the history again (`git import`) or franchise it
+aside, run `prepare`, then import the history again (`git import`) or clone it
 again. It refuses a bay's folder too. A new `.forklift/` (or one that is there but empty) is built under the name
 `.forklift.tmp~<pid>-<n>` and renamed into place when it is complete, so an interrupted
 `prepare` leaves no half-built warehouse, only that folder. It is never tracked, and
@@ -203,7 +203,7 @@ and the office, which first catches up with the remote's as a `lower` takes it; 
 against the anchor the remote serves, which a mirror never installs. A head that does not
 verify is that pallet's failure (`history_unverified`), and a changed, stripped or diverged
 trust refuses the run as it would a `lower`. Refuses
-in a scoped bay or a franchise made with `--only` or `--cache`, which may hold only part of
+in a scoped bay or a clone made with `--only` or `--cache`, which may hold only part of
 each tree. Two runs never share
 the mirror: a run that finds another in progress reports it busy and stops.
 
@@ -253,12 +253,12 @@ own lines:
 ```
 
 The file is **tracked content**, like `.gitignore`: `load` and `stack` it, and its
-rules travel with the history — a `franchise` or `lower` brings the remote's rules
+rules travel with the history — a `clone` or `lower` brings the remote's rules
 along. Only `.forklift/` and the `.forklift.tmp~<pid>-<n>` folders an interrupted
-`prepare` or `franchise` leaves (at any depth) are always ignored. `git import` adds a rule for `.git/` when
+`prepare` or `clone` leaves (at any depth) are always ignored. `git import` adds a rule for `.git/` when
 the warehouse holds a `.git` folder. The rules are read only from the file on disk at
 the warehouse root. Every sparse scope holds that file, whatever its prefixes: a
-`franchise --only` checkout fetches and materializes it, so its rules apply there too and
+`clone --only` checkout fetches and materializes it, so its rules apply there too and
 an edit to it stacks like any in-scope file.
 
 Forklift refuses to read the file, and stops, when it is a symbolic link, when a line
@@ -558,7 +558,7 @@ is: [`diff`](#diff--line-by-line-changes-d) reports it changed without a line di
 
 Over the wire, chunked files travel **per object**: a `lift` uploads the recipe and every chunk
 (re-uploading only the chunks that changed — an appended-to file re-sends its new chunks and
-nothing else), and a `franchise`/`lower`/`expand` fetches each in-scope chunk it doesn't already
+nothing else), and a `clone`/`lower`/`expand` fetches each in-scope chunk it doesn't already
 have. A lift only advances the remote's ref once every chunk is confirmed present, so a chunked
 file is never left half-transferred. Two limits are worth knowing: a `bundle` never carries a
 chunked file (its chunks are reachable only through the recipe, which a bundle doesn't descend —
@@ -873,8 +873,8 @@ non-zero exit. See [`trust-and-identity.md`](trust-and-identity.md).
 "Legacy" is decided by ancestry from the trust boundary the anchor pins, and the
 same honesty rule applies there as to revocations below. This store can lack a
 boundary head outright — `enroll` pins a remote's declared heads by hash without
-fetching them, and `franchise` copies the anchor verbatim while fetching only the
-one pallet it franchises — or can have genuinely lost one it once held, or lost
+fetching them, and `clone` copies the anchor verbatim while fetching only the
+one pallet it clones — or can have genuinely lost one it once held, or lost
 an ancestor behind one it does have. Any of those is a gap the boundary walk
 cannot see past: `audit` refuses instead of concluding a parcel was stacked
 after trust whenever it cannot otherwise place that parcel inside the boundary,
@@ -960,7 +960,7 @@ same note twice changes nothing. An entry this forklift cannot read (a newer kin
 listed as `unreadable` rather than hidden or failing the listing.
 
 The manifest **syncs with the office and the working pallets**: `lift` pushes it, `lower`
-and `franchise` pull it (never into the working directory — it is metadata). If two people
+and `clone` pull it (never into the working directory — it is metadata). If two people
 record entries concurrently the manifest diverges, and `lower` **replays** your entries onto the
 remote's. Entries from different operators never collide; only two copies of your own approval
 written apart can, and `--keep` settles that (see `kv`).
@@ -968,11 +968,11 @@ written apart can, and `--keep` settles that (see `kv`).
 ### `kv` — custom metadata on parcels
 
 ```sh
-forklift kv set main ci green        # set a key on a parcel (any revision)
-forklift kv get main ci              # its value
-forklift kv unset main ci            # remove it
-forklift kv list main                # every key on a parcel; `kv list` for all of them
-forklift kv log main ci              # every change to a key, newest first
+forklift manifest set main ci green        # set a key on a parcel (any revision)
+forklift manifest get main ci              # its value
+forklift manifest unset main ci            # remove it
+forklift manifest keys main                # every key on a parcel; `kv list` for all of them
+forklift manifest log main ci              # every change to a key, newest first
 ```
 
 Free-form text values, keyed by parcel and key, for whatever your tooling wants to record — a CI
@@ -1026,7 +1026,7 @@ A tag's subject is nothing more than a parcel hash: if the parcel was never fetc
 or was collected because nothing else referenced it (e.g. after an `undo` moved the only
 pallet head off it), the hash still exists in the record but the parcel is gone. Both
 causes leave the identical local state, so nothing on disk can tell them apart — and a
-sparse or franchised clone can hit the "never fetched" case in perfectly ordinary use
+sparse or cloned clone can hit the "never fetched" case in perfectly ordinary use
 (cloning `--only` one pallet still adopts every tag, including ones cut on pallets it never
 fetched).
 
@@ -1052,14 +1052,14 @@ forklift haul show <id>
 forklift haul update <id>                                          # propose the source's new head
 forklift haul comment <id> -m "…"
 forklift haul review <id> [--request-changes | --comment] -m "…"   # approves by default
-forklift shift main && forklift haul merge <id>                    # merge lands on the target
+forklift shift main && forklift haul consolidate <id>                    # merge lands on the target
 forklift haul close <id> | reopen <id>
 ```
 
 A **haul** proposes merging one pallet into another, with discussion and reviews — forklift's
 pull request. Like the manifest, it lives on a meta pallet (`@haul`), as signed cells: the
 proposal, the proposed head, the status, one review per reviewer, and the comments. It
-lifts/lowers/franchises with your warehouse, and a diverged `@haul` replays your changes onto
+lifts/lowers/clones with your warehouse, and a diverged `@haul` replays your changes onto
 the remote's like the other meta pallets. Because every cell is signed, authorship —
 **including who approved** — is forge-proof and carries the reviewer's identity class, so a
 human's approval is distinguishable from an agent's (`haul show` tags automated reviewers).
@@ -1250,7 +1250,7 @@ the bay's record is updated. With local changes it refuses and names the way thr
 On a case-insensitive file system (the default on macOS and Windows), two names
 that differ only in case, such as `README` and `readme`, are one file. Every
 command that writes the working directory (`shift`, `consolidate`, `cherry-pick`,
-`lower`, `franchise`, `bay add`, `park` and `park pop`) asks the file system what
+`lower`, `clone`, `bay add`, `park` and `park pop`) asks the file system what
 a new path lands on before it writes anything:
 
 - A case-only rename (`foo` to `Foo`, or `Docs/` to `docs/`) just works. A
@@ -1324,8 +1324,8 @@ from it) can keep working and deliver again.
 ### `cherry-pick` — apply one parcel's change onto the current pallet (`cp`)
 
 ```sh
-forklift cherry-pick 1a2b3c            # apply that parcel's diff here, as a new parcel
-forklift cherry-pick feature -m "..."  # pick a pallet's head, with a custom message
+forklift pick 1a2b3c            # apply that parcel's diff here, as a new parcel
+forklift pick feature -m "..."  # pick a pallet's head, with a custom message
 ```
 
 Applies a parcel's diff — its change against its first parent — onto the current pallet as
@@ -1441,7 +1441,7 @@ A **scoped bay** materializes and operates on only the subtree(s) you name, inst
 whole working tree — handy for a large monorepo, or to hand an agent exactly the corner it
 should touch. Scoping a bay changes only what it materializes: nothing changes on the remote
 and nothing is fetched differently, so in a full warehouse a scoped bay is a local view over a
-store that holds everything. In a sparse (`franchise --only`) warehouse every checkout is
+store that holds everything. In a sparse (`clone --only`) warehouse every checkout is
 scoped within the fetch scope, so `bay add` without `--scope` is refused there, before any bay
 is made.
 
@@ -1498,13 +1498,13 @@ forklift scope --json     # the same, as a machine envelope
 Read-only. In a plain bay or the main tree it reports the full tree; in a scoped bay it lists
 the in-scope subtree prefixes. The warehouse fetch scope is reported too — *full* for an
 ordinary warehouse (the store holds everything), or the fetched prefixes for a sparse
-(`franchise --only`) one. A scoped checkout and a sparse fetch scope also hold the root `.forkliftignore`
+(`clone --only`) one. A scoped checkout and a sparse fetch scope also hold the root `.forkliftignore`
 without it being a prefix; the report lists it as always in scope (`implicit_scope` and
 `implicit_fetch_scope` in `--json`). Widen the fetch scope with `expand`; shrink a checkout's
 materialization scope with `narrow`.
 
 A scope recorded by a Forklift older than the one that put the ignore file in every
-scope is refused by every command that reads it. For a sparse warehouse, franchise the
+scope is refused by every command that reads it. For a sparse warehouse, clone the
 remote again, into a new directory; for a scoped bay, remove the bay and add a new one
 under another name. The same holds for a scope file whose format header names no
 prefix.
@@ -1557,22 +1557,22 @@ downloaded file holds, and the file is kept afterwards, so a clone can briefly n
 history's size. The client accepts gzip-compressed answers only, and a zstd frame received from a
 remote may use at most an 8 MiB window; a frame asking for more is refused.
 
-### `franchise` — clone (`fr`)
+### `clone` — clone (`fr`)
 
 ```sh
-forklift franchise http://forklift.example.com:9418 my-project
-forklift franchise <url> <dir> --pallet main --token <secret>
-forklift franchise <url> <dir> --only src/api            # sparse: fetch one subtree
-forklift franchise <url> <dir> --only src/api --only docs # several subtrees
-forklift franchise <url> <dir> --expect <genesis>          # pin the remote's trust anchor
-forklift franchise <url> <dir> --cache                     # a cache (see below)
+forklift clone http://forklift.example.com:9418 my-project
+forklift clone <url> <dir> --pallet main --token <secret>
+forklift clone <url> <dir> --only src/api            # sparse: fetch one subtree
+forklift clone <url> <dir> --only src/api --only docs # several subtrees
+forklift clone <url> <dir> --expect <genesis>          # pin the remote's trust anchor
+forklift clone <url> <dir> --cache                     # a cache (see below)
 ```
 
 Prepares a fresh warehouse in the target directory, remembers the remote, adopts
 its trust anchor, downloads the history (using the remote's bundle when it has
 one, then loose objects for the rest), and materializes the chosen pallet
 (default: the remote's default pallet). The directory must be new or empty, or hold an unfinished
-franchise of the same remote, which is then resumed.
+clone of the same remote, which is then resumed.
 
 Adopting a trust anchor is announced, never silent: a warning names the remote and the adopted
 genesis, and the report records it (`adopted_genesis`). Verify it out of band — or pin it in advance
@@ -1584,15 +1584,15 @@ The remote is contacted before anything is written, and a `--pallet` typo is che
 handshake's own answer before anything is fetched, so a bad URL, a bad token, an unreachable
 host, or a pallet that does not exist all leave the target exactly as it was found.
 
-**A franchise that fails partway keeps what it fetched.** Once franchise has claimed the target
+**A clone that fails partway keeps what it fetched.** Once clone has claimed the target
 directory (created it, or found it empty, and put its `.forklift` folder there), the directory
-holds a franchise record until the franchise finishes. A failure after that point — a dropped
+holds a clone record until the clone finishes. A failure after that point — a dropped
 connection, a full disk, an `--only` path that is not a directory in the pallet, a path the
 working tree cannot hold — or a kill keeps the directory with every verified object it fetched,
-and exits `franchise_incomplete` (exit 30) naming the cause and the command to run next. Every
-other command run in that directory refuses with the same code until the franchise finishes.
+and exits `clone_incomplete` (exit 30) naming the cause and the command to run next. Every
+other command run in that directory refuses with the same code until the clone finishes.
 
-To finish it, run `franchise` again with the same URL and directory. The fetched objects are kept
+To finish it, run `clone` again with the same URL and directory. The fetched objects are kept
 and everything else is rebuilt, so `--pallet` and `--only` may change — a typo'd `--only` is
 corrected without fetching the history again. An omitted `--token` reuses the one given before,
 and the trust anchor the first attempt saw (or its `--expect` pin) stays enforced: a remote that
@@ -1600,7 +1600,7 @@ changed its anchor in between is refused with `trust_changed`, never adopted. A 
 URL is refused before anything is contacted. The `retry` field of the error's `details` says
 whether running the same command again can help (`same`, `unknown`) or whether it fails the same
 way (`change`), and `next_step` spells out the command. To give up instead, delete the directory.
-Until the franchise finishes the directory belongs to it: a resume deletes everything in it but the
+Until the clone finishes the directory belongs to it: a resume deletes everything in it but the
 fetched objects and the bundle download, files added there since the failure included.
 
 A download of the remote's bundle cut off partway is kept too: what had arrived is synced and
@@ -1611,36 +1611,36 @@ against its digest before any of it is stored; one that does not check out is do
 in full.
 
 Any *parent* directories needed for a nested target path (e.g. `some/new/path`) are created the
-ordinary way and left standing. Claiming the target directory is exclusive: franchise builds
+ordinary way and left standing. Claiming the target directory is exclusive: clone builds
 `.forklift` under a temporary name with the record already inside and moves it into place only if
-none exists, so two concurrent `franchise` runs into the same directory cannot both claim it, and a
+none exists, so two concurrent `clone` runs into the same directory cannot both claim it, and a
 directory with a `.forklift` folder is never left without the record that says what it is. A
-directory that holds anything franchise did not put there is refused as "not empty".
+directory that holds anything clone did not put there is refused as "not empty".
 
-**Sparse franchise (`--only`).** With one or more `--only <path>`, franchise fetches the
+**Sparse clone (`--only`).** With one or more `--only <path>`, clone fetches the
 whole signed history — every parcel, signature and the tree spine — but only the **content**
 under the named subtree(s). Out-of-scope subtrees and files are never downloaded; they stay
 pinned by the exact hash a signed parcel already commits, so nothing can be forged, it is
 simply not fetched. The working tree materializes only the in-scope subtree(s), and the
 remote's whole-store bundle is skipped. History, `audit`, `blame` and `diff` on in-scope paths
-all work; office and every meta pallet are always fetched in full, so a sparse franchise of a
+all work; office and every meta pallet are always fetched in full, so a sparse clone of a
 trusted warehouse still audits offline exactly as a full clone does. Widen later with `expand`.
-A sparse franchise records its origin — see the origin-only lift rule under `lift`.
+A sparse clone records its origin — see the origin-only lift rule under `lift`.
 
-**Cache franchise (`--cache`).** Marks the warehouse as a cache: one that may lack content its
-history reaches, whose remote holds the rest. Like a sparse franchise, it skips the bundle,
+**Cache clone (`--cache`).** Marks the warehouse as a cache: one that may lack content its
+history reaches, whose remote holds the rest. Like a sparse clone, it skips the bundle,
 records its origin (see the origin-only lift rule under `lift`), is never served, and refuses
 `git mirror`; `expand` refuses too, since its scope is already the whole tree. `audit` checks the
-content it holds and says the pass is a cache's. Commands that act on a sparse franchise's
+content it holds and says the pass is a cache's. Commands that act on a sparse clone's
 *scope* (scoped bays, `query`'s scope report) do not apply to a cache. It cannot be combined with `--only`.
 A cache fetches every parcel and signature of the history, so ancestry and signatures check
-offline as in a full franchise, but content only for the head a bay checks out: `franchise`,
+offline as in a full clone, but content only for the head a bay checks out: `clone`,
 a `lower` of the bay's own pallet and a `lift` that merges a diverged remote fetch that head's
 files whole. Every other file stays with the remote, recorded by hash (`audit` counts them as
 held by hash): an older parcel's, and the head's of a pallet `lower <pallet>` moves without
 checking it out. A command that reads content the cache lacks (`show` or `diff` of an older
 parcel, `shift` to a pallet lowered that way) fetches each object it meets from the origin as it
-reads it, and keeps it. A command that writes the bay's files (`franchise`, `shift`,
+reads it, and keeps it. A command that writes the bay's files (`clone`, `shift`,
 `consolidate`, `cherry-pick`, `park`, `lower`, `restore`, `bay add`) fetches every file it is
 about to write in one batch first, before it changes anything. When a new pallet branched off a
 pallet the origin has, or the work merged in another pallet's head as the origin has it, a `lift`
@@ -1652,7 +1652,7 @@ origin is back. Some commands report it as a plain error that names the origin i
 command fetched before refusing stays in the cache; a read-only command changes nothing else, and
 those listed above refuse before their first change to the bay, leaving it as it was.
 
-When the remote's bundle installs native packs straight into the new warehouse, `franchise`
+When the remote's bundle installs native packs straight into the new warehouse, `clone`
 tips the same densify suggestion `git import` does: those packs are the far end's own bulk
 ingest, unseen by a cross-store `store compact --all --redelta` pass.
 
@@ -1690,9 +1690,9 @@ fast-forwards, or reports `diverged` if you moved too. A bay another bay left be
 its pallet is refused with `behind` (exit 26) by `stack`, `deliver` and this auto-merge alike:
 `shift` to the pallet to catch up.
 
-**A partial warehouse talks only to its origin.** A sparse (`franchise --only`) or cache
-(`franchise --cache`) warehouse only ever proved the content it does not hold present on the
-remote it was franchised from — its origin, which the franchise records in `.forklift/origin`
+**A partial warehouse talks only to its origin.** A sparse (`clone --only`) or cache
+(`clone --cache`) warehouse only ever proved the content it does not hold present on the
+remote it was cloned from — its origin, which the clone records in `.forklift/origin`
 before it fetches anything. Talking to a *different* remote could lift onto one that lacks what
 this warehouse never verified there, fetch another history into what this warehouse records, or
 free content by heads the origin does not have. So every command that dials the remote from a
@@ -1702,11 +1702,11 @@ partial warehouse — `lift`, `lower`, `expand`, `scope-prune`, `store evict`, `
 `non_origin_remote` code (exit 11) when `remote.url` is not the origin, naming both and changing
 nothing. `heal` asks no such remote either: it does its local repair and, for what only a remote
 could restore, carries that refusal's message in its own report. Point `remote.url` back at the
-origin, franchise the other remote into a new directory, or move the origin to it with
+origin, clone the other remote into a new directory, or move the origin to it with
 `forklift remote move <url>` (below), which first checks that it holds what this warehouse lacks.
 The origin record is not configuration: no `config` key reaches it. A partial
 warehouse whose record is missing (only a damaged `.forklift` can be) is refused with the same
-code; record the origin with `remote move`, or franchise the remote again. A full warehouse records
+code; record the origin with `remote move`, or clone the remote again. A full warehouse records
 no origin, holds the whole closure and can talk to any remote.
 
 **While a move of the origin stands.** Moving a partial warehouse to another origin first records
@@ -1749,15 +1749,15 @@ Fetches the remote's new parcels for the current pallet and fast-forwards to the
 — working directory and inventory included. On first contact with a trusted
 remote, its trust anchor is adopted (a one-way door, like enrolling) and announced with a
 warning naming its genesis. `--expect <genesis>` pins the anchor before anything is fetched, as
-for `franchise`. A remote whose anchor changed from the one held is refused with `trust_changed`
+for `clone`. A remote whose anchor changed from the one held is refused with `trust_changed`
 (exit 22) — after a legitimate re-genesis, accept it with
 `office accept-regenesis --confirm <genesis>`. A remote that holds an office but declares no
-anchor had it stripped, and is refused the same way, by `franchise` and `lift` too. A diverged
+anchor had it stripped, and is refused the same way, by `clone` and `lift` too. A diverged
 pallet is never merged implicitly: `lower` fetches the parcels and reports the
 divergence, and you consolidate deliberately (`pallet create` the remote head into
 its own pallet, `consolidate` it, then `lift` the merge). Requires a clean
 warehouse. In a sparse warehouse, `lower` stays pruned — it fetches new in-scope
-content and leaves out-of-scope changes sealed by hash, exactly as the franchise did.
+content and leaves out-of-scope changes sealed by hash, exactly as the clone did.
 
 **A slow or busy remote.** Objects normally arrive in a few large batches. A remote that takes
 longer than about 45 seconds to start answering a batch does not fail the command: the rest of
@@ -1768,7 +1768,7 @@ does one that runs out of time partway through a batch (`batch_lane: "out_of_tim
 sent is kept. A remote that sends only part of a batch because the objects asked for are too
 large for one answer is simply asked again for the rest. A remote
 that rate-limits its fetches is waited out, for up to 30 seconds per request. The same holds
-for every command that fetches (`franchise`, `lower`, `expand`, and `lift` when it auto-merges);
+for every command that fetches (`clone`, `lower`, `expand`, and `lift` when it auto-merges);
 `office accept-regenesis` adds the line to its message instead of a `batch_lane` field. A fetch
 that fails reports only its own failure, not whether the batch download had stopped first.
 
@@ -1803,7 +1803,7 @@ replays your changes onto the remote's, and `--keep` resolves the paths both sid
 ### `expand` — widen a sparse warehouse's fetch scope
 
 ```sh
-forklift expand src/web            # fetch a subtree the sparse franchise left sealed
+forklift expand src/web            # fetch a subtree the sparse clone left sealed
 forklift expand src/web docs       # several at once
 ```
 
@@ -1892,7 +1892,7 @@ scope has already narrowed but some objects are left behind. Running `scope-prun
 *same* path resumes rather than refusing "not a fetched path" — it finishes freeing whatever is
 left, or reports there is nothing left to free.
 
-`lift`, `lower` and `franchise` keep a small record of the remote heads they landed or were served
+`lift`, `lower` and `clone` keep a small record of the remote heads they landed or were served
 (`.forklift/held-heads`, at most 16 per pallet). A prune asks the remote whether it still holds
 each recorded head its current heads have moved past, and frees the history of the heads it
 confirms, so another warehouse lifting ahead does not keep your history pinned until you lower.
@@ -1901,10 +1901,10 @@ re-created there after `forklift-server tombstone drop`, or a ref edited on the 
 When the remote cannot answer (a server too old to know the check, or one too busy to finish it),
 the prune prints a `holds_unanswered` warning naming the pallet and frees only what the remote's
 current heads allow; a `lower` of that pallet lets a later prune free what the remote's current
-head reaches. A `lift`, `lower` or `franchise` that cannot write the record prints a
+head reaches. A `lift`, `lower` or `clone` that cannot write the record prints a
 `held_head_unrecorded` warning and keeps its result and exit code. A record that does not parse
 makes a prune refuse, changing nothing; it can be removed, since it only names heads to ask the
-remote about, and the next `lift`, `lower` or `franchise` starts a new one.
+remote about, and the next `lift`, `lower` or `clone` starts a new one.
 
 ### `store evict` — free disk in a cache warehouse
 
@@ -1913,9 +1913,9 @@ forklift store evict            # free cached content the origin holds
 forklift store evict --dry-run  # show what it would free, change nothing
 ```
 
-Frees disk in a cache warehouse (`franchise --cache`): it deletes content the origin holds and
+Frees disk in a cache warehouse (`clone --cache`): it deletes content the origin holds and
 nothing here needs, and records each object it frees as held by hash, so a later read fetches it
-again from the origin as a cache miss does (see the cache franchise under `franchise`). Parcels and
+again from the origin as a cache miss does (see the cache clone under `clone`). Parcels and
 signatures always stay, so ancestry and signatures still check offline. A warehouse that is not a
 cache has nothing to evict and is refused.
 
@@ -2105,7 +2105,7 @@ own.
 
 The global `--json`, `--verbose`, `--no-pager` and `--color` are not params: they are the caller's
 choice of rendering. `help`, `mcp` and `self-schema` itself are left out. The bearer token
-of `franchise --token` and a `config` value are marked secret. An argument shape the
+of `clone --token` and a `config` value are marked secret. An argument shape the
 document cannot express exactly is refused with an error naming the command and argument,
 never dropped: you get the whole surface or none of it.
 
@@ -2137,7 +2137,7 @@ to check the store. A loose object larger than the 64 MiB object ceiling is skip
 way, but it is not corrupt — it predates the ceiling — so it is counted separately as
 `over_ceiling_skipped` and left loose, fully readable, forever.
 
-A signed warehouse writes one small signature file per parcel it signs (a franchise or `lower`
+A signed warehouse writes one small signature file per parcel it signs (a clone or `lower`
 writes the signatures it fetches straight into tables). `store compact` moves those into
 **signature tables** (`.forklift/objects/pack/<id>.sigs`, up to 100,000 signatures each),
 merging small tables as it goes, and removes a signature file only once a durably written table
@@ -2244,7 +2244,7 @@ anything similar outside its own path) sits elsewhere in the store. `--redelta` 
 object one more shot at the best base across the *entire* live set. It costs a full re-encode —
 one-shot and CPU-bound, not something to run routinely — and it is only valid together with
 `--all`. Safe to repeat any number of times on the same store. `store` (and `git import`'s and
-`franchise`'s own output) suggest running it when the store was bulk-ingested and has not been
+`clone`'s own output) suggest running it when the store was bulk-ingested and has not been
 through a redelta pass yet; a successful run clears that suggestion.
 
 > This step removes per-file slack and the open-per-object read cost. Delta compression
@@ -2283,7 +2283,7 @@ pack_threshold, compaction_due, repack_due}, densify_suggested, quarantined_pack
 unenumerable_indexes, foreign_version_indexes}`
 — every size an exact byte count. Nothing is written; run `store compact` to act on what it reports.
 `densify_suggested` (and, in the human view, a one-line tip) appears once the store was
-bulk-ingested (`git import` or a franchise's bundle install) and clears once a `store compact --all
+bulk-ingested (`git import` or a clone's bundle install) and clears once a `store compact --all
 --redelta` pass has run (see [`--redelta`](#store-compact--pack-the-object-store)).
 
 The four problem lists are ordinarily all empty. A pack pair loses its
@@ -2310,7 +2310,7 @@ compaction moves into a table) and `maintenance.signature_table_threshold`
 signature lookup it might answer fails rather than reporting the parcel unsigned. If the table
 was written by a build with another table format, use that build and do not move the file aside;
 if it is corrupt, move it out of the pack folder, accepting that the signatures only it held are
-lost from this store until it is franchised again. `signature_conflicts` (`[{parcel,
+lost from this store until it is cloned again. `signature_conflicts` (`[{parcel,
 sidecar_path, reason}]`) names a signature file that a compaction leaves loose, as described
 under [`store compact`](#store-compact--pack-the-object-store).
 
@@ -2347,7 +2347,7 @@ refusal before ever reaching its own fetch):
   never fetched. A lost parcel that a pallet's history still needs is reported as below, even if
   a tag also names it.
 - **Something is genuinely gone, and something still needs it** — `heal` reports exactly what,
-  with the remedies left once its own fetch attempt has already run: franchise a fresh clone
+  with the remedies left once its own fetch attempt has already run: clone afresh
   from a configured remote if one might still have it, or reproduce it by re-running whatever
   created it if the content still exists in your working tree (`load` then `stack`). The taint
   stays standing on exactly that remainder, and every other command keeps refusing (exit 21)
@@ -2460,8 +2460,8 @@ missing. A file at anything else — an edit you made after the crash, or a file
 from both sides — is left as it is and reported as a local change (`unheld` in `--json`), never
 staged: check it with `stocktake`, and `restore` it if it is not yours.
 
-An interrupted `franchise` is not recovered by `heal`, which refuses there like every other
-command: run the same `franchise` again to resume it (see `franchise`). `heal` reports what it did as an `operation` entry (`finished`,
+An interrupted `clone` is not recovered by `heal`, which refuses there like every other
+command: run the same `clone` again to resume it (see `clone`). `heal` reports what it did as an `operation` entry (`finished`,
 `rolled_forward`, `rolled_back` or `cleared`) beside its taint report. A `load` run meanwhile does
 not clear the record: only `heal` does.
 

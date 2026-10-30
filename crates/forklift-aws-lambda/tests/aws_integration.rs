@@ -1728,7 +1728,7 @@ async fn run_staging_verifier(raw_s3: aws_sdk_s3::Client, s3_ops: S3Ops, config:
 
 /// The founding-bet loop, end to end through the real CLI: a warehouse the CLI built and lifted
 /// through the presigned staging flow (`upload-targets` → presigned staging `PUT`s →
-/// `commit_lift` → the DynamoDB ref CAS), franchised back down through the same head, and its
+/// `commit_lift` → the DynamoDB ref CAS), cloned back down through the same head, and its
 /// content is byte-identical. Then a second round proves incremental lift/lower over staging.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_cli_lifts_and_lowers_through_the_staging_flow_over_s3_and_dynamodb() {
@@ -1756,8 +1756,8 @@ async fn the_cli_lifts_and_lowers_through_the_staging_flow_over_s3_and_dynamodb(
     // would make `forklift lift` exit non-zero, which `Area::forklift` turns into a panic).
     area.forklift("wh", &["lift"]);
 
-    // Franchise a fresh copy back down through the same head; the content must be byte-identical.
-    area.forklift(".", &["franchise", &head.url, "clone"]);
+    // Clone a fresh copy back down through the same head; the content must be byte-identical.
+    area.forklift(".", &["clone", &head.url, "clone"]);
     assert_eq!(
         std::fs::read_to_string(area.path("clone/readme.txt")).expect("clone readme"),
         "hello staging\n"
@@ -2199,7 +2199,7 @@ async fn ref_update_refuses_a_missing_chunk_and_commits_once_complete_over_s3_an
     .expect("the blocking closure audit");
 }
 
-/// PROOF 4 — a full franchise of a chunked file from the AWS head, end to end through the real
+/// PROOF 4 — a full clone of a chunked file from the AWS head, end to end through the real
 /// CLI: presigned chunk `GET`s (redirects) hash-verify (`assemble_chunked_file`'s incremental
 /// `Blake3`) and the file materializes byte-identical. Reuses [`StagingHead`] unmodified — the
 /// staging verifier, the presigned PUT/GET machinery and `commit_lift` pagination are all
@@ -2230,14 +2230,14 @@ async fn the_cli_lifts_and_franchises_a_chunked_file_over_s3_and_dynamodb() {
     // `Area::forklift` turns into a panic).
     area.forklift("wh", &["lift"]);
 
-    // Franchise a fresh copy back down through the same head — every chunk travels a presigned
+    // Clone a fresh copy back down through the same head — every chunk travels a presigned
     // `GET` redirect, and `assemble_chunked_file` re-verifies the whole content hash as it writes.
-    area.forklift(".", &["franchise", &head.url, "clone"]);
+    area.forklift(".", &["clone", &head.url, "clone"]);
 
     let original = std::fs::read(area.path("wh/big.bin")).expect("read the source giant");
-    let materialized = std::fs::read(area.path("clone/big.bin")).expect("read the franchised giant");
+    let materialized = std::fs::read(area.path("clone/big.bin")).expect("read the cloned giant");
     assert_eq!(
         materialized, original,
-        "the franchised chunked file must be byte-identical to the source"
+        "the cloned chunked file must be byte-identical to the source"
     );
 }

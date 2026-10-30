@@ -90,7 +90,7 @@ fn create(name: &str, revision: Option<String>, message: Option<String>) -> Resu
 /// List every tag, attributed to its (forge-proof) tagger, and every tag cell this forklift
 /// cannot read.
 ///
-/// A list is an enumeration, not a claim about one referent — a franchised or sparse store
+/// A list is an enumeration, not a claim about one referent — a cloned or sparse store
 /// legitimately holds `@tags` without every subject's pallet, so an absent subject degrades
 /// the row (`subject_absent`) rather than fails the command. A probe that cannot decide is an
 /// ordinary command failure instead (see [`probe_subject`]).
@@ -115,7 +115,7 @@ async fn list() -> Result<(), String> {
 /// Show one tag in full.
 ///
 /// Renders even when the subject is absent — it does not refuse. `@tags` syncs in full while a
-/// sparse `--only` franchise fetches only the pallets it names, so a healthy clone legitimately
+/// sparse `--only` clone fetches only the pallets it names, so a healthy clone legitimately
 /// holds tags whose subject it never fetched, and every field shown comes from the tag itself,
 /// never from the subject object.
 async fn show(name: &str) -> Result<(), String> {

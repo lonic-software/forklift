@@ -38,7 +38,7 @@ pub(crate) struct StoreReport {
     packs: Vec<PackReport>,
     /// The maintenance thresholds and the current verdict.
     maintenance: Maintenance,
-    /// Whether this store was bulk-ingested (`git import`, or a franchise's native bundle
+    /// Whether this store was bulk-ingested (`git import`, or a clone's native bundle
     /// install) and would still benefit from a one-shot `store compact --all --redelta` pass.
     /// Additive field; never acted on automatically.
     densify_suggested: bool,

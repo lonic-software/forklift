@@ -190,9 +190,9 @@ Upload changes to a remote warehouse.
 Git counterpart: Pull\
 Download changes from a remote warehouse to your local copy.
 
-#### Franchise
+#### Clone
 Git counterpart: Clone\
-Open a local franchise of a remote warehouse: a full local copy that keeps syncing
+Open a local clone of a remote warehouse: a full local copy that keeps syncing
 with the original through lift and lower.
 
 #### Haul

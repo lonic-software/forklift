@@ -23,6 +23,7 @@ forklift bay add: <NAME> [PATH] --scope=<PATH>...
 forklift bay remove: <NAME>
 forklift blame: <PATH> -r/--rev=<REV>
 forklift cherry-pick: <REVISION> -m/--message=<MESSAGE>
+    -> forklift pick: <REVISION> -m/--message=<MESSAGE>
 forklift compact: --all --redelta
     -> forklift store compact: --all --redelta
 forklift config: -g/--global --unset [KEY] [VALUE]
@@ -33,6 +34,7 @@ forklift diff: -s/--staged [REVISION|PATH]...
 forklift export-git: <PATH>
     -> forklift git export: <PATH>
 forklift franchise: <URL> <DIRECTORY> -p/--pallet=<PALLET> -t/--token=<TOKEN> --only=<PATH>... --cache --expect=<GENESIS>
+    -> forklift clone: <URL> <DIRECTORY> -p/--pallet=<PALLET> -t/--token=<TOKEN> --only=<PATH>... --cache --expect=<GENESIS>
 forklift haul:
 forklift haul open: --target=<TARGET> --source=<SOURCE> --title=<TITLE> -m/--message=<MESSAGE>
 forklift haul list: --state=<STATE>
@@ -41,6 +43,7 @@ forklift haul update: <ID>
 forklift haul comment: <ID> -m/--message=<MESSAGE>
 forklift haul review: <ID> --request-changes --comment -m/--message=<MESSAGE>
 forklift haul merge: <ID>
+    -> forklift haul consolidate: <ID>
 forklift haul close: <ID>
 forklift haul reopen: <ID>
 forklift heal:
@@ -53,11 +56,17 @@ forklift lift: --recreate
 forklift load: <PATH>
 forklift lower: [PALLET] --expect=<GENESIS> --keep=<@PALLET:PATH=SIDE>...
 forklift kv:
+    -> forklift manifest:
 forklift kv set: <REVISION> <KEY> <VALUE>
+    -> forklift manifest set: <REVISION> <KEY> <VALUE>
 forklift kv get: <REVISION> <KEY>
+    -> forklift manifest get: <REVISION> <KEY>
 forklift kv unset: <REVISION> <KEY>
+    -> forklift manifest unset: <REVISION> <KEY>
 forklift kv list: [REVISION]
+    -> forklift manifest keys: [REVISION]
 forklift kv log: <REVISION> <KEY>
+    -> forklift manifest log: <REVISION> <KEY>
 forklift manifest:
 forklift manifest note: <REVISION> -m/--message=<MESSAGE>
 forklift manifest approve: <REVISION> -m/--message=<MESSAGE>

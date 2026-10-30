@@ -125,7 +125,7 @@ refusal_codes! {
     /// A whole-tree verb is not (yet) supported in a scoped (sparse) bay (§7.6).
     SparseWorkspace => "sparse_workspace",
 
-    /// A partial warehouse (franchised with `--only` or `--cache`) was asked to talk to a remote
+    /// A partial warehouse (cloned with `--only` or `--cache`) was asked to talk to a remote
     /// other than its origin, or its origin record is missing: the content it does not hold was
     /// only ever proved present on the origin, so every fetch, lift and read of remote heads from
     /// it refuses up front.
@@ -224,13 +224,13 @@ refusal_codes! {
     /// `lower`, `lift`.
     PalletNotFound => "pallet_not_found",
 
-    /// The directory holds a franchise that has not finished: an attempt failed, was killed, or
-    /// is still running. Every command but `franchise` refuses to enter it; running the same
-    /// `franchise` again resumes it, keeping what was fetched (`franchise_utils`). The refusal's
+    /// The directory holds a clone that has not finished: an attempt failed, was killed, or
+    /// is still running. Every command but `clone` refuses to enter it; running the same
+    /// `clone` again resumes it, keeping what was fetched (`franchise_utils`). The refusal's
     /// details carry `{directory, remote, cause_code, retry}`.
-    FranchiseIncomplete => "franchise_incomplete",
+    CloneIncomplete => "clone_incomplete",
 
-    /// A sparse franchise's `--only` prefix names no directory in the pallet's head on the remote.
+    /// A sparse clone's `--only` prefix names no directory in the pallet's head on the remote.
     /// Retrying gets the same answer: the prefix (or the pallet) has to change.
     OnlyPrefixNotFound => "only_prefix_not_found",
 
@@ -262,7 +262,7 @@ refusal_codes! {
     /// next step otherwise brings the pallet back there (`pallet restore <name> --remote`).
     PalletDeletedOnRemote => "pallet_deleted_on_remote",
 
-    /// A cache warehouse (franchised with `--cache`) does not hold content the command reads, and
+    /// A cache warehouse (cloned with `--cache`) does not hold content the command reads, and
     /// could not fetch it because its origin could not be reached. The next step names the origin
     /// to wait for.
     CacheMiss => "cache_miss",

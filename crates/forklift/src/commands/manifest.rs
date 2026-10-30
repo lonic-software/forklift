@@ -8,15 +8,17 @@ use forklift_core::util::meta_tree::MetaSigner;
 use forklift_core::util::office_utils::Role;
 use forklift_core::util::{config_utils, pallet_utils};
 use crate::cli::ManifestAction;
-use crate::commands::lower;
+use crate::commands::{kv, lower};
 use crate::output::{self, CommandOutput};
 
-/// Handle the manifest command: signed post-metadata attached to parcels.
+/// Handle the manifest command: signed facts attached to parcels after the fact.
 ///
-/// * `manifest note <rev> -m …`    - attach a signed note to a parcel.
-/// * `manifest approve <rev> [-m]` - record a signed approval of a parcel.
-/// * `manifest show <rev>`         - show the entries attached to a parcel.
-/// * `manifest`                    - list the whole manifest.
+/// * `manifest note <rev> -m …`          - attach a signed note to a parcel.
+/// * `manifest approve <rev> [-m]`       - record a signed approval of a parcel.
+/// * `manifest provenance <rev> --model` - record how a parcel was produced.
+/// * `manifest show <rev>`               - show the entries attached to a parcel.
+/// * `manifest`                          - list the whole manifest.
+/// * `manifest set/get/unset/keys/log`   - keyed values on `@kv` ([`kv`]).
 ///
 /// Authorship is the entry's signer stamp, so `manifest` needs no author argument — you
 /// record as yourself, verifiably.
@@ -41,6 +43,11 @@ pub fn handle_command(action: Option<ManifestAction>) -> Result<(), String> {
             record(&revision, ManifestKind::Provenance, message.unwrap_or_default(), Some(provenance))
         }
         Some(ManifestAction::Show { revision }) => show(&revision),
+        Some(ManifestAction::Set { revision, key, value }) => kv::set(&revision, &key, &value),
+        Some(ManifestAction::Get { revision, key }) => kv::get(&revision, &key),
+        Some(ManifestAction::Unset { revision, key }) => kv::unset(&revision, &key),
+        Some(ManifestAction::Keys { revision }) => kv::list(revision.as_deref()),
+        Some(ManifestAction::Log { revision, key }) => kv::log(&revision, &key),
         None => list(),
     }
 }

@@ -16,7 +16,7 @@ a Terraform/CDK stack.
 ## Architecture overview
 
 ```
- forklift CLI (lift / lower / franchise)
+ forklift CLI (lift / lower / clone)
         │
         │ HTTPS, JSON control calls: /v1/…
         ▼
@@ -671,7 +671,7 @@ binaries share it) or the AWS SDK's own default provider chain:
 | `FORKLIFT_DYNAMODB_TABLE` | **Required** | Both (verifier builds but never calls the resulting client) | The ref/trust table name. |
 | `FORKLIFT_WAREHOUSE_ID` | Optional | Control plane | Set (non-empty) → single-warehouse mode, serving fixed `/v1/…`. Unset or empty → multi-warehouse mode, `/warehouses/{id}/v1/…`. An empty string is treated as unset. A set id must be a valid warehouse id (see `REMOTE_PROTOCOL.md`, warehouse creation), or the function refuses to start. |
 | `FORKLIFT_AWS_ENDPOINT_URL` | Optional | Both | Endpoint override for LocalStack/MinIO; switches the S3 client to path-style addressing. An empty string is treated as unset. |
-| `FORKLIFT_DEFAULT_PALLET` | Optional | Control plane | The pallet a franchise checks out by default. Defaults to `main`. An empty string is treated as unset. A set value must be a valid pallet name (lowercase; see `format/PALLET_REFS.md`), or the function refuses to start. |
+| `FORKLIFT_DEFAULT_PALLET` | Optional | Control plane | The pallet a clone checks out by default. Defaults to `main`. An empty string is treated as unset. A set value must be a valid pallet name (lowercase; see `format/PALLET_REFS.md`), or the function refuses to start. |
 | `AWS_REGION` | Effectively required | The AWS SDK's provider chain (not this crate directly) | Lambda's own execution environment sets this automatically; no operator action needed in the ordinary case. |
 | `FORKLIFT_TOKEN_SHA256` | See below | Control plane only | The SHA-256 digest (64 lowercase hex characters) of the shared bearer token. |
 | `FORKLIFT_OPERATOR_TOKENS` | See below | Control plane only | A JSON object mapping each per-operator token's SHA-256 digest to its office identifier. |
@@ -783,7 +783,7 @@ deployer-supplied, out-of-repo mechanism.
   enforced by any code path: without a lifecycle expiration on `staging/*`, an abandoned or
   perpetually-paginating lift session accumulates unswept bytes forever.
 
-* **Run `forklift audit --full` periodically against a franchise as your own bit-rot scrub**
+* **Run `forklift audit --full` periodically against a clone as your own bit-rot scrub**
   (`docs/guide/cli.md`). The commit-gate closure check this head runs on every push is
   deliberately *not* a content scrub — an unchanged chunked file's subtree is now pruned by hash
   comparison rather than re-read (the fix that makes routine pushes affordable; see "Timeout
@@ -822,7 +822,7 @@ deployer-supplied, out-of-repo mechanism.
 
   Run this before every deploy that touches `forklift-aws-lambda` — it exercises the same
   presigned-staging round trip, the chunked-file closure audit, and a full CLI
-  lift/franchise/lower cycle that "Verification checklist" below asks you to re-prove against
+  lift/clone/lower cycle that "Verification checklist" below asks you to re-prove against
   the real thing.
 
 * **Version skew.** The protocol version check (`WarehouseInfo.protocol`, exact-string equality)
@@ -847,11 +847,11 @@ Run this against your **actual deployed infrastructure** (not LocalStack) once i
 
 1. `curl https://<your-api>/v1/warehouse` (or the multi-warehouse `/warehouses/{id}/v1/warehouse`
    form) answers `200` with `"chunking": true` in the body.
-2. A small `forklift franchise <url> <dir>` round trip: `forklift prepare`, add a couple of
-   small files, `load`/`stack`, `config remote.url <url>`, `lift`, then `franchise <url> other-dir`
+2. A small `forklift clone <url> <dir>` round trip: `forklift prepare`, add a couple of
+   small files, `load`/`stack`, `config remote.url <url>`, `lift`, then `clone <url> other-dir`
    and diff the two directories byte-for-byte.
 3. A **chunked** round trip: track a file at or above 8 MiB (the chunk threshold), `lift` it, and
-   `franchise` it back down — confirms the presigned chunk `GET`s, the recipe descent, and
+   `clone` it back down — confirms the presigned chunk `GET`s, the recipe descent, and
    `assemble_chunked_file`'s content-hash re-verification all work against your real bucket and
    table, not just LocalStack.
 4. After a successful `lift`, list the bucket under `staging/{session}/` for the session that
@@ -863,11 +863,11 @@ Run this against your **actual deployed infrastructure** (not LocalStack) once i
    over_s3_and_dynamodb` for the exact shape this proves against LocalStack; the point of running
    it again here is proving it against your real IAM policy and bucket, where a permissions gap
    could otherwise silently change the outcome.)
-6. `forklift audit --full` against a fresh franchise of the warehouse comes back clean/green.
+6. `forklift audit --full` against a fresh clone of the warehouse comes back clean/green.
 
 ## Related documents
 
 * `docs/format/REMOTE_PROTOCOL.md` — the wire protocol both heads implement.
 * `docs/SERVER.md` — the self-hostable sibling of this head, same protocol.
-* `docs/guide/cli.md` — the `lift`/`lower`/`franchise`/`audit` commands referenced above.
+* `docs/guide/cli.md` — the `lift`/`lower`/`clone`/`audit` commands referenced above.
 * `docs/format/BUNDLE_FORMAT.md` — the stream format `batch` and `bundles/latest` serve.

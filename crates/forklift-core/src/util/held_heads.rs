@@ -1,5 +1,5 @@
 //! The held-heads record: remote heads of working pallets this warehouse lifted to, lowered or
-//! franchised from.
+//! cloned from.
 //!
 //! The remote's current heads alone stop reaching this warehouse's history of a pallet once
 //! another warehouse lifts past every head held here, and `scope-prune` would keep that history
@@ -87,7 +87,7 @@ pub fn candidates(pallet: &str) -> Result<Vec<String>, String> {
 /// meta pallet records nothing: prune's unlifted walk covers only user parcels.
 ///
 /// Call it only once the remote has accepted the head (a lift's compare-and-set returned) or, on a
-/// `lower` or a `franchise`, the remote served it and this warehouse holds its history (the ref or
+/// `lower` or a `clone`, the remote served it and this warehouse holds its history (the ref or
 /// the bay's base is at it or past it); never before a refusal check: an entry for a head the
 /// remote never took is harmless to a prune, which asks the remote, but it is a false record. The
 /// caller treats an error as a warning, because the head has landed either way and a lost entry
@@ -161,7 +161,7 @@ pub async fn confirmed_heads(client: &RemoteClient, remote_pallets: &BTreeMap<St
     // checks at once, answering `unknown` past that, so asking in parallel would confirm less.
     let entries = read_held_heads().map_err(|e| format!(
         "{} The record only names heads to ask the remote about, so removing it is safe; the next \
-        lift, lower or franchise starts a new one.", e
+        lift, lower or clone starts a new one.", e
     ))?;
     for (pallet, candidates) in to_ask(&entries, remote_pallets) {
         match client.holds(&pallet, &candidates).await {

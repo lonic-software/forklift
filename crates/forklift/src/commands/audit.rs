@@ -153,7 +153,7 @@ pub(crate) struct AuditScope {
     #[serde(skip_serializing_if = "Option::is_none")]
     fetch_scope: Option<Vec<String>>,
 
-    /// The warehouse is a cache (franchised with `--cache`): it may lack content its history
+    /// The warehouse is a cache (cloned with `--cache`): it may lack content its history
     /// reaches, held by hash alone and counted in `held_by_hash`. Omitted on any other warehouse.
     #[serde(skip_serializing_if = "crate::output::is_false")]
     cache: bool,

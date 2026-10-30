@@ -12,29 +12,28 @@ alias: install uninstall status
 audit
 bay: add remove
 blame
-cherry-pick
+clone
 config
 conflicts
 consolidate
 deliver
 diff
 expand
-franchise
 git: import export mirror
-haul: open list show update comment review merge close reopen
+haul: open list show update comment review consolidate close reopen
 heal
 help
 history
-kv: set get unset list log
 lift
 load
 lower
-manifest: note approve provenance show
+manifest: note approve provenance show set get unset keys log
 mcp
 narrow
 office: enroll keygen admit link authorize role rotate retire regenesis accept-regenesis list
 pallet: list create delete restore
 park: pop list
+pick
 prepare
 profile: list create use
 query
@@ -88,10 +87,10 @@ lower --keep …=theirs
 [recorded-text]
 # The commands that record text: free-form prose a person writes to describe a record (a
 # parcel's description, a note, a comment, a review, a tag or delivery message, a haul's longer
-# description). A keyed value (kv set VALUE, config VALUE) and a short title (haul open --title)
+# description). A keyed value (manifest set VALUE, config VALUE) and a short title (haul open --title)
 # are not recorded text.
 stack
-cherry-pick
+pick
 deliver
 haul open
 haul comment

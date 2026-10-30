@@ -1,6 +1,6 @@
 # Remote protocol — version `2026-07-05`
 
-The protocol between a forklift client (`lift` / `lower` / `franchise`) and a forklift
+The protocol between a forklift client (`lift` / `lower` / `clone`) and a forklift
 remote. Two server heads implement it, and both are first-class ways to host a
 warehouse: `forklift-server` (the self-hostable server head, in this repository) and
 the AWS serverless head behind the hosted service (API Gateway + Lambda, DESIGN.html
@@ -111,7 +111,7 @@ without one, so a client refuses a handshake that has `@office` and no `trust` (
 stripped). Every hash — the `pallets` values and the anchor's — is an object hash in its one
 canonical spelling, 64 lowercase hex characters; a client refuses a handshake with any other
 spelling. `default_pallet` is what a
-franchise (clone) checks out when the user does not choose; it is the remote's current
+clone checks out when the user does not choose; it is the remote's current
 pallet. A pallet that exists but has nothing stacked (unborn) is simply absent from
 `pallets`.
 
@@ -464,7 +464,7 @@ defined meaning in HTTP, and a proxy may drop it. Checks, in order:
 3. **CAS**: the current head equals `old_head`, else `409` with `code` `remote_ahead` — except
    that a pallet already deleted at `old_head` (its tombstone holds it) answers `200`, so a retry
    whose first try landed reads as done;
-4. the remote's `default_pallet`, which a franchise checks out, is refused with `409`, and so is
+4. the remote's `default_pallet`, which a clone checks out, is refused with `409`, and so is
    a pallet a checkout of the server's own warehouse stands on (the serverless head has none), one
    an open haul names, and any pallet while a haul cannot be read.
 
@@ -655,9 +655,9 @@ earlier sync leaves its ref unmoved, so its half-fetched objects sit above that 
 are still re-walked and healed. A diverged local pallet is an error (consolidate locally,
 then lift) — protocol v1 has no remote-tracking refs.
 
-**franchise (clone)** — prepare an empty warehouse, adopt the remote's trust anchor,
+**clone** — prepare an empty warehouse, adopt the remote's trust anchor,
 lower the office pallet and the default (or chosen) pallet, materialize the working
 directory. When `GET /v1/bundles/latest` succeeds, the bundle is imported first and the
-breadth-first walk only fetches what it lacked. A franchise that fails partway keeps the bundle
+breadth-first walk only fetches what it lacked. A clone that fails partway keeps the bundle
 bytes it synced, with their tag and total, and its next attempt resumes them as described under
 `GET /v1/bundles/latest`.

@@ -50,7 +50,7 @@ vocabulary, forklift uses shipping-yard words — the concepts map one-to-one:
 | `status` | **stocktake** | show staged and unstaged changes |
 | `push` | **lift** | upload to a remote |
 | `pull` | **lower** | fetch and fast-forward from a remote |
-| `clone` | **franchise** | open a local copy of a remote warehouse |
+| `clone` | **clone** | open a local copy of a remote warehouse |
 | `init` | **prepare** | create a warehouse here |
 | `log` | **history** | walk the parcel graph, newest first |
 | a user | an **operator** | who authored a parcel (an opaque id) |

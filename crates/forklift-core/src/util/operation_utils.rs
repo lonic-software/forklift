@@ -3,7 +3,7 @@
 //!
 //! Every operation that ends in [`inventory_utils::replace_all_inventories`] — shift, park,
 //! consolidate's fast-forward, lower, bay creation, git import, every merge and cherry-pick, and
-//! franchise — raises the marker before its first durable change and finishes it only once its own
+//! clone — raises the marker before its first durable change and finishes it only once its own
 //! final write has landed. Raising it around the rewrite alone would not be enough: shift records
 //! its new position only after the rewrite, so a crash between the two leaves files and staging at
 //! the target under a position still on the source, and a `load ./` followed by `stack` would
@@ -63,8 +63,8 @@ impl OperationKind {
             OperationKind::BayCreation => "bay creation",
             OperationKind::ImportGit => "git import",
             OperationKind::Merge => "merge",
-            OperationKind::CherryPick => "cherry-pick",
-            OperationKind::Franchise => "franchise",
+            OperationKind::CherryPick => "pick",
+            OperationKind::Franchise => "clone",
         }
     }
 
@@ -83,7 +83,7 @@ impl OperationKind {
             OperationKind::Shift | OperationKind::FastForward | OperationKind::Lower
             | OperationKind::Merge | OperationKind::CherryPick => true,
             // Park does not move the bay; bay creation and git import write the position BEFORE
-            // their rewrite; franchise only refuses.
+            // their rewrite; clone only refuses.
             OperationKind::Park | OperationKind::BayCreation | OperationKind::ImportGit
             | OperationKind::Franchise => false,
         }
@@ -507,8 +507,8 @@ pub fn recover() -> Result<Option<Recovery>, String> {
 fn recover_operation(operation: &Operation) -> Result<(RecoveryOutcome, Vec<String>), String> {
     if operation.kind == OperationKind::Franchise {
         return Err(
-            "A franchise into this directory was interrupted before it finished. It held no work of \
-            its own yet: remove the directory and franchise again.".to_string()
+            "A clone into this directory was interrupted before it finished. It held no work of \
+            its own yet: remove the directory and clone again.".to_string()
         );
     }
 
@@ -619,7 +619,7 @@ fn recover_operation(operation: &Operation) -> Result<(RecoveryOutcome, Vec<Stri
             Ok((RecoveryOutcome::RolledForward, unheld))
         }
 
-        OperationKind::Franchise => unreachable!("franchise refuses above"),
+        OperationKind::Franchise => unreachable!("clone refuses above"),
     }
 }
 

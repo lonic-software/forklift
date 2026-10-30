@@ -37,7 +37,7 @@
 #   - the explicit read checks near the end of this script exercise the control plane's Decrypt
 #     grant directly, via a route (the signature sidecar) that isn't a redirect at all.
 #
-# NOT INDEPENDENT EVIDENCE, and it matters: the round trip's franchise leg (which downloads the
+# NOT INDEPENDENT EVIDENCE, and it matters: the round trip's clone leg (which downloads the
 # very files this script just lifted) already goes through `presign_get` as the control plane's
 # own signer, so on a CMK-configured stack (see examples/staging/) that leg alone already
 # exercises the control plane's Decrypt grant once, as a side effect. The explicit read checks
@@ -99,7 +99,7 @@
 #     pallet: run 1 succeeded, then every run after diverged from what the stack actually held
 #     (remote_utils.rs's divergence check / head.rs's "not a fast-forward"), turning the daily
 #     scheduled workflow permanently red after its first success — and indistinguishably from a
-#     real verifier-KMS failure, the worst possible false signal. Fixed by franchising the
+#     real verifier-KMS failure, the worst possible false signal. Fixed by cloning the
 #     persistent stack FIRST, then stacking new fixture content on top of whatever it already
 #     holds, every run (step 2/5's comment has the full reasoning, including why this was chosen
 #     over a per-run pallet).
@@ -293,11 +293,11 @@ staging_key_count() {
 # measure guaranteed to catch the growth regardless of which prefix it nominally sits under, and
 # it is also the number an operator actually pays for.
 #
-# Every run stages a fresh 9 MiB of /dev/urandom (step 2/5 below) and franchises the whole
+# Every run stages a fresh 9 MiB of /dev/urandom (step 2/5 below) and clones the whole
 # store's history twice. Fresh urandom never deduplicates against anything already in objects/,
 # and nothing anywhere — this script, the module, or the crate — ever prunes a canonical object:
-# an S3 lifecycle rule on objects/ would make the NEXT franchise fail on a missing object (the
-# franchise leg fetches the full history closure), which is a permanently red run AND a
+# an S3 lifecycle rule on objects/ would make the NEXT clone fail on a missing object (the
+# clone leg fetches the full history closure), which is a permanently red run AND a
 # genuinely corrupted warehouse, not a fix. So the store grows, by design, forever. The point of
 # this check is not to stop that growth — it's to make its eventual failure self-naming, rather
 # than indistinguishable from a real verifier/KMS failure (this file's header calls that "the
@@ -436,14 +436,14 @@ log "  OK — 200, chunking: true"
 #       warehouse per scheduled run, forever, with no natural cleanup: nothing in this stack's
 #       design ever prunes an abandoned pallet, so this would need its own retention story on
 #       top (and did not get designed one).
-#   (b) franchise (clone) the persistent stack's pallet FIRST, then load/stack new content on
+#   (b) clone the persistent stack's pallet FIRST, then load/stack new content on
 #       top of whatever it already holds, then lift — the same pallet, every run, exactly the
 #       pull-then-push shape a real client actually uses. Chosen: it does not accumulate
-#       anything (no new pallet is ever created after the very first run), and `franchise`
+#       anything (no new pallet is ever created after the very first run), and `clone`
 #       already handles a never-lifted-to remote gracefully (an "unborn" pallet — verified by
-#       reading crates/forklift/src/commands/franchise.rs: it checks out the pallet name with no
+#       reading crates/forklift/src/commands/clone.rs: it checks out the pallet name with no
 #       head and returns cleanly), so the first scheduled run and the thousandth run go through
-#       the identical code path. Franchising also adopts the remote's `remote.url`/`remote.token`
+#       the identical code path. Cloning also adopts the remote's `remote.url`/`remote.token`
 #       and trust anchor automatically, which is why the old explicit `config remote.url` /
 #       `config remote.token` calls are gone below.
 #
@@ -456,20 +456,20 @@ log "  OK — 200, chunking: true"
 log "step 2/5 (checklist #2, #3): small + chunked (>= 8 MiB) round trip"
 
 SRC_DIR="$WORKDIR/src"
-FR_DIR="$WORKDIR/franchise"
+FR_DIR="$WORKDIR/clone"
 
 # Cleared, not just created: a caller-supplied VERIFY_WORKDIR is documented as never removed by
-# this script, which invites reuse across runs — but `forklift franchise` refuses a non-empty
-# target outright ("... is not empty; franchise into a new or empty directory."), so the second
+# this script, which invites reuse across runs — but `forklift clone` refuses a non-empty
+# target outright ("... is not empty; clone into a new or empty directory."), so the second
 # run into the same VERIFY_WORKDIR would die here. Removing only the two subdirectories this
 # script owns keeps that documented contract (the workdir itself, and anything the caller put
 # beside these, survives) while making reuse actually work.
 rm -rf "$SRC_DIR" "$FR_DIR"
 
-log "  franchising the persistent stack into a scratch working copy (so this run stacks on top \
+log "  cloning the persistent stack into a scratch working copy (so this run stacks on top \
 of whatever it already holds, rather than diverging from a disconnected new root)..."
-"$FORKLIFT_BIN" franchise "${ENDPOINT}${PREFIX}" "$SRC_DIR" --token "$TOKEN" >/dev/null ||
-  fail "initial franchise (of the persistent stack, before this run's own changes) failed"
+"$FORKLIFT_BIN" clone "${ENDPOINT}${PREFIX}" "$SRC_DIR" --token "$TOKEN" >/dev/null ||
+  fail "initial clone (of the persistent stack, before this run's own changes) failed"
 
 printf 'FORK-60 Layer 3 verify run — small file A (%s)\n' "$(date -u +%FT%TZ)" >"$SRC_DIR/small-a.txt"
 printf 'FORK-60 Layer 3 verify run — small file B\n' >"$SRC_DIR/small-b.txt"
@@ -487,13 +487,13 @@ log "  lifting (small files promote synchronously; big.bin promotes asynchronous
 run_in "$SRC_DIR" "$FORKLIFT_BIN" lift ||
   fail "lift failed. If this is the only thing that changed since Layer 2's LocalStack coverage passed, this is exactly the asynchronous/invisible verifier-KMS failure this script exists to catch: the staging PUT succeeded, but promotion never completed."
 
-log "  franchising into a second, independent directory and comparing byte-for-byte..."
-"$FORKLIFT_BIN" franchise "${ENDPOINT}${PREFIX}" "$FR_DIR" --token "$TOKEN" >/dev/null ||
-  fail "second franchise failed"
+log "  cloning into a second, independent directory and comparing byte-for-byte..."
+"$FORKLIFT_BIN" clone "${ENDPOINT}${PREFIX}" "$FR_DIR" --token "$TOKEN" >/dev/null ||
+  fail "second clone failed"
 
 for f in small-a.txt small-b.txt big.bin; do
   cmp -s "$SRC_DIR/$f" "$FR_DIR/$f" ||
-    fail "franchised $f differs from the source — byte-for-byte round trip broken"
+    fail "cloned $f differs from the source — byte-for-byte round trip broken"
 done
 
 log "  OK — small files and big.bin round-tripped identically"
@@ -563,7 +563,7 @@ log "  OK — staging/ did not grow ($staging_key_count_before -> $staging_key_c
 #     infrastructure this workflow does not have: enrollment can only happen once per warehouse,
 #     so every later run would need to sign as the SAME already-enrolled identity, which means a
 #     signing key persisted across runs (a new CI secret) and script-level plumbing to place it
-#     correctly in each run's fresh franchise before `stack` — none of which exists today. And
+#     correctly in each run's fresh clone before `stack` — none of which exists today. And
 #     because Layer 3 cannot be run for real from this environment (no AWS account, by design —
 #     see this file's header), establishing trust for the first time could not be verified here
 #     even if it were built.
@@ -603,7 +603,7 @@ on this stack, out of band, as its own decision."
 fi
 
 # NOT INDEPENDENT EVIDENCE (restated from the header comment, where it applies again): step 2's
-# franchise leg already fetched this exact parcel's object bytes via a presigned GET signed by
+# clone leg already fetched this exact parcel's object bytes via a presigned GET signed by
 # the control plane, so on a CMK-configured stack that step alone already exercised the control
 # plane's kms:Decrypt grant once, as a side effect of proving the round trip byte-for-byte. This
 # explicit check is kept anyway so the KMS pin does not rest on that incidental shape — but do

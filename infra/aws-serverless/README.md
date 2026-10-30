@@ -253,8 +253,8 @@ content-addressed `objects/` namespace. Fresh urandom never deduplicates against
 there, and nothing prunes a canonical object once written — that upload has to stay cold and
 un-deduplicated, or the verifier Lambda (the entire reason Layer 3 exists) stops being exercised
 from the second run on. An S3 lifecycle rule on `objects/` was considered and rejected: the
-franchise leg that follows re-fetches the full history closure, so expiring an old object would
-turn the *next* run's franchise into a permanently red run over a genuinely corrupted warehouse,
+clone leg that follows re-fetches the full history closure, so expiring an old object would
+turn the *next* run's clone into a permanently red run over a genuinely corrupted warehouse,
 not a fix. There is also no client-side prune to fall back to — the client has no delete
 operation at all (every "prune" in `remote_utils.rs` is walk-pruning, not a network delete).
 
@@ -280,7 +280,7 @@ few dozen bytes each.
 
 **When the hard threshold fires:** the `examples/staging/` warehouse is fixture-only and
 disposable (see that directory's own `main.tf` header) — it exists solely to give the scheduled
-workflow something to franchise onto and lift into, never to hold anything anyone depends on. The
+workflow something to clone onto and lift into, never to hold anything anyone depends on. The
 demo deployment is a **separate stack** from this one, so there is nothing here to preserve.
 Reset unconditionally:
 

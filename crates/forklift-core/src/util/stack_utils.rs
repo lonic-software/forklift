@@ -215,7 +215,7 @@ pub async fn stack_parcel(description: Option<String>,
     if expected_base.is_none() {
         let started_on = match (&consolidation, &cherry_pick) {
             (Some(state), _) => Some(("consolidation", &state.our_pallet, merge_utils::abort_hint_in(&bay_root()))),
-            (None, Some(state)) => Some(("cherry-pick", &state.our_pallet, cherry_pick_utils::abort_hint())),
+            (None, Some(state)) => Some(("pick", &state.our_pallet, cherry_pick_utils::abort_hint())),
             (None, None) => None,
         };
 
@@ -247,7 +247,7 @@ pub async fn stack_parcel(description: Option<String>,
 
         let started_at = match (&consolidation, &cherry_pick) {
             (Some(state), _) => Some(("consolidation", &state.our_head)),
-            (None, Some(state)) => Some(("cherry-pick", &state.our_head)),
+            (None, Some(state)) => Some(("pick", &state.our_head)),
             (None, None) => None,
         };
 
@@ -415,7 +415,7 @@ pub async fn stack_parcel(description: Option<String>,
                 cherry_pick_utils::clear_state()?;
 
                 return Err(StackError::Other(
-                    "The cherry-pick is empty: applying it changes nothing (the head already \
+                    "The pick is empty: applying it changes nothing (the head already \
                     has these changes). Nothing was stacked.".to_string()
                 ));
             }
@@ -459,7 +459,7 @@ pub async fn stack_parcel(description: Option<String>,
         Some(state) => {
             let authors = cherry_pick_utils::collect_source_authors(&state.source, &operator).map_err(|e| {
                 StackError::Other(format!(
-                    "The cherry-pick in progress cannot be completed: its source parcel {} cannot \
+                    "The pick in progress cannot be completed: its source parcel {} cannot \
                     be read ({}). Nothing was stacked. Abort the pick ({}); stacking its changes \
                     after that records you as their only author.",
                     state.source, e, cherry_pick_utils::abort_hint()
@@ -583,7 +583,7 @@ pub async fn stack_parcel(description: Option<String>,
 /// the old base, so a merge still recorded on it can be aborted and the bay then caught up.
 fn cleanup_failed(pallet: &str, parcel: &str, error: &str) -> String {
     format!(
-        "{} If a consolidation or cherry-pick is still recorded, this parcel completed it: abort it \
+        "{} If a consolidation or pick is still recorded, this parcel completed it: abort it \
         (\"forklift shift {}\" names how) before catching up.",
         pallet_utils::landed_but(pallet, parcel, error), pallet
     )

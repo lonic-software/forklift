@@ -69,7 +69,7 @@ pub const BATCH_CUT_DEADLINE: &str = "deadline";
 pub struct WarehouseInfo {
     pub protocol: String,
 
-    /// The pallet a franchise (clone) checks out when the user does not choose.
+    /// The pallet a clone checks out when the user does not choose.
     pub default_pallet: String,
 
     /// Every pallet with something stacked, mapped to its head parcel hash.

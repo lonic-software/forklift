@@ -172,7 +172,7 @@ pub(crate) fn refuse_mid_merge(doing: &str) -> Result<(), String> {
 
     if cherry_pick_utils::read_state()?.is_some() {
         return Err(format!(
-            "A cherry-pick is in progress. Resolve its conflicts and \"forklift stack\", or {} to abort it, \
+            "A pick is in progress. Resolve its conflicts and \"forklift stack\", or {} to abort it, \
             before {}.",
             cherry_pick_utils::abort_hint(),
             doing

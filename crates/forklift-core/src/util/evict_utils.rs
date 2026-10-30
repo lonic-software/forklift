@@ -1,4 +1,4 @@
-//! Eviction: shrinking a cache warehouse (`franchise --cache`) back down by freeing content its
+//! Eviction: shrinking a cache warehouse (`clone --cache`) back down by freeing content its
 //! origin holds and nothing local needs (DESIGN.html §7.6.1).
 //!
 //! A cache holds every parcel and signature and fetches content when it is read. Eviction is the

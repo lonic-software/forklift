@@ -282,16 +282,16 @@ Lifted the office pallet: 1 new parcel(s).
 Lifted pallet "main" to …: … new parcel(s), … object(s) and 1 signature(s) uploaded.
 ```
 
-`franchise` (clone) a second copy beside it, as a colleague would. The first contact with a server
+`clone` (clone) a second copy beside it, as a colleague would. The first contact with a server
 adopts its trust anchor and warns you to check it; `--expect` checks it before anything is
 fetched:
 
 ```console
 $ cd ..
-$ forklift franchise http://127.0.0.1:7171 hello-copy
-Warning: FIRST CONTACT with http://127.0.0.1:7171: adopted its trust anchor, genesis …. Verify that genesis out of band. To check it before anything is fetched, pass --expect … to franchise or lower.
+$ forklift clone http://127.0.0.1:7171 hello-copy
+Warning: FIRST CONTACT with http://127.0.0.1:7171: adopted its trust anchor, genesis …. Verify that genesis out of band. To check it before anything is fetched, pass --expect … to clone or lower.
 Adopted the remote's trust anchor (genesis …); every parcel is signed from now on.
-Franchised http://127.0.0.1:7171 into "hello-copy": pallet "main" at … (… object(s) fetched loose).
+Cloned http://127.0.0.1:7171 into "hello-copy": pallet "main" at … (… object(s) fetched loose).
 ```
 
 Make a change in the copy and lift it:

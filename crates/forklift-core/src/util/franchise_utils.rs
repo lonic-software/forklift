@@ -1,17 +1,17 @@
-//! The record of a franchise that has not finished: `.forklift/franchise`, and what reads it.
+//! The record of a clone that has not finished: `.forklift/clone`, and what reads it.
 //!
-//! A franchise that has claimed its target directory leaves this record standing until it
+//! A clone that has claimed its target directory leaves this record standing until it
 //! succeeds, so an error, a kill or a power loss part-way through never loses what it fetched.
-//! Running the same `franchise` again resumes it: the verified object store is kept and the rest
+//! Running the same `clone` again resumes it: the verified object store is kept and the rest
 //! of the warehouse is rebuilt (see [`prepare_resume`] for what is kept). Every other command
 //! refuses to enter a warehouse that holds the record ([`gate`]), with the code
-//! `franchise_incomplete`, and names the way out.
+//! `clone_incomplete`, and names the way out.
 //!
 //! ## Storage
 //!
-//! One [`record_utils`] record, `franchise`, in the warehouse's `.forklift` folder, replaced
+//! One [`record_utils`] record, `clone`, in the warehouse's `.forklift` folder, replaced
 //! atomically. Each entry is `key=value`; a list repeats its key. A record this build cannot read
-//! is never taken for "no franchise in progress": the gate refuses, and a resume admits it only as
+//! is never taken for "no clone in progress": the gate refuses, and a resume admits it only as
 //! the debris of a run killed before its first write was durable.
 
 use std::ffi::OsStr;
@@ -79,7 +79,7 @@ impl Retry {
     }
 }
 
-/// The part of a franchise a failure happened in.
+/// The part of a clone a failure happened in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     /// Clearing what an earlier attempt left, and preparing the warehouse.
@@ -147,13 +147,13 @@ pub fn bundle_progressed(start: &BundleState, now: &BundleState) -> bool {
     }
 }
 
-/// What an attempt was asked to franchise, beyond the URL: the parts a resume may change.
+/// What an attempt was asked to clone, beyond the URL: the parts a resume may change.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Request {
     /// The `--pallet` asked for; `None` for the remote's default.
     pub pallet: Option<String>,
 
-    /// The `--only` prefixes, as normalized keys; empty for a full franchise.
+    /// The `--only` prefixes, as normalized keys; empty for a full clone.
     pub only: Vec<String>,
 
     /// Whether `--cache` was asked for.
@@ -176,7 +176,7 @@ pub struct Failure {
     pub retry: Retry,
 }
 
-/// The record of an unfinished franchise.
+/// The record of an unfinished clone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FranchiseRecord {
     /// The remote's URL.
@@ -188,7 +188,7 @@ pub struct FranchiseRecord {
     /// The current (or last) attempt's request.
     pub request: Request,
 
-    /// The trust genesis this franchise is bound to: the `--expect` pin, else the genesis the
+    /// The trust genesis this clone is bound to: the `--expect` pin, else the genesis the
     /// remote announced on first contact. `None` when the remote announced no anchor.
     pub genesis: Option<String>,
 
@@ -367,7 +367,7 @@ impl MarkerError {
     fn describe(&self, path: &Path) -> String {
         match self {
             MarkerError::Torn(why) | MarkerError::Foreign(why) => {
-                format!("The franchise record \"{}\" {}", path.to_string_lossy(), why)
+                format!("The clone record \"{}\" {}", path.to_string_lossy(), why)
             }
             MarkerError::Unreadable(why) => why.clone(),
         }
@@ -393,11 +393,11 @@ pub fn read(forklift: &Path) -> Result<Option<FranchiseRecord>, MarkerError> {
 /// Write the record in `forklift`, replacing any: atomically, and synced with its folder.
 pub fn write(forklift: &Path, record: &FranchiseRecord) -> Result<(), String> {
     file_utils::replace_file_atomically(&record_path(forklift), &record.to_bytes())
-        .map_err(|e| format!("Error while recording the franchise in progress: {}", e))
+        .map_err(|e| format!("Error while recording the clone in progress: {}", e))
 }
 
 /// Remove the record in `forklift`, with any temp file a replacement left behind, and sync the
-/// folder: the last step of a franchise that finished, so the warehouse is never gated again.
+/// folder: the last step of a clone that finished, so the warehouse is never gated again.
 pub fn finish(forklift: &Path) -> Result<(), String> {
     for temp in record_temps(forklift)? {
         file_utils::remove_unfollowed(&temp)?;
@@ -407,7 +407,7 @@ pub fn finish(forklift: &Path) -> Result<(), String> {
         Ok(()) => (),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
         Err(e) => return Err(format!(
-            "Error while clearing the franchise record \"{}\": {}", record_path(forklift).to_string_lossy(), e
+            "Error while clearing the clone record \"{}\": {}", record_path(forklift).to_string_lossy(), e
         )),
     }
 
@@ -440,19 +440,19 @@ fn is_temp_of(name: &OsStr, base: &str) -> bool {
     name.to_str().and_then(file_utils::staged_temp_base) == Some(base)
 }
 
-/// Whether `name`, an entry of a franchise's target directory, is a `.forklift` folder a
-/// franchise was still staging when it stopped: the claim builds `.forklift` under a temp name
+/// Whether `name`, an entry of a clone's target directory, is a `.forklift` folder a
+/// clone was still staging when it stopped: the claim builds `.forklift` under a temp name
 /// and renames it into place.
 pub fn is_staging_leftover(name: &OsStr) -> bool {
     is_temp_of(name, FOLDER_NAME_FORKLIFT_ROOT)
 }
 
-/// Claim `target`, which [`admit`] judged [`Admission::Fresh`], for a new franchise: create it
+/// Claim `target`, which [`admit`] judged [`Admission::Fresh`], for a new clone: create it
 /// (and any missing ancestor) if absent, then put its `.forklift` folder in place with `record`
 /// already inside. The folder is built under a staging name and renamed into place only if no
 /// `.forklift` exists ([`warehouse_utils::place_forklift`]), so the directory is never a warehouse
 /// without its record: a kill at any point leaves either no `.forklift` (only a staging leftover,
-/// which [`admit`] ignores) or one the gate refuses. Two franchises racing for one directory
+/// which [`admit`] ignores) or one the gate refuses. Two clones racing for one directory
 /// cannot both claim it.
 ///
 /// An ancestor is created with the tolerant `create_dir_all` and never removed: an empty one never
@@ -464,7 +464,7 @@ pub fn claim(target: &Path, record: &FranchiseRecord) -> Result<(), String> {
     }
 
     let taken = || format!(
-        "\"{}\" was claimed by another franchise while this one was connecting; franchise into a new \
+        "\"{}\" was claimed by another clone while this one was connecting; clone into a new \
         or empty directory.", target.to_string_lossy()
     );
 
@@ -516,18 +516,18 @@ pub fn census(forklift: &Path) -> Result<u64, String> {
     count(&forklift.join(FOLDER_NAME_OBJECTS_ROOT))
 }
 
-/// How a target directory stands before a franchise into it.
+/// How a target directory stands before a clone into it.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Admission {
     /// Absent, or empty but for `.forklift` folders a stopped claim was staging.
     Fresh,
 
-    /// An unfinished franchise: its record, or `None` for a run that stopped before its record was
+    /// An unfinished clone: its record, or `None` for a run that stopped before its record was
     /// durable (its `.forklift` holds nothing but the lock, record temps and an unreadable record).
     Resume(Option<FranchiseRecord>),
 }
 
-/// Judge `target` for a franchise: a fresh one, a resume, or a refusal. Read-only.
+/// Judge `target` for a clone: a fresh one, a resume, or a refusal. Read-only.
 pub fn admit(target: &Path) -> Result<Admission, String> {
     match std::fs::symlink_metadata(target) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Admission::Fresh),
@@ -537,7 +537,7 @@ pub fn admit(target: &Path) -> Result<Admission, String> {
 
     if !target.is_dir() {
         return Err(format!(
-            "\"{}\" already exists and is not a directory; franchise into a new or empty directory.",
+            "\"{}\" already exists and is not a directory; clone into a new or empty directory.",
             target.to_string_lossy()
         ));
     }
@@ -550,7 +550,7 @@ pub fn admit(target: &Path) -> Result<Admission, String> {
     }
 
     let not_empty = || format!(
-        "\"{}\" is not empty; franchise into a new or empty directory.", target.to_string_lossy()
+        "\"{}\" is not empty; clone into a new or empty directory.", target.to_string_lossy()
     );
 
     if !names.iter().any(|name| name.as_os_str() == FOLDER_NAME_FORKLIFT_ROOT) {
@@ -572,8 +572,8 @@ pub fn admit(target: &Path) -> Result<Admission, String> {
         Ok(None) => Err(not_empty()),
         Err(MarkerError::Torn(_)) if only_debris => Ok(Admission::Resume(None)),
         Err(e) => Err(format!(
-            "\"{}\" holds a franchise that did not finish, but its record cannot be read: {} Delete \
-            the directory and franchise again.",
+            "\"{}\" holds a clone that did not finish, but its record cannot be read: {} Delete \
+            the directory and clone again.",
             target.to_string_lossy(), e.describe(&record_path(&forklift))
         )),
     }
@@ -609,7 +609,7 @@ fn list_names(dir: &Path) -> Result<Vec<std::ffi::OsString>, String> {
 ///    recorded path is deleted, and each deletion is made durable before step 2 drops the taint
 ///    records. Without an anchor to verify against (`record` is `None`, or recorded no genesis),
 ///    every kept signature, sidecar or table, is deleted too, so the resume fetches them again
-///    exactly as a fresh franchise would.
+///    exactly as a fresh clone would.
 /// 2. Every entry of `.forklift` but the object store, the record, the held lock and, unless
 ///    `keep` is [`BundleState::None`], the bundles. Refs above all: the history walk stops at any
 ///    parcel a local ref holds, and a ref an earlier attempt wrote is complete only at that
@@ -631,7 +631,7 @@ pub fn prepare_resume(target: &Path, record: Option<&FranchiseRecord>, keep: &Bu
     let objects = forklift.join(FOLDER_NAME_OBJECTS_ROOT);
 
     if !is_real_dir(&forklift)? {
-        return Err(format!("\"{}\" is not a folder; delete \"{}\" and franchise again.",
+        return Err(format!("\"{}\" is not a folder; delete \"{}\" and clone again.",
                            forklift.to_string_lossy(), target.to_string_lossy()));
     }
 
@@ -860,11 +860,11 @@ pub fn bound_retry(retry: Retry, failure: &Failure, previous: Option<&Failure>, 
     }
 }
 
-/// The `franchise` command that resumes a franchise of `url` into `directory` with `request`.
+/// The `clone` command that resumes a clone of `url` into `directory` with `request`.
 /// Never the token (a resume reuses the recorded one) and never `--expect` (a resume enforces
 /// the recorded genesis itself).
 pub fn resume_command(url: &str, directory: &str, request: &Request) -> String {
-    let mut command = format!("forklift franchise {} {}", quote(url), quote(directory));
+    let mut command = format!("forklift clone {} {}", quote(url), quote(directory));
 
     if let Some(pallet) = &request.pallet {
         command.push_str(&format!(" --pallet {}", quote(pallet)));
@@ -892,7 +892,7 @@ fn quote(arg: &str) -> String {
     }
 }
 
-/// The next step for a franchise whose last attempt failed with `retry`.
+/// The next step for a clone whose last attempt failed with `retry`.
 fn failed_next_step(command: &str, directory: &str, retry: Retry) -> String {
     match retry {
         Retry::Same | Retry::Unknown => format!(
@@ -907,7 +907,7 @@ fn failed_next_step(command: &str, directory: &str, retry: Retry) -> String {
     }
 }
 
-/// The `franchise_incomplete` refusal for a franchise's own failure after its claim: `cause` with
+/// The `clone_incomplete` refusal for a clone's own failure after its claim: `cause` with
 /// the directory kept, and the next step `retry` earns.
 pub fn failure_refusal(directory: &str, record: &FranchiseRecord, cause: &str, failure: &Failure) -> CoreError {
     let message = match CoreError::from(cause.to_string()) {
@@ -917,14 +917,14 @@ pub fn failure_refusal(directory: &str, record: &FranchiseRecord, cause: &str, f
     let command = resume_command(&record.url, directory, &record.request);
 
     CoreError::refusal_with_details(
-        RefusalCode::FranchiseIncomplete,
-        format!("{} The franchise did not finish; \"{}\" was kept with what was fetched.", message.trim_end(), directory),
+        RefusalCode::CloneIncomplete,
+        format!("{} The clone did not finish; \"{}\" was kept with what was fetched.", message.trim_end(), directory),
         failed_next_step(&command, directory, failure.retry),
         details(directory, Some(&record.url), Some(failure)),
     )
 }
 
-/// The `franchise_incomplete` details: the directory, the remote when known, and the last
+/// The `clone_incomplete` details: the directory, the remote when known, and the last
 /// failure's code and retry advice when there is one.
 pub fn details(directory: &str, remote: Option<&str>, failure: Option<&Failure>) -> serde_json::Value {
     serde_json::json!({
@@ -935,18 +935,18 @@ pub fn details(directory: &str, remote: Option<&str>, failure: Option<&Failure>)
     })
 }
 
-/// Refuse to enter the warehouse at `root` while it holds an unfinished franchise: a record, a
+/// Refuse to enter the warehouse at `root` while it holds an unfinished clone: a record, a
 /// record's temp file or an unreadable record. Runs before any lock is taken, for every command,
-/// so a command run while a franchise is still running is told that, not that the lock is held.
+/// so a command run while a clone is still running is told that, not that the lock is held.
 pub fn gate(root: &Path) -> Result<(), CoreError> {
     let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
 
     let directory = root.to_string_lossy().into_owned();
 
-    // Whether a franchise is unfinished cannot be told: refused, never guessed either way.
+    // Whether a clone is unfinished cannot be told: refused, never guessed either way.
     let unknowable = |why: String| CoreError::refusal_with_details(
-        RefusalCode::FranchiseIncomplete,
-        format!("Whether \"{}\" holds a franchise that has not finished cannot be checked: {}", directory, why),
+        RefusalCode::CloneIncomplete,
+        format!("Whether \"{}\" holds a clone that has not finished cannot be checked: {}", directory, why),
         format!("Make \"{}\" readable and run the command again.", forklift.to_string_lossy()),
         details(&directory, None, None),
     );
@@ -963,20 +963,20 @@ pub fn gate(root: &Path) -> Result<(), CoreError> {
     let Some(record) = record else {
         let next_step = if locked {
             format!(
-                "A franchise may still be running there. If none is, remove the stale lock \"{}\" and run \
-                \"forklift franchise <url> {}\" with the URL it was started with; or delete \"{}\".",
+                "A clone may still be running there. If none is, remove the stale lock \"{}\" and run \
+                \"forklift clone <url> {}\" with the URL it was started with; or delete \"{}\".",
                 lock.to_string_lossy(), quote(&directory), directory
             )
         } else {
             format!(
-                "Run \"forklift franchise <url> {}\" with the URL it was started with, or delete \"{}\".",
+                "Run \"forklift clone <url> {}\" with the URL it was started with, or delete \"{}\".",
                 quote(&directory), directory
             )
         };
 
         return Err(CoreError::refusal_with_details(
-            RefusalCode::FranchiseIncomplete,
-            format!("\"{}\" holds a franchise that has not finished.", directory),
+            RefusalCode::CloneIncomplete,
+            format!("\"{}\" holds a clone that has not finished.", directory),
             next_step,
             details(&directory, None, None),
         ));
@@ -987,21 +987,21 @@ pub fn gate(root: &Path) -> Result<(), CoreError> {
 
     let message = match failure {
         Some(failure) => format!(
-            "\"{}\" holds a franchise of {} that has not finished: its last attempt failed ({}).",
+            "\"{}\" holds a clone of {} that has not finished: its last attempt failed ({}).",
             directory, record.url, failure.cause_code
         ),
         None if locked => format!(
-            "\"{}\" holds a franchise of {} that has not finished: it may still be running.",
+            "\"{}\" holds a clone of {} that has not finished: it may still be running.",
             directory, record.url
         ),
         None => format!(
-            "\"{}\" holds a franchise of {} that has not finished: it was interrupted.", directory, record.url
+            "\"{}\" holds a clone of {} that has not finished: it was interrupted.", directory, record.url
         ),
     };
 
     let next_step = if locked {
         format!(
-            "A franchise may still be running there. If none is, remove the stale lock \"{}\", then run \
+            "A clone may still be running there. If none is, remove the stale lock \"{}\", then run \
             \"{}\" to resume it; or delete \"{}\".",
             lock.to_string_lossy(), command, directory
         )
@@ -1013,7 +1013,7 @@ pub fn gate(root: &Path) -> Result<(), CoreError> {
     };
 
     Err(CoreError::refusal_with_details(
-        RefusalCode::FranchiseIncomplete,
+        RefusalCode::CloneIncomplete,
         message,
         next_step,
         details(&directory, Some(&record.url), failure),
@@ -1025,7 +1025,7 @@ mod tests {
     use super::*;
 
     fn temp_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("forklift-franchise-utils-{}-{}", label, std::process::id()));
+        let dir = std::env::temp_dir().join(format!("forklift-clone-utils-{}-{}", label, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1064,7 +1064,7 @@ mod tests {
     }
 
     /// `cache` is written only when set, so any value but `true` is a torn record, never a
-    /// franchise without `--cache`.
+    /// clone without `--cache`.
     ///
     /// Revert: read any `cache` value as false → red.
     #[test]
@@ -1221,7 +1221,7 @@ mod tests {
         std::fs::write(record_path(&forklift), b"/forklift-franchise 9\n").unwrap();
         assert!(admit(&dir).is_err());
 
-        // A finished warehouse is not a franchise to resume.
+        // A finished warehouse is not a clone to resume.
         std::fs::remove_file(record_path(&forklift)).unwrap();
         std::fs::create_dir(forklift.join("pallets")).unwrap();
         assert!(admit(&dir).unwrap_err().contains("is not empty"));
@@ -1333,16 +1333,16 @@ mod tests {
 
         write(&forklift, &record()).unwrap();
         let (refused, details) = code(gate(&dir));
-        assert_eq!(refused, RefusalCode::FranchiseIncomplete);
+        assert_eq!(refused, RefusalCode::CloneIncomplete);
         assert_eq!(details["cause_code"], "error");
         assert_eq!(details["retry"], "unknown");
 
         std::fs::write(record_path(&forklift), b"torn").unwrap();
-        assert_eq!(code(gate(&dir)).0, RefusalCode::FranchiseIncomplete);
+        assert_eq!(code(gate(&dir)).0, RefusalCode::CloneIncomplete);
 
         std::fs::remove_file(record_path(&forklift)).unwrap();
         std::fs::write(forklift.join("franchise.tmp~1-0"), b"x").unwrap();
-        assert_eq!(code(gate(&dir)).0, RefusalCode::FranchiseIncomplete);
+        assert_eq!(code(gate(&dir)).0, RefusalCode::CloneIncomplete);
 
         finish(&forklift).unwrap();
         assert!(gate(&dir).is_ok(), "finishing clears the temps with the record");
@@ -1355,11 +1355,11 @@ mod tests {
         let request = Request { pallet: Some("it's".to_string()), only: vec!["a b".to_string(), "docs".to_string()], cache: false };
         assert_eq!(
             resume_command("http://h:1", "/tmp/my dir", &request),
-            "forklift franchise http://h:1 '/tmp/my dir' --pallet 'it'\\''s' --only 'a b' --only docs"
+            "forklift clone http://h:1 '/tmp/my dir' --pallet 'it'\\''s' --only 'a b' --only docs"
         );
 
         let request = Request { cache: true, ..Request::default() };
-        assert_eq!(resume_command("http://h:1", "d", &request), "forklift franchise http://h:1 d --cache");
+        assert_eq!(resume_command("http://h:1", "d", &request), "forklift clone http://h:1 d --cache");
     }
 
     #[test]
@@ -1374,7 +1374,7 @@ mod tests {
             "nothing but the claimed folder: the staging name is gone");
 
         let second = claim(&target, &record());
-        assert!(second.unwrap_err().contains("claimed by another franchise"));
+        assert!(second.unwrap_err().contains("claimed by another clone"));
         assert_eq!(read(&target.join(FOLDER_NAME_FORKLIFT_ROOT)), Ok(Some(record())), "the winner's record stands");
 
         // A pre-existing empty target, and one holding a stopped claim's staging folder.
@@ -1438,7 +1438,7 @@ mod tests {
         std::fs::create_dir_all(outside.join("ab")).unwrap();
         std::fs::write(outside.join("ab").join("cdef"), b"keep").unwrap();
 
-        // A link to what looks like an unfinished franchise's `.forklift`.
+        // A link to what looks like an unfinished clone's `.forklift`.
         let outside_forklift = root.join("outside-forklift");
         std::fs::create_dir_all(outside_forklift.join("refs")).unwrap();
         write(&outside_forklift, &record()).unwrap();
@@ -1477,7 +1477,7 @@ mod tests {
     }
 
     /// A `.forklift` whose record cannot be read for a reason other than its content is refused
-    /// with the franchise's code, saying it cannot be checked: never waved through, never told to
+    /// with the clone's code, saying it cannot be checked: never waved through, never told to
     /// prepare a warehouse.
     #[test]
     fn the_gate_refuses_what_it_cannot_check() {
@@ -1485,7 +1485,7 @@ mod tests {
         std::fs::create_dir_all(root.join(FOLDER_NAME_FORKLIFT_ROOT).join(FILE_NAME_FRANCHISE)).unwrap();
 
         match gate(&root) {
-            Err(CoreError::Refusal { code: RefusalCode::FranchiseIncomplete, message, .. }) => {
+            Err(CoreError::Refusal { code: RefusalCode::CloneIncomplete, message, .. }) => {
                 assert!(message.contains("cannot be checked"), "{}", message);
             }
             other => panic!("{:?}", other),

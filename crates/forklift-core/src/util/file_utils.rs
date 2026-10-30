@@ -32,7 +32,7 @@ const IGNORE_FILE_COMMENT_PREFIX: &str = "#";
 
 /// Always ignored: the warehouse's own folder, and at any depth the folders a `.forklift` is built
 /// in before it is renamed into place (`.forklift.tmp~<pid>-<n>`, see
-/// `warehouse_utils::place_forklift`), which an interrupted prepare or franchise leaves behind.
+/// `warehouse_utils::place_forklift`), which an interrupted prepare or clone leaves behind.
 /// Anchored at both ends, and the staging rule on a whole path component, so a tracked sibling that
 /// merely starts with the same name (`.forklift-notes`, the ignore file itself) is not swallowed.
 /// The ignore file is tracked content, like `.gitignore`: its rules travel with the history.

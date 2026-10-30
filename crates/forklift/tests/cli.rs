@@ -1536,7 +1536,7 @@ fn an_edit_under_a_cherry_picked_nested_folder_is_visible_and_blocks_shift() {
     assert_success(&warehouse.run(&["stack", "change x/y/z.txt"]));
 
     assert_success(&warehouse.run(&["shift", "main"]));
-    assert_success(&warehouse.run(&["cherry-pick", &source]));
+    assert_success(&warehouse.run(&["pick", &source]));
     assert_eq!(read(&warehouse, "x/y/z.txt"), "z\n");
 
     warehouse.write_file("x/y/z.txt", "local\n");
@@ -5572,7 +5572,7 @@ fn self_update_check_reports_without_mutating() {
 }
 
 /// `self-schema --json` keeps the document's key order, unlike other envelopes' `data`: Pult
-/// binds positional params in the order they are listed, so a sorted `franchise` would take
+/// binds positional params in the order they are listed, so a sorted `clone` would take
 /// the directory for the url. Human mode prints the same document, so the keys of both, in
 /// order, must agree past the envelope's header.
 #[test]
@@ -5589,9 +5589,9 @@ fn self_schema_json_keeps_the_document_order() {
     assert_success(&enveloped);
     assert_success(&human);
 
-    // Not sorted: in franchise, `url` (the first positional) comes before `directory`.
+    // Not sorted: in clone, `url` (the first positional) comes before `directory`.
     let text = stdout(&enveloped);
-    let at = text.find("\"id\": \"franchise\"").expect("franchise is described");
+    let at = text.find("\"id\": \"clone\"").expect("clone is described");
     assert!(text[at..].find("\"url\":").unwrap() < text[at..].find("\"directory\":").unwrap());
 
     let header = ["lonic_json", "tool", "schema", "command", "ok", "data"];
@@ -5928,7 +5928,7 @@ fn haul_reviews_carry_signed_identity_and_merges() {
 
     // Merge is recorded, not gated on the request-changes (MVP policy) → merged, and the
     // source's file is now on the target.
-    assert_success(&warehouse.run(&["haul", "merge", &id]));
+    assert_success(&warehouse.run(&["haul", "consolidate", &id]));
     assert_eq!(std::fs::read_to_string(warehouse.root.join("feature.txt")).unwrap(), "feat 2\n");
     let shown = json(&warehouse.run(&["haul", "show", &id, "--json"]));
     assert_eq!(shown["data"]["status"], "merged");
@@ -5986,7 +5986,7 @@ fn haul_merge_by_a_writer_not_granted_the_target_is_refused_before_merging() {
     let main = pallet_head_hash(&warehouse, "main");
 
     assert_success(&warehouse.run(&["config", "operator.identifier", "dev@forklift"]));
-    let refused = warehouse.run(&["haul", "merge", &id]);
+    let refused = warehouse.run(&["haul", "consolidate", &id]);
     assert!(
         stderr(&refused).contains("Operator dev@forklift may not write \"main\", and only its writers record a merge into it. Nothing was merged."),
         "{}", stderr(&refused)
@@ -6001,7 +6001,7 @@ fn haul_merge_by_a_writer_not_granted_the_target_is_refused_before_merging() {
     assert_success(&warehouse.run(&["config", "operator.identifier", "test@forklift"]));
     assert_success(&warehouse.run(&["office", "role", "dev@forklift", "writer", "--pallet", "feature", "--pallet", "main"]));
     assert_success(&warehouse.run(&["config", "operator.identifier", "dev@forklift"]));
-    assert_success(&warehouse.run(&["haul", "merge", &id]));
+    assert_success(&warehouse.run(&["haul", "consolidate", &id]));
     assert_eq!(json(&warehouse.run(&["haul", "show", &id, "--json"]))["data"]["status"], "merged");
 }
 
@@ -7180,17 +7180,17 @@ fn an_empty_value_is_refused_with_advice_only_where_the_advice_is_always_true() 
     assert!(!message.contains("--unset"), "the parse door may not suggest --unset: {message}");
 }
 
-/// `franchise --token ""` and `profile use ""` refuse in their own words before doing anything,
+/// `clone --token ""` and `profile use ""` refuse in their own words before doing anything,
 /// rather than reaching the configuration write — whose refusal would name a key the user never
 /// typed.
 #[test]
 fn franchise_and_profile_use_refuse_an_empty_value_in_their_own_words() {
-    let warehouse = TestWarehouse::new("empty-value-franchise-profile-use");
+    let warehouse = TestWarehouse::new("empty-value-clone-profile-use");
     assert_success(&warehouse.run(&["prepare"]));
 
     // Nothing listens here: a refusal that came after the handshake would be a network error,
     // not the one asserted below.
-    let refused = warehouse.run(&["franchise", "http://127.0.0.1:9/", "clone", "--token", "  "]);
+    let refused = warehouse.run(&["clone", "http://127.0.0.1:9/", "clone", "--token", "  "]);
     assert!(!refused.status.success(), "an empty token must refuse: {}", stdout(&refused));
 
     let message = stderr(&refused);
@@ -7762,6 +7762,36 @@ fn a_unique_prefix_runs_the_command_and_an_ambiguous_one_is_a_usage_error() {
                "\"re\" could be \"forklift help haul review\" or \"forklift help haul reopen\"; type more of the name");
 }
 
+/// git's words for the renamed pick and haul consolidate still run them, unlisted; the old
+/// Forklift-only names are gone.
+///
+/// Revert: drop `alias = "cherry-pick"` from pick (or `alias = "merge"` from haul consolidate) →
+/// that word is a usage error.
+#[test]
+fn git_words_still_reach_the_renamed_commands_and_old_forklift_names_are_gone() {
+    let warehouse = TestWarehouse::new("renamed-words");
+
+    // Outside a warehouse, the command runs far enough to refuse, and the header names it.
+    let value = json(&warehouse.run(&["--json", "cherry-pick", "main"]));
+    assert_eq!(value["error"]["code"], "not_a_warehouse", "{}", value);
+    assert_eq!(value["command"], "pick", "{}", value);
+    let value = json(&warehouse.run(&["--json", "haul", "merge", "1"]));
+    assert_eq!(value["error"]["code"], "not_a_warehouse", "{}", value);
+    assert_eq!(value["command"], "haul", "{}", value);
+
+    for old in [&["kv", "list"][..], &["franchise", "http://localhost:1", "x"]] {
+        let value = json(&warehouse.run(&[&["--json"][..], old].concat()));
+        assert_eq!(value["error"]["code"], "usage", "{:?}: {}", old, value);
+    }
+
+    // Neither git word is listed as a command.
+    let listed = |help: &str, word: &str| help.lines().any(|line| line.trim_start().starts_with(&format!("{word} ")));
+    let help = stdout(&warehouse.run(&["--help"]));
+    assert!(listed(&help, "pick") && !listed(&help, "cherry-pick"), "{help}");
+    let help = stdout(&warehouse.run(&["haul", "--help"]));
+    assert!(listed(&help, "consolidate") && !listed(&help, "merge"), "{help}");
+}
+
 /// Bare `git` runs nothing and prints its help, listing its subcommands, since each names a
 /// different direction; bare `store` reports as `store status` does.
 ///
@@ -8191,7 +8221,7 @@ fn cherry_pick_refuses_on_an_incomplete_load_before_writing_state() {
     let marker_path = incomplete_load_marker_path(&warehouse);
     std::fs::write(&marker_path, "./\n").unwrap();
 
-    let picked = warehouse.run(&["cherry-pick", &source, "--json"]);
+    let picked = warehouse.run(&["pick", &source, "--json"]);
     assert_eq!(picked.status.code(), Some(20));
     assert_eq!(json(&picked)["error"]["code"], "incomplete_load");
 
@@ -8203,7 +8233,7 @@ fn cherry_pick_refuses_on_an_incomplete_load_before_writing_state() {
 
     // Healing the load lets the cherry-pick proceed normally.
     std::fs::remove_file(&marker_path).unwrap();
-    assert_success(&warehouse.run(&["cherry-pick", &source]));
+    assert_success(&warehouse.run(&["pick", &source]));
 }
 
 /// `haul merge` calls the same shared `merge_head_into_current` consolidate and cherry-pick do:
@@ -8238,7 +8268,7 @@ fn haul_merge_refuses_on_an_incomplete_load_before_writing_consolidation_state()
     let marker_path = incomplete_load_marker_path(&warehouse);
     std::fs::write(&marker_path, "./\n").unwrap();
 
-    let merged = warehouse.run(&["haul", "merge", &id, "--json"]);
+    let merged = warehouse.run(&["haul", "consolidate", &id, "--json"]);
     assert_eq!(merged.status.code(), Some(20));
     assert_eq!(json(&merged)["error"]["code"], "incomplete_load");
 
@@ -8255,7 +8285,7 @@ fn haul_merge_refuses_on_an_incomplete_load_before_writing_consolidation_state()
 
     // Healing the load lets the haul merge normally.
     std::fs::remove_file(&marker_path).unwrap();
-    assert_success(&warehouse.run(&["haul", "merge", &id]));
+    assert_success(&warehouse.run(&["haul", "consolidate", &id]));
 }
 
 /// Re-running `load` is real work an operator may not always want to redo; abandoning an
@@ -8916,7 +8946,7 @@ fn undo_refuses_rather_than_silently_no_opping_when_the_pallet_moved_on() {
         "haul", "open", "--target", "main", "--source", "feature", "--title", "Add feature", "-m", "please review",
     ]));
     let id = json(&warehouse.run(&["haul", "list", "--json"]))["data"]["hauls"][0]["id"].as_str().unwrap().to_string();
-    assert_success(&warehouse.run(&["haul", "merge", &id]));
+    assert_success(&warehouse.run(&["haul", "consolidate", &id]));
 
     let head_before = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap();
 
@@ -8986,7 +9016,7 @@ fn undo_refuses_a_stale_consolidation_after_the_pallet_moved_on() {
         "haul", "open", "--target", "main", "--source", "extra", "--title", "Extra", "-m", "please review",
     ]));
     let id = json(&warehouse.run(&["haul", "list", "--json"]))["data"]["hauls"][0]["id"].as_str().unwrap().to_string();
-    assert_success(&warehouse.run(&["haul", "merge", &id]));
+    assert_success(&warehouse.run(&["haul", "consolidate", &id]));
 
     let head_before = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap();
 
@@ -9490,7 +9520,7 @@ fn cherry_pick_applies_a_parcel_diff_preserving_authorship() {
 
     // test cherry-picks bob's parcel onto main.
     assert_success(&warehouse.run(&["shift", "main"]));
-    let picked = json(&warehouse.run(&["--json", "cherry-pick", &source]));
+    let picked = json(&warehouse.run(&["--json", "pick", &source]));
     assert_eq!(picked["data"]["outcome"], "applied");
 
     // The file is applied, and the new parcel preserves bob's authorship while recording
@@ -9506,7 +9536,7 @@ fn cherry_pick_applies_a_parcel_diff_preserving_authorship() {
     assert!(actions.contains(&("stack".to_string(), "test@forklift".to_string())), "{:?}", actions);
 
     // Cherry-picking the same parcel again is refused: its changes are already present.
-    let again = warehouse.run(&["cherry-pick", &source]);
+    let again = warehouse.run(&["pick", &source]);
     assert!(!again.status.success() && stderr(&again).contains("already"), "{}", stderr(&again));
 }
 
@@ -9532,7 +9562,7 @@ fn cherry_pick_conflicts_are_marked_and_completed_by_stacking() {
     assert_success(&warehouse.run(&["stack", "main edits beta"]));
 
     // The pick reports a conflict and leaves markers.
-    let picked = json(&warehouse.run(&["--json", "cherry-pick", &source]));
+    let picked = json(&warehouse.run(&["--json", "pick", &source]));
     assert_eq!(picked["data"]["outcome"], "conflicts");
     assert_eq!(picked["data"]["conflicts"][0], "f.txt");
     assert!(std::fs::read_to_string(warehouse.root.join("f.txt")).unwrap().contains("<<<<<<<"));
@@ -9577,10 +9607,10 @@ fn undo_reverses_a_conflicted_cherry_pick_and_its_completion() {
 
     // Undoing the conflicted pick abandons it: no parcel comes off, the pick is no longer in
     // progress — and the stack before it is not reached.
-    let picked = json(&warehouse.run(&["--json", "cherry-pick", &source]));
+    let picked = json(&warehouse.run(&["--json", "pick", &source]));
     assert_eq!(picked["data"]["outcome"], "conflicts");
     let undone = json(&warehouse.run(&["--json", "undo"]));
-    assert_eq!(undone["data"]["op"], "cherry-pick");
+    assert_eq!(undone["data"]["op"], "pick");
     assert!(undone["data"].get("undone").is_none(), "{}", undone);
     assert!(!pick_state.exists(), "undo must abandon the pick");
     assert_eq!(std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap(), main_head);
@@ -9588,7 +9618,7 @@ fn undo_reverses_a_conflicted_cherry_pick_and_its_completion() {
     // Pick again, resolve and complete it; undoing the completion puts the pick back in progress.
     warehouse.write_file("f.txt", "alpha\nbeta-MAIN\ngamma\n");
     assert_success(&warehouse.run(&["load", "."]));
-    let picked = json(&warehouse.run(&["--json", "cherry-pick", &source]));
+    let picked = json(&warehouse.run(&["--json", "pick", &source]));
     assert_eq!(picked["data"]["outcome"], "conflicts");
     warehouse.write_file("f.txt", "alpha\nbeta-RESOLVED\ngamma\n");
     assert_success(&warehouse.run(&["load", "."]));
@@ -9828,7 +9858,7 @@ fn cherry_pick_flips_a_tracked_directory_into_a_file_and_back() {
 
     // Cherry-pick that parcel onto "main", where "foo" is still a tracked, clean directory.
     assert_success(&warehouse.run(&["shift", "main"]));
-    let picked = json(&warehouse.run(&["--json", "cherry-pick", &source]));
+    let picked = json(&warehouse.run(&["--json", "pick", &source]));
     assert_eq!(picked["data"]["outcome"], "applied", "{:?}", picked);
 
     assert!(!warehouse.root.join("foo").is_dir(), "\"foo\" must now be a file, not a directory");
@@ -9862,7 +9892,7 @@ fn cherry_pick_flips_a_tracked_file_into_a_directory() {
     let source = extract_parcel_hash(&warehouse.run(&["stack", "flip foo to a directory"]));
 
     assert_success(&warehouse.run(&["shift", "main"]));
-    let picked = json(&warehouse.run(&["--json", "cherry-pick", &source]));
+    let picked = json(&warehouse.run(&["--json", "pick", &source]));
     assert_eq!(picked["data"]["outcome"], "applied", "{:?}", picked);
 
     assert!(warehouse.root.join("foo").is_dir(), "\"foo\" must now be a directory");
@@ -10564,7 +10594,7 @@ fn a_mutating_command_runs_maintenance_when_due() {
 // binary (no `lib` target `tests/cli.rs` could link a unit under test from).
 
 // ---------------------------------------------------------------------------------------------
-// The densify suggestion: `git import`'s pack-direct path (and a franchise's native bundle
+// The densify suggestion: `git import`'s pack-direct path (and a clone's native bundle
 // install) can only ever see per-path/per-window similarity on the way in, unlike a plain
 // `compact --all --redelta`'s whole-store pass — so a bulk-ingested store sets a marker that
 // `store` surfaces as a one-line suggestion, cleared once a redelta run actually earns it back.
@@ -10723,7 +10753,7 @@ fn a_scoped_bay_materializes_only_its_subtree_and_reports_the_scope() {
 }
 
 /// A bay scope recorded in the older, unversioned format is refused, and the way out it names is
-/// the bay's own (a new bay under another name), not the sparse warehouse's (franchise again).
+/// the bay's own (a new bay under another name), not the sparse warehouse's (clone again).
 #[test]
 fn a_scoped_bay_with_an_unversioned_scope_file_names_re_adding_the_bay() {
     let warehouse = scoped_fixture("scoped-legacy");
@@ -10739,7 +10769,7 @@ fn a_scoped_bay_with_an_unversioned_scope_file_names_re_adding_the_bay() {
     assert!(!refused.status.success(), "{}", stdout(&refused));
     assert!(stderr(&refused).contains("older version of Forklift"), "{}", stderr(&refused));
     assert!(stderr(&refused).contains("add a new one under another name"), "{}", stderr(&refused));
-    assert!(!stderr(&refused).contains("Franchise"), "{}", stderr(&refused));
+    assert!(!stderr(&refused).contains("Clone"), "{}", stderr(&refused));
 }
 
 #[test]
@@ -12371,7 +12401,7 @@ fn heal_reports_a_vanished_but_referenced_object_and_everything_still_refuses() 
     assert!(!value["error"]["message"].as_str().unwrap().contains("forklift lower"));
     // Machine-coded remedies, not an exitless refusal.
     let next_step = value["error"]["next_step"].as_str().unwrap();
-    assert!(next_step.contains("franchise") && next_step.contains("accept the loss"));
+    assert!(next_step.contains("clone") && next_step.contains("accept the loss"));
     assert!(!next_step.contains("forklift lower"));
 
     assert!(recorded_taint_paths(&warehouse).contains(&relative),
@@ -12518,7 +12548,7 @@ fn heal_on_a_torn_taint_with_a_dangling_reference_rescans_into_a_named_remainder
     let next_step = value["error"]["next_step"].as_str().unwrap();
     assert!(next_step.contains("no longer torn") && next_step.contains("forklift heal"),
         "the next step must direct to a plain re-run, now that the scope is known: {}", next_step);
-    assert!(next_step.contains("franchise") && next_step.contains("accept the loss"),
+    assert!(next_step.contains("clone") && next_step.contains("accept the loss"),
         "the heavyweight exits must still be named for what a re-run cannot resolve: {}", next_step);
     // No remote is configured, and the rescan itself never drives the §3.2 refetch (that is the
     // *next* heal's job, against the now-known remainder) — "forklift lower" must never be named.
@@ -13433,7 +13463,7 @@ fn a_delete_refuses_an_open_hauls_pallets_and_names_a_merged_haul() {
     }
 
     assert_success(&warehouse.run(&["shift", "release"]));
-    assert_success(&warehouse.run(&["haul", "merge", &id]));
+    assert_success(&warehouse.run(&["haul", "consolidate", &id]));
     assert_success(&warehouse.run(&["shift", "main"]));
 
     let deleted = warehouse.run(&["--json", "pallet", "delete", "release", "--force"]);
@@ -13759,7 +13789,7 @@ fn a_repack_keeps_the_head_an_open_or_closed_haul_proposes_after_its_source_move
 
     assert_success(&warehouse.run(&["haul", "reopen", closed]));
     for (id, _) in &hauls {
-        assert_success(&warehouse.run(&["haul", "merge", id]));
+        assert_success(&warehouse.run(&["haul", "consolidate", id]));
     }
     assert_eq!(std::fs::read_to_string(warehouse.root.join("fix.txt")).unwrap(), "fix only here\n");
 }
@@ -13787,7 +13817,7 @@ fn haul_merge_of_a_head_this_warehouse_does_not_hold_names_where_to_get_it() {
     // As if the haul had been opened elsewhere and its head never fetched here.
     std::fs::remove_file(warehouse.root.join(".forklift/objects").join(&proposed[..2]).join(&proposed[2..])).unwrap();
 
-    let merged = warehouse.run(&["haul", "merge", &id]);
+    let merged = warehouse.run(&["haul", "consolidate", &id]);
     assert!(!merged.status.success());
     let err = stderr(&merged);
     assert!(err.contains("which this warehouse does not hold"), "{}", err);
@@ -13796,7 +13826,7 @@ fn haul_merge_of_a_head_this_warehouse_does_not_hold_names_where_to_get_it() {
     assert!(!warehouse.root.join("feature.txt").exists());
 }
 
-/// `prepare` marks the warehouse, and what an interrupted prepare or franchise leaves while building a
+/// `prepare` marks the warehouse, and what an interrupted prepare or clone leaves while building a
 /// `.forklift` (a `.forklift.tmp~<pid>-<n>` folder, at the top or deeper) is never tracked.
 #[test]
 fn prepare_marks_the_warehouse_and_staging_leftovers_are_never_tracked() {
@@ -13805,7 +13835,7 @@ fn prepare_marks_the_warehouse_and_staging_leftovers_are_never_tracked() {
     assert_eq!(std::fs::read_to_string(warehouse.root.join(".forklift/warehouse")).unwrap(), "/forklift-warehouse 2\nfull\n");
 
     warehouse.write_file(".forklift.tmp~9-9/lock", "");
-    warehouse.write_file(".forklift.tmp~9-9/.forklift/franchise", "x\n");
+    warehouse.write_file(".forklift.tmp~9-9/.forklift/clone", "x\n");
     warehouse.write_file("sub/.forklift.tmp~3-4/notes.txt", "x\n");
     warehouse.write_file("sub/keep.txt", "kept\n");
 

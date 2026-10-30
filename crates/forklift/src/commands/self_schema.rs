@@ -69,7 +69,7 @@ const FORKLIFT: Tables = Tables {
         ("self-schema", "the describer itself"),
     ],
     secret: &[
-        ("franchise", "token"), // the bearer token, remembered as remote.token
+        ("clone", "token"),     // the bearer token, remembered as remote.token
         ("config", "value"),    // a configuration value may be that token
         ("remote move", "token"), // the new origin's bearer token, remembered as remote.token
     ],
@@ -79,10 +79,10 @@ const FORKLIFT: Tables = Tables {
         ("office link", "public_key", "the public half of a key pair"),
         ("office authorize", "public_key", "the public half of a key pair"),
         ("office retire", "key_id", "an identifier, not key material"),
-        ("kv set", "key", "a custom-metadata key name, not key material"),
-        ("kv get", "key", "a custom-metadata key name, not key material"),
-        ("kv unset", "key", "a custom-metadata key name, not key material"),
-        ("kv log", "key", "a custom-metadata key name, not key material"),
+        ("manifest set", "key", "a custom-metadata key name, not key material"),
+        ("manifest get", "key", "a custom-metadata key name, not key material"),
+        ("manifest unset", "key", "a custom-metadata key name, not key material"),
+        ("manifest log", "key", "a custom-metadata key name, not key material"),
     ],
 };
 
@@ -791,12 +791,12 @@ mod tests {
             r#"value: The value to set the key to; omit it to print the current value"}"#,
         )), "{config}");
 
-        let franchise = json("franchise");
+        let franchise = json("clone");
         assert!(franchise.contains(concat!(
             r#""token":{"repeat":{"arg":"--token","max":1,"secret":true},"#,
             r#""description":"The bearer token, when the remote requires one (remembered as \"remote.token\")"}"#,
         )), "{franchise}");
-        assert!(franchise.contains(r#""run":"franchise {pallet} {token} {only} {cache} {expect} -- {url} {directory}""#), "{franchise}");
+        assert!(franchise.contains(r#""run":"clone {pallet} {token} {only} {cache} {expect} -- {url} {directory}""#), "{franchise}");
 
         let office = json("office");
         assert!(office.contains(r#""category":"office""#) && office.contains(r#""params":{}"#), "{office}");

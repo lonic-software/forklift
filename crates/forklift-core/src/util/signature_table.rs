@@ -347,7 +347,7 @@ pub(crate) fn unreadable_message(path: &Path, error: &TableError) -> String {
         TableError::Corrupt(detail) => format!(
             "Signature table \"{}\" is corrupt ({}). Move it out of the pack folder to continue: the \
             signatures it holds are then lost locally, and those parcels read as unsigned until the \
-            warehouse is franchised again.",
+            warehouse is cloned again.",
             path.to_string_lossy(), detail
         ),
     }

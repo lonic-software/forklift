@@ -54,7 +54,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
     if keep.is_empty() {
         return Err(
             "A scoped checkout must keep at least one in-scope path. To stop scoping entirely, \
-            open a fresh full checkout: a plain bay of a full warehouse, or a franchise without \
+            open a fresh full checkout: a plain bay of a full warehouse, or a clone without \
             --only.".to_string()
         );
     }

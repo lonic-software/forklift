@@ -31,7 +31,7 @@ pub async fn handle_command(dry_run: bool) -> Result<(), String> {
     if !scope_utils::is_cache_mode()? {
         return Err(
             "This warehouse is not a cache; there is nothing to evict. \"forklift store evict\" frees content a \
-            cache warehouse (one franchised with \"--cache\") can fetch again from its origin.".to_string()
+            cache warehouse (one cloned with \"--cache\") can fetch again from its origin.".to_string()
         );
     }
 

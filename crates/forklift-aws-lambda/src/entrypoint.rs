@@ -87,7 +87,7 @@ pub enum Routing {
 /// * `FORKLIFT_WAREHOUSE_ID`  (optional) — set for single-warehouse serving (`/v1/…`);
 ///   unset selects multi-warehouse serving (`/warehouses/{id}/v1/…`).
 /// * `FORKLIFT_AWS_ENDPOINT_URL` (optional) — an endpoint override for LocalStack/MinIO.
-/// * `FORKLIFT_DEFAULT_PALLET`(optional) — the franchise default; defaults to `main`.
+/// * `FORKLIFT_DEFAULT_PALLET`(optional) — the clone default; defaults to `main`.
 ///
 /// The region is deliberately absent: the provider chain reads `AWS_REGION`, so pinning it
 /// here would only shadow it.

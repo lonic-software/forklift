@@ -1,6 +1,6 @@
 //! Task-scoped sparse workspaces (DESIGN.html §7.6) — the local scope record and the
 //! three-valued classifier every scope-aware walk branches on. Both layers are live: a bay's
-//! materialization scope, and the warehouse fetch scope a sparse franchise records (empty = the
+//! materialization scope, and the warehouse fetch scope a sparse clone records (empty = the
 //! store holds everything).
 //!
 //! A scoped bay materializes and operates on only chosen path subtrees of the user
@@ -11,8 +11,8 @@
 //! * the **bay materialization scope** (`<bay_root>/scope`, bay-local) — what this bay
 //!   materializes and stacks; always a subset (⊆) of the fetch scope, and
 //! * the **warehouse fetch scope** (`config/fetch-scope`, shared) — what the warehouse
-//!   has fetched at all. A full franchise leaves it unset (= full) and only the bay scope
-//!   restricts behavior; a sparse (`franchise --only`) warehouse records the fetched prefixes
+//!   has fetched at all. A full clone leaves it unset (= full) and only the bay scope
+//!   restricts behavior; a sparse (`clone --only`) warehouse records the fetched prefixes
 //!   here, and `expand` widens them.
 //!
 //! The classifier is **three-valued, not boolean**: a boolean
@@ -474,7 +474,7 @@ fn read_bay_scope_at(path: &Path) -> Result<MaterializationScope, String> {
 /// checkout can read — needed by scope-prune, which must intersect the main tree's scope too, not
 /// only the invoking checkout's and the named bays'.
 ///
-/// Unlike a bay's, the main tree's scope follows the warehouse's mode: only a sparse franchise
+/// Unlike a bay's, the main tree's scope follows the warehouse's mode: only a sparse clone
 /// scopes it. A full or cache warehouse's main tree has no scope file and checks out every path; a
 /// file found there was put in place by hand and is refused whatever it holds. A sparse
 /// warehouse's main tree must have one that names a path within the fetch scope, so deleting it
@@ -509,8 +509,8 @@ pub fn read_main_tree_scope() -> Result<MaterializationScope, String> {
 }
 
 /// The way out for a warehouse's fetch scope or main-tree scope Forklift cannot use: both are
-/// written when the warehouse is prepared, so it is franchised again.
-const REMEDY_REFRANCHISE: &str = "Franchise the remote again, into a new directory.";
+/// written when the warehouse is prepared, so it is cloned again.
+const REMEDY_REFRANCHISE: &str = "Clone the remote again, into a new directory.";
 /// The way out for a bay's scope Forklift cannot use. A removed bay keeps its pallet, so its name
 /// stays taken and the new bay needs another.
 const REMEDY_READD_BAY: &str = "Remove the bay with \"forklift bay remove\" and add a new one under another name; \
@@ -610,7 +610,7 @@ pub fn content_may_be_absent() -> Result<bool, String> {
     Ok(read_fetch_state()?.0 != WarehouseMode::Full)
 }
 
-/// Whether the warehouse was franchised with `--cache`: its mode is cache.
+/// Whether the warehouse was cloned with `--cache`: its mode is cache.
 pub fn is_cache_mode() -> Result<bool, String> {
     Ok(read_fetch_state()?.0 == WarehouseMode::Cache)
 }
@@ -753,13 +753,13 @@ pub fn scope_prune_blocked_refusal(path: &str, blockers: &str) -> CoreError {
 /// and a chunk is structurally absent from every bundle. A bundle could still move a chunked
 /// file's recipe as bytes, but the result would be a bundle over a file whose chunks it cannot
 /// contain — unmaterializable wherever it lands. Refusing up front, naming the path, is the honest
-/// failure; a chunked file reaches a peer over the wire per object (franchise/lower/expand fetch
+/// failure; a chunked file reaches a peer over the wire per object (clone/lower/expand fetch
 /// the recipe, then the chunks loose), never inside a bundle.
 ///
 /// # Arguments
 /// * `path` - The warehouse path of the chunked file that blocked the bundle.
 pub fn chunked_transport_refusal(path: &str) -> CoreError {
-    let next_step = "Move this warehouse's history to the peer over the wire (lower/franchise/lift \
+    let next_step = "Move this warehouse's history to the peer over the wire (lower/clone/lift \
         to a chunk-aware remote), which carries chunked files per object; a bundle cannot.".to_string();
 
     refusal(
@@ -1174,7 +1174,7 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// Every pairing of mode and fetch-scope file but the two a franchise writes is refused, by
+    /// Every pairing of mode and fetch-scope file but the two a clone writes is refused, by
     /// every reader, naming the way out; none reads as full.
     ///
     /// Revert: map a sparse warehouse's missing fetch scope to full → its row goes `Ok`; or skip

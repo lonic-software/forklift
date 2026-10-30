@@ -19,7 +19,7 @@ use forklift_core::util::operation_utils::{Operation, OperationKind};
 use forklift_core::util::take_utils::{FetchAt, TakeTrust};
 use crate::output::{self, CommandOutput};
 
-/// Handle the franchise command (git's "clone"): open a local franchise of a remote
+/// Handle the clone command: open a local clone of a remote
 /// warehouse — prepare a fresh warehouse in the target directory, remember the remote,
 /// adopt its trust anchor, download the history (the remote's bundle first, when it has
 /// one, then whatever the bundle lacked as loose objects) and materialize the chosen
@@ -30,39 +30,39 @@ use crate::output::{self, CommandOutput};
 /// token, an unreachable host, or a `--pallet` typo all leave the filesystem exactly as they found
 /// it.
 ///
-/// Once the directory is claimed, it holds a franchise record (`franchise_utils`) until the
-/// franchise finishes. A failure after that point (a dropped connection, a full disk, a typo'd
+/// Once the directory is claimed, it holds a clone record (`franchise_utils`) until the
+/// clone finishes. A failure after that point (a dropped connection, a full disk, a typo'd
 /// `--only` path, a path the working tree cannot hold) or a kill keeps the directory with what
-/// was fetched, and every other command refuses to run there (`franchise_incomplete`). Running
-/// `franchise` again into the same directory resumes it: the verified object store is kept, the
+/// was fetched, and every other command refuses to run there (`clone_incomplete`). Running
+/// `clone` again into the same directory resumes it: the verified object store is kept, the
 /// rest is rebuilt, and `--pallet` and `--only` may change. The URL may not, an omitted `--token`
 /// reuses the recorded one, and the trust genesis the first attempt bound to stays enforced as if
 /// `--expect` were given again.
 ///
 /// # Arguments
-/// * `url`       - The remote to franchise.
+/// * `url`       - The remote to clone.
 /// * `directory` - The directory to create the warehouse in (must be empty or absent, or hold an
-///                 unfinished franchise of `url`).
+///                 unfinished clone of `url`).
 /// * `pallet`    - The pallet to check out (default: the remote's default pallet).
 /// * `token`     - The bearer token, when the remote requires one (also remembered in
 ///                 the warehouse configuration).
-/// * `only`      - When non-empty, franchise **sparsely**: fetch the full signed history but
+/// * `only`      - When non-empty, clone **sparsely**: fetch the full signed history but
 ///                 only the content under these subtree path(s), leaving the rest sealed by
 ///                 hash. The remote's whole-store bundle is skipped, and the remote is
 ///                 recorded as this sparse warehouse's origin (lift refuses to publish
 ///                 elsewhere).
-/// * `cache`     - Franchise as a **cache**: mark the warehouse as one that may lack content
-///                 its history reaches. Like a sparse franchise, it skips the bundle and
+/// * `cache`     - Clone as a **cache**: mark the warehouse as one that may lack content
+///                 its history reaches. Like a sparse clone, it skips the bundle and
 ///                 records its origin. Never combined with `only` (the CLI refuses that).
 /// * `expect`    - The genesis the remote's trust anchor must have (an out-of-band pin),
 ///                 checked against the handshake before anything is downloaded or created.
 ///
 /// # Returns
-/// * `Ok(())` - If the franchise is ready to work in.
+/// * `Ok(())` - If the clone is ready to work in.
 /// * `Err(String)` - Before the claim, with the target as it was found: `--token` is given but
-///   empty, the directory is not empty (or holds a franchise of another remote), the remote is
+///   empty, the directory is not empty (or holds a clone of another remote), the remote is
 ///   unreachable, its trust anchor is not the expected one, or the pallet does not exist. After
-///   it: a `franchise_incomplete` refusal naming the cause, with the directory kept.
+///   it: a `clone_incomplete` refusal naming the cause, with the directory kept.
 pub async fn handle_command(url: &str,
                             directory: &str,
                             pallet: Option<String>,
@@ -71,7 +71,7 @@ pub async fn handle_command(url: &str,
                             cache: bool,
                             expect: Option<String>) -> Result<(), String> {
     // Normalize the sparse scope up front (before any warehouse is created), so a malformed
-    // --only refuses cleanly. An empty list is a full (ordinary) franchise.
+    // --only refuses cleanly. An empty list is a full (ordinary) clone.
     let fetch_scope = resolve_fetch_scope(&only)?;
     let sparse = !fetch_scope.is_full();
 
@@ -89,7 +89,7 @@ pub async fn handle_command(url: &str,
 
     let target = Path::new(directory);
 
-    // The first of two admissions: before the handshake, because an unfinished franchise's record
+    // The first of two admissions: before the handshake, because an unfinished clone's record
     // supplies the token and the trust pin the handshake needs. It goes stale during the handshake,
     // so it is decided again under the warehouse lock.
     let admission = franchise_utils::admit(target)?;
@@ -159,7 +159,7 @@ pub async fn handle_command(url: &str,
 
     // The handshake (and the pallet check) succeeded; only now may the filesystem change. A fresh
     // directory is claimed with its record already in place; a resumed one is already claimed.
-    // What the second admission must find: this franchise's remote and trust binding.
+    // What the second admission must find: this clone's remote and trust binding.
     let expected = match resumed {
         None => {
             franchise_utils::claim(target, &record)?;
@@ -182,7 +182,7 @@ pub async fn handle_command(url: &str,
         &mut attempt, &absolute_target, expected, resolution, fetch_scope, partial, &client, info,
     ).await;
 
-    // Drop any mmap'd pack handles this run loaded (reading a franchised bundle's packs while
+    // Drop any mmap'd pack handles this run loaded (reading a cloned bundle's packs while
     // adopting trust or meta pallets), and get back to where we started.
     pack_utils::invalidate_cache();
     let _ = std::env::set_current_dir(&original_cwd);
@@ -190,16 +190,16 @@ pub async fn handle_command(url: &str,
     outcome
 }
 
-/// Refuse a resume of the franchise `record` describes that cannot be one: another remote, or an
-/// `--expect` pin that is not the genesis the franchise is bound to.
+/// Refuse a resume of the clone `record` describes that cannot be one: another remote, or an
+/// `--expect` pin that is not the genesis the clone is bound to.
 fn check_resume(directory: &str, record: &FranchiseRecord, url: &str, expect: Option<&str>) -> Result<(), String> {
     let command = franchise_utils::resume_command(&record.url, directory, &record.request);
 
     if !origin_utils::same_remote(&record.url, url) {
         return Err(CoreError::refusal_with_details(
-            RefusalCode::FranchiseIncomplete,
+            RefusalCode::CloneIncomplete,
             format!(
-                "\"{}\" holds a franchise of {} that has not finished, not of {}.", directory, record.url, url
+                "\"{}\" holds a clone of {} that has not finished, not of {}.", directory, record.url, url
             ),
             format!("Run \"{}\" to resume it, or delete \"{}\" first.", command, directory),
             franchise_details(directory, record),
@@ -208,9 +208,9 @@ fn check_resume(directory: &str, record: &FranchiseRecord, url: &str, expect: Op
 
     match (expect, record.genesis.as_deref()) {
         (Some(expect), Some(genesis)) if expect != genesis => Err(CoreError::refusal_with_details(
-            RefusalCode::FranchiseIncomplete,
+            RefusalCode::CloneIncomplete,
             format!(
-                "\"{}\" holds a franchise bound to trust genesis {}, not the expected {}.",
+                "\"{}\" holds a clone bound to trust genesis {}, not the expected {}.",
                 directory, genesis, expect
             ),
             format!(
@@ -223,7 +223,7 @@ fn check_resume(directory: &str, record: &FranchiseRecord, url: &str, expect: Op
     }
 }
 
-/// The `franchise_incomplete` details of a resume refused before it started.
+/// The `clone_incomplete` details of a resume refused before it started.
 fn franchise_details(directory: &str, record: &FranchiseRecord) -> serde_json::Value {
     let failure = record.last_failure.as_ref().filter(|_| record.attempt == Attempt::Failed);
 
@@ -231,7 +231,7 @@ fn franchise_details(directory: &str, record: &FranchiseRecord) -> serde_json::V
 }
 
 /// Point a resume's `trust_changed` refusal at the only way out: the directory is bound to the
-/// genesis its first attempt saw, so a remote that now serves another can only be franchised
+/// genesis its first attempt saw, so a remote that now serves another can only be cloned
 /// afresh, once that is verified.
 fn repin_advice(error: CoreError, directory: &str) -> CoreError {
     match error {
@@ -242,7 +242,7 @@ fn repin_advice(error: CoreError, directory: &str) -> CoreError {
             )),
             next_step: error::sanitize(&format!(
                 "Verify out of band which genesis the remote should have; then delete \"{}\" and \
-                franchise again.", directory
+                clone again.", directory
             )),
             details,
         },
@@ -252,7 +252,7 @@ fn repin_advice(error: CoreError, directory: &str) -> CoreError {
 
 /// What the second admission, under the lock, must find.
 enum Expected {
-    /// A record of this franchise's remote, bound to this genesis.
+    /// A record of this clone's remote, bound to this genesis.
     Record(Option<String>),
 
     /// The debris of a run killed before its record was durable.
@@ -271,20 +271,20 @@ struct FranchiseAttempt {
     /// The record this attempt keeps up to date.
     record: FranchiseRecord,
 
-    /// The part of the franchise in progress.
+    /// The part of the clone in progress.
     phase: Phase,
 
     /// How far the bundle had got when this attempt started, so taking it further counts as
     /// progress.
     bundle_at_start: BundleState,
 
-    /// Whether the franchise has begun removing its record: once the record is gone the warehouse
+    /// Whether the clone has begun removing its record: once the record is gone the warehouse
     /// is complete, and a failure must never write it back.
     finishing: bool,
 }
 
 impl FranchiseAttempt {
-    /// Record `error` as this attempt's failure and turn it into the `franchise_incomplete`
+    /// Record `error` as this attempt's failure and turn it into the `clone_incomplete`
     /// refusal. The retry advice is bounded against the last recorded failure: an unclassified
     /// failure that repeats without storing anything is reported as `change`. Recording is best
     /// effort, and its failure is appended rather than hiding the cause.
@@ -396,7 +396,7 @@ fn bundle_checkpoint_bytes() -> u64 {
         .unwrap_or(remote::BUNDLE_CHECKPOINT_BYTES)
 }
 
-/// Switch into the claimed target, take its lock, decide admission again and run the franchise.
+/// Switch into the claimed target, take its lock, decide admission again and run the clone.
 /// A failure before the second admission passes is returned as it is: this run never started an
 /// attempt, and the record (if any) is another run's. Every later failure is recorded.
 #[allow(clippy::too_many_arguments)]
@@ -413,7 +413,7 @@ async fn enter_and_franchise(
     std::env::set_current_dir(absolute_target)
         .map_err(|e| format!("Error while switching to \"{}\": {}", attempt.directory, e))?;
 
-    // Held until the franchise finishes or its failure is recorded: a resume run meanwhile is
+    // Held until the clone finishes or its failure is recorded: a resume run meanwhile is
     // refused (the lock is never waited for) rather than clearing an attempt in flight.
     let _lock = lock_utils::WarehouseLock::acquire()?;
 
@@ -423,7 +423,7 @@ async fn enter_and_franchise(
         attempt.record.last_failure = previous.last_failure.clone();
     }
 
-    // A finished import or a kept download is kept only for a full franchise: a sparse or cache
+    // A finished import or a kept download is kept only for a full clone: a sparse or cache
     // one has no bundle.
     let keep = match &previous {
         Some(previous) if !partial.any() => previous.bundle.clone(),
@@ -438,11 +438,11 @@ async fn enter_and_franchise(
     outcome.map_err(|e| attempt.fail(e))
 }
 
-/// The second admission, under the lock: the target must still hold this franchise — its remote
+/// The second admission, under the lock: the target must still hold this clone — its remote
 /// and its trust binding — and nothing a user could be working in. Returns the record found.
 fn readmit(directory: &str, absolute_target: &Path, url: &str, expected: &Expected) -> Result<Option<FranchiseRecord>, String> {
     let changed = || format!(
-        "\"{}\" changed while this franchise was connecting to the remote. Run the command again.", directory
+        "\"{}\" changed while this clone was connecting to the remote. Run the command again.", directory
     );
 
     match (franchise_utils::admit(absolute_target)?, expected) {
@@ -519,14 +519,14 @@ async fn franchise_into_prepared_target(
         Ok(recorded) if recorded == (mode.mode(), fetch_scope.clone(), fetch_scope.clone(), origin) => None,
         Ok((mode, fetch, main, origin)) => Some(format!(
             "a {} one fetching {} and checking out {}, {}", mode.word(), describe_scope(&fetch), describe_scope(&main),
-            origin.map_or("with no origin".to_string(), |origin| format!("franchised from \"{}\"", origin))
+            origin.map_or("with no origin".to_string(), |origin| format!("cloned from \"{}\"", origin))
         )),
         Err(reason) => Some(format!("one Forklift cannot use ({})", reason)),
     };
     if let Some(found) = found {
         return Err(format!(
-            "\"{}\" already records a warehouse other than the one this franchise asks for: {}. \
-            Delete \"{}\" and franchise it again.",
+            "\"{}\" already records a warehouse other than the one this clone asks for: {}. \
+            Delete \"{}\" and clone it again.",
             attempt.directory, found, attempt.directory
         ));
     }
@@ -537,7 +537,7 @@ async fn franchise_into_prepared_target(
         config_utils::set_value(config_utils::KEY_REMOTE_TOKEN, token, ConfigScope::Warehouse)?;
     }
 
-    let mut report = FranchiseReport {
+    let mut report = CloneReport {
         remote: url.clone(),
         directory: attempt.directory.clone(),
         bundle_objects: None,
@@ -554,7 +554,7 @@ async fn franchise_into_prepared_target(
     };
 
     // The bundle is a fast start, not a requirement: whatever it lacks (or if there is none) is
-    // fetched loose by the history walk below. A sparse or cache franchise skips it entirely —
+    // fetched loose by the history walk below. A sparse or cache clone skips it entirely —
     // the bundle is the whole store, which would defeat the point of fetching less. A resume whose
     // earlier attempt finished the import keeps it and skips this too, and one that kept part of
     // the download asks only for the rest.
@@ -579,7 +579,7 @@ async fn franchise_into_prepared_target(
 
     // The pallet's history is fetched and verified against the anchor the remote serves before
     // that anchor, its office or a meta pallet is installed, so a refusal leaves no trust behind.
-    // At the scope this franchise asks for, which is not on disk yet. A cache fetches the parcels and
+    // At the scope this clone asks for, which is not on disk yet. A cache fetches the parcels and
     // records their content, then fetches the verified head's own content, which it checks out.
     let fetched = match &remote_head {
         Some(remote_head) => {
@@ -644,7 +644,7 @@ async fn franchise_into_prepared_target(
                     RefusalCode::OnlyPrefixNotFound,
                     format!(
                         "\"{}\" is not a directory in pallet \"{}\" on the remote, so it cannot be a \
-                        sparse franchise scope.",
+                        sparse clone scope.",
                         prefix, pallet_name
                     ),
                     "Name a directory of the pallet with --only.",
@@ -654,13 +654,13 @@ async fn franchise_into_prepared_target(
     }
 
     // Raised before the pallet's head is written, and finished once the tree is materialized. The
-    // franchise record outlives it: a franchise interrupted anywhere is resumed by `franchise`,
+    // clone record outlives it: a clone interrupted anywhere is resumed by `clone`,
     // which discards the marker with the rest of the attempt.
     let position = pallet_utils::BayPosition::new(&pallet_name, Some(remote_head.clone()));
     shift_utils::ensure_tree_present(&tree_hash, &scope_utils::current_scope()?)?;
     operation_utils::raise(&Operation::new(OperationKind::Franchise, position.clone(), None, position))?;
 
-    // A franchise fills a fresh warehouse (a resume discarded every ref), so the pallet is unborn
+    // A clone fills a fresh warehouse (a resume discarded every ref), so the pallet is unborn
     // here. The write stands only on the trust the history was verified against.
     pallet_utils::update_pallet_head(&pallet_name, None, &remote_head, &take_utils::installed(&take_trust)?)?;
     pallet_utils::write_position(&pallet_utils::BayPosition::new(&pallet_name, Some(remote_head.clone())))?;
@@ -678,7 +678,7 @@ async fn franchise_into_prepared_target(
     // the error points at `--only`, which a resume may change without refetching.
     attempt.phase = Phase::Materialize;
 
-    shift_utils::materialize_tree(None, &tree_hash, "Franchising", file_utils::take_stat_anchor()?, &Progress::NONE).map_err(|e| error::append_to_message(
+    shift_utils::materialize_tree(None, &tree_hash, "Cloning", file_utils::take_stat_anchor()?, &Progress::NONE).map_err(|e| error::append_to_message(
         e,
         "(the signed history was already fetched and verified; only checking out the working \
         tree failed. If the same path keeps failing, resume with --only to route around it)",
@@ -702,7 +702,7 @@ struct PalletResolution {
     remote_head: Option<String>,
 }
 
-/// What a franchise leaves out: content outside its `--only` scope, or (with `--cache`) content
+/// What a clone leaves out: content outside its `--only` scope, or (with `--cache`) content
 /// it may fetch only when read.
 #[derive(Clone, Copy)]
 struct Partial {
@@ -716,7 +716,7 @@ impl Partial {
         self.sparse || self.cache
     }
 
-    /// The mode the warehouse is prepared in, a partial one with `origin`, the remote franchised
+    /// The mode the warehouse is prepared in, a partial one with `origin`, the remote cloned
     /// from. `--only` and `--cache` conflict, so at most one holds.
     fn prepare_mode<'a>(self, fetch_scope: &'a MaterializationScope, origin: &'a str) -> PrepareMode<'a> {
         if self.sparse {
@@ -734,7 +734,7 @@ fn describe_scope(scope: &MaterializationScope) -> String {
     if scope.is_full() { "every path".to_string() } else { scope.prefixes().join(", ") }
 }
 
-/// Resolve which pallet franchise should check out, using only the handshake's own answer
+/// Resolve which pallet clone should check out, using only the handshake's own answer
 /// (`info.pallets`) — no I/O. Named explicitly and absent from the remote is refused right here,
 /// before anything is fetched or mutated, unless the remote is entirely fresh (no working pallets
 /// stacked at all), in which case an explicit name still starts unborn, exactly like the default
@@ -774,7 +774,7 @@ fn resolve_pallet(info: &WarehouseInfo, pallet: Option<String>) -> Result<Pallet
 }
 
 /// Normalize the `--only` paths into a fetch [`MaterializationScope`], validating each is a
-/// well-formed, non-root warehouse path. An empty list is the full (ordinary) franchise scope.
+/// well-formed, non-root warehouse path. An empty list is the full (ordinary) clone scope.
 /// The paths cannot be checked against the remote's tree yet (there is no local head), so the
 /// directory check happens after the fetch.
 fn resolve_fetch_scope(only: &[String]) -> Result<MaterializationScope, String> {
@@ -789,7 +789,7 @@ fn resolve_fetch_scope(only: &[String]) -> Result<MaterializationScope, String> 
 
         if path.is_root() {
             return Err(
-                "A franchise scope of the warehouse root is the whole tree — franchise without \
+                "A clone scope of the warehouse root is the whole tree — clone without \
                 --only instead.".to_string()
             );
         }
@@ -819,9 +819,9 @@ fn is_directory_in_tree(root_tree_hash: &str, key: &str) -> Result<bool, String>
     Ok(true)
 }
 
-/// Emit a successful franchise's report, announcing a first-contact adoption first. Only on
-/// success: a franchise that fails afterwards is resumed, and a resume adopts the anchor again.
-fn emit_report(report: &mut FranchiseReport, client: &RemoteClient) {
+/// Emit a successful clone's report, announcing a first-contact adoption first. Only on
+/// success: a clone that fails afterwards is resumed, and a resume adopts the anchor again.
+fn emit_report(report: &mut CloneReport, client: &RemoteClient) {
     if let Some(genesis) = &report.adopted_genesis {
         output::warn_trust_adopted(&trust_utils::first_contact(client.url(), genesis));
     }
@@ -830,10 +830,10 @@ fn emit_report(report: &mut FranchiseReport, client: &RemoteClient) {
     output::emit(report);
 }
 
-/// The result of a franchise: what was imported and which pallet was checked out.
+/// The result of a clone: what was imported and which pallet was checked out.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-pub(crate) struct FranchiseReport {
+pub(crate) struct CloneReport {
     remote: String,
     directory: String,
 
@@ -863,7 +863,7 @@ pub(crate) struct FranchiseReport {
     /// Whether the checked-out pallet started unborn.
     unborn: bool,
 
-    /// The sparse fetch scope, when this was a sparse (`--only`) franchise (empty otherwise).
+    /// The sparse fetch scope, when this was a sparse (`--only`) clone (empty otherwise).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     scope: Vec<String>,
 
@@ -880,7 +880,7 @@ pub(crate) struct FranchiseReport {
     batch_lane: Option<BatchLaneClosure>,
 }
 
-impl CommandOutput for FranchiseReport {
+impl CommandOutput for CloneReport {
     fn render_human(&self) {
         if let (Some(objects), Some(signatures)) = (self.bundle_objects, self.bundle_signatures) {
             println!(
@@ -906,13 +906,13 @@ impl CommandOutput for FranchiseReport {
 
         if self.unborn {
             println!(
-                "Franchised {} into \"{}\": the remote has nothing stacked on \"{}\" yet; \
+                "Cloned {} into \"{}\": the remote has nothing stacked on \"{}\" yet; \
                 the pallet starts unborn.",
                 self.remote, self.directory, self.pallet
             );
         } else {
             println!(
-                "Franchised {} into \"{}\": pallet \"{}\" at {} ({} object(s) fetched loose).",
+                "Cloned {} into \"{}\": pallet \"{}\" at {} ({} object(s) fetched loose).",
                 self.remote, self.directory, self.pallet,
                 self.head.as_deref().unwrap_or(""), self.fetched_objects
             );
@@ -935,7 +935,7 @@ impl CommandOutput for FranchiseReport {
 #[cfg(feature = "docgen")]
 pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
-        crate::docgen::OutputSchema::of::<FranchiseReport>(),
+        crate::docgen::OutputSchema::of::<CloneReport>(),
     ]
 }
 
@@ -975,16 +975,16 @@ mod tests {
         assert_eq!(check_resume("d", &record(), "http://example.com:9418", Some("abc")), Ok(()));
 
         let (code, message, details) = refusal(check_resume("d", &record(), "http://other:1", None));
-        assert_eq!(code, RefusalCode::FranchiseIncomplete);
+        assert_eq!(code, RefusalCode::CloneIncomplete);
         assert!(message.contains("not of http://other:1"), "{}", message);
         assert_eq!(details["remote"], "http://example.com:9418");
         assert_eq!(details["cause_code"], "only_prefix_not_found");
 
         let (code, message, _) = refusal(check_resume("d", &record(), "http://example.com:9418", Some("abd")));
-        assert_eq!(code, RefusalCode::FranchiseIncomplete);
+        assert_eq!(code, RefusalCode::CloneIncomplete);
         assert!(message.contains("bound to trust genesis abc, not the expected abd"), "{}", message);
 
-        // A franchise that recorded no genesis accepts any pin: the pin binds it from now on.
+        // A clone that recorded no genesis accepts any pin: the pin binds it from now on.
         let unbound = FranchiseRecord { genesis: None, ..record() };
         assert_eq!(check_resume("d", &unbound, "http://example.com:9418", Some("abd")), Ok(()));
     }
@@ -993,21 +993,21 @@ mod tests {
     fn a_resume_refused_for_a_changed_anchor_is_told_to_start_over() {
         let changed = CoreError::refusal(RefusalCode::TrustChanged, "The anchor changed.", "Verify it before re-running.");
 
-        match repin_advice(changed, "clone") {
+        match repin_advice(changed, "copy") {
             CoreError::Refusal { code, message, next_step, .. } => {
                 assert_eq!(code, RefusalCode::TrustChanged);
-                assert!(message.contains("\"clone\" is bound to the genesis its first attempt saw"), "{}", message);
-                assert!(next_step.contains("delete \"clone\" and franchise again"), "{}", next_step);
+                assert!(message.contains("\"copy\" is bound to the genesis its first attempt saw"), "{}", message);
+                assert!(next_step.contains("delete \"copy\" and clone again"), "{}", next_step);
             }
             other => panic!("{:?}", other),
         }
 
         let other = CoreError::Other("connection refused".to_string());
-        assert_eq!(repin_advice(other.clone(), "clone"), other);
+        assert_eq!(repin_advice(other.clone(), "copy"), other);
     }
 
     fn temp_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("forklift-franchise-cmd-{}-{}", label, std::process::id()));
+        let dir = std::env::temp_dir().join(format!("forklift-clone-cmd-{}-{}", label, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1015,7 +1015,7 @@ mod tests {
 
     fn attempt(forklift: PathBuf) -> FranchiseAttempt {
         FranchiseAttempt {
-            directory: "clone".to_string(),
+            directory: "copy".to_string(),
             forklift,
             record: FranchiseRecord { attempt: Attempt::Running, last_failure: None, start_census: 0, ..record() },
             phase: Phase::Prepare,
@@ -1024,7 +1024,7 @@ mod tests {
         }
     }
 
-    /// Once the franchise has begun removing its record the warehouse is complete: a failure past
+    /// Once the clone has begun removing its record the warehouse is complete: a failure past
     /// that point is reported as it is, and never puts the record back.
     #[test]
     fn a_failure_while_finishing_never_writes_the_record_back() {
@@ -1038,14 +1038,14 @@ mod tests {
 
         // Finishing failed before the record went: the failure is recorded like any other.
         franchise_utils::write(&forklift, &finishing.record).unwrap();
-        let refusal = finishing.fail("Error while clearing the franchise record: EACCES".to_string());
-        assert!(matches!(CoreError::from(refusal), CoreError::Refusal { code: RefusalCode::FranchiseIncomplete, .. }));
+        let refusal = finishing.fail("Error while clearing the clone record: EACCES".to_string());
+        assert!(matches!(CoreError::from(refusal), CoreError::Refusal { code: RefusalCode::CloneIncomplete, .. }));
         assert_eq!(franchise_utils::read(&forklift).unwrap().unwrap().attempt, Attempt::Failed);
         std::fs::remove_file(franchise_utils::record_path(&forklift)).unwrap();
 
         let mut failing = attempt(forklift.clone());
         let refusal = failing.fail("Error while writing: No space left on device".to_string());
-        assert!(matches!(CoreError::from(refusal), CoreError::Refusal { code: RefusalCode::FranchiseIncomplete, .. }));
+        assert!(matches!(CoreError::from(refusal), CoreError::Refusal { code: RefusalCode::CloneIncomplete, .. }));
         assert!(franchise_utils::read(&forklift).unwrap().is_some());
     }
 
@@ -1055,7 +1055,7 @@ mod tests {
     #[test]
     fn a_resume_that_fails_while_clearing_keeps_the_earlier_import_and_census() {
         let root = temp_dir("clearing");
-        let target = root.join("clone");
+        let target = root.join("copy");
         let elsewhere = root.join("elsewhere");
         std::fs::create_dir_all(&target).unwrap();
         std::fs::create_dir_all(&elsewhere).unwrap();

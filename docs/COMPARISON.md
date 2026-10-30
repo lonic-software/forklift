@@ -16,7 +16,7 @@ to a host or to you, with runnable examples, see [Why Forklift](guide/concepts.m
 
 > **Reading note.** Forklift's terminology is warehouse-themed. The mapping to
 > git words (warehouse = repo, parcel = commit, pallet = branch, load = add,
-> stack = commit, consolidate = merge, lift/lower = push/pull, franchise = clone,
+> stack = commit, consolidate = merge, lift/lower = push/pull, clone = clone,
 > haul = pull request) is in the [README](../README.md) and the
 > [glossary](guide/glossary.md). This document uses Forklift's words for Forklift and
 > each other tool's own words for that tool.
@@ -207,7 +207,7 @@ if you change hosts. Forklift puts them *in the warehouse* as signed records on 
   forge-proof, never silently carries over to new work, and carries the reviewer's identity
   class (human vs. agent). Reviews are recorded but do not yet gate a merge (§8).
 
-These sync with `lift`, `lower` and `franchise` like any other pallet and survive moving
+These sync with `lift`, `lower` and `clone` like any other pallet and survive moving
 hosts.
 
 ### 2.6 Remote & hosting architecture — Forklift's founding bet
@@ -337,7 +337,7 @@ where Forklift is least proven.
   **[Forklift is unproven at scale.]**
 - **Virtual filesystem / lazy fetch (EdenFS).** Sapling fetches file content on demand,
   so you can work in a giant repo without materializing it. Forklift has
-  [sparse warehouses](guide/concepts.md#4-sparse-warehouses): a `franchise --only` fetches
+  [sparse warehouses](guide/concepts.md#4-sparse-warehouses): a `clone --only` fetches
   and materializes only the paths you ask for, and `expand` widens that later. But there is
   no virtual filesystem, and fetching history lazily, so a clone's cost is bounded by the tip
   rather than by history length, is still future work (§8). **[Forklift lacks a virtual

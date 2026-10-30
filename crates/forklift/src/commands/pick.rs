@@ -36,7 +36,7 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
     // A pick applies a diff (the merge machinery) into the working directory, which could
     // touch out-of-scope paths a scoped bay never materialized, so it refuses here.
     crate::commands::scope::refuse_in_scoped_bay(
-        "cherry-pick",
+        "pick",
         "Run it from a full bay.",
     )?;
 
@@ -54,17 +54,17 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
 
     if cherry_pick_utils::read_state()?.is_some() {
         return Err(format!(
-            "A cherry-pick is already in progress. Resolve its conflicts and \"forklift stack\", or {} to \
+            "A pick is already in progress. Resolve its conflicts and \"forklift stack\", or {} to \
             abort it.",
             cherry_pick_utils::abort_hint()
         ));
     }
 
     // The pick is applied onto the tree this bay holds, and moves the pallet from there.
-    position.require_current("cherry-picked")?;
+    position.require_current("picked")?;
 
     let our_head = position.base.clone().ok_or(format!(
-        "Pallet \"{}\" has nothing stacked yet; cherry-pick applies a change onto existing history.",
+        "Pallet \"{}\" has nothing stacked yet; pick applies a change onto existing history.",
         current
     ))?;
 
@@ -78,7 +78,7 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
 
     if source == our_head || merge_utils::is_ancestor(&source, &our_head)? {
         return Err(format!(
-            "Parcel {} is already in the history of \"{}\"; there is nothing to cherry-pick.",
+            "Parcel {} is already in the history of \"{}\"; there is nothing to pick.",
             short, current
         ));
     }
@@ -91,7 +91,7 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
 
     if !consolidate::is_warehouse_clean(&our_tree).await? {
         return Err(
-            "There are local changes that a cherry-pick would overwrite. Stack them, restore \
+            "There are local changes that a pick would overwrite. Stack them, restore \
             them, or park them first (see \"forklift stocktake\" for the details).".to_string()
         );
     }
@@ -105,10 +105,10 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
     let theirs_tree = source_parcel.tree_hash.clone();
 
     if base_tree == theirs_tree {
-        return Err(format!("Parcel {} makes no changes; there is nothing to cherry-pick.", short));
+        return Err(format!("Parcel {} makes no changes; there is nothing to pick.", short));
     }
 
-    let source_label = format!("cherry-pick {}", &source[..source.len().min(10)]);
+    let source_label = format!("pick {}", &source[..source.len().min(10)]);
 
     // A cherry-pick refuses in a scoped bay (above), so the merge always runs at full scope —
     // every path is in scope and materialized, exactly today's behavior.
@@ -120,7 +120,7 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
     // Every change the source made is already present here: an empty pick.
     if actions.is_empty() {
         return Err(format!(
-            "The changes in {} are already present in \"{}\"; there is nothing to cherry-pick.",
+            "The changes in {} are already present in \"{}\"; there is nothing to pick.",
             short, current
         ));
     }
@@ -151,13 +151,13 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
 
         let parcel = consolidate::stack_completion(description, &our_head, &our_tree, anchor).await?;
 
-        output::emit(&CherryPicked::applied(&source, &current, &parcel));
+        output::emit(&Picked::applied(&source, &current, &parcel));
     } else {
         // The pick state owns the bay from here.
         operation_utils::finish()?;
         conflicts.sort();
 
-        output::emit(&CherryPicked::conflicts(&source, &current, conflicts));
+        output::emit(&Picked::conflicts(&source, &current, conflicts));
     }
 
     Ok(())
@@ -168,7 +168,7 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum CherryPickOutcome {
+pub(crate) enum PickOutcome {
     Applied,
     Conflicts,
 }
@@ -176,8 +176,8 @@ pub(crate) enum CherryPickOutcome {
 /// The result of a cherry-pick.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-pub(crate) struct CherryPicked {
-    outcome: CherryPickOutcome,
+pub(crate) struct Picked {
+    outcome: PickOutcome,
 
     /// The parcel that was picked.
     source: String,
@@ -194,10 +194,10 @@ pub(crate) struct CherryPicked {
     conflicts: Vec<String>,
 }
 
-impl CherryPicked {
-    fn applied(source: &str, pallet: &str, parcel: &str) -> CherryPicked {
-        CherryPicked {
-            outcome: CherryPickOutcome::Applied,
+impl Picked {
+    fn applied(source: &str, pallet: &str, parcel: &str) -> Picked {
+        Picked {
+            outcome: PickOutcome::Applied,
             source: source.to_string(),
             pallet: pallet.to_string(),
             parcel: Some(parcel.to_string()),
@@ -205,9 +205,9 @@ impl CherryPicked {
         }
     }
 
-    fn conflicts(source: &str, pallet: &str, conflicts: Vec<String>) -> CherryPicked {
-        CherryPicked {
-            outcome: CherryPickOutcome::Conflicts,
+    fn conflicts(source: &str, pallet: &str, conflicts: Vec<String>) -> Picked {
+        Picked {
+            outcome: PickOutcome::Conflicts,
             source: source.to_string(),
             pallet: pallet.to_string(),
             parcel: None,
@@ -216,12 +216,12 @@ impl CherryPicked {
     }
 }
 
-impl CommandOutput for CherryPicked {
+impl CommandOutput for Picked {
     fn render_human(&self) {
         let short = &self.source[..self.source.len().min(12)];
 
         match self.outcome {
-            CherryPickOutcome::Applied => {
+            PickOutcome::Applied => {
                 println!(
                     "Cherry-picked {} onto \"{}\": stacked parcel {} (authors preserved).",
                     short,
@@ -229,7 +229,7 @@ impl CommandOutput for CherryPicked {
                     self.parcel.as_deref().unwrap_or(""),
                 );
             }
-            CherryPickOutcome::Conflicts => {
+            PickOutcome::Conflicts => {
                 println!(
                     "Cherry-picking {} onto \"{}\" produced {} conflict(s):",
                     short, self.pallet, self.conflicts.len()
@@ -241,7 +241,7 @@ impl CommandOutput for CherryPicked {
 
                 println!(
                     "\nResolve the conflicts, \"forklift load\" the resolved files, then \"forklift stack\" to \
-                    complete the cherry-pick (or {} to abort it).",
+                    complete the pick (or {} to abort it).",
                     cherry_pick_utils::abort_hint()
                 );
             }
@@ -254,7 +254,7 @@ impl CommandOutput for CherryPicked {
 #[cfg(feature = "docgen")]
 pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
-        crate::docgen::OutputSchema::of::<CherryPicked>(),
+        crate::docgen::OutputSchema::of::<Picked>(),
     ]
 }
 

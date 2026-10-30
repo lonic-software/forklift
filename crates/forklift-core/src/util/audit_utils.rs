@@ -459,7 +459,7 @@ fn chains_to_identity_root(key: &crate::util::office_utils::KeyRecord,
 /// * `anchor`         - The trust anchor (its boundary separates the legacy history).
 /// * `office_state`   - The verified office state (the key registry).
 /// * `known_verified` - Heads that already passed this verification, or were signed here
-///                      (empty walks everything — the offline `audit`, a franchise).
+///                      (empty walks everything — the offline `audit`, a clone).
 ///
 /// # Returns
 /// * `Ok((usize, usize))`    - The number of verified and legacy (pre-trust) parcels.
@@ -3403,7 +3403,7 @@ mod tests {
     /// (the function `audit` and every server's ref-update check share): a parcel signed by a
     /// revoked key whose distrust boundary names a head this store has never had at all.
     ///
-    /// This is deliberately *not* built through the CLI/franchise machinery the way the
+    /// This is deliberately *not* built through the CLI/clone machinery the way the
     /// sibling `remote.rs` tests are (see
     /// `a_partial_clone_missing_an_unrelated_boundary_head_still_audits_the_vouched_parcel`'s
     /// doc for why that path cannot reach this case): `office retire` always folds the

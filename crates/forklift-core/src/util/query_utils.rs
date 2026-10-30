@@ -125,7 +125,7 @@ impl MatchTrust {
 ///
 /// `Unresolved` is the third, store-relative answer: the boundary walk crossed a gap — an
 /// absent `distrust_boundary` head, or an absent interior ancestor behind one, either from a
-/// partial clone whose franchise brought over only reachable history or from genuine object
+/// partial clone whose clone brought over only reachable history or from genuine object
 /// loss — that stood between the walk and a definitive answer for this parcel, so the question
 /// cannot be answered here at all. This must never be reported as `Suspect`: a parcel that is,
 /// on the origin, plainly vouched would otherwise be misclassified as suspicious purely because

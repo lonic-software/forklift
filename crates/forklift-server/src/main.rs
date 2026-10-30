@@ -604,7 +604,7 @@ fn parse_config(path: &str) -> Result<ConfigFile, String> {
 fn prepare(root: &str) -> Result<(), String> {
     std::fs::create_dir_all(root).map_err(|e| format!("Error while creating \"{}\": {}", root, e))?;
     let resolved = server::canonical_root(root)?;
-    // An unfinished franchise, a bay's folder, or one with something in it but no warehouse marker,
+    // An unfinished clone, a bay's folder, or one with something in it but no warehouse marker,
     // is not prepare's to take.
     forklift_core::util::warehouse_utils::check_preparable(&resolved, forklift_core::util::warehouse_utils::Head::Server)?;
     let _scope = forklift_core::globals::StorageRootScope::enter(&resolved);
@@ -1378,21 +1378,21 @@ mod tests {
         }
     }
 
-    /// `bundle` and `gc` open their root through core's gate: an unfinished franchise is no
+    /// `bundle` and `gc` open their root through core's gate: an unfinished clone is no
     /// warehouse to work on yet, and neither is a folder whose `.forklift` holds no marker.
     ///
     /// Revert: `server::open_root` without the gate (canonicalize only) → the empty `.forklift` opens → red.
     #[test]
     fn a_root_holding_an_unfinished_franchise_is_refused() {
-        let root = scratch_root("franchise");
+        let root = scratch_root("clone");
         let forklift = root.join(forklift_core::globals::FOLDER_NAME_FORKLIFT_ROOT);
         std::fs::create_dir_all(&forklift).unwrap();
         std::fs::write(forklift_core::util::franchise_utils::record_path(&forklift), b"").unwrap();
 
         let refused = server::open_root(root.to_str().unwrap()).unwrap_err();
-        assert_eq!(refusal(refused).0, forklift_core::error::RefusalCode::FranchiseIncomplete);
+        assert_eq!(refusal(refused).0, forklift_core::error::RefusalCode::CloneIncomplete);
 
-        // Without the franchise, the folder holds no marker: still no warehouse.
+        // Without the clone, the folder holds no marker: still no warehouse.
         std::fs::remove_file(forklift_core::util::franchise_utils::record_path(&forklift)).unwrap();
         let refused = server::open_root(root.to_str().unwrap()).unwrap_err();
         assert_eq!(refusal(refused).0, forklift_core::error::RefusalCode::NotAWarehouse);

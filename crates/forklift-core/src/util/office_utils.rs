@@ -711,7 +711,7 @@ pub enum PinAbsencePolicy {
     /// The pin names history every warehouse holding the anchor holds, by construction: the
     /// re-genesis `adopts` pin. `office regenesis` (office.rs) sets it to this warehouse's own
     /// prior office head; every other way an anchor with `adopts` arrives fetches that history
-    /// before writing the anchor (`remote_utils::fetch_adopted_history`, on franchise and on
+    /// before writing the anchor (`remote_utils::fetch_adopted_history`, on clone and on
     /// `office accept-regenesis`), and a remote refuses a first anchor whose adopted history it
     /// does not hold. Its absence is therefore genuine local loss, reported exactly like any
     /// ordinary ref.

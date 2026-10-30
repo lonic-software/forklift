@@ -144,7 +144,7 @@ fn judge_request(paths: &[String]) -> Result<PruneRequest, String> {
     if fetch.is_full() {
         return Err(
             "This warehouse holds the full tree; there is nothing to prune. \"forklift scope-prune\" \
-            reclaims disk from a sparse warehouse — one franchised with \"--only\", or widened \
+            reclaims disk from a sparse warehouse — one cloned with \"--only\", or widened \
             with \"forklift expand\" — by forgetting a fetched path.".to_string()
         );
     }

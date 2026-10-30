@@ -53,7 +53,7 @@ pub struct AwsConfig {
     /// switches to path-style addressing, which LocalStack and MinIO require.
     pub endpoint_url: Option<String>,
 
-    /// The pallet a franchise checks out when the user does not choose (git's `HEAD`).
+    /// The pallet a clone checks out when the user does not choose (git's `HEAD`).
     /// Defaults to `main`; a hosted deployment that lets a warehouse pick another sets it here.
     pub default_pallet: String,
 }

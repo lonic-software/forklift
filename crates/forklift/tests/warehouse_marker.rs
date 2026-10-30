@@ -243,7 +243,7 @@ fn a_bay_of_an_unmarked_warehouse_is_refused_and_nothing_is_written() {
             refusal.next_step,
             format!(
                 "Re-create the warehouse at {} (move its \".forklift\" aside, run \"forklift prepare\" there, then \
-                import the history again with \"forklift git import\" or franchise it again), then move {} aside and add \
+                import the history again with \"forklift git import\" or clone it again), then move {} aside and add \
                 the bay again with \"forklift bay add\" in {}.",
                 quoted(&root), quoted(&bay), quoted(&root)
             ),

@@ -10,11 +10,11 @@ use crate::output::{self, CommandOutput};
 ///
 /// # Returns
 /// * `Ok(())`      - If the warehouse is prepared.
-/// * `Err(String)` - If the directory holds an unfinished franchise, a bay, or a `.forklift` with
+/// * `Err(String)` - If the directory holds an unfinished clone, a bay, or a `.forklift` with
 ///   something in it but no warehouse marker, or a folder or file could not be created.
 pub fn handle_command(verbose: bool) -> Result<(), String> {
-    // Preparing over an unfinished franchise would hand it to every other command half-built (only
-    // `franchise` finishes it), and over an unmarked folder would vouch for whatever it holds.
+    // Preparing over an unfinished clone would hand it to every other command half-built (only
+    // `clone` finishes it), and over an unmarked folder would vouch for whatever it holds.
     let cwd = std::env::current_dir()
         .map_err(|e| format!("Error while getting the current directory: {}", e))?;
     warehouse_utils::check_preparable(&cwd, warehouse_utils::Head::Client)?;

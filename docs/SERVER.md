@@ -47,17 +47,17 @@ forklift-server serve --root /srv/forklift/wh --addr 127.0.0.1:9418 --token <sec
 ```
 
 Clients configure `forklift config remote.url http://…` (plus `remote.token`), or just
-`forklift franchise <url> <dir> --token <secret>`.
+`forklift clone <url> <dir> --token <secret>`.
 
-A served root must hold the full tree. A partial warehouse (one franchised with `--only` or
+A served root must hold the full tree. A partial warehouse (one cloned with `--only` or
 `--cache`) is refused: `serve --root` will not start on it, and a `--warehouses` server answers
 `409` for it. So is any root whose sealed-object record (`.forklift/sealed`) holds an object, since
 it holds that object by hash alone, without its content, whatever its marker says, and any root
 that records an origin (`.forklift/origin`), which only a partial warehouse has; a record that
 cannot be read is refused too (a `500` from a `--warehouses` server). Clients trust a server to
 hold every object its pallet heads reach, and `scope-prune`, `evict` and `remote move` rely on that,
-so such a root could lead a client to free content it can never fetch back. To serve a franchised
-copy, franchise it without `--only` or `--cache`. A franchise that has not finished is
+so such a root could lead a client to free content it can never fetch back. To serve a cloned
+copy, clone it without `--only` or `--cache`. A clone that has not finished is
 not served either (`503` from a `--warehouses` server) until it is resumed or deleted.
 
 A root is a warehouse only once `prepare` has marked it: its `.forklift` folder holds the
@@ -255,7 +255,7 @@ revocation by more than about a day.
 - **Logs:** structured request logs on stderr (`tracing`); `RUST_LOG` controls the
   filter (default `info`).
 - **Bundles:** `forklift-server bundle --root …` builds the snapshot served at
-  `/v1/bundles/latest` (fast franchising); `rebuild_after_lifts` automates it. The
+  `/v1/bundles/latest` (fast cloning); `rebuild_after_lifts` automates it. The
   bundle is written atomically and streamed, so rebuilds never interrupt serving. A build
   does use every core while it runs, and memory grows with the warehouse: a git.git-sized
   history peaks at 1.2–1.7 GB, plus up to one object per core in flight (a warehouse of

@@ -84,7 +84,7 @@ pub(crate) struct ScopeStatus {
     /// file, so its rules apply to the checkout. Empty when the bay is not scoped.
     implicit_scope: Vec<String>,
 
-    /// The warehouse's fetch-scope prefixes (empty = fully fetched; a sparse franchise records
+    /// The warehouse's fetch-scope prefixes (empty = fully fetched; a sparse clone records
     /// its fetched prefixes here).
     fetch_scope: Vec<String>,
 

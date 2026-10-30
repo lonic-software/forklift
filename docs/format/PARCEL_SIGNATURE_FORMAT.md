@@ -80,7 +80,7 @@ refuses. What to do depends on the cause:
 build that reads it.
 - A corrupt table (a failed crc, a truncated file) can be moved out of the pack folder. The
 signatures it alone held are then lost locally: those parcels read as unsigned until they are
-restored by franchising again.
+restored by cloning again.
 
 `compact` merges every sidecar and every table below the 100,000-entry bound into new tables,
 leaving at most one below it, and removes a sidecar or an older table only once a durably

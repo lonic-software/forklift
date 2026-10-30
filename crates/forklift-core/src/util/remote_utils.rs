@@ -1,5 +1,5 @@
 //! The client side of the remote protocol (`docs/format/REMOTE_PROTOCOL.md`): the HTTP
-//! client and the sync engines behind `lift`, `lower` and `franchise`. Everything here
+//! client and the sync engines behind `lift`, `lower` and `clone`. Everything here
 //! returns data — the commands own the words.
 //!
 //! Transfers are parallel by design (DESIGN.html §4.1): object fetches and uploads fan
@@ -493,12 +493,12 @@ impl TorSettings {
 
     /// Like [`Self::from_config`], but *global* configuration only — never the warehouse scope.
     ///
-    /// The one caller this exists for is `franchise`'s initial handshake, which now (deliberately)
+    /// The one caller this exists for is `clone`'s initial handshake, which now (deliberately)
     /// runs before the target warehouse exists, so there is no "this warehouse" to have an
     /// opinion about Tor — only the ambient working directory, which may happen to sit inside a
     /// *different*, unrelated warehouse. `from_config`'s effective (warehouse-then-global) lookup
     /// would silently pick up that unrelated warehouse's `remote.tor`/`remote.torProxy` — a
-    /// cwd-dependent, security-relevant surprise for a brand-new clone elsewhere. Before franchise
+    /// cwd-dependent, security-relevant surprise for a brand-new clone elsewhere. Before clone
     /// moved its handshake earlier, this could never happen: the handshake ran *inside* the fresh
     /// (still-empty) target, whose warehouse scope had never had anything to set — so global was,
     /// in effect, the only scope that could ever apply. This preserves that.
@@ -2578,7 +2578,7 @@ impl RemoteClient {
     /// refetch (`recovery_utils::attempt_heal_driven_refetch`) is the caller this exists for: the
     /// two cases call for different remedies (a genuinely absent remote has no in-tool fetch to
     /// retry; a broken-but-real one might still be recoverable once it is fixed), and reporting
-    /// the second as the first sends a user toward heavier remedies — franchise, reproduce, or
+    /// the second as the first sends a user toward heavier remedies — clone, reproduce, or
     /// accepting the loss — for an object the remote may still actually have. A read failure here
     /// (the same class `from_config` itself would also hit) is treated as "configured": it is
     /// certainly not "nothing is set," and erring toward the less alarming classification is the
@@ -4819,7 +4819,7 @@ impl Drop for RemoveFileOnDrop<'_> {
 /// and every meta pallet (`@office`, `@haul`, …), since they share one object store and a
 /// ref of either kind is an equally good witness. Their closures are complete by
 /// construction: a ref only moves once its objects are all present (a `stack` writes them
-/// first; a `lower` or `franchise` fetches the whole closure before the fast-forward). So a
+/// first; a `lower` or `clone` fetches the whole closure before the fast-forward). So a
 /// lower that brings one new parcel walks one parcel, not the whole history — the
 /// transfer-economics half of the bounded-negotiation guarantee.
 ///
@@ -4897,7 +4897,7 @@ async fn walk_history(client: &RemoteClient,
     progress.status("Fetching history");
 
     // Every local ref head — user pallets and meta pallets alike — and therefore every
-    // closure already known complete. Empty for a franchise into a fresh warehouse, which
+    // closure already known complete. Empty for a clone into a fresh warehouse, which
     // walks everything, as it must. In a cache, "complete" holds up to the record: a head's
     // parcels are all present, and its content is present or recorded.
     let mut complete: Vec<String> = pallet_utils::all_pallet_refs()?
@@ -5118,7 +5118,7 @@ async fn fetch_unscoped(client: &RemoteClient,
 ///
 /// A full warehouse delegates to [`fetch_history`] verbatim and records nothing, and a cache to
 /// [`fetch_cache`], which fetches the parcels only and records the content it skips. A full warehouse
-/// never becomes sparse (`scope-prune` refuses one, and `franchise` writes a scope only into a new
+/// never becomes sparse (`scope-prune` refuses one, and `clone` writes a scope only into a new
 /// warehouse), so that check needs no lock.
 ///
 /// In a sparse warehouse the fetch is recorded before anything transfers: under the
@@ -5155,7 +5155,7 @@ pub async fn fetch_history_scoped(client: &RemoteClient,
 }
 
 /// [`fetch_history_scoped`] at a scope the caller names rather than the one on disk — for
-/// `franchise`, which fetches before it writes any scope, so that an `--only` naming nothing is
+/// `clone`, which fetches before it writes any scope, so that an `--only` naming nothing is
 /// refused with nothing left behind. A sparse scope records the head in the ledger the same way,
 /// under the [`RefLock`], before anything transfers. It does not re-check the scope afterwards:
 /// no scope exists on disk for an `expand` to widen until the caller writes this one.
@@ -5903,13 +5903,13 @@ async fn fetch_missing_objects_in_chunks(client: &RemoteClient,
 /// Fetch every chunk of the given recipes that is missing locally — the second half of fetching a
 /// chunked file, run *after* the recipes themselves have landed (they ride the ordinary blob wave,
 /// since a tree entry names the recipe like any other file object). Bundles never carry chunks
-/// (trees don't reference them, so no closure walk ever emits one), so a franchise/lower/expand
+/// (trees don't reference them, so no closure walk ever emits one), so a clone/lower/expand
 /// imports the tree+recipe closure and then fetches the in-scope chunks per object here, exactly
 /// the "a bundle is an optimization; missing objects fall back to loose GET" contract.
 ///
 /// Deliberately calls [`fetch_loose_objects`] directly rather than [`fetch_missing_objects`] —
 /// chunks always fetch one presigned `GET` each, **never** through `POST /v1/objects/batch`, no
-/// matter how many are missing (DESIGN.html §9.4b: "franchise, lower and expand fetch chunks
+/// matter how many are missing (DESIGN.html §9.4b: "clone, lower and expand fetch chunks
 /// per-object after the bundle wave"). A chunk is capped at 4 MiB and already hash-verified on
 /// store, so a bundle buys chunks nothing a loose fetch doesn't already give; routing them
 /// through `batch` would only be a redirect an offloading head has to mint and a client has to
@@ -7391,7 +7391,7 @@ fn judge_remote_trust<'a>(url: &str,
     Ok(Some(remote_office_head))
 }
 
-/// What the trust/office synchronization of a lower/franchise did.
+/// What the trust/office synchronization of a lower/clone did.
 #[derive(Default)]
 pub struct TrustSyncStats {
     /// The genesis of the remote's trust anchor, when it was adopted locally (first contact).
@@ -7437,7 +7437,7 @@ pub struct PreparedTrust {
     judged_heads: Option<Vec<String>>,
 }
 
-/// Judge, fetch and verify the remote's trust state for a lower or franchise, writing nothing.
+/// Judge, fetch and verify the remote's trust state for a lower or clone, writing nothing.
 /// A remote whose anchor differs from the local one is refused — that is either tampering or an
 /// unrelated warehouse, and no data is worth guessing which. So is a remote whose anchor was
 /// stripped, and one that is not the `expect` pin; both are checked before anything is fetched.
@@ -8056,7 +8056,7 @@ enum MetaAdoptStep {
     Diverged,
 }
 
-/// Adopt the remote's *non-office* meta pallets (lower / franchise direction): fetch each
+/// Adopt the remote's *non-office* meta pallets (lower / clone direction): fetch each
 /// and fast-forward the local ref, without ever materializing into the working directory
 /// (meta pallets are not working content). A pallet present only on the remote is adopted
 /// outright; one that diverged has its remote side fetched and is returned for the caller
@@ -8078,7 +8078,7 @@ pub async fn adopt_meta_pallets(client: &RemoteClient, info: &WarehouseInfo) -> 
 
     for (key, remote_head) in &info.pallets {
         let Some(name) = key.strip_prefix(pallet_utils::META_QUALIFIER) else {
-            continue; // Not a meta pallet (user pallets are handled by lower/franchise).
+            continue; // Not a meta pallet (user pallets are handled by lower/clone).
         };
 
         if name == OFFICE_PALLET_NAME {
@@ -10765,7 +10765,7 @@ mod tests {
         assert!(file_utils::does_object_exist(&hash).unwrap(), "the dripped object landed in this store");
     }
 
-    /// The designed transport for chunks (DESIGN.html §9.4b: "franchise, lower and expand fetch
+    /// The designed transport for chunks (DESIGN.html §9.4b: "clone, lower and expand fetch
     /// chunks per-object after the bundle wave") — `fetch_recipe_chunks` must never route
     /// through `POST /v1/objects/batch`, no matter how many chunks are missing at once, unlike
     /// the general `fetch_missing_objects` path it deliberately does not delegate to for this.

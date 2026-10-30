@@ -143,7 +143,7 @@ pub fn render_mcp_tools() -> Result<String, String> {
         "Every tool `forklift mcp` serves, generated from the same command definition the binary \
          parses its arguments with, as the server's own tool list is; CI fails when this page \
          falls behind it. A tool is a command path joined by `_` (`forklift tag create` is \
-         `tag_create`, `forklift cherry-pick` is `cherry_pick`), \
+         `tag_create`, `forklift pick` is `cherry_pick`), \
          and its description is the command's one-line description followed by its long one; \
          each argument's own help is that argument's description in the tool's input schema. \
          An argument is an option's long name (with `_` for `-`) or a positional's name. \
@@ -398,14 +398,13 @@ fn command_schemas(name: &str) -> Option<Vec<OutputSchema>> {
         "audit" => commands::audit::__docgen_schemas(),
         "bay" => commands::bay::__docgen_schemas(),
         "blame" => commands::blame::__docgen_schemas(),
-        "cherry-pick" => commands::cherry_pick::__docgen_schemas(),
+        "clone" => commands::clone::__docgen_schemas(),
         "config" => commands::config::__docgen_schemas(),
         "conflicts" => commands::conflicts::__docgen_schemas(),
         "consolidate" => commands::consolidate::__docgen_schemas(),
         "deliver" => commands::deliver::__docgen_schemas(),
         "diff" => commands::diff::__docgen_schemas(),
         "expand" => commands::expand::__docgen_schemas(),
-        "franchise" => commands::franchise::__docgen_schemas(),
         "git" => [
             commands::import_git::__docgen_schemas(),
             commands::export_git::__docgen_schemas(),
@@ -418,12 +417,15 @@ fn command_schemas(name: &str) -> Option<Vec<OutputSchema>> {
         "lift" => commands::lift::__docgen_schemas(),
         "load" => commands::load::__docgen_schemas(),
         "lower" => commands::lower::__docgen_schemas(),
-        "kv" => commands::kv::__docgen_schemas(),
-        "manifest" => commands::manifest::__docgen_schemas(),
+        "manifest" => [
+            commands::manifest::__docgen_schemas(),
+            commands::kv::__docgen_schemas(),
+        ].into_iter().flatten().collect(),
         "narrow" => commands::narrow::__docgen_schemas(),
         "office" => commands::office::__docgen_schemas(),
         "pallet" => commands::pallet::__docgen_schemas(),
         "park" => commands::park::__docgen_schemas(),
+        "pick" => commands::pick::__docgen_schemas(),
         "prepare" => commands::prepare::__docgen_schemas(),
         "profile" => commands::profile::__docgen_schemas(),
         "remove" => commands::remove::__docgen_schemas(),

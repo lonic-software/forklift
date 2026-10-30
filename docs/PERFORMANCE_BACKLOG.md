@@ -274,7 +274,7 @@ A/B tests against saved binaries on a quiet machine.
   filesystem metadata wall (docs/PARALLELIZATION_PLAN.md, item 2).
 - **Fix:** `fanout_utils::prefetch_in_order`. Workers load in a bounded window (256 items, 64 MiB
   held) ahead of a single consumer, which writes **serially and in input order**. That consumer
-  is `shift_utils::apply_ops_each` (shift, park, lower, franchise, consolidate's fast-forward) or
+  is `shift_utils::apply_ops_each` (shift, park, lower, clone, consolidate's fast-forward) or
   `consolidate::apply_merge_actions` (take-theirs writes). Below 8 writes it stays fully serial.
   Chunked entries still stream from the store. A load error is reported at that file's turn,
   after every earlier file has been written, which is the same first failure as the serial loop.

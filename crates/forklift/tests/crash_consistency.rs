@@ -1210,7 +1210,7 @@ fn cherry_pick_barrier_count_for(files_per_dir: usize) -> u64 {
     let area = Area::new(&format!("cherry-pick-barrier-count-{}", files_per_dir));
     let feature = diverged_merge_fixture(&area, files_per_dir, false);
 
-    let mut command = area.command(&["cherry-pick", &feature]);
+    let mut command = area.command(&["pick", &feature]);
     command.env("FORKLIFT_DEBUG_BARRIER_COUNT", "1");
     let output = command.output().unwrap();
     assert!(output.status.success(), "cherry-pick failed: {}", String::from_utf8_lossy(&output.stderr));

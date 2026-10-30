@@ -62,13 +62,13 @@ async fn moved_under_merge(pallet: &str, found: Option<&str>) -> Result<Option<S
             "consolidation",
             state.our_head,
             merge_utils::abort_hint_in(&bay_root()),
-            "merge again (\"forklift consolidate\", or the \"forklift haul merge\" or \"forklift lift\" that started it)".to_string(),
+            "merge again (\"forklift consolidate\", or the \"forklift haul consolidate\" or \"forklift lift\" that started it)".to_string(),
         ),
         (None, Some(state)) => (
-            "cherry-pick",
+            "pick",
             state.our_head,
             cherry_pick_utils::abort_hint(),
-            format!("cherry-pick {} again", state.source),
+            format!("pick {} again", state.source),
         ),
         (None, None) => return Ok(None),
     };
@@ -153,7 +153,7 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
 mod tests {
     use super::*;
     use forklift_core::util::pallet_utils;
-    use crate::commands::{cherry_pick, consolidate, load};
+    use crate::commands::{consolidate, load, pick};
     use crate::test_support::{self, Warehouse};
 
     #[test]
@@ -266,7 +266,7 @@ mod tests {
         test_support::check_out(&our_tree);
 
         // A conflicted pick, resolved and loaded by hand.
-        test_support::block_on(cherry_pick::handle_command(&source, None)).unwrap();
+        test_support::block_on(pick::handle_command(&source, None)).unwrap();
         assert!(cherry_pick_utils::read_state().unwrap().is_some());
         std::fs::write(warehouse.root.join("a.txt"), b"resolved\n").unwrap();
         test_support::block_on(load::handle_command("a.txt")).unwrap();
@@ -276,7 +276,7 @@ mod tests {
 
         let error = test_support::block_on(handle_command(None))
             .expect_err("completing a pick over a moved pallet must be refused");
-        assert!(error.contains("cherry-pick is kept") && error.contains("forklift shift main"), "{}", error);
+        assert!(error.contains("pick is kept") && error.contains("forklift shift main"), "{}", error);
         assert!(error.contains("\"new.txt\""), "the files the pick added must be listed: {}", error);
 
         assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(elsewhere),

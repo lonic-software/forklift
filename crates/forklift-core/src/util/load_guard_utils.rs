@@ -97,7 +97,7 @@
 //!   it either — see `restore::restore_staged`'s doc comment): the region it validated is exactly
 //!   `<path>`'s own subtree, so the same "only what `R` covers" rule already gives the right
 //!   answer with no separate function needed. `shift`, `park`'s post-push reset, a `consolidate`
-//!   fast-forward, `git import`'s initial checkout, and `lower`/`franchise`'s materialization all
+//!   fast-forward, `git import`'s initial checkout, and `lower`/`clone`'s materialization all
 //!   replace the *entire* staging area from a known-good tree — call [`clear_all_recorded`]. Both
 //!   are wired once, inside `inventory_utils::ShardLedger::replace_subtree` and `inventory_utils::
 //!   replace_all_inventories` respectively, so every caller of either gets this for free.
@@ -202,7 +202,7 @@ pub fn clear_recorded_under(root_key: &str) -> BTreeSet<String> {
 
 /// Record that the *entire* staging area is now known-consistent — every operation that replaces
 /// staging wholesale from a known-good tree (`shift`, `park`'s post-push reset, a `consolidate`
-/// fast-forward, `git import`'s initial checkout, `lower`/`franchise`'s materialization) calls
+/// fast-forward, `git import`'s initial checkout, `lower`/`clone`'s materialization) calls
 /// this once it has finished. Best-effort (see [`mark_load_completed`]'s doc comment).
 pub fn clear_all_recorded() {
     marker_utils::clear(&marker_path());
