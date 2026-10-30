@@ -319,12 +319,13 @@ fn the_frozen_rows_of_the_coverage_map_are_unchanged() {
         "a frozen row of surface/coverage.txt changed (hash {hash:#018x}). Restore it: a row stays as \
          it was when the map was frozen, and what it became goes on `-> forklift …: …` lines under it");
     // A destination line is outside the hash, and a row's text is inside it.
-    // (The rows are spelled through a placeholder, or the hint check would read them as hints.)
-    let row = format!("{} compact: --all --redelta\n", "forklift");
+    // (The rows are spelled through a placeholder, or the hint check would read them as hints,
+    // and matched without their line ending, which a Windows checkout may make `\r\n`.)
+    let row = format!("{} compact: --all --redelta", "forklift");
     assert!(COVERAGE.contains(&row));
-    let added = COVERAGE.replacen(&row, &format!("{row}    -> {} x:\n", "forklift"), 1);
+    let added = COVERAGE.replacen(&row, &format!("{row}\n    -> {} x:", "forklift"), 1);
     assert_eq!(frozen_rows_hash(&added), hash);
-    let edited = COVERAGE.replacen(&row, &format!("{} compact: --all\n", "forklift"), 1);
+    let edited = COVERAGE.replacen(&row, &format!("{} compact: --all", "forklift"), 1);
     assert_ne!(frozen_rows_hash(&edited), hash);
 }
 
