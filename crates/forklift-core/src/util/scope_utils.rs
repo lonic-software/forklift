@@ -513,7 +513,7 @@ pub fn read_main_tree_scope() -> Result<MaterializationScope, String> {
 const REMEDY_REFRANCHISE: &str = "Franchise the remote again, into a new directory.";
 /// The way out for a bay's scope Forklift cannot use. A removed bay keeps its pallet, so its name
 /// stays taken and the new bay needs another.
-const REMEDY_READD_BAY: &str = "Remove the bay with \"bay remove\" and add a new one under another name; \
+const REMEDY_READD_BAY: &str = "Remove the bay with \"forklift bay remove\" and add a new one under another name; \
     copy any uncommitted work across by hand.";
 
 /// Set the active checkout's materialization scope, refusing one the readers would refuse: a

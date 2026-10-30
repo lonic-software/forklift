@@ -30,7 +30,7 @@ pub fn handle_command(pallet: Option<String>, full: bool) -> Result<(), String> 
     let Some(anchor) = office_utils::read_trust_anchor()? else {
         return Err(
             "Trust is not established for this warehouse; there are no signatures to \
-            audit. Establish it with \"office enroll\".".to_string()
+            audit. Establish it with \"forklift office enroll\".".to_string()
         );
     };
 

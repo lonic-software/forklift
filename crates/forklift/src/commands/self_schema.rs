@@ -777,7 +777,7 @@ mod tests {
         assert!(diff.contains(r#""run":"diff {staged} -- {targets}""#), "{diff}");
         assert!(diff.contains(concat!(
             r#""staged":{"flag":{"arg":"--staged"},"#,
-            r#""description":"Compare the inventory against the pallet head (what \"stack\" would record)"}"#,
+            r#""description":"Compare the inventory against the pallet head (what \"forklift stack\" would record)"}"#,
         )), "{diff}");
         // A run of one optional positional is described by that positional's help, unlabelled.
         assert!(diff.contains(

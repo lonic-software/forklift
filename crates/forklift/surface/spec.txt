@@ -1,0 +1,106 @@
+# The approved command surface of the `forklift` binary.
+#
+# The surface check (crates/forklift/src/surface_check.rs) fails until this file and the binary
+# name the same commands, so a new command is a decision made here, on review, not a side effect
+# of adding a variant to cli.rs. Adding one means placing it in [commands] and classifying it
+# against the definition of each list below; removing or renaming one means editing it here too.
+# The coverage map beside this file (coverage.txt) records what every earlier command became.
+
+[commands]
+# One top-level name per line. A family is written `name: subcommand subcommand …`.
+alias: install uninstall status
+audit
+bay: add remove
+blame
+cherry-pick
+compact
+config
+conflicts
+consolidate
+deliver
+diff
+evict
+expand
+export-git
+franchise
+haul: open list show update comment review merge close reopen
+heal
+help
+history
+import-git
+kv: set get unset list log
+lift
+load
+lower
+manifest: note approve provenance show
+mcp
+mirror
+narrow
+office: enroll keygen admit link authorize role rotate retire regenesis accept-regenesis list
+palletize
+park: pop list
+peek
+prepare
+profile: list create use
+query
+remote: move
+remove
+restore
+scope: status
+scope-prune
+self-schema
+self-update
+shift
+show
+stack
+stocktake
+store
+tag: create show list
+undo
+unload
+version
+
+[daily-loop]
+# The commands a person runs every day, kept top-level and short. Only these may carry a visible
+# short alias, at most one each.
+load
+unload
+remove
+restore
+stack
+stocktake
+diff
+show
+shift
+consolidate
+undo
+lift
+lower
+history
+park
+
+[destructive]
+# An operation is destructive when it destroys working-tree content, history or a verified trust
+# guarantee that exists now, and no Forklift command can bring it back from this warehouse alone.
+# When only one mode of a command is destructive, the entry names the flag and value selecting it.
+restore
+scope-prune
+office regenesis
+office accept-regenesis
+lower --keep …=theirs
+
+[recorded-text]
+# The commands that record text: free-form prose a person writes to describe a record (a
+# parcel's description, a note, a comment, a review, a tag or delivery message, a haul's longer
+# description). A keyed value (kv set VALUE, config VALUE) and a short title (haul open --title)
+# are not recorded text.
+stack
+cherry-pick
+deliver
+haul open
+haul comment
+haul review
+manifest note
+manifest approve
+manifest provenance
+tag create

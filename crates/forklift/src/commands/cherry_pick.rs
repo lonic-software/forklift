@@ -47,14 +47,14 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
     // in-progress consolidation or another in-progress pick.
     if merge_utils::read_consolidation_state()?.is_some() {
         return Err(
-            "A consolidation is in progress. Complete it (resolve, \"load\", \"stack\") or abort \
+            "A consolidation is in progress. Complete it (resolve, \"forklift load\", \"forklift stack\") or abort \
             it before cherry-picking.".to_string()
         );
     }
 
     if cherry_pick_utils::read_state()?.is_some() {
         return Err(format!(
-            "A cherry-pick is already in progress. Resolve its conflicts and \"stack\", or {} to \
+            "A cherry-pick is already in progress. Resolve its conflicts and \"forklift stack\", or {} to \
             abort it.",
             cherry_pick_utils::abort_hint()
         ));
@@ -92,7 +92,7 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
     if !consolidate::is_warehouse_clean(&our_tree).await? {
         return Err(
             "There are local changes that a cherry-pick would overwrite. Stack them, restore \
-            them, or park them first (see \"stocktake\" for the details).".to_string()
+            them, or park them first (see \"forklift stocktake\" for the details).".to_string()
         );
     }
 
@@ -240,7 +240,7 @@ impl CommandOutput for CherryPicked {
                 }
 
                 println!(
-                    "\nResolve the conflicts, \"load\" the resolved files, then \"stack\" to \
+                    "\nResolve the conflicts, \"forklift load\" the resolved files, then \"forklift stack\" to \
                     complete the cherry-pick (or {} to abort it).",
                     cherry_pick_utils::abort_hint()
                 );

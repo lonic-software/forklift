@@ -176,7 +176,7 @@ impl CommandOutput for ConflictReport {
             }
         }
 
-        println!("\nResolve each file, \"load\" it, then \"stack\" to complete the consolidation.");
+        println!("\nResolve each file, \"forklift load\" it, then \"forklift stack\" to complete the consolidation.");
     }
 }
 

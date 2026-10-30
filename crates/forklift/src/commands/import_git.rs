@@ -65,7 +65,7 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
     if office_utils::read_trust_anchor()?.is_some() {
         return Err(
             "Trust is already established here; unsigned git history cannot be imported. \
-            Import into a fresh warehouse, then \"office enroll\".".to_string()
+            Import into a fresh warehouse, then \"forklift office enroll\".".to_string()
         );
     }
 
@@ -255,8 +255,8 @@ fn unheld_warning(unheld: &[String]) -> Option<String> {
     Some(format!(
         "{} file(s) do not hold the content imported for them, so they read as changed: {}. \
         An uncommitted edit or deletion does this, and so does git converting a file as it checks \
-        it out (line endings, \"ident\", a filter). \"load\" and stack a path to keep it as it is; \
-        for a file you did not edit, \"restore\" writes its imported content back instead, \
+        it out (line endings, \"ident\", a filter). \"forklift load\" and stack a path to keep it as it is; \
+        for a file you did not edit, \"forklift restore\" writes its imported content back instead, \
         discarding what the file holds.",
         unheld.len(), named
     ))
@@ -1267,7 +1267,7 @@ impl CommandOutput for ImportReport {
         }
 
         println!(
-            "The history is unsigned (imported). Run \"office enroll\" to establish trust — \
+            "The history is unsigned (imported). Run \"forklift office enroll\" to establish trust — \
             it anchors the imported history as the legacy boundary."
         );
     }

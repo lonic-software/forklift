@@ -26,7 +26,7 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
     if office_utils::read_trust_anchor()?.is_some() {
         return Err(
             "Trust is already established for this warehouse. Ask an enrolled operator \
-            to admit you: generate a keypair with \"office keygen\" and hand them the \
+            to admit you: generate a keypair with \"forklift office keygen\" and hand them the \
             public key.".to_string()
         );
     }
@@ -63,7 +63,7 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
 
         if info.trust.is_some() {
             return Err(
-                "The remote already has trust established. \"lower\" to adopt its \
+                "The remote already has trust established. \"forklift lower\" to adopt its \
                 office, then ask an enrolled operator to admit you.".to_string()
             );
         }
@@ -327,7 +327,7 @@ pub fn authorize(operator_id: &str, public_key: &str, pop: &str) -> Result<(), S
 
     if operator_id == actor_id {
         return Err(
-            "That is your own identity; link your own devices with \"office link\" — \
+            "That is your own identity; link your own devices with \"forklift office link\" — \
             it endorses the key with your existing key instead of an admin's.".to_string()
         );
     }
@@ -336,7 +336,7 @@ pub fn authorize(operator_id: &str, public_key: &str, pop: &str) -> Result<(), S
 
     if state.find_user(operator_id).is_none() {
         return Err(format!(
-            "\"{}\" is not enrolled; use \"office admit\" for new operators.",
+            "\"{}\" is not enrolled; use \"forklift office admit\" for new operators.",
             operator_id
         ));
     }
@@ -509,7 +509,7 @@ pub async fn retire(key_id: &str, compromised: bool, offline: bool) -> Result<()
     if is_own && own_active_count == 1 {
         return Err(
             "This is your only active key; retiring it would lock you out. Use \
-            \"office rotate\" instead.".to_string()
+            \"forklift office rotate\" instead.".to_string()
         );
     }
 
@@ -706,7 +706,7 @@ impl CommandOutput for OfficeListing {
     fn render_human(&self) {
         if !self.enrolled {
             println!(
-                "No one is enrolled. Establish trust with \"office enroll\" (this makes \
+                "No one is enrolled. Establish trust with \"forklift office enroll\" (this makes \
                 signing mandatory and cannot be undone)."
             );
 
@@ -769,7 +769,7 @@ pub fn regenesis(confirm: bool) -> Result<(), String> {
     let Some((old_anchor, old_anchor_bytes)) = office_utils::read_trust_anchor_with_bytes()? else {
         return Err(
             "Trust is not established for this warehouse; there is nothing to reset. \
-            Use \"office enroll\".".to_string()
+            Use \"forklift office enroll\".".to_string()
         );
     };
 
@@ -871,7 +871,7 @@ pub fn regenesis(confirm: bool) -> Result<(), String> {
         Prior genesis:      {} (chain of custody, recorded in the anchor)\n\
         Adopted history:    {} (frozen, attested by the new anchor)\n\n\
         Every clone must consciously re-accept the new anchor with \
-        \"office accept-regenesis --confirm {}\". A remote accepts the reset only from the server \
+        \"forklift office accept-regenesis --confirm {}\". A remote accepts the reset only from the server \
         operator's static token.",
         genesis, key_id, old_anchor.genesis, old_office_head, genesis
     ));
@@ -931,7 +931,7 @@ pub async fn accept_regenesis(confirm: Option<String>) -> Result<(), String> {
         "Accepted the re-genesis.\n\
         Old genesis: {}\n\
         New genesis: {}\n\
-        The prior history is retained as attested; \"lower\" to continue.",
+        The prior history is retained as attested; \"forklift lower\" to continue.",
         old.genesis, new.genesis
     );
 
@@ -1003,7 +1003,7 @@ fn office_change_preconditions(anchor_bytes: &[u8], pallets: PalletsPrecondition
 pub(crate) fn require_signing_actor(actor: &Operator) -> Result<SigningActor, String> {
     let Some((_, anchor_bytes)) = office_utils::read_trust_anchor_with_bytes()? else {
         return Err(
-            "Trust is not established for this warehouse yet; use \"office enroll\" first.".to_string()
+            "Trust is not established for this warehouse yet; use \"forklift office enroll\" first.".to_string()
         );
     };
 

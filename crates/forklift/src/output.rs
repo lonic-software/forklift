@@ -644,9 +644,9 @@ impl ErrorCode {
             ErrorCode::NonOriginRemote =>
                 "A partial (--only or --cache) warehouse was asked to talk to a remote other than its origin, or its origin record is missing",
             ErrorCode::NarrowUnclean =>
-                "\"narrow\" would delete a subtree that still holds uncommitted work",
+                "\"forklift narrow\" would delete a subtree that still holds uncommitted work",
             ErrorCode::ScopePruneBlocked =>
-                "\"scope-prune\" would free a path a checkout still materializes",
+                "\"forklift scope-prune\" would free a path a checkout still materializes",
             ErrorCode::ChunkedTransportUnsupported =>
                 "A chunked large file can't go into a bundle, or is being lifted to a remote \
                  that doesn't support chunking",
@@ -656,12 +656,12 @@ impl ErrorCode {
                 "A lift needs a paginated commit (many objects) and the remote doesn't support \
                  it yet",
             ErrorCode::QueryPredicateInvalid =>
-                "A \"query\" predicate is malformed or exceeds a fixed bound",
+                "A \"forklift query\" predicate is malformed or exceeds a fixed bound",
             ErrorCode::EmptyHistory =>
-                "\"history\" was asked to walk a pallet that has nothing stacked on it yet",
+                "\"forklift history\" was asked to walk a pallet that has nothing stacked on it yet",
             ErrorCode::IncompleteLoad =>
-                "\"stack\", \"park\", \"consolidate\" or \"cherry-pick\" refused because a \
-                 \"load\" that never finished cleanly is still recorded, or a command refused \
+                "\"forklift stack\", \"forklift park\", \"forklift consolidate\" or \"forklift cherry-pick\" refused because a \
+                 \"forklift load\" that never finished cleanly is still recorded, or a command refused \
                  because an operation that rewrites the whole staging area was interrupted (\"forklift heal\" finishes or undoes it)",
             ErrorCode::DurabilityTaint =>
                 "A durability taint could not be auto-healed (a vanished, unreadable, or \
@@ -674,26 +674,26 @@ impl ErrorCode {
                  misbehaving or corrupt, and retrying gets the same answer",
             ErrorCode::MetaConflict =>
                 "A meta pallet changed differently on both sides at the same path; nothing was \
-                 lifted for it, and \"lower --keep\" resolves each named path",
+                 lifted for it, and \"forklift lower --keep\" resolves each named path",
             ErrorCode::StagedContentMissing =>
-                "\"stack\" or \"park\" found a staged file whose content the object store no \
+                "\"forklift stack\" or \"forklift park\" found a staged file whose content the object store no \
                  longer holds; no parcel was made",
             ErrorCode::Behind =>
                 "Another bay or process moved the pallet past the parcel this bay stands on; \
-                 nothing was moved, and \"shift\" catches the bay up",
+                 nothing was moved, and \"forklift shift\" catches the bay up",
             ErrorCode::TargetNotCovered =>
-                "\"deliver\" was aimed at a target holding changes the draft has not seen; \
+                "\"forklift deliver\" was aimed at a target holding changes the draft has not seen; \
                  consolidating the target into the draft comes first",
             ErrorCode::RemoteAhead =>
                 "The remote's pallet holds parcels this warehouse has not lowered yet; \
-                 \"lower\" comes first",
+                 \"forklift lower\" comes first",
             ErrorCode::PalletNotFound =>
-                "No pallet of that name exists in this warehouse (or, for \"lower\", on the \
-                 remote); \"lower <name>\" brings in the remote's, \"palletize <name>\" creates a \
-                 new one, \"palletize --remote\" lists the remote's",
+                "No pallet of that name exists in this warehouse (or, for \"forklift lower\", on the \
+                 remote); \"forklift lower <name>\" brings in the remote's, \"forklift palletize <name>\" creates a \
+                 new one, \"forklift palletize --remote\" lists the remote's",
             ErrorCode::FranchiseIncomplete =>
                 "The directory holds a franchise that has not finished; running the same \
-                 \"franchise\" again resumes it and keeps what was fetched",
+                 \"forklift franchise\" again resumes it and keeps what was fetched",
             ErrorCode::OnlyPrefixNotFound =>
                 "A sparse franchise's --only path is not a directory in the pallet on the remote",
             ErrorCode::StagedUploadDiscarded =>
@@ -708,14 +708,14 @@ impl ErrorCode {
                  remote serves); nothing was adopted",
             ErrorCode::PalletDeletedOnRemote =>
                 "The remote has the pallet only as a tombstone: it was deleted there, and the name \
-                 stays reserved for that history; \"palletize --restore <name> --remote\" brings it \
-                 back, \"lift --recreate\" re-creates it from work that descends from it",
+                 stays reserved for that history; \"forklift palletize --restore <name> --remote\" brings it \
+                 back, \"forklift lift --recreate\" re-creates it from work that descends from it",
             ErrorCode::CacheMiss =>
                 "A cache warehouse does not hold content the command reads, and could not reach its \
                  origin to fetch it; the command works once the origin can be reached",
             ErrorCode::OriginMovePending =>
-                "A move of a partial warehouse's origin has not finished; \"remote move <url>\" \
-                 finishes it, \"remote move --abort\" abandons one that has not started rewriting",
+                "A move of a partial warehouse's origin has not finished; \"forklift remote move <url>\" \
+                 finishes it, \"forklift remote move --abort\" abandons one that has not started rewriting",
             ErrorCode::OriginMoveIncomplete =>
                 "The server a partial warehouse's origin was to move to lacks content the warehouse \
                  relies on its origin to hold; the origin was left where it was, and copying the old \

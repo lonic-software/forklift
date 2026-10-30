@@ -107,8 +107,8 @@ pub async fn handle_command(staged: bool, targets: &[String], verbose: bool) -> 
             diff_pallets(from_revision, to_revision, filter.as_ref(), verbose)
         }
         _ => Err(
-            "Too many arguments. Usage: \"diff [path]\", \"diff --staged [path]\" or \
-            \"diff <revision-a> <revision-b> [path]\".".to_string()
+            "Too many arguments. Usage: \"forklift diff [path]\", \"forklift diff --staged [path]\" or \
+            \"forklift diff <revision-a> <revision-b> [path]\".".to_string()
         ),
     }
 }
@@ -237,7 +237,7 @@ async fn diff_staged(filter: Option<&WarehousePath>, verbose: bool) -> Result<()
     let head_tree_hash = head_tree_hash.as_deref();
     let blocks = format_blocks(&selected, |change| {
         if change.kind == ChangeKind::Conflict {
-            return Ok(format!("{}\n  (unresolved — resolve the file and \"load\" it)\n",
+            return Ok(format!("{}\n  (unresolved — resolve the file and \"forklift load\" it)\n",
                               color::paint(color::BOLD, format_args!("conflict: {}", change.path))));
         }
 

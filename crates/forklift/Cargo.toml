@@ -42,6 +42,11 @@ serde_json = { workspace = true }
 # The guide-page test splits the pages' commands as a POSIX shell would. Already in the tree, at the
 # version Cargo.lock pins.
 shlex = "2"
+# The hint check lexes every Rust source under crates/ to find the string literals that name a
+# `forklift` command. Both are already in the tree as clap_derive's own dependencies, at the
+# versions Cargo.lock pins.
+proc-macro2 = "1"
+syn = { version = "2", default-features = false, features = ["parsing"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 # The metadata-alias test asks NTFS for the 8.3 short name it gave `.forklift`.

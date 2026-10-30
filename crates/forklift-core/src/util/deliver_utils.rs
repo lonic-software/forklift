@@ -77,7 +77,7 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
     let stack_utils::Signing::Signed { key_id: signing_key_id, office, .. } = stack_utils::resolve_signing_key(&operator)? else {
         return Err(
             "Deliver records the checkpoint trail as signed post-metadata, so it needs an \
-            enrolled key. Establish trust with \"office enroll\" first.".to_string()
+            enrolled key. Establish trust with \"forklift office enroll\" first.".to_string()
         );
     };
 

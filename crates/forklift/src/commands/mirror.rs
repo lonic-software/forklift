@@ -48,7 +48,7 @@ pub async fn handle_command() -> Result<(), String> {
     refuse_partial_view()?;
 
     let url = mirror_url()?.ok_or(format!(
-        "No git mirror is configured. Set one with \"forklift config {} <git url>\".",
+        "No git mirror is configured. Set one with \"forklift config {} <url>\".",
         config_utils::KEY_MIRROR_URL
     ))?;
     let client = RemoteClient::from_config()?;
@@ -199,7 +199,7 @@ fn refuse_partial_view() -> Result<(), CoreError> {
     if scope_utils::content_may_be_absent()? {
         return Err(CoreError::refusal(
             RefusalCode::SparseWorkspace,
-            "\"mirror\" needs every file of each mirrored pallet, and this warehouse was franchised \
+            "\"forklift mirror\" needs every file of each mirrored pallet, and this warehouse was franchised \
             with --only or --cache, so it may lack some of them.",
             "Run \"forklift mirror\" from a franchise made without --only or --cache.",
         ));
@@ -217,7 +217,7 @@ fn mirror_url() -> Result<Option<String>, String> {
 }
 
 fn busy_message() -> String {
-    "Another forklift mirror run is using this warehouse's mirror. Run \"forklift mirror\" again \
+    "Another mirror run is using this warehouse's mirror. Run \"forklift mirror\" again \
     once it finishes.".to_string()
 }
 

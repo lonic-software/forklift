@@ -62,7 +62,7 @@ async fn moved_under_merge(pallet: &str, found: Option<&str>) -> Result<Option<S
             "consolidation",
             state.our_head,
             merge_utils::abort_hint_in(&bay_root()),
-            "merge again (\"consolidate\", or the \"haul merge\" or \"lift\" that started it)".to_string(),
+            "merge again (\"forklift consolidate\", or the \"forklift haul merge\" or \"forklift lift\" that started it)".to_string(),
         ),
         (None, Some(state)) => (
             "cherry-pick",
@@ -76,19 +76,19 @@ async fn moved_under_merge(pallet: &str, found: Option<&str>) -> Result<Option<S
     let left = match left_untracked(&base).await {
         Ok(left) if left.is_empty() => String::new(),
         Ok(left) => format!(
-            " delete the files \"restore\" leaves behind as untracked: {};",
+            " delete the files \"forklift restore\" leaves behind as untracked: {};",
             left.iter().map(|path| format!("\"{}\"", path)).collect::<Vec<_>>().join(", ")
         ),
         Err(e) => format!(
-            " delete the files \"restore\" leaves behind as untracked (they could not be \
+            " delete the files \"forklift restore\" leaves behind as untracked (they could not be \
             listed: {});",
             e
         ),
     };
 
     let way_out = format!(
-        "To redo it on the new head: abort it ({}); discard its output with \"restore --staged .\" \
-        and then \"restore .\";{} catch up with \"forklift shift {}\"; then {}.",
+        "To redo it on the new head: abort it ({}); discard its output with \"forklift restore --staged .\" \
+        and then \"forklift restore .\";{} catch up with \"forklift shift {}\"; then {}.",
         abort,
         left,
         pallet,

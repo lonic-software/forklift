@@ -901,7 +901,7 @@ fn parse_leaf(object: &serde_json::Map<String, Value>) -> Result<Leaf, String> {
         "signer.key" => {
             let (negate, values) = membership_values(object, op, field)?;
             if negate {
-                return Err(invalid("\"signer.key\" supports \"eq\" and \"in\" only.".to_string()));
+                return Err(invalid("The \"signer.key\" field supports \"eq\" and \"in\" only.".to_string()));
             }
             Ok(Leaf::SignerKey { prefixes: string_values(values, field)? })
         }
@@ -914,7 +914,7 @@ fn parse_leaf(object: &serde_json::Map<String, Value>) -> Result<Leaf, String> {
         "signer.boundary" => {
             let (negate, values) = membership_values(object, op, field)?;
             if negate {
-                return Err(invalid("\"signer.boundary\" supports \"eq\" and \"in\" only.".to_string()));
+                return Err(invalid("The \"signer.boundary\" field supports \"eq\" and \"in\" only.".to_string()));
             }
             let values = string_values(values, field)?
                 .into_iter()
@@ -951,7 +951,7 @@ fn parse_leaf(object: &serde_json::Map<String, Value>) -> Result<Leaf, String> {
 
         "is_merge" => {
             if op != "eq" {
-                return Err(invalid("\"is_merge\" supports \"eq\" only.".to_string()));
+                return Err(invalid("The \"is_merge\" field supports \"eq\" only.".to_string()));
             }
             let value = object
                 .get("value")
@@ -962,7 +962,7 @@ fn parse_leaf(object: &serde_json::Map<String, Value>) -> Result<Leaf, String> {
 
         "parents.count" => {
             if op != "eq" {
-                return Err(invalid("\"parents.count\" supports \"eq\" only.".to_string()));
+                return Err(invalid("The \"parents.count\" field supports \"eq\" only.".to_string()));
             }
             let value = object
                 .get("value")
@@ -974,7 +974,7 @@ fn parse_leaf(object: &serde_json::Map<String, Value>) -> Result<Leaf, String> {
         "parcel" => {
             let (negate, values) = membership_values(object, op, field)?;
             if negate {
-                return Err(invalid("\"parcel\" supports \"eq\" and \"in\" only.".to_string()));
+                return Err(invalid("The \"parcel\" field supports \"eq\" and \"in\" only.".to_string()));
             }
             Ok(Leaf::ParcelPrefix { prefixes: string_values(values, field)? })
         }
@@ -1013,14 +1013,14 @@ fn parse_leaf(object: &serde_json::Map<String, Value>) -> Result<Leaf, String> {
         "tag" => {
             let (negate, values) = membership_values(object, op, field)?;
             if negate {
-                return Err(invalid("\"tag\" supports \"eq\" and \"in\" only.".to_string()));
+                return Err(invalid("The \"tag\" field supports \"eq\" and \"in\" only.".to_string()));
             }
             Ok(Leaf::Tag { values: string_values(values, field)? })
         }
 
         "path" => {
             if op != "touches" {
-                return Err(invalid("\"path\" supports the \"touches\" operator only.".to_string()));
+                return Err(invalid("The \"path\" field supports the \"touches\" operator only.".to_string()));
             }
             let raw = object
                 .get("value")

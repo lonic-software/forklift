@@ -2540,7 +2540,7 @@ impl RemoteClient {
             .map(|(value, _)| value)
             .ok_or(format!(
                 "No remote is configured for this warehouse. Set one with \
-                \"config {} <url>\".",
+                \"forklift config {} <url>\".",
                 config_utils::KEY_REMOTE_URL
             ))?;
 
@@ -6270,7 +6270,7 @@ async fn lift_pallet_inner(client: &RemoteClient,
         if !file_utils::does_object_exist(remote_head)? {
             return Err(pallet_utils::remote_ahead_refusal(format!(
                 "The remote's pallet \"{}\" has parcels this warehouse does not know \
-                (head {}). \"lower\" first.",
+                (head {}). \"forklift lower\" first.",
                 pallet, remote_head
             )).into());
         }
@@ -6283,14 +6283,14 @@ async fn lift_pallet_inner(client: &RemoteClient,
             // nothing: it says what it could not decide, and that lowering brings the history in.
             return Err(match merge_utils::is_ancestor(local_head, remote_head) {
                 Ok(true) => pallet_utils::remote_ahead_refusal(format!(
-                    "The remote's pallet \"{}\" is ahead of this warehouse's (head {}). \"lower\" \
+                    "The remote's pallet \"{}\" is ahead of this warehouse's (head {}). \"forklift lower\" \
                     first.",
                     pallet, remote_head
                 )),
                 Ok(false) => diverged_refusal(pallet, remote_head),
                 Err(e) => CoreError::Other(format!(
                     "Could not tell whether the remote's pallet \"{}\" (head {}) is ahead of this \
-                    warehouse's or diverged from it: {}. \"lower\" brings in the remote's history, \
+                    warehouse's or diverged from it: {}. \"forklift lower\" brings in the remote's history, \
                     if that is what is missing.",
                     pallet, remote_head, e
                 )),
@@ -6339,7 +6339,7 @@ pub fn diverged_refusal(pallet: &str, remote_head: &str) -> CoreError {
         return CoreError::refusal(
             RefusalCode::Diverged,
             format!(
-                "The local pallet \"{}\" and the remote have diverged. \"lower\" reconciles it; \
+                "The local pallet \"{}\" and the remote have diverged. \"forklift lower\" reconciles it; \
                 then lift again.",
                 pallet
             ),
@@ -6351,9 +6351,9 @@ pub fn diverged_refusal(pallet: &str, remote_head: &str) -> CoreError {
         RefusalCode::Diverged,
         format!(
             "The local pallet \"{p}\" and the remote have diverged. The remote parcels are \
-            fetched; palletize the remote head into its own pallet (\"palletize {p}-remote-{s} {s}\", \
-            which moves this bay onto it), shift back (\"shift {p}\"), consolidate it \
-            (\"consolidate {p}-remote-{s}\"), and lift the result.",
+            fetched; palletize the remote head into its own pallet (\"forklift palletize {p}-remote-{s} {s}\", \
+            which moves this bay onto it), shift back (\"forklift shift {p}\"), consolidate it \
+            (\"forklift consolidate {p}-remote-{s}\"), and lift the result.",
             p = pallet, s = short
         ),
         format!(
@@ -7699,7 +7699,7 @@ pub enum RegenesisState {
 pub async fn pending_regenesis(client: &RemoteClient) -> Result<RegenesisState, String> {
     let Some((local, local_bytes)) = office_utils::read_trust_anchor_with_bytes()? else {
         return Err(
-            "This warehouse has no trust anchor; a plain \"lower\" adopts the remote's \
+            "This warehouse has no trust anchor; a plain \"forklift lower\" adopts the remote's \
             trust on first contact.".to_string()
         );
     };
@@ -7827,7 +7827,7 @@ pub async fn push_local_trust(client: &RemoteClient,
         if info.trust.is_some() {
             return Err(
                 "The remote has trust established but this warehouse does not. \
-                \"lower\" first to adopt the remote's office.".to_string()
+                \"forklift lower\" first to adopt the remote's office.".to_string()
             );
         }
 

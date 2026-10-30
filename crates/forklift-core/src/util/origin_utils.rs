@@ -101,7 +101,7 @@ pub fn checked_remote() -> Result<(String, Option<String>), CoreError> {
     let url = config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)?
         .map(|(value, _)| value)
         .ok_or_else(|| format!(
-            "No remote is configured for this warehouse. Set one with \"config {} <url>\".",
+            "No remote is configured for this warehouse. Set one with \"forklift config {} <url>\".",
             config_utils::KEY_REMOTE_URL
         ))?;
 

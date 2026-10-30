@@ -77,7 +77,7 @@ async fn create_pallet(name: &str, revision: Option<&str>) -> Result<(), String>
 
     if pallet_utils::does_pallet_exist(name) {
         return Err(format!(
-            "Pallet \"{}\" already exists. Use the \"shift\" command to move to it.",
+            "Pallet \"{}\" already exists. Use the \"forklift shift\" command to move to it.",
             name
         ));
     }
@@ -476,6 +476,14 @@ impl RemoteAction {
             RemoteAction::Restore => "restore",
         }
     }
+
+    /// The command that runs this action on remote pallet `name` again.
+    fn rerun(self, name: &str) -> String {
+        match self {
+            RemoteAction::Delete => format!("forklift palletize --delete {} --remote", name),
+            RemoteAction::Restore => format!("forklift palletize --restore {} --remote", name),
+        }
+    }
 }
 
 /// A remote's refusal of an `action` on user pallet `name` because the pallet changed after the
@@ -490,7 +498,7 @@ fn moved_since_read(why: String, name: &str, action: RemoteAction) -> String {
         return why;
     };
 
-    let rerun = format!("forklift palletize --{} {} --remote", action.flag(), name);
+    let rerun = action.rerun(name);
     let (refusal, message, next_step) = match (error::RefusalCode::from_code(code), action) {
         (Some(refusal @ error::RefusalCode::RemoteAhead), _) => (refusal, format!(
             "The remote's pallet \"{}\" changed after this command read it ({}); nothing was changed. \
@@ -942,7 +950,7 @@ fn describe_remote_entry(entry: &RemotePalletEntry, namespace: PalletNamespace) 
     match entry.relation {
         RemoteRelation::Absent => format!("{} (not here; \"forklift lower {}\" brings it in)", entry.name, entry.name),
         RemoteRelation::Same => format!("{} (same as here)", entry.name),
-        RemoteRelation::LocalAhead => format!("{} (ahead here; \"lift\" from it publishes it)", entry.name),
+        RemoteRelation::LocalAhead => format!("{} (ahead here; \"forklift lift\" from it publishes it)", entry.name),
         RemoteRelation::Differs => format!("{} (differs; \"forklift lower {}\" fast-forwards or reports a divergence)", entry.name, entry.name),
     }
 }

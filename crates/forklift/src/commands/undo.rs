@@ -47,7 +47,7 @@ pub async fn handle_command(as_name: Option<&str>) -> Result<(), String> {
 
     if as_name.is_some() && entry.op != journal_utils::DELETE_OP {
         return Err(format!(
-            "\"undo --as\" brings a deleted pallet back under another name, but the last journaled \
+            "\"forklift undo --as\" brings a deleted pallet back under another name, but the last journaled \
             operation is a \"{}\", not a pallet delete. Nothing was undone.",
             entry.op
         ));
@@ -214,7 +214,7 @@ impl CommandOutput for Undone {
         }
 
         println!("The pallet head is now {}.", self.head);
-        println!("Its changes are staged again — \"stack\" to redo, or adjust them first.");
+        println!("Its changes are staged again — \"forklift stack\" to redo, or adjust them first.");
     }
 }
 

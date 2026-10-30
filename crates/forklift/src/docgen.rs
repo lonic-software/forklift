@@ -66,7 +66,7 @@ pub fn render_commands() -> Result<String, String> {
          in alphabetical order, each followed by its subcommands. \
          An **alias** is a short name shown in `forklift help`. A **hidden alias** is accepted \
          but not shown; most are git's name for the same command, so `forklift commit` runs \
-         `stack`. `forklift help <command>` explains any row in full, and `docs/guide/cli.md` \
+         `forklift stack`. `forklift help <command>` explains any row in full, and `docs/guide/cli.md` \
          walks through them by task.\n\n",
     );
     out.push_str("| Command | Alias | Hidden alias | Does |\n");

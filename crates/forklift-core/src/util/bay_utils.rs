@@ -479,7 +479,7 @@ fn read_redirect_record(forklift_path: &Path) -> Result<BayRedirect, String> {
 fn parse_redirect_record(forklift_path: &Path, bytes: &[u8]) -> Result<BayRedirect, String> {
     let fields = record_utils::from_bytes(bytes, BAY_REDIRECT_RECORD, BAY_REDIRECT_VERSION).map_err(|e| match e {
         RecordError::Unversioned => format!(
-            "\"{}\" is not a valid forklift bay redirect (or an older version of Forklift wrote it).",
+            "\"{}\" is not a valid bay redirect (or an older version of Forklift wrote it).",
             forklift_path.to_string_lossy()
         ),
         _ => format!("The bay redirect \"{}\" {}", forklift_path.to_string_lossy(), e.describe()),

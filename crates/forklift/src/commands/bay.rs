@@ -193,7 +193,7 @@ fn resolve_scope(scope_paths: &[String], head_tree_hash: &str) -> Result<Materia
         if !fetch_scope.is_full() && fetch_scope.classify(&key) != ScopeClass::InScope {
             return Err(format!(
                 "\"{}\" is outside the warehouse's fetch scope ({}), so it cannot be a bay \
-                scope. Fetch it first with \"expand {}\".",
+                scope. Fetch it first with \"forklift expand {}\".",
                 raw, fetch_scope.prefixes().join(", "), raw
             ));
         }
@@ -410,7 +410,7 @@ pub(crate) struct BayEntry {
 impl CommandOutput for BayList {
     fn render_human(&self) {
         if self.bays.is_empty() {
-            println!("No bays. Open one with \"bay add <name>\".");
+            println!("No bays. Open one with \"forklift bay add <name>\".");
             return;
         }
 

@@ -30,7 +30,7 @@ use crate::output::{self, CommandOutput};
 pub async fn handle_command(dry_run: bool) -> Result<(), String> {
     if !scope_utils::is_cache_mode()? {
         return Err(
-            "This warehouse is not a cache; there is nothing to evict. \"evict\" frees content a \
+            "This warehouse is not a cache; there is nothing to evict. \"forklift evict\" frees content a \
             cache warehouse (one franchised with \"--cache\") can fetch again from its origin.".to_string()
         );
     }
@@ -38,7 +38,7 @@ pub async fn handle_command(dry_run: bool) -> Result<(), String> {
     // Read outside the store hold, so a slow origin never keeps other bays' writers out. A ref can
     // move on the origin after this read; the hold does not reach the origin either way.
     let held_heads = crate::remote_heads::held_by_remote(
-        "\"evict\" asks the origin which history it holds, so that it only frees what the origin can \
+        "\"forklift evict\" asks the origin which history it holds, so that it only frees what the origin can \
         refill; nothing was changed.",
     ).await?;
 
@@ -50,7 +50,7 @@ pub async fn handle_command(dry_run: bool) -> Result<(), String> {
     // this command, which would refuse the last.
     let store_lock = StoreLock::acquire()?;
     let serve_lock = ServeLock::acquire().map_err(|e| format!(
-        "\"evict\" cannot run while this warehouse root is being served; stop the server first. If \
+        "\"forklift evict\" cannot run while this warehouse root is being served; stop the server first. If \
         no server is running, the lock below was left by a server, gc or full repack that was killed \
         and can be removed. {}", e
     ))?;
@@ -193,23 +193,23 @@ impl CommandOutput for EvictReport {
         if self.not_held > 0 {
             println!(
                 "{} object(s) were kept because only history the origin does not hold yet reaches \
-                them; lift that work, then run \"evict\" again to free them.",
+                them; lift that work, then run \"forklift evict\" again to free them.",
                 self.not_held
             );
         }
 
         if self.still_packed > 0 {
             println!(
-                "{} object(s) are inside a damaged pack and were not freed; run \"compact --all\" to \
-                salvage it, then \"evict\" again.",
+                "{} object(s) are inside a damaged pack and were not freed; run \"forklift compact --all\" to \
+                salvage it, then \"forklift evict\" again.",
                 self.still_packed
             );
         }
 
         if self.heads_not_lowered > 0 {
             println!(
-                "{} of the origin's head(s) are not in this warehouse yet; run \"lower\" to bring them \
-                in, then \"evict\" again to free what their history holds.",
+                "{} of the origin's head(s) are not in this warehouse yet; run \"forklift lower\" to bring them \
+                in, then \"forklift evict\" again to free what their history holds.",
                 self.heads_not_lowered
             );
         }
