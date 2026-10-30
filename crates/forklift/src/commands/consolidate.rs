@@ -46,7 +46,7 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
 
     if merge_utils::read_consolidation_state()?.is_some() {
         return Err(format!(
-            "A consolidation is already in progress. Resolve its conflicts and \"stack\", or {} \
+            "A consolidation is already in progress. Resolve its conflicts and \"forklift stack\", or {} \
             to abort it.",
             merge_utils::abort_hint_in(&forklift_core::globals::bay_root())
         ));
@@ -54,7 +54,7 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
 
     if forklift_core::util::cherry_pick_utils::read_state()?.is_some() {
         return Err(
-            "A cherry-pick is in progress. Complete it (resolve, \"load\", \"stack\") or abort \
+            "A cherry-pick is in progress. Complete it (resolve, \"forklift load\", \"forklift stack\") or abort \
             it before consolidating.".to_string()
         );
     }
@@ -221,7 +221,7 @@ impl CommandOutput for ConsolidateReport {
                 }
 
                 println!(
-                    "\nResolve the conflicts, \"load\" the resolved files, then \"stack\" to \
+                    "\nResolve the conflicts, \"forklift load\" the resolved files, then \"forklift stack\" to \
                     complete the consolidation."
                 );
             }
@@ -493,7 +493,7 @@ async fn ensure_warehouse_is_clean(our_tree_hash: &str) -> Result<(), String> {
 
     Err(
         "There are local changes that consolidating would overwrite. Stack them, restore \
-        them, or park them first (see \"stocktake\" for the details).".to_string()
+        them, or park them first (see \"forklift stocktake\" for the details).".to_string()
     )
 }
 

@@ -26,7 +26,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
 
     if current.is_full() {
         return Err(
-            "This checkout materializes the full tree; there is nothing to narrow. \"narrow\" \
+            "This checkout materializes the full tree; there is nothing to narrow. \"forklift narrow\" \
             shrinks a scoped (sparse) checkout's materialization scope.".to_string()
         );
     }

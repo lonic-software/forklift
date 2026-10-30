@@ -951,7 +951,7 @@ fn a_busy_mirror_is_reported_and_a_killed_holder_releases_it() {
 
     let busy = area.forklift("bay", &["mirror"]);
     assert!(!busy.status.success(), "{}", stdout(&busy));
-    assert!(stderr(&busy).contains("Another forklift mirror run"), "{}", stderr(&busy));
+    assert!(stderr(&busy).contains("Another mirror run"), "{}", stderr(&busy));
 
     holder.kill().unwrap();
     holder.wait().unwrap();

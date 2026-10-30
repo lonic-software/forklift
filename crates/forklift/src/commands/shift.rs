@@ -163,7 +163,7 @@ pub async fn catch_up(position: pallet_utils::BayPosition) -> Result<CaughtUp, S
 pub(crate) fn refuse_mid_merge(doing: &str) -> Result<(), String> {
     if merge_utils::read_consolidation_state()?.is_some() {
         return Err(format!(
-            "A consolidation is in progress. Complete it (resolve, \"load\", \"stack\") or abort it \
+            "A consolidation is in progress. Complete it (resolve, \"forklift load\", \"forklift stack\") or abort it \
             ({}) before {}.",
             merge_utils::abort_hint_in(&forklift_core::globals::bay_root()),
             doing
@@ -172,7 +172,7 @@ pub(crate) fn refuse_mid_merge(doing: &str) -> Result<(), String> {
 
     if cherry_pick_utils::read_state()?.is_some() {
         return Err(format!(
-            "A cherry-pick is in progress. Resolve its conflicts and \"stack\", or {} to abort it, \
+            "A cherry-pick is in progress. Resolve its conflicts and \"forklift stack\", or {} to abort it, \
             before {}.",
             cherry_pick_utils::abort_hint(),
             doing
@@ -280,7 +280,7 @@ async fn ensure_warehouse_is_clean(current_tree_hash: Option<&str>) -> Result<()
 
     Err(
         "There are local changes that shifting would overwrite. Stack them, restore them, \
-        or park them first (see \"stocktake\" for the details).".to_string()
+        or park them first (see \"forklift stocktake\" for the details).".to_string()
     )
 }
 

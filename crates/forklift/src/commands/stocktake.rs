@@ -110,14 +110,14 @@ impl CommandOutput for StocktakeReport {
         if let Some(moved_to) = &self.moved_to {
             println!(
                 "The pallet has moved on to parcel {} since this bay's files were materialized; \
-                \"shift {}\" catches up.",
+                \"forklift shift {}\" catches up.",
                 moved_to, self.pallet
             );
         }
 
         if let Some(their_pallet) = &self.consolidation_in_progress {
             println!(
-                "A consolidation with pallet \"{}\" is in progress; \"stack\" completes it.",
+                "A consolidation with pallet \"{}\" is in progress; \"forklift stack\" completes it.",
                 their_pallet
             );
         }
@@ -134,7 +134,7 @@ impl CommandOutput for StocktakeReport {
         if self.staged_count == 0 {
             println!("The inventory matches the pallet head; nothing is staged.");
         } else {
-            println!("Staged changes (will be recorded by \"stack\"):");
+            println!("Staged changes (will be recorded by \"forklift stack\"):");
             print_changes(&self.staged);
         }
 
@@ -143,7 +143,7 @@ impl CommandOutput for StocktakeReport {
         if self.unstaged_count == 0 {
             println!("The working directory matches the inventory.");
         } else {
-            println!("Changes not in the inventory (use \"load\" to stage them):");
+            println!("Changes not in the inventory (use \"forklift load\" to stage them):");
             print_changes(&self.unstaged);
         }
     }

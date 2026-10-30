@@ -131,13 +131,13 @@ pub fn resolve_signing_key(operator: &Operator) -> Result<Signing, String> {
     }
 
     let (anchor, office) = audit_utils::verified_local_trust()?
-        .ok_or("Trust is not established for this warehouse yet; use \"office enroll\" first.".to_string())?;
+        .ok_or("Trust is not established for this warehouse yet; use \"forklift office enroll\" first.".to_string())?;
 
     if office.find_user(&operator.identifier).is_none() {
         return Err(format!(
             "Trust is established for this warehouse, and \"{}\" is not enrolled: \
             parcels cannot be stacked without a signature. Ask an enrolled operator to \
-            admit you (\"office keygen\", then \"office admit\").",
+            admit you (\"forklift office keygen\", then \"forklift office admit\").",
             operator.identifier
         ));
     }
@@ -289,8 +289,8 @@ pub async fn stack_parcel(description: Option<String>,
 
     if inventory_utils::has_conflict_entries_in(&prepared) {
         return Err(StackError::Other(
-            "There are unresolved conflicts in the inventory. Resolve them, \"load\" the \
-            resolved files, and stack again (see \"stocktake\" for the list).".to_string()
+            "There are unresolved conflicts in the inventory. Resolve them, \"forklift load\" the \
+            resolved files, and stack again (see \"forklift stocktake\" for the list).".to_string()
         ));
     }
 
@@ -331,7 +331,7 @@ pub async fn stack_parcel(description: Option<String>,
     // `false`, since it discards the map immediately instead).
     let (partial_root, tree_hashes) = tree_utils::build_tree_from_inventory_deferred(&prepared, &batch, true).await?;
     let partial_root = partial_root
-        .ok_or("There is nothing to stack. Use the \"load\" command to stage changes first.".to_string())?;
+        .ok_or("There is nothing to stack. Use the \"forklift load\" command to stage changes first.".to_string())?;
 
     // A staged file whose content the store lost since its `load` must stop the stack here: a
     // parcel naming it would pass `audit` and fail only at a later `restore`.
@@ -397,7 +397,7 @@ pub async fn stack_parcel(description: Option<String>,
 
     if head.is_none() && root_is_empty {
         return Err(StackError::Other(
-            "There is nothing to stack. Use the \"load\" command to stage changes first.".to_string()
+            "There is nothing to stack. Use the \"forklift load\" command to stage changes first.".to_string()
         ));
     }
 

@@ -117,7 +117,7 @@ fn restore_worktree(path: &WarehousePath) -> Result<(), String> {
 
     if item.state == InventoryItemState::Deleted {
         return Err(format!(
-            "The removal of \"{}\" is staged; use \"unload {}\" to unstage it first.",
+            "The removal of \"{}\" is staged; use \"forklift unload {}\" to unstage it first.",
             path.as_key(),
             path.as_key()
         ));

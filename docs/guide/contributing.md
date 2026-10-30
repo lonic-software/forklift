@@ -263,6 +263,18 @@ changelog), `SERVER.md` (server ops), `MACHINE_INTERFACE.md` (`--json`/MCP),
    both the human output and, where it matters, the `--json` envelope.
 7. **Document it** in [`cli.md`](cli.md), and run `bin/gen-docs` to add it to the generated
    command list.
+8. **Approve it in `crates/forklift/surface/`.** `spec.txt` is the reviewed list of every
+   command: place the new one there and classify it against each list's definition (the daily
+   loop, destructive, recorded text). `coverage.txt` records what every earlier command became;
+   a new command gets its own row, and renaming or reshaping one adds `-> forklift …` lines under
+   its old row instead of deleting it. The surface tests (`cargo test -p forklift --bin forklift
+   surface_check`) fail until both agree with the binary.
+
+Any message that names a command does so as `forklift <command> …`, spelled out in full. The
+same tests parse every such mention in the crates' string literals and the binary's help text
+against the binary, so a hint naming a renamed command, a flag that does not exist, or a prefix
+(`forklift palletiz`) fails CI. A top-level command named in double quotes or backticks
+without `forklift ` in front fails too, because the check could not read it.
 
 ---
 

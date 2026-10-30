@@ -479,7 +479,7 @@ fn read_redirect_record(forklift_path: &Path) -> Result<BayRedirect, String> {
 fn parse_redirect_record(forklift_path: &Path, bytes: &[u8]) -> Result<BayRedirect, String> {
     let fields = record_utils::from_bytes(bytes, BAY_REDIRECT_RECORD, BAY_REDIRECT_VERSION).map_err(|e| match e {
         RecordError::Unversioned => format!(
-            "\"{}\" is not a valid forklift bay redirect (or an older version of Forklift wrote it).",
+            "\"{}\" is not a valid bay redirect (or an older version of Forklift wrote it).",
             forklift_path.to_string_lossy()
         ),
         _ => format!("The bay redirect \"{}\" {}", forklift_path.to_string_lossy(), e.describe()),
@@ -1298,7 +1298,7 @@ mod tests {
         std::fs::write(forklift_path.join(FILE_NAME_BAY_REDIRECT), "/srv/warehouse\nreview\n").unwrap();
 
         let error = read_bay_redirect(&forklift_path).err().expect("a headerless redirect must be refused");
-        assert!(error.contains("is not a valid forklift bay"), "{}", error);
+        assert!(error.contains("is not a valid bay redirect"), "{}", error);
 
         std::fs::remove_dir_all(&dir).ok();
     }

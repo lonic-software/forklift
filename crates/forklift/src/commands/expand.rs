@@ -30,15 +30,15 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
     if scope_utils::is_cache_mode()? {
         return Err(
             "This warehouse was franchised with --cache: its scope is already the whole tree, so \
-            there is nothing to expand. \"expand\" widens a sparse (\"franchise --only\") \
+            there is nothing to expand. \"forklift expand\" widens a sparse (\"forklift franchise --only\") \
             warehouse's fetch scope.".to_string()
         );
     }
 
     if current.is_full() {
         return Err(
-            "This warehouse already holds the full tree; there is nothing to expand. \"expand\" \
-            widens a sparse (\"franchise --only\") warehouse's fetch scope.".to_string()
+            "This warehouse already holds the full tree; there is nothing to expand. \"forklift expand\" \
+            widens a sparse (\"forklift franchise --only\") warehouse's fetch scope.".to_string()
         );
     }
 
@@ -189,7 +189,7 @@ impl CommandOutput for ExpandReport {
                 "Expanded the fetch scope with {} ({} object(s) fetched). Fetch scope now: {}.",
                 self.added.join(", "), self.fetched_objects, self.scope.join(", ")
             );
-            println!("Scope a bay to a newly fetched path with \"bay add --scope\".");
+            println!("Scope a bay to a newly fetched path with \"forklift bay add --scope\".");
         }
 
         output::print_batch_lane(self.batch_lane);

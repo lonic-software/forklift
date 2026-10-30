@@ -67,7 +67,7 @@ impl CommandOutput for DeliverReport {
         );
         println!(
             "The trail is kept on \"{}\" (tip {}) and recorded on the parcel's manifest \
-            (\"manifest show {}\").",
+            (\"forklift manifest show {}\").",
             self.source, self.trail_head, self.delivered
         );
     }

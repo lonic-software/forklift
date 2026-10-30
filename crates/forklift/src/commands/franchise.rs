@@ -921,7 +921,7 @@ impl CommandOutput for FranchiseReport {
         if !self.scope.is_empty() {
             println!(
                 "Sparse: fetched and materialized only {}. The rest of the tree is sealed by \
-                hash — widen with \"expand\".",
+                hash — widen with \"forklift expand\".",
                 self.scope.join(", ")
             );
         }

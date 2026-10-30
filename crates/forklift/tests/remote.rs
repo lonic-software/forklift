@@ -1638,7 +1638,7 @@ fn tags_sync_hold_the_admin_rule_at_admission_and_never_move() {
     let refused = area.forklift("b", &["lift"]);
     assert!(!refused.status.success(), "a demoted tagger's tag must not be admitted");
     assert!(stderr(&refused).contains("not an admin"), "{}", stderr(&refused));
-    assert!(stderr(&refused).contains("\"lower --keep @tags:<path>=theirs\" drops it"), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("\"forklift lower --keep @tags:<path>=theirs\" drops it"), "{}", stderr(&refused));
 
     // The way out: lower with theirs at the refused tag. Ours is refused, since nothing on the
     // remote conflicts with it, and so is theirs at a path with no local change.

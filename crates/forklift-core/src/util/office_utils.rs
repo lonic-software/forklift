@@ -392,7 +392,7 @@ pub fn endorse_key(public_key_hex: &str,
         return Err(format!(
             "The proof-of-possession does not verify: the key holder did not sign for \
             operator \"{}\" with this key. Make sure the operator id and the public key \
-            come from the same \"office keygen\" run.",
+            come from the same \"forklift office keygen\" run.",
             operator
         ));
     }

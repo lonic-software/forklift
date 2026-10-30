@@ -1001,7 +1001,7 @@ impl std::ops::Deref for VerifiedOffice {
 /// are judged against the verified office, never the unverified local read.
 pub fn verified_local_office() -> Result<VerifiedOffice, String> {
     Ok(verified_local_trust()?
-        .ok_or("Trust is not established for this warehouse yet; use \"office enroll\" first.".to_string())?
+        .ok_or("Trust is not established for this warehouse yet; use \"forklift office enroll\" first.".to_string())?
         .1)
 }
 
@@ -1012,7 +1012,7 @@ pub fn verified_local_trust() -> Result<Option<(TrustAnchor, VerifiedOffice)>, S
         return Ok(None);
     };
     let head = pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME)?
-        .ok_or("The office pallet is unborn; use \"office enroll\" first.".to_string())?;
+        .ok_or("The office pallet is unborn; use \"forklift office enroll\" first.".to_string())?;
 
     let state = verify_office_chain_memoized(&anchor, &head)?;
 

@@ -5106,7 +5106,7 @@ mod tests {
         // held, on the rescan path, which is exactly when the note must be produced.
         assert!(outcome.notes.iter().any(|note| note.contains(&never_held)),
             "the run must NAME the never-held pin it tolerated, or clearing silently hides the \
-             very state the next `audit` will refuse over: {:?}", outcome.notes
+             very state the next `forklift audit` will refuse over: {:?}", outcome.notes
         );
 
         std::fs::remove_dir_all(&root).ok();

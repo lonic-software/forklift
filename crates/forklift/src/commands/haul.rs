@@ -235,7 +235,7 @@ async fn merge(id: &str) -> Result<(), String> {
     let current = position.pallet.clone();
     if current != haul.opened.target {
         return Err(format!(
-            "Merging lands on the target pallet — shift to \"{}\" first, then \"haul merge\".",
+            "Merging lands on the target pallet — shift to \"{}\" first, then \"forklift haul merge\".",
             haul.opened.target
         ));
     }
@@ -249,7 +249,7 @@ async fn merge(id: &str) -> Result<(), String> {
         return Err(format!(
             "Haul {} proposes parcel {}, which this warehouse does not hold. Lower \"{}\" from the remote the \
              haul came from; if that pallet has moved off the parcel there too, have the haul's opener propose \
-             its current head with \"haul update {}\". Nothing was merged.",
+             its current head with \"forklift haul update {}\". Nothing was merged.",
             short(&haul.id), short(&haul.head), haul.opened.source, short(&haul.id)
         ));
     }
@@ -380,7 +380,7 @@ impl CommandOutput for MergeConflicts {
         for path in &self.conflicts {
             println!("  {}", path);
         }
-        println!("Resolve them, \"stack\", then re-run \"haul merge\" to record the merge.");
+        println!("Resolve them, \"forklift stack\", then re-run \"forklift haul merge\" to record the merge.");
     }
 }
 

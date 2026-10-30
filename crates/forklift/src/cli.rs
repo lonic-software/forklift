@@ -145,7 +145,7 @@ pub enum Command {
                       rebase, cherry-pick only *adds* — no rewrite, no force-push: the picked \
                       parcel's authors are preserved and this operator is recorded as the stacker. \
                       A clean pick is stacked immediately; a conflicting one leaves markers to \
-                      resolve, \"load\" and \"stack\" (which completes the pick single-parent)."
+                      resolve, \"forklift load\" and \"forklift stack\" (which completes the pick single-parent)."
     )]
     CherryPick {
         /// The parcel to cherry-pick: a pallet name, or a parcel hash / unique prefix
@@ -166,7 +166,7 @@ pub enum Command {
                       moved, never re-hashed; a loose file is deleted only after the pack that \
                       holds it is durably written, so compacting can never lose an object. Packs \
                       roll over at a size/count threshold, so no single pack grows unbounded. \
-                      Run it after a large \"import-git\" or periodically as maintenance. With \
+                      Run it after a large \"forklift import-git\" or periodically as maintenance. With \
                       --all, also rewrite the existing packs: drop unreachable (garbage) \
                       objects that were stuck in packs and consolidate many packs into few — a \
                       heavier full repack, worth running occasionally. Add --redelta to a full \
@@ -206,7 +206,7 @@ pub enum Command {
         #[arg(short, long)]
         global: bool,
 
-        /// Remove the key from the configuration (e.g. "config --unset remote.token")
+        /// Remove the key from the configuration (e.g. "forklift config --unset remote.token")
         #[arg(long, conflicts_with = "value")]
         unset: bool,
 
@@ -267,15 +267,15 @@ pub enum Command {
     #[command(
         visible_alias = "d",
         long_about = "Show the line-by-line changes between the working directory and the \
-                      inventory (what \"load\" would stage). With --staged, show the changes \
-                      between the inventory and the pallet head (what \"stack\" would record). \
+                      inventory (what \"forklift load\" would stage). With --staged, show the changes \
+                      between the inventory and the pallet head (what \"forklift stack\" would record). \
                       With two revisions (pallet names or parcel hashes), compare those instead \
                       — use \":empty\" as either revision to compare against the empty tree \
                       (every file on the other side then lists as added). An optional trailing \
                       path limits the report to a file or directory."
     )]
     Diff {
-        /// Compare the inventory against the pallet head (what "stack" would record)
+        /// Compare the inventory against the pallet head (what "forklift stack" would record)
         #[arg(short, long)]
         staged: bool,
 
@@ -336,7 +336,7 @@ pub enum Command {
                          nothing can be forged, it is simply not fetched. The working tree \
                          materializes only the in-scope subtree(s). The remote's whole-store \
                          bundle is skipped (it would defeat the point). Repeatable to fetch \
-                         several subtrees. Widen later with \"expand\"."
+                         several subtrees. Widen later with \"forklift expand\"."
         )]
         only: Vec<String>,
 
@@ -346,8 +346,8 @@ pub enum Command {
             conflicts_with = "only",
             long_help = "Franchise as a cache: mark the warehouse as one that may lack content its \
                          history reaches. It is then treated as partial: a server never serves \
-                         it, it lifts only to the remote it was franchised from, \"mirror\" and \
-                         \"expand\" refuse, and \"audit\" checks the content it holds. The \
+                         it, it lifts only to the remote it was franchised from, \"forklift mirror\" and \
+                         \"forklift expand\" refuse, and \"forklift audit\" checks the content it holds. The \
                          remote's bundle is skipped. It fetches every parcel and signature of the \
                          history, and the content of the head it checks out; the content of \
                          older history stays with the remote, recorded by hash, and is fetched \
@@ -411,7 +411,7 @@ pub enum Command {
     /// Print the command list, or detailed help about one command
     #[command(visible_alias = "h")]
     Help {
-        /// The command to explain (subcommands work too, e.g. "help office admit")
+        /// The command to explain (subcommands work too, e.g. "forklift help office admit")
         #[arg(value_name = "COMMAND")]
         command: Vec<String>,
     },
@@ -450,7 +450,7 @@ pub enum Command {
         long_about = "One-way migration of a git repository's history into this warehouse: \
                       git commits become parcels, trees become trees, blobs become blobs, and each \
                       local branch becomes a pallet. The imported history is unsigned (it predates \
-                      trust), so import into a fresh warehouse and then run \"office enroll\" to \
+                      trust), so import into a fresh warehouse and then run \"forklift office enroll\" to \
                       anchor it. Run it from the git repo's directory (\"forklift import-git .\") so \
                       the checked-out working tree already holds the imported HEAD. Forklift \
                       converts nothing on checkout, so a file git converted (line endings, ident, \
@@ -502,14 +502,14 @@ pub enum Command {
                       remote (\"remote.url\") and fast-forward to them — working directory and \
                       inventory included. Naming another pallet downloads the remote's history of \
                       that pallet and creates or fast-forwards its ref alone: this bay, its files \
-                      and its inventory stay where they are, and \"shift\" moves onto it. On first \
+                      and its inventory stay where they are, and \"forklift shift\" moves onto it. On first \
                       contact with a trusted remote its trust anchor is adopted (one-way, like \
-                      \"office enroll\"), and the adopted genesis is reported. A diverged pallet is \
+                      \"forklift office enroll\"), and the adopted genesis is reported. A diverged pallet is \
                       reported, never merged implicitly."
     )]
     Lower {
-        /// The pallet to lower (default: the current pallet); "palletize --remote" lists the
-        /// remote's
+        /// The pallet to lower (default: the current pallet); "forklift palletize --remote" lists
+        /// the remote's
         pallet: Option<String>,
 
         /// Refuse unless the remote's trust anchor is this genesis (an out-of-band pin)
@@ -549,7 +549,7 @@ pub enum Command {
                       change is one parcel signed by its writer, and every value carries the key \
                       that wrote it, verifiable offline against the office chain. Lower syncs \
                       them: changes to different keys combine, and a key changed differently on \
-                      both sides is a conflict that \"lower --keep\" resolves. Writing needs the \
+                      both sides is a conflict that \"forklift lower --keep\" resolves. Writing needs the \
                       office and a writer or admin role."
     )]
     Kv {
@@ -638,7 +638,7 @@ pub enum Command {
         revision: Option<String>,
 
         /// When listing, also show the meta pallets (the office and other tracked
-        /// metadata; reach them with the "@" qualifier, e.g. "history @office")
+        /// metadata; reach them with the "@" qualifier, e.g. "forklift history @office")
         #[arg(short, long)]
         all: bool,
 
@@ -674,8 +674,8 @@ pub enum Command {
         alias = "stash",
         long_about = "Park the work in progress (the staged and unstaged changes of tracked files) \
                       as a parked parcel and reset the warehouse to the pallet head. Untracked \
-                      files are left alone. \"park pop\" re-applies the latest parked changes; \
-                      \"park list\" lists them."
+                      files are left alone. \"forklift park pop\" re-applies the latest parked changes; \
+                      \"forklift park list\" lists them."
     )]
     Park {
         #[command(subcommand)]
@@ -714,7 +714,7 @@ pub enum Command {
     #[command(
         long_about = "Manage identity profiles: named operator ids stored in the global \
                       configuration. A warehouse selects one \
-                      with \"profile use\", so one machine can act as different operators in \
+                      with \"forklift profile use\", so one machine can act as different operators in \
                       different warehouses — e.g. a personal identity and one per organization. \
                       Without a subcommand, the profiles are listed."
     )]
@@ -838,8 +838,8 @@ pub enum Command {
         visible_alias = "rm",
         long_about = "Stage a file or directory for removal: its inventory entries are marked as \
                       deleted, so they will not be part of the next parcel. The working directory \
-                      is not touched. To unstage changes instead (undo a \"load\"), use \
-                      \"unload\"."
+                      is not touched. To unstage changes instead (undo a \"forklift load\"), use \
+                      \"forklift unload\"."
     )]
     Remove {
         /// The file or directory to stage for removal
@@ -937,7 +937,7 @@ pub enum Command {
         visible_alias = "st",
         alias = "status",
         long_about = "Report the current pallet, the staged changes (inventory vs pallet head — \
-                      what the next \"stack\" records) and the changes not yet loaded (working \
+                      what the next \"forklift stack\" records) and the changes not yet loaded (working \
                       directory vs inventory). With --summary, report only the counts (a \
                       token-cheap overview for scripts and agents)."
     )]
@@ -953,7 +953,7 @@ pub enum Command {
                       store fetches, then download their content across the whole history from the \
                       remote. Cheap and incremental — only the newly in-scope objects are fetched; \
                       what is already present is skipped. After expanding, a bay can be scoped to \
-                      the new path (\"bay add --scope\"). A full (non-sparse) warehouse already \
+                      the new path (\"forklift bay add --scope\"). A full (non-sparse) warehouse already \
                       holds everything, so there is nothing to expand."
     )]
     Expand {
@@ -995,7 +995,7 @@ pub enum Command {
         name = "scope-prune",
         long_about = "Reclaim disk from a sparse warehouse: drop a fetched path from the shared \
                       warehouse fetch scope and free the objects under it from the object store. \
-                      This is the deliberate, destructive counterpart of \"narrow\" — narrow is \
+                      This is the deliberate, destructive counterpart of \"forklift narrow\" — narrow is \
                       bay-local and frees nothing, because narrowed-away content is still \
                       reachable history that garbage collection correctly keeps; scope-prune \
                       forgets a path warehouse-wide and reclaims its disk. It is multi-bay-aware: \
@@ -1003,7 +1003,7 @@ pub enum Command {
                       materializes. It frees only history the remote holds, so it asks the remote \
                       first and refuses, changing nothing, when it cannot; work never lifted keeps \
                       its content until it is lifted and the prune is run again. What it frees is \
-                      sealed by hash afterwards — re-fetchable from the origin with \"expand\". A \
+                      sealed by hash afterwards — re-fetchable from the origin with \"forklift expand\". A \
                       full (non-sparse) warehouse has nothing to \
                       prune. If an earlier prune was interrupted before it finished freeing \
                       everything, running it again on the same path resumes and finishes the job \
@@ -1044,7 +1044,7 @@ pub enum Command {
         long_about = "Manage the remote of a partial warehouse (one franchised with \"--only\" or \
                       \"--cache\"). Such a warehouse talks only to its origin, the remote it was \
                       franchised from, because only the origin was proved to hold the content it \
-                      lacks; \"remote move\" is the one way to change it."
+                      lacks; \"forklift remote move\" is the one way to change it."
     )]
     Remote {
         #[command(subcommand)]
@@ -1053,13 +1053,13 @@ pub enum Command {
 
     /// Report object-store health: loose vs packed objects, packs, and whether compaction is due
     #[command(
-        long_about = "Report the health of the object store — the counterpart of \"stocktake\" \
+        long_about = "Report the health of the object store — the counterpart of \"forklift stocktake\" \
                       (which reports the working tree). Shows how many objects are loose \
                       (unpacked) versus packed, how many pack files there are and how \
                       delta-dense they are, the on-disk sizes, and whether an incremental \
                       compaction or a consolidating repack is currently due per the \
                       maintenance.loose / maintenance.packs thresholds. Read-only; run \
-                      \"compact\" to act on it."
+                      \"forklift compact\" to act on it."
     )]
     Store,
 
@@ -1079,8 +1079,8 @@ pub enum Command {
 
     /// Undo the last stack, consolidate, cherry-pick or shift (soft — keeps your changes)
     #[command(
-        long_about = "Undo the last journaled operation: a \"stack\", \"consolidate\", \
-                      \"cherry-pick\" or \"shift\". A stack, consolidate or cherry-pick is \
+        long_about = "Undo the last journaled operation: a \"forklift stack\", \"forklift consolidate\", \
+                      \"forklift cherry-pick\" or \"forklift shift\". A stack, consolidate or cherry-pick is \
                       reversed softly: the pallet head moves back while the working directory and \
                       the inventory stay as they are (like git's \"reset --soft HEAD~1\"), so the \
                       undone changes are staged again and can be re-stacked — e.g. with a \
@@ -1110,9 +1110,9 @@ pub enum Command {
     #[command(
         visible_alias = "ul",
         long_about = "Unstage a file or directory: reset its inventory entries to the pallet \
-                      head, leaving the working directory untouched — the inverse of \"load\", \
-                      and the same as \"restore --staged\". To stage a removal instead, use \
-                      \"remove\"."
+                      head, leaving the working directory untouched — the inverse of \"forklift load\", \
+                      and the same as \"forklift restore --staged\". To stage a removal instead, use \
+                      \"forklift remove\"."
     )]
     Unload {
         /// The file or directory to unstage
@@ -1209,7 +1209,7 @@ pub enum BayAction {
                          scoped); the bay just checks out, stages and stacks its in-scope \
                          subtree(s), copying every out-of-scope sibling forward by the hash the \
                          signed head already commits. A bay's scope must be within what the \
-                         warehouse fetched (see \"franchise --only\" and \"expand\"). Repeatable to \
+                         warehouse fetched (see \"forklift franchise --only\" and \"forklift expand\"). Repeatable to \
                          scope several subtrees. Scope is local to this bay and never tracked."
         )]
         scope: Vec<String>,
@@ -1364,7 +1364,7 @@ pub enum ManifestAction {
         long_about = "Record signed machine-authorship provenance for a parcel — which model \
                       produced the change, with which tool, in which session, and (optionally) a \
                       transcript fingerprint. Because the entry is signed, it is evidence: paired \
-                      with an agent-class identity (\"office admit --agent --supervisor\"), it \
+                      with an agent-class identity (\"forklift office admit --agent --supervisor\"), it \
                       answers \"which model produced this, under whose supervision\" forge-proof \
                       and offline — the AI-traceability question git cannot answer. Requires an \
                       enrolled signing key."
@@ -1511,7 +1511,7 @@ pub enum RemoteAction {
         long_about = "Point a partial warehouse at a new origin. The move first records that it is \
                       under way, so nothing fetches, lifts or changes what it checks until it ends. \
                       It then asks the new server for its pallets, judges its trust anchor as \
-                      \"lower\" would, fetches the parcels and signatures it lacks (no content), \
+                      \"forklift lower\" would, fetches the parcels and signatures it lacks (no content), \
                       and checks that the new server holds everything this warehouse leans on its \
                       origin for: every tree, file and chunk that something here references and \
                       this warehouse does not hold. Only then does it rewrite the origin and \"remote.url\" (and \
@@ -1520,7 +1520,7 @@ pub enum RemoteAction {
                       warehouse to it server-side and run the move again. A move that stopped \
                       before it started rewriting can be abandoned with --abort; one that stopped \
                       while rewriting is finished by running the move again. A full warehouse has \
-                      no origin: set \"remote.url\" with \"config\" instead."
+                      no origin: set \"remote.url\" with \"forklift config\" instead."
     )]
     Move {
         /// The new origin's URL
@@ -1598,7 +1598,7 @@ pub enum OfficeAction {
                       sign autonomously under their own marked identity, never as a human)."
     )]
     Admit {
-        /// The operator's UUID (printed by their "office keygen")
+        /// The operator's UUID (printed by their "forklift office keygen")
         #[arg(value_name = "OPERATOR_UUID")]
         operator_id: String,
 
@@ -1606,7 +1606,7 @@ pub enum OfficeAction {
         #[arg(value_name = "PUBLIC_KEY_HEX")]
         public_key: String,
 
-        /// The key's proof-of-possession (printed by their "office keygen")
+        /// The key's proof-of-possession (printed by their "forklift office keygen")
         #[arg(value_name = "PROOF_OF_POSSESSION_HEX")]
         pop: String,
 
@@ -1649,7 +1649,7 @@ pub enum OfficeAction {
         #[arg(value_name = "PUBLIC_KEY_HEX")]
         public_key: String,
 
-        /// The new key's proof-of-possession (printed by "office keygen")
+        /// The new key's proof-of-possession (printed by "forklift office keygen")
         #[arg(value_name = "PROOF_OF_POSSESSION_HEX")]
         pop: String,
     },
@@ -1663,11 +1663,11 @@ pub enum OfficeAction {
                       \"forklift office keygen\" on their new machine and hands you the printed \
                       line over a channel where you can confirm it is really them; their \
                       proof-of-possession still co-signs the record, so you cannot attribute a \
-                      key they do not hold. For your own devices use \"office link\"; for a new \
-                      operator use \"office admit\"."
+                      key they do not hold. For your own devices use \"forklift office link\"; for a new \
+                      operator use \"forklift office admit\"."
     )]
     Authorize {
-        /// The enrolled operator's UUID (printed by their "office keygen")
+        /// The enrolled operator's UUID (printed by their "forklift office keygen")
         #[arg(value_name = "OPERATOR_UUID")]
         operator_id: String,
 
@@ -1675,7 +1675,7 @@ pub enum OfficeAction {
         #[arg(value_name = "PUBLIC_KEY_HEX")]
         public_key: String,
 
-        /// The new key's proof-of-possession (printed by "office keygen")
+        /// The new key's proof-of-possession (printed by "forklift office keygen")
         #[arg(value_name = "PROOF_OF_POSSESSION_HEX")]
         pop: String,
     },

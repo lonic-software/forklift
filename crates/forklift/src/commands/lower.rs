@@ -663,7 +663,7 @@ impl CommandOutput for LowerReport {
             }
             Some(LowerOutcome::Ahead) => {
                 println!(
-                    "The local pallet \"{}\" is ahead of the remote; \"lift\" from it to publish it.",
+                    "The local pallet \"{}\" is ahead of the remote; \"forklift lift\" from it to publish it.",
                     self.pallet
                 );
             }
@@ -708,7 +708,7 @@ async fn ensure_warehouse_is_clean(current_tree_hash: Option<&str>) -> Result<()
 
     Err(
         "There are local changes that lowering would overwrite. Stack them, restore \
-        them, or park them first (see \"stocktake\" for the details).".to_string()
+        them, or park them first (see \"forklift stocktake\" for the details).".to_string()
     )
 }
 

@@ -143,9 +143,9 @@ fn judge_request(paths: &[String]) -> Result<PruneRequest, String> {
 
     if fetch.is_full() {
         return Err(
-            "This warehouse holds the full tree; there is nothing to prune. \"scope-prune\" \
+            "This warehouse holds the full tree; there is nothing to prune. \"forklift scope-prune\" \
             reclaims disk from a sparse warehouse — one franchised with \"--only\", or widened \
-            with \"expand\" — by forgetting a fetched path.".to_string()
+            with \"forklift expand\" — by forgetting a fetched path.".to_string()
         );
     }
 
@@ -206,7 +206,7 @@ fn judge_request(paths: &[String]) -> Result<PruneRequest, String> {
 /// it before anything changes.
 async fn remote_pallet_heads() -> Result<Vec<String>, String> {
     crate::remote_heads::held_by_remote(
-        "\"scope-prune\" asks the remote which history it holds, so that it never frees work that \
+        "\"forklift scope-prune\" asks the remote which history it holds, so that it never frees work that \
         exists only here; nothing was changed.",
     ).await
 }
@@ -365,7 +365,7 @@ impl CommandOutput for PruneReport {
             println!(
                 "{} object(s) were kept because lifting history the remote does not hold yet reads \
                 them{}; some may be the only copy. Lift that work (or lower, if the remote is \
-                ahead), then run \"scope-prune {}{}\" again to free them.",
+                ahead), then run \"forklift scope-prune {}{}\" again to free them.",
                 self.kept_unlifted, pallets, separator, paths
             );
         }
@@ -392,16 +392,16 @@ impl CommandOutput for PruneReport {
         if self.kept_for_deleted > 0 {
             println!(
                 "{} object(s) were kept because they belong to unlifted history of a pallet deleted \
-                here, which \"undo\" can still bring back; a later prune frees them once that delete \
+                here, which \"forklift undo\" can still bring back; a later prune frees them once that delete \
                 can no longer be undone.",
                 self.kept_for_deleted
             );
         }
 
         if self.dry_run {
-            println!("What it frees is re-fetchable from the origin with \"expand\".");
+            println!("What it frees is re-fetchable from the origin with \"forklift expand\".");
         } else {
-            println!("What was freed is re-fetchable from the origin with \"expand\".");
+            println!("What was freed is re-fetchable from the origin with \"forklift expand\".");
         }
     }
 }

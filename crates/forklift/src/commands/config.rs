@@ -36,7 +36,7 @@ pub fn handle_command(global: bool,
     if unset {
         let Some(key) = &key else {
             return Err(
-                "Specify the key to remove, e.g. \"config --unset remote.token\".".to_string()
+                "Specify the key to remove, e.g. \"forklift config --unset remote.token\".".to_string()
             );
         };
 

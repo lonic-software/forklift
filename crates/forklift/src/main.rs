@@ -20,6 +20,8 @@ pub mod pager;
 pub mod passphrase;
 mod remote_heads;
 #[cfg(test)]
+mod surface_check;
+#[cfg(test)]
 mod test_support;
 
 /// Windows gives a process's main thread a 1MB stack by default (a linker setting); Linux and
