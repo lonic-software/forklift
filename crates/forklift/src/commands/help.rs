@@ -23,13 +23,14 @@ pub fn handle_command(path: &[String]) -> Result<(), ForkliftError> {
     let mut command = Cli::command().color(choice);
     let mut bin_name = command.get_name().to_string();
 
+    let mut reached: Vec<String> = Vec::new();
     for name in path {
         // A name is matched as on the command line: exactly, or by a unique prefix.
         command = match prefix::subcommand(&command, name) {
             Resolved::Command(subcommand) => subcommand.clone(),
             Resolved::Ambiguous(names) => return Err(ForkliftError::new(
                 ErrorCode::Usage,
-                prefix::ambiguity(name, &names),
+                prefix::ambiguity(name, &reached.iter().map(String::as_str).collect::<Vec<_>>(), &names),
                 "Run \"forklift help\" for a list of available commands.",
             )),
             Resolved::Unknown => return Err(ForkliftError::new(
@@ -45,6 +46,7 @@ pub fn handle_command(path: &[String]) -> Result<(), ForkliftError> {
         // A standalone subcommand does not know its parent chain; rebuilding the binary
         // name keeps the usage line correct (e.g. "forklift office admit ...").
         bin_name = format!("{} {}", bin_name, command.get_name());
+        reached.push(command.get_name().to_string());
         command = command.bin_name(bin_name.clone()).color(choice);
     }
 

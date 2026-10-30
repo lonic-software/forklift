@@ -565,12 +565,13 @@ fn every_hint_names_a_real_command() {
         "these hints name a command the binary does not accept as written:\n{}", failures.join("\n"));
 }
 
-/// Hints and MCP argv are machine surfaces, so they must spell full names: a prefix that works
-/// today breaks when a command starting with the same letters is added. Both checks parse with
-/// `Cli::command()` alone, where the binary's prefix expansion does not run; this holds them
-/// there. clap's own inference, switched on in the tree, would let a prefix through both.
+/// Hints are a machine surface, so they must spell full names: a prefix that works today breaks
+/// when a command starting with the same letters is added. The hint check parses with
+/// `Cli::command()` alone, where the binary's prefix expansion does not run; this holds it there,
+/// and clap's own inference, switched on in the tree, would turn it red. The MCP argv check has
+/// its own (`the_argv_check_parses_with_prefixes_off`).
 #[test]
-fn hints_and_mcp_argv_parse_with_prefixes_off() {
+fn hints_parse_with_prefixes_off() {
     for line in [&["forklift", "ha", "list"][..], &["forklift", "haul", "li"][..]] {
         let error = Cli::command().try_get_matches_from(line).map(|_| ()).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidSubcommand, "{line:?}");

@@ -153,10 +153,9 @@ fn parse_or_exit() -> Cli {
 
     // A unique prefix of a command name is that command (`ha rev` is `haul review`), so clap is
     // given the full names. An ambiguous prefix is a usage error like clap's own.
-    let error = match prefix::expand(&command, args.clone()) {
+    let error = match prefix::expand(&command, &mut args) {
         Err(error) => error,
-        Ok(expanded) => {
-            args = expanded;
+        Ok(()) => {
             match command.try_get_matches_from_mut(&args) {
                 Ok(mut matches) => {
                     output::set_command(matches.subcommand_name());
@@ -207,9 +206,10 @@ fn cross_argument_error(cli: &Cli) -> Option<(&'static str, &'static str)> {
 }
 
 /// The canonical name of the top-level command the arguments name, when the parse that would
-/// have said so failed. The global options are flags that take no value, except `--color`, whose
-/// value is skipped when it is a separate word, so the first other argument that is not an option
-/// is the command, or an alias of one, or nothing known. A help or version flag before it, alone
+/// have said so failed. `args` have been through [`prefix::expand`], so a prefix the user typed is
+/// a full name here. An option's value given as its own word (`--color never`) is skipped, so the
+/// first other argument that is not an option is the command, or an alias of one, or nothing
+/// known. A help or version flag before it, alone
 /// or in a short-flag cluster (`-vh`), means clap answered at the top level, so no command ran.
 fn named_command(args: &[OsString]) -> Option<String> {
     let asks_help_or_version = |arg: &str| match arg.strip_prefix("--") {
@@ -217,22 +217,21 @@ fn named_command(args: &[OsString]) -> Option<String> {
         None => arg.starts_with('-') && arg.contains(['h', 'V']),
     };
 
+    let cli = Cli::command();
     let mut words = args.iter().skip(1)
         .map(|arg| arg.to_string_lossy())
         .take_while(|arg| !asks_help_or_version(arg));
     let token = loop {
         let word = words.next()?;
-        if word == "--color" {
-            words.next();
-        } else if !word.starts_with('-') {
+        if !word.starts_with('-') {
             break word;
         }
+        if prefix::takes_next_word(&cli, &word) {
+            words.next();
+        }
     };
-    let token = token.as_ref();
 
-    Cli::command().get_subcommands()
-        .find(|command| command.get_name() == token || command.get_all_aliases().any(|alias| alias == token))
-        .map(|command| command.get_name().to_string())
+    cli.find_subcommand(token.as_ref()).map(|command| command.get_name().to_string())
 }
 
 /// Report a clap parse result as the one `--json` document, then exit. Help and version are

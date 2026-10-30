@@ -7673,14 +7673,21 @@ fn a_unique_prefix_runs_the_command_and_an_ambiguous_one_is_a_usage_error() {
     assert_eq!(ambiguous.status.code(), Some(2));
     let value = json(&ambiguous);
     assert_eq!(value["error"]["code"], "usage");
-    assert_eq!(value["error"]["message"], "\"he\" could be heal or help; type more of the name");
+    assert_eq!(value["error"]["message"],
+               "\"he\" could be \"forklift heal\" or \"forklift help\"; type more of the name");
     assert!(value["command"].is_null(), "{}", value);
+
+    // Below the top level, the words before the ambiguous one still name their command.
+    let value = json(&warehouse.run(&["--json", "ha", "re"]));
+    assert_eq!(value["error"]["code"], "usage");
+    assert_eq!(value["command"], "haul", "{}", value);
 
     // Below the top level, and without `--json`: prose on stderr with the family's usage line.
     let human = warehouse.run(&["hau", "re"]);
     assert_eq!(human.status.code(), Some(2));
     assert!(stdout(&human).is_empty(), "{}", stdout(&human));
-    assert!(stderr(&human).contains("\"re\" could be review or reopen"), "{}", stderr(&human));
+    assert!(stderr(&human).contains("\"re\" could be \"forklift haul review\" or \"forklift haul reopen\""),
+            "{}", stderr(&human));
     assert!(stderr(&human).contains(" haul "), "the usage line is haul's: {}", stderr(&human));
 
     // The help command matches names the same way.
@@ -7688,7 +7695,8 @@ fn a_unique_prefix_runs_the_command_and_an_ambiguous_one_is_a_usage_error() {
     assert_eq!(help["ok"], true, "{}", help);
     assert!(help["data"]["message"].as_str().unwrap().contains(" haul review "), "{}", help);
     let help = json(&warehouse.run(&["--json", "help", "hau", "re"]));
-    assert_eq!(help["error"]["message"], "\"re\" could be review or reopen; type more of the name");
+    assert_eq!(help["error"]["message"],
+               "\"re\" could be \"forklift haul review\" or \"forklift haul reopen\"; type more of the name");
 }
 
 #[test]
