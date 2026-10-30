@@ -1867,8 +1867,8 @@ warehouse has nothing to prune. Use `--dry-run` before you leap. (Objects alread
 are reported but not reclaimed yet — a scope-aware repack is future work.) A prune, dry run
 included, is **refused while a mutating command runs in another bay**, since that writer could
 reuse an object the prune is about to free; run it again once the other command finishes.
-(A `forklift-server` never serves a sparse warehouse, so no
-server is in the way.)
+(A `forklift-server` never serves a sparse warehouse, a cache, or a root whose sealed-object
+record holds anything, so no server is in the way.)
 
 Pruning a **large (chunked) file** frees its recipe **and every chunk** it names, not just the
 recipe — chunks are content-addressed objects reachable only through the recipe, so a
