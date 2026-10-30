@@ -525,7 +525,7 @@ refuses if a previous `load` over any recorded path never finished cleanly
 (`incomplete_load`, exit 20) — see the note under `load` above; either re-run the
 named `load`(s), or `restore --staged` the affected path(s) to abandon them, then
 stack again. The same code covers a command that rewrites the whole staging area (a shift, park,
-merge, cherry-pick, fast-forward, `lower`, `git import` or bay creation) and was interrupted
+merge, pick, fast-forward, `lower`, `git import` or bay creation) and was interrupted
 before it finished: then the message names that command, and `forklift heal` is the way out (see
 `heal` below). And it refuses with `staged_content_missing` (exit 25), naming the path and the
 hash, when the store no longer holds the content of a file staged since the head (for a large
@@ -574,14 +574,14 @@ forklift undo --as rescued   # undo a pallet delete, bringing the pallet back as
 ```
 
 Reverses the **last state-changing operation**, using an undo journal — not just the
-last `stack`. Each `stack`, `consolidate`, `cherry-pick`, `shift` and `pallet delete` records the state
+last `stack`. Each `stack`, `consolidate`, `pick`, `shift` and `pallet delete` records the state
 before and after it (the current pallet, the pallet refs it moved, and any consolidation or
-cherry-pick left in progress — all tiny, since the objects are content-addressed and already
+pick left in progress — all tiny, since the objects are content-addressed and already
 stored), so `undo` can walk them back one at a time. Only the refs the command itself wrote are
 recorded: a pallet another bay moved while it ran is never part of the entry, so `undo` never
 reverts it.
 
-- Reversing a **`stack`**, **`consolidate`** or **`cherry-pick`** is a *soft reset*: the head moves back while
+- Reversing a **`stack`**, **`consolidate`** or **`pick`** is a *soft reset*: the head moves back while
   the working directory and inventory are kept, so the undone changes are staged again
   (like git's `reset --soft HEAD~1`). This is how a **merge is reversed** too — merge
   parcels are no longer refused.
@@ -610,11 +610,11 @@ which changed nothing in the bay, it refuses outright when the bay no longer mat
 journaled operation left: the current
 pallet was switched since (`pallet create` and `deliver` switch pallets without being
 journaled), the current pallet's head moved (a merged haul, a fast-forwarding `lower`), or a
-consolidation or cherry-pick was started or finished. It also refuses to undo the `stack` that
-completed a cherry-pick once the picked parcel is gone from the warehouse (a `gc` can collect it
+consolidation or pick was started or finished. It also refuses to undo the `stack` that
+completed a pick once the picked parcel is gone from the warehouse (a `gc` can collect it
 when no pallet reaches it), since the pick it would put back could never complete. Continue forward instead.
 In a warehouse that `forklift-server` has served, it refuses to undo a `stack`, `consolidate` or
-`cherry-pick` that would move a pallet back off the head it left, keeping the entry: the remote's
+`pick` that would move a pallet back off the head it left, keeping the entry: the remote's
 clones may already rely on the parcel it would take off, and with no ref holding it the server's
 `gc` could free their only copy (the wire is fast-forward-only for the same reason). A pallet
 other than the current one that another bay has moved on since is left alone, so it does not
@@ -628,7 +628,7 @@ after a `park`, `undo` soft-resets beneath the parked work. `park pop` then re-a
 unless the parked work touches a path the undone parcel changed — it refuses that until the
 undone changes are re-stacked.
 
-Undoing a `consolidate` or `cherry-pick` that stopped at conflicts takes no parcel off the
+Undoing a `consolidate` or `pick` that stopped at conflicts takes no parcel off the
 pallet; it only abandons the merge in progress, leaving the working directory (markers
 included) as it is. Undoing the `stack` that completed one puts it back in progress, so the
 next `stack` completes it again.
@@ -963,19 +963,19 @@ The manifest **syncs with the office and the working pallets**: `lift` pushes it
 and `clone` pull it (never into the working directory — it is metadata). If two people
 record entries concurrently the manifest diverges, and `lower` **replays** your entries onto the
 remote's. Entries from different operators never collide; only two copies of your own approval
-written apart can, and `--keep` settles that (see `kv`).
+written apart can, and `--keep` settles that (see `manifest set`).
 
-### `kv` — custom metadata on parcels
+### `manifest set` — keyed values on parcels
 
 ```sh
 forklift manifest set main ci green        # set a key on a parcel (any revision)
 forklift manifest get main ci              # its value
 forklift manifest unset main ci            # remove it
-forklift manifest keys main                # every key on a parcel; `kv list` for all of them
+forklift manifest keys main                # every key on a parcel; bare `manifest keys` for all
 forklift manifest log main ci              # every change to a key, newest first
 ```
 
-Free-form text values, keyed by parcel and key, for whatever your tooling wants to record — a CI
+The rest of the `manifest` family: free-form text values, keyed by parcel and key, for whatever your tooling wants to record — a CI
 result, a ticket, a review state. A key is one name of at most 128 bytes; a value is UTF-8 text of
 at most 64 KiB. Values live on the `@kv` meta pallet and sync like the manifest, but **each value
 is signed by whoever wrote it**: every write is a parcel signed with your key, and a remote
@@ -1052,7 +1052,7 @@ forklift haul show <id>
 forklift haul update <id>                                          # propose the source's new head
 forklift haul comment <id> -m "…"
 forklift haul review <id> [--request-changes | --comment] -m "…"   # approves by default
-forklift shift main && forklift haul consolidate <id>                    # merge lands on the target
+forklift shift main && forklift haul consolidate <id>              # merge lands on the target
 forklift haul close <id> | reopen <id>
 ```
 
@@ -1066,15 +1066,15 @@ human's approval is distinguishable from an agent's (`haul show` tags automated 
 Only the haul's opener runs `haul update`; a rewound or rebased source moves the haul with it. A
 review records the head it reviewed: after `haul update` moves the haul to new work, an
 earlier approval is still shown, marked with the head it was of, but no longer counts. A merged
-haul stays merged — no one can reopen or close it, on any head. `merge` reuses
+haul stays merged — no one can reopen or close it, on any head. `haul consolidate` reuses
 `consolidate` (a clean disjoint merge auto-stacks; a conflict leaves the consolidation in
-progress — resolve, `stack`, then re-run `haul merge` to record it). A haul opened in another
-warehouse can propose a head this one never fetched; `merge` then refuses, naming the source pallet
+progress — resolve, `stack`, then re-run `haul consolidate` to record it). A haul opened in another
+warehouse can propose a head this one never fetched; `haul consolidate` then refuses, naming the source pallet
 to `lower` first. The head an open or closed haul proposes is kept by `gc`, `store compact --all` and
 `scope-prune` even after its source pallet moves off it or is deleted. A haul id is
 content-addressed; use any unique prefix.
 
-Only an operator who may write the target records a merge: `haul merge` refuses anyone else
+Only an operator who may write the target records a merge: `haul consolidate` refuses anyone else
 before merging anything, and every remote refuses such a record. `haul show` and `haul list`
 judge a merged haul against this warehouse: `--json` carries `merge_proof` (`verdict`
 `verified`, `refuted` or `unproven`, with a `reason` unless verified), and the human views
@@ -1236,7 +1236,7 @@ forklift shift main
 Materializes the target pallet's head tree in the working directory, repopulates
 the inventory from it, and makes it the current pallet. Refuses to run when you
 have staged or unstaged changes (they'd be overwritten) — stack, restore, or park
-them first — or while a consolidation or cherry-pick is in progress, which is
+them first — or while a consolidation or pick is in progress, which is
 completed on the pallet it started on (`pallet create` and `deliver` refuse then too,
 and `stack` refuses to complete it on any other pallet). Untracked files are left alone unless the
 target needs to write over one.
@@ -1249,7 +1249,7 @@ the bay's record is updated. With local changes it refuses and names the way thr
 
 On a case-insensitive file system (the default on macOS and Windows), two names
 that differ only in case, such as `README` and `readme`, are one file. Every
-command that writes the working directory (`shift`, `consolidate`, `cherry-pick`,
+command that writes the working directory (`shift`, `consolidate`, `pick`,
 `lower`, `clone`, `bay add`, `park` and `park pop`) asks the file system what
 a new path lands on before it writes anything:
 
@@ -1321,7 +1321,7 @@ moved after the draft forked from it: those changes would be silently undone
 delivery of a state the draft has been through is fine, so a draft (or a pallet branched
 from it) can keep working and deliver again.
 
-### `cherry-pick` — apply one parcel's change onto the current pallet (`cp`)
+### `pick` — apply one parcel's change onto the current pallet
 
 ```sh
 forklift pick 1a2b3c            # apply that parcel's diff here, as a new parcel
@@ -1329,15 +1329,15 @@ forklift pick feature -m "..."  # pick a pallet's head, with a custom message
 ```
 
 Applies a parcel's diff — its change against its first parent — onto the current pallet as
-a new parcel. Unlike rebase, cherry-pick only **adds**: no rewrite, no
+a new parcel. Unlike rebase, pick only **adds**: no rewrite, no
 force-push, nothing an audit has to bless twice. The picked parcel's **authors are
 preserved** and you are recorded as the stacker (the same author/stacker split as
 `git import`/`git export` and `deliver`), and the new parcel is freshly signed. It is
 applied by three-way merge, so a **clean** pick is stacked immediately as a single-parent
-parcel; a **conflicting** one writes diff3 markers and leaves a cherry-pick in progress —
+parcel; a **conflicting** one writes diff3 markers and leaves a pick in progress —
 resolve, `load`, and `stack` to complete it (still single-parent, still author-preserving),
 or remove `.forklift/cherry-pick` to abort. A pick whose changes are already present is
-refused. Requires a clean warehouse.
+refused. Requires a clean warehouse. git's `cherry-pick` still runs it, unlisted.
 
 ### `conflicts` — list unresolved conflicts
 
@@ -1346,14 +1346,14 @@ forklift conflicts            # human list
 forklift conflicts --json     # structured: each file's base/ours/theirs as content addresses
 ```
 
-Lists the files a consolidation or cherry-pick left in conflict. With `--json`, each file's
+Lists the files a consolidation or pick left in conflict. With `--json`, each file's
 three sides (base, ours, theirs) are reconstructed from the diff3 markers and
 given as content-addressed blob hashes you can `store peek` — designed for agents,
 which resolve merges well given structure instead of marker soup. An empty list
 is a valid answer (nothing to resolve).
 
 **Resolving a conflict:** edit each conflicted file to remove the markers,
-`forklift load` it, then `forklift stack` to complete the consolidation or cherry-pick.
+`forklift load` it, then `forklift stack` to complete the consolidation or pick.
 
 ### `bay` — parallel working directories
 
@@ -1407,7 +1407,7 @@ folder.
 Because the refs are shared, two bays can reach for the same pallet — say both are on `main`.
 Each bay records the parcel its files stand on. When another bay stacks on the pallet, this bay
 is **behind**: `stocktake` reports that the pallet moved on, and `stack`, `consolidate`,
-`cherry-pick`, `haul merge`, `lower`, `deliver` and `lift`'s auto-merge refuse, naming both
+`pick`, `haul consolidate`, `lower`, `deliver` and `lift`'s auto-merge refuse, naming both
 parcels, rather than build on the old tree and revert the other bay's work. `shift <pallet>`
 catches up (see `shift`), and shifting to another pallet works as usual. A merge or pick
 started before the pallet moved cannot be completed or caught up past; abort it and redo it
@@ -1418,7 +1418,7 @@ the meantime, the command is refused with a message naming both heads, and whate
 already written to its own working tree is put back. A head another bay moved is never
 silently overwritten.
 
-That holds for merges too. A `consolidate`, `haul merge`, `lift` auto-merge or `cherry-pick`
+That holds for merges too. A `consolidate`, `haul consolidate`, `lift` auto-merge or `pick`
 that completes on its own is stacked on the head it merged against; if that head moved, the
 merge is undone in the working tree and inventory and nothing is left in progress, so running
 the command again is safe. A merge or pick you resolved by hand is stacked on the head it
@@ -1469,9 +1469,9 @@ Inside a scoped bay:
   **both** sides has no content here to reconcile, so the merge refuses with
   `out_of_scope_conflict`; widen the scope to include that path and retry, or resolve the merge
   in a full workspace.
-- `git export`, `git import` and `cherry-pick` refuse in a scoped bay (`sparse_workspace`): the
+- `git export`, `git import` and `pick` refuse in a scoped bay (`sparse_workspace`): the
   first two bypass the sparse overlay and would export/import a truncated or scope-inconsistent
-  view, and a cherry-pick materializes a diff that may touch paths this bay never fetched. Run
+  view, and a pick materializes a diff that may touch paths this bay never fetched. Run
   them from a full workspace.
 - `park` produces a parcel that stacks over the head's spine exactly like `stack`, so a parked
   parcel from a scoped bay is byte-identical to what parking the same work in progress in a
@@ -1557,7 +1557,7 @@ downloaded file holds, and the file is kept afterwards, so a clone can briefly n
 history's size. The client accepts gzip-compressed answers only, and a zstd frame received from a
 remote may use at most an 8 MiB window; a frame asking for more is refused.
 
-### `clone` — clone (`fr`)
+### `clone` — clone a remote warehouse
 
 ```sh
 forklift clone http://forklift.example.com:9418 my-project
@@ -1641,7 +1641,7 @@ held by hash): an older parcel's, and the head's of a pallet `lower <pallet>` mo
 checking it out. A command that reads content the cache lacks (`show` or `diff` of an older
 parcel, `shift` to a pallet lowered that way) fetches each object it meets from the origin as it
 reads it, and keeps it. A command that writes the bay's files (`clone`, `shift`,
-`consolidate`, `cherry-pick`, `park`, `lower`, `restore`, `bay add`) fetches every file it is
+`consolidate`, `pick`, `park`, `lower`, `restore`, `bay add`) fetches every file it is
 about to write in one batch first, before it changes anything. When a new pallet branched off a
 pallet the origin has, or the work merged in another pallet's head as the origin has it, a `lift`
 reads only the work being lifted and the parent parcel's version of each directory it changed,
@@ -1798,7 +1798,7 @@ no fetch mends it. A remote refuses a push of such a history the same way.
 The meta pallets sync first, each on its own: one that fails or conflicts is reported, and the
 working pallet still lowers. A diverged `@kv`, `@manifest`, `@tags` or `@haul`
 replays your changes onto the remote's, and `--keep` resolves the paths both sides changed (see
-`kv`).
+`manifest set`).
 
 ### `expand` — widen a sparse warehouse's fetch scope
 
@@ -1931,7 +1931,7 @@ a haul, a deleted pallet) stays, and the report counts it (`not_held`): lift tha
 
 It keeps every checkout's files (the base tree of the main checkout and of each bay,
 `kept_for_checkouts`), every meta pallet in full, the trust records, staged work, and what a parked
-stash, an unfinished consolidation or cherry-pick needs (`kept_local`). A kept object that an
+stash, an unfinished consolidation or pick needs (`kept_local`). A kept object that an
 earlier eviction recorded as held by hash and a later read fetched again has that record removed
 (`unsealed`).
 An object the origin's history reaches that is missing here without a record is damage, not an
@@ -2432,7 +2432,7 @@ record cannot be read. A failure to write the record is reported (`unseal_failed
 #### Interrupted operations
 
 Every command that rewrites the whole staging area — `shift`, `park`, `consolidate` (a merge or a
-fast-forward, and the merges `haul` and `lift` run for you), `cherry-pick`, `lower`, `git import`,
+fast-forward, and the merges `haul` and `lift` run for you), `pick`, `lower`, `git import`,
 and creating a bay — first records that it has begun, and clears the record once it is done. If
 one is killed or fails part-way (a crash, a full disk, a power cut), the record stays, and every
 command that changes the bay or commits staged content (`stack`, `load`, `shift`, `park`, `lift`,
@@ -2450,7 +2450,7 @@ of every tracked file.
   rebuilt from the tree it was moving to, and the bay is put at that position. For a park, that
   means the working files are reset to the head, as the park would have left them.
 - **It did not get that far** — the head it was moving to never landed, or another bay moved the
-  pallet meanwhile — the operation is undone: for a merge, cherry-pick, fast-forward or `lower`,
+  pallet meanwhile — the operation is undone: for a merge, pick, fast-forward or `lower`,
   the files it wrote are put back to the tree it started from, and staging and the position
   follow. A park that was interrupted before its work reached the parked list leaves that work
   where it was.
@@ -2638,10 +2638,10 @@ runs `stack` and `forklift push` runs `lift`. They work but are left out of `--h
 shows forklift's own names; the generated page lists each one in its "Hidden alias" column.
 
 The mapping isn't always one-to-one in *behavior*: `commit` runs `stack`, which commits what
-you've `load`ed; it doesn't stage for you. `diff`, `restore`, `tag`, `show` and `cherry-pick`
-keep their git names outright. git's `restore --staged` works as it is (or use `unload`), and
-git's `rm --cached` is `remove`, which takes no `--cached` flag because it only ever stages the
-removal. For the review workflow, git's "pull request" is
+you've `load`ed; it doesn't stage for you. `diff`, `restore`, `tag`, `show` and `clone` keep
+their git names outright, and git's `cherry-pick` runs `pick`. git's `restore --staged` works as
+it is (or use `unload`), and git's `rm --cached` is `remove`, which takes no `--cached` flag
+because it only ever stages the removal. For the review workflow, git's "pull request" is
 [`haul`](#haul--pull-requests-reviewable-merge-proposals). The
 [glossary](glossary.md) maps the concepts behind the names.
 

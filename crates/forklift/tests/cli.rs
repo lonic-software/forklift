@@ -13835,7 +13835,7 @@ fn prepare_marks_the_warehouse_and_staging_leftovers_are_never_tracked() {
     assert_eq!(std::fs::read_to_string(warehouse.root.join(".forklift/warehouse")).unwrap(), "/forklift-warehouse 2\nfull\n");
 
     warehouse.write_file(".forklift.tmp~9-9/lock", "");
-    warehouse.write_file(".forklift.tmp~9-9/.forklift/clone", "x\n");
+    warehouse.write_file(".forklift.tmp~9-9/.forklift/franchise", "x\n");
     warehouse.write_file("sub/.forklift.tmp~3-4/notes.txt", "x\n");
     warehouse.write_file("sub/keep.txt", "kept\n");
 

@@ -8,7 +8,7 @@ or a `--json` output struct).
 
 # MCP tools
 
-Every tool `forklift mcp` serves, generated from the same command definition the binary parses its arguments with, as the server's own tool list is; CI fails when this page falls behind it. A tool is a command path joined by `_` (`forklift tag create` is `tag_create`, `forklift cherry-pick` is `cherry_pick`), and its description is the command's one-line description followed by its long one; each argument's own help is that argument's description in the tool's input schema. An argument is an option's long name (with `_` for `-`) or a positional's name. `docs/MACHINE_INTERFACE.md` describes the server.
+Every tool `forklift mcp` serves, generated from the same command definition the binary parses its arguments with, as the server's own tool list is; CI fails when this page falls behind it. A tool is a command path joined by `_` (`forklift tag create` is `tag_create`, `forklift pick` is `cherry_pick`), and its description is the command's one-line description followed by its long one; each argument's own help is that argument's description in the tool's input schema. An argument is an option's long name (with `_` for `-`) or a positional's name. `docs/MACHINE_INTERFACE.md` describes the server.
 
 | Tool | Runs | Does | Arguments |
 |---|---|---|---|
@@ -17,7 +17,6 @@ Every tool `forklift mcp` serves, generated from the same command definition the
 | `bay_add` | `forklift bay add` | Open a new bay (a new working directory on a new pallet) | `name` (a string, required)<br>`path` (a string)<br>`scope` (an array of strings) |
 | `bay_remove` | `forklift bay remove` | De-register a bay (its pallet ref and materialized files are kept) | `name` (a string, required) |
 | `blame` | `forklift blame` | Show, for each line of a file, the parcel and author that last changed it | `path` (a string, required)<br>`rev` (a string) |
-| `cherry_pick` | `forklift cherry-pick` | Apply a parcel's changes onto the current pallet as a new, author-preserving parcel | `revision` (a string, required)<br>`message` (a string) |
 | `conflicts` | `forklift conflicts` | List the files left in conflict by an unresolved consolidation |  |
 | `consolidate` | `forklift consolidate` | Consolidate (merge) another pallet into the current one | `pallet` (a string, required) |
 | `deliver` | `forklift deliver` | Squash the current draft pallet onto a target as one clean parcel, keeping the trail | `target` (a string, required)<br>`message` (a string) |
@@ -28,7 +27,7 @@ Every tool `forklift mcp` serves, generated from the same command definition the
 | `haul_update` | `forklift haul update` | Propose the source pallet's current head | `id` (a string, required) |
 | `haul_comment` | `forklift haul comment` | Add a comment | `id` (a string, required)<br>`message` (a string, required) |
 | `haul_review` | `forklift haul review` | Record a signed review (approve by default) | `id` (a string, required)<br>`request_changes` (a boolean)<br>`comment` (a boolean)<br>`message` (a string) |
-| `haul_merge` | `forklift haul merge` | Merge a proposal (consolidate its source into the target) | `id` (a string, required) |
+| `haul_consolidate` | `forklift haul consolidate` | Land a proposal: consolidate its source into the target | `id` (a string, required) |
 | `haul_close` | `forklift haul close` | Close a proposal without merging | `id` (a string, required) |
 | `haul_reopen` | `forklift haul reopen` | Reopen a closed proposal | `id` (a string, required) |
 | `heal` | `forklift heal` | Resolve a standing durability taint, or finish or undo an interrupted operation |  |
@@ -36,16 +35,16 @@ Every tool `forklift mcp` serves, generated from the same command definition the
 | `lift` | `forklift lift` | Upload the current pallet's new parcels to the remote (push) | `recreate` (a boolean) |
 | `load` | `forklift load` | Take the current state of a file or directory into the inventory (stage) | `path` (a string, required) |
 | `lower` | `forklift lower` | Download the remote's new parcels and fast-forward the current pallet, or another (pull) | `pallet` (a string)<br>`expect` (a string)<br>`keep` (an array of strings) |
-| `kv_set` | `forklift kv set` | Set a key on a parcel | `revision` (a string, required)<br>`key` (a string, required)<br>`value` (a string, required) |
-| `kv_get` | `forklift kv get` | Show a key's value on a parcel | `revision` (a string, required)<br>`key` (a string, required) |
-| `kv_unset` | `forklift kv unset` | Remove a key from a parcel | `revision` (a string, required)<br>`key` (a string, required) |
-| `kv_list` | `forklift kv list` | List every value, or a parcel's | `revision` (a string) |
-| `kv_log` | `forklift kv log` | Show every change to a key, newest first, with who made it | `revision` (a string, required)<br>`key` (a string, required) |
-| `manifest` | `forklift manifest` | Attach signed post-metadata to a parcel: approvals, review notes |  |
+| `manifest` | `forklift manifest` | Facts recorded about a parcel after the fact: notes, approvals, provenance, keyed values |  |
 | `manifest_note` | `forklift manifest note` | Attach a free-form note to a parcel | `revision` (a string, required)<br>`message` (a string, required) |
 | `manifest_approve` | `forklift manifest approve` | Record a signed approval (sign-off) of a parcel | `revision` (a string, required)<br>`message` (a string) |
 | `manifest_provenance` | `forklift manifest provenance` | Record how a parcel was produced: model, tool, session (AI provenance) | `revision` (a string, required)<br>`model` (a string, required)<br>`tool` (set by the server)<br>`session` (set by the server)<br>`transcript` (a string)<br>`message` (a string) |
 | `manifest_show` | `forklift manifest show` | Show the manifest entries attached to a parcel | `revision` (a string, required) |
+| `manifest_set` | `forklift manifest set` | Set a keyed value on a parcel | `revision` (a string, required)<br>`key` (a string, required)<br>`value` (a string, required) |
+| `manifest_get` | `forklift manifest get` | Show a keyed value on a parcel | `revision` (a string, required)<br>`key` (a string, required) |
+| `manifest_unset` | `forklift manifest unset` | Remove a keyed value from a parcel | `revision` (a string, required)<br>`key` (a string, required) |
+| `manifest_keys` | `forklift manifest keys` | List every keyed value, or a parcel's | `revision` (a string) |
+| `manifest_log` | `forklift manifest log` | Show every change to a key, newest first, with who made it | `revision` (a string, required)<br>`key` (a string, required) |
 | `office_list` | `forklift office list` | List the users and their keys (the default) |  |
 | `pallet_list` | `forklift pallet list` | List the pallets, marking the current one (the default) | `all` (a boolean)<br>`remote` (a boolean) |
 | `pallet_create` | `forklift pallet create` | Create a new pallet and shift to it | `name` (a string, required)<br>`revision` (a string) |
@@ -54,6 +53,7 @@ Every tool `forklift mcp` serves, generated from the same command definition the
 | `park` | `forklift park` | Park the work in progress and reset to the pallet head |  |
 | `park_pop` | `forklift park pop` | Re-apply the most recently parked changes (staged) and drop them from the list |  |
 | `park_list` | `forklift park list` | List the parked parcels, newest first |  |
+| `pick` | `forklift pick` | Apply a parcel's changes onto the current pallet as a new, author-preserving parcel | `revision` (a string, required)<br>`message` (a string) |
 | `query` | `forklift query` | Query parcel history by signed identity, signer and parcel facts | `revisions` (an array of strings)<br>`from` (a string)<br>`class` (a string)<br>`unsupervised` (a boolean)<br>`supervisor` (a string)<br>`signer` (a string)<br>`author_after` (a string)<br>`author_before` (a string)<br>`merges` (a boolean)<br>`no_merges` (a boolean)<br>`grep` (a string)<br>`model` (a string)<br>`tool` (a string)<br>`tag` (a string)<br>`touches` (a string)<br>`verify` (a boolean)<br>`recorded` (a boolean)<br>`where` (an object)<br>`limit` (an integer of at least 1)<br>`after` (a string)<br>`oneline` (a boolean) |
 | `remove` | `forklift remove` | Stage a file or directory for removal | `path` (a string, required) |
 | `restore` | `forklift restore` | Restore a file or directory from the inventory (discard unstaged changes) | `staged` (a boolean)<br>`path` (a string, required) |
@@ -81,7 +81,7 @@ Each of these commands, and every command below it, is a tool for nobody: a pers
 - `forklift prepare`: creates a warehouse, which is setup.
 - `forklift config`: reads and sets configuration, which is setup.
 - `forklift profile`: manages identity profiles, which is setup.
-- `forklift franchise`: clones a remote, which is setup.
+- `forklift clone`: clones a remote, which is setup.
 - `forklift git`: migrates a repository in or out, which is setup, or mirrors to an external git remote under the user's own git credentials.
 - `forklift office enroll`: establishes the operator's trust, a one-way setup step.
 - `forklift office keygen`: creates a signing key, which is setup.

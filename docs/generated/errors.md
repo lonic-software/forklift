@@ -32,7 +32,7 @@ Exit code 17 is reserved for a future feature and is not yet assigned to any cod
 | `commit_pagination_unsupported` | 16 | A lift needs a paginated commit (many objects) and the remote doesn't support it yet |
 | `query_predicate_invalid` | 18 | A "forklift query" predicate is malformed or exceeds a fixed bound |
 | `empty_history` | 19 | "forklift history" was asked to walk a pallet that has nothing stacked on it yet |
-| `incomplete_load` | 20 | "forklift stack", "forklift park", "forklift consolidate" or "forklift cherry-pick" refused because a "forklift load" that never finished cleanly is still recorded, or a command refused because an operation that rewrites the whole staging area was interrupted ("forklift heal" finishes or undoes it) |
+| `incomplete_load` | 20 | "forklift stack", "forklift park", "forklift consolidate" or "forklift pick" refused because a "forklift load" that never finished cleanly is still recorded, or a command refused because an operation that rewrites the whole staging area was interrupted ("forklift heal" finishes or undoes it) |
 | `durability_taint` | 21 | A durability taint could not be auto-healed (a vanished, unreadable, or corrupt path, or a torn taint record) |
 | `trust_changed` | 22 | A remote's trust anchor is not the one this warehouse holds or the command named; the details carry its current value |
 | `remote_protocol_violation` | 23 | A remote answered with something the protocol never produces; it is misbehaving or corrupt, and retrying gets the same answer |
@@ -42,8 +42,8 @@ Exit code 17 is reserved for a future feature and is not yet assigned to any cod
 | `target_not_covered` | 27 | "forklift deliver" was aimed at a target holding changes the draft has not seen; consolidating the target into the draft comes first |
 | `remote_ahead` | 28 | The remote's pallet holds parcels this warehouse has not lowered yet; "forklift lower" comes first |
 | `pallet_not_found` | 29 | No pallet of that name exists in this warehouse (or, for "forklift lower", on the remote); "forklift lower <name>" brings in the remote's, "forklift pallet create <name>" creates a new one, "forklift pallet list --remote" lists the remote's |
-| `franchise_incomplete` | 30 | The directory holds a franchise that has not finished; running the same "forklift franchise" again resumes it and keeps what was fetched |
-| `only_prefix_not_found` | 31 | A sparse franchise's --only path is not a directory in the pallet on the remote |
+| `clone_incomplete` | 30 | The directory holds a clone that has not finished; running the same "forklift clone" again resumes it and keeps what was fetched |
+| `only_prefix_not_found` | 31 | A sparse clone's --only path is not a directory in the pallet on the remote |
 | `staged_upload_discarded` | 32 | A lift's commit named an upload the remote no longer holds (discarded or never received); running the lift again uploads it afresh |
 | `mirror_incomplete` | 33 | A mirror run left at least one pallet out of step with git; the others went through, and each failed pallet's message names its step |
 | `history_unverified` | 34 | History about to be adopted as a pallet's does not verify against the trust anchor it was judged against (the one held here, or at first contact the one the remote serves); nothing was adopted |

@@ -455,7 +455,7 @@ damaged mirror) is not this code.
 ### History the anchor does not vouch for: `history_unverified`
 
 A command that adopts a head another store served (`lower`, `clone`, `lift`'s auto-merge,
-`mirror`) or one already in the store (`pallet create <name> <hash>`, `haul merge`, the `stack` that
+`mirror`) or one already in the store (`pallet create <name> <hash>`, `haul consolidate`, the `stack` that
 completes a conflicted merge) refuses with `history_unverified` (exit 34) when the head's history
 does not verify against the trust anchor and office it is judged against: the ones this warehouse
 holds, or at first contact the ones the remote serves. Nothing was adopted: no ref moved, no
@@ -472,7 +472,7 @@ and follows the step.
 
 | code | exit | condition | `next_step` |
 |---|---|---|---|
-| `behind` | 26 | this bay's base is behind its pallet's head: another bay or process moved the pallet. Raised by every command that moves the bay's pallet (`stack`, `deliver`, `consolidate`, `cherry-pick`, `haul merge`, `lower`, `lift`'s auto-merge, a consolidation's completion) | `forklift shift <pallet>`; a refusal mid-merge names aborting the merge first |
+| `behind` | 26 | this bay's base is behind its pallet's head: another bay or process moved the pallet. Raised by every command that moves the bay's pallet (`stack`, `deliver`, `consolidate`, `pick`, `haul consolidate`, `lower`, `lift`'s auto-merge, a consolidation's completion) | `forklift shift <pallet>`; a refusal mid-merge names aborting the merge first |
 | `remote_ahead` | 28 | the remote's pallet holds parcels this warehouse has not lowered: its head is unknown here, descends from the local head, or moved since this client read it (the `409` of a ref update). It does not promise this side holds nothing new; `lower` then fast-forwards or reports `diverged` | `forklift lower` |
 | `diverged` | 5 | the local pallet and the remote's each hold parcels the other lacks. `lower` never merges them; `lift` reports it when it did not auto-merge (an overlap, an unclean warehouse, or its retry bound) | for a working pallet: create a pallet at the remote head (as `<pallet>-remote-<short hash>`, unique per remote head), shift back, consolidate it, lift; for a meta pallet with replay rules: `forklift lower`. The office and other meta pallets diverge as an unclassified error, reconciled by hand |
 | `target_not_covered` | 27 | `deliver` would undo changes on the target that the draft never consolidated | `forklift consolidate <target>` |
@@ -620,7 +620,7 @@ ignored, so a stale resolution never applies to a later conflict.
 
 ## Structured conflicts
 
-`forklift conflicts` lists the files an unresolved consolidation or cherry-pick left in conflict.
+`forklift conflicts` lists the files an unresolved consolidation or pick left in conflict.
 With `--json`, each file's three sides are **content addresses** — blob hashes a
 resolver fetches (`forklift store peek <hash>`) and diffs, instead of parsing marker soup:
 

@@ -2260,7 +2260,7 @@ fn request_header(head: &str, name: &str) -> Option<String> {
 
 /// The value of `key` in the clone record of `directory`.
 fn franchise_record_value(area: &TestArea, directory: &str, key: &str) -> Option<String> {
-    area.read_file(&format!("{}/.forklift/clone", directory)).lines()
+    area.read_file(&format!("{}/.forklift/franchise", directory)).lines()
         .find_map(|line| line.strip_prefix(&format!("{}=", key)).map(str::to_string))
 }
 
@@ -2433,9 +2433,9 @@ fn a_digest_valid_bundle_that_fails_import_keeps_nothing() {
         if kept == Some(bad.len()) {
             // Whole but not yet imported, as a crash between the last byte and the import leaves it.
             std::fs::write(area.path(&format!("{}/.forklift/bundles/partial", name)), &bad).unwrap();
-            let record = area.read_file(&format!("{}/.forklift/clone", name))
+            let record = area.read_file(&format!("{}/.forklift/franchise", name))
                 .replace(&format!("bundle.length={}", cut), &format!("bundle.length={}", bad.len()));
-            area.write_file(&format!("{}/.forklift/clone", name), &record);
+            area.write_file(&format!("{}/.forklift/franchise", name), &record);
         }
 
         let failed = franchise_checkpointing(&area, &stub.url, name);
@@ -2924,7 +2924,7 @@ fn a_resume_refuses_a_remote_whose_anchor_changed_since_the_first_attempt() {
     assert_eq!(value["error"]["code"], "trust_changed", "{}", value);
     assert!(value["error"]["message"].as_str().unwrap().contains("is bound to the genesis its first attempt saw"), "{}", value);
     assert!(value["error"]["next_step"].as_str().unwrap().contains("delete \"half\" and clone again"), "{}", value);
-    assert!(area.path("half/.forklift/clone").is_file(), "a refused resume keeps the directory");
+    assert!(area.path("half/.forklift/franchise").is_file(), "a refused resume keeps the directory");
 
     // A fresh clone of the same remote adopts the new anchor (with a warning), as always.
     assert_success(&area.forklift(".", &["clone", &server.url, "fresh", "--token", "root"]));
@@ -9746,7 +9746,7 @@ fn a_failed_franchise_keeps_its_directory_and_a_corrected_resume_finishes() {
     assert_eq!(value["error"]["details"]["remote"], server.url.as_str(), "{}", value);
     assert!(value["error"]["message"].as_str().unwrap().contains("\"src/ap\" is not a directory"), "{}", value);
 
-    assert!(area.path("typo/.forklift/clone").is_file(), "the record must stand until the clone finishes");
+    assert!(area.path("typo/.forklift/franchise").is_file(), "the record must stand until the clone finishes");
     assert!(area.path("typo/.forklift/objects").is_dir(), "what was fetched must be kept");
 
     // The corrected resume needs no other options and finishes in place.
@@ -9754,7 +9754,7 @@ fn a_failed_franchise_keeps_its_directory_and_a_corrected_resume_finishes() {
     assert_success(&resumed);
     assert_eq!(area.read_file("typo/src/api/a.txt"), "api v1\n");
     assert!(!area.path("typo/src/web").exists(), "the resume clones at its own scope");
-    assert!(!area.path("typo/.forklift/clone").exists(), "a finished clone clears its record");
+    assert!(!area.path("typo/.forklift/franchise").exists(), "a finished clone clears its record");
     assert_eq!(origin_of(&area, "typo").as_deref(), Some(server.url.as_str()), "the resume records the origin again");
     assert_success(&area.forklift("typo", &["status"]));
 }
@@ -9822,7 +9822,7 @@ fn an_unfinished_franchise_without_a_warehouse_marker_is_still_franchise_incompl
     let failed = area.forklift(".", &["clone", &server.url, "half", "--only", "src/ap"]);
     assert_eq!(failed.status.code(), Some(30), "{}{}", stdout(&failed), stderr(&failed));
     let _ = std::fs::remove_file(area.path("half/.forklift/warehouse"));
-    assert!(!area.path("half/.forklift/warehouse").exists() && area.path("half/.forklift/clone").is_file());
+    assert!(!area.path("half/.forklift/warehouse").exists() && area.path("half/.forklift/franchise").is_file());
 
     for args in [&["--json", "status"][..], &["--json", "prepare"]] {
         let refused = area.forklift("half", args);
@@ -9839,14 +9839,14 @@ fn a_resume_of_another_remote_is_refused_before_it_connects() {
 
     let failed = area.forklift(".", &["clone", &server.url, "half", "--only", "src/ap"]);
     assert_eq!(failed.status.code(), Some(30), "{}{}", stdout(&failed), stderr(&failed));
-    let record = std::fs::read(area.path("half/.forklift/clone")).unwrap();
+    let record = std::fs::read(area.path("half/.forklift/franchise")).unwrap();
 
     // Nothing listens there: a refusal that names the recorded remote proves no connection was tried.
     let refused = area.forklift(".", &["--json", "clone", "http://127.0.0.1:9", "half"]);
     assert_eq!(refused.status.code(), Some(30), "{}{}", stdout(&refused), stderr(&refused));
     let value = json_of(&refused);
     assert!(value["error"]["message"].as_str().unwrap().contains("not of http://127.0.0.1:9"), "{}", value);
-    assert_eq!(std::fs::read(area.path("half/.forklift/clone")).unwrap(), record, "the record is untouched");
+    assert_eq!(std::fs::read(area.path("half/.forklift/franchise")).unwrap(), record, "the record is untouched");
 
     // A trailing slash is the same remote.
     let resumed = area.forklift(".", &["clone", &format!("{}/", server.url), "half"]);
@@ -9861,7 +9861,7 @@ fn a_failed_franchise_into_a_nested_target_keeps_it_and_its_ancestors() {
 
     let failed = area.forklift(".", &["clone", &server.url, "a/b/c", "--only", "src/ap"]);
     assert_eq!(failed.status.code(), Some(30), "{}{}", stdout(&failed), stderr(&failed));
-    assert!(area.path("a/b/c/.forklift/clone").is_file());
+    assert!(area.path("a/b/c/.forklift/franchise").is_file());
 
     assert_success(&area.forklift(".", &["clone", &server.url, "a/b/c"]));
     assert_eq!(area.read_file("a/b/c/src/web/b.txt"), "web v1\n");
@@ -10029,8 +10029,8 @@ fn a_failure_after_the_bundle_install_keeps_it_and_the_resume_skips_the_download
     let failed = area.forklift(".", &["clone", &server.url, "packed"]);
     assert_eq!(failed.status.code(), Some(30),
         "clone must fail when a required object has vanished from the remote: {}", stderr(&failed));
-    assert!(area.read_file("packed/.forklift/clone").contains("bundle=imported"),
-        "{}", area.read_file("packed/.forklift/clone"));
+    assert!(area.read_file("packed/.forklift/franchise").contains("bundle=imported"),
+        "{}", area.read_file("packed/.forklift/franchise"));
 
     let blob = object_store_path(&area, "dev", &blob_b);
     std::fs::copy(&blob, object_store_path(&area, "server-root", &blob_b)).unwrap();

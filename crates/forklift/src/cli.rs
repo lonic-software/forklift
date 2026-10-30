@@ -476,13 +476,14 @@ pub enum Command {
                       fact. Notes, approvals and machine-authorship provenance are entries on the \
                       \"@manifest\" meta pallet (subcommands note, approve, provenance and \
                       show). Keyed values, such as a build status or a ticket link, live on the \
-                      \"@kv\" meta pallet (subcommands set, get, unset, keys and log): a key holds one text value per parcel, and \
-                      lower combines changes to different keys, while a key changed differently on \
-                      both sides is a conflict that \"forklift lower --keep\" resolves. Every \
-                      change is signed by its writer, verifiable offline against the office chain, \
-                      and references the parcel without ever changing it. Recording needs an \
-                      enrolled signing key; a keyed value also needs a writer or admin role. \
-                      Without a subcommand, the whole manifest is listed."
+                      \"@kv\" meta pallet (subcommands set, get, unset, keys and log): a key \
+                      holds one text value per parcel, and lower combines changes to different \
+                      keys, while a key changed differently on both sides is a conflict that \
+                      \"forklift lower --keep\" resolves. Every change is signed by its writer, \
+                      verifiable offline against the office chain, and references the parcel \
+                      without ever changing it. Recording needs an enrolled signing key; a keyed \
+                      value also needs a writer or admin role. Without a subcommand, every \
+                      \"@manifest\" entry is listed."
     )]
     Manifest {
         #[command(subcommand)]
@@ -541,7 +542,7 @@ pub enum Command {
         action: Option<ParkAction>,
     },
 
-    /// Apply a parcel's changes onto the current pallet as a new, author-preserving parcel (cherry-pick)
+    /// Apply a parcel's changes onto the current pallet as a new, author-preserving parcel
     #[command(
         alias = "cherry-pick",
         long_about = "Apply a parcel's diff (its change against its first parent) onto the current \
@@ -1550,7 +1551,7 @@ pub enum HaulAction {
         message: Option<String>,
     },
 
-    /// Land a proposal: consolidate its source into the target (merge)
+    /// Land a proposal: consolidate its source into the target
     #[command(alias = "merge")]
     Consolidate {
         /// The haul id (or a unique prefix)

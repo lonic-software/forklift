@@ -1,4 +1,4 @@
-//! The record of a clone that has not finished: `.forklift/clone`, and what reads it.
+//! The record of a clone that has not finished: `.forklift/franchise`, and what reads it.
 //!
 //! A clone that has claimed its target directory leaves this record standing until it
 //! succeeds, so an error, a kill or a power loss part-way through never loses what it fetched.

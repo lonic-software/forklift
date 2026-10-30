@@ -139,7 +139,7 @@ entries are independent signed records; only two writes to the same entry confli
 `lower --keep` settles which one stays.
 
 Reference: [`manifest`](cli.md#manifest--signed-post-metadata-on-parcels-mf),
-[`kv`](cli.md#kv--custom-metadata-on-parcels), [`tag`](cli.md#tag--signed-tags--releases) and
+[`manifest set`](cli.md#manifest-set--keyed-values-on-parcels), [`tag`](cli.md#tag--signed-tags--releases) and
 [`haul`](cli.md#haul--pull-requests-reviewable-merge-proposals).
 
 ## 4. Sparse warehouses
@@ -229,7 +229,7 @@ $ forklift show main:docs/pricing.md
 Prices in euros.
 ```
 
-Reference: [`clone`](cli.md#clone--clone-fr),
+Reference: [`clone`](cli.md#clone--clone-a-remote-warehouse),
 [`expand`](cli.md#expand--widen-a-sparse-warehouses-fetch-scope),
 [`narrow`](cli.md#narrow--shrink-this-checkouts-materialization-scope),
 [`scope-prune`](cli.md#scope-prune--reclaim-disk-from-a-sparse-warehouse) and
