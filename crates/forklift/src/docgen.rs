@@ -187,9 +187,10 @@ pub fn render_mcp_tools() -> Result<String, String> {
     for (path, why) in mcp::HUMAN_ONLY {
         out.push_str(&format!("- `forklift {path}`: {why}.\n"));
     }
-    out.push_str("\nThese arguments are left out of their tool:\n\n");
-    for (path, key, why) in mcp::HUMAN_ONLY_ARGS {
-        out.push_str(&format!("- `{key}` of `forklift {path}`: {why}.\n"));
+    out.push_str("\nThese arguments are refused together, though each is served alone:\n\n");
+    for (path, keys, why) in mcp::HUMAN_ONLY_TOGETHER {
+        let keys: Vec<String> = keys.iter().map(|key| format!("`{key}`")).collect();
+        out.push_str(&format!("- {} of `forklift {path}`: {why}.\n", keys.join(" with ")));
     }
     out.push_str(
         "\nThese families' bare form runs the same operation as one of their subcommands, so only \

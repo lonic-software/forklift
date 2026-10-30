@@ -273,8 +273,8 @@ changelog), `SERVER.md` (server ops), `MACHINE_INTERFACE.md` (`--json`/MCP),
    definition, so a new command is an agent tool with nothing more to do: its one-line and long
    descriptions are the tool's description and each argument's help is that argument's (put
    anything an agent needs to know in the help, not elsewhere). A command only a person should
-   run goes on `HUMAN_ONLY` in `crates/forklift/src/commands/mcp.rs`, with the reason, and an
-   argument no agent should pass on `HUMAN_ONLY_ARGS`. The MCP unit tests (`cargo test -p
+   run goes on `HUMAN_ONLY` in `crates/forklift/src/commands/mcp.rs`, with the reason, and a
+   combination of arguments no agent should pass on `HUMAN_ONLY_TOGETHER`. The MCP unit tests (`cargo test -p
    forklift --bin forklift commands::mcp`) parse every tool's arguments against the command and
    fail when one would be misread.
 
