@@ -5871,7 +5871,7 @@ fn git_command_aliases_map_to_forklift_verbs() {
     configure_operator(&warehouse);
     warehouse.write_file("a.txt", "x\n");
     assert_success(&warehouse.run(&["add", "."]));
-    assert_success(&warehouse.run(&["commit", "first"]));
+    assert_success(&warehouse.run(&["commit", "-m", "first"]));
 
     // status → stocktake; log → history.
     assert!(stdout(&warehouse.run(&["status"])).contains("matches the inventory"));

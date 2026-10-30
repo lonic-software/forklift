@@ -383,7 +383,7 @@ fn query_pages_deterministically_with_a_cursor() {
     for index in 1..6 {
         warehouse.write_file("a.txt", &format!("content {}\n", index));
         assert_success(&warehouse.run(&["load", "a.txt"]));
-        assert_success(&warehouse.run(&[&"stack".to_string(), &format!("parcel {}", index)]));
+        assert_success(&warehouse.run(&["stack", "-m", &format!("parcel {}", index)]));
     }
 
     let full = json(&warehouse.run(&["--json", "query"]));

@@ -68,6 +68,7 @@ const FORKLIFT: Tables = Tables {
         ("help", "clap meta: it repeats the descriptions this document already carries"),
         ("mcp", "a long-running stdio JSON-RPC server, not a one-shot invocation"),
         ("self schema", "the describer itself"),
+        ("haul review", "its verdict is exactly one of three switches, which no Pult param can require"),
     ],
     secret: &[
         ("clone", "token"),     // the bearer token, remembered as remote.token
@@ -517,6 +518,10 @@ fn command_settings(path: &[&str], command: &Command) -> Result<(), String> {
         "its subcommands change how its arguments bind"
     } else if command.is_multicall_set() {
         "it is a multicall command"
+    } else if command.get_groups().any(|group| group.is_required_set()) {
+        // Pult's params are independent of one another: "exactly one of these" has no form, and
+        // listing the members as plain switches would describe a bare run that clap refuses.
+        "it requires one of a group of arguments"
     } else {
         return Ok(());
     };
@@ -745,7 +750,7 @@ mod tests {
         let doc = forklift();
 
         // Written out rather than read from the table, so a wrong table entry shows up here.
-        let left_out = ["help", "mcp", "self schema"];
+        let left_out = ["help", "mcp", "self schema", "haul review"];
         let expected: usize = root.get_subcommands()
             .filter(|command| !command.is_hide_set())
             .map(|command| runnable(command, command.get_name(), &left_out))
@@ -901,6 +906,14 @@ mod tests {
             /// The next
             next: Option<String>,
         },
+        /// One of a required group
+        #[command(group = clap::ArgGroup::new("pick").required(true).args(["up", "down"]))]
+        Either {
+            #[arg(long)]
+            up: bool,
+            #[arg(long)]
+            down: bool,
+        },
     }
 
     /// The probe tree with only `name` under its root, so each probe is judged alone.
@@ -925,6 +938,7 @@ mod tests {
             ("hidden-switch", "`dump`"),
             ("global-switch", "`loudly`"),
             ("swallow", "swallows options"),
+            ("either", "requires one of a group"),
             ("dollar", "`home` of `forklift dollar`: its help contains `${`"),
             ("dollar-title", "has a title containing `${`"),
             ("dollar-long", "has a description containing `${`"),
