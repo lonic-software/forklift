@@ -207,7 +207,7 @@ impl ServingRefusal {
                 "{} records {} object{} it holds by hash alone, without the content, so it may lack \
                 content its pallets reach. A client trusts a server to hold the whole history it \
                 serves, and could free local copies this one cannot send back. A full warehouse records \
-                nothing by hash, so this root may be a copy of a sparse warehouse or a cache: franchise \
+                nothing by hash, so this root may be a copy of a cache: franchise \
                 the warehouse it was copied from again, from its server, into a new root, without \
                 --only or --cache, and serve that.",
                 name,
