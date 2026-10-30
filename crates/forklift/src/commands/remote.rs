@@ -215,7 +215,7 @@ pub(crate) struct RemoteReport {
     /// The configured `remote.url`; none when no remote is configured.
     remote: Option<String>,
 
-    /// Whether this is a partial warehouse (franchised with `--only` or `--cache`), which talks
+    /// Whether this is a partial warehouse (cloned with `--only` or `--cache`), which talks
     /// only to its origin.
     partial: bool,
 

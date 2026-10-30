@@ -748,7 +748,7 @@ pub(crate) const HUMAN_ONLY: &[(&str, &str)] = &[
     ("prepare", "creates a warehouse, which is setup"),
     ("config", "reads and sets configuration, which is setup"),
     ("profile", "manages identity profiles, which is setup"),
-    ("franchise", "clones a remote, which is setup"),
+    ("clone", "clones a remote, which is setup"),
     ("git", "migrates a repository in or out, which is setup, or mirrors to an external git remote under the user's own git credentials"),
     ("office enroll", "establishes the operator's trust, a one-way setup step"),
     ("office keygen", "creates a signing key, which is setup"),
@@ -1636,11 +1636,11 @@ mod tests {
     fn every_visible_command_path_is_a_tool_unless_it_is_human_only_or_the_same_as_a_subcommand() {
         let names: Vec<&str> = super::tools().unwrap().iter().map(|tool| tool.name.as_str()).collect();
         for name in ["stocktake", "bay", "bay_add", "park", "park_pop", "manifest", "manifest_provenance",
-                     "office_list", "tag_list", "haul_list", "scope_status", "kv_set", "cherry_pick"] {
+                     "office_list", "tag_list", "haul_list", "scope_status", "manifest_set", "pick"] {
             assert!(names.contains(&name), "{name} must be a tool");
         }
         for name in ["office", "tag", "haul", "scope", "pallet", "office_enroll", "office_regenesis", "prepare",
-                     "self_schema", "mcp", "help", "kv"] {
+                     "self_schema", "mcp", "help", "clone"] {
             assert!(!names.contains(&name), "{name} must not be a tool");
         }
         assert_eq!(tool("tag_create").path, ["tag", "create"]);
@@ -1696,10 +1696,10 @@ mod tests {
 
         assert!(refused(cli().mut_subcommand("alias", |alias| alias.hide(true))).contains("HUMAN_ONLY names"));
         assert!(refused(cli().mut_subcommand("haul", |haul| haul.subcommand_required(true))).contains("BARE_SAME_AS names"));
-        assert!(refused(cli().mut_subcommand("kv", |kv| kv.arg(clap::Arg::new("x").long("x"))))
-            .contains("`forklift kv` has subcommands and its own argument"));
-        assert!(refused(cli().subcommand(clap::Command::new("cherry_pick").about("Twin")))
-            .contains("two commands make the tool name `cherry_pick`"));
+        assert!(refused(cli().mut_subcommand("tag", |tag| tag.arg(clap::Arg::new("x").long("x"))))
+            .contains("`forklift tag` has subcommands and its own argument"));
+        assert!(refused(cli().subcommand(clap::Command::new("tag_list").about("Twin")))
+            .contains("two commands make the tool name `tag_list`"));
         assert!(refused(cli().subcommand(clap::Command::new("twin").about("Twin")
             .arg(clap::Arg::new("a-b").long("a-b"))
             .arg(clap::Arg::new("a_b").required(true))))
@@ -1741,7 +1741,7 @@ mod tests {
             ("history", json!({ "limit": 0 })),
             ("stocktake", json!({ "summary": "yes" })),
             ("history", json!(["class", "agent"])),
-            ("kv_get", json!({ "revision": "main" })),
+            ("manifest_get", json!({ "revision": "main" })),
             ("blame", json!({})),
         ] {
             assert!(refused(name, arguments.clone()).is_some(), "{} {} must be refused", name, arguments);
@@ -1751,30 +1751,30 @@ mod tests {
 
         // A null is an omitted optional, and a required one stays missing.
         assert_eq!(refused("history", json!({ "revision": null, "limit": null, "after": null })), None);
-        assert_eq!(refused("kv_get", json!({ "revision": "main", "key": null })).unwrap(),
-                   "the \"kv_get\" tool needs the \"key\" argument");
+        assert_eq!(refused("manifest_get", json!({ "revision": "main", "key": null })).unwrap(),
+                   "the \"manifest_get\" tool needs the \"key\" argument");
         assert_eq!(refused("history", json!({ "limit": "5" })).unwrap(),
                    "the \"history\" tool's \"limit\" argument must be an integer of at least 1");
         assert_eq!(refused("lower", json!({ "keep": "x" })).unwrap(),
                    "the \"lower\" tool's \"keep\" argument must be an array of strings");
 
         // An argument with fixed values takes only those.
-        let tree = crate::cli::Cli::command().subcommand(clap::Command::new("pick").about("Pick")
+        let tree = crate::cli::Cli::command().subcommand(clap::Command::new("choose").about("Choose")
             .arg(clap::Arg::new("side").long("side").value_parser(["ours", "theirs"])));
         let tools = super::generate_tools(&tree).unwrap();
-        let pick = tools.iter().find(|tool| tool.name == "pick").unwrap();
+        let pick = tools.iter().find(|tool| tool.name == "choose").unwrap();
         assert_eq!(pick.refusal(&json!({ "side": "ours" })), None);
         assert_eq!(pick.refusal(&json!({ "side": "both" })).unwrap(),
-                   "the \"pick\" tool's \"side\" argument must be one of \"ours\", \"theirs\"");
+                   "the \"choose\" tool's \"side\" argument must be one of \"ours\", \"theirs\"");
     }
 
     #[test]
     fn the_arguments_become_options_attached_and_positionals_after_a_double_dash() {
         let argv = |name: &str, arguments: serde_json::Value| tool(name).argv(arguments.as_object().unwrap());
 
-        assert_eq!(argv("kv_set", json!({ "revision": "main", "key": "ci", "value": "-green" })).unwrap(),
-                   ["kv", "set", "--", "main", "ci", "-green"]);
-        assert_eq!(argv("kv_list", json!({})).unwrap(), ["kv", "list"]);
+        assert_eq!(argv("manifest_set", json!({ "revision": "main", "key": "ci", "value": "-green" })).unwrap(),
+                   ["manifest", "set", "--", "main", "ci", "-green"]);
+        assert_eq!(argv("manifest_keys", json!({})).unwrap(), ["manifest", "keys"]);
         assert_eq!(argv("lower", json!({ "keep": ["@kv:a/b=ours", "@kv:c=theirs"] })).unwrap(),
                    ["lower", "--keep=@kv:a/b=ours", "--keep=@kv:c=theirs"]);
         assert_eq!(argv("history", json!({ "limit": 5, "oneline": true, "after": null })).unwrap(),

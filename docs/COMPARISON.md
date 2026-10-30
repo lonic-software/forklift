@@ -16,7 +16,7 @@ to a host or to you, with runnable examples, see [Why Forklift](guide/concepts.m
 
 > **Reading note.** Forklift's terminology is warehouse-themed. The mapping to
 > git words (warehouse = repo, parcel = commit, pallet = branch, load = add,
-> stack = commit, consolidate = merge, lift/lower = push/pull, franchise = clone,
+> stack = commit, consolidate = merge, lift/lower = push/pull, clone = clone,
 > haul = pull request) is in the [README](../README.md) and the
 > [glossary](guide/glossary.md). This document uses Forklift's words for Forklift and
 > each other tool's own words for that tool.
@@ -93,8 +93,8 @@ Git has, by a vast margin, the most users, so it gets a dedicated head-to-head. 
 is deliberately close to Git in *shape* — a snapshot store, a staging area, cheap
 branches, push/pull — so a Git user is productive quickly. Forklift accepts Git's names for
 its everyday commands as hidden aliases (`add`, `commit`, `status`, `log`, `branch`,
-`checkout`, `merge`, `clone`, `push`, `pull`, `stash` and more), and keeps `diff`, `restore`,
-`tag`, `show` and `cherry-pick` under their Git names outright; see
+`checkout`, `merge`, `cherry-pick`, `push`, `pull`, `stash` and more), and keeps `diff`,
+`restore`, `tag`, `show` and `clone` under their Git names outright; see
 [Coming from git?](guide/cli.md#coming-from-git). The differences are where it counts.
 
 ### 2.1 Data model & object store
@@ -144,7 +144,7 @@ in one step. Forklift stages whole files: there is no interactive hunk staging.
   already-up-to-date, fast-forward, or a merge against the common ancestor with diff3 conflict
   markers when the sides overlap. On par with Git merge for the common cases.
 - **History tools Forklift has:**
-  - [`cherry-pick`](guide/cli.md#cherry-pick--apply-one-parcels-change-onto-the-current-pallet-cp)
+  - [`pick`](guide/cli.md#pick--apply-one-parcels-change-onto-the-current-pallet)
     — apply one parcel's change onto the current pallet as a new parcel. The original authors
     are preserved and the pick is freshly signed.
   - [`blame`](guide/cli.md#blame--who-wrote-each-line-bl-annotate) — attribute each line to
@@ -155,7 +155,7 @@ in one step. Forklift stages whole files: there is no interactive hunk staging.
     Git has signed tags too; Forklift's differ in that the signer is checked against the
     in-repo office (§2.4) rather than a keyring each reader assembles.
   - [`undo`](guide/cli.md#undo--reverse-the-last-operation) — a journaled undo that walks
-    back `stack`, `consolidate`, `cherry-pick`, `shift` and pallet deletes one at a time.
+    back `stack`, `consolidate`, `pick`, `shift` and pallet deletes one at a time.
     Simpler than choosing among Git's kinds of reset, but shallower than Git's reflog for
     arbitrary recovery.
   - [`deliver`](guide/cli.md#deliver--squash-a-draft-onto-a-target-keeping-the-trail-dv) —
@@ -166,7 +166,7 @@ in one step. Forklift stages whole files: there is no interactive hunk staging.
   `bisect`, and a reflog. **[Forklift lacks these.]** Rebase is declined on purpose: it
   rewrites signed history and needs a force-push, and Forklift's remotes accept only
   fast-forwards on a pallet (the one exception is a deliberate trust reset, re-genesis, of the
-  office). `cherry-pick` plus `consolidate` cover moving changes between pallets. For anyone whose
+  office). `pick` plus `consolidate` cover moving changes between pallets. For anyone whose
   Git workflow is rebase-heavy, this is the most noticeable absence.
 
 ### 2.4 Identity, signing & trust — Forklift's clearest win over Git
@@ -199,7 +199,7 @@ if you change hosts. Forklift puts them *in the warehouse* as signed records on 
 
 - [`manifest`](guide/cli.md#manifest--signed-post-metadata-on-parcels-mf) — signed
   notes, approvals and **AI provenance** attached to parcels.
-- [`kv`](guide/cli.md#kv--custom-metadata-on-parcels) — your own signed keys and values on
+- [`manifest set`](guide/cli.md#manifest-set--keyed-values-on-parcels) — your own signed keys and values on
   any parcel (CI status, for example).
 - [`tag`](guide/cli.md#tag--signed-tags--releases) — releases.
 - [`haul`](guide/cli.md#haul--pull-requests-reviewable-merge-proposals) — pull requests,
@@ -207,7 +207,7 @@ if you change hosts. Forklift puts them *in the warehouse* as signed records on 
   forge-proof, never silently carries over to new work, and carries the reviewer's identity
   class (human vs. agent). Reviews are recorded but do not yet gate a merge (§8).
 
-These sync with `lift`, `lower` and `franchise` like any other pallet and survive moving
+These sync with `lift`, `lower` and `clone` like any other pallet and survive moving
 hosts.
 
 ### 2.6 Remote & hosting architecture — Forklift's founding bet
@@ -294,7 +294,7 @@ jj is the most direct "modern VCS" comparison, and in several areas jj is ahead.
   first-class conflicts.]**
 - **The operation log.** jj records *every* operation and can undo/redo any of them
   (`jj op undo`), including restoring the repo to any past operation state. Forklift's
-  journaled `undo` covers `stack`, `consolidate`, `cherry-pick`, `shift` and pallet deletes,
+  journaled `undo` covers `stack`, `consolidate`, `pick`, `shift` and pallet deletes,
   one step at a time, with no redo. jj's model is more general. **[Forklift's undo is
   narrower.]**
 - **No staging area friction & the working-copy-as-commit model** make history editing
@@ -337,7 +337,7 @@ where Forklift is least proven.
   **[Forklift is unproven at scale.]**
 - **Virtual filesystem / lazy fetch (EdenFS).** Sapling fetches file content on demand,
   so you can work in a giant repo without materializing it. Forklift has
-  [sparse warehouses](guide/concepts.md#4-sparse-warehouses): a `franchise --only` fetches
+  [sparse warehouses](guide/concepts.md#4-sparse-warehouses): a `clone --only` fetches
   and materializes only the paths you ask for, and `expand` widens that later. But there is
   no virtual filesystem, and fetching history lazily, so a clone's cost is bounded by the tip
   rather than by history length, is still future work (§8). **[Forklift lacks a virtual
@@ -379,9 +379,9 @@ mostly about data model.
   offer this; merge results can depend on order and ancestry. **[Forklift, being
   snapshot-based, structurally lacks patch commutativity.]**
 - **Clean cherry-picking & change reordering**, a direct consequence of the patch model.
-  Forklift has `cherry-pick`, but as in Git a pick is a new parcel with its own hash, so the
-  same change then exists twice in history; Pijul applies the same patch. **[Forklift lacks
-  patch identity across picks.]**
+  Forklift has `pick` (git's `cherry-pick`), but as in Git a pick is a new parcel with its own
+  hash, so the same change then exists twice in history; Pijul applies the same patch.
+  **[Forklift lacks patch identity across picks.]**
 - **First-class stored conflicts**, like jj. Forklift blocks on conflicts. **[Forklift
   lacks this.]**
 
@@ -538,7 +538,7 @@ honest that it is also a **bet on a future** that has not fully arrived.
   *Future* (a transcript hash already ships).
 
 **Declined:** `rebase` and interactive history rewriting are not planned. They rewrite signed
-history and need a force-push; `cherry-pick` and `consolidate` cover moving changes between
+history and need a force-push; `pick` and `consolidate` cover moving changes between
 pallets instead.
 
 ---

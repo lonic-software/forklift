@@ -70,7 +70,7 @@
 //! already entitled to collect anything only a tag reaches; a heal that held a taint open over
 //! such an object would wedge every command for nothing, since `tag` has no retire verb. Heal
 //! once rooted tag subjects, and an absent one — collected after `undo` orphaned it, or never
-//! fetched by a sparse `franchise --only`, which adopts every tag record without the history
+//! fetched by a sparse `clone --only`, which adopts every tag record without the history
 //! behind it — wedged the whole warehouse. The tags are still read, but only to name an absent
 //! or non-canonical subject in a note ([`WalkClosureOutcome::never_held_tags`]).
 //!
@@ -168,7 +168,7 @@
 //!
 //! **Scope boundary, stated honestly:** this recovers only objects a configured remote actually
 //! has. An object that vanished *before* it was ever published (lifted) has no remote copy to
-//! find — it stays in the remainder, and franchise / reproduce / accept-loss remain its only
+//! find — it stays in the remainder, and clone / reproduce / accept-loss remain its only
 //! exits (see [`HEAVYWEIGHT_EXITS`]). A torn taint is never routed through this refetch
 //! *directly* — its unknown scope is resolved first by the store-wide rescan below, which
 //! produces an ordinary (non-torn) remainder that the *next* `forklift heal` invocation then
@@ -273,10 +273,10 @@ const PARALLEL_RESTAGE_THRESHOLD: usize = 256;
 /// redundant (already tried) or, pre-fix, unreachable (the wedge this behavior exists to close).
 /// A torn taint's own rescan (§8.3, [`rescan_torn_taint`]) does not drive this refetch either —
 /// its remainder is left for the *next* `forklift heal` invocation to carry through it — so
-/// "franchise a fresh clone" is named here too, for the same reason: it is the one remedy that is
+/// "clone afresh" is named here too, for the same reason: it is the one remedy that is
 /// never blocked by *this* warehouse's own taint, torn or not, since it never re-enters it.
-const HEAVYWEIGHT_EXITS: &str = "franchise a fresh clone from a configured remote if one still \
-    has what is missing (\"forklift franchise\"), reproduce it by re-running whatever operation \
+const HEAVYWEIGHT_EXITS: &str = "clone afresh from a configured remote if one still \
+    has what is missing (\"forklift clone\"), reproduce it by re-running whatever operation \
     created it if its content still exists in your working tree (\"forklift load\" then \
     \"forklift stack\"), or accept the loss — Forklift has no in-tool way to drop a single \
     dangling reference yet, so an object neither remedy reaches stays lost until one of those \
@@ -605,7 +605,7 @@ async fn resolve_the_rest(
                 signature_notes.push(format!(
                     "the signature table \"{}\" is gone; any signature it held that no other table \
                     or signature file holds is lost locally, and those parcels read as unsigned until \
-                    the warehouse is franchised again",
+                    the warehouse is cloned again",
                     relative.to_string_lossy()
                 ));
             }
@@ -615,7 +615,7 @@ async fn resolve_the_rest(
                     signature_notes.push(format!(
                         "the signature file \"{}\" is gone, and no signature table holds parcel {}'s \
                         signature; it is lost locally, and the parcel reads as unsigned until the \
-                        warehouse is franchised again",
+                        warehouse is cloned again",
                         relative.to_string_lossy(), hash
                     ));
                 }
@@ -686,7 +686,7 @@ async fn resolve_the_rest(
         // rejects). Telling the last two apart
         // (`remote_utils::is_configured`) matters here specifically: reporting the second as the
         // first steers a user with a real, merely broken remote toward the heavyweight remedies
-        // (franchise / reproduce / accept the loss) for an object that remote may still actually
+        // (clone / reproduce / accept the loss) for an object that remote may still actually
         // have, once whatever is wrong with its config is fixed.
         Err(why) => (unconsulted(why), BTreeMap::new()),
         // Nothing a fetch could help with this round (e.g. every remaining recorded path is
@@ -960,7 +960,7 @@ fn never_held_pin_note(hash: &str) -> String {
     format!(
         "trust pin \"{}\" is not held locally; this is expected for a boundary or distrust-\
         boundary snapshot that was only ever declared, never fetched — if it should be held, \
-        fetch its history explicitly (a franchise, or an ordinary fetch of that head).",
+        fetch its history explicitly (a clone, or an ordinary fetch of that head).",
         hash
     )
 }
@@ -1431,7 +1431,7 @@ struct WalkRoots {
     parcels: Vec<String>,
     /// Every tag as `(name, subject)` — **never walked** (FORK-83). A tag is not a gc root, so
     /// nothing only a tag reaches may hold a taint open, and an absent subject (collected, or
-    /// never fetched by a sparse franchise) can never be resolved anyway. These are read only so
+    /// never fetched by a sparse clone) can never be resolved anyway. These are read only so
     /// [`walk_closure_for`] can name an absent subject in a note
     /// ([`WalkClosureOutcome::never_held_tags`]).
     tag_subjects: Vec<(String, String)>,
@@ -1460,7 +1460,7 @@ struct WalkRoots {
     /// The head every haul not yet merged proposes ([`GcRootSources::haul_heads`]), walked like a
     /// `Gap`-policy pin: a haul opened elsewhere declares a head this warehouse may never have
     /// fetched, so its absence is never reported as a dangling reference. No note names one
-    /// either: `haul merge` says so when it needs the head. Like a `Gap` pin, this cannot tell a
+    /// either: `haul consolidate` says so when it needs the head. Like a `Gap` pin, this cannot tell a
     /// head never fetched from one held here and then lost to damage: both read as absent.
     haul_heads: Vec<String>,
     /// The head every tombstone of a served root holds ([`GcRootSources::tombstone_heads`]), walked
@@ -2019,7 +2019,7 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
 /// leaf/chunk presence checks that [`closure_references_any`] skips entirely. Same descent, so this
 /// can never tolerate (or fail to tolerate) anything [`closure_references_any`] doesn't — except
 /// that this walk keeps every tree but a meta tree within the warehouse's fetch scope
-/// (FORK-262): a sparse franchise never fetched what lies outside it, so recording those sealed
+/// (FORK-262): a sparse clone never fetched what lies outside it, so recording those sealed
 /// objects as vanished would refuse every torn heal there. A fetch scope that cannot be read is a
 /// degraded source, and the walk then runs in full.
 ///
@@ -3474,7 +3474,7 @@ mod tests {
         (dir, scope)
     }
 
-    /// FORK-262: a sparse franchise never fetched the objects outside its scope, so the
+    /// FORK-262: a sparse clone never fetched the objects outside its scope, so the
     /// enumerating walk records none of them, while an in-scope loss is still recorded. The root
     /// holds an out-of-scope file and subtree (both never stored) and an in-scope subtree whose one
     /// file is never stored. Mutation: walk every entry of a spine tree → the sealed README and
@@ -5395,7 +5395,7 @@ mod tests {
     /// `adopts` is reported when absent, exactly like an ordinary ref — never the `Gap` tolerance
     /// `boundary`/`distrust_boundary` get. Every warehouse holding a re-genesis anchor holds its
     /// adopted history: the one that ran `office regenesis` by construction, every other one
-    /// because franchise and `office accept-regenesis` fetch it before writing the anchor. Its
+    /// because clone and `office accept-regenesis` fetch it before writing the anchor. Its
     /// absence is genuine local loss, not a "maybe never fetched" declared snapshot.
     /// Contrast with `torn_taint_clears_when_the_only_reference_is_a_never_held_trust_pin` above
     /// (a `boundary` hash, correctly a gap) — this fixture is the same shape but for `adopts`, and
@@ -7004,7 +7004,7 @@ mod tests {
     /// nothing is set, or something is set but unreadable/unparseable/unusable. Before this fix,
     /// both `resolve_the_rest`'s `remote_configured` gate and `attempt_heal_driven_refetch`'s own
     /// early return treated the two identically as "not configured," which steers a user whose
-    /// remote is merely *broken* toward the heavyweight remedies (franchise / reproduce / accept
+    /// remote is merely *broken* toward the heavyweight remedies (clone / reproduce / accept
     /// the loss) — wording that overclaims when a fixable, real remote might still have the
     /// object. This fixture makes the warehouse config file itself unparseable (not merely unset)
     /// and asserts the refusal reports the remote as configured but not asked, naming the file that

@@ -21,14 +21,13 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `bay add` |  |  | Open a new bay (a new working directory on a new pallet) |
 | `bay remove` |  |  | De-register a bay (its pallet ref and materialized files are kept) |
 | `blame` | `bl` | `annotate` | Show, for each line of a file, the parcel and author that last changed it |
-| `cherry-pick` | `cp` |  | Apply a parcel's changes onto the current pallet as a new, author-preserving parcel |
+| `clone` |  |  | Clone a remote warehouse into a new directory |
 | `config` | `cfg` |  | Read or change configuration values |
 | `conflicts` |  |  | List the files left in conflict by an unresolved consolidation |
 | `consolidate` | `con` | `merge` | Consolidate (merge) another pallet into the current one |
 | `deliver` | `dv` |  | Squash the current draft pallet onto a target as one clean parcel, keeping the trail |
 | `diff` | `d` |  | Show line-by-line changes |
 | `expand` |  |  | Widen a sparse warehouse's fetch scope and download the newly in-scope subtree(s) |
-| `franchise` | `fr` | `clone` | Open a local franchise of a remote warehouse (clone) |
 | `git` |  |  | Move history between this warehouse and git: import, export and mirror |
 | `git import` |  |  | Import a git repository's history into this warehouse (one-way migration) |
 | `git export` |  |  | Export this warehouse's history into a new git repository (one-way, lossy) |
@@ -40,26 +39,25 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `haul update` |  |  | Propose the source pallet's current head |
 | `haul comment` |  |  | Add a comment |
 | `haul review` |  |  | Record a signed review (approve by default) |
-| `haul merge` |  |  | Merge a proposal (consolidate its source into the target) |
+| `haul consolidate` |  | `merge` | Land a proposal: consolidate its source into the target |
 | `haul close` |  |  | Close a proposal without merging |
 | `haul reopen` |  |  | Reopen a closed proposal |
 | `heal` |  |  | Resolve a standing durability taint, or finish or undo an interrupted operation |
 | `help` | `h` |  | Print the command list, or detailed help about one command |
 | `history` | `hi` | `log` | Print the parcels of a revision, newest first |
-| `kv` |  |  | Custom metadata: signed text values keyed by parcel and key |
-| `kv set` |  |  | Set a key on a parcel |
-| `kv get` |  |  | Show a key's value on a parcel |
-| `kv unset` |  |  | Remove a key from a parcel |
-| `kv list` |  |  | List every value, or a parcel's |
-| `kv log` |  |  | Show every change to a key, newest first, with who made it |
 | `lift` | `li` | `push` | Upload the current pallet's new parcels to the remote (push) |
 | `load` | `l` | `add` | Take the current state of a file or directory into the inventory (stage) |
 | `lower` | `lo` | `pull` | Download the remote's new parcels and fast-forward the current pallet, or another (pull) |
-| `manifest` | `mf` |  | Attach signed post-metadata to a parcel: approvals, review notes |
+| `manifest` | `mf` |  | Facts recorded about a parcel after the fact: notes, approvals, provenance, keyed values |
 | `manifest note` |  |  | Attach a free-form note to a parcel |
 | `manifest approve` |  |  | Record a signed approval (sign-off) of a parcel |
 | `manifest provenance` |  |  | Record how a parcel was produced: model, tool, session (AI provenance) |
 | `manifest show` |  |  | Show the manifest entries attached to a parcel |
+| `manifest set` |  |  | Set a keyed value on a parcel |
+| `manifest get` |  |  | Show a keyed value on a parcel |
+| `manifest unset` |  |  | Remove a keyed value from a parcel |
+| `manifest keys` |  |  | List every keyed value, or a parcel's |
+| `manifest log` |  |  | Show every change to a key, newest first, with who made it |
 | `mcp` |  |  | Serve the command surface to an AI agent as MCP tools (stdio) |
 | `narrow` |  |  | Narrow this checkout's materialization scope and de-materialize the dropped subtree(s) |
 | `office` | `o` |  | Manage the warehouse office: users and signing keys |
@@ -82,6 +80,7 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `park` | `pa` | `stash` | Park the work in progress and reset to the pallet head |
 | `park pop` |  |  | Re-apply the most recently parked changes (staged) and drop them from the list |
 | `park list` |  |  | List the parked parcels, newest first |
+| `pick` |  | `cherry-pick` | Apply a parcel's changes onto the current pallet as a new, author-preserving parcel |
 | `prepare` | `p` | `init` | Prepare a new warehouse in the current directory |
 | `profile` |  |  | Manage identity profiles (named operator ids) and select one per warehouse |
 | `profile list` |  |  | List the profiles and the local keys each one holds (the default) |

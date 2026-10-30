@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run a throwaway local forklift-server over a dev warehouse (.dev/server,
-# gitignored) so you can test lift / lower / franchise against a real remote.
+# gitignored) so you can test lift / lower / clone against a real remote.
 #
 # usage: serve [addr]     (default 127.0.0.1:9418)
 set -euo pipefail

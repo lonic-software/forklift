@@ -38,7 +38,7 @@ on:
   workflow_dispatch: {}
 
 # One run at a time against the one persistent stack. workflow_dispatch is enabled alongside the
-# cron, so two runs can otherwise overlap: both franchise at the same head, both stack a parcel on
+# cron, so two runs can otherwise overlap: both clone at the same head, both stack a parcel on
 # it, and the second lift is refused as not-a-fast-forward by the divergence check. That reddens
 # the job for a reason that has nothing to do with the stack, and it is indistinguishable at a
 # glance from the asynchronous verifier-KMS failure this workflow exists to catch — the worst
@@ -100,7 +100,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # verify.sh drives the real `forklift` CLI (prepare/load/stack/lift/franchise/history/pallet/shift)
+      # verify.sh drives the real `forklift` CLI (prepare/load/stack/lift/clone/history/pallet/shift)
       # against the deployed stack's endpoint — the Lambda binaries themselves are already
       # running there and are not built by this workflow.
       - name: Build the forklift CLI

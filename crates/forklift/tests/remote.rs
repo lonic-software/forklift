@@ -1,5 +1,5 @@
 //! End-to-end tests of the remote stack: a real `forklift-server` process serving a
-//! bare warehouse over HTTP, driven by the real CLI — lift, lower, franchise, bundles,
+//! bare warehouse over HTTP, driven by the real CLI — lift, lower, clone, bundles,
 //! trust, and the server-side verification guarantees of the protocol.
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -464,8 +464,8 @@ fn a_lift_uploads_a_subtree_introduced_by_a_parent_of_both_merge_sides() {
     let lifted = area.forklift("a", &["lift"]);
     assert_success(&lifted);
 
-    // And the content really arrived: a fresh franchise materializes the subtree P introduced.
-    assert_success(&area.forklift(".", &["franchise", &server.url, "verify"]));
+    // And the content really arrived: a fresh clone materializes the subtree P introduced.
+    assert_success(&area.forklift(".", &["clone", &server.url, "verify"]));
     assert_eq!(area.read_file("verify/shared/s.txt"), "introduced by P\n");
     assert_eq!(area.read_file("verify/a.txt"), "a\n");
     assert_eq!(area.read_file("verify/b.txt"), "b\n");
@@ -489,8 +489,8 @@ fn the_ignore_file_travels_with_the_pallet() {
     assert_success(&area.forklift("a", &["stack", "track the ignore rules"]));
     assert_success(&area.forklift("a", &["lift"]));
 
-    // Route 1: franchise into a new directory.
-    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+    // Route 1: clone into a new directory.
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
     assert_eq!(area.read_file("b/.forkliftignore"), rules);
     assert!(!area.path("b/build").exists(), "an ignored path is never part of the pallet");
 
@@ -535,7 +535,7 @@ fn a_prepared_warehouse_lowers_the_tracked_ignore_file() {
     assert!(stdout(&status).contains("matches the inventory"), "{}", stdout(&status));
 }
 
-/// A sparse franchise whose scope leaves out the root holds the root ignore file in scope all
+/// A sparse clone whose scope leaves out the root holds the root ignore file in scope all
 /// the same: it is fetched and materialized, its rules are in force, and an edit to it stacks
 /// and travels both ways, while the other root files stay sealed.
 #[test]
@@ -553,7 +553,7 @@ fn a_sparse_franchise_keeps_the_root_ignore_file_in_scope() {
     assert_success(&area.forklift("dev", &["stack", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src"]));
     assert_eq!(area.read_file("sparse/.forkliftignore"), rules, "the root ignore file is materialized");
     assert!(!area.path("sparse/README").exists(), "another root file stays sealed");
     assert!(!area.path("sparse/docs").exists(), "an out-of-scope folder stays sealed");
@@ -618,7 +618,7 @@ fn a_sparse_checkout_unstages_the_root_ignore_file_and_narrows_past_an_edit_to_i
     assert_success(&area.forklift("dev", &["lift"]));
 
     assert_success(&area.forklift(".",
-        &["franchise", &server.url, "sparse", "--only", "src", "--only", "docs"]));
+        &["clone", &server.url, "sparse", "--only", "src", "--only", "docs"]));
 
     // A staged edit to the rules unstages back to the head's version, by name and as part of
     // the root folder — the folder form rebuilds the root shard, whose files are on the spine.
@@ -656,11 +656,11 @@ fn a_sparse_warehouse_with_an_unversioned_scope_file_is_refused() {
     assert_success(&area.forklift("dev", &["stack", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src"]));
 
     // Rewrite the recorded scopes in the unversioned form an older Forklift wrote.
     for file in ["sparse/.forklift/config/fetch-scope", "sparse/.forklift/scope"] {
-        assert!(area.path(file).exists(), "the sparse franchise records {}", file);
+        assert!(area.path(file).exists(), "the sparse clone records {}", file);
         std::fs::write(area.path(file), "src\n").unwrap();
     }
 
@@ -668,7 +668,7 @@ fn a_sparse_warehouse_with_an_unversioned_scope_file_is_refused() {
         let refused = area.forklift("sparse", verb);
         assert!(!refused.status.success(), "{:?} must refuse: {}", verb, stdout(&refused));
         assert!(stderr(&refused).contains("older version of Forklift"), "{:?}: {}", verb, stderr(&refused));
-        assert!(stderr(&refused).contains("Franchise the remote again"), "{:?}: {}", verb, stderr(&refused));
+        assert!(stderr(&refused).contains("Clone the remote again"), "{:?}: {}", verb, stderr(&refused));
     }
 }
 
@@ -697,15 +697,15 @@ fn lift_franchise_lower_round_trip() {
     assert_success(&again);
     assert!(stdout(&again).contains("Already up to date"), "{}", stdout(&again));
 
-    // Franchise (clone) into a fresh directory.
-    let franchised = area.forklift(".", &["franchise", &server.url, "b"]);
+    // Clone into a fresh directory.
+    let franchised = area.forklift(".", &["clone", &server.url, "b"]);
     assert_success(&franchised);
-    assert!(stdout(&franchised).contains("Franchised"), "{}", stdout(&franchised));
+    assert!(stdout(&franchised).contains("Cloned"), "{}", stdout(&franchised));
 
     assert_eq!(area.read_file("b/readme.txt"), "hello remote, twice\n");
     assert_eq!(area.read_file("b/src/main.txt"), "fn main\n");
 
-    // The franchise is a normal warehouse: clean, with the full history.
+    // The clone is a normal warehouse: clean, with the full history.
     let status = area.forklift("b", &["stocktake"]);
     assert_success(&status);
     assert!(stdout(&status).contains("nothing is staged"), "{}", stdout(&status));
@@ -880,8 +880,8 @@ fn lower_names_a_closed_batch_lane_and_a_healthy_lower_does_not() {
     assert_success(&area.forklift("a", &["stack", "first"]));
     assert_success(&area.forklift("a", &["lift"]));
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "direct"]));
-    assert_success(&area.forklift(".", &["franchise", &server.url, "proxied"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "direct"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "proxied"]));
 
     // Two directories and two files change, so the lower's tree and blob waves each miss more
     // than one object and go to the batch lane.
@@ -944,7 +944,7 @@ fn a_lower_refused_over_an_untracked_file_leaves_nothing_standing() {
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "first"]));
     assert_success(&area.forklift("a", &["lift"]));
-    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
 
     area.write_file("a/added.txt", "theirs\n");
     assert_success(&area.forklift("a", &["load", "added.txt"]));
@@ -973,7 +973,7 @@ fn lowering_in_a_bay_another_bay_already_lowered_names_the_catch_up() {
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "first"]));
     assert_success(&area.forklift("a", &["lift"]));
-    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
 
     let bay_dir = area.path("b-bay");
     assert_success(&area.forklift("b", &["bay", "add", "w", bay_dir.to_str().unwrap()]));
@@ -1159,7 +1159,7 @@ fn diverged_pallets_are_refused_not_merged() {
     assert_success(&area.forklift("a", &["stack", "base"]));
     assert_success(&area.forklift("a", &["lift"]));
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
 
     // A and B both stack on top of the same base; A lifts first.
     area.write_file("a/base.txt", "a's version\n");
@@ -1258,7 +1258,7 @@ fn a_scoped_merge_lifts_without_reading_the_out_of_scope_object() {
 
     // A second machine clones the scoped "work" pallet (full), changes the out-of-scope subtree,
     // and lifts it — so the server's "work" head now carries an out-of-scope change dev never made.
-    assert_success(&area.forklift(".", &["franchise", &server.url, "up", "--pallet", "work"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "up", "--pallet", "work"]));
     area.write_file("up/src/web/w.txt", "web v2 from up\n");
     assert_success(&area.forklift("up", &["load", "."]));
     assert_success(&area.forklift("up", &["stack", "up edits web (out of scope for dev)"]));
@@ -1353,8 +1353,8 @@ fn signed_history_round_trips_and_the_server_audits() {
     assert_success(&lifted);
     assert!(stdout(&lifted).contains("Lifted the office pallet"), "{}", stdout(&lifted));
 
-    // The franchise adopts the anchor and audits clean offline.
-    let franchised = area.forklift(".", &["franchise", &server.url, "b"]);
+    // The clone adopts the anchor and audits clean offline.
+    let franchised = area.forklift(".", &["clone", &server.url, "b"]);
     assert_success(&franchised);
     assert!(stdout(&franchised).contains("Adopted the remote's trust anchor"),
             "{}", stdout(&franchised));
@@ -1408,7 +1408,7 @@ fn optimistic_lift_auto_merges_a_disjoint_divergence_but_stops_on_overlap() {
     assert_success(&area.forklift("a", &["office", "enroll"]));
     assert_success(&area.forklift("a", &["lift"]));
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
 
     // A publishes a change to a file only it touches.
     area.write_file("a/from_a.txt", "a\n");
@@ -1468,7 +1468,7 @@ fn optimistic_lift_refuses_on_an_incomplete_load_before_writing_consolidation_st
     assert_success(&area.forklift("a", &["office", "enroll"]));
     assert_success(&area.forklift("a", &["lift"]));
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
 
     // A publishes a change to a file only it touches.
     area.write_file("a/from_a.txt", "a\n");
@@ -1527,8 +1527,8 @@ fn manifest_syncs_across_remotes_and_replays_when_diverged() {
     assert_success(&lifted);
     assert!(stdout(&lifted).contains("Lifted the @manifest pallet"), "{}", stdout(&lifted));
 
-    // A franchise carries the manifest, not just the working history.
-    let franchised = area.forklift(".", &["franchise", &server.url, "b"]);
+    // A clone carries the manifest, not just the working history.
+    let franchised = area.forklift(".", &["clone", &server.url, "b"]);
     assert_success(&franchised);
     assert!(stdout(&franchised).contains("Adopted the @manifest pallet"), "{}", stdout(&franchised));
     assert!(stdout(&area.forklift("b", &["manifest", "show", "main"])).contains("LGTM"));
@@ -1590,7 +1590,7 @@ fn tags_sync_hold_the_admin_rule_at_admission_and_never_move() {
     assert_success(&area.forklift("a", &["lift"]));
 
     // The worker, an admin for now, tags and publishes a release; a second tag stays local.
-    assert_success(&area.forklift(".", &["franchise", &server.url, "b", "--token", "w-token"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "b", "--token", "w-token"]));
     assert_success(&area.forklift("b", &["config", "operator.identifier", worker_id]));
     assert_success(&area.forklift("b", &["tag", "create", "v1.0", "main", "-m", "release"]));
 
@@ -1627,8 +1627,8 @@ fn tags_sync_hold_the_admin_rule_at_admission_and_never_move() {
     assert_success(&area.forklift("a", &["office", "role", worker_id, "writer"]));
     assert_success(&area.forklift("a", &["lift"]));
 
-    // A fresh franchise adopts the admitted release although its tagger is no longer an admin.
-    let franchised = area.forklift(".", &["franchise", &server.url, "c", "--token", "root"]);
+    // A fresh clone adopts the admitted release although its tagger is no longer an admin.
+    let franchised = area.forklift(".", &["clone", &server.url, "c", "--token", "root"]);
     assert_success(&franchised);
     assert!(stdout(&franchised).contains("Adopted the @tags pallet"), "{}", stdout(&franchised));
     assert!(stdout(&area.forklift("c", &["tag", "show", "v1.0"])).contains("release"));
@@ -1712,8 +1712,8 @@ fn hauls_sync_across_remotes_and_replay_when_diverged() {
     assert_success(&lifted);
     assert!(stdout(&lifted).contains("Lifted the @haul pallet"), "{}", stdout(&lifted));
 
-    // A franchise carries the haul.
-    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+    // A clone carries the haul.
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
     assert!(stdout(&area.forklift("b", &["haul", "show", &id])).contains("Feat"), "b must see the haul");
 
     // Diverge: B comments and publishes; A comments, and opens a second haul, on the same base
@@ -1782,7 +1782,7 @@ fn hauls_sync_across_remotes_and_replay_when_diverged() {
     assert_success(&area.forklift("a", &["haul", "reopen", &id]));
     assert_success(&area.forklift("a", &["haul", "update", &id]));
     let a_head = pallet_head(&area, "a", "feat");
-    assert_success(&area.forklift("a", &["haul", "merge", &id]));
+    assert_success(&area.forklift("a", &["haul", "consolidate", &id]));
     let merge_parcel = show("a")["merge_parcel"].as_str().unwrap().to_string();
 
     let raced = area.forklift("a", &["--json", "lower"]);
@@ -1872,7 +1872,7 @@ fn a_haul_merge_lifts_with_its_target() {
 
     let first = open_haul(&area, "a", "First");
     assert_success(&area.forklift("a", &["lift"]));
-    assert_success(&area.forklift("a", &["haul", "merge", &first]));
+    assert_success(&area.forklift("a", &["haul", "consolidate", &first]));
 
     let lifted = area.forklift("a", &["lift"]);
     assert_success(&lifted);
@@ -1888,9 +1888,9 @@ fn a_haul_merge_lifts_with_its_target() {
     let second = open_haul(&area, "a", "Second");
     stack_file(&area, "a", "base.txt", "main\n");
     let main = pallet_head(&area, "a", "main");
-    assert_success(&area.forklift("a", &["haul", "merge", &second]));
+    assert_success(&area.forklift("a", &["haul", "consolidate", &second]));
     stack_file(&area, "a", "base.txt", "resolved\n");
-    assert_success(&area.forklift("a", &["haul", "merge", &second]));
+    assert_success(&area.forklift("a", &["haul", "consolidate", &second]));
     assert_eq!(serde_json::from_str::<serde_json::Value>(&stdout(&area.forklift("a", &["--json", "haul", "show", &second])))
         .unwrap()["data"]["status"], "merged");
     assert_success(&area.forklift("a", &["undo"]));
@@ -1928,11 +1928,11 @@ fn a_haul_merge_waits_while_the_remote_target_lacks_its_parcel() {
 
     let first = open_haul(&area, "a", "First");
     assert_success(&area.forklift("a", &["lift"]));
-    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
     let remote_haul = remote_pallet_head(&server, "@haul");
 
     // A merges and shifts away; B moves the remote's main; A's lift holds the record.
-    assert_success(&area.forklift("a", &["haul", "merge", &first]));
+    assert_success(&area.forklift("a", &["haul", "consolidate", &first]));
     assert_success(&area.forklift("a", &["shift", "feat"]));
     stack_file(&area, "b", "b.txt", "b\n");
     assert_success(&area.forklift("b", &["lift"]));
@@ -1969,7 +1969,7 @@ fn a_haul_merge_waits_while_the_remote_target_lacks_its_parcel() {
     stack_file(&area, "a", "feat2.txt", "z\n");
     assert_success(&area.forklift("a", &["shift", "main"]));
     assert_success(&area.forklift("a", &["haul", "update", &second]));
-    assert_success(&area.forklift("a", &["haul", "merge", &second]));
+    assert_success(&area.forklift("a", &["haul", "consolidate", &second]));
     assert_success(&area.forklift("a", &["tag", "create", "v1.0", "main"]));
 
     let failed = area.forklift("a", &["lift"]);
@@ -1991,7 +1991,7 @@ fn a_held_haul_merge_names_a_drop_that_keeps_the_rest_of_the_haul() {
     let id = open_haul(&area, "a", "First");
     assert_success(&area.forklift("a", &["lift"]));
     assert_success(&area.forklift("a", &["haul", "comment", &id, "-m", "kept"]));
-    assert_success(&area.forklift("a", &["haul", "merge", &id]));
+    assert_success(&area.forklift("a", &["haul", "consolidate", &id]));
     assert_success(&area.forklift("a", &["shift", "feat"]));
 
     let held = area.forklift("a", &["lift"]);
@@ -2021,7 +2021,7 @@ fn a_held_haul_merge_on_a_remote_without_haul_names_no_drop() {
     assert_eq!(remote_pallet_head(&server, "@haul"), None);
 
     let id = open_haul(&area, "a", "First");
-    assert_success(&area.forklift("a", &["haul", "merge", &id]));
+    assert_success(&area.forklift("a", &["haul", "consolidate", &id]));
     assert_success(&area.forklift("a", &["shift", "feat"]));
 
     let held = area.forklift("a", &["lift"]);
@@ -2050,7 +2050,7 @@ fn a_rehost_refuses_a_merge_by_a_writer_since_ungranted_until_regranted() {
     let dev = keygen_admit_args(&area, "dev@forklift");
     assert_success(&area.forklift("a", &["office", "admit", &dev[0], &dev[1], &dev[2], "--role", "writer"]));
     assert_success(&area.forklift("a", &["config", "operator.identifier", "dev@forklift"]));
-    assert_success(&area.forklift("a", &["haul", "merge", &id]));
+    assert_success(&area.forklift("a", &["haul", "consolidate", &id]));
     assert_success(&area.forklift("a", &["config", "operator.identifier", "tester@forklift"]));
     assert_success(&area.forklift("a", &["office", "role", "dev@forklift", "writer", "--pallet", "feat"]));
 
@@ -2083,7 +2083,7 @@ fn bundles_speed_up_franchising() {
 
     server.rebuild_bundle(&area);
 
-    let franchised = area.forklift(".", &["franchise", &server.url, "c"]);
+    let franchised = area.forklift(".", &["clone", &server.url, "c"]);
     assert_success(&franchised);
     assert!(stdout(&franchised).contains("Imported the remote's bundle"),
             "{}", stdout(&franchised));
@@ -2117,7 +2117,7 @@ fn a_bundle_that_lags_the_remote_heads_still_imports_with_its_signatures() {
     assert_success(&area.forklift("a", &["stack", "lifted after the bundle"]));
     assert_success(&area.forklift("a", &["lift"]));
 
-    let franchised = area.forklift(".", &["franchise", &server.url, "c"]);
+    let franchised = area.forklift(".", &["clone", &server.url, "c"]);
     assert_success(&franchised);
     assert!(stdout(&franchised).contains("Imported the remote's bundle"), "{}", stdout(&franchised));
     assert!(!stdout(&franchised).contains("and 0 signature(s)"),
@@ -2133,10 +2133,10 @@ fn a_bundle_that_lags_the_remote_heads_still_imports_with_its_signatures() {
 /// A whole-warehouse bundle is read only in the version this build writes. A file in another one —
 /// an older record stream, or the previous native envelope a server not yet upgraded still serves —
 /// is set aside as unsupported, never imported by a reader that could not bound what it stores or
-/// check its digest, and the franchise completes through its verified walk. forklift-server itself
+/// check its digest, and the clone completes through its verified walk. forklift-server itself
 /// answers such a file `404`, so a proxy stands in for a head that serves one anyway.
 ///
-/// Revert: treat an unsupported bundle as a failed import in `franchise` → the clone fails → red.
+/// Revert: treat an unsupported bundle as a failed import in `clone` → the clone fails → red.
 #[test]
 fn a_bundle_in_another_version_is_refused_and_franchise_falls_back_to_the_walk() {
     let area = TestArea::new("bundle-foreign-version");
@@ -2162,7 +2162,7 @@ fn a_bundle_in_another_version_is_refused_and_franchise_falls_back_to_the_walk()
             })
         });
 
-        let franchised = area.forklift(".", &["franchise", &proxy.url, name]);
+        let franchised = area.forklift(".", &["clone", &proxy.url, name]);
         assert_success(&franchised);
         assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 1, "{}: the bundle was offered", name);
         assert!(!stdout(&franchised).contains("Imported the remote's bundle"), "{}", stdout(&franchised));
@@ -2173,9 +2173,9 @@ fn a_bundle_in_another_version_is_refused_and_franchise_falls_back_to_the_walk()
 }
 
 /// An upgraded forklift-server still holding a latest bundle built before the upgrade answers it
-/// `404`, and the franchise completes through its verified walk without it.
+/// `404`, and the clone completes through its verified walk without it.
 ///
-/// Revert: treat a `404` for the bundle as a failed download in `franchise` → the clone fails → red.
+/// Revert: treat a `404` for the bundle as a failed download in `clone` → the clone fails → red.
 #[test]
 fn a_server_holding_a_previous_version_bundle_still_franchises() {
     let area = TestArea::new("bundle-server-previous-version");
@@ -2191,7 +2191,7 @@ fn a_server_holding_a_previous_version_bundle_still_franchises() {
     std::fs::write(area.path("server-root/.forklift/bundles/latest"),
                    "forklift-bundle 2026-07-13\nbuilt before the upgrade").unwrap();
 
-    let franchised = area.forklift(".", &["franchise", &server.url, "b"]);
+    let franchised = area.forklift(".", &["clone", &server.url, "b"]);
     assert_success(&franchised);
     assert!(!stdout(&franchised).contains("Imported the remote's bundle"), "{}", stdout(&franchised));
     assert_eq!(area.read_file("b/one.txt"), "one\n");
@@ -2258,7 +2258,7 @@ fn request_header(head: &str, name: &str) -> Option<String> {
     head.lines().find_map(|line| line.strip_prefix(&format!("{}:", name)).map(|value| value.trim().to_string()))
 }
 
-/// The value of `key` in the franchise record of `directory`.
+/// The value of `key` in the clone record of `directory`.
 fn franchise_record_value(area: &TestArea, directory: &str, key: &str) -> Option<String> {
     area.read_file(&format!("{}/.forklift/franchise", directory)).lines()
         .find_map(|line| line.strip_prefix(&format!("{}=", key)).map(str::to_string))
@@ -2281,10 +2281,10 @@ fn warehouse_with_a_bundle(area: &TestArea) -> (Server, Vec<u8>) {
     (server, bundle)
 }
 
-/// Run `franchise` into `directory`, checkpointing the bundle download every 8 KiB.
+/// Run `clone` into `directory`, checkpointing the bundle download every 8 KiB.
 fn franchise_checkpointing(area: &TestArea, url: &str, directory: &str) -> Output {
     forklift_command()
-        .args(["--json", "franchise", url, directory])
+        .args(["--json", "clone", url, directory])
         .current_dir(area.path("."))
         .env("FORKLIFT_GLOBAL_CONFIG", area.path("area-global.toml"))
         .env("FORKLIFT_KEYS_DIR", area.path("shared-keys"))
@@ -2455,7 +2455,7 @@ fn a_digest_valid_bundle_that_fails_import_keeps_nothing() {
 }
 
 /// A head that no longer has the bundle an earlier attempt kept part of drops that download, and
-/// the franchise completes through its verified walk.
+/// the clone completes through its verified walk.
 ///
 /// Revert: skip the bundle phase on a `404` without clearing → the partial and its record stay → red.
 #[test]
@@ -2497,8 +2497,8 @@ fn a_token_protected_remote_requires_the_token() {
     assert_success(&area.forklift("a", &["config", "remote.token", "sesame"]));
     assert_success(&area.forklift("a", &["lift"]));
 
-    // Franchise takes the token as a flag and remembers it in the configuration.
-    let franchised = area.forklift(".", &["franchise", &server.url, "b", "--token", "sesame"]);
+    // Clone takes the token as a flag and remembers it in the configuration.
+    let franchised = area.forklift(".", &["clone", &server.url, "b", "--token", "sesame"]);
     assert_success(&franchised);
     assert_eq!(area.read_file("b/secret.txt"), "locked\n");
 
@@ -2512,7 +2512,7 @@ fn enroll_covers_the_remote_history_in_the_trust_boundary() {
     let area = TestArea::new("enroll-boundary");
     let server = Server::start(&area, None);
 
-    // A lifts unsigned history; B franchises and lifts more, so the remote is ahead
+    // A lifts unsigned history; B clones and lifts more, so the remote is ahead
     // of A. Without the remote check, A's enroll would set a boundary that misses the
     // remote's head — and the pallet could never be lifted again once the anchor
     // reaches the remote (trust is a one-way door, history is immutable).
@@ -2522,7 +2522,7 @@ fn enroll_covers_the_remote_history_in_the_trust_boundary() {
     assert_success(&area.forklift("a", &["stack", "first"]));
     assert_success(&area.forklift("a", &["lift"]));
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
     area.write_file("b/doc.txt", "v2, unsigned, only on the remote\n");
     assert_success(&area.forklift("b", &["load", "doc.txt"]));
     assert_success(&area.forklift("b", &["stack", "second"]));
@@ -2609,9 +2609,9 @@ fn multi_warehouse_serving_isolates_warehouses() {
     assert_success(&area.forklift("b", &["stack", "beta parcel"]));
     assert_success(&area.forklift("b", &["lift"]));
 
-    // A franchise of alpha gets alpha's history and nothing of beta's.
+    // A clone of alpha gets alpha's history and nothing of beta's.
     let franchised = area.forklift(".", &[
-        "franchise", &format!("{}/warehouses/alpha", server.url), "c", "--token", "admin",
+        "clone", &format!("{}/warehouses/alpha", server.url), "c", "--token", "admin",
     ]);
     assert_success(&franchised);
     assert_eq!(area.read_file("c/alpha.txt"), "alpha content\n");
@@ -2704,9 +2704,9 @@ fn operator_tokens_enforce_roles_and_pallet_grants() {
     assert_success(&area.forklift("a", &["office", "role", worker_id, "writer", "--pallet", "main"]));
     assert_success(&area.forklift("a", &["lift"]));
 
-    // The writer works from a franchise, authenticated by their own token.
+    // The writer works from a clone, authenticated by their own token.
     let franchised = area.forklift(".", &[
-        "franchise", &server.url, "b", "--token", "w-token",
+        "clone", &server.url, "b", "--token", "w-token",
     ]);
     assert_success(&franchised);
     // The worker's identity on this "machine": the warehouse-scoped override.
@@ -2741,9 +2741,9 @@ fn operator_tokens_enforce_roles_and_pallet_grants() {
     assert_success(&lifted);
     assert!(stdout(&lifted).contains("Lifted the office pallet"), "{}", stdout(&lifted));
 
-    // The reader can franchise (read) but not lift (write).
+    // The reader can clone (read) but not lift (write).
     let franchised = area.forklift(".", &[
-        "franchise", &server.url, "c", "--token", "r-token",
+        "clone", &server.url, "c", "--token", "r-token",
     ]);
     assert_success(&franchised);
     assert_eq!(area.read_file("c/code.txt"), "v2 by worker\n");
@@ -2759,7 +2759,7 @@ fn operator_tokens_enforce_roles_and_pallet_grants() {
     assert!(stderr(&refused).contains("reader"), "{}", stderr(&refused));
 
     // An unknown token is a plain 401.
-    let unknown = area.forklift(".", &["franchise", &server.url, "d", "--token", "wrong"]);
+    let unknown = area.forklift(".", &["clone", &server.url, "d", "--token", "wrong"]);
     assert!(!unknown.status.success());
     assert!(stderr(&unknown).contains("401"), "{}", stderr(&unknown));
 }
@@ -2788,7 +2788,7 @@ fn regenesis_is_gated_by_the_static_token_and_accepted_consciously() {
     assert_success(&area.forklift("a", &["lift"]));
 
     // The worker clones B before the reset.
-    assert_success(&area.forklift(".", &["franchise", &server.url, "b", "--token", "w-token"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "b", "--token", "w-token"]));
     assert_success(&area.forklift("b", &["config", "operator.identifier", "worker@forklift"]));
 
     // Total key loss on A's side: nobody can extend the chain anymore.
@@ -2891,19 +2891,19 @@ fn regenesis_on_remote(area: &TestArea, before_reset: impl FnOnce(&Server)) -> S
     server
 }
 
-/// FORK-114: a franchise made after a re-genesis copies the remote's anchor, whose `adopts` names
+/// FORK-114: a clone made after a re-genesis copies the remote's anchor, whose `adopts` names
 /// the remote's pre-reset office head — history the new office chain never reaches. The
-/// franchise must fetch it, or every `heal` on it reports that pin dangling and refuses forever.
+/// clone must fetch it, or every `heal` on it reports that pin dangling and refuses forever.
 #[test]
 fn a_franchise_after_a_regenesis_holds_the_adopted_history_and_heals() {
-    let area = TestArea::new("regenesis-franchise-heal");
+    let area = TestArea::new("regenesis-clone-heal");
     let server = regenesis_on_remote(&area, |_| {});
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "c", "--token", "root"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "c", "--token", "root"]));
     plant_torn_taint(&area, "c");
     let healed = area.forklift("c", &["heal"]);
     assert!(healed.status.success(),
-        "heal must clear on a franchise of a re-genesis'd remote: {:?}\n{}",
+        "heal must clear on a clone of a re-genesis'd remote: {:?}\n{}",
         healed.status.code(), stderr(&healed));
 }
 
@@ -2912,33 +2912,33 @@ fn a_franchise_after_a_regenesis_holds_the_adopted_history_and_heals() {
 /// first attempt was given is reused when the resume omits it.
 #[test]
 fn a_resume_refuses_a_remote_whose_anchor_changed_since_the_first_attempt() {
-    let area = TestArea::new("franchise-resume-regenesis");
+    let area = TestArea::new("clone-resume-regenesis");
     let server = regenesis_on_remote(&area, |server| {
-        let failed = area.forklift(".", &["franchise", &server.url, "half", "--token", "root", "--only", "nowhere"]);
+        let failed = area.forklift(".", &["clone", &server.url, "half", "--token", "root", "--only", "nowhere"]);
         assert_eq!(failed.status.code(), Some(30), "{}{}", stdout(&failed), stderr(&failed));
     });
 
-    let refused = area.forklift(".", &["--json", "franchise", &server.url, "half"]);
+    let refused = area.forklift(".", &["--json", "clone", &server.url, "half"]);
     assert_eq!(refused.status.code(), Some(22), "{}{}", stdout(&refused), stderr(&refused));
     let value = json_of(&refused);
     assert_eq!(value["error"]["code"], "trust_changed", "{}", value);
     assert!(value["error"]["message"].as_str().unwrap().contains("is bound to the genesis its first attempt saw"), "{}", value);
-    assert!(value["error"]["next_step"].as_str().unwrap().contains("delete \"half\" and franchise again"), "{}", value);
+    assert!(value["error"]["next_step"].as_str().unwrap().contains("delete \"half\" and clone again"), "{}", value);
     assert!(area.path("half/.forklift/franchise").is_file(), "a refused resume keeps the directory");
 
-    // A fresh franchise of the same remote adopts the new anchor (with a warning), as always.
-    assert_success(&area.forklift(".", &["franchise", &server.url, "fresh", "--token", "root"]));
+    // A fresh clone of the same remote adopts the new anchor (with a warning), as always.
+    assert_success(&area.forklift(".", &["clone", &server.url, "fresh", "--token", "root"]));
 }
 
 /// FORK-114, the accepting side: a clone whose office fell behind before the reset accepts the
 /// re-genesis. Its anchor's `adopts` names the remote's pre-reset office head, which the clone
-/// never lowered; accepting must fetch it, exactly as a fresh franchise does.
+/// never lowered; accepting must fetch it, exactly as a fresh clone does.
 #[test]
 fn accepting_a_regenesis_from_behind_holds_the_adopted_history_and_heals() {
     let area = TestArea::new("regenesis-accept-heal");
     let server = regenesis_on_remote(&area, |server| {
-        assert_success(&area.forklift(".", &["franchise", &server.url, "b", "--token", "w-token"]));
-        // The office moves on after B's franchise, so B never holds the head the reset adopts.
+        assert_success(&area.forklift(".", &["clone", &server.url, "b", "--token", "w-token"]));
+        // The office moves on after B's clone, so B never holds the head the reset adopts.
         let worker = keygen_admit_args(&area, "worker@forklift");
         assert_success(&area.forklift("a", &["office", "admit", &worker[0], &worker[1], &worker[2]]));
         assert_success(&area.forklift("a", &["lift"]));
@@ -2959,7 +2959,7 @@ fn accepting_a_regenesis_from_behind_holds_the_adopted_history_and_heals() {
 /// FORK-114, the lifting side: a warehouse that re-genesised before it ever lifted establishes
 /// its anchor on a fresh remote. The office lift carries only the new chain, so the adopted
 /// history must be uploaded with the anchor — or the remote holds a pin it cannot serve, and
-/// every franchise of it fails.
+/// every clone of it fails.
 #[test]
 fn a_regenesis_lifted_to_a_fresh_remote_carries_its_adopted_history() {
     let area = TestArea::new("regenesis-first-lift");
@@ -2975,15 +2975,15 @@ fn a_regenesis_lifted_to_a_fresh_remote_carries_its_adopted_history() {
     assert_success(&area.forklift("a", &["office", "regenesis", "--confirm"]));
     assert_success(&area.forklift("a", &["lift"]));
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "c", "--token", "root"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "c", "--token", "root"]));
     plant_torn_taint(&area, "c");
     let healed = area.forklift("c", &["heal"]);
     assert!(healed.status.success(),
-        "heal must clear on a franchise of a remote first lifted after a re-genesis: {:?}\n{}",
+        "heal must clear on a clone of a remote first lifted after a re-genesis: {:?}\n{}",
         healed.status.code(), stderr(&healed));
 }
 
-/// FORK-262: a sparse franchise never fetched what lies outside its scope, so heal's torn-taint
+/// FORK-262: a sparse clone never fetched what lies outside its scope, so heal's torn-taint
 /// rescan must not record those sealed objects as vanished. Signing is on, so the walk also
 /// starts from the trust pins and the meta pallets.
 #[test]
@@ -3002,11 +3002,11 @@ fn a_torn_taint_in_a_sparse_franchise_heals_over_its_sealed_objects() {
     assert_success(&area.forklift("dev", &["office", "enroll"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--token", "root", "--only", "src"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--token", "root", "--only", "src"]));
     plant_torn_taint(&area, "sparse");
     let healed = area.forklift("sparse", &["--json", "heal"]);
     assert!(healed.status.success(),
-        "heal must clear over the sealed objects of a sparse franchise: {:?}\n{}\n{}",
+        "heal must clear over the sealed objects of a sparse clone: {:?}\n{}\n{}",
         healed.status.code(), stdout(&healed), stderr(&healed));
     assert!(!area.path("sparse/.forklift/taint").exists()
         || std::fs::read_dir(area.path("sparse/.forklift/taint")).unwrap().next().is_none(),
@@ -3045,7 +3045,7 @@ fn the_server_refuses_a_first_anchor_adopting_history_it_does_not_hold() {
     assert!(status.contains("422"), "{} {}", status, response);
     assert!(response.contains(office_head), "the refusal must name the pin: {}", response);
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "d"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "d"]));
 }
 
 /// Clients refuse a malformed anchor at the handshake, so the server must never store one: trust
@@ -3062,7 +3062,7 @@ fn the_server_refuses_to_store_a_malformed_trust_anchor() {
         assert!(status.contains("422"), "{:?}: {} {}", genesis, status, response);
     }
 
-    // Nothing was stored: the handshake still declares no anchor, so a franchise works.
+    // Nothing was stored: the handshake still declares no anchor, so a clone works.
     let (_, info) = http_get(&server.url, "/v1/warehouse");
     let info: serde_json::Value = serde_json::from_str(&info).unwrap();
     assert!(info["trust"].is_null(), "{}", info);
@@ -3081,22 +3081,22 @@ fn an_expect_pin_is_checked_before_anything_is_fetched_and_first_contact_is_anno
     assert_success(&area.forklift("a", &["lift"]));
 
     // A wrong pin refuses before the target exists: nothing downloaded, nothing created.
-    let wrong = area.forklift(".", &["--json", "franchise", &server.url, "b", "--expect", "not-it"]);
+    let wrong = area.forklift(".", &["--json", "clone", &server.url, "b", "--expect", "not-it"]);
     let details = trust_changed_details(&wrong);
     assert_eq!(details["what_changed"], "unexpected");
     assert_eq!(details["subject"], server.url.as_str());
-    assert!(details.get("previous").is_none(), "a franchise holds no anchor yet: {}", details);
+    assert!(details.get("previous").is_none(), "a clone holds no anchor yet: {}", details);
     assert!(!area.path("b").exists(), "a refused pin must not create the target");
     let genesis = details["current"].as_str().unwrap().to_string();
 
     // The pin is checked first: even a pallet that does not exist refuses as an unexpected
     // anchor, not as a missing pallet — so nothing resolved from it was ever fetched.
-    let first = area.forklift(".", &["--json", "franchise", &server.url, "b", "--pallet", "nope", "--expect", "not-it"]);
+    let first = area.forklift(".", &["--json", "clone", &server.url, "b", "--pallet", "nope", "--expect", "not-it"]);
     assert_eq!(trust_changed_details(&first)["what_changed"], "unexpected");
 
-    // The right pin franchises, and the first contact is still announced — on stderr, as a
+    // The right pin clones, and the first contact is still announced — on stderr, as a
     // warning document — and recorded in the report.
-    let pinned = area.forklift(".", &["--json", "franchise", &server.url, "b", "--expect", &genesis]);
+    let pinned = area.forklift(".", &["--json", "clone", &server.url, "b", "--expect", &genesis]);
     assert_success(&pinned);
     let report: serde_json::Value = serde_json::from_str(&stdout(&pinned)).unwrap();
     assert_eq!(report["data"]["adopted_genesis"], genesis.as_str(), "{}", report);
@@ -3146,11 +3146,11 @@ fn a_remote_whose_anchor_was_stripped_is_refused_before_anything_is_fetched() {
     assert_eq!(details["current"], serde_json::Value::Null);
     assert!(details["previous"].is_string(), "the held genesis is reported: {}", details);
 
-    let franchised = area.forklift(".", &["--json", "franchise", &server.url, "b"]);
+    let franchised = area.forklift(".", &["--json", "clone", &server.url, "b"]);
     let details = trust_changed_details(&franchised);
     assert_eq!(details["what_changed"], "removed", "{}", details);
-    assert!(details.get("previous").is_none(), "a franchise holds no anchor yet: {}", details);
-    assert!(!area.path("b").exists(), "a refused franchise must not create the target");
+    assert!(details.get("previous").is_none(), "a clone holds no anchor yet: {}", details);
+    assert!(!area.path("b").exists(), "a refused clone must not create the target");
 
     // Lift refuses the same way rather than re-upload an anchor over the stripped office.
     let lifted = area.forklift("a", &["--json", "lift"]);
@@ -3187,7 +3187,7 @@ fn a_compromised_key_cannot_sign_beyond_its_distrust_boundary() {
     assert_success(&area.forklift("a", &["lift"]));
 
     // The worker lifts legitimate work before the compromise is noticed…
-    assert_success(&area.forklift(".", &["franchise", &server.url, "b", "--token", "w-token"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "b", "--token", "w-token"]));
     assert_success(&area.forklift("b", &["config", "operator.identifier", "worker@forklift"]));
     area.write_file("b/code.txt", "v2 by worker\n");
     assert_success(&area.forklift("b", &["load", "code.txt"]));
@@ -3224,7 +3224,7 @@ fn a_compromised_key_cannot_sign_beyond_its_distrust_boundary() {
     assert!(stderr(&refused).contains("distrust boundary"), "{}", stderr(&refused));
 
     // Work lifted before the revocation stays valid: a fresh clone audits clean.
-    assert_success(&area.forklift(".", &["franchise", &server.url, "c", "--token", "w-token"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "c", "--token", "w-token"]));
     let audit = area.forklift("c", &["audit"]);
     assert!(audit.status.success(), "{}", stderr(&audit));
 }
@@ -3257,7 +3257,7 @@ fn a_revocation_does_not_vouch_for_work_the_remote_keeps_under_a_tombstone() {
 
     // The worker lifts a side pallet, which is then deleted on the remote: only its tombstone
     // holds the worker's parcel there.
-    assert_success(&area.forklift(".", &["franchise", &server.url, "b", "--token", "w-token"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "b", "--token", "w-token"]));
     assert_success(&area.forklift("b", &["config", "operator.identifier", "worker@forklift"]));
     assert_success(&area.forklift("b", &["pallet", "create", "feat"]));
     area.write_file("b/code.txt", "v2 by worker\n");
@@ -3396,9 +3396,9 @@ fn gc_is_refused_while_serving_then_sweeps_orphans_once_the_server_stops() {
     assert!(!orphan.exists());
 
     // Live history survives the sweep: re-serve the same root (the lock is free again) and
-    // franchise a fresh copy.
+    // clone a fresh copy.
     let server = Server::start(&area, None);
-    let franchised = area.forklift(".", &["franchise", &server.url, "b"]);
+    let franchised = area.forklift(".", &["clone", &server.url, "b"]);
     assert_success(&franchised);
     assert_eq!(area.read_file("b/keep.txt"), "live content\n");
 }
@@ -3530,13 +3530,13 @@ fn franchising_an_unborn_default_pallet_starts_unborn() {
     assert_success(&area.forklift("a", &["stack", "feature work"]));
     assert_success(&area.forklift("a", &["lift"]));
 
-    // Franchising the remote's default pallet starts unborn instead of erroring.
-    let franchised = area.forklift(".", &["franchise", &server.url, "b"]);
+    // Cloning the remote's default pallet starts unborn instead of erroring.
+    let franchised = area.forklift(".", &["clone", &server.url, "b"]);
     assert_success(&franchised);
     assert!(stdout(&franchised).contains("starts unborn"), "{}", stdout(&franchised));
 
     // A pallet asked for by name still gets typo protection.
-    let typo = area.forklift(".", &["franchise", &server.url, "c", "--pallet", "faeture"]);
+    let typo = area.forklift(".", &["clone", &server.url, "c", "--pallet", "faeture"]);
     assert!(!typo.status.success());
     assert!(stderr(&typo).contains("no pallet \"faeture\""), "{}", stderr(&typo));
 }
@@ -4053,18 +4053,18 @@ fn delta_bundle_reconstructs_a_files_many_versions() {
     assert!(out.contains("delta(s)") && !out.contains("0 delta(s)"),
             "the bundle should contain deltas: {}", out);
 
-    // Franchise: the client imports the *delta* bundle, reconstructs every version against
+    // Clone: the client imports the *delta* bundle, reconstructs every version against
     // its base, and lands the latest content — proof the delta round-trip is correct. Every
     // object is hash-verified on import, so a bad delta would fail here (or leave a loose
     // fetch); "0 object(s) fetched loose" confirms the whole closure came from the bundle.
-    let franchised = area.forklift(".", &["franchise", &server.url, "b"]);
+    let franchised = area.forklift(".", &["clone", &server.url, "b"]);
     assert_success(&franchised);
     assert!(stdout(&franchised).contains("Imported the remote's bundle"), "{}", stdout(&franchised));
     assert!(stdout(&franchised).contains("0 object(s) fetched loose"), "{}", stdout(&franchised));
 
     assert_eq!(area.read_file("b/big.txt"), version(8));
 
-    // The franchise is a clean, fully-verifiable warehouse with the full history.
+    // The clone is a clean, fully-verifiable warehouse with the full history.
     let status = area.forklift("b", &["stocktake"]);
     assert_success(&status);
     assert!(stdout(&status).contains("matches the inventory"), "{}", stdout(&status));
@@ -4100,7 +4100,7 @@ fn a_sync_walks_the_gap_between_the_heads_not_the_history() {
     assert_success(&area.forklift("a", &["lift"]));
 
     // B clones the whole history, so its ref head has a complete closure.
-    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
 
     // One more parcel on the remote.
     area.write_file("a/code.txt", "the new segment\n");
@@ -4173,10 +4173,10 @@ fn recipe_first_chunk(area: &TestArea, dir: &str, recipe_hash: &str) -> String {
 
 #[test]
 fn a_sparse_franchise_fetches_only_the_scoped_subtree() {
-    // The headline: `franchise --only src/api` fetches the whole signed history but only the
+    // The headline: `clone --only src/api` fetches the whole signed history but only the
     // content under src/api. The in-scope subtree and blob land; the out-of-scope subtree and a
     // top-level out-of-scope file are never downloaded — sealed by the hash the spine commits.
-    let area = TestArea::new("sparse-franchise");
+    let area = TestArea::new("sparse-clone");
     let server = Server::start(&area, None);
 
     prepare_warehouse(&area, "dev", &server.url);
@@ -4194,7 +4194,7 @@ fn a_sparse_franchise_fetches_only_the_scoped_subtree() {
     let web_blob = path_object_hash(&area, "dev", &head, "src/web/w.txt");
     let top_blob = path_object_hash(&area, "dev", &head, "top.txt");
 
-    let franchised = area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]);
+    let franchised = area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]);
     assert_success(&franchised);
     assert!(stdout(&franchised).contains("Sparse"), "{}", stdout(&franchised));
 
@@ -4240,7 +4240,7 @@ fn a_sparse_franchise_fetches_only_the_scoped_subtree() {
     assert!(stdout(&lifted).contains("Lifted"), "{}", stdout(&lifted));
 
     // The origin now serves the in-scope edit to a full clone.
-    assert_success(&area.forklift(".", &["franchise", &server.url, "full"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "full"]));
     assert_eq!(area.read_file("full/src/api/a.txt"), "api v2 from sparse\n");
     assert_eq!(area.read_file("full/src/web/w.txt"), "web v1\n", "the sealed sibling is intact on the origin");
 }
@@ -4278,7 +4278,7 @@ fn a_sparse_franchise_degrades_touches_to_unknown_out_of_scope() {
 
     // A sparse clone scoped to src/api only: the full signed history lands, but docs/ is
     // never fetched.
-    let franchised = area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]);
+    let franchised = area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]);
     assert_success(&franchised);
     assert!(stdout(&franchised).contains("Sparse"), "{}", stdout(&franchised));
 
@@ -4355,7 +4355,7 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_reads_signer_boundar
     // distrust boundary exactly the same as a published one's.
     //
     // So: a second local-only pallet ("side") supplies the boundary head that a plain
-    // (non-sparse) franchise of `main` alone will never even hear about, let alone fetch —
+    // (non-sparse) clone of `main` alone will never even hear about, let alone fetch —
     // it is flatly absent on the clone, not merely "not reachable from here". That absence
     // is irrelevant to the agent's main-line parcel, which `main`'s own present boundary
     // head vouches for regardless — on both the origin and the clone.
@@ -4442,10 +4442,10 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_reads_signer_boundar
 
     assert_success(&area.forklift("dev", &["lift"]));
 
-    // A fresh clone: an ordinary (non-sparse) franchise fetches only what the remote
+    // A fresh clone: an ordinary (non-sparse) clone fetches only what the remote
     // actually knows about — `side` was never lifted, so its head never reaches the clone
     // at all.
-    let franchised = area.forklift(".", &["franchise", &server.url, "clone"]);
+    let franchised = area.forklift(".", &["clone", &server.url, "clone"]);
     assert_success(&franchised);
 
     let on_clone = area.forklift("clone", &["--json", "query", "main", "--class", "agent"]);
@@ -4591,9 +4591,9 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_audits_the_vouched_p
 
     assert_success(&area.forklift("dev", &["lift"]));
 
-    // A fresh clone: an ordinary (non-sparse) franchise fetches only what the remote
+    // A fresh clone: an ordinary (non-sparse) clone fetches only what the remote
     // actually knows about — `side` was never lifted, so its head never reaches the clone.
-    let franchised = area.forklift(".", &["franchise", &server.url, "clone"]);
+    let franchised = area.forklift(".", &["clone", &server.url, "clone"]);
     assert_success(&franchised);
     assert!(
         !object_store_path(&area, "clone", &side_head).exists(),
@@ -4643,7 +4643,7 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_audits_the_vouched_p
 ///
 /// Resolution: lifting `main` too (its own closure includes U1, U2 and U3) puts U3 on the
 /// server. Retrying the very same `feature` lift then succeeds — the identical command that
-/// just refused — and a fresh clone franchised from the server afterwards audits `main` as
+/// just refused — and a fresh clone cloned from the server afterwards audits `main` as
 /// fully legacy: the definitive, resolved answer.
 #[test]
 fn enrolling_then_lifting_to_a_fresh_remote_with_an_unlifted_other_pallet_refuses_instead_of_accusing() {
@@ -4718,9 +4718,9 @@ fn enrolling_then_lifting_to_a_fresh_remote_with_an_unlifted_other_pallet_refuse
         stderr(&second_lift)
     );
 
-    // The definitive, resolved answer: a fresh clone franchised from the server now audits
+    // The definitive, resolved answer: a fresh clone cloned from the server now audits
     // `main` as fully legacy.
-    let franchised = area.forklift(".", &["franchise", &server.url, "clone"]);
+    let franchised = area.forklift(".", &["clone", &server.url, "clone"]);
     assert_success(&franchised);
     let audit_on_clone = area.forklift("clone", &["audit"]);
     assert_success(&audit_on_clone);
@@ -4757,7 +4757,7 @@ fn enrolling_then_lifting_to_a_fresh_remote_with_an_unlifted_other_pallet_refuse
 /// A0 of tampering instead — a genuinely pre-revocation parcel branded a forged backdate.
 ///
 /// Resolution: lifting `side` (bringing A1, and so A0's presence via A1's own ancestry, fully
-/// onto the server) and retrying the identical `tmp` lift succeeds. A clone franchised scoped
+/// onto the server) and retrying the identical `tmp` lift succeeds. A clone made scoped
 /// to "tmp" alone fetches A1 as the boundary its take's verdict needs; with A1 removed again it
 /// reads A0 as `unresolved`, and fetching A1's history directly
 /// into that same clone (`remote_utils::fetch_history`, the in-process idiom used elsewhere in
@@ -4868,9 +4868,9 @@ fn retiring_a_signer_then_lifting_only_a_replacement_pallet_refuses_instead_of_a
     // distrust boundary, and the take fetches what its verdict lacks. Removing A1 from the clone
     // reproduces the SAME unresolved read, pinning that it is genuinely about A1's absence, not
     // some artifact of the origin.
-    let franchised = area.forklift(".", &["franchise", &server.url, "tmp-clone", "--pallet", "tmp"]);
+    let franchised = area.forklift(".", &["clone", &server.url, "tmp-clone", "--pallet", "tmp"]);
     assert_success(&franchised);
-    assert!(object_present(&area, "tmp-clone", &a1), "the franchise fetches the distrust boundary A1");
+    assert!(object_present(&area, "tmp-clone", &a1), "the clone fetches the distrust boundary A1");
     std::fs::remove_file(object_store_path(&area, "tmp-clone", &a1)).unwrap();
 
     let query_before = area.forklift("tmp-clone", &["--json", "query", "tmp"]);
@@ -4906,7 +4906,7 @@ fn retiring_a_signer_then_lifting_only_a_replacement_pallet_refuses_instead_of_a
     }
 
     // Fetch A1's own ancestry directly into the SAME clone (the in-process idiom used
-    // elsewhere in this file — `remote_utils::fetch_history`), without a second franchise or
+    // elsewhere in this file — `remote_utils::fetch_history`), without a second clone or
     // a `side` pallet ref: this puts A1 (and so A0, already present) fully in reach and flips
     // the identical query's answer.
     {
@@ -4933,7 +4933,7 @@ fn retiring_a_signer_then_lifting_only_a_replacement_pallet_refuses_instead_of_a
 
 #[test]
 fn a_sparse_franchise_still_audits() {
-    // The meta/office carve-out: a sparse franchise fetches office and every meta pallet at full
+    // The meta/office carve-out: a sparse clone fetches office and every meta pallet at full
     // scope, so a trusted warehouse's offline audit still passes — the office chain is verified
     // with full content, exactly as a full clone would.
     let area = TestArea::new("sparse-audit");
@@ -4952,7 +4952,7 @@ fn a_sparse_franchise_still_audits() {
     assert_success(&area.forklift("dev", &["stack", "signed parcel"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
-    let franchised = area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]);
+    let franchised = area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]);
     assert_success(&franchised);
     assert!(stdout(&franchised).contains("Adopted the remote's trust anchor"), "{}", stdout(&franchised));
 
@@ -4978,10 +4978,10 @@ fn lower_into_a_sparse_store_stays_pruned() {
     assert_success(&area.forklift("dev", &["stack", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
 
     // A full clone changes both an in-scope and an out-of-scope file, and lifts.
-    assert_success(&area.forklift(".", &["franchise", &server.url, "up"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "up"]));
     area.write_file("up/src/api/a.txt", "api v2 from up\n");
     area.write_file("up/src/web/w.txt", "web v2 from up\n");
     assert_success(&area.forklift("up", &["load", "."]));
@@ -5020,8 +5020,8 @@ fn expand_fetches_the_widened_subtree_and_a_bay_can_scope_to_it() {
     let web_tree = path_object_hash(&area, "dev", &head, "src/web");
     let web_blob = path_object_hash(&area, "dev", &head, "src/web/w.txt");
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
-    assert!(!object_present(&area, "sparse", &web_tree), "src/web is sealed after the sparse franchise");
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
+    assert!(!object_present(&area, "sparse", &web_tree), "src/web is sealed after the sparse clone");
 
     // Expand fetches the newly in-scope subtree.
     let expanded = area.forklift("sparse", &["expand", "src/web"]);
@@ -5052,8 +5052,8 @@ fn sparse_after_a_diverged_lower(area: &TestArea, server: &Server) -> (String, S
     assert_success(&area.forklift("dev", &["stack", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
-    assert_success(&area.forklift(".", &["franchise", &server.url, "up"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "up"]));
 
     area.write_file("up/src/api/a.txt", "api v2 from up\n");
     area.write_file("up/src/web/w.txt", "web v2 from up\n");
@@ -5126,11 +5126,11 @@ fn expand_checks_its_paths_before_walking_other_histories() {
     assert!(stderr(&refused).contains("\"src/wbe\" is not a directory"), "{}", stderr(&refused));
 }
 
-// Revert: franchise fetches through the scope on disk, which does not exist yet → the whole
+// Revert: clone fetches through the scope on disk, which does not exist yet → the whole
 // tree is fetched and nothing is recorded.
 #[test]
 fn a_sparse_franchise_records_its_head_and_fetches_only_its_scope() {
-    let area = TestArea::new("sparse-franchise-ledger");
+    let area = TestArea::new("sparse-clone-ledger");
     let server = Server::start(&area, None);
 
     prepare_warehouse(&area, "dev", &server.url);
@@ -5143,7 +5143,7 @@ fn a_sparse_franchise_records_its_head_and_fetches_only_its_scope() {
     let head = pallet_head(&area, "dev", "main");
     let web_blob = path_object_hash(&area, "dev", &head, "src/web/w.txt");
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
 
     assert!(!object_present(&area, "sparse", &web_blob), "src/web stays sealed");
     let ledger = area.read_file("sparse/.forklift/fetched-heads");
@@ -5170,8 +5170,8 @@ fn a_sparse_franchise_seals_an_out_of_scope_chunked_file_and_expand_fetches_it()
     let recipe = path_object_hash(&area, "dev", &head, "big/giant.bin");
     let chunk = recipe_first_chunk(&area, "dev", &recipe);
 
-    // Sparse franchise excluding the chunked file's subtree.
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    // Sparse clone excluding the chunked file's subtree.
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
 
     // Out of scope: neither the recipe nor its chunks were fetched.
     assert!(!object_present(&area, "sparse", &recipe), "the out-of-scope recipe is sealed, not fetched");
@@ -5213,7 +5213,7 @@ fn narrow_shrinks_the_scope_and_frees_nothing() {
     let docs_blob = path_object_hash(&area, "dev", &head, "docs/guide.md");
 
     assert_success(&area.forklift(".",
-        &["franchise", &server.url, "sparse", "--only", "src/api", "--only", "docs"]));
+        &["clone", &server.url, "sparse", "--only", "src/api", "--only", "docs"]));
     assert_eq!(area.read_file("sparse/docs/guide.md"), "guide v1\n");
 
     // Narrow away docs.
@@ -5253,7 +5253,7 @@ fn a_sparse_workspace_refuses_to_lift_to_a_non_origin_remote() {
     assert_success(&origin.forklift("dev", &["stack", "base"]));
     assert_success(&origin.forklift("dev", &["lift"]));
 
-    assert_success(&origin.forklift(".", &["franchise", &server1.url, "sparse", "--only", "src/api"]));
+    assert_success(&origin.forklift(".", &["clone", &server1.url, "sparse", "--only", "src/api"]));
 
     // A second, independent remote (empty).
     let server2 = Server::start_at(&origin, "server-root-2", None);
@@ -5312,8 +5312,8 @@ fn a_partial_warehouse_talks_to_no_remote_but_its_origin() {
     assert_success(&area.forklift("dev", &["stack", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
-    assert_success(&area.forklift(".", &["franchise", &server1.url, "sparse", "--only", "src/api", "--only", "docs"]));
-    assert_success(&area.forklift(".", &["franchise", &server1.url, "full"]));
+    assert_success(&area.forklift(".", &["clone", &server1.url, "sparse", "--only", "src/api", "--only", "docs"]));
+    assert_success(&area.forklift(".", &["clone", &server1.url, "full"]));
 
     // The other remote holds the same history, a newer head and another pallet.
     area.write_file("dev/src/api/a.txt", "api v2\n");
@@ -5370,7 +5370,7 @@ fn a_partial_warehouse_talks_to_no_remote_but_its_origin() {
 
 /// A sparse warehouse's partiality is recorded in its marker, so deleting its fetch scope no longer
 /// turns it into a full one: lift, expand and lower each refuse, naming the missing file and
-/// franchising again, and nothing reaches the remote. Before, the warehouse read as full and lifted
+/// cloning again, and nothing reaches the remote. Before, the warehouse read as full and lifted
 /// anywhere.
 ///
 /// Revert: read a sparse warehouse with no fetch-scope file as full (`read_fetch_state` returning
@@ -5387,7 +5387,7 @@ fn a_sparse_warehouse_whose_fetch_scope_is_gone_is_refused() {
     assert_success(&area.forklift("dev", &["stack", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
     assert_eq!(area.read_file("sparse/.forklift/warehouse"), "/forklift-warehouse 2\nsparse\n");
     area.write_file("sparse/src/api/a.txt", "api v2\n");
     assert_success(&area.forklift("sparse", &["load", "."]));
@@ -5407,9 +5407,9 @@ fn a_sparse_warehouse_whose_fetch_scope_is_gone_is_refused() {
     assert_eq!(area.read_file("dev/src/api/a.txt"), "api v1\n", "the refused lift reached the remote");
 }
 
-/// A sparse warehouse's main tree records its scope when it is franchised, so deleting that file
+/// A sparse warehouse's main tree records its scope when it is cloned, so deleting that file
 /// does not make the main tree read as checking out every path: stocktake and stack refuse over
-/// staged work, naming the missing file and franchising again, instead of recording the paths it
+/// staged work, naming the missing file and cloning again, instead of recording the paths it
 /// never fetched as removed.
 ///
 /// Revert: read a sparse main tree with no scope file as full → the stack goes through (or tries
@@ -5426,7 +5426,7 @@ fn a_sparse_main_tree_whose_scope_is_gone_is_refused() {
     assert_success(&area.forklift("dev", &["stack", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
     area.write_file("sparse/src/api/a.txt", "api v2\n");
     assert_success(&area.forklift("sparse", &["load", "."]));
     std::fs::remove_file(area.path("sparse/.forklift/scope")).unwrap();
@@ -5436,7 +5436,7 @@ fn a_sparse_main_tree_whose_scope_is_gone_is_refused() {
         assert!(!refused.status.success(), "{:?} must refuse: {}", args, stdout(&refused));
         let message = json_of(&refused)["error"]["message"].as_str().unwrap().to_string();
         assert!(message.contains("recorded as sparse but its main tree's scope"), "{:?}: {}", args, message);
-        assert!(message.contains("is missing") && message.contains("Franchise the remote again"), "{:?}: {}", args, message);
+        assert!(message.contains("is missing") && message.contains("Clone the remote again"), "{:?}: {}", args, message);
     }
     let log = area.forklift("sparse", &["log"]);
     assert!(!stdout(&log).contains("second"), "nothing was stacked: {}", stdout(&log));
@@ -5459,7 +5459,7 @@ fn an_unscoped_bay_in_a_sparse_warehouse_is_refused_up_front() {
     assert_success(&area.forklift("dev", &["load", "."]));
     assert_success(&area.forklift("dev", &["stack", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
 
     let bay_dir = area.path("bay-plain");
     let refused = area.forklift("sparse", &["--json", "bay", "add", "plain", bay_dir.to_str().unwrap()]);
@@ -5482,7 +5482,7 @@ fn an_unscoped_bay_in_a_sparse_warehouse_is_refused_up_front() {
     assert_eq!(area.read_file("sparse/.forklift/bays/plain/scope"), "/forklift-scope 3\nsrc/api\n");
 }
 
-/// A `--cache` franchise is a partial warehouse, as a sparse one is: it skips the bundle, writes
+/// A `--cache` clone is a partial warehouse, as a sparse one is: it skips the bundle, writes
 /// its marker, records its origin and so refuses to lift elsewhere, runs the content audit, and
 /// refuses `expand`. Combined with `--only`, it is refused before anything is created.
 ///
@@ -5490,7 +5490,7 @@ fn an_unscoped_bay_in_a_sparse_warehouse_is_refused_up_front() {
 /// of the bundle skip → the bundle is imported; gate the audit on the scope alone → no scope.
 #[test]
 fn a_cache_franchise_is_a_partial_warehouse() {
-    let area = TestArea::new("cache-franchise");
+    let area = TestArea::new("cache-clone");
     let (server, _bundle) = warehouse_with_a_bundle(&area);
 
     // Signed, so `audit` has something to verify; the bundle is rebuilt over the signed head.
@@ -5501,13 +5501,13 @@ fn a_cache_franchise_is_a_partial_warehouse() {
     assert_success(&area.forklift("a", &["lift"]));
     server.rebuild_bundle(&area);
 
-    // The distinguishing baseline: a full franchise of the same remote imports the bundle.
-    let full = area.forklift(".", &["--json", "franchise", &server.url, "full"]);
+    // The distinguishing baseline: a full clone of the same remote imports the bundle.
+    let full = area.forklift(".", &["--json", "clone", &server.url, "full"]);
     assert_success(&full);
     assert!(json_of(&full)["data"].get("bundle_objects").is_some(), "{}", stdout(&full));
     assert_eq!(area.read_file("full/.forklift/warehouse"), "/forklift-warehouse 2\nfull\n");
 
-    let cached = area.forklift(".", &["--json", "franchise", &server.url, "cached", "--cache"]);
+    let cached = area.forklift(".", &["--json", "clone", &server.url, "cached", "--cache"]);
     assert_success(&cached);
     assert!(json_of(&cached)["data"].get("bundle_objects").is_none(), "no bundle: {}", stdout(&cached));
     assert_eq!(area.read_file("cached/.forklift/warehouse"), "/forklift-warehouse 2\ncache\n");
@@ -5539,7 +5539,7 @@ fn a_cache_franchise_is_a_partial_warehouse() {
     assert!(json["error"]["message"].as_str().unwrap().contains(&server.url), "{}", json);
     assert!(json["error"]["next_step"].as_str().unwrap().contains(&server.url), "{}", json);
 
-    let both = area.forklift(".", &["franchise", &server.url, "both", "--cache", "--only", "src"]);
+    let both = area.forklift(".", &["clone", &server.url, "both", "--cache", "--only", "src"]);
     assert!(!both.status.success(), "{}", stdout(&both));
     assert!(stderr(&both).contains("--only"), "{}", stderr(&both));
     assert!(!area.path("both").exists(), "nothing was created");
@@ -5623,7 +5623,7 @@ fn signature_files(area: &TestArea, directory: &str) -> (Vec<PathBuf>, usize) {
 }
 
 /// (vii) A fetch buffers the signatures of its walk and, below a full table's worth, writes them
-/// as one signature table, no sidecar each, before the ref moves; a franchise walks each pallet's
+/// as one signature table, no sidecar each, before the ref moves; a clone walks each pallet's
 /// history apart. A fetch that dies partway leaves the parcels it stored unsigned and the ref
 /// where it was; the next fetch re-walks them and stores their signatures.
 ///
@@ -5634,7 +5634,7 @@ fn a_fetch_tables_the_signatures_of_its_walk_and_a_dead_one_stores_none() {
     let area = TestArea::new("fetch-sig-tables");
     let (server, head) = three_signed_parcels(&area);
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
     let (tables, sidecars) = signature_files(&area, "b");
     assert_eq!(sidecars, 0, "a fetch writes no signature sidecar");
     let history = history_with_roots(&area, "b", &head);
@@ -5723,14 +5723,14 @@ fn three_signed_parcels(area: &TestArea) -> (Server, String) {
     (server, head)
 }
 
-/// A cache franchise holds every parcel and signature of the history it fetches, and the
+/// A cache clone holds every parcel and signature of the history it fetches, and the
 /// whole closure of the head it checks out; of every other parcel it records the root tree in the
 /// sealed record instead of fetching it, so `audit` passes and counts them held by hash. The meta
-/// pallets are fetched whole. A full franchise of the same remote is the baseline that holds every
+/// pallets are fetched whole. A full clone of the same remote is the baseline that holds every
 /// root, so the fixture's roots are distinct and absent only because the cache skipped them.
 ///
 /// Revert: push each parcel's root into the cache walk's tree frontier → the older roots are
-/// present and the record is empty; skip the record → the franchise's ref write is refused; skip
+/// present and the record is empty; skip the record → the clone's ref write is refused; skip
 /// the tip's content fetch → nothing is checked out; let the ref write's closure check fetch what
 /// it reads → the older roots are present.
 #[test]
@@ -5738,8 +5738,8 @@ fn a_cache_franchise_holds_the_parcels_and_its_tip_and_records_the_rest() {
     let area = TestArea::new("cache-fetch");
     let (server, head) = three_signed_parcels(&area);
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "full"]));
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "full"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
     assert_eq!(area.read_file("cached/src/code.txt"), "three\n");
 
     let history = history_with_roots(&area, "full", &head);
@@ -5835,8 +5835,8 @@ fn subtree_of(area: &TestArea, directory: &str, tree: &str, name: &str) -> Strin
 fn a_cache_read_of_an_older_parcel_fetches_what_it_reads() {
     let area = TestArea::new("cache-miss-fetch");
     let (server, head) = three_signed_parcels(&area);
-    assert_success(&area.forklift(".", &["franchise", &server.url, "full"]));
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "full"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
 
     let history = history_with_roots(&area, "full", &head);
     let (oldest, oldest_root) = history[2].clone();
@@ -5884,8 +5884,8 @@ fn a_cache_read_of_an_older_parcel_fetches_what_it_reads() {
 fn a_cache_read_with_its_origin_unreachable_refuses_as_a_cache_miss() {
     let area = TestArea::new("cache-miss-offline");
     let (mut server, head) = three_signed_parcels(&area);
-    assert_success(&area.forklift(".", &["franchise", &server.url, "full"]));
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "full"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
     let history = history_with_roots(&area, "full", &head);
     let (oldest, middle) = (history[2].0.clone(), history[1].0.clone());
 
@@ -5919,7 +5919,7 @@ fn a_cache_read_with_its_origin_unreachable_refuses_as_a_cache_miss() {
 fn a_cache_shift_to_a_pallet_lowered_elsewhere_fetches_its_head() {
     let area = TestArea::new("cache-miss-shift");
     let (server, _) = three_signed_parcels(&area);
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
 
     assert_success(&area.forklift("a", &["pallet", "create", "feature"]));
     area.write_file("a/src/feature.txt", "feature\n");
@@ -6000,7 +6000,7 @@ fn a_cache_shift_with_its_origin_unreachable_refuses_before_it_changes_anything(
     let area = TestArea::new("cache-phase-offline");
     let (mut server, _) = three_signed_parcels(&area);
     let (feature, root, blobs) = lift_feature(&area);
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
     assert_success(&area.forklift("cached", &["lower", "feature"]));
 
     for file in ["src/code.txt", "docs/two.txt"] {
@@ -6041,7 +6041,7 @@ fn a_cache_shift_with_its_origin_unreachable_refuses_before_it_changes_anything(
     assert_success(&area.forklift("cached", &["audit"]));
 }
 
-/// The proxied origin of a cache warehouse `cached` franchised through it, and every request path
+/// The proxied origin of a cache warehouse `cached` cloned through it, and every request path
 /// the cache sent it since the last [`Seen::clear`].
 struct Seen {
     _proxy: InterceptingProxy,
@@ -6056,7 +6056,7 @@ impl Seen {
             saw.lock().unwrap().push(path.to_string());
             None
         });
-        assert_success(&area.forklift(".", &["franchise", &proxy.url, "cached", "--cache"]));
+        assert_success(&area.forklift(".", &["clone", &proxy.url, "cached", "--cache"]));
         Seen { _proxy: proxy, paths }
     }
 
@@ -6165,7 +6165,7 @@ fn a_cache_shift_over_absent_trees_with_its_origin_unreachable_refuses_unchanged
     let area = TestArea::new("cache-plan-offline");
     let (mut server, _) = three_signed_parcels(&area);
     let (_, root, _) = lift_feature(&area);
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
     assert_success(&area.forklift("cached", &["lower", "feature"]));
     for tree in [root.clone(), subtree_of(&area, "a", &root, "src"), subtree_of(&area, "a", &root, "docs")] {
         assert!(!object_held(&area, "cached", &tree), "the target's tree is absent: {}", tree);
@@ -6205,7 +6205,7 @@ fn a_cache_shift_over_absent_trees_with_its_origin_unreachable_refuses_unchanged
 fn a_cache_lower_fetches_the_new_tip_and_records_what_it_skips() {
     let area = TestArea::new("cache-lower");
     let (server, old_head) = three_signed_parcels(&area);
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
     let old_root = history_with_roots(&area, "cached", &old_head)[0].1.clone();
     let recorded_before: Vec<String> = history_with_roots(&area, "cached", &old_head)[1..].iter()
         .map(|(_, root)| root.clone()).filter(|root| *root != old_root).collect();
@@ -6243,7 +6243,7 @@ fn a_cache_lower_fetches_the_new_tip_and_records_what_it_skips() {
 fn a_cache_fetch_records_before_it_returns() {
     let area = TestArea::new("cache-record-order");
     let (server, old_head) = three_signed_parcels(&area);
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
 
     area.write_file("a/src/code.txt", "four\n");
     assert_success(&area.forklift("a", &["load", "."]));
@@ -6271,7 +6271,7 @@ fn a_cache_fetch_records_before_it_returns() {
 fn a_cache_lift_auto_merges_a_diverged_remote() {
     let area = TestArea::new("cache-auto-merge");
     let (server, _) = three_signed_parcels(&area);
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
 
     area.write_file("a/from_a.txt", "a\n");
     assert_success(&area.forklift("a", &["load", "."]));
@@ -6296,7 +6296,7 @@ fn a_cache_lift_auto_merges_a_diverged_remote() {
 /// holds, since the remote holds every head's closure: it uploads the one new parcel, not the
 /// history beneath it. In a cache that walk would also have read every older root the cache holds
 /// only by record, fetching the history one object at a time; both recorded roots stay absent. The
-/// lift lands a pallet a full franchise of the remote checks out and audits.
+/// lift lands a pallet a full clone of the remote checks out and audits.
 ///
 /// Revert: stop the walk only at the lifted pallet's own remote head → three more parcels are sent
 /// and the recorded roots are fetched.
@@ -6304,7 +6304,7 @@ fn a_cache_lift_auto_merges_a_diverged_remote() {
 fn a_new_pallets_first_lift_stops_at_the_history_the_remote_holds() {
     let area = TestArea::new("lift-new-pallet");
     let (server, head) = three_signed_parcels(&area);
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
 
     let history = history_with_roots(&area, "cached", &head);
     let (middle_root, oldest_root) = (history[1].1.clone(), history[2].1.clone());
@@ -6326,7 +6326,7 @@ fn a_new_pallets_first_lift_stops_at_the_history_the_remote_holds() {
     assert!(!object_held(&area, "cached", &middle_root), "the lift fetched a root it holds by record");
     assert_success(&area.forklift("cached", &["audit"]));
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "full", "--pallet", "feature-cached"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "full", "--pallet", "feature-cached"]));
     assert_eq!(area.read_file("full/src/feature.txt"), "cached\n");
     assert_success(&area.forklift("full", &["audit"]));
 }
@@ -6353,7 +6353,7 @@ fn cache_fetch_in_process(area: &TestArea, directory: &str, url: &str, head: &st
 fn a_cache_auto_merge_fetches_a_held_parcels_content() {
     let area = TestArea::new("cache-merge-held");
     let (server, _) = three_signed_parcels(&area);
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
 
     area.write_file("a/from_a.txt", "a\n");
     assert_success(&area.forklift("a", &["load", "."]));
@@ -6385,7 +6385,7 @@ fn a_cache_auto_merge_fetches_a_held_parcels_content() {
 fn a_diverged_cache_lower_leaves_its_next_step_workable() {
     let area = TestArea::new("cache-lower-diverged");
     let (server, _) = three_signed_parcels(&area);
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
 
     area.write_file("a/from_a.txt", "a\n");
     assert_success(&area.forklift("a", &["load", "."]));
@@ -6418,7 +6418,7 @@ fn a_diverged_cache_lower_leaves_its_next_step_workable() {
 fn a_dirty_cache_lift_fetches_the_diverged_heads_content() {
     let area = TestArea::new("cache-lift-dirty");
     let (server, _) = three_signed_parcels(&area);
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
 
     area.write_file("a/from_a.txt", "a\n");
     assert_success(&area.forklift("a", &["load", "."]));
@@ -6446,7 +6446,7 @@ fn a_dirty_cache_lift_fetches_the_diverged_heads_content() {
 fn a_failed_cache_fill_records_what_it_left_absent() {
     let area = TestArea::new("cache-fill-fails");
     let (server, _) = three_signed_parcels(&area);
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
 
     area.write_file("a/docs/deep/lost.txt", "the remote loses this\n");
     assert_success(&area.forklift("a", &["load", "."]));
@@ -6488,7 +6488,7 @@ fn a_failed_cache_fill_records_what_it_left_absent() {
 fn recording_a_present_root_records_what_is_absent_beneath_it() {
     let area = TestArea::new("cache-record-beneath");
     let (server, head) = three_signed_parcels(&area);
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
 
     let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("cached"));
     let root = forklift_core::util::object_utils::load_parcel(&head).unwrap().tree_hash;
@@ -6567,8 +6567,8 @@ fn a_pending_move_of_the_origin_refuses_every_remote_client_and_every_writer_it_
     assert_success(&area.forklift("a", &["pallet", "create", "extra"]));
     assert_success(&area.forklift("a", &["lift"]));
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src", "--only", "docs"]));
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src", "--only", "docs"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
     let oldest = history_with_roots(&area, "cached", &head)[2].0.clone();
 
     // Local work for the deletes and the undo to act on, and a scope path no checkout holds.
@@ -6700,8 +6700,8 @@ fn a_partial_warehouse_moves_its_origin_to_a_copy_and_works_against_it() {
     let area = TestArea::new("origin-move-copy");
     let (mut server, head) = three_signed_parcels(&area);
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src"]));
     let oldest = history_with_roots(&area, "cached", &head)[2].0.clone();
 
     // Unlifted work on its own pallet, stacked on "three", whose docs subtree only it and three's
@@ -6778,7 +6778,7 @@ fn a_move_to_a_server_lacking_content_refuses_and_leaves_the_origin() {
         assert_success(&area.forklift("a", &["stack", version]));
     }
     assert_success(&area.forklift("a", &["lift"]));
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
     let head = pallet_head(&area, "server-root", "main");
     let four_root = history_with_roots(&area, "cached", &head)[1].1.clone();
     assert!(recorded(&area, "cached", &four_root));
@@ -6831,7 +6831,7 @@ fn a_move_to_a_server_lacking_content_refuses_and_leaves_the_origin() {
     assert!(!move_stands(&area, "cached"));
 
     // A full warehouse has no origin.
-    assert_success(&area.forklift(".", &["franchise", &server.url, "full"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "full"]));
     let full = area.forklift("full", &["remote", "move", &fresh.url]);
     assert!(!full.status.success() && stderr(&full).contains("config remote.url"), "{}", stderr(&full));
     assert_eq!(configured_remote(&area, "full"), server.url);
@@ -6853,8 +6853,8 @@ fn bare_remote_shows_the_remote_the_origin_and_what_stops_it() {
 
     let area = TestArea::new("remote-show");
     let (server, _) = three_signed_parcels(&area);
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
-    assert_success(&area.forklift(".", &["franchise", &server.url, "full"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "full"]));
     std::fs::create_dir_all(area.path("bare")).unwrap();
     assert_success(&area.forklift("bare", &["prepare"]));
     let show = |directory: &str| {
@@ -6942,7 +6942,7 @@ fn a_stopped_move_is_abandoned_only_while_checking_and_finished_by_the_next() {
 
     let area = TestArea::new("origin-move-stopped");
     let (server, _) = three_signed_parcels(&area);
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
     let copy = serve_copy(&area, "server-root", "copy-root");
 
     let quiet = area.forklift("cached", &["--json", "remote", "move", "--abort"]);
@@ -7014,8 +7014,8 @@ fn a_stopped_move_is_abandoned_only_while_checking_and_finished_by_the_next() {
 fn evict_refuses_a_warehouse_that_is_not_a_cache() {
     let area = TestArea::new("evict-not-cache");
     let (server, _) = three_signed_parcels(&area);
-    assert_success(&area.forklift(".", &["franchise", &server.url, "full"]));
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "full"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src"]));
 
     for directory in ["full", "sparse"] {
         let before = forklift_dir_snapshot(&area, directory);
@@ -7037,7 +7037,7 @@ fn evict_refuses_a_warehouse_that_is_not_a_cache() {
 fn evict_refuses_a_remote_that_is_not_the_origin_and_an_unreachable_origin() {
     let area = TestArea::new("evict-origin");
     let (mut server, head) = three_signed_parcels(&area);
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
     let oldest = history_with_roots(&area, "cached", &head)[2].0.clone();
     assert_success(&area.forklift("cached", &["show", &format!("{}:src/code.txt", oldest)]));
     let before = forklift_dir_snapshot(&area, "cached");
@@ -7078,7 +7078,7 @@ fn evict_refuses_a_remote_that_is_not_the_origin_and_an_unreachable_origin() {
 fn evict_frees_what_the_origin_holds_and_a_read_fetches_it_again() {
     let area = TestArea::new("evict-frees");
     let (server, head) = three_signed_parcels(&area);
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
     let (oldest, oldest_root) = history_with_roots(&area, "cached", &head)[2].clone();
     assert_success(&area.forklift("cached", &["show", &format!("{}:src/code.txt", oldest)]));
     let oldest_src = subtree_of(&area, "cached", &oldest_root, "src");
@@ -7142,7 +7142,7 @@ fn evict_frees_what_the_origin_holds_and_a_read_fetches_it_again() {
 fn evict_keeps_a_staged_blob_that_history_shares() {
     let area = TestArea::new("evict-staged");
     let (server, head) = three_signed_parcels(&area);
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
     let (oldest, oldest_root) = history_with_roots(&area, "cached", &head)[2].clone();
     assert_success(&area.forklift("cached", &["show", &format!("{}:src/code.txt", oldest)]));
     let one = file_of(&area, "cached", &subtree_of(&area, "cached", &oldest_root, "src"), "code.txt");
@@ -7168,7 +7168,7 @@ fn evict_keeps_a_staged_blob_that_history_shares() {
 fn evict_keeps_an_in_progress_consolidation_and_it_finishes() {
     let area = TestArea::new("evict-consolidation");
     let (server, _) = three_signed_parcels(&area);
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
 
     assert_success(&area.forklift("a", &["pallet", "create", "feature"]));
     area.write_file("a/src/code.txt", "feature\n");
@@ -7206,14 +7206,14 @@ fn evict_keeps_an_in_progress_consolidation_and_it_finishes() {
 fn evict_refuses_an_unrecorded_absence_until_heal_records_it() {
     let area = TestArea::new("evict-heal");
     let (server, head) = three_signed_parcels(&area);
-    assert_success(&area.forklift(".", &["franchise", &server.url, "full"]));
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "full"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
     let oldest_root = history_with_roots(&area, "full", &head)[2].1.clone();
     assert!(recorded(&area, "cached", &oldest_root));
 
     let target = object_store_path(&area, "cached", &oldest_root);
     std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-    std::fs::copy(object_store_path(&area, "full", &oldest_root), &target).expect("the full franchise holds the root loose");
+    std::fs::copy(object_store_path(&area, "full", &oldest_root), &target).expect("the full clone holds the root loose");
     let before = forklift_dir_snapshot(&area, "cached");
 
     let refused = area.forklift("cached", &["store", "evict"]);
@@ -7241,7 +7241,7 @@ fn an_interrupted_evict_leaves_a_readable_warehouse_and_a_rerun_finishes() {
 
     let area = TestArea::new("evict-interrupted");
     let (server, head) = three_signed_parcels(&area);
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
     let (oldest, oldest_root) = history_with_roots(&area, "cached", &head)[2].clone();
     assert_success(&area.forklift("cached", &["show", &format!("{}:src/code.txt", oldest)]));
 
@@ -7286,7 +7286,7 @@ fn an_interrupted_evict_leaves_a_readable_warehouse_and_a_rerun_finishes() {
 fn evict_frees_packed_content_and_a_read_fetches_it_again() {
     let area = TestArea::new("evict-packed");
     let (server, head) = three_signed_parcels(&area);
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
     let history = history_with_roots(&area, "cached", &head);
     let (oldest, oldest_root) = history[2].clone();
     assert_success(&area.forklift("cached", &["show", &format!("{}:src/code.txt", oldest)]));
@@ -7330,7 +7330,7 @@ fn evict_frees_packed_content_and_a_read_fetches_it_again() {
 fn evict_refuses_while_the_root_is_served() {
     let area = TestArea::new("evict-served");
     let (server, head) = three_signed_parcels(&area);
-    assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
     let oldest = history_with_roots(&area, "cached", &head)[2].0.clone();
     assert_success(&area.forklift("cached", &["show", &format!("{}:src/code.txt", oldest)]));
 
@@ -7353,7 +7353,7 @@ fn lift_and_franchise_round_trip_a_chunked_file() {
     // Chunk transport, end to end (§9.4b Stage 3). A chunk-aware server advertises `chunking` on
     // its handshake, so a chunked file lifts like any other content: the recipe rides the control
     // plane, its chunks ride the blob plane (per-object negotiation + upload), and the ref advances
-    // only after the commit-gate closure audit confirms every chunk is present. A fresh franchise
+    // only after the commit-gate closure audit confirms every chunk is present. A fresh clone
     // then imports the tree+recipe closure (bundles never carry chunks) and fetches each chunk per
     // object, re-assembling the file byte-for-byte — proving both directions of the wire.
     let area = TestArea::new("chunked-round-trip");
@@ -7379,8 +7379,8 @@ fn lift_and_franchise_round_trip_a_chunked_file() {
     assert!(stdout(&lifted_giant).contains("Lifted pallet"),
         "a chunked file lifts to a chunk-aware remote: {}", stdout(&lifted_giant));
 
-    // A fresh franchise re-materializes the chunked file byte-for-byte (chunks fetched per object).
-    let franchised = area.forklift(".", &["franchise", &server.url, "check"]);
+    // A fresh clone re-materializes the chunked file byte-for-byte (chunks fetched per object).
+    let franchised = area.forklift(".", &["clone", &server.url, "check"]);
     assert_success(&franchised);
     assert_eq!(area.read_file("check/small.txt"), "a normal file\n");
 
@@ -7408,10 +7408,10 @@ fn a_merge_second_parent_below_the_remote_head_lifts_from_a_sparse_store() {
     assert_success(&area.forklift("dev", &["lift"]));
 
     // The sparse workspace under test.
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
 
     // A full clone drives the remote forward twice, each time changing the out-of-scope subtree.
-    assert_success(&area.forklift(".", &["franchise", &server.url, "up"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "up"]));
     area.write_file("up/src/web/w.txt", "web v2 (out of scope)\n");
     assert_success(&area.forklift("up", &["load", "."]));
     assert_success(&area.forklift("up", &["stack", "up edits web (1)"]));
@@ -7475,7 +7475,7 @@ fn narrow_refuses_to_delete_dirty_tracked_changes() {
     assert_success(&area.forklift("dev", &["lift"]));
 
     assert_success(&area.forklift(".",
-        &["franchise", &server.url, "sparse", "--only", "src/api", "--only", "docs"]));
+        &["clone", &server.url, "sparse", "--only", "src/api", "--only", "docs"]));
 
     // An unstaged edit blocks narrowing "docs".
     std::fs::write(area.path("sparse/docs/guide.md"), "guide v2 (unsaved)\n").unwrap();
@@ -7518,7 +7518,7 @@ fn narrow_refuses_to_delete_an_edited_tracked_file_a_rule_covers() {
     assert_success(&area.forklift("dev", &["lift"]));
 
     assert_success(&area.forklift(".",
-        &["franchise", &server.url, "sparse", "--only", "src/api", "--only", "docs"]));
+        &["clone", &server.url, "sparse", "--only", "src/api", "--only", "docs"]));
 
     std::fs::write(area.path("sparse/.forkliftignore"), "^docs/gen\\.txt$\n").unwrap();
     std::fs::write(area.path("sparse/docs/gen.txt"), "gen v2 (unsaved)\n").unwrap();
@@ -7544,7 +7544,7 @@ fn narrow_refuses_to_delete_untracked_files() {
     assert_success(&area.forklift("dev", &["lift"]));
 
     assert_success(&area.forklift(".",
-        &["franchise", &server.url, "sparse", "--only", "src/api", "--only", "docs"]));
+        &["clone", &server.url, "sparse", "--only", "src/api", "--only", "docs"]));
 
     area.write_file("sparse/docs/scratch.md", "not tracked\n");
 
@@ -7576,7 +7576,7 @@ fn bay_add_scope_refuses_a_spine_ancestor_outside_the_fetch_scope() {
     assert_success(&area.forklift("dev", &["stack", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
 
     let bay_dir = area.path("sparse-src");
     let refused = area.forklift("sparse",
@@ -7609,7 +7609,7 @@ fn bay_add_scope_refuses_a_sealed_sibling_outside_the_fetch_scope() {
     assert_success(&area.forklift("dev", &["stack", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
 
     let bay_dir = area.path("sparse-web");
     let refused = area.forklift("sparse",
@@ -7641,7 +7641,7 @@ fn expand_recovers_after_an_unreachable_remote_leaves_the_scope_unchanged() {
     let head = pallet_head(&area, "dev", "main");
     let web_tree = path_object_hash(&area, "dev", &head, "src/web");
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
 
     // Point at an unreachable remote and attempt to expand.
     assert_success(&area.forklift("sparse", &["config", "remote.url", "http://127.0.0.1:9"]));
@@ -7685,7 +7685,7 @@ fn lift_from_a_sparse_workspace_with_no_remote_configured_reports_the_plain_erro
     assert_success(&area.forklift("dev", &["stack", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
     assert_success(&area.forklift("sparse", &["config", "--unset", "remote.url"]));
 
     let failed = area.forklift("sparse", &["--json", "lift"]);
@@ -7721,7 +7721,7 @@ fn a_sparse_audit_names_its_scope_boundary() {
     let head = pallet_head(&area, "dev", "main");
     let web_tree = path_object_hash(&area, "dev", &head, "src/web");
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
 
     // The out-of-scope subtree was sealed, not fetched — yet the audit passes over it.
     assert!(!object_present(&area, "sparse", &web_tree),
@@ -7771,7 +7771,7 @@ fn a_sparse_audit_fails_on_a_tampered_in_scope_tree() {
     let api_tree = path_object_hash(&area, "dev", &head, "src/api");
     let api_blob = path_object_hash(&area, "dev", &head, "src/api/a.txt");
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
 
     // A healthy sparse audit first — the store is valid.
     assert_success(&area.forklift("sparse", &["audit"]));
@@ -7813,7 +7813,7 @@ fn a_sparse_audit_checks_each_path_of_a_shared_spine_tree() {
         "the fixture needs `a` and `b` to be one tree object");
     let y_blob = path_object_hash(&area, "dev", &head, "b/y/y.txt");
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "a/x", "--only", "b/y"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "a/x", "--only", "b/y"]));
     assert_success(&area.forklift("sparse", &["audit"]));
 
     // The blob under `b/y` is the only object in scope at `b` and nowhere else.
@@ -7849,7 +7849,7 @@ fn a_content_corrupted_in_scope_blob_passes_closure_but_fails_on_read() {
     let head = pallet_head(&area, "dev", "main");
     let api_blob = path_object_hash(&area, "dev", &head, "src/api/a.txt");
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
     let sparse_head = pallet_head(&area, "sparse", "main");
 
     // Corrupt the blob's bytes but leave the file present — a degraded-on-disk in-scope blob.
@@ -7893,7 +7893,7 @@ fn path_maybe_changed_absorbs_an_absent_out_of_scope_object() {
     let head = pallet_head(&area, "dev", "main");
     let web_tree = path_object_hash(&area, "dev", &head, "src/web");
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
     let sparse_head = pallet_head(&area, "sparse", "main");
 
     // The changed out-of-scope subtree the filter computation must descend into was never fetched.
@@ -7941,7 +7941,7 @@ fn a_full_store_audit_omits_the_sparse_boundary() {
     assert_success(&area.forklift("dev", &["stack", "signed parcel"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "full"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "full"]));
 
     let audit = area.forklift("full", &["audit"]);
     assert_success(&audit);
@@ -7988,8 +7988,8 @@ fn scope_prune_frees_a_path_no_checkout_needs_and_leaves_the_rest_intact() {
     let web_tree = path_object_hash(&area, "dev", &head, "src/web");
     let web_blob = path_object_hash(&area, "dev", &head, "src/web/w.txt");
 
-    // A sparse franchise of all three paths, then two bays of different scopes on the one store.
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse",
+    // A sparse clone of all three paths, then two bays of different scopes on the one store.
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse",
         "--only", "src/api", "--only", "src/web", "--only", "docs"]));
 
     let apibay = area.path("bay-api");
@@ -8048,7 +8048,7 @@ fn scope_prune_frees_a_path_no_checkout_needs_and_leaves_the_rest_intact() {
 }
 
 /// A remote holding `src/api/a.txt` and `docs/guide.md` (v1), lifted from "dev", and a sparse
-/// franchise "sparse" fetching both paths. Returns the server, which must outlive the test.
+/// clone "sparse" fetching both paths. Returns the server, which must outlive the test.
 fn sparse_with_docs(area: &TestArea) -> Server {
     let server = Server::start(area, None);
 
@@ -8059,7 +8059,7 @@ fn sparse_with_docs(area: &TestArea) -> Server {
     assert_success(&area.forklift("dev", &["stack", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse",
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse",
         "--only", "src/api", "--only", "docs"]));
 
     server
@@ -8123,8 +8123,8 @@ fn scope_prune_keeps_work_never_lifted_and_frees_it_once_lifted() {
 
 #[test]
 fn scope_prune_frees_history_the_remote_confirms_it_still_holds() {
-    // FORK-254: the remote moved on from the head this warehouse was franchised from, so its
-    // current head is absent here and reaches nothing. The franchise recorded that head, the
+    // FORK-254: the remote moved on from the head this warehouse was cloned from, so its
+    // current head is absent here and reaches nothing. The clone recorded that head, the
     // prune asks the remote about it, and the remote confirms it still holds it, so the history
     // it reaches is freed without a lower.
     let area = TestArea::new("scope-prune-remote-ahead");
@@ -8132,7 +8132,7 @@ fn scope_prune_frees_history_the_remote_confirms_it_still_holds() {
 
     let base = pallet_head(&area, "sparse", "main");
     let docs_blob = path_object_hash(&area, "sparse", &base, "docs/guide.md");
-    assert_eq!(held_heads(&area, "sparse"), vec![format!("{} main", base)], "franchise records its head");
+    assert_eq!(held_heads(&area, "sparse"), vec![format!("{} main", base)], "clone records its head");
 
     area.write_file("dev/src/api/a.txt", "api v2\n");
     assert_success(&area.forklift("dev", &["load", "."]));
@@ -8247,7 +8247,7 @@ fn a_slash_named_pallet_crosses(proxy: SlashProxy, name: &str) {
     assert_success(&area.forklift("dev", &["load", "."]));
     assert_success(&area.forklift("dev", &["stack", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
-    assert_success(&area.forklift(".", &["franchise", &proxy.url, "sparse", "--only", "src/api", "--only", "docs"]));
+    assert_success(&area.forklift(".", &["clone", &proxy.url, "sparse", "--only", "src/api", "--only", "docs"]));
     let base = pallet_head(&area, "sparse", "main");
     let docs_blob = path_object_hash(&area, "sparse", &base, "docs/guide.md");
 
@@ -8409,7 +8409,7 @@ fn scope_prune_frees_nothing_beyond_the_current_heads_when_the_remote_cannot_ans
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
         })
     });
-    assert_success(&area.forklift(".", &["franchise", &proxy.url, "sparse",
+    assert_success(&area.forklift(".", &["clone", &proxy.url, "sparse",
         "--only", "src/api", "--only", "docs"]));
     let base = pallet_head(&area, "sparse", "main");
     let docs_blob = path_object_hash(&area, "sparse", &base, "docs/guide.md");
@@ -8448,11 +8448,11 @@ fn held_heads(area: &TestArea, name: &str) -> Vec<String> {
 #[test]
 fn a_landed_lift_lower_or_franchise_records_its_head_and_a_refused_lift_records_nothing() {
     // FORK-254: lift records the head the remote accepted, replacing the recorded heads it descends
-    // from; lower and franchise record the head they were served. A lift the remote refuses records nothing, since
+    // from; lower and clone record the head they were served. A lift the remote refuses records nothing, since
     // the record is written only after the compare-and-set.
     let area = TestArea::new("held-heads-record");
     let server = sparse_with_docs(&area);
-    assert_success(&area.forklift(".", &["franchise", &server.url, "clone"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "clone"]));
 
     let base = pallet_head(&area, "dev", "main");
     assert_eq!(held_heads(&area, "dev"), vec![format!("{} main", base)]);
@@ -8472,7 +8472,7 @@ fn a_landed_lift_lower_or_franchise_records_its_head_and_a_refused_lift_records_
     let refused = area.forklift("sparse", &["lift"]);
     assert!(!refused.status.success(), "the remote diverged, so the lift is refused: {}", stdout(&refused));
     assert_eq!(held_heads(&area, "sparse"), vec![format!("{} main", base)],
-               "the franchise recorded its head, and a refused lift records nothing");
+               "the clone recorded its head, and a refused lift records nothing");
 
     assert_success(&area.forklift("clone", &["lower"]));
     assert_eq!(pallet_head(&area, "clone", "main"), ahead);
@@ -8520,7 +8520,7 @@ fn scope_prune_refuses_and_changes_nothing_when_the_remote_trust_changed() {
         assert_success(&area.forklift("a", &["load", "."]));
         assert_success(&area.forklift("a", &["stack", "paths"]));
         assert_success(&area.forklift("a", &["lift"]));
-        assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--token", "root",
+        assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--token", "root",
             "--only", "docs", "--only", "src"]));
     });
 
@@ -8556,7 +8556,7 @@ fn scope_prune_refuses_while_a_bay_still_materializes_the_path() {
     let web_blob = path_object_hash(&area, "dev", &head, "src/web/w.txt");
 
     assert_success(&area.forklift(".",
-        &["franchise", &server.url, "sparse", "--only", "src/api", "--only", "src/web"]));
+        &["clone", &server.url, "sparse", "--only", "src/api", "--only", "src/web"]));
 
     // A bay scopes src/web; the main checkout narrows it away — so only the bay still needs it.
     let webbay = area.path("bay-web");
@@ -8595,7 +8595,7 @@ fn scope_prune_refuses_on_a_full_warehouse() {
     assert_success(&area.forklift("dev", &["stack", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "full"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "full"]));
     let head = pallet_head(&area, "full", "main");
     let web_tree = path_object_hash(&area, "full", &head, "src/web");
 
@@ -8627,7 +8627,7 @@ fn scope_prune_dry_run_reports_and_frees_nothing() {
     let web_blob = path_object_hash(&area, "dev", &head, "src/web/w.txt");
 
     assert_success(&area.forklift(".",
-        &["franchise", &server.url, "sparse", "--only", "src/api", "--only", "src/web"]));
+        &["clone", &server.url, "sparse", "--only", "src/api", "--only", "src/web"]));
     assert_success(&area.forklift("sparse", &["narrow", "src/web"]));
 
     let dry = area.forklift("sparse", &["--json", "scope-prune", "src/web", "--dry-run"]);
@@ -8672,7 +8672,7 @@ fn scope_prune_is_refused_while_another_process_writes_the_store() {
     let web_blob = path_object_hash(&area, "dev", &head, "src/web/w.txt");
 
     assert_success(&area.forklift(".",
-        &["franchise", &server.url, "sparse", "--only", "src/api", "--only", "src/web"]));
+        &["clone", &server.url, "sparse", "--only", "src/api", "--only", "src/web"]));
     assert_success(&area.forklift("sparse", &["narrow", "src/web"]));
 
     let writer = hold_store_access(&area.path("sparse"), false);
@@ -8725,7 +8725,7 @@ fn scope_prune_resumes_after_an_interrupted_free_and_completes() {
     let web_blob = path_object_hash(&area, "dev", &head, "src/web/w.txt");
 
     assert_success(&area.forklift(".",
-        &["franchise", &server.url, "sparse", "--only", "src/api", "--only", "src/web"]));
+        &["clone", &server.url, "sparse", "--only", "src/api", "--only", "src/web"]));
     assert_success(&area.forklift("sparse", &["narrow", "src/web"]));
 
     // Simulate an interrupted prune by hand: narrow the shared fetch scope directly (step one of
@@ -8791,7 +8791,7 @@ fn scope_prune_reports_zero_freed_as_retained_not_already_pruned() {
     assert_eq!(web_tree, api_tree, "the fixture's subtrees must collide by content-addressing");
 
     assert_success(&area.forklift(".",
-        &["franchise", &server.url, "sparse", "--only", "src/api", "--only", "src/web"]));
+        &["clone", &server.url, "sparse", "--only", "src/api", "--only", "src/web"]));
     assert_success(&area.forklift("sparse", &["narrow", "src/web"]));
 
     // A fresh prune (src/web was a live fetch-scope prefix until this call) that frees nothing:
@@ -8860,7 +8860,7 @@ fn scope_prune_retains_a_user_blob_that_collides_with_an_office_blob() {
     assert_eq!(web_blob, key_blob_hash, "the forced collision landed on the same hash");
 
     assert_success(&area.forklift(".",
-        &["franchise", &server.url, "sparse", "--only", "src/api", "--only", "src/web"]));
+        &["clone", &server.url, "sparse", "--only", "src/api", "--only", "src/web"]));
     assert_success(&area.forklift("sparse", &["narrow", "src/web"]));
 
     let pruned = area.forklift("sparse", &["scope-prune", "src/web"]);
@@ -8900,8 +8900,8 @@ fn the_path_addressed_subtree_endpoint_serves_a_subtree_and_signals_fallback_on_
     let web_tree = path_object_hash(&area, "dev", &head, "src/web");
     let web_blob = path_object_hash(&area, "dev", &head, "src/web/w.txt");
 
-    // A sparse franchise: src/web is sealed by hash, its objects never fetched.
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    // A sparse clone: src/web is sealed by hash, its objects never fetched.
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
     assert!(!object_present(&area, "sparse", &web_tree), "src/web starts sealed, not fetched");
 
     // Drive the client straight against the endpoint. The storage scope is thread-local and the
@@ -8953,7 +8953,7 @@ fn a_subtree_response_imports_in_full_when_the_client_already_holds_a_tree_insid
     let inner_tree = path_object_hash(&area, "dev", &head, "src/web/inner");
 
     // Scoped to src/web/inner: the client holds that tree and its blob, but not src/web's file.
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/web/inner"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/web/inner"]));
     assert!(object_present(&area, "sparse", &inner_tree), "the scoped tree is held");
     assert!(!object_present(&area, "sparse", &web_blob), "src/web's own file starts sealed");
 
@@ -8990,9 +8990,9 @@ fn the_path_addressed_subtree_endpoint_round_trips_a_path_with_reserved_characte
     let weird_tree = path_object_hash(&area, "dev", &head, "src/a dir#1/100%");
     let weird_blob = path_object_hash(&area, "dev", &head, "src/a dir#1/100%/w.txt");
 
-    // A sparse franchise scoped away from the reserved-character path: its objects are sealed,
+    // A sparse clone scoped away from the reserved-character path: its objects are sealed,
     // never fetched, until the path-addressed endpoint is asked for them directly.
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
     assert!(!object_present(&area, "sparse", &weird_tree), "the path starts sealed, not fetched");
 
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -9663,7 +9663,7 @@ fn heal_driven_refetch_force_fetches_a_corrupt_present_object() {
 
 #[test]
 fn a_failed_handshake_leaves_no_target_directory_behind() {
-    // The historical defect, reproduced live against a real remote: franchise created
+    // The historical defect, reproduced live against a real remote: clone created
     // `.forklift`/`.forkliftignore` in the target directory nine lines before the first thing
     // that talks to the remote (`RemoteClient::fetch_info`), so a wrong token left a wedged,
     // half-initialized directory behind. The handshake must now happen before any filesystem
@@ -9675,18 +9675,18 @@ fn a_failed_handshake_leaves_no_target_directory_behind() {
     assert!(!dir.exists());
 
     let failed = area.forklift(".", &[
-        "franchise", &server.url, "attempt1", "--token", "wrong-token",
+        "clone", &server.url, "attempt1", "--token", "wrong-token",
     ]);
-    assert!(!failed.status.success(), "a bad token must fail the franchise");
+    assert!(!failed.status.success(), "a bad token must fail the clone");
     assert!(stderr(&failed).contains("401"), "{}", stderr(&failed));
 
     assert!(!dir.exists(),
-        "a franchise whose handshake failed must not create the target directory at all: {:?}", dir);
+        "a clone whose handshake failed must not create the target directory at all: {:?}", dir);
 }
 
 #[test]
 fn a_retry_after_a_failed_handshake_succeeds_into_the_same_directory() {
-    // Pins the actual user-facing bug (verbatim from the field): before the fix, a franchise
+    // Pins the actual user-facing bug (verbatim from the field): before the fix, a clone
     // whose handshake failed had already dirtied the target with .forklift/.forkliftignore, so
     // an immediate retry with the correct token into the *same* directory was refused — "...is
     // not empty" — even though nothing had ever synced there.
@@ -9705,14 +9705,14 @@ fn a_retry_after_a_failed_handshake_succeeds_into_the_same_directory() {
 
     // First attempt: wrong token, the handshake fails.
     let failed = area.forklift(".", &[
-        "franchise", &server.url, "attempt1", "--token", "wrong-token",
+        "clone", &server.url, "attempt1", "--token", "wrong-token",
     ]);
     assert!(!failed.status.success());
     assert!(stderr(&failed).contains("401"), "{}", stderr(&failed));
 
     // Immediate retry, same directory, correct token: must succeed, not "is not empty".
     let retried = area.forklift(".", &[
-        "franchise", &server.url, "attempt1", "--token", "right-token",
+        "clone", &server.url, "attempt1", "--token", "right-token",
     ]);
     assert_success(&retried);
     assert_eq!(area.read_file("attempt1/code.txt"), "v1\n");
@@ -9732,50 +9732,50 @@ fn remote_with_two_subtrees(area: &TestArea, server: &Server) {
 fn a_failed_franchise_keeps_its_directory_and_a_corrected_resume_finishes() {
     // "src/ap" (missing the final "i") names nothing in the head: refused only after the
     // handshake and the scoped history fetch, by which point objects are in the store.
-    let area = TestArea::new("franchise-resume-corrected");
+    let area = TestArea::new("clone-resume-corrected");
     let server = Server::start(&area, None);
     remote_with_two_subtrees(&area, &server);
 
-    let failed = area.forklift(".", &["--json", "franchise", &server.url, "typo", "--only", "src/ap"]);
+    let failed = area.forklift(".", &["--json", "clone", &server.url, "typo", "--only", "src/ap"]);
     assert_eq!(failed.status.code(), Some(30), "{}{}", stdout(&failed), stderr(&failed));
     let value = json_of(&failed);
-    assert_eq!(value["error"]["code"], "franchise_incomplete", "{}", value);
+    assert_eq!(value["error"]["code"], "clone_incomplete", "{}", value);
     assert_eq!(value["error"]["details"]["cause_code"], "only_prefix_not_found", "{}", value);
     assert_eq!(value["error"]["details"]["retry"], "change", "{}", value);
     assert_eq!(value["error"]["details"]["directory"], "typo", "{}", value);
     assert_eq!(value["error"]["details"]["remote"], server.url.as_str(), "{}", value);
     assert!(value["error"]["message"].as_str().unwrap().contains("\"src/ap\" is not a directory"), "{}", value);
 
-    assert!(area.path("typo/.forklift/franchise").is_file(), "the record must stand until the franchise finishes");
+    assert!(area.path("typo/.forklift/franchise").is_file(), "the record must stand until the clone finishes");
     assert!(area.path("typo/.forklift/objects").is_dir(), "what was fetched must be kept");
 
     // The corrected resume needs no other options and finishes in place.
-    let resumed = area.forklift(".", &["--json", "franchise", &server.url, "typo", "--only", "src/api"]);
+    let resumed = area.forklift(".", &["--json", "clone", &server.url, "typo", "--only", "src/api"]);
     assert_success(&resumed);
     assert_eq!(area.read_file("typo/src/api/a.txt"), "api v1\n");
-    assert!(!area.path("typo/src/web").exists(), "the resume franchises at its own scope");
-    assert!(!area.path("typo/.forklift/franchise").exists(), "a finished franchise clears its record");
+    assert!(!area.path("typo/src/web").exists(), "the resume clones at its own scope");
+    assert!(!area.path("typo/.forklift/franchise").exists(), "a finished clone clears its record");
     assert_eq!(origin_of(&area, "typo").as_deref(), Some(server.url.as_str()), "the resume records the origin again");
     assert_success(&area.forklift("typo", &["status"]));
 }
 
 #[test]
 fn a_resume_keeps_the_objects_an_earlier_attempt_fetched() {
-    // A full franchise of the same remote fetches every object loose (the test server has no
+    // A full clone of the same remote fetches every object loose (the test server has no
     // bundle). A resume after a sparse attempt fetched the spine fetches only what it lacks.
-    let area = TestArea::new("franchise-resume-keeps-objects");
+    let area = TestArea::new("clone-resume-keeps-objects");
     let server = Server::start(&area, None);
     remote_with_two_subtrees(&area, &server);
 
-    let fresh = area.forklift(".", &["--json", "franchise", &server.url, "fresh"]);
+    let fresh = area.forklift(".", &["--json", "clone", &server.url, "fresh"]);
     assert_success(&fresh);
     let fresh_fetched = json_of(&fresh)["data"]["fetched_objects"].as_u64().unwrap();
 
-    let failed = area.forklift(".", &["franchise", &server.url, "kept", "--only", "src/ap"]);
+    let failed = area.forklift(".", &["clone", &server.url, "kept", "--only", "src/ap"]);
     assert_eq!(failed.status.code(), Some(30), "{}{}", stdout(&failed), stderr(&failed));
     assert_eq!(origin_of(&area, "kept").as_deref(), Some(server.url.as_str()), "the origin is recorded before the fetch");
 
-    let resumed = area.forklift(".", &["--json", "franchise", &server.url, "kept"]);
+    let resumed = area.forklift(".", &["--json", "clone", &server.url, "kept"]);
     assert_success(&resumed);
     let resumed_fetched = json_of(&resumed)["data"]["fetched_objects"].as_u64().unwrap();
 
@@ -9789,18 +9789,18 @@ fn a_resume_keeps_the_objects_an_earlier_attempt_fetched() {
 
 #[test]
 fn every_other_command_refuses_inside_an_unfinished_franchise() {
-    let area = TestArea::new("franchise-incomplete-gate");
+    let area = TestArea::new("clone-incomplete-gate");
     let server = Server::start(&area, None);
     remote_with_two_subtrees(&area, &server);
 
-    let failed = area.forklift(".", &["franchise", &server.url, "half", "--only", "src/ap"]);
+    let failed = area.forklift(".", &["clone", &server.url, "half", "--only", "src/ap"]);
     assert_eq!(failed.status.code(), Some(30), "{}{}", stdout(&failed), stderr(&failed));
 
     for args in [&["--json", "status"][..], &["--json", "heal"], &["--json", "prepare"], &["--json", "audit"]] {
         let refused = area.forklift("half", args);
         assert_eq!(refused.status.code(), Some(30), "{:?}: {}{}", args, stdout(&refused), stderr(&refused));
         let value = json_of(&refused);
-        assert_eq!(value["error"]["code"], "franchise_incomplete", "{:?}: {}", args, value);
+        assert_eq!(value["error"]["code"], "clone_incomplete", "{:?}: {}", args, value);
         assert_eq!(value["error"]["details"]["cause_code"], "only_prefix_not_found", "{:?}: {}", args, value);
         assert!(value["error"]["next_step"].as_str().unwrap().contains("--only src/ap"), "{:?}: {}", args, value);
     }
@@ -9811,15 +9811,15 @@ fn every_other_command_refuses_inside_an_unfinished_franchise() {
     assert_eq!(nested.status.code(), Some(30), "{}{}", stdout(&nested), stderr(&nested));
 }
 
-/// A franchise stopped before its warehouse marker was written is still an unfinished franchise,
-/// never a folder that is not a warehouse: the franchise check comes before the marker's.
+/// A clone stopped before its warehouse marker was written is still an unfinished clone,
+/// never a folder that is not a warehouse: the clone check comes before the marker's.
 #[test]
 fn an_unfinished_franchise_without_a_warehouse_marker_is_still_franchise_incomplete() {
-    let area = TestArea::new("franchise-incomplete-unmarked");
+    let area = TestArea::new("clone-incomplete-unmarked");
     let server = Server::start(&area, None);
     remote_with_two_subtrees(&area, &server);
 
-    let failed = area.forklift(".", &["franchise", &server.url, "half", "--only", "src/ap"]);
+    let failed = area.forklift(".", &["clone", &server.url, "half", "--only", "src/ap"]);
     assert_eq!(failed.status.code(), Some(30), "{}{}", stdout(&failed), stderr(&failed));
     let _ = std::fs::remove_file(area.path("half/.forklift/warehouse"));
     assert!(!area.path("half/.forklift/warehouse").exists() && area.path("half/.forklift/franchise").is_file());
@@ -9827,66 +9827,66 @@ fn an_unfinished_franchise_without_a_warehouse_marker_is_still_franchise_incompl
     for args in [&["--json", "status"][..], &["--json", "prepare"]] {
         let refused = area.forklift("half", args);
         let value = json_of(&refused);
-        assert_eq!(value["error"]["code"], "franchise_incomplete", "{:?}: {}", args, value);
+        assert_eq!(value["error"]["code"], "clone_incomplete", "{:?}: {}", args, value);
     }
 }
 
 #[test]
 fn a_resume_of_another_remote_is_refused_before_it_connects() {
-    let area = TestArea::new("franchise-resume-other-remote");
+    let area = TestArea::new("clone-resume-other-remote");
     let server = Server::start(&area, None);
     remote_with_two_subtrees(&area, &server);
 
-    let failed = area.forklift(".", &["franchise", &server.url, "half", "--only", "src/ap"]);
+    let failed = area.forklift(".", &["clone", &server.url, "half", "--only", "src/ap"]);
     assert_eq!(failed.status.code(), Some(30), "{}{}", stdout(&failed), stderr(&failed));
     let record = std::fs::read(area.path("half/.forklift/franchise")).unwrap();
 
     // Nothing listens there: a refusal that names the recorded remote proves no connection was tried.
-    let refused = area.forklift(".", &["--json", "franchise", "http://127.0.0.1:9", "half"]);
+    let refused = area.forklift(".", &["--json", "clone", "http://127.0.0.1:9", "half"]);
     assert_eq!(refused.status.code(), Some(30), "{}{}", stdout(&refused), stderr(&refused));
     let value = json_of(&refused);
     assert!(value["error"]["message"].as_str().unwrap().contains("not of http://127.0.0.1:9"), "{}", value);
     assert_eq!(std::fs::read(area.path("half/.forklift/franchise")).unwrap(), record, "the record is untouched");
 
     // A trailing slash is the same remote.
-    let resumed = area.forklift(".", &["franchise", &format!("{}/", server.url), "half"]);
+    let resumed = area.forklift(".", &["clone", &format!("{}/", server.url), "half"]);
     assert_success(&resumed);
 }
 
 #[test]
 fn a_failed_franchise_into_a_nested_target_keeps_it_and_its_ancestors() {
-    let area = TestArea::new("franchise-nested-kept");
+    let area = TestArea::new("clone-nested-kept");
     let server = Server::start(&area, None);
     remote_with_two_subtrees(&area, &server);
 
-    let failed = area.forklift(".", &["franchise", &server.url, "a/b/c", "--only", "src/ap"]);
+    let failed = area.forklift(".", &["clone", &server.url, "a/b/c", "--only", "src/ap"]);
     assert_eq!(failed.status.code(), Some(30), "{}{}", stdout(&failed), stderr(&failed));
     assert!(area.path("a/b/c/.forklift/franchise").is_file());
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "a/b/c"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "a/b/c"]));
     assert_eq!(area.read_file("a/b/c/src/web/b.txt"), "web v1\n");
 }
 
 #[test]
 fn a_pre_existing_target_keeps_a_failed_franchise_and_a_non_empty_one_is_refused() {
-    let area = TestArea::new("franchise-preexisting-kept");
+    let area = TestArea::new("clone-preexisting-kept");
     let server = Server::start(&area, None);
     remote_with_two_subtrees(&area, &server);
 
     std::fs::create_dir_all(area.path("empty")).unwrap();
-    let failed = area.forklift(".", &["franchise", &server.url, "empty", "--only", "src/ap"]);
+    let failed = area.forklift(".", &["clone", &server.url, "empty", "--only", "src/ap"]);
     assert_eq!(failed.status.code(), Some(30), "{}{}", stdout(&failed), stderr(&failed));
-    assert_success(&area.forklift(".", &["franchise", &server.url, "empty"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "empty"]));
 
-    // A directory holding anything franchise did not put there is never admitted.
+    // A directory holding anything clone did not put there is never admitted.
     area.write_file("busy/notes.txt", "mine\n");
-    let refused = area.forklift(".", &["franchise", &server.url, "busy"]);
+    let refused = area.forklift(".", &["clone", &server.url, "busy"]);
     assert!(!refused.status.success());
     assert!(stderr(&refused).contains("is not empty"), "{}", stderr(&refused));
     assert_eq!(area.read_file("busy/notes.txt"), "mine\n");
 
-    // Nor is a finished warehouse: a franchise that completed is not resumed over.
-    let again = area.forklift(".", &["franchise", &server.url, "empty"]);
+    // Nor is a finished warehouse: a clone that completed is not resumed over.
+    let again = area.forklift(".", &["clone", &server.url, "empty"]);
     assert!(!again.status.success());
     assert!(stderr(&again).contains("is not empty"), "{}", stderr(&again));
 }
@@ -9912,7 +9912,7 @@ fn a_pallet_typo_is_refused_before_anything_is_created() {
     assert!(!dir.exists());
 
     let failed = area.forklift(".", &[
-        "franchise", &server.url, "typo-pallet", "--pallet", "does-not-exist",
+        "clone", &server.url, "typo-pallet", "--pallet", "does-not-exist",
     ]);
     assert!(!failed.status.success(), "a --pallet typo must be refused");
     assert!(stderr(&failed).contains("no pallet \"does-not-exist\""), "{}", stderr(&failed));
@@ -9954,7 +9954,7 @@ fn a_pallet_typo_is_refused_before_a_broken_bundle_would_otherwise_fail_first() 
     let dir = area.path("typo-vs-broken-bundle");
 
     let failed = area.forklift(".", &[
-        "franchise", &server.url, "typo-vs-broken-bundle", "--pallet", "does-not-exist",
+        "clone", &server.url, "typo-vs-broken-bundle", "--pallet", "does-not-exist",
     ]);
     assert!(!failed.status.success());
     assert!(stderr(&failed).contains("no pallet \"does-not-exist\""),
@@ -9965,7 +9965,7 @@ fn a_pallet_typo_is_refused_before_a_broken_bundle_would_otherwise_fail_first() 
 #[test]
 fn franchise_ignores_an_unrelated_ambient_warehouses_tor_setting() {
     // PR #84 review, finding 5: moving the handshake before the cwd switch means it now runs in
-    // whatever directory the operator happened to invoke franchise from — which may be a
+    // whatever directory the operator happened to invoke clone from — which may be a
     // pre-existing, unrelated warehouse with its own `remote.tor`/`remote.torProxy`. Inheriting
     // that warehouse's Tor policy for a brand-new clone elsewhere would be a cwd-dependent,
     // security-relevant surprise, so the initial handshake reads *global* configuration only.
@@ -9973,7 +9973,7 @@ fn franchise_ignores_an_unrelated_ambient_warehouses_tor_setting() {
     // "outer" sets remote.tor = on (route every remote through Tor) and remote.torProxy to a
     // port nothing listens on, at WAREHOUSE scope. If the initial handshake ever inherited this,
     // routing the plain http:// test server through that dead proxy would make it unreachable.
-    let area = TestArea::new("franchise-tor-scope-independent");
+    let area = TestArea::new("clone-tor-scope-independent");
     let server = Server::start(&area, None);
 
     prepare_warehouse(&area, "dev", &server.url);
@@ -9988,14 +9988,14 @@ fn franchise_ignores_an_unrelated_ambient_warehouses_tor_setting() {
     assert_success(&area.forklift("outer", &["config", "remote.torProxy", "socks5h://127.0.0.1:9"]));
 
     // Run from inside "outer": the plain http:// test server must still be reached directly.
-    let franchised = area.forklift("outer", &["franchise", &server.url, "sub"]);
+    let franchised = area.forklift("outer", &["clone", &server.url, "sub"]);
     assert_success(&franchised);
     assert_eq!(area.read_file("outer/sub/code.txt"), "v1\n");
 }
 
 #[test]
 fn a_failure_after_the_bundle_install_keeps_it_and_the_resume_skips_the_download() {
-    // A non-sparse franchise installs the remote's bundle as native packs and reads them in this
+    // A non-sparse clone installs the remote's bundle as native packs and reads them in this
     // same process (adopting trust walks the enrolled office's history, which the bundle covers),
     // so they are mapped when a later step fails. The trigger is a second parcel the
     // already-built bundle does not cover, whose object the remote then no longer has: the
@@ -10026,16 +10026,16 @@ fn a_failure_after_the_bundle_install_keeps_it_and_the_resume_skips_the_download
     // cannot recover an object the far end no longer has.
     std::fs::remove_file(object_store_path(&area, "server-root", &blob_b)).unwrap();
 
-    let failed = area.forklift(".", &["franchise", &server.url, "packed"]);
+    let failed = area.forklift(".", &["clone", &server.url, "packed"]);
     assert_eq!(failed.status.code(), Some(30),
-        "franchise must fail when a required object has vanished from the remote: {}", stderr(&failed));
+        "clone must fail when a required object has vanished from the remote: {}", stderr(&failed));
     assert!(area.read_file("packed/.forklift/franchise").contains("bundle=imported"),
         "{}", area.read_file("packed/.forklift/franchise"));
 
     let blob = object_store_path(&area, "dev", &blob_b);
     std::fs::copy(&blob, object_store_path(&area, "server-root", &blob_b)).unwrap();
 
-    let resumed = area.forklift(".", &["--json", "franchise", &server.url, "packed"]);
+    let resumed = area.forklift(".", &["--json", "clone", &server.url, "packed"]);
     assert_success(&resumed);
     let value = json_of(&resumed);
     assert!(value["data"].get("bundle_objects").is_none(), "the imported bundle is kept, not fetched again: {}", value);
@@ -10052,7 +10052,7 @@ fn franchise_into_an_absolute_target_path_succeeds() {
     // root) returns `PermissionDenied`, not `AlreadyExists`, so that loop refused every absolute
     // Windows target before ever contacting the remote.
     //
-    // Every other franchise test in this file passes a relative target, which cannot exercise
+    // Every other clone test in this file passes a relative target, which cannot exercise
     // this at all: POSIX's `mkdir` on an existing root or intermediate directory (`/`, `/Users`,
     // …) always reports `EEXIST`, so this defect shape is invisible on macOS/Linux CI — the
     // reviewer verified this directly. This test is the missing axis; its ability to discriminate
@@ -10063,9 +10063,9 @@ fn franchise_into_an_absolute_target_path_succeeds() {
     // runs, since this file's own suite cannot reproduce the distinction locally either way.
     //
     // `TestArea::path` already returns an absolute path (it's rooted at `std::env::temp_dir()`),
-    // so no extra resolution is needed here — passing it straight to `franchise` as `directory`
+    // so no extra resolution is needed here — passing it straight to `clone` as `directory`
     // is exactly the case that broke.
-    let area = TestArea::new("franchise-absolute-target");
+    let area = TestArea::new("clone-absolute-target");
     let server = Server::start(&area, None);
 
     prepare_warehouse(&area, "dev", &server.url);
@@ -10078,7 +10078,7 @@ fn franchise_into_an_absolute_target_path_succeeds() {
     assert!(absolute_target.is_absolute(), "the test itself must exercise an absolute path");
 
     let franchised = area.forklift(".", &[
-        "franchise", &server.url, absolute_target.to_str().unwrap(),
+        "clone", &server.url, absolute_target.to_str().unwrap(),
     ]);
     assert_success(&franchised);
     assert_eq!(std::fs::read_to_string(absolute_target.join("code.txt")).unwrap(), "v1\n");
@@ -10129,7 +10129,7 @@ mod progress_events {
             assert!(statuses.iter().any(|status| status == phase), "missing {:?} in {:?}", phase, statuses);
         }
 
-        assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+        assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
 
         area.write_file("a/readme.txt", "hello, twice\n");
         area.write_file("a/new.txt", "new\n");
@@ -10161,7 +10161,7 @@ fn a_lower_across_a_case_only_rename_keeps_the_file() {
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "first"]));
     assert_success(&area.forklift("a", &["lift"]));
-    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
 
     std::fs::remove_file(area.path("a/foo")).unwrap();
     area.write_file("a/Foo", "upper\n");
@@ -10183,7 +10183,7 @@ fn a_lower_across_a_case_only_rename_keeps_the_file() {
 
 /// The full hash of a revision in a warehouse.
 fn parcel_hash(area: &TestArea, dir: &str, revision: &str) -> String {
-    let set = area.forklift(dir, &["--json", "kv", "list", revision]);
+    let set = area.forklift(dir, &["--json", "manifest", "keys", revision]);
     assert_success(&set);
     let value: serde_json::Value = serde_json::from_str(&stdout(&set)).unwrap();
 
@@ -10201,10 +10201,10 @@ fn kv_needs_an_office_and_refuses_readers() {
     assert_success(&area.forklift("a", &["stack", "base"]));
 
     // No office: a write is refused before anything is stacked.
-    let refused = area.forklift("a", &["kv", "set", "main", "ci", "green"]);
+    let refused = area.forklift("a", &["manifest", "set", "main", "ci", "green"]);
     assert!(!refused.status.success(), "a kv write without an office must be refused");
     assert!(stderr(&refused).contains("office"), "{}", stderr(&refused));
-    assert!(stdout(&area.forklift("a", &["kv", "list"])).contains("No custom metadata"));
+    assert!(stdout(&area.forklift("a", &["manifest", "keys"])).contains("No custom metadata"));
 
     assert_success(&area.forklift("a", &["office", "enroll"]));
 
@@ -10213,15 +10213,15 @@ fn kv_needs_an_office_and_refuses_readers() {
     assert_success(&area.forklift("a", &[
         "office", "admit", &reader[0], &reader[1], &reader[2], "--role", "reader",
     ]));
-    assert_success(&area.forklift("a", &["kv", "set", "main", "ci", "green"]));
+    assert_success(&area.forklift("a", &["manifest", "set", "main", "ci", "green"]));
 
     assert_success(&area.forklift("a", &["config", "operator.identifier", "reader@forklift"]));
-    let refused = area.forklift("a", &["kv", "set", "main", "ci", "red"]);
+    let refused = area.forklift("a", &["manifest", "set", "main", "ci", "red"]);
     assert!(!refused.status.success(), "a reader's kv write must be refused");
     assert!(stderr(&refused).contains("reader"), "{}", stderr(&refused));
-    let refused = area.forklift("a", &["kv", "unset", "main", "ci"]);
+    let refused = area.forklift("a", &["manifest", "unset", "main", "ci"]);
     assert!(!refused.status.success(), "a reader's kv unset must be refused");
-    assert_eq!(stdout(&area.forklift("a", &["kv", "get", "main", "ci"])).trim(), "green");
+    assert_eq!(stdout(&area.forklift("a", &["manifest", "get", "main", "ci"])).trim(), "green");
 
     // Nor may it deliver, which writes a pallet and a manifest entry: the target stays put.
     assert_success(&area.forklift("a", &["config", "--unset", "operator.identifier"]));
@@ -10252,9 +10252,9 @@ fn kv_syncs_replays_disjoint_changes_and_resolves_conflicts_with_keep() {
     let subject = parcel_hash(&area, "a", "main");
 
     // Set, read and lift — @kv rides along with the working pallet.
-    assert_success(&area.forklift("a", &["kv", "set", "main", "ci", "green"]));
-    assert_eq!(stdout(&area.forklift("a", &["kv", "get", "main", "ci"])).trim(), "green");
-    let again = area.forklift("a", &["kv", "set", "main", "ci", "green"]);
+    assert_success(&area.forklift("a", &["manifest", "set", "main", "ci", "green"]));
+    assert_eq!(stdout(&area.forklift("a", &["manifest", "get", "main", "ci"])).trim(), "green");
+    let again = area.forklift("a", &["manifest", "set", "main", "ci", "green"]);
     assert_success(&again);
     assert!(stdout(&again).contains("nothing to change"), "{}", stdout(&again));
 
@@ -10262,16 +10262,16 @@ fn kv_syncs_replays_disjoint_changes_and_resolves_conflicts_with_keep() {
     assert_success(&lifted);
     assert!(stdout(&lifted).contains("Lifted the @kv pallet"), "{}", stdout(&lifted));
 
-    // A franchise carries it, readable by the full hash too.
-    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
-    assert_eq!(stdout(&area.forklift("b", &["kv", "get", &subject, "ci"])).trim(), "green");
+    // A clone carries it, readable by the full hash too.
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
+    assert_eq!(stdout(&area.forklift("b", &["manifest", "get", &subject, "ci"])).trim(), "green");
 
     // Disjoint divergence: B sets one key and lifts, A another without lowering. A's lift is
     // refused for @kv alone, and lowering replays A's change onto the remote's and lifts it.
-    assert_success(&area.forklift("b", &["kv", "set", "main", "from-b", "b"]));
+    assert_success(&area.forklift("b", &["manifest", "set", "main", "from-b", "b"]));
     assert_success(&area.forklift("b", &["lift"]));
 
-    assert_success(&area.forklift("a", &["kv", "set", "main", "from-a", "a"]));
+    assert_success(&area.forklift("a", &["manifest", "set", "main", "from-a", "a"]));
     let refused = area.forklift("a", &["lift"]);
     assert!(!refused.status.success(), "a diverged @kv lift must be refused");
     assert!(stderr(&refused).contains("lower"), "{}", stderr(&refused));
@@ -10284,16 +10284,16 @@ fn kv_syncs_replays_disjoint_changes_and_resolves_conflicts_with_keep() {
 
     assert_success(&area.forklift("b", &["lower"]));
     for dir in ["a", "b"] {
-        let listing = stdout(&area.forklift(dir, &["kv", "list", "main"]));
+        let listing = stdout(&area.forklift(dir, &["manifest", "keys", "main"]));
         assert!(listing.contains("from-a = a") && listing.contains("from-b = b") && listing.contains("ci = green"),
                 "{}: {}", dir, listing);
     }
 
     // A conflict: both change the same key. Lowering lifts nothing for @kv and exits 24,
     // naming the path and both sides.
-    assert_success(&area.forklift("b", &["kv", "set", "main", "ci", "red"]));
+    assert_success(&area.forklift("b", &["manifest", "set", "main", "ci", "red"]));
     assert_success(&area.forklift("b", &["lift"]));
-    assert_success(&area.forklift("a", &["kv", "set", "main", "ci", "amber"]));
+    assert_success(&area.forklift("a", &["manifest", "set", "main", "ci", "amber"]));
 
     let conflicted = area.forklift("a", &["--json", "lower"]);
     assert_eq!(conflicted.status.code(), Some(24), "{}", stdout(&conflicted));
@@ -10304,7 +10304,7 @@ fn kv_syncs_replays_disjoint_changes_and_resolves_conflicts_with_keep() {
     assert_eq!(pallets[0]["conflicts"][0]["path"], format!("{}/ci", subject));
     assert_eq!(pallets[0]["conflicts"][0]["ours"]["value"], "amber");
     assert_eq!(pallets[0]["conflicts"][0]["theirs"]["value"], "red");
-    assert_eq!(stdout(&area.forklift("a", &["kv", "get", "main", "ci"])).trim(), "amber",
+    assert_eq!(stdout(&area.forklift("a", &["manifest", "get", "main", "ci"])).trim(), "amber",
                "a conflicted lower leaves the local @kv as it was");
 
     // Keeps that cannot apply are refused: a pallet without resolutions, a malformed side.
@@ -10319,7 +10319,7 @@ fn kv_syncs_replays_disjoint_changes_and_resolves_conflicts_with_keep() {
     let bare = area.forklift("a", &["lower", "--keep", &format!("kv:{}/ci=ours", subject)]);
     assert!(!bare.status.success(), "a keep naming the pallet without its @ must be refused");
     assert!(stderr(&bare).contains(&format!("--keep @kv:{}/ci=ours", subject)), "{}", stderr(&bare));
-    assert_eq!(stdout(&area.forklift("b", &["kv", "get", "main", "ci"])).trim(), "red",
+    assert_eq!(stdout(&area.forklift("b", &["manifest", "get", "main", "ci"])).trim(), "red",
                "nothing was lifted for the refused keep");
 
     // Keeping ours lifts the local value over the remote's.
@@ -10327,36 +10327,36 @@ fn kv_syncs_replays_disjoint_changes_and_resolves_conflicts_with_keep() {
     assert_success(&kept);
     assert!(stdout(&kept).contains("Replayed"), "{}", stdout(&kept));
     assert_success(&area.forklift("b", &["lower"]));
-    assert_eq!(stdout(&area.forklift("b", &["kv", "get", "main", "ci"])).trim(), "amber");
+    assert_eq!(stdout(&area.forklift("b", &["manifest", "get", "main", "ci"])).trim(), "amber");
 
     // Keeping theirs takes the remote's value.
-    assert_success(&area.forklift("b", &["kv", "set", "main", "ci", "blue"]));
+    assert_success(&area.forklift("b", &["manifest", "set", "main", "ci", "blue"]));
     assert_success(&area.forklift("b", &["lift"]));
-    assert_success(&area.forklift("a", &["kv", "set", "main", "ci", "violet"]));
+    assert_success(&area.forklift("a", &["manifest", "set", "main", "ci", "violet"]));
     let kept = area.forklift("a", &["lower", "--keep", &format!("@kv:{}/ci=theirs", subject)]);
     assert_success(&kept);
-    assert_eq!(stdout(&area.forklift("a", &["kv", "get", "main", "ci"])).trim(), "blue");
+    assert_eq!(stdout(&area.forklift("a", &["manifest", "get", "main", "ci"])).trim(), "blue");
 
     // A keep for a pallet that did not diverge is refused rather than silently ignored.
     let stale = area.forklift("a", &["lower", "--keep", &format!("@kv:{}/ci=theirs", subject)]);
     assert!(!stale.status.success(), "a keep with nothing to resolve must be refused");
 
     // On a pallet only this side moved, theirs drops the change it names and replays the rest.
-    assert_success(&area.forklift("a", &["kv", "set", "main", "drop", "x"]));
-    assert_success(&area.forklift("a", &["kv", "set", "main", "stay", "y"]));
+    assert_success(&area.forklift("a", &["manifest", "set", "main", "drop", "x"]));
+    assert_success(&area.forklift("a", &["manifest", "set", "main", "stay", "y"]));
     let kept = area.forklift("a", &["lower", "--keep", &format!("@kv:{}/drop=theirs", subject)]);
     assert_success(&kept);
     assert!(stdout(&kept).contains("Replayed"), "{}", stdout(&kept));
-    assert!(!area.forklift("a", &["kv", "get", "main", "drop"]).status.success(), "the named change is dropped");
+    assert!(!area.forklift("a", &["manifest", "get", "main", "drop"]).status.success(), "the named change is dropped");
     assert_success(&area.forklift("b", &["lower"]));
-    assert_eq!(stdout(&area.forklift("b", &["kv", "get", "main", "stay"])).trim(), "y",
+    assert_eq!(stdout(&area.forklift("b", &["manifest", "get", "main", "stay"])).trim(), "y",
                "the rest is replayed onto the remote");
-    assert!(!area.forklift("b", &["kv", "get", "main", "drop"]).status.success());
+    assert!(!area.forklift("b", &["manifest", "get", "main", "drop"]).status.success());
 
     // Unset removes the key; the log shows every change, newest first.
-    assert_success(&area.forklift("a", &["kv", "unset", "main", "ci"]));
-    assert!(!area.forklift("a", &["kv", "get", "main", "ci"]).status.success());
-    let log = stdout(&area.forklift("a", &["kv", "log", "main", "ci"]));
+    assert_success(&area.forklift("a", &["manifest", "unset", "main", "ci"]));
+    assert!(!area.forklift("a", &["manifest", "get", "main", "ci"]).status.success());
+    let log = stdout(&area.forklift("a", &["manifest", "log", "main", "ci"]));
     let lines: Vec<&str> = log.lines().collect();
     assert!(lines[0].ends_with("removed") && lines[1].ends_with("= blue"), "{}", log);
     assert!(log.contains("= green"), "{}", log);
@@ -10373,18 +10373,18 @@ fn a_conflicted_kv_pallet_does_not_hold_back_the_working_pallet() {
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "base"]));
     assert_success(&area.forklift("a", &["office", "enroll"]));
-    assert_success(&area.forklift("a", &["kv", "set", "main", "ci", "green"]));
+    assert_success(&area.forklift("a", &["manifest", "set", "main", "ci", "green"]));
     assert_success(&area.forklift("a", &["lift"]));
-    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
     let base = parcel_hash(&area, "a", "main");
 
     // B moves the working pallet and @kv; A changes the same key without lowering.
     area.write_file("b/code.txt", "v2\n");
     assert_success(&area.forklift("b", &["load", "."]));
     assert_success(&area.forklift("b", &["stack", "second"]));
-    assert_success(&area.forklift("b", &["kv", "set", &base, "ci", "red"]));
+    assert_success(&area.forklift("b", &["manifest", "set", &base, "ci", "red"]));
     assert_success(&area.forklift("b", &["lift"]));
-    assert_success(&area.forklift("a", &["kv", "set", "main", "ci", "amber"]));
+    assert_success(&area.forklift("a", &["manifest", "set", "main", "ci", "amber"]));
 
     // The lower still brings the working pallet down, then reports the @kv conflict, naming the
     // head the working pallet lowered to.
@@ -10443,13 +10443,13 @@ fn the_server_neither_prepares_nor_serves_a_bay() {
 
 // ---- Remote pallets: `lower <pallet>`, `pallet list --remote`, the pallet_not_found refusal ----
 
-/// Warehouse "a" lifts `main` (base.txt), "b" franchises it, then "a" lifts `feat` (feat.txt) and
+/// Warehouse "a" lifts `main` (base.txt), "b" clones it, then "a" lifts `feat` (feat.txt) and
 /// stands on main again. "b" has no `feat` ref; returns the remote's feat head.
 fn remote_with_a_side_pallet(area: &TestArea, server: &Server) -> String {
     prepare_warehouse(area, "a", &server.url);
     stack_file(area, "a", "base.txt", "base\n");
     assert_success(&area.forklift("a", &["lift"]));
-    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
 
     assert_success(&area.forklift("a", &["pallet", "create", "feat"]));
     stack_file(area, "a", "feat.txt", "feat v1\n");
@@ -10907,7 +10907,7 @@ fn a_sparse_warehouse_lowers_another_pallet_within_scope_and_expand_widens_it() 
     assert_success(&area.forklift("dev", &["load", "."]));
     assert_success(&area.forklift("dev", &["stack", "base"]));
     assert_success(&area.forklift("dev", &["lift"]));
-    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
 
     assert_success(&area.forklift("dev", &["pallet", "create", "feat"]));
     area.write_file("dev/src/web/w.txt", "web v2 on feat\n");
@@ -10986,7 +10986,7 @@ fn a_delete_refuses_a_remote_whose_trust_changed_instead_of_asking_it() {
         stack_file(&area, "a", "feat.txt", "feat v1\n");
         assert_success(&area.forklift("a", &["lift"]));
         assert_success(&area.forklift("a", &["shift", "main"]));
-        assert_success(&area.forklift(".", &["franchise", &server.url, "b", "--token", "root"]));
+        assert_success(&area.forklift(".", &["clone", &server.url, "b", "--token", "root"]));
         assert_success(&area.forklift("b", &["lower", "feat"]));
     });
 
@@ -11007,8 +11007,8 @@ fn history_unverified_message(output: &Output) -> String {
     value["error"]["message"].as_str().unwrap().to_string()
 }
 
-/// The message of a refused franchise whose cause is `history_unverified`: a franchise reports
-/// any failure as `franchise_incomplete` (exit 30), keeping what it fetched for a resume.
+/// The message of a refused clone whose cause is `history_unverified`: a clone reports
+/// any failure as `clone_incomplete` (exit 30), keeping what it fetched for a resume.
 #[track_caller]
 fn franchise_history_unverified_message(output: &Output) -> String {
     assert_eq!(output.status.code(), Some(30), "{}{}", stdout(output), stderr(output));
@@ -11018,7 +11018,7 @@ fn franchise_history_unverified_message(output: &Output) -> String {
 }
 
 /// A remote whose main was signed under an anchor, then stripped of both its anchor and its
-/// office, and moved by an anchorless client "c" to an unsigned parcel. "b" franchised while it
+/// office, and moved by an anchorless client "c" to an unsigned parcel. "b" cloned while it
 /// was whole, so it holds the anchor and stands at the signed head.
 struct StrippedRemote {
     server: Server,
@@ -11040,7 +11040,7 @@ impl StrippedRemote {
         stack_file(area, "a", "code.txt", "v2\n");
         assert_success(&area.forklift("a", &["lift"]));
 
-        assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+        assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
         assert!(area.path("b/.forklift/trust").is_file());
         let signed = pallet_head(area, "b", "main");
 
@@ -11057,7 +11057,7 @@ impl StrippedRemote {
         }
 
         // An anchorless client lifts an unsigned parcel, and the anchorless server takes it.
-        assert_success(&area.forklift(".", &["franchise", &server.url, "c"]));
+        assert_success(&area.forklift(".", &["clone", &server.url, "c"]));
         assert!(!area.path("c/.forklift/trust").exists());
         stack_file(area, "c", "code.txt", "forged\n");
         assert_success(&area.forklift("c", &["lift"]));
@@ -11107,7 +11107,7 @@ fn a_lower_refuses_history_a_stripped_remote_serves_and_takes_nothing() {
     assert_eq!(area.read_file("b/code.txt"), "v2\n");
 
     // Nor does a warehouse that never held an anchor stop taking from one that never had one.
-    assert_success(&area.forklift(".", &["franchise", &remote.server.url, "d"]));
+    assert_success(&area.forklift(".", &["clone", &remote.server.url, "d"]));
     assert_eq!(pallet_head(&area, "d", "main"), remote.forged);
     assert_success(&area.forklift("c", &["lower"]));
 }
@@ -11140,17 +11140,17 @@ fn a_take_by_hash_or_by_auto_merge_refuses_unverified_history() {
 }
 
 /// At first contact the anchor a remote serves is checked against what it serves before anything
-/// is installed: a franchise, a sparse one, and a lower in a warehouse holding no anchor refuse,
+/// is installed: a clone, a sparse one, and a lower in a warehouse holding no anchor refuse,
 /// and leave no anchor, office or pallet behind. Revert: the same mutation of `verify_take`, and
-/// the franchise installs the anchor over the forged main.
+/// the clone installs the anchor over the forged main.
 #[test]
 fn first_contact_refuses_history_that_does_not_verify_against_the_served_anchor() {
     let area = TestArea::new("take-first-contact");
     let remote = StrippedRemote::new(&area);
-    assert_success(&area.forklift(".", &["franchise", &remote.server.url, "e"]));
+    assert_success(&area.forklift(".", &["clone", &remote.server.url, "e"]));
     remote.restore();
 
-    let franchised = area.forklift(".", &["--json", "franchise", &remote.server.url, "d"]);
+    let franchised = area.forklift(".", &["--json", "clone", &remote.server.url, "d"]);
     let message = franchise_history_unverified_message(&franchised);
     assert!(message.contains("the trust anchor the remote serves"), "{}", message);
     assert!(!area.path("d/.forklift/trust").exists(), "no anchor installed");
@@ -11158,11 +11158,11 @@ fn first_contact_refuses_history_that_does_not_verify_against_the_served_anchor(
     assert!(!walk(&area.path("d/.forklift")).iter().any(|entry| entry.starts_with(area.path("d/.forklift/meta"))),
             "no office or other meta pallet adopted");
 
-    let sparse = area.forklift(".", &["--json", "franchise", &remote.server.url, "s", "--only", "code.txt"]);
+    let sparse = area.forklift(".", &["--json", "clone", &remote.server.url, "s", "--only", "code.txt"]);
     franchise_history_unverified_message(&sparse);
     assert!(!area.path("s/.forklift/trust").exists(), "no anchor installed");
 
-    // "e" franchised the stripped remote, so it holds no anchor and stands at the forged head;
+    // "e" cloned the stripped remote, so it holds no anchor and stands at the forged head;
     // the restored anchor does not vouch for it, and a lower installs nothing.
     let lowered = area.forklift("e", &["--json", "lower"]);
     history_unverified_message(&lowered);
@@ -11199,8 +11199,8 @@ fn a_partial_client_fetches_the_trust_boundary_it_lacks() {
     stack_file(&area, "a", "code.txt", "y\n");
     assert_success(&area.forklift("a", &["lift"]));
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
-    assert!(!object_present(&area, "b", &s2), "the franchise did not fetch side");
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
+    assert!(!object_present(&area, "b", &s2), "the clone did not fetch side");
     assert_success(&area.forklift("b", &["lower", "y"]));
     assert_success(&area.forklift("b", &["audit", "y"]));
     let healed = area.forklift("b", &["heal"]);
@@ -11208,7 +11208,7 @@ fn a_partial_client_fetches_the_trust_boundary_it_lacks() {
     assert!(stdout(&healed).contains("Nothing to heal"), "{}", stdout(&healed));
 
     // A remote that no longer holds the boundary head cannot vouch for y.
-    assert_success(&area.forklift(".", &["franchise", &server.url, "c"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "c"]));
     std::fs::remove_file(object_store_path(&area, "server-root", &s2)).unwrap();
     let refused = area.forklift("c", &["--json", "lower", "y"]);
     let message = history_unverified_message(&refused);
@@ -11230,7 +11230,7 @@ fn an_anchor_taken_from_a_remote_does_not_vouch_for_local_work_it_never_saw() {
     assert_success(&area.forklift("a", &["lift"]));
     let base = pallet_head(&area, "a", "main");
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "w"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "w"]));
     assert_success(&area.forklift("w", &["pallet", "create", "feature"]));
     stack_file(&area, "w", "code.txt", "local\n");
     let local = pallet_head(&area, "w", "feature");
@@ -11302,7 +11302,7 @@ fn heal_finishes_an_interrupted_lower_only_under_the_office_it_was_verified_agai
     stack_file(&area, "a", "code.txt", "v1\n");
     assert_success(&area.forklift("a", &["office", "enroll"]));
     assert_success(&area.forklift("a", &["lift"]));
-    assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
     let from = pallet_head(&area, "b", "main");
 
     stack_file(&area, "a", "code.txt", "v2\n");
@@ -11340,7 +11340,7 @@ fn worker_feat(area: &TestArea) -> (Server, String, String) {
     assert_success(&area.forklift("a", &["office", "admit", &worker[0], &worker[1], &worker[2]]));
     assert_success(&area.forklift("a", &["lift"]));
 
-    assert_success(&area.forklift(".", &["franchise", &server.url, "b", "--token", "w-token"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "b", "--token", "w-token"]));
     assert_success(&area.forklift("b", &["config", "operator.identifier", "worker@forklift"]));
     assert_success(&area.forklift("b", &["pallet", "create", "feat"]));
     stack_file(area, "b", "code.txt", "worker\n");
@@ -11409,7 +11409,7 @@ fn a_haul_merge_refuses_a_head_its_office_does_not_vouch_for() {
 
     retire_worker_beyond_feat(&area, &id);
     assert_success(&area.forklift("a", &["haul", "reopen", &id]));
-    let merged = area.forklift("a", &["--json", "haul", "merge", &id]);
+    let merged = area.forklift("a", &["--json", "haul", "consolidate", &id]);
     let message = history_unverified_message(&merged);
     assert!(message.contains(&worked), "{}", message);
     assert_eq!(pallet_head(&area, "a", "main"), main);
@@ -11419,7 +11419,7 @@ fn a_haul_merge_refuses_a_head_its_office_does_not_vouch_for() {
 /// At first contact the office a remote serves is verified against the anchor it serves before
 /// anything is installed: an anchor from another warehouse over this one's office refuses, and
 /// leaves no anchor or office behind. Revert: drop `prepare_remote_trust`'s office-chain check,
-/// and the franchise installs the foreign anchor.
+/// and the clone installs the foreign anchor.
 #[test]
 fn first_contact_refuses_an_office_its_served_anchor_does_not_root() {
     let area = TestArea::new("take-foreign-anchor");
@@ -11435,7 +11435,7 @@ fn first_contact_refuses_an_office_its_served_anchor_does_not_root() {
     assert_success(&area.forklift("x", &["office", "enroll", "--offline"]));
     std::fs::copy(area.path("x/.forklift/trust"), area.path("server-root/.forklift/trust")).unwrap();
 
-    let franchised = area.forklift(".", &["--json", "franchise", &server.url, "d"]);
+    let franchised = area.forklift(".", &["--json", "clone", &server.url, "d"]);
     let message = franchise_history_unverified_message(&franchised);
     assert!(message.contains("The office history"), "{}", message);
     assert!(!area.path("d/.forklift/trust").exists(), "no anchor installed");
@@ -11443,7 +11443,7 @@ fn first_contact_refuses_an_office_its_served_anchor_does_not_root() {
             "no office installed");
 }
 
-/// An anchored remote whose default pallet is unborn still franchises: there is no history to
+/// An anchored remote whose default pallet is unborn still clones: there is no history to
 /// judge, so the anchor and office are installed and the pallet starts unborn.
 #[test]
 fn an_anchored_remote_with_an_unborn_default_pallet_franchises() {
@@ -11457,7 +11457,7 @@ fn an_anchored_remote_with_an_unborn_default_pallet_franchises() {
     assert_success(&area.forklift("a", &["lift"]));
     assert_eq!(remote_pallet_head(&server, "main"), None);
 
-    let franchised = area.forklift(".", &["franchise", &server.url, "b"]);
+    let franchised = area.forklift(".", &["clone", &server.url, "b"]);
     assert_success(&franchised);
     assert!(stdout(&franchised).contains("starts unborn"), "{}", stdout(&franchised));
     assert!(area.path("b/.forklift/trust").is_file());

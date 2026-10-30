@@ -157,6 +157,10 @@ mod tests {
         expands_to("ha rev", "haul review");
         expands_to("hau rev --approve", "haul review --approve");
         expands_to("off adm", "office admit");
+        expands_to("cl", "clone");
+        expands_to("pi", "pick");
+        expands_to("ma k", "manifest keys");
+        expands_to("haul cons", "haul consolidate");
     }
 
     /// An exact name or alias wins over the longer names it starts, hidden aliases included.
@@ -172,6 +176,8 @@ mod tests {
         // Hidden git words, spelled out.
         expands_to("commit", "stack");
         expands_to("status", "stocktake");
+        expands_to("cherry-pick", "pick");
+        expands_to("haul merge", "haul consolidate");
     }
 
     /// A hidden alias takes no part in prefix matching: `comm` is no prefix of a visible name, so
@@ -180,6 +186,7 @@ mod tests {
     fn a_hidden_alias_matches_only_when_spelled_out() {
         expands_to("comm", "comm");
         expands_to("anno", "anno");
+        expands_to("cherry", "cherry");
 
         // A hidden command is reached by its full name only. The binary's one hidden command is
         // compiled in only for docs generation, so a tree of its own holds the rule.
@@ -205,6 +212,10 @@ mod tests {
         let text = error.render().to_string();
         assert!(text.contains("\"re\" could be \"forklift haul review\" or \"forklift haul reopen\";"), "{text}");
         assert!(text.contains("forklift haul"), "the usage line is haul's: {text}");
+
+        let error = expand("haul co").unwrap_err();
+        let text = error.render().to_string();
+        assert!(text.contains("\"co\" could be \"forklift haul comment\" or \"forklift haul consolidate\";"), "{text}");
     }
 
     /// Flags, the values options take, and everything after `--` are left as they are.

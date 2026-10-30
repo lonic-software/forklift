@@ -9,7 +9,7 @@
 //! The settled fix is a presence *probe* at the reader (`crate::commands::tag::probe_subject`),
 //! not rooting the subject (see `gc_utils.rs` for why rooting was refuted) — and not a refusal
 //! either: `show` renders and marks rather than refuses, because "collected here" and "never
-//! fetched here" are the same local state, and a sparse or franchised clone legitimately holds
+//! fetched here" are the same local state, and a sparse or cloned clone legitimately holds
 //! tags whose subject it never fetched. Only a genuinely indeterminate probe (an I/O error, never
 //! a definite answer) is still an ordinary command error — see the probe-failure test below.
 //!
@@ -186,7 +186,7 @@ fn a_signed_tag_subject_is_collected_after_undo_moves_the_head_back() {
     );
 
     // `tag show` must still succeed — exit 0 — over a collected subject: refusing would
-    // over-fire on a healthy sparse/franchised clone that never fetched this pallet at all (see
+    // over-fire on a healthy sparse/cloned clone that never fetched this pallet at all (see
     // the module doc comment). It must still name the hash and mark it, not render it silently.
     let show = warehouse.run(&["tag", "show", "v1.0"]);
     let show_stdout = String::from_utf8_lossy(&show.stdout).to_string();

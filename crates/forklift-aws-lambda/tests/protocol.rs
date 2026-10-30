@@ -585,9 +585,9 @@ fn kv_lifts_under_the_office_and_unknown_meta_names_are_refused() {
     area.write_file("wh/app.txt", "v1\n");
     area.forklift("wh", &["load", "."]);
     area.forklift("wh", &["stack", "signed"]);
-    area.forklift("wh", &["kv", "set", "main", "ci", "green"]);
+    area.forklift("wh", &["manifest", "set", "main", "ci", "green"]);
     let first = harvest(&area.path("wh")).head_of("@kv").expect("kv head");
-    area.forklift("wh", &["kv", "set", "main", "review", "done"]);
+    area.forklift("wh", &["manifest", "set", "main", "review", "done"]);
 
     let harvest = harvest(&area.path("wh"));
     let second = harvest.head_of("@kv").expect("kv head");
@@ -745,7 +745,7 @@ fn a_haul_merge_is_admitted_only_from_a_writer_of_its_target() {
     area.forklift("wh", &admit);
 
     area.forklift("wh", &["config", "operator.identifier", worker]);
-    area.forklift("wh", &["haul", "merge", &id]);
+    area.forklift("wh", &["haul", "consolidate", &id]);
     area.forklift("wh", &["config", "operator.identifier", "tester@forklift"]);
 
     let before = harvest(&area.path("wh"));

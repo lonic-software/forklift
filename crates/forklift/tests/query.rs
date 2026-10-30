@@ -225,7 +225,7 @@ fn verified_query_filters_on_the_signer_never_the_recorded_author() {
     assert_success(&warehouse.run(&["shift", "main"]));
 
     assert_success(&warehouse.run(&["config", "operator.identifier", "agent@forklift"]));
-    let pick = warehouse.run(&["cherry-pick", &human_draft]);
+    let pick = warehouse.run(&["pick", &human_draft]);
     assert_success(&pick);
     let picked = stdout(&pick)
         .split("stacked parcel ")

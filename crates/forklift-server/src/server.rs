@@ -91,7 +91,7 @@ impl WarehouseHandle {
 
     /// A handle for a warehouse this process is about to serve: acquires the serve lock and the
     /// shared store-access hold at `root` and keeps both in the handle for its lifetime. Errors if
-    /// the root holds an unfinished franchise, is already served by another process, or a `gc` or
+    /// the root holds an unfinished clone, is already served by another process, or a `gc` or
     /// full repack is running against it — in each case serving it would be unsafe. Every handle
     /// the server registers must come from here, in single and multi mode alike.
     ///
@@ -105,7 +105,7 @@ impl WarehouseHandle {
     /// removal there leaves a tombstone, which a client that freed its copy of a head this server
     /// listed relies on.
     ///
-    /// A root that may lack content (one franchised with `--only` or `--cache`) is refused for
+    /// A root that may lack content (one cloned with `--only` or `--cache`) is refused for
     /// good. Clients treat a served head as proof that the server holds its whole closure:
     /// scope-prune frees local copies of what the remote heads reach, so such a root would let a
     /// client free content the server cannot serve back. Checking once, here, is enough because a
@@ -125,7 +125,7 @@ impl WarehouseHandle {
         // root (the scope is synchronous and never held across an `.await`; both guards keep an
         // absolute path or an open file, so they stay valid once the scope drops).
         let (serve_lock, store_access) = {
-            // An unfinished franchise has not finished fetching, so even one marked full may lack
+            // An unfinished clone has not finished fetching, so even one marked full may lack
             // what its heads name: it is refused before anything it holds is trusted.
             franchise_utils::gate(&root).map_err(|e| ServingRefusal::Unfinished(String::from(e)))?;
 
@@ -169,7 +169,7 @@ enum ServingRefusal {
     /// once that ends.
     Busy(String),
 
-    /// It holds a franchise that has not finished: it is resumed or deleted first.
+    /// It holds a clone that has not finished: it is resumed or deleted first.
     Unfinished(String),
 
     /// Its warehouse marker, fetch scope, sealed-object record or origin record could not be read,
@@ -197,17 +197,17 @@ impl ServingRefusal {
             | ServingRefusal::Unfinished(reason)
             | ServingRefusal::Unreadable(reason) => reason,
             ServingRefusal::Partial => format!(
-                "{} is a partial warehouse: it was franchised with --only or --cache, so it may \
+                "{} is a partial warehouse: it was cloned with --only or --cache, so it may \
                 lack content its pallets reach. A client trusts a server to hold the whole history \
                 it serves, and could free local copies this one cannot send back. Serve a full \
-                warehouse instead: franchise the remote again without --only or --cache.",
+                warehouse instead: clone the remote again without --only or --cache.",
                 name
             ),
             ServingRefusal::Sealed(count) => format!(
                 "{} records {} object{} it holds by hash alone, without the content, so it may lack \
                 content its pallets reach. A client trusts a server to hold the whole history it \
                 serves, and could free local copies this one cannot send back. A full warehouse records \
-                nothing by hash, so this root may be a copy of a cache: franchise \
+                nothing by hash, so this root may be a copy of a cache: clone \
                 the warehouse it was copied from again, from its server, into a new root, without \
                 --only or --cache, and serve that.",
                 name,
@@ -215,9 +215,9 @@ impl ServingRefusal {
                 if count == 1 { "" } else { "s" }
             ),
             ServingRefusal::Origin => format!(
-                "{} records an origin (.forklift/origin), which only a warehouse franchised with \
+                "{} records an origin (.forklift/origin), which only a warehouse cloned with \
                 --only or --cache has, so its files may come from one that lacks content its pallets \
-                reach. A client trusts a server to hold the whole history it serves. Franchise that \
+                reach. A client trusts a server to hold the whole history it serves. Clone that \
                 origin again into a new root, without --only or --cache, and serve that.",
                 name
             ),
@@ -264,7 +264,7 @@ struct RegistryEntry {
 /// that is not live lets the least recently used *idle* one go first (see
 /// [`WarehouseRegistry::make_room`]). When none is idle the new one is admitted over the cap: a
 /// request is never refused for the cap alone, and running out of files surfaces as
-/// [`WarehouseHandle::serving`]'s refusal: a 503 when the franchise gate or the locks cannot
+/// [`WarehouseHandle::serving`]'s refusal: a 503 when the clone gate or the locks cannot
 /// be checked or taken, a 500 when the marker, fetch scope, sealed-object record or origin
 /// record cannot be read.
 struct WarehouseRegistry {
@@ -1707,7 +1707,7 @@ fn resolve_warehouse(state: &AppState,
     // Only a name the create would take (nothing there, or an empty folder) is missing. Anything
     // else that is not a warehouse (a file, a folder with content but no marker, a bay's) would
     // refuse the create a 404 points at, so it is answered as unusable instead. One that cannot
-    // be judged is a server fault, with no remedy offered. An unfinished franchise, which may not
+    // be judged is a server fault, with no remedy offered. An unfinished clone, which may not
     // have marked its folder yet, goes on to `serving` and its 503.
     // The cause of a check that failed is logged, never sent: it names this server's paths.
     let unchecked = |error: String| {
@@ -1745,7 +1745,7 @@ fn resolve_warehouse(state: &AppState,
     // until the handle is let go. Refuses (503) if a `gc` or full repack is running against this
     // warehouse, or another server already serves it — serving it then would be unsafe. A partial
     // or sealed warehouse, or one that records an origin, stays refused (409) until it is
-    // replaced, one whose records cannot be read gets a 500, and an unfinished franchise (503) until
+    // replaced, one whose records cannot be read gets a 500, and an unfinished clone (503) until
     // it is resumed or deleted.
     let handle = Arc::new(
         WarehouseHandle::serving(root, false).map_err(|refusal| match refusal {
@@ -1754,12 +1754,12 @@ fn resolve_warehouse(state: &AppState,
                 format!("Warehouse \"{}\" is temporarily unavailable (under maintenance): {}", id, reason),
             ),
             // Not the gate's own refusal: its code and next step name this server's directories,
-            // and a client would read them as a franchise of its own to resume.
+            // and a client would read them as a clone of its own to resume.
             ServingRefusal::Unfinished(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!(
-                    "Warehouse \"{}\" is temporarily unavailable: it holds a franchise that has not \
-                    finished, or that could not be checked. It is served once the franchise is resumed \
+                    "Warehouse \"{}\" is temporarily unavailable: it holds a clone that has not \
+                    finished, or that could not be checked. It is served once the clone is resumed \
                     or deleted.",
                     id
                 ),
@@ -3015,7 +3015,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
 /// must descend from it and acknowledge it. Framed as [`post_ref_update`] is: the same
 /// authorization (deleting a ref is moving it), decided again when the office or the anchor moved
 /// under the write. Refused, as the local delete is, for the pallet a bay of this root stands on
-/// (the default pallet first, which a franchise checks out) and for one an open haul names.
+/// (the default pallet first, which a clone checks out) and for one an open haul names.
 async fn delete_ref(State(state): State<Arc<AppState>>,
                     headers: HeaderMap,
                     Path(params): Path<PathParams>,
@@ -4756,7 +4756,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Restrict the fetch scope of the warehouse at `root`, as `franchise --only src` does.
+    /// Restrict the fetch scope of the warehouse at `root`, as `clone --only src` does.
     fn make_sparse(root: &std::path::Path) {
         mark_warehouse_as(root, "sparse");
         let _scope = StorageRootScope::enter(root);
@@ -4893,7 +4893,7 @@ mod tests {
         assert!(matches!(refused, ServingRefusal::Sealed(1)), "{:?}", refused);
         let message = refused.message("\"/srv/wh\"");
         assert!(message.starts_with("\"/srv/wh\" records 1 object it holds by hash alone"), "{}", message);
-        assert!(message.contains("franchise the warehouse it was copied from again, from its server, into a new root"), "{}", message);
+        assert!(message.contains("clone the warehouse it was copied from again, from its server, into a new root"), "{}", message);
         assert!(!sealed.join(FOLDER_NAME_FORKLIFT_ROOT).join("serve.lock").exists(), "a refused root keeps no serve lock");
 
         let emptied = base.join("emptied");
@@ -4930,7 +4930,7 @@ mod tests {
         assert!(matches!(refused, ServingRefusal::Origin), "{:?}", refused);
         let message = refused.message("Warehouse \"origined\"");
         assert!(message.starts_with("Warehouse \"origined\" records an origin (.forklift/origin)"), "{}", message);
-        assert!(message.contains("Franchise that origin again into a new root"), "{}", message);
+        assert!(message.contains("Clone that origin again into a new root"), "{}", message);
         assert!(!message.contains("origin.example"), "the origin URL never reaches a client: {}", message);
 
         let _ = std::fs::remove_dir_all(&base);
@@ -4968,11 +4968,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A multi-warehouse server refuses an unfinished franchise (503) as single mode does: it has
+    /// A multi-warehouse server refuses an unfinished clone (503) as single mode does: it has
     /// not finished fetching, so what it holds cannot be trusted yet. A fetch scope that cannot be
     /// read is a 500.
     ///
-    /// Revert: drop the franchise gate from `serving` → `unfinished` is served → red.
+    /// Revert: drop the clone gate from `serving` → `unfinished` is served → red.
     #[test]
     fn a_multi_server_refuses_an_unfinished_franchise_and_an_unreadable_scope() {
         let base = scratch_dir("unfinished-multi");

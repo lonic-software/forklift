@@ -521,7 +521,7 @@ pub trait RefStore {
     /// object storage has no directory walk (unlike `pallet_utils::all_pallet_refs`).
     fn list_refs(&self) -> Result<RefListing, String>;
 
-    /// The pallet a franchise checks out when the user does not choose (git's `HEAD`).
+    /// The pallet a clone checks out when the user does not choose (git's `HEAD`).
     fn default_pallet(&self) -> Result<String, String>;
 
     /// The warehouse's trust anchor, decoded — alongside the exact bytes it is stored as, or

@@ -239,9 +239,9 @@ impl Fixture {
         Fixture { area, server, git, first }
     }
 
-    /// A franchise of the server at `name`, mirroring nowhere.
+    /// A clone of the server at `name`, mirroring nowhere.
     fn franchise(&self, name: &str) {
-        self.area.forklift_ok(".", &["franchise", &self.server.url, name]);
+        self.area.forklift_ok(".", &["clone", &self.server.url, name]);
     }
 
     fn mirror_dir(&self, warehouse: &str) -> PathBuf {
@@ -1129,7 +1129,7 @@ fn a_race_that_ends_at_the_export_is_up_to_date() {
 }
 
 /// An exported ref whose parcel this warehouse fetches only during the run becomes a boundary
-/// once fetched: a franchise handed another warehouse's mirror repository writes nothing again.
+/// once fetched: a clone handed another warehouse's mirror repository writes nothing again.
 ///
 /// Revert: take the boundaries once, before the fetch → feat's parcel is exported again.
 #[test]

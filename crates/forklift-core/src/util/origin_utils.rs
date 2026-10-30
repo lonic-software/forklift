@@ -1,5 +1,5 @@
-//! The origin record: the remote a partial warehouse (franchised with `--only` or `--cache`) was
-//! franchised from, and the one rule every remote client of a warehouse goes through.
+//! The origin record: the remote a partial warehouse (cloned with `--only` or `--cache`) was
+//! cloned from, and the one rule every remote client of a warehouse goes through.
 //!
 //! A partial warehouse lacks content its history names, and only its origin was proved to hold
 //! it: the sparse fetch skipped out-of-scope content against the origin, and a cache holds the
@@ -11,7 +11,7 @@
 //! The record is a [`record_utils`] file in the shared forklift root holding one entry, the URL. It
 //! is not configuration: no `config` command reaches it, so the origin cannot be edited to agree
 //! with whatever remote is configured. `prepare_warehouse` writes it before the marker of a partial
-//! warehouse, so no partial marker stands without an origin, and before the franchise fetches
+//! warehouse, so no partial marker stands without an origin, and before the clone fetches
 //! anything; afterwards only a move of the origin rewrites it ([`write_locked`]), which is also how a
 //! missing one is recorded again. A full warehouse
 //! has none: it holds its whole closure and may talk to any remote.
@@ -133,7 +133,7 @@ pub fn same_remote(a: &str, b: &str) -> bool {
 /// * `other`  - The configured remote.
 pub fn non_origin_remote_refusal(origin: &str, other: &str) -> CoreError {
     let next_step = format!(
-        "Point \"{}\" back at \"{}\" with \"forklift config {} {}\", or franchise \"{}\" into a new \
+        "Point \"{}\" back at \"{}\" with \"forklift config {} {}\", or clone \"{}\" into a new \
         directory.",
         config_utils::KEY_REMOTE_URL, origin, config_utils::KEY_REMOTE_URL, origin, other
     );
@@ -141,7 +141,7 @@ pub fn non_origin_remote_refusal(origin: &str, other: &str) -> CoreError {
     CoreError::refusal(
         RefusalCode::NonOriginRemote,
         format!(
-            "This is a partial warehouse, franchised from \"{}\", and the configured remote is \
+            "This is a partial warehouse, cloned from \"{}\", and the configured remote is \
             \"{}\". Only the origin was proved to hold the content this warehouse does not, so \
             Forklift talks to no other remote from here; nothing was changed. {}",
             origin, other, next_step
@@ -154,7 +154,7 @@ pub fn non_origin_remote_refusal(origin: &str, other: &str) -> CoreError {
 /// damaged `.forklift` can be: preparing a partial warehouse writes the origin before its marker.
 pub fn missing_origin_refusal() -> CoreError {
     let next_step = "Record the origin with \"forklift remote move <url>\", naming a server that holds \
-        this warehouse's content, or franchise the remote again into a new directory.";
+        this warehouse's content, or clone the remote again into a new directory.";
 
     CoreError::refusal(
         RefusalCode::NonOriginRemote,

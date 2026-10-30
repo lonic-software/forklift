@@ -183,8 +183,8 @@ impl Warehouse {
     /// Delete a loose object's file directly — simulating either cause behind a trust-pin gap
     /// now that FORK-81 has rooted `anchor.boundary`/`distrust_boundary` as GC roots: a head this
     /// store never fetched to begin with (`office enroll` pins a remote's *declared* heads by
-    /// hash without fetching them, and `franchise` copies the anchor verbatim while fetching
-    /// only the one pallet it franchises), or genuine object loss. `gc` can no longer produce
+    /// hash without fetching them, and `clone` copies the anchor verbatim while fetching
+    /// only the one pallet it clones), or genuine object loss. `gc` can no longer produce
     /// this state for a rooted pin (the legs above prove the opposite — a rooted pin survives),
     /// so a leg that needs it reaches for this instead.
     fn delete_object(&self, hash: &str) {
@@ -823,7 +823,7 @@ fn warehouse_with_a_pick_of_an_orphaned_source(warehouse: &Warehouse) -> (String
 
     warehouse.stack("app.txt", "from-main\n", "main work");
 
-    let pick = warehouse.run(&["cherry-pick", &source]);
+    let pick = warehouse.run(&["pick", &source]);
     assert!(
         pick_state_file(warehouse).exists(),
         "the pick must be left in progress with its state on disk; it did not conflict, so the \
@@ -898,7 +898,7 @@ fn undoing_a_completed_pick_whose_source_was_collected_is_refused_and_changes_no
     assert_eq!(warehouse.head("main"), head, "the refused undo moved the pallet; stderr: {}", err);
     assert!(!undo.status.success(), "undo put back a pick whose source is gone");
     assert!(
-        err.contains(&format!("would put the cherry-pick of {} back in progress", source))
+        err.contains(&format!("would put the pick of {} back in progress", source))
             && err.contains("Nothing was undone"),
         "the refusal must name the pick and say nothing changed; stderr: {}",
         err
@@ -907,7 +907,7 @@ fn undoing_a_completed_pick_whose_source_was_collected_is_refused_and_changes_no
     // The refusal consumed no journal entry: a second undo meets the same entry, not an older one.
     let again = warehouse.run(&["undo"]);
     assert!(
-        !again.status.success() && String::from_utf8_lossy(&again.stderr).contains(&format!("cherry-pick of {}", source)),
+        !again.status.success() && String::from_utf8_lossy(&again.stderr).contains(&format!("pick of {}", source)),
         "a second undo must meet the same refused entry; stderr: {}",
         String::from_utf8_lossy(&again.stderr)
     );
@@ -936,7 +936,7 @@ fn a_pick_whose_source_was_lost_refuses_naming_the_pick_and_the_abort_works() {
     assert_eq!(warehouse.head("main"), head, "a refused stack must leave the pallet where it was");
     assert!(!completing.status.success(), "the stack completed a pick whose source is gone");
     assert!(
-        err.contains("The cherry-pick in progress cannot be completed") && err.contains(&source),
+        err.contains("The pick in progress cannot be completed") && err.contains(&source),
         "the refusal must name the pick and its source; stderr: {}",
         err
     );
@@ -968,7 +968,7 @@ fn a_pick_whose_source_was_lost_refuses_naming_the_pick_and_the_abort_works() {
 /// FORK-83 — THE HEALING READER, fixed: an absent tag subject no longer wedges the warehouse.
 ///
 /// A tag is not a gc root, so `undo` plus a collection can sweep a tagged parcel; a sparse
-/// `franchise --only` also adopts every tag record without the history behind it. Locally the two
+/// `clone --only` also adopts every tag record without the history behind it. Locally the two
 /// cannot be told apart, and neither can ever be resolved. Before the fix, heal's walk rooted tag
 /// subjects at the ordinary reporting policy, so a torn taint's store-wide rescan named the
 /// absent subject as dangling and refused, with exit 21, on every command. There was no exit

@@ -39,7 +39,7 @@ and bays.
 
 **Warehouse marker.** The file `.forklift/warehouse`, written last by `prepare`, which marks the
 folder as a complete warehouse rather than a half-built one, and records what it holds: everything
-(full), a sparse franchise's paths (sparse), or what a cache has fetched so far (cache). A `.forklift/`
+(full), a sparse clone's paths (sparse), or what a cache has fetched so far (cache). A `.forklift/`
 folder without it is not a warehouse, and commands refuse to run there.
 
 **Parcel** (git: commit). One immutable recorded snapshot: a root tree, its parents, who made it,
@@ -82,7 +82,8 @@ The everyday verbs map onto git like this:
 | `shift` | `checkout` / `switch` | switch to a pallet |
 | `consolidate` | `merge` | merge another pallet in |
 | `park` | `stash` | set work aside |
-| `franchise` | `clone` | copy a remote warehouse |
+| `pick` | `cherry-pick` | apply one parcel's change as a new parcel |
+| `clone` | `clone` | copy a remote warehouse |
 | `lift` | `push` | upload to a remote |
 | `lower` | `pull --ff-only` | fetch and fast-forward |
 | `diff` | `diff` | line-by-line changes |
@@ -175,8 +176,8 @@ display.
 **Conflict** (git: conflict). A file both sides changed in ways that cannot be combined. See
 [`conflicts`](cli.md#conflicts--list-unresolved-conflicts).
 
-**Cherry-pick** (git: `cherry-pick`). Applies one parcel's change onto the current pallet as a new
-parcel.
+**Pick** (git: `cherry-pick`). Applies one parcel's change onto the current pallet as a new
+parcel. See [`pick`](cli.md#pick--apply-one-parcels-change-onto-the-current-pallet).
 
 **Deliver** (git: squash merge, but git loses the trail). Squashes a draft pallet onto a target as
 one signed parcel, keeping a link back to the draft. See
@@ -199,7 +200,7 @@ using the bay's **undo journal**. See [`undo`](cli.md#undo--reverse-the-last-ope
 ## Sparse warehouses and scope
 
 **Sparse warehouse** (git: partial clone plus sparse checkout). A warehouse that has all of history
-but file content only for some paths. See [`franchise`](cli.md#franchise--clone-fr).
+but file content only for some paths. See [`clone`](cli.md#clone--clone-a-remote-warehouse).
 
 **Fetch scope.** The paths a warehouse holds content for, shared by every bay.
 
@@ -207,7 +208,7 @@ but file content only for some paths. See [`franchise`](cli.md#franchise--clone-
 within the fetch scope. See [`scope`](cli.md#scope--show-the-sparse-workspace-scope).
 
 **Sealed.** Content outside the fetch scope: not on disk, but pinned by the hashes of the trees
-that hold it. See [`franchise`](cli.md#franchise--clone-fr).
+that hold it. See [`clone`](cli.md#clone--clone-a-remote-warehouse).
 
 **Spine.** The trees from the root down to each scoped folder, which a sparse warehouse always
 holds.
@@ -231,7 +232,7 @@ disk. See [`store evict`](cli.md#store-evict--free-disk-in-a-cache-warehouse).
 **Fetched-heads ledger.** A sparse warehouse's record of the heads its fetches brought in, so that
 `expand` widens their history too.
 
-**Origin.** The remote a partial warehouse (franchised with `--only` or `--cache`) fetched from.
+**Origin.** The remote a partial warehouse (cloned with `--only` or `--cache`) fetched from.
 
 ## Durability and recovery
 
@@ -277,8 +278,8 @@ Forklift has several locks, each guarding a different thing.
 **Remote** (git: remote). Another warehouse you sync with, treated as untrusted storage. See
 [Working with remotes](cli.md#6-working-with-remotes).
 
-**Franchise** (git: `clone`). Copies a remote warehouse. See
-[`franchise`](cli.md#franchise--clone-fr).
+**Clone** (git: `clone`). Copies a remote warehouse. See
+[`clone`](cli.md#clone--clone-a-remote-warehouse).
 
 **Lift** (git: `push`, never forced). Uploads a pallet and moves the remote's head. See
 [`lift`](cli.md#lift--push-li).
@@ -286,7 +287,7 @@ Forklift has several locks, each guarding a different thing.
 **Lower** (git: `pull --ff-only`). Fetches and fast-forwards. A diverged working pallet is
 reported, never merged on its own. See [`lower`](cli.md#lower--pull-lo).
 
-**Origin.** The remote a sparse or cache warehouse was franchised from, recorded with the
+**Origin.** The remote a sparse or cache warehouse was cloned from, recorded with the
 warehouse rather than in config; such a warehouse talks to no other remote. See
 [`remote move`](cli.md#remote-move--move-a-partial-warehouse-to-another-origin), the one way to
 change it.
@@ -295,7 +296,7 @@ change it.
 have parcels the other lacks, *remote ahead* when you need to lower first.
 
 **Bundle** (git: bundle, or a packfile in transit). Many objects downloaded as one package, for a
-`franchise`, a `lower` or a sparse fetch. It is never a source of truth. See
+`clone`, a `lower` or a sparse fetch. It is never a source of truth. See
 [Working with remotes](cli.md#6-working-with-remotes).
 
 **Batch endpoint, batch lane.** The request that fetches many objects at once. A client that finds
@@ -435,8 +436,8 @@ as approvals and provenance. See [`manifest`](cli.md#manifest--signed-post-metad
 
 **Provenance.** A manifest entry recording which model, tool and session produced a parcel.
 
-**kv** (`@kv`) (git: notes, loosely). Free-form signed values keyed by parcel. See
-[`kv`](cli.md#kv--custom-metadata-on-parcels).
+**Keyed value** (`@kv`) (git: notes, loosely). Free-form signed values keyed by parcel, set with `manifest set`. See
+[`manifest set`](cli.md#manifest-set--keyed-values-on-parcels).
 
 **Tag** (`@tags`) (git: `tag -s`, but git tags can be moved or deleted). A named, signed pointer at
 a parcel that can never move. See [`tag`](cli.md#tag--signed-tags--releases).
@@ -510,7 +511,7 @@ proposed, but not built.
 
 **Holds request.** A remote request asking whether it still holds a given head.
 
-**Cache mode.** A warehouse franchised with `--cache`: it keeps every parcel and signature, but
+**Cache mode.** A warehouse cloned with `--cache`: it keeps every parcel and signature, but
 content only for what a bay has checked out or a command has read. It holds the rest by hash and
 fetches it from its origin on demand.
 

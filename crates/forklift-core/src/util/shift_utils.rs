@@ -1108,7 +1108,7 @@ fn create_assembly_temp(path: &str) -> Result<(PathBuf, std::fs::File), String> 
 /// Remove every entry of the active bay's assembly folder. Called by
 /// [`WarehouseLock::acquire`](crate::util::lock_utils::WarehouseLock::acquire) once the bay's
 /// lock is held. Every process that assembles into a bay holds that bay's lock (`bay add` and
-/// `franchise` take the lock of the one they create), so anything in the folder then was left by
+/// `clone` take the lock of the one they create), so anything in the folder then was left by
 /// an interrupted process and is never read. Best effort: a leftover that cannot be removed only
 /// costs space.
 pub(crate) fn clear_assembly_leftovers() {
@@ -1485,7 +1485,7 @@ fn join_key(key: &str, name: &str) -> String {
 
 /// Materialize a target tree over the working directory and rebuild the whole staging
 /// area from it — the shared engine of every head-moving operation that arrives from a
-/// remote (`lower`, `franchise`). Refuses up front (before anything is touched) when a
+/// remote (`lower`, `clone`). Refuses up front (before anything is touched) when a
 /// new file would overwrite untracked content or land on another entry through a case alias
 /// (see [`collect_collisions`]).
 ///

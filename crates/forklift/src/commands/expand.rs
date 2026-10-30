@@ -29,8 +29,8 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
     // Checked first: a cache's scope is the whole tree, but it does not hold the whole tree.
     if scope_utils::is_cache_mode()? {
         return Err(
-            "This warehouse was franchised with --cache: its scope is already the whole tree, so \
-            there is nothing to expand. \"forklift expand\" widens a sparse (\"forklift franchise --only\") \
+            "This warehouse was cloned with --cache: its scope is already the whole tree, so \
+            there is nothing to expand. \"forklift expand\" widens a sparse (\"forklift clone --only\") \
             warehouse's fetch scope.".to_string()
         );
     }
@@ -38,7 +38,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
     if current.is_full() {
         return Err(
             "This warehouse already holds the full tree; there is nothing to expand. \"forklift expand\" \
-            widens a sparse (\"forklift franchise --only\") warehouse's fetch scope.".to_string()
+            widens a sparse (\"forklift clone --only\") warehouse's fetch scope.".to_string()
         );
     }
 
@@ -50,7 +50,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
 
         if path.is_root() {
             return Err(
-                "Expanding to the warehouse root would fetch the whole tree — re-franchise \
+                "Expanding to the warehouse root would fetch the whole tree — re-clone \
                 without --only for a full warehouse.".to_string()
             );
         }

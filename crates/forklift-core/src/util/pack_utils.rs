@@ -264,7 +264,7 @@ pub struct StoreStatus {
     pub incremental_due: bool,
     /// Whether a consolidating repack is due now (pack files over the threshold).
     pub repack_due: bool,
-    /// Whether this store was bulk-ingested (`git import`'s pack-direct path, or a franchise's
+    /// Whether this store was bulk-ingested (`git import`'s pack-direct path, or a clone's
     /// native bundle install) and has not since been through a `compact --all --redelta` pass —
     /// see `mark_densify_pending`. A suggestion only; nothing ever acts on it automatically.
     pub densify_pending: bool,
@@ -2032,7 +2032,7 @@ pub(crate) fn pack_health_snapshot() -> Result<PackHealthSnapshot, String> {
 /// it isn't, on this platform/toolchain — if you're relying on it for a *new* decision, verify
 /// it the same way this one was.
 ///
-/// `pub` (not `pub(crate)`) so a caller in the `forklift` binary crate — `franchise`, dropping the
+/// `pub` (not `pub(crate)`) so a caller in the `forklift` binary crate — `clone`, dropping the
 /// mappings its run loaded — can call it too; every other caller here is within this crate.
 pub fn invalidate_cache() {
     registry().lock().expect("the pack registry lock is poisoned")
@@ -2076,7 +2076,7 @@ const DENSIFY_MARKER_NAME: &str = "densify-pending";
 fn mark_densify_pending(pack_folder: &Path) {
     let _ = std::fs::write(
         pack_folder.join(DENSIFY_MARKER_NAME),
-        "This store was bulk-ingested (git import or a franchise bundle install) and has not \
+        "This store was bulk-ingested (git import or a clone bundle install) and has not \
         been through a full delta-compress pass yet. Run \"forklift store compact --all --redelta\" \
         to shrink it further. Safe to delete; it is only a hint.\n",
     );
@@ -2542,11 +2542,11 @@ struct StagedTransportPack {
 /// Import consecutive native pack/index sections from `reader`. Every section is copied to an
 /// ignored temp file, the complete incoming set is structurally and content-hash verified, and
 /// only then are its pack pairs made visible. A failure before publication removes every temp;
-/// a crash during publication leaves at worst a valid subset, which the ordinary franchise
+/// a crash during publication leaves at worst a valid subset, which the ordinary clone
 /// history walk heals from loose/batch fetches.
 ///
 /// The exists/rename publication sequence assumes no *concurrent* importer of the same store:
-/// `franchise` targets a directory it just created, and every other pack writer runs under the
+/// `clone` targets a directory it just created, and every other pack writer runs under the
 /// store lock (`compact`) or warehouse lock.
 ///
 /// # Returns
@@ -6665,7 +6665,7 @@ pub(crate) mod tests {
     }
 
     /// Mechanism-level probe for a held pack mapping blocking a directory's removal, isolated
-    /// from `franchise` entirely:
+    /// from `clone` entirely:
     /// does an `Mmap`'d pack file actually block `remove_dir_all` on its own containing
     /// directory? Windows-only by construction — POSIX permits unlinking (and therefore
     /// recursively removing a directory over) a file that is still mapped, verified empirically
@@ -6673,9 +6673,9 @@ pub(crate) mod tests {
     /// target and the test is gated accordingly rather than asserting something platform-
     /// specific as if it were universal.
     ///
-    /// This was written after the franchise-level regression test for the same worry turned out
+    /// This was written after the clone-level regression test for the same worry turned out
     /// not to discriminate: it passed identically with and without `invalidate_cache()` in
-    /// `franchise.rs`'s cleanup path, on Windows CI. Run directly on `windows-latest`, this probe
+    /// `clone.rs`'s cleanup path, on Windows CI. Run directly on `windows-latest`, this probe
     /// answered the question the other test couldn't: **the mechanism is not real** in this
     /// configuration. `remove_dir_all` succeeds on a directory containing a still-mapped pack.
     ///

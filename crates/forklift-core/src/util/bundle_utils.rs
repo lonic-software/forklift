@@ -78,7 +78,7 @@ pub(crate) const FOLDER_NAME_BUNDLES: &str = "bundles";
 /// The file name of the most recent bundle.
 pub(crate) const FILE_NAME_LATEST: &str = "latest";
 
-/// The file name of a remote's bundle while it is downloaded and imported: kept across franchise
+/// The file name of a remote's bundle while it is downloaded and imported: kept across clone
 /// attempts, and published as `latest` only once imported.
 pub(crate) const FILE_NAME_DOWNLOAD: &str = "partial";
 
@@ -114,7 +114,7 @@ pub struct ImportStats {
     pub stored_signatures: usize,
     pub skipped_records: usize,
     /// Whether this import installed native packs straight from the bundle (only the whole-
-    /// warehouse native format does this — see `import_native_bundle_reader`). `franchise` uses
+    /// warehouse native format does this — see `import_native_bundle_reader`). `clone` uses
     /// this to gate its densify suggestion: those packs are exactly the far end's own bulk-
     /// ingest shape, never having seen cross-path similarity.
     pub installed_packs: bool,
@@ -211,7 +211,7 @@ pub fn build_bundle() -> Result<BuildStats, String> {
     let mut stats = BuildStats { objects: 0, deltas: 0, signatures: 0, path: bundle_path.clone() };
 
     // Every parcel reachable from any pallet head — user *and* meta, so a bundle carries
-    // the office (a franchise imports trust from it), then each parcel's closure.
+    // the office (a clone imports trust from it), then each parcel's closure.
     let mut heads: Vec<String> = Vec::new();
 
     for (_, head) in pallet_utils::all_pallet_refs()? {
@@ -707,7 +707,7 @@ fn plan_tree_closure(walk: &mut PlanWalk,
         // chunked file's *recipe* as bytes (a blob record moves it undecoded), but the result would
         // be a bundle over a file whose chunks it cannot contain — unmaterializable wherever it
         // lands. So this guard stays even now that chunk transport has shipped: a chunked file
-        // reaches a peer over the wire per object (franchise/lower/expand fetch the recipe from the
+        // reaches a peer over the wire per object (clone/lower/expand fetch the recipe from the
         // bundle, then the chunks loose), never inside a bundle. Refuse loudly rather than ship one
         // silently incomplete.
         if file.item_type.is_chunked() {

@@ -84,7 +84,7 @@ pub fn read_state_in(dir: &Path) -> Result<Option<CherryPickState>, String> {
         .map_err(|e| format!("Error while reading \"{}\": {}", path.to_string_lossy(), e))?;
 
     let state: CherryPickState = serde_json::from_str(&content).map_err(|_| format!(
-        "The cherry-pick state file \"{}\" is malformed; remove it to abort the pick.",
+        "The pick state file \"{}\" is malformed; remove it to abort the pick.",
         path.to_string_lossy()
     ))?;
 
@@ -93,7 +93,7 @@ pub fn read_state_in(dir: &Path) -> Result<Option<CherryPickState>, String> {
 
     if !is_valid {
         return Err(format!(
-            "The cherry-pick state file \"{}\" is malformed; remove it to abort the pick.",
+            "The pick state file \"{}\" is malformed; remove it to abort the pick.",
             path.to_string_lossy()
         ));
     }
@@ -111,7 +111,7 @@ pub fn read_state_in(dir: &Path) -> Result<Option<CherryPickState>, String> {
 /// * `Err(String)` - If the file could not be serialized or written.
 pub fn write_state(state: &CherryPickState) -> Result<(), String> {
     let json = serde_json::to_string(state)
-        .map_err(|e| format!("Error while serializing the cherry-pick state: {}", e))?;
+        .map_err(|e| format!("Error while serializing the pick state: {}", e))?;
 
     file_utils::write_file_atomically(&state_path(), json.as_bytes())
 }

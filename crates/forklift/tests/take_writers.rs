@@ -60,7 +60,7 @@ const WRITERS: &[(&str, &str, Class)] = &[
     ("crates/forklift-core/src/util/tombstone_utils.rs", "restore_pallet", Class::Verifies),
     ("crates/forklift/src/commands/bay.rs", "add", Class::CopiesLocal),
     ("crates/forklift/src/commands/consolidate.rs", "fast_forward", Class::CopiesLocal),
-    ("crates/forklift/src/commands/franchise.rs", "franchise_into_prepared_target", Class::Verifies),
+    ("crates/forklift/src/commands/clone.rs", "franchise_into_prepared_target", Class::Verifies),
     ("crates/forklift/src/commands/import_git.rs", "handle_command", Class::RefusesWhenAnchored),
     ("crates/forklift/src/commands/lower.rs", "lower_working_pallet", Class::Verifies),
     ("crates/forklift/src/commands/lower.rs", "lower_named_pallet", Class::Verifies),

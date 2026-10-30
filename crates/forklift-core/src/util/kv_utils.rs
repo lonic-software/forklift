@@ -225,7 +225,7 @@ pub fn set(subject: &str,
     validate_value(text)?;
 
     let edit = meta_tree::set_cell(&cell_path(subject, key), &signer.key_id, KV_TEXT_SCHEMA, &text_value(text))?;
-    let description = format!("kv set {} {}", subject, key);
+    let description = format!("manifest set {} {}", subject, key);
 
     meta_tree::stack_meta_edits(KV_PALLET_NAME, &KvRules, office, &[edit], actor, &description, signer)
 }
@@ -243,7 +243,7 @@ pub fn unset(subject: &str,
     }
 
     let edit = CellEdit::Unset { path: cell_path(subject, key) };
-    let description = format!("kv unset {} {}", subject, key);
+    let description = format!("manifest unset {} {}", subject, key);
 
     meta_tree::stack_meta_edits(KV_PALLET_NAME, &KvRules, office, &[edit], actor, &description, signer)?
         .ok_or(format!("{} has no value for the key \"{}\".", short(subject), key))

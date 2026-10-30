@@ -188,7 +188,7 @@ async fn mirror_trust(client: &RemoteClient, info: &forklift_core::model::remote
 }
 
 /// Refuse a view that may hold only part of each tree: a scoped bay, or a partial warehouse (its
-/// fetch scope path-pruned, or franchised with `--cache`). An export of a partial tree would be a
+/// fetch scope path-pruned, or cloned with `--cache`). An export of a partial tree would be a
 /// different commit.
 fn refuse_partial_view() -> Result<(), CoreError> {
     crate::commands::scope::refuse_in_scoped_bay(
@@ -199,9 +199,9 @@ fn refuse_partial_view() -> Result<(), CoreError> {
     if scope_utils::content_may_be_absent()? {
         return Err(CoreError::refusal(
             RefusalCode::SparseWorkspace,
-            "\"forklift git mirror\" needs every file of each mirrored pallet, and this warehouse was franchised \
+            "\"forklift git mirror\" needs every file of each mirrored pallet, and this warehouse was cloned \
             with --only or --cache, so it may lack some of them.",
-            "Run \"forklift git mirror\" from a franchise made without --only or --cache.",
+            "Run \"forklift git mirror\" from a clone made without --only or --cache.",
         ));
     }
 

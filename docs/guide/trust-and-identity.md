@@ -72,8 +72,8 @@ this warehouse must be signed** — this cannot be undone.
   boundary head this store holds is counted as legacy as usual. It is when an
   unsigned parcel is **not** reachable from anything present, **and** this store
   cannot resolve the boundary — it never held one of the named heads (`enroll`
-  pins a remote's declared heads without fetching them, and `franchise` copies
-  the anchor verbatim while fetching only the one pallet it franchises), or has
+  pins a remote's declared heads without fetching them, and `clone` copies
+  the anchor verbatim while fetching only the one pallet it clones), or has
   genuinely lost one it once held, or an ancestor behind one — that `audit`
   refuses rather than concluding the parcel was stacked after
   trust: it names the specific boundary parcel it could not find and says
@@ -94,7 +94,7 @@ this warehouse must be signed** — this cannot be undone.
 
 ### Joining a trusted warehouse: first contact
 
-The first `franchise` or `lower` against a trusted remote **adopts its trust
+The first `clone` or `lower` against a trusted remote **adopts its trust
 anchor** — trust-on-first-use, like an SSH host key. It is never silent: the
 command warns, naming the remote and the adopted genesis, and its report records
 that genesis (`adopted_genesis` under `--json`, where the warning is a
@@ -104,7 +104,7 @@ whoever runs the warehouse — because every later sync is checked against it.
 To check it *before* anything is fetched, pin it:
 
 ```sh
-forklift franchise <url> my-project --expect <genesis>
+forklift clone <url> my-project --expect <genesis>
 forklift lower --expect <genesis>
 ```
 
@@ -133,9 +133,9 @@ overrides it).
 
 A head another store serves becomes this warehouse's at the ref write that
 adopts it, so every such write is judged first, with the same check `audit` runs:
-`lower` (of the working pallet or one named), `franchise`, `lift`'s auto-merge
+`lower` (of the working pallet or one named), `clone`, `lift`'s auto-merge
 of a remote that moved ahead, and `git mirror` before it exports a head to git — and,
-for a parcel already in the store, `pallet create <name> <hash>` and `haul merge`.
+for a parcel already in the store, `pallet create <name> <hash>` and `haul consolidate`.
 With an anchor held, the head's history must verify against it and the office
 this warehouse holds; nothing the remote serves gets past them, including a
 remote stripped of both its anchor and its office. At first contact it must
@@ -144,8 +144,8 @@ must verify against that anchor too, before either is installed.
 
 A head that does not verify is refused with `history_unverified` (exit 34) before
 anything is recorded: no ref moves, no working file changes, and at first contact
-no anchor, office or meta pallet is installed (a franchise reports it as
-`franchise_incomplete` with `cause_code: "history_unverified"`, keeping what it
+no anchor, office or meta pallet is installed (a clone reports it as
+`clone_incomplete` with `cause_code: "history_unverified"`, keeping what it
 fetched; a mirror reports it as that pallet's failure). The objects fetched stay
 in the store, unreferenced. Run `audit` where the history came from.
 
@@ -154,7 +154,7 @@ in the store, unreferenced. Run `audit` where the history came from.
   finishes is held to the same pair: an office change in between rolls the
   lower back instead.
 - A store that lacks the boundary ancestry a verdict needs — a sparse
-  franchise, or a lower of a pallet whose pre-trust history is bounded by
+  clone, or a lower of a pallet whose pre-trust history is bounded by
   another pallet's head — fetches that boundary from the remote and judges
   again. A remote that cannot serve it is refused, naming the parcel.
 - The pallets this warehouse held before it took a remote's anchor — at first
@@ -167,7 +167,7 @@ in the store, unreferenced. Run `audit` where the history came from.
 - A merge signed here makes the merged history this warehouse's, so the `stack`
   that completes a conflicted merge judges the merged head again under the
   office it signs under: a key revoked since the merge began refuses it.
-- A cache (`franchise --cache`) takes every parcel and signature of the history,
+- A cache (`clone --cache`) takes every parcel and signature of the history,
   so its takes are judged exactly as a full warehouse's are. The content it
   fetches later, when a command reads or writes it, is checked against the hash
   it was asked for before it is stored. That hash comes from the signed history,
@@ -232,7 +232,7 @@ Every operator has a role (recorded in their signed office record):
 operator's own identity** — a per-operator token, or an `authentication` hook — not a
 property of the signature itself. The `--pallet` grant is scoped to working pallets
 only: a `writer`'s granted-pallet list restricts which *working* pallets they may move, but
-every meta pallet is exempt from it **at transport** (the set is fixed — `@office`, `@manifest`, `@haul`, `@tags`, `@kv` — and an `@name` outside it is refused, by the server, the serverless head and a franchising client alike)
+every meta pallet is exempt from it **at transport** (the set is fixed — `@office`, `@manifest`, `@haul`, `@tags`, `@kv` — and an `@name` outside it is refused, by the server, the serverless head and a cloning client alike)
 — any non-`reader` may move a meta pallet's ref regardless of what working pallets they are
 granted. `docs/SERVER.md`'s "Per-operator tokens" section (row 3 and the paragraph below the
 table) is the authoritative statement of that transport rule and of what the content-level
@@ -427,7 +427,7 @@ anchor or a pallet the reset vouches for while it runs, the reset is refused and
 writes nothing; run it again. Accepting a reset is refused the same way when the
 office or the anchor moved while it ran.
 
-The attested history travels with the anchor. Accepting the reset, or franchising
+The attested history travels with the anchor. Accepting the reset, or cloning
 from the remote after it, fetches the old office chain. Lifting a re-genesis to a
 remote that has no anchor yet uploads that chain first. A server refuses an anchor
 whose attested history it does not hold.
@@ -476,7 +476,7 @@ into a state a local `audit` would reject — and a client runs them again on
 everything it takes (§2), so history altered in a remote's storage behind its
 server is refused at the sync rather than found by a later `audit`.
 
-In a cache (`franchise --cache`), `audit` checks every signature as above, since
+In a cache (`clone --cache`), `audit` checks every signature as above, since
 a cache holds every parcel. It reads only the content the cache holds and counts
 the rest as held by hash, without fetching it.
 

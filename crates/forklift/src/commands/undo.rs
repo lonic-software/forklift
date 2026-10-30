@@ -39,7 +39,7 @@ pub async fn handle_command(as_name: Option<&str>) -> Result<(), String> {
     let Some(entry) = journal_utils::peek()? else {
         return Err(
             "There is nothing to undo: the undo journal is empty. Only stack, consolidate, \
-            cherry-pick, shift and a pallet delete are journaled, and a pallet's first parcel \
+            pick, shift and a pallet delete are journaled, and a pallet's first parcel \
             cannot be undone."
                 .to_string()
         );

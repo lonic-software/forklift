@@ -35,7 +35,9 @@ pub const TOOL: &str = "forklift";
 /// `data` shape or the error-code registry changes incompatibly, so an agent can pin it and
 /// detect drift.
 ///
-/// Version 9 (this one): `batch_lane` may be `out_of_time`, when the remote ran out of time for a
+/// Version 13 (this one): the `franchise_incomplete` error code is renamed `clone_incomplete`.
+/// Versions 10–12 are recorded in docs/MACHINE_INTERFACE.md.
+/// Version 9: `batch_lane` may be `out_of_time`, when the remote ran out of time for a
 /// batch download and the rest of the command fetched one object at a time.
 /// Version 8: the `pallet_deleted_on_remote` error code exists; `palletize --remote`
 /// lists the remote's deleted pallets as `deleted`, and `palletize` lists this served warehouse's
@@ -59,7 +61,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 12;
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -197,14 +199,14 @@ pub fn message(text: impl Into<String>) {
 }
 
 /// The densify suggestion (§ densify-pending marker, `forklift_core::util::pack_utils`): shown
-/// by `store`, `git import` and `franchise` whenever the object store carries content a bulk
+/// by `store`, `git import` and `clone` whenever the object store carries content a bulk
 /// ingest wrote without ever seeing cross-path similarity. One shared string so the three
 /// commands never drift apart in wording. Never phrased as "recommended" — redelta is an
 /// optional, opt-in, CPU-bound pass, not something owed to every store.
 pub const DENSIFY_TIP: &str = "Tip: \"forklift store compact --all --redelta\" can significantly \
     shrink this store (one-shot, takes a few minutes on large histories).";
 
-/// The line `franchise`, `lower`, `expand`, `lift` and `office accept-regenesis` print when their
+/// The line `clone`, `lower`, `expand`, `lift` and `office accept-regenesis` print when their
 /// remote's batch lane closed, so a command that ran slow says why. One shared wording, so the
 /// commands never drift apart.
 pub fn batch_lane_line(closure: BatchLaneClosure) -> &'static str {
@@ -492,12 +494,12 @@ error_codes! {
     /// A command named a pallet this warehouse holds no ref for.
     PalletNotFound,
 
-    /// The directory holds a franchise that has not finished; running the same `franchise` again
+    /// The directory holds a clone that has not finished; running the same `clone` again
     /// resumes it. `error.details` carries `{directory, remote, cause_code, retry}`; `remote` is
     /// `null` when the record cannot be read, `cause_code` and `retry` when no attempt failed.
-    FranchiseIncomplete,
+    CloneIncomplete,
 
-    /// A sparse franchise's `--only` prefix names no directory in the pallet on the remote.
+    /// A sparse clone's `--only` prefix names no directory in the pallet on the remote.
     OnlyPrefixNotFound,
 
     /// A lift's commit named a blob the remote holds neither staged nor in the warehouse: the
@@ -561,7 +563,7 @@ impl ErrorCode {
             ErrorCode::TargetNotCovered => RefusalCode::TargetNotCovered.as_str(),
             ErrorCode::RemoteAhead => RefusalCode::RemoteAhead.as_str(),
             ErrorCode::PalletNotFound => RefusalCode::PalletNotFound.as_str(),
-            ErrorCode::FranchiseIncomplete => RefusalCode::FranchiseIncomplete.as_str(),
+            ErrorCode::CloneIncomplete => RefusalCode::CloneIncomplete.as_str(),
             ErrorCode::OnlyPrefixNotFound => RefusalCode::OnlyPrefixNotFound.as_str(),
             ErrorCode::StagedUploadDiscarded => RefusalCode::StagedUploadDiscarded.as_str(),
             ErrorCode::MirrorIncomplete => RefusalCode::MirrorIncomplete.as_str(),
@@ -607,7 +609,7 @@ impl ErrorCode {
             ErrorCode::TargetNotCovered => 27,
             ErrorCode::RemoteAhead => 28,
             ErrorCode::PalletNotFound => 29,
-            ErrorCode::FranchiseIncomplete => 30,
+            ErrorCode::CloneIncomplete => 30,
             ErrorCode::OnlyPrefixNotFound => 31,
             ErrorCode::StagedUploadDiscarded => 32,
             ErrorCode::MirrorIncomplete => 33,
@@ -660,7 +662,7 @@ impl ErrorCode {
             ErrorCode::EmptyHistory =>
                 "\"forklift history\" was asked to walk a pallet that has nothing stacked on it yet",
             ErrorCode::IncompleteLoad =>
-                "\"forklift stack\", \"forklift park\", \"forklift consolidate\" or \"forklift cherry-pick\" refused because a \
+                "\"forklift stack\", \"forklift park\", \"forklift consolidate\" or \"forklift pick\" refused because a \
                  \"forklift load\" that never finished cleanly is still recorded, or a command refused \
                  because an operation that rewrites the whole staging area was interrupted (\"forklift heal\" finishes or undoes it)",
             ErrorCode::DurabilityTaint =>
@@ -691,11 +693,11 @@ impl ErrorCode {
                 "No pallet of that name exists in this warehouse (or, for \"forklift lower\", on the \
                  remote); \"forklift lower <name>\" brings in the remote's, \"forklift pallet create <name>\" creates a \
                  new one, \"forklift pallet list --remote\" lists the remote's",
-            ErrorCode::FranchiseIncomplete =>
-                "The directory holds a franchise that has not finished; running the same \
-                 \"forklift franchise\" again resumes it and keeps what was fetched",
+            ErrorCode::CloneIncomplete =>
+                "The directory holds a clone that has not finished; running the same \
+                 \"forklift clone\" again resumes it and keeps what was fetched",
             ErrorCode::OnlyPrefixNotFound =>
-                "A sparse franchise's --only path is not a directory in the pallet on the remote",
+                "A sparse clone's --only path is not a directory in the pallet on the remote",
             ErrorCode::StagedUploadDiscarded =>
                 "A lift's commit named an upload the remote no longer holds (discarded or never \
                  received); running the lift again uploads it afresh",
@@ -753,7 +755,7 @@ impl ErrorCode {
             RefusalCode::RemoteAhead => ErrorCode::RemoteAhead,
             RefusalCode::Diverged => ErrorCode::Diverged,
             RefusalCode::PalletNotFound => ErrorCode::PalletNotFound,
-            RefusalCode::FranchiseIncomplete => ErrorCode::FranchiseIncomplete,
+            RefusalCode::CloneIncomplete => ErrorCode::CloneIncomplete,
             RefusalCode::OnlyPrefixNotFound => ErrorCode::OnlyPrefixNotFound,
             RefusalCode::StagedUploadDiscarded => ErrorCode::StagedUploadDiscarded,
             RefusalCode::MirrorIncomplete => ErrorCode::MirrorIncomplete,
@@ -955,7 +957,7 @@ fn maintenance_unavailable_warning_text(mode: OutputMode, error: &str) -> String
     }
 }
 
-/// The `--json` warning code for a remote head that a lift landed, or a lower or franchise was
+/// The `--json` warning code for a remote head that a lift landed, or a lower or clone was
 /// served, but that could not be added to the held-heads record.
 pub const CODE_HELD_HEAD_UNRECORDED: &str = "held_head_unrecorded";
 
@@ -963,7 +965,7 @@ pub const CODE_HELD_HEAD_UNRECORDED: &str = "held_head_unrecorded";
 /// prune to ask the remote about, so the command's own work stands.
 pub const HELD_HEAD_UNRECORDED_NEXT_STEP: &str =
     "Resolve the reported cause; a held-heads record that does not parse can be removed, and the \
-     next lift, lower or franchise starts a new one. The command's own work is unaffected.";
+     next lift, lower or clone starts a new one. The command's own work is unaffected.";
 
 /// Surface a remote head left out of the held-heads record, on the stderr side-channel the other
 /// warnings use: the command succeeded, and the exit code stays its own.
@@ -1028,7 +1030,7 @@ fn pallets_unvouched_warning_text(mode: OutputMode, pallets: &[String]) -> Strin
         names.join(", ")
     );
     let next_step = "As an enrolled signer, re-stack the work onto a pallet the anchor vouches for \
-        (\"forklift cherry-pick\"), or delete the pallet (\"forklift pallet delete <name>\", which \
+        (\"forklift pick\"), or delete the pallet (\"forklift pallet delete <name>\", which \
         needs --force when no other pallet holds that work).";
 
     match mode {
@@ -1039,7 +1041,7 @@ fn pallets_unvouched_warning_text(mode: OutputMode, pallets: &[String]) -> Strin
     }
 }
 
-/// Announce a trust anchor adopted on first contact (`lower`, `franchise`). Adoption is never
+/// Announce a trust anchor adopted on first contact (`lower`, `clone`). Adoption is never
 /// silent: this names the adopted value, so a reader can check it out of band, and under `--json`
 /// it is a warning document on stderr whose `details` carry the value — the command's own result
 /// stays the one document on stdout.
@@ -1060,7 +1062,7 @@ fn trust_adopted_warning_text(mode: OutputMode, details: &trust_utils::TrustDeta
     );
     let next_step = format!(
         "Verify that genesis out of band. To check it before anything is fetched, pass \
-         --expect {} to franchise or lower.",
+         --expect {} to clone or lower.",
         genesis
     );
 
@@ -1255,7 +1257,7 @@ mod tests {
             (RefusalCode::TargetNotCovered, "target_not_covered", 27),
             (RefusalCode::RemoteAhead, "remote_ahead", 28),
             (RefusalCode::PalletNotFound, "pallet_not_found", 29),
-            (RefusalCode::FranchiseIncomplete, "franchise_incomplete", 30),
+            (RefusalCode::CloneIncomplete, "clone_incomplete", 30),
             (RefusalCode::OnlyPrefixNotFound, "only_prefix_not_found", 31),
             (RefusalCode::StagedUploadDiscarded, "staged_upload_discarded", 32),
             (RefusalCode::MirrorIncomplete, "mirror_incomplete", 33),

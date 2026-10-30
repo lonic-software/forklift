@@ -489,14 +489,14 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
         Command::Conflicts => commands::conflicts::handle_command(),
         Command::Bay { action } => commands::bay::handle_command(action),
         Command::Consolidate { pallet } => commands::consolidate::handle_command(&pallet).await,
-        Command::CherryPick { revision, message } => commands::cherry_pick::handle_command(&revision, message).await,
+        Command::Pick { revision, message } => commands::pick::handle_command(&revision, message).await,
         Command::Deliver { target, message } => commands::deliver::handle_command(&target, message),
         Command::Diff { staged, targets } => commands::diff::handle_command(staged, &targets, cli.verbose).await,
         Command::Help { .. } => unreachable!("help is answered in `forklift`, before dispatch"),
         Command::Expand { paths } => commands::expand::handle_command(paths).await,
         Command::Narrow { paths } => commands::narrow::handle_command(paths).await,
-        Command::Franchise { url, directory, pallet, token, only, cache, expect } =>
-            commands::franchise::handle_command(&url, &directory, pallet, token, only, cache, expect).await,
+        Command::Clone { url, directory, pallet, token, only, cache, expect } =>
+            commands::clone::handle_command(&url, &directory, pallet, token, only, cache, expect).await,
         Command::Heal => {
             let store_access = store_access.ok_or("heal ran without its store-access hold.")?;
             commands::heal::handle_command(store_access).await
@@ -583,7 +583,6 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
         Command::Show { target } => commands::show::handle_command(&target),
         Command::Stack { description } => commands::stack::handle_command(description).await,
         Command::Tag { action } => commands::tag::handle_command(action).await,
-        Command::Kv { action } => commands::kv::handle_command(action),
         Command::Stocktake { summary } => commands::stocktake::handle_command(summary).await,
         Command::Undo { as_name } => commands::undo::handle_command(as_name.as_deref()).await,
         Command::Unload { path } => commands::unload::handle_command(&path),

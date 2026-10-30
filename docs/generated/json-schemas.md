@@ -118,7 +118,7 @@ A command not listed here either reports only the generic human-message shape `{
       "description": "What a content audit checked, and (on a partial warehouse) what it sealed rather than verified.\nEmitted so a skimming reader or agent can never mistake a sparse pass — which verified content\nonly within the fetch scope — or a cache pass — which verified only the content it holds — for\na full-clone pass, nor a presence-only pass for a `--full` re-read.",
       "properties": {
         "cache": {
-          "description": "The warehouse is a cache (franchised with `--cache`): it may lack content its history\nreaches, held by hash alone and counted in `held_by_hash`. Omitted on any other warehouse.",
+          "description": "The warehouse is a cache (cloned with `--cache`): it may lack content its history\nreaches, held by hash alone and counted in `held_by_hash`. Omitted on any other warehouse.",
           "type": "boolean"
         },
         "chunks": {
@@ -446,57 +446,122 @@ A command not listed here either reports only the generic human-message shape `{
 }
 ```
 
-## `cherry-pick`
+## `clone`
 
-### `CherryPicked`
+### `CloneReport`
 
 ```json
 {
   "$defs": {
-    "CherryPickOutcome": {
-      "description": "What a cherry-pick did. `Conflicts` is the only outcome that leaves work for the operator\n(resolve, load, stack); `Applied` is complete.",
-      "enum": [
-        "applied",
-        "conflicts"
-      ],
-      "type": "string"
+    "BatchLaneClosure": {
+      "description": "Why the remote's batch download stopped being used, after which the command fetched one\nobject at a time.",
+      "oneOf": [
+        {
+          "const": "endpoint_absent",
+          "description": "The remote does not serve batch downloads.",
+          "type": "string"
+        },
+        {
+          "const": "degraded",
+          "description": "The remote was too slow to start a batch answer.",
+          "type": "string"
+        },
+        {
+          "const": "out_of_time",
+          "description": "The remote ran short of time to answer a batch, and sent only part of it.",
+          "type": "string"
+        }
+      ]
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "The result of a cherry-pick.",
+  "description": "The result of a clone: what was imported and which pallet was checked out.",
   "properties": {
-    "conflicts": {
-      "description": "The conflicting paths, when the pick did not complete cleanly.",
-      "items": {
-        "type": "string"
-      },
-      "type": "array"
-    },
-    "outcome": {
-      "$ref": "#/$defs/CherryPickOutcome"
-    },
-    "pallet": {
-      "description": "The pallet the pick applied to (the current one).",
-      "type": "string"
-    },
-    "parcel": {
-      "description": "The new parcel, when the pick completed cleanly.",
+    "adopted_genesis": {
+      "description": "The genesis of the remote's trust anchor, adopted on this first contact (absent when the\nremote has none).",
       "type": [
         "string",
         "null"
       ]
     },
-    "source": {
-      "description": "The parcel that was picked.",
+    "batch_lane": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BatchLaneClosure"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Why the remote's batch download stopped being used, when it did. Absent when it stayed open."
+    },
+    "bundle_objects": {
+      "description": "Objects imported from the remote's bundle, when it had one.",
+      "format": "uint",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "bundle_signatures": {
+      "format": "uint",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "directory": {
       "type": "string"
+    },
+    "fetched_objects": {
+      "description": "Loose objects fetched for the materialized pallet.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "head": {
+      "description": "Its head (`null` when the pallet is unborn on the remote).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "meta_adopted": {
+      "description": "The meta pallets (e.g. `@manifest`) adopted from the remote.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "pallet": {
+      "description": "The pallet checked out.",
+      "type": "string"
+    },
+    "remote": {
+      "type": "string"
+    },
+    "scope": {
+      "description": "The sparse fetch scope, when this was a sparse (`--only`) clone (empty otherwise).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "unborn": {
+      "description": "Whether the checked-out pallet started unborn.",
+      "type": "boolean"
     }
   },
   "required": [
-    "outcome",
-    "source",
-    "pallet"
+    "remote",
+    "directory",
+    "pallet",
+    "unborn",
+    "fetched_objects"
   ],
-  "title": "CherryPicked",
+  "title": "CloneReport",
   "type": "object"
 }
 ```
@@ -853,126 +918,6 @@ A command not listed here either reports only the generic human-message shape `{
     "files"
   ],
   "title": "DiffReport",
-  "type": "object"
-}
-```
-
-## `franchise`
-
-### `FranchiseReport`
-
-```json
-{
-  "$defs": {
-    "BatchLaneClosure": {
-      "description": "Why the remote's batch download stopped being used, after which the command fetched one\nobject at a time.",
-      "oneOf": [
-        {
-          "const": "endpoint_absent",
-          "description": "The remote does not serve batch downloads.",
-          "type": "string"
-        },
-        {
-          "const": "degraded",
-          "description": "The remote was too slow to start a batch answer.",
-          "type": "string"
-        },
-        {
-          "const": "out_of_time",
-          "description": "The remote ran short of time to answer a batch, and sent only part of it.",
-          "type": "string"
-        }
-      ]
-    }
-  },
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "The result of a franchise: what was imported and which pallet was checked out.",
-  "properties": {
-    "adopted_genesis": {
-      "description": "The genesis of the remote's trust anchor, adopted on this first contact (absent when the\nremote has none).",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "batch_lane": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/BatchLaneClosure"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "Why the remote's batch download stopped being used, when it did. Absent when it stayed open."
-    },
-    "bundle_objects": {
-      "description": "Objects imported from the remote's bundle, when it had one.",
-      "format": "uint",
-      "minimum": 0,
-      "type": [
-        "integer",
-        "null"
-      ]
-    },
-    "bundle_signatures": {
-      "format": "uint",
-      "minimum": 0,
-      "type": [
-        "integer",
-        "null"
-      ]
-    },
-    "directory": {
-      "type": "string"
-    },
-    "fetched_objects": {
-      "description": "Loose objects fetched for the materialized pallet.",
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "head": {
-      "description": "Its head (`null` when the pallet is unborn on the remote).",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "meta_adopted": {
-      "description": "The meta pallets (e.g. `@manifest`) adopted from the remote.",
-      "items": {
-        "type": "string"
-      },
-      "type": "array"
-    },
-    "pallet": {
-      "description": "The pallet checked out.",
-      "type": "string"
-    },
-    "remote": {
-      "type": "string"
-    },
-    "scope": {
-      "description": "The sparse fetch scope, when this was a sparse (`--only`) franchise (empty otherwise).",
-      "items": {
-        "type": "string"
-      },
-      "type": "array"
-    },
-    "unborn": {
-      "description": "Whether the checked-out pallet started unborn.",
-      "type": "boolean"
-    }
-  },
-  "required": [
-    "remote",
-    "directory",
-    "pallet",
-    "unborn",
-    "fetched_objects"
-  ],
-  "title": "FranchiseReport",
   "type": "object"
 }
 ```
@@ -2511,7 +2456,191 @@ A command not listed here either reports only the generic human-message shape `{
 }
 ```
 
-## `kv`
+## `manifest`
+
+### `Recorded`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "A newly recorded manifest entry.",
+  "properties": {
+    "body": {
+      "type": "string"
+    },
+    "kind": {
+      "type": "string"
+    },
+    "manifest_head": {
+      "description": "The head of the manifest pallet that holds the entry.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "operator": {
+      "type": "string"
+    },
+    "subject": {
+      "type": "string"
+    },
+    "unchanged": {
+      "description": "Whether the operator had already recorded exactly this entry, so nothing was written.",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "kind",
+    "subject",
+    "operator",
+    "body",
+    "unchanged",
+    "manifest_head"
+  ],
+  "title": "Recorded",
+  "type": "object"
+}
+```
+
+### `ManifestView`
+
+```json
+{
+  "$defs": {
+    "EntryView": {
+      "description": "One manifest entry in a view, with its forge-proof author.",
+      "properties": {
+        "author": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        },
+        "checkpoints": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": "string"
+        },
+        "model": {
+          "description": "Provenance fields, present only on a provenance entry.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "recorded_at": {
+          "description": "When a provenance entry was recorded (Unix seconds); only provenance carries a time.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "description": "Delivery fields, present only on a delivery entry.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "subject": {
+          "type": "string"
+        },
+        "tool": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "trail_head": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "transcript": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "subject",
+        "author",
+        "body"
+      ],
+      "type": "object"
+    },
+    "UnreadableView": {
+      "description": "A manifest cell this forklift cannot read.",
+      "properties": {
+        "path": {
+          "description": "The cell's path in the pallet.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why it cannot be read.",
+          "type": "string"
+        },
+        "subject": {
+          "description": "The subject, when the cell's path names one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "reason"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The manifest, or the slice of it about one parcel.",
+  "properties": {
+    "entries": {
+      "items": {
+        "$ref": "#/$defs/EntryView"
+      },
+      "type": "array"
+    },
+    "subject": {
+      "description": "The parcel the view is scoped to (`null` when listing the whole manifest).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "unreadable": {
+      "description": "Entries this forklift cannot read — a newer kind or schema, or a malformed cell. Listed,\nnever dropped.",
+      "items": {
+        "$ref": "#/$defs/UnreadableView"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "entries"
+  ],
+  "title": "ManifestView",
+  "type": "object"
+}
+```
 
 ### `Changed`
 
@@ -2754,192 +2883,6 @@ A command not listed here either reports only the generic human-message shape `{
     "changes"
   ],
   "title": "KvLog",
-  "type": "object"
-}
-```
-
-## `manifest`
-
-### `Recorded`
-
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "A newly recorded manifest entry.",
-  "properties": {
-    "body": {
-      "type": "string"
-    },
-    "kind": {
-      "type": "string"
-    },
-    "manifest_head": {
-      "description": "The head of the manifest pallet that holds the entry.",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "operator": {
-      "type": "string"
-    },
-    "subject": {
-      "type": "string"
-    },
-    "unchanged": {
-      "description": "Whether the operator had already recorded exactly this entry, so nothing was written.",
-      "type": "boolean"
-    }
-  },
-  "required": [
-    "kind",
-    "subject",
-    "operator",
-    "body",
-    "unchanged",
-    "manifest_head"
-  ],
-  "title": "Recorded",
-  "type": "object"
-}
-```
-
-### `ManifestView`
-
-```json
-{
-  "$defs": {
-    "EntryView": {
-      "description": "One manifest entry in a view, with its forge-proof author.",
-      "properties": {
-        "author": {
-          "type": "string"
-        },
-        "body": {
-          "type": "string"
-        },
-        "checkpoints": {
-          "format": "int64",
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "kind": {
-          "type": "string"
-        },
-        "model": {
-          "description": "Provenance fields, present only on a provenance entry.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "recorded_at": {
-          "description": "When a provenance entry was recorded (Unix seconds); only provenance carries a time.",
-          "format": "int64",
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "session": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "source": {
-          "description": "Delivery fields, present only on a delivery entry.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "subject": {
-          "type": "string"
-        },
-        "tool": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "trail_head": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "transcript": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "kind",
-        "subject",
-        "author",
-        "body"
-      ],
-      "type": "object"
-    },
-    "UnreadableView": {
-      "description": "A manifest cell this forklift cannot read.",
-      "properties": {
-        "path": {
-          "description": "The cell's path in the pallet.",
-          "type": "string"
-        },
-        "reason": {
-          "description": "Why it cannot be read.",
-          "type": "string"
-        },
-        "subject": {
-          "description": "The subject, when the cell's path names one.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "path",
-        "reason"
-      ],
-      "type": "object"
-    }
-  },
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "The manifest, or the slice of it about one parcel.",
-  "properties": {
-    "entries": {
-      "items": {
-        "$ref": "#/$defs/EntryView"
-      },
-      "type": "array"
-    },
-    "subject": {
-      "description": "The parcel the view is scoped to (`null` when listing the whole manifest).",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "unreadable": {
-      "description": "Entries this forklift cannot read — a newer kind or schema, or a malformed cell. Listed,\nnever dropped.",
-      "items": {
-        "$ref": "#/$defs/UnreadableView"
-      },
-      "type": "array"
-    }
-  },
-  "required": [
-    "entries"
-  ],
-  "title": "ManifestView",
   "type": "object"
 }
 ```
@@ -3463,6 +3406,61 @@ A command not listed here either reports only the generic human-message shape `{
     "parked"
   ],
   "title": "ParkedList",
+  "type": "object"
+}
+```
+
+## `pick`
+
+### `Picked`
+
+```json
+{
+  "$defs": {
+    "PickOutcome": {
+      "description": "What a cherry-pick did. `Conflicts` is the only outcome that leaves work for the operator\n(resolve, load, stack); `Applied` is complete.",
+      "enum": [
+        "applied",
+        "conflicts"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The result of a cherry-pick.",
+  "properties": {
+    "conflicts": {
+      "description": "The conflicting paths, when the pick did not complete cleanly.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "outcome": {
+      "$ref": "#/$defs/PickOutcome"
+    },
+    "pallet": {
+      "description": "The pallet the pick applied to (the current one).",
+      "type": "string"
+    },
+    "parcel": {
+      "description": "The new parcel, when the pick completed cleanly.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source": {
+      "description": "The parcel that was picked.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "outcome",
+    "source",
+    "pallet"
+  ],
+  "title": "Picked",
   "type": "object"
 }
 ```
@@ -4517,7 +4515,7 @@ A command not listed here either reports only the generic human-message shape `{
       ]
     },
     "fetch_scope": {
-      "description": "The warehouse's fetch-scope prefixes (empty = fully fetched; a sparse franchise records\nits fetched prefixes here).",
+      "description": "The warehouse's fetch-scope prefixes (empty = fully fetched; a sparse clone records\nits fetched prefixes here).",
       "items": {
         "type": "string"
       },
@@ -4721,7 +4719,7 @@ A command not listed here either reports only the generic human-message shape `{
       ]
     },
     "partial": {
-      "description": "Whether this is a partial warehouse (franchised with `--only` or `--cache`), which talks\nonly to its origin.",
+      "description": "Whether this is a partial warehouse (cloned with `--only` or `--cache`), which talks\nonly to its origin.",
       "type": "boolean"
     },
     "remote": {
@@ -4978,7 +4976,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "integer"
     },
     "densify_suggested": {
-      "description": "Whether this store was bulk-ingested (`git import`, or a franchise's native bundle\ninstall) and would still benefit from a one-shot `store compact --all --redelta` pass.\nAdditive field; never acted on automatically.",
+      "description": "Whether this store was bulk-ingested (`git import`, or a clone's native bundle\ninstall) and would still benefit from a one-shot `store compact --all --redelta` pass.\nAdditive field; never acted on automatically.",
       "type": "boolean"
     },
     "foreign_version_indexes": {
@@ -5525,7 +5523,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "integer"
     },
     "kept_local": {
-      "description": "Objects the origin holds that stay for a meta pallet, a parked, consolidating or\ncherry-picking bay, a trust pin, or staged work.",
+      "description": "Objects the origin holds that stay for a meta pallet, a parked, consolidating or\npicking bay, a trust pin, or staged work.",
       "format": "uint",
       "minimum": 0,
       "type": "integer"

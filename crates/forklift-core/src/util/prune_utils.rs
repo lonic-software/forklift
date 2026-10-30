@@ -5,7 +5,7 @@
 //! from pallet heads — ordinary history, not garbage — so `gc` neither does nor structurally
 //! can free them. A prune frees them precisely because the warehouse fetch scope no longer
 //! covers their path: afterward each is sealed by the hash its parent spine tree still commits,
-//! exactly the state of an object a sparse franchise never fetched. So a prune re-enters the
+//! exactly the state of an object a sparse clone never fetched. So a prune re-enters the
 //! "sealed but unfetched" state rather than leaving a hole an absence check would flag.
 //!
 //! The reclamation is computed as the closure of the pruned subtree(s) across history, minus
@@ -564,7 +564,7 @@ fn local_roots(user_parcels: &[String], meta_parcels: &[String], sources: recove
 }
 
 /// Every object pallet history needs to survive the prune if the remote holds all of it: exactly
-/// what a fresh franchise scoped to the post-prune fetch scope would hold. Local state is added by
+/// what a fresh clone scoped to the post-prune fetch scope would hold. Local state is added by
 /// [`retain_local_closure`], and history the remote does not hold by [`retain_unlifted`].
 ///
 /// User-pallet parcels are walked scoped — the spine and every in-scope subtree in full; at an
@@ -575,7 +575,7 @@ fn local_roots(user_parcels: &[String], meta_parcels: &[String], sources: recove
 /// checked for its namespace (FORK-281).
 ///
 /// A tree or recipe recorded in `sealed` and absent is held by hash alone: it is retained and not
-/// descended, as a fresh franchise would hold it. A recorded one that is present is walked like
+/// descended, as a fresh clone would hold it. A recorded one that is present is walked like
 /// any other. Any other absent tree or recipe the walk loads fails the plan.
 fn collect_retained(
     user_parcels: &[String],

@@ -796,12 +796,12 @@ pub fn check_undoable(entry: &JournalEntry) -> Result<(), String> {
 
     if now.cherry_pick != after.cherry_pick {
         let describe = |pick: &Option<PickInProgress>| match pick {
-            Some(pick) => format!("a cherry-pick of {}", pick.source),
-            None => "no cherry-pick".to_string(),
+            Some(pick) => format!("a pick of {}", pick.source),
+            None => "no pick".to_string(),
         };
 
         return Err(format!(
-            "The cherry-pick state has changed since that operation (\"{}\"): it left {} in \
+            "The pick state has changed since that operation (\"{}\"): it left {} in \
             progress, and {} is in progress now. Undo will not reverse an older operation than \
             the last one.",
             entry.op, describe(&after.cherry_pick), describe(&now.cherry_pick)
@@ -885,7 +885,7 @@ fn refuse_a_pick_without_its_source(entry: &JournalEntry) -> Result<(), String> 
     }
 
     Err(format!(
-        "Undoing \"{}\" would put the cherry-pick of {} back in progress, but this warehouse no \
+        "Undoing \"{}\" would put the pick of {} back in progress, but this warehouse no \
         longer holds that parcel, so the pick could never be completed again. Nothing was undone. \
         The parcel that completed the pick stays; to change it, stack another on top.",
         entry.op, pick.source
@@ -1129,7 +1129,7 @@ fn validate_snapshot(snapshot: &Snapshot) -> Result<(), String> {
     if let Some(pick) = &snapshot.cherry_pick {
         if !object_utils::is_object_hash(&pick.source) || !object_utils::is_object_hash(&pick.our_head)
             || pallet_utils::validate_pallet_name(&pick.our_pallet).is_err() {
-            return Err("records a malformed cherry-pick".to_string());
+            return Err("records a malformed pick".to_string());
         }
     }
 
@@ -1599,7 +1599,7 @@ mod tests {
 
         // A conflicted pick moves no ref; it leaves the pick in progress.
         cherry_pick_utils::write_state(&CherryPickState { source: hash('c'), our_head: hash('e'), our_pallet: "main".to_string(), description: None }).unwrap();
-        push_if_changed("cherry-pick", before).unwrap();
+        push_if_changed("pick", before).unwrap();
 
         let popped = pop().unwrap().expect("a pick left in progress must be journaled");
         assert_eq!(popped.before.cherry_pick, None);
@@ -1678,9 +1678,9 @@ mod tests {
     fn pop_returns_entries_most_recent_first() {
         let _scratch = Scratch::new("pop-lifo");
 
-        write(&[entry("stack", "main", &hash('1'), &hash('2')), entry("cherry-pick", "main", &hash('2'), &hash('3'))]).unwrap();
+        write(&[entry("stack", "main", &hash('1'), &hash('2')), entry("pick", "main", &hash('2'), &hash('3'))]).unwrap();
 
-        assert_eq!(pop().unwrap().unwrap().op, "cherry-pick");
+        assert_eq!(pop().unwrap().unwrap().op, "pick");
         assert_eq!(pop().unwrap().unwrap().op, "stack");
         assert!(pop().unwrap().is_none());
     }
@@ -1789,7 +1789,7 @@ mod tests {
             (bad_head, "not an object hash"),
             (bad_name, "names an invalid pallet"),
             (bad_skeleton, "malformed out-of-scope skeleton"),
-            (bad_pick, "malformed cherry-pick"),
+            (bad_pick, "malformed pick"),
             (bad_label, "consolidation with no label"),
         ] {
             let content = serde_json::to_string(&JournalFile { version: JOURNAL_VERSION, entries: &[bad] }).unwrap();
@@ -2173,10 +2173,10 @@ mod tests {
         cherry_pick_utils::write_state(&CherryPickState { source: hash('6'), our_head: hash('e'), our_pallet: "main".to_string(), description: None }).unwrap();
 
         let error = check_undoable(&entry("stack", "main", &hash('1'), &hash('2'))).unwrap_err();
-        assert!(error.contains("it left no cherry-pick in progress"), "{}", error);
+        assert!(error.contains("it left no pick in progress"), "{}", error);
 
         // And the converse: the op left this pick in progress, and it still is.
-        let mut picked = entry("cherry-pick", "main", &hash('2'), &hash('2'));
+        let mut picked = entry("pick", "main", &hash('2'), &hash('2'));
         picked.after.cherry_pick = Some(PickInProgress { source: hash('6'), our_head: hash('e'), our_pallet: "main".to_string(), description: None });
         check_undoable(&picked).unwrap();
     }

@@ -35,7 +35,7 @@ pub async fn handle_command(action: Option<HaulAction>) -> Result<(), String> {
         Some(HaulAction::Comment { id, message }) => comment(&id, &message),
         Some(HaulAction::Review { id, request_changes, comment, message }) =>
             review(&id, request_changes, comment, message.unwrap_or_default()),
-        Some(HaulAction::Merge { id }) => merge(&id).await,
+        Some(HaulAction::Consolidate { id }) => consolidate(&id).await,
         Some(HaulAction::Close { id }) => set_status(&id, HaulStatus::Closed),
         Some(HaulAction::Reopen { id }) => set_status(&id, HaulStatus::Open),
         None => list(None),
@@ -211,7 +211,7 @@ fn set_status(id: &str, status: HaulStatus) -> Result<(), String> {
 }
 
 /// Merge a haul: consolidate its proposed head into the target, then record the merge.
-async fn merge(id: &str) -> Result<(), String> {
+async fn consolidate(id: &str) -> Result<(), String> {
     let haul = find_open(id, "merged")?;
     let (office, actor, signer) = signing()?;
 
@@ -235,7 +235,7 @@ async fn merge(id: &str) -> Result<(), String> {
     let current = position.pallet.clone();
     if current != haul.opened.target {
         return Err(format!(
-            "Merging lands on the target pallet — shift to \"{}\" first, then \"forklift haul merge\".",
+            "Merging lands on the target pallet — shift to \"{}\" first, then \"forklift haul consolidate\".",
             haul.opened.target
         ));
     }
@@ -290,7 +290,7 @@ async fn merge(id: &str) -> Result<(), String> {
         }
         MergeStatus::Conflicts(paths) => {
             // The consolidation is left in progress; the haul stays open. Resolving and
-            // stacking creates the merge parcel — re-run `haul merge` to record it.
+            // stacking creates the merge parcel — re-run `haul consolidate` to record it.
             output::emit(&MergeConflicts { id: haul.id.clone(), conflicts: paths });
         }
     }
@@ -380,7 +380,7 @@ impl CommandOutput for MergeConflicts {
         for path in &self.conflicts {
             println!("  {}", path);
         }
-        println!("Resolve them, \"forklift stack\", then re-run \"forklift haul merge\" to record the merge.");
+        println!("Resolve them, \"forklift stack\", then re-run \"forklift haul consolidate\" to record the merge.");
     }
 }
 

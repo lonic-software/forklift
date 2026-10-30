@@ -120,9 +120,9 @@ approvals, review notes and AI provenance, `@kv` for your own keys and values on
 authorship is the signature, not a field anyone can type:
 
 ```console
-$ forklift kv set main ci green
+$ forklift manifest set main ci green
 Set ci on parcel ….
-$ forklift kv get main ci
+$ forklift manifest get main ci
 green
 $ forklift manifest approve main -m "Ready to ship"
 Recorded approval of parcel … by "…". "Ready to ship"
@@ -132,14 +132,14 @@ $ forklift tag
 v0.1.0  …  by … (admin)  First release
 ```
 
-Meta pallets travel with `lift`, `lower` and `franchise`, and `history @kv` (or `@manifest`,
+Meta pallets travel with `lift`, `lower` and `clone`, and `history @kv` (or `@manifest`,
 `@tags`, `@haul`) is the audit trail of every change to one. When two people change one
 concurrently, `lower` replays your changes onto the remote's instead of merging, since the
 entries are independent signed records; only two writes to the same entry conflict, and
 `lower --keep` settles which one stays.
 
 Reference: [`manifest`](cli.md#manifest--signed-post-metadata-on-parcels-mf),
-[`kv`](cli.md#kv--custom-metadata-on-parcels), [`tag`](cli.md#tag--signed-tags--releases) and
+[`manifest set`](cli.md#manifest-set--keyed-values-on-parcels), [`tag`](cli.md#tag--signed-tags--releases) and
 [`haul`](cli.md#haul--pull-requests-reviewable-merge-proposals).
 
 ## 4. Sparse warehouses
@@ -169,7 +169,7 @@ $ forklift-server serve --root server --addr 127.0.0.1:7171 --open
 forklift-server listening on http://127.0.0.1:7171
 ```
 
-Back in the first terminal, lift the warehouse, then franchise (clone) only `src`:
+Back in the first terminal, lift the warehouse, then clone only `src`:
 
 ```console
 $ cd shop
@@ -181,13 +181,13 @@ Lifted the @manifest pallet.
 Lifted the @tags pallet.
 Lifted pallet "main" to …: 2 new parcel(s), … object(s) and 1 signature(s) uploaded.
 $ cd ..
-$ forklift franchise http://127.0.0.1:7171 slim --only src
-Warning: FIRST CONTACT with http://127.0.0.1:7171: adopted its trust anchor, genesis …. Verify that genesis out of band. To check it before anything is fetched, pass --expect … to franchise or lower.
+$ forklift clone http://127.0.0.1:7171 slim --only src
+Warning: FIRST CONTACT with http://127.0.0.1:7171: adopted its trust anchor, genesis …. Verify that genesis out of band. To check it before anything is fetched, pass --expect … to clone or lower.
 Adopted the remote's trust anchor (genesis …); every parcel is signed from now on.
 Adopted the @kv pallet from the remote.
 Adopted the @manifest pallet from the remote.
 Adopted the @tags pallet from the remote.
-Franchised http://127.0.0.1:7171 into "slim": pallet "main" at … (… object(s) fetched loose).
+Cloned http://127.0.0.1:7171 into "slim": pallet "main" at … (… object(s) fetched loose).
 Sparse: fetched and materialized only src. The rest of the tree is sealed by hash — widen with "forklift expand".
 ```
 
@@ -229,7 +229,7 @@ $ forklift show main:docs/pricing.md
 Prices in euros.
 ```
 
-Reference: [`franchise`](cli.md#franchise--clone-fr),
+Reference: [`clone`](cli.md#clone--clone-a-remote-warehouse),
 [`expand`](cli.md#expand--widen-a-sparse-warehouses-fetch-scope),
 [`narrow`](cli.md#narrow--shrink-this-checkouts-materialization-scope),
 [`scope-prune`](cli.md#scope-prune--reclaim-disk-from-a-sparse-warehouse) and

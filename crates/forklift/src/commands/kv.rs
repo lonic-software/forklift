@@ -5,37 +5,8 @@ use forklift_core::util::kv_utils::{self, KvChange, KvEntry, KvValue};
 use forklift_core::util::meta_tree::MetaSigner;
 use forklift_core::util::office_utils::Role;
 use forklift_core::util::{config_utils, object_utils, pallet_utils};
-use crate::cli::KvAction;
 use crate::commands::lower;
 use crate::output::{self, CommandOutput};
-
-/// Handle the kv command: custom metadata, text values keyed by parcel and key, on `@kv`.
-///
-/// * `kv set <rev> <key> <value>` - set a key on a parcel.
-/// * `kv get <rev> <key>`         - show a key's value.
-/// * `kv unset <rev> <key>`       - remove a key.
-/// * `kv list [<rev>]`            - list every value, or a parcel's.
-/// * `kv log <rev> <key>`         - every change to a key, newest first.
-///
-/// Writes need the office: each is one parcel signed by the operator's key, and every value
-/// carries its writer's key as its stamp.
-///
-/// # Arguments
-/// * `action` - The subcommand.
-///
-/// # Returns
-/// * `Ok(())`      - If the command was handled.
-/// * `Err(String)` - If the office is missing, the operator may not write, the revision is
-///                   unknown, a key or value is invalid, or an object could not be read or signed.
-pub fn handle_command(action: KvAction) -> Result<(), String> {
-    match action {
-        KvAction::Set { revision, key, value } => set(&revision, &key, &value),
-        KvAction::Get { revision, key } => get(&revision, &key),
-        KvAction::Unset { revision, key } => unset(&revision, &key),
-        KvAction::List { revision } => list(revision.as_deref()),
-        KvAction::Log { revision, key } => log(&revision, &key),
-    }
-}
 
 /// The parcel a value is about. A full parcel hash names it even when the parcel is not held
 /// here, so values about parcels this warehouse never fetched stay readable and removable.
@@ -68,7 +39,7 @@ fn require_writer() -> Result<(forklift_core::util::audit_utils::VerifiedOffice,
     Ok((office, signing_key_id, actor_id, actor))
 }
 
-fn set(revision: &str, key: &str, value: &str) -> Result<(), String> {
+pub(crate) fn set(revision: &str, key: &str, value: &str) -> Result<(), String> {
     // A new value is about a parcel that exists: it must resolve here.
     let subject = pallet_utils::resolve_revision(revision)?;
     let (office, signing_key_id, actor_id, actor) = require_writer()?;
@@ -88,7 +59,7 @@ fn set(revision: &str, key: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn unset(revision: &str, key: &str) -> Result<(), String> {
+pub(crate) fn unset(revision: &str, key: &str) -> Result<(), String> {
     let subject = subject_of(revision)?;
     let (office, signing_key_id, actor_id, actor) = require_writer()?;
 
@@ -107,7 +78,7 @@ fn unset(revision: &str, key: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn get(revision: &str, key: &str) -> Result<(), String> {
+pub(crate) fn get(revision: &str, key: &str) -> Result<(), String> {
     let subject = subject_of(revision)?;
 
     let entry = kv_utils::get(&subject, key)?.ok_or(format!(
@@ -119,7 +90,7 @@ fn get(revision: &str, key: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn list(revision: Option<&str>) -> Result<(), String> {
+pub(crate) fn list(revision: Option<&str>) -> Result<(), String> {
     let subject = revision.map(subject_of).transpose()?;
     let entries = kv_utils::list(subject.as_deref())?.iter().map(EntryView::from).collect();
 
@@ -128,7 +99,7 @@ fn list(revision: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-fn log(revision: &str, key: &str) -> Result<(), String> {
+pub(crate) fn log(revision: &str, key: &str) -> Result<(), String> {
     let subject = subject_of(revision)?;
     let changes = kv_utils::log(&subject, key)?.iter().map(ChangeView::from).collect();
 

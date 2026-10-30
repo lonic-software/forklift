@@ -1,8 +1,8 @@
 //! Verify what a sync takes from a remote, against the trust anchor this warehouse holds.
 //!
 //! A remote serves history; what makes it this warehouse's is the ref write that adopts it. Every
-//! site that adopts a remote head as a user pallet's — `lower`, `franchise`, `lift`'s auto-merge,
-//! `mirror` — and every site that adopts one by hash — `pallet create` at a hash, `haul merge` — calls
+//! site that adopts a remote head as a user pallet's — `lower`, `clone`, `lift`'s auto-merge,
+//! `mirror` — and every site that adopts one by hash — `pallet create` at a hash, `haul consolidate` — calls
 //! [`verify_take`] first, before its first durable record. The verdict is the offline `audit`'s
 //! own ([`audit_utils::verify_pallet_history`]); what this adds is where it is judged from:
 //!
@@ -118,7 +118,7 @@ pub fn installed(first_contact: &TakeTrust) -> Result<RefPreconditions, String> 
 }
 
 /// Where a take fetches what a verdict lacks: the warehouse fetch scope on disk, or one the caller
-/// names because it has not written it yet (a sparse `franchise`).
+/// names because it has not written it yet (a sparse `clone`).
 #[derive(Clone, Copy)]
 pub enum FetchAt<'a> {
     /// The fetch scope on disk.
@@ -136,7 +136,7 @@ pub enum FetchAt<'a> {
 ///
 /// # Arguments
 /// * `client` - The remote the head came from, which is also asked for missing boundary
-///              ancestry; `None` for a head already local (`pallet create` at a hash, `haul merge`),
+///              ancestry; `None` for a head already local (`pallet create` at a hash, `haul consolidate`),
 ///              whose gap is refused as it stands.
 /// * `trust`  - What the head is verified against.
 /// * `head`   - The head about to be adopted; its closure is present.

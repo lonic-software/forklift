@@ -54,7 +54,7 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
 
     if forklift_core::util::cherry_pick_utils::read_state()?.is_some() {
         return Err(
-            "A cherry-pick is in progress. Complete it (resolve, \"forklift load\", \"forklift stack\") or abort \
+            "A pick is in progress. Complete it (resolve, \"forklift load\", \"forklift stack\") or abort \
             it before consolidating.".to_string()
         );
     }

@@ -136,24 +136,72 @@ pub enum Command {
         rev: Option<String>,
     },
 
-    /// Apply a parcel's changes onto the current pallet as a new, author-preserving parcel
+    /// Clone a remote warehouse into a new directory
     #[command(
-        name = "cherry-pick",
-        visible_alias = "cp",
-        long_about = "Apply a parcel's diff (its change against its first parent) onto the current \
-                      pallet as a new, author-preserving, freshly-signed parcel. Unlike \
-                      rebase, cherry-pick only *adds* — no rewrite, no force-push: the picked \
-                      parcel's authors are preserved and this operator is recorded as the stacker. \
-                      A clean pick is stacked immediately; a conflicting one leaves markers to \
-                      resolve, \"forklift load\" and \"forklift stack\" (which completes the pick single-parent)."
+        long_about = "Clone a remote warehouse: prepare a fresh warehouse in \
+                      the target directory, remember the remote, adopt its trust anchor, download \
+                      the history (using the remote's bundle when it has one) and materialize the \
+                      chosen pallet in the working directory. With --only, clone sparsely: \
+                      fetch the full signed history but only the named subtree(s) of content, \
+                      leaving the rest sealed by hash. With --cache, mark the warehouse as a \
+                      cache, which may lack content its history reaches."
     )]
-    CherryPick {
-        /// The parcel to cherry-pick: a pallet name, or a parcel hash / unique prefix
-        revision: String,
+    Clone {
+        /// The URL of the remote warehouse (e.g. http://forklift.example.com:9418)
+        url: String,
 
-        /// The new parcel's message (default: the source parcel's message)
-        #[arg(short = 'm', long)]
-        message: Option<String>,
+        /// The directory to create the warehouse in (must be new or empty)
+        directory: String,
+
+        /// The pallet to check out (default: the remote's default pallet)
+        #[arg(short, long)]
+        pallet: Option<String>,
+
+        /// The bearer token, when the remote requires one (remembered as "remote.token")
+        #[arg(short, long)]
+        token: Option<String>,
+
+        /// Clone sparsely: fetch only the named subtree path(s) of content. Repeatable.
+        #[arg(
+            long = "only",
+            value_name = "PATH",
+            long_help = "Clone sparsely: fetch the whole signed history — every parcel, \
+                         signature and the tree spine — but only the content under the named \
+                         subtree path(s). Out-of-scope subtrees and blobs are never downloaded; \
+                         they stay pinned by the exact hash a signed parcel already commits, so \
+                         nothing can be forged, it is simply not fetched. The working tree \
+                         materializes only the in-scope subtree(s). The remote's whole-store \
+                         bundle is skipped (it would defeat the point). Repeatable to fetch \
+                         several subtrees. Widen later with \"forklift expand\"."
+        )]
+        only: Vec<String>,
+
+        /// Clone as a cache: a warehouse that may lack content its history reaches
+        #[arg(
+            long = "cache",
+            conflicts_with = "only",
+            long_help = "Clone as a cache: mark the warehouse as one that may lack content its \
+                         history reaches. It is then treated as partial: a server never serves \
+                         it, it lifts only to the remote it was cloned from, \"forklift git mirror\" and \
+                         \"forklift expand\" refuse, and \"forklift audit\" checks the content it holds. The \
+                         remote's bundle is skipped. It fetches every parcel and signature of the \
+                         history, and the content of the head it checks out; the content of \
+                         older history stays with the remote, recorded by hash, and is fetched \
+                         from it when a command reads it. Cannot be combined with --only."
+        )]
+        cache: bool,
+
+        /// Refuse unless the remote's trust anchor is this genesis (an out-of-band pin)
+        #[arg(
+            long = "expect",
+            value_name = "GENESIS",
+            long_help = "Refuse unless the remote's trust anchor is exactly this genesis, a value \
+                         obtained out of band (from an operator you know, or a first-contact \
+                         warning you verified). Checked right after the handshake, before anything \
+                         is downloaded or created. Without it, a first contact adopts whatever \
+                         anchor the remote holds, and says which."
+        )]
+        expect: Option<String>,
     },
 
     /// Read or change configuration values
@@ -248,76 +296,6 @@ pub enum Command {
         targets: Vec<String>,
     },
 
-    /// Open a local franchise of a remote warehouse (clone)
-    #[command(
-        visible_alias = "fr",
-        alias = "clone",
-        long_about = "Open a local franchise of a remote warehouse: prepare a fresh warehouse in \
-                      the target directory, remember the remote, adopt its trust anchor, download \
-                      the history (using the remote's bundle when it has one) and materialize the \
-                      chosen pallet in the working directory. With --only, franchise sparsely: \
-                      fetch the full signed history but only the named subtree(s) of content, \
-                      leaving the rest sealed by hash. With --cache, mark the warehouse as a \
-                      cache, which may lack content its history reaches."
-    )]
-    Franchise {
-        /// The URL of the remote warehouse (e.g. http://forklift.example.com:9418)
-        url: String,
-
-        /// The directory to create the warehouse in (must be new or empty)
-        directory: String,
-
-        /// The pallet to check out (default: the remote's default pallet)
-        #[arg(short, long)]
-        pallet: Option<String>,
-
-        /// The bearer token, when the remote requires one (remembered as "remote.token")
-        #[arg(short, long)]
-        token: Option<String>,
-
-        /// Franchise sparsely: fetch only the named subtree path(s) of content. Repeatable.
-        #[arg(
-            long = "only",
-            value_name = "PATH",
-            long_help = "Franchise sparsely: fetch the whole signed history — every parcel, \
-                         signature and the tree spine — but only the content under the named \
-                         subtree path(s). Out-of-scope subtrees and blobs are never downloaded; \
-                         they stay pinned by the exact hash a signed parcel already commits, so \
-                         nothing can be forged, it is simply not fetched. The working tree \
-                         materializes only the in-scope subtree(s). The remote's whole-store \
-                         bundle is skipped (it would defeat the point). Repeatable to fetch \
-                         several subtrees. Widen later with \"forklift expand\"."
-        )]
-        only: Vec<String>,
-
-        /// Franchise as a cache: a warehouse that may lack content its history reaches
-        #[arg(
-            long = "cache",
-            conflicts_with = "only",
-            long_help = "Franchise as a cache: mark the warehouse as one that may lack content its \
-                         history reaches. It is then treated as partial: a server never serves \
-                         it, it lifts only to the remote it was franchised from, \"forklift git mirror\" and \
-                         \"forklift expand\" refuse, and \"forklift audit\" checks the content it holds. The \
-                         remote's bundle is skipped. It fetches every parcel and signature of the \
-                         history, and the content of the head it checks out; the content of \
-                         older history stays with the remote, recorded by hash, and is fetched \
-                         from it when a command reads it. Cannot be combined with --only."
-        )]
-        cache: bool,
-
-        /// Refuse unless the remote's trust anchor is this genesis (an out-of-band pin)
-        #[arg(
-            long = "expect",
-            value_name = "GENESIS",
-            long_help = "Refuse unless the remote's trust anchor is exactly this genesis, a value \
-                         obtained out of band (from an operator you know, or a first-contact \
-                         warning you verified). Checked right after the handshake, before anything \
-                         is downloaded or created. Without it, a first contact adopts whatever \
-                         anchor the remote holds, and says which."
-        )]
-        expect: Option<String>,
-    },
-
     /// Move history between this warehouse and git: import, export and mirror
     #[command(
         subcommand_required = true,
@@ -363,7 +341,7 @@ pub enum Command {
                       Exits 0 once every recorded path is resolved; exits 21, with the taint left \
                       standing on exactly what remains, otherwise.\n\n\
                       It then finishes or undoes an operation that rewrites the whole staging \
-                      area (shift, park, a merge, cherry-pick or fast-forward, lower, git import, \
+                      area (shift, park, a merge, pick or fast-forward, lower, git import, \
                       bay creation) and was interrupted (\"incomplete_load\" refusals naming it, \
                       exit 20): rolled forward where the bay's state shows it got far enough, \
                       rolled back otherwise. Either way it rewrites only files that still hold \
@@ -491,30 +469,21 @@ pub enum Command {
         keep: Vec<String>,
     },
 
-    /// Custom metadata: signed text values keyed by parcel and key
-    #[command(
-        long_about = "Attach custom metadata to a parcel: a text value under a key, as in a \
-                      build status or a ticket link. Values live on the \"@kv\" meta pallet; every \
-                      change is one parcel signed by its writer, and every value carries the key \
-                      that wrote it, verifiable offline against the office chain. Lower syncs \
-                      them: changes to different keys combine, and a key changed differently on \
-                      both sides is a conflict that \"forklift lower --keep\" resolves. Writing needs the \
-                      office and a writer or admin role."
-    )]
-    Kv {
-        #[command(subcommand)]
-        action: KvAction,
-    },
-
-    /// Attach signed post-metadata to a parcel: approvals, review notes
+    /// Facts recorded about a parcel after the fact: notes, approvals, provenance, keyed values
     #[command(
         visible_alias = "mf",
-        long_about = "Record and read the manifest — signed post-metadata attached to a parcel \
-                      after the fact (approvals, review notes; later, machine-authorship \
-                      provenance). Entries are tracked metadata on the \"@manifest\" meta pallet: \
-                      forge-proof, portable and auditable, and they reference parcels without ever \
-                      mutating them. Recording needs an enrolled signing key (like the office). \
-                      Without a subcommand, the whole manifest is listed."
+        long_about = "Record and read the manifest — signed facts attached to a parcel after the \
+                      fact. Notes, approvals and machine-authorship provenance are entries on the \
+                      \"@manifest\" meta pallet (subcommands note, approve, provenance and \
+                      show). Keyed values, such as a build status or a ticket link, live on the \
+                      \"@kv\" meta pallet (subcommands set, get, unset, keys and log): a key \
+                      holds one text value per parcel, and lower combines changes to different \
+                      keys, while a key changed differently on both sides is a conflict that \
+                      \"forklift lower --keep\" resolves. Every change is signed by its writer, \
+                      verifiable offline against the office chain, and references the parcel \
+                      without ever changing it. Recording needs an enrolled signing key; a keyed \
+                      value also needs a writer or admin role. Without a subcommand, every \
+                      \"@manifest\" entry is listed."
     )]
     Manifest {
         #[command(subcommand)]
@@ -571,6 +540,25 @@ pub enum Command {
     Park {
         #[command(subcommand)]
         action: Option<ParkAction>,
+    },
+
+    /// Apply a parcel's changes onto the current pallet as a new, author-preserving parcel
+    #[command(
+        alias = "cherry-pick",
+        long_about = "Apply a parcel's diff (its change against its first parent) onto the current \
+                      pallet as a new, author-preserving, freshly-signed parcel. Unlike \
+                      rebase, pick only *adds* — no rewrite, no force-push: the picked \
+                      parcel's authors are preserved and this operator is recorded as the stacker. \
+                      A clean pick is stacked immediately; a conflicting one leaves markers to \
+                      resolve, \"forklift load\" and \"forklift stack\" (which completes the pick single-parent)."
+    )]
+    Pick {
+        /// The parcel to pick: a pallet name, or a parcel hash / unique prefix
+        revision: String,
+
+        /// The new parcel's message (default: the source parcel's message)
+        #[arg(short = 'm', long)]
+        message: Option<String>,
     },
 
     /// Prepare a new warehouse in the current directory
@@ -911,10 +899,10 @@ pub enum Command {
     /// Show the remote and the origin, or move a partial warehouse's origin to another server
     #[command(
         long_about = "Show where this warehouse lifts to and lowers from: the configured remote \
-                      (\"remote.url\") and, in a partial warehouse (one franchised with \"--only\" \
+                      (\"remote.url\") and, in a partial warehouse (one cloned with \"--only\" \
                       or \"--cache\"), its origin, with any move of the origin that has not \
                       finished. A partial warehouse talks only to its origin, the remote it was \
-                      franchised from, because only the origin was proved to hold the content it \
+                      cloned from, because only the origin was proved to hold the content it \
                       lacks; \"forklift remote move\" is the one way to change it. A full \
                       warehouse has no origin and may talk to any remote."
     )]
@@ -950,7 +938,7 @@ pub enum Command {
     /// Undo the last stack, consolidate, cherry-pick or shift (soft — keeps your changes)
     #[command(
         long_about = "Undo the last journaled operation: a \"forklift stack\", \"forklift consolidate\", \
-                      \"forklift cherry-pick\" or \"forklift shift\". A stack, consolidate or cherry-pick is \
+                      \"forklift pick\" or \"forklift shift\". A stack, consolidate or pick is \
                       reversed softly: the pallet head moves back while the working directory and \
                       the inventory stay as they are (like git's \"reset --soft HEAD~1\"), so the \
                       undone changes are staged again and can be re-stacked — e.g. with a \
@@ -958,10 +946,10 @@ pub enum Command {
                       reverses only the user's last operation: except for a pallet delete, which \
                       changed nothing in the bay, if the current pallet has been \
                       switched (e.g. by pallet create or deliver), its head has moved, or a \
-                      consolidation or cherry-pick was started or finished since the journaled \
+                      consolidation or pick was started or finished since the journaled \
                       operation, it refuses \
                       instead of reaching past that. In a warehouse that has been served, a \
-                      stack, consolidate or cherry-pick is not undone when it would move a user \
+                      stack, consolidate or pick is not undone when it would move a user \
                       pallet back off the head it left, since the warehouse's clones may rely on \
                       that head: stack a parcel that reverts the change instead. An unreadable \
                       journal is reported by name, never read as empty. A pallet delete is \
@@ -1083,7 +1071,7 @@ pub enum BayAction {
                          scoped); the bay just checks out, stages and stacks its in-scope \
                          subtree(s), copying every out-of-scope sibling forward by the hash the \
                          signed head already commits. A bay's scope must be within what the \
-                         warehouse fetched (see \"forklift franchise --only\" and \"forklift expand\"). Repeatable to \
+                         warehouse fetched (see \"forklift clone --only\" and \"forklift expand\"). Repeatable to \
                          scope several subtrees. Scope is local to this bay and never tracked."
         )]
         scope: Vec<String>,
@@ -1245,7 +1233,7 @@ pub enum StoreAction {
     },
     /// Free cached content the origin holds, to be fetched again when read
     #[command(
-        long_about = "Free disk in a cache warehouse (one franchised with \"--cache\"): delete the \
+        long_about = "Free disk in a cache warehouse (one cloned with \"--cache\"): delete the \
                       content its origin holds and nothing here needs, so that a later read fetches \
                       it again. Parcels and signatures always stay. It asks the origin which history \
                       it holds first, and refuses, changing nothing, when the configured remote is \
@@ -1346,69 +1334,6 @@ pub enum TagAction {
 }
 
 #[derive(Subcommand)]
-pub enum KvAction {
-    /// Set a key on a parcel
-    #[command(
-        long_about = "Set a key on a parcel to a text value, replacing any value it held. A key \
-                      is ASCII letters, digits, \".\", \"_\" and \"-\", at most 128 bytes, and \
-                      never begins with \".\" or \"-\"; a value is at most 64 KiB of text. \
-                      Requires an enrolled signing key and a writer or admin role."
-    )]
-    Set {
-        /// The parcel the value is about (a pallet name, or a parcel hash / unique prefix)
-        revision: String,
-
-        /// The key
-        key: String,
-
-        /// The value
-        value: String,
-    },
-
-    /// Show a key's value on a parcel
-    Get {
-        /// The parcel (a pallet name, or a parcel hash / unique prefix)
-        revision: String,
-
-        /// The key
-        key: String,
-    },
-
-    /// Remove a key from a parcel
-    #[command(
-        long_about = "Remove a key from a parcel. A key that holds no value is refused. Requires \
-                      an enrolled signing key and a writer or admin role."
-    )]
-    Unset {
-        /// The parcel (a pallet name, or a parcel hash / unique prefix)
-        revision: String,
-
-        /// The key
-        key: String,
-    },
-
-    /// List every value, or a parcel's
-    List {
-        /// Only this parcel's values (a pallet name, or a parcel hash / unique prefix)
-        revision: Option<String>,
-    },
-
-    /// Show every change to a key, newest first, with who made it
-    #[command(
-        long_about = "Show every change to a key on a parcel, newest first: the parcel that made \
-                      it, when, by whom, and the value after it. Walks the whole history of the \
-                      kv pallet."
-    )]
-    Log {
-        /// The parcel (a pallet name, or a parcel hash / unique prefix)
-        revision: String,
-
-        /// The key
-        key: String,
-    },
-}
-
-#[derive(Subcommand)]
 pub enum ManifestAction {
     /// Attach a free-form note to a parcel
     #[command(
@@ -1483,6 +1408,66 @@ pub enum ManifestAction {
     Show {
         /// The parcel whose manifest to show (a pallet name, or a parcel hash / prefix)
         revision: String,
+    },
+
+    /// Set a keyed value on a parcel
+    #[command(
+        long_about = "Set a key on a parcel to a text value, replacing any value it held. A key \
+                      is ASCII letters, digits, \".\", \"_\" and \"-\", at most 128 bytes, and \
+                      never begins with \".\" or \"-\"; a value is at most 64 KiB of text. \
+                      Requires an enrolled signing key and a writer or admin role."
+    )]
+    Set {
+        /// The parcel the value is about (a pallet name, or a parcel hash / unique prefix)
+        revision: String,
+
+        /// The key
+        key: String,
+
+        /// The value
+        value: String,
+    },
+
+    /// Show a keyed value on a parcel
+    Get {
+        /// The parcel (a pallet name, or a parcel hash / unique prefix)
+        revision: String,
+
+        /// The key
+        key: String,
+    },
+
+    /// Remove a keyed value from a parcel
+    #[command(
+        long_about = "Remove a key from a parcel. A key that holds no value is refused. Requires \
+                      an enrolled signing key and a writer or admin role."
+    )]
+    Unset {
+        /// The parcel (a pallet name, or a parcel hash / unique prefix)
+        revision: String,
+
+        /// The key
+        key: String,
+    },
+
+    /// List every keyed value, or a parcel's
+    Keys {
+        /// Only this parcel's values (a pallet name, or a parcel hash / unique prefix)
+        revision: Option<String>,
+    },
+
+    /// Show every change to a key, newest first, with who made it
+    #[command(
+        long_about = "Show every change to a key on a parcel, newest first: the parcel that made \
+                      it, when, by whom, and the value after it. Walks the whole history of the \
+                      @kv meta pallet."
+    )]
+    Log {
+        /// The parcel (a pallet name, or a parcel hash / unique prefix)
+        revision: String,
+
+        /// The key
+        key: String,
     },
 }
 
@@ -1566,8 +1551,9 @@ pub enum HaulAction {
         message: Option<String>,
     },
 
-    /// Merge a proposal (consolidate its source into the target)
-    Merge {
+    /// Land a proposal: consolidate its source into the target
+    #[command(alias = "merge")]
+    Consolidate {
         /// The haul id (or a unique prefix)
         id: String,
     },
@@ -1906,7 +1892,7 @@ impl Command {
             Command::Audit { .. }
                 | Command::Bay { .. }
                 | Command::Blame { .. }
-                | Command::CherryPick { .. }
+                | Command::Pick { .. }
                 | Command::Conflicts
                 | Command::Consolidate { .. }
                 | Command::Deliver { .. }
@@ -1919,7 +1905,6 @@ impl Command {
                 | Command::Load { .. }
                 | Command::Lower { .. }
                 | Command::Haul { .. }
-                | Command::Kv { .. }
                 | Command::Manifest { .. }
                 | Command::Narrow { .. }
                 | Command::Office { .. }
@@ -1983,7 +1968,7 @@ impl Command {
     pub fn refused_during_interrupted_operation(&self) -> bool {
         matches!(
             self,
-            Command::CherryPick { .. }
+            Command::Pick { .. }
                 | Command::Consolidate { .. }
                 | Command::Expand { .. }
                 | Command::Git { action: GitAction::Import { .. } }
@@ -2008,7 +1993,7 @@ impl Command {
     /// Check whether the command mutates the warehouse (inventory, refs, objects) and
     /// therefore has to hold the warehouse lock while it runs (see `WarehouseLock`). A command
     /// that writes the working directory belongs here too, unless it takes the lock itself, as
-    /// `franchise` does for the warehouse it creates: taking a bay's lock clears its chunked-file
+    /// `clone` does for the warehouse it creates: taking a bay's lock clears its chunked-file
     /// assembly folder, which is safe only while every assembler holds the lock.
     ///
     /// # Returns
@@ -2018,7 +2003,7 @@ impl Command {
         matches!(
             self,
             Command::Bay { .. }
-                | Command::CherryPick { .. }
+                | Command::Pick { .. }
                 | Command::Consolidate { .. }
                 | Command::Deliver { .. }
                 | Command::Expand { .. }
@@ -2028,7 +2013,6 @@ impl Command {
                 | Command::Load { .. }
                 | Command::Lower { .. }
                 | Command::Haul { .. }
-                | Command::Kv { .. }
                 | Command::Manifest { .. }
                 | Command::Narrow { .. }
                 | Command::Office { .. }
@@ -2053,7 +2037,7 @@ impl Command {
     ///
     /// Every command that publishes a root another process can see — a pallet head, a staged
     /// shard, a parked parcel, consolidation state — must be on [`Self::requires_warehouse_lock`]
-    /// for this to cover it; a new such command belongs there. `franchise` is the one command off
+    /// for this to cover it; a new such command belongs there. `clone` is the one command off
     /// that list that sets a pallet head, and it writes into a store it has just created, which
     /// no other process uses yet.
     ///
@@ -2125,7 +2109,7 @@ impl Command {
         match self {
             Command::Stack { .. } => Some("stack"),
             Command::Consolidate { .. } => Some("consolidate"),
-            Command::CherryPick { .. } => Some("cherry-pick"),
+            Command::Pick { .. } => Some("pick"),
             Command::Shift { .. } => Some("shift"),
             _ => None,
         }

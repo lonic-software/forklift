@@ -990,7 +990,7 @@ pub fn record_state(haul_id: &str,
 }
 
 /// The heads every haul not yet merged proposes, at the local `@haul` head: the gc roots a haul
-/// adds. `haul merge` merges the recorded head, not the source pallet's current one, and no ref
+/// adds. `haul consolidate` merges the recorded head, not the source pallet's current one, and no ref
 /// need still reach it once the source moves on, so it stays live while the haul can still be
 /// merged — a closed haul included, since reopening it proposes the same head again.
 ///

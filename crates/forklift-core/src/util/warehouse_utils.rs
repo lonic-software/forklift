@@ -80,8 +80,8 @@ pub fn is_working_tree_root(dir: &Path) -> Result<bool, String> {
 /// # Returns
 /// * `Ok(())`      - If the warehouse was entered successfully.
 /// * `Err(String)` - If no warehouse was found, the root is no warehouse (a framed `not_a_warehouse`
-///                   refusal) or holds a franchise that has not finished (a framed
-///                   `franchise_incomplete` refusal), or the directory switch failed.
+///                   refusal) or holds a clone that has not finished (a framed
+///                   `clone_incomplete` refusal), or the directory switch failed.
 pub fn enter_warehouse() -> Result<(), String> {
     let cwd = std::env::current_dir()
         .map_err(|e| format!("Error while getting the current directory: {}", e))?;
@@ -137,7 +137,7 @@ impl Head {
         match self {
             Head::Client => format!(
                 "Move \"{}\" aside, run {}, then import the history again (\"forklift git import\") or \
-                franchise it again; or, if it was a bay's, restore its redirect.",
+                clone it again; or, if it was a bay's, restore its redirect.",
                 forklift.to_string_lossy(), self.prepare_command(root)
             ),
             // A bay is never served, so its redirect is no way out here; and the old folder is refused
@@ -170,13 +170,13 @@ impl Head {
 /// Open the warehouse whose root is `root`, the one way every head decides that a directory is a
 /// warehouse. Only the `.forklift` at `root` is judged ([`bay_utils::classify_forklift`]); a bay's
 /// redirect is never followed, so a bay's folder is refused here like any other non-warehouse. A
-/// franchise that has not finished is refused before the marker is asked for, since it may not
+/// clone that has not finished is refused before the marker is asked for, since it may not
 /// have written one yet. Next steps are written for `head`.
 ///
 /// # Returns
 /// * `Ok(PathBuf)`     - `root`: its `.forklift` holds a warehouse marker this build reads.
 /// * `Err(CoreError)`  - A `not_a_warehouse` refusal naming the absolute root, a
-///                       `franchise_incomplete` refusal, the older bay format's refusal, or the
+///                       `clone_incomplete` refusal, the older bay format's refusal, or the
 ///                       `.forklift` could not be judged.
 pub fn open_warehouse_root(root: &Path, head: Head) -> Result<PathBuf, CoreError> {
     let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
@@ -275,7 +275,7 @@ fn open_bay_warehouse(bay_root: &Path, redirect: &bay_utils::BayRedirect) -> Res
                 ),
                 format!(
                     "Re-create the warehouse at \"{}\" (move its \"{}\" aside, run \"forklift prepare\" there, \
-                    then import the history again with \"forklift git import\" or franchise it again), then move \
+                    then import the history again with \"forklift git import\" or clone it again), then move \
                     \"{}\" aside and add the bay again with \"forklift bay add\" in \"{}\".",
                     target.to_string_lossy(), FOLDER_NAME_FORKLIFT_ROOT,
                     bay.to_string_lossy(), target.to_string_lossy()
@@ -287,16 +287,16 @@ fn open_bay_warehouse(bay_root: &Path, redirect: &bay_utils::BayRedirect) -> Res
 }
 
 /// Refuse a directory `forklift prepare` (or `forklift-server prepare`) is asked to make a
-/// warehouse of, when what stands there is not for prepare to take: an unfinished franchise, a
+/// warehouse of, when what stands there is not for prepare to take: an unfinished clone, a
 /// bay's folder, or a `.forklift` with something in it but no warehouse marker. A missing or empty
 /// `.forklift` is prepared, and so is a warehouse, which prepare completes.
 ///
-/// [`prepare_warehouse`] itself does not ask this: franchise, the server's create and the Lambda
+/// [`prepare_warehouse`] itself does not ask this: clone, the server's create and the Lambda
 /// scratch fill folders they made or claimed themselves.
 ///
 /// # Returns
 /// * `Ok(())`         - Prepare may run at `root`.
-/// * `Err(CoreError)` - A `franchise_incomplete` or `not_a_warehouse` refusal, or the `.forklift`
+/// * `Err(CoreError)` - A `clone_incomplete` or `not_a_warehouse` refusal, or the `.forklift`
 ///                      could not be judged.
 pub fn check_preparable(root: &Path, head: Head) -> Result<(), CoreError> {
     franchise_utils::gate(root)?;
@@ -459,9 +459,9 @@ const WAREHOUSE_MARKER_VERSION: u32 = 2;
 pub enum WarehouseMode {
     /// Everything its history reaches.
     Full,
-    /// Only the paths of its fetch scope (`franchise --only`).
+    /// Only the paths of its fetch scope (`clone --only`).
     Sparse,
-    /// Content fetched only when read (`franchise --cache`).
+    /// Content fetched only when read (`clone --cache`).
     Cache,
 }
 
@@ -547,7 +547,7 @@ pub fn read_warehouse_marker(forklift: &Path) -> Result<Option<WarehouseMode>, S
         Err(RecordError::OtherVersion(header)) if header == record_utils::header(WAREHOUSE_MARKER_RECORD, 1) => Err(format!(
             "The warehouse marker \"{}\" was written by an older version of Forklift, before the marker \
             recorded what a warehouse holds, so Forklift does not use \"{}\". Make the warehouse again with \
-            this version: franchise it again, or prepare a new one and lower its history into it.",
+            this version: clone it again, or prepare a new one and lower its history into it.",
             path.to_string_lossy(), forklift.to_string_lossy()
         )),
         Err(e) => Err(unknown(e.describe())),
@@ -616,11 +616,11 @@ fn mark_warehouse(forklift: &Path, mode: PrepareMode) -> Result<(), String> {
 ///
 /// Where no `.forklift` stands, or an empty one, the whole folder is built under a staging name and
 /// renamed into place ([`place_forklift`]), so a prepare stopped at any point leaves no half-built
-/// `.forklift`. Where a `.forklift` with anything in it stands (a warehouse, or a franchise's claim),
+/// `.forklift`. Where a `.forklift` with anything in it stands (a warehouse, or a clone's claim),
 /// the missing pieces are added in place.
 ///
 /// No `.forkliftignore` is written, as `git init` writes no `.gitignore`. The ignore file is
-/// tracked content, and a template written here would be an untracked file that franchise and
+/// tracked content, and a template written here would be an untracked file that clone and
 /// lower then refuse to overwrite with a pallet's own copy.
 ///
 /// # Returns
@@ -1147,7 +1147,7 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// A `.forklift` with anything in it is filled in place, marker last (a franchise's claim is
+    /// A `.forklift` with anything in it is filled in place, marker last (a clone's claim is
     /// one); until marked, it is no warehouse.
     #[test]
     fn an_existing_forklift_folder_is_filled_in_place_and_marked() {
@@ -1304,7 +1304,7 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// A franchise's claim puts its `.forklift` in place with the record inside; prepare then fills
+    /// A clone's claim puts its `.forklift` in place with the record inside; prepare then fills
     /// it in place and marks it, keeping the record.
     #[test]
     fn prepare_fills_a_franchise_claim_and_keeps_its_record() {
@@ -1378,7 +1378,7 @@ mod tests {
             assert_eq!(origin_in(&target).as_deref(), (name != "full").then_some(origin), "{}", name);
         }
 
-        // Filled in place: a `.forklift` with something in it but no marker, as a franchise's claim is.
+        // Filled in place: a `.forklift` with something in it but no marker, as a clone's claim is.
         let target = root.join("claimed");
         let forklift = target.join(FOLDER_NAME_FORKLIFT_ROOT);
         std::fs::create_dir_all(&forklift).unwrap();

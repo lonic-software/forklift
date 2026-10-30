@@ -85,7 +85,14 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 12** (current): the `origin_move_incomplete` error code exists.
+**Schema 13** (current): the `franchise_incomplete` error code is renamed `clone_incomplete`
+(exit 30 and its `details` are unchanged), with the command it names. The same release renames
+commands, so an envelope's `command` and the MCP tool names change with them: `franchise` is
+`clone`, `cherry-pick` is `pick` (`cherry_pick` → `pick`), `kv set|get|unset|log` are `manifest
+set|get|unset|log` and `kv list` is `manifest keys` (`kv_set` → `manifest_set`, and so on), and
+`haul merge` is `haul consolidate` (`haul_merge` → `haul_consolidate`).
+
+**Schema 12**: the `origin_move_incomplete` error code exists.
 
 **Schema 11**: the `origin_move_pending` error code exists.
 
@@ -256,7 +263,7 @@ boundary: a forged backdate, or the key's holder kept signing after the revocati
 history it was only asked to read, so this is the loud label instead. It can also read
 `"unresolved"`: the parcel is not reachable from any part of the boundary *this* store
 holds, and the boundary walk crossed a gap (an absent boundary head, or an absent ancestor
-behind one, as in a partial clone whose franchise only ever fetched reachable history) that
+behind one, as in a partial clone whose clone only ever fetched reachable history) that
 could have been what vouches for it, so the question cannot be answered here at all. A gap
 alone never makes a parcel that a present boundary head vouches for `"unresolved"`; it
 stays `"vouched"`. `"unresolved"` must
@@ -397,7 +404,7 @@ Every refusal about a remote's trust anchor is one code, `trust_changed` (exit 2
 - `subject` — the remote, as its URL.
 - `current` — the remote's genesis **now**: the value an override must name. `null` when the
   remote declares no anchor at all, or declares a malformed one (the value is not repeated).
-- `previous` — the genesis this warehouse holds; absent when it holds none (a `franchise`).
+- `previous` — the genesis this warehouse holds; absent when it holds none (a `clone`).
 - `what_changed` — a closed set, to branch on instead of the message:
   `regenesis` (the new anchor names the held one as its prior; the one override is
   `office accept-regenesis --confirm <current>`), `unrelated` (it does not: another warehouse,
@@ -406,7 +413,7 @@ Every refusal about a remote's trust anchor is one code, `trust_changed` (exit 2
   whose values are not object hashes; every command against that remote refuses, and nothing
   overrides it — not a transport failure, so not worth retrying), `removed` (the remote holds an
   office but declares no anchor, which an honest server never does: its anchor was stripped.
-  `lower` and `franchise` refuse before anything is fetched, whether or not an anchor is held,
+  `lower` and `clone` refuse before anything is fetched, whether or not an anchor is held,
   `lift` refuses before anything is uploaded, and nothing overrides it). A remote with neither an anchor nor an office is one trust was never
   established on, and is not refused; pin it with `--expect` to require an anchor.
 
@@ -414,7 +421,7 @@ Every refusal about a remote's trust anchor is one code, `trust_changed` (exit 2
 remote's genesis; any other value refuses with fresh `details`, so an agent re-reads `current`
 rather than retrying a stale one. With nothing pending, it succeeds only when `<value>` is the
 genesis already held; otherwise it refuses (`unexpected`), so "nothing to accept" never reads as
-the value being trusted. `franchise --expect` and `lower --expect` are checked against the
+the value being trusted. `clone --expect` and `lower --expect` are checked against the
 first response, before anything is fetched or created.
 
 ### A misbehaving remote: `remote_protocol_violation`
@@ -451,14 +458,14 @@ damaged mirror) is not this code.
 
 ### History the anchor does not vouch for: `history_unverified`
 
-A command that adopts a head another store served (`lower`, `franchise`, `lift`'s auto-merge,
-`mirror`) or one already in the store (`pallet create <name> <hash>`, `haul merge`, the `stack` that
+A command that adopts a head another store served (`lower`, `clone`, `lift`'s auto-merge,
+`mirror`) or one already in the store (`pallet create <name> <hash>`, `haul consolidate`, the `stack` that
 completes a conflicted merge) refuses with `history_unverified` (exit 34) when the head's history
 does not verify against the trust anchor and office it is judged against: the ones this warehouse
 holds, or at first contact the ones the remote serves. Nothing was adopted: no ref moved, no
 working file changed, and no anchor, office or meta pallet was installed. The message names the
 pallet, the head and why; when a boundary parcel the verdict needed could not be fetched, it says
-so too. A `franchise` reports it as `franchise_incomplete` with `details.cause_code:
+so too. A `clone` reports it as `clone_incomplete` with `details.cause_code:
 "history_unverified"`; a `mirror` reports it as that pallet's `failed` entry.
 
 ### Catching up: `behind`, `remote_ahead`, `diverged`, `target_not_covered`
@@ -469,7 +476,7 @@ and follows the step.
 
 | code | exit | condition | `next_step` |
 |---|---|---|---|
-| `behind` | 26 | this bay's base is behind its pallet's head: another bay or process moved the pallet. Raised by every command that moves the bay's pallet (`stack`, `deliver`, `consolidate`, `cherry-pick`, `haul merge`, `lower`, `lift`'s auto-merge, a consolidation's completion) | `forklift shift <pallet>`; a refusal mid-merge names aborting the merge first |
+| `behind` | 26 | this bay's base is behind its pallet's head: another bay or process moved the pallet. Raised by every command that moves the bay's pallet (`stack`, `deliver`, `consolidate`, `pick`, `haul consolidate`, `lower`, `lift`'s auto-merge, a consolidation's completion) | `forklift shift <pallet>`; a refusal mid-merge names aborting the merge first |
 | `remote_ahead` | 28 | the remote's pallet holds parcels this warehouse has not lowered: its head is unknown here, descends from the local head, or moved since this client read it (the `409` of a ref update). It does not promise this side holds nothing new; `lower` then fast-forwards or reports `diverged` | `forklift lower` |
 | `diverged` | 5 | the local pallet and the remote's each hold parcels the other lacks. `lower` never merges them; `lift` reports it when it did not auto-merge (an overlap, an unclean warehouse, or its retry bound) | for a working pallet: create a pallet at the remote head (as `<pallet>-remote-<short hash>`, unique per remote head), shift back, consolidate it, lift; for a meta pallet with replay rules: `forklift lower`. The office and other meta pallets diverge as an unclassified error, reconciled by hand |
 | `target_not_covered` | 27 | `deliver` would undo changes on the target that the draft never consolidated | `forklift consolidate <target>` |
@@ -504,7 +511,7 @@ or does not descend from it, and when a ref update or delete finds its pallet de
 
 ### Content a cache could not fetch: `cache_miss`
 
-A warehouse franchised with `--cache` holds some content by hash alone, and a command that reads
+A warehouse cloned with `--cache` holds some content by hash alone, and a command that reads
 such content fetches it from the warehouse's origin as it reads. When the origin cannot be reached,
 answers as an unavailable server (`502`, `503` or `504`), or keeps throttling, the command refuses
 with `cache_miss` (exit 36), naming the object in `message`. `next_step` names the origin: running
@@ -552,13 +559,13 @@ names the first ten.
 }
 ```
 
-### An unfinished franchise: `franchise_incomplete`
+### An unfinished clone: `clone_incomplete`
 
-A `franchise` that fails after it has claimed its directory — a dropped connection, a full disk,
+A `clone` that fails after it has claimed its directory — a dropped connection, a full disk,
 a path the working tree cannot hold, or a kill — keeps the directory with everything it fetched and
-exits `franchise_incomplete` (exit 30). Every other command run in that directory, `heal` and
+exits `clone_incomplete` (exit 30). Every other command run in that directory, `heal` and
 `audit` included, refuses with the same code before it takes any lock, so one code means one
-thing: this directory holds a franchise that has not finished. Running the same `franchise` again
+thing: this directory holds a clone that has not finished. Running the same `clone` again
 resumes it: the verified objects are kept, everything else is rebuilt, and `--pallet` and `--only`
 may change. An omitted `--token` reuses the one the first attempt was given, and the trust anchor
 the first attempt saw (or its `--expect` pin) stays enforced.
@@ -572,18 +579,18 @@ the first attempt saw (or its `--expect` pin) stays enforced.
 }
 ```
 
-- `remote` — `null` when the franchise's record cannot be read.
+- `remote` — `null` when the clone's record cannot be read.
 - `cause_code` — the code the failure would have had on its own (`error` when it had none);
   `null` when no attempt has failed yet (one is still running, or was killed).
 - `retry` — what to do next, `null` with `cause_code`:
   - `same` — a transient failure (a timeout, a server error): run the same command again.
   - `unknown` — anything else: run the same command again. When an attempt fails again in the
-    same part of the franchise with the same code and stores nothing new, it is reported as
+    same part of the clone with the same code and stores nothing new, it is reported as
     `change` instead, so an agent never loops on a failure that makes no progress.
   - `change` — the same command fails the same way (`remote_protocol_violation`,
     `only_prefix_not_found`): change `--only` or `--pallet`, or delete the directory.
 
-`next_step` spells out the command. A sparse franchise's `--only` path that names no directory in
+`next_step` spells out the command. A sparse clone's `--only` path that names no directory in
 the pallet is the cause `only_prefix_not_found` (exit 31 where it is raised on its own).
 
 ### Custom metadata that changed on both sides: `meta_conflict`
@@ -617,7 +624,7 @@ ignored, so a stale resolution never applies to a later conflict.
 
 ## Structured conflicts
 
-`forklift conflicts` lists the files an unresolved consolidation or cherry-pick left in conflict.
+`forklift conflicts` lists the files an unresolved consolidation or pick left in conflict.
 With `--json`, each file's three sides are **content addresses** — blob hashes a
 resolver fetches (`forklift store peek <hash>`) and diffs, instead of parsing marker soup:
 
@@ -835,20 +842,20 @@ Example session:
   stderr, not just check the exit code; the taint is enforced regardless on the very next
   command's entry-heal chokepoint (`durability_taint`, exit 21) until `forklift heal`
   resolves it.
-* A `franchise` or `lower` that adopts a remote's trust anchor on first contact writes a
+* A `clone` or `lower` that adopts a remote's trust anchor on first contact writes a
   `trust_adopted` warning to the same channel, with `details`
   `{ "subject": "<url>", "current": "<genesis>", "what_changed": "first_contact" }` — see
   [Trust refusals](#trust-refusals-trust_changed). `lower` writes it as soon as the anchor is
-  adopted, since the adoption stands even if the pull then fails; `franchise` only on success,
-  since a failed franchise removes the warehouse it adopted into.
+  adopted, since the adoption stands even if the pull then fails; `clone` only on success,
+  since a failed clone removes the warehouse it adopted into.
 * A `lower` that adopts a remote's trust anchor on first contact, or an `office accept-regenesis`,
   writes a `pallets_unvouched` warning to the same channel when the anchor does not vouch for the
   history of a pallet this warehouse already held, or that history could not be read to judge it, with `details` `{ "pallets": ["<name>", …] }`.
   Those pallets stay as they are; a take of their history into another pallet is refused
   (`history_unverified`). The command's own result stands and its exit code is unchanged.
-* A `lift`, `lower` or `franchise` whose remote head could not be added to the warehouse's
+* A `lift`, `lower` or `clone` whose remote head could not be added to the warehouse's
   held-heads record (`.forklift/held-heads`, the remote heads it lifted to or was served by a lower,
-  up to date or ahead included, or a franchise) writes a `held_head_unrecorded` warning to the same channel; `message` names the cause. The command's own
+  up to date or ahead included, or a clone) writes a `held_head_unrecorded` warning to the same channel; `message` names the cause. The command's own
   result stands and its exit code is unchanged.
 * A `scope-prune` or `evict` whose remote could not answer which recorded heads of a pallet it still holds
   (a server too old to know the check answers `404`; a busy one answers `unknown`) writes a `holds_unanswered` warning to the

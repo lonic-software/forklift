@@ -12,7 +12,7 @@ use crate::output::{self, CommandOutput};
 /// changes when the configured remote is not the origin, or the origin cannot be reached or is not
 /// trusted. Then, under exclusive store access, it plans: the content of the origin's history,
 /// minus every meta pallet, each checkout's base tree, the parcels a parked, consolidating or
-/// cherry-picking bay names, the trust pins, and staged work. Every object it frees is recorded
+/// picking bay names, the trust pins, and staged work. Every object it frees is recorded
 /// first, so an interrupted eviction leaves a readable warehouse and running it again finishes.
 /// Loose copies are deleted; packed objects go by a full repack that keeps everything else, so
 /// like `store compact --all` it refuses while the warehouse root is served. Last, the record is bounded:
@@ -31,7 +31,7 @@ pub async fn handle_command(dry_run: bool) -> Result<(), String> {
     if !scope_utils::is_cache_mode()? {
         return Err(
             "This warehouse is not a cache; there is nothing to evict. \"forklift store evict\" frees content a \
-            cache warehouse (one franchised with \"--cache\") can fetch again from its origin.".to_string()
+            cache warehouse (one cloned with \"--cache\") can fetch again from its origin.".to_string()
         );
     }
 
@@ -112,7 +112,7 @@ pub(crate) struct EvictReport {
     kept_for_checkouts: usize,
 
     /// Objects the origin holds that stay for a meta pallet, a parked, consolidating or
-    /// cherry-picking bay, a trust pin, or staged work.
+    /// picking bay, a trust pin, or staged work.
     kept_local: usize,
 
     /// Present objects only local history reaches (unlifted work, a haul, a deleted pallet), which
