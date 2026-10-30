@@ -27,7 +27,6 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `consolidate` | `con` | `merge` | Consolidate (merge) another pallet into the current one |
 | `deliver` | `dv` |  | Squash the current draft pallet onto a target as one clean parcel, keeping the trail |
 | `diff` | `d` |  | Show line-by-line changes |
-| `expand` |  |  | Widen a sparse warehouse's fetch scope and download the newly in-scope subtree(s) |
 | `git` |  |  | Move history between this warehouse and git: import, export and mirror |
 | `git import` |  |  | Import a git repository's history into this warehouse (one-way migration) |
 | `git export` |  |  | Export this warehouse's history into a new git repository (one-way, lossy) |
@@ -59,7 +58,6 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `manifest keys` |  |  | List every keyed value, or a parcel's |
 | `manifest log` |  |  | Show every change to a key, newest first, with who made it |
 | `mcp` |  |  | Serve the command surface to an AI agent as MCP tools (stdio) |
-| `narrow` |  |  | Narrow this checkout's materialization scope and de-materialize the dropped subtree(s) |
 | `office` | `o` |  | Manage the warehouse office: users and signing keys |
 | `office enroll` |  |  | Enroll the configured operator and establish trust — one-way! |
 | `office admit` |  |  | Enroll another operator with their public key — admins only |
@@ -92,9 +90,11 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `remote abort` |  |  | Abandon a move that stopped before it started rewriting the origin |
 | `remove` | `rm` |  | Stage a file or directory for removal |
 | `restore` | `r` |  | Restore a file or directory from the inventory (discard unstaged changes) |
-| `scope` |  |  | Show this bay's sparse materialization scope, and the warehouse fetch scope |
-| `scope status` |  |  | Show the current bay's materialization scope and the warehouse fetch scope (the default) |
-| `scope-prune` |  |  | Reclaim disk from a sparse warehouse: forget a fetched path and free its content |
+| `scope` |  |  | Show and change the sparse scopes: this checkout's scope and the warehouse fetch scope |
+| `scope status` |  |  | Show this checkout's scope and the warehouse fetch scope (the default) |
+| `scope fetch` |  |  | Widen a sparse warehouse's fetch scope and download the newly in-scope subtree(s) |
+| `scope narrow` |  |  | Narrow this checkout's scope and remove the dropped subtree(s) from the working directory |
+| `scope prune` |  |  | Reclaim disk from a sparse warehouse: shrink its fetch scope and free the content |
 | `self` |  |  | Manage this binary itself: its update, its short alias and its self-description |
 | `self alias` |  |  | Manage the `fl` short alias for this binary |
 | `self alias install` |  |  | Create the alias next to this binary (default name: "fl") |
