@@ -5267,25 +5267,100 @@ fn a_sparse_workspace_refuses_to_lift_to_a_non_origin_remote() {
     assert!(json["error"]["message"].as_str().unwrap().contains(&server1.url),
         "the refusal names the origin: {}", stdout(&refused));
 
-    // Unsetting the origin is refused at the client the same way, naming the ways out, rather than
-    // left to the empty remote's closure check.
+    // The origin is not configuration: `config` cannot change it to agree with the remote.
+    let set = origin.forklift("sparse", &["config", "remote.origin", &server2.url]);
+    assert!(!set.status.success() && stderr(&set).contains("Unknown configuration key"), "{}", stderr(&set));
+
+    // A missing origin record is refused at the client the same way, never read as the configured
+    // remote, rather than left to the remote's closure check.
     //
-    // Revert: let `ensure_origin_remote` pass a partial warehouse with no origin → the lift fails at
-    // the remote instead, with another code → red.
-    assert_success(&origin.forklift("sparse", &["config", "--unset", "remote.origin"]));
+    // Revert: let a partial warehouse with no origin dial `remote.url` → the lift reaches the
+    // remote and fails there, with another code → red.
+    std::fs::remove_file(origin.path("sparse/.forklift/origin")).unwrap();
+    assert_success(&origin.forklift("sparse", &["config", "remote.url", &server1.url]));
     let forced = origin.forklift("sparse", &["--json", "lift"]);
     assert_eq!(forced.status.code(), Some(11), "an originless sparse lift exits 11: {}", stderr(&forced));
     let json: serde_json::Value = serde_json::from_str(&stdout(&forced)).unwrap();
     assert_eq!(json["error"]["code"], "non_origin_remote", "{}", stdout(&forced));
     let message = json["error"]["message"].as_str().unwrap();
-    assert!(message.contains("is not recorded") && message.contains("forklift config remote.origin <url>"),
-        "the refusal names the missing origin and the ways out: {}", message);
+    assert!(message.contains("origin record") && message.contains("Franchise the remote again"),
+        "the refusal names the missing record and the way out: {}", message);
+}
 
-    // Recording the origin again restores the ordinary guard.
-    assert_success(&origin.forklift("sparse", &["config", "remote.origin", &server1.url]));
-    let again = origin.forklift("sparse", &["--json", "lift"]);
-    assert_eq!(again.status.code(), Some(11), "{}", stderr(&again));
-    assert!(stdout(&again).contains(&server1.url), "the origin guard is back: {}", stdout(&again));
+/// Every command that talks to a remote from a partial warehouse talks only to its origin: pointed
+/// at another remote that holds the same history and more, `lower`, `expand`, `scope-prune`,
+/// `palletize --delete` (asking whether the remote holds the pallet's work), and the remote
+/// `--delete` and `--restore` each refuse as `non_origin_remote` (exit 11), naming both remotes,
+/// with every file under `.forklift` as it was. A full warehouse lowers from the same remote.
+///
+/// Revert: build any one command's client with `RemoteClient::from_config` again → that command
+/// runs against the other remote (lower, expand, scope-prune and the remote delete succeed; the
+/// local delete and the restore fail with another code) → red.
+#[test]
+fn a_partial_warehouse_talks_to_no_remote_but_its_origin() {
+    let area = TestArea::new("origin-only");
+    let server1 = Server::start(&area, None);
+    let server2 = Server::start_at(&area, "server-root-2", None);
+
+    prepare_warehouse(&area, "dev", &server1.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/web/w.txt", "web v1\n");
+    area.write_file("dev/docs/d.txt", "docs v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    assert_success(&area.forklift(".", &["franchise", &server1.url, "sparse", "--only", "src/api", "--only", "docs"]));
+    assert_success(&area.forklift(".", &["franchise", &server1.url, "full"]));
+
+    // The other remote holds the same history, a newer head and another pallet.
+    area.write_file("dev/src/api/a.txt", "api v2\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "second"]));
+    assert_success(&area.forklift("dev", &["config", "remote.url", &server2.url]));
+    assert_success(&area.forklift("dev", &["lift"]));
+    assert_success(&area.forklift("dev", &["palletize", "extra"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    // Work only a local pallet holds, so deleting it asks the remote.
+    assert_success(&area.forklift("sparse", &["palletize", "old"]));
+    area.write_file("sparse/src/api/old.txt", "old\n");
+    assert_success(&area.forklift("sparse", &["load", "."]));
+    assert_success(&area.forklift("sparse", &["stack", "old work"]));
+    assert_success(&area.forklift("sparse", &["shift", "main"]));
+    // No checkout materializes docs, so pruning it asks the remote.
+    assert_success(&area.forklift("sparse", &["narrow", "docs"]));
+
+    assert_success(&area.forklift("sparse", &["config", "remote.url", &server2.url]));
+    let before = forklift_dir_snapshot(&area, "sparse");
+
+    let commands: [&[&str]; 6] = [
+        &["lower"],
+        &["expand", "src/web"],
+        &["scope-prune", "docs"],
+        &["palletize", "--delete", "old"],
+        &["palletize", "--delete", "extra", "--remote"],
+        &["palletize", "--restore", "extra", "--remote"],
+    ];
+    for command in commands {
+        let mut args = vec!["--json"];
+        args.extend_from_slice(command);
+        let refused = area.forklift("sparse", &args);
+        assert_eq!(refused.status.code(), Some(11), "{:?}: {}{}", command, stdout(&refused), stderr(&refused));
+        let json = json_of(&refused);
+        assert_eq!(json["error"]["code"], "non_origin_remote", "{:?}: {}", command, json);
+        let message = json["error"]["message"].as_str().unwrap();
+        assert!(message.contains(&server1.url) && message.contains(&server2.url), "{:?}: {}", command, message);
+        assert!(forklift_dir_snapshot(&area, "sparse") == before, "{:?} changes nothing", command);
+    }
+
+    // The other remote still has the pallet the refused delete named.
+    let listed = json_of(&area.forklift("dev", &["--json", "palletize", "--remote"]));
+    assert!(listed.to_string().contains("extra"), "{}", listed);
+
+    assert_success(&area.forklift("full", &["config", "remote.url", &server2.url]));
+    assert_success(&area.forklift("full", &["lower"]));
+    assert_eq!(area.read_file("full/src/api/a.txt"), "api v2\n");
 }
 
 /// A sparse warehouse's partiality is recorded in its marker, so deleting its fetch scope no longer
