@@ -1687,10 +1687,12 @@ this warehouse never verified there, fetch another history into what this wareho
 free content by heads the origin does not have. So every command that dials the remote from a
 partial warehouse — `lift`, `lower`, `expand`, `scope-prune`, `evict`, `palletize --remote`
 (listing, `--delete` and `--restore`), `office enroll`, `rotate`, `retire` and
-`accept-regenesis`, a cache's fetch of content it lacks, and `heal`'s refetch — refuses with the
+`accept-regenesis`, and a cache's fetch of content it lacks — refuses with the
 `non_origin_remote` code (exit 11) when `remote.url` is not the origin, naming both and changing
-nothing. Point `remote.url` back at the origin, or franchise the other remote into a new
-directory. The origin record is not configuration: no `config` key reaches it. A partial
+nothing. `heal` asks no such remote either: it does its local repair and, for what only a remote
+could restore, carries that refusal's message in its own report. Point `remote.url` back at the
+origin, or franchise the other remote into a new directory. The origin record is not
+configuration: no `config` key reaches it. A partial
 warehouse whose record is missing (only a damaged `.forklift` can be) is refused with the same
 code; franchise the remote again. A full warehouse records no origin, holds the whole closure and
 can talk to any remote.
