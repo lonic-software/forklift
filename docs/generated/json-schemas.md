@@ -4711,7 +4711,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "null"
         }
       ],
-      "description": "The refusal a command that dials the remote would meet from here; none when nothing stops\nit, or when no remote is configured."
+      "description": "The refusal a command that dials the remote would meet from here; none when nothing stops\nit. With no remote configured, only a move of the origin standing or a partial warehouse's\nmissing origin record is reported."
     },
     "origin": {
       "description": "A partial warehouse's origin, the one server proved to hold what it lacks; none for a full\nwarehouse, which may talk to any remote, and for a partial one whose record is missing.",

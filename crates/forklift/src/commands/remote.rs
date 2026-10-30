@@ -139,39 +139,43 @@ async fn check_and_rewrite(target: &str,
 
 /// Handle bare `remote`: report the configured remote, whether this is a partial warehouse and,
 /// for one, its origin, and what would stop a client talking to the remote from here (a move of
-/// the origin standing, or a remote that is not the origin). Reads only; takes no lock.
+/// the origin standing, a remote that is not the origin, or a partial warehouse's missing origin
+/// record). Reads only; takes no lock.
 ///
 /// # Returns
 /// * `Ok(())`      - The report was emitted.
-/// * `Err(String)` - The configuration, the fetch state or the origin record could not be read.
+/// * `Err(String)` - The configuration, the fetch state, the origin record or a move's intent
+///   could not be read.
 pub fn show() -> Result<(), String> {
     let remote = config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)?.map(|(value, _)| value);
     let partial = scope_utils::content_may_be_absent()?;
     let origin = if partial { origin_utils::read_origin()? } else { None };
 
-    // What `checked_remote` refuses is what every client that dials the remote would refuse; with
-    // no remote configured its unclassified error is only that, which the report already says.
-    let refusal = match origin_utils::checked_remote() {
-        Ok(_) => None,
-        Err(refusal @ CoreError::Refusal { .. }) => Some(refusal),
-        // A partial warehouse's missing origin is met only past the remote's URL; it is damage
-        // whether or not a remote is configured.
-        Err(_) if remote.is_none() && partial && origin.is_none() => Some(origin_utils::missing_origin_refusal()),
-        Err(_) if remote.is_none() => None,
-        Err(other) => return Err(other.into()),
-    };
-    let blocked = match refusal {
-        Some(CoreError::Refusal { code, message, next_step, .. }) => Some(RemoteBlock {
-            code: code.as_str(),
-            message,
-            next_step,
-        }),
-        _ => None,
+    // A move of the origin standing stops every client first, remote or none. Past it, what
+    // `checked_remote` refuses is what every client dialing the remote would; with no remote
+    // there is nothing to dial, and only a partial warehouse's missing origin is still damage.
+    let blocked = if let Err(pending) = origin_move::ensure_none_pending() {
+        Some(block_of(pending)?)
+    } else if remote.is_none() {
+        if partial && origin.is_none() { Some(block_of(origin_utils::missing_origin_refusal())?) } else { None }
+    } else {
+        match origin_utils::checked_remote() {
+            Ok(_) => None,
+            Err(refused) => Some(block_of(refused)?),
+        }
     };
 
     output::emit(&RemoteReport { remote, partial, origin, blocked });
 
     Ok(())
+}
+
+/// A refusal as what bare `remote` reports; any other error is the show's own failure.
+fn block_of(error: CoreError) -> Result<RemoteBlock, String> {
+    match error {
+        CoreError::Refusal { code, message, next_step, .. } => Ok(RemoteBlock { code: code.as_str(), message, next_step }),
+        other => Err(other.into()),
+    }
 }
 
 /// `remote move --abort`: clear an intent a move left before rewriting, and report one it left
@@ -220,7 +224,8 @@ pub(crate) struct RemoteReport {
     origin: Option<String>,
 
     /// The refusal a command that dials the remote would meet from here; none when nothing stops
-    /// it, or when no remote is configured.
+    /// it. With no remote configured, only a move of the origin standing or a partial warehouse's
+    /// missing origin record is reported.
     blocked: Option<RemoteBlock>,
 }
 
