@@ -1118,7 +1118,7 @@ fn bearing(token: &str, mut request: Request<Vec<u8>>) -> Request<Vec<u8>> {
 /// identifier), from a key generated under that identifier, then switch back to the admin.
 fn enroll(area: &Area, dir: &str, identifier: &str, role_args: &[&str]) {
     area.forklift(dir, &["config", "set", "operator.identifier", identifier]);
-    let keygen = area.forklift_stdout(dir, &["office", "keygen"]);
+    let keygen = area.forklift_stdout(dir, &["profile", "keygen"]);
     area.forklift(dir, &["config", "set", "operator.identifier", "tester@forklift"]);
 
     let admit: Vec<&str> = keygen.lines()

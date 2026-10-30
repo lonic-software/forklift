@@ -1191,7 +1191,7 @@ mod tests {
     }
 
     /// The base `key = value` lands on: `base` itself, or, when clap refuses the pair as a
-    /// conflict (`peek --inventory` with a hash, `config --unset` with a value), `base` with
+    /// conflict (`peek --inventory` with a hash), `base` with
     /// optional positional words dropped from the end until it parses. Whatever base is
     /// returned, `value` was parsed on it and landed; any other refusal fails the test.
     fn fit(built: &Command, command: &SchemaCommand, base: &BTreeMap<String, Value>, key: &str, value: Value) -> BTreeMap<String, Value> {

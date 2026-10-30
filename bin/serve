@@ -17,7 +17,7 @@ mkdir -p "$root"
 ./target/debug/forklift-server prepare --root "$root" >/dev/null 2>&1 || true
 
 echo "serving \"$root\" at http://$addr (no authentication — --open, local dev only)"
-echo "  point a warehouse at it:  forklift config remote.url http://$addr"
+echo "  point a warehouse at it:  forklift config set remote.url http://$addr"
 echo "  (Ctrl-C to stop; the warehouse persists under .dev/ between runs)"
 # --open: this script's whole point is throwaway, unauthenticated local testing. Without it,
 # forklift-server now refuses to start with no token/tokens/authentication hook configured

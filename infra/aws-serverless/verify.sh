@@ -552,7 +552,7 @@ log "  OK — staging/ did not grow ($staging_key_count_before -> $staging_key_c
 #     presigned URL, unconditionally (line ~734) — there is no size threshold under which it
 #     hands back bytes directly. The signature sidecar is the ONLY 200-with-raw-bytes path this
 #     deployment ever has; there is no unsigned substitute to swap in.
-#   - Establishing a trust anchor from inside this script (`office keygen` + `office admit`,
+#   - Establishing a trust anchor from inside this script (`profile keygen` + `office admit`,
 #     or the equivalent `office enroll`): ruled out as OUT OF SCOPE for this script, not
 #     attempted and silently left broken. `office enroll` is a one-way door for the ENTIRE
 #     persistent warehouse ("from then on every parcel stacked in this warehouse must be

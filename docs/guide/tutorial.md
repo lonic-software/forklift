@@ -75,7 +75,7 @@ Stacked parcel … on pallet "main".
 Your operator id now exists:
 
 ```console
-$ forklift config operator.identifier
+$ forklift config get operator.identifier
 …
 ```
 
@@ -276,7 +276,7 @@ Back in the first terminal, point `hello` at the server and `lift` (push) it:
 
 ```console
 $ cd hello
-$ forklift config remote.url http://127.0.0.1:7171
+$ forklift config set remote.url http://127.0.0.1:7171
 $ forklift lift
 Lifted the office pallet: 1 new parcel(s).
 Lifted pallet "main" to …: … new parcel(s), … object(s) and 1 signature(s) uploaded.

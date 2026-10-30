@@ -181,7 +181,7 @@ in [Trust and identity](guide/trust-and-identity.md).
 | Who can contribute | Whoever the host lets push | On a trusted warehouse, **only holders of admitted keys** |
 | User registry | None (hosts keep one outside the repo) | **In-repo `office`** — users, roles, keys, all signed |
 | Offline verification | `git verify-commit` against a keyring you supply | [`audit`](guide/cli.md#audit--verify-signed-history-offline-a) — verifies the chain from a **genesis trust anchor** offline |
-| Key management | Out of band | `office keygen` / `admit` / `authorize` / `rotate` / `retire`, with revocation decided by ancestry |
+| Key management | Out of band | `profile keygen` / `office admit` / `authorize` / `rotate` / `retire`, with revocation decided by ancestry |
 | Privacy | Name + email baked into immutable history forever | **Pseudonymous: history has no name or email fields**, only an operator id |
 
 Git can sign, but which keys count is decided outside the repository, so a clone cannot tell

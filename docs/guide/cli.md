@@ -154,7 +154,7 @@ it came from and the export format it was written in.
 ### `git mirror` — keep a git remote in step
 
 ```sh
-forklift config mirror.url git@github.com:me/project.git
+forklift config set mirror.url git@github.com:me/project.git
 forklift git mirror
 ```
 
@@ -220,20 +220,21 @@ remote's directory supplies one for an id, and the id otherwise. To act under an
 of your choosing, set it:
 
 ```sh
-forklift config --global operator.identifier ada@example.com
+forklift config set --global operator.identifier ada@example.com
 ```
 
-`config` has four forms:
+`config` is a family of four operations:
 
 ```sh
-forklift config                       # list every known key and its value
-forklift config <key>                 # print one value
-forklift config <key> <value>         # set a value (warehouse scope)
-forklift config --unset <key>         # remove a value
+forklift config                       # list every known key and its value (same as config list)
+forklift config get <key>             # print one value
+forklift config set <key> <value>     # set a value (warehouse scope)
+forklift config unset <key>           # remove a value
 ```
 
-- Add `--global` to target your per-user config (`~/.forkliftconfig`) instead of
-  the warehouse. Reads consult the warehouse first, then fall back to global.
+- Add `--global` to any of them (`config list --global`, `config set --global <key> <value>`)
+  to target your per-user config (`~/.forkliftconfig`) instead of the warehouse. Reads consult
+  the warehouse first, then fall back to global. Outside a warehouse, only `--global` works.
 - Unknown keys are rejected (a typo can't silently do nothing).
 - The known keys are listed in [Configuration reference](#9-configuration-reference).
 
@@ -1659,8 +1660,8 @@ ingest, unseen by a cross-store `store compact --all --redelta` pass.
 ### Configuring a remote on an existing warehouse
 
 ```sh
-forklift config remote.url http://forklift.example.com:9418
-forklift config remote.token <secret>      # only if the server requires one
+forklift config set remote.url http://forklift.example.com:9418
+forklift config set remote.token <secret>  # only if the server requires one
 ```
 
 ### `lift` — push (`li`)
@@ -1989,7 +1990,7 @@ chunk that something here references and this warehouse does not hold, and only 
 origin record and `remote.url` (and `remote.token`, given `--token`; without it the current token is
 used to talk to the new server). The URL is recorded as given, less a trailing `/`. A full warehouse
 has no origin to move and is refused: point it at another remote with
-`forklift config remote.url <url>`.
+`forklift config set remote.url <url>`.
 
 The check judges the new server's trust as `lower` does, without adopting anything, fetches the
 parcels and signatures of its pallets' and tombstones' history that are missing here (no content),
@@ -2025,7 +2026,6 @@ guide: **[`trust-and-identity.md`](trust-and-identity.md)**. In brief:
 
 ```sh
 forklift office enroll            # establish trust (one-way; every parcel is signed after this)
-forklift office keygen            # generate a key and print your enrollment line
 forklift office admit <id> <pub> <pop>   # an admin admits a newcomer (or an agent/bot)
 forklift office list              # who's enrolled, their roles, keys, and classes
 forklift office rotate            # replace your key
@@ -2038,7 +2038,14 @@ forklift office retire <key>      # revoke a key
 forklift profile list
 forklift profile create work
 forklift profile use work
+forklift profile keygen           # generate a key and print your enrollment line
+forklift profile keygen work      # the same, for the work profile's operator id
 ```
+
+`profile keygen` runs anywhere, inside a warehouse or not, and records nothing in one. Without a
+name, the key belongs to the identity the current directory acts as: the profile the enclosing
+warehouse selects, else the globally selected profile, else your default identity. It says which
+one it used.
 
 ---
 
@@ -2163,7 +2170,7 @@ first time you need it.
 mutating command once the store has accumulated enough loose objects or packs to warrant it
 (git's `gc --auto`). It runs synchronously, under that command's lock, so it is correct and
 never races — which means it can add a brief pause when it fires (rarely). Turn it off with
-`config maintenance.auto false`, or tune the thresholds (`maintenance.loose`, `maintenance.packs`,
+`config set maintenance.auto false`, or tune the thresholds (`maintenance.loose`, `maintenance.packs`,
 `maintenance.signatureTables`).
 
 Compaction also takes a **shared object-store lock** (separate from the per-bay lock ordinary
@@ -2535,12 +2542,12 @@ Refused, in either file:
 | `tor = "onn"` | `remote.tor` accepts only `auto`, `on` or `off`. A typo here used to mean `auto` silently, un-proxying every non-onion remote |
 | `auto = "flase"`, `loose = "10k"` | `maintenance.auto` accepts only the spellings listed above, and `maintenance.loose`/`maintenance.packs`/`maintenance.signatureTables` only a whole number. A typo here used to leave maintenance on, or fall back to the default threshold, without a word |
 | an unknown field in a `[profile.<name>]` section | profiles hold only `identifier` |
-| any key set to `""` (or to whitespace) | a key holds a value or is absent, there is no third state — an empty `identifier` was read as an identity by one path and as "fill this in" by the other, which minted a new id *over* your entry. Remove a section key with `forklift config --unset <key>` (add `--global` for the global file); a `[profile.<name>]` field the command cannot address, so remove that one in an editor |
+| any key set to `""` (or to whitespace) | a key holds a value or is absent, there is no third state — an empty `identifier` was read as an identity by one path and as "fill this in" by the other, which minted a new id *over* your entry. Remove a section key with `forklift config unset <key>` (add `--global` for the global file); a `[profile.<name>]` field the command cannot address, so remove that one in an editor |
 
 **A write is refused unless the file it would leave on disk parses completely.** The check is on
 the result, not on what was there before — so `forklift config` *can* repair a broken entry it is
-able to express: with `tor = "onn"` in the file, `forklift config remote.tor on` and `forklift
-config --unset remote.tor` both succeed, because neither leaves the bad value standing. What is
+able to express: with `tor = "onn"` in the file, `forklift config set remote.tor on` and `forklift
+config unset remote.tor` both succeed, because neither leaves the bad value standing. What is
 refused is a write that would preserve it: setting `remote.url` while `tor = "onn"` is still
 there fails, naming the `tor` entry rather than the key you were setting. A fault the command
 cannot express — `operator = 5`, an unknown section, a mistyped key — still needs a text editor;
@@ -2551,10 +2558,10 @@ ever edited with the command.
 Set / read / remove:
 
 ```sh
-forklift config remote.url https://forklift.example.com
-forklift config --global operator.identifier ada@example.com
-forklift config remote.token
-forklift config --unset remote.token
+forklift config set remote.url https://forklift.example.com
+forklift config set --global operator.identifier ada@example.com
+forklift config get remote.token
+forklift config unset remote.token
 ```
 
 The `FORKLIFT_GLOBAL_CONFIG` and `FORKLIFT_KEYS_DIR` environment variables
@@ -2582,8 +2589,8 @@ directly and unchanged. So an onion URL Just Works while a plain `http(s)` remot
 exactly as before.
 
 ```sh
-forklift config remote.torProxy socks5h://127.0.0.1:9150   # Tor Browser's bundled SOCKS port
-forklift config --global remote.tor on                     # route every remote through Tor
+forklift config set remote.torProxy socks5h://127.0.0.1:9150   # Tor Browser's bundled SOCKS port
+forklift config set --global remote.tor on                     # route every remote through Tor
 ```
 
 - `remote.tor` — `auto` (default, onion-only), `on` (every remote — e.g. reach a clearnet

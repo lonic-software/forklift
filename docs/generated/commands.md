@@ -23,6 +23,10 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `blame` | `bl` | `annotate` | Show, for each line of a file, the parcel and author that last changed it |
 | `clone` |  |  | Clone a remote warehouse into a new directory |
 | `config` | `cfg` |  | Read or change configuration values |
+| `config list` |  |  | List every known key and its value (the default) |
+| `config get` |  |  | Print the value of a key |
+| `config set` |  |  | Set a key to a value |
+| `config unset` |  |  | Remove a key (e.g. clearing a "remote.token") |
 | `conflicts` |  |  | List the files left in conflict by an unresolved consolidation |
 | `consolidate` | `con` | `merge` | Consolidate (merge) another pallet into the current one |
 | `deliver` | `dv` |  | Squash the current draft pallet onto a target as one clean parcel, keeping the trail |
@@ -62,7 +66,6 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `narrow` |  |  | Narrow this checkout's materialization scope and de-materialize the dropped subtree(s) |
 | `office` | `o` |  | Manage the warehouse office: users and signing keys |
 | `office enroll` |  |  | Enroll the configured operator and establish trust — one-way! |
-| `office keygen` |  |  | Generate a keypair locally and print its public half + proof-of-possession |
 | `office admit` |  |  | Enroll another operator with their public key — admins only |
 | `office link` |  |  | Link another device's key to your own identity |
 | `office authorize` |  |  | Authorize a new key for an already-enrolled operator — admins only |
@@ -86,9 +89,11 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `profile list` |  |  | List the profiles and the local keys each one holds (the default) |
 | `profile create` |  |  | Create a named profile (mints an operator id unless one is given) |
 | `profile use` |  |  | Act as this profile in the current warehouse |
+| `profile keygen` |  |  | Generate a keypair locally and print its public half + proof-of-possession |
 | `query` | `q` |  | Query parcel history by signed identity, signer and parcel facts |
 | `remote` |  |  | Show the remote and the origin, or move a partial warehouse's origin to another server |
 | `remote move` |  |  | Move a partial warehouse's origin to another server that holds its content |
+| `remote abort` |  |  | Abandon a move that stopped before it started rewriting the origin |
 | `remove` | `rm` |  | Stage a file or directory for removal |
 | `restore` | `r` |  | Restore a file or directory from the inventory (discard unstaged changes) |
 | `scope` |  |  | Show this bay's sparse materialization scope, and the warehouse fetch scope |

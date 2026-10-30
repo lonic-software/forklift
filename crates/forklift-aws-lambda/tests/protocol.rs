@@ -674,7 +674,7 @@ fn a_tag_is_admitted_only_from_an_admin_of_the_held_office() {
     // A second identity in the same warehouse, admitted as an admin, tags a release.
     let worker = "worker@forklift";
     area.forklift("wh", &["config", "set", "operator.identifier", worker]);
-    let keygen = area.forklift_stdout("wh", &["office", "keygen"]);
+    let keygen = area.forklift_stdout("wh", &["profile", "keygen"]);
     area.forklift("wh", &["config", "set", "operator.identifier", "tester@forklift"]);
     let mut admit: Vec<&str> = keygen.lines()
         .find(|line| line.trim_start().starts_with("office admit "))
@@ -735,7 +735,7 @@ fn a_haul_merge_is_admitted_only_from_a_writer_of_its_target() {
 
     let worker = "worker@forklift";
     area.forklift("wh", &["config", "set", "operator.identifier", worker]);
-    let keygen = area.forklift_stdout("wh", &["office", "keygen"]);
+    let keygen = area.forklift_stdout("wh", &["profile", "keygen"]);
     area.forklift("wh", &["config", "set", "operator.identifier", "tester@forklift"]);
     let admit: Vec<&str> = keygen.lines()
         .find(|line| line.trim_start().starts_with("office admit "))
@@ -785,7 +785,7 @@ fn a_writer_promoting_themselves_is_forbidden_and_an_admin_promoting_them_is_not
 
     let worker = "worker@forklift";
     area.forklift("wh", &["config", "set", "operator.identifier", worker]);
-    let keygen = area.forklift_stdout("wh", &["office", "keygen"]);
+    let keygen = area.forklift_stdout("wh", &["profile", "keygen"]);
     area.forklift("wh", &["config", "set", "operator.identifier", "tester@forklift"]);
     let mut admit: Vec<&str> = keygen.lines()
         .find(|line| line.trim_start().starts_with("office admit "))
@@ -2814,7 +2814,7 @@ fn a_grant_revoked_between_the_move_gate_and_the_commit_refuses_the_move() {
 
     let writer = "wes@forklift";
     area.forklift("wh", &["config", "set", "operator.identifier", writer]);
-    let keygen = area.forklift_stdout("wh", &["office", "keygen"]);
+    let keygen = area.forklift_stdout("wh", &["profile", "keygen"]);
     area.forklift("wh", &["config", "set", "operator.identifier", "tester@forklift"]);
     let admit: Vec<&str> = keygen.lines()
         .find(|line| line.trim_start().starts_with("office admit "))
@@ -4287,7 +4287,7 @@ fn a_delete_of_unknown_fate_is_settled_by_the_ref() {
 /// identifier), from a key generated under that identifier, then switch back to the admin.
 fn enroll(area: &Area, dir: &str, identifier: &str, role_args: &[&str]) {
     area.forklift(dir, &["config", "set", "operator.identifier", identifier]);
-    let keygen = area.forklift_stdout(dir, &["office", "keygen"]);
+    let keygen = area.forklift_stdout(dir, &["profile", "keygen"]);
     area.forklift(dir, &["config", "set", "operator.identifier", "tester@forklift"]);
 
     let admit: Vec<&str> = keygen.lines()

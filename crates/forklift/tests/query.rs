@@ -116,7 +116,7 @@ fn configure_operator(warehouse: &TestWarehouse) {
 /// `[operator_id, public_key, pop]`.
 fn keygen_admit_args(warehouse: &TestWarehouse, operator_id: &str) -> Vec<String> {
     assert_success(&warehouse.run(&["config", "set", "operator.identifier", operator_id]));
-    let keygen = stdout(&warehouse.run(&["office", "keygen"]));
+    let keygen = stdout(&warehouse.run(&["profile", "keygen"]));
     assert_success(&warehouse.run(&["config", "set", "operator.identifier", "test@forklift"]));
 
     keygen.lines()

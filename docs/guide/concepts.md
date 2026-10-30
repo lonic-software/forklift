@@ -173,7 +173,7 @@ Back in the first terminal, lift the warehouse, then clone only `src`:
 
 ```console
 $ cd shop
-$ forklift config remote.url http://127.0.0.1:7171
+$ forklift config set remote.url http://127.0.0.1:7171
 $ forklift lift
 Lifted the office pallet: 1 new parcel(s).
 Lifted the @kv pallet.

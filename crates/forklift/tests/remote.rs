@@ -3294,7 +3294,7 @@ fn keygen_admit_args(area: &TestArea, operator_id: &str) -> Vec<String> {
     let admin_id = stdout(&admin_output).trim().to_string();
 
     assert_success(&area.forklift("a", &["config", "set", "operator.identifier", operator_id]));
-    let output = area.forklift("a", &["office", "keygen"]);
+    let output = area.forklift("a", &["profile", "keygen"]);
     assert_success(&output);
     assert_success(&area.forklift("a", &["config", "set", "operator.identifier", &admin_id]));
 
@@ -4370,7 +4370,7 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_reads_signer_boundar
 
     // Admit an agent.
     assert_success(&area.forklift("dev", &["config", "set", "operator.identifier", "agent@forklift"]));
-    let keygen = area.forklift("dev", &["office", "keygen"]);
+    let keygen = area.forklift("dev", &["profile", "keygen"]);
     assert_success(&keygen);
     let admit_args: Vec<String> = stdout(&keygen)
         .lines()
@@ -4533,7 +4533,7 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_audits_the_vouched_p
 
     // Admit an agent.
     assert_success(&area.forklift("dev", &["config", "set", "operator.identifier", "agent@forklift"]));
-    let keygen = area.forklift("dev", &["office", "keygen"]);
+    let keygen = area.forklift("dev", &["profile", "keygen"]);
     assert_success(&keygen);
     let admit_args: Vec<String> = stdout(&keygen)
         .lines()
@@ -4779,7 +4779,7 @@ fn retiring_a_signer_then_lifting_only_a_replacement_pallet_refuses_instead_of_a
 
     // Admit the agent.
     assert_success(&area.forklift("w", &["config", "set", "--global", "operator.identifier", "agent@forklift"]));
-    let keygen = area.forklift("w", &["office", "keygen"]);
+    let keygen = area.forklift("w", &["profile", "keygen"]);
     assert_success(&keygen);
     let admit_args: Vec<String> = stdout(&keygen)
         .lines()

@@ -573,13 +573,13 @@ A command not listed here either reports only the generic human-message shape `{
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "A `config <key> <value>` set (human output stays silent).",
+  "description": "A `config set` (human output stays silent).",
   "properties": {
     "key": {
       "type": "string"
     },
     "value": {
-      "description": "The value as written to the file, which is not always the argument given: a key with a\nfixed set of values (`remote.tor`) is stored in its documented spelling, so `\"  ON  \"` is\nreported, and stored, as `\"on\"`. A later `config <key>` read returns this same string.",
+      "description": "The value as written to the file, which is not always the argument given: a key with a\nfixed set of values (`remote.tor`) is stored in its documented spelling, so `\"  ON  \"` is\nreported, and stored, as `\"on\"`. A later `config get` returns this same string.",
       "type": "string"
     }
   },
@@ -597,7 +597,7 @@ A command not listed here either reports only the generic human-message shape `{
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "A `config <key>` read.",
+  "description": "A `config get` read.",
   "properties": {
     "key": {
       "type": "string"
@@ -4814,7 +4814,7 @@ A command not listed here either reports only the generic human-message shape `{
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "The result of `remote move --abort`.",
+  "description": "The result of `remote abort`.",
   "properties": {
     "abandoned": {
       "description": "The server the abandoned move was going to; none when no move had stopped.",

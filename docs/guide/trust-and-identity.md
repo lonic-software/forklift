@@ -186,7 +186,7 @@ control.
 **The newcomer** generates a key and prints their enrollment line:
 
 ```sh
-forklift office keygen
+forklift profile keygen
 # prints:  office admit <operator-id> <public-key> <proof-of-possession>
 #          office link  <public-key> <proof-of-possession>
 ```
@@ -207,7 +207,7 @@ proof-of-possession is verified, so a stolen line can't be re-attributed to
 someone else. Office records are pseudonymous — no names or emails on-chain.
 
 **Recovery — an admin re-keys an existing operator.** If someone lost every
-device, they run `office keygen` on a new machine and hand you the line; you
+device, they run `profile keygen` on a new machine and hand you the line; you
 authorize the new key for their existing identity:
 
 ```sh
@@ -279,7 +279,7 @@ hold:
 
 ```sh
 # on the new device (configured with the same operator id):
-forklift office keygen
+forklift profile keygen
 # on a device that already holds one of your keys:
 forklift office link <public-key> <pop>
 ```
@@ -298,7 +298,7 @@ agent with shell access. To stop that, protect a human's key with a passphrase:
 
 ```sh
 forklift office enroll --passphrase
-forklift office keygen --passphrase
+forklift profile keygen --passphrase
 forklift office rotate --passphrase
 ```
 

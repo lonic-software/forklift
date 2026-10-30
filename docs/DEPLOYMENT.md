@@ -848,7 +848,7 @@ Run this against your **actual deployed infrastructure** (not LocalStack) once i
 1. `curl https://<your-api>/v1/warehouse` (or the multi-warehouse `/warehouses/{id}/v1/warehouse`
    form) answers `200` with `"chunking": true` in the body.
 2. A small `forklift clone <url> <dir>` round trip: `forklift prepare`, add a couple of
-   small files, `load`/`stack`, `config remote.url <url>`, `lift`, then `clone <url> other-dir`
+   small files, `load`/`stack`, `config set remote.url <url>`, `lift`, then `clone <url> other-dir`
    and diff the two directories byte-for-byte.
 3. A **chunked** round trip: track a file at or above 8 MiB (the chunk threshold), `lift` it, and
    `clone` it back down — confirms the presigned chunk `GET`s, the recipe descent, and

@@ -167,7 +167,7 @@ fn operator_id(warehouse: &TestWarehouse) -> String {
 /// `[operator_id, public_key, pop]`.
 fn keygen_admit_args(warehouse: &TestWarehouse, operator_id: &str) -> Vec<String> {
     assert_success(&warehouse.run(&["config", "set", "operator.identifier", operator_id]));
-    let keygen = stdout(&warehouse.run(&["office", "keygen"]));
+    let keygen = stdout(&warehouse.run(&["profile", "keygen"]));
     assert_success(&warehouse.run(&["config", "set", "operator.identifier", "test@forklift"]));
 
     keygen.lines()
@@ -4503,7 +4503,7 @@ fn office_manages_users_and_keys_as_signed_tracked_metadata() {
     // public key and proof-of-possession — the CSR pattern). Bob runs keygen under
     // his own id (the warehouse scope overrides the global one).
     assert_success(&warehouse.run(&["config", "set", "operator.identifier", "bob@forklift"]));
-    let keygen = stdout(&warehouse.run(&["office", "keygen"]));
+    let keygen = stdout(&warehouse.run(&["profile", "keygen"]));
     let admit_args: Vec<&str> = keygen.lines()
         .find(|line| line.trim_start().starts_with("office admit "))
         .expect("keygen must print the admit line")
@@ -6969,6 +6969,62 @@ fn profiles_select_the_identity_a_warehouse_acts_under() {
     assert!(work_line.contains("1 local key(s)"), "unexpected profile list: {}", list);
 }
 
+/// `profile keygen` binds the key to an identity the command names: the profile given, else the
+/// profile the enclosing warehouse selects, else the globally selected one, else the default
+/// identity. It runs outside a warehouse and records nothing in one; `office keygen` is gone.
+///
+/// Revert: bind a named keygen to the current identity → the admit line carries the default id →
+/// red; drop the outside-a-warehouse entry → keygen in the home refuses → red.
+#[test]
+fn profile_keygen_binds_to_the_named_or_current_identity_inside_or_outside_a_warehouse() {
+    let warehouse = TestWarehouse::new("profile-keygen");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["profile", "create", "work"]));
+    let admitted = |output: &Output| -> String {
+        assert_success(output);
+        stdout(output).lines()
+            .find(|line| line.trim_start().starts_with("office admit "))
+            .expect("keygen prints the admit line")
+            .split_whitespace().nth(2).unwrap().to_string()
+    };
+
+    // Outside a warehouse, with nothing selected: the default identity.
+    let outside = warehouse.home.join("elsewhere");
+    std::fs::create_dir_all(&outside).unwrap();
+    let default = warehouse.run_at(&outside, &["profile", "keygen"]);
+    assert_eq!(admitted(&default), "test@forklift");
+    assert!(stdout(&default).contains("for the default identity"), "{}", stdout(&default));
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0, "keygen outside a warehouse writes nothing there");
+
+    // A named profile, wherever it runs, is that profile's id.
+    let selected = warehouse.run(&["profile", "use", "work"]);
+    assert_success(&selected);
+    let work_id = stdout(&selected).split("operator id ").nth(1).unwrap().trim_end_matches([')', '.', '\n']).to_string();
+    let named = warehouse.run_at(&outside, &["profile", "keygen", "work"]);
+    assert_eq!(admitted(&named), work_id);
+    assert!(stdout(&named).contains("for profile \"work\""), "{}", stdout(&named));
+
+    // Inside the warehouse that selects it, and from a subdirectory of it.
+    warehouse.write_file("sub/a.txt", "one\n");
+    let inside = warehouse.run_in("sub", &["profile", "keygen"]);
+    assert_eq!(admitted(&inside), work_id);
+    assert!(stdout(&inside).contains("profile \"work\", which this warehouse selects"), "{}", stdout(&inside));
+
+    // Outside it, the global selection applies, and says so.
+    assert_success(&warehouse.run(&["config", "set", "--global", "operator.profile", "work"]));
+    let global = warehouse.run_at(&outside, &["profile", "keygen"]);
+    assert_eq!(admitted(&global), work_id);
+    assert!(stdout(&global).contains("selected in the global configuration"), "{}", stdout(&global));
+
+    let missing = warehouse.run_at(&outside, &["profile", "keygen", "nope"]);
+    assert!(!missing.status.success());
+    assert!(stderr(&missing).contains("The profile \"nope\" does not exist"), "{}", stderr(&missing));
+
+    let gone = warehouse.run(&["office", "keygen"]);
+    assert_eq!(gone.status.code(), Some(2), "{}", stderr(&gone));
+}
+
 /// The end-to-end regression the strict
 /// parse exists to prevent. `get_operator` must refuse outright on a malformed selected profile
 /// — and, the part that was unpinned, it must never mint a replacement identifier and write it
@@ -7394,7 +7450,7 @@ fn office_link_endorses_a_second_device_key() {
 
     // "Device 2": a fresh keypair under the same operator UUID (the shared test key
     // directory stands in for the second machine). Keygen prints the exact link line.
-    let keygen = stdout(&warehouse.run(&["office", "keygen"]));
+    let keygen = stdout(&warehouse.run(&["profile", "keygen"]));
     let link_args: Vec<&str> = keygen.lines()
         .find(|line| line.trim_start().starts_with("office link "))
         .expect("keygen must print the link line")
@@ -7419,7 +7475,7 @@ fn office_link_endorses_a_second_device_key() {
 
     // A proof-of-possession bound to another operator's id cannot be linked.
     assert_success(&warehouse.run(&["config", "set", "operator.identifier", "other@forklift"]));
-    let foreign_keygen = stdout(&warehouse.run(&["office", "keygen"]));
+    let foreign_keygen = stdout(&warehouse.run(&["profile", "keygen"]));
     let foreign_args: Vec<String> = foreign_keygen.lines()
         .find(|line| line.trim_start().starts_with("office link "))
         .expect("keygen must print the link line")
@@ -7444,7 +7500,7 @@ fn office_authorize_recovers_an_enrolled_operator_who_lost_all_keys() {
 
     // Bob is admitted as a writer.
     assert_success(&warehouse.run(&["config", "set", "operator.identifier", "bob@forklift"]));
-    let keygen = stdout(&warehouse.run(&["office", "keygen"]));
+    let keygen = stdout(&warehouse.run(&["profile", "keygen"]));
     let admit_args: Vec<String> = keygen.lines()
         .find(|line| line.trim_start().starts_with("office admit "))
         .expect("keygen must print the admit line")
@@ -7458,7 +7514,7 @@ fn office_authorize_recovers_an_enrolled_operator_who_lost_all_keys() {
     // Bob "lost every device": he generates a fresh key on a new machine and hands
     // the admin the keygen line — he cannot link it himself (no surviving key signs).
     assert_success(&warehouse.run(&["config", "set", "operator.identifier", "bob@forklift"]));
-    let recovery_keygen = stdout(&warehouse.run(&["office", "keygen"]));
+    let recovery_keygen = stdout(&warehouse.run(&["profile", "keygen"]));
     let recovery_args: Vec<String> = recovery_keygen.lines()
         .find(|line| line.trim_start().starts_with("office admit "))
         .expect("keygen must print the admit line")
