@@ -1872,6 +1872,43 @@ head reaches. A `lift`, `lower` or `franchise` that cannot write the record prin
 makes a prune refuse, changing nothing; it can be removed, since it only names heads to ask the
 remote about, and the next `lift`, `lower` or `franchise` starts a new one.
 
+### `evict` — free disk in a cache warehouse
+
+```sh
+forklift evict            # free cached content the origin holds
+forklift evict --dry-run  # show what it would free, change nothing
+```
+
+Frees disk in a cache warehouse (`franchise --cache`): it deletes content the origin holds and
+nothing here needs, and records each object it frees as held by hash, so a later read fetches it
+again from the origin as a cache miss does (see the cache franchise under `franchise`). Parcels and
+signatures always stay, so ancestry and signatures still check offline. A warehouse that is not a
+cache has nothing to evict and is refused.
+
+Like `scope-prune`, it asks the remote which history it holds first: the remote's pallet heads,
+the heads its tombstones keep, and the earlier heads recorded here that it confirms (the
+held-heads record above; a `holds_unanswered` warning works the same way). It refuses, changing
+nothing, if the remote cannot be reached or is not trusted, and if the configured remote is not
+the origin (`non_origin_lift`, as for `lift`, including when the origin is not recorded). Only
+content that history reaches is freed; content only local history reaches (stacks not lifted yet,
+a haul, a deleted pallet) stays, and the report counts it (`not_held`): lift that work and run
+`evict` again. An origin head this warehouse has not lowered yet frees nothing
+(`heads_not_lowered`).
+
+It keeps every checkout's files (the base tree of the main checkout and of each bay,
+`kept_for_checkouts`), every meta pallet in full, the trust records, staged work, and what a parked
+stash, an unfinished consolidation or cherry-pick needs (`kept_local`). A kept object that an
+earlier eviction recorded as held by hash and a later read fetched again has that record removed.
+An object the origin's history reaches that is missing here without a record is damage, not an
+eviction: `evict` refuses, changing nothing, and names it; run `heal`, then `evict` again.
+
+Every object is recorded before it is deleted, and an object's children go before it, so an
+interrupted eviction leaves a readable warehouse, and running `evict` again finishes the job.
+Objects already inside a pack are counted (`still_packed`) but not freed yet. An eviction, dry run
+included, is refused while another command in another bay uses the object store, since that
+command could reuse an object the eviction is about to free; run it again once the other command
+finishes. Nothing frees content on its own yet: `evict` runs only when you run it.
+
 ---
 
 ## 7. Identity, signing, and agents

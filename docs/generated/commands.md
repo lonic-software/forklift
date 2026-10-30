@@ -28,6 +28,7 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `consolidate` | `con` | `merge` | Consolidate (merge) another pallet into the current one |
 | `deliver` | `dv` |  | Squash the current draft pallet onto a target as one clean parcel, keeping the trail |
 | `diff` | `d` |  | Show line-by-line changes |
+| `evict` |  |  | Free cached content the origin holds, to be fetched again when read |
 | `expand` |  |  | Widen a sparse warehouse's fetch scope and download the newly in-scope subtree(s) |
 | `export-git` |  |  | Export this warehouse's history into a new git repository (one-way, lossy) |
 | `franchise` | `fr` | `clone` | Open a local franchise of a remote warehouse (clone) |

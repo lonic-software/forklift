@@ -835,9 +835,9 @@ Example session:
   held-heads record (`.forklift/held-heads`, the remote heads it lifted to or was served by a lower,
   up to date or ahead included, or a franchise) writes a `held_head_unrecorded` warning to the same channel; `message` names the cause. The command's own
   result stands and its exit code is unchanged.
-* A `scope-prune` whose remote could not answer which recorded heads of a pallet it still holds
+* A `scope-prune` or `evict` whose remote could not answer which recorded heads of a pallet it still holds
   (a server too old to know the check answers `404`; a busy one answers `unknown`) writes a `holds_unanswered` warning to the
-  same channel, with `details` `{ "pallet": "<name>" }`; `message` names the cause. The prune frees
+  same channel, with `details` `{ "pallet": "<name>" }`; `message` names the cause. The command frees
   only what the remote's current heads allow; its result and exit code are its own.
 * The same stderr channel also carries a maintenance warning, in the same shape:
   `{ "lonic_json": 1, "tool": "forklift", "warning": "maintenance_unavailable", "message": "…", "next_step":
