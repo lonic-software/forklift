@@ -359,7 +359,8 @@ fn string_literals(stream: TokenStream, out: &mut Vec<String>) {
 /// Opened by a quote or a backtick, it runs to the matching one; otherwise to the first `;`, `,`,
 /// `(`, `)`, line break, or `.` that ends a sentence, outside single quotes (`forklift bay remove
 /// 'a;b'` is one hint). An apostrophe inside a word ("the remote's") opens no quote. The crate
-/// name of a `cargo install` (the first `forklift` word after it) is not a mention. Mentions whose
+/// name of a `cargo install` is not a mention: one with only options and a URL between it and
+/// `cargo install` (`cargo install --git <url> forklift --force`). Mentions whose
 /// leading words are in [`NOT_COMMANDS`] are not hints. A command formatted in at run time
 /// (`forklift {}`) cannot be read here and is not a mention.
 fn hints(text: &str) -> Vec<String> {
@@ -370,9 +371,8 @@ fn hints(text: &str) -> Vec<String> {
             continue;
         }
         let line = &text[text[..start].rfind('\n').map_or(0, |i| i + 1)..start];
-        if line.rfind("cargo install ")
-            .is_some_and(|install| !line[install..].split_whitespace()
-                .any(|word| word.trim_end_matches(|c: char| !c.is_alphanumeric()) == "forklift"))
+        if line.rfind("cargo install ").is_some_and(|install| line[install + "cargo install ".len()..]
+            .split_whitespace().all(|word| word.starts_with('-') || word.contains("://")))
         {
             continue;
         }
@@ -484,7 +484,7 @@ fn hint_error(hint: &str) -> Option<String> {
 /// `None` when it is or the hint is not a help hint. Options are skipped wherever they stand, with
 /// the value a global option takes as its own word (`--color always`), and the path ends at the
 /// first word that stands for a name rather than spelling one: a format placeholder (`{}`),
-/// `<command>`, `[COMMAND]`, or an all-capitals `COMMAND`. `raw` is the hint's words before
+/// `<command>`, `[COMMAND]`, or a bare `COMMAND`. `raw` is the hint's words before
 /// placeholders are filled. The tree is not built: only the root's own options and the names
 /// below it are read.
 fn help_path_error(raw: &[String]) -> Option<String> {
@@ -507,8 +507,7 @@ fn help_path_error(raw: &[String]) -> Option<String> {
     if cli.find_subcommand(first.as_str())?.get_name() != "help" {
         return None;
     }
-    let names_a_name = |word: &&&String| word.contains(['{', '<', '['])
-        || word.chars().any(char::is_uppercase) && !word.chars().any(char::is_lowercase);
+    let names_a_name = |word: &&&String| word.contains(['{', '<', '[']) || word.as_str() == "COMMAND";
     let path: Vec<String> = rest.iter().take_while(|word| !names_a_name(word)).map(|word| word.to_string()).collect();
     match find_command(&cli, &path) {
         Some(_) => None,
