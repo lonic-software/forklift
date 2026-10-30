@@ -5066,12 +5066,18 @@ A command not listed here either reports only the generic human-message shape `{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The result of an eviction: how much was (or would be) freed, and why the rest stays.",
   "properties": {
+    "bytes_freed": {
+      "description": "Bytes freed on disk: loose files deleted, plus what the old packs held beyond the packs the\nrepack wrote (`0` on a dry run).",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
     "dry_run": {
       "description": "Whether this was a dry run (nothing changed).",
       "type": "boolean"
     },
     "evicted": {
-      "description": "Loose objects freed (`0` on a dry run). A read of one fetches it again from the origin.",
+      "description": "Objects freed, loose or packed (`0` on a dry run). A read of one fetches it again from the\norigin.",
       "format": "uint",
       "minimum": 0,
       "type": "integer"
@@ -5101,7 +5107,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "integer"
     },
     "still_packed": {
-      "description": "Evictable objects held only inside a pack, which this eviction does not free.",
+      "description": "Objects the plan frees that are still inside a pack after the repack: a damaged pack, which\na repack leaves as found (`0` on a dry run). `compact --all` salvages it.",
       "format": "uint",
       "minimum": 0,
       "type": "integer"
@@ -5113,7 +5119,13 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "integer"
     },
     "would_evict": {
-      "description": "Loose objects the plan frees. After a real run, `evicted` is less only by objects already\ngone when it came to delete them.",
+      "description": "Objects the plan frees. After a real run, `evicted` is less only by `still_packed`.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "would_repack": {
+      "description": "Of `would_evict`, the objects a pack holds, which a full repack drops. `0` means no repack.",
       "format": "uint",
       "minimum": 0,
       "type": "integer"
@@ -5123,6 +5135,8 @@ A command not listed here either reports only the generic human-message shape `{
     "dry_run",
     "evicted",
     "would_evict",
+    "would_repack",
+    "bytes_freed",
     "kept_for_checkouts",
     "kept_local",
     "not_held",
