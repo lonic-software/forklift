@@ -483,7 +483,7 @@ pub enum Command {
     /// Manage the warehouse office: users and signing keys
     #[command(
         long_about = "Manage the warehouse office: users and signing keys, tracked as metadata on \
-                      the reserved \"office\" pallet. Without a subcommand, the users and their \
+                      the \"@office\" meta pallet. Without a subcommand, the users and their \
                       keys are listed."
     )]
     Office {
@@ -842,14 +842,14 @@ pub enum Command {
         action: Option<TagAction>,
     },
 
-    /// Undo the last stack, consolidate, cherry-pick or shift (soft — keeps your changes)
+    /// Undo the last stack, consolidate, pick, shift or pallet delete
     #[command(
         long_about = "Undo the last journaled operation: a \"forklift stack\", \"forklift consolidate\", \
-                      \"forklift pick\" or \"forklift shift\". A stack, consolidate or pick is \
-                      reversed softly: the pallet head moves back while the working directory and \
-                      the inventory stay as they are (like git's \"reset --soft HEAD~1\"), so the \
-                      undone changes are staged again and can be re-stacked — e.g. with a \
-                      corrected message or author. A shift is reversed by shifting back. Undo \
+                      \"forklift pick\", \"forklift shift\" or \"forklift pallet delete\". A stack, \
+                      consolidate or pick is reversed softly: the pallet head moves back while the \
+                      working directory and the inventory stay as they are (like git's \"reset \
+                      --soft HEAD~1\"), so the undone changes are staged again and can be \
+                      re-stacked — e.g. with a corrected message or author. A shift is reversed by shifting back. Undo \
                       reverses only the user's last operation: except for a pallet delete, which \
                       changed nothing in the bay, if the current pallet has been \
                       switched (e.g. by pallet create or deliver), its head has moved, or a \

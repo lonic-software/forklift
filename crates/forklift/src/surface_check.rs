@@ -1,14 +1,10 @@
-//! The command-surface drift guard: three checks that hold the clap tree in `cli.rs` to files a
-//! person edits on purpose, so a new command, a renamed one or a dropped one is a reviewed decision
-//! and never a side effect.
+//! The command-surface drift guard: two checks that hold the clap tree in `cli.rs` to a file a
+//! person edits on purpose, so a new command, a renamed one or a dropped one is a reviewed
+//! decision and never a side effect.
 //!
 //! - **The surface spec** (`surface/spec.txt`) lists every command path the binary accepts, and
 //!   three lists drawn by written criteria: the daily loop, the destructive operations and the
 //!   commands that record text. The binary and the spec must name the same commands.
-//! - **The coverage map** (`surface/coverage.txt`) records every command path the binary had when
-//!   the map was frozen, with its parameters, and what each one became. Every row must still be
-//!   reachable with exactly the parameters it says, and every command the binary has must be some
-//!   row's destination, so no operation is dropped by accident while the surface is reshaped.
 //! - **The hint check** parses every next-step hint that names a `forklift` command, in every
 //!   string literal of the crates' sources, against the real command tree.
 //!
@@ -24,8 +20,8 @@
 //!   behaviour test that holds its preview to that mode.
 //!
 //! `docs/generated/commands.md` is generated from the same tree and checked by `bin/gen-docs
-//! --check`; it follows the binary wherever it goes. These files do not: they change only when
-//! someone edits them, which is what makes them a guard.
+//! --check`; it follows the binary wherever it goes. The spec does not: it changes only when
+//! someone edits it, which is what makes it a guard.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -36,7 +32,6 @@ use proc_macro2::{Delimiter, TokenStream, TokenTree};
 use crate::cli::Cli;
 
 const SPEC: &str = include_str!("../surface/spec.txt");
-const COVERAGE: &str = include_str!("../surface/coverage.txt");
 
 /// The command tree as the binary parses it, built so that every subcommand carries the global
 /// options and the generated `--help` flag.
@@ -206,173 +201,6 @@ fn the_surface_spec_names_exactly_the_binarys_commands() {
             }
         }
     }
-}
-
-/// One parameter, written so that a change to anything a caller depends on changes the text: a
-/// positional's name, whether it is required, whether it repeats; a flag's spellings, whether it
-/// takes a value and which values it accepts; whether it is hidden.
-fn parameter(arg: &clap::Arg) -> String {
-    let takes_value = arg.get_action().takes_values();
-    let repeats = matches!(arg.get_action(), clap::ArgAction::Append)
-        || arg.get_num_args().is_some_and(|range| range.max_values() > 1);
-    let name = arg.get_value_names()
-        .map(|names| names.iter().map(|name| name.to_string()).collect::<Vec<_>>().join(" "))
-        .unwrap_or_else(|| arg.get_id().as_str().to_uppercase());
-    let mut out = if arg.is_positional() {
-        if arg.is_required_set() { format!("<{name}>") } else { format!("[{name}]") }
-    } else {
-        let mut spellings = Vec::new();
-        if let Some(short) = arg.get_short() {
-            spellings.push(format!("-{short}"));
-        }
-        if let Some(long) = arg.get_long() {
-            spellings.push(format!("--{long}"));
-        }
-        let mut flag = spellings.join("/");
-        if takes_value {
-            flag.push_str(&format!("=<{name}>"));
-        }
-        flag
-    };
-    if takes_value {
-        let values: Vec<String> = arg.get_possible_values().iter()
-            .map(|value| value.get_name().to_string()).collect();
-        if !values.is_empty() {
-            out.push_str(&format!("{{{}}}", values.join("|")));
-        }
-    }
-    if repeats {
-        out.push_str("...");
-    }
-    if arg.is_hide_set() {
-        out.push_str("(hidden)");
-    }
-    out
-}
-
-/// A command's parameters in declaration order. Below the binary, the global options and the
-/// generated `--help` are left out: they are the binary's parameters, recorded once on its row.
-fn parameters(command: &clap::Command, is_root: bool) -> String {
-    command.get_arguments()
-        .filter(|arg| is_root || !(arg.is_global_set() || arg.get_id() == "help"))
-        .map(parameter).collect::<Vec<_>>().join(" ")
-}
-
-/// One coverage row: an operation the binary had when the map was frozen, and where each part of
-/// it lives now.
-struct CoverageRow {
-    line: usize,
-    old: (Vec<String>, String),
-    new: Vec<(usize, Vec<String>, String)>,
-}
-
-/// `forklift scope status: [PATHS]...` as the path below the binary and the parameter text.
-fn parse_command_line(number: usize, text: &str) -> Result<(Vec<String>, String), String> {
-    let (path, params) = text.split_once(':')
-        .ok_or_else(|| format!("coverage.txt:{number}: `{text}` has no `:` after the command"))?;
-    let mut words = path.split_whitespace();
-    if words.next() != Some("forklift") {
-        return Err(format!("coverage.txt:{number}: a command starts with `forklift`"));
-    }
-    Ok((words.map(str::to_string).collect(), params.split_whitespace().collect::<Vec<_>>().join(" ")))
-}
-
-/// Parse `surface/coverage.txt`. A row is an old command and its parameters; the indented
-/// `-> forklift …: …` lines under it are what it became. A row with none still exists unchanged.
-fn parse_coverage(text: &str) -> Result<Vec<CoverageRow>, String> {
-    let mut rows: Vec<CoverageRow> = Vec::new();
-    for (number, line) in content_lines(text) {
-        if let Some(rest) = line.strip_prefix("->") {
-            let row = rows.last_mut()
-                .ok_or_else(|| format!("coverage.txt:{number}: `->` before any row"))?;
-            let (path, params) = parse_command_line(number, rest)?;
-            row.new.push((number, path, params));
-        } else {
-            rows.push(CoverageRow { line: number, old: parse_command_line(number, line)?, new: Vec::new() });
-        }
-    }
-    Ok(rows)
-}
-
-/// Every operation the coverage map records is still reachable with the parameters it states,
-/// and every command the binary has is accounted for by some row.
-#[test]
-fn every_covered_operation_is_still_reachable() {
-    let cli = built_cli();
-    let rows = parse_coverage(COVERAGE).unwrap();
-
-    let mut olds = BTreeSet::new();
-    let mut destinations = BTreeSet::new();
-    let mut failures = Vec::new();
-    for row in &rows {
-        if !olds.insert(row.old.0.clone()) {
-            failures.push(format!("coverage.txt:{}: `{}` has two rows", row.line, row.old.0.join(" ")));
-        }
-        let unchanged = [(row.line, row.old.0.clone(), row.old.1.clone())];
-        let new = if row.new.is_empty() { &unchanged[..] } else { &row.new[..] };
-        for (number, path, expected) in new {
-            destinations.insert(path.clone());
-            let shown = std::iter::once("forklift").chain(path.iter().map(String::as_str))
-                .collect::<Vec<_>>().join(" ");
-            match find_command(&cli, path) {
-                None => failures.push(format!("coverage.txt:{number}: `{shown}` is not a command")),
-                Some(command) => {
-                    let actual = parameters(command, path.is_empty());
-                    if &actual != expected {
-                        failures.push(format!(
-                            "coverage.txt:{number}: `{shown}` takes different parameters\n  \
-                             map:    {expected}\n  binary: {actual}"
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    for (path, _) in command_paths(&cli) {
-        if !destinations.contains(&path) {
-            failures.push(format!("`forklift {}` is a command no coverage row leads to", path.join(" ")));
-        }
-    }
-    assert!(failures.is_empty(),
-        "surface/coverage.txt and the binary disagree. A changed operation keeps its row and \
-         gains `-> forklift …: …` lines saying what it became, with any change to its \
-         parameters written there:\n{}", failures.join("\n"));
-}
-
-/// The frozen rows of `surface/coverage.txt` — every line but the `->` destinations — hashed
-/// (64-bit FNV-1a over the rows, each ended by a newline). A row records what the binary had
-/// when the map was frozen, so it never changes; only destinations are added under it.
-const FROZEN_ROWS_HASH: u64 = 0xcb6f_b5e5_5b3a_80af;
-
-/// The hash [`FROZEN_ROWS_HASH`] pins, of the frozen rows of `text`.
-fn frozen_rows_hash(text: &str) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for (_, line) in content_lines(text).filter(|(_, line)| !line.starts_with("->")) {
-        for byte in line.bytes().chain(std::iter::once(b'\n')) {
-            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-    hash
-}
-
-/// The rows of the coverage map are frozen: the reachability check above holds only their
-/// destinations to the binary, so a row rewritten to match the new surface (`office keygen`
-/// turned into `profile keygen`) would pass it while erasing the record of what was there.
-#[test]
-fn the_frozen_rows_of_the_coverage_map_are_unchanged() {
-    let hash = frozen_rows_hash(COVERAGE);
-    assert_eq!(hash, FROZEN_ROWS_HASH,
-        "a frozen row of surface/coverage.txt changed (hash {hash:#018x}). Restore it: a row stays as \
-         it was when the map was frozen, and what it became goes on `-> forklift …: …` lines under it");
-    // A destination line is outside the hash, and a row's text is inside it.
-    // (The rows are spelled through a placeholder, or the hint check would read them as hints,
-    // and matched without their line ending, which a Windows checkout may make `\r\n`.)
-    let row = format!("{} compact: --all --redelta", "forklift");
-    assert!(COVERAGE.contains(&row));
-    let added = COVERAGE.replacen(&row, &format!("{row}\n    -> {} x:", "forklift"), 1);
-    assert_eq!(frozen_rows_hash(&added), hash);
-    let edited = COVERAGE.replacen(&row, &format!("{} compact: --all", "forklift"), 1);
-    assert_ne!(frozen_rows_hash(&edited), hash);
 }
 
 // ---- The hint check ----

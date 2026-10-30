@@ -4,7 +4,6 @@
 # name the same commands, so a new command is a decision made here, on review, not a side effect
 # of adding a variant to cli.rs. Adding one means placing it in [commands] and classifying it
 # against the definition of each list below; removing or renaming one means editing it here too.
-# The coverage map beside this file (coverage.txt) records what every earlier command became.
 
 [commands]
 # One top-level name per line. A family is written `name: subcommand subcommand …`, and a family

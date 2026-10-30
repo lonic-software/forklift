@@ -105,18 +105,18 @@ It is recommended to develop each feature or fix in its own pallet, and then mer
 
 #### Fork
 Git counterpart: Fork\
-A fork is a copy of a warehouse. When you want to create a custom version of someone else's project,
-you can fork their warehouse and implement your changes in your own copy.\
-Forks can also be merged into the original warehouse.
+A fork is your own copy of someone else's warehouse, made with `clone`, where you implement your
+own changes. Merging a fork back into the original warehouse is not built yet: hauls and
+consolidation work within one warehouse.
 
 ### Actions
 #### Prepare
 Git counterpart: Init\
 Prepare a new warehouse. This is the first step when initializing a project.
 
-#### Palletize
-Git counterpart: Checkout to new branch\
-Create a new pallet to organize a set of changes.
+#### Pallet create
+Git counterpart: `switch -c` (`checkout -b`)\
+Create a new pallet to organize a set of changes, and shift to it.
 
 #### Shift
 Git counterpart: Checkout\
@@ -124,11 +124,11 @@ Move to a different pallet.
 
 #### Load
 Git counterpart: Add\
-Add a set of changes to a parcel.
+Stage changes into the inventory, the contents of the next parcel.
 
 #### Unload
-Git counterpart: Remove\
-Remove a set of changes from a parcel.
+Git counterpart: `restore --staged`\
+Unstage: take changes back out of the inventory, keeping them in the working directory.
 
 #### Stack
 Git counterpart: Commit (verb)\
@@ -138,7 +138,7 @@ Stack a parcel (add changes) on top of the current pallet.
 Git counterpart: Merge\
 Combine changes from one pallet into another (warehouse workers consolidate loads onto one pallet).
 
-#### Cherry-pick
+#### Pick
 Git counterpart: Cherry-pick\
 Apply one parcel's change onto the current pallet as a new, author-preserving, freshly-signed
 parcel. Only adds — no rewrite, no force-push.
@@ -149,8 +149,8 @@ Audit the warehouse: report the current pallet, the staged changes and the chang
 
 #### Office
 Git counterpart: none (GitHub org/keys settings, at best)\
-Manage the warehouse office: users and signing keys, tracked as metadata on the reserved
-`office` pallet. Enrolling establishes trust — from then on every parcel is signed (Ed25519),
+Manage the warehouse office: users and signing keys, tracked as metadata on the
+`@office` meta pallet. Enrolling establishes trust — from then on every parcel is signed (Ed25519),
 and that cannot be undone.
 
 #### Audit
@@ -175,12 +175,13 @@ Walk the parcels of a pallet, newest first: hash, operators, timestamps and desc
 #### Blame
 Git counterpart: Blame\
 Attribute each line of a file to the parcel — and signed author — that introduced it. Because
-authorship carries an identity class (§7.1), it answers "was this line written by a human or an
+authorship carries an identity class, it answers "was this line written by a human or an
 agent, under whose supervision" — blame git cannot express.
 
 #### Restore
 Git counterpart: Restore\
-Discard changes in the working directory. Unstaging is `unload`.
+Discard unstaged changes in the working directory. It first lists what would be lost and changes
+nothing; `--confirm` discards it. Unstaging is `unload`.
 
 #### Lift
 Git counterpart: Push\

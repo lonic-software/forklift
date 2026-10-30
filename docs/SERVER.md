@@ -293,8 +293,8 @@ revocation by more than about a day.
   `forklift pallet delete` in one of its checkouts, leaves a tombstone: the head the pallet
   was at, which `gc` keeps. Clients that freed that history because the server held it can still
   fetch it, so nothing expires a tombstone. The name stays reserved for that history: a client
-  re-creating it must descend from it and acknowledge the deletion, and `forklift pallet list
-  --restore NAME` in a checkout of the root brings the pallet back at its tombstone.
+  re-creating it must descend from it and acknowledge the deletion, and `forklift pallet
+  restore NAME` in a checkout of the root brings the pallet back at its tombstone.
   `forklift-server tombstone list --root …` shows them; `forklift-server tombstone drop --root …
   NAME` frees the name for unrelated history and lets the next `gc` collect what only the
   tombstone held. Dropping is refused while the root is served, like `gc`.
