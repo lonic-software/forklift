@@ -142,8 +142,8 @@ pub fn render_mcp_tools() -> Result<String, String> {
     out.push_str(
         "Every tool `forklift mcp` serves, generated from the same command definition the binary \
          parses its arguments with, as the server's own tool list is; CI fails when this page \
-         falls behind it. A tool is a command path joined by `_` (`tag create` is `tag_create`, \
-         `cherry-pick` is `cherry_pick`), \
+         falls behind it. A tool is a command path joined by `_` (`forklift tag create` is \
+         `tag_create`, `forklift cherry-pick` is `cherry_pick`), \
          and its description is the command's full help, which `forklift help <command>` prints. \
          An argument is an option's long name (with `_` for `-`) or a positional's name. \
          `docs/MACHINE_INTERFACE.md` describes the server.\n\n",
