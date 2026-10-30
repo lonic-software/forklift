@@ -1,6 +1,4 @@
 use serde::Serialize;
-use forklift_core::enums::config_scope::ConfigScope;
-use forklift_core::util::config_utils;
 use forklift_core::util::evict_utils;
 use forklift_core::util::lock_utils::StoreAccessLock;
 use forklift_core::util::scope_utils;
@@ -63,6 +61,7 @@ pub async fn handle_command(dry_run: bool) -> Result<(), String> {
         not_held: plan.not_held,
         still_packed: plan.still_packed,
         heads_not_lowered: plan.heads_not_lowered,
+        unsealed: stats.as_ref().map_or(0, |stats| stats.unsealed),
     });
 
     Ok(())
@@ -72,19 +71,10 @@ pub async fn handle_command(dry_run: bool) -> Result<(), String> {
 /// freed, and only the origin was proved to hold what this warehouse lacks. No remote configured
 /// at all is left to the remote client, which says so plainly.
 fn ensure_origin_remote() -> Result<(), String> {
-    let Some(origin) = config_utils::get_scoped_value(config_utils::KEY_REMOTE_ORIGIN, ConfigScope::Warehouse)? else {
-        return Err(scope_utils::unrecorded_origin_evict_refusal().into());
-    };
-
-    let Some((configured, _scope)) = config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)? else {
-        return Ok(());
-    };
-
-    if configured != origin {
-        return Err(scope_utils::non_origin_evict_refusal(&origin, &configured).into());
-    }
-
-    Ok(())
+    scope_utils::ensure_remote_is_origin(
+        scope_utils::unrecorded_origin_evict_refusal,
+        scope_utils::non_origin_evict_refusal,
+    ).map_err(Into::into)
 }
 
 /// The result of an eviction: how much was (or would be) freed, and why the rest stays.
@@ -97,7 +87,8 @@ pub(crate) struct EvictReport {
     /// Loose objects freed (`0` on a dry run). A read of one fetches it again from the origin.
     evicted: usize,
 
-    /// Loose objects an eviction would free (equals `evicted` after a real run).
+    /// Loose objects the plan frees. After a real run, `evicted` is less only by objects already
+    /// gone when it came to delete them.
     would_evict: usize,
 
     /// Objects the origin holds that stay because a checkout's base tree needs them.
@@ -117,14 +108,20 @@ pub(crate) struct EvictReport {
     /// Origin heads this warehouse does not hold yet; their history frees nothing until a `lower`
     /// brings it in.
     heads_not_lowered: usize,
+
+    /// Kept objects an earlier eviction had recorded as held by hash, and a read had fetched again,
+    /// whose record this run removed (`0` on a dry run).
+    unsealed: usize,
 }
 
 impl CommandOutput for EvictReport {
     fn render_human(&self) {
         if self.dry_run {
             println!("Dry run: evicting would free {} object(s).", self.would_evict);
-        } else if self.evicted == 0 {
+        } else if self.evicted == 0 && self.unsealed == 0 {
             println!("Nothing to evict.");
+        } else if self.evicted == 0 {
+            println!("Nothing to evict; {} kept object(s) are no longer recorded as held by hash.", self.unsealed);
         } else {
             println!("Evicted {} object(s); reading one fetches it again from the origin.", self.evicted);
         }

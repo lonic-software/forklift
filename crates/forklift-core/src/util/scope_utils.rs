@@ -746,6 +746,39 @@ pub fn scope_prune_blocked_refusal(path: &str, blockers: &str) -> CoreError {
     )
 }
 
+/// Refuse unless the configured remote is this partial warehouse's recorded origin, the only
+/// remote proved to hold what it lacks. No remote configured at all passes: the remote client
+/// reports that plainly, rather than a refusal naming an empty remote.
+///
+/// # Arguments
+/// * `unrecorded` - The refusal when no origin is recorded (an interrupted franchise, or unset).
+/// * `non_origin` - The refusal when the configured remote differs, given the origin and it.
+///
+/// # Returns
+/// * `Ok(())`         - If the configured remote is the origin, or none is configured.
+/// * `Err(CoreError)` - The matching refusal, or a config read failure.
+pub fn ensure_remote_is_origin(
+    unrecorded: fn() -> CoreError,
+    non_origin: fn(&str, &str) -> CoreError,
+) -> Result<(), CoreError> {
+    use crate::enums::config_scope::ConfigScope;
+    use crate::util::config_utils;
+
+    let Some(origin) = config_utils::get_scoped_value(config_utils::KEY_REMOTE_ORIGIN, ConfigScope::Warehouse)? else {
+        return Err(unrecorded());
+    };
+
+    let Some((configured, _scope)) = config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)? else {
+        return Ok(());
+    };
+
+    if configured != origin {
+        return Err(non_origin(&origin, &configured));
+    }
+
+    Ok(())
+}
+
 /// A ready-made `non_origin_lift` refusal for a lift from a partial warehouse (franchised with
 /// `--only` or `--cache`) to a remote other than the one it fetched against. A partial warehouse
 /// only ever proved the closure it does not hold present on its origin; a different remote may

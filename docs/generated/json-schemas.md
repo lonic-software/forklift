@@ -5106,8 +5106,14 @@ A command not listed here either reports only the generic human-message shape `{
       "minimum": 0,
       "type": "integer"
     },
+    "unsealed": {
+      "description": "Kept objects an earlier eviction had recorded as held by hash, and a read had fetched again,\nwhose record this run removed (`0` on a dry run).",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
     "would_evict": {
-      "description": "Loose objects an eviction would free (equals `evicted` after a real run).",
+      "description": "Loose objects the plan frees. After a real run, `evicted` is less only by objects already\ngone when it came to delete them.",
       "format": "uint",
       "minimum": 0,
       "type": "integer"
@@ -5121,7 +5127,8 @@ A command not listed here either reports only the generic human-message shape `{
     "kept_local",
     "not_held",
     "still_packed",
-    "heads_not_lowered"
+    "heads_not_lowered",
+    "unsealed"
   ],
   "title": "EvictReport",
   "type": "object"

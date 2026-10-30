@@ -1950,7 +1950,8 @@ impl Command {
     /// Whether finishing this command should kick off background object-store maintenance
     /// (git's `gc --auto`): the mutating commands that add loose objects, so the store stays
     /// packed without the user remembering to `compact`. `compact` itself is excluded (or it
-    /// would re-trigger), and `import-git` is (it compacts on its own). `lift` and `lower` are
+    /// would re-trigger), `import-git` is (it compacts on its own), and so is `evict`, which only
+    /// removes objects. `lift` and `lower` are
     /// included on purpose: both bring in objects from a remote. The actual work is
     /// still gated on a cheap loose/pack threshold, so triggering here is only a *check*.
     ///
@@ -1959,7 +1960,7 @@ impl Command {
     /// * `false` - Do not (a read-only, setup, or self-compacting command).
     pub fn triggers_auto_maintenance(&self) -> bool {
         self.requires_warehouse_lock()
-            && !matches!(self, Command::Compact { .. } | Command::ImportGit { .. })
+            && !matches!(self, Command::Compact { .. } | Command::Evict { .. } | Command::ImportGit { .. })
     }
 
     /// Whether the command produces read-only, potentially long output that should go

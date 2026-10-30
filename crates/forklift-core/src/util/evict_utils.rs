@@ -268,7 +268,15 @@ fn walk_held(parcels: &[String], sealed: &SealedSet) -> Result<HeldClosure, Stri
             Step::Expand { hash, named_by, root } => (hash, named_by, root),
         };
 
-        if !closure.seen.insert(hash.clone()) || !held_present(&hash, &named_by, sealed)? {
+        if !closure.seen.insert(hash.clone()) {
+            // A root met first as a subtree of another parcel was walked without the root check.
+            if root {
+                note_meta_root(&hash, &mut closure.meta_roots)?;
+            }
+            continue;
+        }
+
+        if !held_present(&hash, &named_by, sealed)? {
             continue;
         }
 
@@ -332,6 +340,19 @@ struct LocalClosure {
     meta_roots: Vec<String>,
 }
 
+/// Add `hash` to `roots` when it is a present parcel root that walks in full (a meta pallet's shape),
+/// for a root a walk reached first as an ordinary subtree, where it skipped the root check.
+fn note_meta_root(hash: &str, roots: &mut Vec<String>) -> Result<(), String> {
+    if !roots.iter().any(|root| root == hash)
+        && file_utils::is_present_for_sweep(hash)?
+        && recovery_utils::walks_in_full(&object_utils::load_tree(hash)?, "")
+    {
+        roots.push(hash.to_string());
+    }
+
+    Ok(())
+}
+
 /// Count the present content `parcels` reach outside `held`, the origin's closure (whatever an
 /// object in it reaches is in it too, so the walk stops there). Tolerant of any absence: this walk
 /// only counts, and nothing it meets is freed.
@@ -345,7 +366,15 @@ fn walk_local(parcels: &[String], held: &HashSet<String>) -> Result<LocalClosure
     }
 
     while let Some((hash, root)) = queue.pop() {
-        if held.contains(&hash) || !seen.insert(hash.clone()) || !file_utils::is_present_for_sweep(&hash)? {
+        if held.contains(&hash) || !seen.insert(hash.clone()) {
+            // A root the held walk or another parcel reached as a subtree was not checked as one.
+            if root {
+                note_meta_root(&hash, &mut closure.meta_roots)?;
+            }
+            continue;
+        }
+
+        if !file_utils::is_present_for_sweep(&hash)? {
             continue;
         }
 
@@ -627,6 +656,31 @@ mod tests {
 
         assert!(plan.to_free.is_empty());
         assert_eq!(plan.kept_local, 3);
+    }
+
+    /// A meta-shaped root that another held parcel also holds as an ordinary subtree is kept in
+    /// full whichever parcel the walk meets first.
+    #[test]
+    fn plan_keeps_a_meta_shaped_root_another_parcel_holds_as_a_subtree() {
+        let _scratch = Scratch::new("meta-shared");
+        let inner = store_blob("office\n");
+        let meta_dir = store_tree(&[("record", &inner, DirEntryType::Normal)]);
+        let meta_root = store_tree(&[(crate::globals::FOLDER_NAME_FORKLIFT_ROOT, &meta_dir, DirEntryType::Tree)]);
+        let meta = store_parcel(&meta_root, Vec::new());
+        let user_root = store_tree(&[("nested", &meta_root, DirEntryType::Tree)]);
+        let user = store_parcel(&user_root, Vec::new());
+        let hold = store_access();
+
+        for heads in [[user.clone(), meta.clone()], [meta.clone(), user.clone()]] {
+            let plan = plan_evict(&heads, &hold).unwrap();
+            assert_eq!(plan.to_free, vec![user_root.clone()], "only the user root goes");
+            assert_eq!(plan.kept_local, 3);
+        }
+
+        // Held only through the user parcel, while local history (a deleted meta pallet's head, say)
+        // holds it as a root: the local walk stops at the held closure, yet still names the root.
+        let held: HashSet<String> = [user_root.clone(), meta_root.clone(), meta_dir.clone(), inner.clone()].into();
+        assert_eq!(walk_local(&[meta.clone()], &held).unwrap().meta_roots, vec![meta_root.clone()]);
     }
 
     #[test]
