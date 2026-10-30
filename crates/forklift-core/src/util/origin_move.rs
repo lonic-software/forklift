@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use crate::error::{CoreError, RefusalCode};
 use crate::globals;
 use crate::util::lock_utils::{MoveLock, RefLock};
-use crate::util::{file_utils, record_utils, sign_utils};
+use crate::util::{file_utils, origin_utils, record_utils, sign_utils};
 
 /// The intent's file name in the shared forklift root, and its [`record_utils`] kind and version.
 pub const FILE_NAME: &str = "origin-move";
@@ -105,6 +105,9 @@ fn read_recorded() -> Result<Recorded, String> {
             let newer = match &e {
                 record_utils::RecordError::OtherVersion(header) => header
                     .strip_prefix(&format!("/forklift-{} ", RECORD))
+                    // Only a version this record's writers could have written: digits alone, no
+                    // leading zero, which `parse` would otherwise accept along with a sign.
+                    .filter(|version| version.bytes().all(|b| b.is_ascii_digit()) && !version.starts_with('0'))
                     .and_then(|version| version.parse::<u32>().ok())
                     .is_some_and(|version| version > VERSION),
                 _ => false,
@@ -237,20 +240,20 @@ pub fn set_rewriting(lock: &RefLock, token: &MoveToken, target: &str) -> Result<
     write_intent(lock, &Intent { phase: Phase::Rewriting, target: Some(target.to_string()), ..intent })
 }
 
-/// Confirm that `token` owns the intent, that the move is rewriting, and that `url` is the target
-/// it recorded when it did: the one state in which the origin may be rewritten to `url`.
+/// Confirm that `token` owns the intent, that the move is rewriting, and that `url` names the
+/// target it recorded when it did ([`origin_utils::same_remote`]): the one state in which the
+/// origin may be rewritten to `url`.
 pub fn require_rewriting(_lock: &RefLock, token: &MoveToken, url: &str) -> Result<(), String> {
     let intent = owned(token)?;
 
-    if intent.phase == Phase::Rewriting && intent.target.as_deref() == Some(url) {
-        return Ok(());
-    }
+    let why = match (intent.phase, intent.target.as_deref()) {
+        (Phase::Checking, _) => "the move has not started rewriting it".to_string(),
+        (Phase::Rewriting, None) => "the move has not checked a server to rewrite it to".to_string(),
+        (Phase::Rewriting, Some(target)) if origin_utils::same_remote(target, url) => return Ok(()),
+        (Phase::Rewriting, Some(target)) => format!("the move is rewriting it to \"{}\"", target),
+    };
 
-    Err(format!(
-        "The origin is rewritten only to the server its move has checked and started rewriting to, \
-        and \"{}\" is not that server; nothing was rewritten.",
-        url
-    ))
+    Err(format!("The origin was not rewritten to \"{}\": {}.", url, why))
 }
 
 /// Clear the intent of a move that completed: the origin is rewritten.
@@ -489,7 +492,8 @@ mod tests {
         assert_eq!((recorded.phase, recorded.target), (Phase::Rewriting, None), "no target until one is checked");
         let pending = String::from(ensure_none_pending().unwrap_err());
         assert!(pending.contains("remote move <url>") && !pending.contains("fourth"), "{}", pending);
-        assert!(require_rewriting(&lock, &taken, "http://fourth.example").is_err(), "nothing checked yet");
+        let error = require_rewriting(&lock, &taken, "http://fourth.example").unwrap_err();
+        assert!(error.contains("not checked a server"), "{}", error);
         set_rewriting(&lock, &taken, "http://fourth.example").unwrap();
         require_rewriting(&lock, &taken, "http://fourth.example").unwrap();
         finish(&lock, &taken).unwrap();
@@ -508,6 +512,14 @@ mod tests {
             assert_eq!(refusal_code(error), Some(RefusalCode::OriginMovePending));
         }
         assert_eq!(std::fs::read(intent_path()).unwrap(), newer, "a newer intent is never rewritten");
+
+        // A version no writer spells that way is damage, not a newer Forklift's move.
+        for version in ["+3", "03"] {
+            let mut odd = format!("/forklift-{} {}\n", RECORD, version).into_bytes();
+            odd.extend_from_slice(&newer[newer.iter().position(|&b| b == b'\n').unwrap() + 1..]);
+            std::fs::write(intent_path(), &odd).unwrap();
+            assert_eq!(begin(&move_lock, &lock, "http://fifth.example").unwrap().1, Phase::Rewriting, "{}", version);
+        }
     }
 
     /// Under an intent in either phase, every writer of a record a move checks refuses with
@@ -586,7 +598,8 @@ mod tests {
     /// not to another server, and not with no intent at all.
     ///
     /// Revert: skip `require_rewriting` in `write_locked` → the checking-phase row rewrites the
-    /// origin → red; or drop its target comparison → the other-server row rewrites it → red.
+    /// origin → red; or drop its target comparison → the other-server row rewrites it → red; or
+    /// compare byte for byte → the trailing-slash row refuses → red.
     #[test]
     fn only_a_rewriting_move_rewrites_the_origin() {
         use crate::util::origin_utils;
@@ -597,7 +610,8 @@ mod tests {
 
         let checking = begin_for_tests(Phase::Checking);
         let lock = RefLock::acquire().unwrap();
-        assert!(origin_utils::write_locked(&lock, &checking, "http://new.example").is_err());
+        let error = origin_utils::write_locked(&lock, &checking, "http://new-origin.example").unwrap_err();
+        assert!(error.contains("not started rewriting"), "{}", error);
         assert_eq!(origin(), "http://old.example");
         drop(lock);
 
@@ -606,9 +620,12 @@ mod tests {
         assert!(origin_utils::write_locked(&lock, &checking, "http://new.example").is_err(), "a replaced token");
         assert_eq!(origin(), "http://old.example");
 
-        assert!(origin_utils::write_locked(&lock, &rewriting, "http://unchecked.example").is_err(), "another server");
+        let error = origin_utils::write_locked(&lock, &rewriting, "http://unchecked.example").unwrap_err();
+        assert!(error.contains("rewriting it to \"http://new-origin.example\""), "{}", error);
         assert_eq!(origin(), "http://old.example");
 
+        origin_utils::write_locked(&lock, &rewriting, "http://new-origin.example/").unwrap();
+        assert_eq!(origin(), "http://new-origin.example/", "a trailing slash names the same server");
         origin_utils::write_locked(&lock, &rewriting, "http://new-origin.example").unwrap();
         assert_eq!(origin(), "http://new-origin.example");
 
