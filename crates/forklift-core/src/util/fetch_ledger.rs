@@ -5,7 +5,7 @@
 //! re-walks every ref head under the widened scope before recording it. A closure can outlive the
 //! command that fetched it without a ref, though: `lower` fetches the remote head and then refuses
 //! as diverged, and the refusal's own next step creates a pallet at that head through a write that fetches
-//! nothing. If an `scope fetch` ran in between, that head's newly in-scope content would never be
+//! nothing. If a `scope fetch` ran in between, that head's newly in-scope content would never be
 //! fetched. So every scoped fetch records its head here, under the
 //! [`RefLock`](crate::util::lock_utils::RefLock), before it transfers anything, and `scope fetch` walks
 //! the recorded heads as well as the ref heads. A ref write that leaves a head no longer reached

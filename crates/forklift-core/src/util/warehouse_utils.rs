@@ -4,7 +4,7 @@ use crate::error::{CoreError, RefusalCode};
 use crate::globals::{self, forklift_root, FOLDER_NAME_FORKLIFT_ROOT};
 use crate::util::{alias_utils, bay_utils, config_utils, file_utils, franchise_utils, origin_utils, pallet_utils, record_utils, scope_utils};
 use crate::util::record_utils::RecordError;
-use crate::util::scope_utils::MaterializationScope;
+use crate::util::scope_utils::PathScope;
 
 /// The directory the user invoked forklift from, relative to the warehouse root.
 /// Set once by [`enter_warehouse`]; empty when the user is at the root itself.
@@ -517,7 +517,7 @@ impl WarehouseMode {
 pub enum PrepareMode<'a> {
     Full,
     /// `scope` is the fetch scope, which is also the main tree's first scope. Never full.
-    Sparse { scope: &'a MaterializationScope, origin: &'a str },
+    Sparse { scope: &'a PathScope, origin: &'a str },
     Cache { origin: &'a str },
 }
 
@@ -1388,7 +1388,7 @@ mod tests {
     /// back.
     #[test]
     fn prepare_records_the_mode_and_a_partial_one_writes_its_origin_and_scopes_first() {
-        let scope = MaterializationScope::from_prefixes(["src"]);
+        let scope = PathScope::from_prefixes(["src"]);
         let written = b"/forklift-scope 3\nsrc\n".to_vec();
 
         let root = fresh_dir("modes");

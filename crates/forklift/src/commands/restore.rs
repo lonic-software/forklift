@@ -5,7 +5,7 @@ use forklift_core::model::inventory::{Inventory, InventoryItem};
 use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::path_utils::{self, WarehousePath};
 use forklift_core::util::inventory_utils::TrackedKind;
-use forklift_core::util::scope_utils::{self, MaterializationScope, ScopeClass};
+use forklift_core::util::scope_utils::{self, PathScope, ScopeClass};
 use forklift_core::util::{
     alias_utils, cache_miss, file_utils, inventory_utils, load_guard_utils, object_utils, pallet_utils, shift_utils, tree_utils,
 };
@@ -619,7 +619,7 @@ fn build_unstaged_shards(ledger: &inventory_utils::ShardLedger,
                          key: &str,
                          tree_hash: &str,
                          shards: &mut BTreeMap<String, Inventory>,
-                         scope: &MaterializationScope) -> Result<(), String> {
+                         scope: &PathScope) -> Result<(), String> {
     // Hoisted once per directory (not per entry): a full (unscoped) scope, or a level already
     // fully in scope, never needs the per-entry classify calls below — short-circuit them away
     // entirely on that hot, common path.

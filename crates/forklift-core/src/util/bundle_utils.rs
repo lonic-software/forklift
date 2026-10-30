@@ -707,7 +707,7 @@ fn plan_tree_closure(walk: &mut PlanWalk,
         // chunked file's *recipe* as bytes (a blob record moves it undecoded), but the result would
         // be a bundle over a file whose chunks it cannot contain — unmaterializable wherever it
         // lands. So this guard stays even now that chunk transport has shipped: a chunked file
-        // reaches a peer over the wire per object (clone/lower/expand fetch the recipe from the
+        // reaches a peer over the wire per object (clone, lower and scope fetch all fetch the recipe from the
         // bundle, then the chunks loose), never inside a bundle. Refuse loudly rather than ship one
         // silently incomplete.
         if file.item_type.is_chunked() {

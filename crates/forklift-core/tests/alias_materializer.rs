@@ -18,7 +18,7 @@ use forklift_core::globals::StorageRootScope;
 use forklift_core::model::blob::Blob;
 use forklift_core::model::object::loose_object::LooseObject;
 use forklift_core::model::tree_item::TreeItem;
-use forklift_core::util::scope_utils::MaterializationScope;
+use forklift_core::util::scope_utils::PathScope;
 use forklift_core::util::shift_utils::{self, FileOp};
 
 /// Run `body` with the current directory at `root` and the warehouse there in scope, one test at a
@@ -240,12 +240,12 @@ fn a_merge_deletion_keeps_the_aliased_file_in_scope_only() {
         let removed = vec!["readme".to_string()];
         let planned = HashSet::from(["readme"]);
 
-        let kept = shift_utils::kept_through_aliases(&ours, &removed, &planned, &MaterializationScope::full()).unwrap();
+        let kept = shift_utils::kept_through_aliases(&ours, &removed, &planned, &PathScope::full()).unwrap();
         let readme = ours.get_files().find(|(name, _)| *name == "README").unwrap().1.hash.clone();
         assert_eq!(kept.iter().map(|(path, item)| (path.as_str(), item.hash.as_str())).collect::<Vec<_>>(),
                    vec![("README", readme.as_str())]);
 
-        let scoped = MaterializationScope::from_prefixes(["src"]);
+        let scoped = PathScope::from_prefixes(["src"]);
         assert!(shift_utils::kept_through_aliases(&ours, &removed, &planned, &scoped).unwrap().is_empty());
     });
 

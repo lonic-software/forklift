@@ -248,7 +248,7 @@ use crate::util::{
 };
 use crate::util::sealed_utils::SealedSet;
 use crate::util::progress_utils::Progress;
-use crate::util::scope_utils::{MaterializationScope, ScopeClass};
+use crate::util::scope_utils::{PathScope, ScopeClass};
 
 /// How many dangling references a refusal message names individually before summarizing the
 /// rest as "(and N more)" — mirrors `audit_utils::MAX_NAMED_MISSING_CHUNKS`'s reasoning: a pack
@@ -1996,7 +1996,7 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
     let no_corrupt: BTreeSet<String> = BTreeSet::new();
     // Unscoped: gc's live set descends every present tree whatever the fetch scope, so the
     // targeted walk must too, or it could miss a target gc would keep (the superset invariant).
-    let outcome = walk_closure_for(targets, &roots, &no_corrupt, &MaterializationScope::full(), None, None)?;
+    let outcome = walk_closure_for(targets, &roots, &no_corrupt, &PathScope::full(), None, None)?;
     Ok(ClosureWalkResult {
         hashes: outcome.referenced,
         degraded_sources: roots.degraded_sources,
@@ -2055,7 +2055,7 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
             told apart from lost ones.",
             error
         ));
-        MaterializationScope::full()
+        PathScope::full()
     });
     // The same holds for the sealed-object record: without it, an object held by hash alone reads
     // as lost.
@@ -2183,7 +2183,7 @@ fn walk_closure_for(
     targets: &BTreeSet<String>,
     roots: &WalkRoots,
     corrupt: &BTreeSet<String>,
-    scope: &MaterializationScope,
+    scope: &PathScope,
     sealed: Option<&SealedSet>,
     mut sink: Option<&mut dyn FnMut(&str)>,
 ) -> Result<WalkClosureOutcome, String> {
@@ -2380,7 +2380,7 @@ fn drain_parcel_queue(
     unwalked: &mut BTreeMap<String, String>,
     visited_parcels: &mut HashSet<String>,
     visited_trees: &mut TreeVisits,
-    scope: &MaterializationScope,
+    scope: &PathScope,
     sealed: Option<&SealedSet>,
     mut sink: Option<&mut dyn FnMut(&str)>,
 ) -> Result<(), String> {
@@ -2473,7 +2473,7 @@ fn walk_tree(
     referenced: &mut BTreeSet<String>,
     unwalked: &mut BTreeMap<String, String>,
     visited_trees: &mut TreeVisits,
-    scope: &MaterializationScope,
+    scope: &PathScope,
     sealed: Option<&SealedSet>,
     mut sink: Option<&mut dyn FnMut(&str)>,
 ) -> Result<(), String> {
@@ -3497,7 +3497,7 @@ mod tests {
         root.add_child(TreeItem::new("src".to_string(), src_object.hash.clone(), DirEntryType::Tree));
         plant_head_over_tree(pallet_utils::PalletNamespace::User, "main", &root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
-        scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
+        scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src"])).unwrap();
 
         let walk = enumerate_absent_reachable(&BTreeSet::new()).unwrap();
         assert_eq!(walk.hashes, [lost].into_iter().collect::<BTreeSet<String>>(),
@@ -3533,7 +3533,7 @@ mod tests {
         // `b` in scope whole (spine, then full), and `b` itself on the spine (spine, then spine).
         for prefixes in [vec!["a/x", "b"], vec!["a/x", "b/lost"]] {
             crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
-            scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(prefixes.clone())).unwrap();
+            scope_utils::set_fetch_scope(&PathScope::from_prefixes(prefixes.clone())).unwrap();
             let walk = enumerate_absent_reachable(&BTreeSet::new()).unwrap();
             assert_eq!(walk.hashes, [lost.clone()].into_iter().collect::<BTreeSet<String>>(),
                 "under scope {:?}, the loss at b/lost must be recorded", prefixes);
@@ -3577,7 +3577,7 @@ mod tests {
         let root = meta_shaped_tree_with_a_lost_cell(&lost);
         plant_head_over_tree(pallet_utils::PalletNamespace::Meta, "notes", &root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
-        scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
+        scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src"])).unwrap();
 
         let walk = enumerate_absent_reachable(&BTreeSet::new()).unwrap();
         assert_eq!(walk.hashes, [lost].into_iter().collect::<BTreeSet<String>>(),
@@ -3628,7 +3628,7 @@ mod tests {
         {
             let mut sink = |hash: &str| { reported.insert(hash.to_string()); };
             walk_closure_for(
-                &BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::from_prefixes(["src"]), None, Some(&mut sink),
+                &BTreeSet::new(), &roots, &BTreeSet::new(), &PathScope::from_prefixes(["src"]), None, Some(&mut sink),
             ).unwrap();
         }
         assert_eq!(reported, [lost].into_iter().collect::<BTreeSet<String>>(),
@@ -3672,7 +3672,7 @@ mod tests {
         {
             let mut sink = |hash: &str| { reported.insert(hash.to_string()); };
             walk_closure_for(
-                &BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::from_prefixes(["src"]), None, Some(&mut sink),
+                &BTreeSet::new(), &roots, &BTreeSet::new(), &PathScope::from_prefixes(["src"]), None, Some(&mut sink),
             ).unwrap();
         }
         assert_eq!(reported, [lost].into_iter().collect::<BTreeSet<String>>(),
@@ -3697,7 +3697,7 @@ mod tests {
         root.add_child(TreeItem::new("docs".to_string(), docs, DirEntryType::Tree));
         plant_head_over_tree(pallet_utils::PalletNamespace::User, "main", &root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
-        scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
+        scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src"])).unwrap();
 
         let walk = enumerate_absent_reachable(&BTreeSet::new()).unwrap();
         assert!(walk.hashes.is_empty(), "nothing outside the scope may be recorded: {:?}", walk.hashes);
@@ -3720,7 +3720,7 @@ mod tests {
         root.add_child(TreeItem::new("README".to_string(), sealed.clone(), DirEntryType::Normal));
         plant_head_over_tree(pallet_utils::PalletNamespace::User, "main", &root);
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
-        scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
+        scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src"])).unwrap();
         std::fs::write(scope_utils::fetch_scope_path(), b"not a scope file").unwrap();
 
         let walk = enumerate_absent_reachable(&BTreeSet::new()).unwrap();
@@ -3834,7 +3834,7 @@ mod tests {
         {
             let mut sink = |hash: &str| { reported.insert(hash.to_string()); };
             walk_closure_for(
-                &BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::full(), Some(&record), Some(&mut sink),
+                &BTreeSet::new(), &roots, &BTreeSet::new(), &PathScope::full(), Some(&record), Some(&mut sink),
             ).unwrap();
         }
         assert_eq!(reported, [staged].into_iter().collect::<BTreeSet<String>>());
@@ -5159,7 +5159,7 @@ mod tests {
         let mut reported: Vec<String> = Vec::new();
         {
             let mut sink = |hash: &str| reported.push(hash.to_string());
-            walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::full(), None, Some(&mut sink)).unwrap();
+            walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &PathScope::full(), None, Some(&mut sink)).unwrap();
         }
         assert_eq!(reported, vec![lost_parent.clone()]);
 
@@ -5198,7 +5198,7 @@ mod tests {
         let mut reported: Vec<String> = Vec::new();
         {
             let mut sink = |hash: &str| reported.push(hash.to_string());
-            walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::full(), None, Some(&mut sink)).unwrap();
+            walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &PathScope::full(), None, Some(&mut sink)).unwrap();
         }
         assert_eq!(reported, vec![lost]);
 
@@ -5262,7 +5262,7 @@ mod tests {
         let mut reported: Vec<String> = Vec::new();
         let outcome = {
             let mut sink = |hash: &str| reported.push(hash.to_string());
-            walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &MaterializationScope::full(), None, Some(&mut sink))
+            walk_closure_for(&BTreeSet::new(), &roots, &BTreeSet::new(), &PathScope::full(), None, Some(&mut sink))
                 .expect("tag subjects must never abort the walk")
         };
 
@@ -5275,7 +5275,7 @@ mod tests {
         );
 
         let targets: BTreeSet<String> = [absent.clone(), lost_parent.clone()].into_iter().collect();
-        let targeted = walk_closure_for(&targets, &roots, &BTreeSet::new(), &MaterializationScope::full(), None, None)
+        let targeted = walk_closure_for(&targets, &roots, &BTreeSet::new(), &PathScope::full(), None, None)
             .expect("the targeted walk runs");
         assert!(
             targeted.referenced.is_empty(),

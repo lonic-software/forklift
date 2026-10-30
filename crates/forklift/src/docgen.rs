@@ -428,8 +428,8 @@ fn command_schemas(name: &str) -> Option<Vec<OutputSchema>> {
         "remove" => commands::remove::__docgen_schemas(),
         "scope" => [
             commands::scope::__docgen_schemas(),
-            commands::expand::__docgen_schemas(),
-            commands::narrow::__docgen_schemas(),
+            commands::scope_fetch::__docgen_schemas(),
+            commands::scope_narrow::__docgen_schemas(),
             commands::scope_prune::__docgen_schemas(),
         ].into_iter().flatten().collect(),
         "remote" => commands::remote::__docgen_schemas(),

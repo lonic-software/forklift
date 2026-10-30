@@ -4455,7 +4455,7 @@ A command not listed here either reports only the generic human-message shape `{
 }
 ```
 
-### `ExpandReport`
+### `ScopeFetchReport`
 
 ```json
 {
@@ -4520,12 +4520,12 @@ A command not listed here either reports only the generic human-message shape `{
     "scope",
     "fetched_objects"
   ],
-  "title": "ExpandReport",
+  "title": "ScopeFetchReport",
   "type": "object"
 }
 ```
 
-### `NarrowReport`
+### `ScopeNarrowReport`
 
 ```json
 {
@@ -4551,12 +4551,12 @@ A command not listed here either reports only the generic human-message shape `{
     "dropped",
     "scope"
   ],
-  "title": "NarrowReport",
+  "title": "ScopeNarrowReport",
   "type": "object"
 }
 ```
 
-### `PruneReport`
+### `ScopePruneReport`
 
 ```json
 {
@@ -4656,7 +4656,7 @@ A command not listed here either reports only the generic human-message shape `{
     "unlifted_pallets",
     "all_resumed"
   ],
-  "title": "PruneReport",
+  "title": "ScopePruneReport",
   "type": "object"
 }
 ```

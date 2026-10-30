@@ -10,7 +10,7 @@ use crate::model::inventory::RollupStamp;
 use crate::model::tree_item::TreeItem;
 use crate::traits::task_context::TaskContext;
 use crate::types::task::Task;
-use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
+use crate::util::scope_utils::{self, PathScope, ScopeClass};
 use crate::error::{CoreError, RefusalCode};
 use crate::util::{alias_utils, audit_utils, fanout_utils, file_utils, inventory_utils, object_utils};
 
@@ -596,7 +596,7 @@ pub(crate) fn remedy_path_when(path: &str, windows: bool) -> Option<String> {
 ///                    or store.
 pub fn build_scoped_root_tree(head_root_hash: Option<&str>,
                               partial_root: &TreeItem,
-                              scope: &MaterializationScope,
+                              scope: &PathScope,
                               overrides: &BTreeMap<String, Option<(String, DirEntryType)>>,
                               batch: &Arc<file_utils::WriteBatch>)
                               -> Result<TreeItem, String> {
@@ -630,7 +630,7 @@ pub fn build_scoped_root_tree(head_root_hash: Option<&str>,
 fn splice_spine_level(head: Option<&TreeItem>,
                       dock: Option<&TreeItem>,
                       key: &str,
-                      scope: &MaterializationScope,
+                      scope: &PathScope,
                       overrides: &BTreeMap<String, Option<(String, DirEntryType)>>,
                       batch: &Arc<file_utils::WriteBatch>)
                       -> Result<Option<TreeItem>, String> {
@@ -824,7 +824,7 @@ fn is_tree_empty(tree: &TreeItem) -> bool {
 ///
 /// A rewrite is only trustworthy when both hold:
 /// * it is a *complete* materialization of `tree` — the whole tree (an unscoped bay), or a
-///   directory already fully in scope (see [`MaterializationScope::classify`]). A spine
+///   directory already fully in scope (see [`PathScope::classify`]). A spine
 ///   directory in a scoped bay only ever rebuilds the in-scope subset of its real content, so
 ///   stamping it with `tree`'s hash would misrepresent staged state.
 /// * `tree` is not empty. An empty tree is only possible for the warehouse root (a stored tree
@@ -836,7 +836,7 @@ fn is_tree_empty(tree: &TreeItem) -> bool {
 /// * `key`       - The warehouse path key of the directory whose shard was just rebuilt.
 /// * `tree`      - The (loaded) tree the shard was rebuilt from.
 /// * `tree_hash` - The hash of `tree`.
-pub fn rollup_stamp(scope: &MaterializationScope, key: &str, tree: &TreeItem, tree_hash: &str) -> Option<RollupStamp> {
+pub fn rollup_stamp(scope: &PathScope, key: &str, tree: &TreeItem, tree_hash: &str) -> Option<RollupStamp> {
     let stampable = (scope.is_full() || scope.classify(key) == ScopeClass::InScope) && !is_tree_empty(tree);
 
     stampable.then(|| RollupStamp::trusted(tree_hash.to_string()))

@@ -233,7 +233,7 @@ mod tests {
         for mode in [WarehouseMode::Cache, WarehouseMode::Sparse] {
             warehouse_utils::mark_for_test(mode);
             if mode == WarehouseMode::Sparse {
-                scope_utils::set_fetch_scope(&scope_utils::MaterializationScope::from_prefixes(["docs"])).unwrap();
+                scope_utils::set_fetch_scope(&scope_utils::PathScope::from_prefixes(["docs"])).unwrap();
             }
 
             set_url("http://origin.example");

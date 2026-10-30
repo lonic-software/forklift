@@ -8,7 +8,7 @@ use forklift_core::util::franchise_utils::{self, Admission, Attempt, BundleState
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{self as remote, BatchLaneClosure, BundleDownload, PartialBundle, RemoteClient, TorSettings};
-use forklift_core::util::scope_utils::MaterializationScope;
+use forklift_core::util::scope_utils::PathScope;
 use forklift_core::util::warehouse_utils::PrepareMode;
 use forklift_core::util::{
     bundle_utils, config_utils, file_utils, held_heads, lock_utils, object_utils, operation_utils, origin_utils,
@@ -405,7 +405,7 @@ async fn enter_and_franchise(
     absolute_target: &Path,
     expected: Expected,
     resolution: PalletResolution,
-    fetch_scope: MaterializationScope,
+    fetch_scope: PathScope,
     partial: Partial,
     client: &RemoteClient,
     info: WarehouseInfo,
@@ -491,7 +491,7 @@ fn start_attempt(attempt: &mut FranchiseAttempt,
 async fn franchise_into_prepared_target(
     attempt: &mut FranchiseAttempt,
     resolution: PalletResolution,
-    fetch_scope: MaterializationScope,
+    fetch_scope: PathScope,
     partial: Partial,
     client: &RemoteClient,
     info: WarehouseInfo,
@@ -718,7 +718,7 @@ impl Partial {
 
     /// The mode the warehouse is prepared in, a partial one with `origin`, the remote cloned
     /// from. `--only` and `--cache` conflict, so at most one holds.
-    fn prepare_mode<'a>(self, fetch_scope: &'a MaterializationScope, origin: &'a str) -> PrepareMode<'a> {
+    fn prepare_mode<'a>(self, fetch_scope: &'a PathScope, origin: &'a str) -> PrepareMode<'a> {
         if self.sparse {
             PrepareMode::Sparse { scope: fetch_scope, origin }
         } else if self.cache {
@@ -730,7 +730,7 @@ impl Partial {
 }
 
 /// A scope as a refusal names it: "every path" when full, else its prefixes.
-fn describe_scope(scope: &MaterializationScope) -> String {
+fn describe_scope(scope: &PathScope) -> String {
     if scope.is_full() { "every path".to_string() } else { scope.prefixes().join(", ") }
 }
 
@@ -773,13 +773,13 @@ fn resolve_pallet(info: &WarehouseInfo, pallet: Option<String>) -> Result<Pallet
     Ok(PalletResolution { pallet_name, remote_head: None })
 }
 
-/// Normalize the `--only` paths into a fetch [`MaterializationScope`], validating each is a
+/// Normalize the `--only` paths into a fetch [`PathScope`], validating each is a
 /// well-formed, non-root warehouse path. An empty list is the full (ordinary) clone scope.
 /// The paths cannot be checked against the remote's tree yet (there is no local head), so the
 /// directory check happens after the fetch.
-fn resolve_fetch_scope(only: &[String]) -> Result<MaterializationScope, String> {
+fn resolve_fetch_scope(only: &[String]) -> Result<PathScope, String> {
     if only.is_empty() {
-        return Ok(MaterializationScope::full());
+        return Ok(PathScope::full());
     }
 
     let mut keys: Vec<String> = Vec::new();
@@ -797,7 +797,7 @@ fn resolve_fetch_scope(only: &[String]) -> Result<MaterializationScope, String> 
         keys.push(path.as_key().to_string());
     }
 
-    Ok(MaterializationScope::from_prefixes(keys))
+    Ok(PathScope::from_prefixes(keys))
 }
 
 /// Whether a warehouse path resolves to a subtree (directory) in the given root tree. Used after

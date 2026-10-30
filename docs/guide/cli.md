@@ -1503,8 +1503,8 @@ forklift scope --json     # the same, as a machine envelope
 
 There are two scopes. The **checkout scope** is what one checkout (a bay, or the main tree)
 writes to disk, and the **fetch scope** is what the warehouse's store holds, shared by every
-checkout. A checkout scope never reaches outside the fetch scope. The `scope` family changes
-them in pairs: `scope narrow` shrinks this checkout's scope, and `scope fetch` and `scope prune`
+checkout. A checkout scope never reaches outside the fetch scope. Each `scope` subcommand changes
+exactly one of them: `scope narrow` shrinks this checkout's scope, and `scope fetch` and `scope prune`
 widen and shrink the fetch scope. Bare `scope` (or `scope status`) shows both.
 
 The report is read-only. In a plain bay or the main tree it reports the full tree; in a scoped bay it lists

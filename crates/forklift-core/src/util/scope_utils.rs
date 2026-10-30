@@ -97,7 +97,7 @@ pub enum ScopeClass {
     /// holds: fully materialized — descend, materialize, verify and merge exactly as a full
     /// workspace would. Nothing below needs re-classifying. Not every in-scope path is under a
     /// directory prefix — the ignore file is a file at a spine level — so a walk that refuses a
-    /// type change asks [`MaterializationScope::requires_directory`], never this variant.
+    /// type change asks [`PathScope::requires_directory`], never this variant.
     InScope,
 
     /// A strict ancestor of at least one in-scope prefix: must be walked (something below it
@@ -111,7 +111,8 @@ pub enum ScopeClass {
     OutOfScope,
 }
 
-/// A bay's (or the warehouse's) checkout scope: a set of in-scope path prefixes.
+/// A set of in-scope path prefixes, used as either scope: a checkout's (what a bay or the main
+/// tree writes to disk) or the warehouse's fetch scope (what its store holds).
 ///
 /// An empty set means **full scope** — no restriction, so [`classify`](Self::classify)
 /// returns [`ScopeClass::InScope`] for every path, and every scope-aware code path collapses to
@@ -119,22 +120,22 @@ pub enum ScopeClass {
 /// absent is decided by whose it is ([`read_fetch_scope`], [`read_main_tree_scope`],
 /// [`read_bay_scope`]), never by reading an absence as full.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MaterializationScope {
+pub struct PathScope {
     /// Normalized in-scope prefixes: warehouse path keys (no leading/trailing slash, `/`
     /// separators), sorted and de-duplicated, none empty. Empty vec = full scope.
     prefixes: Vec<String>,
 }
 
-impl MaterializationScope {
+impl PathScope {
     /// The full (unrestricted) scope — every path is in scope.
-    pub fn full() -> MaterializationScope {
-        MaterializationScope { prefixes: Vec::new() }
+    pub fn full() -> PathScope {
+        PathScope { prefixes: Vec::new() }
     }
 
     /// Build a scope from raw in-scope prefixes, normalizing them: an empty (root) prefix
     /// means "materialize everything", so it collapses the whole scope to full; the rest are
     /// trimmed of `/`, de-duplicated and sorted for a canonical on-disk form.
-    pub fn from_prefixes<I, S>(prefixes: I) -> MaterializationScope
+    pub fn from_prefixes<I, S>(prefixes: I) -> PathScope
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -147,7 +148,7 @@ impl MaterializationScope {
 
             // A root prefix means the whole tree — that is full scope, so no restriction.
             if trimmed.is_empty() {
-                return MaterializationScope::full();
+                return PathScope::full();
             }
 
             normalized.push(trimmed);
@@ -156,7 +157,7 @@ impl MaterializationScope {
         normalized.sort();
         normalized.dedup();
 
-        MaterializationScope { prefixes: normalized }
+        PathScope { prefixes: normalized }
     }
 
     /// Whether this scope is full (unrestricted). A full scope makes every scope-aware walk
@@ -237,7 +238,7 @@ impl MaterializationScope {
     /// Whether this scope is a subset (⊆) of `other` — every path this scope materializes is
     /// in scope for `other`. The bay checkout scope must always be ⊆ the warehouse
     /// fetch scope (design §3.1): a bay can never materialize what the warehouse never fetched.
-    pub fn subset_of(&self, other: &MaterializationScope) -> bool {
+    pub fn subset_of(&self, other: &PathScope) -> bool {
         if other.is_full() {
             return true;
         }
@@ -273,9 +274,9 @@ impl MaterializationScope {
     /// # Arguments
     /// * `bytes`  - The file's contents.
     /// * `remedy` - The way out for a file in the older format, which depends on whose file it is.
-    fn from_bytes(bytes: &[u8], remedy: &str) -> Result<MaterializationScope, String> {
+    fn from_bytes(bytes: &[u8], remedy: &str) -> Result<PathScope, String> {
         if bytes.is_empty() {
-            return Ok(MaterializationScope::full());
+            return Ok(PathScope::full());
         }
 
         let lines = record_utils::from_bytes(bytes, SCOPE_RECORD, SCOPE_VERSION).map_err(|e| match e {
@@ -297,7 +298,7 @@ impl MaterializationScope {
             _ => e.describe(),
         })?;
 
-        let scope = MaterializationScope::from_prefixes(lines);
+        let scope = PathScope::from_prefixes(lines);
 
         if scope.is_full() {
             return Err(format!(
@@ -312,7 +313,7 @@ impl MaterializationScope {
 }
 
 /// Whether `path` is `prefix` itself or lies under it — a pure path test, unlike
-/// [`MaterializationScope::classify`], which also holds the root ignore file in scope.
+/// [`PathScope::classify`], which also holds the root ignore file in scope.
 pub fn is_at_or_under(path: &str, prefix: &str) -> bool {
     path == prefix || is_strictly_under(path, prefix)
 }
@@ -345,9 +346,9 @@ pub fn fetch_scope_path() -> PathBuf {
 /// # Arguments
 /// * `path`   - The scope file.
 /// * `remedy` - The way out when the file is in the older, unversioned format.
-fn read_scope_file_if_present(path: &Path, remedy: &str) -> Result<Option<MaterializationScope>, String> {
+fn read_scope_file_if_present(path: &Path, remedy: &str) -> Result<Option<PathScope>, String> {
     match std::fs::read(path) {
-        Ok(bytes) => MaterializationScope::from_bytes(&bytes, remedy).map(Some).map_err(|reason| {
+        Ok(bytes) => PathScope::from_bytes(&bytes, remedy).map(Some).map_err(|reason| {
             format!("The scope file \"{}\" {}", path.to_string_lossy(), reason)
         }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -366,13 +367,13 @@ fn scope_file_is_present(path: &Path) -> Result<bool, String> {
 }
 
 /// Write a scope file atomically (its parent folder must already exist).
-fn write_scope_file(path: &Path, scope: &MaterializationScope) -> Result<(), String> {
+fn write_scope_file(path: &Path, scope: &PathScope) -> Result<(), String> {
     crate::util::file_utils::write_file_atomically(path, &scope.to_bytes())
 }
 
 /// The active checkout's scope: the main tree's ([`read_main_tree_scope`]) or the
 /// active bay's ([`read_bay_scope`]), checked the same way.
-pub fn current_scope() -> Result<MaterializationScope, String> {
+pub fn current_scope() -> Result<PathScope, String> {
     match globals::active_bay() {
         Some(_) => read_bay_scope_at(&bay_scope_path()),
         None => read_main_tree_scope(),
@@ -389,12 +390,12 @@ pub fn is_scoped() -> Result<bool, String> {
 /// sparse one. The file is read against the mode the warehouse marker records, never on its own:
 /// a full or cache warehouse must hold no fetch-scope file and a sparse one a non-full one, so
 /// deleting the file cannot make a sparse warehouse read as full.
-pub fn read_fetch_scope() -> Result<MaterializationScope, String> {
+pub fn read_fetch_scope() -> Result<PathScope, String> {
     Ok(read_fetch_state()?.1)
 }
 
 /// The warehouse's mode and its fetch scope, checked against each other (see [`read_fetch_scope`]).
-fn read_fetch_state() -> Result<(WarehouseMode, MaterializationScope), String> {
+fn read_fetch_state() -> Result<(WarehouseMode, PathScope), String> {
     let mode = warehouse_utils::warehouse_mode()?;
     let path = fetch_scope_path();
 
@@ -403,7 +404,7 @@ fn read_fetch_state() -> Result<(WarehouseMode, MaterializationScope), String> {
         // hand. It is refused whatever it holds rather than parsed, and deleting it is safe: the
         // mode, not the file, says what the warehouse holds.
         if !scope_file_is_present(&path)? {
-            return Ok((mode, MaterializationScope::full()));
+            return Ok((mode, PathScope::full()));
         }
         let kind = mode_kind(mode);
         return Err(format!(
@@ -442,11 +443,11 @@ fn mode_kind(mode: WarehouseMode) -> &'static str {
 ///
 /// # Arguments
 /// * `name` - The bay's name (as listed by `bay_utils::list_bays`).
-pub fn read_bay_scope(name: &str) -> Result<MaterializationScope, String> {
+pub fn read_bay_scope(name: &str) -> Result<PathScope, String> {
     read_bay_scope_at(&crate::util::bay_utils::bay_state_dir(name).join(FILE_NAME_BAY_SCOPE))
 }
 
-fn read_bay_scope_at(path: &Path) -> Result<MaterializationScope, String> {
+fn read_bay_scope_at(path: &Path) -> Result<PathScope, String> {
     let refused = |found: &str| format!(
         "The bay's scope (\"{}\") {}, so Forklift cannot tell which paths the bay checks out. {}",
         path.to_string_lossy(), found, REMEDY_READD_BAY
@@ -479,13 +480,13 @@ fn read_bay_scope_at(path: &Path) -> Result<MaterializationScope, String> {
 /// file found there was put in place by hand and is refused whatever it holds. A sparse
 /// warehouse's main tree must have one that names a path within the fetch scope, so deleting it
 /// cannot make the main tree read as holding every path.
-pub fn read_main_tree_scope() -> Result<MaterializationScope, String> {
+pub fn read_main_tree_scope() -> Result<PathScope, String> {
     let (mode, fetch) = read_fetch_state()?;
     let path = globals::forklift_root().join(FILE_NAME_BAY_SCOPE);
 
     if mode != WarehouseMode::Sparse {
         if !scope_file_is_present(&path)? {
-            return Ok(MaterializationScope::full());
+            return Ok(PathScope::full());
         }
         return Err(format!(
             "The warehouse is recorded as {} but its main tree holds a scope (\"{}\"), which only a \
@@ -523,7 +524,7 @@ const REMEDY_READD_BAY: &str = "Remove the bay with \"forklift bay remove\" and 
 ///
 /// # Arguments
 /// * `scope` - The checkout scope to record for the active checkout.
-pub fn set_bay_scope(scope: &MaterializationScope) -> Result<(), String> {
+pub fn set_bay_scope(scope: &PathScope) -> Result<(), String> {
     let main_tree = globals::active_bay().is_none();
     if main_tree && warehouse_utils::warehouse_mode()? != WarehouseMode::Sparse {
         return Err("Only a sparse warehouse's main tree records a scope.".to_string());
@@ -534,11 +535,11 @@ pub fn set_bay_scope(scope: &MaterializationScope) -> Result<(), String> {
 
 /// [`set_bay_scope`] for the bay whose state dir is `dir`, before its context is entered. Every bay
 /// records its scope, a full one included ([`read_bay_scope`]).
-pub fn set_bay_scope_in(dir: &std::path::Path, scope: &MaterializationScope) -> Result<(), String> {
+pub fn set_bay_scope_in(dir: &std::path::Path, scope: &PathScope) -> Result<(), String> {
     set_bay_scope_at(&dir.join(FILE_NAME_BAY_SCOPE), scope)
 }
 
-fn set_bay_scope_at(path: &std::path::Path, scope: &MaterializationScope) -> Result<(), String> {
+fn set_bay_scope_at(path: &std::path::Path, scope: &PathScope) -> Result<(), String> {
     let fetch = read_fetch_scope()?;
 
     if !fetch.is_full() && scope.is_full() {
@@ -568,7 +569,7 @@ fn set_bay_scope_at(path: &std::path::Path, scope: &MaterializationScope) -> Res
 ///
 /// # Arguments
 /// * `scope` - The fetch scope to record for the warehouse.
-pub fn set_fetch_scope(scope: &MaterializationScope) -> Result<(), String> {
+pub fn set_fetch_scope(scope: &PathScope) -> Result<(), String> {
     if warehouse_utils::warehouse_mode()? != WarehouseMode::Sparse {
         return Err("Only a sparse warehouse records a fetch scope.".to_string());
     }
@@ -587,7 +588,7 @@ pub fn set_fetch_scope(scope: &MaterializationScope) -> Result<(), String> {
 /// # Arguments
 /// * `forklift` - The `.forklift` folder being prepared.
 /// * `scope`    - The fetch scope, which is also the main tree's. Never full.
-pub(crate) fn record_sparse_scopes(forklift: &Path, scope: &MaterializationScope) -> Result<(), String> {
+pub(crate) fn record_sparse_scopes(forklift: &Path, scope: &PathScope) -> Result<(), String> {
     if scope.is_full() {
         return Err("A sparse warehouse's fetch scope must name at least one path.".to_string());
     }
@@ -706,14 +707,14 @@ pub fn sparse_workspace_refusal(verb: &str, next_step: &str) -> CoreError {
 pub fn narrow_unclean_refusal(path: &str, blocked_by: &str) -> CoreError {
     let next_step = format!(
         "Stack or restore the changes under \"{}\" (or move untracked files out of the way), \
-        then narrow again.",
+        then run \"forklift scope narrow\" again.",
         path
     );
 
     refusal(
         RefusalCode::NarrowUnclean,
         format!(
-            "\"{}\" has {} that narrow would otherwise delete; narrow refuses to discard \
+            "\"{}\" has {} that scope narrow would otherwise delete; it refuses to discard \
             uncommitted work. {}",
             path, blocked_by, next_step
         ),
@@ -732,14 +733,15 @@ pub fn narrow_unclean_refusal(path: &str, blocked_by: &str) -> CoreError {
 /// * `blockers`  - The checkout(s) still materializing it (for the message).
 pub fn scope_prune_blocked_refusal(path: &str, blockers: &str) -> CoreError {
     let next_step = format!(
-        "Narrow {} off \"{}\" first (that is bay-local and frees nothing), then prune.",
+        "Run \"forklift scope narrow\" in {} to drop \"{}\" first (that is checkout-local and frees \
+        nothing), then prune.",
         blockers, path
     );
 
     refusal(
         RefusalCode::ScopePruneBlocked,
         format!(
-            "\"{}\" is still materialized by {}; pruning it would break that checkout. {}",
+            "\"{}\" is still in the checkout scope of {}; pruning it would break that checkout. {}",
             path, blockers, next_step
         ),
         next_step,
@@ -753,7 +755,7 @@ pub fn scope_prune_blocked_refusal(path: &str, blockers: &str) -> CoreError {
 /// and a chunk is structurally absent from every bundle. A bundle could still move a chunked
 /// file's recipe as bytes, but the result would be a bundle over a file whose chunks it cannot
 /// contain — unmaterializable wherever it lands. Refusing up front, naming the path, is the honest
-/// failure; a chunked file reaches a peer over the wire per object (clone/lower/expand fetch
+/// failure; a chunked file reaches a peer over the wire per object (clone, lower and scope fetch all fetch
 /// the recipe, then the chunks loose), never inside a bundle.
 ///
 /// # Arguments
@@ -873,7 +875,7 @@ mod tests {
 
     #[test]
     fn full_scope_classifies_everything_in_scope() {
-        let scope = MaterializationScope::full();
+        let scope = PathScope::full();
 
         assert!(scope.is_full());
         for path in ["", "src", "src/api", "src/api/x.rs", "README.md"] {
@@ -883,7 +885,7 @@ mod tests {
 
     #[test]
     fn classify_is_three_valued_over_a_single_prefix() {
-        let scope = MaterializationScope::from_prefixes(["src/api"]);
+        let scope = PathScope::from_prefixes(["src/api"]);
 
         // Spine: the root and the intermediate directory on the path to the in-scope leaf.
         assert_eq!(scope.classify(""), ScopeClass::Spine);
@@ -905,14 +907,14 @@ mod tests {
 
     #[test]
     fn the_root_ignore_file_is_in_every_scope_without_being_a_prefix() {
-        let scope = MaterializationScope::from_prefixes(["src/api"]);
+        let scope = PathScope::from_prefixes(["src/api"]);
 
         // The root ignore file is in scope, though no prefix names it — but it is not a declared
         // prefix, so the scope never requires it to be a directory, and it widens nothing else.
         assert_eq!(scope.classify(".forkliftignore"), ScopeClass::InScope);
         assert!(!scope.requires_directory(".forkliftignore"));
         assert_eq!(scope.implicit_members(), &[".forkliftignore"]);
-        assert!(MaterializationScope::full().implicit_members().is_empty());
+        assert!(PathScope::full().implicit_members().is_empty());
         assert!(!scope.spine_file_is_sealed(".forkliftignore").unwrap());
         assert!(scope.spine_file_is_sealed("README.md").unwrap());
         assert!(scope.spine_file_is_sealed("src").is_err(), "a file where a spine directory is expected");
@@ -939,7 +941,7 @@ mod tests {
 
     #[test]
     fn classify_handles_multiple_prefixes() {
-        let scope = MaterializationScope::from_prefixes(["src/api", "docs"]);
+        let scope = PathScope::from_prefixes(["src/api", "docs"]);
 
         assert_eq!(scope.classify(""), ScopeClass::Spine);
         assert_eq!(scope.classify("src"), ScopeClass::Spine);
@@ -952,76 +954,76 @@ mod tests {
 
     #[test]
     fn prefixes_are_normalized_and_a_root_prefix_is_full() {
-        let scope = MaterializationScope::from_prefixes(["/src/api/", "src/api", "docs/"]);
+        let scope = PathScope::from_prefixes(["/src/api/", "src/api", "docs/"]);
         assert_eq!(scope.prefixes(), &["docs".to_string(), "src/api".to_string()]);
 
         // A root prefix collapses to full scope.
-        assert!(MaterializationScope::from_prefixes(["/"]).is_full());
-        assert!(MaterializationScope::from_prefixes([""]).is_full());
+        assert!(PathScope::from_prefixes(["/"]).is_full());
+        assert!(PathScope::from_prefixes([""]).is_full());
     }
 
     #[test]
     fn scope_round_trips_through_its_on_disk_form() {
-        let scope = MaterializationScope::from_prefixes(["src/api", "docs"]);
+        let scope = PathScope::from_prefixes(["src/api", "docs"]);
         let bytes = scope.to_bytes();
 
-        assert_eq!(MaterializationScope::from_bytes(&bytes, "").unwrap(), scope);
+        assert_eq!(PathScope::from_bytes(&bytes, "").unwrap(), scope);
 
         // The full scope round-trips as the empty file.
-        assert!(MaterializationScope::full().to_bytes().is_empty());
-        assert!(MaterializationScope::from_bytes(b"", "").unwrap().is_full());
+        assert!(PathScope::full().to_bytes().is_empty());
+        assert!(PathScope::from_bytes(b"", "").unwrap().is_full());
         // Only the empty file is: whitespace is no longer trimmed away, so a file of blank lines
         // has no header and is refused.
-        assert!(MaterializationScope::from_bytes(b"\n  \n", "").is_err());
+        assert!(PathScope::from_bytes(b"\n  \n", "").is_err());
     }
 
     #[test]
     fn a_scope_file_without_its_format_header_is_refused() {
         // A non-full scope is written under its format header.
-        let bytes = MaterializationScope::from_prefixes(["src"]).to_bytes();
+        let bytes = PathScope::from_prefixes(["src"]).to_bytes();
         assert!(bytes.starts_with(b"/forklift-scope 3\n"), "{:?}", String::from_utf8_lossy(&bytes));
 
         // The unversioned form an older Forklift wrote is refused, naming the way out.
-        let legacy = MaterializationScope::from_bytes(b"src\n", "Do the remedy.").unwrap_err();
+        let legacy = PathScope::from_bytes(b"src\n", "Do the remedy.").unwrap_err();
         assert!(legacy.contains("older version of Forklift"), "{}", legacy);
         assert!(legacy.ends_with("Do the remedy."), "{}", legacy);
 
         // So is a format this build does not know.
-        let unknown = MaterializationScope::from_bytes(b"/forklift-scope 4\nsrc\n", "").unwrap_err();
+        let unknown = PathScope::from_bytes(b"/forklift-scope 4\nsrc\n", "").unwrap_err();
         assert!(unknown.contains("/forklift-scope 4"), "{}", unknown);
 
         // Format 2 wrote prefixes raw, so a prefix holding a line break read back as two.
-        let raw = MaterializationScope::from_bytes(b"/forklift-scope 2\nsrc\n", "Do the remedy.").unwrap_err();
+        let raw = PathScope::from_bytes(b"/forklift-scope 2\nsrc\n", "Do the remedy.").unwrap_err();
         assert!(raw.contains("/forklift-scope 2") && raw.contains("Do the remedy."), "{}", raw);
         assert!(!raw.contains("Use the Forklift that wrote it"), "{}", raw);
 
         // Line endings rewritten to CRLF still read as the older format they are.
-        let crlf = MaterializationScope::from_bytes(b"/forklift-scope 2\r\nsrc\r\n", "Do the remedy.").unwrap_err();
+        let crlf = PathScope::from_bytes(b"/forklift-scope 2\r\nsrc\r\n", "Do the remedy.").unwrap_err();
         assert!(crlf.contains("Do the remedy."), "{}", crlf);
 
         // And a header with no prefix after it, which would otherwise read as the full scope.
-        let bare = MaterializationScope::from_bytes(b"/forklift-scope 3\n", "Do the remedy.").unwrap_err();
+        let bare = PathScope::from_bytes(b"/forklift-scope 3\n", "Do the remedy.").unwrap_err();
         assert!(bare.contains("no prefix narrower than the warehouse root"), "{}", bare);
-        let rooted = MaterializationScope::from_bytes(b"/forklift-scope 3\nsrc\n/\n", "").unwrap_err();
+        let rooted = PathScope::from_bytes(b"/forklift-scope 3\nsrc\n/\n", "").unwrap_err();
         assert!(rooted.contains("no prefix narrower than the warehouse root"), "{}", rooted);
         assert!(bare.ends_with("Do the remedy."), "{}", bare);
     }
 
     #[test]
     fn subset_invariant_holds_for_bay_within_fetch() {
-        let fetch = MaterializationScope::from_prefixes(["src"]);
+        let fetch = PathScope::from_prefixes(["src"]);
 
         // A bay ⊆ the fetch scope.
-        assert!(MaterializationScope::from_prefixes(["src/api"]).subset_of(&fetch));
-        assert!(MaterializationScope::from_prefixes(["src"]).subset_of(&fetch));
+        assert!(PathScope::from_prefixes(["src/api"]).subset_of(&fetch));
+        assert!(PathScope::from_prefixes(["src"]).subset_of(&fetch));
 
         // A bay reaching outside the fetch scope is not a subset.
-        assert!(!MaterializationScope::from_prefixes(["src/api", "docs"]).subset_of(&fetch));
-        assert!(!MaterializationScope::full().subset_of(&fetch));
+        assert!(!PathScope::from_prefixes(["src/api", "docs"]).subset_of(&fetch));
+        assert!(!PathScope::full().subset_of(&fetch));
 
         // Everything is a subset of the full fetch scope.
-        assert!(MaterializationScope::from_prefixes(["anything"]).subset_of(&MaterializationScope::full()));
-        assert!(MaterializationScope::full().subset_of(&MaterializationScope::full()));
+        assert!(PathScope::from_prefixes(["anything"]).subset_of(&PathScope::full()));
+        assert!(PathScope::full().subset_of(&PathScope::full()));
     }
 
     /// Destructure a refusal into `(code, message, next_step)` for the assertions below — the
@@ -1127,9 +1129,9 @@ mod tests {
 
     #[test]
     fn prefixes_holding_line_breaks_or_edge_spaces_round_trip() {
-        let scope = MaterializationScope::from_prefixes(["a\nb", " docs ", "c\r", "d\\ne"]);
+        let scope = PathScope::from_prefixes(["a\nb", " docs ", "c\r", "d\\ne"]);
 
-        let read_back = MaterializationScope::from_bytes(&scope.to_bytes(), "").unwrap();
+        let read_back = PathScope::from_bytes(&scope.to_bytes(), "").unwrap();
 
         assert_eq!(read_back, scope);
     }
@@ -1166,10 +1168,10 @@ mod tests {
         assert!(read_fetch_scope().unwrap().is_full());
 
         mark_for_test(WarehouseMode::Sparse);
-        set_fetch_scope(&MaterializationScope::from_prefixes(["docs"])).unwrap();
+        set_fetch_scope(&PathScope::from_prefixes(["docs"])).unwrap();
         assert!(content_may_be_absent().unwrap());
         assert!(!is_cache_mode().unwrap());
-        assert_eq!(read_fetch_scope().unwrap(), MaterializationScope::from_prefixes(["docs"]));
+        assert_eq!(read_fetch_scope().unwrap(), PathScope::from_prefixes(["docs"]));
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1183,7 +1185,7 @@ mod tests {
     fn a_fetch_scope_that_does_not_match_the_mode_is_refused() {
         let (root, _scope) = scratch("mode-mismatch");
         let path = fetch_scope_path();
-        let sparse = MaterializationScope::from_prefixes(["docs"]).to_bytes();
+        let sparse = PathScope::from_prefixes(["docs"]).to_bytes();
 
         // A stray file in a full warehouse or a cache is refused unparsed, so a garbled one says
         // "delete it" too.
@@ -1216,7 +1218,7 @@ mod tests {
     #[test]
     fn set_fetch_scope_refuses_a_warehouse_that_is_not_sparse_and_a_full_scope() {
         let (root, _scope) = scratch("set-fetch-scope");
-        let docs = MaterializationScope::from_prefixes(["docs"]);
+        let docs = PathScope::from_prefixes(["docs"]);
 
         for mode in [WarehouseMode::Full, WarehouseMode::Cache] {
             mark_for_test(mode);
@@ -1225,7 +1227,7 @@ mod tests {
         }
 
         mark_for_test(WarehouseMode::Sparse);
-        assert!(set_fetch_scope(&MaterializationScope::full()).unwrap_err().contains("at least one path"));
+        assert!(set_fetch_scope(&PathScope::full()).unwrap_err().contains("at least one path"));
         assert!(!fetch_scope_path().exists());
 
         std::fs::remove_dir_all(&root).ok();

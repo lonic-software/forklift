@@ -39,7 +39,7 @@ use crate::util::office_utils::{OfficeState, TrustAnchor};
 use crate::util::pallet_utils::{self, AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions};
 use crate::util::progress_utils::Progress;
 use crate::util::remote_utils::{self, RemoteClient};
-use crate::util::scope_utils::MaterializationScope;
+use crate::util::scope_utils::PathScope;
 
 /// What a take is verified against.
 pub enum TakeTrust {
@@ -125,7 +125,7 @@ pub enum FetchAt<'a> {
     Warehouse,
 
     /// This scope.
-    Scope(&'a MaterializationScope),
+    Scope(&'a PathScope),
 }
 
 /// Verify `head`, served by `client` for `pallet`, against `trust` before it is adopted.

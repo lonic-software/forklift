@@ -4760,7 +4760,7 @@ mod tests {
     fn make_sparse(root: &std::path::Path) {
         mark_warehouse_as(root, "sparse");
         let _scope = StorageRootScope::enter(root);
-        scope_utils::set_fetch_scope(&scope_utils::MaterializationScope::from_prefixes(["src"])).unwrap();
+        scope_utils::set_fetch_scope(&scope_utils::PathScope::from_prefixes(["src"])).unwrap();
     }
 
     /// A sparse warehouse is never served, and the refusal is a 409 naming it as sparse rather than

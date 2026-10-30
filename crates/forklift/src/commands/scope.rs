@@ -90,9 +90,9 @@ impl CommandOutput for ScopeStatus {
         };
 
         if !self.scoped {
-            println!("{} checks out the full tree (not a scoped bay).", where_);
+            println!("{} checks out the full tree (not scoped).", where_);
         } else {
-            println!("{} is a scoped (sparse) bay. Checkout scope:", where_);
+            println!("{} is scoped (sparse). Checkout scope:", where_);
             for prefix in &self.checkout_scope {
                 println!("  {}", prefix);
             }

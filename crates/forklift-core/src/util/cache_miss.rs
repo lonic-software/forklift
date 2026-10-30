@@ -741,7 +741,7 @@ mod tests {
     // could not be fetched instead.
     #[test]
     fn a_planner_refusal_comes_before_a_failed_prefetch() {
-        use crate::util::scope_utils::MaterializationScope;
+        use crate::util::scope_utils::PathScope;
         use crate::util::{merge_utils, shift_utils};
 
         let fixture = fixture("precedence");
@@ -750,7 +750,7 @@ mod tests {
         sealed_utils::append(&[(SealOp::Record, &meta)]).unwrap();
         remove(&meta);
 
-        let refused = shift_utils::diff_trees_in(None, &root, &MaterializationScope::full()).err().expect("the shift refuses");
+        let refused = shift_utils::diff_trees_in(None, &root, &PathScope::full()).err().expect("the shift refuses");
         assert!(refused.contains("metadata folder"), "{}", refused);
 
         let held_in = tree(&[("a", &blob("a"), DirEntryType::Normal)]);
@@ -760,7 +760,7 @@ mod tests {
         sealed_utils::append(&[(SealOp::Record, &their_in)]).unwrap();
         remove(&their_in);
 
-        let scope = MaterializationScope::from_prefixes(["in"]);
+        let scope = PathScope::from_prefixes(["in"]);
         match CoreError::from(merge_utils::compute_merge_actions(&base, &ours, &theirs, "ours", "theirs", &scope).err().expect("the merge refuses")) {
             CoreError::Refusal { code, .. } => assert_eq!(code, RefusalCode::OutOfScopeConflict),
             other => panic!("not the planner's refusal: {:?}", other),

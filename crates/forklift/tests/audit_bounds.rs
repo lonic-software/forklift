@@ -20,7 +20,7 @@ use forklift_core::globals::StorageRootScope;
 use forklift_core::util::{
     audit_utils, file_utils, graph_utils, object_utils, office_utils, pallet_utils, sealed_utils, tree_utils,
 };
-use forklift_core::util::scope_utils::MaterializationScope;
+use forklift_core::util::scope_utils::PathScope;
 use forklift_core::util::audit_utils::SealedTolerance;
 use forklift_core::util::sealed_utils::SealOp;
 
@@ -670,7 +670,7 @@ fn full_audit_re_reads_chunks_and_catches_corruption_a_presence_check_misses() {
     let head = warehouse.stack_large("big.bin", 0x5EED, CHUNK_THRESHOLD + 60_000, "a giant");
 
     warehouse.scoped(|| {
-        let full = forklift_core::util::scope_utils::MaterializationScope::full();
+        let full = forklift_core::util::scope_utils::PathScope::full();
 
         // Corrupt one chunk's bytes but leave the object present. (Corrupt before ever reading the
         // chunk in this process, so the read cache never holds the good bytes — the on-disk
@@ -801,7 +801,7 @@ fn subtree(head: &str, path: &str) -> String {
 
 /// The audit as `forklift audit` runs it, against the warehouse's sealed record. Returns how many
 /// absent objects the record held.
-fn audit(head: &str, scope: &MaterializationScope, full: bool) -> Result<usize, String> {
+fn audit(head: &str, scope: &PathScope, full: bool) -> Result<usize, String> {
     let record = sealed_utils::read_sealed()?;
     let tolerance = SealedTolerance::new(&record);
     audit_utils::verify_parcel_closure_scoped(head, None, scope, full, Some(&tolerance))?;
@@ -825,7 +825,7 @@ fn audit_tolerates_a_recorded_absent_tree_and_what_lies_under_it_but_the_push_ga
     );
 
     warehouse.scoped(|| {
-        let full = MaterializationScope::full();
+        let full = PathScope::full();
         let gone = subtree(&head, "gone");
         let below = file_hash(&head, "gone/z.txt");
         warehouse.delete_object(&gone);
@@ -861,7 +861,7 @@ fn a_recorded_tree_that_is_present_seals_nothing_beneath_it() {
         warehouse.seal(&[&dir]);
         warehouse.delete_object(&lost);
 
-        let err = audit(&head, &MaterializationScope::full(), false)
+        let err = audit(&head, &PathScope::full(), false)
             .expect_err("a present recorded tree is walked, and its lost blob reported");
         assert!(err.contains(&lost), "{}", err);
     });
@@ -874,7 +874,7 @@ fn audit_tolerates_a_recorded_absent_blob_only() {
     let head = warehouse.stack_files(&[("a.txt", "a\n"), ("b.txt", "b\n")], "K");
 
     warehouse.scoped(|| {
-        let full = MaterializationScope::full();
+        let full = PathScope::full();
         let a = file_hash(&head, "a.txt");
         let b = file_hash(&head, "b.txt");
         warehouse.delete_object(&a);
@@ -902,7 +902,7 @@ fn audit_tolerates_a_recorded_absent_recipe_or_chunk() {
     let head = warehouse.stack_large("big.bin", 0x5EA1, CHUNK_THRESHOLD + 60_000, "a giant");
 
     warehouse.scoped(|| {
-        let full = MaterializationScope::full();
+        let full = PathScope::full();
         let recipe = file_hash(&head, "big.bin");
         let chunks: Vec<String> = object_utils::load_recipe(&recipe).unwrap().chunks.iter()
             .map(|chunk| chunk.hash.clone())
@@ -942,7 +942,7 @@ fn full_audit_re_reads_the_present_chunks_beside_a_recorded_absent_one() {
     let head = warehouse.stack_large("big.bin", 0x5EA2, CHUNK_THRESHOLD + 60_000, "a giant");
 
     warehouse.scoped(|| {
-        let full = MaterializationScope::full();
+        let full = PathScope::full();
         let recipe = file_hash(&head, "big.bin");
         let chunks: Vec<String> = object_utils::load_recipe(&recipe).unwrap().chunks.iter()
             .map(|chunk| chunk.hash.clone())
@@ -970,7 +970,7 @@ fn audit_tolerates_a_recorded_absent_spine_tree() {
     let head = warehouse.stack_files(&[("deep/in/a.txt", "a\n"), ("deep/out.txt", "o\n")], "K");
 
     warehouse.scoped(|| {
-        let scope = MaterializationScope::from_prefixes(["deep/in"]);
+        let scope = PathScope::from_prefixes(["deep/in"]);
         let deep = subtree(&head, "deep");
         warehouse.delete_object(&deep);
 
@@ -993,7 +993,7 @@ fn audit_tolerates_a_recorded_absent_blob_on_the_spine() {
     let head = warehouse.stack_files(&[("deep/f.txt", "f\n"), ("deep/g.txt", "g\n")], "K");
 
     warehouse.scoped(|| {
-        let scope = MaterializationScope::from_prefixes(["deep/f.txt"]);
+        let scope = PathScope::from_prefixes(["deep/f.txt"]);
         let blob = file_hash(&head, "deep/f.txt");
         warehouse.delete_object(&blob);
 
@@ -1134,7 +1134,7 @@ fn an_unreadable_record_fails_the_audit() {
     std::fs::write(warehouse.root.join(".forklift").join("sealed"), b"/forklift-sealed 99\n").unwrap();
 
     warehouse.scoped(|| {
-        let err = audit(&head, &MaterializationScope::full(), false)
+        let err = audit(&head, &PathScope::full(), false)
             .expect_err("an unknown record version is refused");
         assert!(err.contains("sealed-object record") && err.contains("format"), "{}", err);
     });

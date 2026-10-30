@@ -3,7 +3,7 @@ use crate::error::{CoreError, RefusalCode};
 use crate::globals::{bay_root, forklift_root};
 use crate::util::{file_utils, object_utils};
 use crate::util::audit_utils::ClosureError;
-use crate::util::scope_utils::MaterializationScope;
+use crate::util::scope_utils::PathScope;
 use crate::util::sealed_utils::SealedSet;
 
 /// The folder inside the forklift root that holds the *user* pallet ref files (branches).
@@ -1143,14 +1143,14 @@ pub fn update_pallet_head_verified(
 #[derive(Clone, Debug)]
 pub struct VerifiedClosure {
     head: String,
-    scope: MaterializationScope,
+    scope: PathScope,
     namespace: PalletNamespace,
     bound: Option<String>,
 }
 
 impl VerifiedClosure {
     pub(crate) fn new(head: &str,
-                      scope: MaterializationScope,
+                      scope: PathScope,
                       namespace: PalletNamespace,
                       bound: Option<&str>) -> VerifiedClosure {
         VerifiedClosure { head: head.to_string(), scope, namespace, bound: bound.map(str::to_string) }
@@ -1163,7 +1163,7 @@ impl VerifiedClosure {
 /// [`verify_new_head`]), before the lock, since the walk can be long and the hold does no walking.
 /// Objects cannot vanish between the walk and the write: every command that writes a ref holds
 /// the store-access lock shared, which every deleter needs exclusively. The fetch scope can change
-/// in between, though (an `scope fetch` in another bay commits a widened one under the lock), so the
+/// in between, though (a `scope fetch` in another bay commits a widened one under the lock), so the
 /// hold re-reads it, and when it is no longer the scope verified against, the hold is released and
 /// the closure verified again at the new one. A verification that held an absence by the
 /// sealed-by-hash record has the hold re-read the record the same way, since its writers commit
@@ -1378,7 +1378,7 @@ fn closure_to_verify(namespace: PalletNamespace, expected: Option<&str>, new: &s
 fn verify_new_head(name: &str,
                    expected: Option<&str>,
                    new: &str,
-                   scope: &MaterializationScope) -> Result<Option<SealedSet>, RefUpdateError> {
+                   scope: &PathScope) -> Result<Option<SealedSet>, RefUpdateError> {
     let heads: Vec<String> = all_pallet_refs()?.into_iter()
         .filter(|(pallet, _)| pallet.namespace == PalletNamespace::User)
         .map(|(_, head)| head)
@@ -1435,7 +1435,7 @@ fn verify_new_head(name: &str,
 
 /// The head a write of `new` over `expected` leaves no longer reached from its ref, when that
 /// matters: a user-pallet ref in a sparse warehouse moving to a parcel that does not descend from
-/// its old head. Such a head goes into the fetched-heads ledger with the write, so an `scope fetch`
+/// its old head. Such a head goes into the fetched-heads ledger with the write, so a `scope fetch`
 /// walks it before an `undo` can write it back.
 fn left_unreached<'a>(namespace: PalletNamespace,
                       expected: Option<&'a str>,
@@ -2078,7 +2078,7 @@ pub(crate) mod tests {
         fn a_sparse_move_off_a_non_ancestor_onto_a_gone_ancestry_is_refused_as_incomplete() {
             let (_root, _scope) = scratch("closure-sparse-unreached");
             crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
-            crate::util::scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
+            crate::util::scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src"])).unwrap();
             let other = parcel(&two_dirs("x0", "y0"), &[]);
             write("main", None, &other).unwrap();
             let base = parcel(&two_dirs("a0", "b0"), &[]);
@@ -2152,7 +2152,7 @@ pub(crate) mod tests {
         fn a_sparse_warehouse_checks_only_what_its_scope_holds() {
             let (_root, _scope) = scratch("closure-sparse");
             crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
-            crate::util::scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
+            crate::util::scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src"])).unwrap();
             let base = parcel(&two_dirs("a0", "b0"), &[]);
             write("main", None, &base).unwrap();
 
@@ -2172,7 +2172,7 @@ pub(crate) mod tests {
         fn a_sparse_warehouse_keeps_the_base_tree_prune() {
             let (_root, _scope) = scratch("closure-sparse-prune");
             crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
-            crate::util::scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
+            crate::util::scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src"])).unwrap();
             let base = parcel(&two_dirs("a0", "b0"), &[]);
             write("main", None, &base).unwrap();
             let head = parcel(&two_dirs("a0", "b1"), &[&base]);
@@ -2217,7 +2217,7 @@ pub(crate) mod tests {
         fn a_scope_widened_between_the_check_and_the_hold_is_checked_again() {
             let (_root, _scope) = scratch("closure-widened");
             crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
-            crate::util::scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src"])).unwrap();
+            crate::util::scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src"])).unwrap();
             let base = parcel(&two_dirs("a0", "b0"), &[]);
             write("main", None, &base).unwrap();
             let head = parcel(&two_dirs("a1", "b-sealed"), &[&base]);
@@ -2225,7 +2225,7 @@ pub(crate) mod tests {
 
             BEFORE_HOLD.with(|slot| *slot.borrow_mut() = Some(Box::new(|| {
                 crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
-                crate::util::scope_utils::set_fetch_scope(&MaterializationScope::from_prefixes(["src", "web"])).unwrap();
+                crate::util::scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src", "web"])).unwrap();
             })));
 
             assert_incomplete(write("main", Some(&base), &head), "main", Some(&base));
@@ -2361,14 +2361,14 @@ pub(crate) mod tests {
             let head = parcel(&tree(&[("f", &missing, DirEntryType::Normal)]), &[]);
             let other = stub_parcel("other");
             remove(&missing);
-            let full = MaterializationScope::full();
+            let full = PathScope::full();
 
             let wrong_head = VerifiedClosure::new(&other, full.clone(), PalletNamespace::User, None);
             assert_incomplete(update_pallet_head_verified(
                 PalletNamespace::User, "main", None, &head, &RefPreconditions::NONE, &wrong_head, None
             ), "main", None);
 
-            let wrong_scope = VerifiedClosure::new(&head, MaterializationScope::from_prefixes(["src"]), PalletNamespace::User, None);
+            let wrong_scope = VerifiedClosure::new(&head, PathScope::from_prefixes(["src"]), PalletNamespace::User, None);
             assert_incomplete(update_pallet_head_verified(
                 PalletNamespace::User, "main", None, &head, &RefPreconditions::NONE, &wrong_scope, None
             ), "main", None);
@@ -3470,7 +3470,7 @@ pub(crate) mod tests {
         assert!(crate::util::fetch_ledger::read_ledger().unwrap().is_empty(), "a full warehouse keeps no ledger");
 
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
-        crate::util::scope_utils::set_fetch_scope(&crate::util::scope_utils::MaterializationScope::from_prefixes(["src"])).unwrap();
+        crate::util::scope_utils::set_fetch_scope(&crate::util::scope_utils::PathScope::from_prefixes(["src"])).unwrap();
         // A removal refused for want of anything to root its head writes nothing first.
         remove_pallet_head_in(PalletNamespace::User, "sparse", &hash('b'), &RefPreconditions::NONE, None).unwrap_err();
         assert!(crate::util::fetch_ledger::read_ledger().unwrap().is_empty(), "a refused removal records nothing");

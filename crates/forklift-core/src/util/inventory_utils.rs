@@ -15,7 +15,7 @@ use crate::traits::task_context::TaskContext;
 use crate::util::{alias_utils, chunk_utils, fanout_utils, file_utils, load_guard_utils, object_utils, office_utils, path_utils, record_utils, tree_utils, warehouse_utils};
 use crate::util::object_utils::IngestMode;
 use crate::util::path_utils::WarehousePath;
-use crate::util::scope_utils::{MaterializationScope, ScopeClass};
+use crate::util::scope_utils::{PathScope, ScopeClass};
 
 mod shard_write;
 
@@ -1619,7 +1619,7 @@ pub struct RollupSkipPlan {
 /// * `Err(String)`           - If the metadata file, a head tree on the walk, or a read shard at
 ///                             or before the first conflict in sorted key order could not be
 ///                             read or parsed.
-pub fn prepare_stack_inventory(skip: Option<(&str, &MaterializationScope)>) -> Result<PreparedInventory, String> {
+pub fn prepare_stack_inventory(skip: Option<(&str, &PathScope)>) -> Result<PreparedInventory, String> {
     let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
 
     let Some(metadata) = metadata_opt else {
@@ -1772,7 +1772,7 @@ fn read_stack_shard(key: &str) -> Result<Option<(Inventory, bool)>, String> {
 fn read_unskipped_shards(registered: &BTreeSet<&str>,
                          children: &BTreeMap<String, Vec<String>>,
                          head_root_tree_hash: &str,
-                         scope: &MaterializationScope,
+                         scope: &PathScope,
                          parsed: &mut BTreeMap<String, Result<Option<(Inventory, bool)>, String>>,
                          plan: &mut RollupSkipPlan) -> Result<(), String> {
     let scope_is_full = scope.is_full();

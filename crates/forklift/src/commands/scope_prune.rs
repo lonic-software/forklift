@@ -3,7 +3,7 @@ use forklift_core::error::CoreError;
 use forklift_core::util::{bay_utils, journal_utils};
 use forklift_core::util::lock_utils::StoreAccessLock;
 use forklift_core::util::path_utils::WarehousePath;
-use forklift_core::util::scope_utils::{self, MaterializationScope, ScopeClass};
+use forklift_core::util::scope_utils::{self, PathScope, ScopeClass};
 use forklift_core::util::prune_utils;
 use crate::output::{self, CommandOutput};
 
@@ -70,7 +70,7 @@ pub async fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), Str
     let plan = prune_utils::plan_prune(&to_reclaim, &post_prune, &remote_heads, &removed_heads, &store_access)?;
 
     if dry_run {
-        output::emit(&PruneReport {
+        output::emit(&ScopePruneReport {
             dry_run: true,
             pruned: to_reclaim,
             scope: post_prune.prefixes().to_vec(),
@@ -99,7 +99,7 @@ pub async fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), Str
 
     let stats = prune_utils::free_objects(&plan.to_free, &store_access)?;
 
-    output::emit(&PruneReport {
+    output::emit(&ScopePruneReport {
         dry_run: false,
         pruned: to_reclaim,
         scope: post_prune.prefixes().to_vec(),
@@ -121,7 +121,7 @@ pub async fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), Str
 /// A scope prune request judged against the warehouse as it stands.
 struct PruneRequest {
     /// The warehouse fetch scope after the prune.
-    post_prune: MaterializationScope,
+    post_prune: PathScope,
     /// The path keys to reclaim: the freshly pruned ones, then the resumed ones.
     to_reclaim: Vec<String>,
     /// Whether every requested path was already outside the fetch scope.
@@ -188,7 +188,7 @@ fn judge_request(paths: &[String]) -> Result<PruneRequest, String> {
         );
     }
 
-    let post_prune = MaterializationScope::from_prefixes(keep);
+    let post_prune = PathScope::from_prefixes(keep);
     let to_reclaim: Vec<String> = freshly_pruned.iter().chain(resumed.iter()).cloned().collect();
 
     // Multi-bay hazard, checked for every requested path, resumed ones included: a resumed path
@@ -196,7 +196,7 @@ fn judge_request(paths: &[String]) -> Result<PruneRequest, String> {
     // the CURRENT fetch scope, and this path is already outside it — `bay add --scope`/`scope narrow`
     // enforce that at write time), so this is provably a no-op for `resumed`. It costs nothing
     // to check anyway, and a destructive verb is exactly where redundant defense earns its keep.
-    guard_materialization_scopes(&to_reclaim, &post_prune)?;
+    guard_checkout_scopes(&to_reclaim, &post_prune)?;
 
     Ok(PruneRequest { post_prune, to_reclaim, all_resumed })
 }
@@ -215,7 +215,7 @@ async fn remote_pallet_heads() -> Result<Vec<String>, String> {
 /// checkout's scope is always a subset of the fetch scope; after the prune the
 /// fetch scope shrinks, so a checkout whose scope is no longer a subset is one that still needs
 /// a path the prune would free. All blockers are named at once.
-fn guard_materialization_scopes(pruned: &[String], post_prune: &MaterializationScope) -> Result<(), CoreError> {
+fn guard_checkout_scopes(pruned: &[String], post_prune: &PathScope) -> Result<(), CoreError> {
     let mut blockers: Vec<String> = Vec::new();
 
     if !scope_utils::read_main_tree_scope()?.subset_of(post_prune) {
@@ -239,7 +239,7 @@ fn guard_materialization_scopes(pruned: &[String], post_prune: &MaterializationS
 /// (or would be) freed.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-pub(crate) struct PruneReport {
+pub(crate) struct ScopePruneReport {
     /// Whether this was a dry run (nothing changed).
     dry_run: bool,
 
@@ -298,7 +298,7 @@ pub(crate) struct PruneReport {
     all_resumed: bool,
 }
 
-impl CommandOutput for PruneReport {
+impl CommandOutput for ScopePruneReport {
     fn render_human(&self) {
         if self.dry_run {
             println!(
@@ -424,7 +424,7 @@ fn shell_quote(path: &str) -> String {
 #[cfg(feature = "docgen")]
 pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
-        crate::docgen::OutputSchema::of::<PruneReport>(),
+        crate::docgen::OutputSchema::of::<ScopePruneReport>(),
     ]
 }
 

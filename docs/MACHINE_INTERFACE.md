@@ -89,7 +89,8 @@ exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a deat
 `materialization_scope`. The same release moves the sparse commands into the `scope` family, so an
 envelope's `command` and the MCP tool names change with them: `expand` is `scope fetch` (`expand`
 → `scope_fetch`), `narrow` is `scope narrow` (`narrow` → `scope_narrow`), and `scope-prune` is
-`scope prune`, which agents still cannot run. Each envelope's `command` is now `scope`.
+`scope prune`, which agents still cannot run. As in every family, the envelope's `command` is the
+top-level name, so all four now report `scope`.
 
 **Schema 13**: the `franchise_incomplete` error code is renamed `clone_incomplete`
 (exit 30 and its `details` are unchanged), with the command it names. The same release renames

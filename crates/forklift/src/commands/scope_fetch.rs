@@ -66,7 +66,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
 
     if added.is_empty() {
         // Everything requested is already fetched — a clean no-op.
-        output::emit(&ExpandReport {
+        output::emit(&ScopeFetchReport {
             added: Vec::new(),
             scope: current.prefixes().to_vec(),
             fetched_objects: 0,
@@ -114,7 +114,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
 
         match expansion.commit()? {
             ExpandCommit::Written(scope) => {
-                output::emit(&ExpandReport {
+                output::emit(&ScopeFetchReport {
                     added: expansion.added().to_vec(),
                     scope: scope.prefixes().to_vec(),
                     fetched_objects: expansion.fetched_objects(),
@@ -124,7 +124,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
                 return Ok(());
             }
             ExpandCommit::Covered(scope) => {
-                output::emit(&ExpandReport {
+                output::emit(&ScopeFetchReport {
                     added: Vec::new(),
                     scope: scope.prefixes().to_vec(),
                     fetched_objects: expansion.fetched_objects(),
@@ -164,7 +164,7 @@ fn is_directory_in_tree(root_tree_hash: &str, key: &str) -> Result<bool, String>
 /// The result of a `scope fetch`: what was added to the fetch scope and how much was fetched.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-pub(crate) struct ExpandReport {
+pub(crate) struct ScopeFetchReport {
     /// The prefixes newly added to the fetch scope (empty when everything was already in scope).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     added: Vec<String>,
@@ -180,7 +180,7 @@ pub(crate) struct ExpandReport {
     batch_lane: Option<BatchLaneClosure>,
 }
 
-impl CommandOutput for ExpandReport {
+impl CommandOutput for ScopeFetchReport {
     fn render_human(&self) {
         if self.added.is_empty() {
             println!("Nothing to fetch: every requested path is already in the fetch scope.");
@@ -201,6 +201,6 @@ impl CommandOutput for ExpandReport {
 #[cfg(feature = "docgen")]
 pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
-        crate::docgen::OutputSchema::of::<ExpandReport>(),
+        crate::docgen::OutputSchema::of::<ScopeFetchReport>(),
     ]
 }

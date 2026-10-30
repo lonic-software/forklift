@@ -1,7 +1,7 @@
 use serde::Serialize;
 use forklift_core::error::CoreError;
 use forklift_core::util::path_utils::WarehousePath;
-use forklift_core::util::scope_utils::MaterializationScope;
+use forklift_core::util::scope_utils::PathScope;
 use forklift_core::util::stocktake_utils::ChangeKind;
 use std::path::Path;
 use forklift_core::util::{inventory_utils, object_utils, office_utils, pallet_utils, scope_utils, stocktake_utils};
@@ -26,7 +26,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
 
     if current.is_full() {
         return Err(
-            "This checkout materializes the full tree; there is nothing to narrow. \"forklift scope narrow\" \
+            "This checkout has the full tree; there is nothing to narrow. \"forklift scope narrow\" \
             shrinks a scoped (sparse) checkout's scope.".to_string()
         );
     }
@@ -80,7 +80,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
         ensure_narrow_target_is_clean(prefix).await?;
     }
 
-    let narrowed = MaterializationScope::from_prefixes(keep);
+    let narrowed = PathScope::from_prefixes(keep);
     scope_utils::set_bay_scope(&narrowed)?;
 
     // De-materialize each dropped subtree: drop its staged shards (so it stops being reported),
@@ -90,7 +90,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
         remove_working_subtree(prefix)?;
     }
 
-    output::emit(&NarrowReport {
+    output::emit(&ScopeNarrowReport {
         dropped,
         scope: narrowed.prefixes().to_vec(),
     });
@@ -210,7 +210,7 @@ fn remove_working_subtree(prefix: &str) -> Result<(), String> {
 /// The result of a narrow: the paths dropped and the scope that remains.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-pub(crate) struct NarrowReport {
+pub(crate) struct ScopeNarrowReport {
     /// The in-scope prefixes dropped from this checkout.
     dropped: Vec<String>,
 
@@ -218,7 +218,7 @@ pub(crate) struct NarrowReport {
     scope: Vec<String>,
 }
 
-impl CommandOutput for NarrowReport {
+impl CommandOutput for ScopeNarrowReport {
     fn render_human(&self) {
         println!(
             "Narrowed away {}; those files are de-materialized. Checkout scope now: {}.",
@@ -233,6 +233,6 @@ impl CommandOutput for NarrowReport {
 #[cfg(feature = "docgen")]
 pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
-        crate::docgen::OutputSchema::of::<NarrowReport>(),
+        crate::docgen::OutputSchema::of::<ScopeNarrowReport>(),
     ]
 }

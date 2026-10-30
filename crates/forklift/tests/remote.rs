@@ -5004,7 +5004,7 @@ fn lower_into_a_sparse_store_stays_pruned() {
 
 #[test]
 fn expand_fetches_the_widened_subtree_and_a_bay_can_scope_to_it() {
-    // `expand` widens a sparse warehouse's fetch scope and downloads the newly in-scope subtree
+    // `scope fetch` widens a sparse warehouse's fetch scope and downloads the newly in-scope subtree
     // across history; a bay can then be scoped to the newly available path.
     let area = TestArea::new("sparse-expand");
     let server = Server::start(&area, None);
@@ -5027,8 +5027,8 @@ fn expand_fetches_the_widened_subtree_and_a_bay_can_scope_to_it() {
     let expanded = area.forklift("sparse", &["scope", "fetch", "src/web"]);
     assert_success(&expanded);
     assert!(stdout(&expanded).contains("Widened the fetch scope"), "{}", stdout(&expanded));
-    assert!(object_present(&area, "sparse", &web_tree), "expand must fetch the widened subtree object");
-    assert!(object_present(&area, "sparse", &web_blob), "expand must fetch the widened subtree's blob");
+    assert!(object_present(&area, "sparse", &web_tree), "scope fetch must fetch the widened subtree object");
+    assert!(object_present(&area, "sparse", &web_blob), "scope fetch must fetch the widened subtree's blob");
 
     let scope = area.forklift("sparse", &["--json", "scope"]);
     let scope_json: serde_json::Value = serde_json::from_str(&stdout(&scope)).unwrap();
@@ -5076,7 +5076,7 @@ fn sparse_after_a_diverged_lower(area: &TestArea, server: &Server) -> (String, S
     (up_head, web_blob)
 }
 
-// Revert: expand skips the fetched-heads ledger → the remote head's src/web stays sealed, so the
+// Revert: scope fetch skips the fetched-heads ledger → the remote head's src/web stays sealed, so the
 // pallet create makes a ref whose closure lacks it.
 #[test]
 fn expand_fetches_the_widened_content_of_a_head_a_refused_lower_fetched() {
@@ -5110,7 +5110,7 @@ fn expand_leaves_a_fetched_head_the_remote_can_no_longer_serve_unable_to_become_
 }
 
 // Revert: walk every closure before checking the added paths → the unservable ref refuses the
-// expand first, hiding the typo.
+// scope fetch first, hiding the typo.
 #[test]
 fn expand_checks_its_paths_before_walking_other_histories() {
     let area = TestArea::new("sparse-expand-typo");
@@ -5154,7 +5154,7 @@ fn a_sparse_franchise_records_its_head_and_fetches_only_its_scope() {
 fn a_sparse_franchise_seals_an_out_of_scope_chunked_file_and_expand_fetches_it() {
     // Sparse × chunked (§9.4b Stage 3): an out-of-scope chunked file fetches NOTHING — its recipe
     // is sealed by hash and, by the store invariant "recipe absent ⟹ chunks absent", none of its
-    // chunks are ever named or fetched. `expand` into its scope then fetches the recipe AND every
+    // chunks are ever named or fetched. `scope fetch` into its scope then fetches the recipe AND every
     // chunk, and a bay scoped to it materializes the file byte-for-byte.
     let area = TestArea::new("sparse-chunked");
     let server = Server::start(&area, None);
@@ -5181,8 +5181,8 @@ fn a_sparse_franchise_seals_an_out_of_scope_chunked_file_and_expand_fetches_it()
     // Expand into the chunked file's scope: the recipe AND its chunks arrive.
     let expanded = area.forklift("sparse", &["scope", "fetch", "big"]);
     assert_success(&expanded);
-    assert!(object_present(&area, "sparse", &recipe), "expand fetches the recipe");
-    assert!(object_present(&area, "sparse", &chunk), "expand fetches the recipe's chunks");
+    assert!(object_present(&area, "sparse", &recipe), "scope fetch fetches the recipe");
+    assert!(object_present(&area, "sparse", &chunk), "scope fetch fetches the recipe's chunks");
 
     // A bay scoped to the newly-fetched path materializes the giant byte-for-byte.
     let bay_dir = area.path("sparse-big");
@@ -5289,13 +5289,13 @@ fn a_sparse_workspace_refuses_to_lift_to_a_non_origin_remote() {
 
 /// Every command that talks to a remote from a partial warehouse talks only to its origin: pointed
 /// at another remote that holds the same history and more, the remote pallet listing, `office
-/// enroll` and `accept-regenesis`, `lower`, `expand`, `scope prune`, `pallet delete` (asking
+/// enroll` and `accept-regenesis`, `lower`, `scope fetch`, `scope prune`, `pallet delete` (asking
 /// whether the remote holds the pallet's work), and the remote `--delete` and `--restore` each
 /// refuse as `non_origin_remote` (exit 11), naming both remotes,
 /// with every file under `.forklift` as it was. A full warehouse lowers from the same remote.
 ///
 /// Revert: build any one command's client with `RemoteClient::from_config` again → that command
-/// runs against the other remote (the listing, lower, expand, scope prune and the remote delete
+/// runs against the other remote (the listing, lower, scope fetch, scope prune and the remote delete
 /// succeed; enroll, the regenesis check, the local delete and the restore fail with another code)
 /// → red.
 #[test]
@@ -5369,7 +5369,7 @@ fn a_partial_warehouse_talks_to_no_remote_but_its_origin() {
 }
 
 /// A sparse warehouse's partiality is recorded in its marker, so deleting its fetch scope no longer
-/// turns it into a full one: lift, expand and lower each refuse, naming the missing file and
+/// turns it into a full one: lift, scope fetch and lower each refuse, naming the missing file and
 /// cloning again, and nothing reaches the remote. Before, the warehouse read as full and lifted
 /// anywhere.
 ///
@@ -5402,7 +5402,7 @@ fn a_sparse_warehouse_whose_fetch_scope_is_gone_is_refused() {
         assert!(message.contains("recorded as sparse but its fetch scope"), "{:?}: {}", args, message);
         assert!(message.contains("is missing"), "{:?}: {}", args, message);
     }
-    assert!(!area.path("sparse/docs").exists(), "expand fetched nothing");
+    assert!(!area.path("sparse/docs").exists(), "scope fetch fetched nothing");
     assert_success(&area.forklift("dev", &["lower"]));
     assert_eq!(area.read_file("dev/src/api/a.txt"), "api v1\n", "the refused lift reached the remote");
 }
@@ -5484,7 +5484,7 @@ fn an_unscoped_bay_in_a_sparse_warehouse_is_refused_up_front() {
 
 /// A `--cache` clone is a partial warehouse, as a sparse one is: it skips the bundle, writes
 /// its marker, records its origin and so refuses to lift elsewhere, runs the content audit, and
-/// refuses `expand`. Combined with `--only`, it is refused before anything is created.
+/// refuses `scope fetch`. Combined with `--only`, it is refused before anything is created.
 ///
 /// Revert: skip the marker or the origin write → the non-origin lift is attempted; leave cache out
 /// of the bundle skip → the bundle is imported; gate the audit on the scope alone → no scope.
@@ -6545,7 +6545,7 @@ fn assert_move_pending(area: &TestArea,
 
 /// While a move of a partial warehouse's origin stands, in either phase, nothing talks to a
 /// remote and nothing writes what the move checks: with `remote.url` still the origin, the remote
-/// listing, `office rotate` and `accept-regenesis`, `lower`, `lift`, `expand`, `scope prune` and
+/// listing, `office rotate` and `accept-regenesis`, `lower`, `lift`, `scope fetch`, `scope prune` and
 /// the remote `--delete` and `--restore` refuse up front, and so do the local writers: an `undo`
 /// that moves a pallet back, adding its head to the fetched-heads ledger, and a forced delete,
 /// which removes no pallet under a move whether or not its head is already in the ledger. In a
@@ -6685,7 +6685,7 @@ fn move_stands(area: &TestArea, directory: &str) -> bool {
 }
 
 /// A cache and a sparse warehouse move their origin to a copy of it, named with a trailing slash,
-/// and from then on read, expand and lift against the copy alone, the old origin stopped: the cache
+/// and from then on read, scope fetch and lift against the copy alone, the old origin stopped: the cache
 /// reads an older parcel's content it never fetched, the sparse warehouse fetches content it left
 /// out by expanding, and the cache lifts unlifted work. The cache's checkout is not its unlifted work, so an
 /// eviction freed a subtree that work shares with the origin's history only beneath a root this
@@ -6747,7 +6747,7 @@ fn a_partial_warehouse_moves_its_origin_to_a_copy_and_works_against_it() {
 
     assert!(!object_present(&area, "sparse", &three_docs), "docs is out of the sparse warehouse's scope");
     assert_success(&area.forklift("sparse", &["scope", "fetch", "docs"]));
-    assert!(object_present(&area, "sparse", &three_docs), "expand fetches docs from the new origin");
+    assert!(object_present(&area, "sparse", &three_docs), "scope fetch fetches docs from the new origin");
 
     assert_success(&area.forklift("cached", &["shift", "local"]));
     assert_success(&area.forklift("cached", &["lift"]));
@@ -7623,7 +7623,7 @@ fn bay_add_scope_refuses_a_sealed_sibling_outside_the_fetch_scope() {
 
 #[test]
 fn expand_recovers_after_an_unreachable_remote_leaves_the_scope_unchanged() {
-    // The crash-consistency property: expand must not persist the widened fetch scope until the
+    // The crash-consistency property: scope fetch must not persist the widened fetch scope until the
     // content actually landed. Simulated deterministically by pointing at an unreachable remote
     // (the same failure shape as a fetch that never completes) — the fetch scope must come back
     // unchanged, and a plain re-run against the real remote must then complete on its own,
@@ -7646,15 +7646,15 @@ fn expand_recovers_after_an_unreachable_remote_leaves_the_scope_unchanged() {
     // Point at an unreachable remote and attempt to expand.
     assert_success(&area.forklift("sparse", &["config", "set", "remote.url", "http://127.0.0.1:9"]));
     let failed = area.forklift("sparse", &["scope", "fetch", "src/web"]);
-    assert!(!failed.status.success(), "expand against an unreachable remote must fail");
+    assert!(!failed.status.success(), "scope fetch against an unreachable remote must fail");
 
     // The fetch scope must be unchanged — not left claiming "src/web" is in scope while nothing
-    // was actually fetched (that would make the next expand see it as already-in-scope and
+    // was actually fetched (that would make the next scope fetch see it as already-in-scope and
     // no-op, defeating self-heal).
     let scope = area.forklift("sparse", &["--json", "scope"]);
     let scope_json: serde_json::Value = serde_json::from_str(&stdout(&scope)).unwrap();
     assert_eq!(scope_json["data"]["fetch_scope"], serde_json::json!(["src/api"]),
-        "a failed expand must not persist the widened scope: {}", stdout(&scope));
+        "a failed scope fetch must not persist the widened scope: {}", stdout(&scope));
     assert!(!object_present(&area, "sparse", &web_tree), "nothing was fetched by the failed attempt");
 
     // Point back at the real remote: a plain re-run completes the fetch.
@@ -8043,8 +8043,8 @@ fn scope_prune_frees_a_path_no_checkout_needs_and_leaves_the_rest_intact() {
     // ...and the pruned path is re-fetchable from the origin, proving it was only sealed.
     let expanded = area.forklift("sparse", &["scope", "fetch", "docs"]);
     assert_success(&expanded);
-    assert!(object_present(&area, "sparse", &docs_tree), "expand re-fetches the pruned subtree object");
-    assert!(object_present(&area, "sparse", &docs_blob), "expand re-fetches the pruned blob");
+    assert!(object_present(&area, "sparse", &docs_tree), "scope fetch re-fetches the pruned subtree object");
+    assert!(object_present(&area, "sparse", &docs_blob), "scope fetch re-fetches the pruned blob");
 }
 
 /// A remote holding `src/api/a.txt` and `docs/guide.md` (v1), lifted from "dev", and a sparse
@@ -8069,7 +8069,7 @@ fn sparse_with_docs(area: &TestArea) -> Server {
 fn scope_prune_keeps_work_never_lifted_and_frees_it_once_lifted() {
     // FORK-251: a change stacked under the pruned path and never lifted exists only here. The
     // prune keeps it, and the parent tree its lift compares against, names the pallet, and says
-    // how to free it. The parent's blob, which that lift never reads, is freed. Lifting then works, a second prune frees both sides, and expand
+    // how to free it. The parent's blob, which that lift never reads, is freed. Lifting then works, a second prune frees both sides, and scope fetch
     // fetches the lifted change back.
     let area = TestArea::new("scope-prune-unlifted");
     let _server = sparse_with_docs(&area);
@@ -8118,7 +8118,7 @@ fn scope_prune_keeps_work_never_lifted_and_frees_it_once_lifted() {
     }
 
     assert_success(&area.forklift("sparse", &["scope", "fetch", "docs"]));
-    assert!(object_present(&area, "sparse", &v2_blob), "expand fetches the lifted change back");
+    assert!(object_present(&area, "sparse", &v2_blob), "scope fetch fetches the lifted change back");
 }
 
 #[test]
@@ -8651,7 +8651,7 @@ fn scope_prune_dry_run_reports_and_frees_nothing() {
 fn scope_prune_is_refused_while_another_process_writes_the_store() {
     // FORK-150: scope prune computes what to keep from the fetch scope and every bay's work, then
     // frees the rest. A writer in another bay — a load that dedups against a planned object, an
-    // expand widening the fetch scope — must not run between the two, so scope prune takes the
+    // scope fetch widening the fetch scope — must not run between the two, so scope prune takes the
     // store exclusively before it reads anything, dry run included, and is refused while any
     // writer holds it. The test process stands in for that writer with a shared hold.
     //
@@ -8733,7 +8733,7 @@ fn scope_prune_resumes_after_an_interrupted_free_and_completes() {
     // parent tree in a real run's order — leaving the parent tree behind (step two, interrupted).
     {
         let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("sparse"));
-        let narrowed = forklift_core::util::scope_utils::MaterializationScope::from_prefixes(["src/api"]);
+        let narrowed = forklift_core::util::scope_utils::PathScope::from_prefixes(["src/api"]);
         forklift_core::util::scope_utils::set_fetch_scope(&narrowed).unwrap();
     }
     std::fs::remove_file(object_store_path(&area, "sparse", &web_blob)).unwrap();
@@ -10922,7 +10922,7 @@ fn a_sparse_warehouse_lowers_another_pallet_within_scope_and_expand_widens_it() 
     assert!(!object_present(&area, "sparse", &web_blob), "the out-of-scope change stays sealed");
 
     assert_success(&area.forklift("sparse", &["scope", "fetch", "src/web"]));
-    assert!(object_present(&area, "sparse", &web_blob), "expand widens the lowered pallet's history too");
+    assert!(object_present(&area, "sparse", &web_blob), "scope fetch widens the lowered pallet's history too");
 }
 
 // Revert: skip the remote ask in the delete's containment → the lowered pallet refuses without

@@ -8,7 +8,7 @@ use forklift_core::model::diff::Diff;
 use forklift_core::model::inventory::Inventory;
 use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::path_utils::{self, WarehousePath};
-use forklift_core::util::scope_utils::{self, MaterializationScope, ScopeClass};
+use forklift_core::util::scope_utils::{self, PathScope, ScopeClass};
 use forklift_core::util::stocktake_utils::{Change, ChangeKind};
 use forklift_core::util::{
     chunk_utils, diff, fanout_utils, file_utils, merge_utils, object_utils, pallet_utils,
@@ -555,7 +555,7 @@ fn collect_tree_changes(from: Option<&TreeItem>,
                         to: Option<&TreeItem>,
                         key: &str,
                         changes: &mut Vec<TreeChange>,
-                        scope: &MaterializationScope) -> Result<(), String> {
+                        scope: &PathScope) -> Result<(), String> {
     // Hoisted once per directory level (not per entry): a full (unscoped) scope always
     // classifies everything in scope, so the classify (and its `join_key` allocation) is
     // pure overhead on the hot, common full-bay path — short-circuit it away entirely there,

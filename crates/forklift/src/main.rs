@@ -568,8 +568,8 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
         Command::Restore { staged, path } => commands::restore::handle_command(staged, &path),
         Command::Scope { action } => match action {
             Some(ScopeAction::Status) | None => commands::scope::handle_command(),
-            Some(ScopeAction::Fetch { paths }) => commands::expand::handle_command(paths).await,
-            Some(ScopeAction::Narrow { paths }) => commands::narrow::handle_command(paths).await,
+            Some(ScopeAction::Fetch { paths }) => commands::scope_fetch::handle_command(paths).await,
+            Some(ScopeAction::Narrow { paths }) => commands::scope_narrow::handle_command(paths).await,
             Some(ScopeAction::Prune { paths, dry_run }) => commands::scope_prune::handle_command(paths, dry_run).await,
         },
         Command::Remote { action } => match action {

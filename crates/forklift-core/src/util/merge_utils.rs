@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::model::remote::{HoldAnswer, MAX_HOLDS_CANDIDATES};
 use crate::globals::bay_root;
-use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
+use crate::util::scope_utils::{self, PathScope, ScopeClass};
 use crate::util::{cache_miss, fanout_utils, file_utils, graph_utils, lcs, object_utils, pallet_utils, record_utils};
 
 /// The name of the consolidation-state file (inside the forklift root folder). While a
@@ -943,7 +943,7 @@ pub fn compute_merge_actions(base_hash: &str,
                              theirs_hash: &str,
                              ours_label: &str,
                              theirs_label: &str,
-                             scope: &MaterializationScope) -> Result<Vec<MergeAction>, String> {
+                             scope: &PathScope) -> Result<Vec<MergeAction>, String> {
     cache_miss::prefetch_trees(&[Some(base_hash), Some(ours_hash), Some(theirs_hash)], |path, sides| {
         !merge_skips_subtree(sides[0], sides[1], sides[2]) && scope.classify(path) != ScopeClass::OutOfScope
     });
@@ -1132,7 +1132,7 @@ fn merge_directory(base: Option<&crate::model::tree_item::TreeItem>,
                    ours: Option<&crate::model::tree_item::TreeItem>,
                    theirs: Option<&crate::model::tree_item::TreeItem>,
                    key: &str,
-                   scope: &MaterializationScope,
+                   scope: &PathScope,
                    pending: &mut Vec<PendingAction>) -> Result<(), String> {
     use std::collections::BTreeMap;
     use crate::enums::dir_entry_type::DirEntryType;
@@ -1765,7 +1765,7 @@ mod tests {
 
         // "src/web" is out of scope throughout (only "src/api" is in scope); "src/api" never
         // needs to exist in these trees at all — the classifier is a pure path-prefix test.
-        let scope = MaterializationScope::from_prefixes(["src/api"]);
+        let scope = PathScope::from_prefixes(["src/api"]);
 
         // Direction A: base has "src/web" as a DIRECTORY; theirs replaces it with a FILE (ours
         // unchanged). The file loop's "set" is emitted BEFORE the subtree loop's "delete" —

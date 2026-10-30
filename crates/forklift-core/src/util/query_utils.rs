@@ -42,7 +42,7 @@ use crate::model::parcel::Parcel;
 use crate::util::audit_utils::{self, SignatureTrust};
 use crate::util::office_utils::{IdentityClass, OfficeState, RevocationReason, Role};
 use crate::util::path_utils::WarehousePath;
-use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
+use crate::util::scope_utils::{self, PathScope, ScopeClass};
 use crate::util::{
     fanout_utils, manifest_utils, merge_utils, object_utils, pallet_utils, tag_utils,
     tree_utils,
@@ -282,7 +282,7 @@ struct QueryContext {
     /// The warehouse's fetch scope, read once — `touches`'s confirming diff degrades to
     /// `Unknown` (rather than a hard error) only for a path this scope provably never
     /// fetched.
-    fetch_scope: MaterializationScope,
+    fetch_scope: PathScope,
 
     /// How many `touches` evaluations degraded per the above, across the whole walk.
     /// `Cell` because evaluation only ever borrows the context immutably.
@@ -1925,7 +1925,7 @@ mod tests {
         let ctx = QueryContext {
             provenance: None,
             tags: None,
-            fetch_scope: MaterializationScope::full(),
+            fetch_scope: PathScope::full(),
             out_of_scope: Cell::new(0),
             tree_hashes: RefCell::new(HashMap::new()),
             boundary_memo: RefCell::new(audit_utils::DistrustBoundaryMemo::new()),
@@ -1967,7 +1967,7 @@ mod tests {
         let ctx = QueryContext {
             provenance: None,
             tags: None,
-            fetch_scope: MaterializationScope::full(),
+            fetch_scope: PathScope::full(),
             out_of_scope: Cell::new(0),
             tree_hashes: RefCell::new(HashMap::new()),
             boundary_memo: RefCell::new(audit_utils::DistrustBoundaryMemo::new()),
@@ -1999,7 +1999,7 @@ mod tests {
         let ctx = QueryContext {
             provenance: Some(provenance),
             tags: Some(tags),
-            fetch_scope: MaterializationScope::full(),
+            fetch_scope: PathScope::full(),
             out_of_scope: Cell::new(0),
             tree_hashes: RefCell::new(HashMap::new()),
             boundary_memo: RefCell::new(audit_utils::DistrustBoundaryMemo::new()),

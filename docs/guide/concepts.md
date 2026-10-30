@@ -197,7 +197,7 @@ There are two scopes. The **fetch scope** is what the warehouse has downloaded; 
 ```console
 $ cd slim
 $ forklift scope
-the main tree is a scoped (sparse) bay. Checkout scope:
+the main tree is scoped (sparse). Checkout scope:
   src
   .forkliftignore (always in scope)
 Warehouse fetch scope:
