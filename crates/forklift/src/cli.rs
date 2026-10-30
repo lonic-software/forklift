@@ -422,7 +422,9 @@ pub enum Command {
         alias = "log",
         long_about = "Print the parcels of the current pallet (or of the given revision — a pallet \
                       name or a parcel hash), newest first: hash, operators, timestamps and \
-                      description."
+                      description. Read a long history in pages: --limit caps a page, and \
+                      --after resumes from the cursor the previous page returned. To filter on \
+                      identity, signer or provenance, use \"forklift query\"."
     )]
     History {
         /// A pallet name or a parcel hash prefix (default: the current pallet)
@@ -505,7 +507,10 @@ pub enum Command {
                       and its inventory stay where they are, and \"forklift shift\" moves onto it. On first \
                       contact with a trusted remote its trust anchor is adopted (one-way, like \
                       \"forklift office enroll\"), and the adopted genesis is reported. A diverged pallet is \
-                      reported, never merged implicitly."
+                      reported, never merged implicitly. A diverged metadata pallet (@kv, @tags, \
+                      @manifest, @haul) replays the local changes onto the remote's; paths both \
+                      sides changed refuse the lower with a meta_conflict error (exit 24) naming \
+                      every pallet, path and both sides, until --keep resolves each one."
     )]
     Lower {
         /// The pallet to lower (default: the current pallet); "forklift palletize --remote" lists
@@ -519,8 +524,9 @@ pub enum Command {
             long_help = "Refuse unless the remote's trust anchor is exactly this genesis, a value \
                          obtained out of band (from an operator you know, or a first-contact \
                          warning you verified). Checked right after the handshake, before anything \
-                         is downloaded or created. Without it, a first contact adopts whatever \
-                         anchor the remote holds, and says which."
+                         is downloaded or created; a mismatch refuses with a trust_changed error. \
+                         Without it, a first contact adopts whatever anchor the remote holds, and \
+                         says which."
         )]
         expect: Option<String>,
 
@@ -737,7 +743,13 @@ pub enum Command {
                       either direction (absence isn't a claim to negate); an untagged parcel \
                       plainly does not carry a --tag. Flags AND together; --where takes a JSON \
                       predicate tree for or/not/nesting. Scope the walk with revisions and \
-                      --from — that (not --limit) is what bounds verification work."
+                      --from — that (not --limit) is what bounds verification work. A match \
+                      signed by a since-revoked key carries signer.boundary: vouched (inside the \
+                      history its revocation vouched for), suspect (outside it: a forged \
+                      backdate, or the key's holder kept signing after the revocation), or \
+                      unresolved (a partial clone lacks a boundary head or an ancestor of one, so \
+                      the question cannot be answered here; never read it as suspect). A \
+                      --where leaf on signer.boundary filters on vouched or suspect."
     )]
     Query {
         /// Walk from these revisions (pallet names or parcel hashes; default: the current
@@ -816,7 +828,14 @@ pub enum Command {
         recorded: bool,
 
         /// A JSON predicate tree ("-" reads it from stdin) AND-ed with the flags
-        #[arg(long, value_name = "JSON")]
+        #[arg(
+            long,
+            value_name = "JSON",
+            long_help = "A JSON predicate tree AND-ed with the flags (\"-\" reads it from stdin). \
+                         A node is {\"all\": [nodes]}, {\"any\": [nodes]}, {\"not\": node} or a \
+                         leaf {\"field\", \"op\", \"value\"}; an unknown field is refused with \
+                         the list of fields."
+        )]
         r#where: Option<String>,
 
         /// Show at most this many matches (bounds the output page, never the verification
@@ -1146,6 +1165,9 @@ pub enum DocgenTarget {
     JsonSchemas,
     /// Every command and subcommand with its aliases (`docs/generated/commands.md`).
     Commands,
+    /// Every MCP tool with its command and arguments, and the commands no agent drives
+    /// (`docs/generated/mcp-tools.md`).
+    McpTools,
 }
 
 #[derive(Subcommand)]
@@ -1190,7 +1212,8 @@ pub enum BayAction {
         long_about = "Open a bay: a new working directory bound to this warehouse, checked out to \
                       a new pallet named after the bay (branched from the current head). The bay \
                       shares this warehouse's objects, refs and trust; it has its own working tree, \
-                      inventory and current pallet. cd into it to work there."
+                      inventory and current pallet. cd into it to work there. A scoped bay \
+                      (--scope) is how an orchestrator hands a sub-agent a task-scoped sandbox."
     )]
     Add {
         /// The bay's name (also the name of the new pallet it checks out)

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Regenerate the parts of the docs that are derivable from code: the error/exit-code
-# reference table, the command and alias list, and every command's `--json` output schema.
+# reference table, the command and alias list, every command's `--json` output schema, and
+# the MCP tool list.
 # All come out of the `forklift` binary itself, built with the dev-only `docgen` feature
 # (never enabled in a release build — see crates/forklift/Cargo.toml and
 # crates/forklift/src/docgen.rs).
@@ -16,7 +17,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # Each page is rendered by `forklift __docgen <target>` into docs/generated/<target>.md.
-pages=(errors json-schemas commands)
+pages=(errors json-schemas commands mcp-tools)
 
 check=false
 case "${1:-}" in

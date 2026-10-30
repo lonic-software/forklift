@@ -743,7 +743,7 @@ fn progress_notification(token: &Value, progress: f64, message: Option<String>) 
 /// touch is enforced remote-side), and every bay operation is non-destructive: `add` refuses a
 /// non-empty directory, and `remove` deletes only the bay's own `.forklift` entry and its
 /// bay-state folder, never the materialized working tree.
-const HUMAN_ONLY: &[(&str, &str)] = &[
+pub(crate) const HUMAN_ONLY: &[(&str, &str)] = &[
     ("alias", "manages the `fl` shell alias next to this binary, a host concern"),
     ("prepare", "creates a warehouse, which is setup"),
     ("config", "reads and sets configuration, which is setup"),
@@ -775,7 +775,7 @@ const HUMAN_ONLY: &[(&str, &str)] = &[
 /// The families whose bare form runs the same operation as one of their subcommands, with that
 /// subcommand. The subcommand is the tool; the bare form gets none, so an agent sees one tool
 /// per operation.
-const BARE_SAME_AS: &[(&str, &str)] = &[
+pub(crate) const BARE_SAME_AS: &[(&str, &str)] = &[
     ("haul", "list"),
     ("office", "list"),
     ("scope", "status"),
@@ -793,7 +793,7 @@ const INJECTED: &[(&str, &str, Injected)] = &[
 
 /// Where the server takes an [`INJECTED`] argument's value from.
 #[derive(Clone, Copy)]
-enum Injected {
+pub(crate) enum Injected {
     /// The client application `initialize` named; the argument is left out when it named none.
     Client,
 
@@ -820,24 +820,24 @@ enum Typed {
 }
 
 /// One tool: the command it runs and the arguments it takes.
-struct Tool {
+pub(crate) struct Tool {
     /// The command path joined by `_` (hyphens too), so a family run bare is its own name.
-    name: String,
+    pub(crate) name: String,
 
     /// The command path below the binary (`["tag", "create"]`).
-    path: Vec<String>,
+    pub(crate) path: Vec<String>,
 
     /// The command's long description, else its one-line one.
     description: String,
 
     /// The arguments in declaration order.
-    params: Vec<ToolParam>,
+    pub(crate) params: Vec<ToolParam>,
 }
 
 /// One tool argument.
-struct ToolParam {
+pub(crate) struct ToolParam {
     /// The property name: an option's long name with `_` for `-`, a positional's id.
-    key: String,
+    pub(crate) key: String,
 
     /// Where its words go in the command.
     form: Form,
@@ -846,10 +846,10 @@ struct ToolParam {
     value: ValueKind,
 
     /// Whether the command refuses to run without it.
-    required: bool,
+    pub(crate) required: bool,
 
     /// Set by the server rather than the agent, from this source.
-    injected: Option<Injected>,
+    pub(crate) injected: Option<Injected>,
 
     /// The argument's help text.
     help: Option<String>,
@@ -882,7 +882,7 @@ enum ValueKind {
 /// # Returns
 /// * `Ok(&[Tool])`  - The tools, in the tree's declaration order.
 /// * `Err(String)`  - The tree has a command or argument with no tool shape (see [`generate_tools`]).
-fn tools() -> Result<&'static [Tool], String> {
+pub(crate) fn tools() -> Result<&'static [Tool], String> {
     use clap::CommandFactory;
 
     static TOOLS: std::sync::OnceLock<Result<Vec<Tool>, String>> = std::sync::OnceLock::new();
@@ -1169,7 +1169,7 @@ impl ToolParam {
     }
 
     /// The argument's type in words, for a refusal ("a string", "an array of strings").
-    fn describe(&self) -> String {
+    pub(crate) fn describe(&self) -> String {
         if self.repeats() {
             format!("an array of {}", self.value.describe(true))
         } else {

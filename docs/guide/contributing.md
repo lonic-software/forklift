@@ -269,6 +269,13 @@ changelog), `SERVER.md` (server ops), `MACHINE_INTERFACE.md` (`--json`/MCP),
    a new command gets its own row, and renaming or reshaping one adds `-> forklift …` lines under
    its old row instead of deleting it. The surface tests (`cargo test -p forklift --bin forklift
    surface_check`) fail until both agree with the binary.
+9. **Decide whether agents drive it.** `forklift mcp` generates its tools from the command
+   definition, so a new command is an agent tool with nothing more to do: its full help is the
+   tool's description (put anything an agent needs to know in the help, not elsewhere) and its
+   arguments are the tool's. A command only a person should run goes on `HUMAN_ONLY` in
+   `crates/forklift/src/commands/mcp.rs`, with the reason. The MCP unit tests (`cargo test -p
+   forklift --bin forklift commands::mcp`) parse every tool's arguments against the command and
+   fail when one would be misread.
 
 Any message that names a command does so as `forklift <command> …`, spelled out in full. The
 same tests parse every such mention in the crates' string literals and the binary's help text
@@ -339,8 +346,9 @@ The guides intentionally *reference* rather than duplicate `SERVER.md`,
 update for each concern. Keep it that way — duplication is what drifts.
 
 **Generated docs never need this by hand.** `docs/generated/errors.md` (the error/exit-code
-table), `docs/generated/commands.md` (every command and subcommand with its aliases) and
-`docs/generated/json-schemas.md` (every command's `--json` `data` schema) are
+table), `docs/generated/commands.md` (every command and subcommand with its aliases),
+`docs/generated/json-schemas.md` (every command's `--json` `data` schema) and
+`docs/generated/mcp-tools.md` (every MCP tool with its arguments) are
 produced by `bin/gen-docs` from the code itself — the `ErrorCode` enum, the clap command
 definition in `crates/forklift/src/cli.rs`, and the
 `#[derive(schemars::JsonSchema)]` output structs in `crates/forklift/src/commands/`
