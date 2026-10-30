@@ -794,9 +794,11 @@ mod tests {
         assert!(present(&plan.to_free[0]));
     }
 
-    /// Text large enough that a delta between two versions pays, ending in `tail`.
+    /// Text that barely compresses, so a delta between two versions beats a full record, ending in
+    /// `tail`.
     fn version(tail: &str) -> String {
-        format!("{}{}\n", "a line every version of this file shares\n".repeat(200), tail)
+        let lines: String = (0..200).map(|line| format!("{}\n", blake3::hash(format!("line {}", line).as_bytes()).to_hex())).collect();
+        format!("{}{}\n", lines, tail)
     }
 
     /// Stores `content` as a blob in a pack of its own: in full, or as a delta against `base`.
@@ -815,13 +817,14 @@ mod tests {
     }
 
     /// Four versions of `f.txt`, one per parcel, each parcel on the last: `v0` and `v1` lifted,
-    /// `v2` and `v3` stacked here only. Every blob is packed; `v2` is a delta against `v0` and `v3`
+    /// `v2` and `v3` stacked here only. Every object is packed; `v2` is a delta against `v0` and `v3`
     /// a delta against `v2`. So evicting the lifted history drops both `v2`'s old base and its
     /// previous version at its path, and `v3` is a copied delta whose base is re-encoded.
     struct Versions {
         held: String,
         v: [String; 4],
         text: [String; 4],
+        roots: Vec<String>,
     }
 
     fn versions() -> Versions {
@@ -833,9 +836,11 @@ mod tests {
 
         let mut parents = Vec::new();
         let mut held = String::new();
+        let mut roots = Vec::new();
         for (index, blob) in [&v0, &v1, &v2, &v3].into_iter().enumerate() {
             let root = store_tree(&[("f.txt", blob, DirEntryType::Normal)]);
             let parcel = store_parcel(&root, parents);
+            roots.push(root);
             if index == 1 {
                 held = parcel.clone();
             }
@@ -843,8 +848,11 @@ mod tests {
         }
         set_main(&parents[0]);
         position(None);
+        // The trees too: a loose evicted tree is freed before the repack's path walk reaches it,
+        // which then stops there and never meets the versions beneath it.
+        pack_utils::compact(false, false, false, &Progress::NONE).unwrap();
 
-        Versions { held, v: [v0, v1, v2, v3], text }
+        Versions { held, v: [v0, v1, v2, v3], text, roots }
     }
 
     /// The bytes `hash` reads as from the disk alone: every cache this process holds is dropped
@@ -857,10 +865,10 @@ mod tests {
     /// The packed versions the lifted history holds are evicted by a repack, and the kept ones read
     /// back from the disk alone once the old packs are gone: `v2`, re-encoded because its base is
     /// dropped, whose previous version at its path is dropped too, and `v3`, a copied delta whose
-    /// base was re-encoded.
+    /// base was re-encoded. The kept root trees read too, whose previous versions are evicted.
     ///
-    /// Revert: let an evicted object be a path base → `v2` is re-encoded against `v1`, which the
-    /// repack deletes, and no longer reads.
+    /// Revert: let an evicted blob be a path base → `v2` is re-encoded against `v1`, which the
+    /// repack deletes, and no longer reads; an evicted tree → the third root, against the second.
     #[test]
     fn a_repack_drops_the_packed_versions_and_keeps_every_kept_version_readable() {
         let _scratch = Scratch::new("packed-versions");
@@ -884,6 +892,7 @@ mod tests {
             let bytes = read_fresh(&f.v[kept]).unwrap_or_else(|e| panic!("v{} reads: {}", kept, e));
             let expected = LooseObjectBuilder::build_blob(&Blob { content: f.text[kept].as_bytes().to_vec() }).content;
             assert!(bytes == expected, "v{} reads back as written", kept);
+            read_fresh(&f.roots[kept]).unwrap_or_else(|e| panic!("root {} reads: {}", kept, e));
         }
 
         let again = plan_evict(&[f.held.clone()], &hold).unwrap();
