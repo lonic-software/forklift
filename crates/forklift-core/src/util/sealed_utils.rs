@@ -190,6 +190,12 @@ pub fn sealed_path() -> PathBuf {
     globals::forklift_root().join(FILE_NAME_SEALED)
 }
 
+/// The length of a frame of `entries` entries.
+#[cfg(test)]
+pub(crate) fn frame_len(entries: usize) -> usize {
+    FRAME_OVERHEAD + entries * ENTRY_LEN
+}
+
 /// The header line a record opens with, line ending included.
 pub fn header_bytes() -> Vec<u8> {
     let mut header = record_utils::header(SEALED_RECORD, SEALED_VERSION).into_bytes();
@@ -814,16 +820,13 @@ fn referenced(parcels: &[String], sealed: &SealedSet) -> Result<Result<HashSet<S
     )?;
 
     let mut heads: Vec<String> = parcels.to_vec();
-    heads.extend(sources.parcels);
-    heads.extend(sources.haul_heads);
-    heads.extend(sources.tombstone_heads);
-    heads.extend(sources.mirror_roots);
-    heads.extend(sources.pin_parcels.into_iter().map(|(hash, _)| hash));
+    heads.extend(sources.heads());
 
     let (present_parcels, gaps) = audit_utils::collect_reachable_noting_gaps(&heads, is_present)?;
     let mut referenced: HashSet<String> = gaps.into_iter().collect();
     let damage = |hash: &str, named_by: &str| Ok(Err(format!(
-        "object {} is missing, and the record does not say the origin holds it ({} references it)",
+        "object {} is missing, and the record does not say the origin holds it ({} references it); \
+        run \"forklift heal\"",
         hash, named_by
     )));
 
@@ -834,9 +837,14 @@ fn referenced(parcels: &[String], sealed: &SealedSet) -> Result<Result<HashSet<S
     }
 
     for (hash, item_type) in &sources.shard_leaves {
+        // A tree is met when it is popped.
+        if *item_type == DirEntryType::Tree {
+            trees.push((hash.clone(), "staged work".to_string()));
+            continue;
+        }
+
         match meet(hash, sealed, &mut referenced)? {
             Met::Unrecorded => return damage(hash, "staged work"),
-            Met::Present if *item_type == DirEntryType::Tree => trees.push((hash.clone(), "staged work".to_string())),
             Met::Present if item_type.is_chunked() => {
                 if let Some(chunk) = unrecorded_chunk(hash, sealed, &mut referenced)? {
                     return damage(&chunk, hash);
@@ -854,7 +862,7 @@ fn referenced(parcels: &[String], sealed: &SealedSet) -> Result<Result<HashSet<S
             Met::Again | Met::Recorded => continue,
         }
 
-        let tree = object_utils::load_tree_shared(&hash)?;
+        let tree = object_utils::load_tree(&hash)?;
 
         for (_, file) in tree.get_files() {
             match meet(&file.hash, sealed, &mut referenced)? {

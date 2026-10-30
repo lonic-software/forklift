@@ -111,7 +111,8 @@ pub struct EvictStats {
     /// Records dropped by the bound: absent objects nothing present references any more.
     pub record_dropped: usize,
 
-    /// Why the bound dropped nothing: it met an absent object the record does not hold.
+    /// Why the bound dropped nothing: it met an absent object the record does not hold, or could
+    /// not run.
     pub record_bound_skipped: Option<String>,
 }
 
@@ -152,12 +153,7 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
         &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed,
     )?;
 
-    let mut local_heads: Vec<String> = sources.parcels;
-    local_heads.extend(sources.haul_heads);
-    local_heads.extend(sources.tombstone_heads);
-    local_heads.extend(sources.mirror_roots);
-    local_heads.extend(sources.pin_parcels.iter().map(|(hash, _)| hash.clone()));
-    let local_parcels = sorted(gc_utils::collect_reachable_for_sweep(&local_heads)?);
+    let local_parcels = sorted(gc_utils::collect_reachable_for_sweep(&sources.heads())?);
     let local = walk_local(&local_parcels, &held.seen)?;
 
     let mut checkout_roots: Vec<String> = Vec::new();
@@ -256,11 +252,12 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
 }
 
 /// Carry out `plan`: record every object it evicts, repack without them, free the loose copies in
-/// the plan's order, unseal the kept objects the record still held, then bound the record. Records first: a crash
-/// after them leaves recorded objects still present, which seal nothing and read as they did, and
-/// the next eviction frees them. The repack before the frees: it re-encodes every kept delta whose
-/// base is evicted, and reads that base from whichever copy holds it, loose or packed. The bound
-/// last, once every object it judges absent is gone.
+/// the plan's order, unseal the kept objects the record still held, then bound the record. Records
+/// first: a crash after them leaves recorded objects still present, which seal nothing and read as
+/// they did, and the next eviction frees them. The repack before the frees: it re-encodes every
+/// kept delta whose base is evicted, and reads that base from whichever copy holds it, loose or
+/// packed. The bound last, once every object it judges absent is gone; it only shrinks the record,
+/// so a bound that fails is reported as skipped rather than failing a run that already freed.
 ///
 /// Holds the locks a full repack takes, which the plan was computed under too: a repack keeps only
 /// what is live when it runs, so nothing may change what is live between the plan and the delete.
@@ -275,8 +272,7 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
 /// # Returns
 /// * `Ok(EvictStats)` - What was evicted, freed, unsealed and dropped from the record.
 /// * `Err(String)`    - If the record could not be written (nothing was freed), or a free, the
-///                      repack, the unseal or the bound failed. Either way, running `evict` again
-///                      finishes.
+///                      repack or the unseal failed. Either way, running `evict` again finishes.
 pub fn carry_out(plan: &EvictPlan,
                  store_lock: &StoreLock,
                  serve_lock: &ServeLock,
@@ -310,7 +306,8 @@ pub fn carry_out(plan: &EvictPlan,
         sealed_utils::unseal(store_access, &plan.to_unseal)?.removed.len()
     };
 
-    let bounded = sealed_utils::bound(store_access, &plan.held_heads)?;
+    let bounded = sealed_utils::bound(store_access, &plan.held_heads)
+        .unwrap_or_else(|error| sealed_utils::Bounded { dropped: Vec::new(), skipped: Some(error) });
 
     Ok(EvictStats {
         evicted: plan.to_evict.len() - still_packed,
@@ -1140,7 +1137,7 @@ mod tests {
         assert_eq!((stats.record_dropped, stats.record_bound_skipped.as_deref()), (2, None));
         assert_record(&[&h.held_root, &h.dir], "after the bound");
         let bytes = std::fs::read(sealed_utils::sealed_path()).unwrap();
-        assert_eq!(bytes.len(), sealed_utils::header_bytes().len() + 12 + 2 * 33, "one compacted frame of two entries");
+        assert_eq!(bytes.len(), sealed_utils::header_bytes().len() + sealed_utils::frame_len(2), "one compacted frame of two entries");
     }
 
     /// A refill of the evicted root tree records its children again before its own record goes:
@@ -1199,7 +1196,13 @@ mod tests {
         let staged = store_blob("staged\n");
         let (folder, file) = file_utils::get_path_for_object(&staged).unwrap();
         std::fs::remove_file(PathBuf::from(folder).join(file)).unwrap();
-        crate::util::gc_utils::tests::plant_staged_shard("b", &[("s.txt", &staged, DirEntryType::Normal)]);
+        let kid = store_blob("kid\n");
+        let (folder, file) = file_utils::get_path_for_object(&kid).unwrap();
+        std::fs::remove_file(PathBuf::from(folder).join(file)).unwrap();
+        let staged_dir = store_tree(&[("kid.txt", &kid, DirEntryType::Normal)]);
+        crate::util::gc_utils::tests::plant_staged_shard(
+            "b", &[("s.txt", &staged, DirEntryType::Normal), ("d", &staged_dir, DirEntryType::Tree)],
+        );
 
         // Named by the caller: a ref refuses a head whose history is incomplete.
         let parent = "e".repeat(64);
@@ -1209,6 +1212,7 @@ mod tests {
         let gone = "f".repeat(64);
         sealed_utils::append(&[
             (SealOp::Record, staged.as_str()),
+            (SealOp::Record, kid.as_str()),
             (SealOp::Record, parent.as_str()),
             (SealOp::Record, stray.as_str()),
             (SealOp::Record, gone.as_str()),
@@ -1218,6 +1222,6 @@ mod tests {
         let bounded = sealed_utils::bound(&hold, &[parcel]).unwrap();
 
         assert_eq!((bounded.dropped, bounded.skipped), (vec![gone.clone()], None));
-        assert_record(&[&staged, &parent, &stray], "kept");
+        assert_record(&[&staged, &kid, &parent, &stray], "kept");
     }
 }

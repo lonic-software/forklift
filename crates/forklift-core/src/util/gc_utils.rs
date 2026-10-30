@@ -189,13 +189,7 @@ pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
         crate::util::office_utils::TrustPinReadPolicy::FailClosed,
     )?;
 
-    let mut roots: Vec<String> = sources.parcels;
-    roots.extend(sources.haul_heads);
-    roots.extend(sources.tombstone_heads);
-    roots.extend(sources.mirror_roots);
-    roots.extend(sources.pin_parcels.into_iter().map(|(hash, _policy)| hash));
-
-    let parcels = collect_reachable_for_sweep(&roots)?;
+    let parcels = collect_reachable_for_sweep(&sources.heads())?;
 
     let mut live: HashSet<String> = HashSet::new();
     let mut tree_queue: VecDeque<String> = VecDeque::new();

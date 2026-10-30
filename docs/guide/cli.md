@@ -1919,8 +1919,9 @@ object nothing present here names any more, such as a file under an evicted dire
 record (`record_dropped`), since it is reached only through that directory, whose record stays.
 Reading the directory again fetches it and records its contents again, so reads by path work as
 before; asking for such an object by its hash alone reads it as missing, not as a cache miss. If
-the run meets an object missing here that the record does not hold, nothing is dropped and the
-report says why (`record_bound_skipped`); run `heal`, then `evict` again.
+the run meets an object missing here that the record does not hold, or cannot finish this step,
+nothing is dropped and the report says why (`record_bound_skipped`); the eviction itself still
+stands. For a missing object, run `heal`, then `evict` again.
 
 ---
 

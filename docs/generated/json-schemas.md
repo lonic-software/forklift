@@ -5107,7 +5107,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "integer"
     },
     "record_bound_skipped": {
-      "description": "Why no record was dropped, when the run met an object missing here that the record does not\nhold (`null` otherwise, and on a dry run). `heal` repairs that; the next `evict` drops them.",
+      "description": "Why no record was dropped: the run met an object missing here that the record does not hold\n(`heal` repairs that), or could not finish the walk (`null` otherwise, and on a dry run). The\nnext `evict` tries again.",
       "type": [
         "string",
         "null"
