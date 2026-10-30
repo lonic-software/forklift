@@ -1921,7 +1921,9 @@ Reading the directory again fetches it and records its contents again, so reads 
 before; asking for such an object by its hash alone reads it as missing, not as a cache miss. If
 the run meets an object missing here that the record does not hold, or cannot finish this step,
 nothing is dropped and the report says why (`record_bound_skipped`); the eviction itself still
-stands. For a missing object, run `heal`, then `evict` again.
+stands. A missing object here is one only local history names (the origin's history was checked
+before anything was freed), so the record keeps everything until that content is back, for example
+by restoring it from a copy that has it.
 
 ---
 

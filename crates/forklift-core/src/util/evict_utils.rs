@@ -111,8 +111,8 @@ pub struct EvictStats {
     /// Records dropped by the bound: absent objects nothing present references any more.
     pub record_dropped: usize,
 
-    /// Why the bound dropped nothing: it met an absent object the record does not hold, or could
-    /// not run.
+    /// Why the bound dropped nothing: it met an absent object the record does not hold. Or why it
+    /// could not finish, in which case `record_dropped` is `0` though the record may have shrunk.
     pub record_bound_skipped: Option<String>,
 }
 
@@ -1138,6 +1138,38 @@ mod tests {
         assert_record(&[&h.held_root, &h.dir], "after the bound");
         let bytes = std::fs::read(sealed_utils::sealed_path()).unwrap();
         assert_eq!(bytes.len(), sealed_utils::header_bytes().len() + sealed_utils::frame_len(2), "one compacted frame of two entries");
+    }
+
+    /// A bound that cannot run fails nothing the run already did: the bay's position is unreadable
+    /// once the plan is made, so the bound's root read fails, and the eviction still reports what
+    /// it freed.
+    ///
+    /// Revert: let the bound's error fail the run → `carry_out` returns it.
+    #[test]
+    fn a_bound_that_cannot_run_is_reported_and_the_eviction_stands() {
+        let _scratch = Scratch::new("bound-fails");
+        let h = history();
+        let hold = store_access();
+        let plan = plan_evict(&[h.held.clone()], &hold).unwrap();
+        assert!(!plan.repack, "sanity: no repack reads the bays after the plan");
+
+        let mut broken = 0;
+        for dir in bay_utils::all_bay_state_dirs().unwrap() {
+            let position = dir.join(pallet_utils::FILE_NAME_POSITION);
+            if position.exists() {
+                std::fs::write(&position, b"garbage").unwrap();
+                broken += 1;
+            }
+        }
+        assert!(broken > 0, "sanity: a bay position was broken");
+
+        let stats = carry(&plan, &hold).expect("the eviction stands");
+
+        assert_eq!(stats.evicted, plan.to_evict.len());
+        assert_eq!(stats.record_dropped, 0);
+        let skipped = stats.record_bound_skipped.expect("the bound reports why it did not run");
+        assert!(skipped.contains("position"), "{}", skipped);
+        assert!(!file_utils::is_present_for_sweep(&h.held_root).unwrap(), "the root tree is still freed");
     }
 
     /// A refill of the evicted root tree records its children again before its own record goes:

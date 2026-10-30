@@ -149,9 +149,9 @@ pub(crate) struct EvictReport {
     /// (`0` on a dry run).
     record_dropped: usize,
 
-    /// Why no record was dropped: the run met an object missing here that the record does not hold
-    /// (`heal` repairs that), or could not finish the walk (`null` otherwise, and on a dry run). The
-    /// next `evict` tries again.
+    /// Why no record was dropped: the run met an object missing here that the record does not hold,
+    /// or could not finish, in which case the record may have shrunk though `record_dropped` is `0`
+    /// (`null` otherwise, and on a dry run). The next `evict` tries again.
     record_bound_skipped: Option<String>,
 }
 
@@ -184,8 +184,9 @@ impl CommandOutput for EvictReport {
 
         if let Some(why) = &self.record_bound_skipped {
             println!(
-                "The record of evicted objects was not shrunk: {}. The next \"evict\" tries again.",
-                why
+                "The record of evicted objects was not shrunk, or not wholly: {}. The next \"evict\" tries \
+                again.",
+                why.trim_end_matches('.')
             );
         }
 
