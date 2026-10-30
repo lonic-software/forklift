@@ -83,7 +83,9 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 11** (current): the `origin_move_pending` error code exists.
+**Schema 12** (current): the `origin_move_incomplete` error code exists.
+
+**Schema 11**: the `origin_move_pending` error code exists.
 
 **Schema 10**: the `cache_miss` error code exists.
 
@@ -526,7 +528,25 @@ write was refused partway, because the move began while it ran, keeps what it di
 while the move has not yet started rewriting the origin, `remote move --abort`, which abandons it. A
 record of a move that cannot be read is refused the same way, as a move that may have started
 rewriting, and `next_step` names `remote move <url>`, since the record no longer says which server
-the move was going to. Stacking and commands that only read this warehouse still run.
+the move was going to. Stacking and commands that only read this warehouse still run. A second
+`remote move`, or a `remote move --abort`, while a move is running refuses with the same code.
+
+### A new origin that lacks content: `origin_move_incomplete`
+
+`remote move` checks the new server before it rewrites anything: its history, its pallets' and its
+tombstones', must reach every object this partial warehouse lacks and relies on its origin for.
+When it does not, the move refuses with `origin_move_incomplete` (exit 38) and leaves the origin and
+`remote.url` where they were. It clears its record, unless it was finishing a move that had already
+started rewriting the origin: that one still stands, and the message says so. The parcels and signatures it fetched to look
+stay, and change nothing a command reads. `next_step` says to copy the old origin's warehouse to the
+new server, on the server's side, and run the move again. `details.missing` lists every object not
+found, sorted; the message names the first ten.
+
+```json
+"details": {
+  "missing": ["3f0c…", "9ab1…"]
+}
+```
 
 ### An unfinished franchise: `franchise_incomplete`
 
