@@ -9023,14 +9023,13 @@ fn heal_driven_refetch_leaves_the_taint_intact_on_a_failed_fetch() {
 
 #[test]
 fn heal_names_an_unreadable_fetch_scope_instead_of_blaming_connectivity() {
-    // A fetch scope this build refuses (here one a full warehouse should never hold) skips the
-    // user pallets' history fetches. Re-running heal cannot fix that, so the remedy must name the
-    // scope file and its way out, not only the "once connectivity is restored" wording a
-    // transient failure gets, and must keep the reproduce-it remedy, since the remote was still
-    // asked for the object by hash.
+    // A fetch scope a full warehouse should never hold leaves its mode unreadable, so heal cannot
+    // tell whether it may ask the remote at all and asks it nothing. Re-running heal cannot fix
+    // that, so the remedy must name the scope file and its way out, not the "once connectivity is
+    // restored" wording a transient failure gets, and must keep the reproduce-it remedy.
     //
-    // Mutation: map the skipped fetch to `ConsultedWithErrors` → the remedy never names the
-    // scope file → red.
+    // Mutation: map a client that cannot be built to `ConsultedWithErrors` → the remedy never
+    // names the scope file → red.
     let area = TestArea::new("heal-refetch-unreadable-scope");
     let server = Server::start(&area, None);
 
@@ -9061,8 +9060,9 @@ fn heal_names_an_unreadable_fetch_scope_instead_of_blaming_connectivity() {
         "the remedy must name the unreadable scope file: {}", output);
     assert!(output.contains("Delete that file"),
         "the remedy must name the way out: {}", output);
-    assert!(output.contains("checked the configured remote") && output.contains("\"forklift load\" then \"forklift stack\""),
-        "the remote was still asked by hash, and reproducing it is still a way out: {}", output);
+    assert!(output.contains("did not ask the configured remote") && !output.contains("connectivity")
+        && output.contains("\"forklift load\" then \"forklift stack\""),
+        "the remote was not asked, and reproducing it is still a way out: {}", output);
 }
 
 #[test]

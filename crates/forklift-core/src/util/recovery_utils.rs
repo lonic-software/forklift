@@ -2707,15 +2707,19 @@ enum RemoteConsultation {
     /// completed without error — whatever is still missing afterward, the remote genuinely lacks
     /// too, at least as of this run.
     ConsultedCleanly,
-    /// A remote is configured, but this partial warehouse may not ask it: it is not the origin, or
-    /// no origin is recorded. `reason` is the refusal, with its way out.
-    Refused { reason: String },
+    /// A remote is configured, but heal did not ask it: a partial warehouse may not (it is not the
+    /// origin, or no origin is recorded), or the client could not be built at all (the warehouse's
+    /// mode, its origin record or the configuration cannot be read, so whether it may is unknown).
+    /// `reason` says which, with its way out; no connectivity is involved.
+    NotAsked { reason: String },
     /// A remote is configured, but the handshake or at least one pallet's fetch failed this run —
     /// a hash still missing below was not necessarily *confirmed* absent upstream, only not yet
     /// recovered; retrying once connectivity is restored may still help.
     ConsultedWithErrors,
     /// The fetch scope could not be read, so the user pallets' history fetches were skipped;
-    /// the hash-addressed passes still asked the remote. `reason` names the scope file and its
+    /// the hash-addressed passes still asked the remote. Building the client reads the same
+    /// state (an unreadable one is [`RemoteConsultation::NotAsked`]), so this is reached only
+    /// when the scope changes during the heal. `reason` names the scope file and its
     /// way out; `other_errors` is whether some other part of the consultation also failed, so a
     /// re-run might still help.
     ScopeUnreadable { reason: String, other_errors: bool },
@@ -2745,7 +2749,7 @@ fn remedy_text(consultation: &RemoteConsultation) -> String {
             reproduce it by re-running the operation that created it if its content still exists \
             in your working tree (\"forklift load\" then \"forklift stack\") — there is no \
             in-tool way to abandon a single dangling reference yet",
-        RemoteConsultation::Refused { reason } => return format!(
+        RemoteConsultation::NotAsked { reason } => return format!(
             "this heal did not ask the configured remote for it: {} Then re-run \"forklift heal\", \
             or reproduce it by re-running the operation that created it if its content still exists \
             in your working tree (\"forklift load\" then \"forklift stack\") — there is no in-tool \
@@ -2768,13 +2772,15 @@ fn remedy_text(consultation: &RemoteConsultation) -> String {
     }.to_string()
 }
 
-/// What heal reports when it could not build the remote client: a partial warehouse's refusal to
-/// ask a remote other than its origin, as itself; otherwise nothing configured, or something
-/// configured but unusable — the two `RemoteClient::is_configured` tells apart.
+/// What heal reports when it could not build the remote client: nothing configured, or a remote
+/// configured but not asked, with the reason — a partial warehouse's refusal to ask a remote other
+/// than its origin, or what could not be read. Building a client dials nothing, so none of these
+/// is a connectivity failure a re-run once online would cure.
 fn unconsulted(why: Option<CoreError>) -> RemoteConsultation {
     match why {
-        Some(CoreError::Refusal { message, .. }) => RemoteConsultation::Refused { reason: message },
-        _ if remote_utils::RemoteClient::is_configured() => RemoteConsultation::ConsultedWithErrors,
+        Some(CoreError::Refusal { message, .. }) => RemoteConsultation::NotAsked { reason: message },
+        Some(error) if remote_utils::RemoteClient::is_configured() =>
+            RemoteConsultation::NotAsked { reason: String::from(error) },
         _ => RemoteConsultation::NotConfigured,
     }
 }
@@ -7010,12 +7016,12 @@ mod tests {
     /// remote is merely *broken* toward the heavyweight remedies (franchise / reproduce / accept
     /// the loss) — wording that overclaims when a fixable, real remote might still have the
     /// object. This fixture makes the warehouse config file itself unparseable (not merely unset)
-    /// and asserts the refusal reports the remote as configured-but-unconsultable — reusing
-    /// [`RemoteConsultation::ConsultedWithErrors`]'s existing wording, never `NotConfigured`'s.
+    /// and asserts the refusal reports the remote as configured but not asked, naming the file that
+    /// could not be read ([`RemoteConsultation::NotAsked`]), never `NotConfigured`'s wording, and
+    /// never a connectivity failure a re-run would cure.
     ///
-    /// Revert either fixed call site (`resolve_the_rest`'s `remote_configured` branch, or
-    /// `attempt_heal_driven_refetch`'s own `Err` branch) back to a bare `NotConfigured` return and
-    /// this reddens.
+    /// Revert: map a client that cannot be built to `NotConfigured`, or to `ConsultedWithErrors`
+    /// → this reddens.
     #[test]
     fn heal_reports_a_broken_remote_config_as_unconsultable_not_unconfigured() {
         use crate::builder::object::loose_object_builder::LooseObjectBuilder;
@@ -7088,10 +7094,9 @@ mod tests {
         assert!(!message.contains("no remote is configured"),
             "a broken (but real) remote config must never be reported as though nothing were \
             configured: {}", message);
-        assert!(message.contains(
-            "tried to check the configured remote automatically but could not complete that check"
-        ), "a broken remote config must be reported as consulted-but-failed, not silently \
-            misclassified as unconfigured: {}", message);
+        assert!(message.contains("did not ask the configured remote") && message.contains("warehouse.toml")
+            && !message.contains("connectivity"),
+            "a broken remote config must be reported as configured but not asked, naming the file: {}", message);
 
         std::fs::remove_dir_all(&root).ok();
     }
