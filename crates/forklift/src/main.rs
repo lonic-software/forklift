@@ -234,7 +234,8 @@ fn branch_name_error(command: &clap::Command, args: &[OsString]) -> Option<clap:
         if word.starts_with('-') && word != "-" {
             // A flag the pallet level does not have is git's (`branch -d NAME`, `branch -m OLD NEW`),
             // which says what the name is for: not a create, so clap refuses the flag instead.
-            if !at_root && (!knows_option(level, word) || word == "-h" || word == "--help") {
+            let asks_for_help = word == "--help" || (!word.starts_with("--") && word.contains('h'));
+            if asks_for_help || (!at_root && !knows_option(level, word)) {
                 return None;
             }
             index += if prefix::takes_next_word(level, word) { 2 } else { 1 };
