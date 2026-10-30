@@ -209,8 +209,8 @@ pub enum Command {
         visible_alias = "cfg",
         long_about = "Read or change configuration values (e.g. \"remote.url\"): list every known \
                       key, get one, set one or unset one. Values are stored in the current \
-                      warehouse by default, and --global targets the per-user configuration that \
-                      applies to all warehouses; when reading, the warehouse value wins over the \
+                      warehouse by default, and each subcommand's --global targets the per-user \
+                      configuration that applies to all warehouses; when reading, the warehouse value wins over the \
                       global one. Without a subcommand, every known key is listed with its \
                       effective value."
     )]
@@ -1899,7 +1899,8 @@ pub enum ProfileAction {
                       profile name, the key belongs to that profile's operator id. Without one, \
                       it belongs to the identity this directory acts as: the profile the \
                       enclosing warehouse selects, else the globally selected profile, else the \
-                      default identity. It says which one it used. Runs outside a warehouse \
+                      warehouse's operator.identifier, else the global one (the default \
+                      identity). It says which one it used. Runs outside a warehouse \
                       too, and records nothing in one."
     )]
     Keygen {

@@ -505,8 +505,8 @@ fn a_config_file_that_sets_a_name_is_refused() {
 /// Before this, `get_value_from_document` collapsed three states — absent, section-is-not-a-table,
 /// field-is-the-wrong-type — into `None`, and each caller decided for itself what `None` meant.
 /// The two reads below took that decision in opposite directions on the very same broken file:
-/// `config operator.identifier` fell through to the global scope and exited **0**, printing a
-/// value from a file the user was not configuring; `config remote.url` had nothing to fall
+/// `config get operator.identifier` fell through to the global scope and exited **0**, printing a
+/// value from a file the user was not configuring; `config get remote.url` had nothing to fall
 /// through to and exited **1** saying the key was "not set". One file, one defect, two answers,
 /// neither of them the truth.
 ///
@@ -564,7 +564,7 @@ fn a_configuration_file_either_parses_completely_or_every_read_of_it_refuses() {
 
 /// A bad value must not block its own repair. Validating the file *before*
 /// the edit meant `remote.tor = "onn"` refused every write to that file — including
-/// `config remote.tor on`, the command that corrects it. The value blocked its own repair, and a
+/// `config set remote.tor on`, the command that corrects it. The value blocked its own repair, and a
 /// text editor was the only way out. `write_validated` now parses the document **as edited**, so
 /// the question is whether the file you are about to leave on disk is valid.
 ///
@@ -6994,8 +6994,14 @@ fn profile_keygen_binds_to_the_named_or_current_identity_inside_or_outside_a_war
     std::fs::create_dir_all(&outside).unwrap();
     let default = warehouse.run_at(&outside, &["profile", "keygen"]);
     assert_eq!(admitted(&default), "test@forklift");
-    assert!(stdout(&default).contains("for the default identity"), "{}", stdout(&default));
+    assert!(stdout(&default).contains("for the default identity (the global operator.identifier)"), "{}", stdout(&default));
     assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0, "keygen outside a warehouse writes nothing there");
+
+    // Inside the warehouse, an operator.identifier it sets wins over the global one.
+    assert_success(&warehouse.run(&["config", "set", "operator.identifier", "local@forklift"]));
+    let local = warehouse.run(&["profile", "keygen"]);
+    assert_eq!(admitted(&local), "local@forklift");
+    assert!(stdout(&local).contains("this warehouse's operator.identifier"), "{}", stdout(&local));
 
     // A named profile, wherever it runs, is that profile's id.
     let selected = warehouse.run(&["profile", "use", "work"]);

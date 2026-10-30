@@ -176,7 +176,7 @@ pub fn keygen(profile: Option<&str>, passphrase: bool) -> Result<(), String> {
                 OperatorSource::Identifier { set_in: ConfigScope::Warehouse } =>
                     "this warehouse's operator.identifier".to_string(),
                 OperatorSource::Identifier { set_in: ConfigScope::Global } =>
-                    "the default identity".to_string(),
+                    "the default identity (the global operator.identifier)".to_string(),
             };
 
             (operator, identity)

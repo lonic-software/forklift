@@ -895,7 +895,7 @@ fn mint_profile_identifier(profile: &str) -> Result<String, String> {
 
         let Some(record) = parse_config(&document, path)?.profile(profile).cloned() else {
             return Err(format!(
-                "The selected profile \"{}\" does not exist in the global configuration. \
+                "The profile \"{}\" does not exist in the global configuration. \
                 Create it with \"forklift profile create {}\".",
                 profile, profile
             ));
@@ -975,12 +975,13 @@ fn set_profile_identifier_in_document(document: &mut DocumentMut,
     // understood, and refusing it on load would turn someone else's harmless litter into a file
     // that no command can read. The strict parse is for values that would be *misread*.
     //
-    // Both checks are preconditions, not live defences: both callers already exclude every
+    // Both checks are preconditions, not live defences: every caller already excludes every
     // case — `create_profile` validates its inputs with its own wording before calling, and
-    // `mint_profile_identifier` is reached with an `operator.profile` that `validate_value`
-    // refuses when empty, with a freshly minted identifier. No caller can reach them, so a unit
-    // test calls this function directly on an in-memory document. Re-check this if a third caller
-    // appears.
+    // `mint_profile_identifier` is reached with a freshly minted identifier and a profile name
+    // that is either an `operator.profile` value, which `validate_value` refuses when empty, or
+    // the NAME of `profile keygen`, which `commands::profile::keygen` refuses when blank before
+    // resolving it. No caller can reach them, so a unit test calls this function directly on an
+    // in-memory document. Re-check this if another caller appears.
     if is_blank(profile) {
         return Err(EMPTY_PROFILE_NAME.to_string());
     }
@@ -1273,7 +1274,7 @@ fn dangling_link_in(path: &Path) -> Option<PathBuf> {
 ///
 /// Validating after the edit rather than before it is what lets `forklift config` repair the
 /// very entry that is refusing. A pre-edit check turned `remote.tor = "onn"` into a trap: the
-/// file refused every write, so `config remote.tor on` — the command that fixes it, at the one
+/// file refused every write, so `config set remote.tor on` — the command that fixes it, at the one
 /// moment it is most needed — was refused by the value it was correcting, and a text editor was
 /// the only way out. A post-edit check accepts that write, because the file it is about to
 /// leave on disk is valid.

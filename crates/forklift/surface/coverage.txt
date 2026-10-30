@@ -82,7 +82,7 @@ forklift mirror:
     -> forklift git mirror:
 forklift office:
 forklift office enroll: --offline --passphrase
-forklift profile keygen: --passphrase
+forklift office keygen: --passphrase
     -> forklift profile keygen: [NAME] --passphrase
 forklift office admit: <OPERATOR_UUID> <PUBLIC_KEY_HEX> <PROOF_OF_POSSESSION_HEX> --role=<ROLE> --pallet=<PALLET>... --agent --bot --service --supervisor=<OPERATOR>
 forklift office link: <PUBLIC_KEY_HEX> <PROOF_OF_POSSESSION_HEX>

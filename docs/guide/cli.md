@@ -2044,8 +2044,8 @@ forklift profile keygen work      # the same, for the work profile's operator id
 
 `profile keygen` runs anywhere, inside a warehouse or not, and records nothing in one. Without a
 name, the key belongs to the identity the current directory acts as: the profile the enclosing
-warehouse selects, else the globally selected profile, else your default identity. It says which
-one it used.
+warehouse selects, else the globally selected profile, else the warehouse's `operator.identifier`,
+else the global one (your default identity). It says which one it used.
 
 ---
 

@@ -293,6 +293,38 @@ fn every_covered_operation_is_still_reachable() {
          parameters written there:\n{}", failures.join("\n"));
 }
 
+/// The frozen rows of `surface/coverage.txt` — every line but the `->` destinations — hashed
+/// (64-bit FNV-1a over the rows, each ended by a newline). A row records what the binary had
+/// when the map was frozen, so it never changes; only destinations are added under it.
+const FROZEN_ROWS_HASH: u64 = 0xcb6f_b5e5_5b3a_80af;
+
+/// The hash [`FROZEN_ROWS_HASH`] pins, of the frozen rows of `text`.
+fn frozen_rows_hash(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for (_, line) in content_lines(text).filter(|(_, line)| !line.starts_with("->")) {
+        for byte in line.bytes().chain(std::iter::once(b'\n')) {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash
+}
+
+/// The rows of the coverage map are frozen: the reachability check above holds only their
+/// destinations to the binary, so a row rewritten to match the new surface (`office keygen`
+/// turned into `profile keygen`) would pass it while erasing the record of what was there.
+#[test]
+fn the_frozen_rows_of_the_coverage_map_are_unchanged() {
+    let hash = frozen_rows_hash(COVERAGE);
+    assert_eq!(hash, FROZEN_ROWS_HASH,
+        "a frozen row of surface/coverage.txt changed (hash {hash:#018x}). Restore it: a row stays as \
+         it was when the map was frozen, and what it became goes on `-> forklift …: …` lines under it");
+    // A destination line is outside the hash, and a row's text is inside it.
+    let added = COVERAGE.replacen("forklift compact: --all --redelta\n", "forklift compact: --all --redelta\n    -> forklift x:\n", 1);
+    assert_eq!(frozen_rows_hash(&added), hash);
+    let edited = COVERAGE.replacen("forklift compact: --all --redelta\n", "forklift compact: --all\n", 1);
+    assert_ne!(frozen_rows_hash(&edited), hash);
+}
+
 // ---- The hint check ----
 
 /// The words that follow "forklift " without naming a command: prose ("a newer forklift does not
