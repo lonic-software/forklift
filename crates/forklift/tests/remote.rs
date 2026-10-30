@@ -5026,7 +5026,7 @@ fn expand_fetches_the_widened_subtree_and_a_bay_can_scope_to_it() {
     // Expand fetches the newly in-scope subtree.
     let expanded = area.forklift("sparse", &["scope", "fetch", "src/web"]);
     assert_success(&expanded);
-    assert!(stdout(&expanded).contains("Expanded"), "{}", stdout(&expanded));
+    assert!(stdout(&expanded).contains("Widened the fetch scope"), "{}", stdout(&expanded));
     assert!(object_present(&area, "sparse", &web_tree), "expand must fetch the widened subtree object");
     assert!(object_present(&area, "sparse", &web_blob), "expand must fetch the widened subtree's blob");
 
@@ -7661,7 +7661,7 @@ fn expand_recovers_after_an_unreachable_remote_leaves_the_scope_unchanged() {
     assert_success(&area.forklift("sparse", &["config", "set", "remote.url", &server.url]));
     let recovered = area.forklift("sparse", &["scope", "fetch", "src/web"]);
     assert_success(&recovered);
-    assert!(stdout(&recovered).contains("Expanded"), "{}", stdout(&recovered));
+    assert!(stdout(&recovered).contains("Widened the fetch scope"), "{}", stdout(&recovered));
     assert!(object_present(&area, "sparse", &web_tree), "the re-run must complete the fetch");
 
     let scope2 = area.forklift("sparse", &["--json", "scope"]);
