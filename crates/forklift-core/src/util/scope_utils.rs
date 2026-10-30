@@ -1124,7 +1124,7 @@ mod tests {
         assert_eq!(code, RefusalCode::ScopePruneBlocked);
         assert!(message.contains("docs"), "the path is named: {}", message);
         assert!(message.contains("bay \"reviewer\""), "the blocker is named: {}", message);
-        assert!(next_step.contains("Narrow"), "the recovery says how to unblock: {}", next_step);
+        assert!(next_step.contains("scope narrow"), "the recovery says how to unblock: {}", next_step);
     }
 
     #[test]
