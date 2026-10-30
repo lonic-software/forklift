@@ -404,8 +404,9 @@ error_codes! {
     /// there is no content to reconcile, so it refuses rather than guess.
     OutOfScopeConflict,
 
-    /// A lift from a sparse warehouse was aimed at a remote other than its origin: the
-    /// out-of-scope closure was only ever proved present on the origin, so it refuses up front.
+    /// A partial (sparse or cache) warehouse was asked to talk to a remote other than its origin,
+    /// or its origin record is missing: what it lacks was only ever proved present on the origin,
+    /// so every remote command refuses up front.
     NonOriginRemote,
 
     /// `narrow` was asked to drop a subtree that still holds uncommitted work (staged,
@@ -534,7 +535,7 @@ impl ErrorCode {
             ErrorCode::OutOfScopeConflict   => scope_utils::CODE_OUT_OF_SCOPE_CONFLICT,
             ErrorCode::ScopePathTypeChanged => scope_utils::CODE_SCOPE_PATH_TYPE_CHANGED,
             ErrorCode::SparseWorkspace      => scope_utils::CODE_SPARSE_WORKSPACE,
-            ErrorCode::NonOriginRemote        => scope_utils::CODE_NON_ORIGIN_REMOTE,
+            ErrorCode::NonOriginRemote      => scope_utils::CODE_NON_ORIGIN_REMOTE,
             ErrorCode::NarrowUnclean        => scope_utils::CODE_NARROW_UNCLEAN,
             ErrorCode::ScopePruneBlocked    => scope_utils::CODE_SCOPE_PRUNE_BLOCKED,
             ErrorCode::ChunkedTransportUnsupported => scope_utils::CODE_CHUNKED_TRANSPORT_UNSUPPORTED,
@@ -577,7 +578,7 @@ impl ErrorCode {
             ErrorCode::ScopePathTypeChanged => 8,
             ErrorCode::SparseWorkspace      => 9,
             ErrorCode::OutOfScopeConflict   => 10,
-            ErrorCode::NonOriginRemote        => 11,
+            ErrorCode::NonOriginRemote      => 11,
             ErrorCode::NarrowUnclean        => 12,
             ErrorCode::ScopePruneBlocked    => 13,
             ErrorCode::ChunkedTransportUnsupported => 14,

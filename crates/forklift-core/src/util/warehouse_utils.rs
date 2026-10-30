@@ -1397,7 +1397,7 @@ mod tests {
         std::fs::remove_file(forklift.join(origin_utils::FILE_NAME)).unwrap();
         {
             let _scope = globals::StorageRootScope::enter(&target);
-            prepare_warehouse(sparse).unwrap();
+            prepare_warehouse(PrepareMode::Full).unwrap();
             assert!(crate::util::scope_utils::read_fetch_scope().unwrap_err().contains("is missing"));
         }
         assert_eq!(read_warehouse_marker(&forklift), Ok(Some(WarehouseMode::Sparse)));

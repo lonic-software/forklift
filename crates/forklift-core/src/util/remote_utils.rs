@@ -2552,8 +2552,10 @@ impl RemoteClient {
 
     /// Create the client every command of a warehouse talks to its remote through: the configured
     /// remote, and in a partial warehouse only when it is the recorded origin
-    /// ([`origin_utils::checked_remote`]). [`from_config`](RemoteClient::from_config) stays for
-    /// what needs no origin: reading the configured remote's office, or naming it.
+    /// ([`origin_utils::checked_remote`]). [`from_config`](RemoteClient::from_config) stays only
+    /// where no partial warehouse dials through it: `mirror`, which refuses a partial warehouse
+    /// before it builds a client, and the best-effort display-name lookup, which reads no history
+    /// and no heads.
     ///
     /// # Returns
     /// * `Ok(RemoteClient)` - The client.

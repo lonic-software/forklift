@@ -750,7 +750,7 @@ impl CommandOutput for PalletList {
 /// * `Err(String)` - If no remote is configured, the handshake failed, or a local ref or parcel
 ///                   could not be read.
 async fn list_remote_pallets(all: bool) -> Result<(), String> {
-    let client = RemoteClient::from_config()?;
+    let client = RemoteClient::for_warehouse()?;
     let info = client.fetch_info().await?;
 
     let mut pallets = Vec::new();

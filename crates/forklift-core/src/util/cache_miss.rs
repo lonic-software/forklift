@@ -290,7 +290,13 @@ fn refill_with(hook: Option<&FetchHook>, absent: &[String]) -> Result<bool, Stri
             ),
             format!("Run the command again once the origin ({}) can be reached.", origin),
         ).into()),
-        Fetched::Refused(refusal) => return Err(refusal.into()),
+        Fetched::Refused(refusal) => return Err(crate::error::prefix_message(
+            &format!(
+                "{} not in this cache warehouse, and {} cannot be fetched from the configured remote",
+                describe(&still_absent(&wanted).unwrap_or(wanted.clone())).is, named.them
+            ),
+            refusal.into(),
+        )),
         Fetched::Failed(why) => return Err(format!(
             "{} not in this cache warehouse, and fetching {} from the origin failed: {}",
             describe(&still_absent(&wanted).unwrap_or(wanted.clone())).is, named.them, why

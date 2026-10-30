@@ -1685,8 +1685,9 @@ remote it was franchised from — its origin, which the franchise records in `.f
 before it fetches anything. Talking to a *different* remote could lift onto one that lacks what
 this warehouse never verified there, fetch another history into what this warehouse records, or
 free content by heads the origin does not have. So every command that dials the remote from a
-partial warehouse — `lift`, `lower`, `expand`, `scope-prune`, `evict`, `palletize --delete`
-and `--restore`, a cache's fetch of content it lacks, and `heal`'s refetch — refuses with the
+partial warehouse — `lift`, `lower`, `expand`, `scope-prune`, `evict`, `palletize --remote`
+(listing, `--delete` and `--restore`), `office enroll`, `revoke` and `accept-regenesis`, a cache's
+fetch of content it lacks, and `heal`'s refetch — refuses with the
 `non_origin_remote` code (exit 11) when `remote.url` is not the origin, naming both and changing
 nothing. Point `remote.url` back at the origin, or franchise the other remote into a new
 directory. The origin record is not configuration: no `config` key reaches it. A partial

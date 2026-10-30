@@ -94,7 +94,7 @@ pub fn checked_remote() -> Result<(String, Option<String>), CoreError> {
             return Err(missing_origin_refusal());
         };
 
-        if url != origin {
+        if !same_remote(&url, &origin) {
             return Err(non_origin_remote_refusal(&origin, &url));
         }
     }
@@ -102,6 +102,11 @@ pub fn checked_remote() -> Result<(String, Option<String>), CoreError> {
     let token = config_utils::get_effective_value(config_utils::KEY_REMOTE_TOKEN)?.map(|(value, _)| value);
 
     Ok((url, token))
+}
+
+/// Whether two spellings of a remote's URL name the same remote, as the client dials it.
+pub fn same_remote(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
 }
 
 /// The `non_origin_remote` refusal for a partial warehouse whose configured remote is not its
@@ -201,7 +206,8 @@ mod tests {
     /// dials whatever is configured, with or without a record.
     ///
     /// Revert: skip the comparison → the non-origin rows go `Ok`; or gate on the cache mode alone
-    /// → the sparse rows go `Ok`; or pass a missing origin → the missing rows go `Ok`.
+    /// → the sparse rows go `Ok`; or pass a missing origin → the missing rows go `Ok`; or compare
+    /// the URLs byte for byte → the trailing-slash row refuses.
     #[test]
     fn only_the_origin_is_dialled_from_a_partial_warehouse() {
         let (root, _scope) = scratch("checked");
@@ -219,6 +225,9 @@ mod tests {
 
             write_for_tests("http://origin.example");
             assert_eq!(checked_remote().unwrap().0, "http://origin.example", "{:?}", mode);
+
+            set_url("http://origin.example/");
+            assert_eq!(checked_remote().unwrap().0, "http://origin.example/", "{:?}: a trailing slash names the same remote", mode);
 
             set_url("http://other.example");
             let error = checked_remote().unwrap_err();

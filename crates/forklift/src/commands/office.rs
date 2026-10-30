@@ -52,7 +52,7 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
         config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)?.is_some();
 
     if has_remote && !offline {
-        let client = RemoteClient::from_config()?;
+        let client = RemoteClient::for_warehouse()?;
 
         let info = client.fetch_info().await.map_err(|e| format!(
             "{}\nEnroll includes the remote's pallet heads in the trust boundary, so it \
@@ -586,7 +586,7 @@ async fn revocation_boundary(offline: bool) -> Result<Vec<String>, String> {
         config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)?.is_some();
 
     if has_remote && !offline {
-        let client = RemoteClient::from_config()?;
+        let client = RemoteClient::for_warehouse()?;
 
         let info = client.fetch_info().await.map_err(|e| format!(
             "{}\nA revocation's distrust boundary must vouch for work already on the \
@@ -889,7 +889,7 @@ pub fn regenesis(confirm: bool) -> Result<(), String> {
 /// # Arguments
 /// * `confirm` - The new genesis being accepted, or `None` to only describe the reset.
 pub async fn accept_regenesis(confirm: Option<String>) -> Result<(), String> {
-    let client = RemoteClient::from_config()?;
+    let client = RemoteClient::for_warehouse()?;
 
     let Some(confirmed) = confirm else {
         let remote_utils::RegenesisState::Pending { local, remote: remote_trust, .. } =

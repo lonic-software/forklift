@@ -195,7 +195,7 @@ pub async fn handle_command(url: &str,
 fn check_resume(directory: &str, record: &FranchiseRecord, url: &str, expect: Option<&str>) -> Result<(), String> {
     let command = franchise_utils::resume_command(&record.url, directory, &record.request);
 
-    if !same_remote(&record.url, url) {
+    if !origin_utils::same_remote(&record.url, url) {
         return Err(CoreError::refusal_with_details(
             RefusalCode::FranchiseIncomplete,
             format!(
@@ -221,11 +221,6 @@ fn check_resume(directory: &str, record: &FranchiseRecord, url: &str, expect: Op
         ).into()),
         _ => Ok(()),
     }
-}
-
-/// Whether two spellings of a remote's URL name the same remote, as the client dials it.
-fn same_remote(a: &str, b: &str) -> bool {
-    a.trim_end_matches('/') == b.trim_end_matches('/')
 }
 
 /// The `franchise_incomplete` details of a resume refused before it started.
@@ -451,7 +446,7 @@ fn readmit(directory: &str, absolute_target: &Path, url: &str, expected: &Expect
     );
 
     match (franchise_utils::admit(absolute_target)?, expected) {
-        (Admission::Resume(Some(record)), Expected::Record(genesis)) if same_remote(&record.url, url) && &record.genesis == genesis => {
+        (Admission::Resume(Some(record)), Expected::Record(genesis)) if origin_utils::same_remote(&record.url, url) && &record.genesis == genesis => {
             Ok(Some(record))
         }
         (Admission::Resume(None), Expected::Debris) => Ok(None),

@@ -679,22 +679,21 @@ async fn resolve_the_rest(
         .collect();
     let corrupt_hashes: Vec<String> = corrupt_candidates.keys().cloned().collect();
 
-    let (consultation, corrupt_failures) = if !remote_configured {
-        // `remote_configured` is `false` for three different reasons: a partial warehouse's
-        // remote that is not its origin (reported as that refusal), genuinely nothing set, or
+    let (consultation, corrupt_failures) = match remote {
+        // No client, for one of three different reasons: a partial warehouse's remote that is
+        // not its origin (reported as that refusal), genuinely nothing set, or
         // something set but unusable (a config read/parse error, or a URL `RemoteClient::new`
         // rejects). Telling the last two apart
         // (`remote_utils::is_configured`) matters here specifically: reporting the second as the
         // first steers a user with a real, merely broken remote toward the heavyweight remedies
         // (franchise / reproduce / accept the loss) for an object that remote may still actually
         // have, once whatever is wrong with its config is fixed.
-        (unconsulted(remote.err()), BTreeMap::new())
-    } else if candidate_hashes.is_empty() && corrupt_hashes.is_empty() {
+        Err(why) => (unconsulted(why), BTreeMap::new()),
         // Nothing a fetch could help with this round (e.g. every remaining recorded path is
         // `unreadable`/`restage_failed`, never object-shaped) — skip the network entirely.
-        (RemoteConsultation::ConsultedCleanly, BTreeMap::new())
-    } else {
-        attempt_heal_driven_refetch(&candidate_hashes, &corrupt_hashes).await
+        Ok(_) if candidate_hashes.is_empty() && corrupt_hashes.is_empty() =>
+            (RemoteConsultation::ConsultedCleanly, BTreeMap::new()),
+        Ok(client) => attempt_heal_driven_refetch(client, &candidate_hashes, &corrupt_hashes).await,
     };
 
     // Classifying-read filter (DESIGN.html §3.1.1): a candidate present elsewhere (another pack,
@@ -2776,16 +2775,18 @@ fn remedy_text(consultation: &RemoteConsultation) -> String {
 /// configured but not asked, with the reason — a partial warehouse's refusal to ask a remote other
 /// than its origin, or what could not be read. Building a client dials nothing, so none of these
 /// is a connectivity failure a re-run once online would cure.
-fn unconsulted(why: Option<CoreError>) -> RemoteConsultation {
+fn unconsulted(why: CoreError) -> RemoteConsultation {
     match why {
-        Some(CoreError::Refusal { message, .. }) => RemoteConsultation::NotAsked { reason: message },
-        Some(error) if remote_utils::RemoteClient::is_configured() =>
+        CoreError::Refusal { message, .. } => RemoteConsultation::NotAsked { reason: message },
+        error if remote_utils::RemoteClient::is_configured() =>
             RemoteConsultation::NotAsked { reason: String::from(error) },
         _ => RemoteConsultation::NotConfigured,
     }
 }
 
-/// §3.2 D1/D3/D4: the heal-driven refetch. Three passes, all best-effort — see the "empirically
+/// §3.2 D1/D3/D4: the heal-driven refetch, through `client`, the one the caller built and
+/// checked ([`RemoteClient::for_warehouse`](remote_utils::RemoteClient::for_warehouse)). Three
+/// passes, all best-effort — see the "empirically
 /// found" note below (pass 2) and the module doc comment (pass 3), which is why this is *not* a
 /// bare call to `fetch_history_scoped` as first drafted.
 ///
@@ -2837,20 +2838,10 @@ fn unconsulted(why: Option<CoreError>) -> RemoteConsultation {
 /// threaded straight through). Empty whenever pass 3 never ran (no corrupt candidates this round)
 /// or recovered every one of them.
 async fn attempt_heal_driven_refetch(
+    client: remote_utils::RemoteClient,
     candidate_hashes: &[String],
     corrupt_hashes: &[String],
 ) -> (RemoteConsultation, BTreeMap<String, String>) {
-    // In practice this function's own caller already filters out the "nothing configured" case
-    // before ever calling it (`resolve_the_rest`'s own `remote_configured` gate, fixed the same
-    // way — see its doc comment), so this `Err` branch mainly guards a config that broke *between*
-    // that check and this `.await` actually running. Same distinction either way: never conflate
-    // "configured but unusable" with "nothing configured" — see `remote_utils::is_configured`'s
-    // own doc comment.
-    let client = match remote_utils::RemoteClient::for_warehouse() {
-        Ok(client) => client,
-        Err(why) => return (unconsulted(Some(why)), BTreeMap::new()),
-    };
-
     // Armed for the rest of this function — both passes below, and every `.await` inside them —
     // so every store this refetch makes is exempt from `taint_recheck`'s standing-taint success
     // re-check against the very taint this run is in the middle of healing (see
@@ -7104,9 +7095,8 @@ mod tests {
     /// A partial warehouse's heal asks only its origin: pointed at another remote, it reports the
     /// refusal and its way out, and fetches nothing, though that remote serves the missing object.
     ///
-    /// Revert: build heal's clients (the configured check and the refetch's) with `from_config`
-    /// again → the object is refetched from the other remote and the heal clears. Either alone
-    /// stays green: the configured check feeds its refusal to the report before the refetch runs.
+    /// Revert: build heal's client with `from_config` again → the object is refetched from the
+    /// other remote and the heal clears.
     #[test]
     fn a_partial_warehouses_heal_asks_no_remote_but_its_origin() {
         use crate::builder::object::loose_object_builder::LooseObjectBuilder;

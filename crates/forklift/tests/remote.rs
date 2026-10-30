@@ -5288,14 +5288,16 @@ fn a_sparse_workspace_refuses_to_lift_to_a_non_origin_remote() {
 }
 
 /// Every command that talks to a remote from a partial warehouse talks only to its origin: pointed
-/// at another remote that holds the same history and more, `lower`, `expand`, `scope-prune`,
-/// `palletize --delete` (asking whether the remote holds the pallet's work), and the remote
-/// `--delete` and `--restore` each refuse as `non_origin_remote` (exit 11), naming both remotes,
+/// at another remote that holds the same history and more, the remote pallet listing, `office
+/// enroll` and `accept-regenesis`, `lower`, `expand`, `scope-prune`, `palletize --delete` (asking
+/// whether the remote holds the pallet's work), and the remote `--delete` and `--restore` each
+/// refuse as `non_origin_remote` (exit 11), naming both remotes,
 /// with every file under `.forklift` as it was. A full warehouse lowers from the same remote.
 ///
 /// Revert: build any one command's client with `RemoteClient::from_config` again → that command
-/// runs against the other remote (lower, expand, scope-prune and the remote delete succeed; the
-/// local delete and the restore fail with another code) → red.
+/// runs against the other remote (the listing, lower, expand, scope-prune and the remote delete
+/// succeed; enroll, the regenesis check, the local delete and the restore fail with another code)
+/// → red.
 #[test]
 fn a_partial_warehouse_talks_to_no_remote_but_its_origin() {
     let area = TestArea::new("origin-only");
@@ -5334,7 +5336,10 @@ fn a_partial_warehouse_talks_to_no_remote_but_its_origin() {
     assert_success(&area.forklift("sparse", &["config", "remote.url", &server2.url]));
     let before = forklift_dir_snapshot(&area, "sparse");
 
-    let commands: [&[&str]; 6] = [
+    let commands: [&[&str]; 9] = [
+        &["palletize", "--remote"],
+        &["office", "enroll"],
+        &["office", "accept-regenesis"],
         &["lower"],
         &["expand", "src/web"],
         &["scope-prune", "docs"],
@@ -5857,6 +5862,7 @@ fn a_cache_read_of_an_older_parcel_fetches_what_it_reads() {
     assert!(stderr(&elsewhere).contains(&server.url) && stderr(&elsewhere).contains(&other.url), "the refusal names both: {}", stderr(&elsewhere));
     let as_json = area.forklift("cached", &["--json", "show", &format!("{}:docs/two.txt", middle)]);
     assert!(stdout(&as_json).contains("\"non_origin_remote\""), "{}", stdout(&as_json));
+    assert!(stdout(&as_json).contains("not in this cache warehouse"), "the refusal names the read's miss: {}", stdout(&as_json));
     assert!(!object_held(&area, "cached", &middle_root));
     assert_success(&area.forklift("cached", &["config", "remote.url", &server.url]));
 
