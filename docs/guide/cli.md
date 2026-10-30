@@ -1117,7 +1117,9 @@ forklift pallet restore old --remote       # bring "old" back on the remote
 working on it. Git's `branch` is a hidden alias of `pallet`, for muscle memory: `branch` alone lists
 the pallets, as git's does. `branch <name>` is refused rather than read as a subcommand prefix,
 because git's `branch <name>` creates a branch *without* switching to it, and `pallet create`
-switches; the refusal names `forklift pallet create <name>`.
+switches; the refusal names `forklift pallet create <name>`. git's `branch -d` and `branch -m` are
+refused as unknown flags; `pallet delete` deletes, and pallets are not renamed. The listing's flags
+belong to `pallet list`: `pallet list --all`, not `pallet --all`.
 
 The list shows user pallets only by default; `--all` adds the meta pallets (the office
 and other tracked metadata), each in its `@`-qualified form — the address you reach it
