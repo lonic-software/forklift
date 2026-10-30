@@ -59,7 +59,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 12;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -523,6 +523,10 @@ error_codes! {
     /// A move of a partial warehouse's origin has not finished; the command refused before it
     /// changed anything.
     OriginMovePending,
+
+    /// A move of a partial warehouse's origin found the new server lacking content this warehouse
+    /// relies on its origin to hold; the origin was left where it was.
+    OriginMoveIncomplete,
 }
 
 impl ErrorCode {
@@ -565,6 +569,7 @@ impl ErrorCode {
             ErrorCode::PalletDeletedOnRemote => RefusalCode::PalletDeletedOnRemote.as_str(),
             ErrorCode::CacheMiss => RefusalCode::CacheMiss.as_str(),
             ErrorCode::OriginMovePending => RefusalCode::OriginMovePending.as_str(),
+            ErrorCode::OriginMoveIncomplete => RefusalCode::OriginMoveIncomplete.as_str(),
         }
     }
 
@@ -610,6 +615,7 @@ impl ErrorCode {
             ErrorCode::PalletDeletedOnRemote => 35,
             ErrorCode::CacheMiss => 36,
             ErrorCode::OriginMovePending => 37,
+            ErrorCode::OriginMoveIncomplete => 38,
         }
     }
 
@@ -710,6 +716,10 @@ impl ErrorCode {
             ErrorCode::OriginMovePending =>
                 "A move of a partial warehouse's origin has not finished; \"remote move <url>\" \
                  finishes it, \"remote move --abort\" abandons one that has not started rewriting",
+            ErrorCode::OriginMoveIncomplete =>
+                "The server a partial warehouse's origin was to move to lacks content the warehouse \
+                 relies on its origin to hold; the origin was left where it was, and copying the old \
+                 server's warehouse to the new one, server-side, lets the move run again",
         }
     }
 
@@ -752,6 +762,7 @@ impl ErrorCode {
             RefusalCode::PalletDeletedOnRemote => ErrorCode::PalletDeletedOnRemote,
             RefusalCode::CacheMiss => ErrorCode::CacheMiss,
             RefusalCode::OriginMovePending => ErrorCode::OriginMovePending,
+            RefusalCode::OriginMoveIncomplete => ErrorCode::OriginMoveIncomplete,
         }
     }
 }
@@ -1253,6 +1264,7 @@ mod tests {
             (RefusalCode::PalletDeletedOnRemote, "pallet_deleted_on_remote", 35),
             (RefusalCode::CacheMiss, "cache_miss", 36),
             (RefusalCode::OriginMovePending, "origin_move_pending", 37),
+            (RefusalCode::OriginMoveIncomplete, "origin_move_incomplete", 38),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

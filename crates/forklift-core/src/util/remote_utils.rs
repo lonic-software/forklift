@@ -4864,6 +4864,24 @@ pub async fn fetch_history_within(client: &RemoteClient,
     Ok(walk_history(client, head, roots, true, progress).await?.0)
 }
 
+/// The parcels and signatures of `head`'s history, bounded as [`fetch_history`] bounds them, and
+/// none of their content, recording nothing: for a move of the origin, which reads the new server's
+/// history to judge it and adopts nothing from it. The parcels it stores no ref reaches until a
+/// fetch takes their head, so they are what any interrupted fetch leaves.
+///
+/// # Arguments
+/// * `client` - The remote.
+/// * `head`   - The parcel hash to fetch from.
+///
+/// # Returns
+/// * `Ok(FetchStats)` - What was actually transferred, and how many parcels were walked.
+/// * `Err(String)`    - If a transfer or verification failed.
+pub async fn fetch_parcels_only(client: &RemoteClient,
+                                head: &str,
+                                progress: &Progress) -> Result<FetchStats, String> {
+    Ok(walk_history(client, head, &[], false, progress).await?.0)
+}
+
 /// The bounded parcel walk of [`fetch_history_within`]: every parcel and signature from `head` down
 /// to what is already known complete, and with `content`, every walked parcel's closure as well.
 /// Without it, nothing below a parcel is fetched and the walked parcels' root trees are returned

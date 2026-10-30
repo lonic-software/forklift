@@ -12,7 +12,8 @@
 //! is not configuration: no `config` command reaches it, so the origin cannot be edited to agree
 //! with whatever remote is configured. `prepare_warehouse` writes it before the marker of a partial
 //! warehouse, so no partial marker stands without an origin, and before the franchise fetches
-//! anything; afterwards only a move of the origin rewrites it ([`write_locked`]). A full warehouse
+//! anything; afterwards only a move of the origin rewrites it ([`write_locked`]), which is also how a
+//! missing one is recorded again. A full warehouse
 //! has none: it holds its whole closure and may talk to any remote.
 
 use std::path::{Path, PathBuf};
@@ -152,7 +153,8 @@ pub fn non_origin_remote_refusal(origin: &str, other: &str) -> CoreError {
 /// The `non_origin_remote` refusal for a partial warehouse with no origin recorded, which only a
 /// damaged `.forklift` can be: preparing a partial warehouse writes the origin before its marker.
 pub fn missing_origin_refusal() -> CoreError {
-    let next_step = "Franchise the remote again, into a new directory.";
+    let next_step = "Record the origin with \"forklift remote move <url>\", naming a server that holds \
+        this warehouse's content, or franchise the remote again into a new directory.";
 
     CoreError::refusal(
         RefusalCode::NonOriginRemote,

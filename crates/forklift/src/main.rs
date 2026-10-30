@@ -3,7 +3,7 @@ use clap::error::ErrorKind;
 use clap::{CommandFactory, FromArgMatches};
 use forklift_core::util::{lock_utils, warehouse_utils};
 use forklift_core::util::fanout_utils::block_on_worker_stack;
-use crate::cli::{Cli, Command, OfficeAction, ParkAction, ProfileAction};
+use crate::cli::{Cli, Command, OfficeAction, ParkAction, ProfileAction, RemoteAction};
 use crate::output::{ErrorCode, ForkliftError, OutputMode};
 
 pub mod cache_fetch;
@@ -491,6 +491,12 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
         Command::Scope { action } => commands::scope::handle_command(action),
         Command::ScopePrune { paths, dry_run } => commands::scope_prune::handle_command(paths, dry_run).await,
         Command::Evict { dry_run } => commands::evict::handle_command(dry_run).await,
+        Command::Remote { action } => match action {
+            RemoteAction::Move { url, token, abort } => {
+                let store_access = store_access.ok_or("remote move ran without its store-access hold.")?;
+                commands::remote::move_origin(url, token, abort, store_access).await
+            }
+        },
         Command::Shift { pallet } => commands::shift::handle_command(&pallet).await,
         Command::Show { target } => commands::show::handle_command(&target),
         Command::Stack { description } => commands::stack::handle_command(description).await,
