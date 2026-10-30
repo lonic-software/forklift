@@ -43,7 +43,7 @@ use forklift_core::util::pallet_utils::{
 use forklift_core::util::lock_utils::{self, BaseServeLock, ServeLock, StoreAccessLock};
 use forklift_core::util::{
     audit_utils, body_utils, bay_utils, bundle_utils, file_utils, franchise_utils, hook_utils, merge_utils, meta_tree,
-    object_utils, office_utils, pack_utils, pallet_utils, scope_utils, sealed_utils, sign_utils, tree_utils, warehouse_utils,
+    object_utils, office_utils, origin_utils, pack_utils, pallet_utils, scope_utils, sealed_utils, sign_utils, tree_utils, warehouse_utils,
 };
 use subtle::ConstantTimeEq;
 
@@ -116,9 +116,10 @@ impl WarehouseHandle {
     /// So is a root whose sealed-object record holds anything, or cannot be read, whatever its
     /// marker says: each hash recorded there is an object it holds by hash alone, without its
     /// content. Only a cache records one in the normal course, but the record is read rather than
-    /// inferred from the mode. Once is enough here too: a new entry is refused where no origin is
-    /// recorded, which a full root never has, and every other write only moves or drops an entry
-    /// already there.
+    /// inferred from the mode. And so is a root that records an origin, which only a partial
+    /// warehouse is prepared with. Once is enough here too: a new claim is refused where no origin
+    /// is recorded, and the push-downs that record without one start only from entries already
+    /// there, or run only in a cache; with neither an entry nor an origin, nothing adds one.
     fn serving(root: PathBuf, wait: bool) -> Result<WarehouseHandle, ServingRefusal> {
         // Acquire inside the root's storage scope so the locks land at this warehouse's store
         // root (the scope is synchronous and never held across an `.await`; both guards keep an
@@ -138,6 +139,9 @@ impl WarehouseHandle {
             let sealed = sealed_utils::read_sealed().map_err(ServingRefusal::Unreadable)?;
             if !sealed.is_empty() {
                 return Err(ServingRefusal::Sealed(sealed.len()));
+            }
+            if origin_utils::read_origin().map_err(ServingRefusal::Unreadable)?.is_some() {
+                return Err(ServingRefusal::Origin);
             }
 
             let serve_lock = ServeLock::acquire().map_err(ServingRefusal::Busy)?;
@@ -168,8 +172,8 @@ enum ServingRefusal {
     /// It holds a franchise that has not finished: it is resumed or deleted first.
     Unfinished(String),
 
-    /// Its warehouse marker, fetch scope or sealed-object record could not be read, or its served
-    /// mark could not be read or written.
+    /// Its warehouse marker, fetch scope, sealed-object record or origin record could not be read,
+    /// or its served mark could not be read or written.
     Unreadable(String),
 
     /// It is sparse or a cache, so it may lack content, and is never served.
@@ -178,6 +182,10 @@ enum ServingRefusal {
     /// Its sealed-object record holds this many objects it has by hash alone, so it may lack
     /// content, and is never served.
     Sealed(usize),
+
+    /// It records an origin, as only a partial warehouse does, so its files may come from one that
+    /// lacks content, and it is never served.
+    Origin,
 }
 
 impl ServingRefusal {
@@ -197,11 +205,19 @@ impl ServingRefusal {
             ServingRefusal::Sealed(count) => format!(
                 "{} records {} object{} it holds by hash alone, without the content, so it may lack \
                 content its pallets reach. A client trusts a server to hold the whole history it \
-                serves, and could free local copies this one cannot send back. Serve a warehouse \
-                whose sealed-object record is empty instead.",
+                serves, and could free local copies this one cannot send back. Its files may come from a \
+                cache: franchise the remote again into a new root, without --only or --cache, and \
+                serve that.",
                 name,
                 count,
                 if count == 1 { "" } else { "s" }
+            ),
+            ServingRefusal::Origin => format!(
+                "{} records an origin, which only a warehouse franchised with --only or --cache has, \
+                so its files may come from one that lacks content its pallets reach. A client trusts \
+                a server to hold the whole history it serves. Franchise the remote again into a new \
+                root, without --only or --cache, and serve that.",
+                name
             ),
         }
     }
@@ -247,7 +263,8 @@ struct RegistryEntry {
 /// [`WarehouseRegistry::make_room`]). When none is idle the new one is admitted over the cap: a
 /// request is never refused for the cap alone, and running out of files surfaces as
 /// [`WarehouseHandle::serving`]'s refusal: a 503 when the franchise gate or the locks cannot
-/// be checked or taken, a 500 when the fetch scope cannot be read.
+/// be checked or taken, a 500 when the marker, fetch scope, sealed-object record or origin
+/// record cannot be read.
 struct WarehouseRegistry {
     entries: HashMap<String, RegistryEntry>,
     clock: u64,
@@ -1725,7 +1742,8 @@ fn resolve_warehouse(state: &AppState,
     // Acquire this warehouse's serve lock as it is served, and hold it in the registry's handle
     // until the handle is let go. Refuses (503) if a `gc` or full repack is running against this
     // warehouse, or another server already serves it — serving it then would be unsafe. A partial
-    // or sealed warehouse stays refused (409) until it is replaced, and an unfinished franchise (503) until
+    // or sealed warehouse, or one that records an origin, stays refused (409) until it is
+    // replaced, one whose records cannot be read gets a 500, and an unfinished franchise (503) until
     // it is resumed or deleted.
     let handle = Arc::new(
         WarehouseHandle::serving(root, false).map_err(|refusal| match refusal {
@@ -1745,7 +1763,7 @@ fn resolve_warehouse(state: &AppState,
                 ),
             ),
             ServingRefusal::Unreadable(reason) => internal(reason),
-            refusal @ (ServingRefusal::Partial | ServingRefusal::Sealed(_)) => (
+            refusal @ (ServingRefusal::Partial | ServingRefusal::Sealed(_) | ServingRefusal::Origin) => (
                 StatusCode::CONFLICT,
                 refusal.message(&format!("Warehouse \"{}\"", id)),
             ),
@@ -4857,7 +4875,8 @@ mod tests {
     /// Revert: drop the sealed check from `serving` → `sealed` is served → red. Revert: refuse a
     /// root that merely has a record file → `emptied` (a record and its removal) is refused → red.
     /// Revert: read an unreadable record as empty (`unwrap_or_default`) → `garbled` is served →
-    /// red.
+    /// red. Revert: drop the origin check → `origined` is served → red. A torn append after frames
+    /// that replay to nothing reads as nothing recorded, so `emptied` is served with one.
     #[test]
     fn serving_refuses_a_full_root_whose_sealed_record_holds_an_object() {
         use sealed_utils::SealOp;
@@ -4872,11 +4891,20 @@ mod tests {
         assert!(matches!(refused, ServingRefusal::Sealed(1)), "{:?}", refused);
         let message = refused.message("\"/srv/wh\"");
         assert!(message.starts_with("\"/srv/wh\" records 1 object it holds by hash alone"), "{}", message);
+        assert!(message.contains("franchise the remote again into a new root"), "{}", message);
         assert!(!sealed.join(FOLDER_NAME_FORKLIFT_ROOT).join("serve.lock").exists(), "a refused root keeps no serve lock");
 
         let emptied = base.join("emptied");
         mark_warehouse(&emptied);
         write_sealed(&emptied, &[(SealOp::Record, &one), (SealOp::Remove, &one)]);
+        {
+            let _scope = StorageRootScope::enter(&emptied);
+            let mut torn = sealed_utils::encode_frame(SealOp::Record, &two).unwrap();
+            torn.truncate(torn.len() / 2);
+            let mut bytes = std::fs::read(sealed_utils::sealed_path()).unwrap();
+            bytes.extend(torn);
+            std::fs::write(sealed_utils::sealed_path(), bytes).unwrap();
+        }
         drop(WarehouseHandle::serving(emptied, false).expect("a record that replays to nothing is served"));
 
         let garbled = base.join("garbled");
@@ -4887,6 +4915,17 @@ mod tests {
         }
         let refused = WarehouseHandle::serving(garbled, false).err().expect("an unreadable record is refused");
         assert!(matches!(&refused, ServingRefusal::Unreadable(reason) if reason.contains("sealed-object record")), "{:?}", refused);
+
+        // An origin is what lets a new entry be recorded, so a full root that records one is
+        // refused even with nothing recorded yet.
+        let origined = base.join("origined");
+        mark_warehouse(&origined);
+        {
+            let _scope = StorageRootScope::enter(&origined);
+            origin_utils::write_for_tests("http://origin.example");
+        }
+        let refused = WarehouseHandle::serving(origined, false).err().expect("a root recording an origin is refused");
+        assert!(matches!(refused, ServingRefusal::Origin), "{:?}", refused);
 
         let _ = std::fs::remove_dir_all(&base);
     }
