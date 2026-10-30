@@ -456,7 +456,7 @@ pub enum Command {
                       every pallet, path and both sides, until --keep resolves each one."
     )]
     Lower {
-        /// The pallet to lower (default: the current pallet); "forklift palletize --remote" lists
+        /// The pallet to lower (default: the current pallet); "forklift pallet list --remote" lists
         /// the remote's
         pallet: Option<String>,
 
@@ -548,58 +548,15 @@ pub enum Command {
         action: Option<OfficeAction>,
     },
 
-    /// Create a new pallet (branch) and shift to it; without a name, list the pallets
+    /// Manage pallets (branches): list, create, delete and restore them
     #[command(
-        visible_alias = "pz",
         alias = "branch",
-        long_about = "Create a new pallet at the current head — or at the given revision (a pallet \
-                      name or a parcel hash) — and shift to it. Without arguments, the pallets are \
-                      listed with the current one marked; with \"--remote\", the remote's pallets \
-                      are listed instead, each with how it relates to the local one. With \
-                      \"--delete\", the named pallet is deleted instead: its ref goes, its parcels \
-                      stay, and \"forklift undo\" brings it back. With \"--restore\", a pallet \
-                      deleted in a served warehouse comes back at the head its tombstone holds. \
-                      With \"--remote\" as well, either acts on the remote's pallet: a pallet \
-                      deleted there keeps its history on the remote, and no clone's own pallet \
-                      changes."
+        long_about = "Manage pallets, Forklift's branches. Without a subcommand, the pallets are \
+                      listed, as \"forklift pallet list\" does."
     )]
-    Palletize {
-        /// The name of the new pallet; omit it to list the pallets
-        name: Option<String>,
-
-        /// Where the new pallet starts: a pallet name or a parcel hash prefix
-        /// (default: the current pallet's head)
-        revision: Option<String>,
-
-        /// When listing, also show the meta pallets (the office and other tracked
-        /// metadata; reach them with the "@" qualifier, e.g. "forklift history @office")
-        #[arg(short, long)]
-        all: bool,
-
-        /// List the remote's pallets instead: each with its remote head, the local head, and
-        /// whether the two are the same, the local one is ahead, or they differ (lower decides),
-        /// and the pallets deleted there. Downloads and writes nothing. With "--delete" or
-        /// "--restore", delete or restore the named pallet on the remote instead
-        #[arg(long, conflicts_with = "revision")]
-        remote: bool,
-
-        /// Delete the named pallet: remove its ref, keeping its parcels. Refused for the pallet a
-        /// bay stands on, one an open haul names, and — without "--force" — one whose work no
-        /// other pallet here or on the remote holds. Undo it with "forklift undo"
-        #[arg(long, requires = "name", conflicts_with_all = ["revision", "all"])]
-        delete: bool,
-
-        /// With "--delete": delete even when no other pallet holds the pallet's work. It stays
-        /// recoverable by "forklift undo" while the delete is in this bay's undo journal, and in a
-        /// warehouse a server has served by "--restore" while its tombstone stands
-        #[arg(long, requires = "delete", conflicts_with = "remote")]
-        force: bool,
-
-        /// Bring back the named pallet, deleted in this warehouse after it was served, at the head
-        /// its tombstone holds. Refused while a bay stands on the name at another head. With
-        /// "--remote", bring it back on the remote, which needs no history here
-        #[arg(long, requires = "name", conflicts_with_all = ["revision", "all", "delete"])]
-        restore: bool,
+    Pallet {
+        #[command(subcommand)]
+        action: Option<PalletAction>,
     },
 
     /// Park the work in progress and reset to the pallet head
@@ -1000,7 +957,7 @@ pub enum Command {
                       corrected message or author. A shift is reversed by shifting back. Undo \
                       reverses only the user's last operation: except for a pallet delete, which \
                       changed nothing in the bay, if the current pallet has been \
-                      switched (e.g. by palletize or deliver), its head has moved, or a \
+                      switched (e.g. by pallet create or deliver), its head has moved, or a \
                       consolidation or cherry-pick was started or finished since the journaled \
                       operation, it refuses \
                       instead of reaching past that. In a warehouse that has been served, a \
@@ -1148,6 +1105,78 @@ pub enum BayAction {
 pub enum ScopeAction {
     /// Show the current bay's materialization scope and the warehouse fetch scope (the default)
     Status,
+}
+
+#[derive(Subcommand)]
+pub enum PalletAction {
+    /// List the pallets, marking the current one (the default)
+    #[command(
+        long_about = "List the pallets, marking the current one. With \"--remote\", list the \
+                      remote's pallets instead, each with how it relates to the local one, and the \
+                      pallets deleted there."
+    )]
+    List {
+        /// Also show the meta pallets (the office and other tracked metadata; reach them with the
+        /// "@" qualifier, e.g. "forklift history @office")
+        #[arg(short, long)]
+        all: bool,
+
+        /// List the remote's pallets instead: each with its remote head, the local head, and
+        /// whether the two are the same, the local one is ahead, or they differ (lower decides),
+        /// and the pallets deleted there. Downloads and writes nothing
+        #[arg(long)]
+        remote: bool,
+    },
+    /// Create a new pallet and shift to it
+    #[command(
+        long_about = "Create a new pallet at the current head, or at the given revision (a pallet \
+                      name or a parcel hash), and shift to it."
+    )]
+    Create {
+        /// The name of the new pallet
+        name: String,
+
+        /// Where the new pallet starts: a pallet name or a parcel hash prefix
+        /// (default: the current pallet's head)
+        revision: Option<String>,
+    },
+    /// Delete a pallet: remove its ref, keeping its parcels
+    #[command(
+        long_about = "Delete a pallet: its ref goes, its parcels stay, and \"forklift undo\" brings \
+                      it back. Refused for the pallet a bay stands on, one an open haul names, and, \
+                      without \"--force\", one whose work no other pallet here or on the remote \
+                      holds. With \"--remote\", delete the remote's pallet instead: it keeps its \
+                      history on the remote, and no clone's own pallet changes."
+    )]
+    Delete {
+        /// The pallet to delete
+        name: String,
+
+        /// Delete even when no other pallet holds the pallet's work. It stays recoverable by
+        /// "forklift undo" while the delete is in this bay's undo journal, and in a warehouse a
+        /// server has served by "forklift pallet restore" while its tombstone stands
+        #[arg(long, conflicts_with = "remote")]
+        force: bool,
+
+        /// Delete the remote's pallet instead of the local one
+        #[arg(long)]
+        remote: bool,
+    },
+    /// Bring back a deleted pallet at the head its tombstone holds
+    #[command(
+        long_about = "Bring back a pallet deleted in this warehouse after it was served, at the \
+                      head its tombstone holds. Refused while a bay stands on the name at another \
+                      head. With \"--remote\", bring it back on the remote, which needs no history \
+                      here."
+    )]
+    Restore {
+        /// The pallet to bring back
+        name: String,
+
+        /// Bring the remote's pallet back instead of the local one
+        #[arg(long)]
+        remote: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1894,7 +1923,7 @@ impl Command {
                 | Command::Manifest { .. }
                 | Command::Narrow { .. }
                 | Command::Office { .. }
-                | Command::Palletize { .. }
+                | Command::Pallet { .. }
                 | Command::Park { .. }
                 | Command::Query { .. }
                 | Command::Remove { .. }
@@ -1945,7 +1974,8 @@ impl Command {
     /// position, or commits staged content. The staging such an operation leaves may be
     /// incomplete, and committing it could record the removal of every tracked file. `heal` is
     /// the way out; commands that touch only refs of other pallets, the shared store or
-    /// metadata stay usable.
+    /// metadata stay usable. Of the pallet family only the listing runs: `pallet delete` writes
+    /// the bay's undo journal, and `pallet restore` re-creates a ref a checkout may stand on.
     ///
     /// # Returns
     /// * `true`  - The command refuses while such an operation is recorded.
@@ -1962,7 +1992,7 @@ impl Command {
                 | Command::Lower { .. }
                 | Command::Haul { .. }
                 | Command::Narrow { .. }
-                | Command::Palletize { .. }
+                | Command::Pallet { action: Some(PalletAction::Create { .. } | PalletAction::Delete { .. } | PalletAction::Restore { .. }) }
                 | Command::Park { .. }
                 | Command::Remove { .. }
                 | Command::Restore { .. }
@@ -2002,7 +2032,7 @@ impl Command {
                 | Command::Manifest { .. }
                 | Command::Narrow { .. }
                 | Command::Office { .. }
-                | Command::Palletize { .. }
+                | Command::Pallet { .. }
                 | Command::Park { .. }
                 | Command::Remove { .. }
                 | Command::Remote { action: Some(_) }
@@ -2090,7 +2120,7 @@ impl Command {
     /// their pre-operation state is snapshotted so `undo` can restore it. Pure-staging
     /// (`load`/`remove`/`unload`/`restore`), trust and remote commands are intentionally excluded.
     /// A pallet delete is journaled as well, but writes its own entry inside the removal's ref-lock
-    /// hold (`palletize --delete`), so it is not listed here.
+    /// hold (`pallet delete`), so it is not listed here.
     pub fn journal_op(&self) -> Option<&'static str> {
         match self {
             Command::Stack { .. } => Some("stack"),

@@ -3054,7 +3054,7 @@ A command not listed here either reports only the generic human-message shape `{
 }
 ```
 
-## `palletize`
+## `pallet`
 
 ### `Palletized`
 
@@ -3264,7 +3264,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "boolean"
     },
     "deleted": {
-      "description": "The pallets deleted in this warehouse since a server served it, whose tombstones still\nstand; `palletize --restore <name>` brings one back. Omitted when empty.",
+      "description": "The pallets deleted in this warehouse since a server served it, whose tombstones still\nstand; `pallet restore <name>` brings one back. Omitted when empty.",
       "items": {
         "$ref": "#/$defs/DeletedEntry"
       },
@@ -3384,7 +3384,7 @@ A command not listed here either reports only the generic human-message shape `{
   "description": "The remote's pallets, each against the local pallet of that name.",
   "properties": {
     "deleted": {
-      "description": "The pallets deleted on the remote whose tombstones still stand; the remote keeps each one's\nhistory, and `palletize --restore <name> --remote` brings it back. Omitted when empty.",
+      "description": "The pallets deleted on the remote whose tombstones still stand; the remote keeps each one's\nhistory, and `pallet restore <name> --remote` brings it back. Omitted when empty.",
       "items": {
         "$ref": "#/$defs/RemoteDeletedEntry"
       },

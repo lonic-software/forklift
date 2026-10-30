@@ -71,7 +71,7 @@ pub async fn handle_command(pallet: Option<String>, expect: Option<String>, keep
         if !info.pallets.contains_key(name) {
             remote_utils::check_remote_trust(&client, &info, expect.as_deref())?;
 
-            return Err(remote_lacks_pallet(&info, name, "forklift palletize --remote").into());
+            return Err(remote_lacks_pallet(&info, name, "forklift pallet list --remote").into());
         }
     }
 
@@ -173,7 +173,7 @@ async fn lower_working_pallet(client: &RemoteClient,
         None => {
             let next_step = match pallet_utils::get_pallet_head(&pallet)? {
                 Some(_) => "forklift lift",
-                None => "forklift palletize --remote",
+                None => "forklift pallet list --remote",
             };
             return Err(remote_lacks_pallet(info, &pallet, next_step).into());
         }
@@ -298,7 +298,7 @@ fn remote_pallet_head<'a>(info: &'a forklift_core::model::remote::WarehouseInfo,
 
 /// The [`RefusalCode::PalletNotFound`] refusal for a remote that has no user pallet `pallet`,
 /// naming the ones it has. `next_step` is the remedy at the site: `lift` publishes a current
-/// pallet with something stacked, `palletize --remote` lists what another name could be. A pallet
+/// pallet with something stacked, `pallet list --remote` lists what another name could be. A pallet
 /// deleted on the remote is refused naming the deletion and its restore instead.
 fn remote_lacks_pallet(info: &forklift_core::model::remote::WarehouseInfo, pallet: &str, next_step: &str) -> CoreError {
     // A deleted pallet's history is still there, under its tombstone: restoring it is the way on.
@@ -307,10 +307,10 @@ fn remote_lacks_pallet(info: &forklift_core::model::remote::WarehouseInfo, palle
             RefusalCode::PalletNotFound,
             format!(
                 "The remote's pallet \"{}\" was deleted at {}; the remote still holds its history. \
-                \"forklift palletize --restore {} --remote\" brings it back there.",
+                \"forklift pallet restore {} --remote\" brings it back there.",
                 pallet, head, pallet
             ),
-            format!("forklift palletize --restore {} --remote", pallet),
+            format!("forklift pallet restore {} --remote", pallet),
         );
     }
 
@@ -322,7 +322,7 @@ fn remote_lacks_pallet(info: &forklift_core::model::remote::WarehouseInfo, palle
     CoreError::refusal(
         RefusalCode::PalletNotFound,
         format!(
-            "The remote has no pallet \"{}\" (it has: {}). \"forklift palletize --remote\" lists \
+            "The remote has no pallet \"{}\" (it has: {}). \"forklift pallet list --remote\" lists \
             them.",
             pallet,
             if user.is_empty() { "none".to_string() } else { user.join(", ") }
@@ -346,7 +346,7 @@ async fn lower_named_pallet(client: &RemoteClient,
                             report: &mut LowerReport,
                             progress: &Progress) -> Result<(), String> {
     let pallet = report.pallet.clone();
-    let remote_head = remote_pallet_head(info, &pallet, "forklift palletize --remote")?;
+    let remote_head = remote_pallet_head(info, &pallet, "forklift pallet list --remote")?;
 
     report.head = remote_head.clone();
 
@@ -369,7 +369,7 @@ async fn lower_named_pallet(client: &RemoteClient,
             return Ok(());
         }
 
-        // Not the working pallet's refusal: its remedy palletizes and shifts this bay, which a
+        // Not the working pallet's refusal: its remedy creates a pallet and shifts this bay, which a
         // named lower promised to leave alone. The reconciliation happens on the pallet itself.
         if !merge_utils::is_ancestor(local, remote_head)? {
             return Err(CoreError::refusal(

@@ -113,10 +113,10 @@ Reference: [Tracking changes](cli.md#2-tracking-changes) and [`history`](cli.md#
 
 ## 4. Branch and merge
 
-A **pallet** is a branch. `palletize` creates one and shifts to it:
+A **pallet** is a branch. `pallet create` creates one and shifts to it:
 
 ```console
-$ forklift palletize shout
+$ forklift pallet create shout
 Created pallet "shout" and shifted to it.
 $ echo 'HELLO, FORKLIFT!' > readme.md
 $ forklift load readme.md

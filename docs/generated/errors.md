@@ -41,13 +41,13 @@ Exit code 17 is reserved for a future feature and is not yet assigned to any cod
 | `behind` | 26 | Another bay or process moved the pallet past the parcel this bay stands on; nothing was moved, and "forklift shift" catches the bay up |
 | `target_not_covered` | 27 | "forklift deliver" was aimed at a target holding changes the draft has not seen; consolidating the target into the draft comes first |
 | `remote_ahead` | 28 | The remote's pallet holds parcels this warehouse has not lowered yet; "forklift lower" comes first |
-| `pallet_not_found` | 29 | No pallet of that name exists in this warehouse (or, for "forklift lower", on the remote); "forklift lower <name>" brings in the remote's, "forklift palletize <name>" creates a new one, "forklift palletize --remote" lists the remote's |
+| `pallet_not_found` | 29 | No pallet of that name exists in this warehouse (or, for "forklift lower", on the remote); "forklift lower <name>" brings in the remote's, "forklift pallet create <name>" creates a new one, "forklift pallet list --remote" lists the remote's |
 | `franchise_incomplete` | 30 | The directory holds a franchise that has not finished; running the same "forklift franchise" again resumes it and keeps what was fetched |
 | `only_prefix_not_found` | 31 | A sparse franchise's --only path is not a directory in the pallet on the remote |
 | `staged_upload_discarded` | 32 | A lift's commit named an upload the remote no longer holds (discarded or never received); running the lift again uploads it afresh |
 | `mirror_incomplete` | 33 | A mirror run left at least one pallet out of step with git; the others went through, and each failed pallet's message names its step |
 | `history_unverified` | 34 | History about to be adopted as a pallet's does not verify against the trust anchor it was judged against (the one held here, or at first contact the one the remote serves); nothing was adopted |
-| `pallet_deleted_on_remote` | 35 | The remote has the pallet only as a tombstone: it was deleted there, and the name stays reserved for that history; "forklift palletize --restore <name> --remote" brings it back, "forklift lift --recreate" re-creates it from work that descends from it |
+| `pallet_deleted_on_remote` | 35 | The remote has the pallet only as a tombstone: it was deleted there, and the name stays reserved for that history; "forklift pallet restore <name> --remote" brings it back, "forklift lift --recreate" re-creates it from work that descends from it |
 | `cache_miss` | 36 | A cache warehouse does not hold content the command reads, and could not reach its origin to fetch it; the command works once the origin can be reached |
 | `origin_move_pending` | 37 | A move of a partial warehouse's origin has not finished; "forklift remote move <url>" finishes it, "forklift remote move --abort" abandons one that has not started rewriting |
 | `origin_move_incomplete` | 38 | The server a partial warehouse's origin was to move to lacks content the warehouse relies on its origin to hold; the origin was left where it was, and copying the old server's warehouse to the new one, server-side, lets the move run again |

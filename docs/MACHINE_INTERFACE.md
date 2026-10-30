@@ -284,7 +284,7 @@ identity query resolves every phase-1 survivor in its walked scope. Scope the wa
 pallet argument, `--from <rev>`) to bound work; an unscoped verified identity query
 over all of history costs about what `audit` does.
 
-### `palletize --json` (listing)
+### `pallet list --json`
 
 ```json
 {
@@ -452,7 +452,7 @@ damaged mirror) is not this code.
 ### History the anchor does not vouch for: `history_unverified`
 
 A command that adopts a head another store served (`lower`, `franchise`, `lift`'s auto-merge,
-`mirror`) or one already in the store (`palletize <name> <hash>`, `haul merge`, the `stack` that
+`mirror`) or one already in the store (`pallet create <name> <hash>`, `haul merge`, the `stack` that
 completes a conflicted merge) refuses with `history_unverified` (exit 34) when the head's history
 does not verify against the trust anchor and office it is judged against: the ones this warehouse
 holds, or at first contact the ones the remote serves. Nothing was adopted: no ref moved, no
@@ -471,7 +471,7 @@ and follows the step.
 |---|---|---|---|
 | `behind` | 26 | this bay's base is behind its pallet's head: another bay or process moved the pallet. Raised by every command that moves the bay's pallet (`stack`, `deliver`, `consolidate`, `cherry-pick`, `haul merge`, `lower`, `lift`'s auto-merge, a consolidation's completion) | `forklift shift <pallet>`; a refusal mid-merge names aborting the merge first |
 | `remote_ahead` | 28 | the remote's pallet holds parcels this warehouse has not lowered: its head is unknown here, descends from the local head, or moved since this client read it (the `409` of a ref update). It does not promise this side holds nothing new; `lower` then fast-forwards or reports `diverged` | `forklift lower` |
-| `diverged` | 5 | the local pallet and the remote's each hold parcels the other lacks. `lower` never merges them; `lift` reports it when it did not auto-merge (an overlap, an unclean warehouse, or its retry bound) | for a working pallet: palletize the remote head (as `<pallet>-remote-<short hash>`, unique per remote head), shift back, consolidate it, lift; for a meta pallet with replay rules: `forklift lower`. The office and other meta pallets diverge as an unclassified error, reconciled by hand |
+| `diverged` | 5 | the local pallet and the remote's each hold parcels the other lacks. `lower` never merges them; `lift` reports it when it did not auto-merge (an overlap, an unclean warehouse, or its retry bound) | for a working pallet: create a pallet at the remote head (as `<pallet>-remote-<short hash>`, unique per remote head), shift back, consolidate it, lift; for a meta pallet with replay rules: `forklift lower`. The office and other meta pallets diverge as an unclassified error, reconciled by hand |
 | `target_not_covered` | 27 | `deliver` would undo changes on the target that the draft never consolidated | `forklift consolidate <target>` |
 
 `diverged` used to be described as a remote ref moving under a lift. That case is now
@@ -483,22 +483,22 @@ and follows the step.
 pallet) refuse a pallet name this warehouse holds no ref for with `pallet_not_found` (exit 29). The
 remedy depends on where the pallet might be: with a remote configured, `next_step` is
 `forklift lower <name>`, which brings the remote's pallet in without moving this bay; without
-one it is `forklift palletize <name>`. A missing meta pallet names `forklift lower` (which syncs
-the remote's meta pallets) with a remote, `forklift palletize --all` without one. `lower <name>` for
+one it is `forklift pallet create <name>`. A missing meta pallet names `forklift lower` (which syncs
+the remote's meta pallets) with a remote, `forklift pallet list --all` without one. `lower <name>` for
 a pallet the remote does not have refuses with the same code before writing anything, naming
-`forklift palletize --remote`; a bare `lower` of a current pallet the remote does not have names
+`forklift pallet list --remote`; a bare `lower` of a current pallet the remote does not have names
 `forklift lift`.
-`forklift palletize --remote` lists what the remote holds, so an agent can tell the two apart
+`forklift pallet list --remote` lists what the remote holds, so an agent can tell the two apart
 before acting.
 A pallet the remote deleted is the exception: `lower <name>` still refuses with
-`pallet_not_found`, but says it was deleted and names `forklift palletize --restore <name> --remote`.
+`pallet_not_found`, but says it was deleted and names `forklift pallet restore <name> --remote`.
 
 ### A pallet the remote deleted: `pallet_deleted_on_remote`
 
 A `lift` that would re-create a pallet the remote has only as a tombstone refuses with
 `pallet_deleted_on_remote` (exit 35) before uploading anything. `next_step` is
 `forklift lift --recreate` when the local head descends from the head the tombstone keeps, and
-`forklift palletize --restore <name> --remote` otherwise. The remote raises the same code, with
+`forklift pallet restore <name> --remote` otherwise. The remote raises the same code, with
 the restore as `next_step`, when a creation of a deleted pallet does not acknowledge its tombstone
 or does not descend from it, and when a ref update or delete finds its pallet deleted.
 

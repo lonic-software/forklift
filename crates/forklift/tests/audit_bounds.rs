@@ -289,7 +289,7 @@ fn a_merge_lift_reads_nothing_below_the_fork_point() {
     let base = warehouse.stack("app.txt", "base\n", "base");
 
     // A branch forking at `base`, never lifted: its parcels are genuinely new.
-    warehouse.run_ok(&["palletize", "feature"]);
+    warehouse.run_ok(&["pallet", "create", "feature"]);
     let branch = warehouse.stack("feature.txt", "from the branch\n", "on the branch");
 
     // main moves on; that head is what the remote already trusts.

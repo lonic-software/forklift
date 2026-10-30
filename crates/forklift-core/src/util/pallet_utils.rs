@@ -250,7 +250,7 @@ fn pallet_name_problem(name: &str) -> Option<String> {
 }
 
 /// Check whether a user pallet exists (i.e. it has a ref file — it was stacked on at least
-/// once or explicitly palletized from an existing head).
+/// once or explicitly created at an existing head).
 ///
 /// # Arguments
 /// * `name` - The name of the pallet.
@@ -344,7 +344,7 @@ pub fn remote_ahead_refusal(message: String) -> CoreError {
 
 /// The [`RefusalCode::PalletNotFound`] refusal for `reference`, a pallet this warehouse holds no
 /// ref for. A user pallet may exist on the remote, so with a remote configured the next step is
-/// `lower <name>`, which brings it in; without one it is `palletize <name>`, which creates it. A
+/// `lower <name>`, which brings it in; without one it is `pallet create <name>`, which creates it. A
 /// meta pallet is never created by hand: a bare `lower` syncs the remote's, and without a remote
 /// the next step lists the ones there are.
 pub fn pallet_not_found_refusal(reference: &PalletRef) -> CoreError {
@@ -367,7 +367,7 @@ pub fn pallet_not_found_refusal(reference: &PalletRef) -> CoreError {
         return CoreError::refusal(
             RefusalCode::PalletNotFound,
             format!("No meta pallet \"{}\" exists in this warehouse.", wire),
-            "forklift palletize --all",
+            "forklift pallet list --all",
         );
     }
 
@@ -376,7 +376,7 @@ pub fn pallet_not_found_refusal(reference: &PalletRef) -> CoreError {
             RefusalCode::PalletNotFound,
             format!(
                 "No pallet named \"{p}\" exists in this warehouse (or it has nothing stacked). If the \
-                remote has one, \"forklift lower {p}\" brings it in; \"forklift palletize {p}\" \
+                remote has one, \"forklift lower {p}\" brings it in; \"forklift pallet create {p}\" \
                 creates a new one.",
                 p = wire
             ),
@@ -388,10 +388,10 @@ pub fn pallet_not_found_refusal(reference: &PalletRef) -> CoreError {
         RefusalCode::PalletNotFound,
         format!(
             "No pallet named \"{p}\" exists in this warehouse (or it has nothing stacked). \
-            \"forklift palletize {p}\" creates it.",
+            \"forklift pallet create {p}\" creates it.",
             p = wire
         ),
-        format!("forklift palletize {}", wire),
+        format!("forklift pallet create {}", wire),
     )
 }
 
@@ -412,7 +412,7 @@ pub fn pallet_moved_refusal(current: Option<&str>, expected: Option<&str>) -> Co
 pub fn pallet_deleted_refusal(pallet: &str, head: &str, offers_drop: bool) -> CoreError {
     deleted_on_remote(pallet, format!(
         "Pallet \"{}\" was deleted on this remote at {}, and the name stays reserved for that \
-        history. \"forklift palletize --restore {} --remote\" brings it back; otherwise use \
+        history. \"forklift pallet restore {} --remote\" brings it back; otherwise use \
         another name for new work{}. Nothing was written.",
         pallet, head, pallet, tombstone_drop_clause(pallet, offers_drop)
     ))
@@ -427,13 +427,13 @@ pub fn pallet_recreation_refusal(pallet: &str, head: &str, acknowledged: bool, o
         false => format!(
             "Pallet \"{}\" was deleted on this remote at {}, and the name stays reserved for that \
             history: re-creating it must acknowledge the deletion (\"forklift lift --recreate\", for \
-            work that descends from it). \"forklift palletize --restore {} --remote\" brings it back \
+            work that descends from it). \"forklift pallet restore {} --remote\" brings it back \
             instead; otherwise lift the work under another name{}. Nothing was written.",
             pallet, head, pallet, drop
         ),
         true => format!(
             "Pallet \"{}\" was deleted on this remote at {}, and the new head does not descend from \
-            it: the name stays reserved for that history. \"forklift palletize --restore {} --remote\" \
+            it: the name stays reserved for that history. \"forklift pallet restore {} --remote\" \
             brings it back, to lower and consolidate into this work; otherwise lift the work under \
             another name{}. Nothing was written.",
             pallet, head, pallet, drop
@@ -460,7 +460,7 @@ fn deleted_on_remote(pallet: &str, message: String) -> CoreError {
     CoreError::refusal(
         RefusalCode::PalletDeletedOnRemote,
         message,
-        format!("forklift palletize --restore {} --remote", pallet),
+        format!("forklift pallet restore {} --remote", pallet),
     )
 }
 
@@ -833,7 +833,7 @@ impl std::fmt::Display for RefUpdateError {
 
                 write!(
                     f,
-                    " Run \"forklift palletize --restore {}\" to bring it back at that head; or, \
+                    " Run \"forklift pallet restore {}\" to bring it back at that head; or, \
                     where the warehouse is served from, \"forklift-server tombstone drop --root <warehouse> {}\" frees \
                     the name for unrelated history (and lets the deleted history be collected).",
                     pallet, pallet
@@ -3219,7 +3219,7 @@ pub(crate) mod tests {
             let refused = update_pallet_head("gone", None, &on_it, &RefPreconditions::NONE).unwrap_err();
 
             assert!(matches!(&refused, RefUpdateError::Deleted { acknowledged: false, .. }), "{:?}", refused);
-            assert!(refused.to_string().contains("forklift palletize --restore gone"), "{}", refused);
+            assert!(refused.to_string().contains("forklift pallet restore gone"), "{}", refused);
             assert_eq!(get_pallet_head("gone").unwrap(), None);
             assert_eq!(tombstone_utils::tombstone_heads().unwrap(), vec![hash('a')], "the tombstone stands");
             let _ = std::fs::remove_dir_all(&root);
@@ -3268,7 +3268,7 @@ pub(crate) mod tests {
             write_position(&BayPosition::new("gone", Some(hash('z')))).unwrap();
 
             let refused = tombstone_utils::restore_pallet("gone").unwrap_err();
-            assert!(refused.contains("out of step") && refused.contains("\"forklift palletize --restore gone\" again"), "{}", refused);
+            assert!(refused.contains("out of step") && refused.contains("\"forklift pallet restore gone\" again"), "{}", refused);
             assert_eq!(get_pallet_head("gone").unwrap(), None, "nothing was restored");
 
             // A bay at exactly the tombstone's head is put back in step by the restore.

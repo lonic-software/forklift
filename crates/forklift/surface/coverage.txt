@@ -79,6 +79,11 @@ forklift office regenesis: --confirm
 forklift office accept-regenesis: --confirm=<GENESIS>
 forklift office list:
 forklift palletize: [NAME] [REVISION] -a/--all --remote --delete --force --restore
+    -> forklift pallet:
+    -> forklift pallet list: -a/--all --remote
+    -> forklift pallet create: <NAME> [REVISION]
+    -> forklift pallet delete: <NAME> --force --remote
+    -> forklift pallet restore: <NAME> --remote
 forklift park:
 forklift park pop:
 forklift park list:

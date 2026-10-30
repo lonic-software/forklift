@@ -726,7 +726,7 @@ pub fn pop() -> Result<Option<JournalEntry>, String> {
 /// conflicted cherry-pick moves no ref). Or whether an undo of `entry` stopped halfway, after
 /// writing the bay's earlier position and before putting the refs back (see
 /// [`is_half_undone`]), which a retry resumes. Anything else means an
-/// operation outside the journal ran since (`palletize` and `deliver` switch the current pallet,
+/// operation outside the journal ran since (`pallet create` and `deliver` switch the current pallet,
 /// a fast-forward `lower` or a haul merge moves its head), and reversing `entry` now would undo an
 /// older operation than the user's last. Refs other than the current pallet are not compared: they
 /// are shared by every bay, and `restore_refs` already leaves any that moved alone.
@@ -770,7 +770,7 @@ pub fn check_undoable(entry: &JournalEntry) -> Result<(), String> {
     if now.current_pallet != after.current_pallet {
         return Err(format!(
             "The last journaled operation (\"{}\") left pallet \"{}\" current, but \"{}\" is \
-            current now: something outside the undo journal (such as palletize or deliver) \
+            current now: something outside the undo journal (such as pallet create or deliver) \
             switched pallets since, and undo cannot reach past it.",
             entry.op, after.current_pallet, now.current_pallet
         ));
@@ -864,7 +864,7 @@ fn refuse_a_served_rewind(entry: &JournalEntry) -> Result<(), String> {
             this warehouse has been served, so its clones may rely on that head. Nothing was undone, \
             and undo cannot reach an older operation past this one. To take the change out, stack a \
             parcel that reverts it; a pallet deleted since this warehouse was served comes back \
-            with \"forklift palletize --restore <name>\".",
+            with \"forklift pallet restore <name>\".",
             entry.op, crate::error::sanitize(&reference.name)
         ));
     }
@@ -2097,7 +2097,7 @@ mod tests {
     fn check_undoable_refuses_once_the_current_pallet_switched() {
         let _scratch = Scratch::new("gate-switched");
 
-        // The op left "main" current at 2; an un-journaled palletize has since switched to
+        // The op left "main" current at 2; an un-journaled pallet create has since switched to
         // "feature" at the same head.
         advance(
             "main",

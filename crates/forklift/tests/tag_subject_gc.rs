@@ -159,7 +159,7 @@ fn a_signed_tag_subject_is_collected_after_undo_moves_the_head_back() {
 
     // The canary: built and orphaned BEFORE the stack this test undoes, so `undo` (which targets
     // the newest journal entry) reverts the right thing. See `assert_the_sweep_ran`.
-    warehouse.run_ok(&["palletize", "canary"]);
+    warehouse.run_ok(&["pallet", "create", "canary"]);
     let canary = warehouse.stack("canary.txt", "c1\n", "canary work");
     warehouse.run_ok(&["shift", "main"]);
     warehouse.delete_pallet_ref("canary");
@@ -521,7 +521,7 @@ fn list_row_fields_cannot_forge_hide_or_corrupt_the_absent_marker() {
 
     // A genuinely absent-subject tag, built the same way
     // `a_signed_tag_subject_is_collected_after_undo_moves_the_head_back` does.
-    warehouse.run_ok(&["palletize", "canary"]);
+    warehouse.run_ok(&["pallet", "create", "canary"]);
     let canary = warehouse.stack("canary.txt", "c1\n", "canary work");
     warehouse.run_ok(&["shift", "main"]);
     warehouse.delete_pallet_ref("canary");

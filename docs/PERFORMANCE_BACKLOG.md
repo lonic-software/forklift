@@ -653,7 +653,7 @@ change):
 
 | Command | Before | After |
 |---------|--------|-------|
-| `history -n 1` | 7.5 ms | 3.4 ms (`palletize`, which reads no object: 3.3 ms) |
+| `history -n 1` | 7.5 ms | 3.4 ms (`pallet create`, which reads no object: 3.3 ms) |
 | `diff --staged` | 7.4 ms | 3.3 ms |
 | `stocktake` | 11.5 ms | 10.7 ms |
 | `store` | 15.0 ms | 17.4 ms — the census now checks every bucket's crc and the tiling |

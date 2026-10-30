@@ -15,8 +15,8 @@ and key change.
 
 Because it is namespaced, the office does not reserve any user pallet name — `office` is
 a legal working pallet, distinct from it. The office is addressed with the `@` qualifier:
-`history @office` and `audit @office` read it, `palletize --all` lists it. Working-pallet
-operations (`palletize`, `shift`, `consolidate`, `stack`) only ever see the user
+`history @office` and `audit @office` read it, `pallet list --all` lists it. Working-pallet
+operations (`pallet create`, `shift`, `consolidate`, `stack`) only ever see the user
 namespace, so they never touch it; the content guard (a tree with a top-level
 `.forklift` entry, in any case, is never materialized, and no working-directory
 write lands inside `.forklift`) stays as defense-in-depth.

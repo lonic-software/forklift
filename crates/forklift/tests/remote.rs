@@ -445,7 +445,7 @@ fn a_lift_uploads_a_subtree_introduced_by_a_parent_of_both_merge_sides() {
     let p = pallet_head(&area, "a", "main");
 
     // B — a second line off P, touching only a root file.
-    assert_success(&area.forklift("a", &["palletize", "side", &p])); // palletize also shifts
+    assert_success(&area.forklift("a", &["pallet", "create", "side", &p])); // pallet create also shifts
     area.write_file("a/b.txt", "b\n");
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "B edits b.txt"]));
@@ -1181,13 +1181,13 @@ fn diverged_pallets_are_refused_not_merged() {
     // B's lift must be refused: the remote moved. Nothing may be overwritten.
     let refused = area.forklift("b", &["lift"]);
     assert!(!refused.status.success());
-    assert!(stderr(&refused).contains("diverged") && stderr(&refused).contains("palletize"), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("diverged") && stderr(&refused).contains("pallet create"), "{}", stderr(&refused));
 
     let refused = area.forklift("b", &["--json", "lift"]);
     assert_eq!(refused.status.code(), Some(5), "{}{}", stdout(&refused), stderr(&refused));
     let value: serde_json::Value = serde_json::from_str(&stdout(&refused)).unwrap();
     assert_eq!(value["error"]["code"], "diverged", "{}", value);
-    assert!(value["error"]["next_step"].as_str().unwrap().starts_with("forklift palletize "), "{}", value);
+    assert!(value["error"]["next_step"].as_str().unwrap().starts_with("forklift pallet create "), "{}", value);
 
     // B's lower reports the divergence (with the parcels fetched for a consolidate).
     let diverged = area.forklift("b", &["lower"]);
@@ -1271,12 +1271,12 @@ fn a_scoped_merge_lifts_without_reading_the_out_of_scope_object() {
     assert_success(&area.forklift("dev-work", &["stack", "dev edits api"]));
 
     // Lower fetches the diverged remote head (with its out-of-scope object) and reports the
-    // divergence; palletize that head and consolidate it into work — the scoped bay adopts the
+    // divergence; make that head a pallet and consolidate it into work — the scoped bay adopts the
     // out-of-scope subtree by hash into the stacked merge parcel.
     let lowered = area.forklift("dev-work", &["lower"]);
     assert!(!lowered.status.success(), "the divergence must be reported: {}", stdout(&lowered));
 
-    assert_success(&area.forklift("dev-work", &["palletize", "incoming", &remote_web_head]));
+    assert_success(&area.forklift("dev-work", &["pallet", "create", "incoming", &remote_web_head]));
     assert_success(&area.forklift("dev-work", &["shift", "work"]));
     assert_success(&area.forklift("dev-work", &["consolidate", "incoming"]));
 
@@ -1445,7 +1445,7 @@ fn optimistic_lift_auto_merges_a_disjoint_divergence_but_stops_on_overlap() {
     assert_success(&area.forklift("b", &["stack", "b edits shared"]));
     let refused = area.forklift("b", &["lift"]);
     assert!(!refused.status.success(), "an overlapping divergence must not auto-merge");
-    assert!(stderr(&refused).contains("diverged") && stderr(&refused).contains("palletize"), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("diverged") && stderr(&refused).contains("pallet create"), "{}", stderr(&refused));
     assert_eq!(area.read_file("b/shared.txt"), "from b\n"); // untouched — no half-merge
 }
 
@@ -1695,7 +1695,7 @@ fn hauls_sync_across_remotes_and_replay_when_diverged() {
     assert_success(&area.forklift("a", &["office", "enroll"]));
 
     // Open a haul (feat → main) and lift — the @haul meta pallet rides along.
-    assert_success(&area.forklift("a", &["palletize", "feat"]));
+    assert_success(&area.forklift("a", &["pallet", "create", "feat"]));
     area.write_file("a/feat.txt", "x\n");
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "feat work"]));
@@ -1770,7 +1770,7 @@ fn hauls_sync_across_remotes_and_replay_when_diverged() {
     // head it did not merge: B moves the haul to other work and lifts while A merges the head it
     // has. (B's source is its own `feat`, whose objects A never needs to hold.)
     assert_success(&area.forklift("b", &["haul", "reopen", &id]));
-    assert_success(&area.forklift("b", &["palletize", "feat"]));
+    assert_success(&area.forklift("b", &["pallet", "create", "feat"]));
     area.write_file("b/other.txt", "z\n");
     assert_success(&area.forklift("b", &["load", "."]));
     assert_success(&area.forklift("b", &["stack", "other feat work"]));
@@ -1855,7 +1855,7 @@ fn haul_warehouse(area: &TestArea, server: &Server) {
     assert_success(&area.forklift("a", &["office", "enroll"]));
     assert_success(&area.forklift("a", &["lift"]));
 
-    assert_success(&area.forklift("a", &["palletize", "feat"]));
+    assert_success(&area.forklift("a", &["pallet", "create", "feat"]));
     stack_file(area, "a", "feat.txt", "x\n");
     assert_success(&area.forklift("a", &["lift"]));
     assert_success(&area.forklift("a", &["shift", "main"]));
@@ -2042,7 +2042,7 @@ fn a_rehost_refuses_a_merge_by_a_writer_since_ungranted_until_regranted() {
     prepare_warehouse(&area, "a", &server.url);
     stack_file(&area, "a", "base.txt", "base\n");
     assert_success(&area.forklift("a", &["office", "enroll"]));
-    assert_success(&area.forklift("a", &["palletize", "feat"]));
+    assert_success(&area.forklift("a", &["pallet", "create", "feat"]));
     stack_file(&area, "a", "feat.txt", "x\n");
     assert_success(&area.forklift("a", &["shift", "main"]));
     let id = open_haul(&area, "a", "Feat");
@@ -2723,7 +2723,7 @@ fn operator_tokens_enforce_roles_and_pallet_grants() {
     assert!(stderr(&refused).contains("not an office admin"), "{}", stderr(&refused));
 
     // The writer's grant is "main" only: another pallet is refused by the remote.
-    assert_success(&area.forklift("b", &["palletize", "side"]));
+    assert_success(&area.forklift("b", &["pallet", "create", "side"]));
     area.write_file("b/code.txt", "v3 on side\n");
     assert_success(&area.forklift("b", &["load", "code.txt"]));
     assert_success(&area.forklift("b", &["stack", "side change"]));
@@ -3259,12 +3259,12 @@ fn a_revocation_does_not_vouch_for_work_the_remote_keeps_under_a_tombstone() {
     // holds the worker's parcel there.
     assert_success(&area.forklift(".", &["franchise", &server.url, "b", "--token", "w-token"]));
     assert_success(&area.forklift("b", &["config", "operator.identifier", "worker@forklift"]));
-    assert_success(&area.forklift("b", &["palletize", "feat"]));
+    assert_success(&area.forklift("b", &["pallet", "create", "feat"]));
     area.write_file("b/code.txt", "v2 by worker\n");
     assert_success(&area.forklift("b", &["load", "code.txt"]));
     assert_success(&area.forklift("b", &["stack", "side work"]));
     assert_success(&area.forklift("b", &["lift"]));
-    assert_success(&area.forklift("a", &["palletize", "--delete", "feat", "--remote"]));
+    assert_success(&area.forklift("a", &["pallet", "delete", "feat", "--remote"]));
 
     // The admin revokes the worker's key: the boundary is the remote's live heads, not the tombstone.
     assert_success(&area.forklift("a", &["lower"]));
@@ -3278,7 +3278,7 @@ fn a_revocation_does_not_vouch_for_work_the_remote_keeps_under_a_tombstone() {
     assert_success(&area.forklift("a", &["office", "retire", &worker_key_id, "--compromised"]));
     assert_success(&area.forklift("a", &["lift"]));
 
-    let restored = area.forklift("a", &["palletize", "--restore", "feat", "--remote"]);
+    let restored = area.forklift("a", &["pallet", "restore", "feat", "--remote"]);
     assert!(!restored.status.success(), "the deleted work is not vouched for: {}", stdout(&restored));
     assert!(stderr(&restored).contains("distrust boundary"), "{}", stderr(&restored));
     assert!(!area.path("server-root/.forklift/pallets/feat").exists(), "the pallet stays deleted");
@@ -3524,7 +3524,7 @@ fn franchising_an_unborn_default_pallet_starts_unborn() {
     area.write_file("a/doc.txt", "v1\n");
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "base"]));
-    assert_success(&area.forklift("a", &["palletize", "feature"]));
+    assert_success(&area.forklift("a", &["pallet", "create", "feature"]));
     area.write_file("a/doc.txt", "v2 on feature\n");
     assert_success(&area.forklift("a", &["load", "doc.txt"]));
     assert_success(&area.forklift("a", &["stack", "feature work"]));
@@ -4398,7 +4398,7 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_reads_signer_boundar
 
     // A second, local-only pallet: its head will sit in the retirement's boundary below but
     // will never reach the remote — nothing ever lifts `side`.
-    assert_success(&area.forklift("dev", &["palletize", "side"]));
+    assert_success(&area.forklift("dev", &["pallet", "create", "side"]));
     area.write_file("dev/side.txt", "side work\n");
     assert_success(&area.forklift("dev", &["load", "side.txt"]));
     assert_success(&area.forklift("dev", &["stack", "side work"]));
@@ -4558,7 +4558,7 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_audits_the_vouched_p
 
     // A second, local-only pallet: its head will sit in the retirement's boundary below but
     // will never reach the remote — nothing ever lifts `side`.
-    assert_success(&area.forklift("dev", &["palletize", "side"]));
+    assert_success(&area.forklift("dev", &["pallet", "create", "side"]));
     area.write_file("dev/side.txt", "side work\n");
     assert_success(&area.forklift("dev", &["load", "side.txt"]));
     assert_success(&area.forklift("dev", &["stack", "side work"]));
@@ -4619,7 +4619,7 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_audits_the_vouched_p
 
 /// Construction T (PR #121 round 2): the trust-arm honest refusal, reproduced end to end
 /// against the ORIGIN SERVER from two entirely ordinary commands — `office enroll`,
-/// `palletize`, `lift` — never a hand-built fixture and never a deleted object. This is the
+/// `pallet create`, `lift` — never a hand-built fixture and never a deleted object. This is the
 /// direct falsifier of PR #121 round 1's interior-only narrowing: under that narrowing this
 /// exact, unremarkable sequence made the origin ACCUSE a genuinely pre-trust, legacy parcel of
 /// tampering, and the defect was not confined to clones or the AWS Lambda head — it fired here
@@ -4627,7 +4627,7 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_audits_the_vouched_p
 ///
 /// `w` stacks three unsigned parcels on `main` (U1 <- U2 <- U3, no office yet), enrolls with no
 /// remote configured (`office enroll`'s boundary is then purely local: exactly `[U3]`, per
-/// `commands/office.rs`'s `enroll`), then `palletize`s "feature" at U1 — an OLDER ancestor of
+/// `commands/office.rs`'s `enroll`), then creates pallet "feature" at U1 — an OLDER ancestor of
 /// `main`'s current head, not `main`'s head itself. Only now is a fresh remote configured, and
 /// `lift` (current pallet: "feature") uploads U1's own closure, which does NOT include U2 or U3
 /// (they are U1's descendants, not its ancestors).
@@ -4681,7 +4681,7 @@ fn enrolling_then_lifting_to_a_fresh_remote_with_an_unlifted_other_pallet_refuse
 
     // "feature" starts at U1 — an ancestor of `main`'s current head, not the head itself — so
     // lifting it never touches U2 or U3.
-    assert_success(&area.forklift("w", &["palletize", "feature", &u1]));
+    assert_success(&area.forklift("w", &["pallet", "create", "feature", &u1]));
 
     // The remote is configured only now, AFTER enroll: it plays no part in the boundary.
     assert_success(&area.forklift("w", &["config", "remote.url", &server.url]));
@@ -4737,12 +4737,12 @@ fn enrolling_then_lifting_to_a_fresh_remote_with_an_unlifted_other_pallet_refuse
 /// `git show main:crates/forklift-core/src/util/audit_utils.rs`), so this exact sequence was
 /// already handled soundly before PR #121 round 1 narrowed it to interior-only gaps.
 ///
-/// `w` is trusted, with admin `admin@forklift` and agent key `A`. `side` is palletized from
+/// `w` is trusted, with admin `admin@forklift` and agent key `A`. `side` is created from
 /// `main`'s current head (call it M1); as `A`, two parcels are stacked on `side`: A0, then A1
 /// (`side`'s new head). Back on `main` (still at M1, untouched), the admin retires `A`:
 /// `revocation_boundary` (`commands/office.rs`) snapshots every LOCAL pallet head at that
 /// moment — `main`'s M1 and `side`'s A1 — so `A.distrust_boundary = [M1, A1]`. A THIRD pallet,
-/// "tmp", is then palletized at A0 (an ancestor of A1, not A1 itself) and lifted: the office
+/// "tmp", is then created at A0 (an ancestor of A1, not A1 itself) and lifted: the office
 /// parcel and "tmp" (closure of A0) reach the server, but `side` — and so A1 — never do.
 ///
 /// M1 being present is irrelevant to A0: reachability only ever follows `.parents` (backward),
@@ -4796,7 +4796,7 @@ fn retiring_a_signer_then_lifting_only_a_replacement_pallet_refuses_instead_of_a
     ]));
 
     // "side" starts at M1 (main's current head). As the agent, stack A0 then A1 on it.
-    assert_success(&area.forklift("w", &["palletize", "side"]));
+    assert_success(&area.forklift("w", &["pallet", "create", "side"]));
     assert_success(&area.forklift("w", &["config", "--global", "operator.identifier", "agent@forklift"]));
     area.write_file("w/side.txt", "a0\n");
     assert_success(&area.forklift("w", &["load", "."]));
@@ -4828,7 +4828,7 @@ fn retiring_a_signer_then_lifting_only_a_replacement_pallet_refuses_instead_of_a
 
     // "tmp" starts at A0 — `side`'s own earlier parcel, never its current head — and is lifted.
     // `side` itself is never lifted, so A1 never reaches the server.
-    assert_success(&area.forklift("w", &["palletize", "tmp", &a0]));
+    assert_success(&area.forklift("w", &["pallet", "create", "tmp", &a0]));
 
     let first_lift = area.forklift("w", &["lift"]);
     let out = format!("{}{}", stdout(&first_lift), stderr(&first_lift));
@@ -5077,7 +5077,7 @@ fn sparse_after_a_diverged_lower(area: &TestArea, server: &Server) -> (String, S
 }
 
 // Revert: expand skips the fetched-heads ledger → the remote head's src/web stays sealed, so the
-// palletize makes a ref whose closure lacks it.
+// pallet create makes a ref whose closure lacks it.
 #[test]
 fn expand_fetches_the_widened_content_of_a_head_a_refused_lower_fetched() {
     let area = TestArea::new("sparse-expand-ledger");
@@ -5085,15 +5085,15 @@ fn expand_fetches_the_widened_content_of_a_head_a_refused_lower_fetched() {
     let (up_head, web_blob) = sparse_after_a_diverged_lower(&area, &server);
 
     assert_success(&area.forklift("sparse", &["expand", "src/web"]));
-    assert_success(&area.forklift("sparse", &["palletize", &format!("main-remote-{}", &up_head[..12]), &up_head]));
+    assert_success(&area.forklift("sparse", &["pallet", "create", &format!("main-remote-{}", &up_head[..12]), &up_head]));
 
-    assert!(object_present(&area, "sparse", &web_blob), "the palletized head's widened content is present");
+    assert!(object_present(&area, "sparse", &web_blob), "the new pallet's head's widened content is present");
 }
 
-// Revert: let the ref compare-and-set skip the closure check → the palletize lands on a head
+// Revert: let the ref compare-and-set skip the closure check → the pallet create lands on a head
 // whose src/web is missing.
 #[test]
-fn expand_leaves_a_fetched_head_the_remote_can_no_longer_serve_unpalletizable() {
+fn expand_leaves_a_fetched_head_the_remote_can_no_longer_serve_unable_to_become_a_pallet() {
     let area = TestArea::new("sparse-expand-unservable");
     let server = Server::start(&area, None);
     let (up_head, web_blob) = sparse_after_a_diverged_lower(&area, &server);
@@ -5103,7 +5103,7 @@ fn expand_leaves_a_fetched_head_the_remote_can_no_longer_serve_unpalletizable() 
     let expanded = area.forklift("sparse", &["expand", "src/web"]);
     assert_success(&expanded);
 
-    let refused = area.forklift("sparse", &["palletize", "x", &up_head]);
+    let refused = area.forklift("sparse", &["pallet", "create", "x", &up_head]);
     assert!(!refused.status.success(), "an incomplete head is no new head: {}", stdout(&refused));
     assert!(stderr(&refused).contains("not completely present"), "{}", stderr(&refused));
     assert!(!area.path("sparse/.forklift/pallets/x").exists());
@@ -5117,7 +5117,7 @@ fn expand_checks_its_paths_before_walking_other_histories() {
     let server = Server::start(&area, None);
     let (up_head, web_blob) = sparse_after_a_diverged_lower(&area, &server);
 
-    assert_success(&area.forklift("sparse", &["palletize", "x", &up_head]));
+    assert_success(&area.forklift("sparse", &["pallet", "create", "x", &up_head]));
     assert_success(&area.forklift("sparse", &["shift", "main"]));
     std::fs::remove_file(object_store_path(&area, "server-root", &web_blob)).unwrap();
 
@@ -5289,7 +5289,7 @@ fn a_sparse_workspace_refuses_to_lift_to_a_non_origin_remote() {
 
 /// Every command that talks to a remote from a partial warehouse talks only to its origin: pointed
 /// at another remote that holds the same history and more, the remote pallet listing, `office
-/// enroll` and `accept-regenesis`, `lower`, `expand`, `scope-prune`, `palletize --delete` (asking
+/// enroll` and `accept-regenesis`, `lower`, `expand`, `scope-prune`, `pallet delete` (asking
 /// whether the remote holds the pallet's work), and the remote `--delete` and `--restore` each
 /// refuse as `non_origin_remote` (exit 11), naming both remotes,
 /// with every file under `.forklift` as it was. A full warehouse lowers from the same remote.
@@ -5321,11 +5321,11 @@ fn a_partial_warehouse_talks_to_no_remote_but_its_origin() {
     assert_success(&area.forklift("dev", &["stack", "second"]));
     assert_success(&area.forklift("dev", &["config", "remote.url", &server2.url]));
     assert_success(&area.forklift("dev", &["lift"]));
-    assert_success(&area.forklift("dev", &["palletize", "extra"]));
+    assert_success(&area.forklift("dev", &["pallet", "create", "extra"]));
     assert_success(&area.forklift("dev", &["lift"]));
 
     // Work only a local pallet holds, so deleting it asks the remote.
-    assert_success(&area.forklift("sparse", &["palletize", "old"]));
+    assert_success(&area.forklift("sparse", &["pallet", "create", "old"]));
     area.write_file("sparse/src/api/old.txt", "old\n");
     assert_success(&area.forklift("sparse", &["load", "."]));
     assert_success(&area.forklift("sparse", &["stack", "old work"]));
@@ -5337,15 +5337,15 @@ fn a_partial_warehouse_talks_to_no_remote_but_its_origin() {
     let before = forklift_dir_snapshot(&area, "sparse");
 
     let commands: [&[&str]; 9] = [
-        &["palletize", "--remote"],
+        &["pallet", "list", "--remote"],
         &["office", "enroll"],
         &["office", "accept-regenesis"],
         &["lower"],
         &["expand", "src/web"],
         &["scope-prune", "docs"],
-        &["palletize", "--delete", "old"],
-        &["palletize", "--delete", "extra", "--remote"],
-        &["palletize", "--restore", "extra", "--remote"],
+        &["pallet", "delete", "old"],
+        &["pallet", "delete", "extra", "--remote"],
+        &["pallet", "restore", "extra", "--remote"],
     ];
     for command in commands {
         let mut args = vec!["--json"];
@@ -5360,7 +5360,7 @@ fn a_partial_warehouse_talks_to_no_remote_but_its_origin() {
     }
 
     // The other remote still has the pallet the refused delete named.
-    let listed = json_of(&area.forklift("dev", &["--json", "palletize", "--remote"]));
+    let listed = json_of(&area.forklift("dev", &["--json", "pallet", "list", "--remote"]));
     assert!(listed.to_string().contains("extra"), "{}", listed);
 
     assert_success(&area.forklift("full", &["config", "remote.url", &server2.url]));
@@ -5469,7 +5469,7 @@ fn an_unscoped_bay_in_a_sparse_warehouse_is_refused_up_front() {
         && message.contains("src/api"), "{}", message);
     assert!(!bay_dir.exists(), "no bay directory is left behind");
     assert!(!area.path("sparse/.forklift/bays/plain").exists(), "no bay state is left behind");
-    let pallets = area.forklift("sparse", &["palletize"]);
+    let pallets = area.forklift("sparse", &["pallet", "list"]);
     assert!(!stdout(&pallets).contains("plain"), "no pallet is left behind: {}", stdout(&pallets));
 
     // A root scope names the whole tree too; the refusal points at the fetch scope, not at the plain
@@ -5921,7 +5921,7 @@ fn a_cache_shift_to_a_pallet_lowered_elsewhere_fetches_its_head() {
     let (server, _) = three_signed_parcels(&area);
     assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
 
-    assert_success(&area.forklift("a", &["palletize", "feature"]));
+    assert_success(&area.forklift("a", &["pallet", "create", "feature"]));
     area.write_file("a/src/feature.txt", "feature\n");
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "a feature"]));
@@ -5970,7 +5970,7 @@ fn file_of(area: &TestArea, directory: &str, tree: &str, name: &str) -> String {
 /// files under `src` and removes `docs/one.txt`. Returns its head, its root, and the two new
 /// files' blobs.
 fn lift_feature(area: &TestArea) -> (String, String, [String; 2]) {
-    assert_success(&area.forklift("a", &["palletize", "feature"]));
+    assert_success(&area.forklift("a", &["pallet", "create", "feature"]));
     area.write_file("a/src/feature.txt", "feature\n");
     area.write_file("a/src/more.txt", "more\n");
     std::fs::remove_file(area.path("a/docs/one.txt")).unwrap();
@@ -6112,7 +6112,7 @@ fn a_cache_shift_fetches_the_trees_it_plans_over_one_batch_per_level() {
 fn a_cache_merge_fetches_its_trees_by_level_and_its_blobs_in_one_batch() {
     let area = TestArea::new("cache-merge-levels");
     let (server, _) = three_signed_parcels(&area);
-    assert_success(&area.forklift("a", &["palletize", "feature"]));
+    assert_success(&area.forklift("a", &["pallet", "create", "feature"]));
     for (file, content) in [("src/code.txt", "feature\n"), ("docs/two.txt", "feature two\n"), ("docs/three.txt", "feature three\n")] {
         area.write_file(&format!("a/{}", file), content);
     }
@@ -6311,7 +6311,7 @@ fn a_new_pallets_first_lift_stops_at_the_history_the_remote_holds() {
     assert_record_is(&area, "cached", &[&middle_root, &oldest_root]);
 
     for warehouse in ["a", "cached"] {
-        assert_success(&area.forklift(warehouse, &["palletize", &format!("feature-{}", warehouse)]));
+        assert_success(&area.forklift(warehouse, &["pallet", "create", &format!("feature-{}", warehouse)]));
         area.write_file(&format!("{}/src/feature.txt", warehouse), &format!("{}\n", warehouse));
         assert_success(&area.forklift(warehouse, &["load", "."]));
         assert_success(&area.forklift(warehouse, &["stack", "the feature"]));
@@ -6379,7 +6379,7 @@ fn a_cache_auto_merge_fetches_a_held_parcels_content() {
 /// head out on a pallet of its own, so a cache fetches that head's content before refusing, and
 /// the next step works through to a lift.
 ///
-/// Revert: fetch the head's content only past the divergence check → `palletize` cannot check the
+/// Revert: fetch the head's content only past the divergence check → `pallet create` cannot check the
 /// remote head out.
 #[test]
 fn a_diverged_cache_lower_leaves_its_next_step_workable() {
@@ -6401,7 +6401,7 @@ fn a_diverged_cache_lower_leaves_its_next_step_workable() {
 
     let short = &theirs[..12];
     let side = format!("main-remote-{}", short);
-    assert_success(&area.forklift("cached", &["palletize", &side, short]));
+    assert_success(&area.forklift("cached", &["pallet", "create", &side, short]));
     assert_eq!(area.read_file("cached/from_a.txt"), "a\n");
     assert_success(&area.forklift("cached", &["shift", "main"]));
     assert_success(&area.forklift("cached", &["consolidate", &side]));
@@ -6564,7 +6564,7 @@ fn a_pending_move_of_the_origin_refuses_every_remote_client_and_every_writer_it_
 
     let area = TestArea::new("origin-move-pending");
     let (server, head) = three_signed_parcels(&area);
-    assert_success(&area.forklift("a", &["palletize", "extra"]));
+    assert_success(&area.forklift("a", &["pallet", "create", "extra"]));
     assert_success(&area.forklift("a", &["lift"]));
 
     assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src", "--only", "docs"]));
@@ -6573,7 +6573,7 @@ fn a_pending_move_of_the_origin_refuses_every_remote_client_and_every_writer_it_
 
     // Local work for the deletes and the undo to act on, and a scope path no checkout holds.
     for directory in ["sparse", "cached"] {
-        assert_success(&area.forklift(directory, &["palletize", "old"]));
+        assert_success(&area.forklift(directory, &["pallet", "create", "old"]));
         area.write_file(&format!("{}/src/old.txt", directory), "old\n");
         assert_success(&area.forklift(directory, &["load", "."]));
         assert_success(&area.forklift(directory, &["stack", "old work"]));
@@ -6585,23 +6585,23 @@ fn a_pending_move_of_the_origin_refuses_every_remote_client_and_every_writer_it_
     assert_success(&area.forklift("sparse", &["stack", "local"]));
 
     let sparse_commands: [&[&str]; 12] = [
-        &["palletize", "--remote"],
+        &["pallet", "list", "--remote"],
         &["office", "rotate"],
         &["office", "accept-regenesis"],
         &["lower"],
         &["lift"],
         &["expand", "notes"],
         &["scope-prune", "docs"],
-        &["palletize", "--delete", "old"],
-        &["palletize", "--delete", "extra", "--remote"],
-        &["palletize", "--restore", "extra", "--remote"],
+        &["pallet", "delete", "old"],
+        &["pallet", "delete", "extra", "--remote"],
+        &["pallet", "restore", "extra", "--remote"],
         &["undo"],
-        &["palletize", "--delete", "old", "--force"],
+        &["pallet", "delete", "old", "--force"],
     ];
     let cache_commands: [&[&str]; 3] = [
         &["store", "evict"],
         &["show", &format!("{}:src/code.txt", oldest)],
-        &["palletize", "--delete", "old", "--force"],
+        &["pallet", "delete", "old", "--force"],
     ];
 
     for phase in [Phase::Checking, Phase::Rewriting] {
@@ -6641,7 +6641,7 @@ fn a_pending_move_of_the_origin_refuses_every_remote_client_and_every_writer_it_
     // With the intent gone, what it refused runs.
     assert_success(&area.forklift("sparse", &["lift"]));
     assert_success(&area.forklift("cached", &["show", &format!("{}:src/code.txt", oldest)]));
-    assert_success(&area.forklift("cached", &["palletize", "--delete", "old", "--force"]));
+    assert_success(&area.forklift("cached", &["pallet", "delete", "old", "--force"]));
     assert_success(&area.forklift("cached", &["store", "evict"]));
 }
 
@@ -6706,7 +6706,7 @@ fn a_partial_warehouse_moves_its_origin_to_a_copy_and_works_against_it() {
 
     // Unlifted work on its own pallet, stacked on "three", whose docs subtree only it and three's
     // root name; then the checkout moves past three and the eviction frees that subtree.
-    assert_success(&area.forklift("cached", &["palletize", "local"]));
+    assert_success(&area.forklift("cached", &["pallet", "create", "local"]));
     area.write_file("cached/src/local.txt", "local\n");
     assert_success(&area.forklift("cached", &["load", "."]));
     assert_success(&area.forklift("cached", &["stack", "local work"]));
@@ -7170,7 +7170,7 @@ fn evict_keeps_an_in_progress_consolidation_and_it_finishes() {
     let (server, _) = three_signed_parcels(&area);
     assert_success(&area.forklift(".", &["franchise", &server.url, "cached", "--cache"]));
 
-    assert_success(&area.forklift("a", &["palletize", "feature"]));
+    assert_success(&area.forklift("a", &["pallet", "create", "feature"]));
     area.write_file("a/src/code.txt", "feature\n");
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "feature"]));
@@ -7426,7 +7426,7 @@ fn a_merge_second_parent_below_the_remote_head_lifts_from_a_sparse_store() {
 
     let lowered = area.forklift("sparse", &["lower"]);
     assert!(!lowered.status.success(), "the first divergence must be reported");
-    assert_success(&area.forklift("sparse", &["palletize", "incoming1", &p2]));
+    assert_success(&area.forklift("sparse", &["pallet", "create", "incoming1", &p2]));
     assert_success(&area.forklift("sparse", &["shift", "main"]));
     assert_success(&area.forklift("sparse", &["consolidate", "incoming1"]));
 
@@ -7442,7 +7442,7 @@ fn a_merge_second_parent_below_the_remote_head_lifts_from_a_sparse_store() {
     // The sparse workspace merges p3 too — building the second merge whose ancestry re-reaches p2.
     let lowered = area.forklift("sparse", &["lower"]);
     assert!(!lowered.status.success(), "the second divergence must be reported");
-    assert_success(&area.forklift("sparse", &["palletize", "incoming2", &p3]));
+    assert_success(&area.forklift("sparse", &["pallet", "create", "incoming2", &p3]));
     assert_success(&area.forklift("sparse", &["shift", "main"]));
     assert_success(&area.forklift("sparse", &["consolidate", "incoming2"]));
 
@@ -8155,7 +8155,7 @@ fn scope_prune_frees_work_the_remote_keeps_under_a_tombstone() {
     let area = TestArea::new("scope-prune-tombstone");
     let _server = sparse_with_docs(&area);
 
-    assert_success(&area.forklift("sparse", &["palletize", "side"]));
+    assert_success(&area.forklift("sparse", &["pallet", "create", "side"]));
     std::fs::write(area.path("sparse/docs/guide.md"), "guide on side\n").unwrap();
     assert_success(&area.forklift("sparse", &["load", "."]));
     assert_success(&area.forklift("sparse", &["stack", "side docs edit"]));
@@ -8164,7 +8164,7 @@ fn scope_prune_frees_work_the_remote_keeps_under_a_tombstone() {
     assert_success(&area.forklift("sparse", &["lift"]));
     assert_success(&area.forklift("sparse", &["shift", "main"]));
 
-    assert_success(&area.forklift("dev", &["palletize", "--delete", "side", "--remote"]));
+    assert_success(&area.forklift("dev", &["pallet", "delete", "side", "--remote"]));
     assert_success(&area.forklift("sparse", &["narrow", "docs"]));
 
     let pruned = area.forklift("sparse", &["--json", "scope-prune", "docs"]);
@@ -8190,7 +8190,7 @@ fn scope_prune_asks_and_lifts_a_pallet_named_with_a_slash() {
     assert_success(&area.forklift("dev", &["load", "."]));
     assert_success(&area.forklift("dev", &["stack", "ahead"]));
     assert_success(&area.forklift("dev", &["lift"]));
-    assert_success(&area.forklift("dev", &["palletize", "feature/x"]));
+    assert_success(&area.forklift("dev", &["pallet", "create", "feature/x"]));
     assert_success(&area.forklift("dev", &["shift", "feature/x"]));
     area.write_file("dev/src/api/a.txt", "api v3\n");
     assert_success(&area.forklift("dev", &["load", "."]));
@@ -8256,7 +8256,7 @@ fn a_slash_named_pallet_crosses(proxy: SlashProxy, name: &str) {
     assert_success(&area.forklift("dev", &["load", "."]));
     assert_success(&area.forklift("dev", &["stack", "ahead"]));
     assert_success(&area.forklift("dev", &["lift"]));
-    assert_success(&area.forklift("dev", &["palletize", "feature/x"]));
+    assert_success(&area.forklift("dev", &["pallet", "create", "feature/x"]));
     assert_success(&area.forklift("dev", &["shift", "feature/x"]));
     area.write_file("dev/src/api/a.txt", "api v3\n");
     assert_success(&area.forklift("dev", &["load", "."]));
@@ -8277,7 +8277,7 @@ fn a_slash_named_pallet_crosses(proxy: SlashProxy, name: &str) {
     assert!(!object_present(&area, "sparse", &docs_blob), "history the remote confirms is freed");
 
     assert_success(&area.forklift("dev", &["shift", "main"]));
-    assert_success(&area.forklift("dev", &["palletize", "--delete", "feature/x", "--remote"]));
+    assert_success(&area.forklift("dev", &["pallet", "delete", "feature/x", "--remote"]));
     assert_eq!(remote_pallet_head(&server, "feature/x"), None, "the delete removed feature/x");
     assert_eq!(remote_pallet_head(&server, "main").as_deref(), Some(pallet_head(&area, "dev", "main").as_str()));
 }
@@ -8342,7 +8342,7 @@ fn scope_prune_frees_nothing_the_remote_moved_back_past_or_started_over() {
     assert_success(&area.forklift("dev", &["lift"]));
     let ahead = pallet_head(&area, "dev", "main");
 
-    assert_success(&area.forklift("dev", &["palletize", "side", &base]));
+    assert_success(&area.forklift("dev", &["pallet", "create", "side", &base]));
     area.write_file("dev/src/api/a.txt", "api side\n");
     assert_success(&area.forklift("dev", &["load", "."]));
     assert_success(&area.forklift("dev", &["stack", "side"]));
@@ -9583,7 +9583,7 @@ fn heal_driven_refetch_recovers_a_hash_referenced_only_by_a_non_current_pallet()
 
     // A second, published pallet: its head is a durable ref (a closure-walk root) exactly like
     // `main`'s, but it is never the *current* pallet when `heal` runs below.
-    assert_success(&area.forklift("dev", &["palletize", "other"]));
+    assert_success(&area.forklift("dev", &["pallet", "create", "other"]));
     area.write_file("dev/other.txt", "other content\n");
     assert_success(&area.forklift("dev", &["load", "other.txt"]));
     assert_success(&area.forklift("dev", &["stack", "other parcel"]));
@@ -10225,7 +10225,7 @@ fn kv_needs_an_office_and_refuses_readers() {
 
     // Nor may it deliver, which writes a pallet and a manifest entry: the target stays put.
     assert_success(&area.forklift("a", &["config", "--unset", "operator.identifier"]));
-    assert_success(&area.forklift("a", &["palletize", "draft"]));
+    assert_success(&area.forklift("a", &["pallet", "create", "draft"]));
     area.write_file("a/code.txt", "v2\n");
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "draft work"]));
@@ -10400,7 +10400,7 @@ fn a_conflicted_kv_pallet_does_not_hold_back_the_working_pallet() {
     assert!(stdout(&again).contains("ours") && stdout(&again).contains("theirs"), "{}", stdout(&again));
 
     // When the working pallet itself fails, its error leads and still names the conflict.
-    assert_success(&area.forklift("a", &["palletize", "side"]));
+    assert_success(&area.forklift("a", &["pallet", "create", "side"]));
     let failed = area.forklift("a", &["lower"]);
     assert!(!failed.status.success());
     assert_ne!(failed.status.code(), Some(24), "the working pallet's failure outranks the conflict");
@@ -10441,7 +10441,7 @@ fn the_server_neither_prepares_nor_serves_a_bay() {
     assert!(!served.status.success());
 }
 
-// ---- Remote pallets: `lower <pallet>`, `palletize --remote`, the pallet_not_found refusal ----
+// ---- Remote pallets: `lower <pallet>`, `pallet list --remote`, the pallet_not_found refusal ----
 
 /// Warehouse "a" lifts `main` (base.txt), "b" franchises it, then "a" lifts `feat` (feat.txt) and
 /// stands on main again. "b" has no `feat` ref; returns the remote's feat head.
@@ -10451,7 +10451,7 @@ fn remote_with_a_side_pallet(area: &TestArea, server: &Server) -> String {
     assert_success(&area.forklift("a", &["lift"]));
     assert_success(&area.forklift(".", &["franchise", &server.url, "b"]));
 
-    assert_success(&area.forklift("a", &["palletize", "feat"]));
+    assert_success(&area.forklift("a", &["pallet", "create", "feat"]));
     stack_file(area, "a", "feat.txt", "feat v1\n");
     assert_success(&area.forklift("a", &["lift"]));
     assert_success(&area.forklift("a", &["shift", "main"]));
@@ -10551,12 +10551,12 @@ fn a_named_lower_whose_fetch_fails_leaves_no_ref() {
 
 // Revert: report every local head as same → feat/side relations collapse.
 #[test]
-fn palletize_remote_lists_the_remotes_pallets_against_this_warehouse() {
-    let area = TestArea::new("palletize-remote");
+fn pallet_list_remote_lists_the_remotes_pallets_against_this_warehouse() {
+    let area = TestArea::new("pallet-list-remote");
     let server = Server::start(&area, None);
     remote_with_a_side_pallet(&area, &server);
     assert_success(&area.forklift("a", &["office", "enroll"]));
-    assert_success(&area.forklift("a", &["palletize", "side"]));
+    assert_success(&area.forklift("a", &["pallet", "create", "side"]));
     stack_file(&area, "a", "side.txt", "side v1\n");
     assert_success(&area.forklift("a", &["lift"]));
     assert_success(&area.forklift("a", &["shift", "main"]));
@@ -10565,14 +10565,14 @@ fn palletize_remote_lists_the_remotes_pallets_against_this_warehouse() {
     assert_success(&area.forklift("b", &["lower", "side"]));
     stack_file(&area, "b", "local.txt", "local\n");
     advance_remote(&area, "side", "side.txt", "side v2\n");
-    assert_success(&area.forklift("a", &["palletize", "fresh"]));
+    assert_success(&area.forklift("a", &["pallet", "create", "fresh"]));
     assert_success(&area.forklift("a", &["lift"]));
     assert_success(&area.forklift("a", &["shift", "main"]));
 
     let pallets_before = std::fs::read_dir(area.path("b/.forklift/pallets")).unwrap().count();
     let objects_before = std::fs::read_dir(area.path("b/.forklift/objects")).unwrap().count();
 
-    let listed = area.forklift("b", &["--json", "palletize", "--remote"]);
+    let listed = area.forklift("b", &["--json", "pallet", "list", "--remote"]);
     assert_success(&listed);
     let value = json_of(&listed);
     let relation = |name: &str| value["data"]["pallets"].as_array().unwrap().iter()
@@ -10586,7 +10586,7 @@ fn palletize_remote_lists_the_remotes_pallets_against_this_warehouse() {
     assert!(value["data"].get("meta").is_none(), "meta pallets only with --all: {}", value);
     assert!(value["data"]["pallets"].as_array().unwrap().iter().all(|e| !e["name"].as_str().unwrap().starts_with('@')));
 
-    let all = json_of(&area.forklift("b", &["--json", "palletize", "--remote", "--all"]));
+    let all = json_of(&area.forklift("b", &["--json", "pallet", "list", "--remote", "--all"]));
     assert!(all["data"]["meta"].as_array().unwrap().iter().any(|e| e["name"] == "@office"), "{}", all);
 
     assert_eq!(std::fs::read_dir(area.path("b/.forklift/pallets")).unwrap().count(), pallets_before);
@@ -10602,7 +10602,7 @@ fn refusal_of(output: &Output, exit: i32) -> serde_json::Value {
 
 /// The remote's head of meta pallet `name`, if it has one, read through `dir`'s remote listing.
 fn remote_meta_head(area: &TestArea, dir: &str, name: &str) -> Option<String> {
-    let listed = json_of(&area.forklift(dir, &["--json", "palletize", "--remote", "--all"]));
+    let listed = json_of(&area.forklift(dir, &["--json", "pallet", "list", "--remote", "--all"]));
     listed["data"]["meta"].as_array()?.iter()
         .find(|entry| entry["name"] == name)
         .map(|entry| entry["remote_head"].as_str().unwrap().to_string())
@@ -10618,7 +10618,7 @@ fn a_pallet_deleted_on_the_remote_is_listed_and_lifts_back_only_acknowledged() {
     let feat = remote_with_a_side_pallet(&area, &server);
     assert_success(&area.forklift("b", &["lower", "feat"]));
 
-    let deleted = area.forklift("a", &["--json", "palletize", "--delete", "feat", "--remote"]);
+    let deleted = area.forklift("a", &["--json", "pallet", "delete", "feat", "--remote"]);
     assert_success(&deleted);
     let value = json_of(&deleted);
     assert_eq!(value["data"]["head"], feat.as_str(), "{}", value);
@@ -10628,13 +10628,13 @@ fn a_pallet_deleted_on_the_remote_is_listed_and_lifts_back_only_acknowledged() {
     assert_eq!(value["data"]["already"], false, "{}", value);
 
     // A rerun, as after a delete whose answer was lost, finds it deleted and reports it done.
-    let again = area.forklift("a", &["--json", "palletize", "--delete", "feat", "--remote"]);
+    let again = area.forklift("a", &["--json", "pallet", "delete", "feat", "--remote"]);
     assert_success(&again);
     let value = json_of(&again);
     assert_eq!(value["data"]["already"], true, "{}", value);
     assert_eq!(value["data"]["head"], feat.as_str(), "{}", value);
 
-    let listed = json_of(&area.forklift("b", &["--json", "palletize", "--remote"]));
+    let listed = json_of(&area.forklift("b", &["--json", "pallet", "list", "--remote"]));
     assert!(listed["data"]["pallets"].as_array().unwrap().iter().all(|entry| entry["name"] != "feat"), "{}", listed);
     assert_eq!(listed["data"]["deleted"][0]["name"], "feat", "{}", listed);
     assert_eq!(listed["data"]["deleted"][0]["head"], feat.as_str(), "{}", listed);
@@ -10642,7 +10642,7 @@ fn a_pallet_deleted_on_the_remote_is_listed_and_lifts_back_only_acknowledged() {
 
     let lowered = refusal_of(&area.forklift("b", &["--json", "lower", "feat"]), 29);
     assert!(lowered["message"].as_str().unwrap().contains("was deleted"), "{}", lowered);
-    assert_eq!(lowered["next_step"], "forklift palletize --restore feat --remote", "{}", lowered);
+    assert_eq!(lowered["next_step"], "forklift pallet restore feat --remote", "{}", lowered);
 
     // This clone's work descends from the deleted head: "--recreate" re-creates the pallet with it.
     assert_success(&area.forklift("b", &["shift", "feat"]));
@@ -10658,7 +10658,7 @@ fn a_pallet_deleted_on_the_remote_is_listed_and_lifts_back_only_acknowledged() {
 
     assert_success(&area.forklift("b", &["lift", "--recreate"]));
     assert_eq!(pallet_head(&area, "server-root", "feat"), pallet_head(&area, "b", "feat"));
-    let listed = json_of(&area.forklift("b", &["--json", "palletize", "--remote"]));
+    let listed = json_of(&area.forklift("b", &["--json", "pallet", "list", "--remote"]));
     assert!(listed["data"].get("deleted").is_none(), "the re-creation cleared the tombstone: {}", listed);
 }
 
@@ -10669,27 +10669,27 @@ fn a_stale_clone_restores_a_pallet_deleted_on_the_remote_rather_than_re_creating
     let area = TestArea::new("remote-delete-restore");
     let server = Server::start(&area, None);
     let feat = remote_with_a_side_pallet(&area, &server);
-    assert_success(&area.forklift("a", &["palletize", "--delete", "feat", "--remote"]));
+    assert_success(&area.forklift("a", &["pallet", "delete", "feat", "--remote"]));
 
     // "b" never lowered "feat": its own "feat" starts from main, which the deleted head descends from.
-    assert_success(&area.forklift("b", &["palletize", "feat"]));
+    assert_success(&area.forklift("b", &["pallet", "create", "feat"]));
     stack_file(&area, "b", "other.txt", "other\n");
     for args in [&["--json", "lift"][..], &["--json", "lift", "--recreate"]] {
         let refused = refusal_of(&area.forklift("b", args), 35);
-        assert_eq!(refused["next_step"], "forklift palletize --restore feat --remote", "{:?}: {}", args, refused);
+        assert_eq!(refused["next_step"], "forklift pallet restore feat --remote", "{:?}: {}", args, refused);
         assert!(refused["message"].as_str().unwrap().contains("does not descend"), "{}", refused);
     }
 
-    let restored = area.forklift("b", &["--json", "palletize", "--restore", "feat", "--remote"]);
+    let restored = area.forklift("b", &["--json", "pallet", "restore", "feat", "--remote"]);
     assert_success(&restored);
     assert_eq!(json_of(&restored)["data"]["head"], feat.as_str());
     assert_eq!(pallet_head(&area, "server-root", "feat"), feat, "the remote has it back at the deleted head");
 
-    let again = area.forklift("b", &["palletize", "--restore", "feat", "--remote"]);
+    let again = area.forklift("b", &["pallet", "restore", "feat", "--remote"]);
     assert!(!again.status.success() && stderr(&again).contains("is not deleted"), "{}{}", stdout(&again), stderr(&again));
-    let named = area.forklift("b", &["palletize", "feat", "--remote"]);
+    let named = area.forklift("b", &["pallet", "create", "feat", "--remote"]);
     assert_eq!(named.status.code(), Some(2), "a usage error: {}", stderr(&named));
-    assert!(stderr(&named).contains("needs \"--delete\" or \"--restore\""), "{}", stderr(&named));
+    assert!(stderr(&named).contains("unexpected argument '--remote'"), "{}", stderr(&named));
 }
 
 // Revert: drop the capability check → the delete is sent, and reaches the server behind the proxy.
@@ -10721,8 +10721,8 @@ fn a_remote_whose_handshake_lists_no_tombstones_is_never_sent_a_delete() {
     });
     assert_success(&area.forklift("a", &["config", "remote.url", &proxy.url]));
 
-    for verb in ["--delete", "--restore"] {
-        let refused = area.forklift("a", &["palletize", verb, "feat", "--remote"]);
+    for verb in ["delete", "restore"] {
+        let refused = area.forklift("a", &["pallet", verb, "feat", "--remote"]);
         assert!(!refused.status.success(), "{}", stdout(&refused));
         assert!(stderr(&refused).contains("does not support deleting pallets"), "{}", stderr(&refused));
     }
@@ -10738,14 +10738,14 @@ fn a_local_delete_counts_work_the_remote_keeps_under_a_tombstone_as_held() {
     let server = Server::start(&area, None);
     remote_with_a_side_pallet(&area, &server);
     assert_success(&area.forklift("b", &["lower", "feat"]));
-    assert_success(&area.forklift("a", &["palletize", "--delete", "feat", "--remote"]));
+    assert_success(&area.forklift("a", &["pallet", "delete", "feat", "--remote"]));
 
-    let deleted = area.forklift("b", &["--json", "palletize", "--delete", "feat"]);
+    let deleted = area.forklift("b", &["--json", "pallet", "delete", "feat"]);
     assert_success(&deleted);
     assert_eq!(json_of(&deleted)["data"]["contained_by"], "the remote", "{}", stdout(&deleted));
 }
 
-// Revert: name `palletize` whatever the remote → the remote warehouse's next step is not lower.
+// Revert: name `pallet create` whatever the remote → the remote warehouse's next step is not lower.
 #[test]
 fn a_missing_pallet_is_a_coded_refusal_naming_lower_only_with_a_remote() {
     let area = TestArea::new("pallet-not-found");
@@ -10777,7 +10777,7 @@ fn a_missing_pallet_is_a_coded_refusal_naming_lower_only_with_a_remote() {
     let refused = area.forklift("solo", &["--json", "shift", "nope"]);
     assert_eq!(refused.status.code(), Some(29), "{}{}", stdout(&refused), stderr(&refused));
     let value = json_of(&refused);
-    assert_eq!(value["error"]["next_step"], "forklift palletize nope", "{}", value);
+    assert_eq!(value["error"]["next_step"], "forklift pallet create nope", "{}", value);
     assert!(!value["error"]["message"].as_str().unwrap().contains("lower"), "{}", value);
 }
 
@@ -10793,7 +10793,7 @@ fn lowering_a_pallet_the_remote_lacks_names_only_user_pallets() {
     let refused = area.forklift("b", &["lower", "nope"]);
     assert!(!refused.status.success());
     let message = stderr(&refused);
-    assert!(message.contains("feat") && message.contains("palletize --remote"), "{}", message);
+    assert!(message.contains("feat") && message.contains("pallet list --remote"), "{}", message);
     assert!(!message.contains('@'), "{}", message);
     assert!(!message.contains("FIRST CONTACT"), "refused before the remote's trust is adopted: {}", message);
 
@@ -10801,7 +10801,7 @@ fn lowering_a_pallet_the_remote_lacks_names_only_user_pallets() {
     assert_eq!(refused.status.code(), Some(29), "{}{}", stdout(&refused), stderr(&refused));
     let value = json_of(&refused);
     assert_eq!((value["error"]["code"].as_str(), value["error"]["next_step"].as_str()),
-        (Some("pallet_not_found"), Some("forklift palletize --remote")), "{}", value);
+        (Some("pallet_not_found"), Some("forklift pallet list --remote")), "{}", value);
 
     // A pin the remote fails is refused as such, not as the remote's missing pallet.
     let pinned = area.forklift("b", &["--json", "lower", "nope", "--expect", &"0".repeat(64)]);
@@ -10809,7 +10809,7 @@ fn lowering_a_pallet_the_remote_lacks_names_only_user_pallets() {
     assert_ne!(json_of(&pinned)["error"]["code"], "pallet_not_found", "{}", stdout(&pinned));
 
     // The current pallet the remote lacks is the same condition, with the remedy at that site.
-    assert_success(&area.forklift("b", &["palletize", "local-only"]));
+    assert_success(&area.forklift("b", &["pallet", "create", "local-only"]));
     let bare = area.forklift("b", &["--json", "lower"]);
     assert_eq!(bare.status.code(), Some(29), "{}{}", stdout(&bare), stderr(&bare));
     assert_eq!(json_of(&bare)["error"]["next_step"], "forklift lift");
@@ -10909,7 +10909,7 @@ fn a_sparse_warehouse_lowers_another_pallet_within_scope_and_expand_widens_it() 
     assert_success(&area.forklift("dev", &["lift"]));
     assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
 
-    assert_success(&area.forklift("dev", &["palletize", "feat"]));
+    assert_success(&area.forklift("dev", &["pallet", "create", "feat"]));
     area.write_file("dev/src/web/w.txt", "web v2 on feat\n");
     assert_success(&area.forklift("dev", &["load", "."]));
     assert_success(&area.forklift("dev", &["stack", "feat edits web"]));
@@ -10934,7 +10934,7 @@ fn a_lowered_pallet_the_remote_holds_deletes_without_force() {
     let feat = remote_with_a_side_pallet(&area, &server);
     assert_success(&area.forklift("b", &["lower", "feat"]));
 
-    let deleted = area.forklift("b", &["--json", "palletize", "--delete", "feat"]);
+    let deleted = area.forklift("b", &["--json", "pallet", "delete", "feat"]);
     assert_success(&deleted);
     let value = json_of(&deleted);
     assert_eq!(value["data"]["contained_by"], "the remote", "{}", value);
@@ -10946,7 +10946,7 @@ fn a_lowered_pallet_the_remote_holds_deletes_without_force() {
     assert_success(&area.forklift("b", &["shift", "feat"]));
     stack_file(&area, "b", "local.txt", "local\n");
     assert_success(&area.forklift("b", &["shift", "main"]));
-    let refused = area.forklift("b", &["palletize", "--delete", "feat"]);
+    let refused = area.forklift("b", &["pallet", "delete", "feat"]);
     assert!(!refused.status.success());
     assert!(stderr(&refused).contains("Neither does the remote"), "{}", stderr(&refused));
 }
@@ -10956,14 +10956,14 @@ fn scope_prune_keeps_unlifted_history_behind_a_deleted_pallet_for_its_undo() {
     let area = TestArea::new("scope-prune-deleted");
     let _server = sparse_with_docs(&area);
 
-    assert_success(&area.forklift("sparse", &["palletize", "side"]));
+    assert_success(&area.forklift("sparse", &["pallet", "create", "side"]));
     std::fs::write(area.path("sparse/docs/guide.md"), "guide on side, never lifted\n").unwrap();
     assert_success(&area.forklift("sparse", &["load", "."]));
     assert_success(&area.forklift("sparse", &["stack", "side docs edit"]));
     let head = pallet_head(&area, "sparse", "side");
     let blob = path_object_hash(&area, "sparse", &head, "docs/guide.md");
     assert_success(&area.forklift("sparse", &["shift", "main"]));
-    assert_success(&area.forklift("sparse", &["palletize", "--delete", "side", "--force"]));
+    assert_success(&area.forklift("sparse", &["pallet", "delete", "side", "--force"]));
 
     assert_success(&area.forklift("sparse", &["narrow", "docs"]));
     let pruned = area.forklift("sparse", &["--json", "scope-prune", "docs"]);
@@ -10982,7 +10982,7 @@ fn scope_prune_keeps_unlifted_history_behind_a_deleted_pallet_for_its_undo() {
 fn a_delete_refuses_a_remote_whose_trust_changed_instead_of_asking_it() {
     let area = TestArea::new("delete-remote-regenesis");
     let _server = regenesis_on_remote(&area, |server| {
-        assert_success(&area.forklift("a", &["palletize", "feat"]));
+        assert_success(&area.forklift("a", &["pallet", "create", "feat"]));
         stack_file(&area, "a", "feat.txt", "feat v1\n");
         assert_success(&area.forklift("a", &["lift"]));
         assert_success(&area.forklift("a", &["shift", "main"]));
@@ -10990,7 +10990,7 @@ fn a_delete_refuses_a_remote_whose_trust_changed_instead_of_asking_it() {
         assert_success(&area.forklift("b", &["lower", "feat"]));
     });
 
-    let refused = area.forklift("b", &["palletize", "--delete", "feat"]);
+    let refused = area.forklift("b", &["pallet", "delete", "feat"]);
     assert!(!refused.status.success(), "{}", stdout(&refused));
     assert!(stderr(&refused).contains("CHANGED"), "{}", stderr(&refused));
     assert!(stderr(&refused).contains("nothing was deleted"), "{}", stderr(&refused));
@@ -11100,7 +11100,7 @@ fn a_lower_refuses_history_a_stripped_remote_serves_and_takes_nothing() {
     assert_eq!(area.read_file("b/code.txt"), "v2\n");
     assert!(!operation_standing(&area, "b"), "a refused take raises no operation");
 
-    assert_success(&area.forklift("b", &["palletize", "side"]));
+    assert_success(&area.forklift("b", &["pallet", "create", "side"]));
     let named = area.forklift("b", &["--json", "lower", "main"]);
     history_unverified_message(&named);
     assert_eq!(pallet_head(&area, "b", "main"), remote.signed);
@@ -11114,7 +11114,7 @@ fn a_lower_refuses_history_a_stripped_remote_serves_and_takes_nothing() {
 
 /// What a refused lower fetched is in the store, but adopting it by hash refuses the same way:
 /// a pallet created at it, and a lift whose auto-merge would take it. Revert: the same mutation
-/// of `verify_take`, and the palletize creates the pallet at the forged parcel.
+/// of `verify_take`, and the pallet create makes the pallet at the forged parcel.
 #[test]
 fn a_take_by_hash_or_by_auto_merge_refuses_unverified_history() {
     let area = TestArea::new("take-stripped-hash");
@@ -11123,7 +11123,7 @@ fn a_take_by_hash_or_by_auto_merge_refuses_unverified_history() {
     history_unverified_message(&area.forklift("b", &["--json", "lower"]));
     assert!(object_present(&area, "b", &remote.forged), "the refused lower fetched the forged parcel");
 
-    let created = area.forklift("b", &["--json", "palletize", "forged", &remote.forged]);
+    let created = area.forklift("b", &["--json", "pallet", "create", "forged", &remote.forged]);
     let message = history_unverified_message(&created);
     assert!(message.contains("was not moved to it"), "{}", message);
     assert!(!area.path("b/.forklift/pallets/forged").exists());
@@ -11184,7 +11184,7 @@ fn a_partial_client_fetches_the_trust_boundary_it_lacks() {
     stack_file(&area, "a", "code.txt", "v1\n");
     assert_success(&area.forklift("a", &["lift"]));
 
-    assert_success(&area.forklift("a", &["palletize", "side"]));
+    assert_success(&area.forklift("a", &["pallet", "create", "side"]));
     stack_file(&area, "a", "code.txt", "s1\n");
     let s1 = pallet_head(&area, "a", "side");
     stack_file(&area, "a", "code.txt", "s2\n");
@@ -11195,7 +11195,7 @@ fn a_partial_client_fetches_the_trust_boundary_it_lacks() {
     assert_success(&area.forklift("a", &["office", "enroll"]));
     assert_success(&area.forklift("a", &["lift"]));
 
-    assert_success(&area.forklift("a", &["palletize", "y", &s1]));
+    assert_success(&area.forklift("a", &["pallet", "create", "y", &s1]));
     stack_file(&area, "a", "code.txt", "y\n");
     assert_success(&area.forklift("a", &["lift"]));
 
@@ -11219,7 +11219,7 @@ fn a_partial_client_fetches_the_trust_boundary_it_lacks() {
 /// Work stacked here before the remote enrolled is not vouched for by the anchor a later lower
 /// installs: the install records it, and a take never skips its history as a known-verified head.
 /// A head the anchor does vouch for stays known. Revert: let a held take count every local head as
-/// known, and `palletize copy` adopts the unsigned head.
+/// known, and `pallet create copy` adopts the unsigned head.
 #[test]
 fn an_anchor_taken_from_a_remote_does_not_vouch_for_local_work_it_never_saw() {
     let area = TestArea::new("take-unvouched-local");
@@ -11231,7 +11231,7 @@ fn an_anchor_taken_from_a_remote_does_not_vouch_for_local_work_it_never_saw() {
     let base = pallet_head(&area, "a", "main");
 
     assert_success(&area.forklift(".", &["franchise", &server.url, "w"]));
-    assert_success(&area.forklift("w", &["palletize", "feature"]));
+    assert_success(&area.forklift("w", &["pallet", "create", "feature"]));
     stack_file(&area, "w", "code.txt", "local\n");
     let local = pallet_head(&area, "w", "feature");
     assert_success(&area.forklift("w", &["shift", "main"]));
@@ -11251,12 +11251,12 @@ fn an_anchor_taken_from_a_remote_does_not_vouch_for_local_work_it_never_saw() {
     assert!(recorded.contains(&local), "{}", recorded);
     assert!(!recorded.contains(&base), "{}", recorded);
 
-    let refused = area.forklift("w", &["--json", "palletize", "copy", &local]);
+    let refused = area.forklift("w", &["--json", "pallet", "create", "copy", &local]);
     let message = history_unverified_message(&refused);
     assert!(message.contains(&local), "{}", message);
     assert!(!area.path("w/.forklift/pallets/copy").exists());
 
-    assert_success(&area.forklift("w", &["palletize", "kept", &base]));
+    assert_success(&area.forklift("w", &["pallet", "create", "kept", &base]));
 }
 
 /// Stand an interrupted lower of b's main from `from` to `to` — interrupted after it wrote the
@@ -11342,7 +11342,7 @@ fn worker_feat(area: &TestArea) -> (Server, String, String) {
 
     assert_success(&area.forklift(".", &["franchise", &server.url, "b", "--token", "w-token"]));
     assert_success(&area.forklift("b", &["config", "operator.identifier", "worker@forklift"]));
-    assert_success(&area.forklift("b", &["palletize", "feat"]));
+    assert_success(&area.forklift("b", &["pallet", "create", "feat"]));
     stack_file(area, "b", "code.txt", "worker\n");
     assert_success(&area.forklift("b", &["lift"]));
     assert_success(&area.forklift("b", &["shift", "main"]));
@@ -11362,7 +11362,7 @@ fn worker_feat(area: &TestArea) -> (Server, String, String) {
 /// the haul, closed meanwhile, would keep `feat` — so the distrust boundary does not hold it.
 fn retire_worker_beyond_feat(area: &TestArea, id: &str) {
     assert_success(&area.forklift("a", &["haul", "close", id]));
-    assert_success(&area.forklift("a", &["palletize", "--delete", "feat"]));
+    assert_success(&area.forklift("a", &["pallet", "delete", "feat"]));
 
     let list = stdout(&area.forklift("a", &["office", "list"]));
     let worker_key_id = list.lines().rev()
@@ -11452,7 +11452,7 @@ fn an_anchored_remote_with_an_unborn_default_pallet_franchises() {
     prepare_warehouse(&area, "a", &server.url);
     stack_file(&area, "a", "code.txt", "v1\n");
     assert_success(&area.forklift("a", &["office", "enroll"]));
-    assert_success(&area.forklift("a", &["palletize", "feature"]));
+    assert_success(&area.forklift("a", &["pallet", "create", "feature"]));
     stack_file(&area, "a", "code.txt", "feature\n");
     assert_success(&area.forklift("a", &["lift"]));
     assert_eq!(remote_pallet_head(&server, "main"), None);

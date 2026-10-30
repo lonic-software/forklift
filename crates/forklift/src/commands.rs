@@ -25,7 +25,7 @@ pub mod shift;
 pub mod stocktake;
 pub mod stack;
 pub mod tag;
-pub mod palletize;
+pub mod pallet;
 pub mod config;
 pub mod version;
 pub mod help;

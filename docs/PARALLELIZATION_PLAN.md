@@ -42,7 +42,7 @@ contention.** Two things decide almost every row:
 | **history** (full log) | hot | decode+render parcel | **sequential heap walk** | must read every parcel to display it; ordering dependency; read/graph mutexes | **None** — see the blame lesson | — |
 | **blame** | hot | changed-path filter check + LCS | **sequential chain + LCS** | first-parent chain (linked list), LCS attribution (oldest→newest); filter checks too small a fraction | **None** — *measured*: no speedup even with an `RwLock` cache (below) | — |
 | **ancestry / merge-base** | hot (internal) | generation-pruned walk | bounded walk | already O(gap) via generation numbers; graph mutex | **None** — already fast + tiny | — |
-| **stack (parcel), undo, palletize, shift-ref, tag, peek, config, park list, office/haul/manifest/provenance subcommands** | mixed | O(1) — a ref move, one object, one signature | trivial | — | **N/A** — constant-size work | — |
+| **stack (parcel), undo, pallet, shift-ref, tag, peek, config, park list, office/haul/manifest/provenance subcommands** | mixed | O(1) — a ref move, one object, one signature | trivial | — | **N/A** — constant-size work | — |
 
 ## Where to spend the effort (ranked)
 

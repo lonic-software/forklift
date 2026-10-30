@@ -135,7 +135,7 @@ A head another store serves becomes this warehouse's at the ref write that
 adopts it, so every such write is judged first, with the same check `audit` runs:
 `lower` (of the working pallet or one named), `franchise`, `lift`'s auto-merge
 of a remote that moved ahead, and `git mirror` before it exports a head to git — and,
-for a parcel already in the store, `palletize <name> <hash>` and `haul merge`.
+for a parcel already in the store, `pallet create <name> <hash>` and `haul merge`.
 With an anchor held, the head's history must verify against it and the office
 this warehouse holds; nothing the remote serves gets past them, including a
 remote stripped of both its anchor and its office. At first contact it must

@@ -33,7 +33,7 @@ manifest: note approve provenance show
 mcp
 narrow
 office: enroll keygen admit link authorize role rotate retire regenesis accept-regenesis list
-palletize
+pallet: list create delete restore
 park: pop list
 prepare
 profile: list create use

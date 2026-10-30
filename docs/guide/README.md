@@ -38,9 +38,10 @@ vocabulary, forklift uses shipping-yard words — the concepts map one-to-one:
 | the index / staging area | the **inventory** (a.k.a. the **dock**) | what the next parcel will contain |
 | `commit` | **stack** | record the inventory as a new parcel |
 | `checkout <branch>` | **shift** | switch the working directory to a pallet |
-| `checkout -b` / branch | **palletize** | create a new pallet |
-| `branch -d` / `branch -D` | **palletize --delete** / **--delete --force** | delete a pallet (undoable; its parcels stay) |
-| `push --delete <remote> <branch>` | **palletize --delete --remote** | delete a pallet on the remote (restorable with **--restore --remote**) |
+| `checkout -b` | **pallet create** | create a new pallet and shift to it |
+| `branch` | **pallet** (or **pallet list**) | list the pallets |
+| `branch -d` / `branch -D` | **pallet delete** / **pallet delete --force** | delete a pallet (undoable; its parcels stay) |
+| `push --delete <remote> <branch>` | **pallet delete --remote** | delete a pallet on the remote (restorable with **pallet restore --remote**) |
 | `merge` | **consolidate** | merge another pallet in |
 | `stash` | **park** | set work aside and return to the head |
 | `add` | **load** | stage a file or directory |
@@ -62,7 +63,7 @@ Two more terms you'll meet:
   a root tree. Everything is content-addressed with Blake3 and immutable.
 - A **revision** is anywhere a point in history is named: a pallet name *or* a
   parcel hash (a unique prefix, ≥ 4 hex characters). `history`, `diff`,
-  `palletize` and `audit` all accept either.
+  `pallet create` and `audit` all accept either.
 
 ## The shortest possible tour
 
@@ -73,7 +74,7 @@ echo "hello" > readme.txt
 forklift load .                            # stage everything
 forklift stack "first parcel"             # commit
 
-forklift palletize feature                 # branch and switch to it
+forklift pallet create feature             # branch and switch to it
 echo "more" >> readme.txt
 forklift load . && forklift stack "work"
 

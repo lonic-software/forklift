@@ -369,7 +369,7 @@ fn a_tracked_folder_that_becomes_a_nested_working_tree_refuses_until_it_is_remov
 #[test]
 fn a_shift_into_an_untracked_nested_working_tree_refuses_and_writes_nothing() {
     let warehouse = Warehouse::new("shift-into");
-    warehouse.run_ok(&["palletize", "feature"]);
+    warehouse.run_ok(&["pallet", "create", "feature"]);
     warehouse.run_ok(&["shift", "feature"]);
     warehouse.write("app.txt", "changed\n");
     warehouse.write("sub/x.txt", "feature\n");
@@ -409,7 +409,7 @@ fn replacing_a_folder_holding_a_nested_working_tree_refuses_whatever_the_rules_s
         warehouse.write("app.txt", "payload\n");
         warehouse.run_ok(&["load", "."]);
         warehouse.run_ok(&["stack", "dir"]);
-        warehouse.run_ok(&["palletize", "flip"]);
+        warehouse.run_ok(&["pallet", "create", "flip"]);
         warehouse.run_ok(&["shift", "flip"]);
         warehouse.run_ok(&["remove", "a"]);
         std::fs::remove_dir_all(warehouse.path("a")).unwrap();
@@ -455,7 +455,7 @@ fn replacing_a_folder_holding_an_ignored_file_refuses_and_writes_nothing() {
     warehouse.write("a/x", "tracked\n");
     warehouse.run_ok(&["load", "."]);
     warehouse.run_ok(&["stack", "dir"]);
-    warehouse.run_ok(&["palletize", "flip"]);
+    warehouse.run_ok(&["pallet", "create", "flip"]);
     warehouse.run_ok(&["shift", "flip"]);
     warehouse.run_ok(&["remove", "a"]);
     std::fs::remove_dir_all(warehouse.path("a")).unwrap();

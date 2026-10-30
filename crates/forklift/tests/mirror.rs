@@ -463,7 +463,7 @@ fn a_race_to_a_tip_the_mirror_holds_ends_already_ahead() {
     let fixture = Fixture::new("race-held");
     let area = &fixture.area;
 
-    area.forklift_ok("a", &["palletize", "feat"]);
+    area.forklift_ok("a", &["pallet", "create", "feat"]);
     area.stack("a", "code.txt", "feat\n", "on feat");
     area.lift("a");
     area.forklift_ok("a", &["shift", "main"]);
@@ -699,7 +699,7 @@ fn a_failed_push_resumes_without_re_exporting_after_gc() {
     let area = &fixture.area;
 
     fixture.franchise("b");
-    area.forklift_ok("b", &["palletize", "feat"]);
+    area.forklift_ok("b", &["pallet", "create", "feat"]);
     area.stack("b", "feat.txt", "feat\n", "feat only");
     area.lift("b");
 
@@ -732,7 +732,7 @@ fn a_boundary_survives_gc_and_only_the_new_parcel_exports() {
     let area = &fixture.area;
 
     fixture.franchise("b");
-    area.forklift_ok("b", &["palletize", "feat"]);
+    area.forklift_ok("b", &["pallet", "create", "feat"]);
     area.stack("b", "feat.txt", "feat 1\n", "feat one");
     area.lift("b");
 
@@ -970,7 +970,7 @@ fn unmirrorable_pallets_are_skipped_without_refs() {
     let fixture = Fixture::new("unmirrorable");
     let area = &fixture.area;
 
-    area.forklift_ok("a", &["palletize", "feature.lock"]);
+    area.forklift_ok("a", &["pallet", "create", "feature.lock"]);
     area.stack("a", "code.txt", "lock\n", "on feature.lock");
     area.lift("a");
     area.forklift_ok("a", &["shift", "main"]);
@@ -994,7 +994,7 @@ fn a_fast_forward_to_another_pallet_is_a_divergence() {
     let fixture = Fixture::new("other-pallet");
     let area = &fixture.area;
 
-    area.forklift_ok("a", &["palletize", "feat"]);
+    area.forklift_ok("a", &["pallet", "create", "feat"]);
     area.stack("a", "code.txt", "feat\n", "on feat");
     area.lift("a");
     area.forklift_ok("a", &["shift", "main"]);
@@ -1019,7 +1019,7 @@ fn an_unreadable_roots_record_is_rebuilt_from_the_exported_refs() {
     let fixture = Fixture::new("record");
     let area = &fixture.area;
 
-    area.forklift_ok("a", &["palletize", "feat"]);
+    area.forklift_ok("a", &["pallet", "create", "feat"]);
     area.stack("a", "code.txt", "feat\n", "on feat");
     area.lift("a");
     area.forklift_ok("a", &["shift", "main"]);
@@ -1139,7 +1139,7 @@ fn an_exported_parcel_fetched_by_the_run_is_built_on() {
 
     fixture.franchise("b");
     area.forklift_ok("a", &["config", "mirror.auto", "off"]);
-    area.forklift_ok("a", &["palletize", "feat"]);
+    area.forklift_ok("a", &["pallet", "create", "feat"]);
     area.stack("a", "feat.txt", "feat\n", "feat only");
     area.lift("a");
     area.forklift_ok("a", &["config", "mirror.pallets", "main,feat"]);
@@ -1178,7 +1178,7 @@ fn a_damaged_export_refuses_only_its_own_pallet() {
     let area = &fixture.area;
 
     area.forklift_ok("a", &["config", "mirror.auto", "off"]);
-    area.forklift_ok("a", &["palletize", "feat"]);
+    area.forklift_ok("a", &["pallet", "create", "feat"]);
     area.stack("a", "feat.txt", "feat\n", "feat only");
     area.lift("a");
     area.forklift_ok("a", &["shift", "main"]);

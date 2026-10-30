@@ -65,8 +65,8 @@ const WRITERS: &[(&str, &str, Class)] = &[
     ("crates/forklift/src/commands/lower.rs", "lower_working_pallet", Class::Verifies),
     ("crates/forklift/src/commands/lower.rs", "lower_named_pallet", Class::Verifies),
     // At a hash, verified; at another pallet, that pallet's head.
-    ("crates/forklift/src/commands/palletize.rs", "create_pallet", Class::Verifies),
-    ("crates/forklift/src/commands/palletize.rs", "create_pallet", Class::CopiesLocal),
+    ("crates/forklift/src/commands/pallet.rs", "create_pallet", Class::Verifies),
+    ("crates/forklift/src/commands/pallet.rs", "create_pallet", Class::CopiesLocal),
 ];
 
 fn workspace_root() -> PathBuf {

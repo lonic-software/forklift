@@ -226,7 +226,7 @@ t0=$(_now_ms); fl store compact >/dev/null; t1=$(_now_ms)
 FRESH_COMPACT_MS=$(( t1 - t0 ))
 
 echo "-> building the diverging shift-target pallet…"
-fl palletize bench-shift-b >/dev/null
+fl pallet create bench-shift-b >/dev/null
 touch_files 0 40 5000
 fl load . >/dev/null
 fl stack "diverge for shift bench" >/dev/null

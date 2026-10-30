@@ -689,8 +689,8 @@ impl ErrorCode {
                  \"forklift lower\" comes first",
             ErrorCode::PalletNotFound =>
                 "No pallet of that name exists in this warehouse (or, for \"forklift lower\", on the \
-                 remote); \"forklift lower <name>\" brings in the remote's, \"forklift palletize <name>\" creates a \
-                 new one, \"forklift palletize --remote\" lists the remote's",
+                 remote); \"forklift lower <name>\" brings in the remote's, \"forklift pallet create <name>\" creates a \
+                 new one, \"forklift pallet list --remote\" lists the remote's",
             ErrorCode::FranchiseIncomplete =>
                 "The directory holds a franchise that has not finished; running the same \
                  \"forklift franchise\" again resumes it and keeps what was fetched",
@@ -708,7 +708,7 @@ impl ErrorCode {
                  remote serves); nothing was adopted",
             ErrorCode::PalletDeletedOnRemote =>
                 "The remote has the pallet only as a tombstone: it was deleted there, and the name \
-                 stays reserved for that history; \"forklift palletize --restore <name> --remote\" brings it \
+                 stays reserved for that history; \"forklift pallet restore <name> --remote\" brings it \
                  back, \"forklift lift --recreate\" re-creates it from work that descends from it",
             ErrorCode::CacheMiss =>
                 "A cache warehouse does not hold content the command reads, and could not reach its \
@@ -1028,7 +1028,7 @@ fn pallets_unvouched_warning_text(mode: OutputMode, pallets: &[String]) -> Strin
         names.join(", ")
     );
     let next_step = "As an enrolled signer, re-stack the work onto a pallet the anchor vouches for \
-        (\"forklift cherry-pick\"), or delete the pallet (\"forklift palletize --delete <name>\", which \
+        (\"forklift cherry-pick\"), or delete the pallet (\"forklift pallet delete <name>\", which \
         needs --force when no other pallet holds that work).";
 
     match mode {

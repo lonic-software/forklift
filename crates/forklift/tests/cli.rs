@@ -1039,7 +1039,7 @@ fn warehouse_with_a_diverged_pallet(name: &str) -> TestWarehouse {
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "one"]));
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("notes.txt", "v2\n");
     warehouse.write_file("build/out.txt", "b2\n");
     assert_success(&warehouse.run(&["load", "."]));
@@ -1316,7 +1316,7 @@ fn a_mode_only_change_is_reported_staged_and_unstaged_and_blocks_shift() {
     assert!(pallets.contains("modified: notes.txt") && pallets.contains("(mode: normal -> executable)"), "{}", pallets);
 
     // Back the other way, folded into a move: the pallet diff keeps the mode of the moved file.
-    assert_success(&warehouse.run(&["palletize", "executable"]));
+    assert_success(&warehouse.run(&["pallet", "create", "executable"]));
     forklift_core::util::file_utils::rename(&path, warehouse.root.join("moved.txt")).unwrap();
     std::fs::set_permissions(warehouse.root.join("moved.txt"), std::fs::Permissions::from_mode(0o644)).unwrap();
     assert_success(&warehouse.run(&["load", "."]));
@@ -1343,7 +1343,7 @@ fn a_consolidate_keeps_the_side_that_changed_the_executable_bit() {
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "base"]));
 
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("run.sh", "a\nb\nc\nd\nE\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "theirs edits"]));
@@ -1377,7 +1377,7 @@ fn a_consolidate_takes_their_chmod_over_our_binary_edit() {
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "base"]));
 
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "theirs drops the bit"]));
@@ -1498,7 +1498,7 @@ fn an_edit_under_a_nested_single_file_load_is_visible_and_blocks_shift() {
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "base"]));
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("a/b/c.txt", "feature\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "feature"]));
@@ -1526,7 +1526,7 @@ fn an_edit_under_a_cherry_picked_nested_folder_is_visible_and_blocks_shift() {
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "base"]));
 
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("x/y/z.txt", "z\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "add x/y/z.txt"]));
@@ -1555,7 +1555,7 @@ fn a_directory_only_its_descendant_registered_is_tracked_for_replace_and_remove(
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "base"]));
-    assert_success(&warehouse.run(&["palletize", "flat"]));
+    assert_success(&warehouse.run(&["pallet", "create", "flat"]));
     warehouse.write_file("a", "a file\n");
     assert_success(&warehouse.run(&["load", "a"]));
     assert_success(&warehouse.run(&["stack", "a is a file"]));
@@ -1797,15 +1797,15 @@ fn stack_requires_staged_changes() {
 }
 
 #[test]
-fn palletize_creates_pallets_at_the_current_head() {
-    let warehouse = TestWarehouse::new("palletize");
+fn pallet_create_creates_pallets_at_the_current_head() {
+    let warehouse = TestWarehouse::new("pallet-create");
     warehouse.write_file("file.txt", "content\n");
 
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
 
     // Before anything is stacked, the default pallet is listed as unborn.
-    let unborn_listing = stdout(&warehouse.run(&["palletize"]));
+    let unborn_listing = stdout(&warehouse.run(&["pallet", "list"]));
     assert!(unborn_listing.contains("* main (unborn)"));
 
     assert_success(&warehouse.run(&["load", "."]));
@@ -1814,13 +1814,13 @@ fn palletize_creates_pallets_at_the_current_head() {
     let main_head = extract_parcel_hash(&stack);
 
     // A new pallet starts at the current head and becomes current.
-    assert_success(&warehouse.run(&["palletize", "feature/x"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature/x"]));
     let feature_ref = std::fs::read_to_string(
         warehouse.root.join(".forklift/pallets/feature/x")
     ).unwrap();
     assert_eq!(feature_ref.trim(), main_head);
 
-    let listing = stdout(&warehouse.run(&["palletize"]));
+    let listing = stdout(&warehouse.run(&["pallet", "list"]));
     assert!(listing.contains("* feature/x"));
     assert!(listing.contains("  main"));
 
@@ -1833,18 +1833,18 @@ fn palletize_creates_pallets_at_the_current_head() {
     assert_eq!(main_ref.trim(), main_head);
 
     // Duplicate and invalid names are rejected.
-    let duplicate = warehouse.run(&["palletize", "feature/x"]);
+    let duplicate = warehouse.run(&["pallet", "create", "feature/x"]);
     assert!(!duplicate.status.success());
     assert!(stderr(&duplicate).contains("already"));
 
-    let invalid = warehouse.run(&["palletize", "bad name"]);
+    let invalid = warehouse.run(&["pallet", "create", "bad name"]);
     assert!(!invalid.status.success());
     assert!(stderr(&invalid).contains("not a valid pallet name"));
 }
 
 #[test]
-fn palletize_json_listing_reports_head_hashes() {
-    let warehouse = TestWarehouse::new("palletize-json");
+fn pallet_list_json_listing_reports_head_hashes() {
+    let warehouse = TestWarehouse::new("pallet-list-json");
     warehouse.write_file("file.txt", "content\n");
 
     assert_success(&warehouse.run(&["prepare"]));
@@ -1852,7 +1852,7 @@ fn palletize_json_listing_reports_head_hashes() {
 
     // Before anything is stacked, the (only, current) pallet is listed with a null head —
     // folded into `pallets` itself, not left as a side flag a caller must special-case.
-    let unborn = json(&warehouse.run(&["palletize", "--json"]));
+    let unborn = json(&warehouse.run(&["pallet", "list", "--json"]));
     assert_eq!(unborn["data"]["current_unborn"], true);
     let pallets = unborn["data"]["pallets"].as_array().unwrap();
     assert_eq!(pallets.len(), 1, "unexpected pallets: {:?}", pallets);
@@ -1862,10 +1862,10 @@ fn palletize_json_listing_reports_head_hashes() {
 
     assert_success(&warehouse.run(&["load", "."]));
     let main_head = extract_parcel_hash(&warehouse.run(&["stack", "first"]));
-    assert_success(&warehouse.run(&["palletize", "feature/x"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature/x"]));
 
     // Once born, each pallet's listed `head` is its actual head parcel hash.
-    let listing = json(&warehouse.run(&["palletize", "--json"]));
+    let listing = json(&warehouse.run(&["pallet", "list", "--json"]));
     assert_eq!(listing["data"]["current_unborn"], false);
     let pallets = listing["data"]["pallets"].as_array().unwrap();
     let by_name = |name: &str| pallets.iter()
@@ -1949,7 +1949,7 @@ fn shift_switches_pallets_and_materializes_the_target_tree() {
     assert_success(&warehouse.run(&["stack", "on main"]));
 
     // Build a diverging state on a feature pallet.
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("a.txt", "feature content\n");
     warehouse.write_file("dir/new.txt", "only on feature\n");
     assert_success(&warehouse.run(&["load", "."]));
@@ -2002,7 +2002,7 @@ fn shift_refuses_dirty_warehouses_and_untracked_collisions() {
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "on main"]));
 
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("extra.txt", "tracked on feature\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "on feature"]));
@@ -2057,7 +2057,7 @@ fn shift_preserves_executables_and_symlinks() {
     assert_success(&warehouse.run(&["stack", "with modes"]));
 
     // An empty pallet state to shift away to: remove everything on a feature pallet.
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("placeholder.txt", "placeholder\n");
     std::fs::remove_file(warehouse.root.join("run.sh")).unwrap();
     std::fs::remove_file(warehouse.root.join("link")).unwrap();
@@ -2115,7 +2115,7 @@ fn a_wide_shift_writes_every_file_its_own_content_mode_and_type() {
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "main's files"]));
 
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     for (index, path) in paths.iter().enumerate() {
         warehouse.write_file(path, &wide_content("feature", index));
     }
@@ -2159,7 +2159,7 @@ fn a_wide_consolidate_writes_every_file_theirs_takes_its_own_content() {
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "base"]));
 
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     for (index, path) in paths.iter().enumerate() {
         warehouse.write_file(path, &wide_content("feature", index));
     }
@@ -2469,12 +2469,17 @@ fn an_import_git_that_cannot_build_its_inventory_is_refused_until_heal() {
     std::fs::set_permissions(root.join("locked.txt"), std::fs::Permissions::from_mode(0o644)).unwrap();
     assert!(!import.status.success(), "the inventory build must fail on the unreadable file");
 
-    for args in [&["--json", "stack", "after import"][..], &["--json", "load", "."][..]] {
+    let create = ["--json", "pallet", "create", "side"];
+    for args in [&["--json", "stack", "after import"][..], &["--json", "load", "."][..], &create[..]] {
         let refused = json(&warehouse.run(args));
         assert_eq!(refused["error"]["code"], "incomplete_load", "{:?}: {}", args, refused);
         assert_eq!(refused["error"]["next_step"], "forklift heal", "{:?}: {}", args, refused);
         assert!(refused["error"]["message"].as_str().unwrap().contains("git import"), "{}", refused);
     }
+    // Listing the pallets touches nothing, so it shows where the bay is before the heal.
+    // Revert: refuse the whole pallet family again → the listing is refused.
+    assert_success(&warehouse.run(&["pallet", "list"]));
+    assert_success(&warehouse.run(&["pallet"]));
 
     let healed = json(&warehouse.run(&["--json", "heal"]));
     assert_eq!(healed["data"]["operation"]["operation"], "git import", "{}", healed);
@@ -2663,7 +2668,7 @@ fn a_large_tree_lands_every_entry_in_its_own_shard() {
     // A shift between two pallets on the same parcel writes nothing and rebuilds every shard.
     assert_success(&warehouse.run(&["restore", "d17/f2.txt"]));
     std::thread::sleep(std::time::Duration::from_millis(2100));
-    assert_success(&warehouse.run(&["palletize", "other"]));
+    assert_success(&warehouse.run(&["pallet", "create", "other"]));
     assert_success(&warehouse.run(&["shift", "main"]));
 
     assert_eq!(unstaged_changes(&warehouse), vec![untracked_ignore]);
@@ -2860,7 +2865,7 @@ fn an_edit_in_the_second_of_a_shift_survives_a_sibling_load() {
         configure_operator(&warehouse);
         assert_success(&warehouse.run(&["load", "."]));
         assert_success(&warehouse.run(&["stack", "base"]));
-        assert_success(&warehouse.run(&["palletize", "feature"]));
+        assert_success(&warehouse.run(&["pallet", "create", "feature"]));
         warehouse.write_file("a.txt", "two\n");
         assert_success(&warehouse.run(&["load", "a.txt"]));
         assert_success(&warehouse.run(&["stack", "second"]));
@@ -3194,7 +3199,7 @@ fn consolidate_fast_forwards_when_possible() {
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "base"]));
 
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("b.txt", "b\n");
     assert_success(&warehouse.run(&["load", "."]));
     let feature_stack = warehouse.run(&["stack", "feature work"]);
@@ -3239,7 +3244,7 @@ fn consolidate_merges_divergent_pallets_cleanly() {
     assert_success(&warehouse.run(&["stack", "base"]));
 
     // Diverge: feature changes the last line and adds a file...
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("file.txt", "one\ntwo\nthree\nfour\nFIVE\n");
     warehouse.write_file("feat.txt", "feature file\n");
     assert_success(&warehouse.run(&["load", "."]));
@@ -3293,7 +3298,7 @@ fn commit_graph_is_built_by_compact_and_ancestry_stays_correct() {
     assert_success(&warehouse.run(&["stack", "base"]));
 
     // Diverge two pallets off the base so a merge base has to be found.
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("file.txt", "one\ntwo\nthree\nfour\nFIVE\n");
     assert_success(&warehouse.run(&["load", "."]));
     let feature_stack = warehouse.run(&["stack", "feature work"]);
@@ -3345,7 +3350,7 @@ fn a_corrupted_commit_graph_shard_is_ignored_and_rewritten() {
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "base"]));
 
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("file.txt", "one\ntwo\nthree\nfour\nFIVE\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "feature work"]));
@@ -3502,7 +3507,7 @@ fn an_unwritable_commit_graph_never_fails_a_query() {
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "base"]));
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("file.txt", "one\ntwo\nthree\nfour\nFIVE\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "feature work"]));
@@ -3611,7 +3616,7 @@ fn consolidate_conflicts_are_marked_and_resolved_by_stacking() {
     assert_success(&warehouse.run(&["stack", "base"]));
 
     // Both pallets change the same line differently.
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("file.txt", "one\nTHEIRS\nthree\n");
     assert_success(&warehouse.run(&["load", "file.txt"]));
     let feature_stack = warehouse.run(&["stack", "theirs"]);
@@ -3935,7 +3940,7 @@ fn piped_output_is_plain_unless_colour_is_forced() {
     assert_success(&warehouse.run(&["stack", "first"]));
     assert_success(&warehouse.run(&["office", "enroll"]));
 
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("b.txt", "feature\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "feature work"]));
@@ -4200,7 +4205,7 @@ fn diff_compares_the_heads_of_two_pallets() {
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "base"]));
 
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("src/app.rs", "shared\nfeature line\n");
     warehouse.write_file("new.txt", "extra\n");
     std::fs::remove_file(warehouse.root.join("notes.txt")).unwrap();
@@ -4279,7 +4284,7 @@ fn history_walks_the_parcel_graph_newest_first() {
 
     // A consolidation parcel lists the parents it consolidates, and the merged-in
     // pallet's parcels appear in the history of the target pallet.
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("b.txt", "feature\n");
     assert_success(&warehouse.run(&["load", "."]));
     let feature = extract_parcel_hash(&warehouse.run(&["stack", "feature parcel"]));
@@ -4412,7 +4417,7 @@ fn moves_are_detected_as_a_post_pass_and_reported_as_one_change() {
 
     // Pallet-to-pallet comparisons pair moves by blob hash too.
     assert_success(&warehouse.run(&["stack", "renamed"]));
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     std::fs::create_dir_all(warehouse.root.join("sub")).unwrap();
     forklift_core::util::file_utils::rename(
         warehouse.root.join("src/beta.txt"),
@@ -4443,9 +4448,9 @@ fn revisions_resolve_pallets_and_parcel_hash_prefixes() {
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "second"]));
 
-    // palletize <name> <revision> creates the pallet at that parcel and materializes it.
+    // pallet create <name> <revision> creates the pallet at that parcel and materializes it.
     let prefix = &first[0..8];
-    assert_success(&warehouse.run(&["palletize", "hotfix", prefix]));
+    assert_success(&warehouse.run(&["pallet", "create", "hotfix", prefix]));
     assert_eq!(std::fs::read_to_string(warehouse.root.join("a.txt")).unwrap(), "v1\n");
 
     // diff and history accept parcel hash prefixes wherever a pallet name works.
@@ -4460,7 +4465,7 @@ fn revisions_resolve_pallets_and_parcel_hash_prefixes() {
     // A prefix in another case names the same parcel, and what it resolves to is the stored
     // lowercase spelling: a ref written from the user's casing would be refused when read back.
     let upper = first[0..8].to_uppercase();
-    assert_success(&warehouse.run(&["palletize", "upper", &upper]));
+    assert_success(&warehouse.run(&["pallet", "create", "upper", &upper]));
     let history = stdout(&warehouse.run(&["history", "upper"]));
     assert!(history.contains(&format!("parcel {}", first)), "unexpected history: {}", history);
 
@@ -4534,7 +4539,7 @@ fn office_manages_users_and_keys_as_signed_tracked_metadata() {
 
     // The office is a meta pallet now, not a reserved name: "office" is a legal working
     // pallet, stored in a separate namespace and distinct from the @office metadata chain.
-    assert_success(&warehouse.run(&["palletize", "office"]));
+    assert_success(&warehouse.run(&["pallet", "create", "office"]));
 
     // A bare "office" is the (just-created, unborn) user pallet — never the meta office.
     let bare = warehouse.run(&["history", "office"]);
@@ -4545,10 +4550,10 @@ fn office_manages_users_and_keys_as_signed_tracked_metadata() {
     assert!(meta.contains("Admitted operator \"bob@forklift\""), "@office must still reach the office: {}", meta);
 
     // The office shows up in the pallet list only behind --all, under its own heading.
-    let listed = stdout(&warehouse.run(&["palletize", "--all"]));
+    let listed = stdout(&warehouse.run(&["pallet", "list", "--all"]));
     assert!(listed.contains("Meta pallets:"), "unexpected list: {}", listed);
     assert!(listed.contains("@office"), "unexpected list: {}", listed);
-    let default_list = stdout(&warehouse.run(&["palletize"]));
+    let default_list = stdout(&warehouse.run(&["pallet", "list"]));
     assert!(!default_list.contains("@office"), "meta pallets must be hidden by default: {}", default_list);
 }
 
@@ -4581,7 +4586,7 @@ fn manifest_records_signed_post_metadata_on_a_meta_pallet() {
     let audit = stdout(&warehouse.run(&["audit", "@manifest"]));
     assert!(audit.contains("2 signed parcel(s) valid"), "unexpected audit: {}", audit);
 
-    let listed = stdout(&warehouse.run(&["palletize", "--all"]));
+    let listed = stdout(&warehouse.run(&["pallet", "list", "--all"]));
     assert!(listed.contains("@manifest"), "unexpected list: {}", listed);
 
     // A note about a parcel that does not exist is refused (the subject must resolve).
@@ -4797,7 +4802,7 @@ fn import_git_migrates_a_repo_into_the_warehouse() {
     assert!(stdout(&imported).contains("Imported 2 commit(s) into 2 pallet(s)"), "{}", stdout(&imported));
 
     // Each branch became a pallet; git's HEAD branch is checked out.
-    let pallets = stdout(&warehouse.run(&["palletize"]));
+    let pallets = stdout(&warehouse.run(&["pallet", "list"]));
     assert!(pallets.contains("* main") && pallets.contains("feature"), "unexpected: {}", pallets);
 
     // History and authorship survived; the colocated working tree reads clean apart from the
@@ -5243,7 +5248,7 @@ fn a_conflicted_ignore_file_is_refused_not_read_as_rules() {
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "base"]));
 
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file(".forkliftignore", "^out(/.*)?$\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "feature rules"]));
@@ -5772,6 +5777,53 @@ fn the_fl_alias_behaves_identically_to_forklift() {
     assert_eq!(json(&via_alias), json(&via_forklift), "fl must behave exactly like forklift");
 }
 
+// Revert: drop the branch-name check from parse_or_exit → `branch feature` falls to clap's
+// generic unrecognized-subcommand error, and `branch cr` is expanded to `pallet create`.
+#[test]
+fn branch_with_a_pallet_name_is_refused_naming_pallet_create() {
+    let warehouse = TestWarehouse::new("branch-name");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    warehouse.write_file("a.txt", "x\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "first"]));
+
+    // git's `branch NAME` creates without switching; pallet create switches, so the name is
+    // refused rather than guessed at — even one that is a prefix of a subcommand.
+    for name in ["feature", "cr"] {
+        let refused = warehouse.run(&["--json", "branch", name]);
+        assert_eq!(refused.status.code(), Some(2), "{}", stdout(&refused));
+        let value = json(&refused);
+        assert_eq!(value["error"]["code"], "usage", "{}", value);
+        assert_eq!(value["command"], "pallet", "{}", value);
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains(&format!("\"forklift pallet create {}\"", name)), "{}", message);
+    }
+    assert!(!warehouse.root.join(".forklift/pallets/feature").exists(), "nothing was created");
+    assert!(!warehouse.root.join(".forklift/pallets/cr").exists(), "nothing was created");
+    assert!(stdout(&warehouse.run(&["pallet", "list"])).contains("* main"));
+
+    // Options before the name do not hide it; a subcommand typed in full still runs.
+    let refused = warehouse.run(&["branch", "--verbose", "feature"]);
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(stderr(&refused).contains("forklift pallet create feature"), "{}", stderr(&refused));
+    assert!(stdout(&warehouse.run(&["branch", "list", "--all"])).contains("main"));
+
+    // git's delete and rename flags say the name is not for a create: clap refuses the flag.
+    // Revert: step over flags the pallet level lacks → the refusal tells a delete to create.
+    for args in [&["branch", "-d", "main"][..], &["branch", "-m", "main", "trunk"][..], &["branch", "--delete=x", "main"][..]] {
+        let refused = warehouse.run(args);
+        assert_eq!(refused.status.code(), Some(2), "{:?}", args);
+        assert!(stderr(&refused).contains("unexpected argument") && !stderr(&refused).contains("create"), "{:?}: {}", args, stderr(&refused));
+    }
+    // A help flag asks for the help, not for the name to be judged.
+    for args in [&["branch", "-h", "feature"][..], &["branch", "-vh", "feature"][..], &["-h", "branch", "feature"][..]] {
+        let help = warehouse.run(args);
+        assert_success(&help);
+        assert!(stdout(&help).contains("Usage: forklift"), "{:?}: {}", args, stdout(&help));
+    }
+}
+
 #[test]
 fn git_command_aliases_map_to_forklift_verbs() {
     let warehouse = TestWarehouse::new("git-aliases");
@@ -5787,10 +5839,11 @@ fn git_command_aliases_map_to_forklift_verbs() {
     assert!(stdout(&warehouse.run(&["status"])).contains("matches the inventory"));
     assert!(stdout(&warehouse.run(&["log"])).contains("first"));
 
-    // branch → palletize; switch → shift.
-    assert_success(&warehouse.run(&["branch", "feature"])); // switches to feature
+    // branch → pallet (bare, it lists); switch → shift.
+    assert!(stdout(&warehouse.run(&["branch"])).contains("* main"));
+    assert_success(&warehouse.run(&["branch", "create", "feature"])); // switches to feature
     assert_success(&warehouse.run(&["switch", "main"]));
-    assert!(stdout(&warehouse.run(&["palletize"])).contains("* main"));
+    assert!(stdout(&warehouse.run(&["pallet", "list"])).contains("* main"));
 
     // The git names are hidden aliases — the top-level help still lists forklift's own
     // command names (they dispatch, but do not clutter or replace the vocabulary).
@@ -5808,7 +5861,7 @@ fn haul_reviews_carry_signed_identity_and_merges() {
     assert_success(&warehouse.run(&["office", "enroll"]));
 
     // A feature pallet with work to propose.
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("feature.txt", "feat\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "feature work"]));
@@ -5919,7 +5972,7 @@ fn haul_merge_by_a_writer_not_granted_the_target_is_refused_before_merging() {
     assert_success(&warehouse.run(&["stack", "base"]));
     assert_success(&warehouse.run(&["office", "enroll"]));
 
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("feature.txt", "feat\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "feature work"]));
@@ -5969,7 +6022,7 @@ fn record_text_renders_inert_for_humans_and_verbatim_in_json() {
     assert_success(&warehouse.run(&["stack", &description]));
     assert_success(&warehouse.run(&["office", "enroll"]));
 
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("feature.txt", "feat\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "feature work"]));
@@ -6212,7 +6265,7 @@ fn bays_are_parallel_working_directories_sharing_the_warehouse() {
     // The main tree is untouched (its own working file and current pallet), but it shares
     // the refs — it sees the bay's pallet and history.
     assert_eq!(std::fs::read_to_string(warehouse.root.join("code.txt")).unwrap(), "shared v1\n");
-    let pallets = stdout(&warehouse.run(&["palletize"]));
+    let pallets = stdout(&warehouse.run(&["pallet", "list"]));
     assert!(pallets.contains("* main") && pallets.contains("feature"), "unexpected: {}", pallets);
     assert!(stdout(&warehouse.run(&["history", "feature"])).contains("work in the bay"));
 
@@ -6342,7 +6395,7 @@ fn deliver_from_a_bay_behind_its_draft_pallet_is_refused() {
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "initial"]));
     assert_success(&warehouse.run(&["office", "enroll"]));
-    assert_success(&warehouse.run(&["palletize", "draft"]));
+    assert_success(&warehouse.run(&["pallet", "create", "draft"]));
 
     let bay = warehouse.home.join("bay-b");
     assert_success(&warehouse.run(&["bay", "add", "b", bay.to_str().unwrap()]));
@@ -6375,7 +6428,7 @@ fn deliver_over_a_target_change_the_draft_has_not_seen_is_refused_with_its_code(
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "initial"]));
     assert_success(&warehouse.run(&["office", "enroll"]));
-    assert_success(&warehouse.run(&["palletize", "draft"]));
+    assert_success(&warehouse.run(&["pallet", "create", "draft"]));
 
     warehouse.write_file("code.txt", "v2\n");
     assert_success(&warehouse.run(&["load", "."]));
@@ -6445,7 +6498,7 @@ fn bay_mid_consolidation(name: &str) -> (TestWarehouse, std::path::PathBuf, Stri
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "initial"]));
-    assert_success(&warehouse.run(&["palletize", "side"]));
+    assert_success(&warehouse.run(&["pallet", "create", "side"]));
     stack_at(&warehouse, &warehouse.root, "f.txt", "side\n", "side changes f");
     assert_success(&warehouse.run(&["shift", "main"]));
     let y = stack_at(&warehouse, &warehouse.root, "f.txt", "main v2\n", "main changes f");
@@ -6668,7 +6721,7 @@ fn deliver_squashes_a_draft_trail_and_keeps_it_as_post_metadata() {
     assert_success(&warehouse.run(&["office", "enroll"]));
 
     // A draft pallet with a messy checkpoint trail.
-    assert_success(&warehouse.run(&["palletize", "draft/feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "draft/feature"]));
     for v in ["v2", "v3", "v4"] {
         warehouse.write_file("code.txt", &format!("{}\n", v));
         assert_success(&warehouse.run(&["load", "."]));
@@ -6712,7 +6765,7 @@ fn deliver_onto_a_target_that_moved_after_the_draft_forked_is_refused() {
     assert_success(&warehouse.run(&["stack", "initial"]));
     assert_success(&warehouse.run(&["office", "enroll"]));
 
-    assert_success(&warehouse.run(&["palletize", "draft"]));
+    assert_success(&warehouse.run(&["pallet", "create", "draft"]));
     warehouse.write_file("code.txt", "v2\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "draft work"]));
@@ -6750,7 +6803,7 @@ fn a_draft_delivered_once_can_deliver_its_later_work() {
     assert_success(&warehouse.run(&["stack", "initial"]));
     assert_success(&warehouse.run(&["office", "enroll"]));
 
-    assert_success(&warehouse.run(&["palletize", "draft"]));
+    assert_success(&warehouse.run(&["pallet", "create", "draft"]));
     warehouse.write_file("code.txt", "v2\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "wip v2"]));
@@ -6772,7 +6825,7 @@ fn a_draft_delivered_once_can_deliver_its_later_work() {
     // deliver over it although a different pallet recorded the delivery.
     // Revert: also require the record's source to be the delivering pallet → refused.
     assert_success(&warehouse.run(&["shift", "draft"]));
-    assert_success(&warehouse.run(&["palletize", "branch"]));
+    assert_success(&warehouse.run(&["pallet", "create", "branch"]));
     warehouse.write_file("code.txt", "v4\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "wip v4"]));
@@ -6793,7 +6846,7 @@ fn deliver_over_a_target_rolled_back_to_a_checkpoints_content_is_refused() {
     assert_success(&warehouse.run(&["stack", "initial"]));
     assert_success(&warehouse.run(&["office", "enroll"]));
 
-    assert_success(&warehouse.run(&["palletize", "draft"]));
+    assert_success(&warehouse.run(&["pallet", "create", "draft"]));
     for v in ["v2", "v3"] {
         warehouse.write_file("code.txt", &format!("{}\n", v));
         assert_success(&warehouse.run(&["load", "."]));
@@ -8079,7 +8132,7 @@ fn consolidate_refuses_on_an_incomplete_load_before_writing_consolidation_state(
     assert_success(&warehouse.run(&["stack", "base"]));
 
     // Diverge with non-overlapping changes so the merge would otherwise complete cleanly.
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("file.txt", "one\ntwo\nthree\nfour\nFIVE\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "feature work"]));
@@ -8127,7 +8180,7 @@ fn cherry_pick_refuses_on_an_incomplete_load_before_writing_state() {
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "base"]));
 
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("feat.txt", "feature file\n");
     assert_success(&warehouse.run(&["load", "."]));
     let source = extract_parcel_hash(&warehouse.run(&["stack", "feature work"]));
@@ -8169,7 +8222,7 @@ fn haul_merge_refuses_on_an_incomplete_load_before_writing_consolidation_state()
     assert_success(&warehouse.run(&["stack", "base"]));
     assert_success(&warehouse.run(&["office", "enroll"]));
 
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("feature.txt", "feat\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "feature work"]));
@@ -8464,7 +8517,7 @@ fn conflicts_json_exposes_the_three_sides_as_content_addresses() {
     warehouse.write_file("f.txt", "line1\nline2\nline3\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "base"]));
-    assert_success(&warehouse.run(&["palletize", "other"]));
+    assert_success(&warehouse.run(&["pallet", "create", "other"]));
     warehouse.write_file("f.txt", "line1\nTHEIRS\nline3\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "theirs"]));
@@ -8742,7 +8795,7 @@ fn undo_reverses_a_consolidate_and_a_shift() {
     assert_success(&warehouse.run(&["stack", "base"]));
 
     // A side pallet changes one file; main changes another → a clean two-parent merge.
-    assert_success(&warehouse.run(&["palletize", "side"]));
+    assert_success(&warehouse.run(&["pallet", "create", "side"]));
     warehouse.write_file("side.txt", "side\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "side work"]));
@@ -8754,11 +8807,11 @@ fn undo_reverses_a_consolidate_and_a_shift() {
     // Reverse a shift first (while the warehouse is clean): move to side, undo → back on
     // main, re-materialized.
     assert_success(&warehouse.run(&["shift", "side"]));
-    assert!(stdout(&warehouse.run(&["palletize"])).contains("* side"));
+    assert!(stdout(&warehouse.run(&["pallet", "list"])).contains("* side"));
     let unshift = warehouse.run(&["undo", "--json"]);
     assert_success(&unshift);
     assert_eq!(json(&unshift)["data"]["op"], "shift");
-    assert!(stdout(&warehouse.run(&["palletize"])).contains("* main"), "undo must return to main");
+    assert!(stdout(&warehouse.run(&["pallet", "list"])).contains("* main"), "undo must return to main");
 
     // Clean merge → a two-parent merge parcel becomes the head.
     assert_success(&warehouse.run(&["consolidate", "side"]));
@@ -8846,7 +8899,7 @@ fn undo_refuses_rather_than_silently_no_opping_when_the_pallet_moved_on() {
 
     // "feature"'s own divergent work is set up *before* the op under test, so it doesn't
     // end up on top of the journal (a stack there would be the next thing undo reverses).
-    assert_success(&warehouse.run(&["palletize", "feature"])); // switches onto feature
+    assert_success(&warehouse.run(&["pallet", "create", "feature"])); // switches onto feature
     warehouse.write_file("feature.txt", "feat\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "feature work"]));
@@ -8898,7 +8951,7 @@ fn undo_refuses_a_stale_consolidation_after_the_pallet_moved_on() {
     assert_success(&warehouse.run(&["stack", "base"]));
 
     // "feature" diverges on the very line "main" will also change (a guaranteed conflict).
-    assert_success(&warehouse.run(&["palletize", "feature"])); // switches onto feature
+    assert_success(&warehouse.run(&["pallet", "create", "feature"])); // switches onto feature
     warehouse.write_file("file.txt", "one\nTHEIRS\nthree\n");
     assert_success(&warehouse.run(&["load", "file.txt"]));
     assert_success(&warehouse.run(&["stack", "theirs"]));
@@ -8906,7 +8959,7 @@ fn undo_refuses_a_stale_consolidation_after_the_pallet_moved_on() {
     // "extra" is the un-journaled advance's future source — set up now, before the op
     // under test, so its own stack doesn't land on top of the journal.
     assert_success(&warehouse.run(&["shift", "main"]));
-    assert_success(&warehouse.run(&["palletize", "extra"])); // switches onto extra
+    assert_success(&warehouse.run(&["pallet", "create", "extra"])); // switches onto extra
     warehouse.write_file("extra.txt", "extra work\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "extra work"]));
@@ -8955,12 +9008,12 @@ fn undo_refuses_a_stale_consolidation_after_the_pallet_moved_on() {
     assert_success(&warehouse.run(&["undo"]));
 }
 
-// `palletize` is not journaled, so after it the newest journal entry is an older operation.
+// `pallet create` is not journaled, so after it the newest journal entry is an older operation.
 // Reversing that entry would undo something other than the user's last operation: the gate
 // refuses because the current pallet is no longer the one the entry left current.
 #[test]
-fn undo_refuses_to_reach_past_a_palletize() {
-    let warehouse = TestWarehouse::new("undo-past-palletize");
+fn undo_refuses_to_reach_past_a_pallet_create() {
+    let warehouse = TestWarehouse::new("undo-past-pallet-create");
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["prepare"]));
 
@@ -8972,7 +9025,7 @@ fn undo_refuses_to_reach_past_a_palletize() {
     assert_success(&warehouse.run(&["stack", "second"]));
 
     // Un-journaled: a new pallet at the same head, made current.
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     let main_before = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap();
 
     let refused = warehouse.run(&["undo"]);
@@ -8984,7 +9037,7 @@ fn undo_refuses_to_reach_past_a_palletize() {
 
     let main_after = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap();
     assert_eq!(main_before, main_after, "a refused undo must not move main");
-    assert!(stdout(&warehouse.run(&["palletize"])).contains("* feature"), "a refused undo must not switch pallets");
+    assert!(stdout(&warehouse.run(&["pallet", "list"])).contains("* feature"), "a refused undo must not switch pallets");
 }
 
 // The same for `deliver`, which moves its target and makes it current: the newest entry is the
@@ -8999,7 +9052,7 @@ fn undo_refuses_to_reach_past_a_deliver() {
     assert_success(&warehouse.run(&["stack", "initial"]));
     assert_success(&warehouse.run(&["office", "enroll"]));
 
-    assert_success(&warehouse.run(&["palletize", "draft/feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "draft/feature"]));
     for v in ["v2", "v3"] {
         warehouse.write_file("code.txt", &format!("{}\n", v));
         assert_success(&warehouse.run(&["load", "."]));
@@ -9018,29 +9071,29 @@ fn undo_refuses_to_reach_past_a_deliver() {
 
     let draft_after = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/draft/feature")).unwrap();
     assert_eq!(draft_before, draft_after, "a refused undo must not rewind the draft");
-    assert!(stdout(&warehouse.run(&["palletize"])).contains("* main"), "a refused undo must not switch pallets");
+    assert!(stdout(&warehouse.run(&["pallet", "list"])).contains("* main"), "a refused undo must not switch pallets");
 }
 
 // A shift entry passes through the same gate: after `shift main` and an un-journaled
-// `palletize other`, undo must not shift back to "side" — the user's last operation was the
-// palletize, not the shift.
+// `pallet create other`, undo must not shift back to "side" — the user's last operation was the
+// pallet create, not the shift.
 #[test]
-fn undo_refuses_to_reverse_a_shift_past_a_palletize() {
-    let warehouse = TestWarehouse::new("undo-shift-past-palletize");
+fn undo_refuses_to_reverse_a_shift_past_a_pallet_create() {
+    let warehouse = TestWarehouse::new("undo-shift-past-pallet-create");
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["prepare"]));
 
     warehouse.write_file("base.txt", "base\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "base"]));
-    assert_success(&warehouse.run(&["palletize", "side"]));
+    assert_success(&warehouse.run(&["pallet", "create", "side"]));
     warehouse.write_file("side.txt", "side\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "side work"]));
 
     // Journaled: side → main. Un-journaled after it: a new pallet at main's head, made current.
     assert_success(&warehouse.run(&["shift", "main"]));
-    assert_success(&warehouse.run(&["palletize", "other"]));
+    assert_success(&warehouse.run(&["pallet", "create", "other"]));
 
     let refused = warehouse.run(&["undo"]);
     assert!(!refused.status.success());
@@ -9048,7 +9101,7 @@ fn undo_refuses_to_reverse_a_shift_past_a_palletize() {
         stderr(&refused).contains("left pallet \"main\" current, but \"other\" is current now"),
         "{}", stderr(&refused)
     );
-    assert!(stdout(&warehouse.run(&["palletize"])).contains("* other"), "a refused undo must not shift");
+    assert!(stdout(&warehouse.run(&["pallet", "list"])).contains("* other"), "a refused undo must not shift");
     assert!(!warehouse.root.join("side.txt").exists(), "a refused undo must not materialize \"side\"");
 }
 
@@ -9145,7 +9198,7 @@ fn a_merge_that_cannot_be_signed_is_left_for_stack_to_complete() {
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run_with_env(&["stack", "base"], &pass));
 
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("b.txt", "theirs\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run_with_env(&["stack", "theirs"], &pass));
@@ -9408,7 +9461,7 @@ fn tags_are_signed_admin_only_and_verify_offline() {
     // not a reserved user name.
     let audit = stdout(&warehouse.run(&["audit", "@tags"]));
     assert!(audit.contains("verified"), "unexpected audit: {}", audit);
-    assert!(stdout(&warehouse.run(&["palletize", "--all"])).contains("@tags"));
+    assert!(stdout(&warehouse.run(&["pallet", "list", "--all"])).contains("@tags"));
 
     // Only an admin may cut a tag (the release convention, §9.4d): a writer is refused.
     let writer = keygen_admit_args(&warehouse, "writer@forklift");
@@ -9428,7 +9481,7 @@ fn cherry_pick_applies_a_parcel_diff_preserving_authorship() {
     assert_success(&warehouse.run(&["stack", "base"]));
 
     // A feature pallet whose parcel is authored by *bob* (a different operator).
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     assert_success(&warehouse.run(&["config", "operator.identifier", "bob@forklift"]));
     warehouse.write_file("bob.txt", "bob's work\n");
     assert_success(&warehouse.run(&["load", "."]));
@@ -9467,7 +9520,7 @@ fn cherry_pick_conflicts_are_marked_and_completed_by_stacking() {
     assert_success(&warehouse.run(&["stack", "base"]));
 
     // feature changes line 2 one way.
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("f.txt", "alpha\nbeta-FEATURE\ngamma\n");
     assert_success(&warehouse.run(&["load", "."]));
     let source = extract_parcel_hash(&warehouse.run(&["stack", "feature edits beta"]));
@@ -9510,7 +9563,7 @@ fn undo_reverses_a_conflicted_cherry_pick_and_its_completion() {
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "base"]));
 
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     warehouse.write_file("f.txt", "alpha\nbeta-FEATURE\ngamma\n");
     assert_success(&warehouse.run(&["load", "."]));
     let source = extract_parcel_hash(&warehouse.run(&["stack", "feature edits beta"]));
@@ -9569,7 +9622,7 @@ fn shift_flips_a_tracked_directory_into_a_file_and_back() {
     assert_success(&warehouse.run(&["stack", "base"]));
 
     // "flipped" replaces the tracked directory "foo" with a plain file.
-    assert_success(&warehouse.run(&["palletize", "flipped"]));
+    assert_success(&warehouse.run(&["pallet", "create", "flipped"]));
     std::fs::remove_dir_all(warehouse.root.join("foo")).unwrap();
     warehouse.write_file("foo", "foo is a file now\n");
     assert_success(&warehouse.run(&["load", "."]));
@@ -9613,7 +9666,7 @@ fn shift_still_refuses_a_directory_to_file_flip_when_untracked_content_is_beneat
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "base"]));
 
-    assert_success(&warehouse.run(&["palletize", "flipped"]));
+    assert_success(&warehouse.run(&["pallet", "create", "flipped"]));
     std::fs::remove_dir_all(warehouse.root.join("foo")).unwrap();
     warehouse.write_file("foo", "foo is a file now\n");
     assert_success(&warehouse.run(&["load", "."]));
@@ -9650,7 +9703,7 @@ fn consolidate_flips_a_tracked_directory_into_a_file_and_back() {
     assert_success(&warehouse.run(&["stack", "base"]));
 
     // "feature" one-sidedly replaces the tracked directory "foo" with a file.
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     std::fs::remove_dir_all(warehouse.root.join("foo")).unwrap();
     warehouse.write_file("foo", "foo is a file now\n");
     assert_success(&warehouse.run(&["load", "."]));
@@ -9694,7 +9747,7 @@ fn consolidate_flips_a_tracked_file_into_a_directory() {
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "base"]));
 
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     std::fs::remove_file(warehouse.root.join("foo")).unwrap();
     warehouse.write_file("foo/inner.txt", "inner v1\n");
     assert_success(&warehouse.run(&["load", "."]));
@@ -9730,7 +9783,7 @@ fn consolidate_still_refuses_a_directory_to_file_flip_when_untracked_content_is_
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "base"]));
 
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     std::fs::remove_dir_all(warehouse.root.join("foo")).unwrap();
     warehouse.write_file("foo", "foo is a file now\n");
     assert_success(&warehouse.run(&["load", "."]));
@@ -9767,7 +9820,7 @@ fn cherry_pick_flips_a_tracked_directory_into_a_file_and_back() {
     assert_success(&warehouse.run(&["stack", "base"]));
 
     // "feature" replaces the tracked directory "foo" with a file, in a single parcel.
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     std::fs::remove_dir_all(warehouse.root.join("foo")).unwrap();
     warehouse.write_file("foo", "foo is a file now\n");
     assert_success(&warehouse.run(&["load", "."]));
@@ -9802,7 +9855,7 @@ fn cherry_pick_flips_a_tracked_file_into_a_directory() {
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "base"]));
 
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     std::fs::remove_file(warehouse.root.join("foo")).unwrap();
     warehouse.write_file("foo/inner.txt", "inner v1\n");
     assert_success(&warehouse.run(&["load", "."]));
@@ -11064,7 +11117,7 @@ fn a_scoped_merge_resolves_one_sided_out_of_scope_changes_by_hash_without_readin
     assert_success(&warehouse.run(&["stack", "base"]));
 
     // "theirs" changes only out-of-scope content: a subtree (src/web) and a root file (README).
-    assert_success(&warehouse.run(&["palletize", "theirs"]));
+    assert_success(&warehouse.run(&["pallet", "create", "theirs"]));
     warehouse.write_file("src/web/w.txt", "web v2 from theirs\n");
     warehouse.write_file("README.md", "readme v2 from theirs\n");
     assert_success(&warehouse.run(&["load", "."]));
@@ -11122,7 +11175,7 @@ fn a_scoped_merge_refuses_a_two_sided_out_of_scope_conflict() {
     assert_success(&warehouse.run(&["stack", "base"]));
 
     // theirs branches from the base and changes src/web one way...
-    assert_success(&warehouse.run(&["palletize", "theirs"]));
+    assert_success(&warehouse.run(&["pallet", "create", "theirs"]));
     warehouse.write_file("src/web/w.txt", "web from theirs\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "theirs edits web"]));
@@ -11164,7 +11217,7 @@ fn a_scoped_merge_resolves_a_one_sided_out_of_scope_symlink_by_hash() {
     assert_success(&warehouse.run(&["stack", "base"]));
 
     // theirs re-points the out-of-scope symlink one-sided.
-    assert_success(&warehouse.run(&["palletize", "theirs"]));
+    assert_success(&warehouse.run(&["pallet", "create", "theirs"]));
     std::fs::remove_file(warehouse.root.join("shortcut")).unwrap();
     symlink("src/api/a.txt", warehouse.root.join("shortcut")).unwrap();
     assert_success(&warehouse.run(&["load", "."]));
@@ -11249,7 +11302,7 @@ fn a_scoped_merge_resolves_an_out_of_scope_directory_to_file_flip_by_hash() {
     // theirs one-sidedly replaces the out-of-scope directory src/web with a FILE. This is the
     // exact construction that emits a "set" (file loop) then a "delete" (subtree loop) for the
     // same path, in that order — the direction a plain last-write-wins insert gets wrong.
-    assert_success(&warehouse.run(&["palletize", "theirs"]));
+    assert_success(&warehouse.run(&["pallet", "create", "theirs"]));
     std::fs::remove_dir_all(warehouse.root.join("src/web")).unwrap();
     warehouse.write_file("src/web", "web is a file now\n");
     assert_success(&warehouse.run(&["load", "."]));
@@ -11353,7 +11406,7 @@ fn a_stack_refuses_when_consolidation_state_exists_but_the_skeleton_file_is_gone
 
     // theirs changes both the out-of-scope subtree one-sidedly (so the merge produces a
     // skeleton) and the in-scope file (so the scoped bay's own edit below conflicts with it).
-    assert_success(&warehouse.run(&["palletize", "theirs"]));
+    assert_success(&warehouse.run(&["pallet", "create", "theirs"]));
     warehouse.write_file("src/web/w.txt", "web v2 from theirs\n");
     warehouse.write_file("src/api/a.txt", "api a v2 from theirs\n");
     assert_success(&warehouse.run(&["load", "."]));
@@ -11413,7 +11466,7 @@ fn a_scoped_merge_resumed_after_a_conflict_keeps_an_out_of_scope_name_holding_a_
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "base"]));
 
-    assert_success(&warehouse.run(&["palletize", "theirs"]));
+    assert_success(&warehouse.run(&["pallet", "create", "theirs"]));
     warehouse.write_file("src/web\nold/w.txt", "web v2 from theirs\n");
     warehouse.write_file("src/api/a.txt", "api a v2 from theirs\n");
     assert_success(&warehouse.run(&["load", "."]));
@@ -11604,13 +11657,13 @@ fn chunked_file_round_trips_byte_identical_through_shift() {
     assert_success(&warehouse.run(&["stack", "with the giant"]));
 
     // Diverge on a feature pallet that does not have the giant.
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     std::fs::remove_file(warehouse.root.join("big.bin")).unwrap();
     warehouse.write_file("small.txt", "on feature\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "without the giant"]));
 
-    // `palletize` already switched us to feature, whose tree has no giant on disk.
+    // `pallet create` already switched us to feature, whose tree has no giant on disk.
     assert!(!warehouse.root.join("big.bin").exists(), "the giant is gone on feature");
 
     // Shifting back to main re-materializes the giant byte-for-byte (stream-assembled + verified).
@@ -11689,7 +11742,7 @@ fn compact_leaves_chunks_loose_and_the_file_still_materializes() {
     }
 
     // The file still materializes byte-identically after compaction.
-    assert_success(&warehouse.run(&["palletize", "empty"]));
+    assert_success(&warehouse.run(&["pallet", "create", "empty"]));
     std::fs::remove_file(warehouse.root.join("big.bin")).unwrap();
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "no giant"]));
@@ -11723,9 +11776,9 @@ fn a_corrupt_chunk_makes_materialization_fail_loudly() {
     // so reading it back fails loudly rather than returning wrong bytes.
     std::fs::write(&chunk_path, b"this is not the real chunk object").unwrap();
 
-    // On a branch, replace big.bin with a small plain "sentinel" and stack it. `palletize`
+    // On a branch, replace big.bin with a small plain "sentinel" and stack it. `pallet create`
     // switches to the new pallet.
-    assert_success(&warehouse.run(&["palletize", "other"]));
+    assert_success(&warehouse.run(&["pallet", "create", "other"]));
     write_bytes(&warehouse, "big.bin", b"sentinel content\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "sentinel"]));
@@ -11825,7 +11878,7 @@ fn a_file_flips_between_chunked_and_plain_across_revisions() {
     assert_eq!(entry_object_type(&warehouse, &chunked_parcel, "x.bin"), "recipe");
 
     // Revision 2 on a branch: the same path is now a tiny plain file (chunked -> plain flip).
-    assert_success(&warehouse.run(&["palletize", "plain"]));
+    assert_success(&warehouse.run(&["pallet", "create", "plain"]));
     write_bytes(&warehouse, "x.bin", b"now i am small\n");
     assert_success(&warehouse.run(&["load", "."]));
     let plain_parcel = extract_parcel_hash(&{
@@ -11862,8 +11915,8 @@ fn a_chunked_file_directory_flip_shift_succeeds() {
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "node is a chunked file"]));
 
-    // On a branch, "node" becomes a directory. `palletize` switches to the new pallet.
-    assert_success(&warehouse.run(&["palletize", "asdir"]));
+    // On a branch, "node" becomes a directory. `pallet create` switches to the new pallet.
+    assert_success(&warehouse.run(&["pallet", "create", "asdir"]));
     std::fs::remove_file(warehouse.root.join("node")).unwrap();
     warehouse.write_file("node/inside.txt", "now a directory\n");
     assert_success(&warehouse.run(&["load", "."]));
@@ -12847,14 +12900,14 @@ fn naming_commands_refuse_a_name_outside_the_grammar_and_suggest_the_lowercase_o
     let pallets_before = metadata_listing(&warehouse, "pallets");
 
     for args in [
-        vec!["palletize", "Main"], vec!["palletize", "feature/X"], vec!["palletize", "con.txt"],
-        vec!["palletize", "main."], vec!["shift", "Main"],
+        vec!["pallet", "create", "Main"], vec!["pallet", "create", "feature/X"], vec!["pallet", "create", "con.txt"],
+        vec!["pallet", "create", "main."], vec!["shift", "Main"],
     ] {
         let output = warehouse.run(&args);
         assert!(!output.status.success(), "{:?} must be refused", args);
         assert!(stderr(&output).contains("is not a valid pallet name"), "{:?}: {}", args, stderr(&output));
     }
-    assert!(stderr(&warehouse.run(&["palletize", "Main"])).contains("the lowercase \"main\" is valid"));
+    assert!(stderr(&warehouse.run(&["pallet", "create", "Main"])).contains("the lowercase \"main\" is valid"));
 
     for name in ["Review", "feature/x"] {
         let bay_dir = warehouse.home.join("bay-refused");
@@ -13196,7 +13249,7 @@ fn import_git_lowercases_a_branch_and_keeps_a_lowercase_one() {
     assert_success(&warehouse.run(&["git", "import", dir.to_str().unwrap()]));
 
     // A component that would start with "-" is anchored alike at every level.
-    let pallets = stdout(&warehouse.run(&["palletize"]));
+    let pallets = stdout(&warehouse.run(&["pallet", "list"]));
     for name in ["main", "feature/login", "fix/fork-17", "branch-wip", "feature/branch-wip"] {
         assert!(pallets.lines().any(|line| line.trim_start_matches('*').trim() == name), "{}: {}", name, pallets);
     }
@@ -13227,9 +13280,9 @@ fn stack_one(warehouse: &TestWarehouse, path: &str, content: &str) -> String {
     extract_parcel_hash(&stacked)
 }
 
-/// The user pallets `palletize` lists, with their heads.
+/// The user pallets `pallet create` lists, with their heads.
 fn pallet_heads(warehouse: &TestWarehouse) -> Vec<(String, String)> {
-    let listed = json(&warehouse.run(&["--json", "palletize"]));
+    let listed = json(&warehouse.run(&["--json", "pallet", "list"]));
     listed["data"]["pallets"].as_array().unwrap().iter()
         .map(|pallet| (pallet["name"].as_str().unwrap().to_string(), pallet["head"].as_str().unwrap_or_default().to_string()))
         .collect()
@@ -13259,7 +13312,7 @@ fn warehouse_with_side(name: &str) -> (TestWarehouse, String) {
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["prepare"]));
     let base = stack_one(&warehouse, "a.txt", "one\n");
-    assert_success(&warehouse.run(&["palletize", "side"]));
+    assert_success(&warehouse.run(&["pallet", "create", "side"]));
     assert_success(&warehouse.run(&["shift", "main"]));
     (warehouse, base)
 }
@@ -13270,7 +13323,7 @@ fn a_deleted_pallet_is_gone_from_the_list_and_undo_brings_it_back() {
     let (warehouse, base) = warehouse_with_side("delete-undo");
     let entries = journal_len(&warehouse);
 
-    let deleted = warehouse.run(&["--json", "palletize", "--delete", "side"]);
+    let deleted = warehouse.run(&["--json", "pallet", "delete", "side"]);
     assert_success(&deleted);
     let value = json(&deleted);
     assert_eq!(value["data"]["pallet"], "side", "{}", value);
@@ -13290,7 +13343,7 @@ fn a_deleted_pallet_is_gone_from_the_list_and_undo_brings_it_back() {
     assert!(pallet_heads(&warehouse).contains(&("side".to_string(), base.clone())));
     assert_eq!(journal_len(&warehouse), entries, "the undo consumed the delete's entry");
 
-    let human = warehouse.run(&["palletize", "--delete", "side"]);
+    let human = warehouse.run(&["pallet", "delete", "side"]);
     assert_success(&human);
     assert!(stdout(&human).contains("Deleted pallet \"side\""), "{}", stdout(&human));
     let undone = warehouse.run(&["undo"]);
@@ -13305,32 +13358,32 @@ fn a_delete_refuses_a_meta_pallet_one_a_checkout_stands_on_and_unheld_work() {
     let (warehouse, _) = warehouse_with_side("delete-refusals");
     assert_success(&warehouse.run(&["office", "enroll"]));
 
-    let meta = warehouse.run(&["palletize", "--delete", "@office"]);
+    let meta = warehouse.run(&["pallet", "delete", "@office"]);
     assert!(!meta.status.success());
     assert!(stderr(&meta).contains("is a meta pallet"), "{}", stderr(&meta));
 
-    let current = warehouse.run(&["palletize", "--delete", "main"]);
+    let current = warehouse.run(&["pallet", "delete", "main"]);
     assert!(!current.status.success());
     assert!(stderr(&current).contains("The warehouse's own working tree stands on pallet \"main\""), "{}", stderr(&current));
 
     let bay = open_bay(&warehouse, "b2");
-    let in_bay = warehouse.run(&["palletize", "--delete", "b2"]);
+    let in_bay = warehouse.run(&["pallet", "delete", "b2"]);
     assert!(!in_bay.status.success());
     assert!(stderr(&in_bay).contains("Bay \"b2\" stands on pallet \"b2\""), "{}", stderr(&in_bay));
     assert_success(&bay.run(&["shift", "side"]));
-    let from_main = warehouse.run(&["palletize", "--delete", "side"]);
+    let from_main = warehouse.run(&["pallet", "delete", "side"]);
     assert!(stderr(&from_main).contains("Bay \"b2\" stands on pallet \"side\""), "{}", stderr(&from_main));
     assert_success(&bay.run(&["shift", "b2"]));
 
-    let missing = warehouse.run(&["palletize", "--delete", "nope"]);
+    let missing = warehouse.run(&["pallet", "delete", "nope"]);
     assert!(!missing.status.success());
 
     // Work on "lone" that no other pallet holds, with no remote to ask.
-    assert_success(&warehouse.run(&["palletize", "lone"]));
+    assert_success(&warehouse.run(&["pallet", "create", "lone"]));
     let lone = stack_one(&warehouse, "lone.txt", "lone\n");
     assert_success(&warehouse.run(&["shift", "main"]));
 
-    let unheld = warehouse.run(&["palletize", "--delete", "lone"]);
+    let unheld = warehouse.run(&["pallet", "delete", "lone"]);
     assert!(!unheld.status.success());
     let message = stderr(&unheld);
     assert!(message.contains("No other pallet here holds the work on pallet \"lone\""), "{}", message);
@@ -13338,19 +13391,19 @@ fn a_delete_refuses_a_meta_pallet_one_a_checkout_stands_on_and_unheld_work() {
     assert!(message.contains("100 later journaled operations"), "{}", message);
     assert!(pallet_heads(&warehouse).contains(&("lone".to_string(), lone.clone())), "a refused delete removes nothing");
 
-    let forced = warehouse.run(&["--json", "palletize", "--delete", "lone", "--force"]);
+    let forced = warehouse.run(&["--json", "pallet", "delete", "lone", "--force"]);
     assert_success(&forced);
     assert!(json(&forced)["data"]["contained_by"].is_null(), "{}", stdout(&forced));
     assert!(!pallet_heads(&warehouse).iter().any(|(name, _)| name == "lone"));
 
     // A pallet a later pallet descends from is held by it.
     assert_success(&warehouse.run(&["undo"]));
-    let held = warehouse.run(&["--json", "palletize", "--delete", "side"]);
+    let held = warehouse.run(&["--json", "pallet", "delete", "side"]);
     assert_success(&held);
     let by = json(&held)["data"]["contained_by"].as_str().unwrap().to_string();
     assert!(by == "pallet \"b2\"" || by == "pallet \"lone\"" || by == "pallet \"main\"", "{}", by);
 
-    let force_alone = warehouse.run(&["palletize", "--force"]);
+    let force_alone = warehouse.run(&["pallet", "list", "--force"]);
     assert!(!force_alone.status.success(), "--force needs --delete");
 }
 
@@ -13363,17 +13416,17 @@ fn a_delete_refuses_an_open_hauls_pallets_and_names_a_merged_haul() {
     stack_one(&warehouse, "base.txt", "base\n");
     assert_success(&warehouse.run(&["office", "enroll"]));
 
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     stack_one(&warehouse, "feature.txt", "feat\n");
     assert_success(&warehouse.run(&["shift", "main"]));
-    assert_success(&warehouse.run(&["palletize", "release"]));
+    assert_success(&warehouse.run(&["pallet", "create", "release"]));
 
     assert_success(&warehouse.run(&["haul", "open", "--target", "release", "--source", "feature", "--title", "Ship it"]));
     let id = json(&warehouse.run(&["haul", "list", "--json"]))["data"]["hauls"][0]["id"].as_str().unwrap().to_string();
     assert_success(&warehouse.run(&["shift", "main"]));
 
     for pallet in ["feature", "release"] {
-        let refused = warehouse.run(&["palletize", "--delete", pallet, "--force"]);
+        let refused = warehouse.run(&["pallet", "delete", pallet, "--force"]);
         assert!(!refused.status.success(), "{}", pallet);
         assert!(stderr(&refused).contains(&format!("Open haul {}", id)), "{}", stderr(&refused));
         assert!(pallet_heads(&warehouse).iter().any(|(name, _)| name == pallet));
@@ -13383,7 +13436,7 @@ fn a_delete_refuses_an_open_hauls_pallets_and_names_a_merged_haul() {
     assert_success(&warehouse.run(&["haul", "merge", &id]));
     assert_success(&warehouse.run(&["shift", "main"]));
 
-    let deleted = warehouse.run(&["--json", "palletize", "--delete", "release", "--force"]);
+    let deleted = warehouse.run(&["--json", "pallet", "delete", "release", "--force"]);
     assert_success(&deleted);
     assert_eq!(json(&deleted)["data"]["merged_hauls"], serde_json::json!([id]), "{}", stdout(&deleted));
 }
@@ -13394,11 +13447,11 @@ fn a_delete_refuses_an_open_hauls_pallets_and_names_a_merged_haul() {
 fn undo_of_a_delete_refuses_a_name_taken_since_and_undo_as_brings_it_back_elsewhere() {
     let (warehouse, base) = warehouse_with_side("delete-undo-as");
     let second = stack_one(&warehouse, "b.txt", "two\n");
-    assert_success(&warehouse.run(&["palletize", "--delete", "side"]));
+    assert_success(&warehouse.run(&["pallet", "delete", "side"]));
 
     // Another bay creates "side" again, at another head.
     let bay = open_bay(&warehouse, "b2");
-    assert_success(&bay.run(&["palletize", "side", &second]));
+    assert_success(&bay.run(&["pallet", "create", "side", &second]));
     let entries = journal_len(&warehouse);
 
     let refused = warehouse.run(&["undo"]);
@@ -13442,9 +13495,9 @@ fn undo_of_a_delete_refuses_a_name_taken_since_and_undo_as_brings_it_back_elsewh
 #[test]
 fn undo_of_a_delete_whose_pallet_is_back_at_its_head_counts_as_restored() {
     let (warehouse, base) = warehouse_with_side("delete-undo-restored");
-    assert_success(&warehouse.run(&["palletize", "--delete", "side"]));
+    assert_success(&warehouse.run(&["pallet", "delete", "side"]));
     let bay = open_bay(&warehouse, "b2");
-    assert_success(&bay.run(&["palletize", "side", &base]));
+    assert_success(&bay.run(&["pallet", "create", "side", &base]));
     let entries = journal_len(&warehouse);
 
     let undone = warehouse.run(&["--json", "undo"]);
@@ -13470,7 +13523,7 @@ fn undo_of_a_delete_refuses_a_bay_on_the_name_out_of_step_and_leaves_one_at_the_
     assert_success(&bay.run(&["shift", "side"]));
     let at_head = std::fs::read(bay_position_file(&warehouse, "b2")).unwrap();
     assert_success(&bay.run(&["shift", "b2"]));
-    assert_success(&warehouse.run(&["palletize", "--delete", "side", "--force"]));
+    assert_success(&warehouse.run(&["pallet", "delete", "side", "--force"]));
 
     std::fs::write(bay_position_file(&warehouse, "b2"), &early).unwrap();
     let refused = warehouse.run(&["undo"]);
@@ -13481,10 +13534,10 @@ fn undo_of_a_delete_refuses_a_bay_on_the_name_out_of_step_and_leaves_one_at_the_
     assert!(!pallet_heads(&warehouse).iter().any(|(name, _)| name == "side"), "nothing was created");
 
     // "--as" judges the bays on the name it creates: one standing on "side-new" at another base refuses.
-    assert_success(&bay.run(&["palletize", "side-new"]));
+    assert_success(&bay.run(&["pallet", "create", "side-new"]));
     let on_new = std::fs::read(bay_position_file(&warehouse, "b2")).unwrap();
     assert_success(&bay.run(&["shift", "b2"]));
-    assert_success(&bay.run(&["palletize", "--delete", "side-new"]));
+    assert_success(&bay.run(&["pallet", "delete", "side-new"]));
     std::fs::write(bay_position_file(&warehouse, "b2"), &on_new).unwrap();
     let refused = warehouse.run(&["undo", "--as", "side-new"]);
     assert!(stderr(&refused).contains("Bay \"b2\" stands on pallet \"side-new\""), "{}", stderr(&refused));
@@ -13504,7 +13557,7 @@ fn undo_of_a_delete_refuses_history_enrollment_left_out_and_survives_an_admit() 
     assert_success(&warehouse.run(&["shift", "side"]));
     stack_one(&warehouse, "side.txt", "unsigned\n");
     assert_success(&warehouse.run(&["shift", "main"]));
-    assert_success(&warehouse.run(&["palletize", "--delete", "side", "--force"]));
+    assert_success(&warehouse.run(&["pallet", "delete", "side", "--force"]));
     assert_success(&warehouse.run(&["office", "enroll"]));
 
     for args in [&["undo"][..], &["undo", "--as", "side-old"][..]] {
@@ -13515,11 +13568,11 @@ fn undo_of_a_delete_refuses_history_enrollment_left_out_and_survives_an_admit() 
     assert!(!pallet_heads(&warehouse).iter().any(|(name, _)| name.starts_with("side")));
 
     // Signed work deleted before an admit comes back.
-    assert_success(&warehouse.run(&["palletize", "signed"]));
+    assert_success(&warehouse.run(&["pallet", "create", "signed"]));
     let signed = stack_one(&warehouse, "signed.txt", "signed\n");
     assert_success(&warehouse.run(&["shift", "main"]));
     let entries = journal_len(&warehouse);
-    assert_success(&warehouse.run(&["palletize", "--delete", "signed", "--force"]));
+    assert_success(&warehouse.run(&["pallet", "delete", "signed", "--force"]));
     let bob = keygen_admit_args(&warehouse, "bob@forklift");
     assert_success(&warehouse.run(&["office", "admit", &bob[0], &bob[1], &bob[2]]));
     assert_success(&warehouse.run(&["undo"]));
@@ -13535,10 +13588,10 @@ fn a_repack_keeps_a_deleted_head_until_the_bay_that_deleted_it_is_removed() {
     assert_success(&warehouse.run(&["prepare"]));
     stack_one(&warehouse, "a.txt", "one\n");
 
-    assert_success(&warehouse.run(&["palletize", "side"]));
+    assert_success(&warehouse.run(&["pallet", "create", "side"]));
     let head = stack_one(&warehouse, "side.txt", "only here\n");
     assert_success(&warehouse.run(&["shift", "main"]));
-    assert_success(&warehouse.run(&["palletize", "--delete", "side", "--force"]));
+    assert_success(&warehouse.run(&["pallet", "delete", "side", "--force"]));
 
     // Automatic maintenance repacks on the next command.
     assert_success(&warehouse.run(&["store", "compact"]));
@@ -13555,7 +13608,7 @@ fn a_repack_keeps_a_deleted_head_until_the_bay_that_deleted_it_is_removed() {
 
     // Deleted from a bay, then the bay removed: nothing roots the head any more.
     let bay = open_bay(&warehouse, "b2");
-    assert_success(&bay.run(&["palletize", "--delete", "side", "--force"]));
+    assert_success(&bay.run(&["pallet", "delete", "side", "--force"]));
     assert_success(&bay.run(&["store", "compact", "--all"]));
     assert_success(&warehouse.run(&["show", &format!("{}:side.txt", head)]));
     assert_success(&warehouse.run(&["bay", "remove", "b2"]));
@@ -13575,7 +13628,7 @@ fn a_version_two_journal_takes_a_delete_and_its_undo() {
     std::fs::write(&path, text.replace("\"version\":3", "\"version\":2")).unwrap();
 
     assert_success(&warehouse.run(&["store", "compact", "--all"]));
-    assert_success(&warehouse.run(&["palletize", "--delete", "side"]));
+    assert_success(&warehouse.run(&["pallet", "delete", "side"]));
     assert_success(&warehouse.run(&["store", "compact", "--all"]));
     assert_success(&warehouse.run(&["undo"]));
     assert!(pallet_heads(&warehouse).iter().any(|(name, _)| name == "side"));
@@ -13594,10 +13647,10 @@ fn older_entries_after_undo_as_act_on_whatever_the_old_name_holds() {
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["prepare"]));
     let base = stack_one(&warehouse, "a.txt", "one\n");
-    assert_success(&warehouse.run(&["palletize", "x"]));
+    assert_success(&warehouse.run(&["pallet", "create", "x"]));
     stack_one(&warehouse, "x.txt", "x\n");
     assert_success(&warehouse.run(&["shift", "main"]));
-    assert_success(&warehouse.run(&["palletize", "--delete", "x", "--force"]));
+    assert_success(&warehouse.run(&["pallet", "delete", "x", "--force"]));
 
     let renamed = warehouse.run(&["undo", "--as", "y"]);
     assert_success(&renamed);
@@ -13611,7 +13664,7 @@ fn older_entries_after_undo_as_act_on_whatever_the_old_name_holds() {
     // Once "x" exists again, at another head, the shift lands on it; the stack on the old "x" then
     // refuses as moved.
     let bay = open_bay(&warehouse, "b2");
-    assert_success(&bay.run(&["palletize", "x", &base]));
+    assert_success(&bay.run(&["pallet", "create", "x", &base]));
     assert_success(&warehouse.run(&["undo"]));
     assert_eq!(std::fs::read_to_string(warehouse.root.join("x.txt")).ok(), None, "the bay is on the new x");
 
@@ -13625,8 +13678,8 @@ fn older_entries_after_undo_as_act_on_whatever_the_old_name_holds() {
 fn undo_of_a_delete_reaches_past_a_switch_of_pallets() {
     let (warehouse, base) = warehouse_with_side("delete-undo-after-switch");
 
-    assert_success(&warehouse.run(&["palletize", "--delete", "side"]));
-    assert_success(&warehouse.run(&["palletize", "next"]));
+    assert_success(&warehouse.run(&["pallet", "delete", "side"]));
+    assert_success(&warehouse.run(&["pallet", "create", "next"]));
 
     let undone = warehouse.run(&["--json", "undo"]);
     assert_success(&undone);
@@ -13642,12 +13695,12 @@ fn undo_of_a_delete_refuses_a_pallet_that_took_its_folder_and_names_undo_as() {
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["prepare"]));
     let base = stack_one(&warehouse, "a.txt", "one\n");
-    assert_success(&warehouse.run(&["palletize", "q/r"]));
+    assert_success(&warehouse.run(&["pallet", "create", "q/r"]));
     assert_success(&warehouse.run(&["shift", "main"]));
-    assert_success(&warehouse.run(&["palletize", "a/b"]));
+    assert_success(&warehouse.run(&["pallet", "create", "a/b"]));
     assert_success(&warehouse.run(&["shift", "main"]));
 
-    assert_success(&warehouse.run(&["palletize", "--delete", "a/b"]));
+    assert_success(&warehouse.run(&["pallet", "delete", "a/b"]));
     // A bay creates pallet "a" without journaling anything here.
     let _bay = open_bay(&warehouse, "a");
     let entries = journal_len(&warehouse);
@@ -13681,7 +13734,7 @@ fn a_repack_keeps_the_head_an_open_or_closed_haul_proposes_after_its_source_move
     // undone, and the change it re-stages is dropped.
     let mut hauls = Vec::new();
     for source in ["feature", "fix"] {
-        assert_success(&warehouse.run(&["palletize", source]));
+        assert_success(&warehouse.run(&["pallet", "create", source]));
         let file = format!("{}.txt", source);
         let proposed = stack_one(&warehouse, &file, &format!("{} only here\n", source));
         let opened = warehouse.run(&["--json", "haul", "open", "--target", "main", "--source", source, "--title", source]);
@@ -13721,7 +13774,7 @@ fn haul_merge_of_a_head_this_warehouse_does_not_hold_names_where_to_get_it() {
     stack_one(&warehouse, "base.txt", "base\n");
     assert_success(&warehouse.run(&["office", "enroll"]));
 
-    assert_success(&warehouse.run(&["palletize", "feature"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
     let proposed = stack_one(&warehouse, "feature.txt", "feature only here\n");
     let opened = warehouse.run(&["--json", "haul", "open", "--target", "main", "--source", "feature", "--title", "feature"]);
     assert_success(&opened);

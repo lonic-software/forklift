@@ -220,7 +220,7 @@ refusal_codes! {
 
     /// A command named a pallet this warehouse holds no ref for — or, for `lower`, one the remote
     /// does not have. The next step is `lower <name>` when a remote is configured (the remote may
-    /// have it), else `palletize <name>`; for `lower <name>`, `palletize --remote`, and for a bare
+    /// have it), else `pallet create <name>`; for `lower <name>`, `pallet list --remote`, and for a bare
     /// `lower`, `lift`.
     PalletNotFound => "pallet_not_found",
 
@@ -259,7 +259,7 @@ refusal_codes! {
     /// The remote has the pallet only as a tombstone: it was deleted there, and the remote keeps
     /// the name reserved for the history its tombstone holds. A lift re-creates it only by
     /// acknowledging the deletion (`lift --recreate`) from work that descends from that head; the
-    /// next step otherwise brings the pallet back there (`palletize --restore <name> --remote`).
+    /// next step otherwise brings the pallet back there (`pallet restore <name> --remote`).
     PalletDeletedOnRemote => "pallet_deleted_on_remote",
 
     /// A cache warehouse (franchised with `--cache`) does not hold content the command reads, and

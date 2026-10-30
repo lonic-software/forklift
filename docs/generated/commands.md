@@ -74,7 +74,11 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `office regenesis` |  |  | RESET trust: new root, prior history pinned as attested — recovery only |
 | `office accept-regenesis` |  |  | Consciously accept a remote's trust reset (re-genesis) |
 | `office list` |  |  | List the users and their keys (the default) |
-| `palletize` | `pz` | `branch` | Create a new pallet (branch) and shift to it; without a name, list the pallets |
+| `pallet` |  | `branch` | Manage pallets (branches): list, create, delete and restore them |
+| `pallet list` |  |  | List the pallets, marking the current one (the default) |
+| `pallet create` |  |  | Create a new pallet and shift to it |
+| `pallet delete` |  |  | Delete a pallet: remove its ref, keeping its parcels |
+| `pallet restore` |  |  | Bring back a deleted pallet at the head its tombstone holds |
 | `park` | `pa` | `stash` | Park the work in progress and reset to the pallet head |
 | `park pop` |  |  | Re-apply the most recently parked changes (staged) and drop them from the list |
 | `park list` |  |  | List the parked parcels, newest first |
