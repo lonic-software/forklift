@@ -138,6 +138,13 @@ mod tests {
             .map(|()| args.into_iter().skip(1).map(|arg| arg.into_string().unwrap()).collect())
     }
 
+    /// The argv `line` expands to over `tree`, joined.
+    fn walk(tree: &clap::Command, line: &[&str]) -> String {
+        let mut args: Vec<OsString> = line.iter().map(OsString::from).collect();
+        super::expand(tree, &mut args).unwrap();
+        args.into_iter().map(|arg| arg.into_string().unwrap()).collect::<Vec<_>>().join(" ")
+    }
+
     fn expands_to(line: &str, expected: &str) {
         let got = expand(line).unwrap_or_else(|error| panic!("`{line}`: {error}"));
         assert_eq!(got.join(" "), expected, "`{line}`");
@@ -173,9 +180,16 @@ mod tests {
     fn a_hidden_alias_matches_only_when_spelled_out() {
         expands_to("comm", "comm");
         expands_to("anno", "anno");
-        // A hidden command is reached by its full name only.
-        expands_to("__d", "__d");
-        expands_to("__docgen", "__docgen");
+
+        // A hidden command is reached by its full name only. The binary's one hidden command is
+        // compiled in only for docs generation, so a tree of its own holds the rule.
+        let mut tree = clap::Command::new("t")
+            .subcommand(clap::Command::new("haul"))
+            .subcommand(clap::Command::new("hidden").hide(true));
+        tree.build();
+        assert_eq!(walk(&tree, &["t", "hi"]), "t hi");
+        assert_eq!(walk(&tree, &["t", "hidden"]), "t hidden");
+        assert_eq!(walk(&tree, &["t", "ha"]), "t haul");
     }
 
     /// A prefix of several names is a usage error naming exactly those names, on the command whose
@@ -223,11 +237,7 @@ mod tests {
             .arg(clap::Arg::new("value").short('c').short_alias('k').action(clap::ArgAction::Set))
             .subcommand(clap::Command::new("haul"));
         tree.build();
-        let walk = |line: &[&str]| {
-            let mut args: Vec<OsString> = line.iter().map(OsString::from).collect();
-            super::expand(&tree, &mut args).unwrap();
-            args.into_iter().map(|arg| arg.into_string().unwrap()).collect::<Vec<_>>().join(" ")
-        };
+        let walk = |line: &[&str]| walk(&tree, line);
         assert_eq!(walk(&["t", "-c", "ha"]), "t -c ha");
         assert_eq!(walk(&["t", "-vc", "ha"]), "t -vc ha");
         assert_eq!(walk(&["t", "-k", "ha"]), "t -k ha");
