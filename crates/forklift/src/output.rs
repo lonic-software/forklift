@@ -531,8 +531,8 @@ error_codes! {
     /// relies on its origin to hold; the origin was left where it was.
     OriginMoveIncomplete,
 
-    /// A destructive command had something to destroy and was run without `--confirm`; it showed
-    /// what it would destroy and changed nothing.
+    /// A destructive command had something to destroy (for `lower`, a resolution named `theirs`)
+    /// and was run without `--confirm`; it showed what it would destroy and changed nothing.
     ConfirmationRequired,
 }
 
@@ -730,8 +730,8 @@ impl ErrorCode {
                  relies on its origin to hold; the origin was left where it was, and copying the old \
                  server's warehouse to the new one, server-side, lets the move run again",
             ErrorCode::ConfirmationRequired =>
-                "A destructive command had something to destroy and was run without --confirm; it \
-                 showed what it would destroy, changed nothing, and running it again with --confirm \
+                "A destructive command had something to destroy (for lower, a resolution named \
+                 theirs) and was run without --confirm; it showed what it would destroy, changed nothing, and running it again with --confirm \
                  destroys it",
         }
     }

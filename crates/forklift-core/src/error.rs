@@ -281,7 +281,8 @@ refusal_codes! {
     /// A destructive command was run without `--confirm` while it had something to destroy: work
     /// in the working tree, content held here, or the trust guarantee. It showed what it would
     /// destroy and changed nothing; the details carry that preview, and running it again with
-    /// `--confirm` destroys it.
+    /// `--confirm` destroys it. `lower` refuses whenever a resolution names `theirs`, before it
+    /// knows whether that drops anything.
     ConfirmationRequired => "confirmation_required",
 }
 

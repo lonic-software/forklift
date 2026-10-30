@@ -107,7 +107,7 @@ way an uncommitted edit does, and the import warns, naming the files (`--json` l
 `unheld`). Like any unstaged change, it must be settled before a command that needs a clean
 working tree, in one of two ways: `load` and stack it to track the file as checked out (under
 `core.autocrlf=true` that stacks every text file with CRLF line endings), or, for a file you did
-not edit, `restore` it to write the imported content back, discarding what the file holds (a
+not edit, `restore --confirm` it to write the imported content back, discarding what the file holds (a
 colocated git checkout may then list it as modified; a symlink is restored only where one can be
 created). The import does not refuse such a repository: git.git itself converts its `.bat`
 files.
