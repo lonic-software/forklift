@@ -2257,6 +2257,9 @@ pub(crate) mod tests {
             write("main", None, &base).unwrap();
             let root_tree = two_dirs("a1", "b1");
             let head = parcel(&root_tree, &[&base]);
+            // A full warehouse records no origin, so nothing appends an entry to it; the fixture
+            // writes one anyway, so the gate itself is what refuses.
+            crate::util::origin_utils::write_for_tests("http://origin.test");
             record(&root_tree);
             remove(&root_tree);
 

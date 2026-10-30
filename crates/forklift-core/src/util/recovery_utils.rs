@@ -540,7 +540,8 @@ async fn resolve_the_rest(
     // going straight to the remainder with the plain "no remote" wording. A remote that is
     // configured but unreachable still takes this branch — the dedicated fetch below simply fails
     // and the recheck (also below) finds the bytes exactly as they were.
-    let remote_configured = remote_utils::RemoteClient::from_config().is_ok();
+    let remote = remote_utils::RemoteClient::for_warehouse();
+    let remote_configured = remote.is_ok();
 
     for (relative, error) in &attempt.unreadable {
         remainder.insert(relative.clone());
@@ -679,19 +680,15 @@ async fn resolve_the_rest(
     let corrupt_hashes: Vec<String> = corrupt_candidates.keys().cloned().collect();
 
     let (consultation, corrupt_failures) = if !remote_configured {
-        // `remote_configured` is `false` for two different reasons `RemoteClient::from_config`
-        // conflates into one `Err`: genuinely nothing set, or something set but unusable (a
-        // config read/parse error, or a URL `RemoteClient::new` rejects). Telling them apart
+        // `remote_configured` is `false` for three different reasons: a partial warehouse's
+        // remote that is not its origin (reported as that refusal), genuinely nothing set, or
+        // something set but unusable (a config read/parse error, or a URL `RemoteClient::new`
+        // rejects). Telling the last two apart
         // (`remote_utils::is_configured`) matters here specifically: reporting the second as the
         // first steers a user with a real, merely broken remote toward the heavyweight remedies
         // (franchise / reproduce / accept the loss) for an object that remote may still actually
         // have, once whatever is wrong with its config is fixed.
-        let consultation = if remote_utils::RemoteClient::is_configured() {
-            RemoteConsultation::ConsultedWithErrors
-        } else {
-            RemoteConsultation::NotConfigured
-        };
-        (consultation, BTreeMap::new())
+        (unconsulted(remote.err()), BTreeMap::new())
     } else if candidate_hashes.is_empty() && corrupt_hashes.is_empty() {
         // Nothing a fetch could help with this round (e.g. every remaining recorded path is
         // `unreadable`/`restage_failed`, never object-shaped) — skip the network entirely.
@@ -2710,6 +2707,9 @@ enum RemoteConsultation {
     /// completed without error — whatever is still missing afterward, the remote genuinely lacks
     /// too, at least as of this run.
     ConsultedCleanly,
+    /// A remote is configured, but this partial warehouse may not ask it: it is not the origin, or
+    /// no origin is recorded. `reason` is the refusal, with its way out.
+    Refused { reason: String },
     /// A remote is configured, but the handshake or at least one pallet's fetch failed this run —
     /// a hash still missing below was not necessarily *confirmed* absent upstream, only not yet
     /// recovered; retrying once connectivity is restored may still help.
@@ -2745,6 +2745,13 @@ fn remedy_text(consultation: &RemoteConsultation) -> String {
             reproduce it by re-running the operation that created it if its content still exists \
             in your working tree (\"forklift load\" then \"forklift stack\") — there is no \
             in-tool way to abandon a single dangling reference yet",
+        RemoteConsultation::Refused { reason } => return format!(
+            "this heal did not ask the configured remote for it: {} Then re-run \"forklift heal\", \
+            or reproduce it by re-running the operation that created it if its content still exists \
+            in your working tree (\"forklift load\" then \"forklift stack\") — there is no in-tool \
+            way to abandon a single dangling reference yet",
+            reason.trim_end()
+        ),
         RemoteConsultation::ScopeUnreadable { reason, other_errors } => return format!(
             "this heal checked the configured remote for it but skipped the history fetch of the \
             working pallets: {} {}reproduce it by re-running the operation that created it if its \
@@ -2759,6 +2766,17 @@ fn remedy_text(consultation: &RemoteConsultation) -> String {
             }
         ),
     }.to_string()
+}
+
+/// What heal reports when it could not build the remote client: a partial warehouse's refusal to
+/// ask a remote other than its origin, as itself; otherwise nothing configured, or something
+/// configured but unusable — the two `RemoteClient::is_configured` tells apart.
+fn unconsulted(why: Option<CoreError>) -> RemoteConsultation {
+    match why {
+        Some(CoreError::Refusal { message, .. }) => RemoteConsultation::Refused { reason: message },
+        _ if remote_utils::RemoteClient::is_configured() => RemoteConsultation::ConsultedWithErrors,
+        _ => RemoteConsultation::NotConfigured,
+    }
 }
 
 /// §3.2 D1/D3/D4: the heal-driven refetch. Three passes, all best-effort — see the "empirically
@@ -2822,13 +2840,9 @@ async fn attempt_heal_driven_refetch(
     // that check and this `.await` actually running. Same distinction either way: never conflate
     // "configured but unusable" with "nothing configured" — see `remote_utils::is_configured`'s
     // own doc comment.
-    let client = match remote_utils::RemoteClient::from_config() {
+    let client = match remote_utils::RemoteClient::for_warehouse() {
         Ok(client) => client,
-        Err(_) => return (if remote_utils::RemoteClient::is_configured() {
-            RemoteConsultation::ConsultedWithErrors
-        } else {
-            RemoteConsultation::NotConfigured
-        }, BTreeMap::new()),
+        Err(why) => return (unconsulted(Some(why)), BTreeMap::new()),
     };
 
     // Armed for the rest of this function — both passes below, and every `.await` inside them —
@@ -7078,6 +7092,75 @@ mod tests {
             "tried to check the configured remote automatically but could not complete that check"
         ), "a broken remote config must be reported as consulted-but-failed, not silently \
             misclassified as unconfigured: {}", message);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A partial warehouse's heal asks only its origin: pointed at another remote, it reports the
+    /// refusal and its way out, and fetches nothing, though that remote serves the missing object.
+    ///
+    /// Revert: build heal's client with `from_config` again → the object is refetched from the
+    /// other remote and the heal clears.
+    #[test]
+    fn a_partial_warehouses_heal_asks_no_remote_but_its_origin() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::globals::StorageRootScope;
+        use crate::model::blob::Blob;
+        use crate::model::parcel::Parcel;
+        use crate::model::tree_item::TreeItem;
+        use crate::util::config_utils;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-non-origin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Cache);
+        let forklift = forklift_root();
+
+        let content = b"referenced content".to_vec();
+        let mut blob_object = LooseObjectBuilder::build_blob(&Blob { content: content.clone() });
+        blob_object.store().unwrap();
+        let b_hash = blob_object.hash.clone();
+        let (folder, file_name) = file_utils::get_path_for_object(&b_hash).unwrap();
+        let b_absolute = PathBuf::from(&folder).join(&file_name);
+        let b_relative = b_absolute.strip_prefix(&forklift).unwrap().to_path_buf();
+
+        let mut root_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        root_tree.add_child(TreeItem::new("b.txt".to_string(), b_hash.clone(), DirEntryType::Normal));
+        let mut tree_object = LooseObjectBuilder::build_tree(&root_tree);
+        tree_object.store().unwrap();
+
+        let parcel = Parcel {
+            tree_hash: tree_object.hash.clone(),
+            parents: Vec::new(),
+            actions: Vec::new(),
+            description: Some("references B".to_string()),
+        };
+        let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
+        parcel_object.store().unwrap();
+        pallet_utils::update_pallet_head("main", None, &parcel_object.hash, &pallet_utils::RefPreconditions::NONE).unwrap();
+
+        std::fs::remove_file(&b_absolute).unwrap();
+        plant_complete_taint(&forklift, &[b_relative.to_str().unwrap()]);
+
+        let mut objects = HashMap::new();
+        objects.insert(b_hash.clone(), content);
+        let other = start_object_remote(objects);
+        config_utils::set_value(config_utils::KEY_REMOTE_URL, &other, crate::enums::config_scope::ConfigScope::Warehouse).unwrap();
+
+        let error = run_heal().expect_err("the object is not fetched from a remote other than the origin");
+        assert_durability_taint(&error, &[b_hash.as_str()]);
+        let message = match &error {
+            CoreError::Refusal { message, .. } => message.clone(),
+            other => panic!("expected a DurabilityTaint refusal, got {:?}", other),
+        };
+        assert!(message.contains("did not ask the configured remote"), "{}", message);
+        assert!(message.contains(crate::util::warehouse_utils::TEST_ORIGIN) && message.contains(&other), "{}", message);
+        assert!(!b_absolute.exists(), "nothing was fetched from the other remote");
 
         std::fs::remove_dir_all(&root).ok();
     }

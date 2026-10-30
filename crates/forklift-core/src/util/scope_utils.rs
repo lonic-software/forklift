@@ -54,7 +54,7 @@ pub const CODE_OUT_OF_SCOPE: &str = RefusalCode::OutOfScope.as_str();
 pub const CODE_OUT_OF_SCOPE_CONFLICT: &str = RefusalCode::OutOfScopeConflict.as_str();
 pub const CODE_SCOPE_PATH_TYPE_CHANGED: &str = RefusalCode::ScopePathTypeChanged.as_str();
 pub const CODE_SPARSE_WORKSPACE: &str = RefusalCode::SparseWorkspace.as_str();
-pub const CODE_NON_ORIGIN_LIFT: &str = RefusalCode::NonOriginLift.as_str();
+pub const CODE_NON_ORIGIN_REMOTE: &str = RefusalCode::NonOriginRemote.as_str();
 pub const CODE_NARROW_UNCLEAN: &str = RefusalCode::NarrowUnclean.as_str();
 pub const CODE_SCOPE_PRUNE_BLOCKED: &str = RefusalCode::ScopePruneBlocked.as_str();
 
@@ -746,119 +746,6 @@ pub fn scope_prune_blocked_refusal(path: &str, blockers: &str) -> CoreError {
     )
 }
 
-/// Refuse unless the configured remote is this partial warehouse's recorded origin, the only
-/// remote proved to hold what it lacks. No remote configured at all passes: the remote client
-/// reports that plainly, rather than a refusal naming an empty remote.
-///
-/// # Arguments
-/// * `unrecorded` - The refusal when no origin is recorded (an interrupted franchise, or unset).
-/// * `non_origin` - The refusal when the configured remote differs, given the origin and it.
-///
-/// # Returns
-/// * `Ok(())`         - If the configured remote is the origin, or none is configured.
-/// * `Err(CoreError)` - The matching refusal, or a config read failure.
-pub fn ensure_remote_is_origin(
-    unrecorded: fn() -> CoreError,
-    non_origin: fn(&str, &str) -> CoreError,
-) -> Result<(), CoreError> {
-    use crate::enums::config_scope::ConfigScope;
-    use crate::util::config_utils;
-
-    let Some(origin) = config_utils::get_scoped_value(config_utils::KEY_REMOTE_ORIGIN, ConfigScope::Warehouse)? else {
-        return Err(unrecorded());
-    };
-
-    let Some((configured, _scope)) = config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)? else {
-        return Ok(());
-    };
-
-    if configured != origin {
-        return Err(non_origin(&origin, &configured));
-    }
-
-    Ok(())
-}
-
-/// A ready-made `non_origin_lift` refusal for a lift from a partial warehouse (franchised with
-/// `--only` or `--cache`) to a remote other than the one it fetched against. A partial warehouse
-/// only ever proved the closure it does not hold present on its origin; a different remote may
-/// lack objects it never verified there, so the lift would fail late at the remote's closure
-/// check. Refusing up front is the clearer failure.
-///
-/// # Arguments
-/// * `origin` - The remote this warehouse was franchised from.
-/// * `other`  - The currently configured remote it is trying to lift to.
-pub fn non_origin_lift_refusal(origin: &str, other: &str) -> CoreError {
-    let next_step = format!(
-        "Point \"remote.url\" back at \"{}\", or franchise \"{}\" without --only or --cache.",
-        origin, other
-    );
-
-    refusal(
-        RefusalCode::NonOriginLift,
-        format!(
-            "This is a partial warehouse, franchised from \"{}\"; lifting to \"{}\" may fail \
-            because that remote may lack objects this warehouse does not hold and never verified \
-            there. {}",
-            origin, other, next_step
-        ),
-        next_step,
-    )
-}
-
-/// A ready-made `non_origin_lift` refusal for a partial warehouse whose origin is not recorded:
-/// without it Forklift cannot tell whether the configured remote holds what this warehouse lacks.
-pub fn unrecorded_origin_lift_refusal() -> CoreError {
-    let next_step = "Franchise the remote again, into a new directory, or record the remote this \
-        warehouse was franchised from with \"forklift config remote.origin <url>\".";
-
-    refusal(
-        RefusalCode::NonOriginLift,
-        format!(
-            "This is a partial warehouse, but the remote it was franchised from (\"remote.origin\") \
-            is not recorded, so Forklift cannot tell whether the remote it would lift to holds the \
-            objects this warehouse does not. {}",
-            next_step
-        ),
-        next_step,
-    )
-}
-
-/// A ready-made `non_origin_lift` refusal for an `evict` while the configured remote is not the
-/// cache's origin: only the origin was proved to hold what this warehouse lacks, so only its heads
-/// may decide what a refill can fetch back.
-pub fn non_origin_evict_refusal(origin: &str, other: &str) -> CoreError {
-    let next_step = format!("Point \"remote.url\" back at \"{}\", then run \"forklift evict\" again.", origin);
-
-    refusal(
-        RefusalCode::NonOriginLift,
-        format!(
-            "This cache warehouse was franchised from \"{}\", and the configured remote is \"{}\"; \
-            evicting asks the origin which history it holds, since only the origin can refill what \
-            is freed. Nothing was changed. {}",
-            origin, other, next_step
-        ),
-        next_step,
-    )
-}
-
-/// A ready-made `non_origin_lift` refusal for an `evict` in a cache whose origin is not recorded.
-pub fn unrecorded_origin_evict_refusal() -> CoreError {
-    let next_step = "Record the remote this warehouse was franchised from with \"forklift config \
-        remote.origin <url>\", then run \"forklift evict\" again.";
-
-    refusal(
-        RefusalCode::NonOriginLift,
-        format!(
-            "The remote this cache warehouse was franchised from (\"remote.origin\") is not recorded, \
-            so Forklift cannot tell which remote can refill what an eviction frees. Nothing was \
-            changed. {}",
-            next_step
-        ),
-        next_step,
-    )
-}
-
 /// A ready-made `chunked_transport_unsupported` refusal for writing a large file stored in chunks
 /// **into a bundle**. Chunk transport ships per object (a chunked file's chunks ride the loose
 /// GET/PUT byte plane, negotiated one hash at a time), but **no bundle ever carries a chunk** by
@@ -1169,17 +1056,6 @@ mod tests {
         assert!(message.contains("docs"), "the path is named: {}", message);
         assert!(message.contains("untracked file(s)"), "the blocker is named: {}", message);
         assert!(next_step.contains("docs"), "the recovery names the path: {}", next_step);
-    }
-
-    #[test]
-    fn a_non_origin_lift_refusal_carries_the_stable_code_and_names_both_remotes() {
-        let refusal = non_origin_lift_refusal("http://origin.example", "http://other.example");
-        let (code, message, next_step) = parts(&refusal);
-
-        assert_eq!(code, RefusalCode::NonOriginLift);
-        assert!(message.contains("http://origin.example"), "the origin is named: {}", message);
-        assert!(message.contains("http://other.example"), "the target is named: {}", message);
-        assert!(next_step.contains("http://origin.example"), "the recovery names the origin: {}", next_step);
     }
 
     #[test]

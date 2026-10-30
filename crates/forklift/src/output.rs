@@ -406,7 +406,7 @@ error_codes! {
 
     /// A lift from a sparse warehouse was aimed at a remote other than its origin: the
     /// out-of-scope closure was only ever proved present on the origin, so it refuses up front.
-    NonOriginLift,
+    NonOriginRemote,
 
     /// `narrow` was asked to drop a subtree that still holds uncommitted work (staged,
     /// unstaged or untracked): it refuses rather than silently discard it.
@@ -534,7 +534,7 @@ impl ErrorCode {
             ErrorCode::OutOfScopeConflict   => scope_utils::CODE_OUT_OF_SCOPE_CONFLICT,
             ErrorCode::ScopePathTypeChanged => scope_utils::CODE_SCOPE_PATH_TYPE_CHANGED,
             ErrorCode::SparseWorkspace      => scope_utils::CODE_SPARSE_WORKSPACE,
-            ErrorCode::NonOriginLift        => scope_utils::CODE_NON_ORIGIN_LIFT,
+            ErrorCode::NonOriginRemote        => scope_utils::CODE_NON_ORIGIN_REMOTE,
             ErrorCode::NarrowUnclean        => scope_utils::CODE_NARROW_UNCLEAN,
             ErrorCode::ScopePruneBlocked    => scope_utils::CODE_SCOPE_PRUNE_BLOCKED,
             ErrorCode::ChunkedTransportUnsupported => scope_utils::CODE_CHUNKED_TRANSPORT_UNSUPPORTED,
@@ -577,7 +577,7 @@ impl ErrorCode {
             ErrorCode::ScopePathTypeChanged => 8,
             ErrorCode::SparseWorkspace      => 9,
             ErrorCode::OutOfScopeConflict   => 10,
-            ErrorCode::NonOriginLift        => 11,
+            ErrorCode::NonOriginRemote        => 11,
             ErrorCode::NarrowUnclean        => 12,
             ErrorCode::ScopePruneBlocked    => 13,
             ErrorCode::ChunkedTransportUnsupported => 14,
@@ -628,8 +628,8 @@ impl ErrorCode {
                 "A whole-tree verb is not supported in a scoped (sparse) bay yet",
             ErrorCode::OutOfScopeConflict =>
                 "A scoped bay merge hit an out-of-scope entry changed on both sides",
-            ErrorCode::NonOriginLift =>
-                "A partial (--only or --cache) warehouse tried to lift to, or a cache to evict against, a remote other than its origin",
+            ErrorCode::NonOriginRemote =>
+                "A partial (--only or --cache) warehouse was asked to talk to a remote other than its origin, or its origin record is missing",
             ErrorCode::NarrowUnclean =>
                 "\"narrow\" would delete a subtree that still holds uncommitted work",
             ErrorCode::ScopePruneBlocked =>
@@ -715,7 +715,7 @@ impl ErrorCode {
             RefusalCode::OutOfScopeConflict => ErrorCode::OutOfScopeConflict,
             RefusalCode::ScopePathTypeChanged => ErrorCode::ScopePathTypeChanged,
             RefusalCode::SparseWorkspace => ErrorCode::SparseWorkspace,
-            RefusalCode::NonOriginLift => ErrorCode::NonOriginLift,
+            RefusalCode::NonOriginRemote => ErrorCode::NonOriginRemote,
             RefusalCode::NarrowUnclean => ErrorCode::NarrowUnclean,
             RefusalCode::ScopePruneBlocked => ErrorCode::ScopePruneBlocked,
             RefusalCode::ChunkedTransportUnsupported => ErrorCode::ChunkedTransportUnsupported,
@@ -1215,7 +1215,7 @@ mod tests {
             (RefusalCode::ScopePathTypeChanged, "scope_path_type_changed", 8),
             (RefusalCode::SparseWorkspace, "sparse_workspace", 9),
             (RefusalCode::OutOfScopeConflict, "out_of_scope_conflict", 10),
-            (RefusalCode::NonOriginLift, "non_origin_lift", 11),
+            (RefusalCode::NonOriginRemote, "non_origin_remote", 11),
             (RefusalCode::NarrowUnclean, "narrow_unclean", 12),
             (RefusalCode::ScopePruneBlocked, "scope_prune_blocked", 13),
             (RefusalCode::ChunkedTransportUnsupported, "chunked_transport_unsupported", 14),

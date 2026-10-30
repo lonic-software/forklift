@@ -42,12 +42,6 @@ pub const KEY_REMOTE_URL: &str = "remote.url";
 /// The bearer token for remotes that require one.
 pub const KEY_REMOTE_TOKEN: &str = "remote.token";
 
-/// The remote a partial franchise (`--only` or `--cache`) fetched from — its origin. A partial
-/// warehouse only proved the closure it does not hold present on this remote, so `lift` refuses
-/// to publish to a different one (it would fail late at that remote's closure check). Unset for
-/// a full franchise, which has the whole closure and can lift anywhere.
-pub const KEY_REMOTE_ORIGIN: &str = "remote.origin";
-
 /// Whether to reach the remote through a Tor SOCKS proxy — the peer-to-peer transport
 /// (DESIGN.html §4.7). `auto` (the default when unset) routes through Tor only when the
 /// remote is an onion service (its host ends in `.onion`), so a plain remote is untouched
@@ -206,9 +200,9 @@ pub fn parse_maintenance_threshold(key: &str, value: &str) -> Result<usize, Stri
 
 /// The configuration keys Forklift understands, in `section.key` form.
 /// Setting a key outside this list is rejected (it would silently do nothing).
-pub const KNOWN_KEYS: [&str; 14] = [
+pub const KNOWN_KEYS: [&str; 13] = [
     KEY_OPERATOR_IDENTIFIER, KEY_OPERATOR_PROFILE, KEY_REMOTE_URL, KEY_REMOTE_TOKEN,
-    KEY_REMOTE_ORIGIN, KEY_REMOTE_TOR, KEY_REMOTE_TOR_PROXY, KEY_MAINTENANCE_AUTO, KEY_MAINTENANCE_LOOSE,
+    KEY_REMOTE_TOR, KEY_REMOTE_TOR_PROXY, KEY_MAINTENANCE_AUTO, KEY_MAINTENANCE_LOOSE,
     KEY_MAINTENANCE_PACKS, KEY_MAINTENANCE_SIGNATURE_TABLES, KEY_MIRROR_URL, KEY_MIRROR_PALLETS, KEY_MIRROR_AUTO,
 ];
 
@@ -263,8 +257,6 @@ pub struct RemoteSection {
     pub url: Option<String>,
     /// [`KEY_REMOTE_TOKEN`].
     pub token: Option<String>,
-    /// [`KEY_REMOTE_ORIGIN`].
-    pub origin: Option<String>,
     /// [`KEY_REMOTE_TOR`].
     pub tor: Option<String>,
     /// [`KEY_REMOTE_TOR_PROXY`].
@@ -333,7 +325,6 @@ impl ConfigFile {
             KEY_OPERATOR_PROFILE    => &self.operator.profile,
             KEY_REMOTE_URL          => &self.remote.url,
             KEY_REMOTE_TOKEN        => &self.remote.token,
-            KEY_REMOTE_ORIGIN       => &self.remote.origin,
             KEY_REMOTE_TOR          => &self.remote.tor,
             KEY_REMOTE_TOR_PROXY    => &self.remote.tor_proxy,
             KEY_MAINTENANCE_AUTO    => &self.maintenance.auto,
@@ -370,7 +361,6 @@ impl ConfigFile {
             KEY_OPERATOR_PROFILE    => &mut self.operator.profile,
             KEY_REMOTE_URL          => &mut self.remote.url,
             KEY_REMOTE_TOKEN        => &mut self.remote.token,
-            KEY_REMOTE_ORIGIN       => &mut self.remote.origin,
             KEY_REMOTE_TOR          => &mut self.remote.tor,
             KEY_REMOTE_TOR_PROXY    => &mut self.remote.tor_proxy,
             KEY_MAINTENANCE_AUTO    => &mut self.maintenance.auto,

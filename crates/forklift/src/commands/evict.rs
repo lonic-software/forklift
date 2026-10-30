@@ -35,8 +35,6 @@ pub async fn handle_command(dry_run: bool) -> Result<(), String> {
         );
     }
 
-    ensure_origin_remote()?;
-
     // Read outside the store hold, so a slow origin never keeps other bays' writers out. A ref can
     // move on the origin after this read; the hold does not reach the origin either way.
     let held_heads = crate::remote_heads::held_by_remote(
@@ -83,16 +81,6 @@ pub async fn handle_command(dry_run: bool) -> Result<(), String> {
     });
 
     Ok(())
-}
-
-/// Refuse unless the configured remote is the cache's recorded origin: its heads decide what is
-/// freed, and only the origin was proved to hold what this warehouse lacks. No remote configured
-/// at all is left to the remote client, which says so plainly.
-fn ensure_origin_remote() -> Result<(), String> {
-    scope_utils::ensure_remote_is_origin(
-        scope_utils::unrecorded_origin_evict_refusal,
-        scope_utils::non_origin_evict_refusal,
-    ).map_err(Into::into)
 }
 
 /// The result of an eviction: how much was (or would be) freed, and why the rest stays.

@@ -86,7 +86,7 @@ use std::path::{Path, PathBuf};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::enums::object_type::ObjectType;
 use crate::globals;
-use crate::util::{audit_utils, bay_utils, file_utils, object_utils, office_utils, pack_utils, record_utils, recovery_utils, sign_utils};
+use crate::util::{audit_utils, bay_utils, file_utils, object_utils, office_utils, origin_utils, pack_utils, record_utils, recovery_utils, sign_utils};
 use crate::util::lock_utils::{RefLock, StoreAccessExclusive, StoreAccessLock};
 
 /// The record's file name under the shared forklift root.
@@ -529,8 +529,9 @@ pub fn append(ops: &[(SealOp, &str)]) -> Result<SealedSet, String> {
 ///
 /// # Returns
 /// * `Ok(SealedSet)` - The set the record now replays to.
-/// * `Err(String)`   - If a hash is not an object hash, the record cannot be read or parsed, or
-///                     the write fails. Nothing is written in the first two cases. A failed
+/// * `Err(String)`   - If a hash is not an object hash, the record cannot be read or parsed, an
+///                     entry would be added where no origin is recorded, or the write fails.
+///                     Nothing is written in the first three cases. A failed
 ///                     write may still have landed: some of its frames whole (and perhaps a
 ///                     torn one, which the next write drops), or the whole new record when the
 ///                     create failed after its rename. Read the record back to learn which.
@@ -624,6 +625,17 @@ fn append_decided_locked(
     };
 
     let ops = decide(&set)?;
+
+    // An entry says the origin holds the object, so none is added where no origin is recorded:
+    // a full warehouse, or a partial one whose record is gone. Removals stand on their own.
+    if ops.iter().any(|(op, _)| *op == SealOp::Record) && origin_utils::read_origin()?.is_none() {
+        return Err(format!(
+            "This warehouse records no origin, so nothing can be recorded as held by hash: no remote \
+            is known to hold it. The record \"{}\" was not changed.",
+            path.to_string_lossy()
+        ));
+    }
+
     let borrowed: Vec<(SealOp, &str)> = ops.iter().map(|(op, hash)| (*op, hash.as_str())).collect();
     let frames = encode_frames(&borrowed)?;
 
@@ -1463,6 +1475,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let scope = crate::globals::StorageRootScope::enter(&root);
+        origin_utils::write_for_tests("http://origin.test");
         (root, scope)
     }
 
@@ -1641,6 +1654,29 @@ mod tests {
         // An uppercase spelling is refused too: the replay would give it back lowercase.
         assert!(append(&[(SealOp::Record, &B.to_uppercase())]).is_err());
         assert_eq!(std::fs::read(sealed_path()).unwrap(), before);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An entry says the origin holds the object, so with no origin recorded nothing is added;
+    /// a removal still lands.
+    ///
+    /// Revert: drop the origin check → the entry lands.
+    #[test]
+    fn an_entry_is_never_added_where_no_origin_is_recorded() {
+        let (root, _scope) = scratch("no-origin");
+        append(&[(SealOp::Record, A)]).unwrap();
+        std::fs::remove_file(globals::forklift_root().join(origin_utils::FILE_NAME)).unwrap();
+        let before = std::fs::read(sealed_path()).unwrap();
+
+        let error = append(&[(SealOp::Remove, A), (SealOp::Record, B)]).unwrap_err();
+        assert!(error.contains("records no origin"), "{}", error);
+        assert_eq!(std::fs::read(sealed_path()).unwrap(), before);
+        assert!(record_absences_under(&[B.to_string()]).unwrap_err().contains("records no origin"));
+        assert_eq!(std::fs::read(sealed_path()).unwrap(), before);
+
+        append(&[(SealOp::Remove, A)]).unwrap();
+        assert!(!read_sealed().unwrap().contains(A));
 
         let _ = std::fs::remove_dir_all(&root);
     }

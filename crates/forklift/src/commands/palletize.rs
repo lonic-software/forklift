@@ -301,7 +301,7 @@ async fn containment(pallet: &str, head: &str) -> Result<(Option<String>, RefPre
     }
 
     let note = "The delete asks the remote whether it holds the pallet's work; nothing was deleted.";
-    let client = RemoteClient::from_config().map_err(|e| error::append_to_message(e, note))?;
+    let client = RemoteClient::for_warehouse().map_err(|e| error::append_to_message(e.into(), note))?;
     let info = client.fetch_info().await.map_err(|e| error::append_to_message(e, note))?;
     remote_utils::check_remote_trust(&client, &info, None).map_err(|e| error::append_to_message(e, note))?;
 
@@ -356,7 +356,7 @@ async fn remote_for_deletes(name: &str, verb: &str) -> Result<(RemoteClient, for
         ));
     }
 
-    let client = RemoteClient::from_config()?;
+    let client = RemoteClient::for_warehouse()?;
     let info = client.fetch_info().await?;
     remote_utils::check_remote_trust(&client, &info, None)?;
 

@@ -21,10 +21,11 @@ use crate::output;
 /// # Returns
 /// * `Ok(Vec<String>)` - The head of every pallet the remote holds or keeps a tombstone of, and the
 ///   confirmed recorded heads.
-/// * `Err(String)`     - If no remote is configured, it cannot be reached, its trust state is
+/// * `Err(String)`     - If no remote is configured, a partial warehouse's remote is not its
+///   origin, it cannot be reached, its trust state is
 ///   refused, or the held-heads record does not parse; the message ends with `note`.
 pub(crate) async fn held_by_remote(note: &str) -> Result<Vec<String>, String> {
-    let client = RemoteClient::from_config().map_err(|e| error::append_to_message(e, note))?;
+    let client = RemoteClient::for_warehouse().map_err(|e| error::append_to_message(e.into(), note))?;
     let info = client.fetch_info().await.map_err(|e| error::append_to_message(e, note))?;
     remote_utils::check_remote_trust(&client, &info, None).map_err(|e| error::append_to_message(e, note))?;
 

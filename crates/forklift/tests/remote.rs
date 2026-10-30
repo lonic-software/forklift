@@ -5263,7 +5263,7 @@ fn a_sparse_workspace_refuses_to_lift_to_a_non_origin_remote() {
     let refused = origin.forklift("sparse", &["--json", "lift"]);
     assert_eq!(refused.status.code(), Some(11), "non-origin lift exits 11: {}", stderr(&refused));
     let json: serde_json::Value = serde_json::from_str(&stdout(&refused)).unwrap();
-    assert_eq!(json["error"]["code"], "non_origin_lift", "{}", stdout(&refused));
+    assert_eq!(json["error"]["code"], "non_origin_remote", "{}", stdout(&refused));
     assert!(json["error"]["message"].as_str().unwrap().contains(&server1.url),
         "the refusal names the origin: {}", stdout(&refused));
 
@@ -5276,7 +5276,7 @@ fn a_sparse_workspace_refuses_to_lift_to_a_non_origin_remote() {
     let forced = origin.forklift("sparse", &["--json", "lift"]);
     assert_eq!(forced.status.code(), Some(11), "an originless sparse lift exits 11: {}", stderr(&forced));
     let json: serde_json::Value = serde_json::from_str(&stdout(&forced)).unwrap();
-    assert_eq!(json["error"]["code"], "non_origin_lift", "{}", stdout(&forced));
+    assert_eq!(json["error"]["code"], "non_origin_remote", "{}", stdout(&forced));
     let message = json["error"]["message"].as_str().unwrap();
     assert!(message.contains("is not recorded") && message.contains("forklift config remote.origin <url>"),
         "the refusal names the missing origin and the ways out: {}", message);
@@ -5453,7 +5453,7 @@ fn a_cache_franchise_is_a_partial_warehouse() {
     let refused = area.forklift("cached", &["--json", "lift"]);
     assert_eq!(refused.status.code(), Some(11), "{}", stdout(&refused));
     let json = json_of(&refused);
-    assert_eq!(json["error"]["code"], "non_origin_lift", "{}", json);
+    assert_eq!(json["error"]["code"], "non_origin_remote", "{}", json);
     assert!(json["error"]["message"].as_str().unwrap().contains(&server.url), "{}", json);
     assert!(json["error"]["next_step"].as_str().unwrap().contains("--cache"), "{}", json);
 
@@ -6447,7 +6447,7 @@ fn evict_refuses_a_warehouse_that_is_not_a_cache() {
 }
 
 /// `evict` asks the origin which history it holds, and only the origin: with the remote pointed
-/// elsewhere it refuses as `non_origin_lift` naming both, and with the origin unreachable it
+/// elsewhere it refuses as `non_origin_remote` naming both, and with the origin unreachable it
 /// refuses too, each leaving every file under `.forklift` as it was. With the origin back, it runs.
 ///
 /// Revert: skip the origin check → the other remote's heads decide what is freed; ask the remote
@@ -6467,7 +6467,7 @@ fn evict_refuses_a_remote_that_is_not_the_origin_and_an_unreachable_origin() {
     let elsewhere = area.forklift("cached", &["--json", "evict"]);
     assert_eq!(elsewhere.status.code(), Some(11), "{}", stderr(&elsewhere));
     let json = json_of(&elsewhere);
-    assert_eq!(json["error"]["code"], "non_origin_lift", "{}", json);
+    assert_eq!(json["error"]["code"], "non_origin_remote", "{}", json);
     let message = json["error"]["message"].as_str().unwrap();
     assert!(message.contains(&server.url) && message.contains(&other.url), "{}", message);
     assert_success(&area.forklift("cached", &["config", "remote.url", &server.url]));
@@ -7110,10 +7110,10 @@ fn lift_from_a_sparse_workspace_with_no_remote_configured_reports_the_plain_erro
 
     let failed = area.forklift("sparse", &["--json", "lift"]);
     assert!(!failed.status.success(), "lift with no remote configured must fail");
-    assert_ne!(failed.status.code(), Some(11), "must not be misclassified as non_origin_lift: {}", stdout(&failed));
+    assert_ne!(failed.status.code(), Some(11), "must not be misclassified as non_origin_remote: {}", stdout(&failed));
 
     let json: serde_json::Value = serde_json::from_str(&stdout(&failed)).unwrap();
-    assert_ne!(json["error"]["code"], serde_json::json!("non_origin_lift"), "{}", stdout(&failed));
+    assert_ne!(json["error"]["code"], serde_json::json!("non_origin_remote"), "{}", stdout(&failed));
     assert!(json["error"]["message"].as_str().unwrap().contains("No remote is configured"),
         "{}", stdout(&failed));
 }

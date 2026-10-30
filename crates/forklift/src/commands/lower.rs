@@ -60,7 +60,7 @@ pub async fn handle_command(pallet: Option<String>, expect: Option<String>, keep
     let named = pallet.filter(|name| *name != current);
 
     let progress = events::progress();
-    let client = RemoteClient::from_config()?;
+    let client = RemoteClient::for_warehouse()?;
     let info = client.fetch_info().await?;
 
     // A named pallet the remote lacks is refused before trust or a meta pallet is written: it is

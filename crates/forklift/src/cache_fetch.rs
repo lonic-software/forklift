@@ -11,10 +11,10 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use forklift_core::enums::config_scope::ConfigScope;
+use forklift_core::error::CoreError;
 use forklift_core::model::remote::MAX_MISSING_BATCH;
 use forklift_core::util::cache_miss::{self, Deliver, Fetched};
-use forklift_core::util::config_utils;
+use forklift_core::util::origin_utils;
 use forklift_core::util::remote_utils::{BatchOutcome, ObjectFetch, RemoteClient, TorMode, TorSettings};
 
 /// How many objects are fetched on their own at once.
@@ -51,7 +51,8 @@ pub fn install() {
 fn fetch(hashes: &[String], deliver: Deliver) -> Fetched {
     let (url, token, tor) = match origin_settings() {
         Ok(settings) => settings,
-        Err(why) => return Fetched::Failed(why),
+        Err(refusal @ CoreError::Refusal { .. }) => return Fetched::Refused(refusal),
+        Err(why) => return Fetched::Failed(why.into()),
     };
 
     let (reply, replies) = mpsc::sync_channel(QUEUED_OBJECTS);
@@ -82,28 +83,13 @@ fn fetch(hashes: &[String], deliver: Deliver) -> Fetched {
     Fetched::Failed("the fetch thread stopped before it replied".to_string())
 }
 
-/// The origin's URL, the token and the Tor settings to fetch with. The configured remote must be
-/// the origin: only the origin was proved to hold what this warehouse holds by hash.
-fn origin_settings() -> Result<(String, Option<String>, TorSettings), String> {
-    let origin = config_utils::get_scoped_value(config_utils::KEY_REMOTE_ORIGIN, ConfigScope::Warehouse)?
-        .ok_or("this warehouse's origin is not recorded".to_string())?;
+/// The origin's URL, the token and the Tor settings to fetch with, resolved here rather than on the
+/// fetch thread, which reads no warehouse. The configured remote must be the origin: only the
+/// origin was proved to hold what this warehouse holds by hash.
+fn origin_settings() -> Result<(String, Option<String>, TorSettings), CoreError> {
+    let (url, token) = origin_utils::checked_remote()?;
 
-    let url = config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)?.map(|(value, _)| value);
-
-    if url.as_deref() != Some(origin.as_str()) {
-        return Err(format!(
-            "only its origin ({}) holds it, and the configured remote is {}; set it back with \
-            \"config {} {}\"",
-            origin,
-            url.map(|url| format!("\"{}\"", url)).unwrap_or_else(|| "unset".to_string()),
-            config_utils::KEY_REMOTE_URL,
-            origin
-        ));
-    }
-
-    let token = config_utils::get_effective_value(config_utils::KEY_REMOTE_TOKEN)?.map(|(value, _)| value);
-
-    Ok((origin, token, TorSettings::from_config()?))
+    Ok((url, token, TorSettings::from_config()?))
 }
 
 /// The sending end of the fetch thread's queue, which starts it on first use.
