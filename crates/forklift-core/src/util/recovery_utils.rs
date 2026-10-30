@@ -7099,8 +7099,9 @@ mod tests {
     /// A partial warehouse's heal asks only its origin: pointed at another remote, it reports the
     /// refusal and its way out, and fetches nothing, though that remote serves the missing object.
     ///
-    /// Revert: build heal's client with `from_config` again → the object is refetched from the
-    /// other remote and the heal clears.
+    /// Revert: build heal's clients (the configured check and the refetch's) with `from_config`
+    /// again → the object is refetched from the other remote and the heal clears. Either alone
+    /// stays green: the configured check feeds its refusal to the report before the refetch runs.
     #[test]
     fn a_partial_warehouses_heal_asks_no_remote_but_its_origin() {
         use crate::builder::object::loose_object_builder::LooseObjectBuilder;

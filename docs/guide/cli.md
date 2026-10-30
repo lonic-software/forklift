@@ -1679,15 +1679,20 @@ fast-forwards, or reports `diverged` if you moved too. A bay another bay left be
 its pallet is refused with `behind` (exit 26) by `stack`, `deliver` and this auto-merge alike:
 `shift` to the pallet to catch up.
 
-**Origin-only lift from a partial warehouse.** A sparse (`franchise --only`) or cache
+**A partial warehouse talks only to its origin.** A sparse (`franchise --only`) or cache
 (`franchise --cache`) warehouse only ever proved the content it does not hold present on the
-remote it was franchised from — its origin. Lifting to a *different* remote could fail late at
-that remote's closure check, so `lift` refuses up front with the `non_origin_lift` code, naming
-the origin. Point `remote.url` back at the origin, or franchise the new remote without `--only`
-or `--cache`. A partial warehouse whose origin is not recorded (`remote.origin`, which an
-interrupted franchise may not have written, or which was unset) is refused with the same code:
-franchise again, or record the origin with `forklift config remote.origin <url>`. A full
-warehouse holds the whole closure and can lift anywhere.
+remote it was franchised from — its origin, which the franchise records in `.forklift/origin`
+before it fetches anything. Talking to a *different* remote could lift onto one that lacks what
+this warehouse never verified there, fetch another history into what this warehouse records, or
+free content by heads the origin does not have. So every command that dials the remote from a
+partial warehouse — `lift`, `lower`, `expand`, `scope-prune`, `evict`, `palletize --delete`
+and `--restore`, a cache's fetch of content it lacks, and `heal`'s refetch — refuses with the
+`non_origin_remote` code (exit 11) when `remote.url` is not the origin, naming both and changing
+nothing. Point `remote.url` back at the origin, or franchise the other remote into a new
+directory. The origin record is not configuration: no `config` key reaches it. A partial
+warehouse whose record is missing (only a damaged `.forklift` can be) is refused with the same
+code; franchise the remote again. A full warehouse records no origin, holds the whole closure and
+can talk to any remote.
 
 **Very large lifts and old remotes.** A lift touching more objects than fit in one commit batch
 (tens of thousands of distinct objects — realistic for a single maximal chunked file, or simply a
@@ -1777,7 +1782,8 @@ forklift expand src/web docs       # several at once
 Adds subtree path(s) to what the warehouse has fetched, and downloads their content across the
 whole history from the remote. Incremental and precise — only the newly in-scope objects are
 fetched; what is already present is skipped, and the content is hash-verified against the seals
-the history commits (so widening is safe from any remote — only publishing is origin-bound).
+the history commits. Like every remote command in a partial warehouse, it talks only to the
+origin (`non_origin_remote`).
 After expanding, a bay can be scoped to the new path (`bay add --scope`). A full warehouse
 already holds everything, so there is nothing to expand.
 
@@ -1889,7 +1895,7 @@ Like `scope-prune`, it asks the remote which history it holds first: the remote'
 the heads its tombstones keep, and the earlier heads recorded here that it confirms (the
 held-heads record above; a `holds_unanswered` warning works the same way). It refuses, changing
 nothing, if the remote cannot be reached or is not trusted, and if the configured remote is not
-the origin (`non_origin_lift`, as for `lift`, including when the origin is not recorded). Only
+the origin (`non_origin_remote`, as for `lift`, including when the origin is not recorded). Only
 content that history reaches is freed; content only local history reaches (stacks not lifted yet,
 a haul, a deleted pallet) stays, and the report counts it (`not_held`): lift that work and run
 `evict` again. An origin head this warehouse has not lowered yet frees nothing
