@@ -6235,7 +6235,7 @@ async fn lift_pallet_inner(client: &RemoteClient,
         // An acknowledged tombstone's head is held on the remote (a gc root), so a re-creation
         // uploads only the work past it.
         upload_history(client, local_head, remote_head.or(tombstone),
-                       &held_elsewhere(info, pallet, remote_head.or(tombstone))?, info.chunking, progress).await?;
+                       &held_elsewhere(info, pallet), info.chunking, progress).await?;
 
     client.update_ref(pallet, remote_head, local_head, tombstone).await?;
 
@@ -6297,27 +6297,26 @@ pub fn diverged_refusal(pallet: &str, remote_head: &str) -> CoreError {
     )
 }
 
-/// The other heads a lift's parcel walk stops at ([`new_parcels_parents_first`]): on a user
-/// pallet's first lift (no head of its own on the remote, `own_head` `None`), the remote's other
-/// live user pallet heads whose parcel is present here. A pallet the remote already has stops at
-/// its own head, and a meta pallet's history never branches off a user pallet's, so neither
-/// pays an ancestry check per parcel per head. A tombstone's head is left out: the remote may
-/// drop it mid-lift, and the walk would have stopped at history nothing roots any more.
-fn held_elsewhere(info: &WarehouseInfo, pallet: &str, own_head: Option<&str>) -> Result<Vec<String>, String> {
+/// The other heads a user pallet's lift stops its parcel walk at ([`new_parcels_parents_first`]):
+/// the remote's other live user pallet heads whose parcel is present here. A meta pallet's history
+/// never branches off a user pallet's, so it gets none. A tombstone's head is left out: the remote
+/// may drop it mid-lift, and the walk would have stopped at history nothing roots any more. Like
+/// the stop itself, this is only a shortcut, so a head whose presence cannot be read is left out.
+fn held_elsewhere(info: &WarehouseInfo, pallet: &str) -> Vec<String> {
     let mut heads = Vec::new();
 
-    if own_head.is_some() || pallet.starts_with(pallet_utils::META_QUALIFIER) {
-        return Ok(heads);
+    if pallet.starts_with(pallet_utils::META_QUALIFIER) {
+        return heads;
     }
 
     for (name, head) in &info.pallets {
         if name != pallet && !name.starts_with(pallet_utils::META_QUALIFIER) && !heads.contains(head)
-            && file_utils::does_object_exist(head)? {
+            && file_utils::does_object_exist(head).unwrap_or(false) {
             heads.push(head.clone());
         }
     }
 
-    Ok(heads)
+    heads
 }
 
 /// Upload the history `local_head` reaches and the remote does not — every parcel past
@@ -6413,11 +6412,13 @@ async fn upload_history(client: &RemoteClient,
 /// The new parcels of a lift — everything reachable from the local head that the remote does
 /// not already have — **ordered parents-first**.
 ///
-/// The walk stops at the remote head, at every head in `elsewhere` and at any ancestor of one (a
-/// merge's other side rejoins below the remote head), so a linear lift touches O(new parcels) and a
-/// merge never re-walks the shared slice. The remote holds the whole closure of every head it
-/// lists, not only the lifted pallet's, so a new pallet branched off another one stops where it
-/// branched instead of walking, negotiating and uploading the whole history. Pruning at every
+/// The walk stops at the remote head and any ancestor of it (a merge's other side rejoins below
+/// the remote head), so a linear lift touches O(new parcels) and a merge never re-walks the shared
+/// slice. The remote holds the whole closure of every head it lists, not only the lifted pallet's,
+/// so the walk also stops at every head in `elsewhere`, and on a first lift (no remote head) at
+/// their ancestors too: a new pallet branched off another one stops where it branched instead of
+/// walking, negotiating and uploading the whole history, and work that merged in another pallet's
+/// head stops there. Pruning at every
 /// ancestor — not just the head hashes — is also what keeps a partial warehouse liftable: an
 /// interior parcel the remote already has may carry content this warehouse never fetched (out of a
 /// sparse scope, or held by a cache only by hash), and re-walking it would try to load it. The
@@ -6479,9 +6480,11 @@ fn new_parcels_parents_first(local_head: &str,
             }
         }
 
-        // Another head is only a shortcut: one whose ancestry cannot be read here (fetched
-        // before its ancestors) answers "not known", and the parcel is walked as it was before.
-        if elsewhere.iter().any(|head| merge_utils::is_ancestor(&hash, head).unwrap_or(false)) {
+        // Another head's ancestors only on a first lift, which has no head of its own to stop
+        // at: on every other lift that would cost an ancestry walk per parcel per head, and a
+        // merged-in head still stops the walk by its hash above. Only a shortcut: a head whose
+        // ancestry cannot be read here answers "not known", and the parcel is walked.
+        if remote_head.is_none() && elsewhere.iter().any(|head| merge_utils::is_ancestor(&hash, head).unwrap_or(false)) {
             continue;
         }
 
@@ -8985,8 +8988,12 @@ mod tests {
     /// sends only what lies past where it branched. A head whose ancestry cannot be read here
     /// is only a shortcut lost: the walk answers "not known" and goes on, as it would without it.
     ///
+    /// With a remote head of its own, another head stops the walk by its hash alone: an ancestry
+    /// check there would cost a walk per parcel per head on every lift.
+    ///
     /// Revert: ignore `elsewhere` → `B` and `R` are walked too; propagate the other head's
-    /// ancestry error → the walk fails.
+    /// ancestry error → the walk fails; drop the hash stop → the merge of `N` walks it; check
+    /// ancestry with a remote head too → the merge of `R` stops at it.
     #[test]
     fn the_walk_stops_at_another_held_head_and_walks_past_an_unreadable_one() {
         let _scratch = Scratch::new("walk-held-elsewhere");
@@ -9000,17 +9007,23 @@ mod tests {
 
         let unreadable = stack(vec!["f".repeat(64)], "U a head over an absent parent");
         let walked = new_parcels_parents_first(&n, None, &[unreadable]).unwrap();
-        assert_eq!(walked, vec![b, r, n]);
+        assert_eq!(walked, vec![b.clone(), r.clone(), n.clone()]);
+
+        let own = stack(vec![], "O the pallet's own remote head");
+        let merges_head = stack(vec![own.clone(), n.clone()], "M merges the held head N in");
+        assert_eq!(new_parcels_parents_first(&merges_head, Some(&own), &[n.clone()]).unwrap(), vec![merges_head]);
+        let merges_older = stack(vec![own.clone(), r.clone()], "M merges R, an ancestor of N, in");
+        assert_eq!(new_parcels_parents_first(&merges_older, Some(&own), &[n]).unwrap(), vec![b, r, merges_older]);
     }
 
-    /// A lift's walk is bounded by other heads only on a user pallet's first lift, and only by
-    /// the live user pallet heads present here: never its own name, a meta pallet, a tombstone,
-    /// or a head this warehouse lacks; and never for a meta pallet or a pallet the remote has.
+    /// A user pallet's lift is bounded by the remote's live user pallet heads present here: never
+    /// its own name, a meta pallet, a tombstone, or a head this warehouse lacks; and a meta
+    /// pallet's lift by none.
     ///
     /// Revert: take `held_pallet_heads`, or drop any one condition → the first assertion fails;
-    /// drop either early return → the last two fail.
+    /// drop the early return → the second fails.
     #[test]
-    fn a_first_lift_stops_only_at_the_remotes_other_live_user_heads_present_here() {
+    fn a_user_pallets_lift_stops_only_at_the_remotes_other_live_user_heads_present_here() {
         let _scratch = Scratch::new("held-elsewhere");
 
         let main = stack(vec![], "main");
@@ -9034,9 +9047,8 @@ mod tests {
             tombstones: Some(BTreeMap::from([("gone".to_string(), deleted)])),
         };
 
-        assert_eq!(held_elsewhere(&info, "feature", None).unwrap(), vec![main.clone()]);
-        assert!(held_elsewhere(&info, "feature", Some(&main)).unwrap().is_empty());
-        assert!(held_elsewhere(&info, "@manifest", None).unwrap().is_empty());
+        assert_eq!(held_elsewhere(&info, "feature"), vec![main.clone()]);
+        assert!(held_elsewhere(&info, "@manifest").is_empty());
     }
 
     /// The lift closure walk prunes a subtree against **every** parent, not just the
