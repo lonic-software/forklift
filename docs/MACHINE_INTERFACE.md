@@ -654,7 +654,8 @@ both sides of it, and the working pallet that lowered with its new head:
 ```
 
 A side without `value` removed the key. Rerun `lower` with one `--keep @<pallet>:<path>=ours|theirs`
-per path, both exactly as `details` names them (`--keep @kv:<subject>/<key>=theirs`). The pallet
+per path, both exactly as `details` names them (`--keep @kv:<subject>/<key>=theirs`), and `--confirm`
+if any keep takes `theirs`. The pallet
 keeps its `@`; a bare `kv:` is refused. `theirs` on a bare `<subject>` resolves every key under
 it. A keep that names no conflict, or a pallet that did not diverge, is refused rather than
 ignored, so a stale resolution never applies to a later conflict.
