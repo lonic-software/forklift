@@ -8587,11 +8587,42 @@ fn scope_prune_refuses_while_a_bay_still_materializes_the_path() {
     let next_step = json["error"]["next_step"].as_str().unwrap();
     assert!(next_step.contains("scope narrow") && next_step.contains("remove a bay"),
         "the next step names both ways out: {}", next_step);
-    assert!(!area.forklift("bay-web", &["scope", "narrow", "src/web"]).status.success(),
-        "narrowing away the bay's last path refuses");
+    let last = area.forklift("bay-web", &["scope", "narrow", "src/web"]);
+    assert!(stderr(&last).contains("must keep at least one in-scope path"),
+        "narrowing away the bay's last path refuses: {}", stderr(&last));
     assert_success(&area.forklift("sparse", &["bay", "remove", "webbay"]));
     assert_success(&area.forklift("sparse", &["scope", "prune", "src/web"]));
     assert!(!object_present(&area, "sparse", &web_blob), "the prune freed src/web once the bay was gone");
+}
+
+#[test]
+fn scope_prune_blocked_by_the_main_trees_whole_scope_says_there_is_no_way_out() {
+    // The main tree can be neither removed nor narrowed to nothing, so a path that is all of its
+    // scope cannot be pruned. The refusal says so instead of naming steps that would refuse too.
+    let area = TestArea::new("scope-prune-main-stuck");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/docs/guide.md", "guide\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    assert_success(&area.forklift(".",
+        &["clone", &server.url, "sparse", "--only", "src/api", "--only", "docs"]));
+    assert_success(&area.forklift("sparse", &["scope", "narrow", "src/api"]));
+
+    let refused = area.forklift("sparse", &["--json", "scope", "prune", "docs"]);
+    assert_eq!(refused.status.code(), Some(13), "the main tree blocks the prune: {}", stderr(&refused));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&refused)).unwrap();
+    let next_step = json["error"]["next_step"].as_str().unwrap();
+    assert!(next_step.contains("the main tree") && next_step.contains("cannot be pruned"),
+        "the refusal says the main tree's last path has no way out: {}", next_step);
+
+    // The named limit holds: narrowing the main tree's last path refuses.
+    let last = area.forklift("sparse", &["scope", "narrow", "docs"]);
+    assert!(stderr(&last).contains("must keep at least one in-scope path"), "{}", stderr(&last));
 }
 
 #[test]

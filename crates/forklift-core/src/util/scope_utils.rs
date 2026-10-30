@@ -731,12 +731,20 @@ pub fn narrow_unclean_refusal(path: &str, blocked_by: &str) -> CoreError {
 /// # Arguments
 /// * `path`      - The path the prune was asked to free.
 /// * `blockers`  - The checkout(s) still materializing it (for the message).
-pub fn scope_prune_blocked_refusal(path: &str, blockers: &str) -> CoreError {
-    let next_step = format!(
+/// * `main_tree_blocks` - Whether the main tree is among them: it cannot be removed and keeps at
+///   least one in-scope path, so a path that is all of its scope has no way out yet.
+pub fn scope_prune_blocked_refusal(path: &str, blockers: &str, main_tree_blocks: bool) -> CoreError {
+    let mut next_step = format!(
         "In {}, drop the in-scope paths that overlap \"{}\" with \"forklift scope narrow\" \
         (checkout-local, it frees nothing), or remove a bay whose whole scope overlaps, then prune.",
         blockers, path
     );
+    if main_tree_blocks {
+        next_step.push_str(
+            " The main tree keeps at least one in-scope path, so while all of its scope overlaps, \
+            the path cannot be pruned from this warehouse.",
+        );
+    }
 
     refusal(
         RefusalCode::ScopePruneBlocked,
@@ -1118,7 +1126,7 @@ mod tests {
 
     #[test]
     fn a_scope_prune_blocked_refusal_carries_the_stable_code_and_names_the_blocker() {
-        let refusal = scope_prune_blocked_refusal("docs", "bay \"reviewer\"");
+        let refusal = scope_prune_blocked_refusal("docs", "bay \"reviewer\"", false);
         let (code, message, next_step) = parts(&refusal);
 
         assert_eq!(code, RefusalCode::ScopePruneBlocked);

@@ -218,7 +218,8 @@ async fn remote_pallet_heads() -> Result<Vec<String>, String> {
 fn guard_checkout_scopes(pruned: &[String], post_prune: &PathScope) -> Result<(), CoreError> {
     let mut blockers: Vec<String> = Vec::new();
 
-    if !scope_utils::read_main_tree_scope()?.subset_of(post_prune) {
+    let main_tree_blocks = !scope_utils::read_main_tree_scope()?.subset_of(post_prune);
+    if main_tree_blocks {
         blockers.push("the main tree".to_string());
     }
 
@@ -229,7 +230,7 @@ fn guard_checkout_scopes(pruned: &[String], post_prune: &PathScope) -> Result<()
     }
 
     if !blockers.is_empty() {
-        return Err(scope_utils::scope_prune_blocked_refusal(&pruned.join(", "), &blockers.join(", ")));
+        return Err(scope_utils::scope_prune_blocked_refusal(&pruned.join(", "), &blockers.join(", "), main_tree_blocks));
     }
 
     Ok(())
