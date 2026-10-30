@@ -18,7 +18,7 @@ The envelope is the one every Lonic tool shares. Success:
 {
   "lonic_json": 1,
   "tool": "forklift",
-  "schema": 10,
+  "schema": 11,
   "command": "stocktake",
   "ok": true,
   "data": { "…command-specific…" }
@@ -32,7 +32,7 @@ Failure keeps the same header, with `"ok": false` and an `error` in place of `da
 {
   "lonic_json": 1,
   "tool": "forklift",
-  "schema": 10,
+  "schema": 11,
   "command": "stocktake",
   "ok": false,
   "error": {
