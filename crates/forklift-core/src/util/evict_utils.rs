@@ -90,8 +90,8 @@ pub struct EvictStats {
     /// Objects of the plan no longer present: freed, dropped from the packs, or already gone.
     pub evicted: usize,
 
-    /// Objects of the plan still inside a pack: a damaged one, which the repack neither copies
-    /// from nor deletes.
+    /// Objects of the plan still inside a pack: one found damaged only during the repack (the plan
+    /// refuses a pack already damaged), which the repack neither copies from nor deletes.
     pub still_packed: usize,
 
     /// The bytes freed: the loose files deleted, and what the old packs held beyond the new ones.
@@ -215,9 +215,20 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
     plan.to_record = plan.to_evict.iter().filter(|hash| !sealed.contains(hash)).cloned().collect();
 
     // A packed delta can stand on a loose-only object: one a read fetched again after a
-    // compaction, which a later compaction then used as a path base.
+    // compaction, which a later compaction then used as a path base. A damaged pack refuses the
+    // whole run: its deltas cannot be read to say what they stand on, and the repack, which runs
+    // without salvage, would leave it as found.
     let loose_only: HashSet<String> = plan.to_free.iter().filter(|hash| !plan.to_drop.contains(*hash)).cloned().collect();
-    plan.repack = !plan.to_drop.is_empty() || pack_utils::any_packed_delta_against(&loose_only)?;
+    let delta_on_loose = if plan.to_evict.is_empty() {
+        false
+    } else {
+        pack_utils::any_packed_delta_against(&loose_only).map_err(|e| format!(
+            "\"evict\" cannot run while a pack in this warehouse is damaged, since it cannot tell \
+            which packed content stands on what it would free; nothing was changed. Run \"compact \
+            --all\" to salvage the pack, then \"evict\" again. {}", e
+        ))?
+    };
+    plan.repack = !plan.to_drop.is_empty() || delta_on_loose;
     plan.to_unseal = sealed_utils::present_recorded(&sealed)?
         .into_iter()
         .filter(|hash| checkout_keep.contains(hash) || local_keep.contains(hash))
@@ -865,8 +876,8 @@ mod tests {
         }
         set_main(&parents[0]);
         position(None);
-        // The trees too: a loose evicted tree is freed before the repack's path walk reaches it,
-        // which then stops there and never meets the versions beneath it.
+        // The trees too, as a cache filled by reads and then compacted holds them: the repack's path
+        // walk then meets every evicted tree in an old pack, where only its filter stops it.
         pack_utils::compact(false, false, false, &Progress::NONE).unwrap();
 
         Versions { held, v: [v0, v1, v2, v3], text, roots }
@@ -968,6 +979,55 @@ mod tests {
         carry(&plan, &hold).unwrap();
         assert!(!loose.exists() && !pack_utils::is_in_packs(&h.a).unwrap());
         assert!(present(&h.local_root) && present(&h.b), "what only local history reaches stays");
+    }
+
+    /// `bytes_freed` counts a dropped pack though the repack also packs kept loose content: the new
+    /// pack holds that content, which its loose files held before.
+    ///
+    /// Revert: leave the packed loose files off the old side → the new pack outweighs the old one
+    /// and the drop counts as nothing.
+    #[test]
+    fn bytes_freed_counts_a_drop_while_the_repack_packs_kept_loose_content() {
+        let _scratch = Scratch::new("bytes-freed");
+        let held_blob = pack_blob(&version("held"), None);
+        let pack_bytes: u64 = std::fs::read_dir(pack_utils::pack_folder()).unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum();
+        let held_root = store_tree(&[("f.txt", &held_blob, DirEntryType::Normal)]);
+        let held = store_parcel(&held_root, Vec::new());
+        let local_text: String = (0..2000)
+            .map(|line| format!("{}\n", blake3::hash(format!("local {}", line).as_bytes()).to_hex()))
+            .collect();
+        let local_blob = store_blob(&local_text);
+        let local_root = store_tree(&[("f.txt", &local_blob, DirEntryType::Normal)]);
+        set_main(&store_parcel(&local_root, vec![held.clone()]));
+        position(None);
+        let hold = store_access();
+
+        let plan = plan_evict(&[held.clone()], &hold).unwrap();
+        assert!(plan.to_drop.contains(&held_blob) && plan.repack, "sanity: the held blob is dropped");
+        let stats = carry(&plan, &hold).unwrap();
+        assert!(stats.bytes_freed * 2 >= pack_bytes, "{} freed, the dropped pack held {}", stats.bytes_freed, pack_bytes);
+        assert!(present(&local_blob) && !file_utils::loose_dentry_exists(&local_blob).unwrap(), "sanity: packed");
+    }
+
+    /// A damaged pack refuses the plan before anything changes, whether or not a pack holds an
+    /// evicted object: its deltas cannot say what they stand on, and the repack would leave it.
+    ///
+    /// Revert: pass over a pack whose index fails → the loose case plans; ask only when no pack
+    /// holds an evicted object → the packed case plans.
+    #[test]
+    fn a_damaged_pack_refuses_the_plan() {
+        for packed in [false, true] {
+            let _scratch = Scratch::new(if packed { "damaged-packed" } else { "damaged-loose" });
+            let held = if packed { versions().held } else { history().held };
+            pack_utils::tests::pack_as_unreadable(&store_blob("stray\n"), pack_utils::tests::Unreadable::CorruptBucket);
+            let hold = store_access();
+
+            let Err(error) = plan_evict(&[held], &hold) else { panic!("packed {}: a damaged pack refuses", packed) };
+            assert!(error.contains("damaged") && error.contains("nothing was changed"), "packed {}: {}", packed, error);
+            assert!(sealed_utils::read_sealed().unwrap().is_empty(), "packed {}: nothing is recorded", packed);
+        }
     }
 
     /// A repack that evicts keeps the signature of every parcel: parcels are never evicted.

@@ -634,8 +634,8 @@ pub struct CompactStats {
     /// index file. Always empty for a run with salvage, and for an incremental compaction.
     pub damaged_packs_skipped: Vec<String>,
 
-    /// Bytes the old pack files a full repack deleted held beyond the packs it wrote. Always 0 for
-    /// an incremental compaction.
+    /// Bytes the old pack files and the loose files a full repack deleted held beyond the packs it
+    /// wrote. Always 0 for an incremental compaction.
     pub pack_bytes_freed: u64,
 
     /// Signature tables written (FORK-333).
@@ -3381,34 +3381,36 @@ pub fn is_in_packs(hash: &str) -> Result<bool, String> {
 }
 
 /// Whether a pack holds a delta whose base is one of `bases`: a record that stops decoding once
-/// its base is deleted, unless a repack re-encodes it first. A pack whose records cannot be read
-/// is passed over, as a repack without salvage passes it over.
+/// its base is deleted, unless a repack re-encodes it first. Every pack's index is validated even
+/// when `bases` is empty, so a caller about to delete objects learns of a damaged pack first.
 ///
 /// # Arguments
 /// * `bases` - Object hashes about to be deleted.
 ///
 /// # Returns
-/// * `Ok(bool)`    - Whether any readable pack has such a delta.
-/// * `Err(String)` - If the pack registry could not be loaded or a record header read.
+/// * `Ok(bool)`    - Whether any pack has such a delta.
+/// * `Err(String)` - If the pack registry could not be loaded, or a pack's index or a record header
+///   could not be read: nothing can then say which deltas stand on `bases`, and a repack without
+///   salvage would leave that pack, and any such delta in it, as found.
 pub fn any_packed_delta_against(bases: &HashSet<String>) -> Result<bool, String> {
     let wanted: HashSet<[u8; HASH_LEN]> = bases.iter().filter_map(|hash| hash_to_bytes(hash)).collect();
-    if wanted.is_empty() {
-        return Ok(false);
-    }
 
     let packs = loaded_packs()?;
+    let mut found = false;
     for pack in packs.packs.iter() {
-        let Ok(records) = pack.records() else {
+        let records = pack.records()?;
+        if found || wanted.is_empty() {
             continue;
-        };
+        }
         for record in records.iter() {
             if read_record_header(pack, record.offset, record.length)?.base.is_some_and(|base| wanted.contains(&base)) {
-                return Ok(true);
+                found = true;
+                break;
             }
         }
     }
 
-    Ok(false)
+    Ok(found)
 }
 
 /// [`is_in_packs`] against the cached set only, with no revalidation: the first step of a
@@ -4031,6 +4033,12 @@ fn compact_held(all: bool,
     // source first — the post-condition ("it is not loose") already holds, so tolerate NotFound.
     progress.status("Removing packed originals");
 
+    // The new packs hold the loose objects packed here too, so their bytes count on the old side.
+    let loose_bytes_packed: u64 = packed_sources.iter()
+        .filter_map(|source| std::fs::metadata(source).ok())
+        .map(|metadata| metadata.len())
+        .sum();
+
     for source in &packed_sources {
         match std::fs::remove_file(source) {
             Ok(()) => stats.loose_removed += 1,
@@ -4048,7 +4056,8 @@ fn compact_held(all: bool,
     let file_bytes = |files: &mut dyn Iterator<Item = &PathBuf>| -> u64 {
         files.filter_map(|path| std::fs::metadata(path).ok()).map(|metadata| metadata.len()).sum()
     };
-    stats.pack_bytes_freed = file_bytes(&mut old_packs.iter()).saturating_sub(file_bytes(&mut new_pack_files.iter()));
+    stats.pack_bytes_freed = (file_bytes(&mut old_packs.iter()) + loose_bytes_packed)
+        .saturating_sub(file_bytes(&mut new_pack_files.iter()));
 
     for old_pack in &old_packs {
         // A layout-derived pack id means an unchanged repack writes the same filename it is

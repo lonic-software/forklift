@@ -6711,7 +6711,7 @@ fn evict_frees_packed_content_and_a_read_fetches_it_again() {
 
     let dry = area.forklift("cached", &["--json", "evict", "--dry-run"]);
     assert_success(&dry);
-    assert!(json_of(&dry)["data"]["would_repack"].as_u64().unwrap() >= 3, "{}", json_of(&dry));
+    assert!(json_of(&dry)["data"]["would_drop"].as_u64().unwrap() >= 3, "{}", json_of(&dry));
 
     let evicted = area.forklift("cached", &["--json", "evict"]);
     assert_success(&evicted);

@@ -51,9 +51,9 @@ pub async fn handle_command(dry_run: bool) -> Result<(), String> {
     // this command, which would refuse the last.
     let store_lock = StoreLock::acquire()?;
     let serve_lock = ServeLock::acquire().map_err(|e| format!(
-        "\"evict\" cannot run while this warehouse root is being served, or while a gc or full repack \
-        runs against it; stop the server first. If neither is running, the lock below was left by \
-        one that was killed and can be removed. {}", e
+        "\"evict\" cannot run while this warehouse root is being served; stop the server first. If \
+        no server is running, the lock below was left by a server, gc or full repack that was killed \
+        and can be removed. {}", e
     ))?;
     let store_access = StoreAccessLock::try_exclusive()?;
     let plan = evict_utils::plan_evict(&held_heads, &store_access)?;
@@ -68,7 +68,8 @@ pub async fn handle_command(dry_run: bool) -> Result<(), String> {
         dry_run,
         evicted: stats.as_ref().map_or(0, |stats| stats.evicted),
         would_evict: plan.to_evict.len(),
-        would_repack: plan.to_drop.len(),
+        would_drop: plan.to_drop.len(),
+        repack: plan.repack,
         bytes_freed: stats.as_ref().map_or(0, |stats| stats.bytes_freed),
         kept_for_checkouts: plan.kept_for_checkouts,
         kept_local: plan.kept_local,
@@ -105,8 +106,12 @@ pub(crate) struct EvictReport {
     /// Objects the plan frees. After a real run, `evicted` is less only by `still_packed`.
     would_evict: usize,
 
-    /// Of `would_evict`, the objects a pack holds, which a full repack drops. `0` means no repack.
-    would_repack: usize,
+    /// Of `would_evict`, the objects a pack holds, which a full repack drops.
+    would_drop: usize,
+
+    /// Whether the run rewrites every pack (on a dry run, would): when `would_drop` is not `0`, and
+    /// also when a packed delta stands on a loose copy it frees, which the repack re-encodes first.
+    repack: bool,
 
     /// Bytes freed on disk: loose files deleted, plus what the old packs held beyond the packs the
     /// repack wrote (`0` on a dry run).
@@ -123,8 +128,9 @@ pub(crate) struct EvictReport {
     /// the origin is not known to hold. Lifting that work lets a later eviction free them.
     not_held: usize,
 
-    /// Objects the plan frees that are still inside a pack after the repack: a damaged pack, which
-    /// a repack leaves as found (`0` on a dry run). `compact --all` salvages it.
+    /// Objects the plan frees that are still inside a pack after the repack: one found damaged only
+    /// during it, which a repack leaves as found (`0` on a dry run; a pack already damaged refuses
+    /// the run). `compact --all` salvages it.
     still_packed: usize,
 
     /// Origin heads this warehouse does not hold yet; their history frees nothing until a `lower`
@@ -140,8 +146,10 @@ impl CommandOutput for EvictReport {
     fn render_human(&self) {
         if self.dry_run {
             println!("Dry run: evicting would free {} object(s).", self.would_evict);
-            if self.would_repack > 0 {
-                println!("{} of them are inside packs, which would be rewritten without them.", self.would_repack);
+            if self.would_drop > 0 {
+                println!("{} of them are inside packs, which would be rewritten without them.", self.would_drop);
+            } else if self.repack {
+                println!("Packed content stands on some of them, so the packs would be rewritten first.");
             }
         } else if self.evicted == 0 {
             println!("Nothing to evict.");

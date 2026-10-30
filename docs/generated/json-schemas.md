@@ -5106,8 +5106,12 @@ A command not listed here either reports only the generic human-message shape `{
       "minimum": 0,
       "type": "integer"
     },
+    "repack": {
+      "description": "Whether the run rewrites every pack (on a dry run, would): when `would_drop` is not `0`, and\nalso when a packed delta stands on a loose copy it frees, which the repack re-encodes first.",
+      "type": "boolean"
+    },
     "still_packed": {
-      "description": "Objects the plan frees that are still inside a pack after the repack: a damaged pack, which\na repack leaves as found (`0` on a dry run). `compact --all` salvages it.",
+      "description": "Objects the plan frees that are still inside a pack after the repack: one found damaged only\nduring it, which a repack leaves as found (`0` on a dry run; a pack already damaged refuses\nthe run). `compact --all` salvages it.",
       "format": "uint",
       "minimum": 0,
       "type": "integer"
@@ -5118,14 +5122,14 @@ A command not listed here either reports only the generic human-message shape `{
       "minimum": 0,
       "type": "integer"
     },
-    "would_evict": {
-      "description": "Objects the plan frees. After a real run, `evicted` is less only by `still_packed`.",
+    "would_drop": {
+      "description": "Of `would_evict`, the objects a pack holds, which a full repack drops.",
       "format": "uint",
       "minimum": 0,
       "type": "integer"
     },
-    "would_repack": {
-      "description": "Of `would_evict`, the objects a pack holds, which a full repack drops. `0` means no repack.",
+    "would_evict": {
+      "description": "Objects the plan frees. After a real run, `evicted` is less only by `still_packed`.",
       "format": "uint",
       "minimum": 0,
       "type": "integer"
@@ -5135,7 +5139,8 @@ A command not listed here either reports only the generic human-message shape `{
     "dry_run",
     "evicted",
     "would_evict",
-    "would_repack",
+    "would_drop",
+    "repack",
     "bytes_freed",
     "kept_for_checkouts",
     "kept_local",
