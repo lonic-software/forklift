@@ -3380,6 +3380,37 @@ pub fn is_in_packs(hash: &str) -> Result<bool, String> {
     })
 }
 
+/// Whether a pack holds a delta whose base is one of `bases`: a record that stops decoding once
+/// its base is deleted, unless a repack re-encodes it first. A pack whose records cannot be read
+/// is passed over, as a repack without salvage passes it over.
+///
+/// # Arguments
+/// * `bases` - Object hashes about to be deleted.
+///
+/// # Returns
+/// * `Ok(bool)`    - Whether any readable pack has such a delta.
+/// * `Err(String)` - If the pack registry could not be loaded or a record header read.
+pub fn any_packed_delta_against(bases: &HashSet<String>) -> Result<bool, String> {
+    let wanted: HashSet<[u8; HASH_LEN]> = bases.iter().filter_map(|hash| hash_to_bytes(hash)).collect();
+    if wanted.is_empty() {
+        return Ok(false);
+    }
+
+    let packs = loaded_packs()?;
+    for pack in packs.packs.iter() {
+        let Ok(records) = pack.records() else {
+            continue;
+        };
+        for record in records.iter() {
+            if read_record_header(pack, record.offset, record.length)?.base.is_some_and(|base| wanted.contains(&base)) {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
 /// [`is_in_packs`] against the cached set only, with no revalidation: the first step of a
 /// presence check that tries packs, then loose, then revalidated packs (`does_object_exist`).
 /// Asking the cached set first keeps a loose object's check free of the revalidation; asking the
@@ -3572,7 +3603,8 @@ fn compact_bounded(all: bool,
 
 /// A full repack for an eviction (DESIGN.html §7.6.1): [`compact`] with `all`, keeping the live set
 /// minus `evicted`, so the objects of `evicted` a pack holds are gone once the old packs are
-/// deleted. The caller already holds every lock a full repack takes, in the order [`compact`]
+/// deleted; a loose copy of one is neither packed nor deleted, which is the caller's to do, after
+/// this returns. The caller already holds every lock a full repack takes, in the order [`compact`]
 /// takes them, from before it chose `evicted` until this returns: an eviction plans under the same
 /// hold that deletes.
 ///
@@ -3582,7 +3614,7 @@ fn compact_bounded(all: bool,
 /// object one holds stays present.
 ///
 /// # Arguments
-/// * `evicted`       - The objects to drop from the packs.
+/// * `evicted`       - Every object the eviction deletes, packed or loose.
 /// * `_store_lock`   - The object-store lock, held.
 /// * `_serve_lock`   - The serve lock, held: a repack keeps no grace period.
 /// * `_store_access` - Exclusive store access, held.
@@ -4970,7 +5002,7 @@ struct CollectedTargets {
 /// sort (and so window-batch) objects by how well they happened to already compress, not by how
 /// big they are, which is close to meaningless for grouping similar-sized objects together.
 ///
-/// A repack's live set excludes `evicted` (an eviction's drop set, empty otherwise): an evicted
+/// A repack's live set excludes `evicted` (what an eviction deletes, empty otherwise): an evicted
 /// object is dropped like garbage, and a delta against one is reconstructed like any delta whose
 /// base is dropped.
 fn collect_targets(all: bool, redelta: bool, salvage: bool, evicted: &HashSet<String>) -> Result<CollectedTargets, String> {
@@ -5452,8 +5484,8 @@ impl Bloom {
 /// memory is bounded (a bit budget) rather than one entry per object — what keeps it viable at
 /// kernel scale (see [`Bloom`]).
 ///
-/// No object of `evicted` (an eviction's drop set) is ever offered as a base: the repack deletes
-/// the packs that hold it, so a kept object encoded against it would no longer decode. An evicted
+/// No object of `evicted` (what an eviction deletes) is ever offered as a base: it is deleted once
+/// the repack is done, so a kept object encoded against it would no longer decode. An evicted
 /// object is not recorded at its path at all, so the next version there takes the previous kept
 /// version as its base instead; an evicted tree is still descended, since a kept object can sit
 /// beneath it.
