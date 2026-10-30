@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::{self, forklift_root, FOLDER_NAME_FORKLIFT_ROOT};
-use crate::util::{alias_utils, bay_utils, config_utils, file_utils, franchise_utils, pallet_utils, record_utils, scope_utils};
+use crate::util::{alias_utils, bay_utils, config_utils, file_utils, franchise_utils, origin_utils, pallet_utils, record_utils, scope_utils};
 use crate::util::record_utils::RecordError;
 use crate::util::scope_utils::MaterializationScope;
 
@@ -481,14 +481,14 @@ impl WarehouseMode {
     }
 }
 
-/// The mode [`prepare_warehouse`] gives a warehouse it marks, with what a sparse one needs written
-/// before its marker.
+/// The mode [`prepare_warehouse`] gives a warehouse it marks, with what a partial one needs
+/// written before its marker: its origin, and a sparse one's scopes.
 #[derive(Clone, Copy, Debug)]
 pub enum PrepareMode<'a> {
     Full,
-    /// The fetch scope, which is also the main tree's first scope. Never full.
-    Sparse(&'a MaterializationScope),
-    Cache,
+    /// `scope` is the fetch scope, which is also the main tree's first scope. Never full.
+    Sparse { scope: &'a MaterializationScope, origin: &'a str },
+    Cache { origin: &'a str },
 }
 
 impl PrepareMode<'_> {
@@ -496,8 +496,8 @@ impl PrepareMode<'_> {
     pub fn mode(&self) -> WarehouseMode {
         match self {
             PrepareMode::Full => WarehouseMode::Full,
-            PrepareMode::Sparse(_) => WarehouseMode::Sparse,
-            PrepareMode::Cache => WarehouseMode::Cache,
+            PrepareMode::Sparse { .. } => WarehouseMode::Sparse,
+            PrepareMode::Cache { .. } => WarehouseMode::Cache,
         }
     }
 }
@@ -573,21 +573,35 @@ fn write_warehouse_marker(forklift: &Path, mode: WarehouseMode) -> Result<(), St
         .map_err(|e| format!("Error while marking \"{}\" as a warehouse: {}", forklift.to_string_lossy(), e))
 }
 
+/// The origin [`mark_for_test`] records for a partial mode.
+#[cfg(test)]
+pub(crate) const TEST_ORIGIN: &str = "http://origin.test";
+
 /// Record `mode` in the marker of the warehouse in scope, replacing any marker there, for a test
-/// fixture that builds a `.forklift` by hand or changes its mode midway. Writes no scope file.
+/// fixture that builds a `.forklift` by hand or changes its mode midway. A partial mode records
+/// [`TEST_ORIGIN`] first, as preparing one records its origin; writes no scope file.
 #[cfg(test)]
 pub(crate) fn mark_for_test(mode: WarehouseMode) {
     let forklift = forklift_root();
     std::fs::create_dir_all(forklift.join("config")).unwrap();
+    if mode != WarehouseMode::Full {
+        origin_utils::write_origin(&forklift, TEST_ORIGIN).unwrap();
+    }
     write_warehouse_marker(&forklift, mode).unwrap();
 }
 
-/// Mark `forklift` as a warehouse in `mode`. A sparse warehouse's fetch scope and main-tree scope
-/// are written first, so no marker says sparse while either is missing. They are written here
-/// rather than through `scope_utils`' setters, which read the mode this writes.
+/// Mark `forklift` as a warehouse in `mode`. A partial warehouse's origin, and a sparse one's fetch
+/// scope and main-tree scope, are written first, so no marker says partial while any is missing.
+/// The scopes are written here rather than through `scope_utils`' setters, which read the mode
+/// this writes.
 fn mark_warehouse(forklift: &Path, mode: PrepareMode) -> Result<(), String> {
-    if let PrepareMode::Sparse(scope) = mode {
-        scope_utils::record_sparse_scopes(forklift, scope)?;
+    match mode {
+        PrepareMode::Full => (),
+        PrepareMode::Sparse { scope, origin } => {
+            origin_utils::write_origin(forklift, origin)?;
+            scope_utils::record_sparse_scopes(forklift, scope)?;
+        }
+        PrepareMode::Cache { origin } => origin_utils::write_origin(forklift, origin)?,
     }
 
     write_warehouse_marker(forklift, mode.mode())
@@ -1327,21 +1341,30 @@ mod tests {
         (std::fs::read(forklift.join("config").join("fetch-scope")).ok(), std::fs::read(forklift.join("scope")).ok())
     }
 
-    /// `prepare_warehouse` records the mode it is given, and a sparse one writes the fetch scope and
-    /// the main tree's scope with it, built under the staging name and filled in place alike. Over
-    /// a marker already standing it keeps the mode and writes no scope, so preparing a sparse
-    /// warehouse again never restores a scope that was deleted.
+    fn origin_in(target: &Path) -> Option<String> {
+        let _scope = globals::StorageRootScope::enter(target);
+        origin_utils::read_origin().unwrap()
+    }
+
+    /// `prepare_warehouse` records the mode it is given; a partial one writes its origin with it,
+    /// and a sparse one the fetch scope and the main tree's scope too, built under the staging name
+    /// and filled in place alike. Over a marker already standing it keeps the mode and writes no
+    /// scope or origin, so preparing a sparse warehouse again never restores a scope that was
+    /// deleted.
     ///
     /// Revert: write the marker before the scopes, or skip them in place (`fill_in_place` marking
-    /// with `Full`) → the claim reads full; let `fill_in_place` write the scopes over a standing
-    /// marker → the deleted fetch scope comes back.
+    /// with `Full`) → the claim reads full; skip the origin for a cache → its row reads `None`;
+    /// let `fill_in_place` write the scopes over a standing marker → the deleted fetch scope comes
+    /// back.
     #[test]
-    fn prepare_records_the_mode_and_a_sparse_one_writes_both_scopes_first() {
+    fn prepare_records_the_mode_and_a_partial_one_writes_its_origin_and_scopes_first() {
         let scope = MaterializationScope::from_prefixes(["src"]);
         let written = b"/forklift-scope 3\nsrc\n".to_vec();
 
         let root = fresh_dir("modes");
-        for (name, mode) in [("full", PrepareMode::Full), ("sparse", PrepareMode::Sparse(&scope)), ("cache", PrepareMode::Cache)] {
+        let origin = "http://origin.example";
+        let sparse = PrepareMode::Sparse { scope: &scope, origin };
+        for (name, mode) in [("full", PrepareMode::Full), ("sparse", sparse), ("cache", PrepareMode::Cache { origin })] {
             let target = root.join(name);
             std::fs::create_dir_all(&target).unwrap();
             let forklift = target.join(FOLDER_NAME_FORKLIFT_ROOT);
@@ -1352,6 +1375,7 @@ mod tests {
             assert_eq!(read_warehouse_marker(&forklift), Ok(Some(mode.mode())), "{}", name);
             let expected = if name == "sparse" { (Some(written.clone()), Some(written.clone())) } else { (None, None) };
             assert_eq!(scope_files(&forklift), expected, "{}", name);
+            assert_eq!(origin_in(&target).as_deref(), (name != "full").then_some(origin), "{}", name);
         }
 
         // Filled in place: a `.forklift` with something in it but no marker, as a franchise's claim is.
@@ -1361,14 +1385,16 @@ mod tests {
         std::fs::write(forklift.join("keep"), b"").unwrap();
         {
             let _scope = globals::StorageRootScope::enter(&target);
-            prepare_warehouse(PrepareMode::Sparse(&scope)).unwrap();
+            prepare_warehouse(sparse).unwrap();
         }
         assert_eq!(read_warehouse_marker(&forklift), Ok(Some(WarehouseMode::Sparse)));
         assert_eq!(scope_files(&forklift), (Some(written.clone()), Some(written.clone())));
+        assert_eq!(origin_in(&target).as_deref(), Some(origin));
 
-        // Prepared again over its marker, with its fetch scope gone: the mode stands and nothing
-        // is restored, so the warehouse stays refused rather than quietly whole again.
+        // Prepared again over its marker, with its fetch scope and origin gone: the mode stands and
+        // nothing is restored, so the warehouse stays refused rather than quietly whole again.
         std::fs::remove_file(forklift.join("config").join("fetch-scope")).unwrap();
+        std::fs::remove_file(forklift.join(origin_utils::FILE_NAME)).unwrap();
         {
             let _scope = globals::StorageRootScope::enter(&target);
             prepare_warehouse(PrepareMode::Full).unwrap();
@@ -1376,6 +1402,7 @@ mod tests {
         }
         assert_eq!(read_warehouse_marker(&forklift), Ok(Some(WarehouseMode::Sparse)));
         assert_eq!(scope_files(&forklift), (None, Some(written)));
+        assert_eq!(origin_in(&target), None);
 
         std::fs::remove_dir_all(&root).ok();
     }

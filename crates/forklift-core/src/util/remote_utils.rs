@@ -29,7 +29,7 @@ use crate::util::body_utils::{self, BodyReadError, JsonReadError};
 use crate::util::object_utils::MAX_OBJECT_BYTES;
 use crate::util::{
     audit_utils, bundle_utils, config_utils, fetch_ledger, file_utils, haul_utils, held_heads, merge_utils, meta_tree, object_utils,
-    office_utils, pack_utils, pallet_utils, sealed_utils, sign_utils, take_utils, trust_utils,
+    office_utils, origin_utils, pack_utils, pallet_utils, sealed_utils, sign_utils, take_utils, trust_utils,
 };
 
 /// How many object transfers run concurrently.
@@ -2548,6 +2548,23 @@ impl RemoteClient {
             .map(|(value, _)| value);
 
         RemoteClient::new(&url, token)
+    }
+
+    /// Create the client every command of a warehouse talks to its remote through: the configured
+    /// remote, and in a partial warehouse only when it is the recorded origin
+    /// ([`origin_utils::checked_remote`]). [`from_config`](RemoteClient::from_config) stays only
+    /// where no partial warehouse dials through it: `mirror`, which refuses a partial warehouse
+    /// before it builds a client, and the best-effort display-name lookup, which reads no history
+    /// and no heads.
+    ///
+    /// # Returns
+    /// * `Ok(RemoteClient)` - The client.
+    /// * `Err(CoreError)`   - No remote is configured, a partial warehouse's remote is not its
+    ///   origin or it has none (`non_origin_remote`), or the client could not be built.
+    pub fn for_warehouse() -> Result<RemoteClient, CoreError> {
+        let (url, token) = origin_utils::checked_remote()?;
+
+        Ok(RemoteClient::new(&url, token)?)
     }
 
     /// Whether a remote URL is configured at all for this warehouse — independent of whether

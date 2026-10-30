@@ -1,10 +1,9 @@
 use serde::Serialize;
-use forklift_core::error::CoreError;
 use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{BatchLaneClosure, LiftResult, RemoteClient};
 use forklift_core::util::{
     file_utils, merge_utils, object_utils, pallet_utils,
-    remote_utils, scope_utils, take_utils,
+    remote_utils, take_utils,
 };
 use forklift_core::util::take_utils::{FetchAt, TakeTrust};
 use crate::commands::consolidate::{self, MergeStatus};
@@ -33,8 +32,6 @@ const MAX_AUTO_MERGES: usize = 5;
 /// * `Err(String)` - If no remote is configured, the remote is ahead, or a transfer
 ///                   failed.
 pub async fn handle_command(recreate: bool) -> Result<(), String> {
-    ensure_origin_remote()?;
-
     let progress = events::progress();
     let mut auto_merged = 0usize;
     // Each attempt dials a fresh client, so a lane an earlier attempt's fetch closed is carried here.
@@ -44,7 +41,9 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
     // consolidates and retries, so a fleet stacking to one pallet stops serializing
     // through a human. True overlaps still stop with the diverged error.
     loop {
-        let client = RemoteClient::from_config()?;
+        // A partial warehouse lifts only to its origin, the one remote proved to hold what it
+        // lacks; another could fail late at its closure check over objects never verified there.
+        let client = RemoteClient::for_warehouse()?;
         let info = client.fetch_info().await?;
 
         // The upload lifts the pallet's ref; only the auto-merge below works from this bay's files.
@@ -207,28 +206,6 @@ fn with_drop_hint(error: String, info: &forklift_core::model::remote::WarehouseI
     forklift_core::error::append_to_message(error, &format!(
         "If the remote refuses a local change, \"lower --keep {}:<path>=theirs\" drops it.", wire
     ))
-}
-
-/// Refuse a lift from a partial warehouse (franchised with `--only` or `--cache`) to a remote
-/// other than the one it fetched against. A partial warehouse only ever proved the closure it
-/// does not hold present on its origin; a different remote may lack objects it never verified
-/// there, so the lift's closure check would fail late and confusingly. Refusing up front, with
-/// the origin named, is the clearer failure, and a partial warehouse with no origin recorded is
-/// refused too. A no-op for a full warehouse, which holds the whole closure and can lift anywhere,
-/// and for a partial warehouse still pointed at its origin.
-fn ensure_origin_remote() -> Result<(), CoreError> {
-    if !scope_utils::content_may_be_absent()? {
-        return Ok(());
-    }
-
-    // Franchise records the origin before the head, so a partial warehouse without one was left by
-    // an interrupted franchise or had it unset. Its lift is refused rather than left to the
-    // remote's closure check, which would fail late against the wrong remote. No remote configured
-    // at all is left to `RemoteClient::from_config`, called right after this guard.
-    scope_utils::ensure_remote_is_origin(
-        scope_utils::unrecorded_origin_lift_refusal,
-        scope_utils::non_origin_lift_refusal,
-    )
 }
 
 /// If the remote head has genuinely diverged from ours and a clean auto-merge is possible,

@@ -11,7 +11,7 @@ use forklift_core::util::remote_utils::{self as remote, BatchLaneClosure, Bundle
 use forklift_core::util::scope_utils::MaterializationScope;
 use forklift_core::util::warehouse_utils::PrepareMode;
 use forklift_core::util::{
-    bundle_utils, config_utils, file_utils, held_heads, lock_utils, object_utils, operation_utils,
+    bundle_utils, config_utils, file_utils, held_heads, lock_utils, object_utils, operation_utils, origin_utils,
     pack_utils, pallet_utils, remote_utils, scope_utils, shift_utils, take_utils, trust_utils,
     warehouse_utils,
 };
@@ -195,7 +195,7 @@ pub async fn handle_command(url: &str,
 fn check_resume(directory: &str, record: &FranchiseRecord, url: &str, expect: Option<&str>) -> Result<(), String> {
     let command = franchise_utils::resume_command(&record.url, directory, &record.request);
 
-    if !same_remote(&record.url, url) {
+    if !origin_utils::same_remote(&record.url, url) {
         return Err(CoreError::refusal_with_details(
             RefusalCode::FranchiseIncomplete,
             format!(
@@ -221,11 +221,6 @@ fn check_resume(directory: &str, record: &FranchiseRecord, url: &str, expect: Op
         ).into()),
         _ => Ok(()),
     }
-}
-
-/// Whether two spellings of a remote's URL name the same remote, as the client dials it.
-fn same_remote(a: &str, b: &str) -> bool {
-    a.trim_end_matches('/') == b.trim_end_matches('/')
 }
 
 /// The `franchise_incomplete` details of a resume refused before it started.
@@ -451,7 +446,7 @@ fn readmit(directory: &str, absolute_target: &Path, url: &str, expected: &Expect
     );
 
     match (franchise_utils::admit(absolute_target)?, expected) {
-        (Admission::Resume(Some(record)), Expected::Record(genesis)) if same_remote(&record.url, url) && &record.genesis == genesis => {
+        (Admission::Resume(Some(record)), Expected::Record(genesis)) if origin_utils::same_remote(&record.url, url) && &record.genesis == genesis => {
             Ok(Some(record))
         }
         (Admission::Resume(None), Expected::Debris) => Ok(None),
@@ -504,22 +499,27 @@ async fn franchise_into_prepared_target(
     let sparse = partial.sparse;
     let url = attempt.record.url.clone();
 
-    // The mode is on disk from here on, a sparse warehouse's scopes with it, so every ref write
-    // below is gated by what this warehouse will hold. A resume clears the marker before this, so
-    // a recorded mode other than the one asked for, or a sparse one over other paths, is never
-    // expected; it is refused all the same, since a standing marker keeps the scopes it has.
-    let mode = partial.prepare_mode(&fetch_scope);
+    // The mode is on disk from here on, a partial warehouse's origin and a sparse one's scopes
+    // with it, so every ref write below is gated by what this warehouse will hold, and every
+    // fetch, the cache's included, dials only the origin. A resume clears the marker and the
+    // origin before this, so a recorded mode other than the one asked for, a sparse one over other
+    // paths, or another origin is never expected; it is refused all the same, since a standing
+    // marker keeps what it has.
+    let mode = partial.prepare_mode(&fetch_scope, &url);
     warehouse_utils::prepare_warehouse(mode)?;
 
     // A standing record the readers refuse is a mismatch too, reported the same way: the way out
     // is this directory's, not the one the reader names for a warehouse in use.
     let recorded = (|| Ok::<_, String>((
-        warehouse_utils::warehouse_mode()?, scope_utils::read_fetch_scope()?, scope_utils::read_main_tree_scope()?
+        warehouse_utils::warehouse_mode()?, scope_utils::read_fetch_scope()?, scope_utils::read_main_tree_scope()?,
+        origin_utils::read_origin()?,
     )))();
+    let origin = partial.any().then(|| url.clone());
     let found = match recorded {
-        Ok(recorded) if recorded == (mode.mode(), fetch_scope.clone(), fetch_scope.clone()) => None,
-        Ok((mode, fetch, main)) => Some(format!(
-            "a {} one fetching {} and checking out {}", mode.word(), describe_scope(&fetch), describe_scope(&main)
+        Ok(recorded) if recorded == (mode.mode(), fetch_scope.clone(), fetch_scope.clone(), origin) => None,
+        Ok((mode, fetch, main, origin)) => Some(format!(
+            "a {} one fetching {} and checking out {}, {}", mode.word(), describe_scope(&fetch), describe_scope(&main),
+            origin.map_or("with no origin".to_string(), |origin| format!("franchised from \"{}\"", origin))
         )),
         Err(reason) => Some(format!("one Forklift cannot use ({})", reason)),
     };
@@ -620,8 +620,6 @@ async fn franchise_into_prepared_target(
         // There is no tree to validate --only against (the pallet has nothing stacked on the
         // remote yet); the requested sparse scope stands as prepared, so a later lower/expand
         // into this pallet, once it is born, stays within it.
-        record_partial(partial, &url)?;
-
         attempt.finishing = true;
         franchise_utils::finish(&attempt.forklift)?;
 
@@ -634,8 +632,8 @@ async fn franchise_into_prepared_target(
 
     let tree_hash = object_utils::load_parcel(&remote_head)?.tree_hash;
 
-    // Validate the --only paths against the fetched head before the origin record and the pallet
-    // head are written. The scopes are already recorded, but a resume clears them with the marker
+    // Validate the --only paths against the fetched head before the pallet head is written. The
+    // scopes are already recorded, but a resume clears them with the marker
     // and prepares again, and the fetched objects are kept, so a resume with the path corrected
     // fetches only what the new scope adds. The spine is fetched, so the walk to each in-scope
     // subtree resolves without touching anything absent.
@@ -654,8 +652,6 @@ async fn franchise_into_prepared_target(
             }
         }
     }
-
-    record_partial(partial, &url)?;
 
     // Raised before the pallet's head is written, and finished once the tree is materialized. The
     // franchise record outlives it: a franchise interrupted anywhere is resumed by `franchise`,
@@ -720,12 +716,13 @@ impl Partial {
         self.sparse || self.cache
     }
 
-    /// The mode the warehouse is prepared in. `--only` and `--cache` conflict, so at most one holds.
-    fn prepare_mode(self, fetch_scope: &MaterializationScope) -> PrepareMode<'_> {
+    /// The mode the warehouse is prepared in, a partial one with `origin`, the remote franchised
+    /// from. `--only` and `--cache` conflict, so at most one holds.
+    fn prepare_mode<'a>(self, fetch_scope: &'a MaterializationScope, origin: &'a str) -> PrepareMode<'a> {
         if self.sparse {
-            PrepareMode::Sparse(fetch_scope)
+            PrepareMode::Sparse { scope: fetch_scope, origin }
         } else if self.cache {
-            PrepareMode::Cache
+            PrepareMode::Cache { origin }
         } else {
             PrepareMode::Full
         }
@@ -735,16 +732,6 @@ impl Partial {
 /// A scope as a refusal names it: "every path" when full, else its prefixes.
 fn describe_scope(scope: &MaterializationScope) -> String {
     if scope.is_full() { "every path".to_string() } else { scope.prefixes().join(", ") }
-}
-
-/// Record the origin of a partial franchise: the one remote that holds what it lacks. Nothing for
-/// a full franchise.
-fn record_partial(partial: Partial, url: &str) -> Result<(), String> {
-    if partial.any() {
-        config_utils::set_value(config_utils::KEY_REMOTE_ORIGIN, url, ConfigScope::Warehouse)?;
-    }
-
-    Ok(())
 }
 
 /// Resolve which pallet franchise should check out, using only the handshake's own answer

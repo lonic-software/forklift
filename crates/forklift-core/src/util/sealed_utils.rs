@@ -86,7 +86,7 @@ use std::path::{Path, PathBuf};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::enums::object_type::ObjectType;
 use crate::globals;
-use crate::util::{audit_utils, bay_utils, file_utils, object_utils, office_utils, pack_utils, record_utils, recovery_utils, sign_utils};
+use crate::util::{audit_utils, bay_utils, file_utils, object_utils, office_utils, origin_utils, pack_utils, record_utils, recovery_utils, sign_utils};
 use crate::util::lock_utils::{RefLock, StoreAccessExclusive, StoreAccessLock};
 
 /// The record's file name under the shared forklift root.
@@ -529,14 +529,15 @@ pub fn append(ops: &[(SealOp, &str)]) -> Result<SealedSet, String> {
 ///
 /// # Returns
 /// * `Ok(SealedSet)` - The set the record now replays to.
-/// * `Err(String)`   - If a hash is not an object hash, the record cannot be read or parsed, or
-///                     the write fails. Nothing is written in the first two cases. A failed
+/// * `Err(String)`   - If a hash is not an object hash, the record cannot be read or parsed, an
+///                     entry would be added where no origin is recorded, or the write fails.
+///                     Nothing is written in the first three cases. A failed
 ///                     write may still have landed: some of its frames whole (and perhaps a
 ///                     torn one, which the next write drops), or the whole new record when the
 ///                     create failed after its rename. Read the record back to learn which.
 pub fn append_locked(lock: &RefLock, ops: &[(SealOp, &str)]) -> Result<SealedSet, String> {
     let ops: Vec<(SealOp, String)> = ops.iter().map(|(op, hash)| (*op, hash.to_string())).collect();
-    append_decided_locked(lock, |_| Ok(ops))
+    append_decided_locked(lock, Entries::Claimed, |_| Ok(ops))
 }
 
 /// Record every absence in the closures of `roots` the record does not already hold: a root that
@@ -571,7 +572,7 @@ pub fn record_absences_under(roots: &[String]) -> Result<(), String> {
 
     let lock = RefLock::acquire()?;
 
-    append_decided_locked(&lock, |set| {
+    append_decided_locked(&lock, Entries::Claimed, |set| {
         let mut written: HashSet<&str> = HashSet::new();
 
         Ok(absent.iter()
@@ -594,7 +595,7 @@ pub fn record_absences_under(roots: &[String]) -> Result<(), String> {
 pub fn forget_filled<'a>(filled: impl Iterator<Item = &'a String>) -> Result<(), String> {
     let lock = RefLock::acquire()?;
 
-    append_decided_locked(&lock, |set| {
+    append_decided_locked(&lock, Entries::PushedDown, |set| {
         Ok(filled.filter(|hash| set.contains(hash))
             .map(|hash| (SealOp::Remove, hash.clone()))
             .collect())
@@ -603,10 +604,21 @@ pub fn forget_filled<'a>(filled: impl Iterator<Item = &'a String>) -> Result<(),
     Ok(())
 }
 
+/// What the entries an append adds stand on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Entries {
+    /// New claims that the origin holds each object, so an origin must be recorded.
+    Claimed,
+    /// Coverage pushed down from entries already recorded, which carry the claim beneath them; a
+    /// warehouse with no origin may hold such entries (an `unseal` there must still remove them).
+    PushedDown,
+}
+
 /// [`append_locked`] with the ops decided from the set the record replays to when it is re-read
 /// under the lock, so a decision about what is recorded is made on what is recorded.
 fn append_decided_locked(
     _lock: &RefLock,
+    entries: Entries,
     decide: impl FnOnce(&SealedSet) -> Result<Vec<(SealOp, String)>, String>,
 ) -> Result<SealedSet, String> {
     let path = sealed_path();
@@ -624,6 +636,20 @@ fn append_decided_locked(
     };
 
     let ops = decide(&set)?;
+
+    // An entry says the origin holds the object, so no new claim is added where no origin is
+    // recorded: a full warehouse, or a partial one whose record is gone. Removals stand on their
+    // own, and a push-down only moves a claim already recorded.
+    if entries == Entries::Claimed && ops.iter().any(|(op, _)| *op == SealOp::Record)
+        && origin_utils::read_origin()?.is_none()
+    {
+        return Err(format!(
+            "This warehouse records no origin, so nothing can be recorded as held by hash: no remote \
+            is known to hold it. The record \"{}\" was not changed.",
+            path.to_string_lossy()
+        ));
+    }
+
     let borrowed: Vec<(SealOp, &str)> = ops.iter().map(|(op, hash)| (*op, hash.as_str())).collect();
     let frames = encode_frames(&borrowed)?;
 
@@ -999,7 +1025,7 @@ pub fn unseal(_hold: &impl StoreAccessHold, hashes: &[String]) -> Result<Unseale
     let mut removed = Vec::new();
     let mut pushed_down = Vec::new();
 
-    append_decided_locked(&lock, |set| {
+    append_decided_locked(&lock, Entries::PushedDown, |set| {
         pushed_down = still_absent.into_iter().filter(|hash| !set.contains(hash)).collect();
         removed = walked.into_iter().filter(|hash| set.contains(hash)).collect::<BTreeSet<String>>().into_iter().collect();
 
@@ -1094,7 +1120,7 @@ pub(crate) fn refill_all(_hold: &impl StoreAccessHold, objects: &[(&str, &[u8])]
     if !absent.is_empty() {
         let lock = RefLock::acquire()?;
 
-        append_decided_locked(&lock, |set| {
+        append_decided_locked(&lock, Entries::PushedDown, |set| {
             let mut written: HashSet<&str> = HashSet::new();
 
             Ok(absent.iter()
@@ -1110,7 +1136,7 @@ pub(crate) fn refill_all(_hold: &impl StoreAccessHold, objects: &[(&str, &[u8])]
 
     let lock = RefLock::acquire()?;
 
-    append_decided_locked(&lock, |set| {
+    append_decided_locked(&lock, Entries::PushedDown, |set| {
         let mut written: HashSet<&str> = HashSet::new();
 
         Ok(objects.iter()
@@ -1463,6 +1489,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
         let scope = crate::globals::StorageRootScope::enter(&root);
+        origin_utils::write_for_tests("http://origin.test");
         (root, scope)
     }
 
@@ -1641,6 +1668,32 @@ mod tests {
         // An uppercase spelling is refused too: the replay would give it back lowercase.
         assert!(append(&[(SealOp::Record, &B.to_uppercase())]).is_err());
         assert_eq!(std::fs::read(sealed_path()).unwrap(), before);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An entry says the origin holds the object, so with no origin recorded no new claim is
+    /// added; a removal still lands. A push-down only moves a recorded claim and is not refused:
+    /// `heal_pushes_a_present_recorded_trees_coverage_down` (audit_bounds) unseals in a full
+    /// warehouse.
+    ///
+    /// Revert: drop the origin check → the entry lands; apply it to push-downs too → that heal
+    /// test's unseal fails.
+    #[test]
+    fn an_entry_is_never_added_where_no_origin_is_recorded() {
+        let (root, _scope) = scratch("no-origin");
+        append(&[(SealOp::Record, A)]).unwrap();
+        std::fs::remove_file(globals::forklift_root().join(origin_utils::FILE_NAME)).unwrap();
+        let before = std::fs::read(sealed_path()).unwrap();
+
+        let error = append(&[(SealOp::Remove, A), (SealOp::Record, B)]).unwrap_err();
+        assert!(error.contains("records no origin"), "{}", error);
+        assert_eq!(std::fs::read(sealed_path()).unwrap(), before);
+        assert!(record_absences_under(&[B.to_string()]).unwrap_err().contains("records no origin"));
+        assert_eq!(std::fs::read(sealed_path()).unwrap(), before);
+
+        append(&[(SealOp::Remove, A)]).unwrap();
+        assert!(!read_sealed().unwrap().contains(A));
 
         let _ = std::fs::remove_dir_all(&root);
     }

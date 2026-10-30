@@ -11,8 +11,8 @@ use crate::output::{self, CommandOutput};
 /// A ref's closure is complete only at the scope it was fetched at, so widening the scope
 /// re-walks the bay's base, every local ref head and every head a fetch recorded without a ref
 /// yet ([`remote_utils::Expansion`]); the shared history is walked once. The content is fetched
-/// from the configured remote and hash-verified against the seals the history already commits, so
-/// widening from any remote is safe — only publishing (`lift`) is origin-bound. A full
+/// from the origin (a partial warehouse dials no other remote, [`forklift_core::util::origin_utils::checked_remote`])
+/// and hash-verified against the seals the history already commits. A full
 /// (non-sparse) warehouse already holds everything, so there is nothing to expand.
 ///
 /// # Arguments
@@ -76,7 +76,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
         return Ok(());
     }
 
-    let client = RemoteClient::from_config()?;
+    let client = RemoteClient::for_warehouse()?;
     // The tree this bay holds: its base, not the pallet's ref, which another bay can move.
     let position = pallet_utils::read_position()?;
     let pallet = position.pallet.clone();

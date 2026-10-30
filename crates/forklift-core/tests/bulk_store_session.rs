@@ -227,6 +227,7 @@ fn the_sealed_object_record_is_written_through_an_open_session() {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join(forklift_core::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
     let _scope = StorageRootScope::enter(&root);
+    forklift_core::util::origin_utils::write_for_tests("http://origin.test");
 
     let a = "aa00000000000000000000000000000000000000000000000000000000000001";
     let b = "bb00000000000000000000000000000000000000000000000000000000000002";
