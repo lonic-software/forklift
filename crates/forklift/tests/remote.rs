@@ -8580,6 +8580,18 @@ fn scope_prune_refuses_while_a_bay_still_materializes_the_path() {
     let scope_json: serde_json::Value = serde_json::from_str(&stdout(&scope)).unwrap();
     assert_eq!(scope_json["data"]["fetch_scope"], serde_json::json!(["src/api", "src/web"]),
         "the refused prune left the fetch scope unchanged: {}", stdout(&scope));
+
+    // The named way out, run from the refused state. src/web is the bay's whole scope, so
+    // narrowing it there refuses (a checkout keeps at least one path); removing the bay is the
+    // step the refusal names for that case, and the prune then goes through.
+    let next_step = json["error"]["next_step"].as_str().unwrap();
+    assert!(next_step.contains("scope narrow") && next_step.contains("remove a bay"),
+        "the next step names both ways out: {}", next_step);
+    assert!(!area.forklift("bay-web", &["scope", "narrow", "src/web"]).status.success(),
+        "narrowing away the bay's last path refuses");
+    assert_success(&area.forklift("sparse", &["bay", "remove", "webbay"]));
+    assert_success(&area.forklift("sparse", &["scope", "prune", "src/web"]));
+    assert!(!object_present(&area, "sparse", &web_blob), "the prune freed src/web once the bay was gone");
 }
 
 #[test]

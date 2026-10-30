@@ -733,8 +733,8 @@ pub fn narrow_unclean_refusal(path: &str, blocked_by: &str) -> CoreError {
 /// * `blockers`  - The checkout(s) still materializing it (for the message).
 pub fn scope_prune_blocked_refusal(path: &str, blockers: &str) -> CoreError {
     let next_step = format!(
-        "Run \"forklift scope narrow\" in {} to drop \"{}\" first (that is checkout-local and frees \
-        nothing), then prune.",
+        "In {}, drop the in-scope paths that overlap \"{}\" with \"forklift scope narrow\" \
+        (checkout-local, it frees nothing), or remove a bay whose whole scope overlaps, then prune.",
         blockers, path
     );
 
