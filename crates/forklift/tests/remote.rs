@@ -6545,19 +6545,19 @@ fn assert_move_pending(area: &TestArea,
 
 /// While a move of a partial warehouse's origin stands, in either phase, nothing talks to a
 /// remote and nothing writes what the move checks: with `remote.url` still the origin, the remote
-/// listing, `office rotate` and `accept-regenesis`, `lower`, `lift`, `expand`,
-/// `scope-prune` and the remote `--delete` and `--restore` refuse up front, and so do the writers
-/// that never dial a remote but add to the fetched-heads ledger (an `undo` that moves a pallet
-/// back, a forced local delete). In a cache, `evict`, a read
-/// of a parcel it never fetched, and a forced delete refuse the same way. Each refusal is
-/// `origin_move_pending` (exit 37), changes nothing under `.forklift`, and offers `--abort` only
-/// while the move is still checking. Stacking, local reads and `heal` proceed; with the intent
-/// gone, the refused commands run again.
+/// listing, `office rotate` and `accept-regenesis`, `lower`, `lift`, `expand`, `scope-prune` and
+/// the remote `--delete` and `--restore` refuse up front, and so do the local writers: an `undo`
+/// that moves a pallet back, adding its head to the fetched-heads ledger, and a forced delete,
+/// which removes no pallet under a move whether or not its head is already in the ledger. In a
+/// cache, `evict`, a read of a parcel it never fetched, and a forced delete refuse the same way.
+/// Each refusal is `origin_move_pending` (exit 37), changes nothing under `.forklift`, and offers
+/// `--abort` only while the move is still checking. Stacking, local reads and `heal` proceed; with
+/// the intent gone, the refused commands run again.
 ///
 /// Revert: drop the up-front check in `checked_remote` → the remote commands run (lower, the
-/// listing and the cache's read succeed) → red; drop the removal funnel → the cache's forced
-/// delete removes its pallet → red; drop the ledger funnel → undo and the sparse delete refuse
-/// with another code (only the ledger's own write is refused under the lock) or run → red.
+/// listing and the cache's read succeed) → red; drop the removal funnel → the forced delete
+/// removes its pallet (the sparse one too: its head is in the ledger already, so nothing is
+/// written there) → red; drop the ledger funnel → the undo runs → red.
 #[test]
 fn a_pending_move_of_the_origin_refuses_every_remote_client_and_every_writer_it_checks() {
     use forklift_core::util::origin_move::Phase;
