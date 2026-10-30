@@ -15,7 +15,8 @@ use crate::output::{self, CommandOutput};
 /// cherry-picking bay names, the trust pins, and staged work. Every object it frees is recorded
 /// first, so an interrupted eviction leaves a readable warehouse and running it again finishes.
 /// Loose copies are deleted; packed objects go by a full repack that keeps everything else, so
-/// like `compact --all` it refuses while the warehouse root is served.
+/// like `compact --all` it refuses while the warehouse root is served. Last, the record is bounded:
+/// the record of an evicted object nothing present names any more is dropped.
 ///
 /// # Arguments
 /// * `dry_run` - Report what would be freed and change nothing.
@@ -77,6 +78,8 @@ pub async fn handle_command(dry_run: bool) -> Result<(), String> {
         still_packed: stats.as_ref().map_or(0, |stats| stats.still_packed),
         heads_not_lowered: plan.heads_not_lowered,
         unsealed: stats.as_ref().map_or(plan.to_unseal.len(), |stats| stats.unsealed),
+        record_dropped: stats.as_ref().map_or(0, |stats| stats.record_dropped),
+        record_bound_skipped: stats.and_then(|stats| stats.record_bound_skipped),
     });
 
     Ok(())
@@ -140,6 +143,15 @@ pub(crate) struct EvictReport {
     /// Kept objects an earlier eviction had recorded as held by hash, and a read had fetched again,
     /// whose record this run removed (on a dry run, would remove).
     unsealed: usize,
+
+    /// Records of evicted objects this run dropped because nothing present names them any more: an
+    /// object under an evicted tree is reached only through that tree, whose own record stays
+    /// (`0` on a dry run).
+    record_dropped: usize,
+
+    /// Why no record was dropped, when the run met an object missing here that the record does not
+    /// hold (`null` otherwise, and on a dry run). `heal` repairs that; the next `evict` drops them.
+    record_bound_skipped: Option<String>,
 }
 
 impl CommandOutput for EvictReport {
@@ -166,6 +178,14 @@ impl CommandOutput for EvictReport {
                 "{} kept object(s) {} recorded as held by hash.",
                 self.unsealed,
                 if self.dry_run { "would no longer be" } else { "are no longer" }
+            );
+        }
+
+        if let Some(why) = &self.record_bound_skipped {
+            println!(
+                "The record of evicted objects was not shrunk: {}. Run \"forklift heal\", then \"evict\" \
+                again.",
+                why
             );
         }
 

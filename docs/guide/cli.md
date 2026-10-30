@@ -1914,6 +1914,14 @@ warehouse root is being served, and while another command in another bay uses th
 since either could rely on an object the eviction is about to free; run it again once the other
 command finishes. Nothing frees content on its own yet: `evict` runs only when you run it.
 
+Last, `evict` shrinks the record of what it freed, so it does not grow with every run: an evicted
+object nothing present here names any more, such as a file under an evicted directory, loses its
+record (`record_dropped`), since it is reached only through that directory, whose record stays.
+Reading the directory again fetches it and records its contents again, so reads by path work as
+before; asking for such an object by its hash alone reads it as missing, not as a cache miss. If
+the run meets an object missing here that the record does not hold, nothing is dropped and the
+report says why (`record_bound_skipped`); run `heal`, then `evict` again.
+
 ---
 
 ## 7. Identity, signing, and agents
