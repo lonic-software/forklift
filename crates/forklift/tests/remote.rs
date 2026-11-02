@@ -3063,6 +3063,27 @@ fn enroll_refuses_an_office_with_no_anchor_and_its_ways_out_work() {
     assert_success(&area.forklift("elsewhere", &["office", "enroll"]));
 }
 
+/// The way out for a warehouse that lost its anchor while its remote reset its trust: lower has no
+/// chain to reconcile with, and a new clone holds the remote's trust.
+#[test]
+fn a_lost_anchor_over_a_remote_that_reset_its_trust_clones_again() {
+    let area = TestArea::new("enroll-lost-anchor-regenesis");
+    let server = regenesis_on_remote(&area, |server| {
+        assert_success(&area.forklift(".", &["clone", &server.url, "b", "--token", "root"]));
+    });
+    std::fs::remove_file(area.path("b/.forklift/trust")).unwrap();
+
+    let refused = area.forklift("b", &["office", "enroll"]);
+    assert!(stderr(&refused).contains("clone it again"), "{}", stderr(&refused));
+
+    let lowered = area.forklift("b", &["lower"]);
+    assert!(!lowered.status.success(), "{}{}", stdout(&lowered), stderr(&lowered));
+    assert!(!area.path("b/.forklift/trust").exists(), "no anchor is taken");
+
+    assert_success(&area.forklift(".", &["clone", &server.url, "c", "--token", "root"]));
+    assert_success(&area.forklift("c", &["audit", "@office"]));
+}
+
 /// Write a parcel straight into the server's storage and point `pallet` at it, as a push the server
 /// has no reason to refuse. Returns the parcel's hash.
 fn plant_on_server(area: &TestArea, pallet: &str, parcel: forklift_core::model::parcel::Parcel) -> String {
