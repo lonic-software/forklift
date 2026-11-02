@@ -659,8 +659,8 @@ fn gc(root: &str, grace_hours: u64) -> Result<(), String> {
 
     println!(
         "Scanned {} object(s): deleted {} unreferenced, kept {} within the {}h grace \
-        period.",
-        stats.scanned, stats.deleted, stats.kept_recent, grace_hours
+        period and {} that packed content is stored against.",
+        stats.scanned, stats.deleted, stats.kept_recent, grace_hours, stats.kept_for_deltas
     );
 
     Ok(())

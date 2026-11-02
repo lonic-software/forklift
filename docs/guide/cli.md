@@ -1899,7 +1899,9 @@ leaves the fetch scope as it was, refusing with `confirmation_required` (exit 39
 its `details`); with nothing to free it runs without `--confirm`. A confirmed run plans again, so
 if the remote moved in between it may free slightly more or less than the preview showed.
 (Objects already inside a pack are reported but not reclaimed yet — a scope-aware repack is future
-work.) A prune, preview included, is **refused while a mutating command runs in another bay**, since that writer could
+work.) When packed content is stored as a delta against an object the prune frees, the prune first
+rewrites every pack so that content still reads; the report's `repack` says so. A damaged pack
+refuses the prune before anything changes: `store compact --all` salvages it, then prune again. A prune, preview included, is **refused while a mutating command runs in another bay**, since that writer could
 reuse an object the prune is about to free; run it again once the other command finishes.
 (A `forklift-server` never serves a sparse warehouse, a cache, or a root whose sealed-object
 record holds anything, so no server is in the way.)

@@ -1,10 +1,11 @@
 use serde::Serialize;
 use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::util::{bay_utils, journal_utils};
-use forklift_core::util::lock_utils::StoreAccessLock;
+use forklift_core::util::lock_utils::{ServeLock, StoreAccessLock, StoreLock};
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::scope_utils::{self, PathScope, ScopeClass};
 use forklift_core::util::prune_utils;
+use crate::events;
 use crate::output::{self, CommandOutput};
 
 /// Handle `scope prune` (§7.6): the deliberate, destructive counterpart of `scope narrow`.
@@ -59,6 +60,14 @@ pub async fn handle_command(paths: Vec<String>, confirm: bool) -> Result<(), Str
     // run anywhere between this read and the last deletion. The preview takes it too, so it shows
     // exactly the plan a confirmed run would carry out against the warehouse as it stands now. Never waits: refused while any writer holds
     // the store. `main` takes no shared hold for this command, which would refuse this try.
+    // The store and serve locks come first, in the order a full repack takes them: the plan may
+    // need one, and a repack keeps only what is live when it runs.
+    let store_lock = StoreLock::acquire()?;
+    let serve_lock = ServeLock::acquire().map_err(|e| format!(
+        "\"forklift scope prune\" cannot run while this warehouse root is being served; stop the server first. If \
+        no server is running, the lock below was left by a server, gc or full repack that was killed \
+        and can be removed. {}", e
+    ))?;
     let store_access = StoreAccessLock::try_exclusive()?;
     let PruneRequest { post_prune, to_reclaim, all_resumed } = judge_request(&paths)?;
 
@@ -80,6 +89,7 @@ pub async fn handle_command(paths: Vec<String>, confirm: bool) -> Result<(), Str
             scope: post_prune.prefixes().to_vec(),
             freed: 0,
             would_free: plan.to_free.len(),
+            repack: plan.repack,
             still_packed: plan.still_packed,
             retained_shared: plan.retained_shared,
             kept_unlifted: plan.kept_unlifted,
@@ -116,7 +126,7 @@ pub async fn handle_command(paths: Vec<String>, confirm: bool) -> Result<(), Str
     // The reverse order could leave an in-scope object missing, which is unsafe.
     scope_utils::set_fetch_scope(&post_prune)?;
 
-    let stats = prune_utils::free_objects(&plan.to_free, &store_access)?;
+    let stats = prune_utils::carry_out(&plan, &store_lock, &serve_lock, &store_access, &events::progress())?;
 
     output::emit(&ScopePruneReport {
         preview: false,
@@ -125,6 +135,7 @@ pub async fn handle_command(paths: Vec<String>, confirm: bool) -> Result<(), Str
         scope: post_prune.prefixes().to_vec(),
         freed: stats.freed,
         would_free: plan.to_free.len(),
+        repack: plan.repack,
         still_packed: plan.still_packed,
         retained_shared: plan.retained_shared,
         kept_unlifted: plan.kept_unlifted,
@@ -283,6 +294,10 @@ pub(crate) struct ScopePruneReport {
     /// Loose objects the prune frees (equals `freed` after a confirmed run).
     would_free: usize,
 
+    /// Whether the run rewrites every pack first (in the preview, would): a packed delta stands on
+    /// an object it frees, which the repack re-encodes so that the delta still reads.
+    repack: bool,
+
     /// Candidate objects present only inside a pack: a loose delete cannot reclaim them and a
     /// reachability repack keeps them (they are still reachable history), so a scope-aware
     /// repack is future work. Reported so the count is never silently lost.
@@ -370,6 +385,10 @@ impl CommandOutput for ScopePruneReport {
                 "Pruned {}; freed {} loose object(s). Fetch scope now: {}.",
                 self.pruned.join(", "), self.freed, self.scope.join(", ")
             );
+        }
+
+        if self.preview && self.repack {
+            println!("It would first rewrite every pack, since packed content is stored against what it frees.");
         }
 
         if self.still_packed > 0 {

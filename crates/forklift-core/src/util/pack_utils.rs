@@ -3424,6 +3424,29 @@ pub fn any_packed_delta_against(bases: &HashSet<String>) -> Result<bool, PackSca
     Ok(found)
 }
 
+/// Every object a pack's delta stands on: what stops those deltas decoding if it is deleted while
+/// they remain. Every pack's index and record headers are read, so a damaged pack says so rather
+/// than hiding a base.
+///
+/// # Returns
+/// * `Ok(HashSet)`        - The hashes of the bases.
+/// * `Err(PackScanError)` - As [`any_packed_delta_against`].
+pub(crate) fn packed_delta_bases() -> Result<HashSet<String>, PackScanError> {
+    let packs = loaded_packs().map_err(PackScanError::Registry)?;
+    let mut bases = HashSet::new();
+    for pack in packs.packs.iter() {
+        let records = pack.records().map_err(PackScanError::Damaged)?;
+        for record in records.iter() {
+            let header = read_record_header(pack, record.offset, record.length).map_err(PackScanError::Damaged)?;
+            if let Some(base) = header.base {
+                bases.insert(sign_utils::to_hex(&base));
+            }
+        }
+    }
+
+    Ok(bases)
+}
+
 /// [`is_in_packs`] against the cached set only, with no revalidation: the first step of a
 /// presence check that tries packs, then loose, then revalidated packs (`does_object_exist`).
 /// Asking the cached set first keeps a loose object's check free of the revalidation; asking the
