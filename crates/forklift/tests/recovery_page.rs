@@ -372,6 +372,11 @@ fn a_damaged_pack_is_salvaged_and_an_unenumerable_index_is_moved_aside() {
     forklift_core::util::file_utils::rename(&index, &aside).unwrap();
     assert_eq!(status("unenumerable_indexes"), 0);
     assert!(!area.run("w", &["history"]).status.success(), "the page warns this index may hold what is needed");
+    forklift_core::util::file_utils::rename(&aside, &index).unwrap();
+    assert_eq!(status("unenumerable_indexes"), 1, "putting it back restores what was there");
+
+    // The damaged half starts from the good index; a real warehouse would clone afresh here, which
+    // the quarantine test runs.
     std::fs::write(&index, &original).unwrap();
     area.ok("w", &["history"]);
 
@@ -447,7 +452,7 @@ fn a_clone_stopped_by_a_wrong_only_path_finishes_with_the_right_one() {
         let error = area.refused(".", &["clone", &server.url, "partial", "--token", "secret", "--only", "nosuch"],
             "clone_incomplete", 30);
         assert_eq!(error["details"]["cause_code"], "only_prefix_not_found", "{}", error);
-        assert!(area.path("partial").exists(), "what it fetched is kept");
+        assert!(!object_files(&area.path("partial/.forklift/objects")).is_empty(), "what it fetched is kept");
     }
 
     area.ok(".", &["clone", &server.url, "partial", "--token", "secret", "--only", "src"]);

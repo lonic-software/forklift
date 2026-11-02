@@ -2319,7 +2319,7 @@ data file only in unusual circumstances (a file removed by hand, a partial resto
 happens, `store` lists it under `quarantined_packs` — `[{index_path, error}]` — rather than
 failing the census: the objects it named are not lost, only unreachable through that copy, and
 `heal` can refetch from a configured remote any of them still under a durability taint (for the
-rest, restore the pack's data file). `store` checks every index in full: a pack whose
+rest, restore the pack's data file or clone afresh). `store` checks every index in full: a pack whose
 index is damaged in places is listed under `damaged_packs` (same shape) and left out of the counts.
 Ordinary reads keep using its sound parts; an object in a damaged part reads as unverifiable.
 `forklift store compact --all` salvages it (see [`store compact`](#store-compact--pack-the-object-store)). `unenumerable_indexes` — the same `[{index_path,

@@ -43,8 +43,9 @@ To throw away edits on purpose, `forklift restore` previews what it would discar
 Another forklift process holds the warehouse lock, or one was killed and left the lock file behind.
 The message names the file, and the process id if the lock file holds one.
 
-First check that process is gone; with no id to check, look for any running forklift in this warehouse. If it is still running, wait for it. If it is not, remove the file
-the message names and run your command again.
+First check that process is gone. With no id to check, look for any forklift still running in this
+warehouse. If one is, wait for it. If none is, remove the file the message names and run your command
+again.
 
 **Do not** remove the lock while that process is alive: it guards the staging area while it is being
 rewritten.
@@ -233,9 +234,11 @@ using that remote.
 
 ### Lost keys: re-genesis
 
-"No active key … is present on this machine" means this machine cannot sign. If another of your
-own devices still holds a key, [link this machine](trust-and-identity.md#5-multiple-devices) from it.
-If another admin holds one, have them [re-key you](trust-and-identity.md#3-adding-people). Either way, stop here. Restore a backup of your key folder if you have one.
+"No active key … is present on this machine" means this machine cannot sign. You may not need a reset:
+
+- Restore a backup of your key folder, if you have one.
+- If another of your own devices still holds a key, [link this machine](trust-and-identity.md#5-multiple-devices) from it.
+- If another admin holds one, have them [re-key you](trust-and-identity.md#3-adding-people).
 
 If every key is gone and no admin is left, reset trust:
 
