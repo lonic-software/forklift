@@ -6164,9 +6164,6 @@ mod tests {
         let params = ref_update_params("@office");
         let body = RefUpdateRequest { old_head: None, new_head: "a".repeat(64), tombstone: None };
 
-        // The transport layer authenticates via the bearer-token map; give "dana" a
-        // token so `check_auth` yields `Principal::Operator("dana")`.
-
         let response = post_ref_update(
             State(state), as_operator("dana"), Path(params), Json(body)
         ).await;
@@ -7216,7 +7213,6 @@ mod tests {
 
     /// The office fixture's state with an admin token, for the meta-pallet falsifiers.
     fn admin_state(fixture: &OfficeFixture) -> Arc<AppState> {
-
         Arc::new(single_mode_state(fixture.root.clone()))
     }
 
