@@ -329,7 +329,7 @@ fn a_quarantined_pack_comes_back_from_its_file_or_a_fresh_clone_and_not_from_hea
     area.ok("a", &["store", "compact", "--all"]);
     let pack = area.only_pack("a").with_extension("pack");
     let saved = area.path("saved.pack");
-    std::fs::rename(&pack, &saved).unwrap();
+    forklift_core::util::file_utils::rename(&pack, &saved).unwrap();
 
     let status: serde_json::Value = serde_json::from_str(&area.ok("a", &["--json", "store", "status"])).unwrap();
     assert_eq!(status["data"]["quarantined_packs"].as_array().unwrap().len(), 1, "{}", status);
@@ -343,7 +343,7 @@ fn a_quarantined_pack_comes_back_from_its_file_or_a_fresh_clone_and_not_from_hea
     area.ok(".", &["clone", &server.url, "fresh", "--token", "secret"]);
     area.ok("fresh", &["stocktake"]);
 
-    std::fs::rename(&saved, &pack).unwrap();
+    forklift_core::util::file_utils::rename(&saved, &pack).unwrap();
     area.ok("a", &["stocktake"]);
 }
 
@@ -366,7 +366,7 @@ fn a_damaged_pack_is_salvaged_and_an_unenumerable_index_is_moved_aside() {
     std::fs::write(&index, &unparsable).unwrap();
     assert_eq!(status("unenumerable_indexes"), 1);
     let aside = area.path("aside.idx");
-    std::fs::rename(&index, &aside).unwrap();
+    forklift_core::util::file_utils::rename(&index, &aside).unwrap();
     assert_eq!(status("unenumerable_indexes"), 0);
 
     let mut damaged = original.clone();
@@ -387,7 +387,7 @@ fn lost_keys_are_recovered_by_regenesis_and_every_clone_accepts_it_once_named() 
     area.ok("a", &["office", "enroll"]);
     area.ok("a", &["lift"]);
     area.ok("b", &["lower"]);
-    std::fs::rename(area.path("keys"), area.path("lost-keys")).unwrap();
+    forklift_core::util::file_utils::rename(area.path("keys"), area.path("lost-keys")).unwrap();
 
     area.write("a/f.txt", "after\n");
     area.ok("a", &["load", "f.txt"]);
