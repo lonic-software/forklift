@@ -3944,7 +3944,7 @@ mod tests {
 
     /// A client mid-upload must still be told why, not see a dead connection: the refusal arrives
     /// while it is writing a body the server will not keep. Reverts: the discard removed — the
-    /// client's write then breaks and `send` returns a transport error.
+    /// client's write can then break before it reads the 401, a race this test usually loses.
     #[tokio::test]
     async fn a_client_uploading_with_a_bad_token_reads_the_refusal() {
         let root = scratch_dir("auth-layer-client");
@@ -6240,7 +6240,7 @@ mod tests {
     }
 
     /// Lift an office parcel promoting "bob" (a writer) to admin, signed by `signer`'s key and
-    /// stacked on the fixture's current office head, with the admin's token, and return the
+    /// stacked on the fixture's current office head, as the admin, and return the
     /// status. The admin may transport the office, so any refusal comes from its content check.
     async fn lift_bob_promotion(fixture: &OfficeFixture, signer: &Operator, signer_key_id: &str) -> StatusCode {
         let head = forklift_core::util::pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)
@@ -6255,7 +6255,7 @@ mod tests {
         ).unwrap();
 
         post_ref_update(
-            State(admin_state(fixture)), as_operator(&fixture.admin.identifier),
+            State(office_state(fixture)), as_operator(&fixture.admin.identifier),
             Path(ref_update_params("@office")),
             Json(RefUpdateRequest { old_head: Some(head), new_head: promotion, tombstone: None })
         ).await.into_response().status()
@@ -6299,7 +6299,7 @@ mod tests {
         ).unwrap();
 
         let response = post_ref_update(
-            State(admin_state(&fixture)), as_operator(&fixture.admin.identifier),
+            State(office_state(&fixture)), as_operator(&fixture.admin.identifier),
             Path(ref_update_params("@office")),
             Json(RefUpdateRequest { old_head: Some(held.clone()), new_head: lifted, tombstone: None })
         ).await.into_response();
@@ -7211,8 +7211,8 @@ mod tests {
         assert!(body.contains("trust is a one-way door"), "{}", body);
     }
 
-    /// The office fixture's state with an admin token, for the meta-pallet falsifiers.
-    fn admin_state(fixture: &OfficeFixture) -> Arc<AppState> {
+    /// The office fixture's state for an office fixture, for the meta-pallet falsifiers.
+    fn office_state(fixture: &OfficeFixture) -> Arc<AppState> {
         Arc::new(single_mode_state(fixture.root.clone()))
     }
 
@@ -7224,7 +7224,7 @@ mod tests {
         let new_head = store_signed_parcel(&fixture.admin, &fixture.admin_key_id, Vec::new(), "@foo");
 
         let response = post_ref_update(
-            State(admin_state(&fixture)), as_operator(&fixture.admin.identifier),
+            State(office_state(&fixture)), as_operator(&fixture.admin.identifier),
             Path(ref_update_params("@foo")), Json(RefUpdateRequest { old_head: None, new_head, tombstone: None })
         ).await;
 
@@ -7262,7 +7262,7 @@ mod tests {
 
         let new_head = forged.into_inner().expect("the forged parcel was signed");
         let response = post_ref_update(
-            State(admin_state(&fixture)), as_operator(&fixture.admin.identifier),
+            State(office_state(&fixture)), as_operator(&fixture.admin.identifier),
             Path(ref_update_params("@kv")), Json(RefUpdateRequest { old_head: None, new_head, tombstone: None })
         ).await;
 
