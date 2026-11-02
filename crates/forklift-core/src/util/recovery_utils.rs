@@ -443,7 +443,7 @@ fn pack_health_warning_lines() -> Result<Vec<String>, String> {
             "pack index \"{}\" could not be loaded ({}); the objects it names are quarantined — \
             \"forklift heal\" can refetch any of them still under a durability taint from a \
             configured remote, and such ones will be reported dangling if they are still referenced \
-            and none is configured; for the rest, restore the pack's data file",
+            and none is configured; for the rest, restore the pack's data file or clone afresh",
             index_path.to_string_lossy(), error
         ));
     }

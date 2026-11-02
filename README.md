@@ -26,6 +26,7 @@ Detailed guides live in [`docs/guide/`](docs/guide/README.md):
 - **[Tutorial](docs/guide/tutorial.md)** — one project from an empty folder to a shared warehouse, in 15 minutes.
 - **[Why Forklift](docs/guide/concepts.md)** — what Forklift does that git cannot, each with a runnable example.
 - **[User guide](docs/guide/cli.md)** — every CLI command, organized by workflow, with examples.
+- **[Recovery & troubleshooting](docs/guide/recovery.md)** — what to do about each refusal, damaged stores, lost keys.
 - **[Trust & identity](docs/guide/trust-and-identity.md)** — signing, users, roles, agents, key protection.
 - **[Machine & agent interface](docs/MACHINE_INTERFACE.md)** — `--json`, stable errors, the MCP server.
 - **[VCS comparison](docs/COMPARISON.md)** — honest comparison of Forklift vs. git, jujutsu, sapling, and pijul.
