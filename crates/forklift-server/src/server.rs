@@ -15,12 +15,13 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::body::{Body, Bytes, HttpBody};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use forklift_core::globals::{StorageRootScope, FOLDER_NAME_FORKLIFT_ROOT};
 use forklift_core::model::hooks::{
     AdmissionHookRequest, AdmissionHookResponse, AuthenticationHookRequest,
@@ -762,8 +763,6 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         _ => return Err("Pass exactly one of --root and --warehouses.".to_string()),
     };
 
-    let is_multi = matches!(mode, ServeMode::Multi { .. });
-
     // Blank (empty or whitespace-only) is treated as absent for both fields, applying the same
     // rule this PR unified everywhere else a string is checked for "is this configured at all"
     // (PR #124 round 4, F4). This is a config-completeness gate, not a credential comparison —
@@ -840,47 +839,13 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
     // (a `bool` copy) — used only for the startup-bind warning once the address is actually
     // bound. Reaching this point at all means `auth_configured || options.open` held.
 
-    let protocol = Router::new()
-        .route("/warehouse", get(get_warehouse))
-        .route("/objects/missing", post(post_missing))
-        .route("/objects/upload-targets", post(post_upload_targets))
-        .route("/objects/batch", post(post_objects_batch))
-        .route("/parcels/{parcel}/subtree/{*path}", get(get_subtree))
-        .route("/objects/{hash}", get(get_object).put(put_object))
-        .route("/signatures/{hash}", get(get_signature).put(put_signature))
-        .route("/trust", put(put_trust))
-        .route("/pallets/{*name}", post(post_ref_update).delete(delete_ref))
-        .route("/holds/{*name}", post(post_holds))
-        .route("/resolve", post(post_resolve))
-        .route("/bundles/latest", get(get_bundle));
-
-    let app = if is_multi {
-        Router::new()
-            .route("/warehouses/{warehouse}", put(put_warehouse))
-            .nest("/warehouses/{warehouse}/v1", protocol)
-    } else {
-        Router::new().nest("/v1", protocol)
-    };
-
     // The hash check gates correctness; the body cap gates disk-fill abuse (§9.4b R9/D7). It now
     // defaults **on** at the whole-object ceiling: after chunking, the largest legitimate object a
     // client ever PUTs is a `MAX_OBJECT_BYTES` recipe or tree (a blob is below the chunk threshold,
     // a chunk is at most `MAX_CHUNK_BYTES`), so this is a principled default value rather than the
     // old "unlimited unless an operator remembers to cap it". An operator may still raise it for a
     // grandfathered-giant read path or lower it, via `max_body_mb`.
-    let body_limit = DefaultBodyLimit::max(body_limit_bytes(options.max_body_mb)?);
-
-    let app = app
-        // Liveness only — deliberately unauthenticated and warehouse-free.
-        .route("/healthz", get(|| async { "ok" }))
-        .layer(body_limit)
-        // Objects travel uncompressed on the wire by format (the hash covers the
-        // uncompressed form, §4.4), so transport compression is nearly free wins;
-        // bundle/batch responses are already zstd streams and mark themselves
-        // `content-encoding: identity`, which the layer respects.
-        .layer(tower_http::compression::CompressionLayer::new())
-        .layer(tower_http::trace::TraceLayer::new_for_http())
-        .with_state(state);
+    let app = router(state, DefaultBodyLimit::max(body_limit_bytes(options.max_body_mb)?));
 
     let listener = tokio::net::TcpListener::bind(&options.addr)
         .await
@@ -904,6 +869,95 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|e| format!("The server failed: {}", e))
+}
+
+/// Every route the server answers. Authentication is a layer over all of them except `/healthz`,
+/// so it runs before any extractor: a refused caller's request body is never buffered, and a route
+/// added above the layer cannot forget it. A handler that needs to know who is calling takes the
+/// `Extension<Principal>` the layer leaves, and refuses on a route outside the layer. A handler that
+/// does not take it has no such guard, so a route below the layer is open to everyone.
+fn router(state: Arc<AppState>, body_limit: DefaultBodyLimit) -> Router {
+    let protocol = Router::new()
+        .route("/warehouse", get(get_warehouse))
+        .route("/objects/missing", post(post_missing))
+        .route("/objects/upload-targets", post(post_upload_targets))
+        .route("/objects/batch", post(post_objects_batch))
+        .route("/parcels/{parcel}/subtree/{*path}", get(get_subtree))
+        .route("/objects/{hash}", get(get_object).put(put_object))
+        .route("/signatures/{hash}", get(get_signature).put(put_signature))
+        .route("/trust", put(put_trust))
+        .route("/pallets/{*name}", post(post_ref_update).delete(delete_ref))
+        .route("/holds/{*name}", post(post_holds))
+        .route("/resolve", post(post_resolve))
+        .route("/bundles/latest", get(get_bundle));
+
+    let app = if matches!(state.mode, ServeMode::Multi { .. }) {
+        Router::new()
+            .route("/warehouses/{warehouse}", put(put_warehouse))
+            .nest("/warehouses/{warehouse}/v1", protocol)
+    } else {
+        Router::new().nest("/v1", protocol)
+    };
+
+    app.route_layer(middleware::from_fn_with_state(Arc::clone(&state), authenticate))
+        // Liveness only — deliberately unauthenticated and warehouse-free.
+        .route("/healthz", get(|| async { "ok" }))
+        .layer(body_limit)
+        // Objects travel uncompressed on the wire by format (the hash covers the
+        // uncompressed form, §4.4), so transport compression is nearly free wins;
+        // bundle/batch responses are already zstd streams and mark themselves
+        // `content-encoding: identity`, which the layer respects.
+        .layer(tower_http::compression::CompressionLayer::new())
+        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .with_state(state)
+}
+
+/// The authentication layer: refuse the request from its headers alone, or pass it on with its
+/// [`Principal`] in the request extensions. See [`router`].
+async fn authenticate(State(state): State<Arc<AppState>>, mut request: Request, next: Next) -> Response {
+    match check_auth(&state, request.headers()).await {
+        Ok(principal) => {
+            request.extensions_mut().insert(principal);
+            next.run(request).await
+        }
+        Err(error) => {
+            let body = request.into_body();
+
+            if !body.is_end_stream() {
+                tokio::spawn(discard_refused_body(
+                    body, REFUSED_BODY_DISCARD_TIME, REFUSED_BODY_DISCARD_BYTES
+                ));
+            }
+
+            error_response(error)
+        }
+    }
+}
+
+/// How long, and how many bytes, one refused request's body is read and thrown away.
+const REFUSED_BODY_DISCARD_TIME: std::time::Duration = std::time::Duration::from_secs(5);
+const REFUSED_BODY_DISCARD_BYTES: usize = 128 * 1024 * 1024;
+
+/// Read a refused request's body and keep none of it. Closing the connection on a client still
+/// writing would break its pipe before it reads the refusal, and it would report a network failure
+/// instead of a bad token. Past either bound the connection closes and that client does see the
+/// failure. The bounds are per request: a body finished inside them leaves the connection open for
+/// the next request, as any refusal does, so limiting a peer's request rate stays the proxy's job.
+async fn discard_refused_body(body: Body, time: std::time::Duration, bytes: usize) {
+    use tokio_stream::StreamExt;
+
+    let mut frames = body.into_data_stream();
+    let mut discarded = 0;
+
+    let _ = tokio::time::timeout(time, async {
+        while let Some(Ok(chunk)) = frames.next().await {
+            discarded += chunk.len();
+
+            if discarded >= bytes {
+                break;
+            }
+        }
+    }).await;
 }
 
 /// The startup-log risk to warn about for a bound address, or `None` when there is nothing to
@@ -1944,13 +1998,8 @@ fn sweep_interrupted_creations(base: &std::path::Path) {
 /// created, `200` when the warehouse already exists, `409` when something that is not a
 /// warehouse holds its name.
 async fn put_warehouse(State(state): State<Arc<AppState>>,
-                       headers: HeaderMap,
+                       Extension(principal): Extension<Principal>,
                        Path(params): Path<PathParams>) -> Response {
-    let principal = match check_auth(&state, &headers).await {
-        Ok(principal) => principal,
-        Err(error) => return error_response(error),
-    };
-
     let ServeMode::Multi { base } = &state.mode else {
         return error_response((
             StatusCode::NOT_FOUND,
@@ -2012,12 +2061,7 @@ async fn put_warehouse(State(state): State<Arc<AppState>>,
 
 /// `GET /v1/warehouse` — the handshake: protocol version, refs and trust.
 async fn get_warehouse(State(state): State<Arc<AppState>>,
-                       headers: HeaderMap,
                        Path(params): Path<PathParams>) -> Response {
-    if let Err(error) = check_auth(&state, &headers).await {
-        return error_response(error);
-    }
-
     let warehouse = match resolve_warehouse(&state, &params) {
         Ok(warehouse) => warehouse,
         Err(error) => return error_response(error),
@@ -2060,13 +2104,8 @@ async fn get_warehouse(State(state): State<Arc<AppState>>,
 
 /// `POST /v1/objects/missing` — which of these objects does the remote lack?
 async fn post_missing(State(state): State<Arc<AppState>>,
-                      headers: HeaderMap,
                       Path(params): Path<PathParams>,
                       Json(request): Json<MissingObjectsRequest>) -> Response {
-    if let Err(error) = check_auth(&state, &headers).await {
-        return error_response(error);
-    }
-
     let warehouse = match resolve_warehouse(&state, &params) {
         Ok(warehouse) => warehouse,
         Err(error) => return error_response(error),
@@ -2112,13 +2151,8 @@ static HOLDS_WALKS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(M
 /// already allows, so nothing past authentication is asked. A pallet deleted here is walked from
 /// the head its tombstone holds, which stays stored and served like a live ref's.
 async fn post_holds(State(state): State<Arc<AppState>>,
-                    headers: HeaderMap,
                     Path(params): Path<PathParams>,
                     Json(request): Json<HoldsRequest>) -> Response {
-    if let Err(error) = check_auth(&state, &headers).await {
-        return error_response(error);
-    }
-
     let warehouse = match resolve_warehouse(&state, &params) {
         Ok(warehouse) => warehouse,
         Err(error) => return error_response(error),
@@ -2181,13 +2215,8 @@ async fn post_holds(State(state): State<Arc<AppState>>,
 /// empty. That is exactly what lets one client code path serve both this head and a storage-
 /// backed one (`REMOTE_PROTOCOL.md`), and it subsumes `missing` on the upload path.
 async fn post_upload_targets(State(state): State<Arc<AppState>>,
-                             headers: HeaderMap,
                              Path(params): Path<PathParams>,
                              Json(request): Json<UploadTargetsRequest>) -> Response {
-    if let Err(error) = check_auth(&state, &headers).await {
-        return error_response(error);
-    }
-
     let warehouse = match resolve_warehouse(&state, &params) {
         Ok(warehouse) => warehouse,
         Err(error) => return error_response(error),
@@ -2241,13 +2270,8 @@ async fn post_upload_targets(State(state): State<Arc<AppState>>,
 /// warehouse lacks are simply absent from the stream; the client notices and falls
 /// back to loose fetches.
 async fn post_objects_batch(State(state): State<Arc<AppState>>,
-                            headers: HeaderMap,
                             Path(params): Path<PathParams>,
                             Json(request): Json<MissingObjectsRequest>) -> Response {
-    if let Err(error) = check_auth(&state, &headers).await {
-        return error_response(error);
-    }
-
     let warehouse = match resolve_warehouse(&state, &params) {
         Ok(warehouse) => warehouse,
         Err(error) => return error_response(error),
@@ -2293,13 +2317,8 @@ async fn post_objects_batch(State(state): State<Arc<AppState>>,
 /// whose remote predates the route gets a `404` and falls back to the hash-addressed scoped
 /// walk, so shipping it needs no protocol bump.
 async fn get_subtree(State(state): State<Arc<AppState>>,
-                     headers: HeaderMap,
+                     Extension(principal): Extension<Principal>,
                      Path(params): Path<PathParams>) -> Response {
-    let principal = match check_auth(&state, &headers).await {
-        Ok(principal) => principal,
-        Err(error) => return error_response(error),
-    };
-
     let warehouse = match resolve_warehouse(&state, &params) {
         Ok(warehouse) => warehouse,
         Err(error) => return error_response(error),
@@ -2400,12 +2419,7 @@ async fn authorize_subtree(_state: &AppState,
 /// variant plus an async→sync body bridge. Neither is a handler-local change, and neither closes the
 /// grandfathered-blob gap above, so the boundedness is left as described rather than reworked here.
 async fn get_object(State(state): State<Arc<AppState>>,
-                    headers: HeaderMap,
                     Path(params): Path<PathParams>) -> Response {
-    if let Err(error) = check_auth(&state, &headers).await {
-        return error_response(error);
-    }
-
     let warehouse = match resolve_warehouse(&state, &params) {
         Ok(warehouse) => warehouse,
         Err(error) => return error_response(error),
@@ -2433,14 +2447,9 @@ async fn get_object(State(state): State<Arc<AppState>>,
 /// `PUT /v1/objects/{hash}` — store an object; the hash is verified before anything
 /// becomes fetchable (the non-negotiable invariant of the protocol).
 async fn put_object(State(state): State<Arc<AppState>>,
-                    headers: HeaderMap,
+                    Extension(principal): Extension<Principal>,
                     Path(params): Path<PathParams>,
                     body: Bytes) -> Response {
-    let principal = match check_auth(&state, &headers).await {
-        Ok(principal) => principal,
-        Err(error) => return error_response(error),
-    };
-
     let warehouse = match resolve_warehouse(&state, &params) {
         Ok(warehouse) => warehouse,
         Err(error) => return error_response(error),
@@ -2470,12 +2479,7 @@ async fn put_object(State(state): State<Arc<AppState>>,
 
 /// `GET /v1/signatures/{hash}` — a parcel's signature sidecar.
 async fn get_signature(State(state): State<Arc<AppState>>,
-                       headers: HeaderMap,
                        Path(params): Path<PathParams>) -> Response {
-    if let Err(error) = check_auth(&state, &headers).await {
-        return error_response(error);
-    }
-
     let warehouse = match resolve_warehouse(&state, &params) {
         Ok(warehouse) => warehouse,
         Err(error) => return error_response(error),
@@ -2501,14 +2505,9 @@ async fn get_signature(State(state): State<Arc<AppState>>,
 /// here; whether the signature *verifies* is decided at ref update time. A conflicting
 /// sidecar for an already-signed parcel is refused (signatures are immutable).
 async fn put_signature(State(state): State<Arc<AppState>>,
-                       headers: HeaderMap,
+                       Extension(principal): Extension<Principal>,
                        Path(params): Path<PathParams>,
                        body: Bytes) -> Response {
-    let principal = match check_auth(&state, &headers).await {
-        Ok(principal) => principal,
-        Err(error) => return error_response(error),
-    };
-
     let warehouse = match resolve_warehouse(&state, &params) {
         Ok(warehouse) => warehouse,
         Err(error) => return error_response(error),
@@ -2548,14 +2547,9 @@ async fn put_signature(State(state): State<Arc<AppState>>,
 /// the dead chain) may sanction it; per-operator tokens may not, since their roles
 /// come from exactly the chain being replaced.
 async fn put_trust(State(state): State<Arc<AppState>>,
-                   headers: HeaderMap,
+                   Extension(principal): Extension<Principal>,
                    Path(params): Path<PathParams>,
                    Json(anchor): Json<TrustAnchorDto>) -> Response {
-    let principal = match check_auth(&state, &headers).await {
-        Ok(principal) => principal,
-        Err(error) => return error_response(error),
-    };
-
     // Clients refuse a malformed anchor at the handshake, and trust here is a one-way door: one
     // stored would lock every client out of this warehouse for good.
     if let Err(problem) = anchor.validate() {
@@ -2701,14 +2695,9 @@ async fn put_trust(State(state): State<Arc<AppState>>,
 /// the full closure, fast-forward-ness, and — on trusted warehouses — the same audit
 /// the CLI runs offline.
 async fn post_ref_update(State(state): State<Arc<AppState>>,
-                         headers: HeaderMap,
+                         Extension(principal): Extension<Principal>,
                          Path(params): Path<PathParams>,
                          Json(request): Json<RefUpdateRequest>) -> Response {
-    let principal = match check_auth(&state, &headers).await {
-        Ok(principal) => principal,
-        Err(error) => return error_response(error),
-    };
-
     let warehouse = match resolve_warehouse(&state, &params) {
         Ok(warehouse) => warehouse,
         Err(error) => return error_response(error),
@@ -3017,14 +3006,9 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
 /// under the write. Refused, as the local delete is, for the pallet a bay of this root stands on
 /// (the default pallet first, which a clone checks out) and for one an open haul names.
 async fn delete_ref(State(state): State<Arc<AppState>>,
-                    headers: HeaderMap,
+                    Extension(principal): Extension<Principal>,
                     Path(params): Path<PathParams>,
                     Query(request): Query<RefDeleteRequest>) -> Response {
-    let principal = match check_auth(&state, &headers).await {
-        Ok(principal) => principal,
-        Err(error) => return error_response(error),
-    };
-
     let warehouse = match resolve_warehouse(&state, &params) {
         Ok(warehouse) => warehouse,
         Err(error) => return error_response(error),
@@ -3224,14 +3208,9 @@ fn maybe_rebuild_bundle(state: &AppState, warehouse: Arc<WarehouseHandle>) {
 /// the caller may see — is an empty map, and the client shows the pseudonymous
 /// identifiers. This only ever feeds display; it is never a verification input.
 async fn post_resolve(State(state): State<Arc<AppState>>,
-                      headers: HeaderMap,
+                      Extension(principal): Extension<Principal>,
                       Path(params): Path<PathParams>,
                       Json(request): Json<ResolveRequest<'static>>) -> Response {
-    let principal = match check_auth(&state, &headers).await {
-        Ok(principal) => principal,
-        Err(error) => return error_response(error),
-    };
-
     // A request against a warehouse that does not exist is a `404`, like every other
     // endpoint (resolution reads no warehouse state, but the route is warehouse-scoped).
     if let Err(error) = resolve_warehouse(&state, &params) {
@@ -3328,10 +3307,6 @@ impl tokio::io::AsyncRead for PinnedFile {
 async fn get_bundle(State(state): State<Arc<AppState>>,
                     headers: HeaderMap,
                     Path(params): Path<PathParams>) -> Response {
-    if let Err(error) = check_auth(&state, &headers).await {
-        return error_response(error);
-    }
-
     let warehouse = match resolve_warehouse(&state, &params) {
         Ok(warehouse) => warehouse,
         Err(error) => return error_response(error),
@@ -3667,11 +3642,8 @@ mod tests {
     /// armed at [`TEST_HOOK_TIMEOUT`] so they do not wait out the production figure.
     ///
     /// `open: true` here is a test-fixture convenience only, never the production default (see
-    /// `ServeOptions::open`'s doc comment and `serve`'s startup refusal): almost none of the
-    /// handler tests built on this are testing authentication, so they need the pre-existing
-    /// "no auth configured" fixture to keep answering requests with no bearer header. The
-    /// `check_auth` section below overrides this explicitly, in both directions, to test the
-    /// actual auth decision.
+    /// `ServeOptions::open`'s doc comment and `serve`'s startup refusal). The `check_auth` section
+    /// below overrides this explicitly, in both directions, to test the actual auth decision.
     fn base_state(mode: ServeMode) -> AppState {
         AppState {
             mode,
@@ -3695,6 +3667,13 @@ mod tests {
 
     fn single_mode_state(root: PathBuf) -> AppState {
         base_state(ServeMode::Single(Arc::new(WarehouseHandle::new(root))))
+    }
+
+    /// What the authentication layer hands a handler for an operator token. The handler tests
+    /// call handlers directly, so they start from the authenticated principal; the layer itself
+    /// is tested through [`router`].
+    fn as_operator(identifier: &str) -> Extension<Principal> {
+        Extension(Principal::Operator(identifier.to_string()))
     }
 
     fn headers_with_bearer(token: &str) -> HeaderMap {
@@ -3806,6 +3785,261 @@ mod tests {
 
             SilentHook { url: format!("http://{}/hook", addr), _park: tx }
         }
+    }
+
+    // ---------------------------------------------------------------------------------
+    // The authentication layer — refused before the body is buffered
+    // ---------------------------------------------------------------------------------
+
+    /// Serve [`router`] on a real socket: what is under test is when the server stops waiting for
+    /// bytes, which a request driven through the router in-process cannot show.
+    async fn serve_router(state: Arc<AppState>, body_limit: usize) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(state, DefaultBodyLimit::max(body_limit));
+
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        addr
+    }
+
+    /// Send a request head announcing `content_length` bytes, and none of them. Returns the open
+    /// connection, so the caller decides what to send next.
+    async fn send_head(addr: std::net::SocketAddr, method: &str, path: &str, token: Option<&str>,
+                       content_length: usize) -> tokio::net::TcpStream {
+        use tokio::io::AsyncWriteExt;
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let authorization = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
+        let head = format!(
+            "{method} {path} HTTP/1.1\r\nHost: test\r\n{authorization}\
+            Content-Type: application/json\r\nContent-Length: {content_length}\r\n\r\n"
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+
+        stream
+    }
+
+    /// The response's status line, failing the test if none comes while the request's body is
+    /// still owed: that wait is exactly what a server reading the body first does.
+    async fn status_line(stream: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 1024];
+
+        let read = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !received.windows(2).any(|pair| pair == b"\r\n") {
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert!(count > 0, "the connection closed with no response");
+                received.extend_from_slice(&chunk[..count]);
+            }
+        }).await;
+
+        assert!(read.is_ok(), "no response while the body was owed: the server is waiting for it");
+
+        let text = String::from_utf8_lossy(&received);
+        text.lines().next().unwrap().to_string()
+    }
+
+    fn token_state(mode: ServeMode) -> Arc<AppState> {
+        Arc::new(AppState { token: Some("the-token".to_string()), open: false, ..base_state(mode) })
+    }
+
+    /// Every route of the protocol, as `(method, path after the protocol prefix)`. Each is asked
+    /// with no credential, then a wrong one, with a body announced and never sent.
+    const PROTOCOL_ROUTES: &[(&str, &str)] = &[
+        ("GET", "/warehouse"),
+        ("POST", "/objects/missing"),
+        ("POST", "/objects/upload-targets"),
+        ("POST", "/objects/batch"),
+        ("GET", "/parcels/p/subtree/a/b"),
+        ("GET", "/objects/abc"),
+        ("PUT", "/objects/abc"),
+        ("GET", "/signatures/abc"),
+        ("PUT", "/signatures/abc"),
+        ("PUT", "/trust"),
+        ("POST", "/pallets/main"),
+        ("DELETE", "/pallets/main"),
+        ("POST", "/holds/main"),
+        ("POST", "/resolve"),
+        ("GET", "/bundles/latest"),
+    ];
+
+    /// Reverts: the handler-level check, or a route moved outside the layer — then the request
+    /// waits for its body (or, with no principal, answers 500) instead of a 401.
+    #[tokio::test]
+    async fn every_route_refuses_a_bad_caller_with_the_body_still_owed() {
+        let single = scratch_dir("auth-layer-single");
+        let multi = scratch_dir("auth-layer-multi");
+        let cases = [
+            (token_state(ServeMode::Single(Arc::new(WarehouseHandle::new(single)))), "/v1"),
+            (token_state(ServeMode::Multi { base: multi }), "/warehouses/w1/v1"),
+        ];
+
+        for (state, prefix) in cases {
+            let is_multi = prefix != "/v1";
+            let addr = serve_router(state, 1 << 20).await;
+            let mut routes: Vec<(&str, String)> = PROTOCOL_ROUTES.iter()
+                .map(|(method, path)| (*method, format!("{prefix}{path}")))
+                .collect();
+
+            if is_multi {
+                routes.push(("PUT", "/warehouses/w1".to_string()));
+            }
+
+            for (method, path) in &routes {
+                for token in [None, Some("not-the-token")] {
+                    let mut stream = send_head(addr, method, path, token, 1 << 19).await;
+                    let status = status_line(&mut stream).await;
+
+                    assert!(status.contains(" 401 "), "{method} {path} with {token:?}: {status}");
+                }
+            }
+        }
+    }
+
+    /// The other half of the same layer: the right caller gets through, and the server does wait
+    /// for that caller's body. Without this, a server refusing everything would pass the test
+    /// above. Reverts: a layer that drops the principal — the handler's extractor then refuses.
+    #[tokio::test]
+    async fn an_admitted_upload_is_read_in_full_and_stored() {
+        use tokio::io::AsyncWriteExt;
+
+        let root = scratch_dir("auth-layer-admitted");
+        let _scope = StorageRootScope::enter(&root);
+        let addr = serve_router(token_state(ServeMode::Single(Arc::new(WarehouseHandle::new(root)))), 1 << 20).await;
+
+        let bytes = b"an object the admitted caller uploads in two writes";
+        let hash = object_utils::hash_object_bytes(bytes);
+        let path = format!("/v1/objects/{hash}");
+
+        let mut stream = send_head(addr, "PUT", &path, Some("the-token"), bytes.len()).await;
+        stream.write_all(&bytes[..10]).await.unwrap();
+        stream.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        stream.write_all(&bytes[10..]).await.unwrap();
+
+        let status = status_line(&mut stream).await;
+        assert!(status.contains(" 201 "), "{status}");
+        assert!(file_utils::does_object_exist(&hash).unwrap());
+    }
+
+    /// The body cap still applies to admitted callers. Reverts: `body_limit` dropped from the stack.
+    #[tokio::test]
+    async fn an_admitted_upload_over_the_cap_is_refused() {
+        use tokio::io::AsyncWriteExt;
+
+        let root = scratch_dir("auth-layer-cap");
+        let _scope = StorageRootScope::enter(&root);
+        let addr = serve_router(token_state(ServeMode::Single(Arc::new(WarehouseHandle::new(root)))), 1024).await;
+
+        let hash = object_utils::hash_object_bytes(b"whatever");
+        let mut stream = send_head(addr, "PUT", &format!("/v1/objects/{hash}"), Some("the-token"), 4096).await;
+        stream.write_all(&[0u8; 4096]).await.unwrap();
+        let status = status_line(&mut stream).await;
+
+        assert!(status.contains(" 413 "), "{status}");
+    }
+
+    /// A client mid-upload must still be told why, not see a dead connection: the refusal arrives
+    /// while it is writing a body the server will not keep. Reverts: the discard removed — the
+    /// client's write can then break before it reads the 401; that is a race, so this may stay green.
+    #[tokio::test]
+    async fn a_client_uploading_with_a_bad_token_reads_the_refusal() {
+        let root = scratch_dir("auth-layer-client");
+        let addr = serve_router(token_state(ServeMode::Single(Arc::new(WarehouseHandle::new(root)))), 64 << 20).await;
+        let client = reqwest::Client::new();
+
+        for _ in 0..20 {
+            let response = client.put(format!("http://{addr}/v1/objects/abc"))
+                .bearer_auth("not-the-token")
+                .body(vec![0u8; 32 << 20])
+                .send().await
+                .expect("the refusal must reach the client as a response, not a transport error");
+
+            assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    /// A refused caller who never sends the body it announced does not keep the connection.
+    /// Reverts: the discard's time bound — the connection then stays open and this times out.
+    #[tokio::test]
+    async fn a_refused_connection_owing_its_body_is_closed() {
+        use tokio::io::AsyncReadExt;
+
+        let root = scratch_dir("auth-layer-close");
+        let addr = serve_router(token_state(ServeMode::Single(Arc::new(WarehouseHandle::new(root)))), 1 << 20).await;
+
+        let mut stream = send_head(addr, "PUT", "/v1/objects/abc", None, 1 << 19).await;
+        assert!(status_line(&mut stream).await.contains(" 401 "));
+
+        let mut rest = Vec::new();
+        let closed = tokio::time::timeout(
+            REFUSED_BODY_DISCARD_TIME * 3, stream.read_to_end(&mut rest)
+        ).await;
+
+        assert!(closed.is_ok(), "the connection outlived the discard's time bound");
+    }
+
+    /// A refused body is read past the socket's buffers, and the connection closes before an
+    /// oversized one ends, by whichever bound comes first. Reverts: the discard removed — writes
+    /// fail almost at once, under the lower limit; both bounds removed — every write succeeds.
+    #[tokio::test]
+    async fn a_refused_body_is_read_and_then_cut_off() {
+        use tokio::io::AsyncWriteExt;
+
+        const CHUNK: usize = 1 << 20;
+        const ANNOUNCED: usize = 512 * CHUNK;
+
+        let root = scratch_dir("auth-layer-cutoff");
+        let addr = serve_router(token_state(ServeMode::Single(Arc::new(WarehouseHandle::new(root)))), 1 << 20).await;
+
+        let mut stream = send_head(addr, "PUT", "/v1/objects/abc", None, ANNOUNCED).await;
+        assert!(status_line(&mut stream).await.contains(" 401 "));
+
+        let chunk = vec![0u8; CHUNK];
+        let mut written = 0;
+
+        let cut_off = tokio::time::timeout(REFUSED_BODY_DISCARD_TIME * 6, async {
+            while written < ANNOUNCED {
+                if stream.write_all(&chunk).await.is_err() {
+                    return true;
+                }
+
+                written += CHUNK;
+            }
+
+            false
+        }).await;
+
+        assert_eq!(cut_off, Ok(true), "wrote {written} bytes");
+        assert!(written > 16 * CHUNK, "only {written} bytes were read before the connection closed");
+    }
+
+    /// The byte bound stops a body that never ends. Reverts: the bound removed — this times out.
+    #[tokio::test]
+    async fn the_discard_stops_at_its_byte_bound() {
+        let endless = tokio_stream::iter(std::iter::repeat_with(
+            || Ok::<_, std::io::Error>(Bytes::from_static(b"0123456789"))
+        ));
+        let discard = discard_refused_body(
+            Body::from_stream(endless), std::time::Duration::from_secs(3600), 1000
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), discard).await
+            .expect("the discard must stop at its byte bound");
+    }
+
+    #[tokio::test]
+    async fn healthz_stays_open() {
+        let root = scratch_dir("auth-layer-healthz");
+        let addr = serve_router(token_state(ServeMode::Single(Arc::new(WarehouseHandle::new(root)))), 1024).await;
+
+        let mut stream = send_head(addr, "GET", "/healthz", None, 0).await;
+        let status = status_line(&mut stream).await;
+
+        assert!(status.contains(" 200 "), "{status}");
     }
 
     // ---------------------------------------------------------------------------------
@@ -5887,10 +6121,7 @@ mod tests {
         let fixture = OfficeFixture::genesis("put-object-unenrolled");
         fixture.admit("carol", Role::Writer, vec!["main".to_string()], IdentityClass::Human, None);
 
-        let mut operator_tokens = HashMap::new();
-        operator_tokens.insert("tok-mallory".to_string(), "mallory".to_string());
-        operator_tokens.insert("tok-carol".to_string(), "carol".to_string());
-        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+        let state = Arc::new(single_mode_state(fixture.root.clone()));
 
         let bytes = b"an object an unenrolled operator tries to upload";
         let hash = object_utils::hash_object_bytes(bytes);
@@ -5898,7 +6129,7 @@ mod tests {
         params.insert("hash".to_string(), hash.clone());
 
         let response = put_object(
-            State(Arc::clone(&state)), headers_with_bearer("tok-mallory"), Path(params.clone()),
+            State(Arc::clone(&state)), as_operator("mallory"), Path(params.clone()),
             Bytes::from_static(bytes)
         ).await;
 
@@ -5908,7 +6139,7 @@ mod tests {
         assert!(!file_utils::does_object_exist(&hash).unwrap(), "a refused upload must store nothing");
 
         let response = put_object(
-            State(state), headers_with_bearer("tok-carol"), Path(params), Bytes::from_static(bytes)
+            State(state), as_operator("carol"), Path(params), Bytes::from_static(bytes)
         ).await;
 
         assert_eq!(response.status(), StatusCode::CREATED);
@@ -5933,14 +6164,8 @@ mod tests {
         let params = ref_update_params("@office");
         let body = RefUpdateRequest { old_head: None, new_head: "a".repeat(64), tombstone: None };
 
-        // The transport layer authenticates via the bearer-token map; give "dana" a
-        // token so `check_auth` yields `Principal::Operator("dana")`.
-        let mut operator_tokens = HashMap::new();
-        operator_tokens.insert("tok-dana".to_string(), "dana".to_string());
-        let state = Arc::new(AppState { operator_tokens, ..Arc::try_unwrap(state).ok().unwrap() });
-
         let response = post_ref_update(
-            State(state), headers_with_bearer("tok-dana"), Path(params), Json(body)
+            State(state), as_operator("dana"), Path(params), Json(body)
         ).await;
 
         assert_eq!(response.into_response().status(), StatusCode::FORBIDDEN);
@@ -5953,15 +6178,13 @@ mod tests {
             "erin", Role::Writer, vec!["only-this-one".to_string()], IdentityClass::Human, None
         );
 
-        let mut operator_tokens = HashMap::new();
-        operator_tokens.insert("tok-erin".to_string(), "erin".to_string());
-        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+        let state = Arc::new(single_mode_state(fixture.root.clone()));
 
         let params = ref_update_params("someone-elses-pallet");
         let body = RefUpdateRequest { old_head: None, new_head: "a".repeat(64), tombstone: None };
 
         let response = post_ref_update(
-            State(state), headers_with_bearer("tok-erin"), Path(params), Json(body)
+            State(state), as_operator("erin"), Path(params), Json(body)
         ).await;
 
         assert_eq!(response.into_response().status(), StatusCode::FORBIDDEN);
@@ -5974,9 +6197,7 @@ mod tests {
             "frank", Role::Writer, vec!["main".to_string()], IdentityClass::Human, None
         );
 
-        let mut operator_tokens = HashMap::new();
-        operator_tokens.insert("tok-frank".to_string(), "frank".to_string());
-        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+        let state = Arc::new(single_mode_state(fixture.root.clone()));
 
         let params = ref_update_params("main");
         // A `new_head` that was never uploaded: this must fail *later*, on object
@@ -5985,7 +6206,7 @@ mod tests {
         let body = RefUpdateRequest { old_head: None, new_head: "b".repeat(64), tombstone: None };
 
         let response = post_ref_update(
-            State(state), headers_with_bearer("tok-frank"), Path(params), Json(body)
+            State(state), as_operator("frank"), Path(params), Json(body)
         ).await;
 
         let status = response.into_response().status();
@@ -6003,13 +6224,11 @@ mod tests {
             "frank", Role::Writer, vec!["main".to_string()], IdentityClass::Human, None
         );
 
-        let mut operator_tokens = HashMap::new();
-        operator_tokens.insert("tok-frank".to_string(), "frank".to_string());
-        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+        let state = Arc::new(single_mode_state(fixture.root.clone()));
 
         let body = RefUpdateRequest { old_head: None, new_head: "b".repeat(64), tombstone: None };
         let response = post_ref_update(
-            State(state), headers_with_bearer("tok-frank"), Path(ref_update_params("Main")), Json(body)
+            State(state), as_operator("frank"), Path(ref_update_params("Main")), Json(body)
         ).await.into_response();
 
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
@@ -6021,7 +6240,7 @@ mod tests {
     }
 
     /// Lift an office parcel promoting "bob" (a writer) to admin, signed by `signer`'s key and
-    /// stacked on the fixture's current office head, with the admin's token, and return the
+    /// stacked on the fixture's current office head, as the admin, and return the
     /// status. The admin may transport the office, so any refusal comes from its content check.
     async fn lift_bob_promotion(fixture: &OfficeFixture, signer: &Operator, signer_key_id: &str) -> StatusCode {
         let head = forklift_core::util::pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)
@@ -6036,7 +6255,7 @@ mod tests {
         ).unwrap();
 
         post_ref_update(
-            State(admin_token_state(fixture)), headers_with_bearer("tok-alice"),
+            State(office_state(fixture)), as_operator(&fixture.admin.identifier),
             Path(ref_update_params("@office")),
             Json(RefUpdateRequest { old_head: Some(head), new_head: promotion, tombstone: None })
         ).await.into_response().status()
@@ -6080,7 +6299,7 @@ mod tests {
         ).unwrap();
 
         let response = post_ref_update(
-            State(admin_token_state(&fixture)), headers_with_bearer("tok-alice"),
+            State(office_state(&fixture)), as_operator(&fixture.admin.identifier),
             Path(ref_update_params("@office")),
             Json(RefUpdateRequest { old_head: Some(held.clone()), new_head: lifted, tombstone: None })
         ).await.into_response();
@@ -6187,9 +6406,7 @@ mod tests {
         let fixture = OfficeFixture::genesis("post-ref-meta-shaped");
         let quinn_key_id = fixture.admit("quinn", Role::Writer, vec!["crafted".to_string()], IdentityClass::Human, None);
         let quinn = Operator { identifier: "quinn".to_string() };
-        let mut operator_tokens = HashMap::new();
-        operator_tokens.insert("tok-quinn".to_string(), "quinn".to_string());
-        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+        let state = Arc::new(single_mode_state(fixture.root.clone()));
 
         let metadata = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
         let mut metadata_object = LooseObjectBuilder::build_tree(&metadata);
@@ -6199,7 +6416,7 @@ mod tests {
         let crafted = store_signed_parcel_over(&quinn, &quinn_key_id, Vec::new(), "crafted", &root_tree);
 
         let response = post_ref_update(
-            State(Arc::clone(&state)), headers_with_bearer("tok-quinn"), Path(ref_update_params("crafted")),
+            State(Arc::clone(&state)), as_operator("quinn"), Path(ref_update_params("crafted")),
             Json(RefUpdateRequest { old_head: None, new_head: crafted.clone(), tombstone: None }),
         ).await.into_response();
 
@@ -6212,7 +6429,7 @@ mod tests {
         // The control: the gate refuses the shape, not the writer or the push.
         let clean = store_signed_parcel(&quinn, &quinn_key_id, Vec::new(), "clean");
         let response = post_ref_update(
-            State(state), headers_with_bearer("tok-quinn"), Path(ref_update_params("crafted")),
+            State(state), as_operator("quinn"), Path(ref_update_params("crafted")),
             Json(RefUpdateRequest { old_head: None, new_head: clean.clone(), tombstone: None }),
         ).await.into_response();
 
@@ -6315,16 +6532,14 @@ mod tests {
         let quinn = Operator { identifier: "quinn-seam".to_string() };
         let new_head = store_signed_parcel(&quinn, &quinn_key_id, Vec::new(), "quinn-seam's push");
 
-        let mut operator_tokens = HashMap::new();
-        operator_tokens.insert("tok-quinn-seam".to_string(), "quinn-seam".to_string());
-        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+        let state = Arc::new(single_mode_state(fixture.root.clone()));
 
         let (_seam, reached, gate) = arm_office_lookup_checkpoint("quinn-seam");
 
         let params = ref_update_params("main");
         let body = RefUpdateRequest { old_head: None, new_head, tombstone: None };
         let push = tokio::spawn(post_ref_update(
-            State(Arc::clone(&state)), headers_with_bearer("tok-quinn-seam"), Path(params), Json(body)
+            State(Arc::clone(&state)), as_operator("quinn-seam"), Path(params), Json(body)
         ));
 
         reached.recv_timeout(std::time::Duration::from_secs(5))
@@ -6424,15 +6639,13 @@ mod tests {
             adopts: None,
         }).unwrap();
 
-        let mut operator_tokens = HashMap::new();
-        operator_tokens.insert("tok-alice".to_string(), "alice".to_string());
-        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(root.clone()) });
+        let state = Arc::new(single_mode_state(root.clone()));
 
         let params = ref_update_params("@office");
         let body = RefUpdateRequest { old_head: None, new_head: genesis_hash, tombstone: None };
 
         let response = post_ref_update(
-            State(state), headers_with_bearer("tok-alice"), Path(params), Json(body)
+            State(state), as_operator("alice"), Path(params), Json(body)
         ).await;
 
         assert_eq!(
@@ -6507,9 +6720,7 @@ mod tests {
         let quinn_key_id = fixture.admit("quinn", Role::Writer, vec!["office-moved".to_string()], IdentityClass::Human, None);
         let quinn = Operator { identifier: "quinn".to_string() };
         let new_head = store_signed_parcel(&quinn, &quinn_key_id, Vec::new(), "quinn's push");
-        let mut operator_tokens = HashMap::new();
-        operator_tokens.insert("tok-quinn".to_string(), "quinn".to_string());
-        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+        let state = Arc::new(single_mode_state(fixture.root.clone()));
 
         // A local bay of this warehouse stacks a real office parcel between every audit and its
         // write, so each decision reads an office that verifies and is gone by the write.
@@ -6525,7 +6736,7 @@ mod tests {
         });
 
         let response = post_ref_update(
-            State(state), headers_with_bearer("tok-quinn"), Path(ref_update_params("office-moved")),
+            State(state), as_operator("quinn"), Path(ref_update_params("office-moved")),
             Json(RefUpdateRequest { old_head: None, new_head, tombstone: None }),
         ).await.into_response();
 
@@ -6546,9 +6757,7 @@ mod tests {
         let quinn_key_id = fixture.admit("quinn", Role::Writer, vec!["anchor-moved".to_string()], IdentityClass::Human, None);
         let quinn = Operator { identifier: "quinn".to_string() };
         let new_head = store_signed_parcel(&quinn, &quinn_key_id, Vec::new(), "quinn's push");
-        let mut operator_tokens = HashMap::new();
-        operator_tokens.insert("tok-quinn".to_string(), "quinn".to_string());
-        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+        let state = Arc::new(single_mode_state(fixture.root.clone()));
 
         // The anchor's bytes change between every audit and its write.
         let trust = fixture.root.join(FOLDER_NAME_FORKLIFT_ROOT).join("trust");
@@ -6559,7 +6768,7 @@ mod tests {
         });
 
         let response = post_ref_update(
-            State(state), headers_with_bearer("tok-quinn"), Path(ref_update_params("anchor-moved")),
+            State(state), as_operator("quinn"), Path(ref_update_params("anchor-moved")),
             Json(RefUpdateRequest { old_head: None, new_head, tombstone: None }),
         ).await.into_response();
 
@@ -6574,7 +6783,7 @@ mod tests {
     /// A ref update to `name` from an unborn head, by an open principal, as a spawned task.
     fn spawn_open_push(state: &Arc<AppState>, name: &str, new_head: String) -> tokio::task::JoinHandle<Response> {
         tokio::spawn(post_ref_update(
-            State(Arc::clone(state)), HeaderMap::new(), Path(ref_update_params(name)),
+            State(Arc::clone(state)), Extension(Principal::Open), Path(ref_update_params(name)),
             Json(RefUpdateRequest { old_head: None, new_head, tombstone: None }),
         ))
     }
@@ -6619,7 +6828,7 @@ mod tests {
 
         let trust = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            put_trust(State(Arc::clone(&state)), HeaderMap::new(), Path(PathParams::new()), Json(first_anchor(Vec::new()))),
+            put_trust(State(Arc::clone(&state)), Extension(Principal::Open), Path(PathParams::new()), Json(first_anchor(Vec::new()))),
         ).await.expect("trust establishment must not wait for the parked push").into_response();
         assert_eq!(trust.status(), StatusCode::CREATED);
 
@@ -6703,14 +6912,14 @@ mod tests {
 
         async fn delete(root: &std::path::Path, name: &str, old_head: &str) -> Response {
             delete_ref(
-                State(Arc::new(single_mode_state(root.to_path_buf()))), HeaderMap::new(), Path(ref_update_params(name)),
+                State(Arc::new(single_mode_state(root.to_path_buf()))), Extension(Principal::Open), Path(ref_update_params(name)),
                 Query(RefDeleteRequest { old_head: old_head.to_string() }),
             ).await.into_response()
         }
 
         async fn create(root: &std::path::Path, name: &str, new_head: &str, tombstone: Option<&str>) -> Response {
             post_ref_update(
-                State(Arc::new(single_mode_state(root.to_path_buf()))), HeaderMap::new(), Path(ref_update_params(name)),
+                State(Arc::new(single_mode_state(root.to_path_buf()))), Extension(Principal::Open), Path(ref_update_params(name)),
                 Json(RefUpdateRequest { old_head: None, new_head: new_head.to_string(), tombstone: tombstone.map(str::to_string) }),
             ).await.into_response()
         }
@@ -6738,7 +6947,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK, "{}", body_text(response).await);
             assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), None);
 
-            let info = get_warehouse(State(Arc::new(single_mode_state(root.clone()))), HeaderMap::new(), Path(PathParams::new()))
+            let info = get_warehouse(State(Arc::new(single_mode_state(root.clone()))), Path(PathParams::new()))
                 .await.into_response();
             let info: WarehouseInfo = serde_json::from_str(&body_text(info).await).unwrap();
             assert_eq!(info.tombstones, Some(BTreeMap::from([("side".to_string(), side)])));
@@ -6755,7 +6964,7 @@ mod tests {
             assert_eq!(delete(&root, "side", &side).await.status(), StatusCode::OK);
 
             let response = post_ref_update(
-                State(Arc::new(single_mode_state(root.clone()))), HeaderMap::new(), Path(ref_update_params("side")),
+                State(Arc::new(single_mode_state(root.clone()))), Extension(Principal::Open), Path(ref_update_params("side")),
                 Json(RefUpdateRequest { old_head: Some(side.clone()), new_head: on_it, tombstone: None }),
             ).await.into_response();
 
@@ -6866,7 +7075,7 @@ mod tests {
             assert_eq!(delete(&root, "side", &side).await.status(), StatusCode::OK);
 
             let response = post_holds(
-                State(Arc::new(single_mode_state(root.clone()))), HeaderMap::new(), Path(ref_update_params("side")),
+                State(Arc::new(single_mode_state(root.clone()))), Path(ref_update_params("side")),
                 Json(HoldsRequest { candidates: vec![side.clone()] }),
             ).await.into_response();
 
@@ -6897,7 +7106,7 @@ mod tests {
             ).unwrap();
         });
 
-        let response = put_trust(State(state), HeaderMap::new(), Path(PathParams::new()), Json(first_anchor(Vec::new())))
+        let response = put_trust(State(state), Extension(Principal::Open), Path(PathParams::new()), Json(first_anchor(Vec::new())))
             .await.into_response();
 
         assert_eq!(office_utils::read_trust_anchor().unwrap(), None, "no anchor may be written");
@@ -6914,7 +7123,7 @@ mod tests {
         forklift_core::util::pallet_utils::update_pallet_head("main", None, &head, &RefPreconditions::NONE).unwrap();
         let state = Arc::new(single_mode_state(root.clone()));
 
-        let response = put_trust(State(state), HeaderMap::new(), Path(PathParams::new()), Json(first_anchor(vec!["2".repeat(64)])))
+        let response = put_trust(State(state), Extension(Principal::Open), Path(PathParams::new()), Json(first_anchor(vec!["2".repeat(64)])))
             .await.into_response();
 
         assert_eq!(office_utils::read_trust_anchor().unwrap(), None, "no anchor may be written");
@@ -6923,7 +7132,7 @@ mod tests {
         assert!(body.contains("Pallet \\\"main\\\" here is at") && body.contains("boundary does not hold"), "{}", body);
 
         let accepted = put_trust(
-            State(Arc::new(single_mode_state(root.clone()))), HeaderMap::new(), Path(PathParams::new()),
+            State(Arc::new(single_mode_state(root.clone()))), Extension(Principal::Open), Path(PathParams::new()),
             Json(first_anchor(vec![head])),
         ).await.into_response();
         assert!(accepted.status().is_success(), "a boundary holding every head installs: {}", accepted.status());
@@ -6941,11 +7150,11 @@ mod tests {
 
         let (_seam, reached, gate) = park_first_write(&root, TRUST_WRITE_SEAM);
         let parked = tokio::spawn(put_trust(
-            State(Arc::clone(&state)), HeaderMap::new(), Path(PathParams::new()), Json(first_anchor(Vec::new())),
+            State(Arc::clone(&state)), Extension(Principal::Open), Path(PathParams::new()), Json(first_anchor(Vec::new())),
         ));
         reached.recv_timeout(std::time::Duration::from_secs(5)).expect("the first PUT must park at its install");
 
-        let second = put_trust(State(Arc::clone(&state)), HeaderMap::new(), Path(PathParams::new()), Json(second_anchor.clone()))
+        let second = put_trust(State(Arc::clone(&state)), Extension(Principal::Open), Path(PathParams::new()), Json(second_anchor.clone()))
             .await.into_response().status();
 
         if move_office {
@@ -7002,12 +7211,9 @@ mod tests {
         assert!(body.contains("trust is a one-way door"), "{}", body);
     }
 
-    /// The office fixture's state with an admin token, for the meta-pallet falsifiers.
-    fn admin_token_state(fixture: &OfficeFixture) -> Arc<AppState> {
-        let mut operator_tokens = HashMap::new();
-        operator_tokens.insert("tok-alice".to_string(), fixture.admin.identifier.clone());
-
-        Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) })
+    /// The office fixture's state, for the meta-pallet falsifiers.
+    fn office_state(fixture: &OfficeFixture) -> Arc<AppState> {
+        Arc::new(single_mode_state(fixture.root.clone()))
     }
 
     /// Falsifier: a meta pallet name outside the known list is refused, even when its history
@@ -7018,7 +7224,7 @@ mod tests {
         let new_head = store_signed_parcel(&fixture.admin, &fixture.admin_key_id, Vec::new(), "@foo");
 
         let response = post_ref_update(
-            State(admin_token_state(&fixture)), headers_with_bearer("tok-alice"),
+            State(office_state(&fixture)), as_operator(&fixture.admin.identifier),
             Path(ref_update_params("@foo")), Json(RefUpdateRequest { old_head: None, new_head, tombstone: None })
         ).await;
 
@@ -7056,7 +7262,7 @@ mod tests {
 
         let new_head = forged.into_inner().expect("the forged parcel was signed");
         let response = post_ref_update(
-            State(admin_token_state(&fixture)), headers_with_bearer("tok-alice"),
+            State(office_state(&fixture)), as_operator(&fixture.admin.identifier),
             Path(ref_update_params("@kv")), Json(RefUpdateRequest { old_head: None, new_head, tombstone: None })
         ).await;
 
@@ -7084,7 +7290,7 @@ mod tests {
         let new_head = store_signed_parcel(&actor, &key_id, Vec::new(), "@kv without an office");
 
         let response = post_ref_update(
-            State(Arc::new(single_mode_state(root.clone()))), HeaderMap::new(),
+            State(Arc::new(single_mode_state(root.clone()))), Extension(Principal::Open),
             Path(ref_update_params("@kv")), Json(RefUpdateRequest { old_head: None, new_head, tombstone: None })
         ).await;
 
@@ -7125,20 +7331,17 @@ mod tests {
         let quinn_head = store_signed_parcel(&quinn, &quinn_key_id, Vec::new(), "quinn's push");
         let roger_head = store_signed_parcel(&roger, &roger_key_id, Vec::new(), "roger's push");
 
-        let mut operator_tokens = HashMap::new();
-        operator_tokens.insert("tok-quinn".to_string(), "quinn".to_string());
-        operator_tokens.insert("tok-roger".to_string(), "roger".to_string());
-        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+        let state = Arc::new(single_mode_state(fixture.root.clone()));
 
         let quinn_push = tokio::spawn(post_ref_update(
             State(Arc::clone(&state)),
-            headers_with_bearer("tok-quinn"),
+            as_operator("quinn"),
             Path(ref_update_params("main")),
             Json(RefUpdateRequest { old_head: None, new_head: quinn_head, tombstone: None }),
         ));
         let roger_push = tokio::spawn(post_ref_update(
             State(Arc::clone(&state)),
-            headers_with_bearer("tok-roger"),
+            as_operator("roger"),
             Path(ref_update_params("side")),
             Json(RefUpdateRequest { old_head: None, new_head: roger_head, tombstone: None }),
         ));
