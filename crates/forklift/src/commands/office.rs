@@ -31,9 +31,15 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
         );
     }
 
-    // The office head the genesis extends, read before anything: the install moves the office
-    // only while it still holds it.
-    let office_head = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?;
+    // An office with no anchor lost its anchor: a new genesis would orphan every parcel that
+    // office vouches for, and no head accepts an anchor over one.
+    if pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?.is_some() {
+        return Err(
+            "This warehouse holds an office but no trust anchor: its anchor was lost. Nothing was \
+            changed. If a remote holds this warehouse's trust, \"forklift lower\" restores the anchor; \
+            otherwise restore the warehouse's trust file from a backup.".to_string()
+        );
+    }
 
     // Everything reachable from the current pallet heads is the pre-trust history:
     // audit will allow it to be unsigned, and require signatures on everything else.
@@ -105,7 +111,7 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
 
     let description = format!("Enrolled operator \"{}\" (genesis).", operator.identifier);
     let genesis = office_utils::build_and_sign_office_parcel(
-        &state, &operator, description, &key_id, office_head.iter().cloned().collect(),
+        &state, &operator, description, &key_id, Vec::new(),
     )?;
 
     // The anchor and the genesis land together, and only while no other bay moved a pallet since
@@ -119,7 +125,7 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
             adopts: None,
         },
         replaces: None,
-        office: office_head.as_deref(),
+        office: None,
         new_office: Some(&genesis),
         pallets: PalletsPrecondition::WithinBoundary { boundary, scope: BoundaryScope::UserPallets },
     })?;

@@ -4861,7 +4861,48 @@ pub async fn fetch_history_within(client: &RemoteClient,
                                   head: &str,
                                   roots: &[String],
                                   progress: &Progress) -> Result<FetchStats, String> {
-    Ok(walk_history(client, head, roots, true, progress).await?.0)
+    let mut complete = all_ref_heads()?;
+    for root in roots {
+        if file_utils::does_object_exist(root)? {
+            complete.push(root.clone());
+        }
+    }
+
+    Ok(walk_history(client, head, &complete, true, progress).await?.0)
+}
+
+/// [`fetch_history`] for meta history, bounded by the meta pallet heads alone. Meta history is held
+/// whole, while a user head in a sparse warehouse vouches only for what its scope brought, so a
+/// meta head a user head descends from is not known complete until a meta ref reaches it.
+///
+/// # Arguments
+/// * `client` - The remote.
+/// * `head`   - The parcel hash to fetch from.
+///
+/// # Returns
+/// * `Ok(FetchStats)` - What was actually transferred, and how many parcels were walked.
+/// * `Err(String)`    - If a transfer or verification failed.
+pub async fn fetch_meta_history(client: &RemoteClient,
+                                head: &str,
+                                progress: &Progress) -> Result<FetchStats, String> {
+    let complete: Vec<String> = pallet_utils::all_pallet_refs()?
+        .into_iter()
+        .filter(|(pallet_ref, _)| pallet_ref.namespace == pallet_utils::PalletNamespace::Meta)
+        .map(|(_, head)| head)
+        .collect();
+
+    Ok(walk_history(client, head, &complete, true, progress).await?.0)
+}
+
+/// Every local ref head, user pallets and meta pallets alike, and therefore every closure already
+/// known complete. Empty for a clone into a fresh warehouse, which walks everything, as it must. In
+/// a cache, "complete" holds up to the record: a head's parcels are all present, and its content is
+/// present or recorded.
+fn all_ref_heads() -> Result<Vec<String>, String> {
+    Ok(pallet_utils::all_pallet_refs()?
+        .into_iter()
+        .map(|(_, head)| head)
+        .collect())
 }
 
 /// The parcels and signatures of `head`'s history, bounded as [`fetch_history`] bounds them, and
@@ -4879,36 +4920,22 @@ pub async fn fetch_history_within(client: &RemoteClient,
 pub async fn fetch_parcels_only(client: &RemoteClient,
                                 head: &str,
                                 progress: &Progress) -> Result<FetchStats, String> {
-    Ok(walk_history(client, head, &[], false, progress).await?.0)
+    Ok(walk_history(client, head, &all_ref_heads()?, false, progress).await?.0)
 }
 
 /// The bounded parcel walk of [`fetch_history_within`]: every parcel and signature from `head` down
-/// to what is already known complete, and with `content`, every walked parcel's closure as well.
+/// to `complete`, the parcels whose closures are known complete, and with `content`, every walked parcel's closure as well.
 /// Without it, nothing below a parcel is fetched and the walked parcels' root trees are returned
 /// instead, in walk order, one per parcel.
 async fn walk_history(client: &RemoteClient,
                       head: &str,
-                      roots: &[String],
+                      complete: &[String],
                       content: bool,
                       progress: &Progress) -> Result<(FetchStats, Vec<String>), String> {
     let mut stats = FetchStats::default();
     let mut skipped_roots: Vec<String> = Vec::new();
 
     progress.status("Fetching history");
-
-    // Every local ref head — user pallets and meta pallets alike — and therefore every
-    // closure already known complete. Empty for a clone into a fresh warehouse, which
-    // walks everything, as it must. In a cache, "complete" holds up to the record: a head's
-    // parcels are all present, and its content is present or recorded.
-    let mut complete: Vec<String> = pallet_utils::all_pallet_refs()?
-        .into_iter()
-        .map(|(_, head)| head)
-        .collect();
-    for root in roots {
-        if file_utils::does_object_exist(root)? {
-            complete.push(root.clone());
-        }
-    }
 
     let mut parcel_frontier: Vec<String> = vec![head.to_string()];
     let mut seen_parcels: HashSet<String> = HashSet::new();
@@ -4923,7 +4950,7 @@ async fn walk_history(client: &RemoteClient,
         let mut wave: Vec<String> = Vec::new();
 
         for hash in candidates {
-            if !is_known_complete(&hash, &complete)? {
+            if !is_known_complete(&hash, complete)? {
                 wave.push(hash);
             }
         }
@@ -5046,7 +5073,7 @@ async fn fetch_tree_closures(client: &RemoteClient,
 pub async fn fetch_cache(client: &RemoteClient,
                          head: &str,
                          progress: &Progress) -> Result<FetchStats, String> {
-    let (stats, skipped_roots) = walk_history(client, head, &[], false, progress).await?;
+    let (stats, skipped_roots) = walk_history(client, head, &all_ref_heads()?, false, progress).await?;
 
     sealed_utils::record_absences_under(&skipped_roots)?;
 
@@ -7479,7 +7506,7 @@ pub async fn prepare_remote_trust(client: &RemoteClient,
         return Ok(prepared);
     };
 
-    prepared.fetch = fetch_history(client, remote_office_head, &Progress::NONE).await?;
+    prepared.fetch = fetch_meta_history(client, remote_office_head, &Progress::NONE).await?;
     // Before the office head moves: an anchor is only ever held with its adopted history. A held
     // anchor was adopted with it already, so only an anchor about to be written needs the walk.
     if local.is_none() {
@@ -7663,12 +7690,17 @@ impl PreparedTrust {
 /// this, a warehouse would hold an anchor pinning history it never had, and every `heal` would
 /// report that pin dangling. Called before the anchor is written, so a failure leaves none held.
 ///
-/// The adopted chain is frozen and attested by the anchor, so it is fetched, not re-verified.
+/// The adopted chain is frozen and may predate the keys, so its signatures are not checked. Its
+/// shape is: an anchor must not make a remote's user head into history walked in full here.
 async fn fetch_adopted_history(client: &RemoteClient, remote_trust: &TrustAnchorDto) -> Result<(), String> {
     if let Some(adopts) = &remote_trust.adopts {
-        fetch_history(client, adopts, &Progress::NONE).await.map_err(|error| format!(
+        fetch_meta_history(client, adopts, &Progress::NONE).await.map_err(|error| format!(
             "Could not fetch the office history {} adopted by the trust anchor of {}: {}",
             adopts, client.url(), error
+        ))?;
+
+        office_utils::check_adopted_office_chain(adopts).map_err(|error| format!(
+            "Refusing the trust anchor of {}: {}", client.url(), error
         ))?;
     }
 
@@ -7775,7 +7807,7 @@ pub async fn accept_regenesis(client: &RemoteClient,
     // only while it still holds this.
     let local_office_head = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?;
 
-    fetch_history(client, remote_office_head, &Progress::NONE).await?;
+    fetch_meta_history(client, remote_office_head, &Progress::NONE).await?;
     fetch_adopted_history(client, remote_trust).await?;
 
     // Never adopt an anchor whose chain does not even verify against itself.
@@ -8116,7 +8148,7 @@ async fn adopt_meta_pallet(client: &RemoteClient, name: &str, remote_head: &str)
 
     // A first adoption, a fast-forward or a divergence — deciding between the last two needs
     // the remote head's ancestry, so fetch it first, then classify.
-    fetch_history(client, remote_head, &Progress::NONE).await?;
+    fetch_meta_history(client, remote_head, &Progress::NONE).await?;
 
     let fast_forward = match &local {
         Some(local) => merge_utils::is_ancestor(local, remote_head)?,
@@ -9302,7 +9334,7 @@ mod tests {
             let load_base_tree = |hash: &str| object_utils::load_tree(hash);
 
             crate::util::audit_utils::verify_parcel_closure_with(
-                &merge, known_complete, pallet_utils::PalletNamespace::User, &blob_exists, &chunks_missing,
+                &merge, known_complete, &blob_exists, &chunks_missing,
                 &load_recipe_chunks, &load_base_tree,
             ).expect("the fixture is complete, so the audit must pass");
 

@@ -42,7 +42,6 @@
 
 use std::collections::HashSet;
 use crate::util::lock_utils::{ServeLock, StoreAccessExclusive, StoreLock};
-use crate::util::pallet_utils::PalletNamespace;
 use crate::util::progress_utils::Progress;
 use crate::util::sealed_utils::{self, SealOp, SealedSet};
 use crate::util::{
@@ -172,17 +171,14 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
             local_roots.push(pick.our_head);
         }
     }
+    local_roots.extend(meta_parcels(&sources)?);
     local_roots.extend(sources.pin_parcels.into_iter().map(|(hash, _)| hash));
-    local_roots.extend(meta_parcels()?);
 
     let mut checkout_keep: HashSet<String> = HashSet::new();
     keep_closure(root_trees(&checkout_roots)?, &mut checkout_keep)?;
 
     let mut local_keep: HashSet<String> = HashSet::new();
-    let mut local_trees = root_trees(&local_roots)?;
-    local_trees.extend(held.meta_roots);
-    local_trees.extend(local.meta_roots);
-    keep_closure(local_trees, &mut local_keep)?;
+    keep_closure(root_trees(&local_roots)?, &mut local_keep)?;
 
     for (hash, item_type) in &sources.shard_leaves {
         if local_keep.insert(hash.clone()) && item_type.is_chunked() {
@@ -198,7 +194,7 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
         to_record: Vec::new(),
         kept_for_checkouts: 0,
         kept_local: 0,
-        not_held: local.present,
+        not_held: local,
         heads_not_lowered,
         to_unseal: Vec::new(),
         held_heads: held_heads.to_vec(),
@@ -335,8 +331,6 @@ struct HeldClosure {
     present: Vec<String>,
     /// Every object met, present or not: the whole closure the origin holds.
     seen: HashSet<String>,
-    /// The root trees of held parcels that are meta-shaped, kept in full.
-    meta_roots: Vec<String>,
 }
 
 /// Walk the content closure of `parcels`, the parcels the origin's heads reach, children before
@@ -346,35 +340,31 @@ struct HeldClosure {
 /// would claim the origin holds what may simply be lost.
 fn walk_held(parcels: &[String], sealed: &SealedSet) -> Result<HeldClosure, String> {
     /// One step of the explicit post-order walk: a tree to expand (with the object that named it,
-    /// for the error, and whether it is a parcel's root), or one whose children are all done.
+    /// for the error), or one whose children are all done.
     enum Step {
-        Expand { hash: String, named_by: String, root: bool },
+        Expand { hash: String, named_by: String },
         Finalize(String),
     }
 
-    let mut closure = HeldClosure { present: Vec::new(), seen: HashSet::new(), meta_roots: Vec::new() };
+    let mut closure = HeldClosure { present: Vec::new(), seen: HashSet::new() };
     let mut stack: Vec<Step> = Vec::new();
 
     for parcel in parcels.iter().rev() {
         let tree_hash = object_utils::load_parcel(parcel)?.tree_hash;
-        stack.push(Step::Expand { hash: tree_hash, named_by: parcel.clone(), root: true });
+        stack.push(Step::Expand { hash: tree_hash, named_by: parcel.clone() });
     }
 
     while let Some(step) = stack.pop() {
-        let (hash, named_by, root) = match step {
+        let (hash, named_by) = match step {
             // Popped only after every child pushed above it is done (LIFO): the post-order spot.
             Step::Finalize(hash) => {
                 closure.present.push(hash);
                 continue;
             }
-            Step::Expand { hash, named_by, root } => (hash, named_by, root),
+            Step::Expand { hash, named_by } => (hash, named_by),
         };
 
         if !closure.seen.insert(hash.clone()) {
-            // A root met first as a subtree of another parcel was walked without the root check.
-            if root {
-                note_meta_root(&hash, &mut closure.meta_roots)?;
-            }
             continue;
         }
 
@@ -383,9 +373,6 @@ fn walk_held(parcels: &[String], sealed: &SealedSet) -> Result<HeldClosure, Stri
         }
 
         let tree = object_utils::load_tree(&hash)?;
-        if root && recovery_utils::walks_in_full(&tree, "") {
-            closure.meta_roots.push(hash.clone());
-        }
 
         stack.push(Step::Finalize(hash.clone()));
 
@@ -408,7 +395,7 @@ fn walk_held(parcels: &[String], sealed: &SealedSet) -> Result<HeldClosure, Stri
         }
 
         for (_, subtree) in tree.get_subtrees() {
-            stack.push(Step::Expand { hash: subtree.hash.clone(), named_by: hash.clone(), root: false });
+            stack.push(Step::Expand { hash: subtree.hash.clone(), named_by: hash.clone() });
         }
     }
 
@@ -434,92 +421,57 @@ fn held_present(hash: &str, named_by: &str, sealed: &SealedSet) -> Result<bool, 
     ))
 }
 
-/// What the walk of local history outside the origin's closure found.
-struct LocalClosure {
-    /// How many present content objects only local history reaches.
-    present: usize,
-    /// The root trees of local parcels that are meta-shaped, kept in full.
-    meta_roots: Vec<String>,
-}
-
-/// Add `hash` to `roots` when it is a present parcel root that walks in full (a meta pallet's shape),
-/// for a root a walk reached first as an ordinary subtree, where it skipped the root check.
-fn note_meta_root(hash: &str, roots: &mut Vec<String>) -> Result<(), String> {
-    if !roots.iter().any(|root| root == hash)
-        && file_utils::is_present_for_sweep(hash)?
-        && recovery_utils::walks_in_full(&object_utils::load_tree(hash)?, "")
-    {
-        roots.push(hash.to_string());
-    }
-
-    Ok(())
-}
-
 /// Count the present content `parcels` reach outside `held`, the origin's closure (whatever an
 /// object in it reaches is in it too, so the walk stops there). Tolerant of any absence: this walk
 /// only counts, and nothing it meets is freed.
-fn walk_local(parcels: &[String], held: &HashSet<String>) -> Result<LocalClosure, String> {
-    let mut closure = LocalClosure { present: 0, meta_roots: Vec::new() };
+fn walk_local(parcels: &[String], held: &HashSet<String>) -> Result<usize, String> {
+    let mut present = 0;
     let mut seen: HashSet<String> = HashSet::new();
-    let mut queue: Vec<(String, bool)> = Vec::new();
+    let mut queue: Vec<String> = Vec::new();
 
     for parcel in parcels {
-        queue.push((object_utils::load_parcel(parcel)?.tree_hash, true));
+        queue.push(object_utils::load_parcel(parcel)?.tree_hash);
     }
 
-    while let Some((hash, root)) = queue.pop() {
+    while let Some(hash) = queue.pop() {
         if !seen.insert(hash.clone()) {
             continue;
         }
 
-        if held.contains(&hash) {
-            // A root the held walk reached as a subtree was not checked as one.
-            if root {
-                note_meta_root(&hash, &mut closure.meta_roots)?;
-            }
+        if held.contains(&hash) || !file_utils::is_present_for_sweep(&hash)? {
             continue;
         }
 
-        if !file_utils::is_present_for_sweep(&hash)? {
-            continue;
-        }
-
-        closure.present += 1;
+        present += 1;
         let tree = object_utils::load_tree(&hash)?;
-        if root && recovery_utils::walks_in_full(&tree, "") {
-            closure.meta_roots.push(hash.clone());
-        }
 
         for (_, file) in tree.get_files() {
             if held.contains(&file.hash) || !seen.insert(file.hash.clone()) || !file_utils::is_present_for_sweep(&file.hash)? {
                 continue;
             }
 
-            closure.present += 1;
+            present += 1;
             if file.item_type.is_chunked() {
                 for chunk in object_utils::recipe_chunk_hashes(&file.hash)? {
                     if !held.contains(&chunk) && seen.insert(chunk.clone()) && file_utils::is_present_for_sweep(&chunk)? {
-                        closure.present += 1;
+                        present += 1;
                     }
                 }
             }
         }
 
         for (_, subtree) in tree.get_subtrees() {
-            queue.push((subtree.hash.clone(), false));
+            queue.push(subtree.hash.clone());
         }
     }
 
-    Ok(closure)
+    Ok(present)
 }
 
-/// The parcels every meta pallet head reaches, kept in full.
-fn meta_parcels() -> Result<Vec<String>, String> {
-    let heads: Vec<String> = pallet_utils::all_pallet_refs()?
-        .into_iter()
-        .filter(|(pallet_ref, _)| pallet_ref.namespace == PalletNamespace::Meta)
-        .map(|(_, head)| head)
-        .collect();
+/// The parcels every meta pallet head and `adopts` reach, kept in full.
+fn meta_parcels(sources: &recovery_utils::GcRootSources) -> Result<Vec<String>, String> {
+    let mut heads = sources.meta_heads.clone();
+    heads.extend(sources.adopted_heads());
 
     Ok(sorted(gc_utils::collect_reachable_for_sweep(&heads)?))
 }
@@ -755,13 +707,20 @@ mod tests {
         assert!(present(&h.dir) && present(&h.shared));
     }
 
-    #[test]
-    fn plan_keeps_a_meta_shaped_tree_in_full() {
-        let _scratch = Scratch::new("meta-shaped");
-        let inner = store_blob("office\n");
+    /// A tree holding the metadata folder, its folder and its one blob, as a parcel.
+    fn metadata_parcel(content: &str) -> (String, String) {
+        let inner = store_blob(content);
         let meta_dir = store_tree(&[("record", &inner, DirEntryType::Normal)]);
         let root = store_tree(&[(crate::globals::FOLDER_NAME_FORKLIFT_ROOT, &meta_dir, DirEntryType::Tree)]);
-        let parcel = store_parcel(&root, Vec::new());
+        (store_parcel(&root, Vec::new()), root)
+    }
+
+    // Revert: leave the meta heads out of what is kept → the plan frees the office.
+    #[test]
+    fn plan_keeps_a_meta_pallets_history_in_full() {
+        let _scratch = Scratch::new("meta-ref");
+        let (parcel, _) = metadata_parcel("office\n");
+        pallet_utils::update_meta_pallet_head("notes", None, &parcel, &pallet_utils::RefPreconditions::NONE).unwrap();
         let hold = store_access();
 
         let plan = plan_evict(&[parcel], &hold).unwrap();
@@ -770,29 +729,34 @@ mod tests {
         assert_eq!(plan.kept_local, 3);
     }
 
-    /// A meta-shaped root that another held parcel also holds as an ordinary subtree is kept in
-    /// full whichever parcel the walk meets first.
+    // Revert: `meta_parcels` reads the meta heads alone → the parcel below the pin loses its keep.
     #[test]
-    fn plan_keeps_a_meta_shaped_root_another_parcel_holds_as_a_subtree() {
-        let _scratch = Scratch::new("meta-shared");
-        let inner = store_blob("office\n");
-        let meta_dir = store_tree(&[("record", &inner, DirEntryType::Normal)]);
-        let meta_root = store_tree(&[(crate::globals::FOLDER_NAME_FORKLIFT_ROOT, &meta_dir, DirEntryType::Tree)]);
-        let meta = store_parcel(&meta_root, Vec::new());
-        let user_root = store_tree(&[("nested", &meta_root, DirEntryType::Tree)]);
-        let user = store_parcel(&user_root, Vec::new());
+    fn plan_keeps_the_ancestors_of_the_adopted_office_head_in_full() {
+        let _scratch = Scratch::new("meta-adopts");
+        let (old, old_root) = metadata_parcel("old\n");
+        let adopted = store_parcel(&store_tree(&[]), vec![old.clone()]);
+        office_utils::write_trust_anchor(&office_utils::TrustAnchor {
+            genesis: "c".repeat(64), enabled_at: 1, boundary: Vec::new(), prior_genesis: None, adopts: Some(adopted.clone()),
+        }).unwrap();
         let hold = store_access();
 
-        for heads in [[user.clone(), meta.clone()], [meta.clone(), user.clone()]] {
-            let plan = plan_evict(&heads, &hold).unwrap();
-            assert_eq!(plan.to_free, vec![user_root.clone()], "only the user root goes");
-            assert_eq!(plan.kept_local, 3);
-        }
+        let plan = plan_evict(&[adopted], &hold).unwrap();
 
-        // Held only through the user parcel, while local history (a deleted meta pallet's head, say)
-        // holds it as a root: the local walk stops at the held closure, yet still names the root.
-        let held: HashSet<String> = [user_root.clone(), meta_root.clone(), meta_dir.clone(), inner.clone()].into();
-        assert_eq!(walk_local(&[meta.clone()], &held).unwrap().meta_roots, vec![meta_root.clone()]);
+        assert!(!plan.to_free.contains(&old_root), "{:?}", plan.to_free);
+    }
+
+    // Revert: keep a root tree holding the metadata folder in full, whatever reached it → the plan
+    // frees nothing.
+    #[test]
+    fn plan_frees_a_crafted_head_no_meta_root_reaches() {
+        let _scratch = Scratch::new("crafted-held");
+        let (parcel, root) = metadata_parcel("crafted\n");
+        let hold = store_access();
+
+        let plan = plan_evict(&[parcel], &hold).unwrap();
+
+        assert!(plan.to_free.contains(&root), "{:?}", plan.to_free);
+        assert_eq!(plan.to_free.len(), 3, "{:?}", plan.to_free);
     }
 
     #[test]

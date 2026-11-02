@@ -804,6 +804,86 @@ pub fn collect_trust_pin_roots(policy: TrustPinReadPolicy) -> Result<TrustPinRoo
     }
 }
 
+/// Refuse a parcel that is not of office shape: at most one parent; a root tree holding exactly
+/// `.forklift`, that holding exactly `tracked`, that holding exactly the `users` and `keys` folders,
+/// which hold only files that parse as records under their bound names. Office history is walked in
+/// full under any fetch scope, so this is what stops a remote naming anything else as office history.
+///
+/// # Arguments
+/// * `office_parcel_hash` - The hash of the office parcel.
+///
+/// # Returns
+/// * `Ok(Parcel)`  - The parcel.
+/// * `Err(String)` - The refusal, or why an object could not be read.
+pub fn check_office_parcel_shape(office_parcel_hash: &str) -> Result<Parcel, String> {
+    let parcel = object_utils::load_parcel(office_parcel_hash)?;
+
+    if parcel.parents.len() > 1 {
+        return Err(not_office_shape(office_parcel_hash, &format!("has {} parents", parcel.parents.len())));
+    }
+
+    let mut tree_hash = parcel.tree_hash.clone();
+
+    for (at, expected) in [
+        ("its root", &[TREE_NAME_FORKLIFT][..]),
+        (TREE_NAME_FORKLIFT, &[TREE_NAME_TRACKED][..]),
+        (TREE_NAME_TRACKED, &[TREE_NAME_USERS, TREE_NAME_KEYS][..]),
+    ] {
+        let tree = object_utils::load_tree(&tree_hash)?;
+
+        if let Some((file, _)) = tree.get_files().next() {
+            return Err(not_office_shape(office_parcel_hash, &format!("holds a file {} in {}", file, at)));
+        }
+
+        if let Some((other, _)) = tree.get_subtrees().find(|(name, _)| !expected.contains(&name.as_str())) {
+            return Err(not_office_shape(office_parcel_hash, &format!("holds a folder {} in {}", other, at)));
+        }
+
+        for wanted in expected {
+            let Some((_, subtree)) = tree.get_subtrees().find(|(name, _)| name == wanted) else {
+                return Err(not_office_shape(office_parcel_hash, &format!("has no folder {} in {}", wanted, at)));
+            };
+
+            tree_hash = subtree.hash.clone();
+        }
+    }
+
+    // What `users` and `keys` hold: only record files, named for what they hold.
+    read_office_state_of(office_parcel_hash)?;
+
+    Ok(parcel)
+}
+
+/// The refusal of a parcel [`check_office_parcel_shape`] finds is not of office shape.
+fn not_office_shape(office_parcel_hash: &str, what: &str) -> String {
+    format!(
+        "The office parcel {} {}, which Forklift never writes, so this office may have been tampered with.",
+        office_parcel_hash, what
+    )
+}
+
+/// Walk an adopted office chain to its root under [`check_office_parcel_shape`] alone. Its
+/// signatures are not checked, since it is frozen and may predate the keys. Run wherever a remote's
+/// anchor is taken, never in [`install_trust`]: a local re-genesis has to stay usable over damaged
+/// older history.
+///
+/// # Arguments
+/// * `adopts` - The head of the adopted chain.
+///
+/// # Returns
+/// * `Ok(())`      - Every parcel of the chain is of office shape.
+/// * `Err(String)` - The refusal, or why an object could not be read.
+pub fn check_adopted_office_chain(adopts: &str) -> Result<(), String> {
+    let mut cursor = adopts.to_string();
+
+    loop {
+        match check_office_parcel_shape(&cursor)?.parents.into_iter().next() {
+            Some(parent) => cursor = parent,
+            None => return Ok(()),
+        }
+    }
+}
+
 /// Why an office-record read failed — see [`read_trust_pin_keys`] and
 /// [`degraded_office_note`] (F4, PR #120 round 2). Replaces one opaque error string: the previous
 /// single "restage" remedy never actually fit either real cause (a never-durable object cannot be
@@ -1944,6 +2024,103 @@ pub(crate) mod tests {
 
         /// Write, then report failure.
         AfterLanding,
+    }
+
+    /// How [`odd_office_parcel`] departs from the shape Forklift writes.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum OddOfficeShape {
+        EmptyRoot,
+        FileBesideMetadata,
+        FolderBesideMetadata,
+        FileBesideTracked,
+        FolderUnderTracked,
+        NoKeysFolder,
+        StrayFileUnderUsers,
+    }
+
+    impl OddOfficeShape {
+        pub(crate) const ALL: [OddOfficeShape; 7] = [
+            OddOfficeShape::EmptyRoot,
+            OddOfficeShape::FileBesideMetadata,
+            OddOfficeShape::FolderBesideMetadata,
+            OddOfficeShape::FileBesideTracked,
+            OddOfficeShape::FolderUnderTracked,
+            OddOfficeShape::NoKeysFolder,
+            OddOfficeShape::StrayFileUnderUsers,
+        ];
+    }
+
+    /// A parcel on `head` holding `head`'s records in an office tree of `shape`, properly signed
+    /// by `signing_key_id`, so that only its shape can refuse it.
+    pub(crate) fn odd_office_parcel(shape: OddOfficeShape, head: &str, actor: &Operator, signing_key_id: &str) -> String {
+        use OddOfficeShape::*;
+
+        let store_tree = |tree: &TreeItem| {
+            let mut object = LooseObjectBuilder::build_tree(tree);
+            object.store().unwrap();
+            object.hash
+        };
+        let folder = |tree: &TreeItem, name: &str| tree.get_subtrees()
+            .find(|(held, _)| held.as_str() == name)
+            .map(|(_, item)| item.hash.clone())
+            .unwrap();
+        let named = |name: &str, hash: &str| TreeItem::new(name.to_string(), hash.to_string(), DirEntryType::Tree);
+        let file = |name: &str, hash: &str| TreeItem::new(name.to_string(), hash.to_string(), DirEntryType::Normal);
+
+        let root = object_utils::load_tree(&object_utils::load_parcel(head).unwrap().tree_hash).unwrap();
+        let metadata = object_utils::load_tree(&folder(&root, TREE_NAME_FORKLIFT)).unwrap();
+        let tracked = object_utils::load_tree(&folder(&metadata, TREE_NAME_TRACKED)).unwrap();
+        let keys = folder(&tracked, TREE_NAME_KEYS);
+        let stray = store_record("stray = true\n").unwrap();
+
+        let mut users = object_utils::load_tree(&folder(&tracked, TREE_NAME_USERS)).unwrap();
+        if shape == StrayFileUnderUsers {
+            users.add_child(file("stray", &stray));
+        }
+        let users = store_tree(&users);
+
+        let mut new_tracked = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        new_tracked.add_child(named(TREE_NAME_USERS, &users));
+        if shape != NoKeysFolder {
+            new_tracked.add_child(named(TREE_NAME_KEYS, &keys));
+        }
+        if shape == FolderUnderTracked {
+            new_tracked.add_child(named("extra", &users));
+        }
+
+        let mut new_metadata = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        new_metadata.add_child(named(TREE_NAME_TRACKED, &store_tree(&new_tracked)));
+        if shape == FileBesideTracked {
+            new_metadata.add_child(file("stray", &stray));
+        }
+
+        let mut new_root = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        if shape != EmptyRoot {
+            new_root.add_child(named(TREE_NAME_FORKLIFT, &store_tree(&new_metadata)));
+        }
+        if shape == FileBesideMetadata {
+            new_root.add_child(file("stray", &stray));
+        }
+        if shape == FolderBesideMetadata {
+            new_root.add_child(named("src", &users));
+        }
+
+        let timestamp = Utc::now();
+        let mut parcel = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: store_tree(&new_root),
+            parents: vec![head.to_string()],
+            actions: vec![
+                ParcelAction { operator: actor.clone(), action: ParcelActionType::Author, description: None, timestamp },
+                ParcelAction { operator: actor.clone(), action: ParcelActionType::Stack, description: None, timestamp },
+            ],
+            description: Some(format!("{:?}", shape)),
+        });
+        parcel.store().unwrap();
+
+        let signature = sign_utils::sign_parcel_hash(signing_key_id, &parcel.hash).unwrap();
+        sign_utils::store_parcel_signature(&parcel.hash, &signature).unwrap();
+
+        parcel.hash
     }
 
     fn user(class: IdentityClass, supervisor: Option<&str>) -> UserRecord {

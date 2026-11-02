@@ -392,7 +392,7 @@ fn a_ref_update_with_a_missing_blob_is_refused() {
 
 /// A parcel over `parent` whose root tree holds the metadata folder, stored in `warehouse`: a user
 /// history crafted into the shape of meta history.
-fn store_meta_shaped_parcel(warehouse: &Path, parent: &str) -> String {
+fn store_metadata_root_parcel(warehouse: &Path, parent: &str) -> String {
     use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
     use forklift_core::enums::dir_entry_type::DirEntryType;
     use forklift_core::model::blob::Blob;
@@ -420,19 +420,18 @@ fn store_meta_shaped_parcel(warehouse: &Path, parent: &str) -> String {
     parcel.hash
 }
 
-/// A user-pallet ref update to a history holding a meta-shaped root is refused (`422`), every
-/// object of it uploaded, and the ref stays where it was.
-// Revert: drop the shape check from the walk, or pass the meta namespace for every pallet → the
-// update commits.
+/// A push of a head whose root holds the metadata folder commits: nothing on a server walks it as
+/// metadata, and every client command that would materialize it refuses.
+// Revert: refuse the entry on a ref update again → the update is refused.
 #[test]
-fn a_ref_update_to_a_meta_shaped_user_history_is_refused() {
-    let area = Area::new("meta-shaped");
+fn a_ref_update_to_a_head_holding_the_metadata_folder_commits() {
+    let area = Area::new("metadata-root");
     prepare(&area, "wh");
     area.write_file("wh/a.txt", "alpha\n");
     area.forklift("wh", &["load", "."]);
     area.forklift("wh", &["stack", "-m", "first"]);
     let main_head = harvest(&area.path("wh")).head_of("main").expect("main head");
-    let crafted = store_meta_shaped_parcel(&area.path("wh"), &main_head);
+    let crafted = store_metadata_root_parcel(&area.path("wh"), &main_head);
 
     let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
     upload_all(&head, &harvest(&area.path("wh")));
@@ -440,13 +439,10 @@ fn a_ref_update_to_a_meta_shaped_user_history_is_refused() {
     head.ref_update(&Principal::Static, "main", &lift).expect("the control: the clean head lifts");
 
     let request = RefUpdateRequest { old_head: Some(main_head.clone()), new_head: crafted.clone(), tombstone: None };
-    let err = head.ref_update(&Principal::Static, "main", &request).expect_err("a meta-shaped user history");
-    assert_eq!(err.status, Status::Unprocessable);
-    assert!(err.message.contains(".forklift") && err.message.contains(&crafted), "{}", err.message);
+    head.ref_update(&Principal::Static, "main", &request).expect("the crafted head commits");
     assert_eq!(
         head.refs.get_head(pallet_utils::PalletNamespace::User, "main").unwrap().live(),
-        Some(main_head.as_str()),
-        "nothing was written"
+        Some(crafted.as_str()),
     );
 }
 
@@ -3837,6 +3833,33 @@ fn a_first_anchor_adopting_history_the_head_does_not_hold_is_refused() {
 
     upload_all(&head, &harvest);
     head.put_trust(&Principal::Static, &anchor).expect("adopted history held");
+}
+
+/// A first anchor adopting a head that is not office history is refused even with its history
+/// held: clients refuse such an anchor, and a stored anchor is a one-way door.
+// Revert: drop the office-shape check from `require_adopted_history` → the anchor is stored.
+#[test]
+fn a_first_anchor_adopting_anything_but_office_history_is_refused() {
+    let area = Area::new("first-anchor-adopts-user-head");
+    prepare(&area, "wh");
+    area.forklift("wh", &["office", "enroll"]);
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "-m", "signed"]);
+
+    let harvest = harvest(&area.path("wh"));
+    let user_head = harvest.head_of("main").expect("main head");
+    let anchor = TrustAnchorDto {
+        genesis: "e".repeat(64),
+        adopts: Some(user_head.clone()),
+        ..harvest.trust.clone().expect("trust")
+    };
+
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &harvest);
+    let err = head.put_trust(&Principal::Static, &anchor).expect_err("not office history");
+    assert_eq!(err.status, Status::Unprocessable, "{}", err.message);
+    assert!(err.message.contains("not office history") && err.message.contains(&user_head), "{}", err.message);
 }
 
 // ---------------------------------------------------------------------------------------

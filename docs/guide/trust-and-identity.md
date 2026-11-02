@@ -60,6 +60,10 @@ This generates your identity-root key, writes the genesis office parcel
 (self-signed), and establishes the trust anchor. **From now on every parcel in
 this warehouse must be signed** — this cannot be undone.
 
+A warehouse that holds an office but has lost its trust file is refused: a new
+genesis would silently replace the chain. `forklift lower` restores the anchor from
+a remote that holds this warehouse's trust; otherwise restore the file from a backup.
+
 - If a remote is configured, its pallet heads are folded into the trust boundary
   (history the remote already has stays valid unsigned), so the remote must be
   reachable — or pass `--offline` if it's gone for good.

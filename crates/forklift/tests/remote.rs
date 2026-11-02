@@ -2956,6 +2956,229 @@ fn accepting_a_regenesis_from_behind_holds_the_adopted_history_and_heals() {
         healed.status.code(), stderr(&healed));
 }
 
+/// Rewrite the anchor held in the server's storage to adopt `adopts`, as a dishonest server would.
+fn make_server_anchor_adopt(area: &TestArea, adopts: &str) {
+    let path = area.path("server-root/.forklift/trust");
+    let held = std::fs::read_to_string(&path).unwrap();
+    let rewritten: Vec<String> = held.lines()
+        .map(|line| if line.starts_with("adopts") { format!("adopts = \"{}\"", adopts) } else { line.to_string() })
+        .collect();
+    assert!(rewritten.iter().any(|line| line.contains(adopts)), "the anchor adopts a head: {}", held);
+    std::fs::write(&path, rewritten.join("\n") + "\n").unwrap();
+}
+
+/// The head a warehouse holds for a user pallet.
+fn user_head(area: &TestArea, warehouse: &str, pallet: &str) -> String {
+    std::fs::read_to_string(area.path(&format!("{}/.forklift/pallets/{}", warehouse, pallet))).unwrap().trim().to_string()
+}
+
+/// The first place a remote's anchor is taken: a clone. An anchor adopting a user head is refused
+/// before the anchor is written, whatever the head's own history.
+// Revert: drop the office-shape check from `fetch_adopted_history` → the clone takes the anchor.
+#[test]
+fn a_clone_refuses_an_anchor_adopting_anything_but_office_history() {
+    let area = TestArea::new("regenesis-clone-adopts-user-head");
+    let server = regenesis_on_remote(&area, |_| {});
+    let main = user_head(&area, "a", "main");
+    make_server_anchor_adopt(&area, &main);
+
+    let refused = area.forklift(".", &["clone", &server.url, "c", "--token", "root"]);
+    assert!(!refused.status.success(), "{}{}", stdout(&refused), stderr(&refused));
+    assert!(stderr(&refused).contains("Refusing the trust anchor"), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains(&main), "{}", stderr(&refused));
+    assert!(!area.path("c/.forklift/trust").exists(), "the anchor is not written");
+}
+
+/// The other place: accepting a re-genesis. The refused warehouse keeps the anchor it held.
+// Revert: drop the office-shape check from `fetch_adopted_history` → the anchor is accepted.
+#[test]
+fn accepting_a_regenesis_refuses_an_anchor_adopting_anything_but_office_history() {
+    let area = TestArea::new("regenesis-accept-adopts-user-head");
+    let server = regenesis_on_remote(&area, |server| {
+        assert_success(&area.forklift(".", &["clone", &server.url, "b", "--token", "w-token"]));
+    });
+    let main = user_head(&area, "a", "main");
+    make_server_anchor_adopt(&area, &main);
+    let held = std::fs::read(area.path("b/.forklift/trust")).unwrap();
+
+    let current = trust_changed_details(&area.forklift("b", &["--json", "lower"]))["current"].as_str().unwrap().to_string();
+    let refused = area.forklift("b", &["office", "accept-regenesis", "--confirm", &current]);
+    assert!(!refused.status.success(), "{}{}", stdout(&refused), stderr(&refused));
+    assert!(stderr(&refused).contains("Refusing the trust anchor"), "{}", stderr(&refused));
+    assert_eq!(std::fs::read(area.path("b/.forklift/trust")).unwrap(), held, "the held anchor stands");
+}
+
+/// A warehouse that lost its anchor but holds an office is refused a new one, unchanged, and each
+/// way out the refusal names works from that state.
+// Revert: let `office enroll` proceed over an office with no anchor → it writes a new anchor.
+#[test]
+fn enroll_refuses_an_office_with_no_anchor_and_its_ways_out_work() {
+    let area = TestArea::new("enroll-lost-anchor");
+    let server = Server::start(&area, Some("root"));
+    prepare_warehouse(&area, "a", &server.url);
+    assert_success(&area.forklift("a", &["config", "set", "remote.token", "root"]));
+    area.write_file("a/code.txt", "v1\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    let trust = area.path("a/.forklift/trust");
+    let held = std::fs::read(&trust).unwrap();
+    let office_head = |area: &TestArea| {
+        let root = area.path("a");
+        let _scope = forklift_core::globals::StorageRootScope::enter(&root);
+        forklift_core::util::pallet_utils::get_meta_pallet_head("office").unwrap().unwrap()
+    };
+    let office_before = office_head(&area);
+
+    // Way out one: restore the file from a backup.
+    std::fs::remove_file(&trust).unwrap();
+    let refused = area.forklift("a", &["office", "enroll"]);
+    assert!(!refused.status.success(), "{}{}", stdout(&refused), stderr(&refused));
+    let message = stderr(&refused);
+    assert!(message.contains("holds an office but no trust anchor"), "{}", message);
+    assert!(message.contains("forklift lower"), "{}", message);
+    assert!(!trust.exists(), "no anchor is written");
+    assert_eq!(office_head(&area), office_before, "the office is not moved");
+
+    std::fs::write(&trust, &held).unwrap();
+    assert_success(&area.forklift("a", &["audit", "@office"]));
+
+    // Way out two: a remote that holds the trust.
+    std::fs::remove_file(&trust).unwrap();
+    assert!(!area.forklift("a", &["office", "enroll"]).status.success());
+    assert_success(&area.forklift("a", &["lower"]));
+    assert_eq!(std::fs::read(&trust).unwrap(), held, "lower restores the anchor");
+    assert_success(&area.forklift("a", &["audit", "@office"]));
+}
+
+/// Write a parcel straight into the server's storage and point `pallet` at it, as a push the server
+/// has no reason to refuse. Returns the parcel's hash.
+fn plant_on_server(area: &TestArea, pallet: &str, parcel: forklift_core::model::parcel::Parcel) -> String {
+    use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+
+    let root = area.path("server-root");
+    let _scope = forklift_core::globals::StorageRootScope::enter(&root);
+    let mut object = LooseObjectBuilder::build_parcel(&parcel);
+    object.store().unwrap();
+    std::fs::write(
+        forklift_core::util::pallet_utils::get_pallets_folder().join(pallet),
+        format!("{}\n", object.hash),
+    ).unwrap();
+    object.hash
+}
+
+/// A sparse warehouse can hold a meta parcel only through a user head's history, its cell out of
+/// scope. Adopting that parcel when the meta pallet reaches it must still fetch it in full: only meta
+/// ref heads vouch that what is below them is complete.
+// Revert: pass every ref head as the complete set in `fetch_meta_history` → the walk stops at the
+// held parcel, and the adoption cannot read the cell.
+#[test]
+fn a_sparse_warehouse_adopts_in_full_a_meta_parcel_its_user_head_descends_from() {
+    let area = TestArea::new("meta-bound-sparse");
+    let server = Server::start(&area, Some("root"));
+    prepare_warehouse(&area, "a", &server.url);
+    assert_success(&area.forklift("a", &["config", "set", "remote.token", "root"]));
+    area.write_file("a/src/code.txt", "v1\n");
+    area.write_file("a/docs/readme.txt", "v1\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+    assert_success(&area.forklift("a", &["tag", "create", "v0", "main"]));
+    let tags_head = || {
+        let root = area.path("a");
+        let _scope = forklift_core::globals::StorageRootScope::enter(&root);
+        forklift_core::util::pallet_utils::get_meta_pallet_head("tags").unwrap().unwrap()
+    };
+    let older = tags_head();
+    assert_success(&area.forklift("a", &["tag", "create", "v1", "main"]));
+    let newer = tags_head();
+
+    // Stacked for real, so signed: a pallet starting at the meta head, with the bay put on it by
+    // hand, since nothing would shift to a tree holding the metadata folder.
+    let held = user_head(&area, "a", "main");
+    let position = std::fs::read_to_string(area.path("a/.forklift/position")).unwrap();
+    area.write_file("a/.forklift/pallets/descends", &format!("{}\n", newer));
+    area.write_file("a/.forklift/position", &position.replacen("main", "descends", 1).replace(&held, &newer));
+    area.write_file("a/src/code.txt", "v2\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "on a meta head"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    // The server's main takes that history while its tags stand one parcel behind it, so a clone
+    // holds the newer tags parcel only through main.
+    let descends = user_head(&area, "a", "descends");
+    let move_tags = |from: &str, to: &str| {
+        let root = area.path("server-root");
+        let _scope = forklift_core::globals::StorageRootScope::enter(&root);
+        forklift_core::util::pallet_utils::update_meta_pallet_head(
+            "tags", Some(from), to, &forklift_core::util::pallet_utils::RefPreconditions::NONE,
+        ).unwrap();
+    };
+    move_tags(&newer, &older);
+    area.write_file("server-root/.forklift/pallets/main", &format!("{}\n", descends));
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--token", "root", "--only", "src"]));
+    assert_eq!(user_head(&area, "sparse", "main"), descends);
+
+    move_tags(&older, &newer);
+    assert_success(&area.forklift("sparse", &["lower"]));
+    assert_success(&area.forklift("sparse", &["audit", "@tags"]));
+    assert!(stdout(&area.forklift("sparse", &["tag", "list"])).contains("v1"));
+}
+
+/// A server has no reason to refuse a head holding the metadata folder, so what stands between it
+/// and a client's own metadata is the materializing commands.
+#[test]
+fn a_clone_and_a_lower_refuse_a_head_holding_the_metadata_folder() {
+    use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+    use forklift_core::enums::dir_entry_type::DirEntryType;
+    use forklift_core::model::tree_item::TreeItem;
+
+    let area = TestArea::new("crafted-head-materialize");
+    let server = Server::start(&area, None);
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/code.txt", "v1\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "behind"]));
+
+    let main = user_head(&area, "a", "main");
+    let tree_hash = {
+        let root = area.path("server-root");
+        let _scope = forklift_core::globals::StorageRootScope::enter(&root);
+        let parcel = forklift_core::util::object_utils::load_parcel(&main).unwrap();
+        let mut tree = forklift_core::util::object_utils::load_tree(&parcel.tree_hash).unwrap();
+        let blob = tree.get_files().next().map(|(_, item)| item.hash.clone()).unwrap();
+
+        let mut metadata = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        metadata.add_child(TreeItem::new("escaped.txt".to_string(), blob, DirEntryType::Normal));
+        let mut metadata = LooseObjectBuilder::build_tree(&metadata);
+        metadata.store().unwrap();
+        tree.add_child(TreeItem::new(".forklift".to_string(), metadata.hash.clone(), DirEntryType::Tree));
+        let mut object = LooseObjectBuilder::build_tree(&tree);
+        object.store().unwrap();
+        object.hash
+    };
+    plant_on_server(&area, "main", forklift_core::model::parcel::Parcel {
+        tree_hash,
+        parents: vec![main],
+        actions: Vec::new(),
+        description: Some("crafted".to_string()),
+    });
+
+    let cloned = area.forklift(".", &["clone", &server.url, "fresh"]);
+    assert!(!cloned.status.success(), "{}{}", stdout(&cloned), stderr(&cloned));
+    assert!(stderr(&cloned).contains("\".forklift\""), "{}", stderr(&cloned));
+    assert!(!area.path("fresh/.forklift/escaped.txt").exists());
+
+    let lowered = area.forklift("behind", &["lower"]);
+    assert!(!lowered.status.success(), "{}{}", stdout(&lowered), stderr(&lowered));
+    assert!(stderr(&lowered).contains("\".forklift\""), "{}", stderr(&lowered));
+    assert!(!area.path("behind/.forklift/escaped.txt").exists());
+}
+
 /// FORK-114, the lifting side: a warehouse that re-genesised before it ever lifted establishes
 /// its anchor on a fresh remote. The office lift carries only the new chain, so the adopted
 /// history must be uploaded with the anchor — or the remote holds a pin it cannot serve, and
