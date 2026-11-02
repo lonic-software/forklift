@@ -182,13 +182,15 @@ fn the_page_has_an_entry_for_every_code_with_its_exit() {
         let entry = format!("`{}` (exit {})", code, exit);
         assert!(headings.iter().any(|heading| heading.contains(&entry)), "no heading holds {}", entry);
     }
-    // And no entry names a code or an exit the table does not.
+    // And no entry names a code or an exit the table does not. Backticks alternate, so every odd
+    // piece of a heading is a code and the piece after it holds that code's exit.
     for heading in headings {
-        for piece in heading.split(", ") {
-            let Some((_, rest)) = piece.split_once('`') else { continue };
-            let Some((code, rest)) = rest.split_once("` (exit ") else { continue };
+        let pieces: Vec<&str> = heading.split('`').collect();
+        for pair in pieces[1..].chunks(2) {
+            let [code, rest] = pair else { continue };
+            let Some(rest) = rest.strip_prefix(" (exit ") else { continue };
             let exit = rest.split(')').next().unwrap();
-            assert!(table.iter().any(|(c, e)| c == code && e == exit), "{} is not in the table", piece);
+            assert!(table.iter().any(|(c, e)| c == code && e == exit), "{} (exit {}) is not in the table", code, exit);
         }
     }
 }
@@ -202,7 +204,8 @@ fn a_lock_a_killed_process_left_is_cleared_by_removing_the_file_it_names() {
     std::fs::write(&lock, "999999").unwrap();
 
     let error = area.refused("w", &["load", "a.txt"], "warehouse_locked", 6);
-    assert!(error["message"].as_str().unwrap().contains("lock"), "{}", error);
+    let message = error["message"].as_str().unwrap();
+    assert!(message.contains(".forklift") && message.contains("999999"), "{}", error);
 
     std::fs::remove_file(&lock).unwrap();
     area.ok("w", &["load", "a.txt"]);
@@ -368,6 +371,9 @@ fn a_damaged_pack_is_salvaged_and_an_unenumerable_index_is_moved_aside() {
     let aside = area.path("aside.idx");
     forklift_core::util::file_utils::rename(&index, &aside).unwrap();
     assert_eq!(status("unenumerable_indexes"), 0);
+    assert!(!area.run("w", &["history"]).status.success(), "the page warns this index may hold what is needed");
+    std::fs::write(&index, &original).unwrap();
+    area.ok("w", &["history"]);
 
     let mut damaged = original.clone();
     let near_end = damaged.len() - 40;
@@ -430,14 +436,20 @@ fn undo_as_brings_a_deleted_pallet_back_and_park_pop_brings_work_back() {
 }
 
 #[test]
-fn a_clone_stopped_by_a_wrong_only_path_finishes_when_run_again() {
+fn a_clone_stopped_by_a_wrong_only_path_finishes_with_the_right_one() {
     let area = Area::new("clone");
     let server = two_clones(&area);
-    let error = area.refused(".", &["clone", &server.url, "partial", "--token", "secret", "--only", "nosuch"],
-        "clone_incomplete", 30);
-    assert_eq!(error["details"]["cause_code"], "only_prefix_not_found", "{}", error);
-    assert!(area.path("partial").exists(), "what it fetched is kept");
+    std::fs::create_dir(area.path("a/src")).unwrap();
+    area.stack("a", "src/app.txt", "app\n");
+    area.ok("a", &["lift"]);
 
-    area.ok(".", &["clone", &server.url, "partial", "--token", "secret"]);
-    assert_eq!(std::fs::read_to_string(area.path("partial/f.txt")).unwrap(), "one\n");
+    for _ in 0..2 {
+        let error = area.refused(".", &["clone", &server.url, "partial", "--token", "secret", "--only", "nosuch"],
+            "clone_incomplete", 30);
+        assert_eq!(error["details"]["cause_code"], "only_prefix_not_found", "{}", error);
+        assert!(area.path("partial").exists(), "what it fetched is kept");
+    }
+
+    area.ok(".", &["clone", &server.url, "partial", "--token", "secret", "--only", "src"]);
+    assert_eq!(std::fs::read_to_string(area.path("partial/src/app.txt")).unwrap(), "app\n");
 }

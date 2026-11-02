@@ -2,8 +2,8 @@
 
 Something refused, or something looks broken. Find the code below and do what its entry says.
 
-Every failure prints a message that names its own next step, and exits with a fixed status. With
-`--json`, the same code is in `error.code` and the step in `error.next_step`. The
+Every failure prints a message and exits with a fixed status, and almost every message names its next
+step. With `--json`, the same code is in `error.code` and the step in `error.next_step`. The
 [table of error and exit codes](../generated/errors.md) lists them all; this page says what to do
 about each one.
 
@@ -41,9 +41,9 @@ To throw away edits on purpose, `forklift restore` previews what it would discar
 ### `warehouse_locked` (exit 6)
 
 Another forklift process holds the warehouse lock, or one was killed and left the lock file behind.
-The message names the process id and the file.
+The message names the file, and the process id if the lock file holds one.
 
-First check that process is gone. If it is still running, wait for it. If it is not, remove the file
+First check that process is gone; with no id to check, look for any running forklift in this warehouse. If it is still running, wait for it. If it is not, remove the file
 the message names and run your command again.
 
 **Do not** remove the lock while that process is alive: it guards the staging area while it is being
@@ -62,8 +62,9 @@ still need.
 ### `incomplete_load` (exit 20)
 
 A `load` failed part-way, or a command that rewrites the staging area was killed. Stacking now could
-record a half-written staging area, so `stack`, `park`, `consolidate` and `pick` refuse. The message
-says which case you are in.
+record a half-written staging area, so `stack`, `park`, `consolidate` and `pick` refuse. After an
+interrupted command, so does anything else that changes the bay, including `load`. The message says
+which case you are in.
 
 After a failed load, fix what stopped it (the load names the file), then do what the message says:
 run the same `forklift load` again, or `forklift unload` the same path to abandon it.
@@ -115,7 +116,8 @@ forklift load -- <path>
 
 ### Pack problems
 
-Commands failing with "whose data file could not be loaded" or "is corrupt" point here. Run
+Commands failing with "whose data file could not be loaded", "is corrupt", "which could not be parsed"
+or "which this build cannot read" point here. Run
 `forklift store status`, whose `pack problems:` section names each file:
 
 | Listed as | What to do |
@@ -167,7 +169,8 @@ A metadata pallet such as `@kv` changed differently here and on the remote at th
 message names each path and both values. Choose a side for each one:
 
 ```sh
-forklift lower --keep @kv:<path>=ours      # or =theirs
+forklift lower --keep @kv:<path>=ours
+forklift lower --keep @kv:<path>=theirs --confirm   # discards your side, so it asks you to confirm
 ```
 
 Spell the pallet with its `@`. Your files and your other pallets are not affected.
@@ -230,9 +233,9 @@ using that remote.
 
 ### Lost keys: re-genesis
 
-"No active key … is present on this machine" means this machine cannot sign. If another admin or
-another of your own devices still holds a key, have it [issue you one](trust-and-identity.md#5-multiple-devices)
-and stop here. Restore a backup of your key folder if you have one.
+"No active key … is present on this machine" means this machine cannot sign. If another of your
+own devices still holds a key, [link this machine](trust-and-identity.md#5-multiple-devices) from it.
+If another admin holds one, have them [re-key you](trust-and-identity.md#3-adding-people). Either way, stop here. Restore a backup of your key folder if you have one.
 
 If every key is gone and no admin is left, reset trust:
 
@@ -264,6 +267,9 @@ reachable and run the command again.
 A partial clone was pointed at a remote other than the one it was cloned from. Only its origin is
 known to hold what it lacks. Set `remote.url` back to the origin the message names, or use
 [`remote move`](cli.md#remote-move-and-remote-abort--move-a-partial-warehouse-to-another-origin) to move the origin properly. `config` cannot change the origin.
+
+If the message says the origin record is missing, the `.forklift` folder is damaged: name a server
+holding this warehouse's content with `forklift remote move <url>`, or clone afresh.
 
 ### `origin_move_pending` (exit 37)
 
@@ -328,4 +334,4 @@ it again.
 
 `usage` means the command line could not be parsed: `forklift help <command>` shows the form. `error`
 has no specific code yet, so the message is all there is. If it names a next step, take it; if nothing
-here helps, please [report it](../../README.md).
+here helps, please [report it](https://github.com/lonic-software/forklift/issues).
