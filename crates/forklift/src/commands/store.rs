@@ -267,7 +267,8 @@ impl CommandOutput for StoreReport {
                 println!("    other format:  \"{}\" — {}", issue.index_path, issue.error);
             }
             println!(
-                "    quarantined objects are recoverable via \"forklift heal\"; a damaged pack's \
+                "    a quarantined pack needs its data file restored or a fresh clone (\"forklift heal\" \
+                refetches only objects under a durability taint); a damaged pack's \
                 sound parts are still read, and \"forklift store compact --all\" salvages it, recovering \
                 what its data file still holds (if it keeps the pack, or refuses because the pack \
                 could not be completely salvaged, the objects it reports cannot be recovered from \

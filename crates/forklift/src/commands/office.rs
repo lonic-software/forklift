@@ -129,7 +129,7 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
         Genesis parcel:    {}\n\
         Identity root key: {}\n\n\
         From now on every parcel stacked in this warehouse must be signed. This cannot \
-        be undone (a lockout is handled by archiving and re-preparing the warehouse).",
+        be undone (a lockout is handled by re-genesis, \"forklift office regenesis\").",
         operator.identifier, genesis, key_id
     ));
 

@@ -18,6 +18,7 @@ machine/agent interface).
 | Deciding whether forklift fits | [`concepts.md`](concepts.md) — what it does that git cannot, with runnable examples |
 | A user learning the CLI | [`cli.md`](cli.md) — every command, by workflow, with examples |
 | Looking up what a term means | [`glossary.md`](glossary.md) — Forklift's terms, with their git equivalents |
+| Stuck on a refusal, a lock, damage, or lost keys | [`recovery.md`](recovery.md) — what to do about each one |
 | Setting up signing, users, or agents | [`trust-and-identity.md`](trust-and-identity.md) |
 | Running a forklift server | [`../SERVER.md`](../SERVER.md) |
 | Driving forklift from a script or AI agent | [`../MACHINE_INTERFACE.md`](../MACHINE_INTERFACE.md) |

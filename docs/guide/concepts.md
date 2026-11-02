@@ -47,7 +47,7 @@ Enrolled "…" and established trust.
 Genesis parcel:    …
 Identity root key: …
 
-From now on every parcel stacked in this warehouse must be signed. This cannot be undone (a lockout is handled by archiving and re-preparing the warehouse).
+From now on every parcel stacked in this warehouse must be signed. This cannot be undone (a lockout is handled by re-genesis, "forklift office regenesis").
 $ echo 'Prices in euros.' > docs/pricing.md
 $ forklift load docs
 $ forklift stack -m "Add pricing"

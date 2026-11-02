@@ -2687,7 +2687,8 @@ forklift's own classified failures.
 
 The full, always-current table — generated from the same enum the binary itself
 branches on, so it can never fall behind — is
-[`../generated/errors.md`](../generated/errors.md).
+[`../generated/errors.md`](../generated/errors.md). What to do about each one is in
+[`recovery.md`](recovery.md).
 
 With `--json`, the same classification appears as `error.code` in the output
 envelope, usage errors included. See [`../MACHINE_INTERFACE.md`](../MACHINE_INTERFACE.md).
