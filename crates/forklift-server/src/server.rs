@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use axum::body::{Body, Bytes};
+use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
@@ -872,9 +872,10 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
 }
 
 /// Every route the server answers. Authentication is a layer over all of them except `/healthz`,
-/// so it runs before any extractor: a refused caller's request body is never read, and a route
+/// so it runs before any extractor: a refused caller's request body is never buffered, and a route
 /// added above the layer cannot forget it. A handler that needs to know who is calling takes the
-/// `Extension<Principal>` the layer leaves; on a route outside the layer that extractor refuses.
+/// `Extension<Principal>` the layer leaves, and refuses on a route outside the layer. A handler that
+/// does not take it has no such guard, so a route below the layer is open to everyone.
 fn router(state: Arc<AppState>, body_limit: DefaultBodyLimit) -> Router {
     let protocol = Router::new()
         .route("/warehouse", get(get_warehouse))
@@ -920,23 +921,28 @@ async fn authenticate(State(state): State<Arc<AppState>>, mut request: Request, 
             next.run(request).await
         }
         Err(error) => {
-            tokio::spawn(discard_refused_body(
-                request.into_body(), REFUSED_BODY_DISCARD_TIME, REFUSED_BODY_DISCARD_BYTES
-            ));
+            let body = request.into_body();
+
+            if !body.is_end_stream() {
+                tokio::spawn(discard_refused_body(
+                    body, REFUSED_BODY_DISCARD_TIME, REFUSED_BODY_DISCARD_BYTES
+                ));
+            }
 
             error_response(error)
         }
     }
 }
 
-/// How long, and how many bytes, a refused request's body is read and thrown away.
+/// How long, and how many bytes, one refused request's body is read and thrown away.
 const REFUSED_BODY_DISCARD_TIME: std::time::Duration = std::time::Duration::from_secs(5);
 const REFUSED_BODY_DISCARD_BYTES: usize = 128 * 1024 * 1024;
 
 /// Read a refused request's body and keep none of it. Closing the connection on a client still
 /// writing would break its pipe before it reads the refusal, and it would report a network failure
-/// instead of a bad token. Both bounds are there so a refused caller gets no more than an idle
-/// connection would: past either, the connection closes and that client does see the failure.
+/// instead of a bad token. Past either bound the connection closes and that client does see the
+/// failure. The bounds are per request: a body finished inside them leaves the connection open for
+/// the next request, as any refusal does, so limiting a peer's request rate stays the proxy's job.
 async fn discard_refused_body(body: Body, time: std::time::Duration, bytes: usize) {
     use tokio_stream::StreamExt;
 
@@ -3782,7 +3788,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------------
-    // The authentication layer — refused before the body is read
+    // The authentication layer — refused before the body is buffered
     // ---------------------------------------------------------------------------------
 
     /// Serve [`router`] on a real socket: what is under test is when the server stops waiting for
@@ -3937,7 +3943,8 @@ mod tests {
     }
 
     /// A client mid-upload must still be told why, not see a dead connection: the refusal arrives
-    /// while it is writing a body the server will never read.
+    /// while it is writing a body the server will not keep. Reverts: the discard removed — the
+    /// client's write then breaks and `send` returns a transport error.
     #[tokio::test]
     async fn a_client_uploading_with_a_bad_token_reads_the_refusal() {
         let root = scratch_dir("auth-layer-client");
@@ -3973,6 +3980,41 @@ mod tests {
         ).await;
 
         assert!(closed.is_ok(), "the connection outlived the discard's time bound");
+    }
+
+    /// A refused body is read past the socket's buffers, and the connection closes before an
+    /// oversized one ends, by whichever bound comes first. Reverts: the discard removed — writes
+    /// fail almost at once, under the lower limit; both bounds removed — every write succeeds.
+    #[tokio::test]
+    async fn a_refused_body_is_read_and_then_cut_off() {
+        use tokio::io::AsyncWriteExt;
+
+        const CHUNK: usize = 1 << 20;
+        const ANNOUNCED: usize = 512 * CHUNK;
+
+        let root = scratch_dir("auth-layer-cutoff");
+        let addr = serve_router(token_state(ServeMode::Single(Arc::new(WarehouseHandle::new(root)))), 1 << 20).await;
+
+        let mut stream = send_head(addr, "PUT", "/v1/objects/abc", None, ANNOUNCED).await;
+        assert!(status_line(&mut stream).await.contains(" 401 "));
+
+        let chunk = vec![0u8; CHUNK];
+        let mut written = 0;
+
+        let cut_off = tokio::time::timeout(REFUSED_BODY_DISCARD_TIME * 6, async {
+            while written < ANNOUNCED {
+                if stream.write_all(&chunk).await.is_err() {
+                    return true;
+                }
+
+                written += CHUNK;
+            }
+
+            false
+        }).await;
+
+        assert_eq!(cut_off, Ok(true), "wrote {written} bytes");
+        assert!(written > 16 * CHUNK, "only {written} bytes were read before the connection closed");
     }
 
     /// The byte bound stops a body that never ends. Reverts: the bound removed — this times out.
@@ -6079,10 +6121,7 @@ mod tests {
         let fixture = OfficeFixture::genesis("put-object-unenrolled");
         fixture.admit("carol", Role::Writer, vec!["main".to_string()], IdentityClass::Human, None);
 
-        let mut operator_tokens = HashMap::new();
-        operator_tokens.insert("tok-mallory".to_string(), "mallory".to_string());
-        operator_tokens.insert("tok-carol".to_string(), "carol".to_string());
-        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+        let state = Arc::new(single_mode_state(fixture.root.clone()));
 
         let bytes = b"an object an unenrolled operator tries to upload";
         let hash = object_utils::hash_object_bytes(bytes);
@@ -6127,9 +6166,6 @@ mod tests {
 
         // The transport layer authenticates via the bearer-token map; give "dana" a
         // token so `check_auth` yields `Principal::Operator("dana")`.
-        let mut operator_tokens = HashMap::new();
-        operator_tokens.insert("tok-dana".to_string(), "dana".to_string());
-        let state = Arc::new(AppState { operator_tokens, ..Arc::try_unwrap(state).ok().unwrap() });
 
         let response = post_ref_update(
             State(state), as_operator("dana"), Path(params), Json(body)
@@ -6145,9 +6181,7 @@ mod tests {
             "erin", Role::Writer, vec!["only-this-one".to_string()], IdentityClass::Human, None
         );
 
-        let mut operator_tokens = HashMap::new();
-        operator_tokens.insert("tok-erin".to_string(), "erin".to_string());
-        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+        let state = Arc::new(single_mode_state(fixture.root.clone()));
 
         let params = ref_update_params("someone-elses-pallet");
         let body = RefUpdateRequest { old_head: None, new_head: "a".repeat(64), tombstone: None };
@@ -6166,9 +6200,7 @@ mod tests {
             "frank", Role::Writer, vec!["main".to_string()], IdentityClass::Human, None
         );
 
-        let mut operator_tokens = HashMap::new();
-        operator_tokens.insert("tok-frank".to_string(), "frank".to_string());
-        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+        let state = Arc::new(single_mode_state(fixture.root.clone()));
 
         let params = ref_update_params("main");
         // A `new_head` that was never uploaded: this must fail *later*, on object
@@ -6195,9 +6227,7 @@ mod tests {
             "frank", Role::Writer, vec!["main".to_string()], IdentityClass::Human, None
         );
 
-        let mut operator_tokens = HashMap::new();
-        operator_tokens.insert("tok-frank".to_string(), "frank".to_string());
-        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+        let state = Arc::new(single_mode_state(fixture.root.clone()));
 
         let body = RefUpdateRequest { old_head: None, new_head: "b".repeat(64), tombstone: None };
         let response = post_ref_update(
@@ -6228,7 +6258,7 @@ mod tests {
         ).unwrap();
 
         post_ref_update(
-            State(admin_token_state(fixture)), as_operator(&fixture.admin.identifier),
+            State(admin_state(fixture)), as_operator(&fixture.admin.identifier),
             Path(ref_update_params("@office")),
             Json(RefUpdateRequest { old_head: Some(head), new_head: promotion, tombstone: None })
         ).await.into_response().status()
@@ -6272,7 +6302,7 @@ mod tests {
         ).unwrap();
 
         let response = post_ref_update(
-            State(admin_token_state(&fixture)), as_operator(&fixture.admin.identifier),
+            State(admin_state(&fixture)), as_operator(&fixture.admin.identifier),
             Path(ref_update_params("@office")),
             Json(RefUpdateRequest { old_head: Some(held.clone()), new_head: lifted, tombstone: None })
         ).await.into_response();
@@ -6379,9 +6409,7 @@ mod tests {
         let fixture = OfficeFixture::genesis("post-ref-meta-shaped");
         let quinn_key_id = fixture.admit("quinn", Role::Writer, vec!["crafted".to_string()], IdentityClass::Human, None);
         let quinn = Operator { identifier: "quinn".to_string() };
-        let mut operator_tokens = HashMap::new();
-        operator_tokens.insert("tok-quinn".to_string(), "quinn".to_string());
-        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+        let state = Arc::new(single_mode_state(fixture.root.clone()));
 
         let metadata = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
         let mut metadata_object = LooseObjectBuilder::build_tree(&metadata);
@@ -6507,9 +6535,7 @@ mod tests {
         let quinn = Operator { identifier: "quinn-seam".to_string() };
         let new_head = store_signed_parcel(&quinn, &quinn_key_id, Vec::new(), "quinn-seam's push");
 
-        let mut operator_tokens = HashMap::new();
-        operator_tokens.insert("tok-quinn-seam".to_string(), "quinn-seam".to_string());
-        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+        let state = Arc::new(single_mode_state(fixture.root.clone()));
 
         let (_seam, reached, gate) = arm_office_lookup_checkpoint("quinn-seam");
 
@@ -6616,9 +6642,7 @@ mod tests {
             adopts: None,
         }).unwrap();
 
-        let mut operator_tokens = HashMap::new();
-        operator_tokens.insert("tok-alice".to_string(), "alice".to_string());
-        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(root.clone()) });
+        let state = Arc::new(single_mode_state(root.clone()));
 
         let params = ref_update_params("@office");
         let body = RefUpdateRequest { old_head: None, new_head: genesis_hash, tombstone: None };
@@ -6699,9 +6723,7 @@ mod tests {
         let quinn_key_id = fixture.admit("quinn", Role::Writer, vec!["office-moved".to_string()], IdentityClass::Human, None);
         let quinn = Operator { identifier: "quinn".to_string() };
         let new_head = store_signed_parcel(&quinn, &quinn_key_id, Vec::new(), "quinn's push");
-        let mut operator_tokens = HashMap::new();
-        operator_tokens.insert("tok-quinn".to_string(), "quinn".to_string());
-        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+        let state = Arc::new(single_mode_state(fixture.root.clone()));
 
         // A local bay of this warehouse stacks a real office parcel between every audit and its
         // write, so each decision reads an office that verifies and is gone by the write.
@@ -6738,9 +6760,7 @@ mod tests {
         let quinn_key_id = fixture.admit("quinn", Role::Writer, vec!["anchor-moved".to_string()], IdentityClass::Human, None);
         let quinn = Operator { identifier: "quinn".to_string() };
         let new_head = store_signed_parcel(&quinn, &quinn_key_id, Vec::new(), "quinn's push");
-        let mut operator_tokens = HashMap::new();
-        operator_tokens.insert("tok-quinn".to_string(), "quinn".to_string());
-        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+        let state = Arc::new(single_mode_state(fixture.root.clone()));
 
         // The anchor's bytes change between every audit and its write.
         let trust = fixture.root.join(FOLDER_NAME_FORKLIFT_ROOT).join("trust");
@@ -7195,11 +7215,9 @@ mod tests {
     }
 
     /// The office fixture's state with an admin token, for the meta-pallet falsifiers.
-    fn admin_token_state(fixture: &OfficeFixture) -> Arc<AppState> {
-        let mut operator_tokens = HashMap::new();
-        operator_tokens.insert("tok-alice".to_string(), fixture.admin.identifier.clone());
+    fn admin_state(fixture: &OfficeFixture) -> Arc<AppState> {
 
-        Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) })
+        Arc::new(single_mode_state(fixture.root.clone()))
     }
 
     /// Falsifier: a meta pallet name outside the known list is refused, even when its history
@@ -7210,7 +7228,7 @@ mod tests {
         let new_head = store_signed_parcel(&fixture.admin, &fixture.admin_key_id, Vec::new(), "@foo");
 
         let response = post_ref_update(
-            State(admin_token_state(&fixture)), as_operator(&fixture.admin.identifier),
+            State(admin_state(&fixture)), as_operator(&fixture.admin.identifier),
             Path(ref_update_params("@foo")), Json(RefUpdateRequest { old_head: None, new_head, tombstone: None })
         ).await;
 
@@ -7248,7 +7266,7 @@ mod tests {
 
         let new_head = forged.into_inner().expect("the forged parcel was signed");
         let response = post_ref_update(
-            State(admin_token_state(&fixture)), as_operator(&fixture.admin.identifier),
+            State(admin_state(&fixture)), as_operator(&fixture.admin.identifier),
             Path(ref_update_params("@kv")), Json(RefUpdateRequest { old_head: None, new_head, tombstone: None })
         ).await;
 
@@ -7317,10 +7335,7 @@ mod tests {
         let quinn_head = store_signed_parcel(&quinn, &quinn_key_id, Vec::new(), "quinn's push");
         let roger_head = store_signed_parcel(&roger, &roger_key_id, Vec::new(), "roger's push");
 
-        let mut operator_tokens = HashMap::new();
-        operator_tokens.insert("tok-quinn".to_string(), "quinn".to_string());
-        operator_tokens.insert("tok-roger".to_string(), "roger".to_string());
-        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+        let state = Arc::new(single_mode_state(fixture.root.clone()));
 
         let quinn_push = tokio::spawn(post_ref_update(
             State(Arc::clone(&state)),
