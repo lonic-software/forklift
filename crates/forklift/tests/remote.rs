@@ -3056,6 +3056,11 @@ fn enroll_refuses_an_office_with_no_anchor_and_its_ways_out_work() {
     assert_success(&area.forklift("a", &["lower"]));
     assert_eq!(std::fs::read(&trust).unwrap(), held, "lower restores the anchor");
     assert_success(&area.forklift("a", &["audit", "@office"]));
+
+    // The last resort: another folder, on its own.
+    std::fs::create_dir_all(area.path("elsewhere")).unwrap();
+    assert_success(&area.forklift("elsewhere", &["prepare"]));
+    assert_success(&area.forklift("elsewhere", &["office", "enroll"]));
 }
 
 /// Write a parcel straight into the server's storage and point `pallet` at it, as a push the server

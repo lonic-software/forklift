@@ -13,6 +13,14 @@ use crate::output::{self, CommandOutput};
 // keys as tracked metadata on the "@office" meta pallet. One public
 // function per subcommand; the CLI surface itself is defined in `cli.rs`.
 
+/// The refusal of `enroll` and `regenesis` over an office whose anchor is gone.
+const LOST_ANCHOR: &str = "This warehouse holds an office but no trust anchor: its anchor was lost. Nothing was \
+    changed. Restore the warehouse's trust file from a backup if you have one. Otherwise \"forklift lower\" \
+    takes the anchor of the configured remote, with nothing here to compare it against, so use it only with a \
+    remote you trust; if that remote has reset its trust, clone it again instead. With neither, trust cannot be \
+    re-established here: run \"forklift prepare\" in another folder, which starts without this warehouse's \
+    history, and enroll there.";
+
 /// Enroll the configured operator and establish trust: the genesis office parcel
 /// introduces the first user and key, self-signed by that key (the TOFU anchor).
 ///
@@ -1162,12 +1170,6 @@ pub(crate) mod tests {
         assert_ne!(pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap(), office_before);
     }
 }
-
-/// The refusal of `enroll` and `regenesis` over an office whose anchor is gone.
-const LOST_ANCHOR: &str = "This warehouse holds an office but no trust anchor: its anchor was lost. Nothing was \
-    changed. If a remote holds this warehouse's trust, \"forklift lower\" restores the anchor; otherwise \
-    restore the warehouse's trust file from a backup. With neither, trust cannot be re-established here: \
-    start a new warehouse with \"forklift prepare\" and enroll there.";
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
 #[cfg(feature = "docgen")]
