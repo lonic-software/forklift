@@ -1207,8 +1207,7 @@ fn is_missing_or_empty_folder(root: &std::path::Path) -> std::io::Result<bool> {
 
 /// Map a trust install that did not land to the answer a ref update gives for the same condition:
 /// a `409` when the office or the anchor it was judged against moved, or when a pallet head here
-/// stands outside the anchor's boundary (it wrote nothing), a `422` for a meta-shaped user history,
-/// and a 500 when a write failed.
+/// stands outside the anchor's boundary (it wrote nothing), and a 500 when a write failed.
 fn trust_install_refusal(error: RefUpdateError) -> HandlerError {
     match error {
         RefUpdateError::OfficeMoved { found } => office_moved(found.as_deref()),
@@ -1227,7 +1226,6 @@ fn trust_install_refusal(error: RefUpdateError) -> HandlerError {
             | RefUpdateError::Backward { .. }) => {
             (StatusCode::CONFLICT, moved.to_string())
         }
-        refused @ RefUpdateError::MetaShaped { .. } => unprocessable(refused.to_string()),
         RefUpdateError::Failed(message) => internal(message),
     }
 }
@@ -2813,10 +2811,8 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             // covers the request's two heads, whose content no other writer can change.
             let verified = match verified_closure.take() {
                 Some(verified) => verified,
-                // A user pallet's walk also refuses a meta-shaped root: a 422 as well, which no
-                // retry or further upload mends.
-                None => audit_utils::verify_parcel_closure_for_write(&request.new_head, request.old_head.as_deref(), namespace)
-                    .map_err(|refusal| unprocessable(refusal.to_string()))?,
+                None => audit_utils::verify_parcel_closure_for_write(&request.new_head, request.old_head.as_deref())
+                    .map_err(unprocessable)?,
             };
 
             // An early refusal too, after the closure check, so its walk of the new history reads
@@ -2972,7 +2968,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                 }
                 // The fast-forward check above refuses such a move first; a conflict all the same.
                 Err(backward @ RefUpdateError::Backward { .. }) => return Err((StatusCode::CONFLICT, backward.to_string())),
-                Err(refused @ (RefUpdateError::Incomplete { .. } | RefUpdateError::MetaShaped { .. })) => {
+                Err(refused @ RefUpdateError::Incomplete { .. }) => {
                     return Err(unprocessable(refused.to_string()));
                 }
                 Err(RefUpdateError::Deleted { pallet, head, acknowledged }) => {
@@ -6394,19 +6390,18 @@ mod tests {
         parcel_object.hash
     }
 
-    /// A user pallet's ref update to a history whose root holds the metadata folder is a 422, and
-    /// the ref stays unborn; the same writer's clean parcel lifts.
-    // Revert: drop the shape check from the walk, or walk every pallet as the meta namespace → the
-    // crafted head lifts.
+    /// A push of a head whose root holds the metadata folder is accepted: nothing on a server walks
+    /// it as metadata, and every client command that would materialize it refuses.
+    // Revert: refuse the entry on a ref update again → the crafted head does not land.
     #[tokio::test]
-    async fn a_ref_update_to_a_meta_shaped_user_history_is_refused() {
+    async fn a_ref_update_to_a_head_holding_the_metadata_folder_is_accepted() {
         use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
         use forklift_core::enums::dir_entry_type::DirEntryType;
 
-        let fixture = OfficeFixture::genesis("post-ref-meta-shaped");
+        let fixture = OfficeFixture::genesis("post-ref-metadata-root");
         let quinn_key_id = fixture.admit("quinn", Role::Writer, vec!["crafted".to_string()], IdentityClass::Human, None);
         let quinn = Operator { identifier: "quinn".to_string() };
-        let state = Arc::new(single_mode_state(fixture.root.clone()));
+        let state = single_mode_state(fixture.root.clone());
 
         let metadata = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
         let mut metadata_object = LooseObjectBuilder::build_tree(&metadata);
@@ -6416,25 +6411,12 @@ mod tests {
         let crafted = store_signed_parcel_over(&quinn, &quinn_key_id, Vec::new(), "crafted", &root_tree);
 
         let response = post_ref_update(
-            State(Arc::clone(&state)), as_operator("quinn"), Path(ref_update_params("crafted")),
+            State(Arc::new(state)), as_operator("quinn"), Path(ref_update_params("crafted")),
             Json(RefUpdateRequest { old_head: None, new_head: crafted.clone(), tombstone: None }),
         ).await.into_response();
 
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let body = body_text(response).await;
-        assert!(body.contains(FOLDER_NAME_FORKLIFT_ROOT) && body.contains(&crafted), "{}", body);
-        assert_eq!(forklift_core::util::pallet_utils::get_pallet_head("crafted").unwrap(), None,
-            "the pallet must be unchanged");
-
-        // The control: the gate refuses the shape, not the writer or the push.
-        let clean = store_signed_parcel(&quinn, &quinn_key_id, Vec::new(), "clean");
-        let response = post_ref_update(
-            State(state), as_operator("quinn"), Path(ref_update_params("crafted")),
-            Json(RefUpdateRequest { old_head: None, new_head: clean.clone(), tombstone: None }),
-        ).await.into_response();
-
         assert!(response.status().is_success(), "{}", body_text(response).await);
-        assert_eq!(forklift_core::util::pallet_utils::get_pallet_head("crafted").unwrap(), Some(clean));
+        assert_eq!(forklift_core::util::pallet_utils::get_pallet_head("crafted").unwrap(), Some(crafted));
     }
 
     /// Store an unsigned parcel over an empty tree and return its hash: a pallet head whose history
@@ -7092,6 +7074,39 @@ mod tests {
         let scope = StorageRootScope::enter(&root);
 
         (root, scope)
+    }
+
+    // Revert: drop the office-shape check from `require_adopted_history` → the anchor is stored.
+    #[tokio::test]
+    async fn a_first_anchor_adopting_anything_but_office_history_is_refused_and_writes_nothing() {
+        use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+        use forklift_core::enums::dir_entry_type::DirEntryType;
+        use forklift_core::model::parcel::Parcel;
+
+        let (root, _scope) = trust_warehouse("put-trust-adopts-non-office");
+        let state = Arc::new(single_mode_state(root.clone()));
+
+        let mut tree = LooseObjectBuilder::build_tree(&TreeItem::new(String::new(), String::new(), DirEntryType::Tree));
+        tree.store().unwrap();
+        let mut parcel = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: tree.hash,
+            parents: Vec::new(),
+            actions: Vec::new(),
+            description: None,
+        });
+        parcel.store().unwrap();
+
+        let anchor = TrustAnchorDto { adopts: Some(parcel.hash.clone()), ..first_anchor(Vec::new()) };
+        let response = put_trust(State(state), Extension(Principal::Open), Path(PathParams::new()), Json(anchor))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = body_text(response).await;
+        assert!(body.contains("not office history") && body.contains(&parcel.hash), "{}", body);
+        assert!(!root.join(".forklift").join("trust").exists(), "nothing is written");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // Revert: the first anchor installs with `OfficePrecondition::NotConsumed` → the anchor lands

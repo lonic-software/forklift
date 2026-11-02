@@ -13,6 +13,14 @@ use crate::output::{self, CommandOutput};
 // keys as tracked metadata on the "@office" meta pallet. One public
 // function per subcommand; the CLI surface itself is defined in `cli.rs`.
 
+/// The refusal of `enroll` and `regenesis` over an office whose anchor is gone.
+const LOST_ANCHOR: &str = "This warehouse holds an office but no trust anchor: its anchor was lost. Nothing was \
+    changed. Restore the warehouse's trust file from a backup if you have one. Otherwise \"forklift lower\" \
+    takes the anchor of the configured remote, with nothing here to compare it against, so use it only with a \
+    remote you trust; if that remote has reset its trust, clone it again instead. With neither, trust cannot be \
+    re-established here: run \"forklift prepare\" in another folder, which starts without this warehouse's \
+    history, and enroll there.";
+
 /// Enroll the configured operator and establish trust: the genesis office parcel
 /// introduces the first user and key, self-signed by that key (the TOFU anchor).
 ///
@@ -31,9 +39,11 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
         );
     }
 
-    // The office head the genesis extends, read before anything: the install moves the office
-    // only while it still holds it.
-    let office_head = pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?;
+    // An office with no anchor lost its anchor: a new genesis would orphan every parcel that
+    // office vouches for, and no head accepts an anchor over one.
+    if pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?.is_some() {
+        return Err(LOST_ANCHOR.to_string());
+    }
 
     // Everything reachable from the current pallet heads is the pre-trust history:
     // audit will allow it to be unsigned, and require signatures on everything else.
@@ -105,7 +115,7 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
 
     let description = format!("Enrolled operator \"{}\" (genesis).", operator.identifier);
     let genesis = office_utils::build_and_sign_office_parcel(
-        &state, &operator, description, &key_id, office_head.iter().cloned().collect(),
+        &state, &operator, description, &key_id, Vec::new(),
     )?;
 
     // The anchor and the genesis land together, and only while no other bay moved a pallet since
@@ -119,7 +129,7 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
             adopts: None,
         },
         replaces: None,
-        office: office_head.as_deref(),
+        office: None,
         new_office: Some(&genesis),
         pallets: PalletsPrecondition::WithinBoundary { boundary, scope: BoundaryScope::UserPallets },
     })?;
@@ -743,6 +753,10 @@ pub fn regenesis(confirm: bool) -> Result<(), String> {
     let operator = config_utils::get_operator()?;
 
     let Some((old_anchor, old_anchor_bytes)) = office_utils::read_trust_anchor_with_bytes()? else {
+        if pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?.is_some() {
+            return Err(LOST_ANCHOR.to_string());
+        }
+
         return Err(
             "Trust is not established for this warehouse; there is nothing to reset. \
             Use \"forklift office enroll\".".to_string()

@@ -10,9 +10,9 @@ use std::sync::{Mutex, OnceLock};
 use crate::model::tree_item::TreeItem;
 use crate::util::office_utils::{KeyRecord, OfficeState, TrustAnchor};
 use crate::util::scope_utils::{PathScope, ScopeClass};
-use crate::util::{cache_miss, fanout_utils, file_utils, graph_utils, object_utils, office_utils, pallet_utils, recovery_utils, sign_utils};
+use crate::util::{cache_miss, fanout_utils, file_utils, graph_utils, object_utils, office_utils, pallet_utils, sign_utils};
 use crate::util::sealed_utils::SealedSet;
-use crate::util::pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletNamespace, PalletsPrecondition, RefPreconditions};
+use crate::util::pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions};
 
 /// Why an office chain did not verify. The heads answer the two classes differently: an
 /// inauthentic chain is bad input, while an authentic parcel that oversteps its signer's
@@ -126,7 +126,15 @@ pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<Of
     let mut previous_state: Option<OfficeState> = None;
 
     for hash in &chain {
-        let state = crate::util::office_utils::read_office_state_of(hash).map_err(Inauthentic)?;
+        let (shaped, state) = crate::util::office_utils::check_office_parcel_shape(hash).map_err(Inauthentic)?;
+
+        if *hash == anchor.genesis && !shaped.parents.is_empty() {
+            return Err(Inauthentic(format!(
+                "The genesis parcel {} has a parent, which Forklift never writes, so this office \
+                may have been tampered with.",
+                hash
+            )));
+        }
 
         let lookup_state = previous_state.as_ref().unwrap_or(&state);
 
@@ -1731,6 +1739,11 @@ pub fn require_adopted_history(
         "The trust anchor adopts office head {}, but this warehouse does not hold that history \
         completely ({}). Lift that history before the anchor.",
         adopts, missing
+    ))?;
+
+    // Clients refuse an anchor adopting anything else, and a stored anchor is a one-way door.
+    crate::util::office_utils::check_adopted_office_chain(adopts).map_err(|refusal| format!(
+        "The trust anchor adopts office head {}, which is not office history: {}", adopts, refusal
     ))
 }
 
@@ -1760,17 +1773,7 @@ pub fn require_adopted_history(
 /// * `Ok(())`      - If everything is present.
 /// * `Err(String)` - If a parcel, tree or blob is missing (or unreadable).
 ///
-/// The walk is the meta namespace's, so it does not refuse a meta-shaped root: the callers check a
-/// trust anchor's adopted office chain, or prove a history present whatever its shape. A user
-/// pallet's ref update goes through [`verify_parcel_closure_for_write`] with its namespace.
 pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result<(), String> {
-    verify_local_closure(head, known_complete, PalletNamespace::Meta).map_err(|error| error.to_string())
-}
-
-/// [`verify_parcel_closure_with`] over the local object store.
-fn verify_local_closure(head: &str,
-                        known_complete: Option<&str>,
-                        namespace: PalletNamespace) -> Result<(), ClosureError> {
     // The default checks read straight from the local object store; the serverless head passes an
     // S3 HEAD for blob presence, a bounded-concurrency batch of S3 HEADs for the chunk-presence
     // seam, a store-backed recipe read for the chunk descent, and a store-backed tree read for the
@@ -1778,7 +1781,6 @@ fn verify_local_closure(head: &str,
     verify_parcel_closure_with(
         head,
         known_complete,
-        namespace,
         &|hash| file_utils::does_object_exist(hash),
         &local_chunks_missing,
         &|hash| object_utils::recipe_chunk_hashes(hash),
@@ -1786,24 +1788,19 @@ fn verify_local_closure(head: &str,
     )
 }
 
-/// [`verify_parcel_closure`] for a ref update of a pallet in `namespace`, returning the proof a ref
-/// write accepts in place of verifying the same head again
+/// [`verify_parcel_closure`] for a ref update, returning the proof a ref write accepts in place of verifying the same head again
 /// ([`pallet_utils::update_pallet_head_verified`]). The walk is unscoped, so the proof is for the
-/// full scope: in a sparse warehouse the write verifies again at its own. A user pallet's walk also
-/// refuses a meta-shaped root (see [`verify_parcel_closure_with`]), and the proof records the
-/// namespace it was walked for, so a meta walk's proof never lets a user-pallet write skip that,
-/// and `known_complete`, which a write accepts only as the head its compare-and-set expects.
+/// full scope: in a sparse warehouse the write verifies again at its own. The proof records
+/// `known_complete`, which a write accepts only as the head its compare-and-set expects.
 ///
 /// # Returns
 /// * `Ok(VerifiedClosure)` - Everything is present.
-/// * `Err(ClosureError)`   - If a parcel, tree or blob is missing (or unreadable), or a user
-///                           history holds a meta-shaped root.
+/// * `Err(String)`         - If a parcel, tree or blob is missing (or unreadable).
 pub fn verify_parcel_closure_for_write(head: &str,
-                                       known_complete: Option<&str>,
-                                       namespace: PalletNamespace) -> Result<pallet_utils::VerifiedClosure, ClosureError> {
-    verify_local_closure(head, known_complete, namespace)?;
+                                       known_complete: Option<&str>) -> Result<pallet_utils::VerifiedClosure, String> {
+    verify_parcel_closure(head, known_complete)?;
 
-    Ok(pallet_utils::VerifiedClosure::new(head, PathScope::full(), namespace, known_complete))
+    Ok(pallet_utils::VerifiedClosure::new(head, PathScope::full(), known_complete))
 }
 
 /// [`verify_parcel_closure`], with the leaf-blob presence check made pluggable.
@@ -1814,9 +1811,6 @@ pub fn verify_parcel_closure_for_write(head: &str,
 /// head varies: the AWS serverless head mirrors the parcels and trees it must parse into
 /// a scratch `.forklift`, but leaves the (large, many) working blobs in object storage
 /// and answers this check with an S3 `HEAD` (DESIGN.html §4.6).
-///
-/// For a user pallet the walk also refuses any new parcel whose root tree has the shape of
-/// metadata history (see [`ClosureError::MetaShapedRoot`]).
 ///
 /// # Arguments
 /// * `head`               - The head parcel whose closure is verified.
@@ -1863,54 +1857,19 @@ pub fn verify_parcel_closure_for_write(head: &str,
 pub fn verify_parcel_closure_with(
     head: &str,
     known_complete: Option<&str>,
-    namespace: PalletNamespace,
     blob_exists: &dyn Fn(&str) -> Result<bool, String>,
     chunks_missing: &dyn Fn(&[String]) -> Result<Vec<String>, String>,
     load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
     load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>,
-) -> Result<(), ClosureError> {
+) -> Result<(), String> {
     // A remote must hold the whole closure of every head it accepts: the push gate tolerates no
     // recorded absence.
     let seams = ClosureSeams { blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, sealed: None };
 
     verify_closure_core(
         head, known_complete.as_ref().map(std::slice::from_ref), known_complete, &PathScope::full(),
-        false, namespace == PalletNamespace::User, &seams,
+        false, &seams,
     )
-}
-
-/// Why a closure walk refused a head.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ClosureError {
-    /// A parcel, tree, blob or chunk of the history is missing or unreadable; the message names it.
-    Incomplete(String),
-
-    /// A new parcel of a user pallet's history has a root tree holding a `.forklift` entry: the
-    /// shape of office and meta history, which heal and scope prune walk in full whatever the
-    /// fetch scope. No fetch can mend it, so it is never reported as missing history.
-    MetaShapedRoot {
-        /// The parcel whose root tree has that shape.
-        parcel: String,
-    },
-}
-
-impl From<String> for ClosureError {
-    fn from(missing: String) -> ClosureError {
-        ClosureError::Incomplete(missing)
-    }
-}
-
-impl std::fmt::Display for ClosureError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ClosureError::Incomplete(missing) => f.write_str(missing),
-            ClosureError::MetaShapedRoot { parcel } => write!(
-                f,
-                "Parcel {} holds a \"{}\" entry at its root, which only metadata history may hold.",
-                parcel, crate::globals::FOLDER_NAME_FORKLIFT_ROOT
-            ),
-        }
-    }
 }
 
 /// The object-store reads [`verify_closure_core`] varies by head (see
@@ -1975,17 +1934,14 @@ fn holds_absent(sealed: Option<&SealedTolerance>, hash: &str) -> bool {
 /// * `scope`    - The warehouse fetch scope: content outside it is sealed, never loaded. A full
 ///                scope walks everything.
 /// * `reverify` - The `audit --full` content level, threaded down to each chunked file.
-/// * `refuse_meta_roots` - Refuse a parcel of the segment whose root tree is meta-shaped: set for a
-///                         user pallet's ref update.
 fn verify_closure_core(
     head: &str,
     bounds: Option<&[&str]>,
     base: Option<&str>,
     scope: &PathScope,
     reverify: bool,
-    refuse_meta_roots: bool,
     seams: &ClosureSeams,
-) -> Result<(), ClosureError> {
+) -> Result<(), String> {
     let ClosureSeams { blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, sealed } = *seams;
 
     // The walk reads to learn what the store holds, and a failed read is what it reports: it
@@ -2091,9 +2047,6 @@ fn verify_closure_core(
     // excludes — fall through to a load.
     let mut tree_of: HashMap<String, String> = HashMap::new();
 
-    // The root trees whose shape has been checked, so a root shared by several parcels is read once.
-    let mut roots_checked: HashSet<String> = HashSet::new();
-
     // Seed with `base`: it is the boundary parent of every linear push, and its tree was
     // already loaded above for `base_root`. Without this the common case pays a second read of the
     // same parcel purely to learn a hash already in hand.
@@ -2161,17 +2114,6 @@ fn verify_closure_core(
         bases.sort();
         bases.dedup();
 
-        // Heal and scope prune walk a meta-shaped root tree in full whatever the scope, and heal
-        // roots every parcel of a history it reaches, so a user history may take that shape at no
-        // parcel it newly admits. Checked on the root itself, not inside the tree walk below, which
-        // skips a tree it has already seen as a subtree. A root some candidate base carries is
-        // admitted history's, which passed this check when it was admitted. Any other root is read
-        // from the local store, as the walk reads it: the AWS head's scratch mirrors every tree of
-        // the segment, and the one tree it spares, the bound's root, is a candidate base.
-        if refuse_meta_roots && !bases.contains(&parcel.tree_hash) && roots_checked.insert(parcel.tree_hash.clone()) {
-            refuse_meta_shaped_root(hash, &parcel.tree_hash, blob_exists, sealed)?;
-        }
-
         // At a full scope this is the plain tree walk (the root is in scope); in a sparse
         // warehouse it stops at each out-of-scope boundary. The commit gate presence-checks;
         // content re-verification is `audit --full` only.
@@ -2182,26 +2124,6 @@ fn verify_closure_core(
     }
 
     Ok(())
-}
-
-/// Refuse `parcel` when its root tree `tree_hash` is meta-shaped: the test heal's and scope prune's
-/// walks apply at a root ([`recovery_utils::walks_in_full`]), so the two cannot disagree. A root the
-/// sealed-by-hash record holds absent cannot be read, and passes: the remote it came from checked it.
-fn refuse_meta_shaped_root(parcel: &str,
-                           tree_hash: &str,
-                           object_exists: &dyn Fn(&str) -> Result<bool, String>,
-                           sealed: Option<&SealedTolerance>) -> Result<(), ClosureError> {
-    if sealed_absent(sealed, tree_hash, object_exists)? {
-        return Ok(());
-    }
-
-    let tree = object_utils::load_tree(tree_hash)
-        .map_err(|e| format!("Tree {} is missing or unreadable: {}", tree_hash, e))?;
-
-    match recovery_utils::walks_in_full(&tree, "") {
-        true => Err(ClosureError::MetaShapedRoot { parcel: parcel.to_string() }),
-        false => Ok(()),
-    }
 }
 
 /// Order a push's new segment so every parcel follows the parents that are in the segment with it.
@@ -2317,8 +2239,8 @@ pub fn verify_parcel_closure_scoped(
     };
 
     verify_closure_core(
-        head, known_complete.as_ref().map(std::slice::from_ref), known_complete, scope, reverify, false, &seams,
-    ).map_err(|error| error.to_string())
+        head, known_complete.as_ref().map(std::slice::from_ref), known_complete, scope, reverify, &seams,
+    )
 }
 
 /// Verify the closure of `head` before a ref is moved to it, in this warehouse: every parcel from
@@ -2344,15 +2266,13 @@ pub fn verify_parcel_closure_scoped(
 /// * `sealed`         - The sealed-by-hash record, or `None` to tolerate no recorded absence.
 ///
 /// # Returns
-/// * `Ok(())`            - Everything within the scope is present or held by the record.
-/// * `Err(ClosureError)` - What is missing (or unreadable), or the parcel whose root is
-///                         meta-shaped: the ref is a user pallet's, whose history may not take that
-///                         shape.
+/// * `Ok(())`      - Everything within the scope is present or held by the record.
+/// * `Err(String)` - What is missing (or unreadable).
 pub fn verify_ref_head_closure(head: &str,
                                known_complete: &[String],
                                base: Option<&str>,
                                scope: &PathScope,
-                               sealed: Option<&SealedSet>) -> Result<(), ClosureError> {
+                               sealed: Option<&SealedSet>) -> Result<(), String> {
     let bounds: Vec<&str> = known_complete.iter().map(String::as_str).collect();
     let tolerance = sealed.map(SealedTolerance::new);
     let seams = ClosureSeams {
@@ -2363,7 +2283,7 @@ pub fn verify_ref_head_closure(head: &str,
         sealed: tolerance.as_ref(),
     };
 
-    verify_closure_core(head, Some(&bounds), base, scope, false, true, &seams)
+    verify_closure_core(head, Some(&bounds), base, scope, false, &seams)
 }
 
 /// [`verify_tree_closure`], threaded with the three-valued sparse classifier so an out-of-scope
@@ -3762,6 +3682,109 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    /// The refusal of a chain that must not verify, as text.
+    fn chain_refusal(anchor: &TrustAnchor, head: &str) -> String {
+        match verify_office_chain(anchor, head) {
+            Err(OfficeChainError::Inauthentic(message)) => message,
+            Err(OfficeChainError::Unauthorized { message, .. }) => panic!("refused as unauthorized: {}", message),
+            Ok(_) => panic!("the chain at {} must be refused", head),
+        }
+    }
+
+    // Revert: drop the shape check from `verify_office_chain` → each signed parcel verifies, except
+    // the stray record, which reading the state refuses by itself.
+    #[test]
+    fn a_signed_office_parcel_of_any_other_shape_breaks_the_chain() {
+        use crate::util::office_utils::tests::{odd_office_parcel, OddOfficeShape};
+
+        let fixture = PrivilegeFixture::new("office-shape-live");
+        let (_, head) = fixture.admit("bob@x", Role::Writer, crate::util::office_utils::IdentityClass::Human, None);
+        assert!(verify_office_chain(&fixture.anchor, &head).is_ok(), "what Forklift writes verifies");
+
+        for shape in OddOfficeShape::ALL {
+            let odd = odd_office_parcel(shape, &head, &fixture.admin, &fixture.admin_key_id);
+            let refusal = chain_refusal(&fixture.anchor, &odd);
+            assert!(refusal.contains(&odd), "{:?} must be named: {}", shape, refusal);
+        }
+    }
+
+    // Revert: drop the parent bound from `check_office_parcel_shape` → the merge parcel verifies.
+    #[test]
+    fn an_office_parcel_with_a_second_parent_breaks_the_chain() {
+        let fixture = PrivilegeFixture::new("office-shape-parents");
+        let (_, head) = fixture.admit("bob@x", Role::Writer, crate::util::office_utils::IdentityClass::Human, None);
+        let state = crate::util::office_utils::read_office_state_of(&head).unwrap();
+
+        let merge = crate::util::office_utils::build_and_sign_office_parcel(
+            &state, &fixture.admin, "merge".to_string(), &fixture.admin_key_id,
+            vec![head.clone(), fixture.anchor.genesis.clone()],
+        ).unwrap();
+
+        let refusal = chain_refusal(&fixture.anchor, &merge);
+        assert!(refusal.contains("has 2 parents"), "{}", refusal);
+    }
+
+    // Revert: drop the genesis test from `verify_office_chain` → a genesis with a parent verifies.
+    #[test]
+    fn a_genesis_with_a_parent_breaks_the_chain() {
+        let fixture = PrivilegeFixture::new("office-shape-genesis");
+        let state = crate::util::office_utils::read_office_state().unwrap();
+
+        let child = crate::util::office_utils::build_and_sign_office_parcel(
+            &state, &fixture.admin, "child".to_string(), &fixture.admin_key_id,
+            vec![fixture.anchor.genesis.clone()],
+        ).unwrap();
+
+        // The same parcel is fine as a link of the chain, so only its being the genesis refuses it.
+        assert!(verify_office_chain(&fixture.anchor, &child).is_ok(), "an ordinary link");
+
+        let anchor = TrustAnchor { genesis: child.clone(), ..fixture.anchor.clone() };
+        let refusal = chain_refusal(&anchor, &child);
+        assert!(refusal.contains("has a parent"), "{}", refusal);
+    }
+
+    // Revert: make `check_adopted_office_chain` stop at the head → the odd parcel below is adopted.
+    #[test]
+    fn an_adopted_chain_is_refused_for_any_parcel_of_another_shape() {
+        use crate::util::office_utils::{check_adopted_office_chain, tests::{odd_office_parcel, OddOfficeShape}};
+
+        let fixture = PrivilegeFixture::new("office-shape-adopted");
+        let (_, head) = fixture.admit("bob@x", Role::Writer, crate::util::office_utils::IdentityClass::Human, None);
+        check_adopted_office_chain(&head).expect("what Forklift writes is adoptable");
+
+        let state = crate::util::office_utils::read_office_state_of(&head).unwrap();
+
+        for shape in OddOfficeShape::ALL {
+            let odd = odd_office_parcel(shape, &head, &fixture.admin, &fixture.admin_key_id);
+            let refusal = check_adopted_office_chain(&odd).expect_err("an odd head");
+            assert!(refusal.contains(&odd), "{:?} must be named: {}", shape, refusal);
+
+            let above = crate::util::office_utils::build_and_sign_office_parcel(
+                &state, &fixture.admin, format!("above {:?}", shape), &fixture.admin_key_id, vec![odd.clone()],
+            ).unwrap();
+            let refusal = check_adopted_office_chain(&above).expect_err("an odd parcel below the head");
+            assert!(refusal.contains(&odd), "{:?} must be named: {}", shape, refusal);
+        }
+    }
+
+    // Revert: verify signatures in `check_adopted_office_chain` → the unsigned parcel is refused.
+    #[test]
+    fn an_adopted_chain_is_never_judged_by_its_signatures() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+
+        let fixture = PrivilegeFixture::new("office-shape-unsigned");
+        let tree_hash = object_utils::load_parcel(&fixture.anchor.genesis).unwrap().tree_hash;
+        let mut unsigned = LooseObjectBuilder::build_parcel(&crate::model::parcel::Parcel {
+            tree_hash,
+            parents: Vec::new(),
+            actions: Vec::new(),
+            description: None,
+        });
+        unsigned.store().unwrap();
+
+        crate::util::office_utils::check_adopted_office_chain(&unsigned.hash).expect("frozen history may predate the keys");
     }
 
     /// The trust file's bytes as they stand.

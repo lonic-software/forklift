@@ -372,7 +372,12 @@ adopts = "<hash>"          # re-genesis only: the old office head, kept as attes
 ```
 
 - `genesis` anchors the office chain; `audit` refuses an office history that does not
-  reach it.
+  reach it. The genesis has no parents, and every parcel of the chain has at most one and a
+  tree holding only `.forklift/tracked/users` and `.forklift/tracked/keys` with their record
+  files. `audit` refuses anything else.
+- `adopts` is held to that same shape, parcel by parcel to its root, wherever a remote's
+  anchor is taken, without checking signatures. Local re-genesis does not check it, so it
+  stays usable over damaged older history.
 - `boundary` is the head of every pallet at the moment trust was established: parcels
   reachable from these are the pre-trust (legacy) history and may be unsigned;
   everything else must be signed. The boundary is exact ancestry — timestamps have

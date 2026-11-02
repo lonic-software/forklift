@@ -151,7 +151,7 @@ fn plan_from(
     sources: recovery_utils::GcRootSources,
 ) -> Result<PrunePlan, String> {
     let sealed = sealed_utils::read_sealed().map_err(|error| format!("{} Then run the prune again.", error))?;
-    let (live_parcels, meta_parcels) = reachable_parcels()?;
+    let (live_parcels, meta_parcels) = reachable_parcels(&sources.adopted_heads())?;
     // A haul's proposed head joins the local pallet heads like a removed one: a merge reads the
     // recorded head, which no ref need still reach.
     let proposed = gc_utils::collect_reachable_for_sweep(&sources.haul_heads)?;
@@ -501,9 +501,9 @@ pub fn free_objects(to_free: &[String], _store_access: &StoreAccessExclusive) ->
 ///
 /// Only the persistent pallet heads are roots here: they alone decide what a prune *targets*.
 /// What it must *retain* also counts every other gc root, see [`local_roots`].
-fn reachable_parcels() -> Result<(Vec<String>, Vec<String>), String> {
+fn reachable_parcels(adopted: &[String]) -> Result<(Vec<String>, Vec<String>), String> {
     let mut user_roots: Vec<String> = Vec::new();
-    let mut meta_roots: Vec<String> = Vec::new();
+    let mut meta_roots: Vec<String> = adopted.to_vec();
 
     for (pallet_ref, head) in pallet_utils::all_pallet_refs()? {
         match pallet_ref.namespace {
@@ -522,8 +522,8 @@ fn reachable_parcels() -> Result<(Vec<String>, Vec<String>), String> {
 /// targets through them.
 struct LocalRoots {
     /// Every parcel reachable from a bay's base or parked parcel, an in-progress consolidation or
-    /// cherry-pick, or a trust pin, in any bay, that the pallet heads do not already reach. Walked scoped, like history,
-    /// except a meta-shaped tree, which is walked in full (see [`retain_local_closure`]).
+    /// cherry-pick, or a `boundary` or `distrust_boundary` pin, in any bay, that the pallet heads
+    /// and `adopts` do not already reach. Walked scoped, like history (see [`retain_local_closure`]).
     parcels: Vec<String>,
     /// Every staged inventory shard leaf, in any bay. Retained whatever its path.
     staged: Vec<(String, DirEntryType)>,
@@ -548,7 +548,7 @@ fn root_sources() -> Result<recovery_utils::GcRootSources, String> {
 ///
 /// # Arguments
 /// * `user_parcels` - The parcels the user pallet heads reach, already retained.
-/// * `meta_parcels` - The parcels the meta pallet heads reach, already retained.
+/// * `meta_parcels` - The parcels the meta pallet heads and `adopts` reach, already retained.
 /// * `sources`      - The root sources; their haul heads are already in `user_parcels`.
 fn local_roots(user_parcels: &[String], meta_parcels: &[String], sources: recovery_utils::GcRootSources) -> Result<LocalRoots, String> {
     let known: HashSet<&String> = user_parcels.iter().chain(meta_parcels).collect();
@@ -569,10 +569,10 @@ fn local_roots(user_parcels: &[String], meta_parcels: &[String], sources: recove
 ///
 /// User-pallet parcels are walked scoped — the spine and every in-scope subtree in full; at an
 /// out-of-scope subtree the walk keeps nothing and stops, so the boundary object itself becomes
-/// freeable while its hash stays sealed inside the retained parent spine tree. Meta-pallet
-/// parcels are walked in full: the carve-out never scopes them. So is a user parcel whose tree is
-/// meta-shaped ([`recovery_utils::walks_in_full`]), since a removed or proposed head is not
-/// checked for its namespace (FORK-281).
+/// freeable while its hash stays sealed inside the retained parent spine tree. Meta history is
+/// walked in full: the carve-out never scopes it. The class comes from the root that reached a
+/// parcel, as in heal's enumerating walk, never from its tree: a removed or proposed head is user
+/// history whatever it holds.
 ///
 /// A tree or recipe recorded in `sealed` and absent is held by hash alone: it is retained and not
 /// descended, as a fresh clone would hold it. A recorded one that is present is walked like
@@ -585,7 +585,7 @@ fn collect_retained(
 ) -> Result<HashSet<String>, String> {
     let mut retained: HashSet<String> = HashSet::new();
 
-    // Meta pallets and every in-scope subtree feed one full, path-independent closure walk.
+    // Meta history and every in-scope subtree feed one full, path-independent closure walk.
     let mut full_frontier: VecDeque<String> = VecDeque::new();
 
     for parcel in meta_parcels {
@@ -615,13 +615,6 @@ fn collect_retained(
             continue;
         }
         let tree = object_utils::load_tree(&tree_hash)?;
-
-        // A meta-shaped root is walked in full, however it joined the user parcels: a removed
-        // head or a haul's proposed head is not checked for its namespace (FORK-281).
-        if recovery_utils::walks_in_full(&tree, &path) {
-            full_frontier.push_back(tree_hash);
-            continue;
-        }
 
         for (name, file) in tree.get_files() {
             // A file is never spine; retain it unless it is out of scope (files carry no
@@ -687,15 +680,10 @@ fn collect_retained(
 }
 
 /// Retain what [`LocalRoots`] reach: every staged leaf whatever its path (descending a chunked
-/// entry's recipe), and every local parcel: user history scoped, meta history in full. Which is
-/// which is read off the root tree's shape ([`recovery_utils::walks_in_full`], the rule
-/// [`collect_retained`] applies to its user parcels), never off the root that reached it: a trust
-/// pin can name either, and the `adopts` pin names office history that no meta head reaches after
-/// a re-genesis (FORK-281).
+/// entry's recipe), and every local parcel, scoped like user history. Meta history is not among
+/// them: [`collect_retained`] walks it in full, `adopts` included.
 ///
-/// Meta history is walked in full because the fetch scope never selects from it: its own content
-/// is the history, and its metadata folder reads out of scope at the root. For user history,
-/// scoped is enough, because a prune only ever frees its targets, and every
+/// Scoped is enough, because a prune only ever frees its targets, and every
 /// target is pallet history under the pruned path. A local parcel's own work (an edit parked
 /// under that path) is a new object, never a target, so it survives whatever this walk does.
 /// What a local parcel shares with a target is history: re-fetchable when the remote holds it,
@@ -744,11 +732,6 @@ fn retain_local_closure(
 
         retained.insert(tree_hash.clone());
         let tree = object_utils::load_tree(&tree_hash)?;
-
-        // A meta tree is retained in full whatever reached it, as in `collect_retained`: the
-        // `adopts` pin names office history no meta head reaches after a re-genesis, and the scope
-        // would read its metadata folder as out of scope (FORK-281).
-        let path = path.filter(|path| !recovery_utils::walks_in_full(&tree, path));
 
         for (name, file) in tree.get_files() {
             let kept = match &path {
@@ -1164,7 +1147,7 @@ mod tests {
             "prune must free only the pruned path, not all out-of-scope content");
     }
 
-    /// A parcel over a meta-shaped tree, `.forklift/tracked/cells/cell`, whose one cell is `blob`.
+    /// A parcel over a tree of meta form, `.forklift/tracked/cells/cell`, whose one cell is `blob`.
     fn office_parcel_holding(blob: &str) -> String {
         let cells = store_tree(&[("cell", blob, DirEntryType::Normal)]);
         let tracked = store_tree(&[("cells", &cells, DirEntryType::Tree)]);
@@ -1174,10 +1157,9 @@ mod tests {
     }
 
     /// FORK-281: after a re-genesis the anchor's `adopts` pin names office history no meta head
-    /// reaches. Its tree is meta-shaped, so it is retained in full whatever the fetch scope, and
-    /// a cell sharing its bytes with the pruned path stays. Mutation: drop the meta-tree rule in
-    /// `retain_local_closure` → `.forklift` reads out of scope at the root, the shared blob is
-    /// freed → red.
+    /// reaches. It is retained in full whatever the fetch scope, and a cell sharing its bytes with
+    /// the pruned path stays. Mutation: leave `adopts` out of the meta parcels → `.forklift` reads
+    /// out of scope at the root, the shared blob is freed → red.
     #[test]
     fn plan_prune_keeps_an_adopted_office_cell_the_pruned_path_shares() {
         let _scratch = Scratch::new("keeps-adopted-office");
@@ -1198,12 +1180,11 @@ mod tests {
         assert_eq!(plan.to_free, vec![f.web_tree.clone()]);
     }
 
-    /// FORK-281: a trust pin over a user-shaped tree is still walked within the scope, so a blob it
-    /// holds only out of scope is freed with the pruned path. Pins `adopts` apart from the other
-    /// roots by the tree's shape, never by the pin. Mutation: walk every pinned parcel in full → the
-    /// pinned `other/w.txt` keeps the shared blob → red.
+    /// FORK-281: a `Gap` pin is still walked within the scope, so a blob it holds only out of scope
+    /// is freed with the pruned path. Mutation: walk every pinned parcel in full → the pinned
+    /// `other/w.txt` keeps the shared blob → red.
     #[test]
-    fn plan_prune_still_frees_a_blob_a_user_shaped_pin_holds_out_of_scope() {
+    fn plan_prune_still_frees_a_blob_a_gap_pin_holds_out_of_scope() {
         let _scratch = Scratch::new("frees-user-pin");
         let f = build_fixture();
 
@@ -1217,24 +1198,98 @@ mod tests {
         let plan = plan_from(&["src/web".to_string()], &post_prune, &lifted(), &[], sources).unwrap();
 
         assert!(plan.to_free.contains(&f.web_blob),
-            "a pinned user tree holds the blob only out of scope, so it is freed: {:?}", plan.to_free);
+            "a pinned tree holds the blob only out of scope, so it is freed: {:?}", plan.to_free);
     }
 
-    /// FORK-281: a meta-shaped tree that joins the user parcels, here as a removed head, is retained
-    /// in full like meta history. Mutation: drop the meta-tree rule in `collect_retained` → the
-    /// cell's bytes, shared with the pruned path, are freed → red.
+    /// FORK-332: a crafted head with the metadata folder at its root is user history on every route
+    /// that is not a meta ref or `adopts`, so what it holds outside the scope is freed with the
+    /// pruned path. Every fixture has the remote hold the crafted head: unlifted, it is kept as
+    /// unlifted, whatever the class. Mutation: walk a root tree holding `.forklift` in full → the
+    /// cell's bytes, shared with the pruned path, stay → red on each route.
     #[test]
-    fn plan_prune_keeps_a_cell_a_meta_shaped_removed_head_holds() {
-        let _scratch = Scratch::new("keeps-removed-office");
+    fn plan_prune_frees_a_cell_a_crafted_head_holds_on_a_user_route() {
+        type Route = fn(&mut recovery_utils::GcRootSources, &str) -> Vec<String>;
+        let routes: [(&str, Route); 6] = [
+            ("a user ref", |_, crafted| {
+                pallet_utils::update_pallet_head_in(PalletNamespace::User, "side", None, crafted, &pallet_utils::RefPreconditions::NONE).unwrap();
+                Vec::new()
+            }),
+            ("a removed head", |_, crafted| vec![crafted.to_string()]),
+            ("a haul's proposed head", |sources, crafted| { sources.haul_heads.push(crafted.to_string()); Vec::new() }),
+            ("a mirror root", |sources, crafted| { sources.mirror_roots.push(crafted.to_string()); Vec::new() }),
+            ("a tombstone", |sources, crafted| { sources.tombstone_heads.push(crafted.to_string()); Vec::new() }),
+            ("a boundary pin", |sources, crafted| {
+                sources.pin_parcels.push((crafted.to_string(), office_utils::PinAbsencePolicy::Gap));
+                Vec::new()
+            }),
+        ];
+
+        for (route, plant) in routes {
+            let _scratch = Scratch::new("frees-crafted");
+            let f = build_fixture();
+            let crafted = office_parcel_holding(&f.web_blob);
+            let mut remote_heads = lifted();
+            remote_heads.push(crafted.clone());
+
+            let mut sources = root_sources().unwrap();
+            let removed = plant(&mut sources, &crafted);
+
+            let post_prune = PathScope::from_prefixes(["src/api"]);
+            let plan = plan_from(&["src/web".to_string()], &post_prune, &remote_heads, &removed, sources).unwrap();
+
+            assert!(plan.to_free.contains(&f.web_blob), "{}: {:?}", route, plan.to_free);
+        }
+    }
+
+    /// FORK-332: a meta pallet is retained in full whatever its tree holds and whichever way its
+    /// parcels are also reached. Mutations: seed the meta heads as user history → the shared cell is
+    /// freed; decide by the tree's form → the plain tree's blob is freed; both red.
+    #[test]
+    fn plan_prune_keeps_what_a_meta_pallet_holds_whatever_its_form() {
+        let _scratch = Scratch::new("keeps-meta-forms");
         let f = build_fixture();
-        let removed = office_parcel_holding(&f.web_blob);
+
+        let other = store_tree(&[("w.txt", &f.web_blob, DirEntryType::Normal)]);
+        let plain = store_parcel(&store_tree(&[("other", &other, DirEntryType::Tree)]), Vec::new());
+        pallet_utils::update_meta_pallet_head("notes", None, &plain, &pallet_utils::RefPreconditions::NONE).unwrap();
+        let shaped = office_parcel_holding(&f.readme_blob);
+        pallet_utils::update_meta_pallet_head("other", None, &shaped, &pallet_utils::RefPreconditions::NONE).unwrap();
+        // A crafted user head naming the meta parcels as parents.
+        let user = store_parcel(&f.root_tree, vec![plain, shaped]);
+        pallet_utils::update_pallet_head_in(PalletNamespace::User, "side", None, &user, &pallet_utils::RefPreconditions::NONE).unwrap();
+        let mut remote_heads = lifted();
+        remote_heads.push(user);
 
         let post_prune = PathScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[removed], &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string(), "README".to_string()], &post_prune, &remote_heads, &[], &store_access()).unwrap();
 
-        assert!(!plan.to_free.contains(&f.web_blob),
-            "a blob a meta-shaped removed head holds must not be freed: {:?}", plan.to_free);
-        assert_eq!(plan.to_free, vec![f.web_tree.clone()]);
+        assert!(!plan.to_free.contains(&f.web_blob), "{:?}", plan.to_free);
+        assert!(!plan.to_free.contains(&f.readme_blob), "{:?}", plan.to_free);
+    }
+
+    /// FORK-332: a tree lost under meta history fails the plan: a prune cannot tell what the lost
+    /// tree held. Mutation: leave `adopts` out of the meta parcels → the plan passes over it.
+    #[test]
+    fn plan_prune_fails_on_a_tree_lost_under_meta_history() {
+        for adopted in [false, true] {
+            let _scratch = Scratch::new("meta-lost-tree");
+            let f = build_fixture();
+            let lost = store_tree(&[("record", &f.web_blob, DirEntryType::Normal)]);
+            let root = store_tree(&[("other", &lost, DirEntryType::Tree)]);
+            let meta = store_parcel(&root, Vec::new());
+            let (folder, file) = file_utils::get_path_for_object(&lost).unwrap();
+            std::fs::remove_file(std::path::PathBuf::from(folder).join(file)).unwrap();
+
+            let mut sources = root_sources().unwrap();
+            if adopted {
+                sources.pin_parcels.push((meta, office_utils::PinAbsencePolicy::Loss));
+            } else {
+                pallet_utils::update_meta_pallet_head("notes", None, &meta, &pallet_utils::RefPreconditions::NONE).unwrap();
+            }
+
+            let post_prune = PathScope::from_prefixes(["src/api"]);
+            assert!(plan_from(&["src/web".to_string()], &post_prune, &lifted(), &[], sources).is_err(), "adopted: {}", adopted);
+        }
     }
 
     #[test]
