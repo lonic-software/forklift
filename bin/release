@@ -26,6 +26,9 @@ git fetch --tags origin main
   { echo "release: main is not in sync with origin/main" >&2; exit 1; }
 ! git rev-parse --verify --quiet "refs/tags/v$version" >/dev/null ||
   { echo "release: tag v$version already exists" >&2; exit 1; }
+# A release says what changed: Unreleased needs an entry, and the rollover below needs its heading.
+awk '/^## /{in_unreleased = ($0 == "## [Unreleased]")} in_unreleased && /^- /{found = 1} END {exit !found}' CHANGELOG.md ||
+  { echo "release: CHANGELOG.md has no entries under '## [Unreleased]'" >&2; exit 1; }
 
 ./bin/check
 
@@ -41,12 +44,18 @@ V="$version" perl -pi -e '
 ' Cargo.toml
 cargo check --quiet   # refresh Cargo.lock's version entries
 
+echo "── roll CHANGELOG.md's Unreleased section into $version"
+V="$version" D="$(date -u +%F)" perl -pi -e '
+  s/^## \[Unreleased\]$/## [Unreleased]\n\n## [$ENV{V}] - $ENV{D}/ and $n++;
+  END { $n == 1 or die "expected exactly one Unreleased heading in CHANGELOG.md\n" }
+' CHANGELOG.md
+
 echo "── commit, tag, push"
-if git diff --quiet Cargo.toml Cargo.lock; then
+if git diff --quiet Cargo.toml Cargo.lock CHANGELOG.md; then
   echo "   (already at $version — tagging the current HEAD)"
 else
   git --no-pager diff --stat
-  git add Cargo.toml Cargo.lock
+  git add Cargo.toml Cargo.lock CHANGELOG.md
   git commit -m "release v$version"
 fi
 git tag "v$version"

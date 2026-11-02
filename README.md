@@ -32,6 +32,7 @@ Detailed guides live in [`docs/guide/`](docs/guide/README.md):
 - **[Running a server](docs/SERVER.md)** — self-host a forklift remote.
 - **[Contributing](docs/guide/contributing.md)** — architecture, build/test, conventions.
 - **[Design & roadmap](docs/DESIGN.html)** — the source of truth for how and why.
+- **[Changelog](CHANGELOG.md)** · **[Security policy](SECURITY.md)** · **[Code of conduct](CODE_OF_CONDUCT.md)**
 
 ## Install
 
