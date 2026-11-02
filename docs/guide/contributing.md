@@ -152,7 +152,7 @@ so the operational commands are one launcher away; the real logic lives in `bin/
 | --- | --- |
 | `pult check` | `bin/check` — the [formatting guard](#formatting) + build + test + clippy, the same checks CI runs (CI runs the tests under cargo-nextest and skips them on docs-only pull requests), plus docs freshness. A test that reads a file under `docs/` must name it by its literal repo path (e.g. `"../../docs/guide/cli.md"`), because that is how CI tells a docs-only change from one a test depends on |
 | `pult test` | just the test suite (fast loop) |
-| `pult release` | `bin/release` — preflight, bump the workspace version, tag `v<x.y.z>`, push (the tag triggers `.github/workflows/release.yml`) |
+| `pult release` | `bin/release` — preflight, bump the workspace version, roll the changelog, tag `v<x.y.z>`, push (the tag triggers `.github/workflows/release.yml`) |
 | `pult install` | build & install the CLI + server from this checkout |
 | `pult dev-server` | `bin/serve` — a throwaway local `forklift-server` over `.dev/server` for testing lift/lower/clone |
 | `pult design` | open `docs/DESIGN.html` (the source of truth) in a browser |
@@ -160,7 +160,9 @@ so the operational commands are one launcher away; the real logic lives in `bin/
 
 Cutting a release: `pult release` picks the next patch/minor/major from the latest `v*`
 tag (or run `bin/release <x.y.z> --dry-run` to preflight without touching anything). It
-refuses unless the working tree is clean and `main` is in sync with `origin/main`.
+refuses unless the working tree is clean, `main` is in sync with `origin/main`, and
+[`CHANGELOG.md`](../../CHANGELOG.md) has entries under **Unreleased**, which it then rolls into the new
+version. A pull request that changes something a user would notice adds its entry there.
 
 ---
 
