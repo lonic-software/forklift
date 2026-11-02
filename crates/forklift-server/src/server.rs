@@ -3944,7 +3944,7 @@ mod tests {
 
     /// A client mid-upload must still be told why, not see a dead connection: the refusal arrives
     /// while it is writing a body the server will not keep. Reverts: the discard removed — the
-    /// client's write can then break before it reads the 401, a race this test usually loses.
+    /// client's write can then break before it reads the 401; that is a race, so this may stay green.
     #[tokio::test]
     async fn a_client_uploading_with_a_bad_token_reads_the_refusal() {
         let root = scratch_dir("auth-layer-client");
@@ -7211,7 +7211,7 @@ mod tests {
         assert!(body.contains("trust is a one-way door"), "{}", body);
     }
 
-    /// The office fixture's state for an office fixture, for the meta-pallet falsifiers.
+    /// The office fixture's state, for the meta-pallet falsifiers.
     fn office_state(fixture: &OfficeFixture) -> Arc<AppState> {
         Arc::new(single_mode_state(fixture.root.clone()))
     }
