@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cut a release: preflight → checks → bump the workspace version → commit →
+# Cut a release: preflight → checks → bump the workspace version → roll the changelog → commit →
 # tag → push. Pushing the v* tag triggers .github/workflows/release.yml, which
 # builds every target and publishes the GitHub release (both heads + checksums).
 #
