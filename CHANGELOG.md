@@ -36,6 +36,8 @@ Entries are written by hand in the pull request that makes the change, under **U
 
 ### Fixed
 
+- `forklift-server` authenticates from a request's headers before reading its body, so an
+  unauthenticated peer can no longer hold server memory by opening large uploads.
 - Many silent-loss, case-folding, durability and trust-verification fixes. Pull request titles from
   #152 to #327 have the detail.
 

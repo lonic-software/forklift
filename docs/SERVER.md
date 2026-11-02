@@ -346,6 +346,9 @@ forklift.example.com {
 Request timeouts, connection limits and rate limiting also belong to the proxy layer
 (nginx/caddy/haproxy do this better than any embedded knob). `max_body_mb` is the one
 limit the server enforces itself, because it gates disk-fill abuse behind verification.
+It applies to callers the server has admitted: authentication runs on the request's headers,
+and a refused caller's body is thrown away as it arrives, never held in memory, for at most 5
+seconds and 128 MiB before the connection closes.
 
 **The single-writer rule:** exactly one serving process per warehouse root; a second server
 on the same root is refused at startup, since the serve lock it needs is held. Do not point two

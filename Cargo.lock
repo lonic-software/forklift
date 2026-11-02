@@ -1281,6 +1281,7 @@ dependencies = [
  "serde_json",
  "subtle",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "toml_edit",
  "tower-http",
