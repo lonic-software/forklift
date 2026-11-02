@@ -2039,7 +2039,7 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
 /// both collects every absence found and (per the module doc comment) turns on the terminal-
 /// leaf/chunk presence checks that [`closure_references_any`] skips entirely. Same descent, so this
 /// can never tolerate (or fail to tolerate) anything [`closure_references_any`] doesn't — except
-/// that this walk keeps every tree but a meta tree within the warehouse's fetch scope
+/// that this walk keeps every tree a meta root does not reach within the warehouse's fetch scope
 /// (FORK-262): a sparse clone never fetched what lies outside it, so recording those sealed
 /// objects as vanished would refuse every torn heal there. A fetch scope that cannot be read is a
 /// degraded source, and the walk then runs in full.

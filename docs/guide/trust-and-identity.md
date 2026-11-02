@@ -63,6 +63,7 @@ this warehouse must be signed** — this cannot be undone.
 A warehouse that holds an office but has lost its trust file is refused: a new
 genesis would silently replace the chain. `forklift lower` restores the anchor from
 a remote that holds this warehouse's trust; otherwise restore the file from a backup.
+With neither, trust cannot be re-established there: start a new warehouse.
 
 - If a remote is configured, its pallet heads are folded into the trust boundary
   (history the remote already has stays valid unsigned), so the remote must be

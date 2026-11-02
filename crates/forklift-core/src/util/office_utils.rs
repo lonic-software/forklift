@@ -813,9 +813,9 @@ pub fn collect_trust_pin_roots(policy: TrustPinReadPolicy) -> Result<TrustPinRoo
 /// * `office_parcel_hash` - The hash of the office parcel.
 ///
 /// # Returns
-/// * `Ok(Parcel)`  - The parcel.
-/// * `Err(String)` - The refusal, or why an object could not be read.
-pub fn check_office_parcel_shape(office_parcel_hash: &str) -> Result<Parcel, String> {
+/// * `Ok((Parcel, OfficeState))` - The parcel and the state its records hold.
+/// * `Err(String)`               - The refusal, or why an object could not be read.
+pub fn check_office_parcel_shape(office_parcel_hash: &str) -> Result<(Parcel, OfficeState), String> {
     let parcel = object_utils::load_parcel(office_parcel_hash)?;
 
     if parcel.parents.len() > 1 {
@@ -849,9 +849,9 @@ pub fn check_office_parcel_shape(office_parcel_hash: &str) -> Result<Parcel, Str
     }
 
     // What `users` and `keys` hold: only record files, named for what they hold.
-    read_office_state_of(office_parcel_hash)?;
+    let state = read_office_state_of(office_parcel_hash)?;
 
-    Ok(parcel)
+    Ok((parcel, state))
 }
 
 /// The refusal of a parcel [`check_office_parcel_shape`] finds is not of office shape.
@@ -877,7 +877,7 @@ pub fn check_adopted_office_chain(adopts: &str) -> Result<(), String> {
     let mut cursor = adopts.to_string();
 
     loop {
-        match check_office_parcel_shape(&cursor)?.parents.into_iter().next() {
+        match check_office_parcel_shape(&cursor)?.0.parents.into_iter().next() {
             Some(parent) => cursor = parent,
             None => return Ok(()),
         }

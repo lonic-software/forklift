@@ -34,11 +34,7 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
     // An office with no anchor lost its anchor: a new genesis would orphan every parcel that
     // office vouches for, and no head accepts an anchor over one.
     if pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?.is_some() {
-        return Err(
-            "This warehouse holds an office but no trust anchor: its anchor was lost. Nothing was \
-            changed. If a remote holds this warehouse's trust, \"forklift lower\" restores the anchor; \
-            otherwise restore the warehouse's trust file from a backup.".to_string()
-        );
+        return Err(LOST_ANCHOR.to_string());
     }
 
     // Everything reachable from the current pallet heads is the pre-trust history:
@@ -749,6 +745,10 @@ pub fn regenesis(confirm: bool) -> Result<(), String> {
     let operator = config_utils::get_operator()?;
 
     let Some((old_anchor, old_anchor_bytes)) = office_utils::read_trust_anchor_with_bytes()? else {
+        if pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?.is_some() {
+            return Err(LOST_ANCHOR.to_string());
+        }
+
         return Err(
             "Trust is not established for this warehouse; there is nothing to reset. \
             Use \"forklift office enroll\".".to_string()
@@ -1162,6 +1162,12 @@ pub(crate) mod tests {
         assert_ne!(pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME).unwrap(), office_before);
     }
 }
+
+/// The refusal of `enroll` and `regenesis` over an office whose anchor is gone.
+const LOST_ANCHOR: &str = "This warehouse holds an office but no trust anchor: its anchor was lost. Nothing was \
+    changed. If a remote holds this warehouse's trust, \"forklift lower\" restores the anchor; otherwise \
+    restore the warehouse's trust file from a backup. With neither, trust cannot be re-established here: \
+    start a new warehouse with \"forklift prepare\" and enroll there.";
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
 #[cfg(feature = "docgen")]

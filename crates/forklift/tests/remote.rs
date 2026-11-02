@@ -3042,6 +3042,11 @@ fn enroll_refuses_an_office_with_no_anchor_and_its_ways_out_work() {
     assert!(!trust.exists(), "no anchor is written");
     assert_eq!(office_head(&area), office_before, "the office is not moved");
 
+    // A reset has no anchor to replace, and must not send this state back to enroll.
+    let reset = area.forklift("a", &["office", "regenesis", "--confirm"]);
+    assert!(!reset.status.success(), "{}{}", stdout(&reset), stderr(&reset));
+    assert!(stderr(&reset).contains("holds an office but no trust anchor"), "{}", stderr(&reset));
+
     std::fs::write(&trust, &held).unwrap();
     assert_success(&area.forklift("a", &["audit", "@office"]));
 

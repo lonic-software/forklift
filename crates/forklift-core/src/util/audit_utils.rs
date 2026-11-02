@@ -126,7 +126,7 @@ pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<Of
     let mut previous_state: Option<OfficeState> = None;
 
     for hash in &chain {
-        let shaped = crate::util::office_utils::check_office_parcel_shape(hash).map_err(Inauthentic)?;
+        let (shaped, state) = crate::util::office_utils::check_office_parcel_shape(hash).map_err(Inauthentic)?;
 
         if *hash == anchor.genesis && !shaped.parents.is_empty() {
             return Err(Inauthentic(format!(
@@ -135,8 +135,6 @@ pub fn verify_office_chain(anchor: &TrustAnchor, office_head: &str) -> Result<Of
                 hash
             )));
         }
-
-        let state = crate::util::office_utils::read_office_state_of(hash).map_err(Inauthentic)?;
 
         let lookup_state = previous_state.as_ref().unwrap_or(&state);
 
