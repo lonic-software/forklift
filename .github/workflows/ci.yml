@@ -138,14 +138,6 @@ jobs:
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
 
-      # Trial (FORK-65): target/ on a ReFS Dev Drive on Windows, mounted in place so rust-cache's
-      # relative target path still finds it.
-      - uses: samypr100/setup-dev-drive@562171fe8df7401fdf582d766cd3b6ab80d5b1a0 # v4.1.0
-        if: runner.os == 'Windows'
-        with:
-          drive-size: 24GB
-          mount-path: ${{ github.workspace }}/target
-
       # One OS's shares build under the same cache key, and a key is saved once. The last share
       # saves it: it is the one that also builds for the doc-tests and Clippy, so the cache holds
       # their artifacts too, and no two shares race to upload the same files.
