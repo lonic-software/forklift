@@ -2,6 +2,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use crate::builder::object::loose_object_builder::LooseObjectBuilder;
 use crate::enums::dir_entry_type::DirEntryType;
+use crate::enums::object::loose_object_version::LooseObjectVersion;
 use crate::enums::object::parsed_object::ParsedObject;
 use crate::enums::object_type::ObjectType;
 use crate::globals;
@@ -762,7 +763,7 @@ thread_local! {
 pub(crate) fn validate_imported_object(claimed_hash: &str, bytes: &[u8]) -> Result<(), String> {
     verify_object_bytes(claimed_hash, bytes)?;
     enforce_object_ceiling(bytes)?;
-    enforce_chunk_ceiling(claimed_hash, bytes)
+    enforce_header_policy(claimed_hash, bytes)
 }
 
 /// Store raw object bytes received from elsewhere (a remote or a bundle). The claimed
@@ -828,7 +829,7 @@ fn store_object_bytes_impl(claimed_hash: &str, bytes: &[u8], check_presence: boo
     // store as well as on read, even though a larger object would otherwise be a legal object.
     // Without this a malicious recipe could reference an over-size chunk and the streaming-
     // assembly memory bound would be far looser than the per-chunk ceiling explicit types buy.
-    enforce_chunk_ceiling(claimed_hash, bytes)?;
+    enforce_header_policy(claimed_hash, bytes)?;
 
     if check_presence && file_utils::does_object_exist(claimed_hash)? {
         return Ok(false);
@@ -844,54 +845,109 @@ fn store_object_bytes_impl(claimed_hash: &str, bytes: &[u8], check_presence: boo
     Ok(true)
 }
 
+/// Why [`peek_object_header`] read no header.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PeekError {
+    /// The header begins with a loose object version this build does not read. Since an object's
+    /// name is the hash of its bytes, such an object can never be rewritten into a version this
+    /// build reads: it was written by a newer Forklift, or the bytes are not an object at all.
+    /// Callers that otherwise let an unreadable header pass refuse on this one.
+    UnknownVersion(u64),
+
+    /// The bytes are not a header, or not yet a whole one (a streamed prefix may still be short).
+    Malformed(String),
+}
+
+impl std::fmt::Display for PeekError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PeekError::UnknownVersion(version) => write!(
+                formatter,
+                "The object has loose object version {}, which this build does not read. A newer \
+                 Forklift wrote it, or it is not a Forklift object; update the binary.",
+                version
+            ),
+            PeekError::Malformed(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
+impl From<PeekError> for String {
+    fn from(error: PeekError) -> String {
+        error.to_string()
+    }
+}
+
+/// The refusal for an object arriving from elsewhere whose version this build does not read: an
+/// object that cannot be read must not be stored as though it could.
+fn unknown_version_error(claimed_hash: &str, version: u64) -> String {
+    format!(
+        "Object {} has loose object version {}, which this build does not read; refusing to store \
+         it. A newer Forklift wrote it, or it is not a Forklift object; update the binary.",
+        claimed_hash, version
+    )
+}
+
 /// Peek a loose object's header without a full parse: its type and the length of the header
 /// (version VLQ, type VLQ, content-length VLQ, terminating null). The payload is everything after
 /// the header, so `bytes.len() - header_len` is the true payload length.
 ///
 /// # Arguments
-/// * `bytes` - The full (uncompressed) object bytes.
+/// * `bytes` - The full (uncompressed) object bytes, or a prefix of them holding the header.
 ///
 /// # Returns
-/// * `Ok((ObjectType, usize))` - The object type and the header length in bytes.
-/// * `Err(String)`             - If the header is malformed.
-pub fn peek_object_header(bytes: &[u8]) -> Result<(ObjectType, usize), String> {
-    let (_version, after_version) = byte_utils::number_from_vlq_bytes(0, bytes)
-        .map_err(|e| format!("Failed to peek object version: {}", e))?;
+/// * `Ok((ObjectType, usize))`         - The object type and the header length in bytes.
+/// * `Err(PeekError::UnknownVersion)`  - If the version is one this build does not read. It is
+///                                       judged as soon as the version is whole, so a prefix too
+///                                       short for the rest of the header still yields it.
+/// * `Err(PeekError::Malformed)`       - If the header is malformed or incomplete.
+pub fn peek_object_header(bytes: &[u8]) -> Result<(ObjectType, usize), PeekError> {
+    let (version, version_len) = byte_utils::number_from_vlq_bytes(0, bytes)
+        .map_err(|e| PeekError::Malformed(format!("Failed to peek object version: {}", e)))?;
 
-    let (type_code, after_type) = byte_utils::number_from_vlq_bytes(after_version, bytes)
-        .map_err(|e| format!("Failed to peek object type: {}", e))?;
+    LooseObjectVersion::from_code(version).map_err(|_| PeekError::UnknownVersion(version))?;
 
-    let object_type = ObjectType::from_code(type_code)?;
+    let (type_code, type_len) = byte_utils::number_from_vlq_bytes(version_len, bytes)
+        .map_err(|e| PeekError::Malformed(format!("Failed to peek object type: {}", e)))?;
+    let after_type = version_len + type_len;
 
-    let (_length, after_length) = byte_utils::number_from_vlq_bytes(after_type, bytes)
-        .map_err(|e| format!("Failed to peek object content length: {}", e))?;
+    let object_type = ObjectType::from_code(type_code).map_err(PeekError::Malformed)?;
 
-    // The header ends at the terminating null byte (written by `LooseObjectBuilder::write_header`).
-    let (_, null_read) = byte_utils::read_until_byte_value(after_length, bytes, globals::BYTE_NULL)
-        .ok_or_else(|| "Object header has no terminating null byte.".to_string())?;
+    let (_length, length_len) = byte_utils::number_from_vlq_bytes(after_type, bytes)
+        .map_err(|e| PeekError::Malformed(format!("Failed to peek object content length: {}", e)))?;
+    let after_length = after_type + length_len;
 
-    Ok((object_type, after_length + null_read))
+    // The header ends at the null byte `LooseObjectBuilder::write_header` puts right after the
+    // length.
+    if bytes.get(after_length) != Some(&globals::BYTE_NULL) {
+        return Err(PeekError::Malformed("Object header has no terminating null byte.".to_string()));
+    }
+
+    Ok((object_type, after_length + 1))
 }
 
-/// Enforce the per-type chunk ceiling on the way *into* the store: a `Chunk`-typed object whose
-/// payload exceeds `chunk_utils::MAX_CHUNK_BYTES` is refused. Non-chunk objects pass untouched
-/// (their own ceilings live elsewhere). The check is on the true payload length (after the
-/// header), not a declared length, so a lying header cannot slip an over-size chunk through.
+/// Enforce what an object's header decides on the way *into* the store. An object whose version
+/// this build does not read is refused: it could never be read back. A `Chunk`-typed object whose
+/// payload exceeds `chunk_utils::MAX_CHUNK_BYTES` is refused. Everything else passes (other types'
+/// ceilings live elsewhere). The chunk check is on the true payload length (after the header), not
+/// a declared length, so a lying header cannot slip an over-size chunk through.
 ///
 /// # Arguments
 /// * `claimed_hash` - The object's hash (for the error message).
 /// * `bytes`        - The full (uncompressed) object bytes.
 ///
 /// # Returns
-/// * `Ok(())`      - If the object is not an over-size chunk.
-/// * `Err(String)` - If it is a `Chunk` object above the ceiling.
-fn enforce_chunk_ceiling(claimed_hash: &str, bytes: &[u8]) -> Result<(), String> {
-    // Only a *confirmed* over-size chunk is refused. An object whose header cannot be peeked is
-    // not a recognizable chunk (a real chunk always has a valid header); pass it through — this
-    // path is content-addressing, not a general validator, and the read-side parser (`load_chunk`)
-    // enforces the same ceiling on anything that is actually read back as a chunk.
-    let Ok((object_type, header_len)) = peek_object_header(bytes) else {
-        return Ok(());
+/// * `Ok(())`      - If the object's version is read by this build and it is not an over-size chunk.
+/// * `Err(String)` - If its version is unknown, or it is a `Chunk` object above the ceiling.
+fn enforce_header_policy(claimed_hash: &str, bytes: &[u8]) -> Result<(), String> {
+    // Only a *confirmed* over-size chunk is refused. An object whose header is malformed is not a
+    // recognizable chunk (a real chunk always has a valid header); pass it through — this path is
+    // content-addressing, not a general validator, and the read-side parser (`load_chunk`) enforces
+    // the same ceiling on anything that is actually read back as a chunk.
+    let (object_type, header_len) = match peek_object_header(bytes) {
+        Ok(header) => header,
+        Err(PeekError::UnknownVersion(version)) => return Err(unknown_version_error(claimed_hash, version)),
+        Err(PeekError::Malformed(_)) => return Ok(()),
     };
 
     if object_type == ObjectType::Chunk {
@@ -1128,18 +1184,24 @@ fn stream_to_temp(claimed_hash: &str,
                     object_type = Some(peeked_type);
                     header_len = peeked_header_len;
                 }
-                Err(_) if prefix.len() > 4096 => {
+                // A whole version is judged at once, however short the prefix: the store paths
+                // refuse an object this build could never read.
+                Err(PeekError::UnknownVersion(version)) => {
+                    return Err(unknown_version_error(claimed_hash, version));
+                }
+                Err(PeekError::Malformed(_)) if prefix.len() > 4096 => {
                     // Sentinel: give up peeking, but do not fail — an unrecognized header is not a
                     // chunk, and the hash check still guards what actually lands.
                     header_len = usize::MAX;
                 }
-                Err(_) => {}
+                // Malformed so far may only mean the prefix is still too short.
+                Err(PeekError::Malformed(_)) => {}
             }
         }
 
         // A `Chunk`-typed object whose payload exceeds the per-chunk ceiling is refused mid-stream,
         // before the whole (bounded) payload is even written — the streaming twin of
-        // `enforce_chunk_ceiling`.
+        // `enforce_header_policy`.
         if object_type == Some(ObjectType::Chunk)
             && read_total.saturating_sub(header_len as u64) > chunk_utils::MAX_CHUNK_BYTES as u64 {
             return Err(format!(
@@ -1941,6 +2003,92 @@ mod tests {
         assert!(err.contains("chunk ceiling"), "{}", err);
         assert!(!file_utils::does_object_exist(&object.hash).unwrap(), "nothing unverified may land");
         assert!(no_temp_files_left(&_scratch.root), "the temp file must be cleaned up");
+    }
+
+    /// `object`'s bytes with their loose object version replaced by `version` (a single VLQ byte),
+    /// and the hash of the result, so the object is content-addressed correctly but unreadable.
+    fn with_version(object: &crate::model::object::loose_object::LooseObject, version: u8) -> (String, Vec<u8>) {
+        assert!(version < 0x80, "a single-byte VLQ");
+        assert_eq!(object.content[0], 1, "the current loose object version is 1");
+        let mut bytes = object.content.clone();
+        bytes[0] = version;
+        (hash_object_bytes(&bytes), bytes)
+    }
+
+    /// The peeked header length is the whole header, version through null, including a content
+    /// length that is itself zero and so encodes as a null byte.
+    #[test]
+    fn peek_object_header_measures_the_whole_header() {
+        let blob = LooseObjectBuilder::build_blob(&Blob { content: vec![7u8; 3] });
+        assert_eq!(peek_object_header(&blob.content), Ok((ObjectType::Blob, 4)));
+
+        let empty = LooseObjectBuilder::build_blob(&Blob { content: Vec::new() });
+        assert_eq!(peek_object_header(&empty.content), Ok((ObjectType::Blob, 4)));
+
+        let long = LooseObjectBuilder::build_blob(&Blob { content: vec![7u8; 300] });
+        assert_eq!(peek_object_header(&long.content), Ok((ObjectType::Blob, 5)), "a two-byte length");
+    }
+
+    /// An unknown version is its own error, judged as soon as the version is whole, while a
+    /// prefix too short to finish the version is only malformed.
+    #[test]
+    fn peek_object_header_names_an_unknown_version() {
+        let blob = LooseObjectBuilder::build_blob(&Blob { content: vec![7u8; 3] });
+        let (_, bytes) = with_version(&blob, 2);
+
+        assert_eq!(peek_object_header(&bytes), Err(PeekError::UnknownVersion(2)));
+        assert_eq!(peek_object_header(&bytes[..1]), Err(PeekError::UnknownVersion(2)));
+        assert_eq!(peek_object_header(&[0x81, 0x01]), Err(PeekError::UnknownVersion(129)));
+        assert!(matches!(peek_object_header(&[0x81]), Err(PeekError::Malformed(_))), "an unfinished version");
+        assert!(matches!(peek_object_header(&blob.content[..2]), Err(PeekError::Malformed(_))), "a known version, cut short");
+    }
+
+    /// The buffered store refuses an object of an unknown version, though its hash is right, and
+    /// stores the same object at the version this build reads.
+    #[test]
+    fn store_object_bytes_refuses_an_unknown_version() {
+        let _scratch = Scratch::new("store-unknown-version");
+
+        let blob = LooseObjectBuilder::build_blob(&Blob { content: vec![9u8; 64] });
+        let (hash, bytes) = with_version(&blob, 2);
+
+        let err = store_object_bytes(&hash, &bytes).expect_err("an unknown version must be refused");
+        assert!(err.contains("loose object version 2"), "{}", err);
+        assert!(!file_utils::does_object_exist(&hash).unwrap(), "nothing unreadable may land");
+
+        assert!(store_object_bytes(&blob.hash, &blob.content).unwrap(), "the readable version is stored");
+    }
+
+    /// The streaming store refuses an object of an unknown version even when its prefix arrives a
+    /// byte at a time, so the version is judged from a one-byte prefix, and leaves nothing behind.
+    #[test]
+    fn store_object_stream_refuses_an_unknown_version() {
+        let _scratch = Scratch::new("stream-unknown-version");
+
+        let blob = LooseObjectBuilder::build_blob(&Blob { content: vec![0x44u8; 10_000] });
+        let (hash, bytes) = with_version(&blob, 2);
+
+        let mut reader = OneByteAtATime { remaining: &bytes, consumed: 0 };
+        let err = store_object_stream(&hash, &mut reader, bytes.len() as u64)
+            .expect_err("an unknown version must be refused");
+        assert!(err.contains("loose object version 2"), "{}", err);
+        assert!(!file_utils::does_object_exist(&hash).unwrap(), "nothing unreadable may land");
+        assert!(no_temp_files_left(&_scratch.root), "the temp file must be cleaned up");
+
+        let mut reader = OneByteAtATime { remaining: &blob.content, consumed: 0 };
+        assert!(store_object_stream(&blob.hash, &mut reader, blob.content.len() as u64).unwrap(),
+            "the readable version streams in a byte at a time");
+    }
+
+    /// The pack import check refuses an object of an unknown version, and passes the readable one.
+    #[test]
+    fn validate_imported_object_refuses_an_unknown_version() {
+        let blob = LooseObjectBuilder::build_blob(&Blob { content: vec![5u8; 64] });
+        let (hash, bytes) = with_version(&blob, 2);
+
+        let err = validate_imported_object(&hash, &bytes).expect_err("an unknown version must be refused");
+        assert!(err.contains("loose object version 2"), "{}", err);
+        assert!(validate_imported_object(&blob.hash, &blob.content).is_ok());
     }
 
     /// A stream shorter than its declared length is reported as truncation, and nothing lands.
