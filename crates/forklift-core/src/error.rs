@@ -728,7 +728,7 @@ mod tests {
         let framed = frame("some_future_code", "a human explanation", "do this", None);
         let error: CoreError = framed.into();
 
-        assert_eq!(error, CoreError::Other("a human explanation do this".to_string()));
+        assert_eq!(error, CoreError::Other("a human explanation Next step: do this".to_string()));
         assert!(!error.to_string().contains('\u{1f}'));
     }
 
@@ -799,7 +799,7 @@ mod tests {
 
         match CoreError::from(wrapped) {
             CoreError::Other(message) => assert_eq!(
-                message, "The tree could not be read: object x is missing Wait for it. No parcel was made."
+                message, "The tree could not be read: object x is missing Next step: Wait for it. No parcel was made."
             ),
             other => panic!("a wrapped frame claims no code: {:?}", other),
         }
@@ -811,7 +811,7 @@ mod tests {
         let wrapped = format!("Two reads failed:\n{} Nothing was written.", detailed);
 
         match CoreError::from(wrapped) {
-            CoreError::Other(message) => assert_eq!(message, "Two reads failed:\nobject y is missing Wait. Nothing was written."),
+            CoreError::Other(message) => assert_eq!(message, "Two reads failed:\nobject y is missing Next step: Wait. Nothing was written."),
             other => panic!("a wrapped frame claims no code: {:?}", other),
         }
 
@@ -823,7 +823,7 @@ mod tests {
 
         match CoreError::from(wrapped) {
             CoreError::Other(message) => assert_eq!(
-                message, format!("Read {} then:\na is missing Wait for A.\nb is missing Wait for B.", not_a_frame)
+                message, format!("Read {} then:\na is missing Next step: Wait for A.\nb is missing Next step: Wait for B.", not_a_frame)
             ),
             other => panic!("wrapped frames claim no code: {:?}", other),
         }
