@@ -559,6 +559,7 @@ fn remote_pallet_head<'a>(info: &'a forklift_core::model::remote::WarehouseInfo,
 /// naming the ones it has. `next_step` is the remedy at the site: `lift` publishes a current
 /// pallet with something stacked, `pallet list --remote` lists what another name could be. A pallet
 /// deleted on the remote is refused naming the deletion and its restore instead.
+#[track_caller]
 fn remote_lacks_pallet(info: &forklift_core::model::remote::WarehouseInfo, pallet: &str, next_step: &str) -> CoreError {
     // A deleted pallet's history is still there, under its tombstone: restoring it is the way on.
     if let Some(head) = info.tombstone(pallet) {
@@ -578,12 +579,16 @@ fn remote_lacks_pallet(info: &forklift_core::model::remote::WarehouseInfo, palle
         .filter(|name| !name.starts_with(pallet_utils::META_QUALIFIER))
         .collect();
 
+    // The listing is pointed at unless it is the step itself.
+    let listing = if next_step.contains("pallet list --remote") { "" } else { " \"forklift pallet list --remote\" lists them." };
+
     CoreError::refusal(
         RefusalCode::PalletNotFound,
         format!(
-            "The remote has no pallet \"{}\" (it has: {}).",
+            "The remote has no pallet \"{}\" (it has: {}).{}",
             pallet,
-            if user.is_empty() { "none".to_string() } else { user.join(", ") }
+            if user.is_empty() { "none".to_string() } else { user.join(", ") },
+            listing
         ),
         next_step,
     )

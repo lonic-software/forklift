@@ -2335,15 +2335,7 @@ fn classify_remote_error(status: u16, action: &str, message: String,
     let wrapped = format!("The remote refused {} ({}): {}", action, status, message);
 
     match code.as_deref().and_then(RefusalCode::from_code) {
-        // Built field by field: the remote wrote this text, so [`CoreError::refusal`]'s debug check
-        // that a message does not restate its step, which is about this build's wording, does not
-        // apply. The texts are sanitized as that constructor would.
-        Some(code) => String::from(CoreError::Refusal {
-            code,
-            message: crate::error::sanitize(&wrapped),
-            next_step: crate::error::sanitize(&next_step.unwrap_or_default()),
-            details: None,
-        }),
+        Some(code) => String::from(CoreError::remote_refusal(code, wrapped, next_step.unwrap_or_default())),
         None => crate::error::with_next_step(&wrapped, next_step.as_deref().unwrap_or_default()),
     }
 }

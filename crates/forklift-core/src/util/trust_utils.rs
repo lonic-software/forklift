@@ -294,6 +294,7 @@ fn check_expected(subject: &str,
 }
 
 /// A `trust_changed` refusal.
+#[track_caller]
 fn refusal(message: String, next_step: impl Into<String>, details: TrustDetails) -> CoreError {
     CoreError::refusal_with_details(RefusalCode::TrustChanged, message, next_step, details.to_value())
 }

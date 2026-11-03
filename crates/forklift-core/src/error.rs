@@ -399,15 +399,34 @@ impl CoreError {
             details: Some(details),
         }
     }
+
+    /// A refusal relaying a remote's own words — its message, or a caller's text built around it.
+    /// [Sanitized](sanitize) as [`CoreError::refusal`] is, but without its debug check that the
+    /// message does not restate the step: that check is about this build's wording, and a remote
+    /// (another version, another head) may word its message any way it likes.
+    pub fn remote_refusal(
+        code: RefusalCode,
+        message: impl Into<String>,
+        next_step: impl Into<String>,
+    ) -> CoreError {
+        CoreError::Refusal {
+            code,
+            message: sanitize(&message.into()),
+            next_step: sanitize(&next_step.into()),
+            details: None,
+        }
+    }
 }
 
 impl fmt::Display for CoreError {
-    /// Renders the human message only — a `Refusal` shows its `message` (no code, no next step, no
-    /// frame), an `Other` shows its string. A head prints a failure through
-    /// [`human_failure_text`], which adds the next step on a line of its own.
+    /// Renders the error as one line of text — a `Refusal` shows its `message` with its next step
+    /// [folded in](with_next_step) (no code, no frame), an `Other` shows its string. A message no
+    /// longer carries its own step, so text that embeds an error (a clone's failure naming its
+    /// cause) keeps the cause's way out this way. A head prints a failure through
+    /// [`human_failure_text`] instead, which puts the next step on a line of its own.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CoreError::Refusal { message, .. } => f.write_str(message),
+            CoreError::Refusal { message, next_step, .. } => f.write_str(&with_next_step(message, next_step)),
             CoreError::Other(message) => f.write_str(message),
         }
     }
@@ -626,7 +645,7 @@ pub fn sanitize_lines(text: &str) -> String {
 /// line of its own under the message, so a message that carries it too shows it twice: this
 /// build's refusals assert they do not, in debug builds, in [`CoreError::refusal`] and
 /// [`CoreError::refusal_with_details`]. A refusal carrying a remote's own words is not this build's
-/// wording, and is built without them.
+/// wording, and is built with [`CoreError::remote_refusal`], which does not check.
 pub fn restates_next_step(message: &str, next_step: &str) -> bool {
     let step = next_step.trim();
     !step.is_empty() && message.contains(step)
@@ -742,9 +761,9 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_displays_its_human_message_only() {
+    fn a_refusal_displays_its_message_and_folded_step_without_its_frame() {
         let error = CoreError::refusal(RefusalCode::OutOfScope, "the message", "the next step");
-        assert_eq!(error.to_string(), "the message");
+        assert_eq!(error.to_string(), "the message (Next step: the next step)");
         assert!(!error.to_string().contains('\u{1f}'));
     }
 
@@ -1009,5 +1028,16 @@ mod tests {
         CoreError::refusal(RefusalCode::Behind, "Behind.", "  ");
         assert!(!restates_next_step("anything", ""));
         assert!(restates_next_step("Run x now.", " x "));
+    }
+
+    // Revert: Display shows the message alone → text embedding a refusal loses its way out.
+    #[test]
+    fn an_embedded_refusal_keeps_its_next_step() {
+        let cause = CoreError::refusal(RefusalCode::IncompleteLoad, "Interrupted.", "forklift heal");
+        assert_eq!(format!("clone failed: {}", cause), "clone failed: Interrupted. (Next step: forklift heal)");
+
+        // A refusal relaying a remote's words is built unchecked, whatever they say.
+        CoreError::remote_refusal(RefusalCode::Behind, "Behind. Run forklift lower.", "forklift lower");
+        assert_eq!(CoreError::Other("plain".into()).to_string(), "plain");
     }
 }

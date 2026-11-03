@@ -934,9 +934,8 @@ fn failed_next_step(command: &str, directory: &str, retry: Retry) -> String {
 /// The `clone_incomplete` refusal for a clone's own failure after its claim: `cause` with
 /// the directory kept, and the next step `retry` earns.
 pub fn failure_refusal(directory: &str, record: &FranchiseRecord, cause: &str, failure: &Failure) -> CoreError {
-    let message = match CoreError::from(cause.to_string()) {
-        CoreError::Refusal { message, .. } | CoreError::Other(message) => message,
-    };
+    // The cause's own way out stays with it, folded in: resuming the clone may not get past it.
+    let message = CoreError::from(cause.to_string()).to_string();
 
     let command = resume_command(&record.url, directory, &record.request);
 

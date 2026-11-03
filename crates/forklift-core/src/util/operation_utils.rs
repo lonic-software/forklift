@@ -279,7 +279,7 @@ pub fn raise_in(dir: &Path, operation: &Operation) -> Result<(), String> {
     let path = dir.join(FILE_NAME_OPERATION);
 
     if path.exists() {
-        return Err(standing_refusal_message(&path));
+        return Err(standing_refusal(&path).into());
     }
 
     write_marker(&path, operation)?;
@@ -402,6 +402,12 @@ fn read_at(path: &Path) -> Result<Option<Operation>, String> {
         .map_err(|reason| format!("The operation record \"{}\" {}", path.to_string_lossy(), reason))
 }
 
+/// The `incomplete_load` refusal for the marker standing at `path`: `forklift heal` finishes or
+/// undoes the interrupted operation.
+fn standing_refusal(path: &Path) -> CoreError {
+    CoreError::refusal(RefusalCode::IncompleteLoad, standing_refusal_message(path), "forklift heal")
+}
+
 fn standing_refusal_message(path: &Path) -> String {
     match read_at(path) {
         Ok(Some(operation)) => format!(
@@ -430,7 +436,7 @@ pub fn check_none_standing() -> Result<(), CoreError> {
         return Ok(());
     }
 
-    Err(CoreError::refusal(RefusalCode::IncompleteLoad, standing_refusal_message(&path), "forklift heal"))
+    Err(standing_refusal(&path))
 }
 
 /// How [`recover`] settled an interrupted operation.
@@ -818,6 +824,30 @@ mod tests {
             .expect("the owner of the marker may rewrite");
         finish().unwrap();
         assert!(read().unwrap().is_none());
+
+        drop(scope);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // Revert: `raise_in` returns the bare message → no code, and no step to finish it by.
+    #[test]
+    fn raising_over_a_standing_marker_refuses_naming_heal() {
+        let root = std::env::temp_dir().join(format!("forklift-operation-raise-over-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let scope = crate::globals::StorageRootScope::enter(&root);
+
+        raise(&operation()).unwrap();
+        forget_raised_for_tests();
+        let error = CoreError::from(raise(&operation()).expect_err("a standing marker must refuse a second"));
+
+        match error {
+            CoreError::Refusal { code, next_step, .. } => {
+                assert_eq!(code, RefusalCode::IncompleteLoad);
+                assert_eq!(next_step, "forklift heal");
+            }
+            other => panic!("expected an incomplete_load refusal, got {:?}", other),
+        }
 
         drop(scope);
         std::fs::remove_dir_all(&root).ok();

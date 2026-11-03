@@ -335,6 +335,7 @@ pub fn behind_refusal(pallet: &str, base: Option<&str>, head: Option<&str>, oper
 }
 
 /// A [`RefusalCode::RemoteAhead`] refusal saying `message`: `lower` brings the remote's parcels in.
+#[track_caller]
 pub fn remote_ahead_refusal(message: String) -> CoreError {
     CoreError::refusal(RefusalCode::RemoteAhead, message, "forklift lower")
 }
@@ -453,6 +454,7 @@ fn tombstone_drop_clause(pallet: &str, offers_drop: bool) -> String {
 }
 
 /// The [`RefusalCode::PalletDeletedOnRemote`] refusal carrying `message`, for user pallet `pallet`.
+#[track_caller]
 fn deleted_on_remote(pallet: &str, message: String) -> CoreError {
     CoreError::refusal(
         RefusalCode::PalletDeletedOnRemote,
