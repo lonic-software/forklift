@@ -265,7 +265,9 @@ format, it runs the upgrade on each and then does the same. Format 1 has no olde
 loop is empty for now.
 
 The fixtures are made by an ignored test, `freeze_the_current_format_fixtures`, which refuses to
-replace a format's fixtures. A format's fixtures change only by being made again at a new format. Two
+replace a format's fixtures. A format's fixtures change only by being made again at a new format, once a
+release has carried it: a format no release has carried has no warehouse to upgrade, so a change
+to it edits its `versions` and makes its fixtures again in place, after deleting them. Two
 things are not frozen: bays, because a bay's redirect holds an absolute path, and the out-of-scope
 skeleton's reader, which only a partial checkout's consolidation reaches.
 
