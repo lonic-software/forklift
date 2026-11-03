@@ -324,6 +324,20 @@ fn an_untracked_nested_working_tree_is_left_to_itself() {
     assert!(stdout(&inner).contains("x.txt"), "the nested warehouse must see its own file: {}", stdout(&inner));
 }
 
+/// An untracked folder holding nothing but another working tree, deeper down, is listed as one
+/// untracked folder: what is in it is not this warehouse's to judge, and hiding it would hide the
+/// nested tree from the user.
+#[test]
+fn an_untracked_folder_holding_only_a_nested_working_tree_is_listed() {
+    let warehouse = Warehouse::new("walk-untracked-deep");
+    warehouse.prepare_nested("outer/deeper/sub");
+    warehouse.write(".gitignore", "*.log\n");
+    warehouse.write("outer/deeper/a.log", "ignored\n");
+
+    let unstaged = warehouse.changes("unstaged");
+    assert!(unstaged.contains(&("untracked".to_string(), "outer/".to_string())), "{:?}", unstaged);
+}
+
 /// A folder this warehouse tracks that becomes another working tree's root makes the walks refuse
 /// rather than guess, and the way out the message names leaves a clean walk: straight away when
 /// only stocktake refused, and after re-running the load when a load did, as its own note says.

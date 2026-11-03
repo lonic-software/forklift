@@ -1001,6 +1001,11 @@ fn stocktake_leaves_an_ignored_tracked_directory_alone_instead_of_reporting_it_r
         paths,
     );
 
+    // A new file under it is untracked content the rule covers, so it stays hidden.
+    warehouse.write_file("build/artifact3.txt", "generated\n");
+    let paths = unstaged_paths(&warehouse);
+    assert!(!paths.iter().any(|path| path.starts_with("build")), "{:?}", paths);
+
     // But a genuine deletion of a tracked, non-ignored file is still reported.
     std::fs::remove_file(warehouse.root.join("keep.txt")).unwrap();
     let paths = unstaged_paths(&warehouse);
@@ -5229,11 +5234,12 @@ fn ignore_rules_are_gitignore_lines_in_every_ignore_file() {
     // `re:` lines are anchored to the whole key, `\re:` is a literal, and the root ignore file
     // wins over every `.gitignore`.
     let (_, loaded) = untracked_then_loaded("ignore-regex", &[
-        (".forkliftignore", "re:build\n\\re:x\n!re:config\\.env\n"), (".gitignore", "*.env\n"),
+        (".forkliftignore", "re:build\n\\re:x\n!re:config\\.env\n*.tmp\n!keep.tmp\n"), (".gitignore", "*.env\n"),
+        ("keep.tmp", "k\n"), ("drop.tmp", "d\n"),
         ("build/o", "o\n"), ("rebuild.rs", "r\n"), ("sub/build", "b\n"), ("re:x", "x\n"),
         ("config.env", "c\n"), ("secret.env", "s\n"),
     ]);
-    assert_eq!(loaded, [".forkliftignore", ".gitignore", "config.env", "rebuild.rs", "sub/build"]);
+    assert_eq!(loaded, [".forkliftignore", ".gitignore", "config.env", "keep.tmp", "rebuild.rs", "sub/build"]);
 }
 
 #[test]
