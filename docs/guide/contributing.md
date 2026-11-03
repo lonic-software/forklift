@@ -85,23 +85,20 @@ Notes:
   byte-reproducible repacks, and the warehouse-lock refusal. A parser or
   format change should keep the fuzzer green; if you add a length-prefixed field,
   bound it with a `checked_add` (never `start + length` before the bounds check).
-- Keep tests fast: CI runs the suite on every pull request, on three OSes. A
-  test that has to watch a timeout fire arms a short one instead of waiting out
-  production's (see `FAST` in `remote_utils.rs`), and a fixture writes only the
-  files the code under test reads. Under `cargo nextest run`, which CI uses,
-  `.config/nextest.toml` reports a test as SLOW at 30 s and fails it at two
-  minutes; the crash suite's kill tests get ten. CI runs twice as many tests
-  as cores, so a test with a wall-clock bound needs margin
-  for a shared core; `cargo nextest run --profile ci --test-threads $((2 * $(nproc 2>/dev/null || sysctl -n hw.ncpu)))`
-  reproduces that load locally (the `ci` profile gives the crash suite's kill
-  tests two slots each, which only pays at that thread count).
+- Keep tests fast; see [Keeping tests fast](#keeping-tests-fast) below. Under
+  `cargo nextest run`, which CI uses, `.config/nextest.toml` reports a test as SLOW at
+  30 s and fails it at two minutes; the crash suite's kill tests get ten. CI runs twice
+  as many tests as cores, so a test with a wall-clock bound needs margin for a shared
+  core; `cargo nextest run --profile ci --test-threads $((2 * $(nproc 2>/dev/null || sysctl -n hw.ncpu)))`
+  reproduces that load locally (the `ci` profile gives the crash suite's kill tests two
+  slots each, which only pays at that thread count).
 - CI (`.github/workflows/ci.yml`) splits the tests across runners: one on Linux,
   two on macOS and four on Windows, each running its share with nextest's
-  `--partition count:K/N`. Doc-tests, Clippy and the guards run once per OS in
-  a separate `lint (<os>)` job. The `ci passed` check is green only when every
-  share, every lint job and the generated-docs check passed, or the run was
-  docs-only; gate a merge on it, not on the individual shares. To rerun the share
-  that failed, say `test (windows-latest, 3/4)`, locally:
+  `--partition count:K/N`. The last share of each OS also runs the doc-tests,
+  Clippy and the guards. The `ci passed` check is green only when every share and
+  the generated-docs check passed, or the run was docs-only; gate a merge on it,
+  not on the individual shares. To rerun the share that failed, say
+  `test (windows-latest, 3/4)`, locally:
   `cargo nextest run --workspace --profile ci --partition count:3/4`. Which tests
   land in a share depends only on the list of tests, so `cargo nextest list
   --partition count:3/4` shows it on any OS, apart from tests that only exist on
@@ -128,6 +125,63 @@ Notes:
     should print 0. Listing the whole directory is itself slow once it is large.
 - To install a working binary (e.g. to dogfood): `cargo install --path
   crates/forklift --force` (lands in `~/.cargo/bin`).
+
+### Keeping tests fast
+
+CI runs the whole suite on three OSes on every push to a pull request that changes code,
+and a pull request gets several pushes, so every second a test spends is paid many times
+over. Much of the suite's time has gone to tests waiting out real timeouts or writing far
+more files than they checked. Write new tests so that work does not have to be done again.
+
+**The budget.** A new or changed test finishes in about a second on Linux and in at most
+**10 s on the Windows CI runner**, which is where the suite's time goes. Windows is not a
+fixed multiple of Linux: on main CI run 41699714241 (2026-11-03) the same test took about
+four times as long at the median, eight times or more for one test in ten, and 22 times
+for `walk_tree_survives_a_pathologically_deep_tree`, so a test that fits on Linux can
+still blow the budget there. A test that needs more says why in a comment above it: what
+it does that takes the time, and why a smaller version would not catch the same failure.
+Not every existing test meets this yet (37 took over 10 s on Windows in that run); do not
+take one of them as the model for a new test. The SLOW and failure limits in
+`.config/nextest.toml` are a backstop against hangs, not the budget: a test can be well
+inside them and still too slow.
+
+**Check the time where it is paid.** Every test's time is in the CI log: nextest prints
+`PASS [  12.368s]` before each name. Before merging a pull request that adds or changes
+tests, look up those tests in the `test (windows-latest, K/4)` jobs. A local run on a fast
+machine does not tell you what Windows will take.
+
+**How to stay inside it:**
+
+- **Never wait out a production timeout.** A test that has to watch a timeout or budget
+  fire makes it a value the code takes and arms a short one: `remote_utils.rs` tests
+  build their clients with `FAST` budgets in place of the real ones, and the server's
+  hook tests arm a 1.5 s hook instead of 10 s. If the timeout is a constant, turn it into
+  a parameter first.
+- **Wait on the event, not the clock.** A `sleep` long enough to be safe on a loaded
+  runner is far too long everywhere else. Poll for the condition with a short interval
+  and an overall deadline, so the test ends as soon as the thing happens.
+- **Make a limit something the test can set small.** A test that crosses a cap, a depth
+  or a size passes a small value of it rather than building a fixture past the
+  production one. `walk_tree_survives_a_pathologically_deep_tree` checks stack safety on
+  a small thread stack at depth 2,000 instead of a tree 50,000 levels deep (226 s on
+  Windows); a fixture of about 2,000 loose objects took 4 s on Linux and was killed at the
+  two-minute limit on Windows.
+- **Write only what the code under test reads.** No blob contents for a check that looks
+  only at tree shape, no history beyond the parcels the assertion needs.
+- **Launch through the helpers.** `forklift_command()` and `server_command()` turn fsync
+  off (above); a test that builds its own `Command` pays for every sync. Each launch of a
+  binary costs much more on Windows than on Linux, so a loop over launches is where a
+  Windows run spends its time: launch once with many paths rather than many times with
+  one.
+- **Test at the cheapest level that can fail.** An integration test launches real
+  binaries and pays for every launch; a unit test of the same function pays for none.
+  Put the cases of a rule (every input shape, every edge) in unit tests, and keep one
+  integration test per path that proves the command reaches the rule and reports it.
+  Before adding an integration test, check whether an existing one already crosses the
+  same wiring; if so, add an assertion to it instead of a new test.
+- **Repetition is the cost.** A test that repeats a run to catch a race or a crash at a
+  random point uses the fewest rounds that still catch the failure, and says in a comment
+  how the count was chosen.
 
 ### Formatting
 
