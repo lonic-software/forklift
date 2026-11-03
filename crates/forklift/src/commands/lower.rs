@@ -481,22 +481,36 @@ fn stack_diverged_repair(pallet: &str,
                          ref_head: Option<&str>) -> Result<CoreError, String> {
     let side = format!("{}-repair-{}", pallet, &remote_head[..12.min(remote_head.len())]);
 
-    // A pallet already there holds the repair a rerun stacked, or work built on it.
+    // A pallet already there is reused only when it holds the repair a rerun stacked, or work built
+    // on it: past the remote's head, and holding no name the repair removes.
     match pallet_utils::get_pallet_head(&side)? {
-        Some(head) if merge_utils::is_ancestor(remote_head, &head)? => {}
-        Some(_) => return Err(format!(
-            "Pallet \"{s}\" already exists and holds no repair of the remote's head {h}, so no repair was \
-            stacked. Delete it (\"forklift pallet delete {s}\") and lower again.",
-            s = side, h = remote_head
-        )),
+        Some(head) if head != remote_head
+            && merge_utils::is_ancestor(remote_head, &head)?
+            && repair_utils::first_repairable_path(&head)?.is_none() => {}
+        Some(_) => return Err(CoreError::refusal(
+            RefusalCode::HeadNotMaterializable,
+            format!(
+                "The remote's head {h} holds a name no client can check out, and its repair could not \
+                be stacked: the pallet \"{s}\" already exists and holds no repair of that head. Delete \
+                it (\"forklift pallet delete {s}\") and lower again.",
+                s = side, h = remote_head
+            ),
+            format!("forklift pallet delete {}", side),
+        ).into()),
         None => {
             let repair = repair_utils::repair_head(remote_head)?.ok_or("The remote's head has nothing to repair.")?;
             match pallet_utils::update_pallet_head(&side, None, &repair.parcel, preconditions) {
                 Ok(()) => {}
                 // A failed write can still have landed: decided by reading the ref back.
-                Err(pallet_utils::RefUpdateError::Failed(error)) if pallet_utils::get_pallet_head(&side)?.as_deref() != Some(repair.parcel.as_str()) =>
-                    return Err(format!("Pallet \"{}\" was not created: {}", side, error)),
-                Err(pallet_utils::RefUpdateError::Failed(_)) => {}
+                Err(pallet_utils::RefUpdateError::Failed(error)) => match pallet_utils::get_pallet_head(&side) {
+                    Ok(head) if head.as_deref() == Some(repair.parcel.as_str()) => {}
+                    Ok(_) => return Err(format!("Pallet \"{}\" was not created: {}", side, error)),
+                    Err(read) => return Err(format!(
+                        "Creating pallet \"{}\" failed ({}), and reading it back failed too ({}); it may or \
+                        may not hold parcel {}.",
+                        side, error, read, repair.parcel
+                    )),
+                },
                 Err(error) => return Err(error.to_string()),
             }
         }

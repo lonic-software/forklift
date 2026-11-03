@@ -3510,11 +3510,14 @@ fn a_lower_repair_over_a_diverged_ref_keeps_its_parcels() {
         assert_eq!(user_head(&area, "b", &side), repair);
         assert_eq!(std::fs::read_dir(area.path("b/.forklift/pallets")).unwrap().count(), pallets);
 
-        // One holding something else is never overwritten.
-        area.write_file(&format!("b/.forklift/pallets/{}", side), &format!("{}\n", own));
-        let taken = area.forklift("b", &["lower", "--repair"]);
-        assert!(stderr(&taken).contains(&format!("forklift pallet delete {}", side)), "{}{}", stdout(&taken), stderr(&taken));
-        assert_eq!(user_head(&area, "b", &side), own);
+        // One holding something else, the wedged head itself included, is never overwritten.
+        for other in [&own, &wedged] {
+            area.write_file(&format!("b/.forklift/pallets/{}", side), &format!("{}\n", other));
+            let taken = json_of(&area.forklift("b", &["--json", "lower", "--repair"]));
+            assert_eq!(taken["error"]["code"], "head_not_materializable", "{}", taken);
+            assert_eq!(taken["error"]["next_step"], format!("forklift pallet delete {}", side).as_str(), "{}", taken);
+            assert_eq!(&user_head(&area, "b", &side), other);
+        }
         area.write_file(&format!("b/.forklift/pallets/{}", side), &format!("{}\n", repair));
 
         run_next_steps(&area, "b", &next_step);
