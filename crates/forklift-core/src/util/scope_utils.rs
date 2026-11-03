@@ -40,11 +40,12 @@ const FILE_NAME_FETCH_SCOPE: &str = "fetch-scope";
 
 /// The [`record_utils`] kind and version of every non-full scope file. Format 2 put the root
 /// ignore file in every scope, refusing the unversioned files before it; format 3 escapes each
-/// prefix, so one may hold a line break. A file in either earlier format is refused on read.
+/// prefix, so one may hold a line break; format 4 puts the spine `.gitignore` files in every
+/// scope ([`PathScope::implicit_members`]). A file in any earlier format is refused on read.
 /// The header opens with "/", which no stored prefix can (prefixes are trimmed of it), so an
 /// unversioned file can never be mistaken for a versioned one.
 const SCOPE_RECORD: &str = "scope";
-const SCOPE_VERSION: u32 = 3;
+const SCOPE_VERSION: u32 = 4;
 
 /// The stable machine-branchable refusal codes this feature contributes to the §7.4 error
 /// taxonomy, as their code strings — kept as re-exports of the typed [`RefusalCode`] (the source
@@ -93,10 +94,10 @@ pub use crate::error::{REFUSAL_PREFIX, REFUSAL_FIELD_SEPARATOR};
 /// §3.1). Every scope-aware walk branches on the three cases, never on a single predicate.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ScopeClass {
-    /// At or under a configured in-scope prefix, or the root ignore file, which every scope
-    /// holds: fully materialized — descend, materialize, verify and merge exactly as a full
+    /// At or under a configured in-scope prefix, or one of the ignore files every scope holds
+    /// ([`PathScope::implicit_members`]): fully materialized — descend, materialize, verify and merge exactly as a full
     /// workspace would. Nothing below needs re-classifying. Not every in-scope path is under a
-    /// directory prefix — the ignore file is a file at a spine level — so a walk that refuses a
+    /// directory prefix — an ignore file is a file at a spine level — so a walk that refuses a
     /// type change asks [`PathScope::requires_directory`], never this variant.
     InScope,
 
@@ -124,12 +125,16 @@ pub struct PathScope {
     /// Normalized in-scope prefixes: warehouse path keys (no leading/trailing slash, `/`
     /// separators), sorted and de-duplicated, none empty. Empty vec = full scope.
     prefixes: Vec<String>,
+
+    /// The ignore files the prefixes hold in scope without naming them, computed once from the
+    /// prefixes (see [`PathScope::implicit_members`]), since [`PathScope::classify`] runs per path.
+    implicit: Vec<String>,
 }
 
 impl PathScope {
     /// The full (unrestricted) scope — every path is in scope.
     pub fn full() -> PathScope {
-        PathScope { prefixes: Vec::new() }
+        PathScope { prefixes: Vec::new(), implicit: Vec::new() }
     }
 
     /// Build a scope from raw in-scope prefixes, normalizing them: an empty (root) prefix
@@ -157,7 +162,9 @@ impl PathScope {
         normalized.sort();
         normalized.dedup();
 
-        PathScope { prefixes: normalized }
+        let implicit = implicit_members_of(&normalized);
+
+        PathScope { prefixes: normalized, implicit }
     }
 
     /// Whether this scope is full (unrestricted). A full scope makes every scope-aware walk
@@ -171,19 +178,18 @@ impl PathScope {
         &self.prefixes
     }
 
-    /// The paths every non-full scope holds in scope without declaring them as prefixes: the
-    /// root ignore file. Empty for the full scope, which holds everything anyway.
-    pub fn implicit_members(&self) -> &'static [&'static str] {
-        if self.prefixes.is_empty() {
-            &[]
-        } else {
-            &[crate::util::file_utils::FILENAME_IGNORE]
-        }
+    /// The paths a non-full scope holds in scope without declaring them as prefixes, sorted: the
+    /// root ignore file, and the `.gitignore` of the root and of every proper ancestor of a
+    /// declared prefix, so a sparse checkout holds every rule that applies to what it checks out.
+    /// A `.gitignore` under a prefix is in scope already and is not listed. Empty for the full
+    /// scope, which holds everything anyway.
+    pub fn implicit_members(&self) -> &[String] {
+        &self.implicit
     }
 
     /// Classify a file entry at a spine level, for a walker that carries out-of-scope files by
-    /// hash: `Ok(true)` when it is out of scope (sealed), `Ok(false)` when it is in scope (the
-    /// root ignore file — handled like any in-scope file), and the type-changed refusal when the
+    /// hash: `Ok(true)` when it is out of scope (sealed), `Ok(false)` when it is in scope (an
+    /// implicit member — handled like any in-scope file), and the type-changed refusal when the
     /// scope expects a directory there.
     ///
     /// # Arguments
@@ -206,11 +212,14 @@ impl PathScope {
             return ScopeClass::InScope;
         }
 
-        // In scope: at or under some in-scope prefix, or an implicit member (the root ignore file,
-        // so a sparse checkout always holds the rules that apply to it). A directory of that name
-        // is in scope whole, as on a full warehouse, where reading the rules refuses it.
-        // `requires_directory` and `subset_of` reason over the declared prefixes only.
-        for prefix in self.prefixes.iter().map(String::as_str).chain(self.implicit_members().iter().copied()) {
+        // In scope: at or under some in-scope prefix, or an implicit member (an ignore file, so a
+        // sparse checkout always holds the rules that apply to it). A directory of that name is in
+        // scope whole, as on a full warehouse, where it is ordinary content (or, for the root
+        // ignore file, refused when the rules are read); no member is a place the scope needs a
+        // directory, so this never shadows a spine. `requires_directory` and `subset_of` reason
+        // over the declared prefixes only: every member of a subset's scope is in scope for the
+        // superset, because each ancestor of a prefix is under or above the prefix holding it.
+        for prefix in self.prefixes.iter().chain(&self.implicit).map(String::as_str) {
             if is_at_or_under(path, prefix) {
                 return ScopeClass::InScope;
             }
@@ -264,10 +273,10 @@ impl PathScope {
 
     /// Parse a scope from its on-disk form; an error is phrased to follow "The scope file
     /// \"<path>\"". An empty file is the full scope. Anything else must be a [`record_utils`]
-    /// file at [`SCOPE_VERSION`] naming at least one prefix: a file without the header was written
-    /// under the older meaning of a scope, which left the root ignore file out, and reading it
-    /// under today's meaning would report that file as removed and commit the removal — so it is
-    /// refused, as is a header naming a format this build does not know, and a header with no
+    /// file at [`SCOPE_VERSION`] naming at least one prefix: a file in an older format was written
+    /// under an older meaning of a scope, which left out ignore files today's holds, and reading
+    /// it under today's meaning would report those files as removed and commit the removal — so
+    /// it is refused, as is a header naming a format this build does not know, and a header with no
     /// prefix after it, which no write produces and which would otherwise widen a sparse scope to
     /// full.
     ///
@@ -282,7 +291,7 @@ impl PathScope {
         let lines = record_utils::from_bytes(bytes, SCOPE_RECORD, SCOPE_VERSION).map_err(|e| match e {
             RecordError::Unversioned => format!(
                 "was written by an older version of Forklift, whose sparse checkouts left out \
-                the root ignore file, so it cannot be read safely. {}",
+                the ignore files, so it cannot be read safely. {}",
                 remedy
             ),
             RecordError::OtherVersion(ref header) => {
@@ -290,7 +299,11 @@ impl PathScope {
                     .and_then(|version| version.trim().parse::<u32>().ok())
                     .is_some_and(|version| version < SCOPE_VERSION);
                 if older {
-                    format!("{} An older version of Forklift wrote it. {}", e.describe(), remedy)
+                    format!(
+                        "{} An older version of Forklift wrote it, whose sparse checkouts left out \
+                        ignore files this one holds in scope. {}",
+                        e.describe(), remedy
+                    )
                 } else {
                     format!("{} Use the Forklift that wrote it.", e.describe())
                 }
@@ -312,8 +325,34 @@ impl PathScope {
     }
 }
 
+/// The implicit members of a scope with these normalized prefixes (see
+/// [`PathScope::implicit_members`]). A candidate at or above a prefix is left out, since the scope
+/// needs a directory there (`a/.gitignore` for the prefix `a/.gitignore/b`), and so is one under a
+/// prefix, which holds it already.
+fn implicit_members_of(prefixes: &[String]) -> Vec<String> {
+    use crate::util::file_utils::{FILENAME_GITIGNORE, FILENAME_IGNORE};
+
+    if prefixes.is_empty() {
+        return Vec::new();
+    }
+
+    let mut members: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    members.insert(FILENAME_IGNORE.to_string());
+    members.insert(FILENAME_GITIGNORE.to_string());
+
+    for prefix in prefixes {
+        for (slash, _) in prefix.match_indices('/') {
+            members.insert(format!("{}/{}", &prefix[..slash], FILENAME_GITIGNORE));
+        }
+    }
+
+    members.into_iter()
+        .filter(|member| !prefixes.iter().any(|prefix| is_at_or_under(prefix, member) || is_at_or_under(member, prefix)))
+        .collect()
+}
+
 /// Whether `path` is `prefix` itself or lies under it — a pure path test, unlike
-/// [`PathScope::classify`], which also holds the root ignore file in scope.
+/// [`PathScope::classify`], which also holds the implicit members in scope.
 pub fn is_at_or_under(path: &str, prefix: &str) -> bool {
     path == prefix || is_strictly_under(path, prefix)
 }
@@ -922,7 +961,7 @@ mod tests {
         // prefix, so the scope never requires it to be a directory, and it widens nothing else.
         assert_eq!(scope.classify(".forkliftignore"), ScopeClass::InScope);
         assert!(!scope.requires_directory(".forkliftignore"));
-        assert_eq!(scope.implicit_members(), &[".forkliftignore"]);
+        assert_eq!(scope.implicit_members(), &[".forkliftignore", ".gitignore", "src/.gitignore"]);
         assert!(PathScope::full().implicit_members().is_empty());
         assert!(!scope.spine_file_is_sealed(".forkliftignore").unwrap());
         assert!(scope.spine_file_is_sealed("README.md").unwrap());
@@ -932,20 +971,69 @@ mod tests {
         assert_eq!(scope.classify(".forkliftignorex"), ScopeClass::OutOfScope);
         assert_eq!(scope.classify("src/.forkliftignore"), ScopeClass::OutOfScope);
 
-        // A path test that does not go through the scope sees only the prefix.
-        // Every implicit member, not just today's one, is a root-level file the spine walkers
+        // Every implicit member is a file whose folder is a spine level, which the spine walkers
         // keep as in scope, and never a place the scope expects a directory.
         for member in scope.implicit_members() {
-            assert!(!member.contains('/'), "{} must sit at the root, a spine level", member);
+            let parent = member.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("");
+            assert_eq!(scope.classify(parent), ScopeClass::Spine, "{} must sit at a spine level", member);
             assert_eq!(scope.classify(member), ScopeClass::InScope, "{}", member);
             assert!(!scope.requires_directory(member), "{}", member);
             assert!(!scope.spine_file_is_sealed(member).unwrap(), "{}", member);
         }
 
+        // A path test that does not go through the scope sees only the prefix.
         assert!(is_at_or_under("src/api/x.rs", "src/api"));
         assert!(is_at_or_under("src/api", "src/api"));
         assert!(!is_at_or_under(".forkliftignore", "src/api"));
         assert!(!is_at_or_under("src", "src/api"));
+    }
+
+    /// The `.gitignore` of the root and of each folder above a prefix is in scope, because its
+    /// rules reach the prefix; one beside a prefix, below a spine sibling, or of a longer name is
+    /// not, and one under a prefix is in scope as content, not listed.
+    #[test]
+    fn the_spine_gitignore_files_are_in_scope_and_no_others() {
+        let scope = PathScope::from_prefixes(["src/api/v1", "docs", "src/api/v1/inner"]);
+
+        assert_eq!(
+            scope.implicit_members(),
+            &[".forkliftignore", ".gitignore", "src/.gitignore", "src/api/.gitignore"],
+        );
+        for path in [".gitignore", "src/.gitignore", "src/api/.gitignore", "src/api/v1/.gitignore", "docs/.gitignore"] {
+            assert_eq!(scope.classify(path), ScopeClass::InScope, "{}", path);
+        }
+        for path in ["src/web/.gitignore", "src/.gitignorex", "src/api/v2/.gitignore", "tests/.gitignore", "src/x/.gitignore"] {
+            assert_eq!(scope.classify(path), ScopeClass::OutOfScope, "{}", path);
+        }
+
+        // A prefix through a folder of that name keeps the folder a spine: the scope needs a
+        // directory there, so it is no member, and nothing beside the prefix inside it is in scope.
+        let through = PathScope::from_prefixes(["a/.gitignore/b"]);
+        assert_eq!(through.implicit_members(), &[".forkliftignore", ".gitignore", "a/.gitignore/.gitignore"]);
+        assert_eq!(through.classify("a/.gitignore"), ScopeClass::Spine);
+        assert!(through.requires_directory("a/.gitignore"));
+        assert_eq!(through.classify("a/.gitignore/c"), ScopeClass::OutOfScope);
+
+        // The full scope holds everything and lists nothing.
+        assert!(PathScope::full().implicit_members().is_empty());
+    }
+
+    /// A bay's scope within the fetch scope holds no implicit member the fetch scope lacks, so a
+    /// bay never checks out an ignore file the warehouse never fetched.
+    #[test]
+    fn a_subset_scope_holds_no_member_its_superset_lacks() {
+        for (bay, fetch) in [
+            (vec!["src/api/v1"], vec!["src/api"]),
+            (vec!["src/api/v1", "docs/x"], vec!["src", "docs"]),
+            (vec!["a/b/c/d"], vec!["a/b/c/d", "e"]),
+        ] {
+            let bay = PathScope::from_prefixes(bay);
+            let fetch = PathScope::from_prefixes(fetch);
+            assert!(bay.subset_of(&fetch));
+            for member in bay.implicit_members() {
+                assert_eq!(fetch.classify(member), ScopeClass::InScope, "{} of {:?} in {:?}", member, bay, fetch);
+            }
+        }
     }
 
     #[test]
@@ -990,7 +1078,7 @@ mod tests {
     fn a_scope_file_without_its_format_header_is_refused() {
         // A non-full scope is written under its format header.
         let bytes = PathScope::from_prefixes(["src"]).to_bytes();
-        assert!(bytes.starts_with(b"/forklift-scope 3\n"), "{:?}", String::from_utf8_lossy(&bytes));
+        assert!(bytes.starts_with(b"/forklift-scope 4\n"), "{:?}", String::from_utf8_lossy(&bytes));
 
         // The unversioned form an older Forklift wrote is refused, naming the way out.
         let legacy = PathScope::from_bytes(b"src\n", "Do the remedy.").unwrap_err();
@@ -998,8 +1086,13 @@ mod tests {
         assert!(legacy.ends_with("Do the remedy."), "{}", legacy);
 
         // So is a format this build does not know.
-        let unknown = PathScope::from_bytes(b"/forklift-scope 4\nsrc\n", "").unwrap_err();
-        assert!(unknown.contains("/forklift-scope 4"), "{}", unknown);
+        let unknown = PathScope::from_bytes(b"/forklift-scope 5\nsrc\n", "").unwrap_err();
+        assert!(unknown.contains("/forklift-scope 5"), "{}", unknown);
+
+        // Format 3 left the spine `.gitignore` files out, so it is refused with the way out.
+        let spineless = PathScope::from_bytes(b"/forklift-scope 3\nsrc\n", "Do the remedy.").unwrap_err();
+        assert!(spineless.contains("/forklift-scope 3") && spineless.ends_with("Do the remedy."), "{}", spineless);
+        assert!(!spineless.contains("Use the Forklift that wrote it"), "{}", spineless);
 
         // Format 2 wrote prefixes raw, so a prefix holding a line break read back as two.
         let raw = PathScope::from_bytes(b"/forklift-scope 2\nsrc\n", "Do the remedy.").unwrap_err();
@@ -1011,9 +1104,9 @@ mod tests {
         assert!(crlf.contains("Do the remedy."), "{}", crlf);
 
         // And a header with no prefix after it, which would otherwise read as the full scope.
-        let bare = PathScope::from_bytes(b"/forklift-scope 3\n", "Do the remedy.").unwrap_err();
+        let bare = PathScope::from_bytes(b"/forklift-scope 4\n", "Do the remedy.").unwrap_err();
         assert!(bare.contains("no prefix narrower than the warehouse root"), "{}", bare);
-        let rooted = PathScope::from_bytes(b"/forklift-scope 3\nsrc\n/\n", "").unwrap_err();
+        let rooted = PathScope::from_bytes(b"/forklift-scope 4\nsrc\n/\n", "").unwrap_err();
         assert!(rooted.contains("no prefix narrower than the warehouse root"), "{}", rooted);
         assert!(bare.ends_with("Do the remedy."), "{}", bare);
     }
