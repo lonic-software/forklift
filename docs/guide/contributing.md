@@ -157,6 +157,12 @@ machine does not tell you what Windows will take.
   binary costs much more on Windows than on Linux, so a loop over launches is where a
   Windows run spends its time: launch once with many paths rather than many times with
   one.
+- **Test at the cheapest level that can fail.** An integration test launches real
+  binaries and pays for every launch; a unit test of the same function pays for none.
+  Put the cases of a rule (every input shape, every edge) in unit tests, and keep one
+  integration test per path that proves the command reaches the rule and reports it.
+  Before adding an integration test, check whether an existing one already crosses the
+  same wiring; if so, add an assertion to it instead of a new test.
 - **Repetition is the cost.** A test that repeats a run to catch a race or a crash at a
   random point (the crash suite's kill tests) uses the fewest rounds that still catch the
   failure, and says in a comment how the count was chosen.
