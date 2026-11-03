@@ -574,7 +574,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             if office_head.is_some() {
                 return Err(Self::anchor_lost());
             }
-            self.require_adopted_history(&anchor)?;
+            self.require_adopted_history(anchor)?;
 
             // Fenced on the warehouse's format like every write, and so a transaction re-issued
             // like every other: under one token, an attempt of unknown fate that landed makes the

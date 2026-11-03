@@ -641,6 +641,7 @@ impl DynamoRefStore {
     /// The one transaction behind both pallet writers — [`RefStore::compare_and_set_head`] and
     /// [`RefStore::delete_head`]: the format fence, the action on the pallet's own item, plus the
     /// office and anchor `ConditionCheck`s.
+    #[allow(clippy::too_many_arguments)]
     async fn commit(
         &self,
         entity: &str,
