@@ -1847,11 +1847,13 @@ no fetch mends it.
 
 **A head no client can check out.** A remote refuses a lift whose new head holds, at any depth, an
 entry named like the warehouse's metadata folder (`.forklift` in any case, and the names some file
-systems open as it), and names the first such path: remove it and lift again. Only what the lift
-changes is judged, so a name the remote's head already held is refused once a lift changes its
-directory, and lifts elsewhere pass. A remote can still hold such a head from before it checked.
-`lower` and `clone` refuse it before anything changes, with `head_not_materializable` (exit 46),
-and `lower` does so even when the bay has diverged from it. No command repairs such a head yet, so
+systems open as it), and names the first such path. Only what the lift changes is judged, so a
+name the remote's head already held is refused once a lift changes its directory or anything
+below it, and lifts that leave that directory alone pass. A remote can still hold such a head from
+before it checked. A `lower` of the current pallet and a `clone` refuse it before anything changes,
+with `head_not_materializable` (exit 46), and `lower` does so even when the bay has diverged from
+it. `lower <pallet>` checks nothing out, so it still moves that pallet onto such a head, and
+`shift` to it is refused. No command repairs such a head yet, so
 the pallet stays where it is. A sparse warehouse is refused only for a name its scope would check
 out, or one at the root. A refused clone keeps what it fetched (`clone_incomplete`, with
 `head_not_materializable` as its cause), and resuming it with another `--pallet`, or an `--only`

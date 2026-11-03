@@ -1053,8 +1053,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
             // Every head a user pallet takes can be checked out, judged against the old head or a
             // creation against the tombstone this warehouse stores, never the request's tombstone
-            // field; the order and the rule are `forklift-server`'s. Read through the object store,
-            // as `load_base_tree` is: the old head's trees are not in the audit scratch.
+            // field; the order and the rule are `forklift-server`'s. The base's trees are read
+            // through the object store, as `load_base_tree` is: they are not in the audit scratch.
+            // The new head's are, since `materialize` mirrored what the closure check just walked,
+            // so they are read there first and from the store only on a miss: one GET per changed
+            // directory, in series, would crowd the integration ceiling on a large first lift.
             if !is_meta {
                 let base = match expected {
                     ExpectedHead::At(old) | ExpectedHead::Deleted(old) => Some(old),
@@ -1068,11 +1071,15 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
                     object_utils::parse_parcel_bytes(hash, &bytes)
                 };
+                let load_head_tree = |hash: &str| -> Result<TreeItem, String> {
+                    object_utils::load_tree(hash).or_else(|_| load_base_tree(hash))
+                };
 
                 if let Some(path) = audit_utils::first_metadata_folder_path(
                     &request.new_head,
                     base,
                     &load_parcel,
+                    &load_head_tree,
                     &load_base_tree,
                 )
                 .map_err(HeadError::internal)?

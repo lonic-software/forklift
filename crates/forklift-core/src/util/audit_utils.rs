@@ -1810,7 +1810,8 @@ pub fn verify_parcel_closure_for_write(head: &str,
 /// Every subtree of `head` whose hash differs from `base`'s subtree at the same path is loaded, and
 /// every entry of a loaded tree is checked, files, symlinks and subtrees alike, whether or not
 /// `base` held that entry. A subtree equal to `base`'s at its path is not loaded. So a matching name
-/// already in `base` stays only while the write leaves its directory unchanged.
+/// already in `base` stays only while the write leaves its directory unchanged, and that directory
+/// changes with any change below it.
 ///
 /// Deliberately not part of the closure walk, which also skips a tree equal to any *parent's* at
 /// the same path: a merge carrying an older parent's tree would slip past a name rule there.
@@ -1823,8 +1824,9 @@ pub fn verify_parcel_closure_for_write(head: &str,
 /// * `base`        - The head it is judged against: the old head, or for a creation over a
 ///                   tombstone the remote itself stores, that tombstone's head; `None` checks the
 ///                   whole tree.
-/// * `load_parcel` - Reads a parcel, from the store the head reads.
-/// * `load_tree`   - Reads a tree, from the store the head reads.
+/// * `load_parcel`    - Reads a parcel, from the store the head reads.
+/// * `load_tree`      - Reads a tree of `head`'s, from the store the head reads.
+/// * `load_base_tree` - Reads a tree of `base`'s, which a head may hold somewhere `head`'s are not.
 ///
 /// # Returns
 /// * `Ok(Some(path))` - The warehouse path of the first matching entry, walked by name.
@@ -1833,7 +1835,8 @@ pub fn verify_parcel_closure_for_write(head: &str,
 pub fn first_metadata_folder_path(head: &str,
                                   base: Option<&str>,
                                   load_parcel: &dyn Fn(&str) -> Result<crate::model::parcel::Parcel, String>,
-                                  load_tree: &dyn Fn(&str) -> Result<TreeItem, String>)
+                                  load_tree: &dyn Fn(&str) -> Result<TreeItem, String>,
+                                  load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>)
                                   -> Result<Option<String>, String> {
     let root = load_parcel(head)?.tree_hash;
     let base_root = base.map(load_parcel).transpose()?.map(|parcel| parcel.tree_hash);
@@ -1854,7 +1857,7 @@ pub fn first_metadata_folder_path(head: &str,
 
         let tree = load_tree(&tree_hash)?;
         let mut base_subtrees: HashMap<String, String> = match &base_hash {
-            Some(base_hash) => load_tree(base_hash)?
+            Some(base_hash) => load_base_tree(base_hash)?
                 .get_subtrees()
                 .map(|(name, subtree)| (name.clone(), subtree.hash.clone()))
                 .collect(),
@@ -1883,7 +1886,7 @@ pub fn first_metadata_folder_path(head: &str,
 pub fn head_not_materializable_message(path: &str) -> String {
     format!(
         "The new head holds \"{}\", the name of the warehouse's metadata folder, which no client \
-        can check out. Remove it and lift again.",
+        can check out, so this remote does not take it.",
         path
     )
 }

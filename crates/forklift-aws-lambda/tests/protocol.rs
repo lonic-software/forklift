@@ -531,6 +531,24 @@ fn an_edit_beside_an_old_bad_name_is_refused_and_one_elsewhere_commits() {
     assert_eq!(user_head(&head, "side"), Some(elsewhere));
 }
 
+/// The gate reads the new head's trees from the audit scratch the closure check just filled, so a
+/// wide creation costs no store read per tree beyond the closure check's own.
+// Revert: load the new head's trees through the store → every tree is read twice → red.
+#[test]
+fn the_gate_reads_the_new_heads_trees_from_the_audit_scratch() {
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    let dirs = (0..40).map(|i| gate_dir(&head, &format!("d{}", i), vec![gate_file(&head, "f", &i.to_string())])).collect();
+    let wide = gate_parcel(&head, &[], dirs);
+
+    head.objects.reset_reads();
+    let request = RefUpdateRequest { old_head: None, new_head: wide, tombstone: None };
+    head.ref_update(&Principal::Static, "main", &request).expect("a clean creation lifts");
+    let reads = head.objects.reads();
+
+    // 41 trees and a parcel: a gate reading through the store would add at least 41 more.
+    assert!(reads <= 42 + 5, "{} reads for 41 trees and a parcel", reads);
+}
+
 /// Classify an object as a blob by trying to parse it as a parcel/tree under the source
 /// warehouse's scope; a blob is neither.
 fn is_probably_blob(warehouse: &Path, hash: &str) -> bool {

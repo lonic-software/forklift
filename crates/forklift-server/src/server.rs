@@ -2897,7 +2897,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                 let base = request.old_head.as_deref().or(recreated.as_deref());
 
                 if let Some(path) = audit_utils::first_metadata_folder_path(
-                    &request.new_head, base, &object_utils::load_parcel, &object_utils::load_tree,
+                    &request.new_head, base, &object_utils::load_parcel, &object_utils::load_tree, &object_utils::load_tree,
                 ).map_err(internal)? {
                     return Err(unprocessable(audit_utils::head_not_materializable_message(&path)));
                 }

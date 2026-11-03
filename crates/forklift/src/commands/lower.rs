@@ -239,7 +239,7 @@ async fn lower_working_pallet(client: &RemoteClient,
             // The refusal's next step checks the remote head out on a pallet of its own, so a head
             // no client can check out is refused as that first.
             remote_utils::fetch_head_content(client, remote_head, progress).await?;
-            refuse_unmaterializable(&pallet, local_tree.as_deref(), remote_head)?;
+            refuse_unmaterializable(&pallet, local_tree.as_deref(), &object_utils::load_parcel(remote_head)?.tree_hash)?;
             return Err(remote_utils::diverged_refusal(&pallet, remote_head).into());
         }
     }
@@ -258,7 +258,7 @@ async fn lower_working_pallet(client: &RemoteClient,
     // Refused before the marker, so a refusal leaves nothing standing (`materialize_tree` checks
     // again, finding the same). A name that opens the metadata folder is refused as the head's,
     // before the planning below trips over it.
-    refuse_unmaterializable(&pallet, local_tree.as_deref(), remote_head)?;
+    refuse_unmaterializable(&pallet, local_tree.as_deref(), &remote_tree)?;
     let (ops, removed_dirs) = shift_utils::diff_trees(local_tree.as_deref(), &remote_tree)?;
     alias_utils::refuse_collisions("Lowering", &shift_utils::collect_collisions(&ops, &removed_dirs)?)?;
     shift_utils::ensure_writes_present(&ops)?;
@@ -292,13 +292,11 @@ async fn lower_working_pallet(client: &RemoteClient,
     Ok(())
 }
 
-/// Refuse `remote_head` of `pallet` with `head_not_materializable` when checking it out over
-/// `local_tree` in this bay's scope would write a name that opens the metadata folder.
-fn refuse_unmaterializable(pallet: &str,
-                           local_tree: Option<&str>,
-                           remote_head: &str) -> Result<(), String> {
-    let remote_tree = object_utils::load_parcel(remote_head)?.tree_hash;
-    let Some(path) = shift_utils::first_unmaterializable_path(local_tree, &remote_tree, &scope_utils::current_scope()?)? else {
+/// Refuse the remote head of `pallet`, whose tree is `remote_tree`, with `head_not_materializable`
+/// when checking it out over `local_tree` in this bay's scope would write a name that opens the
+/// metadata folder.
+fn refuse_unmaterializable(pallet: &str, local_tree: Option<&str>, remote_tree: &str) -> Result<(), String> {
+    let Some(path) = shift_utils::first_unmaterializable_path(local_tree, remote_tree, &scope_utils::current_scope()?)? else {
         return Ok(());
     };
 
