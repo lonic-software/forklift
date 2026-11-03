@@ -22,6 +22,9 @@ use forklift_core::util::object_utils;
 use forklift_core::util::office_utils::{TrustAnchor, OFFICE_PALLET_NAME};
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef, DEFAULT_PALLET_NAME};
 
+use crate::aws::dynamo::{
+    ATTR_ANCHOR, ATTR_DELETED_HEAD, ATTR_HEAD, ATTR_STATE, ENTITY_FORMAT, ENTITY_PALLET_PREFIX, ENTITY_TRUST,
+};
 use crate::store::{
     CasOutcome, ExpectedHead, FormatFence, FormatStore, ObjectAccess, ObjectStore, OffloadedResponse,
     OfficePrecondition, PromoteOutcome, PutOutcome, PutTarget, RefHead, RefListing, RefStore, SignatureOutcome,
@@ -297,6 +300,60 @@ impl MemoryRefStore {
     /// formats were recorded.
     pub fn set_format(&self, state: Option<&str>) {
         self.state.lock().unwrap().format = state.map(str::to_string);
+    }
+
+    /// This store's state as the DynamoDB items `DynamoRefStore` keeps for it: each item's sort
+    /// key, its one payload attribute and that attribute's value, sorted by sort key. What the AWS
+    /// format fixture freezes.
+    pub fn items(&self) -> Vec<(String, String, String)> {
+        let state = self.state.lock().unwrap();
+        let mut items = Vec::new();
+
+        if let Some(format) = &state.format {
+            items.push((ENTITY_FORMAT.to_string(), ATTR_STATE.to_string(), format.clone()));
+        }
+        if let Some(trust) = &state.trust {
+            items.push((ENTITY_TRUST.to_string(), ATTR_ANCHOR.to_string(), trust.clone()));
+        }
+        for (wire, head) in &state.pallets {
+            let entity = format!("{}{}", ENTITY_PALLET_PREFIX, wire);
+            match head {
+                RefHead::Live(head) => items.push((entity, ATTR_HEAD.to_string(), head.clone())),
+                RefHead::Deleted(head) => items.push((entity, ATTR_DELETED_HEAD.to_string(), head.clone())),
+                RefHead::Absent => {}
+            }
+        }
+
+        items.sort();
+        items
+    }
+
+    /// A store holding exactly `items`, as [`Self::items`] lists them.
+    ///
+    /// # Returns
+    /// * `Ok(MemoryRefStore)` - The store.
+    /// * `Err(String)`        - An item this build does not keep: an unknown sort key, or an
+    ///                          attribute its kind of item does not carry.
+    pub fn from_items(items: &[(String, String, String)]) -> Result<MemoryRefStore, String> {
+        let store = MemoryRefStore::new();
+        let mut state = store.state.lock().unwrap();
+
+        for (entity, attribute, value) in items {
+            let pallet = entity.strip_prefix(ENTITY_PALLET_PREFIX);
+
+            match (entity.as_str(), pallet, attribute.as_str()) {
+                (ENTITY_FORMAT, _, ATTR_STATE) => state.format = Some(value.clone()),
+                (ENTITY_TRUST, _, ATTR_ANCHOR) => state.trust = Some(value.clone()),
+                (_, Some(wire), ATTR_HEAD) => { state.pallets.insert(wire.to_string(), RefHead::Live(value.clone())); }
+                (_, Some(wire), ATTR_DELETED_HEAD) => {
+                    state.pallets.insert(wire.to_string(), RefHead::Deleted(value.clone()));
+                }
+                _ => return Err(format!("The item \"{}\" carries \"{}\", which this build does not keep.", entity, attribute)),
+            }
+        }
+
+        drop(state);
+        Ok(store)
     }
 
     fn key(namespace: PalletNamespace, name: &str) -> String {

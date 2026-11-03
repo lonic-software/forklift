@@ -105,24 +105,24 @@ use crate::store::{
 };
 
 /// The partition-key attribute: the warehouse id.
-const ATTR_WAREHOUSE: &str = "wh";
+pub(crate) const ATTR_WAREHOUSE: &str = "wh";
 /// The sort-key attribute: the item kind (`pallet#…` or `trust`).
-const ATTR_ENTITY: &str = "entity";
+pub(crate) const ATTR_ENTITY: &str = "entity";
 /// A live pallet item's head hash.
-const ATTR_HEAD: &str = "head";
+pub(crate) const ATTR_HEAD: &str = "head";
 /// A deleted pallet item's tombstone: the head the pallet held when it was deleted.
-const ATTR_DELETED_HEAD: &str = "deleted_head";
+pub(crate) const ATTR_DELETED_HEAD: &str = "deleted_head";
 /// A trust item's anchor, as a JSON string.
-const ATTR_ANCHOR: &str = "anchor";
+pub(crate) const ATTR_ANCHOR: &str = "anchor";
 /// The format item's state.
-const ATTR_STATE: &str = "state";
+pub(crate) const ATTR_STATE: &str = "state";
 
 /// The sort-key prefix of every pallet head; `begins_with` on it is the ref enumeration.
-const ENTITY_PALLET_PREFIX: &str = "pallet#";
+pub(crate) const ENTITY_PALLET_PREFIX: &str = "pallet#";
 /// The sort key of the single trust item.
-const ENTITY_TRUST: &str = "trust";
+pub(crate) const ENTITY_TRUST: &str = "trust";
 /// The sort key of the single format item.
-const ENTITY_FORMAT: &str = "format";
+pub(crate) const ENTITY_FORMAT: &str = "format";
 
 /// The sort key of a pallet head — `pallet#{wire}`, the qualified reference the fake keys on.
 fn pallet_entity(namespace: PalletNamespace, name: &str) -> String {
@@ -1116,6 +1116,14 @@ pub fn list_warehouses(client: &DynamoOps, table: &str, bridge: &AsyncBridge) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The table's key attributes are the deployment's key schema, which no upgrade step can change:
+    /// a new one is a new table. The items under them are frozen per AWS format by
+    /// `tests/aws_format.rs`, on the memory store, which keeps them under these same names.
+    #[test]
+    fn the_key_schema_is_the_deployments() {
+        assert_eq!((ATTR_WAREHOUSE, ATTR_ENTITY), ("wh", "entity"));
+    }
 
     #[test]
     fn pallet_entities_qualify_the_wire_form_and_stay_distinct_across_namespaces() {
