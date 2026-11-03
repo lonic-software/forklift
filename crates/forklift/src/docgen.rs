@@ -450,6 +450,7 @@ fn command_schemas(name: &str) -> Option<Vec<OutputSchema>> {
         ].into_iter().flatten().collect(),
         "tag" => commands::tag::__docgen_schemas(),
         "undo" => commands::undo::__docgen_schemas(),
+        "upgrade" => commands::upgrade::__docgen_schemas(),
         "version" => commands::version::__docgen_schemas(),
         _ => return None,
     })

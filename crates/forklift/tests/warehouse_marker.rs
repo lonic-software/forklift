@@ -758,3 +758,115 @@ fn prepare_over_a_warehouse_with_a_read_only_format_lock_has_nothing_to_do() {
     std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert!(output.status.success(), "{}{}", text(&output.stdout), text(&output.stderr));
 }
+
+/// `upgrade` on a warehouse already in this build's format changes nothing and says so, from
+/// anywhere inside the working tree.
+///
+/// Revert: dispatch `upgrade` through the open gate → it holds the lease itself and refuses → red.
+#[test]
+fn upgrade_leaves_a_current_warehouse_as_it_is() {
+    let area = Area::new("upgrade-current");
+    let root = area.warehouse("w");
+    let below = area.dir("w/src");
+    let before = std::fs::read(marker_of(&root)).unwrap();
+
+    let output = area.run_ok(&below, &["--json", "upgrade"]);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["data"], serde_json::json!({"from": 1, "to": 1, "resumed": null, "steps_run": 0}), "{}", value);
+
+    let output = area.run_ok(&root, &["upgrade"]);
+    assert!(text(&output.stdout).contains("Nothing to do."), "{}", text(&output.stdout));
+    assert_eq!(std::fs::read(marker_of(&root)).unwrap(), before);
+    area.run_ok(&root, &["stocktake"]);
+}
+
+/// `upgrade` needs the warehouse to itself: while another process holds the format lease it
+/// refuses at once with its own code, and runs once the lease is let go.
+///
+/// Revert: take the lease shared in the upgrade → it runs beside the reader → red.
+#[test]
+fn upgrade_refuses_a_warehouse_in_use() {
+    let area = Area::new("upgrade-in-use");
+    let root = area.warehouse("w");
+    let held = forklift_core::util::lock_utils::FormatLease::shared(&root.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+
+    let (message, next_step) = format_refusal(&area, &root, &["upgrade"], "warehouse_in_use", 45);
+    assert!(message.contains("is in use"), "{}", message);
+    assert!(next_step.contains("run the upgrade again"), "{}", next_step);
+
+    drop(held);
+    area.run_ok(&root, &["upgrade"]);
+}
+
+/// A bay is upgraded with its warehouse, so `upgrade` in a bay names the warehouse to run it in.
+///
+/// Revert: let `upgrade` follow the bay's redirect → it upgrades from the bay → red.
+#[test]
+fn upgrade_in_a_bay_names_its_warehouse() {
+    let area = Area::new("upgrade-bay");
+    let root = area.warehouse("w");
+    let bay = area.path("bay");
+    area.run_ok(&root, &["bay", "add", "feature", bay.to_str().unwrap()]);
+
+    let refusal = area.refused(&bay, &["upgrade"]);
+    assert_eq!(refusal.next_step, format!("Run \"forklift upgrade\" in {}.", quoted(&root)));
+}
+
+/// What this build's upgrade cannot carry is refused with the way out its side calls for, and the
+/// marker is left as it was: a format older than any upgrade reaches is made again, a newer one or
+/// an unfinished upgrade to a newer one needs a newer binary.
+///
+/// Revert: answer format 0 with the gate's "run the upgrade" → the upgrade names itself → red.
+#[test]
+fn upgrade_refuses_what_it_cannot_carry_and_says_where_to_go() {
+    let area = Area::new("upgrade-refusals");
+    let root = area.warehouse("w");
+    let cases = [
+        ("/forklift-warehouse 3\nformat 0\nfull\n", "warehouse_format_older", 40, "\"forklift prepare\""),
+        ("/forklift-warehouse 3\nformat 2\nfull\n", "warehouse_format_newer", 41, "Update this Forklift"),
+        ("/forklift-warehouse 3\nformat 1\nfull\nupgrading 2 0\n", "warehouse_upgrade_incomplete", 42, "reads format 2"),
+    ];
+
+    for (content, code, exit, expected) in cases {
+        std::fs::write(marker_of(&root), content).unwrap();
+        let (_, next_step) = format_refusal(&area, &root, &["upgrade"], code, exit);
+        assert!(next_step.contains(expected), "{:?}: {}", content, next_step);
+        assert!(!next_step.contains("forklift upgrade"), "{:?}: {}", content, next_step);
+        assert_eq!(std::fs::read_to_string(marker_of(&root)).unwrap(), content);
+    }
+}
+
+/// `forklift-server upgrade` is refused while the warehouse is served and runs once the server has
+/// stopped, and its refusals carry the server's own way out.
+///
+/// Revert: take the lease shared in the upgrade → it runs under the running server → red.
+#[test]
+fn the_server_upgrades_only_a_warehouse_it_is_not_serving() {
+    use std::io::BufRead;
+
+    let area = Area::new("upgrade-server");
+    let root = area.warehouse("w");
+    let upgrade = || std::process::Command::new(common::server_binary())
+        .args(["upgrade", "--root"]).arg(&root).output().unwrap();
+
+    let mut serving = std::process::Command::new(common::server_binary())
+        .args(["serve", "--root", root.to_str().unwrap(), "--addr", "127.0.0.1:0", "--open"])
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(serving.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    let during = upgrade();
+    let _ = serving.kill();
+    let _ = serving.wait();
+    assert!(!line.is_empty(), "the server started");
+    assert!(!during.status.success(), "the upgrade ran under the server: {}", text(&during.stdout));
+    assert!(text(&during.stderr).contains("is in use"), "{}", text(&during.stderr));
+
+    let after = upgrade();
+    assert!(after.status.success(), "{}", text(&after.stderr));
+    assert!(text(&after.stdout).contains("Nothing to do."), "{}", text(&after.stdout));
+
+    std::fs::write(marker_of(&root), "/forklift-warehouse 3\nformat 0\nfull\n").unwrap();
+    let older = upgrade();
+    assert!(!older.status.success());
+    assert!(text(&older.stderr).contains("\"forklift-server prepare\""), "{}", text(&older.stderr));
+}

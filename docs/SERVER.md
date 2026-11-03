@@ -74,6 +74,13 @@ A build reads exactly one [warehouse format](format/WAREHOUSE_FORMAT.md). `serve
 that warehouse and goes on serving the others. A served warehouse holds `format.lock` shared for as
 long as it is served.
 
+`forklift-server upgrade --root <root>` upgrades a warehouse to the format this build reads, with
+the same steps as `forklift upgrade`, and resumes one that was interrupted. It needs the warehouse to
+itself: stop every server serving it and let any `bundle` or `gc` finish first, or it refuses. It
+takes no serve lock, so a lock left by a server that was killed does not stand in its way. On a
+`--warehouses` server, stop the server, upgrade each warehouse it answers `503` for, and start it
+again.
+
 ## Serving many warehouses
 
 ```sh

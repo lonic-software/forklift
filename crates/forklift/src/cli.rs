@@ -545,6 +545,17 @@ pub enum Command {
     )]
     Prepare,
 
+    /// Upgrade the warehouse to the format this version of Forklift reads
+    #[command(
+        long_about = "Upgrade the warehouse the current directory is in, with all its bays, to the \
+                      format this version of Forklift reads, one format at a time, or finish an \
+                      upgrade that was interrupted. Every other command refuses a warehouse in another \
+                      format, or one whose upgrade has not finished. The upgrade needs the warehouse to \
+                      itself: it refuses while any other Forklift command, in the warehouse or one of \
+                      its bays, or a server serving it has it open. Upgrades are one-way."
+    )]
+    Upgrade,
+
     /// Manage identity profiles (named operator ids) and select one per warehouse
     #[command(
         long_about = "Manage identity profiles: named operator ids stored in the global \

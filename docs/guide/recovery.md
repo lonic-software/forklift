@@ -327,8 +327,12 @@ No `.forklift` here or in any parent. Change into the warehouse, or run `forklif
 ### `warehouse_format_older` (exit 40)
 
 The warehouse is in an older [format](../format/WAREHOUSE_FORMAT.md) than this build reads. Nothing was
-read or changed. The refusal names the upgrade command to run. Format 1 is the first format, so no
+read or changed. Run the upgrade the refusal names: `forklift upgrade` in the warehouse, or
+`forklift-server upgrade --root <root>` with no server serving it. Format 1 is the first format, so no
 warehouse is older yet.
+
+When the upgrade itself refuses with this code, the format is older than any it upgrades. Make the
+warehouse again as its next step says.
 
 ### `warehouse_format_newer` (exit 41)
 
@@ -337,13 +341,19 @@ A newer Forklift made or upgraded this warehouse, and upgrades are one-way. Upda
 ### `warehouse_upgrade_incomplete` (exit 42)
 
 An upgrade stopped before it finished, so the warehouse is between two formats and every command
-refuses it. The refusal names the upgrade command to run with a build that reads the target format;
-it resumes the upgrade. No upgrade can have started yet, since format 1 is the first format.
+refuses it. Run the upgrade the refusal names, with a build that reads the target format; it resumes
+at the first step not done. No upgrade can have started yet, since format 1 is the first format.
 
 ### `warehouse_upgrade_running` (exit 43)
 
 Another process holds `.forklift/format.lock` exclusively, which is what an upgrade does. Run the
 command again once it finishes. A process that dies releases the lock.
+
+### `warehouse_in_use` (exit 45)
+
+The upgrade needs the warehouse to itself, and another process has it open: a command in the
+warehouse or one of its bays, a server serving it, a bundle or a gc. Nothing was changed. Let those
+finish and stop the server, then run the upgrade again.
 
 ### `warehouse_lease_missing` (exit 44)
 

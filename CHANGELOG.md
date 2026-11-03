@@ -21,7 +21,7 @@ Entries are written by hand in the pull request that makes the change, under **U
 - Destructive operations preview by default and act with `--confirm`; without it they exit 39.
 - `restore --staged` is gone; use `unload`.
 - MCP tools are generated from the command tree.
-- `--json` documents are now at schema 16.
+- `--json` documents are now at schema 17.
 - **A warehouse now records its format, and a build reads exactly one.** A warehouse in another format
   is refused before anything in it is read, with its own error code and way out. Warehouses made by
   an earlier build are refused and must be made again: no upgrade reaches back before this change.
@@ -29,6 +29,9 @@ Entries are written by hand in the pull request that makes the change, under **U
 
 ### Added
 
+- `forklift upgrade` and `forklift-server upgrade --root` upgrade a warehouse, with all its bays, to the
+  format the build reads, and resume an upgrade that was interrupted. Both refuse while anything else has
+  the warehouse open (exit 45). No format before the first is upgraded.
 - Partial warehouses: a cache warehouse fetches what it reads from its origin, `store evict` frees what
   the origin holds, and `remote move` moves the origin.
 - `git mirror` keeps a git remote in step, never by force.

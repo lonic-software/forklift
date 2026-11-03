@@ -172,7 +172,7 @@ impl Head {
 
     /// The way out for a `.forklift` at `root` (absolute) that has content but no marker: making
     /// the warehouse again, and for the CLI, restoring a bay's lost redirect.
-    fn recreate_step(self, forklift: &Path, root: &Path) -> String {
+    pub(crate) fn recreate_step(self, forklift: &Path, root: &Path) -> String {
         match self {
             Head::Client => format!(
                 "Move \"{}\" aside, run {}, then import the history again (\"forklift git import\") or \
@@ -484,7 +484,7 @@ fn unprepared_refusal(root: &Path, head: Head) -> Result<CoreError, CoreError> {
 }
 
 /// `root` as an absolute path, for the refusals that name it.
-fn shown_root(root: &Path) -> PathBuf {
+pub(crate) fn shown_root(root: &Path) -> PathBuf {
     std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf())
 }
 
@@ -628,25 +628,25 @@ const FILE_NAME_STAGING_LOCK: &str = "lock";
 
 /// What a warehouse marker records, read through its frozen framing, whatever the format.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct WarehouseMarker {
+pub(crate) struct WarehouseMarker {
     /// The warehouse's format.
-    format: u32,
+    pub(crate) format: u32,
 
     /// The mode's word. Only [`WAREHOUSE_FORMAT`]'s words are this build's to interpret.
-    mode: String,
+    pub(crate) mode: String,
 
     /// The upgrade that was started and has not finished.
-    upgrade: Option<MarkerUpgrade>,
+    pub(crate) upgrade: Option<MarkerUpgrade>,
 }
 
 /// An upgrade recorded in a warehouse marker.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct MarkerUpgrade {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MarkerUpgrade {
     /// The format it moves to.
-    target: u32,
+    pub(crate) target: u32,
 
     /// The steps of it that have finished.
-    step: u32,
+    pub(crate) step: u32,
 }
 
 /// A marker's number as its writer spells it: plain decimal digits, no sign and no leading zero.
@@ -683,7 +683,7 @@ fn parse_marker_entries(entries: &[String]) -> Result<WarehouseMarker, String> {
 /// * `Ok(Some(marker))` - It holds a marker.
 /// * `Ok(None)`         - It holds none.
 /// * `Err(String)`      - The marker cannot be read, or its framing is not the frozen one.
-fn read_marker(forklift: &Path) -> Result<Option<WarehouseMarker>, String> {
+pub(crate) fn read_marker(forklift: &Path) -> Result<Option<WarehouseMarker>, String> {
     let path = forklift.join(FILE_NAME_WAREHOUSE_MARKER);
 
     let bytes = match std::fs::read(&path) {
@@ -770,12 +770,20 @@ pub fn warehouse_mode() -> Result<WarehouseMode, String> {
 
 /// Write the warehouse marker recording `mode` in `forklift`, atomically and synced with its folder.
 fn write_warehouse_marker(forklift: &Path, mode: WarehouseMode) -> Result<(), String> {
-    let bytes = record_utils::to_bytes(
-        WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION, [format!("format {}", WAREHOUSE_FORMAT).as_str(), mode.word()]
-    );
+    write_marker(forklift, &WarehouseMarker { format: WAREHOUSE_FORMAT, mode: mode.word().to_string(), upgrade: None })
+}
+
+/// Write `marker` as the warehouse marker in `forklift`, in the framing frozen at record version 3,
+/// atomically and synced with its folder.
+pub(crate) fn write_marker(forklift: &Path, marker: &WarehouseMarker) -> Result<(), String> {
+    let format = format!("format {}", marker.format);
+    let upgrade = marker.upgrade.map(|upgrade| format!("upgrading {} {}", upgrade.target, upgrade.step));
+    let entries = [Some(format.as_str()), Some(marker.mode.as_str()), upgrade.as_deref()];
+
+    let bytes = record_utils::to_bytes(WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION, entries.into_iter().flatten());
 
     file_utils::replace_file_atomically(&forklift.join(FILE_NAME_WAREHOUSE_MARKER), &bytes)
-        .map_err(|e| format!("Error while marking \"{}\" as a warehouse: {}", forklift.to_string_lossy(), e))
+        .map_err(|e| format!("Error while writing the warehouse marker in \"{}\": {}", forklift.to_string_lossy(), e))
 }
 
 /// The origin [`mark_for_test`] records for a partial mode.

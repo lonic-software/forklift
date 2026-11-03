@@ -32,6 +32,7 @@ pub mod alias_utils;
 pub mod scope_utils;
 pub mod prune_utils;
 pub mod stocktake_utils;
+pub mod upgrade_utils;
 pub mod warehouse_utils;
 pub mod file_utils;
 pub mod object_utils;

@@ -305,6 +305,11 @@ refusal_codes! {
     /// The warehouse's format lease file is missing and this user cannot create it, so no command can
     /// be kept safe from an upgrade. The next step creates the file or restores write access.
     WarehouseLeaseMissing => "warehouse_lease_missing",
+
+    /// An upgrade was refused because another process has the warehouse open: a command, a server
+    /// serving it, or another upgrade. Nothing was changed; the next step is to let them finish, then
+    /// run the upgrade again.
+    WarehouseInUse => "warehouse_in_use",
 }
 
 impl RefusalCode {

@@ -57,4 +57,5 @@ Exit code 17 is reserved for a future feature and is not yet assigned to any cod
 | `warehouse_upgrade_incomplete` | 42 | An upgrade of the warehouse did not finish, and every other command refuses; "forklift upgrade" resumes it |
 | `warehouse_upgrade_running` | 43 | Another process is upgrading the warehouse right now; run the command again once it finishes |
 | `warehouse_lease_missing` | 44 | The warehouse's format lease file is missing and this user cannot create it; create it, or restore write access |
+| `warehouse_in_use` | 45 | An upgrade found the warehouse open in another process; let it finish, then run the upgrade again |
 

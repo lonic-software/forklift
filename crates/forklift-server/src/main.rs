@@ -77,6 +77,21 @@ enum Command {
         root: String,
     },
 
+    /// Upgrade a warehouse to the format this version reads (refused while it is served)
+    #[command(
+        long_about = "Upgrade the warehouse at --root to the format this version of forklift-server \
+                      reads, one format at a time, or finish an upgrade that was interrupted. The \
+                      server refuses to serve a warehouse in another format, or one whose upgrade has \
+                      not finished. The upgrade needs the warehouse to itself: stop every server \
+                      serving it, and let any bundle or gc finish, before running it. Upgrades are \
+                      one-way."
+    )]
+    Upgrade {
+        /// The warehouse root to upgrade
+        #[arg(long)]
+        root: String,
+    },
+
     /// Build the bundle served at /v1/bundles/latest (see BUNDLE_FORMAT.md)
     Bundle {
         /// The warehouse root to bundle
@@ -157,6 +172,7 @@ async fn async_main() {
         Command::Serve { root, warehouses, addr, token, tokens, max_body_mb, rebuild_after_lifts, open, config } =>
             serve(root, warehouses, addr, token, tokens, max_body_mb, rebuild_after_lifts, open, config).await,
         Command::Prepare { root } => prepare(&root),
+        Command::Upgrade { root } => upgrade(&root),
         Command::Bundle { root } => bundle(&root),
         Command::Gc { root, grace_hours } => gc(&root, grace_hours),
         Command::Tombstone { action: TombstoneAction::List { root } } => list_tombstones(&root),
@@ -615,6 +631,29 @@ fn prepare(root: &str) -> Result<(), String> {
         println!("Nothing to do.");
     } else {
         println!("Prepared warehouse at \"{}\".", root);
+    }
+
+    Ok(())
+}
+
+/// Upgrade the warehouse at `root` to the format this build reads. No serve lock is taken: the
+/// format lease the upgrade holds exclusively already refuses while a server, a bundle or a gc
+/// has the warehouse open, and a serve lock left behind by a killed server would refuse an
+/// upgrade nothing else is in the way of.
+fn upgrade(root: &str) -> Result<(), String> {
+    use forklift_core::util::{upgrade_utils, warehouse_utils};
+
+    let resolved = server::canonical_root(root)?;
+    let report = upgrade_utils::upgrade_warehouse(&resolved, warehouse_utils::Head::Server, &upgrade_utils::CHAIN)?;
+
+    if let Some(resumed) = report.resumed {
+        println!("Resumed the unfinished upgrade to format {} after its step {}.", resumed.target, resumed.step);
+    }
+
+    if report.from == report.to && report.resumed.is_none() {
+        println!("The warehouse at \"{}\" is in format {}, the one this version reads. Nothing to do.", root, report.to);
+    } else {
+        println!("Upgraded the warehouse at \"{}\" from format {} to format {}.", root, report.from, report.to);
     }
 
     Ok(())

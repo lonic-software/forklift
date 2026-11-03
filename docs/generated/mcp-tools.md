@@ -78,6 +78,7 @@ Every tool `forklift mcp` serves, generated from the same command definition the
 Each of these commands, and every command below it, is a tool for nobody: a person runs it.
 
 - `forklift prepare`: creates a warehouse, which is setup.
+- `forklift upgrade`: changes the format of the whole warehouse, every bay's included, one way, which is setup.
 - `forklift config`: reads and sets configuration, which is setup.
 - `forklift profile`: manages identity profiles, which is setup.
 - `forklift clone`: clones a remote, which is setup.

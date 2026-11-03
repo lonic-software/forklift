@@ -49,4 +49,5 @@ pub mod profile;
 pub mod query;
 pub mod remove;
 pub mod undo;
+pub mod upgrade;
 pub mod unload;

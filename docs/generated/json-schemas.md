@@ -3394,6 +3394,78 @@ A command not listed here either reports only the generic human-message shape `{
 }
 ```
 
+## `upgrade`
+
+### `Upgraded`
+
+```json
+{
+  "$defs": {
+    "Resumed": {
+      "description": "An unfinished upgrade `upgrade` found on record.",
+      "properties": {
+        "steps_done": {
+          "description": "The steps of it already done when this run started.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "target": {
+          "description": "The format it was moving to.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "target",
+        "steps_done"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "What `upgrade` did: the format the warehouse was in and the one it is in now (the same when\nthere was nothing to do).",
+  "properties": {
+    "from": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "resumed": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Resumed"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The unfinished upgrade found on record and finished, if any."
+    },
+    "steps_run": {
+      "description": "The migration steps this run carried out.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "to": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "from",
+    "to",
+    "resumed",
+    "steps_run"
+  ],
+  "title": "Upgraded",
+  "type": "object"
+}
+```
+
 ## `profile`
 
 ### `ProfileList`

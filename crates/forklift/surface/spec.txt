@@ -48,6 +48,7 @@ store: status compact peek evict
 tag: create show list
 undo
 unload
+upgrade
 version
 
 [daily-loop]
