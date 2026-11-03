@@ -1250,11 +1250,11 @@ instead (it takes `--remote`). It deletes only if the remote holds the pallet at
 it done if the pallet was deleted at that head (as a pinned rerun after a lost answer finds it),
 and otherwise refuses without sending anything: `remote_ahead` (exit 28) when the pallet is at
 another head, `pallet_deleted_on_remote` (exit 35) when it is deleted at another head, each naming
-`pallet list --remote` to look first. An error that leaves the delete's fate unknown — a timeout, a
-lost connection, a `5xx` — names that pinned rerun, and a
-refusal saying the pallet moved since the command read it names the listing, never a bare rerun. A
-serverless remote whose storage could not settle a delete answers with an error naming the head the
-delete was for, and sends you to that listing before deleting again.
+`pallet list --remote` to look first. An error that may leave the delete's fate unknown — a
+timeout, a lost connection, a `5xx` — names that pinned rerun, and a refusal saying the pallet
+moved since the command read it names the listing, never a bare rerun. A serverless remote whose
+storage could not settle a delete answers with an error naming the head the delete was for, which
+sends you to that listing before deleting again and also names the pinned rerun.
 
 A pallet deleted on the remote is not lowered or lifted as if it had never existed.
 `lower <name>` refuses with `pallet_not_found`, saying it was deleted and naming

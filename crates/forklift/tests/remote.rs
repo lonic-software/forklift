@@ -11104,7 +11104,7 @@ fn a_remote_delete_of_unknown_fate_names_its_head_and_the_pinned_rerun() {
     assert!(!failed.status.success(), "{}", stdout(&failed));
     let said = stderr(&failed);
     assert!(said.contains(&format!("The delete was for \"feat\" at {}.", feat)), "{}", said);
-    assert!(said.contains(&format!("\"forklift pallet delete feat --remote --at {}\" runs it again at that head only", feat)), "{}", said);
+    assert!(said.contains(&format!("\"forklift pallet delete feat --remote --at {}\" runs this delete again at that head only", feat)), "{}", said);
     assert_eq!(pallet_head(&area, "server-root", "feat"), feat, "the proxy answered for the remote");
 }
 
