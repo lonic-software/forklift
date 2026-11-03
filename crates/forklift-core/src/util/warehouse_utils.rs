@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::{self, forklift_root, FOLDER_NAME_FORKLIFT_ROOT};
-use crate::util::{alias_utils, bay_utils, config_utils, file_utils, franchise_utils, lock_utils, origin_utils, pallet_utils, record_utils, scope_utils};
+use crate::util::{alias_utils, bay_utils, config_utils, file_utils, franchise_utils, lock_utils, origin_utils, pallet_utils, record_utils, scope_utils, upgrade_utils};
 use crate::util::record_utils::RecordError;
 use crate::util::scope_utils::PathScope;
 
@@ -231,19 +231,20 @@ pub fn hold_warehouse_format(root: &Path, head: Head) -> Result<lock_utils::Form
         "The warehouse marker in \"{}\" was removed while the warehouse was being opened.", forklift.to_string_lossy()
     ))?;
 
-    judge_format(&marker, &shown_root(root), head)?;
+    judge_format(&marker, &shown_root(root), head, &upgrade_utils::CHAIN)?;
 
     Ok(lease)
 }
 
-/// Whether a build reading [`WAREHOUSE_FORMAT`] may use a warehouse with `marker`, whose absolute
-/// root is `root`. Next steps are written for `head`.
+/// Whether a build upgrading with `chain` (this build's is [`upgrade_utils::CHAIN`], reading
+/// [`WAREHOUSE_FORMAT`]) may use a warehouse with `marker`, whose absolute root is `root`. An older
+/// format is sent to the upgrade only when the chain reaches it. Next steps are written for `head`.
 ///
 /// # Returns
 /// * `Ok(())`         - It may.
 /// * `Err(CoreError)` - A `warehouse_upgrade_incomplete`, `warehouse_format_older` or
 ///                      `warehouse_format_newer` refusal.
-fn judge_format(marker: &WarehouseMarker, root: &Path, head: Head) -> Result<(), CoreError> {
+fn judge_format(marker: &WarehouseMarker, root: &Path, head: Head, chain: &upgrade_utils::UpgradeChain) -> Result<(), CoreError> {
     let shown = root.to_string_lossy();
 
     if let Some(upgrade) = &marker.upgrade {
@@ -257,13 +258,22 @@ fn judge_format(marker: &WarehouseMarker, root: &Path, head: Head) -> Result<(),
         ));
     }
 
-    match marker.format.cmp(&WAREHOUSE_FORMAT) {
+    match marker.format.cmp(&chain.reads) {
         std::cmp::Ordering::Equal => Ok(()),
+        std::cmp::Ordering::Less if marker.format < chain.floor() => Err(CoreError::refusal(
+            RefusalCode::WarehouseFormatOlder,
+            format!(
+                "The warehouse at \"{}\" is in format {}, older than any format this version of Forklift \
+                upgrades (format {} and later).",
+                shown, marker.format, chain.floor()
+            ),
+            head.recreate_step(&root.join(FOLDER_NAME_FORKLIFT_ROOT), root),
+        )),
         std::cmp::Ordering::Less => Err(CoreError::refusal(
             RefusalCode::WarehouseFormatOlder,
             format!(
                 "The warehouse at \"{}\" is in format {}, older than the format {} this version of Forklift reads.",
-                shown, marker.format, WAREHOUSE_FORMAT
+                shown, marker.format, chain.reads
             ),
             format!("Run {}.", head.upgrade_command(root)),
         )),
@@ -271,7 +281,7 @@ fn judge_format(marker: &WarehouseMarker, root: &Path, head: Head) -> Result<(),
             RefusalCode::WarehouseFormatNewer,
             format!(
                 "The warehouse at \"{}\" is in format {}, newer than the format {} this version of Forklift reads.",
-                shown, marker.format, WAREHOUSE_FORMAT
+                shown, marker.format, chain.reads
             ),
             "Update this Forklift binary to one that reads that format.",
         )),
@@ -596,7 +606,7 @@ impl WarehouseMode {
         }
     }
 
-    fn from_word(word: &str) -> Option<WarehouseMode> {
+    pub(crate) fn from_word(word: &str) -> Option<WarehouseMode> {
         [WarehouseMode::Full, WarehouseMode::Sparse, WarehouseMode::Cache].into_iter()
             .find(|mode| mode.word() == word)
     }
@@ -1666,6 +1676,29 @@ mod tests {
 
             std::fs::remove_dir_all(&root).ok();
         }
+    }
+
+    /// An older format is sent to the upgrade only when the chain reaches it; one older than that is
+    /// told to make the warehouse again, never pointed at an upgrade that would refuse it.
+    ///
+    /// Revert: name the upgrade for every older format → format 1 below the floor names it → red.
+    #[test]
+    fn an_older_format_is_sent_to_the_upgrade_only_when_the_chain_reaches_it() {
+        let none: [upgrade_utils::UpgradeStep; 0] = [];
+        let migrations = [upgrade_utils::Migration { steps: &none }];
+        let chain = upgrade_utils::UpgradeChain { reads: 3, migrations: &migrations };
+        let root = Path::new("/w");
+        let step_for = |format| {
+            let marker = WarehouseMarker { format, mode: "full".to_string(), upgrade: None };
+            match judge_format(&marker, root, Head::Client, &chain) {
+                Err(CoreError::Refusal { code: RefusalCode::WarehouseFormatOlder, next_step, .. }) => next_step,
+                other => panic!("format {}: {:?}", format, other),
+            }
+        };
+
+        assert!(step_for(2).contains("\"forklift upgrade\""), "{}", step_for(2));
+        assert!(step_for(1).contains("\"forklift prepare\""), "{}", step_for(1));
+        assert!(!step_for(1).contains("upgrade"), "{}", step_for(1));
     }
 
     /// Classifying decides only that a folder is a warehouse: any format is one, even with a mode

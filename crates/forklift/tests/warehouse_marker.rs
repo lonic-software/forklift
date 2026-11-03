@@ -538,7 +538,8 @@ fn a_warehouse_in_another_format_is_refused_with_its_own_way_out() {
     let root = area.warehouse("w");
     let marker = marker_of(&root);
     let cases = [
-        ("/forklift-warehouse 3\nformat 0\nfull\n", "warehouse_format_older", 40, "forklift upgrade"),
+        // Older than any format this build upgrades: made again, never sent to the upgrade.
+        ("/forklift-warehouse 3\nformat 0\nfull\n", "warehouse_format_older", 40, "\"forklift prepare\""),
         ("/forklift-warehouse 3\nformat 2\nfull\n", "warehouse_format_newer", 41, "Update this Forklift"),
         // A mode of a format this build does not read is not this build's to judge.
         ("/forklift-warehouse 3\nformat 2\nsomething-new\n", "warehouse_format_newer", 41, "Update this Forklift"),
@@ -553,7 +554,7 @@ fn a_warehouse_in_another_format_is_refused_with_its_own_way_out() {
         for args in [&["stocktake"][..], &["stack", "-m", "again"], &["prepare"], &["pallet", "list"]] {
             let (_, next_step) = format_refusal(&area, &root, args, code, exit);
             assert!(next_step.contains(expected), "{:?} over {:?}: {}", args, content, next_step);
-            assert!(!next_step.contains("prepare"), "{:?} over {:?}: {}", args, content, next_step);
+            assert!(expected.contains("prepare") || !next_step.contains("prepare"), "{:?} over {:?}: {}", args, content, next_step);
         }
         assert_eq!(listing(&root), before, "{:?}: a refused command writes nothing", content);
     }
@@ -686,7 +687,7 @@ fn the_server_serves_no_warehouse_in_another_format() {
     let area = Area::new("format-server");
     let root = area.warehouse("w");
 
-    for (content, expected) in [("/forklift-warehouse 3\nformat 0\nfull\n", "forklift-server upgrade"),
+    for (content, expected) in [("/forklift-warehouse 3\nformat 0\nfull\n", "\"forklift-server prepare\""),
                                 ("/forklift-warehouse 3\nformat 2\nfull\n", "Update this Forklift")] {
         std::fs::write(marker_of(&root), content).unwrap();
         let mut serving = std::process::Command::new(common::server_binary())

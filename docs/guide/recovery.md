@@ -328,11 +328,9 @@ No `.forklift` here or in any parent. Change into the warehouse, or run `forklif
 
 The warehouse is in an older [format](../format/WAREHOUSE_FORMAT.md) than this build reads. Nothing was
 read or changed. Run the upgrade the refusal names: `forklift upgrade` in the warehouse, or
-`forklift-server upgrade --root <root>` with no server serving it. Format 1 is the first format, so no
-warehouse is older yet.
-
-When the upgrade itself refuses with this code, the format is older than any it upgrades. Make the
-warehouse again as its next step says.
+`forklift-server upgrade --root <root>` with no server serving it. When the format is older than any
+this build upgrades, the refusal says to make the warehouse again instead. Format 1 is the first
+format, so no warehouse is older yet.
 
 ### `warehouse_format_newer` (exit 41)
 

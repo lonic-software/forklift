@@ -36,7 +36,7 @@ pieces of its own format under another number.
 | Marker | Refusal | Exit | Way out |
 |---|---|---|---|
 | `upgrading` present | `warehouse_upgrade_incomplete` | 42 | Run the upgrade again, with a build that reads the target format. |
-| Older than this build | `warehouse_format_older` | 40 | Run the upgrade. |
+| Older than this build | `warehouse_format_older` | 40 | Run the upgrade; for a format older than any the build upgrades, make the warehouse again. |
 | Newer than this build | `warehouse_format_newer` | 41 | Update the binary. Upgrades are one-way. |
 
 A `--warehouses` server answers `503` for such a warehouse and serves the others. No warehouse can
@@ -61,8 +61,10 @@ itself:
    are given the forklift folder and the state folder of every bay.
 5. It records `format F+1` with no upgrade, and takes the next format until it reaches the one it reads.
 
-Run again after a crash or a failed step, the upgrade resumes at the first step not recorded done. The
-mode word is kept as it is.
+Run again after a crash or a failed step, the upgrade resumes at the first step not recorded done. Steps
+run with the warehouse as the storage root, wherever the upgrade was started. The mode word is kept,
+unless a step rewrites it; at the format the build reads it must be a mode that build knows, or the
+upgrade stays on record.
 
 What it cannot carry it refuses, changing nothing:
 

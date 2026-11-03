@@ -16,6 +16,7 @@ pub fn handle_command() -> Result<(), String> {
     let report = upgrade_utils::upgrade_warehouse(&root, warehouse_utils::Head::Client, &upgrade_utils::CHAIN)?;
 
     output::emit(&Upgraded {
+        summary: report.summary(),
         from: report.from,
         to: report.to,
         resumed: report.resumed.map(|resumed| Resumed { target: resumed.target, steps_done: resumed.step }),
@@ -38,6 +39,10 @@ pub(crate) struct Upgraded {
 
     /// The migration steps this run carried out.
     steps_run: u32,
+
+    /// What it did, for a person; not part of the data.
+    #[serde(skip)]
+    summary: Vec<String>,
 }
 
 /// An unfinished upgrade `upgrade` found on record.
@@ -53,17 +58,8 @@ pub(crate) struct Resumed {
 
 impl CommandOutput for Upgraded {
     fn render_human(&self) {
-        if let Some(resumed) = &self.resumed {
-            println!(
-                "Resumed the unfinished upgrade to format {} after its step {}.",
-                resumed.target, resumed.steps_done
-            );
-        }
-
-        if self.from == self.to && self.resumed.is_none() {
-            println!("The warehouse is in format {}, the one this version reads. Nothing to do.", self.to);
-        } else {
-            println!("Upgraded the warehouse from format {} to format {}.", self.from, self.to);
+        for line in &self.summary {
+            println!("{}", line);
         }
     }
 }

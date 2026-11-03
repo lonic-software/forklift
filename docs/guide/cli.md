@@ -72,7 +72,8 @@ forklift upgrade
 
 The marker also records the warehouse's [format](../format/WAREHOUSE_FORMAT.md), and a
 version of Forklift reads exactly one. Every other command refuses a warehouse in an older
-format with `warehouse_format_older` (exit 40) and names this command. `upgrade` moves the
+format with `warehouse_format_older` (exit 40) and names this command, when this version can
+upgrade that format. `upgrade` moves the
 warehouse, with all its bays, one format at a time to the one this version reads, and
 finishes an upgrade that was interrupted: run again, it resumes where it stopped. A warehouse
 already in this version's format is left as it is ("Nothing to do.").

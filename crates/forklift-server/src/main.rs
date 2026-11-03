@@ -646,14 +646,8 @@ fn upgrade(root: &str) -> Result<(), String> {
     let resolved = server::canonical_root(root)?;
     let report = upgrade_utils::upgrade_warehouse(&resolved, warehouse_utils::Head::Server, &upgrade_utils::CHAIN)?;
 
-    if let Some(resumed) = report.resumed {
-        println!("Resumed the unfinished upgrade to format {} after its step {}.", resumed.target, resumed.step);
-    }
-
-    if report.from == report.to && report.resumed.is_none() {
-        println!("The warehouse at \"{}\" is in format {}, the one this version reads. Nothing to do.", root, report.to);
-    } else {
-        println!("Upgraded the warehouse at \"{}\" from format {} to format {}.", root, report.from, report.to);
+    for line in report.summary() {
+        println!("{}", line);
     }
 
     Ok(())
