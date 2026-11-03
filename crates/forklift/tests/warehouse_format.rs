@@ -409,7 +409,10 @@ fn fixtures() -> Vec<(&'static str, Vec<Vec<&'static str>>)> {
 /// Open the fixture at `archive` and walk it against the census, before and after.
 fn open_and_walk(archive: &Path, commands: &[Vec<&str>], upgrade: bool) {
     let name = archive.file_stem().unwrap().to_string_lossy().into_owned();
-    let scratch = Scratch::new(&format!("fixture-{}", name));
+    // Named by format as well as mode: fixtures open concurrently, and every format has the same
+    // mode names.
+    let format = archive.parent().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+    let scratch = Scratch::new(&format!("fixture-{}-{}", format, name));
     let warehouse = scratch.0.join("w");
     unpack_fixture(archive, &warehouse);
     unpack_fixture(&archive.with_file_name(format!("{}.fixture", OPERATOR)), &scratch.0.join(OPERATOR));

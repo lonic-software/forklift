@@ -15568,7 +15568,7 @@ mod tests {
     #[test]
     fn presence_answers_give_up_on_a_remote_that_never_stops_trickling() {
         const HEAD_DELAY: std::time::Duration = std::time::Duration::from_millis(600);
-        let patience = std::time::Duration::from_millis(900);
+        let patience = std::time::Duration::from_millis(1_100);
         let budgets = Budgets {
             object_read: std::time::Duration::from_millis(1_200),
             batch_head_patience: patience,

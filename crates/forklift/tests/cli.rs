@@ -2316,9 +2316,9 @@ fn backdate(path: &std::path::Path, seconds: u64) {
     file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(seconds)).unwrap();
 }
 
-/// [`backdate`] every file under `root` outside its `.forklift` and `.git` folders: what waiting
-/// until the files are old enough for the next command's stats to prove them would do, without
-/// the wait.
+/// [`backdate`] every file under `root` outside its `.forklift` and `.git` folders, so the next
+/// command's stats can prove them without waiting until they are old enough. Directories keep
+/// their mtimes: a stat proof reads only a file's.
 fn backdate_tree(root: &std::path::Path, seconds: u64) {
     for entry in std::fs::read_dir(root).unwrap() {
         let entry = entry.unwrap();

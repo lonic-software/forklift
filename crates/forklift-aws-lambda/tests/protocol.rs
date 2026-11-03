@@ -4418,13 +4418,12 @@ impl RefStore for RacesTheDelete {
 /// that races several deletes builds one warehouse rather than one per race.
 fn racing_head(warehouse: &(Harvest, String, String, String), race: impl FnOnce(String, String) -> DeleteRace) -> (Arc<MemoryRefStore>, Head<MemoryObjectStore, RacesTheDelete>, String, String) {
     let (harvest, main_head, feature_v2, feature_v3) = warehouse;
-    let (feature_v2, feature_v3) = (feature_v2.clone(), feature_v3.clone());
     let store = Arc::new(MemoryRefStore::new());
-    lifted_feature(SharedMemoryRefs(store.clone()), harvest, main_head, &feature_v2);
+    lifted_feature(SharedMemoryRefs(store.clone()), harvest, main_head, feature_v2);
 
     let head = Head::new(MemoryObjectStore::new(), RacesTheDelete { inner: store.clone(), race: race(feature_v2.clone(), feature_v3.clone()) });
     upload_all(&head, harvest);
-    (store, head, feature_v2, feature_v3)
+    (store, head, feature_v2.clone(), feature_v3.clone())
 }
 
 /// A lift of `feature` from `from` to `to`, raced against a delete.
