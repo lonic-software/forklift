@@ -110,8 +110,11 @@ jobs:
   # faster. macOS runs on a Blacksmith runner (6 vCPU, Apple silicon) rather than GitHub's: on
   # 2026-11-03 GitHub's macOS jobs waited five to fifteen minutes for a runner, and some were
   # never given one, which failed the run. It stays one job, since Blacksmith bills each macOS
-  # minute and a second share would save about two. To change a count, edit the entries;
-  # `ci passed` fails a run whose shares for an OS are not exactly 1/N to N/N.
+  # minute and a second share would save about two. An entry's `blacksmith` label is used only
+  # for this repository's own branches: a pull request from a fork, or a run in a fork, gets
+  # GitHub's runner, so unreviewed code never runs on a billed one and a fork never asks for a
+  # runner it does not have. To change a count, edit the entries; `ci passed` fails a run whose
+  # shares for an OS are not exactly 1/N to N/N.
   test:
     name: test (${{ matrix.os }}${{ matrix.partitions > 1 && format(', {0}/{1}', matrix.partition, matrix.partitions) || '' }})
     needs: changes
@@ -123,12 +126,12 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest, partition: 1, partitions: 1 }
-          - { os: blacksmith-6vcpu-macos-latest, partition: 1, partitions: 1 }
+          - { os: macos-latest, blacksmith: blacksmith-6vcpu-macos-latest, partition: 1, partitions: 1 }
           - { os: windows-latest, partition: 1, partitions: 4 }
           - { os: windows-latest, partition: 2, partitions: 4 }
           - { os: windows-latest, partition: 3, partitions: 4 }
           - { os: windows-latest, partition: 4, partitions: 4 }
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.blacksmith && github.repository == 'lonic-software/forklift' && !github.event.pull_request.head.repo.fork && matrix.blacksmith || matrix.os }}
     # A hang anywhere in the job fails here rather than at GitHub's six-hour limit. A cold-cache
     # Windows run compiles for about eight minutes before its tests start.
     timeout-minutes: 40
