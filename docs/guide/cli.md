@@ -1899,7 +1899,11 @@ leaves the fetch scope as it was, refusing with `confirmation_required` (exit 39
 its `details`); with nothing to free it runs without `--confirm`. A confirmed run plans again, so
 if the remote moved in between it may free slightly more or less than the preview showed.
 (Objects already inside a pack are reported but not reclaimed yet — a scope-aware repack is future
-work.) A prune, preview included, is **refused while a mutating command runs in another bay**, since that writer could
+work.) A loose object that packed content is stored as a delta against is kept too, since that
+content would no longer read without it; the report counts it in `kept_for_deltas`, and a later prune
+does not reclaim it. A pack that cannot be read refuses a prune that would free anything, before
+anything changes: `store compact --all` salvages a damaged pack, and one it cannot salvage must be
+restored, or moved aside only if it holds nothing this warehouse needs. A prune, preview included, is **refused while a mutating command runs in another bay**, since that writer could
 reuse an object the prune is about to free; run it again once the other command finishes.
 (A `forklift-server` never serves a sparse warehouse, a cache, or a root whose sealed-object
 record holds anything, so no server is in the way.)
@@ -2239,9 +2243,16 @@ Telling garbage from live content means reading every parcel, tree and large-fil
 in use. If one of those is missing but a broken pack might hold it (a damaged part of a pack, a
 pack whose data file is missing, or a pack index that cannot be read at all), the full repack
 **refuses and deletes nothing**, naming the object: what it refers to cannot be told apart from
-garbage. `scope prune` and `forklift-server gc` refuse the same way. `forklift store` lists the
+garbage. `scope prune` and `forklift-server gc` refuse the same way. Both also refuse to delete anything
+while any pack cannot be read, needed or not, since it could hold a delta stored against what
+they would delete; a pack another forklift version wrote needs a build that reads it. `gc` keeps a
+garbage object a readable pack's delta stands on until a full repack has re-encoded or dropped that
+delta. `forklift store` lists the
 pack under `quarantined_packs`, `damaged_packs`, `unenumerable_indexes` or
-`foreign_version_indexes`; once the pack is restored or moved aside, the sweep can run. A full
+`foreign_version_indexes`; once the pack is restored, or moved aside if it holds nothing this
+warehouse needs (a sweep reads what only it holds as absent, and everything beneath as garbage), the
+sweep can run. Do not bring a pack back once a sweep has run past it: its deltas may stand on what
+the sweep deleted. A full
 repack salvages a damaged pack before this walk, so it refuses only on what salvage could not
 recover, and then says that the pack could not be completely salvaged: nothing was deleted, but an
 object read through the pack's damaged part may be held nowhere else, and this store cannot recover

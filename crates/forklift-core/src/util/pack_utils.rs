@@ -3385,13 +3385,46 @@ pub fn is_in_packs(hash: &str) -> Result<bool, String> {
 pub enum PackScanError {
     /// A pack's index or one of its record headers could not be read.
     Damaged(String),
+    /// Another build wrote a pack's index in a version this build cannot read.
+    ForeignVersion(String),
     /// The pack registry could not be loaded.
     Registry(String),
 }
 
+impl PackScanError {
+    /// The refusal for a `command` about to delete objects: says what was left alone and what to
+    /// do. A pack holding what the warehouse needs must not be moved aside, as a sweep then reads
+    /// everything beneath it as garbage, and neither may it return after a sweep, as its deltas
+    /// may stand on what the sweep deleted.
+    ///
+    /// # Arguments
+    /// * `command` - The command, as the message names it.
+    /// * `outcome` - What the refused run changed.
+    pub(crate) fn refusal(self, command: &str, outcome: &str) -> String {
+        let why = "since it cannot tell which packed content stands on what it would delete";
+
+        match self {
+            PackScanError::Damaged(e) => format!(
+                "{} cannot run while a pack in this warehouse cannot be read, {}; {}. Run \"forklift store compact --all\" to salvage a damaged pack; \
+                otherwise restore the pack, or move it out of the pack folder only if it holds nothing this warehouse needs, and do not bring it back \
+                once a sweep has run. {}",
+                command, why, outcome,
+                e
+            ),
+            PackScanError::ForeignVersion(e) => format!(
+                "{} cannot run while a pack in this warehouse was written by another forklift version, {}; {}. \
+                Run it with a build that reads that version. {}",
+                command, why, outcome, e
+            ),
+            PackScanError::Registry(e) => e,
+        }
+    }
+}
+
 /// Whether a pack holds a delta whose base is one of `bases`: a record that stops decoding once
 /// its base is deleted, unless a repack re-encodes it first. Every pack's index is validated even
-/// when `bases` is empty, so a caller about to delete objects learns of a damaged pack first.
+/// when `bases` is empty, so a caller about to delete objects learns of a damaged pack first, and
+/// a pack the registry could not load refuses too.
 ///
 /// # Arguments
 /// * `bases` - Object hashes about to be deleted.
@@ -3406,6 +3439,8 @@ pub fn any_packed_delta_against(bases: &HashSet<String>) -> Result<bool, PackSca
     let wanted: HashSet<[u8; HASH_LEN]> = bases.iter().filter_map(|hash| hash_to_bytes(hash)).collect();
 
     let packs = loaded_packs().map_err(PackScanError::Registry)?;
+    refuse_unscannable_packs(&packs)?;
+
     let mut found = false;
     for pack in packs.packs.iter() {
         let records = pack.records().map_err(PackScanError::Damaged)?;
@@ -3422,6 +3457,53 @@ pub fn any_packed_delta_against(bases: &HashSet<String>) -> Result<bool, PackSca
     }
 
     Ok(found)
+}
+
+/// The objects packed deltas stand on, from [`packed_delta_bases`].
+pub(crate) struct PackedDeltaBases(HashSet<[u8; HASH_LEN]>);
+
+impl PackedDeltaBases {
+    pub(crate) fn contains(&self, hash: &str) -> bool {
+        hash_to_bytes(hash).is_some_and(|bytes| self.0.contains(&bytes))
+    }
+}
+
+/// Every object a pack's delta stands on: what stops those deltas decoding if it is deleted while
+/// they remain. A delta nothing reaches counts too, as nothing here says what is live.
+///
+/// # Returns
+/// * `Ok(PackedDeltaBases)` - The bases.
+/// * `Err(PackScanError)`   - As [`any_packed_delta_against`].
+pub(crate) fn packed_delta_bases() -> Result<PackedDeltaBases, PackScanError> {
+    let packs = loaded_packs().map_err(PackScanError::Registry)?;
+    refuse_unscannable_packs(&packs)?;
+
+    let mut bases = HashSet::new();
+    for pack in packs.packs.iter() {
+        let records = pack.records().map_err(PackScanError::Damaged)?;
+        for record in records.iter() {
+            let header = read_record_header(pack, record.offset, record.length).map_err(PackScanError::Damaged)?;
+            bases.extend(header.base);
+        }
+    }
+
+    Ok(PackedDeltaBases(bases))
+}
+
+/// Refuse a pack the registry could not load: it may hold deltas nothing can list, and its data may
+/// come back.
+fn refuse_unscannable_packs(packs: &PackSet) -> Result<(), PackScanError> {
+    if let Some(pack) = packs.unenumerable.iter().find(|pack| pack.foreign_version) {
+        return Err(PackScanError::ForeignVersion(format!("Pack index {}: {}", pack.index_path.display(), pack.error)));
+    }
+    if let Some(pack) = packs.quarantined.first() {
+        return Err(PackScanError::Damaged(format!("Pack index {}: {}", pack.index_path.display(), pack.error)));
+    }
+    if let Some(pack) = packs.unenumerable.first() {
+        return Err(PackScanError::Damaged(format!("Pack index {}: {}", pack.index_path.display(), pack.error)));
+    }
+
+    Ok(())
 }
 
 /// [`is_in_packs`] against the cached set only, with no revalidation: the first step of a
@@ -6460,6 +6542,17 @@ pub(crate) mod tests {
         invalidate_cache();
 
         artifacts.remove(0)
+    }
+
+    /// What is wrong with a sweep's refusal over a pack unreadable as `how`, if anything.
+    pub(crate) fn refusal_problem(how: Unreadable, error: &str) -> Option<String> {
+        let right = if matches!(how, Unreadable::ForeignVersion) {
+            error.contains("another forklift version") && !error.contains("move it out")
+        } else {
+            error.contains("cannot be read") && error.contains("holds nothing this warehouse needs") && error.contains("do not bring it back")
+        };
+
+        (!right).then(|| format!("{:?}: {}", how, error))
     }
 
     /// Run `case` once per [`Unreadable`] kind and fail with every arm's failure together, so a red

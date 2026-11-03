@@ -18,7 +18,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::time::SystemTime;
-use crate::util::{audit_utils, bay_utils, file_utils, lock_utils, object_utils};
+use crate::util::{audit_utils, bay_utils, file_utils, lock_utils, object_utils, pack_utils};
 // Test-only: `collect_live_set`'s own pallet-head root gathering moved into the shared
 // `recovery_utils::gc_root_sources`, so this module's non-test code no
 // longer calls `pallet_utils` directly — only its own test fixtures still build pallet refs by
@@ -37,6 +37,11 @@ pub struct GcStats {
     /// Unreferenced objects kept because they are younger than the grace period
     /// (an in-flight lift may still be uploading their reachers).
     pub kept_recent: usize,
+
+    /// Unreferenced objects kept because a pack's delta stands on them: deleting one would leave
+    /// that delta unreadable, even if nothing reaches it. The collection after a full repack deletes
+    /// them.
+    pub kept_for_deltas: usize,
 }
 
 /// Collect the garbage of the active warehouse: delete every object no GC root
@@ -48,7 +53,8 @@ pub struct GcStats {
 /// # Returns
 /// * `Ok(GcStats)` - What happened.
 /// * `Err(String)` - If another forklift process is using the store, the live set could
-///                   not be computed (nothing is deleted then), or a deletion failed.
+///                   not be computed (nothing is deleted then), a deletion failed, or a pack
+///                   could not be read to say which deltas stand on what the sweep would delete.
 pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
     // Exclusive store access from before the live set is computed until the sweep ends
     // (FORK-150): the grace period protects only objects *written* recently, and a writer that
@@ -62,7 +68,10 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
     let objects_root = std::path::PathBuf::from(file_utils::get_path_objects_root());
     let now = SystemTime::now();
 
-    let mut stats = GcStats { scanned: 0, deleted: 0, kept_recent: 0 };
+    let mut stats = GcStats { scanned: 0, deleted: 0, kept_recent: 0, kept_for_deltas: 0 };
+
+    // Read at the first object the sweep would delete: most collections delete nothing.
+    let mut delta_bases: Option<pack_utils::PackedDeltaBases> = None;
 
     let folders = std::fs::read_dir(&objects_root)
         .map_err(|e| format!("Error while reading the objects folder: {}", e))?;
@@ -120,6 +129,17 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
 
             if age_is_protected {
                 stats.kept_recent += 1;
+                continue;
+            }
+
+            let bases = match &mut delta_bases {
+                Some(bases) => bases,
+                unread => unread.insert(pack_utils::packed_delta_bases()
+                    .map_err(|error| error.refusal("gc", "nothing more was deleted"))?),
+            };
+
+            if bases.contains(&hash) {
+                stats.kept_for_deltas += 1;
                 continue;
             }
 
@@ -341,7 +361,7 @@ pub(crate) mod tests {
     use crate::model::blob::Blob;
     use crate::model::parcel::Parcel;
     use crate::model::tree_item::TreeItem;
-    use crate::util::pack_utils::tests::{for_each_unreadable, pack_alone, pack_as_unreadable, Unreadable};
+    use crate::util::pack_utils::tests::{for_each_unreadable, pack_alone, pack_as_unreadable, refusal_problem, Unreadable};
     use std::path::{Path, PathBuf};
 
     /// A fresh warehouse root for one test, entered as the active storage-root scope for its
@@ -368,6 +388,76 @@ pub(crate) mod tests {
 
             Scratch { _scope: scope, root }
         }
+    }
+
+    fn read_fresh(hash: &str) -> Result<Vec<u8>, String> {
+        pack_utils::forget_warehouse();
+        file_utils::retrieve_object_by_hash_uncached(hash)
+    }
+
+    /// An unreachable loose object a live packed delta stands on stays, so the delta still reads,
+    /// while other garbage goes. A full repack re-encodes the delta, and the next collection
+    /// deletes the object.
+    ///
+    /// Revert: delete it like any other garbage → the live delta no longer reads; keep every
+    /// object once a pack holds a delta → the other garbage stays.
+    #[test]
+    fn gc_keeps_an_unreachable_base_of_a_packed_delta_until_a_repack_re_encodes_it() {
+        let _scratch = Scratch::new("delta-base");
+        let lines: String = (0..200).map(|line| format!("{}\n", blake3::hash(format!("line {}", line).as_bytes()).to_hex())).collect();
+        let blob = |tail: &str| LooseObjectBuilder::build_blob(&Blob { content: format!("{}{}\n", lines, tail).into_bytes() });
+        let (mut base, mut other, live) = (blob("base"), blob("other"), blob("live"));
+        base.store().unwrap();
+        other.store().unwrap();
+
+        let mut ingest = pack_utils::StoreIngest::new().unwrap();
+        let stored = ingest.store_with_base(&live, Some(pack_utils::IngestBase { hash: &base.hash, bytes: &base.content, depth: 0 })).unwrap();
+        assert!(matches!(stored, pack_utils::IngestStored::Delta { .. }), "the fixture's shape");
+        ingest.finish().unwrap();
+
+        let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        tree.add_child(TreeItem::new("f".to_string(), live.hash.clone(), DirEntryType::Normal));
+        let mut tree = LooseObjectBuilder::build_tree(&tree);
+        tree.store().unwrap();
+        let mut parcel = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: tree.hash.clone(), parents: Vec::new(), actions: Vec::new(), description: Some("p".to_string()),
+        });
+        parcel.store().unwrap();
+        crate::util::pallet_utils::update_pallet_head("main", None, &parcel.hash, &crate::util::pallet_utils::RefPreconditions::NONE).unwrap();
+
+        let stats = collect_garbage(0).unwrap();
+        assert_eq!((stats.deleted, stats.kept_for_deltas), (1, 1));
+        assert!(read_fresh(&live.hash).unwrap() == live.content, "the live delta reads back as written");
+        assert!(read_fresh(&base.hash).is_ok(), "its base stays");
+        assert!(read_fresh(&other.hash).is_err(), "other garbage goes");
+
+        pack_utils::compact(true, false, false, &crate::util::progress_utils::Progress::NONE).unwrap();
+        let stats = collect_garbage(0).unwrap();
+        assert_eq!((stats.deleted, stats.kept_for_deltas), (1, 0));
+        assert!(read_fresh(&base.hash).is_err(), "the base goes once nothing stands on it");
+        assert!(read_fresh(&live.hash).unwrap() == live.content, "the re-encoded delta needs no base");
+    }
+
+    /// A pack that cannot be read refuses a sweep that would delete something, and deletes nothing.
+    ///
+    /// Revert: pass over a pack whose index fails → CorruptBucket deletes the garbage; pass over a
+    /// pack the registry could not load → the other kinds do.
+    #[test]
+    fn gc_refuses_to_delete_past_an_unreadable_pack() {
+        for_each_unreadable(|how| {
+            let _scratch = Scratch::new("delta-unreadable");
+            let mut stray = LooseObjectBuilder::build_blob(&Blob { content: b"packed and damaged\n".to_vec() });
+            stray.store().unwrap();
+            pack_as_unreadable(&stray.hash, how);
+            let mut garbage = LooseObjectBuilder::build_blob(&Blob { content: b"loose and unreachable\n".to_vec() });
+            garbage.store().unwrap();
+
+            let Err(error) = collect_garbage(0) else { return Some(format!("{:?}: a pack that cannot be read refuses", how)) };
+            if let Some(problem) = refusal_problem(how, &error) {
+                return Some(problem);
+            }
+            (!loose_path(&garbage.hash).exists()).then(|| format!("{:?}: the garbage must stay", how))
+        });
     }
 
     impl Drop for Scratch {

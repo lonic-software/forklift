@@ -229,14 +229,8 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
     let delta_on_loose = if plan.to_evict.is_empty() {
         false
     } else {
-        pack_utils::any_packed_delta_against(&loose_only).map_err(|error| match error {
-            pack_utils::PackScanError::Damaged(e) => format!(
-                "\"forklift store evict\" cannot run while a pack in this warehouse is damaged, since it cannot tell \
-                which packed content stands on what it would free; nothing was changed. Run \
-                \"forklift store compact --all\" to salvage the pack, then \"forklift store evict\" again. {}", e
-            ),
-            pack_utils::PackScanError::Registry(e) => e,
-        })?
+        pack_utils::any_packed_delta_against(&loose_only)
+            .map_err(|error| error.refusal("\"forklift store evict\"", "nothing was changed"))?
     };
     plan.repack = !plan.to_drop.is_empty() || delta_on_loose;
     plan.to_unseal = sealed_utils::present_recorded(&sealed)?
@@ -1023,23 +1017,35 @@ mod tests {
         assert_eq!(stats.pack_bytes_freed, 0);
     }
 
-    /// A damaged pack refuses the plan before anything changes, whether or not a pack holds an
-    /// evicted object: its deltas cannot say what they stand on, and the repack would leave it.
+    /// A pack that cannot be read refuses the plan before anything changes, whether or not a pack
+    /// holds an evicted object: its deltas cannot say what they stand on, and the repack would leave
+    /// it.
     ///
-    /// Revert: pass over a pack whose index fails → the loose case plans; ask only when no pack
-    /// holds an evicted object → the packed case plans.
+    /// Revert: pass over a pack whose index fails → CorruptBucket's loose case plans; pass over a
+    /// pack the registry could not load → the other kinds' do; ask only when no pack holds an
+    /// evicted object → the packed case plans.
     #[test]
-    fn a_damaged_pack_refuses_the_plan() {
-        for packed in [false, true] {
-            let _scratch = Scratch::new(if packed { "damaged-packed" } else { "damaged-loose" });
-            let held = if packed { versions().held } else { history().held };
-            pack_utils::tests::pack_as_unreadable(&store_blob("stray\n"), pack_utils::tests::Unreadable::CorruptBucket);
-            let hold = store_access();
+    fn an_unreadable_pack_refuses_the_plan() {
+        pack_utils::tests::for_each_unreadable(|how| {
+            for packed in [false, true] {
+                let _scratch = Scratch::new(if packed { "damaged-packed" } else { "damaged-loose" });
+                let held = if packed { versions().held } else { history().held };
+                pack_utils::tests::pack_as_unreadable(&store_blob("stray\n"), how);
+                let hold = store_access();
 
-            let Err(error) = plan_evict(&[held], &hold) else { panic!("packed {}: a damaged pack refuses", packed) };
-            assert!(error.contains("damaged") && error.contains("nothing was changed"), "packed {}: {}", packed, error);
-            assert!(sealed_utils::read_sealed().unwrap().is_empty(), "packed {}: nothing is recorded", packed);
-        }
+                let Err(error) = plan_evict(&[held], &hold) else { return Some(format!("{:?} packed {}: must refuse", how, packed)) };
+                if !error.contains("nothing was changed") {
+                    return Some(format!("{:?} packed {}: {}", how, packed, error));
+                }
+                if let Some(problem) = pack_utils::tests::refusal_problem(how, &error) {
+                    return Some(problem);
+                }
+                if !sealed_utils::read_sealed().unwrap().is_empty() {
+                    return Some(format!("{:?} packed {}: nothing is recorded", how, packed));
+                }
+            }
+            None
+        });
     }
 
     /// A repack that evicts keeps the signature of every parcel: parcels are never evicted.

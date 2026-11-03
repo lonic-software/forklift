@@ -4579,6 +4579,12 @@ A command not listed here either reports only the generic human-message shape `{
       "minimum": 0,
       "type": "integer"
     },
+    "kept_for_deltas": {
+      "description": "Candidates kept because packed content is stored as a delta against them, and would no\nlonger read without them. A later prune does not reclaim them.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
     "kept_for_hauls": {
       "description": "Candidates kept because lifting the unlifted history a haul not yet merged proposes reads\nthem, where no pallet reaches it any more. Lifting cannot free these; once the haul is\nmerged and its target lifted, a later prune does. A closed haul keeps them, since\nreopening it proposes the same head.",
       "format": "uint",
@@ -4648,6 +4654,7 @@ A command not listed here either reports only the generic human-message shape `{
     "kept_for_hauls",
     "kept_for_mirror",
     "kept_for_deleted",
+    "kept_for_deltas",
     "unlifted_pallets",
     "all_resumed"
   ],

@@ -46,6 +46,8 @@
 //! front-to-back). Under that discipline, a present parent implies every one of its still-listed
 //! children is present too, so an absent node can only mean its whole subtree was already
 //! freed — never a corrupt gap a resumed walk could misinterpret as newly-discovered garbage.
+//! The one exception is an object kept because a packed delta stands on it, which can outlive its
+//! parent or its children: a resumed walk then misses it or stops short, which only frees less.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use crate::enums::dir_entry_type::DirEntryType;
@@ -60,7 +62,8 @@ use crate::util::lock_utils::StoreAccessExclusive;
 /// The reclamation a prune would carry out, computed without mutating anything (safe for the
 /// preview an unconfirmed prune shows).
 pub struct PrunePlan {
-    /// Present, loose objects to delete: under a pruned path, and needed by no retained scope.
+    /// Present, loose objects to delete: under a pruned path, needed by no retained scope, and
+    /// standing under no packed delta.
     pub to_free: Vec<String>,
 
     /// Candidates present only inside a pack. A loose delete cannot reclaim a packed object
@@ -96,6 +99,10 @@ pub struct PrunePlan {
     /// `undo` can still put back, reads them. Lifting cannot free these; a later prune does once
     /// the delete can no longer be undone.
     pub kept_for_deleted: usize,
+
+    /// Candidates kept because a packed delta stands on them, and would stop decoding without
+    /// them. A prune does not reclaim them: a repack packs whichever history still reaches.
+    pub kept_for_deltas: usize,
 
     /// The user pallets, as wire names, whose unlifted history changed a pruned path, so that
     /// lifting them (or lowering) lets a later prune free what this one kept. Empty when
@@ -256,7 +263,20 @@ fn plan_from(
         }
     }
 
-    Ok(PrunePlan { to_free, still_packed, retained_shared, kept_unlifted, kept_for_hauls, kept_for_mirror, kept_for_deleted, unlifted_pallets })
+    // A packed delta can stand on a loose object: an ingest stores a delta against a base it holds
+    // loose. Filtering keeps to_free's order. A kept child under a freed parent is at worst loose
+    // garbage, and a kept parent over freed children reads like a packed one: fetch checks each
+    // object. A pack that cannot be read refuses the run: its deltas cannot say what they stand on.
+    let mut kept_for_deltas = 0usize;
+    if !to_free.is_empty() {
+        let bases = pack_utils::packed_delta_bases()
+            .map_err(|error| error.refusal("\"forklift scope prune\"", "nothing was changed"))?;
+        let candidates = to_free.len();
+        to_free.retain(|hash| !bases.contains(hash));
+        kept_for_deltas = candidates - to_free.len();
+    }
+
+    Ok(PrunePlan { to_free, still_packed, retained_shared, kept_unlifted, kept_for_hauls, kept_for_mirror, kept_for_deleted, kept_for_deltas, unlifted_pallets })
 }
 
 /// `live_parcels`, then every `held` parcel they do not reach, once: the user history a prune
@@ -803,7 +823,8 @@ fn retain_recipe_chunks(recipe_hash: &str, retained: &mut HashSet<String>) -> Re
 /// hash the walk cannot find on disk is treated as "already freed by an earlier run" — its
 /// descent is simply skipped, never an error — which is sound only because objects are always
 /// *freed* in the same child-before-parent order this function produces, so an absent node
-/// proves its whole subtree is already gone, not merely that this one object is.
+/// proves its whole subtree is already gone, not merely that this one object is. (Bar an object
+/// kept for a packed delta, which the plan never frees anyway: missing it never frees more.)
 ///
 /// Presence here is the plain [`file_utils::does_object_exist`], not the fail-closed sweep form
 /// the retained walks use. An object only an unreadable pack index might hold reads absent, so
@@ -1688,6 +1709,112 @@ mod tests {
         // The in-scope subtree, shared across both revisions, survives.
         assert!(!plan.to_free.contains(&api_tree), "the in-scope subtree must survive");
         assert!(!plan.to_free.contains(&api_blob), "the in-scope blob must survive");
+    }
+
+    /// Text that barely compresses, so a delta between two versions beats a full record.
+    fn version(tail: &str) -> String {
+        let lines: String = (0..200).map(|line| format!("{}\n", blake3::hash(format!("line {}", line).as_bytes()).to_hex())).collect();
+        format!("{}{}\n", lines, tail)
+    }
+
+    /// `src/web/w.txt` a loose blob and `src/api/a.txt` a kept blob, in a pack of its own: a delta
+    /// against the web blob when `on_web`, against a blob at no path otherwise. Returns the web
+    /// blob, the api blob and the api blob's bytes.
+    fn prune_over_a_packed_blob(on_web: bool) -> (String, String, Vec<u8>) {
+        let (web_text, api_text, other_text) = (version("web"), version("api"), version("other"));
+        let web_blob = store_blob(&web_text);
+        let other_blob = store_blob(&other_text);
+        let (base_hash, base_text) = if on_web { (&web_blob, &web_text) } else { (&other_blob, &other_text) };
+
+        let api = LooseObjectBuilder::build_blob(&Blob { content: api_text.as_bytes().to_vec() });
+        let base_bytes = LooseObjectBuilder::build_blob(&Blob { content: base_text.as_bytes().to_vec() }).content;
+        let mut ingest = pack_utils::StoreIngest::new().unwrap();
+        let stored = ingest.store_with_base(&api, Some(pack_utils::IngestBase { hash: base_hash, bytes: &base_bytes, depth: 0 })).unwrap();
+        assert!(matches!(stored, pack_utils::IngestStored::Delta { .. }), "the fixture's shape");
+        ingest.finish().unwrap();
+
+        let web_tree = store_tree(&[("w.txt", &web_blob, DirEntryType::Normal)]);
+        let api_tree = store_tree(&[("a.txt", &api.hash, DirEntryType::Normal)]);
+        let src = store_tree(&[("api", &api_tree, DirEntryType::Tree), ("web", &web_tree, DirEntryType::Tree)]);
+        let root = store_tree(&[("src", &src, DirEntryType::Tree)]);
+        pallet_utils::update_pallet_head("main", None, &store_parcel(&root, Vec::new()), &pallet_utils::RefPreconditions::NONE).unwrap();
+
+        (web_blob, api.hash, api.content)
+    }
+
+    /// The bytes `hash` reads as from the disk alone: every cache this process holds is dropped
+    /// first, so nothing reconstructed against a deleted object can answer.
+    fn read_fresh(hash: &str) -> Result<Vec<u8>, String> {
+        pack_utils::forget_warehouse();
+        file_utils::retrieve_object_by_hash_uncached(hash)
+    }
+
+    /// A base a kept packed delta stands on is not freed, so the delta still reads, and the prune
+    /// frees the rest. A delta on something else keeps nothing.
+    ///
+    /// Revert: free the candidates a delta stands on → the first arm's delta no longer reads;
+    /// keep every candidate once a pack holds a delta → the second arm's blob stays.
+    #[test]
+    fn a_prune_keeps_only_the_loose_objects_a_packed_delta_stands_on() {
+        for on_web in [true, false] {
+            let _scratch = Scratch::new(if on_web { "delta-on-web" } else { "delta-elsewhere" });
+            let (web_blob, api_blob, api_bytes) = prune_over_a_packed_blob(on_web);
+            let post_prune = PathScope::from_prefixes(["src/api"]);
+            let hold = store_access();
+
+            let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &hold).unwrap();
+            assert_eq!(plan.kept_for_deltas, usize::from(on_web));
+            assert_eq!(plan.to_free.contains(&web_blob), !on_web);
+            assert!(!plan.to_free.is_empty(), "on_web {}: the web tree goes either way", on_web);
+
+            free_objects(&plan.to_free, &hold).unwrap();
+            assert_eq!(loose_exists(&web_blob), on_web);
+            assert!(read_fresh(&api_blob).unwrap() == api_bytes, "on_web {}: the kept delta reads back as written", on_web);
+        }
+    }
+
+    /// A pack that cannot be read refuses a plan that frees anything, before anything changes, and
+    /// the refusal's ways out let the prune run: moving the pack aside, for every kind; a salvaging
+    /// repack, for a damaged index. A plan that frees nothing has nothing to ask.
+    ///
+    /// Revert: pass over a pack whose index fails → CorruptBucket plans; pass over a pack the
+    /// registry could not load → the other kinds plan.
+    #[test]
+    fn an_unreadable_pack_refuses_a_plan_that_frees_and_the_named_steps_clear_it() {
+        for_each_unreadable(|how| {
+            let _scratch = Scratch::new("unreadable-pack");
+            let f = build_fixture();
+            pack_as_unreadable(&store_blob("stray\n"), how);
+            let post_prune = PathScope::from_prefixes(["src/api"]);
+            let plan = || plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access());
+
+            let nothing = plan_prune(&["never/fetched".to_string()], &PathScope::from_prefixes(["src"]), &lifted(), &[], &store_access());
+            if !nothing.is_ok_and(|plan| plan.to_free.is_empty()) {
+                return Some(format!("{:?}: nothing to free, nothing to ask", how));
+            }
+
+            let Err(error) = plan() else { return Some(format!("{:?}: a prune must refuse", how)) };
+            if !error.contains("nothing was changed") {
+                return Some(format!("{:?}: {}", how, error));
+            }
+            if let Some(problem) = pack_utils::tests::refusal_problem(how, &error) {
+                return Some(problem);
+            }
+
+            if matches!(how, Unreadable::CorruptBucket) {
+                pack_utils::compact(true, false, true, &crate::util::progress_utils::Progress::NONE).unwrap();
+            } else {
+                for entry in std::fs::read_dir(PathBuf::from(file_utils::get_path_objects_root()).join("pack")).unwrap() {
+                    std::fs::remove_file(entry.unwrap().path()).unwrap();
+                }
+                pack_utils::forget_warehouse();
+            }
+            match plan() {
+                Ok(plan) if plan.to_free.contains(&f.web_blob) || plan.still_packed > 0 => None,
+                Ok(_) => Some(format!("{:?}: the plan lost the pruned path", how)),
+                Err(error) => Some(format!("{:?}: the named step did not clear it: {}", how, error)),
+            }
+        });
     }
 
     #[test]
