@@ -161,8 +161,9 @@ inventory and current pallet. See [`bay`](cli.md#bay--parallel-working-directori
 **Incomplete load.** A `load` that was interrupted. Recording a parcel is refused while it stands,
 so a half-staged change is never stacked. See [`load`](cli.md#load--stage-changes-l).
 
-**Ignore file** (git: `.gitignore`). `.forkliftignore`; see
-[`.forkliftignore`](cli.md#forkliftignore--files-forklift-shouldnt-track).
+**Ignore file** (git: `.gitignore`). Every `.gitignore`, read as git reads it, plus an optional
+`.forkliftignore` at the root for rules only forklift follows; see
+[Ignore rules](cli.md#ignore-rules--files-forklift-shouldnt-track).
 
 ## Merging and moving work
 

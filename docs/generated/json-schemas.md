@@ -866,26 +866,6 @@ A command not listed here either reports only the generic human-message shape `{
 ```json
 {
   "$defs": {
-    "ExistingRule": {
-      "description": "A rule of the ignore file, by where it stands.",
-      "properties": {
-        "line": {
-          "description": "The line number, counting from 1.",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "pattern": {
-          "description": "The pattern, as written on that line.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "line",
-        "pattern"
-      ],
-      "type": "object"
-    },
     "Packed": {
       "description": "The packed-store summary (a slim view of `pack_utils::IngestStats`).",
       "properties": {
@@ -947,21 +927,6 @@ A command not listed here either reports only the generic human-message shape `{
         "null"
       ]
     },
-    "git_already_ignored": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/ExistingRule"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "The rule already in `.forkliftignore` that covers `.git`, when one did and so none was\nadded."
-    },
-    "ignored_git": {
-      "description": "Whether a `.git` ignore pattern was added to `.forkliftignore`.",
-      "type": "boolean"
-    },
     "pallets": {
       "description": "The pallets created (one per local branch).",
       "items": {
@@ -975,7 +940,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "integer"
     },
     "unheld": {
-      "description": "Every checked-out file that does not hold the content imported for it (an uncommitted\nedit or deletion, or a file git converted as it checked it out), in tree order. Each reads\nas an unstaged change. The warning names only the first few. A tracked `.forkliftignore`\nthe import appended the `.git` rule to is not listed, although it reads as changed, even\nwhen it also held an edit of its own before the import.",
+      "description": "Every checked-out file that does not hold the content imported for it (an uncommitted\nedit or deletion, or a file git converted as it checked it out), in tree order. Each reads\nas an unstaged change. The warning names only the first few.",
       "items": {
         "type": "string"
       },
@@ -993,8 +958,7 @@ A command not listed here either reports only the generic human-message shape `{
     "commits",
     "trees",
     "blobs",
-    "pallets",
-    "ignored_git"
+    "pallets"
   ],
   "title": "ImportReport",
   "type": "object"

@@ -45,7 +45,7 @@ holding `*`, so where the directory is a git working tree too, `git add -A` stag
 nothing of `.forklift/`, the remote token in its config included; `clone` writes one too,
 and `bay add` writes one into the bay's `.forklift/`. A `.forklift/.gitignore` already there is kept
 as it is. It writes no `.forkliftignore`,
-as `git init` writes no `.gitignore` — see [`.forkliftignore`](#forkliftignore--files-forklift-shouldnt-track).
+as `git init` writes no `.gitignore` — see [ignore rules](#ignore-rules--files-forklift-shouldnt-track).
 Idempotent —
 running it in an existing warehouse only creates what's missing. `-v` lists each
 piece created.
@@ -109,11 +109,8 @@ still not a valid pallet name (a branch `con`, or a part ending in `.`), when tw
 one name (`Feature` and `feature`), when one mapped name would be a folder of another (`a+b` and
 `a-b/x`), or when the name is already a pallet here or nests with one. Git's HEAD
 branch is checked out; git itself never stages `.forklift/`, which ignores itself (see
-`prepare`). `.git/` is added to `.forkliftignore` (creating the file if
-there is none) so a colocated repo reads clean, unless a rule there already matches `.git`, which
-it then names. The rule is added before the inventory is built, so an import interrupted there and
-finished by `heal` has it too. An ignore file Forklift refuses to read is left as it is, with a warning. The edit is left in the working tree,
-not stacked: `load .forkliftignore` and stack it with your next parcel. Requires `git` on your PATH. The imported history is **unsigned** (it
+`prepare`), and forklift always ignores `.git`, so a colocated repo reads clean with no rule
+written anywhere. The repo's `.gitignore` files are honoured as they stand. Requires `git` on your PATH. The imported history is **unsigned** (it
 predates trust) — import into a fresh warehouse, then `office enroll` to anchor it as the
 legacy boundary (a later `audit` then tolerates the imported parcels as legacy). Submodules
 (gitlinks) are skipped with a warning. A file or directory name that is not valid UTF-8, or that
@@ -264,43 +261,62 @@ forklift config unset <key>           # remove a value
 - Unknown keys are rejected (a typo can't silently do nothing).
 - The known keys are listed in [Configuration reference](#9-configuration-reference).
 
-### `.forkliftignore` — files forklift shouldn't track
+### Ignore rules — files forklift shouldn't track
 
-Create a `.forkliftignore` at the warehouse root when you need one; `prepare`
-does not write it. Each line is a **regex** (not a glob) matched against
-warehouse-relative, `/`-separated paths. Blank lines and lines starting with `#`
-are skipped; a `#` anywhere else is part of the pattern, so put comments on their
-own lines:
+Forklift reads ignore rules the way git does. Every `.gitignore` in the working tree applies to its
+own folder and everything below it, a deeper one winning over a shallower one, and every line means
+what it means to git: `build` hides a file or folder of that name at any depth (and not
+`rebuild.rs`), `/build` only the one at the root, `build/` only folders, `*.log` any `.log` file, and
+`!keep.log` brings one back. Nothing is brought back below a folder that is itself ignored. A
+project arriving from git keeps its rules with no conversion.
+
+A `.forkliftignore` at the warehouse root holds rules only forklift follows. Its lines are
+gitignore lines too, matched from the root, and it is read after every `.gitignore`, so it wins
+over them: `!.env.example` keeps a file a `.gitignore` hides. A line starting `re:` is a
+**regular expression** matched against the whole `/`-separated path from the root, as if it began
+with `^` and ended with `$`: `re:build` means the path `build` and nothing else, and
+`re:src/.*\.gen` every `.gen` file under `src`. `!re:` brings paths back. To ignore a file whose
+name begins with `re:`, write `\re:`.
 
 ```
-# a folder called target (not targets.txt)
-^target(/.*)?$
-# any .log file
-\.log$
+# a folder called target at the root (not targets.txt)
+/target/
+# any .log file, at any depth
+*.log
+# generated sources, by regex
+re:src/(api|model)/.*\.gen\.rs
 ```
 
-The file is **tracked content**, like `.gitignore`: `load` and `stack` it, and its
-rules travel with the history — a `clone` or `lower` brings the remote's rules
-along. Only `.forklift/` and the `.forklift.tmp~<pid>-<n>` folders an interrupted
-`prepare` or `clone` leaves (at any depth) are always ignored. `git import` adds a rule for `.git/` when
-the warehouse holds a `.git` folder. The rules are read only from the file on disk at
-the warehouse root. Every sparse scope holds that file, whatever its prefixes: a
-`clone --only` checkout fetches and materializes it, so its rules apply there too and
-an edit to it stacks like any in-scope file.
+Matching is case-sensitive on every system, so a rule hides the same paths on every machine; on a
+volume that ignores case, git can disagree about a name that differs only in case. Forklift reads
+no global ignore file (`core.excludesFile`) and not `.git/info/exclude`: rules outside the tree
+would let two machines disagree about what is untracked.
 
-Forklift refuses to read the file, and stops, when it is a symbolic link, when a line
-is a leftover conflict marker (consolidating two edits of the file writes them), when
-a pattern holds a control or invisible character (a tab, a carriage return, a
-zero-width space, a soft hyphen, a bidirectional override; a joiner between two
-characters of an emoji or a Persian or Indic name is fine, as is a flag emoji),
-when a pattern starts or ends with whitespace, or when a pattern matches the empty
-string (`.*`, `x*`, `a|`): such a pattern matches every path. Whitespace around a
-pattern would be part of the regex, so `^build$ ` never matches `build`; write a
-space the pattern needs at its edge as `\x20`, and a tab as `\t`. A space inside a
-pattern is fine. The error names the character's code point and its escape, so an
-invisible one can be found. Save the file with newline (or CRLF) line endings; a
-byte order mark at its start is skipped.
-`git import` leaves a refused ignore file as it is and says why.
+Both files are **tracked content**: `load` and `stack` them, and their rules travel with the
+history — a `clone` or `lower` brings the remote's rules along. Only `.forklift/` and the
+`.forklift.tmp~<pid>-<n>` folders an interrupted `prepare` or `clone` leaves (at any depth) are
+always ignored whatever the rules say; `.git`, a folder or a file, is ignored at any depth by a
+rule no file can remove, but unlike those it ignores only untracked paths, as the next paragraph
+describes. `.github` and `.gitignore` are ordinary content. The root `.forkliftignore` is in every
+sparse scope, whatever its prefixes: a `clone --only` checkout fetches and materializes it, so its
+rules apply there too and an edit to it stacks like any in-scope file.
+
+`stocktake` lists an untracked folder as `folder/` only when `load .` would stage something in it:
+a virtual environment whose `.gitignore` holds `*`, or a folder holding only ignored files or empty
+folders, is not listed.
+
+A `.gitignore` that is a symbolic link or a folder contributes no rules, as in git. Forklift
+refuses to read `.forkliftignore`, and stops, when it is a symbolic link, when a line in it or in a
+`.gitignore` is a leftover conflict marker (consolidating two edits of the file writes them, and the
+lines between the markers would apply both sides' rules at once), or when a line of
+`.forkliftignore` holds a control or invisible character (a tab, a carriage return, a zero-width
+space, a soft hyphen, a bidirectional override; a joiner between two characters of an emoji or a
+Persian or Indic name is fine, as is a flag emoji). A `re:` line is also refused when its regex
+starts or ends with whitespace, which would be part of the regex (`re:build ` never matches
+`build`; write a space the regex needs at its edge as `\x20`, and a tab as `\t`), or when it matches
+the empty string (`re:.*`, `re:x*`), which is no path. The error names the character's code point
+and its escape, so an invisible one can be found. A byte order mark at the start of either file is
+skipped.
 
 As in git, a rule covers only **untracked** paths. A path inside a folder a rule
 covers is covered too, even where no rule matches the path itself. A tracked path
@@ -313,9 +329,6 @@ is ignored from then on.
 Naming a file in `load` tracks it despite a rule. Loading a folder (`load .`,
 `load build`) never adds content the rules cover. It still refreshes tracked files
 inside that folder. Nothing under `.forklift/` can be loaded at all.
-
-Anchor a folder rule at both ends. `^target\/?.*$` also matches `targets.txt` and
-`target-notes/`, so an unanchored rule can hide new files you meant to load.
 
 ### `self alias` — the `fl` short name
 
@@ -461,7 +474,7 @@ Marks the path's inventory entries as deleted so the next parcel won't contain
 them. The working directory is **not** touched (the file stays on disk). To
 un-stage the removal, `load` the file again (if it's still there) or use
 `unload`. A file that stays on disk after its removal is stacked is untracked, so
-this is how a tracked path starts being covered by a `.forkliftignore` rule.
+this is how a tracked path starts being covered by an ignore rule.
 
 ### `stocktake` — status (`st`)
 
@@ -1931,7 +1944,7 @@ open a fresh full checkout. `scope narrow` is the counterpart of a bay's `--scop
 *checkout scope* (what this checkout writes to disk), and the fetch scope stays as it is.
 It refuses (`narrow_unclean`) a subtree holding uncommitted work (staged or unstaged changes, or
 untracked files), and one holding another working
-tree (a folder with its own `.forklift`) at any depth, whatever `.forkliftignore` says.
+tree (a folder with its own `.forklift`) at any depth, whatever the ignore rules say.
 
 ### `scope prune` — reclaim disk from a sparse warehouse
 
