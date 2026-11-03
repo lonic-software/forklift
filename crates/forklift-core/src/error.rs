@@ -408,6 +408,17 @@ impl fmt::Display for CoreError {
 
 impl std::error::Error for CoreError {}
 
+impl CoreError {
+    /// The error as a head prints it in human mode: see [`human_failure_text`]. An `Other` has no
+    /// next step; one that degraded from a refusal already carries it, folded into its text.
+    pub fn human_text(&self) -> String {
+        match self {
+            CoreError::Refusal { message, next_step, .. } => human_failure_text(message, Some(next_step)),
+            CoreError::Other(message) => human_failure_text(message, None),
+        }
+    }
+}
+
 /// A plain string is an unclassified error — unless it is a sentinel-framed refusal that a
 /// still-String segment carried across the migration frontier, in which case it is decoded back
 /// into the typed `Refusal` it was framed from (see the module docs). A frame whose code this
@@ -546,15 +557,15 @@ fn after_detail(text: &str) -> &str {
     }
 }
 
-/// Fold a would-be-dropped next step into the human message, for the degrade-to-`Other` paths
-/// that have no typed field left to carry it in. Next steps in this codebase read as complete
-/// sentences (e.g. "Move them out of the way (or load and stack them) first."), so a space is
-/// enough to join them naturally; an empty next step folds to no-op.
-fn with_next_step(human: &str, next_step: &str) -> String {
-    if next_step.is_empty() {
-        human.to_string()
-    } else {
-        format!("{} {}", human, next_step)
+/// Fold a next step into a message, for a text with no field of its own to carry it: a refusal
+/// degraded to `Other` (an unknown code, a frame a caller wrapped) and a failure reported as one
+/// line among others. The step keeps its [`NEXT_STEP_LABEL`], since many are bare commands; it
+/// stays on the message's line, because the text may sit inside a longer one. A blank step folds
+/// to the message alone.
+pub fn with_next_step(human: &str, next_step: &str) -> String {
+    match next_step.trim() {
+        "" => human.to_string(),
+        step => format!("{} {}{}", human, NEXT_STEP_LABEL, step),
     }
 }
 
@@ -595,15 +606,15 @@ pub fn sanitize_lines(text: &str) -> String {
 /// (`forklift lower`), and printed unlabelled under an error it reads as the command that failed.
 pub const NEXT_STEP_LABEL: &str = "Next step: ";
 
-/// What a head prints for a failure in human mode: the message, then the next step on a line of
-/// its own after [`NEXT_STEP_LABEL`], both [sanitized](sanitize_lines). A missing or blank next
-/// step adds no line. Every head prints a failure through this, so a person at a terminal sees the
-/// same recovery a `--json` consumer reads from `next_step`.
+/// What a head prints for a failure in human mode: the message, [sanitized](sanitize_lines), then
+/// the next step on one line of its own after [`NEXT_STEP_LABEL`], [sanitized](sanitize) to that
+/// one line. A missing or blank next step adds no line. A person at a terminal sees the same
+/// recovery a `--json` consumer reads from `next_step`.
 pub fn human_failure_text(message: &str, next_step: Option<&str>) -> String {
     let message = sanitize_lines(message);
 
     match next_step.map(str::trim).filter(|step| !step.is_empty()) {
-        Some(step) => format!("{}\n{}{}", message, NEXT_STEP_LABEL, sanitize_lines(step)),
+        Some(step) => format!("{}\n{}{}", message, NEXT_STEP_LABEL, sanitize(step)),
         None => message,
     }
 }
@@ -667,7 +678,7 @@ mod tests {
 
         // The texts survive and the code is dropped, as for an unknown code; the raw frame never
         // reaches output.
-        assert_eq!(CoreError::from(framed), CoreError::Other("changed verify".to_string()));
+        assert_eq!(CoreError::from(framed), CoreError::Other("changed Next step: verify".to_string()));
     }
 
     /// Proves the round trip for every variant the `refusal_codes!` invocation actually declares —
@@ -872,6 +883,28 @@ mod tests {
 
         // The step is made inert like the message: it can quote a path or a remote's answer.
         assert_eq!(human_failure_text("a\x1b[2J", Some("b\x1b[2J")), "a [2J\nNext step: b [2J");
+
+        // The step keeps to its one labelled line; the message keeps its lines.
+        assert_eq!(human_failure_text("one\ntwo", Some("three\nfour")), "one\ntwo\nNext step: three four");
+    }
+
+    #[test]
+    fn every_error_prints_through_the_same_human_text() {
+        let refusal = CoreError::refusal(RefusalCode::OutOfScope, "It failed.", "forklift lower");
+        assert_eq!(refusal.human_text(), "It failed.\nNext step: forklift lower");
+
+        // An `Other` has no step, and is made inert like a refusal: it can quote a path or a peer.
+        assert_eq!(CoreError::Other("a\x1b[2J\nb".to_string()).human_text(), "a [2J\nb");
+    }
+
+    #[test]
+    fn a_folded_next_step_keeps_its_label_on_the_message_line() {
+        assert_eq!(with_next_step("It failed.", "forklift lower"), "It failed. Next step: forklift lower");
+        assert_eq!(with_next_step("It failed.", " "), "It failed.");
+
+        // A frame a caller wrapped keeps the label too.
+        let wrapped = format!("Could not lift: {}", String::from(CoreError::refusal(RefusalCode::OutOfScope, "It failed.", "forklift lower")));
+        assert_eq!(CoreError::from(wrapped), CoreError::Other("Could not lift: It failed. Next step: forklift lower".to_string()));
     }
 
     #[test]

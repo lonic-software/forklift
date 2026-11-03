@@ -3,8 +3,8 @@
 Something refused, or something looks broken. Find the code below and do what its entry says.
 
 Every failure prints a message and exits with a fixed status, and almost every failure prints its next
-step on a line of its own, after `Next step:`. With `--json`, the same code is in `error.code` and
-the step in `error.next_step`. The
+step after `Next step:`. With `--json`, the same code is in `error.code` and the step in
+`error.next_step`. The
 [table of error and exit codes](../generated/errors.md) lists them all; this page says what to do
 about each one.
 
@@ -397,5 +397,5 @@ it again.
 ### `usage` (exit 2) and `error` (exit 1)
 
 `usage` means the command line could not be parsed: `forklift help <command>` shows the form. `error`
-has no specific code yet, so the message is all there is. If it names a next step, take it; if nothing
+has no specific code yet, so the message is all there is. If it names a next step (after `Next step:`), take it; if nothing
 here helps, please [report it](https://github.com/lonic-software/forklift/issues).

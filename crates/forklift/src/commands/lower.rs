@@ -797,7 +797,7 @@ impl MetaPalletFailure {
     pub(crate) fn new(pallet: String, error: String) -> MetaPalletFailure {
         let error = match forklift_core::error::CoreError::from(error) {
             forklift_core::error::CoreError::Refusal { message, next_step, .. }
-                if !next_step.is_empty() && !message.contains(&next_step) => format!("{} {}", message, next_step),
+                if !message.contains(&next_step) => forklift_core::error::with_next_step(&message, &next_step),
             other => other.to_string(),
         };
 

@@ -875,7 +875,8 @@ impl From<CoreError> for ForkliftError {
             CoreError::Refusal { code, message, next_step, details } => ForkliftError {
                 code: ErrorCode::from_refusal(code),
                 message,
-                next_step: Some(next_step),
+                // A blank step is no recovery: `--json` leaves the field out, as it does for none.
+                next_step: Some(next_step).filter(|step| !step.trim().is_empty()),
                 details,
             },
             CoreError::Other(message) => {
@@ -1185,6 +1186,16 @@ macro_rules! human {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A blank step is no recovery: `--json` leaves `next_step` out, as for an error with none.
+    #[test]
+    fn a_blank_next_step_is_no_next_step() {
+        let refusal = CoreError::refusal(forklift_core::error::RefusalCode::OutOfScope, "It failed.", " ");
+        assert_eq!(ForkliftError::from(refusal).next_step, None);
+
+        let refusal = CoreError::refusal(forklift_core::error::RefusalCode::OutOfScope, "It failed.", "forklift lower");
+        assert_eq!(ForkliftError::from(refusal).next_step.as_deref(), Some("forklift lower"));
+    }
 
     /// Each closure reason gets its own sentence, and the JSON value names it the same way the
     /// docs do. Revert: word both reasons alike → the two lines compare equal.
