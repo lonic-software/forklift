@@ -563,9 +563,11 @@ fn after_detail(text: &str) -> &str {
 /// stays on the message's line, because the text may sit inside a longer one. A blank step folds
 /// to the message alone.
 pub fn with_next_step(human: &str, next_step: &str) -> String {
-    match next_step.trim() {
-        "" => human.to_string(),
-        step => format!("{} {}{}", human, NEXT_STEP_LABEL, step),
+    // Checked trimmed, kept as written: a wrapped frame's step runs on into the caller's text.
+    if next_step.trim().is_empty() {
+        human.to_string()
+    } else {
+        format!("{} {}{}", human, NEXT_STEP_LABEL, next_step)
     }
 }
 
