@@ -29,10 +29,10 @@ pub struct UpgradeContext {
 /// One step of a migration. It must be idempotent, since a step interrupted part way is run again
 /// from its start, and must sync what it writes before it returns, since returning records it done.
 /// It runs inside the warehouse's storage-root scope, which is per thread: a step that fans work out
-/// enters it on every worker (`globals::StorageRootScope::enter`). It runs under the format lease held exclusively by
-/// this process, so it must not open the warehouse through anything that takes the lease shared
-/// ([`warehouse_utils::open_warehouse_root`] and its kin): that refuses as an upgrade running. A
-/// step may rewrite the marker's mode word, keeping its format and upgrade entries.
+/// enters it on every worker (`globals::StorageRootScope::enter`). It runs under the format lease
+/// held exclusively by this process, so it must not open the warehouse through anything that takes
+/// the lease shared ([`warehouse_utils::open_warehouse_root`] and its kin): that refuses as an
+/// upgrade running. A step may rewrite the marker's mode word, keeping its format and upgrade entries.
 pub type UpgradeStep<'a> = &'a (dyn Fn(&UpgradeContext) -> Result<(), String> + Sync);
 
 /// The steps that move a warehouse from one format to the next.
@@ -89,10 +89,10 @@ impl UpgradeReport {
 
         if let Some(resumed) = self.resumed {
             lines.push(match resumed.step {
-                0 => format!("Resumed the unfinished upgrade to format {}, which had done none of its steps.", resumed.target),
                 step if step >= resumed.steps => format!(
                     "Resumed the unfinished upgrade to format {}, which had done all its steps.", resumed.target
                 ),
+                0 => format!("Resumed the unfinished upgrade to format {}, which had done none of its steps.", resumed.target),
                 step => format!("Resumed the unfinished upgrade to format {} at its step {}.", resumed.target, step + 1),
             });
         }
@@ -659,14 +659,16 @@ mod tests {
         }
     }
 
-    /// The summary says where a resumed upgrade picked up, and that none of it was done when the
-    /// crash came before its first step finished.
+    /// The summary says where a resumed upgrade picked up, that none of it was done when the crash
+    /// came before its first step finished, and that all of it was when no step was left.
     #[test]
     fn the_summary_names_the_step_a_resume_starts_at() {
         let report = |step| UpgradeReport { from: 1, to: 2, resumed: Some(ResumedUpgrade { target: 2, step, steps: 2 }), steps_run: 1 };
         assert_eq!(report(0).summary()[0], "Resumed the unfinished upgrade to format 2, which had done none of its steps.");
         assert_eq!(report(1).summary()[0], "Resumed the unfinished upgrade to format 2 at its step 2.");
         assert_eq!(report(2).summary()[0], "Resumed the unfinished upgrade to format 2, which had done all its steps.");
+        let stepless = UpgradeReport { from: 1, to: 2, resumed: Some(ResumedUpgrade { target: 2, step: 0, steps: 0 }), steps_run: 0 };
+        assert_eq!(stepless.summary()[0], "Resumed the unfinished upgrade to format 2, which had done all its steps.");
         assert_eq!(UpgradeReport { from: 1, to: 1, resumed: None, steps_run: 0 }.summary(),
                    ["The warehouse is in format 1, the one this version reads. Nothing to do."]);
     }

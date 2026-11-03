@@ -340,7 +340,9 @@ A newer Forklift made or upgraded this warehouse, and upgrades are one-way. Upda
 
 An upgrade stopped before it finished, so the warehouse is between two formats and every command
 refuses it. Run the upgrade the refusal names, with a build that reads the target format; it resumes
-at the first step not done. No upgrade can have started yet, since format 1 is the first format.
+at the first step not done. If the upgrade itself refuses this way, its steps are all done but they
+left a mode this build does not read: update the binary to one that reads it, and run its upgrade. No
+upgrade can have started yet, since format 1 is the first format.
 
 ### `warehouse_upgrade_running` (exit 43)
 
