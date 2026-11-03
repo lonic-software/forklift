@@ -5232,13 +5232,18 @@ fn ignore_rules_are_gitignore_lines_in_every_ignore_file() {
     assert_eq!(loaded, [".gitignore", "a.tmp", "keep.log", "src/.gitignore", "src/x.rs"]);
 
     // `re:` lines are anchored to the whole key, `\re:` is a literal, and the root ignore file
-    // wins over every `.gitignore`.
-    let (_, loaded) = untracked_then_loaded("ignore-regex", &[
+    // wins over every `.gitignore`. Windows has no file named `re:x` (the colon names a stream of
+    // `re`), so there the literal rule is left with nothing to hide.
+    let mut files = vec![
         (".forkliftignore", "re:build\n\\re:x\n!re:config\\.env\n*.tmp\n!keep.tmp\n"), (".gitignore", "*.env\n"),
         ("keep.tmp", "k\n"), ("drop.tmp", "d\n"),
-        ("build/o", "o\n"), ("rebuild.rs", "r\n"), ("sub/build", "b\n"), ("re:x", "x\n"),
+        ("build/o", "o\n"), ("rebuild.rs", "r\n"), ("sub/build", "b\n"),
         ("config.env", "c\n"), ("secret.env", "s\n"),
-    ]);
+    ];
+    if !cfg!(windows) {
+        files.push(("re:x", "x\n"));
+    }
+    let (_, loaded) = untracked_then_loaded("ignore-regex", &files);
     assert_eq!(loaded, [".forkliftignore", ".gitignore", "config.env", "keep.tmp", "rebuild.rs", "sub/build"]);
 }
 
