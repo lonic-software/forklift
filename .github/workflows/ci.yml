@@ -131,7 +131,7 @@ jobs:
           - { os: windows-latest, partition: 2, partitions: 4 }
           - { os: windows-latest, partition: 3, partitions: 4 }
           - { os: windows-latest, partition: 4, partitions: 4 }
-    runs-on: ${{ matrix.blacksmith && github.repository == 'lonic-software/forklift' && !github.event.pull_request.head.repo.fork && matrix.blacksmith || matrix.os }}
+    runs-on: ${{ matrix.blacksmith && github.repository == 'lonic-software/forklift' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && matrix.blacksmith || matrix.os }}
     # A hang anywhere in the job fails here rather than at GitHub's six-hour limit. A cold-cache
     # Windows run compiles for about eight minutes before its tests start.
     timeout-minutes: 40
