@@ -5257,6 +5257,12 @@ fn stocktake_lists_an_untracked_folder_holding_one_it_cannot_list() {
     warehouse.write_file("u/locked/f", "f\n");
     warehouse.write_file("v/.gitignore", "*\n");
     warehouse.write_file("w/unlisted/f", "f\n");
+    // Only Linux volumes take a name that is not UTF-8.
+    if cfg!(target_os = "linux") {
+        use std::os::unix::ffi::OsStrExt;
+        std::fs::create_dir_all(warehouse.root.join("x")).unwrap();
+        std::fs::write(warehouse.root.join("x").join(std::ffi::OsStr::from_bytes(b"bad\xff")), "b\n").unwrap();
+    }
     let modes = [("u/locked", 0o000), ("w/unlisted", 0o100)];
     for (path, mode) in modes {
         std::fs::set_permissions(warehouse.root.join(path), std::fs::Permissions::from_mode(mode)).unwrap();
@@ -5266,7 +5272,11 @@ fn stocktake_lists_an_untracked_folder_holding_one_it_cannot_list() {
         std::fs::set_permissions(warehouse.root.join(path), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let untracked = |path: &str| ("untracked".to_string(), path.to_string());
-    assert_eq!(unstaged, [untracked("u/"), untracked("w/")]);
+    let mut expected = vec![untracked("u/"), untracked("w/")];
+    if cfg!(target_os = "linux") {
+        expected.push(untracked("x/"));
+    }
+    assert_eq!(unstaged, expected);
 }
 
 #[test]

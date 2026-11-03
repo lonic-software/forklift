@@ -442,7 +442,7 @@ async fn collect_unstaged_changes_impl(context: ChangeWalkContext)
 ///
 /// # Returns
 /// * `Ok(bool)`    - Whether the folder holds such an entry, or one it cannot list or inspect.
-/// * `Err(String)` - If an entry's name or a `.gitignore` could not be read.
+/// * `Err(String)` - If a `.gitignore` could not be read, or was refused.
 fn untracked_directory_has_content(ignore_rules: &file_utils::IgnoreRules,
                                    parent_context: &file_utils::RuleContext,
                                    key: &str,
@@ -451,13 +451,16 @@ fn untracked_directory_has_content(ignore_rules: &file_utils::IgnoreRules,
     // A folder that cannot be listed or an entry that cannot be inspected may hold anything, so the
     // folder is reported, as before the descent existed and as git reports it, rather than failing
     // the whole stocktake. Nothing below an untracked folder is registered, so no refusal is lost.
+    // A `.gitignore` that cannot be read or is refused still fails it, as it fails a load.
     let Ok(entries) = file_utils::read_directory_entries(&fs_path) else {
         return Ok(true);
     };
     let context = ignore_rules.enter(parent_context, key, || file_utils::read_gitignore_in(&fs_path, &entries))?;
 
     for entry in &entries {
-        let name = file_utils::get_name_for_file_or_directory(entry)?;
+        let Ok(name) = file_utils::get_name_for_file_or_directory(entry) else {
+            return Ok(true);
+        };
         let entry_key = join_key(key, &name);
 
         match inventory_utils::rule_verdict(ignore_rules, &context, None, entry, &name, &entry_key, keys) {

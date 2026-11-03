@@ -3537,8 +3537,8 @@ impl IgnoreRules {
 
     /// The context a directory passes to its entries, given its parent's. A directory a user rule
     /// excludes passes that down, and its `.gitignore` is not read: nothing below it can be
-    /// re-included. Otherwise its `.gitignore` is read, even when that file, or the directory,
-    /// is itself ignored by a rule, as git reads it.
+    /// re-included, even when the directory itself is tracked. Otherwise its `.gitignore` is read,
+    /// even when a rule ignores that file, as git reads it.
     ///
     /// # Arguments
     /// * `parent`    - The context of the directory's parent ([`RuleContext::above_root`] for the
