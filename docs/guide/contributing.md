@@ -92,6 +92,18 @@ Notes:
   core; `cargo nextest run --profile ci --test-threads $((2 * $(nproc 2>/dev/null || sysctl -n hw.ncpu)))`
   reproduces that load locally (the `ci` profile gives the crash suite's kill tests two
   slots each, which only pays at that thread count).
+- CI (`.github/workflows/ci.yml`) splits the Windows tests across four runners,
+  each running its share with nextest's `--partition count:K/N`; Linux and macOS
+  run theirs in one job each. The last share of each OS also runs the doc-tests
+  and Clippy; the formatting guard runs on Linux and the split-debuginfo guard on
+  macOS. The `ci passed` check is green only when every share and the
+  generated-docs check passed, or the run was docs-only; gate a merge on it, not
+  on the individual shares. To rerun a failed share, say
+  `test (windows-latest, 3/4)`, run its failing tests by name, or on Windows the
+  whole share: `cargo nextest run --workspace --profile ci --partition count:3/4`.
+  The share holds every fourth test of each test binary, so on another OS a test
+  that exists only on some platforms shifts the rest of its binary into other
+  shares, and `--partition count:3/4` there runs a different set.
 - On macOS, `.cargo/config.toml` builds with `-Csplit-debuginfo=packed`: debuginfo
   goes into a `.dSYM` beside each binary instead of object files left in
   `target/debug/deps`. Under the default, every incremental rebuild leaves fresh
@@ -136,7 +148,7 @@ inside them and still too slow.
 
 **Check the time where it is paid.** Every test's time is in the CI log: nextest prints
 `PASS [  12.368s]` before each name. Before merging a pull request that adds or changes
-tests, look up those tests in the `test (windows-latest)` job. A local run on a fast
+tests, look up those tests in the `test (windows-latest, K/4)` jobs. A local run on a fast
 machine does not tell you what Windows will take.
 
 **How to stay inside it:**
