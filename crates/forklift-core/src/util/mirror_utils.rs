@@ -16,8 +16,14 @@ use crate::util::{file_utils, object_utils, pallet_utils};
 /// The record's file name, at the shared `.forklift` root: every bay mirrors into one place.
 pub const FILE_NAME_MIRROR_ROOTS: &str = "mirror-roots";
 
-/// The record's first line. A later format gets a new version, which this build refuses to read.
-const HEADER: &str = "forklift mirror roots 1";
+/// The version in the record's first line. A later format gets a new version, which this build
+/// refuses to read.
+const VERSION: u32 = 1;
+
+/// The record's first line.
+fn header() -> String {
+    format!("forklift mirror roots {}", VERSION)
+}
 
 /// Where the record lives.
 pub fn mirror_roots_path() -> PathBuf {
@@ -61,7 +67,7 @@ pub fn read_mirror_roots() -> Result<BTreeMap<String, String>, String> {
 
 /// Replace the record with `roots`, atomically.
 pub fn write_mirror_roots(roots: &BTreeMap<String, String>) -> Result<(), String> {
-    let mut content = format!("{}\n", HEADER);
+    let mut content = format!("{}\n", header());
     for (pallet, parcel) in roots {
         content.push_str(&format!("{} {}\n", pallet, parcel));
     }
@@ -74,8 +80,8 @@ fn parse(bytes: &[u8]) -> Result<BTreeMap<String, String>, String> {
     let mut lines = text.split_terminator('\n');
 
     match lines.next() {
-        Some(HEADER) => {}
-        Some(other) => return Err(format!("its first line is \"{}\", not \"{}\"", other, HEADER)),
+        Some(first) if first == header() => {}
+        Some(other) => return Err(format!("its first line is \"{}\", not \"{}\"", other, header())),
         None => return Err("it is empty".to_string()),
     }
 

@@ -26,7 +26,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 /// The extension of a signature table in the pack folder.
-pub(crate) const SIGNATURE_TABLE_EXTENSION: &str = "sigs";
+pub(crate) const FILE_EXTENSION_SIGNATURE_TABLE: &str = "sigs";
 
 /// The most entries a table holds: the pack bound, so no table grows without bound.
 pub(crate) const MAX_TABLE_ENTRIES: usize = 100_000;

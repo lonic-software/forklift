@@ -82,7 +82,7 @@ use crate::globals::forklift_root;
 use crate::util::{file_utils, record_utils};
 
 /// The folder under a storage root that holds taint files.
-const TAINT_DIR_NAME: &str = "taint";
+const FOLDER_NAME_TAINT: &str = "taint";
 
 /// The literal last line of a complete taint file. Its presence (as the file's exact suffix,
 /// including the newline that follows it) is what distinguishes a fully-written taint file from
@@ -268,7 +268,7 @@ fn taint_record_line(path: &Path) -> String {
 /// created before returning the error — a *returned* error (as opposed to a crash, which runs no
 /// cleanup at all) therefore never leaves a taint file behind.
 fn write_taint_file(root: &Path, relative_paths: &BTreeSet<PathBuf>) -> Result<(), String> {
-    let taint_dir = root.join(TAINT_DIR_NAME);
+    let taint_dir = root.join(FOLDER_NAME_TAINT);
     file_utils::create_folder_if_not_exists(&taint_dir)?;
 
     let (mut handle, candidate) = create_taint_file(&taint_dir)?;
@@ -606,7 +606,7 @@ pub fn read_taints(root: &Path) -> Result<TaintState, String> {
         return Ok(TaintState::default());
     }
 
-    let taint_dir = root.join(TAINT_DIR_NAME);
+    let taint_dir = root.join(FOLDER_NAME_TAINT);
     if !taint_dir.exists() {
         return Ok(TaintState::default());
     }
@@ -696,7 +696,7 @@ fn delete_snapshot_and_sync(root: &Path, files: &[PathBuf]) -> Result<(), String
         }
     }
 
-    let taint_dir = root.join(TAINT_DIR_NAME);
+    let taint_dir = root.join(FOLDER_NAME_TAINT);
     if !taint_dir.exists() {
         return Ok(());
     }
@@ -845,7 +845,7 @@ fn sync_gate_with_disk(root: &Path) -> Result<(), String> {
 /// `false`, but without paying for parsing or unioning any file's contents: [`sync_gate_with_disk`]
 /// only needs presence, never what a taint file records.
 fn any_taint_file_present(root: &Path) -> Result<bool, String> {
-    let taint_dir = root.join(TAINT_DIR_NAME);
+    let taint_dir = root.join(FOLDER_NAME_TAINT);
     if !taint_dir.exists() {
         return Ok(false);
     }
@@ -872,7 +872,7 @@ fn any_taint_file_present(root: &Path) -> Result<bool, String> {
 /// marker_path_under` serves for the incomplete-load marker). Assumes a plain, non-bay warehouse
 /// layout (`<root>/.forklift/taint/...`), which is all such a caller ever drives.
 pub fn taint_dir_path_under(warehouse_root: &Path) -> PathBuf {
-    warehouse_root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT).join(TAINT_DIR_NAME)
+    warehouse_root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT).join(FOLDER_NAME_TAINT)
 }
 
 #[cfg(test)]
@@ -978,7 +978,7 @@ mod tests {
         let root = scratch("o-excl-survivor");
         let _scope = StorageRootScope::enter(&root);
         let forklift = forklift_root();
-        let taint_dir = forklift.join(TAINT_DIR_NAME);
+        let taint_dir = forklift.join(FOLDER_NAME_TAINT);
 
         // Learn this process's actual next filename shape by recording for real first — the
         // process-global counter's absolute value depends on how many taint files earlier tests in
@@ -1030,7 +1030,7 @@ mod tests {
         let root = scratch("unique-forever");
         let _scope = StorageRootScope::enter(&root);
         let forklift = forklift_root();
-        let taint_dir = forklift.join(TAINT_DIR_NAME);
+        let taint_dir = forklift.join(FOLDER_NAME_TAINT);
 
         let object_a = forklift.join("objects").join("aa").join("bb001122");
         record_taint(&[object_a.as_path()]).unwrap();
@@ -1054,7 +1054,7 @@ mod tests {
 
         let root = scratch("torn");
         let forklift = root.join(".forklift");
-        let taint_dir = forklift.join(TAINT_DIR_NAME);
+        let taint_dir = forklift.join(FOLDER_NAME_TAINT);
         std::fs::create_dir_all(&taint_dir).unwrap();
         std::fs::write(taint_dir.join("taint-99999-0"), b"/forklift-taint 1\nobjects/ab/cdef\nobjects/c").unwrap();
 
@@ -1071,7 +1071,7 @@ mod tests {
 
         let root = scratch("line-break");
         let forklift = root.join(".forklift");
-        let taint_dir = forklift.join(TAINT_DIR_NAME);
+        let taint_dir = forklift.join(FOLDER_NAME_TAINT);
         std::fs::create_dir_all(&taint_dir).unwrap();
         let paths = ["dir/a\nb/file", "dir/c\r/file", "objects/ab/cd\\n"];
         std::fs::write(taint_dir.join("taint-99999-0"), taint_file_bytes(paths)).unwrap();
@@ -1088,7 +1088,7 @@ mod tests {
 
         let root = scratch("headerless");
         let forklift = root.join(".forklift");
-        let taint_dir = forklift.join(TAINT_DIR_NAME);
+        let taint_dir = forklift.join(FOLDER_NAME_TAINT);
         std::fs::create_dir_all(&taint_dir).unwrap();
 
         // An older, unescaped file: torn, and none of its lines read as paths — this raw path,
@@ -1119,7 +1119,7 @@ mod tests {
         let object_path = forklift.join("objects").join("22").join("33445566");
 
         record_taint(&[object_path.as_path()]).unwrap();
-        assert!(!forklift.join(TAINT_DIR_NAME).exists(),
+        assert!(!forklift.join(FOLDER_NAME_TAINT).exists(),
             "an unactivated process must create no taint directory at all");
         assert!(gate_check(&forklift).is_ok(), "the gate must never trip in an unactivated process");
         assert!(read_taints(&forklift).unwrap().recorded.is_empty(),
@@ -1191,7 +1191,7 @@ mod tests {
             "the fault must have fired exactly once — no recursion back into tainting");
         drop(fault);
 
-        let taint_dir = forklift.join(TAINT_DIR_NAME);
+        let taint_dir = forklift.join(FOLDER_NAME_TAINT);
         let leftovers: Vec<_> = std::fs::read_dir(&taint_dir).unwrap().filter_map(|e| e.ok()).collect();
         assert!(leftovers.is_empty(), "a failed taint write must leave no taint file behind, found {:?}",
             leftovers.iter().map(|e| e.file_name()).collect::<Vec<_>>());
@@ -1217,7 +1217,7 @@ mod tests {
 
         let result = record_taint(&[unrelated.as_path()]);
         assert!(result.is_ok(), "an unresolvable root must be tolerated, not errored");
-        assert!(!forklift.join(TAINT_DIR_NAME).exists(),
+        assert!(!forklift.join(FOLDER_NAME_TAINT).exists(),
             "nothing may be written when a path cannot be resolved against the storage root");
     }
 
@@ -1258,7 +1258,7 @@ mod tests {
         let root = scratch("snapshot-scoped-remove");
         let _scope = StorageRootScope::enter(&root);
         let forklift = forklift_root();
-        let taint_dir = forklift.join(TAINT_DIR_NAME);
+        let taint_dir = forklift.join(FOLDER_NAME_TAINT);
 
         let object_t1 = forklift.join("objects").join("11").join("aa112233");
         record_taint(&[object_t1.as_path()]).unwrap();
@@ -1314,7 +1314,7 @@ mod tests {
         // recording rig behind `sync_dir_attempts` never records there — this assertion only
         // holds on Unix.
         #[cfg(unix)]
-        assert!(file_utils::sync_dir_attempts().contains(&forklift.join(TAINT_DIR_NAME)),
+        assert!(file_utils::sync_dir_attempts().contains(&forklift.join(FOLDER_NAME_TAINT)),
             "the taint directory must still be synced even when every snapshotted file was already gone");
     }
 
@@ -1578,7 +1578,7 @@ mod tests {
         record_taint(&[object_path.as_path()]).unwrap();
         assert!(gate_check(&forklift).is_err(), "sanity: the gate is standing before the swap");
 
-        let taint_dir = forklift.join(TAINT_DIR_NAME);
+        let taint_dir = forklift.join(FOLDER_NAME_TAINT);
         std::fs::remove_dir_all(&taint_dir).unwrap();
         std::fs::write(&taint_dir, b"not a directory").unwrap();
 

@@ -633,8 +633,8 @@ async fn resolve_the_rest(
     // Resolve every vanished pack's stem: enumerate its surviving index, or escalate.
     let mut pack_candidates: BTreeMap<String, PathBuf> = BTreeMap::new();
     for stem in &pack_stems {
-        let index_relative = stem.with_extension(pack_utils::PACK_INDEX_EXTENSION);
-        let data_relative = stem.with_extension(pack_utils::PACK_DATA_EXTENSION);
+        let index_relative = stem.with_extension(pack_utils::FILE_EXTENSION_PACK_INDEX);
+        let data_relative = stem.with_extension(pack_utils::FILE_EXTENSION_PACK_DATA);
         let index_absolute = root.join(&index_relative);
 
         let enumerated = if index_absolute.exists() {
@@ -1006,7 +1006,7 @@ fn mark_still_dangling(
     }
     if let Some(pack_path) = pack_candidates.get(hash) {
         remainder.insert(pack_path.clone());
-        let index_relative = pack_path.with_extension(pack_utils::PACK_INDEX_EXTENSION);
+        let index_relative = pack_path.with_extension(pack_utils::FILE_EXTENSION_PACK_INDEX);
         if recorded.contains(&index_relative) {
             remainder.insert(index_relative);
         }
@@ -1332,8 +1332,8 @@ fn walk_pack_paths(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
 
         let is_pack_shaped = matches!(
             file.path().extension().and_then(|e| e.to_str()),
-            Some(ext) if ext == pack_utils::PACK_DATA_EXTENSION || ext == pack_utils::PACK_INDEX_EXTENSION
-                || ext == signature_table::SIGNATURE_TABLE_EXTENSION
+            Some(ext) if ext == pack_utils::FILE_EXTENSION_PACK_DATA || ext == pack_utils::FILE_EXTENSION_PACK_INDEX
+                || ext == signature_table::FILE_EXTENSION_SIGNATURE_TABLE
         );
         if !is_pack_shaped {
             continue;
@@ -1392,9 +1392,9 @@ fn classify_vanished(relative: &Path) -> VanishedClass {
     }
 
     match relative.extension().and_then(|ext| ext.to_str()) {
-        Some(ext) if ext == pack_utils::PACK_DATA_EXTENSION => VanishedClass::PackData(relative.with_extension("")),
-        Some(ext) if ext == pack_utils::PACK_INDEX_EXTENSION => VanishedClass::PackIndex(relative.with_extension("")),
-        Some(ext) if ext == signature_table::SIGNATURE_TABLE_EXTENSION => VanishedClass::SignatureTable,
+        Some(ext) if ext == pack_utils::FILE_EXTENSION_PACK_DATA => VanishedClass::PackData(relative.with_extension("")),
+        Some(ext) if ext == pack_utils::FILE_EXTENSION_PACK_INDEX => VanishedClass::PackIndex(relative.with_extension("")),
+        Some(ext) if ext == signature_table::FILE_EXTENSION_SIGNATURE_TABLE => VanishedClass::SignatureTable,
         _ => VanishedClass::Unrecognized,
     }
 }
@@ -8146,7 +8146,7 @@ mod tests {
 
         let hash = "ab".repeat(32);
         let entries = vec![(pack_utils::hash_to_bytes(&hash).unwrap(), some_signature())];
-        let name = format!("{}.{}", signature_table::table_id(&entries), signature_table::SIGNATURE_TABLE_EXTENSION);
+        let name = format!("{}.{}", signature_table::table_id(&entries), signature_table::FILE_EXTENSION_SIGNATURE_TABLE);
         std::fs::write(pack_utils::pack_folder().join(name), signature_table::build(&entries)).unwrap();
 
         plant_torn_taint(&forklift, &[]);
