@@ -21,7 +21,15 @@ Entries are written by hand in the pull request that makes the change, under **U
 - Destructive operations preview by default and act with `--confirm`; without it they exit 39.
 - `restore --staged` is gone; use `unload`.
 - MCP tools are generated from the command tree.
-- `--json` documents are now at schema 17.
+- `--json` documents are now at schema 19.
+- **Ignore files speak gitignore.** Every line of `.forkliftignore` is a gitignore line, and every
+  `.gitignore` in the tree is honoured where it stands; `.forkliftignore` is read last and wins over
+  them. A regex is written as a `re:` or `!re:` line, matched against the whole path. Matching is
+  case-sensitive on every system. A `.git` folder or file is ignored at any depth by a rule no file
+  can remove, so `git import` no longer writes one into `.forkliftignore`. `stocktake` reports an
+  untracked folder only when `load .` would stage something in it.
+- A failure printed for a person shows its next step on its own labelled line, in both heads, and the
+  message no longer restates it.
 - **A warehouse now records its format, and a build reads exactly one.** A warehouse in another format
   is refused before anything in it is read, with its own error code and way out. Warehouses made by
   an earlier build are refused and must be made again: no upgrade reaches back before this change.
@@ -48,13 +56,20 @@ Entries are written by hand in the pull request that makes the change, under **U
 - A cut-off `clone` keeps what it fetched and resumes.
 - A tutorial, a concepts page and a glossary in `docs/guide`.
 - `--color`, and `NO_COLOR` is honoured.
+- A remote refuses a pallet head holding a name no client can check out, `lower` and `clone` refuse
+  one a remote already holds, and `lower --repair` and `clone --repair` stack a way back from it.
+- A remote pallet delete names the head it deletes, `--at` pins it to that head, and the remote
+  listing shows each pallet's head.
 
 ### Fixed
 
 - `forklift-server` authenticates from a request's headers before reading its body, so an
   unauthenticated peer can no longer hold server memory by opening large uploads.
+- A served root's meta pallets never move back to an ancestor.
+- Every `.forklift` folder ignores itself for git, so `git add -A` in a colocated repository never
+  stages a remote token.
 - Many silent-loss, case-folding, durability and trust-verification fixes. Pull request titles from
-  #152 to #327 have the detail.
+  #152 to #343 have the detail.
 
 ## [0.3.1] - 2026-10-16
 
