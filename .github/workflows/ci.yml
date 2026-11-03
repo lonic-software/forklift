@@ -107,8 +107,11 @@ jobs:
   # a binary's slow tests (the crash suite's kill tests) over all of them. Replaying that run's
   # per-test times over the three schemes put the slowest Windows share at 142–144 s for every one,
   # against a single longest test of 123 s, so more Windows shares buy little until that test is
-  # faster. To change a count, edit the entries; `ci passed` fails a run whose shares for an OS are
-  # not exactly 1/N to N/N.
+  # faster. macOS stays one job: its runners are scarce, and on 2026-11-03 a single macOS job
+  # already waited about five minutes for one on most runs, while a run with two or three waited
+  # for the slowest of them (ten minutes, once never started), more than the two minutes a second
+  # share saves. To change a count, edit the entries; `ci passed` fails a run whose shares for an OS
+  # are not exactly 1/N to N/N.
   test:
     name: test (${{ matrix.os }}${{ matrix.partitions > 1 && format(', {0}/{1}', matrix.partition, matrix.partitions) || '' }})
     needs: changes
@@ -120,8 +123,7 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest, partition: 1, partitions: 1 }
-          - { os: macos-latest, partition: 1, partitions: 2 }
-          - { os: macos-latest, partition: 2, partitions: 2 }
+          - { os: macos-latest, partition: 1, partitions: 1 }
           - { os: windows-latest, partition: 1, partitions: 4 }
           - { os: windows-latest, partition: 2, partitions: 4 }
           - { os: windows-latest, partition: 3, partitions: 4 }
@@ -168,9 +170,8 @@ jobs:
             --partition "count:${{ matrix.partition }}/${{ matrix.partitions }}"
 
       # What is not split runs once per OS, on its last share, reusing that share's build: the
-      # doc-tests (nextest does not run them), Clippy and the guards. Not in a job of its own: an
-      # account runs at most five macOS jobs at once, and a third macOS job per run left one
-      # queued for ten minutes on 2026-11-03 while another run held the rest.
+      # doc-tests (nextest does not run them), Clippy and the guards. Not in a job of its own, which
+      # would add a macOS job to wait for a runner (see the note on macOS above).
       - name: Formatting guard
         # The tree is formatted by hand and rustfmt.toml switches rustfmt off; bin/fmt-guard fails
         # if that guard is missing, or if a second rustfmt config would override it. Its answer

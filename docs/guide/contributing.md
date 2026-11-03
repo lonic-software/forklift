@@ -92,9 +92,9 @@ Notes:
   core; `cargo nextest run --profile ci --test-threads $((2 * $(nproc 2>/dev/null || sysctl -n hw.ncpu)))`
   reproduces that load locally (the `ci` profile gives the crash suite's kill tests two
   slots each, which only pays at that thread count).
-- CI (`.github/workflows/ci.yml`) splits the tests across runners: one on Linux,
-  two on macOS and four on Windows, each running its share with nextest's
-  `--partition count:K/N`. The last share of each OS also runs the doc-tests,
+- CI (`.github/workflows/ci.yml`) splits the Windows tests across four runners,
+  each running its share with nextest's `--partition count:K/N`; Linux and macOS
+  run theirs in one job each. The last share of each OS also runs the doc-tests,
   Clippy and the guards. The `ci passed` check is green only when every share and
   the generated-docs check passed, or the run was docs-only; gate a merge on it,
   not on the individual shares. To rerun the share that failed, say
