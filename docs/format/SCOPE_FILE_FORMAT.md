@@ -19,13 +19,13 @@ collaborators. Which of them must exist is set out [below](#which-scope-files-mu
 A [state record](STATE_RECORD_FORMAT.md) of kind `scope`: a format header line, then one
 in-scope path prefix per line, escaped:
 ```
-/forklift-scope 3[NL]
+/forklift-scope 4[NL]
 [prefix_1][NL]
 [prefix_2][NL]
 ...
 ```
 Where:
-- `/forklift-scope 3` names the format. It opens with `/`, which no stored prefix can, so it
+- `/forklift-scope 4` names the format. It opens with `/`, which no stored prefix can, so it
   cannot be mistaken for a prefix. A full scope is written as the empty file, with no header.
 - `prefix_n` is a **warehouse path key**: `/`-separated, relative to the warehouse root,
   with no leading or trailing `/` and no `.`/`..` components (e.g. `src/api`). A prefix names
@@ -49,8 +49,9 @@ Where:
   before the root ignore file joined every scope, and is **refused** — read under today's
   meaning, the never-inventoried ignore file would show as removed and the next stack would
   commit the removal. A header naming any other version is refused too, format 2 included,
-  which wrote prefixes raw, so a prefix holding a line break read back as two. Nothing is
-  migrated.
+  which wrote prefixes raw, so a prefix holding a line break read back as two, and format 3,
+  whose scopes left out the `.gitignore` of each folder above a prefix: read under today's
+  meaning, each would show as removed in the same way. Nothing is migrated.
   The way out depends on the file: for the fetch scope or the main tree's scope, clone
   the remote again, into a new directory; for a bay's scope, remove the bay with `bay remove`
   and add a new one under another name (a removed bay keeps its pallet, so its name stays
@@ -95,11 +96,16 @@ sparse.
 Against a scope, every user-pallet content path is classified three ways (the classifier the
 sparse walks branch on):
 
-- **In scope** — the path is at or under an in-scope prefix, or is the root `.forkliftignore`,
-  which every non-full scope holds so that a sparse checkout always has the rules that apply
-  to it. Fully materialized: descended, staged, verified and merged exactly as a full
-  workspace would. The ignore file is not a declared prefix, so a scope never requires it to
-  be a directory.
+- **In scope** — the path is at or under an in-scope prefix, or is one of the scope's
+  *implicit members*: the root `.forkliftignore` and `.gitignore`, and the `.gitignore` of each
+  folder above a prefix. Every non-full scope holds them, so that a sparse checkout always has
+  the rules that apply to what it holds and ignores what a full checkout ignores there. Fully
+  materialized: descended, staged, verified and merged exactly as a full workspace would. An
+  implicit member is not a declared prefix, so a scope never requires it to be a directory,
+  and one at or under a prefix, or above one, is not a member: the prefix already decides it.
+  For prefixes `src/api` and `docs`, the members are `.forkliftignore`, `.gitignore` and
+  `src/.gitignore`; `src/web/.gitignore` beside the prefix stays out of scope. Narrowing a
+  scope drops each member no kept prefix still needs, with the prefixes.
 - **Spine** — the path is a strict ancestor of an in-scope prefix (so the root is always
   spine in a scoped bay). Walked, but its *other* entries at that level are out of scope and
   carried forward by hash, never descended.

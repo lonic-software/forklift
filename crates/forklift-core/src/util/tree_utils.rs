@@ -658,8 +658,8 @@ fn splice_spine_level(head: Option<&TreeItem>,
         .unwrap_or_default();
 
     // A spine level's own files are out of scope, and copied verbatim — or resolved by the merge
-    // skeleton where it changed them — except the root ignore file, which every scope holds in
-    // scope and which the pass over the built tree below takes. A file where the scope expects a
+    // skeleton where it changed them — except the ignore files above a prefix, which every scope
+    // holds in scope and which the pass over the built tree below takes. A file where the scope expects a
     // directory (a spine ancestor, or an in-scope prefix itself) flipped from a directory at this
     // revision: a spine-path type change.
     for (name, item) in &head_files {

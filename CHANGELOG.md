@@ -30,6 +30,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   can remove, so `git import` no longer writes one into `.forkliftignore`. `stocktake` reports an
   untracked folder only when `load .` would stage something in it. A `.forkliftignore` line that
   reads as an old regex, starting with `^` or ending with `$`, is refused rather than misread.
+- **A sparse checkout ignores what a full one ignores.** Besides the root `.forkliftignore`, every
+  `clone --only` scope and scoped bay now holds the root `.gitignore` and the `.gitignore` of each
+  folder above a scoped path, and `scope narrow` removes the ones it no longer needs. Sparse
+  warehouses and scoped bays made before this change are refused and must be made again.
 - A failure printed for a person shows its next step on its own labelled line, in both heads, and the
   message no longer restates it.
 - **A warehouse now records its format, and a build reads exactly one.** A warehouse in another format

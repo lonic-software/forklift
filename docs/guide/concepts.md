@@ -200,10 +200,17 @@ $ forklift scope
 the main tree is scoped (sparse). Checkout scope:
   src
   .forkliftignore (always in scope)
+  .gitignore (always in scope)
 Warehouse fetch scope:
   src
   .forkliftignore (always in scope)
+  .gitignore (always in scope)
 ```
+
+A sparse checkout always holds the ignore files that apply to what it shows: the root
+`.forkliftignore` and `.gitignore`, and the `.gitignore` of every folder above a scoped path. With
+`--only src/api`, that includes `src/.gitignore`, so the checkout ignores just what a full one
+ignores there.
 
 A sparse warehouse still audits in full: every signature is checked, and the sealed content is
 pinned by the hashes those signatures cover:
