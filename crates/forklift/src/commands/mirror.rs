@@ -567,7 +567,7 @@ impl<'a> Run<'a> {
         // pallet's message carries the refusal's step, which the run's next step points at.
         take_utils::verify_take(Some(self.client), &self.trust, head, pallet, FetchAt::Warehouse).await
             .map_err(|refusal| Problem::Failed(match CoreError::from(refusal) {
-                CoreError::Refusal { message, next_step, .. } => format!("{} {}", message, next_step),
+                CoreError::Refusal { message, next_step, .. } => forklift_core::error::with_next_step(&message, &next_step),
                 other => other.to_string(),
             }))?;
 

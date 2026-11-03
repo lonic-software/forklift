@@ -7823,6 +7823,21 @@ fn json_errors_carry_a_stable_code_and_a_deterministic_exit_code() {
     assert!(value.get("data").is_none(), "a failure carries no data: {}", value);
 }
 
+/// A person at a terminal gets the same recovery a `--json` consumer reads from `next_step`: on a
+/// line of its own under the message, labelled.
+#[test]
+fn a_human_failure_prints_its_next_step_under_the_message() {
+    let warehouse = TestWarehouse::new("human-error-next-step");
+    let failure = json(&warehouse.run(&["stocktake", "--json"]));
+    let (message, next_step) = (failure["error"]["message"].as_str().unwrap(), failure["error"]["next_step"].as_str().unwrap());
+
+    let outside = warehouse.run(&["stocktake"]);
+    assert_eq!(outside.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&outside.stderr).to_string();
+    assert_eq!(stderr, format!("{}\nNext step: {}\n", message, next_step));
+    assert!(!message.contains(next_step), "the message does not restate its step: {}", message);
+}
+
 #[test]
 fn a_json_failure_names_the_command_clap_resolved_not_the_alias_typed() {
     let warehouse = TestWarehouse::new("json-error-alias");

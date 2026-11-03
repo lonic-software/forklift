@@ -21,6 +21,7 @@ use forklift_aws_lambda::aws::build_clients;
 use forklift_aws_lambda::format::{self, UpgradeOptions, CHAIN};
 use forklift_aws_lambda::reissue::request_token;
 use forklift_aws_lambda::{AsyncBridge, AwsConfig, DynamoRefStore};
+use forklift_core::error::CoreError;
 
 /// The wait after marking a warehouse, by default: well past the control-plane Lambda's timeout,
 /// which `infra/aws-serverless` caps at API Gateway's 29 seconds. The verifier never reads a
@@ -111,7 +112,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("{}", error);
+            eprintln!("{}", CoreError::from(error).human_text());
             ExitCode::FAILURE
         }
     }
@@ -152,7 +153,7 @@ fn run(arguments: &Arguments, dynamodb: forklift_aws_lambda::aws::DynamoOps, bri
                 }
             }
             Err(error) => {
-                eprintln!("{}", error);
+                eprintln!("{}", CoreError::from(error).human_text());
                 failed += 1;
             }
         }

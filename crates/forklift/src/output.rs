@@ -329,7 +329,10 @@ pub fn report_error(error: &ForkliftError) {
     match mode() {
         // A message can quote a record or a remote's answer, so the human copy is made inert
         // here, at the one place every error is printed; the JSON body stays exact.
-        OutputMode::Human => eprintln!("{}", forklift_core::error::sanitize_lines(&error.message)),
+        OutputMode::Human => eprintln!(
+            "{}",
+            forklift_core::error::human_failure_text(&error.message, error.next_step.as_deref())
+        ),
         OutputMode::Json => print_document::<()>(None, Some(ErrorBody {
             code: error.code.as_str(),
             message: &error.message,
@@ -851,12 +854,12 @@ pub struct ForkliftError {
 }
 
 impl ForkliftError {
-    /// A classified error with a next step.
+    /// A classified error with a next step. A blank step is none, as for a refusal.
     pub fn new(code: ErrorCode, message: impl Into<String>, next_step: impl Into<String>) -> ForkliftError {
         ForkliftError {
             code,
             message: message.into(),
-            next_step: Some(next_step.into()),
+            next_step: Some(next_step.into()).filter(|step| !step.trim().is_empty()),
             details: None,
         }
     }
@@ -872,7 +875,8 @@ impl From<CoreError> for ForkliftError {
             CoreError::Refusal { code, message, next_step, details } => ForkliftError {
                 code: ErrorCode::from_refusal(code),
                 message,
-                next_step: Some(next_step),
+                // A blank step is no recovery: `--json` leaves the field out, as it does for none.
+                next_step: Some(next_step).filter(|step| !step.trim().is_empty()),
                 details,
             },
             CoreError::Other(message) => {
@@ -1183,6 +1187,19 @@ macro_rules! human {
 mod tests {
     use super::*;
 
+    /// A blank step is no recovery: `--json` leaves `next_step` out, as for an error with none.
+    #[test]
+    fn a_blank_next_step_is_no_next_step() {
+        let refusal = CoreError::refusal(forklift_core::error::RefusalCode::OutOfScope, "It failed.", " ");
+        assert_eq!(ForkliftError::from(refusal).next_step, None);
+
+        let refusal = CoreError::refusal(forklift_core::error::RefusalCode::OutOfScope, "It failed.", "forklift lower");
+        assert_eq!(ForkliftError::from(refusal).next_step.as_deref(), Some("forklift lower"));
+
+        assert_eq!(ForkliftError::new(ErrorCode::Generic, "It failed.", " ").next_step, None);
+        assert_eq!(ForkliftError::new(ErrorCode::Generic, "It failed.", "forklift lower").next_step.as_deref(), Some("forklift lower"));
+    }
+
     /// Each closure reason gets its own sentence, and the JSON value names it the same way the
     /// docs do. Revert: word both reasons alike → the two lines compare equal.
     #[test]
@@ -1266,7 +1283,7 @@ mod tests {
         let error: ForkliftError = frame.into();
 
         assert_eq!(error.code.as_str(), "error"); // ErrorCode::Generic
-        assert_eq!(error.message, "a human explanation do this");
+        assert_eq!(error.message, "a human explanation (Next step: do this)");
         assert!(!error.message.contains('\u{1f}'), "the raw frame must never leak into the message");
     }
 
