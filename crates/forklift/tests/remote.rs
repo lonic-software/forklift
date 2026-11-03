@@ -11055,7 +11055,8 @@ fn a_remote_delete_pinned_with_at_deletes_only_that_head() {
     assert_eq!(refused["next_step"], "forklift pallet list --remote", "{}", refused);
     let message = refused["message"].as_str().unwrap();
     assert!(message.contains(&format!("is at {}, not at {}", now, read)), "{}", message);
-    assert!(message.contains(&format!("\"forklift pallet delete feat --remote --at {}\"", now)), "{}", message);
+    assert!(message.contains("\"forklift pallet delete feat --remote --at <head>\""), "{}", message);
+    assert!(!message.contains(&format!("--at {}", now)), "no ready-made delete of a head nobody looked at: {}", message);
     assert_eq!(pallet_head(&area, "server-root", "feat"), now, "the remote's pallet is untouched");
 
     let deleted = area.forklift("b", &["--json", "pallet", "delete", "feat", "--remote", "--at", &now]);
@@ -11069,11 +11070,11 @@ fn a_remote_delete_pinned_with_at_deletes_only_that_head() {
     assert_success(&again);
     assert_eq!(json_of(&again)["data"]["already"], true);
 
-    // Pinned to a head the deletion did not keep: someone else deleted it after it moved.
+    // Pinned to a head the deletion did not keep: refused, whoever deleted it.
     let other = refusal_of(&area.forklift("b", &["--json", "pallet", "delete", "feat", "--remote", "--at", &read]), 35);
     assert_eq!(other["code"], "pallet_deleted_on_remote", "{}", other);
     assert_eq!(other["next_step"], "forklift pallet list --remote", "{}", other);
-    assert!(other["message"].as_str().unwrap().contains(&format!("deleted at {}, not at {}", now, read)), "{}", other);
+    assert!(other["message"].as_str().unwrap().contains(&format!("is deleted at {}, not at {}", now, read)), "{}", other);
 
     let malformed = area.forklift("b", &["pallet", "delete", "feat", "--remote", "--at", &now[..12]]);
     assert!(!malformed.status.success() && stderr(&malformed).contains("takes a pallet's full head"), "{}", stderr(&malformed));
