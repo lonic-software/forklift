@@ -40,7 +40,11 @@ forklift prepare
 
 Creates `.forklift/` in the current directory: the object store, the inventory,
 the config folder, the pallets folder, the default pallet `main` (unborn until
-your first `stack`) and a warehouse config file. It writes no `.forkliftignore`,
+your first `stack`) and a warehouse config file. It also writes `.forklift/.gitignore`
+holding `*`, so where the directory is a git working tree too, `git add -A` stages
+nothing of `.forklift/`, the remote token in its config included; `clone` writes one too,
+and `bay add` writes one into the bay's `.forklift/`. A `.forklift/.gitignore` already there is kept
+as it is. It writes no `.forkliftignore`,
 as `git init` writes no `.gitignore` — see [`.forkliftignore`](#forkliftignore--files-forklift-shouldnt-track).
 Idempotent —
 running it in an existing warehouse only creates what's missing. `-v` lists each
@@ -104,7 +108,8 @@ Before anything is converted, the import refuses, naming the branches, when a ma
 still not a valid pallet name (a branch `con`, or a part ending in `.`), when two branches map to
 one name (`Feature` and `feature`), when one mapped name would be a folder of another (`a+b` and
 `a-b/x`), or when the name is already a pallet here or nests with one. Git's HEAD
-branch is checked out, and `.git/` is added to `.forkliftignore` (creating the file if
+branch is checked out; git itself never stages `.forklift/`, which ignores itself (see
+`prepare`). `.git/` is added to `.forkliftignore` (creating the file if
 there is none) so a colocated repo reads clean, unless a rule there already matches `.git`, which
 it then names. The rule is added before the inventory is built, so an import interrupted there and
 finished by `heal` has it too. An ignore file Forklift refuses to read is left as it is, with a warning. The edit is left in the working tree,
