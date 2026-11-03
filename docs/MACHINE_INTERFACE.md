@@ -85,7 +85,11 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 17** (current): the `warehouse_in_use` error code exists (exit 45). `forklift upgrade`
+**Schema 18** (current): the `head_not_materializable` error code exists (exit 46). `lower` and
+`clone` refuse with it, changing nothing, when the remote's head of the pallet holds an entry named
+like the warehouse's metadata folder, which no client can check out.
+
+**Schema 17**: the `warehouse_in_use` error code exists (exit 45). `forklift upgrade`
 refuses with it when another process has the warehouse open.
 
 **Schema 16**: the `warehouse_format_older` (exit 40), `warehouse_format_newer` (exit 41),

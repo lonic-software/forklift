@@ -45,6 +45,7 @@ use forklift_core::model::remote::{
     HoldAnswer, RefUpdateRequest, TrustAnchorDto, UploadTargetsResponse, WarehouseInfo, MAX_MISSING_BATCH,
     PROTOCOL_VERSION, REFUSAL_NOT_AN_OBJECT_HASH,
 };
+use forklift_core::model::parcel::Parcel;
 use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::authority_utils::{self, Denied, Principal};
 use forklift_core::util::office_utils::{self, OfficeState, TrustAnchor, OFFICE_PALLET_NAME};
@@ -1047,6 +1048,36 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                         Lower, consolidate, and lift the merge."
                             .to_string(),
                     ));
+                }
+            }
+
+            // Every head a user pallet takes can be checked out, judged against the old head or a
+            // creation against the tombstone this warehouse stores, never the request's tombstone
+            // field; the order and the rule are `forklift-server`'s. Read through the object store,
+            // as `load_base_tree` is: the old head's trees are not in the audit scratch.
+            if !is_meta {
+                let base = match expected {
+                    ExpectedHead::At(old) | ExpectedHead::Deleted(old) => Some(old),
+                    ExpectedHead::Unborn => None,
+                };
+                let load_parcel = |hash: &str| -> Result<Parcel, String> {
+                    let bytes = self
+                        .objects
+                        .get(hash)?
+                        .ok_or_else(|| format!("Parcel {} is missing.", hash))?;
+
+                    object_utils::parse_parcel_bytes(hash, &bytes)
+                };
+
+                if let Some(path) = audit_utils::first_metadata_folder_path(
+                    &request.new_head,
+                    base,
+                    &load_parcel,
+                    &load_base_tree,
+                )
+                .map_err(HeadError::internal)?
+                {
+                    return Err(HeadError::unprocessable(audit_utils::head_not_materializable_message(&path)));
                 }
             }
 

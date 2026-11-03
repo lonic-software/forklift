@@ -58,4 +58,5 @@ Exit code 17 is reserved for a future feature and is not yet assigned to any cod
 | `warehouse_upgrade_running` | 43 | Another process is upgrading the warehouse right now; run the command again once it finishes |
 | `warehouse_lease_missing` | 44 | The warehouse's format lease file is missing and this user cannot create it; create it, or restore write access |
 | `warehouse_in_use` | 45 | An upgrade found the warehouse open in another process; let it finish, then run the upgrade again |
+| `head_not_materializable` | 46 | The remote's head of the pallet holds an entry named like the warehouse's metadata folder, so it cannot be checked out; nothing was changed |
 

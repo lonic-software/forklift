@@ -2856,6 +2856,8 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
 
             // An early refusal too, after the closure check, so its walk of the new history reads
             // only what is present: the ref write applies the same rule under its lock.
+            let mut recreated: Option<String> = None;
+
             if request.old_head.is_none() && !is_meta {
                 if let Some(head) = forklift_core::util::tombstone_utils::read_tombstones().map_err(internal)?.remove(&bare) {
                     let acknowledged = request.tombstone.as_deref() == Some(head.as_str());
@@ -2866,6 +2868,8 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                     if !acknowledged || !descends {
                         return Err(pallet_deleted(&bare, &head, acknowledged));
                     }
+
+                    recreated = Some(head);
                 }
             }
 
@@ -2882,6 +2886,20 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                         "The update is not a fast-forward; the protocol has no force \
                         push. Lower, consolidate, and lift the merge.".to_string()
                     ));
+                }
+            }
+
+            // Every head a user pallet takes can be checked out. Judged against the old head, or a
+            // creation against the tombstone this warehouse itself stores, never the request's
+            // tombstone field, which is free client data when none stands. A meta pallet's tree
+            // carries `.forklift` by design, so the namespace decides, never the tree's shape.
+            if !is_meta {
+                let base = request.old_head.as_deref().or(recreated.as_deref());
+
+                if let Some(path) = audit_utils::first_metadata_folder_path(
+                    &request.new_head, base, &object_utils::load_parcel, &object_utils::load_tree,
+                ).map_err(internal)? {
+                    return Err(unprocessable(audit_utils::head_not_materializable_message(&path)));
                 }
             }
 
@@ -6500,11 +6518,11 @@ mod tests {
         parcel_object.hash
     }
 
-    /// A push of a head whose root holds the metadata folder is accepted: nothing on a server walks
-    /// it as metadata, and every client command that would materialize it refuses.
-    // Revert: refuse the entry on a ref update again → the crafted head does not land.
+    /// A push of a head whose root holds the metadata folder is refused, under trust too: every
+    /// client command that would check it out refuses, so the pallet would be stuck there.
+    // Revert: drop the materializable-head gate from `post_ref_update` → the crafted head lands.
     #[tokio::test]
-    async fn a_ref_update_to_a_head_holding_the_metadata_folder_is_accepted() {
+    async fn a_ref_update_to_a_head_holding_the_metadata_folder_is_refused() {
         use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
         use forklift_core::enums::dir_entry_type::DirEntryType;
 
@@ -6525,8 +6543,11 @@ mod tests {
             Json(RefUpdateRequest { old_head: None, new_head: crafted.clone(), tombstone: None }),
         ).await.into_response();
 
-        assert!(response.status().is_success(), "{}", body_text(response).await);
-        assert_eq!(forklift_core::util::pallet_utils::get_pallet_head("crafted").unwrap(), Some(crafted));
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = body_text(response).await;
+        assert!(body.contains(r#"holds \".forklift\""#), "{}", body);
+        assert_eq!(forklift_core::util::pallet_utils::get_pallet_head("crafted").unwrap(), None);
+        let _ = crafted;
     }
 
     /// Store an unsigned parcel over an empty tree and return its hash: a pallet head whose history
@@ -7173,6 +7194,208 @@ mod tests {
 
             let holds: HoldsResponse = serde_json::from_str(&body_text(response).await).unwrap();
             assert_eq!(holds.holds.get(&side), Some(&HoldAnswer::Held));
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// The push gate on a user pallet's head: a name no client can check out is refused, judged
+    /// against the old head or the tombstone this warehouse itself stores.
+    mod materializable_heads {
+        use super::*;
+        use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+        use forklift_core::enums::dir_entry_type::DirEntryType;
+        use forklift_core::model::blob::Blob;
+        use forklift_core::model::parcel::Parcel;
+        use forklift_core::util::tombstone_utils;
+
+        fn file(name: &str, content: &str) -> TreeItem {
+            let mut blob = LooseObjectBuilder::build_blob(&Blob { content: content.as_bytes().to_vec() });
+            blob.store().unwrap();
+            TreeItem::new(name.to_string(), blob.hash, DirEntryType::Normal)
+        }
+
+        /// A stored tree named `name` holding `children`.
+        fn dir(name: &str, children: Vec<TreeItem>) -> TreeItem {
+            let mut tree = TreeItem::new(name.to_string(), String::new(), DirEntryType::Tree);
+            for child in children {
+                tree.add_child(child);
+            }
+            let mut object = LooseObjectBuilder::build_tree(&tree);
+            object.store().unwrap();
+            tree.hash = object.hash;
+            tree
+        }
+
+        /// A stored parcel on `parents` whose root holds `children`.
+        fn parcel(parents: &[&str], children: Vec<TreeItem>) -> String {
+            let root = dir("", children);
+            let mut object = LooseObjectBuilder::build_parcel(&Parcel {
+                tree_hash: root.hash,
+                parents: parents.iter().map(|parent| parent.to_string()).collect(),
+                actions: Vec::new(),
+                description: Some("gate".to_string()),
+            });
+            object.store().unwrap();
+            object.hash
+        }
+
+        /// A served root whose bay stands on "main".
+        fn served(name: &str) -> (PathBuf, StorageRootScope) {
+            let (root, scope) = trust_warehouse(name);
+            let main = store_bare_parcel("main");
+            pallet_utils::update_pallet_head("main", None, &main, &RefPreconditions::NONE).unwrap();
+            pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(main))).unwrap();
+            assert!(tombstone_utils::mark_served(false).unwrap());
+
+            (root, scope)
+        }
+
+        /// Plant `head` on user pallet `name` past the gate, as a writer from before it would have.
+        fn plant(name: &str, head: &str) {
+            pallet_utils::update_pallet_head(name, None, head, &RefPreconditions::NONE).unwrap();
+        }
+
+        async fn update(root: &std::path::Path, name: &str, old_head: Option<&str>, new_head: &str,
+                        tombstone: Option<&str>) -> (StatusCode, String) {
+            let response = post_ref_update(
+                State(Arc::new(single_mode_state(root.to_path_buf()))), Extension(Principal::Open), Path(ref_update_params(name)),
+                Json(RefUpdateRequest {
+                    old_head: old_head.map(str::to_string),
+                    new_head: new_head.to_string(),
+                    tombstone: tombstone.map(str::to_string),
+                }),
+            ).await.into_response();
+            let status = response.status();
+
+            (status, body_text(response).await)
+        }
+
+        /// Revert: drop the gate → both crafted heads land → red. A clean head beside them lands,
+        /// so the refusals are the names', not the fixture's.
+        #[tokio::test]
+        async fn a_head_holding_the_metadata_folder_at_any_depth_is_refused() {
+            let (root, _scope) = served("gate-any-depth");
+            let at_root = parcel(&[], vec![dir(".forklift", vec![file("config", "x")])]);
+            let below = parcel(&[], vec![dir("docs", vec![file("a", "1"), file(".ForkLift", "x")])]);
+            let clean = parcel(&[], vec![dir("docs", vec![file("a", "1")])]);
+
+            let (status, body) = update(&root, "side", None, &at_root, None).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{}", body);
+            assert!(body.contains(r#"holds \".forklift\""#), "{}", body);
+
+            let (status, body) = update(&root, "side", None, &below, None).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{}", body);
+            assert!(body.contains(r#"holds \"docs/.ForkLift\""#), "the path is named whole: {}", body);
+            assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), None);
+
+            let (status, body) = update(&root, "side", None, &clean, None).await;
+            assert_eq!(status, StatusCode::OK, "{}", body);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// A creation names a wedged parcel as its tombstone when none stands, and builds on it
+        /// without changing its tree. Judged against the request's field, nothing would be loaded.
+        ///
+        /// Revert: take the base from `request.tombstone` → the creation lands → red.
+        #[tokio::test]
+        async fn a_creation_is_judged_against_the_stored_tombstone_never_the_request() {
+            let (root, _scope) = served("gate-free-tombstone");
+            let wedged_tree = vec![file(".forklift", "x"), file("a", "1")];
+            let wedged = parcel(&[], wedged_tree.clone());
+            let on_it = parcel(&[&wedged], wedged_tree);
+
+            let (status, body) = update(&root, "side", None, &on_it, Some(&wedged)).await;
+
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{}", body);
+            assert!(body.contains(r#"holds \".forklift\""#), "{}", body);
+            assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), None);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// A wedged head deleted here comes back by a restore, whose tree is its stored tombstone's,
+        /// so nothing is loaded; the pallet is then repaired like any wedged head.
+        ///
+        /// Revert: judge a creation against nothing even when a tombstone stands → the restore is
+        /// refused → red.
+        #[tokio::test]
+        async fn a_restore_of_a_wedged_tombstone_head_is_accepted() {
+            let (root, _scope) = served("gate-restore");
+            let wedged = parcel(&[], vec![file(".forklift", "x")]);
+            plant("side", &wedged);
+            let deleted = delete_ref(
+                State(Arc::new(single_mode_state(root.clone()))), Extension(Principal::Open), Path(ref_update_params("side")),
+                Query(RefDeleteRequest { old_head: wedged.clone() }),
+            ).await.into_response();
+            assert_eq!(deleted.status(), StatusCode::OK);
+
+            let (status, body) = update(&root, "side", None, &wedged, Some(&wedged)).await;
+
+            assert_eq!(status, StatusCode::OK, "{}", body);
+            assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), Some(wedged));
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// A pallet planted with a bad name in `d`: an edit in `d` is refused until a repair removes
+        /// it, and an edit in `e` passes.
+        ///
+        /// Revert: skip a name the base already held → the edit in `d` lands → red. Revert: load
+        /// every subtree whatever the base → the edit in `e` is refused → red.
+        #[tokio::test]
+        async fn an_edit_beside_an_old_bad_name_is_refused_and_one_elsewhere_passes() {
+            let (root, _scope) = served("gate-old-name");
+            let e = dir("e", vec![file("g", "1")]);
+            let wedged = parcel(&[], vec![dir("d", vec![file(".forklift", "x"), file("f", "1")]), e.clone()]);
+            plant("side", &wedged);
+
+            let beside = parcel(&[&wedged], vec![dir("d", vec![file(".forklift", "x"), file("f", "2")]), e]);
+            let (status, body) = update(&root, "side", Some(&wedged), &beside, None).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{}", body);
+            assert!(body.contains(r#"holds \"d/.forklift\""#), "{}", body);
+
+            let elsewhere = parcel(&[&wedged], vec![dir("d", vec![file(".forklift", "x"), file("f", "1")]), dir("e", vec![file("g", "2")])]);
+            let (status, body) = update(&root, "side", Some(&wedged), &elsewhere, None).await;
+            assert_eq!(status, StatusCode::OK, "{}", body);
+            assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), Some(elsewhere));
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// A merge over a repaired head that takes its older, wedged parent's tree. The closure walk
+        /// skips that tree as its parent's; the gate judges it against the old head alone.
+        ///
+        /// Revert: also skip a tree equal to a parent's → the merge lands → red.
+        #[tokio::test]
+        async fn a_merge_carrying_an_older_wedged_tree_is_refused() {
+            let (root, _scope) = served("gate-merge");
+            let wedged_tree = vec![file(".forklift", "x"), file("a", "1")];
+            let wedged = parcel(&[], wedged_tree.clone());
+            let repaired = parcel(&[&wedged], vec![file("a", "1")]);
+            plant("side", &repaired);
+            let merge = parcel(&[&repaired, &wedged], wedged_tree);
+
+            let (status, body) = update(&root, "side", Some(&repaired), &merge, None).await;
+
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{}", body);
+            assert_eq!(pallet_utils::get_pallet_head("side").unwrap(), Some(repaired));
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// A changed tree copied to a second path: at `a` its unchanged subtree `s` is the base's,
+        /// at `b` there is no base, so the bad name inside `s` is new there.
+        ///
+        /// Revert: remember checked trees by hash alone → `b` is skipped as already checked → the
+        /// head lands → red.
+        #[tokio::test]
+        async fn a_copied_tree_owes_what_its_new_path_never_held() {
+            let (root, _scope) = served("gate-copy");
+            let s = dir("s", vec![file(".forklift", "x")]);
+            let wedged = parcel(&[], vec![dir("a", vec![s.clone(), file("x", "1")])]);
+            plant("side", &wedged);
+            let copied = parcel(&[&wedged], vec![dir("a", vec![s.clone(), file("x", "2")]), dir("b", vec![s, file("x", "2")])]);
+
+            let (status, body) = update(&root, "side", Some(&wedged), &copied, None).await;
+
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{}", body);
+            assert!(body.contains(r#"holds \"b/s/.forklift\""#), "{}", body);
             let _ = std::fs::remove_dir_all(&root);
         }
     }

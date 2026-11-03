@@ -5,7 +5,7 @@ use crate::model::inventory::{Inventory, InventoryItem};
 use crate::model::tree_item::TreeItem;
 use crate::util::progress_utils::Progress;
 use crate::util::scope_utils::{self, PathScope, ScopeClass};
-use crate::util::{alias_utils, cache_miss, fanout_utils, file_utils, inventory_utils, object_utils, office_utils, tree_utils, warehouse_utils};
+use crate::util::{alias_utils, audit_utils, cache_miss, fanout_utils, file_utils, inventory_utils, object_utils, office_utils, tree_utils, warehouse_utils};
 
 /// A single file operation needed to turn one tree into another in the working directory.
 pub enum FileOp {
@@ -90,6 +90,61 @@ pub fn diff_trees_in(from: Option<&str>,
 /// on each side: where they differ, and the subtree is not out of scope.
 fn diff_descends(path: &str, from: Option<&str>, to: Option<&str>, scope: &PathScope) -> bool {
     from != to && (scope.is_full() || scope.classify(path) != ScopeClass::OutOfScope)
+}
+
+/// The first path in the `to` tree a checkout from `from` in `scope` could not write, because one of
+/// its names opens a metadata folder ([`office_utils::opens_metadata_folder`]): the check a head is
+/// put to before anything is changed for it, so a head no client can check out is refused whole,
+/// up front, rather than by the planning or the write that first trips over it.
+///
+/// It walks what [`diff_trees_in`] walks: the root, whose top-level entries are always checked (as
+/// [`office_utils::ensure_not_metadata_root`] checks them), and every subtree that differs from
+/// `from`'s at its path and is not out of scope, whose in-scope entries are checked. A subtree equal
+/// to `from`'s is one this checkout already holds, so it has nothing new to write.
+///
+/// # Arguments
+/// * `from`  - The hash of the root tree checked out now (`None` for an empty working directory).
+/// * `to`    - The hash of the root tree to check out.
+/// * `scope` - The scope the checkout runs in.
+///
+/// # Returns
+/// * `Ok(Some(path))` - The first such path, depth first in name order.
+/// * `Ok(None)`       - If the checkout would write no such name.
+/// * `Err(String)`    - If a tree could not be loaded, or the volume could not say for a name.
+pub fn first_unmaterializable_path(from: Option<&str>,
+                                   to: &str,
+                                   scope: &PathScope) -> Result<Option<String>, String> {
+    cache_miss::prefetch_trees(&[from, Some(to)], |path, sides| diff_descends(path, sides[0], sides[1], scope));
+
+    let mut pending: Vec<(String, String, Option<String>)> = vec![(String::new(), to.to_string(), from.map(str::to_string))];
+
+    while let Some((prefix, to_hash, from_hash)) = pending.pop() {
+        let tree = object_utils::load_tree(&to_hash)?;
+        let mut from_subtrees: HashMap<String, String> = match &from_hash {
+            Some(hash) => object_utils::load_tree(hash)?.get_subtrees().map(|(name, subtree)| (name.clone(), subtree.hash.clone())).collect(),
+            None => HashMap::new(),
+        };
+
+        let mut names: Vec<&String> = tree.get_files().map(|(name, _)| name).chain(tree.get_subtrees().map(|(name, _)| name)).collect();
+        names.sort();
+
+        for name in names {
+            let path = audit_utils::child_path(&prefix, name);
+
+            if (prefix.is_empty() || scope.is_full() || scope.classify(&path) != ScopeClass::OutOfScope)
+                && office_utils::opens_metadata_folder(Path::new(&prefix), name)? {
+                return Ok(Some(path));
+            }
+        }
+
+        let children: Vec<_> = tree.get_subtrees()
+            .map(|(name, subtree)| (audit_utils::child_path(&prefix, name), subtree.hash.clone(), from_subtrees.remove(name)))
+            .filter(|(path, hash, from)| diff_descends(path, from.as_deref(), Some(hash), scope))
+            .collect();
+        pending.extend(children.into_iter().rev());
+    }
+
+    Ok(None)
 }
 
 /// What [`diff_directory`] collects.

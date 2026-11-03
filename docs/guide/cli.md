@@ -1843,7 +1843,19 @@ missing object, and writes nothing; running that fetch again completes the histo
 The same check refuses a history in which a parcel it newly reaches has a folder or file named
 `.forklift` at its root. Only metadata history takes that shape, and `heal` and scope pruning walk
 such a tree in full whatever the fetch scope. The command names the parcel and writes nothing, and
-no fetch mends it. A remote refuses a push of such a history the same way.
+no fetch mends it.
+
+**A head no client can check out.** A remote refuses a lift whose new head holds, at any depth, an
+entry named like the warehouse's metadata folder (`.forklift` in any case, and the names some file
+systems open as it), and names the first such path: remove it and lift again. Only what the lift
+changes is judged, so a name the remote's head already held is refused once a lift changes its
+directory, and lifts elsewhere pass. A remote can still hold such a head from before it checked.
+`lower` and `clone` refuse it before anything changes, with `head_not_materializable` (exit 46),
+and `lower` does so even when the bay has diverged from it. No command repairs such a head yet, so
+the pallet stays where it is. A sparse warehouse is refused only for a name its scope would check
+out, or one at the root. A refused clone keeps what it fetched (`clone_incomplete`, with
+`head_not_materializable` as its cause), and resuming it with another `--pallet`, or an `--only`
+that leaves the path out, finishes it.
 
 The meta pallets sync first, each on its own: one that fails or conflicts is reported, and the
 working pallet still lowers. A diverged `@kv`, `@manifest`, `@tags` or `@haul`

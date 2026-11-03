@@ -1803,6 +1803,91 @@ pub fn verify_parcel_closure_for_write(head: &str,
     Ok(pallet_utils::VerifiedClosure::new(head, PathScope::full(), known_complete))
 }
 
+/// The path of the first entry of `head`'s tree that no client can check out, because
+/// [`office_utils::is_metadata_folder_name`] matches its name, judged relative to `base`: a remote's
+/// gate on a write to a user pallet, so every head it accepts can be checked out.
+///
+/// Every subtree of `head` whose hash differs from `base`'s subtree at the same path is loaded, and
+/// every entry of a loaded tree is checked, files, symlinks and subtrees alike, whether or not
+/// `base` held that entry. A subtree equal to `base`'s at its path is not loaded. So a matching name
+/// already in `base` stays only while the write leaves its directory unchanged.
+///
+/// Deliberately not part of the closure walk, which also skips a tree equal to any *parent's* at
+/// the same path: a merge carrying an older parent's tree would slip past a name rule there.
+///
+/// Only the static half of the client's rule runs here. The client also asks its own volume about
+/// a `~` short name ([`office_utils::opens_metadata_folder`]), and a remote has no volume to ask.
+///
+/// # Arguments
+/// * `head`        - The new head.
+/// * `base`        - The head it is judged against: the old head, or for a creation over a
+///                   tombstone the remote itself stores, that tombstone's head; `None` checks the
+///                   whole tree.
+/// * `load_parcel` - Reads a parcel, from the store the head reads.
+/// * `load_tree`   - Reads a tree, from the store the head reads.
+///
+/// # Returns
+/// * `Ok(Some(path))` - The warehouse path of the first matching entry, walked by name.
+/// * `Ok(None)`       - No entry matches.
+/// * `Err(String)`    - If a parcel or tree could not be read.
+pub fn first_metadata_folder_path(head: &str,
+                                  base: Option<&str>,
+                                  load_parcel: &dyn Fn(&str) -> Result<crate::model::parcel::Parcel, String>,
+                                  load_tree: &dyn Fn(&str) -> Result<TreeItem, String>)
+                                  -> Result<Option<String>, String> {
+    let root = load_parcel(head)?.tree_hash;
+    let base_root = base.map(load_parcel).transpose()?.map(|parcel| parcel.tree_hash);
+
+    // Keyed by the tree *and* its base, never the tree alone: a tree loaded once against a base
+    // had the subtrees that base shared skipped, so the same tree at another path, under another
+    // base, still owes them.
+    let mut checked: HashSet<(String, Option<String>)> = HashSet::new();
+    let mut pending: Vec<(String, String, Option<String>)> = vec![(String::new(), root, base_root)];
+
+    while let Some((prefix, tree_hash, base_hash)) = pending.pop() {
+        if base_hash.as_deref() == Some(tree_hash.as_str()) {
+            continue;
+        }
+        if !checked.insert((tree_hash.clone(), base_hash.clone())) {
+            continue;
+        }
+
+        let tree = load_tree(&tree_hash)?;
+        let mut base_subtrees: HashMap<String, String> = match &base_hash {
+            Some(base_hash) => load_tree(base_hash)?
+                .get_subtrees()
+                .map(|(name, subtree)| (name.clone(), subtree.hash.clone()))
+                .collect(),
+            None => HashMap::new(),
+        };
+
+        let mut names: Vec<&String> = tree.get_files().map(|(name, _)| name).chain(tree.get_subtrees().map(|(name, _)| name)).collect();
+        names.sort();
+
+        if let Some(name) = names.into_iter().find(|name| office_utils::is_metadata_folder_name(name)) {
+            return Ok(Some(child_path(&prefix, name)));
+        }
+
+        // Pushed in reverse so they are walked by name.
+        let children: Vec<_> = tree.get_subtrees()
+            .map(|(name, subtree)| (child_path(&prefix, name), subtree.hash.clone(), base_subtrees.remove(name)))
+            .collect();
+        pending.extend(children.into_iter().rev());
+    }
+
+    Ok(None)
+}
+
+/// The refusal a remote gives a write whose head holds `path`, the first entry
+/// [`first_metadata_folder_path`] found.
+pub fn head_not_materializable_message(path: &str) -> String {
+    format!(
+        "The new head holds \"{}\", the name of the warehouse's metadata folder, which no client \
+        can check out. Remove it and lift again.",
+        path
+    )
+}
+
 /// [`verify_parcel_closure`], with the leaf-blob presence check made pluggable.
 ///
 /// Parcels and trees are always read (and parsed) from the object store — the walk

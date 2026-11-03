@@ -3156,56 +3156,173 @@ fn a_sparse_warehouse_adopts_in_full_a_meta_parcel_its_user_head_descends_from()
     assert!(stdout(&area.forklift("sparse", &["tag", "list"])).contains("v1"));
 }
 
-/// A server has no reason to refuse a head holding the metadata folder, so what stands between it
-/// and a client's own metadata is the materializing commands.
-#[test]
-fn a_clone_and_a_lower_refuse_a_head_holding_the_metadata_folder() {
+/// Stack, straight into the server's storage, a parcel on `pallet`'s head whose tree adds a
+/// `.forklift` folder in the directory `at` ("" for the root), as a pre-gate push could have left it.
+/// Returns the parcel's hash.
+fn plant_wedged_head(area: &TestArea, pallet: &str, at: &str) -> String {
     use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
     use forklift_core::enums::dir_entry_type::DirEntryType;
     use forklift_core::model::tree_item::TreeItem;
+    use forklift_core::util::object_utils;
 
-    let area = TestArea::new("crafted-head-materialize");
-    let server = Server::start(&area, None);
-    prepare_warehouse(&area, "a", &server.url);
-    area.write_file("a/code.txt", "v1\n");
-    assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
-    assert_success(&area.forklift("a", &["lift"]));
-    assert_success(&area.forklift(".", &["clone", &server.url, "behind"]));
+    fn first_blob(tree: &str) -> String {
+        let tree = object_utils::load_tree(tree).unwrap();
+        match tree.get_files().next() {
+            Some((_, item)) => item.hash.clone(),
+            None => first_blob(&tree.get_subtrees().next().unwrap().1.hash),
+        }
+    }
 
-    let main = user_head(&area, "a", "main");
-    let tree_hash = {
-        let root = area.path("server-root");
-        let _scope = forklift_core::globals::StorageRootScope::enter(&root);
-        let parcel = forklift_core::util::object_utils::load_parcel(&main).unwrap();
-        let mut tree = forklift_core::util::object_utils::load_tree(&parcel.tree_hash).unwrap();
-        let blob = tree.get_files().next().map(|(_, item)| item.hash.clone()).unwrap();
-
-        let mut metadata = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
-        metadata.add_child(TreeItem::new("escaped.txt".to_string(), blob, DirEntryType::Normal));
-        let mut metadata = LooseObjectBuilder::build_tree(&metadata);
-        metadata.store().unwrap();
-        tree.add_child(TreeItem::new(".forklift".to_string(), metadata.hash.clone(), DirEntryType::Tree));
+    fn with_entry(tree: Option<&str>, components: &[&str], entry: TreeItem) -> String {
+        let mut tree = match tree {
+            Some(hash) => object_utils::load_tree(hash).unwrap(),
+            None => TreeItem::new(String::new(), String::new(), DirEntryType::Tree),
+        };
+        match components.split_first() {
+            None => tree.add_child(entry),
+            Some((name, rest)) => {
+                let existing = tree.get_subtrees().find(|(child, _)| child == name).map(|(_, subtree)| subtree.hash.clone());
+                let child = with_entry(existing.as_deref(), rest, entry);
+                tree.add_child(TreeItem::new(name.to_string(), child, DirEntryType::Tree));
+            }
+        }
         let mut object = LooseObjectBuilder::build_tree(&tree);
         object.store().unwrap();
         object.hash
+    }
+
+    let head = area.read_file(&format!("server-root/.forklift/pallets/{}", pallet)).trim().to_string();
+    let tree_hash = {
+        let root = area.path("server-root");
+        let _scope = forklift_core::globals::StorageRootScope::enter(&root);
+        let root_tree = object_utils::load_parcel(&head).unwrap().tree_hash;
+
+        let mut metadata = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        metadata.add_child(TreeItem::new("escaped.txt".to_string(), first_blob(&root_tree), DirEntryType::Normal));
+        let mut metadata = LooseObjectBuilder::build_tree(&metadata);
+        metadata.store().unwrap();
+
+        let components: Vec<&str> = at.split('/').filter(|component| !component.is_empty()).collect();
+        with_entry(Some(&root_tree), &components, TreeItem::new(".forklift".to_string(), metadata.hash.clone(), DirEntryType::Tree))
     };
-    plant_on_server(&area, "main", forklift_core::model::parcel::Parcel {
+
+    plant_on_server(area, pallet, forklift_core::model::parcel::Parcel {
         tree_hash,
-        parents: vec![main],
+        parents: vec![head],
         actions: Vec::new(),
-        description: Some("crafted".to_string()),
-    });
+        description: Some("wedged".to_string()),
+    })
+}
 
-    let cloned = area.forklift(".", &["clone", &server.url, "fresh"]);
+/// A warehouse "a" lifted to a fresh server, with files in "src", "src/app" and "docs".
+fn lifted_with_two_directories(area: &TestArea) -> Server {
+    let server = Server::start(area, None);
+    prepare_warehouse(area, "a", &server.url);
+    area.write_file("a/src/code.txt", "v1\n");
+    area.write_file("a/src/app/main.txt", "v1\n");
+    area.write_file("a/docs/readme.txt", "v1\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    server
+}
+
+/// A head holding the metadata folder at any depth is refused whole, before anything is changed for
+/// it: a lower leaves the bay and the ref where they were, and a clone leaves its pallet head
+/// unwritten, so the clone stays resumable rather than standing at the head half-finished, and the
+/// resume its next step names, with an --only that leaves the path out, finishes it.
+// Revert: drop `refuse_unmaterializable` before lower's marker → the planning's backstop refuses
+// with no code; drop clone's check → the head is written before the materialize trips.
+#[test]
+fn a_lower_and_a_clone_refuse_a_wedged_head_before_changing_anything() {
+    let area = TestArea::new("wedged-head-refused");
+    let server = lifted_with_two_directories(&area);
+    assert_success(&area.forklift(".", &["clone", &server.url, "behind"]));
+    let before = user_head(&area, "behind", "main");
+    let position = area.read_file("behind/.forklift/position");
+    plant_wedged_head(&area, "main", "docs/deep");
+
+    let lowered = area.forklift("behind", &["--json", "lower"]);
+    assert_eq!(lowered.status.code(), Some(46), "{}{}", stdout(&lowered), stderr(&lowered));
+    let value = json_of(&lowered);
+    assert_eq!(value["error"]["code"], "head_not_materializable", "{}", value);
+    assert_eq!(value["error"]["next_step"], "No command in this build repairs such a head, so the pallet stays where it is; lowering again refuses the same way.", "{}", value);
+    assert!(value["error"]["message"].as_str().unwrap().contains("\"docs/deep/.forklift\""), "{}", value);
+    assert_eq!(user_head(&area, "behind", "main"), before);
+    assert_eq!(area.read_file("behind/.forklift/position"), position);
+    assert!(!area.path("behind/docs/deep").exists());
+
+    let cloned = area.forklift(".", &["--json", "clone", &server.url, "fresh"]);
     assert!(!cloned.status.success(), "{}{}", stdout(&cloned), stderr(&cloned));
-    assert!(stderr(&cloned).contains("\".forklift\""), "{}", stderr(&cloned));
-    assert!(!area.path("fresh/.forklift/escaped.txt").exists());
+    let value = json_of(&cloned);
+    assert_eq!(value["error"]["code"], "clone_incomplete", "{}", value);
+    assert_eq!(value["error"]["details"]["cause_code"], "head_not_materializable", "{}", value);
+    assert_eq!(value["error"]["details"]["retry"], "change", "{}", value);
+    assert!(value["error"]["next_step"].as_str().unwrap().contains("with a different --only or --pallet"), "{}", value);
+    assert!(value["error"]["message"].as_str().unwrap().contains("\"docs/deep/.forklift\""), "{}", value);
+    assert!(!area.path("fresh/.forklift/pallets/main").exists(), "the head is never written");
+    assert!(!area.path("fresh/docs").exists());
 
-    let lowered = area.forklift("behind", &["lower"]);
-    assert!(!lowered.status.success(), "{}{}", stdout(&lowered), stderr(&lowered));
-    assert!(stderr(&lowered).contains("\".forklift\""), "{}", stderr(&lowered));
-    assert!(!area.path("behind/.forklift/escaped.txt").exists());
+    assert_success(&area.forklift(".", &["clone", &server.url, "fresh", "--only", "src"]));
+    assert_eq!(area.read_file("fresh/src/code.txt"), "v1\n");
+    assert!(!area.path("fresh/docs").exists());
+}
+
+/// A diverged bay over a wedged remote is refused as not materializable, never as diverged: the
+/// diverged refusal's next step would check the remote head out on a pallet of its own.
+// Revert: drop the check before lower's diverged return → the refusal is `diverged`, naming
+// `forklift pallet create`.
+#[test]
+fn a_diverged_bay_over_a_wedged_remote_is_refused_as_not_materializable() {
+    let area = TestArea::new("wedged-head-diverged");
+    let server = lifted_with_two_directories(&area);
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
+    area.write_file("b/src/code.txt", "b's own\n");
+    assert_success(&area.forklift("b", &["load", "."]));
+    assert_success(&area.forklift("b", &["stack", "-m", "b work"]));
+    let own = user_head(&area, "b", "main");
+    plant_wedged_head(&area, "main", "");
+
+    let lowered = area.forklift("b", &["--json", "lower"]);
+    assert_eq!(lowered.status.code(), Some(46), "{}{}", stdout(&lowered), stderr(&lowered));
+    let value = json_of(&lowered);
+    assert_eq!(value["error"]["code"], "head_not_materializable", "{}", value);
+    assert_eq!(value["error"]["next_step"], "No command in this build repairs such a head, so the pallet stays where it is; lowering again refuses the same way.", "{}", value);
+    assert!(value["error"]["message"].as_str().unwrap().contains("holds \".forklift\""), "{}", value);
+    assert_eq!(user_head(&area, "b", "main"), own);
+    assert_eq!(area.read_file("b/src/code.txt"), "b's own\n");
+    assert!(std::fs::read_dir(area.path("b/.forklift/pallets")).unwrap().count() == 1, "no pallet is made for the remote head");
+}
+
+/// In a sparse warehouse only what its scope checks out is judged, the root's own entries always
+/// among it: a wedged name out of scope is lowered past, even one beside the scope in a directory
+/// the walk reads on its way down, while one in scope is refused.
+// Revert: descend whatever the scope, or judge every entry of a directory read → an out-of-scope
+// name refuses the lower; skip the root's entries when out of scope → the top-level name is lowered.
+#[test]
+fn a_sparse_warehouse_judges_only_what_its_scope_checks_out() {
+    let area = TestArea::new("wedged-head-sparse");
+    let server = lifted_with_two_directories(&area);
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/app"]));
+
+    let mut outside = String::new();
+    for at in ["docs", "src"] {
+        outside = plant_wedged_head(&area, "main", at);
+        assert_success(&area.forklift("sparse", &["lower"]));
+        assert_eq!(user_head(&area, "sparse", "main"), outside);
+    }
+
+    for at in ["src/app", ""] {
+        plant_wedged_head(&area, "main", at);
+        let lowered = area.forklift("sparse", &["--json", "lower"]);
+        assert_eq!(lowered.status.code(), Some(46), "{}: {}{}", at, stdout(&lowered), stderr(&lowered));
+        let value = json_of(&lowered);
+        assert_eq!(value["error"]["code"], "head_not_materializable", "{}", value);
+        let path = if at.is_empty() { ".forklift".to_string() } else { format!("{}/.forklift", at) };
+        assert!(value["error"]["message"].as_str().unwrap().contains(&format!("\"{}\"", path)), "{}", value);
+        assert_eq!(user_head(&area, "sparse", "main"), outside);
+        area.write_file("server-root/.forklift/pallets/main", &format!("{}\n", outside));
+    }
 }
 
 /// FORK-114, the lifting side: a warehouse that re-genesised before it ever lifted establishes

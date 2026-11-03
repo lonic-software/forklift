@@ -666,6 +666,14 @@ async fn franchise_into_prepared_target(
     // which discards the marker with the rest of the attempt.
     let position = pallet_utils::BayPosition::new(&pallet_name, Some(remote_head.clone()));
     shift_utils::ensure_tree_present(&tree_hash, &scope_utils::current_scope()?)?;
+
+    // A head no client can check out is refused before its head is written, so the clone stays
+    // resumable rather than standing at it half-finished: a resume with another --pallet, or an
+    // --only that leaves the path out, finishes it.
+    if let Some(path) = shift_utils::first_unmaterializable_path(None, &tree_hash, &scope_utils::current_scope()?)? {
+        return Err(remote_utils::head_not_materializable_refusal(&pallet_name, &path).into());
+    }
+
     operation_utils::raise(&Operation::new(OperationKind::Franchise, position.clone(), None, position))?;
 
     // A clone fills a fresh warehouse (a resume discarded every ref), so the pallet is unborn
