@@ -441,8 +441,7 @@ async fn collect_unstaged_changes_impl(context: ChangeWalkContext)
 /// * `keys`           - All inventoried directory keys.
 ///
 /// # Returns
-/// * `Ok(bool)`    - Whether the folder holds such an entry; `true` for one holding a folder that
-///                   cannot be listed or an entry that cannot be inspected.
+/// * `Ok(bool)`    - Whether the folder holds such an entry, or one it cannot list or inspect.
 /// * `Err(String)` - If an entry's name or a `.gitignore` could not be read.
 fn untracked_directory_has_content(ignore_rules: &file_utils::IgnoreRules,
                                    parent_context: &file_utils::RuleContext,
