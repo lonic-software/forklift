@@ -1039,8 +1039,8 @@ impl FormatStore for DynamoRefStore {
             let mut uncertain = false;
             let may_have_landed = |message: String| {
                 format!(
-                    "{} The format item may now hold \"{}\", this run's own state: if running the \
-                    upgrade again reports it, add --takeover.",
+                    "{} The write may still have landed, leaving the format item holding \"{}\". \
+                    Run the upgrade again: it reads the state on record and says what is left.",
                     message, new
                 )
             };
@@ -1063,13 +1063,13 @@ impl FormatStore for DynamoRefStore {
                 }
             }
 
-            let message = "DynamoDB refused the format item's write through every attempt: the \
-                warehouse stayed busy."
-                .to_string();
-
             match uncertain {
-                true => Err(may_have_landed(message)),
-                false => Err(format!("{} Nothing was changed; run the upgrade again.", message)),
+                true => Err(may_have_landed(
+                    "DynamoDB could not confirm the format item's write in any attempt.".to_string(),
+                )),
+                false => Err("DynamoDB refused the format item's write through every attempt: the \
+                    warehouse stayed busy. Nothing was changed; run the upgrade again."
+                    .to_string()),
             }
         })
     }

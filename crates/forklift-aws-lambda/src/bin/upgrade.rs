@@ -132,6 +132,10 @@ fn run(arguments: &Arguments, dynamodb: forklift_aws_lambda::aws::DynamoOps, bri
     let options = UpgradeOptions { owner: request_token(), takeover: arguments.takeover, wait: arguments.wait };
     let mut failed = 0;
 
+    // A run that stops part way leaves its mark naming this token, and a later run's refusal names
+    // it back: the operator tells their own run from someone else's by it.
+    println!("This is run {}.", options.owner);
+
     for warehouse in &warehouses {
         let store = DynamoRefStore::new(
             dynamodb.clone(),
