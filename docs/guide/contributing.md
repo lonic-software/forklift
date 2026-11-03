@@ -124,14 +124,15 @@ more files than they checked. Write new tests so that work does not have to be d
 
 **The budget.** A new or changed test finishes in about a second on Linux and in at most
 **10 s on the Windows CI runner**, which is where the suite's time goes. Windows is not a
-fixed multiple of Linux: on the main run of 2026-11-03 the same test took about four times
-as long at the median, eight times or more for one test in ten, and 22 times for
-`walk_tree_survives_a_pathologically_deep_tree`, so a test that fits on Linux can still
-blow the budget there. A test that needs more says why in a comment above it: what it does
-that takes the time, and why a smaller version would not catch the same failure. Not every
-existing test meets this yet (37 took over 10 s on Windows in that run); do not take one of
-them as the model for a new test. The SLOW and failure limits in `.config/nextest.toml` are a backstop against
-hangs, not the budget: a test can be well inside them and still too slow.
+fixed multiple of Linux: on main CI run 41699714241 (2026-11-03) the same test took about
+four times as long at the median, eight times or more for one test in ten, and 22 times
+for `walk_tree_survives_a_pathologically_deep_tree`, so a test that fits on Linux can
+still blow the budget there. A test that needs more says why in a comment above it: what
+it does that takes the time, and why a smaller version would not catch the same failure.
+Not every existing test meets this yet (37 took over 10 s on Windows in that run); do not
+take one of them as the model for a new test. The SLOW and failure limits in
+`.config/nextest.toml` are a backstop against hangs, not the budget: a test can be well
+inside them and still too slow.
 
 **Check the time where it is paid.** Every test's time is in the CI log: nextest prints
 `PASS [  12.368s]` before each name. Before merging a pull request that adds or changes
