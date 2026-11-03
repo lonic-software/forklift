@@ -1855,7 +1855,8 @@ below it, and lifts that leave that directory alone pass. A remote can still hol
 before it checked. A `lower` of the current pallet and a `clone` refuse it before anything changes,
 with `head_not_materializable` (exit 46), and `lower` does so even when the bay has diverged from
 it. `lower <pallet>` checks nothing out, so it still moves that pallet onto such a head, and a
-`shift` to it or a `consolidate` of it is refused with the same code. A sparse warehouse is refused
+`shift` to it, a `consolidate` of it, and a `lift` that would merge it are refused with the same
+code, naming the repair. A sparse warehouse is refused
 only for a name its scope would check out, or one at the root. A refused clone keeps what it fetched
 (`clone_incomplete`, with `head_not_materializable` as its cause), and resuming it with another
 `--pallet`, or an `--only` that leaves the path out, finishes it.
@@ -1870,9 +1871,9 @@ happens depends on the pallet here:
   `repaired`), and for the current pallet so does the bay. A bay behind its own pallet is moved
   from where it stands, so its files are right; one beside it is refused as `behind`.
 - **Holding parcels the remote's head lacks:** they are kept. The repair goes on a new pallet,
-  `<pallet>-remote-<hash>`, and the lower refuses as `diverged`, naming the steps: shift onto the
-  pallet if this bay is not on it at its head, `forklift consolidate <pallet>-remote-<hash>`, then
-  `forklift lift`.
+  `<pallet>-repair-<hash>`, named for the remote's head so a rerun finds it, and the lower refuses
+  as `diverged`, naming the steps: shift onto the pallet if this bay is not on it at its head,
+  `forklift consolidate <pallet>-repair-<hash>`, then `forklift lift`.
 - **Ahead of the remote, or the head holds nothing to repair:** it lowers as usual.
 
 A sparse warehouse cannot build the repair, which reads the whole tree, so its `lower --repair` is

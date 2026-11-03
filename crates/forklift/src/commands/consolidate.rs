@@ -278,6 +278,10 @@ pub(crate) async fn merge_head_into_current(current: &str,
     let our_tree_hash = object_utils::load_parcel(our_head)?.tree_hash;
     let their_tree_hash = object_utils::load_parcel(their_head)?.tree_hash;
 
+    // A name that opens the metadata folder, brought in by their side, is refused with its code
+    // before the merge plans anything. A lift's other side is the remote's head of this pallet.
+    let their_pallet = if their_label == "remote" { current } else { their_label };
+    shift_utils::refuse_unmaterializable_pallet(their_pallet, Some(&our_tree_hash), &their_tree_hash)?;
     office_utils::ensure_not_metadata_tree(&their_tree_hash)?;
 
     let base = merge_utils::find_merge_base(our_head, their_head)?

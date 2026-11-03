@@ -15,7 +15,7 @@ use crate::enums::parcel_action_type::ParcelActionType;
 use crate::model::parcel::Parcel;
 use crate::model::parcel_action::ParcelAction;
 use crate::model::tree_item::TreeItem;
-use crate::util::stack_utils::{self, Signing};
+use crate::util::stack_utils;
 use crate::util::{audit_utils, config_utils, object_utils, office_utils, sign_utils};
 
 /// A repair parcel, stored (and signed when trust is established) but on no pallet yet.
@@ -28,15 +28,15 @@ pub struct Repair {
 
     /// The paths it removed, in name order.
     pub removed: Vec<String>,
-
-    /// How it was signed, whose preconditions its head write carries.
-    pub signing: Signing,
 }
 
 /// Build the repair of `head`: its tree minus every entry, at any depth, whose name opens the
 /// metadata folder by the rule a checkout refuses with ([`office_utils::opens_metadata_folder`]),
 /// with every directory those removals leave empty dropped too, stacked as a parcel on `head` and
-/// signed as `stack` would sign it. The whole tree is read, so its content must be present.
+/// signed as `stack` would sign it. The whole tree is read, so its content must be present. Its head
+/// write carries the preconditions of the take that verified `head`, which a signing choice made
+/// since cannot loosen: unsigned is chosen only with no anchor held, which the take's write
+/// requires too, and signed only under the office it verified against.
 ///
 /// # Returns
 /// * `Ok(Some(Repair))` - The repair parcel.
@@ -78,7 +78,7 @@ pub fn repair_head(head: &str) -> Result<Option<Repair>, String> {
         sign_utils::store_parcel_signature(&object.hash, &signature)?;
     }
 
-    Ok(Some(Repair { parcel: object.hash, tree, removed, signing }))
+    Ok(Some(Repair { parcel: object.hash, tree, removed }))
 }
 
 /// The first path in the whole tree of `head` whose name opens the metadata folder, by the rule

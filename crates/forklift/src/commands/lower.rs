@@ -321,7 +321,7 @@ fn refuse_unmaterializable(client: &RemoteClient, pallet: &str, local_tree: Opti
 
     // A sparse warehouse cannot build the repair, so its refusal sends the repair to a new clone.
     let route = if scope_utils::read_fetch_scope()?.is_full() {
-        remote_utils::RepairRoute::Lower(None)
+        remote_utils::RepairRoute::Lower
     } else {
         remote_utils::RepairRoute::NewClone(client.url())
     };
@@ -371,7 +371,6 @@ async fn repair_pallet(client: &RemoteClient,
     let stats = remote_utils::fetch_history_scoped(client, &remote_head, &pallet, progress).await?;
     report.fetched_objects = stats.fetched_objects;
     report.fetched_signatures = stats.fetched_signatures;
-    report.fetched_objects += remote_utils::fetch_head_content(client, &remote_head, progress).await?.fetched_objects;
 
     let ref_head = pallet_utils::get_pallet_head(&pallet)?;
     let behind_remote = match &ref_head {
@@ -380,7 +379,13 @@ async fn repair_pallet(client: &RemoteClient,
     };
     let ahead_of_remote = !behind_remote && merge_utils::is_ancestor(&remote_head, ref_head.as_deref().unwrap_or_default())?;
 
-    if ahead_of_remote || repair_utils::first_repairable_path(&remote_head)?.is_none() {
+    // An ahead ref lowers as usual without the head's content; anything else reads its whole tree.
+    let repairable = !ahead_of_remote && {
+        report.fetched_objects += remote_utils::fetch_head_content(client, &remote_head, progress).await?.fetched_objects;
+        repair_utils::first_repairable_path(&remote_head)?.is_some()
+    };
+
+    if !repairable {
         return match named {
             true => lower_named_pallet(client, info, report, progress).await,
             false => lower_working_pallet(client, info, report, progress).await,
@@ -405,19 +410,17 @@ async fn repair_pallet(client: &RemoteClient,
         refuse_a_bay_on_unborn(&pallet)?;
     }
 
+    if !behind_remote {
+        return Err(stack_diverged_repair(&pallet, &remote_head, &preconditions, &position, ref_head.as_deref())?.into());
+    }
+
+    // The head write carries the take's preconditions, which are the signing's too: an unsigned
+    // repair was judged with no anchor held, a signed one under the office it was signed against.
     let repair = repair_utils::repair_head(&remote_head)?.ok_or("The remote's head has nothing to repair.")?;
     report.repair = Some(RepairReport { parcel: repair.parcel.clone(), removed: repair.removed.clone() });
 
-    if !behind_remote {
-        return Err(stack_diverged_repair(&pallet, &remote_head, &repair, &preconditions, &position, ref_head.as_deref())?.into());
-    }
-
     if named {
-        pallet_utils::update_pallet_head(&pallet, ref_head.as_deref(), &repair.parcel, &preconditions).map_err(|error| error.to_string())?;
-        record_served_head(&pallet, &remote_head);
-        report.outcome = Some(LowerOutcome::Repaired);
-
-        return Ok(());
+        return write_named_head(&pallet, ref_head.as_deref(), &repair.parcel, &remote_head, &preconditions, report, LowerOutcome::Repaired);
     }
 
     let local_tree = match &position.base {
@@ -461,22 +464,24 @@ async fn repair_pallet(client: &RemoteClient,
 }
 
 /// Stack the repair of the remote head `remote_head` of `pallet`, whose ref `ref_head` holds parcels
-/// it lacks, on a pallet of its own, `<pallet>-remote-<r>`, and return the diverged refusal naming
+/// it lacks, on a pallet of its own, `<pallet>-repair-<head>`, and return the diverged refusal naming
 /// the way on: consolidating it into `pallet` descends from the repair, so the lift of the result
-/// fast-forwards the remote. `pallet` and this bay stay where they are.
+/// fast-forwards the remote. `pallet` and this bay stay where they are. The pallet is named for the
+/// head, so a rerun finds the repair it stacked rather than stacking another.
 fn stack_diverged_repair(pallet: &str,
                          remote_head: &str,
-                         repair: &repair_utils::Repair,
                          preconditions: &pallet_utils::RefPreconditions,
                          position: &pallet_utils::BayPosition,
                          ref_head: Option<&str>) -> Result<CoreError, String> {
-    let side = format!("{}-remote-{}", pallet, &repair.parcel[..12.min(repair.parcel.len())]);
+    let side = format!("{}-repair-{}", pallet, &remote_head[..12.min(remote_head.len())]);
 
-    match pallet_utils::update_pallet_head(&side, None, &repair.parcel, preconditions) {
-        Ok(()) => {}
-        // A repair of the same head by the same operator in the same second is the same parcel.
-        Err(pallet_utils::RefUpdateError::Moved(found)) if found.found.as_deref() == Some(repair.parcel.as_str()) => {}
-        Err(error) => return Err(error.to_string()),
+    let stacked = match pallet_utils::get_pallet_head(&side)? {
+        Some(head) => object_utils::load_parcel(&head)?.parents == [remote_head],
+        None => false,
+    };
+    if !stacked {
+        let repair = repair_utils::repair_head(remote_head)?.ok_or("The remote's head has nothing to repair.")?;
+        pallet_utils::update_pallet_head(&side, None, &repair.parcel, preconditions).map_err(|error| error.to_string())?;
     }
     record_served_head(&side, remote_head);
 
@@ -494,7 +499,7 @@ fn stack_diverged_repair(pallet: &str,
         RefusalCode::Diverged,
         format!(
             "The local pallet \"{p}\" and the remote have diverged, and the remote's head held a name \
-            no client can check out. Its repair is stacked on the new pallet \"{s}\"; {how}consolidate \
+            no client can check out. Its repair is stacked on the pallet \"{s}\"; {how}consolidate \
             it (\"forklift consolidate {s}\"), and lift the result.",
             p = pallet,
             s = side,
@@ -627,9 +632,23 @@ async fn lower_named_pallet(client: &RemoteClient,
         refuse_a_bay_on_unborn(&pallet)?;
     }
 
-    let error = match pallet_utils::update_pallet_head(&pallet, local_head.as_deref(), remote_head, &preconditions) {
+    write_named_head(&pallet, local_head.as_deref(), remote_head, remote_head, &preconditions, report, moved)
+}
+
+/// Move the ref of `pallet`, which no bay here is lowering, from `expected` to `new` (the remote's
+/// head `served`, or a repair of it), recording `moved` as the outcome and `served` as a held head
+/// once the ref holds `new`. A write that reported an error can still have landed, so the ref read
+/// back decides.
+fn write_named_head(pallet: &str,
+                    expected: Option<&str>,
+                    new: &str,
+                    served: &str,
+                    preconditions: &pallet_utils::RefPreconditions,
+                    report: &mut LowerReport,
+                    moved: LowerOutcome) -> Result<(), String> {
+    let error = match pallet_utils::update_pallet_head(pallet, expected, new, preconditions) {
         Ok(()) => {
-            record_served_head(&pallet, remote_head);
+            record_served_head(pallet, served);
             report.outcome = Some(moved);
             return Ok(());
         }
@@ -638,8 +657,8 @@ async fn lower_named_pallet(client: &RemoteClient,
 
     match error {
         // Another writer already put the pallet where this lower would have.
-        pallet_utils::RefUpdateError::Moved(found) if found.found.as_deref() == Some(remote_head.as_str()) => {
-            record_served_head(&pallet, remote_head);
+        pallet_utils::RefUpdateError::Moved(found) if found.found.as_deref() == Some(new) => {
+            record_served_head(pallet, served);
             report.outcome = Some(LowerOutcome::UpToDate);
             Ok(())
         }
@@ -647,17 +666,16 @@ async fn lower_named_pallet(client: &RemoteClient,
         pallet_utils::RefUpdateError::Moved(found) => Err(format!(
             "{} Run \"forklift lower {}\" again.", found, pallet
         )),
-        // A failed write can still have landed: decided by reading the ref back.
-        pallet_utils::RefUpdateError::Failed(error) => match pallet_utils::get_pallet_head(&pallet) {
-            Ok(head) if head.as_deref() == Some(remote_head.as_str()) => {
-                record_served_head(&pallet, remote_head);
-                Err(format!("Pallet \"{}\" now holds parcel {}, but its write reported an error: {}", pallet, remote_head, error))
+        pallet_utils::RefUpdateError::Failed(error) => match pallet_utils::get_pallet_head(pallet) {
+            Ok(head) if head.as_deref() == Some(new) => {
+                record_served_head(pallet, served);
+                Err(format!("Pallet \"{}\" now holds parcel {}, but its write reported an error: {}", pallet, new, error))
             }
             Ok(_) => Err(format!("Pallet \"{}\" was not moved: {}", pallet, error)),
             Err(read) => Err(format!(
                 "Writing pallet \"{}\" failed ({}), and reading it back failed too ({}); it may or may \
                 not hold parcel {}.",
-                pallet, error, read, remote_head
+                pallet, error, read, new
             )),
         },
         refused => Err(refused.to_string()),

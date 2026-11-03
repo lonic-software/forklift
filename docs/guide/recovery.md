@@ -178,8 +178,10 @@ directory. A clone refused this way reports `clone_incomplete` with this code as
 it with `--repair` (the command its next step names), or with another `--pallet`, or with an `--only`
 that leaves the named path out.
 
-A `shift` or `consolidate` refused with this code names `forklift lower <pallet> --repair`: a named
-`lower` had moved that pallet onto the head.
+A `shift`, `consolidate` or `lift` refused with this code names `forklift lower <pallet> --repair`
+(in a sparse warehouse, the clone): a named `lower` had moved that pallet onto the head, or the lift
+would have merged it. A pallet the remote does not hold, such as a hand-made ref, is deleted
+instead with `forklift pallet delete <pallet>`.
 
 ### `behind` (exit 26)
 

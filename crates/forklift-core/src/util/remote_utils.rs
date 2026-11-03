@@ -6397,9 +6397,8 @@ pub fn diverged_refusal(pallet: &str, remote_head: &str) -> CoreError {
 
 /// Where a refused head's repair is built ([`head_not_materializable_refusal`]).
 pub enum RepairRoute<'a> {
-    /// By `forklift lower --repair` in this warehouse, naming the pallet when it is not the
-    /// current one.
-    Lower(Option<&'a str>),
+    /// By `forklift lower --repair` in this warehouse, for its current pallet.
+    Lower,
 
     /// By a clone of the remote at this URL with `--repair`, into a new directory: this warehouse
     /// fetches only part of each tree, so it cannot build the repair, which reads the whole of it.
@@ -6420,11 +6419,8 @@ pub enum RepairRoute<'a> {
 /// * `route`  - Where the repair is built.
 pub fn head_not_materializable_refusal(pallet: &str, path: &str, route: RepairRoute) -> CoreError {
     let (how, next_step) = match route {
-        RepairRoute::Lower(named) => {
-            let command = match named {
-                Some(named) => format!("forklift lower {} --repair", named),
-                None => "forklift lower --repair".to_string(),
-            };
+        RepairRoute::Lower => {
+            let command = "forklift lower --repair".to_string();
 
             (format!("\"{}\" stacks a parcel on it that removes every such name, and \"forklift lift\" then publishes it.", command), command)
         }

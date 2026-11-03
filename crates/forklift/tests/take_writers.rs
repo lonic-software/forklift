@@ -60,6 +60,8 @@ const WRITERS: &[(&str, &str, Class)] = &[
     ("crates/forklift-core/src/util/tombstone_utils.rs", "restore_pallet", Class::Verifies),
     ("crates/forklift/src/commands/bay.rs", "add", Class::CopiesLocal),
     ("crates/forklift/src/commands/consolidate.rs", "fast_forward", Class::CopiesLocal),
+    // With --repair it writes a repair of the verified head instead, signed as a stack is, under
+    // the same preconditions.
     ("crates/forklift/src/commands/clone.rs", "franchise_into_prepared_target", Class::Verifies),
     ("crates/forklift/src/commands/import_git.rs", "handle_command", Class::RefusesWhenAnchored),
     ("crates/forklift/src/commands/lower.rs", "lower_working_pallet", Class::Verifies),

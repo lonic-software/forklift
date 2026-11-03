@@ -3292,6 +3292,13 @@ fn a_diverged_bay_over_a_wedged_remote_is_refused_as_not_materializable() {
     assert_eq!(user_head(&area, "b", "main"), own);
     assert_eq!(area.read_file("b/src/code.txt"), "b's own\n");
     assert!(std::fs::read_dir(area.path("b/.forklift/pallets")).unwrap().count() == 1, "no pallet is made for the remote head");
+
+    // A lift's auto-merge of the remote's head is refused the same way, before it plans the merge.
+    let lifted = area.forklift("b", &["--json", "lift"]);
+    let value = json_of(&lifted);
+    assert_eq!(value["error"]["code"], "head_not_materializable", "{}", value);
+    assert_eq!(value["error"]["next_step"], "forklift lower main --repair", "{}", value);
+    assert_eq!(user_head(&area, "b", "main"), own);
 }
 
 /// In a sparse warehouse only what its scope checks out is judged, the root's own entries always
@@ -3492,9 +3499,16 @@ fn a_lower_repair_over_a_diverged_ref_keeps_its_parcels() {
         let next_step = value["error"]["next_step"].as_str().unwrap().to_string();
         assert_eq!(next_step.starts_with("forklift shift main; then "), stacked_past, "{}", next_step);
         let side = next_step.split("forklift consolidate ").nth(1).unwrap().split(';').next().unwrap().to_string();
-        assert!(side.starts_with("main-remote-"), "{}", next_step);
+        assert!(side.starts_with("main-repair-"), "{}", next_step);
         let repair = user_head(&area, "b", &side);
         assert_eq!(parents_of(&area, "b", &repair), vec![wedged]);
+
+        // A rerun finds the repair it stacked rather than stacking another.
+        let pallets = std::fs::read_dir(area.path("b/.forklift/pallets")).unwrap().count();
+        let again = json_of(&area.forklift("b", &["--json", "lower", "--repair"]));
+        assert_eq!(again["error"]["next_step"], next_step.as_str(), "{}", again);
+        assert_eq!(user_head(&area, "b", &side), repair);
+        assert_eq!(std::fs::read_dir(area.path("b/.forklift/pallets")).unwrap().count(), pallets);
 
         run_next_steps(&area, "b", &next_step);
         let head = area.read_file("server-root/.forklift/pallets/main").trim().to_string();
@@ -3555,7 +3569,7 @@ fn a_named_lower_repair_reaches_a_pallet_the_bay_is_not_on() {
     assert_eq!(value["error"]["code"], "diverged", "{}", value);
     assert_eq!(user_head(&area, "b", "main"), own);
     let next_step = value["error"]["next_step"].as_str().unwrap().to_string();
-    assert!(next_step.starts_with("forklift shift main; then forklift consolidate main-remote-"), "{}", next_step);
+    assert!(next_step.starts_with("forklift shift main; then forklift consolidate main-repair-"), "{}", next_step);
     run_next_steps(&area, "b", &next_step);
     let head = area.read_file("server-root/.forklift/pallets/main").trim().to_string();
     assert!(descends_from(&area, "b", &head, &own));
@@ -3623,6 +3637,14 @@ fn a_sparse_lower_repair_names_a_clone_repair() {
         assert_eq!(value["error"]["code"], code, "{}", value);
         assert_eq!(value["error"]["next_step"], clone.as_str(), "{}", value);
     }
+
+    // The backstop over a pallet a named lower moved onto the head names the clone too.
+    assert_success(&area.forklift("sparse", &["pallet", "create", "other"]));
+    assert_success(&area.forklift("sparse", &["lower", "main"]));
+    let shifted = area.forklift("sparse", &["--json", "shift", "main"]);
+    let value = json_of(&shifted);
+    assert_eq!(value["error"]["code"], "head_not_materializable", "{}", value);
+    assert_eq!(value["error"]["next_step"], clone.as_str(), "{}", value);
 }
 
 /// FORK-114, the lifting side: a warehouse that re-genesised before it ever lifted establishes
