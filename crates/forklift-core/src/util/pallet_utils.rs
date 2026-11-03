@@ -3164,8 +3164,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// A served root's user pallets move only forward: a move off a head the new one does not
-    /// descend from is refused, since the root's clones may rely on that head.
+    /// A served root's user pallets move only forward, and its meta pallets never back to an
+    /// ancestor: such a move off a head is refused, since the root's clones may rely on that head.
     mod served_moves {
         use super::*;
         use crate::util::tombstone_utils;
