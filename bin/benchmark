@@ -357,19 +357,6 @@ fi
 FORK_SIZE_K=$(du -sk "$B/.forklift" 2>/dev/null | cut -f1)
 FORK_SIZE=$(du -sh "$B/.forklift" 2>/dev/null | cut -f1 | tr -d ' ')
 
-# git import adds a `.git` rule to `.forkliftignore` and asks for it to be loaded and
-# stacked. Do that (untimed), like the redelta it suggests: left untracked, the file
-# would join the diff step's `forklift load .` and give forklift one more change than git.
-# A repo that already tracks a .forkliftignore with that rule gets nothing added, and
-# stacking nothing fails — so only stack when the load staged something.
-if [ -f "$B/.forkliftignore" ]; then
-    run_in "$B" 'forklift load .forkliftignore'
-    if ( cd "$B" && forklift --json stocktake --summary ) 2>/dev/null \
-        | grep -q '"staged_count": *[1-9]'; then
-        run_in "$B" 'forklift stack -m "Keep the .git ignore rule"'
-    fi
-fi
-
 # From here B is a fully imported, packed warehouse whose current pallet is '$MAIN_REF'.
 
 # ── 2. status on a clean tree ───────────────────────────────────────────────

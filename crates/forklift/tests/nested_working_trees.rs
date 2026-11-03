@@ -283,7 +283,7 @@ fn stack_refuses_a_metadata_folder_name_below_the_top_level() {
         assert_eq!(warehouse.head("main"), head, "a parcel was stacked");
 
         warehouse.run_ok(&["unload", refused]);
-        warehouse.write(".forkliftignore", &format!("^{}$\n", refused.replace('.', "\\.")));
+        warehouse.write(".forkliftignore", &format!("/{}\n", refused));
         warehouse.run_ok(&["load", "."]);
         warehouse.run_ok(&["stack", "-m", "without it"]);
         assert_ne!(warehouse.head("main"), head);
@@ -322,6 +322,20 @@ fn an_untracked_nested_working_tree_is_left_to_itself() {
     let inner = warehouse.run_at(&warehouse.path("sub"), &["--json", "stocktake"]);
     assert!(inner.status.success(), "{}", stderr(&inner));
     assert!(stdout(&inner).contains("x.txt"), "the nested warehouse must see its own file: {}", stdout(&inner));
+}
+
+/// An untracked folder holding nothing but another working tree, deeper down, is listed as one
+/// untracked folder: what is in it is not this warehouse's to judge, and hiding it would hide the
+/// nested tree from the user.
+#[test]
+fn an_untracked_folder_holding_only_a_nested_working_tree_is_listed() {
+    let warehouse = Warehouse::new("walk-untracked-deep");
+    warehouse.prepare_nested("outer/deeper/sub");
+    warehouse.write(".gitignore", "*.log\n");
+    warehouse.write("outer/deeper/a.log", "ignored\n");
+
+    let unstaged = warehouse.changes("unstaged");
+    assert!(unstaged.contains(&("untracked".to_string(), "outer/".to_string())), "{:?}", unstaged);
 }
 
 /// A folder this warehouse tracks that becomes another working tree's root makes the walks refuse
@@ -391,8 +405,8 @@ fn a_shift_into_an_untracked_nested_working_tree_refuses_and_writes_nothing() {
 fn ignore_variants(parent: &str) -> [(Option<String>, String); 3] {
     [
         (None, format!("{}/sub", parent)),
-        (Some(format!("^{}/sub$\n", parent)), format!("{}/sub", parent)),
-        (Some(format!("^{}/gen$\n", parent)), format!("{}/gen/sub", parent)),
+        (Some(format!("/{}/sub\n", parent)), format!("{}/sub", parent)),
+        (Some(format!("/{}/gen\n", parent)), format!("{}/gen/sub", parent)),
     ]
 }
 
@@ -465,7 +479,7 @@ fn replacing_a_folder_holding_an_ignored_file_refuses_and_writes_nothing() {
     warehouse.run_ok(&["stack", "-m", "file"]);
     warehouse.run_ok(&["shift", "main"]);
 
-    warehouse.write(".forkliftignore", "^a/junk$\n");
+    warehouse.write(".forkliftignore", "/a/junk\n");
     warehouse.write("a/junk", "ignored\n");
 
     let shift = warehouse.run(&["shift", "flip"]);

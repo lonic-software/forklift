@@ -38,14 +38,14 @@ $ forklift prepare
 Prepared warehouse.
 ```
 
-Add a file, and a build folder that should never be tracked. A `.forkliftignore` at the warehouse
-root holds one regular expression per line, matched against `/`-separated paths:
+Add a file, and a build folder that should never be tracked. Forklift reads ignore rules the way
+git does, from a `.gitignore` in any folder, so a project you bring over keeps its rules:
 
 ```console
 $ echo 'Hello, world!' > readme.md
 $ mkdir build
 $ echo 'compiled output' > build/app.bin
-$ echo '^build(/.*)?$' > .forkliftignore
+$ echo 'build/' > .gitignore
 ```
 
 `stocktake` is forklift's `status`. The build folder does not appear in it:
@@ -57,14 +57,16 @@ On pallet "main" (unborn — nothing stacked yet)
 The inventory matches the pallet head; nothing is staged.
 
 Changes not in the inventory (use "forklift load" to stage them):
-  untracked: .forkliftignore
+  untracked: .gitignore
   untracked: readme.md
 ```
 
 ## 3. Record changes
 
 `load` stages changes into the **inventory**, and `stack` records the inventory as a **parcel**, a
-commit. `.forkliftignore` is ordinary tracked content, so its rules travel with the history.
+commit. `.gitignore` is ordinary tracked content, so its rules travel with the history. A
+`.forkliftignore` at the warehouse root takes the same syntax and wins over every `.gitignore`, for
+rules only forklift should follow.
 
 ```console
 $ forklift load .

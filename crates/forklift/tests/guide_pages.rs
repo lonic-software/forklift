@@ -579,7 +579,7 @@ fn only_commands_a_shell_runs_unchanged_are_run() {
     assert!(runs("forklift stack -m \"First parcel\""));
     assert!(runs("echo 'Hello, world!' > readme.md"));
     assert!(runs("echo \"text\" >> notes.md"));
-    assert!(runs("echo '^build(/.*)?$' > .forkliftignore"));
+    assert!(runs("echo 'build/' > .gitignore"));
     assert!(runs("cd ../hello"));
 
     assert!(!runs("echo \"Hello, world!\" > readme.md"));

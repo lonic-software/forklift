@@ -259,10 +259,6 @@ du -sh .forklift                             # packed, as imported
 time forklift store compact --all --redelta
 du -sh .forklift                             # densified — the state the table compares
 
-# 2c. git import leaves an untracked .forkliftignore (the .git rule) and asks you to
-#     record it; do, so that a later `load .` stages only your edits.
-forklift load .forkliftignore && forklift stack -m "Keep the .git ignore rule"
-
 # 3. Compare, running each tool in its own copy.
 # status:
 ( cd ~/bench/A && time git status )

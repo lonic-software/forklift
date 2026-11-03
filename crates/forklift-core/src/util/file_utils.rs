@@ -6,6 +6,7 @@ use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use regex::Regex;
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::globals::{bay_root, forklift_root, FOLDER_NAME_GRAPH_ROOT, FOLDER_NAME_INVENTORY_ROOT, FOLDER_NAME_OBJECTS_ROOT};
@@ -3481,7 +3482,10 @@ pub fn get_owners_for_file(_metadata: &Metadata) -> (u64, u64) {
 }
 
 /// The ignore rules in force: the built-in rules, which keep the warehouse's own folder out of
-/// tracking, and the user's rules from the ignore file.
+/// tracking, and the user's rules. The user's rules are, from weakest to strongest, the
+/// `.gitignore` of every directory a walk enters (a deeper one wins), the root ignore file, and
+/// the fixed `.git` rule no file can remove. They speak gitignore syntax; the root ignore file
+/// also takes `re:` and `!re:` regex lines.
 ///
 /// A user rule covers only untracked paths, as in git: a file with a live entry in its parent's
 /// shard, or a directory registered in the inventory metadata, is tracked whatever the rules say,
@@ -3492,103 +3496,199 @@ pub fn get_owners_for_file(_metadata: &Metadata) -> (u64, u64) {
 /// tracked name of the other type, from `inventory_utils::rule_verdict`.
 pub struct IgnoreRules {
     built_in: Vec<Regex>,
-    user: Vec<IgnoreFileRule>,
+
+    /// The root ignore file's rules, in file order.
+    forklift: Vec<IgnoreFileRule>,
+
+    /// Whether the user's rules apply at all: `false` for [`IgnoreRules::built_in_only`].
+    user: bool,
 }
 
-/// Whether a user rule matches a directory's key or the key of one of its ancestors: what that
-/// directory passes down to [`IgnoreRules::excludes`] for its entries. Opaque, so it can only
-/// feed that one method; a walk computes it once per directory instead of once per entry.
-#[derive(Clone, Copy)]
-pub struct Coverage(bool);
+/// What a directory passes down to [`IgnoreRules::excludes`] for its entries: whether a user rule
+/// excludes the directory or one of its ancestors, and the `.gitignore` files in force there.
+/// Opaque, so it can only feed that one method; a walk builds it once per directory, with
+/// [`IgnoreRules::enter`], instead of once per entry.
+#[derive(Clone, Default)]
+pub struct RuleContext {
+    excluded: bool,
+    levels: Option<Arc<GitignoreLevel>>,
+}
+
+/// One directory's `.gitignore`, linked to the nearest one above it.
+struct GitignoreLevel {
+    /// The warehouse path key of the directory holding the file (`""` for the root).
+    base: String,
+    rules: Vec<IgnoreFileRule>,
+    parent: Option<Arc<GitignoreLevel>>,
+}
+
+impl RuleContext {
+    /// The context above the warehouse root, which [`IgnoreRules::enter`] takes for the root.
+    pub fn above_root() -> RuleContext {
+        RuleContext::default()
+    }
+}
 
 impl IgnoreRules {
-    /// The coverage the directory with the given key passes to its entries.
-    ///
-    /// # Arguments
-    /// * `dir_key` - The warehouse path key of the directory (`""` for the root).
-    ///
-    /// # Returns
-    /// * `Coverage` - Whether a user rule matches the key or an ancestor's key.
-    pub fn coverage_of(&self, dir_key: &str) -> Coverage {
-        Coverage(self.covering_rule(dir_key).is_some())
+    /// The built-in rules alone, for a caller whose answer no user rule can change.
+    pub fn built_in_only() -> Result<IgnoreRules, String> {
+        Ok(IgnoreRules { built_in: get_default_ignored_paths()?, forklift: Vec::new(), user: false })
     }
 
-    /// The first user rule, in file order, that matches the directory's key or the key of one of
-    /// its ancestors: the rule behind [`IgnoreRules::coverage_of`].
+    /// The context a directory passes to its entries, given its parent's. A directory a user rule
+    /// excludes passes that down, and its `.gitignore` is not read: nothing below it can be
+    /// re-included, even when the directory itself is tracked. Otherwise its `.gitignore` is read,
+    /// even when a rule ignores that file, as git reads it.
     ///
     /// # Arguments
-    /// * `dir_key` - The warehouse path key of the directory (`""` for the root).
+    /// * `parent`    - The context of the directory's parent ([`RuleContext::above_root`] for the
+    ///                 root).
+    /// * `dir_key`   - The warehouse path key of the directory (`""` for the root).
+    /// * `gitignore` - Reads the directory's `.gitignore` (see [`read_gitignore_in`] and
+    ///                 [`read_gitignore_at`]); called only when the file is needed.
     ///
     /// # Returns
-    /// * `Some(&IgnoreFileRule)` - The rule, nearest key first.
-    /// * `None`                  - No user rule covers the directory.
-    pub fn covering_rule(&self, dir_key: &str) -> Option<&IgnoreFileRule> {
-        let mut current = dir_key;
+    /// * `Ok(RuleContext)` - The directory's context.
+    /// * `Err(String)`     - If the `.gitignore` could not be read, or was refused.
+    pub fn enter(&self,
+                 parent: &RuleContext,
+                 dir_key: &str,
+                 gitignore: impl FnOnce() -> Result<Option<String>, String>) -> Result<RuleContext, String> {
+        let excluded = parent.excluded || (!dir_key.is_empty() && self.user_verdict(dir_key, true, parent) == Some(true));
 
-        while !current.is_empty() {
-            if let Some(rule) = self.user.iter().find(|rule| rule.matches(current)) {
-                return Some(rule);
-            }
-
-            current = current.rsplit_once(PATH_SEPARATOR_CHAR).map(|(parent, _)| parent).unwrap_or("");
+        if excluded || !self.user {
+            return Ok(RuleContext { excluded, levels: parent.levels.clone() });
         }
 
-        None
+        let levels = match gitignore()? {
+            Some(content) => {
+                let label = if dir_key.is_empty() { FILENAME_GITIGNORE.to_string() } else { format!("{}/{}", dir_key, FILENAME_GITIGNORE) };
+                let rules = parse_ignore_lines(&content, &label, IgnoreFileKind::Gitignore)?;
+                match rules.is_empty() {
+                    true => parent.levels.clone(),
+                    false => Some(Arc::new(GitignoreLevel { base: dir_key.to_string(), rules, parent: parent.levels.clone() })),
+                }
+            }
+            None => parent.levels.clone(),
+        };
+
+        Ok(RuleContext { excluded, levels })
     }
 
-    /// The coverage a directory passes to its entries, given its parent's: what
-    /// [`IgnoreRules::coverage_of`] returns, without climbing the ancestors again.
+    /// The context of the directory with the given key, built from the root down: every
+    /// `.gitignore` on the way is read from disk. For a caller that holds a key rather than a
+    /// walk.
     ///
     /// # Arguments
-    /// * `parent`  - The coverage of the directory's parent.
     /// * `dir_key` - The warehouse path key of the directory (`""` for the root).
     ///
     /// # Returns
-    /// * `Coverage` - Whether a user rule matches the key or an ancestor's key.
-    pub fn coverage_below(&self, parent: Coverage, dir_key: &str) -> Coverage {
-        Coverage(parent.0 || (!dir_key.is_empty() && self.user.iter().any(|rule| rule.matches(dir_key))))
+    /// * `Ok(RuleContext)` - The directory's context.
+    /// * `Err(String)`     - If a `.gitignore` could not be read, or was refused.
+    pub fn context_of(&self, dir_key: &str) -> Result<RuleContext, String> {
+        let mut context = self.enter(&RuleContext::above_root(), "", || read_gitignore_at(""))?;
+
+        if dir_key.is_empty() {
+            return Ok(context);
+        }
+
+        let mut end = 0;
+        loop {
+            end = dir_key[end..].find(PATH_SEPARATOR_CHAR).map(|i| end + i).unwrap_or(dir_key.len());
+            let key = &dir_key[..end];
+            context = self.enter(&context, key, || read_gitignore_at(key))?;
+            if end == dir_key.len() {
+                return Ok(context);
+            }
+            end += 1;
+        }
     }
 
     /// Whether the walks should skip the path with the given key.
     ///
-    /// An untracked path is covered by a user rule that matches its own key or the key of any
-    /// ancestor: a tracked folder a rule matches is walked, and the untracked content beneath it
-    /// stays ignored even where no rule matches its own key.
+    /// An untracked path is excluded when its parent's context is (a rule excludes an ancestor),
+    /// or when the strongest user rule that matches it ignores rather than re-includes it: the
+    /// `.git` rule, then the last matching line of the root ignore file, then the last matching
+    /// line of the nearest `.gitignore` with one. A tracked folder a rule excludes is walked, and
+    /// the untracked content beneath it stays excluded whatever the rules say of its own key.
     ///
     /// # Arguments
-    /// * `key`     - The warehouse path key (see `WarehousePath::as_key`).
-    /// * `tracked` - Whether the path is tracked as what it is on disk now: a file with a live
-    ///               entry in its parent's shard, a directory whose key is registered. The walks
-    ///               ask through `inventory_utils::rule_verdict`, which also tells a tracked name
-    ///               of the other type apart; call this directly only with that answer.
-    /// * `parent`  - The coverage of the path's parent directory (see [`IgnoreRules::coverage_of`]).
+    /// * `key`          - The warehouse path key (see `WarehousePath::as_key`).
+    /// * `is_directory` - Whether the path is a directory on disk (a symbolic link is not), for
+    ///                    the rules that match only directories.
+    /// * `tracked`      - Whether the path is tracked as what it is on disk now: a file with a
+    ///                    live entry in its parent's shard, a directory whose key is registered.
+    ///                    The walks ask through `inventory_utils::rule_verdict`, which also tells
+    ///                    a tracked name of the other type apart; call this directly only with
+    ///                    that answer.
+    /// * `parent`       - The context of the path's parent directory (see
+    ///                    [`IgnoreRules::enter`]).
     ///
     /// # Returns
     /// * `true`  - If the path should be skipped.
     /// * `false` - If the path should be walked.
-    pub fn excludes(&self, key: &str, tracked: bool, parent: Coverage) -> bool {
+    pub fn excludes(&self, key: &str, is_directory: bool, tracked: bool, parent: &RuleContext) -> bool {
         if self.built_in.iter().any(|r| r.is_match(key)) {
             return true;
         }
 
-        !tracked && (parent.0 || self.user.iter().any(|rule| rule.matches(key)))
+        !tracked && (parent.excluded || self.user_verdict(key, is_directory, parent) == Some(true))
+    }
+
+    /// The strongest user rule's verdict on the path: `Some(true)` ignored, `Some(false)`
+    /// re-included, `None` when no user rule matches it.
+    fn user_verdict(&self, key: &str, is_directory: bool, parent: &RuleContext) -> Option<bool> {
+        if !self.user {
+            return None;
+        }
+
+        // The fixed `.git` rule: a final component of exactly `.git`, never `.github` or
+        // `.gitignore`, which are tracked content.
+        if key.rsplit(PATH_SEPARATOR_CHAR).next() == Some(GIT_DIRECTORY_NAME) {
+            return Some(true);
+        }
+
+        if let Some(rule) = self.forklift.iter().rev().find(|rule| rule.matches(key, is_directory)) {
+            return Some(!rule.negated);
+        }
+
+        let mut level = parent.levels.as_deref();
+        while let Some(current) = level {
+            let relative = match current.base.is_empty() {
+                true => Some(key),
+                false => key.strip_prefix(current.base.as_str()).and_then(|rest| rest.strip_prefix(PATH_SEPARATOR_CHAR)),
+            };
+            if let Some(rule) = relative.and_then(|relative| current.rules.iter().rev().find(|rule| rule.matches(relative, is_directory))) {
+                return Some(!rule.negated);
+            }
+            level = current.parent.as_deref();
+        }
+
+        None
     }
 }
 
-/// Get the ignore rules in force: the built-in rules and the rules of the ignore file.
+/// The name of git's metadata folder, which the fixed `.git` rule ignores at any depth.
+const GIT_DIRECTORY_NAME: &str = ".git";
+
+/// The name of git's ignore file, honoured in every directory a walk enters.
+pub const FILENAME_GITIGNORE: &str = ".gitignore";
+
+/// Get the ignore rules in force: the built-in rules and the rules of the ignore file. The
+/// `.gitignore` files are read as the walks enter their directories (see [`IgnoreRules::enter`]).
 ///
 /// # Returns
 /// * Ok(IgnoreRules) - The rules.
 /// * Err(String)     - If the ignore file could not be read, or was refused: a symbolic link or
-///                     folder, a conflict marker, whitespace around a pattern, a control
-///                     character in one, or a pattern matching the empty string.
+///                     folder, a conflict marker, an invisible or control character, or a
+///                     regex line with whitespace around its regex, matching the empty string,
+///                     or not compiling.
 pub fn get_ignore_rules() -> Result<IgnoreRules, String> {
     ignore_rules_from(read_ignore_file()?.as_deref())
 }
 
 /// Get the ignore rules in force for the given ignore file content: the built-in rules and the
-/// rules the content holds. A caller that goes on to rewrite the file reads it once and judges
-/// that same content.
+/// rules the content holds.
 ///
 /// # Arguments
 /// * `content` - The ignore file's content (see [`read_ignore_file`]), or `None` for no file.
@@ -3598,12 +3698,79 @@ pub fn get_ignore_rules() -> Result<IgnoreRules, String> {
 /// * Err(String)     - If the content was refused (see [`get_ignore_rules`]).
 pub fn ignore_rules_from(content: Option<&str>) -> Result<IgnoreRules, String> {
     let built_in = get_default_ignored_paths()?;
-    let user = match content {
-        Some(content) => parse_ignore_file(content)?,
+    let forklift = match content {
+        Some(content) => parse_ignore_lines(content, FILENAME_IGNORE, IgnoreFileKind::Forklift)?,
         None => Vec::new(),
     };
 
-    Ok(IgnoreRules { built_in, user })
+    Ok(IgnoreRules { built_in, forklift, user: true })
+}
+
+/// Read a directory's `.gitignore` from the listing the walk already holds, so a directory
+/// without one costs no extra call. Only a regular file is read: a symbolic link or a folder of
+/// that name contributes no rules and fails nothing, as in git, and a folder is walked as
+/// content.
+///
+/// # Arguments
+/// * `directory` - The path of the directory, as the walk listed it.
+/// * `entries`   - The directory's entries.
+///
+/// # Returns
+/// * `Ok(Some(String))` - The file's content.
+/// * `Ok(None)`         - There is no `.gitignore` that is a regular file.
+/// * `Err(String)`      - If the file's type or content could not be read.
+pub fn read_gitignore_in(directory: &Path, entries: &[std::fs::DirEntry]) -> Result<Option<String>, String> {
+    let Some(entry) = entries.iter().find(|entry| entry.file_name() == FILENAME_GITIGNORE) else {
+        return Ok(None);
+    };
+
+    let path = directory.join(FILENAME_GITIGNORE);
+    let is_file = entry.file_type()
+        .map_err(|e| format!("Error while getting the type of \"{}\": {}", path.display(), e))?
+        .is_file();
+
+    match is_file {
+        true => std::fs::read_to_string(&path).map(Some).map_err(|e| format!("Error while reading \"{}\": {}", path.display(), e)),
+        false => Ok(None),
+    }
+}
+
+/// Read the `.gitignore` of the directory with the given key from disk, under the same rule as
+/// [`read_gitignore_in`]: only a regular file is read.
+///
+/// # Arguments
+/// * `dir_key` - The warehouse path key of the directory (`""` for the root).
+///
+/// # Returns
+/// * `Ok(Some(String))` - The file's content.
+/// * `Ok(None)`         - There is no `.gitignore` that is a regular file.
+/// * `Err(String)`      - If the file's type or content could not be read.
+pub fn read_gitignore_at(dir_key: &str) -> Result<Option<String>, String> {
+    let path = crate::globals::warehouse_root().join(dir_key).join(FILENAME_GITIGNORE);
+
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => std::fs::read_to_string(&path)
+            .map(Some)
+            .map_err(|e| format!("Error while reading \"{}\": {}", path.display(), e)),
+        Ok(_) => Ok(None),
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => Ok(None),
+        Err(e) => Err(format!("Error while reading \"{}\": {}", path.display(), e)),
+    }
+}
+
+/// Read every entry of a directory, so a walk can read its `.gitignore` (see
+/// [`read_gitignore_in`]) before judging any entry.
+///
+/// # Arguments
+/// * `path` - The path to the directory.
+///
+/// # Returns
+/// * `Ok(Vec<std::fs::DirEntry>)` - The entries, in the order the file system lists them.
+/// * `Err(String)`                - If the directory or an entry could not be read.
+pub fn read_directory_entries(path: &PathBuf) -> Result<Vec<std::fs::DirEntry>, String> {
+    read_directory(path)?
+        .map(|entry| entry.map_err(|e| format!("Error while reading directory entry: {}", e)))
+        .collect()
 }
 
 /// The path of the warehouse's ignore file, at the root of the working tree.
@@ -3661,53 +3828,98 @@ impl From<IgnoreFileError> for String {
     }
 }
 
-/// One rule of the ignore file, with the line it was read from.
+/// Which ignore file a content was read from: the root ignore file refuses control and invisible
+/// characters, edge whitespace on a regex line and a glob line that reads as a regex, and takes
+/// regex lines, while a `.gitignore` means in forklift what it means in git. Both refuse conflict
+/// markers.
+#[derive(Clone, Copy, PartialEq)]
+enum IgnoreFileKind {
+    Forklift,
+    Gitignore,
+}
+
+/// One rule of an ignore file.
 #[derive(Debug)]
-pub struct IgnoreFileRule {
-    /// The line number, counting from 1.
-    pub line: usize,
+struct IgnoreFileRule {
+    /// A `!` line: a match re-includes the path.
+    negated: bool,
+    matcher: RuleMatcher,
+}
 
-    /// The pattern, as written on that line.
-    pub pattern: String,
+#[derive(Debug)]
+enum RuleMatcher {
+    /// A `re:` line: the regex, anchored at both ends, against the whole key.
+    Regex(Regex),
 
-    regex: Regex,
+    /// A gitignore line.
+    Glob {
+        /// A trailing `/`: the rule matches only directories.
+        directory_only: bool,
+        /// No `/` but a trailing one: matched against the final component only.
+        basename: bool,
+        /// `None` for a pattern git can never match (a trailing `\`, an unclosed class).
+        regex: Option<Regex>,
+    },
 }
 
 impl IgnoreFileRule {
-    /// Whether the rule matches the given warehouse path key.
-    pub fn matches(&self, key: &str) -> bool {
-        self.regex.is_match(key)
+    /// Whether the rule matches the path, given relative to the ignore file's directory.
+    fn matches(&self, relative: &str, is_directory: bool) -> bool {
+        match &self.matcher {
+            RuleMatcher::Regex(regex) => regex.is_match(relative),
+            RuleMatcher::Glob { directory_only, basename, regex } => {
+                if *directory_only && !is_directory {
+                    return false;
+                }
+                let Some(regex) = regex else { return false };
+                let subject = match basename {
+                    true => relative.rsplit(PATH_SEPARATOR_CHAR).next().unwrap_or(relative),
+                    false => relative,
+                };
+                regex.is_match(subject)
+            }
+        }
     }
 }
 
-/// Parse the ignore file's content into rules: one regex per line, skipping blank lines (empty,
-/// or whitespace only) and lines that start with `#`. A byte order mark opening the file is an
-/// encoding marker, not part of the first line, and is skipped as git skips it.
+/// The prefix of a regex line in the root ignore file. A gitignore line that must begin with it
+/// literally escapes it as `\re:`, which git already reads as the literal.
+const REGEX_LINE_PREFIX: &str = "re:";
+
+/// Parse an ignore file's content into rules, in file order. A byte order mark opening the file
+/// is an encoding marker, not part of the first line, and is skipped as git skips it. Every line
+/// is a gitignore line (see [`parse_glob_line`]); in the root ignore file, a line starting `re:`
+/// or `!re:` is a regex, matched against the whole warehouse path key and anchored at both ends.
 ///
-/// Four kinds of line are refused rather than compiled:
-/// * a merge conflict marker, which consolidating two edits of the file writes into it. One of
-///   them, `||||||| base`, compiles to a pattern that matches every path, so the next `load .`
-///   would stage the removal of the whole tree;
-/// * a pattern holding a control or an invisible format character (Unicode categories Cc and
-///   Cf): a tab, the carriage returns of a file with bare-CR line endings (which reads as one
-///   line whose rules never match), a zero-width space, a soft hyphen, a bidirectional override
-///   that makes the rule display as another, a byte order mark past the start of the file. A
-///   pattern that needs one writes its escape. Only the format characters of real names are
-///   accepted, and only where a name holds them: a joiner (U+200C, U+200D) between two visible
-///   non-ASCII characters, as in an emoji sequence or Persian script, and the tag run that
-///   spells a flag emoji, right after the black flag and closed by its cancel tag;
-/// * a pattern with whitespace at its start or end. It would be part of the regex, so `^build$ `
-///   never matches `build`. Trimming it instead would guess: a space the pattern needs is
-///   written `\x20`;
-/// * a pattern that matches the empty string. Matching is a search anywhere in the path, so
-///   such a pattern (`.*`, `x*`, `a|`) matches every path.
+/// A line opening with a merge conflict marker is refused in every ignore file: consolidating
+/// two edits of the file writes them, and the lines between them would apply both sides' rules
+/// at once. The root ignore file is forklift's own and refuses more:
+/// * a line holding a control or an invisible format character (Unicode categories Cc and Cf):
+///   a tab, the carriage returns of a file with bare-CR line endings (which reads as one line
+///   whose rules never match), a zero-width space, a soft hyphen, a bidirectional override that
+///   makes the rule display as another, a byte order mark past the start of the file. A regex
+///   that needs one writes its escape. Only the format characters of real names are accepted,
+///   and only where a name holds them: a joiner (U+200C, U+200D) between two visible non-ASCII
+///   characters, as in an emoji sequence or Persian script, and the tag run that spells a flag
+///   emoji, right after the black flag and closed by its cancel tag;
+/// * a regex line whose regex has whitespace at its start or end. It would be part of the
+///   regex, so `re:build ` never matches `build`. Trimming it instead would guess: a space the
+///   regex needs is written `\x20`;
+/// * a regex line whose regex matches the empty string, which is no path: `re:.*` hides
+///   everything, `re:x*` reads as a rule for `x`;
+/// * a regex line whose regex does not compile.
 ///
 /// The error names the refused character by code point, so an invisible one can be found.
+///
+/// # Arguments
+/// * `content` - The file's content.
+/// * `label`   - The file's warehouse path key, for the error.
+/// * `kind`    - Which ignore file it is.
 ///
 /// # Returns
 /// * `Ok(Vec<IgnoreFileRule>)` - The rules, in file order.
 /// * `Err(String)`             - The first refused line, by number.
-fn parse_ignore_file(content: &str) -> Result<Vec<IgnoreFileRule>, String> {
+fn parse_ignore_lines(content: &str, label: &str, kind: IgnoreFileKind) -> Result<Vec<IgnoreFileRule>, String> {
     static INVISIBLE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let invisible = INVISIBLE.get_or_init(|| Regex::new(r"[\p{Cc}\p{Cf}]").expect("a valid class"));
 
@@ -3715,60 +3927,277 @@ fn parse_ignore_file(content: &str) -> Result<Vec<IgnoreFileRule>, String> {
     let mut rules = Vec::new();
 
     for (index, line) in content.lines().enumerate() {
-        if line.trim().is_empty() || line.starts_with(IGNORE_FILE_COMMENT_PREFIX) {
+        if line.starts_with(IGNORE_FILE_COMMENT_PREFIX) {
             continue;
         }
 
         if ["<<<<<<<", "|||||||", "=======", ">>>>>>>"].iter().any(|marker| line.starts_with(marker)) {
             return Err(format!(
                 "\"{}\" has an unresolved conflict marker on line {}. Resolve the file first.",
-                FILENAME_IGNORE, index + 1
+                label, index + 1
             ));
         }
 
+        if kind == IgnoreFileKind::Gitignore {
+            rules.extend(parse_glob_line(line).map_err(|e| format!("\"{}\", line {}: {}", label, index + 1, e))?);
+            continue;
+        }
+
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let regex_line = line.strip_prefix(REGEX_LINE_PREFIX).map(|regex| (false, regex))
+            .or_else(|| line.strip_prefix('!').and_then(|rest| rest.strip_prefix(REGEX_LINE_PREFIX)).map(|regex| (true, regex)));
+
         if let Some(c) = refused_format_character(line, invisible) {
-            let remedy = match c {
-                '\r' => "Save the file with newline line endings.".to_string(),
-                _ => format!("Remove it, or write it as {} if the pattern needs it.", escape_for(c)),
+            let remedy = match (c, regex_line.is_some()) {
+                ('\r', _) => "Save the file with newline line endings.".to_string(),
+                (_, true) => format!("Remove it, or write it as {} if the regex needs it.", escape_for(c)),
+                (_, false) => format!("Remove it, or match it with a {} line that writes it as {}.", REGEX_LINE_PREFIX, escape_for(c)),
             };
             return Err(format!(
                 "\"{}\", line {}: the pattern {:?} holds an invisible or control character ({}), which \
-                would be part of the regex. {}",
-                FILENAME_IGNORE, index + 1, line, code_point(c), remedy
+                would be part of the pattern. {}",
+                label, index + 1, line, code_point(c), remedy
             ));
         }
 
-        let edge = [line.chars().next(), line.chars().next_back()].into_iter().flatten().find(|c| c.is_whitespace());
+        let Some((negated, regex)) = regex_line else {
+            if reads_as_anchored_regex(line) {
+                return Err(format!(
+                    "\"{}\", line {}: the pattern {:?} reads as a regex, but a line without the {} \
+                    prefix is a gitignore pattern, so it would match only a name holding that `^` or \
+                    `$`. Prefix it with {} if it is a regex, or write the character as `\\^` or `\\$` \
+                    if it is part of a name.",
+                    label, index + 1, line, REGEX_LINE_PREFIX, REGEX_LINE_PREFIX
+                ));
+            }
+            rules.extend(parse_glob_line(line).map_err(|e| format!("\"{}\", line {}: {}", label, index + 1, e))?);
+            continue;
+        };
+
+        let edge = [regex.chars().next(), regex.chars().next_back()].into_iter().flatten().find(|c| c.is_whitespace());
         if let Some(c) = edge {
             return Err(format!(
-                "\"{}\", line {}: the pattern {:?} starts or ends with whitespace ({}), which would be part \
-                of the regex. Remove it, or write it as {} if the pattern needs it.",
-                FILENAME_IGNORE, index + 1, line, code_point(c), escape_for(c)
+                "\"{}\", line {}: the regex {:?} starts or ends with whitespace ({}), which would be part \
+                of the regex. Remove it, or write it as {} if the regex needs it.",
+                label, index + 1, regex, code_point(c), escape_for(c)
             ));
         }
 
-        let regex = get_regex_for_pattern(line)
-            .map_err(|e| format!("\"{}\", line {}: {}", FILENAME_IGNORE, index + 1, e))?;
+        let compiled = get_regex_for_pattern(&format!("^(?:{})$", regex))
+            .map_err(|e| format!("\"{}\", line {}: {}", label, index + 1, e))?;
 
-        if regex.is_match("") {
+        if compiled.is_match("") {
             return Err(format!(
-                "\"{}\", line {}: the pattern {:?} matches the empty string, so it would match every path.",
-                FILENAME_IGNORE, index + 1, line
+                "\"{}\", line {}: the regex {:?} matches the empty string, which is no path. Write one \
+                that matches only the paths it is meant to hide.",
+                label, index + 1, regex
             ));
         }
 
-        rules.push(IgnoreFileRule { line: index + 1, pattern: line.to_string(), regex });
+        rules.push(IgnoreFileRule { negated, matcher: RuleMatcher::Regex(compiled) });
     }
 
     Ok(rules)
+}
+
+/// Parse one gitignore line, as git does: a blank line or a comment is no rule; trailing spaces
+/// are trimmed unless escaped by `\`; a leading `!` re-includes; a trailing `/` matches only
+/// directories; a pattern with no other `/` matches the final component at any depth, and one
+/// with a `/` is anchored to the ignore file's directory; `*` and `?` never match a `/`, `**`
+/// as a whole component matches any number of directories, `[...]` is a class, and `\` escapes
+/// the next character.
+///
+/// # Returns
+/// * `Ok(Some(IgnoreFileRule))` - The rule.
+/// * `Ok(None)`                 - The line holds no rule.
+/// * `Err(String)`              - If the translated pattern could not be compiled.
+fn parse_glob_line(line: &str) -> Result<Option<IgnoreFileRule>, String> {
+    let mut pattern = trim_trailing_spaces(line);
+    if pattern.is_empty() {
+        return Ok(None);
+    }
+
+    let negated = pattern.starts_with('!');
+    if negated {
+        pattern = &pattern[1..];
+    }
+
+    let directory_only = pattern.ends_with('/');
+    if directory_only {
+        pattern = &pattern[..pattern.len() - 1];
+    }
+
+    if pattern.is_empty() {
+        return Ok(None);
+    }
+
+    let basename = !pattern.contains('/');
+    let pattern = pattern.strip_prefix('/').unwrap_or(pattern);
+    let regex = match wildmatch_to_regex(pattern) {
+        Some(body) => Some(get_regex_for_pattern(&format!("^(?s:{})$", body))?),
+        None => None,
+    };
+
+    Ok(Some(IgnoreFileRule { negated, matcher: RuleMatcher::Glob { directory_only, basename, regex } }))
+}
+
+/// Whether a glob line reads as an anchored regex of the old `.forkliftignore` format: past a
+/// leading `!`, it starts with `^` or ends with a `$` no backslash escapes. Read as a glob, such a
+/// line would match only names holding the character, so the rule it meant would be lost silently.
+fn reads_as_anchored_regex(line: &str) -> bool {
+    let pattern = trim_trailing_spaces(line);
+    let pattern = pattern.strip_prefix('!').unwrap_or(pattern);
+    let Some(body) = pattern.strip_suffix('$') else {
+        return pattern.starts_with('^');
+    };
+    let escapes = body.bytes().rev().take_while(|b| *b == b'\\').count();
+    pattern.starts_with('^') || escapes % 2 == 0
+}
+
+/// The line without its trailing spaces, except one escaped by a backslash, as git trims them.
+fn trim_trailing_spaces(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut end = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b' ' => {}
+            b'\\' => {
+                i += 1;
+                end = (i + 1).min(bytes.len());
+            }
+            _ => end = i + 1,
+        }
+        i += 1;
+    }
+    &line[..end]
+}
+
+/// A gitignore pattern as the body of a regex, matched as git's wildmatch matches a path (`*`,
+/// `?` and classes never match a `/`). `None` for a pattern git never matches: a trailing `\`,
+/// an unclosed class, an unknown `[:name:]`.
+fn wildmatch_to_regex(pattern: &str) -> Option<String> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                let next = *chars.get(i + 1)?;
+                out.push_str(&regex::escape(next.encode_utf8(&mut [0; 4])));
+                i += 2;
+            }
+            '?' => {
+                out.push_str("[^/]");
+                i += 1;
+            }
+            '*' => {
+                let start = i;
+                while i < chars.len() && chars[i] == '*' {
+                    i += 1;
+                }
+                let at_segment_start = start == 0 || chars[start - 1] == '/';
+                let at_segment_end = i == chars.len() || chars[i] == '/'
+                    || (chars[i] == '\\' && chars.get(i + 1) == Some(&'/'));
+                if i - start >= 2 && at_segment_start && at_segment_end {
+                    if i == chars.len() {
+                        out.push_str(".*");
+                    } else {
+                        // `**/`: zero or more whole directories, its slash included.
+                        i += if chars[i] == '\\' { 2 } else { 1 };
+                        out.push_str("(?:.*/)?");
+                    }
+                } else {
+                    out.push_str("[^/]*");
+                }
+            }
+            '[' => {
+                let (class, next) = class_to_regex(&chars, i)?;
+                out.push_str(&class);
+                i = next;
+            }
+            c => {
+                out.push_str(&regex::escape(c.encode_utf8(&mut [0; 4])));
+                i += 1;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// A bracket class opening at `chars[open]`, as a regex class that never matches `/`, and the
+/// index past its `]`. `None` for an unclosed class or an unknown `[:name:]`.
+fn class_to_regex(chars: &[char], open: usize) -> Option<(String, usize)> {
+    const CLASS_NAMES: [&str; 12] = ["alnum", "alpha", "blank", "cntrl", "digit", "graph", "lower", "print", "punct", "space", "upper", "xdigit"];
+    let escaped = |c: char| match c {
+        '\\' | ']' | '[' | '^' | '-' | '&' | '~' => format!("\\{}", c),
+        _ => c.to_string(),
+    };
+
+    let mut i = open + 1;
+    let negated = matches!(chars.get(i), Some('!') | Some('^'));
+    if negated {
+        i += 1;
+    }
+
+    let mut items = String::new();
+    let mut first = true;
+    loop {
+        let c = *chars.get(i)?;
+        if c == ']' && !first {
+            i += 1;
+            break;
+        }
+        first = false;
+
+        if c == '[' && chars.get(i + 1) == Some(&':') {
+            let rest: String = chars[i + 2..].iter().collect();
+            let end = rest.find(":]")?;
+            let name = &rest[..end];
+            if !CLASS_NAMES.contains(&name) {
+                return None;
+            }
+            items.push_str(&format!("[:{}:]", name));
+            i += 2 + name.chars().count() + 2;
+            continue;
+        }
+
+        let low = if c == '\\' { i += 1; *chars.get(i)? } else { c };
+        i += 1;
+        if chars.get(i) == Some(&'-') && chars.get(i + 1).is_some_and(|&next| next != ']') {
+            i += 1;
+            let mut high = chars[i];
+            if high == '\\' {
+                i += 1;
+                high = *chars.get(i)?;
+            }
+            i += 1;
+            if low <= high {
+                items.push_str(&format!("{}-{}", escaped(low), escaped(high)));
+            }
+            continue;
+        }
+        items.push_str(&escaped(low));
+    }
+
+    let class = match (negated, items.is_empty()) {
+        (true, true) => "[^/]".to_string(),
+        (true, false) => format!("[^/{}]", items),
+        (false, true) => r"[^\x00-\x{10FFFF}]".to_string(),
+        (false, false) => format!("[[{}]&&[^/]]", items),
+    };
+    Some((class, i))
 }
 
 /// The first control or format character in the line that no real name holds there, if any.
 /// A joiner is accepted between two visible non-ASCII characters, as an emoji sequence or a
 /// Persian or Indic name holds it, and the tags of a flag emoji as one run right after the black
 /// flag (U+1F3F4) and closed by the cancel tag (U+E007F). Anywhere else they are invisible text,
-/// as every other control and format character is: next to ASCII or regex syntax, `^build\u{200D}$`
-/// displays as `^build$` and never matches.
+/// as every other control and format character is: next to ASCII or pattern syntax,
+/// `build\u{200D}` displays as `build` and never matches.
 fn refused_format_character(line: &str, invisible: &Regex) -> Option<char> {
     const BLACK_FLAG: char = '\u{1F3F4}';
     const CANCEL_TAG: char = '\u{E007F}';
@@ -4488,13 +4917,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Whether the rules exclude the path, judged as a walk judges it: every directory above it
+    /// entered from the root down, each reading its `.gitignore` from `gitignores`.
+    fn walk_excludes(rules: &IgnoreRules, gitignores: &[(&str, &str)], key: &str, is_directory: bool, tracked: bool) -> bool {
+        let read = |dir: &str| {
+            let path = match dir.is_empty() { true => FILENAME_GITIGNORE.to_string(), false => format!("{}/{}", dir, FILENAME_GITIGNORE) };
+            Ok(gitignores.iter().find(|(p, _)| *p == path).map(|(_, content)| content.to_string()))
+        };
+        let mut context = rules.enter(&RuleContext::above_root(), "", || read("")).unwrap();
+        let mut parts: Vec<&str> = key.split('/').collect();
+        parts.pop();
+        for end in 1..=parts.len() {
+            let dir = parts[..end].join("/");
+            context = rules.enter(&context, &dir, || read(&dir)).unwrap();
+        }
+        rules.excludes(key, is_directory, tracked, &context)
+    }
+
+    fn rules_of(forkliftignore: &str) -> IgnoreRules {
+        ignore_rules_from(Some(forkliftignore)).unwrap()
+    }
+
     #[test]
     fn default_ignore_rules_cover_the_warehouse_folder_but_no_sibling() {
-        let defaults = IgnoreRules { built_in: get_default_ignored_paths().unwrap(), user: Vec::new() };
-        let excludes = |key: &str, tracked: bool| {
-            let parent = key.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("");
-            defaults.excludes(key, tracked, defaults.coverage_of(parent))
-        };
+        let defaults = IgnoreRules::built_in_only().unwrap();
+        let excludes = |key: &str, tracked: bool| defaults.excludes(key, false, tracked, &RuleContext::above_root());
 
         for ignored in [".forklift", ".forklift/config/warehouse.toml", ".forklift.tmp~12-0", ".forklift.tmp~12-0/lock",
                         "sub/.forklift.tmp~7-3", "sub/deeper/.forklift.tmp~7-3/.forklift/objects"] {
@@ -4506,139 +4953,392 @@ mod tests {
                         "x.forklift.tmp~1-2", ".forklift.tmp~1-2x", ".forklift.tmp~1", ".forklift.tmp~a-2", "a/b.forklift.tmp~1-2"] {
             assert!(!excludes(tracked, false), "{} must not be ignored", tracked);
         }
+        // The built-in rules alone know no `.git` rule: that is a user rule.
+        assert!(!excludes(".git", false));
+    }
+
+    #[test]
+    fn gitignore_lines_mean_what_they_mean_to_git() {
+        // Every case's verdict on every file of the corpus, and on its ignore files, is git's.
+        let rules = ignore_rules_from(None).unwrap();
+        for (name, gitignores, ignored) in GIT_CASES {
+            let mut files: Vec<&str> = GIT_CORPUS.iter().copied().chain(gitignores.iter().map(|(path, _)| *path)).collect();
+            files.sort();
+            for file in files {
+                assert_eq!(walk_excludes(&rules, gitignores, file, false, false), ignored.contains(&file),
+                    "case {}: {}", name, file);
+            }
+        }
+    }
+
+    /// The corpus every case below is judged on: the tree of the differential that pinned
+    /// the gitignore translation to git 2.55, which recorded the verdicts below. It holds no two
+    /// names differing only in case: it was recorded on a volume that folds case.
+    const GIT_CORPUS: &[&str] = &[
+        "build/o", "build/sub/o", "src/build/o", "src/rebuild.rs", "rebuild.rs", "a.log",
+        "src/a.log", "src/b.log", "logs/x.txt", "log", "src/log.txt", ".env",
+        "src/.env", "src/environment.md", "node_modules/x/i.js", "doc/a/b/c.md", "doc/c.md", "doc/x.md",
+        "foo/bar/baz.txt", "a/b/foo/x", "xd/foo", "space name.txt", "trail ", "re:foo",
+        "!bang", "#hash", "[x]", "x", "q?x", "qax",
+        "star*x", "starx", "keep/keep.txt", "keep/drop.txt", "deep/a/b/c/d.txt", "deep/d.txt",
+        "Foo.TXT", "out", "src/out/o", "{a,b}", "a.js",
+        "a.ts", "back\\slash", "abc/def", "ab/cd", "bb.log", "cb.log",
+        "_.log", "-.log", "target/debug/x", "vendor/lib/a.log", "vendor/lib/keep.log",
+    ];
+
+    /// (case, its ignore files as (path, content), the files git ignores)
+    const GIT_CASES: &[(&str, &[(&str, &str)], &[&str])] = &[
+        ("basename-build", &[(".gitignore", "build\n")],
+         &["build/o", "build/sub/o", "src/build/o"]),
+        ("dir-only", &[(".gitignore", "build/\nout/\n")],
+         &["build/o", "build/sub/o", "src/build/o", "src/out/o"]),
+        ("anchored", &[(".gitignore", "/build\n/out\n")],
+         &["build/o", "build/sub/o", "out"]),
+        ("star-log", &[(".gitignore", "*.log\n")],
+         &["-.log", "_.log", "a.log", "bb.log", "cb.log", "src/a.log", "src/b.log", "vendor/lib/a.log", "vendor/lib/keep.log"]),
+        ("log-word", &[(".gitignore", "log\n")],
+         &["log"]),
+        ("dstar-prefix", &[(".gitignore", "**/build\n")],
+         &["build/o", "build/sub/o", "src/build/o"]),
+        ("dstar-suffix", &[(".gitignore", "build/**\n")],
+         &["build/o", "build/sub/o"]),
+        ("dstar-middle", &[(".gitignore", "doc/**/c.md\n")],
+         &["doc/a/b/c.md", "doc/c.md"]),
+        ("dir-star", &[(".gitignore", "doc/*\n")],
+         &["doc/a/b/c.md", "doc/c.md", "doc/x.md"]),
+        ("a-dstar-x", &[(".gitignore", "a/**/x\n")],
+         &["a/b/foo/x"]),
+        ("slash-middle", &[(".gitignore", "foo/bar\n")],
+         &["foo/bar/baz.txt"]),
+        ("star", &[(".gitignore", "*\n")],
+         &["!bang", "#hash", "-.log", ".env", ".gitignore", "Foo.TXT", "[x]", "_.log", "a.js", "a.log", "a.ts", "a/b/foo/x", "ab/cd", "abc/def", "back\\slash", "bb.log", "build/o", "build/sub/o", "cb.log", "deep/a/b/c/d.txt", "deep/d.txt", "doc/a/b/c.md", "doc/c.md", "doc/x.md", "foo/bar/baz.txt", "keep/drop.txt", "keep/keep.txt", "log", "logs/x.txt", "node_modules/x/i.js", "out", "q?x", "qax", "re:foo", "rebuild.rs", "space name.txt", "src/.env", "src/a.log", "src/b.log", "src/build/o", "src/environment.md", "src/log.txt", "src/out/o", "src/rebuild.rs", "star*x", "starx", "target/debug/x", "trail ", "vendor/lib/a.log", "vendor/lib/keep.log", "x", "xd/foo", "{a,b}"]),
+        ("whitelist", &[(".gitignore", "*\n!*/\n!keep/keep.txt\n")],
+         &["!bang", "#hash", "-.log", ".env", ".gitignore", "Foo.TXT", "[x]", "_.log", "a.js", "a.log", "a.ts", "a/b/foo/x", "ab/cd", "abc/def", "back\\slash", "bb.log", "build/o", "build/sub/o", "cb.log", "deep/a/b/c/d.txt", "deep/d.txt", "doc/a/b/c.md", "doc/c.md", "doc/x.md", "foo/bar/baz.txt", "keep/drop.txt", "log", "logs/x.txt", "node_modules/x/i.js", "out", "q?x", "qax", "re:foo", "rebuild.rs", "space name.txt", "src/.env", "src/a.log", "src/b.log", "src/build/o", "src/environment.md", "src/log.txt", "src/out/o", "src/rebuild.rs", "star*x", "starx", "target/debug/x", "trail ", "vendor/lib/a.log", "vendor/lib/keep.log", "x", "xd/foo", "{a,b}"]),
+        ("whitelist-dir", &[(".gitignore", "/*\n!/src\n")],
+         &["!bang", "#hash", "-.log", ".env", ".gitignore", "Foo.TXT", "[x]", "_.log", "a.js", "a.log", "a.ts", "a/b/foo/x", "ab/cd", "abc/def", "back\\slash", "bb.log", "build/o", "build/sub/o", "cb.log", "deep/a/b/c/d.txt", "deep/d.txt", "doc/a/b/c.md", "doc/c.md", "doc/x.md", "foo/bar/baz.txt", "keep/drop.txt", "keep/keep.txt", "log", "logs/x.txt", "node_modules/x/i.js", "out", "q?x", "qax", "re:foo", "rebuild.rs", "space name.txt", "star*x", "starx", "target/debug/x", "trail ", "vendor/lib/a.log", "vendor/lib/keep.log", "x", "xd/foo", "{a,b}"]),
+        ("reinclude-in-dir", &[(".gitignore", "keep/*\n!keep/keep.txt\n")],
+         &["keep/drop.txt"]),
+        ("no-reinclude-ex-dir", &[(".gitignore", "build/\n!build/o\n")],
+         &["build/o", "build/sub/o", "src/build/o"]),
+        ("escaped-bang", &[(".gitignore", "\\!bang\n")],
+         &["!bang"]),
+        ("escaped-hash", &[(".gitignore", "\\#hash\n")],
+         &["#hash"]),
+        ("escaped-class", &[(".gitignore", "\\[x\\]\n")],
+         &["[x]"]),
+        ("class-x", &[(".gitignore", "[x]\n")],
+         &["a/b/foo/x", "node_modules/x/i.js", "target/debug/x", "x"]),
+        ("escaped-q", &[(".gitignore", "q\\?x\n")],
+         &["q?x"]),
+        ("q-wild", &[(".gitignore", "q?x\n")],
+         &["q?x", "qax"]),
+        ("space-inner", &[(".gitignore", "space name.txt\n")],
+         &["space name.txt"]),
+        ("trailing-spaces", &[(".gitignore", "a.log   \n")],
+         &["a.log", "src/a.log", "vendor/lib/a.log"]),
+        ("escaped-trail", &[(".gitignore", "trail\\ \n")],
+         &["trail "]),
+        ("re-literal", &[(".gitignore", "re:foo\n")],
+         &["re:foo"]),
+        ("re-escaped", &[(".gitignore", "\\re:foo\n")],
+         &["re:foo"]),
+        ("case-sensitive", &[(".gitignore", "*.TXT\n")],
+         &["Foo.TXT"]),
+        ("dstar-all", &[(".gitignore", "**\n")],
+         &["!bang", "#hash", "-.log", ".env", ".gitignore", "Foo.TXT", "[x]", "_.log", "a.js", "a.log", "a.ts", "a/b/foo/x", "ab/cd", "abc/def", "back\\slash", "bb.log", "build/o", "build/sub/o", "cb.log", "deep/a/b/c/d.txt", "deep/d.txt", "doc/a/b/c.md", "doc/c.md", "doc/x.md", "foo/bar/baz.txt", "keep/drop.txt", "keep/keep.txt", "log", "logs/x.txt", "node_modules/x/i.js", "out", "q?x", "qax", "re:foo", "rebuild.rs", "space name.txt", "src/.env", "src/a.log", "src/b.log", "src/build/o", "src/environment.md", "src/log.txt", "src/out/o", "src/rebuild.rs", "star*x", "starx", "target/debug/x", "trail ", "vendor/lib/a.log", "vendor/lib/keep.log", "x", "xd/foo", "{a,b}"]),
+        ("star-slash", &[(".gitignore", "*/\n")],
+         &["a/b/foo/x", "ab/cd", "abc/def", "build/o", "build/sub/o", "deep/a/b/c/d.txt", "deep/d.txt", "doc/a/b/c.md", "doc/c.md", "doc/x.md", "foo/bar/baz.txt", "keep/drop.txt", "keep/keep.txt", "logs/x.txt", "node_modules/x/i.js", "src/.env", "src/a.log", "src/b.log", "src/build/o", "src/environment.md", "src/log.txt", "src/out/o", "src/rebuild.rs", "target/debug/x", "vendor/lib/a.log", "vendor/lib/keep.log", "xd/foo"]),
+        ("deep-dstar", &[(".gitignore", "deep/**/d.txt\n")],
+         &["deep/a/b/c/d.txt", "deep/d.txt"]),
+        ("deep-a-dstar", &[(".gitignore", "deep/a/**\n")],
+         &["deep/a/b/c/d.txt"]),
+        ("q-og", &[(".gitignore", "?og\n")],
+         &["log"]),
+        ("range", &[(".gitignore", "[a-c].log\n")],
+         &["a.log", "src/a.log", "src/b.log", "vendor/lib/a.log"]),
+        ("neg-class", &[(".gitignore", "[!b].log\n")],
+         &["-.log", "_.log", "a.log", "src/a.log", "vendor/lib/a.log"]),
+        ("caret-class", &[(".gitignore", "[^b]b.log\n")],
+         &["cb.log"]),
+        ("posix-class", &[(".gitignore", "[[:alpha:]].log\n")],
+         &["a.log", "src/a.log", "src/b.log", "vendor/lib/a.log"]),
+        ("dash-class", &[(".gitignore", "[-_].log\n")],
+         &["-.log", "_.log"]),
+        ("bracket-first", &[(".gitignore", "[]x]\n")],
+         &["a/b/foo/x", "node_modules/x/i.js", "target/debug/x", "x"]),
+        ("unclosed-class", &[(".gitignore", "[x\n")],
+         &[]),
+        ("src-star-log", &[(".gitignore", "src/*.log\n")],
+         &["src/a.log", "src/b.log"]),
+        ("dstar-foo-x", &[(".gitignore", "**/foo/x\n")],
+         &["a/b/foo/x"]),
+        ("braces-literal", &[(".gitignore", "*.{js,ts}\n{a,b}\n")],
+         &["{a,b}"]),
+        ("star-in-name", &[(".gitignore", "star\\*x\n")],
+         &["star*x"]),
+        ("backslash-trailing", &[(".gitignore", "log\\\n")],
+         &[]),
+        ("backslash-name", &[(".gitignore", "back\\\\slash\n")],
+         &["back\\slash"]),
+        ("triple-star", &[(".gitignore", "a/***/x\n")],
+         &["a/b/foo/x"]),
+        ("star-dstar-mid", &[(".gitignore", "a**b\nab**\n")],
+         &["ab/cd", "abc/def"]),
+        ("crlf", &[(".gitignore", "build\r\nlog\r\n")],
+         &["build/o", "build/sub/o", "log", "src/build/o"]),
+        ("comment-blank", &[(".gitignore", "# c\n\n   \nbuild\n")],
+         &["build/o", "build/sub/o", "src/build/o"]),
+        ("nested-basic", &[("src/.gitignore", "*.log\n!a.log\n")],
+         &["src/b.log"]),
+        ("nested-anchored", &[("doc/.gitignore", "/c.md\n")],
+         &["doc/c.md"]),
+        ("nested-override", &[(".gitignore", "*.log\n"), ("vendor/lib/.gitignore", "!keep.log\n")],
+         &["-.log", "_.log", "a.log", "bb.log", "cb.log", "src/a.log", "src/b.log", "vendor/lib/a.log"]),
+        ("nested-vs-root", &[(".gitignore", "!src/b.log\n"), ("src/.gitignore", "*.log\n")],
+         &["src/a.log", "src/b.log"]),
+        ("nested-in-ignored", &[(".gitignore", "vendor/\n"), ("vendor/lib/.gitignore", "!a.log\n")],
+         &["vendor/lib/.gitignore", "vendor/lib/a.log", "vendor/lib/keep.log"]),
+        ("dstar-anchored-file", &[(".gitignore", "/**/o\n")],
+         &["build/o", "build/sub/o", "src/build/o", "src/out/o"]),
+        ("dir-only-dstar", &[(".gitignore", "**/build/\n")],
+         &["build/o", "build/sub/o", "src/build/o"]),
+        ("middle-slash-dir", &[(".gitignore", "target/debug/\n")],
+         &["target/debug/x"]),
+        ("dot-start", &[(".gitignore", ".*\n")],
+         &[".env", ".gitignore", "src/.env"]),
+        ("neg-then-pos", &[(".gitignore", "!a.log\n*.log\n")],
+         &["-.log", "_.log", "a.log", "bb.log", "cb.log", "src/a.log", "src/b.log", "vendor/lib/a.log", "vendor/lib/keep.log"]),
+    ];
+
+    #[test]
+    fn a_rule_is_case_sensitive_on_every_volume() {
+        let rules = ignore_rules_from(None).unwrap();
+        let gitignores = [(".gitignore", "*.TXT\nBuild/\n")];
+        assert!(walk_excludes(&rules, &gitignores, "Foo.TXT", false, false));
+        assert!(!walk_excludes(&rules, &gitignores, "foo.txt", false, false));
+        assert!(!walk_excludes(&rules, &gitignores, "build/x", false, false));
+        assert!(!walk_excludes(&rules_of("re:a\\.log\n"), &[], "A.log", false, false));
     }
 
     #[test]
     fn a_user_rule_covers_only_untracked_paths_and_their_descendants() {
-        let rules = IgnoreRules {
-            built_in: get_default_ignored_paths().unwrap(),
-            user: parse_ignore_file("^build$\n\\.log$\n").unwrap(),
-        };
-        let excludes = |key: &str, tracked: bool| {
-            let parent = key.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("");
-            rules.excludes(key, tracked, rules.coverage_of(parent))
-        };
+        let rules = rules_of("build/\n*.log\n");
+        let excludes = |key: &str, is_directory: bool, tracked: bool| walk_excludes(&rules, &[], key, is_directory, tracked);
 
         // A tracked path is never excluded by a user rule, an untracked one is.
-        assert!(!excludes("build", true));
-        assert!(excludes("build", false));
-        assert!(!excludes("a/x.log", true));
-        assert!(excludes("a/x.log", false));
-        // Coverage is inherited: the rule matches only the folder's key, not the file's.
-        assert!(excludes("build/new.txt", false));
-        assert!(excludes("build/sub/new.txt", false));
-        assert!(!excludes("build/new.txt", true));
-        assert!(!excludes("src/main.rs", false));
+        assert!(!excludes("build", true, true));
+        assert!(excludes("build", true, false));
+        assert!(!excludes("a/x.log", false, true));
+        assert!(excludes("a/x.log", false, false));
+        // Coverage is inherited, even below a tracked folder the rule excludes.
+        assert!(excludes("build/new.txt", false, false));
+        assert!(excludes("build/sub/new.txt", false, false));
+        assert!(!excludes("build/new.txt", false, true));
+        assert!(!excludes("src/main.rs", false, false));
+        // A directory-only rule never matches a file of that name.
+        assert!(!excludes("build", false, false));
     }
 
     #[test]
-    fn ignore_rules_refuse_conflict_markers_and_match_everything_patterns() {
-        let rules = parse_ignore_file("# comment\n\n^build(/.*)?$\n\\.log$\n").unwrap();
-        assert_eq!(rules.len(), 2);
+    fn the_root_ignore_file_is_stronger_than_every_gitignore() {
+        let gitignores = [(".gitignore", "*.log\n!keep.txt\n"), ("src/.gitignore", "!a.log\ngen/\n")];
 
+        // Without it, the deeper `.gitignore` wins over the root one.
+        let rules = ignore_rules_from(None).unwrap();
+        assert!(walk_excludes(&rules, &gitignores, "b.log", false, false));
+        assert!(!walk_excludes(&rules, &gitignores, "src/a.log", false, false));
+        assert!(walk_excludes(&rules, &gitignores, "src/gen/x", false, false));
+
+        // It overrides both, whichever way, and a gitignore line in it is anchored to the root.
+        let rules = rules_of("src/a.log\n!/b.log\n!src/gen/\n");
+        assert!(walk_excludes(&rules, &gitignores, "src/a.log", false, false));
+        assert!(!walk_excludes(&rules, &gitignores, "b.log", false, false));
+        assert!(!walk_excludes(&rules, &gitignores, "src/gen/x", false, false));
+        assert!(walk_excludes(&rules, &gitignores, "src/b.log", false, false));
+
+        // Nothing re-includes a path below an excluded directory.
+        let rules = rules_of("vendor/\n!vendor/keep\n");
+        assert!(walk_excludes(&rules, &[], "vendor/keep", false, false));
+    }
+
+    #[test]
+    fn a_regex_line_matches_the_whole_key_and_an_escaped_one_is_a_glob() {
+        let rules = rules_of("re:src/[a-z]+\\.gen\nre:build\nre:logs/.*\n!re:logs/keep(/.*)?\n");
+        assert!(walk_excludes(&rules, &[], "src/main.gen", false, false));
+        // Anchored at both ends: no substring, no other depth.
+        assert!(!walk_excludes(&rules, &[], "lib/src/main.gen", false, false));
+        assert!(!walk_excludes(&rules, &[], "src/main.gen.rs", false, false));
+        assert!(!walk_excludes(&rules, &[], "rebuild", false, false));
+        assert!(walk_excludes(&rules, &[], "build", true, false));
+        // A negated regex re-includes, except below an excluded directory.
+        assert!(!walk_excludes(&rules, &[], "logs/keep", true, false));
+        assert!(!walk_excludes(&rules, &[], "logs/keep/x", false, false));
+        assert!(walk_excludes(&rules, &[], "logs/x", false, false));
+        assert!(walk_excludes(&rules, &[], "build/keep", false, false));
+
+        // `\re:` is the literal name, as git reads it, and `re:` means nothing in a `.gitignore`.
+        let rules = rules_of("\\re:foo\n");
+        assert!(walk_excludes(&rules, &[], "re:foo", false, false) && walk_excludes(&rules, &[], "a/re:foo", false, false));
+        assert!(!walk_excludes(&rules, &[], "foo", false, false));
+        let rules = ignore_rules_from(None).unwrap();
+        assert!(walk_excludes(&rules, &[(".gitignore", "re:fo+\n")], "re:fo+", false, false));
+        assert!(!walk_excludes(&rules, &[(".gitignore", "re:fo+\n")], "foo", false, false));
+    }
+
+    #[test]
+    fn the_git_rule_ignores_every_git_folder_and_no_file_removes_it() {
+        let gitignores = [(".gitignore", "!.git\n!.git/\n")];
+        let rules = rules_of("!.git\n!re:(.*/)?\\.git\n");
+        for key in [".git", "sub/.git", "a/b/.git"] {
+            assert!(walk_excludes(&rules, &gitignores, key, true, false), "{}", key);
+            assert!(walk_excludes(&rules, &gitignores, &format!("{}/HEAD", key), false, false), "{}", key);
+        }
+        // Only the exact name.
+        for key in [".github", ".gitignore", ".gitmodules", "a/.git2", "x.git"] {
+            assert!(!walk_excludes(&rules, &gitignores, key, true, false), "{}", key);
+        }
+        // A tracked `.git` stays tracked, and the untracked content below it stays covered.
+        assert!(!walk_excludes(&rules, &[], ".git", true, true));
+        assert!(walk_excludes(&rules, &[], ".git/config", false, false));
+        assert!(!walk_excludes(&rules, &[], ".git/config", false, true));
+    }
+
+    #[test]
+    fn a_gitignore_inside_an_excluded_directory_is_not_read() {
+        let rules = rules_of("vendor/\n");
+        let context = rules.enter(&RuleContext::above_root(), "", || Ok(None)).unwrap();
+        let context = rules.enter(&context, "vendor", || panic!("an excluded directory's .gitignore was read")).unwrap();
+        assert!(rules.excludes("vendor/x", false, false, &context));
+    }
+
+    #[test]
+    fn every_ignore_file_refuses_conflict_markers() {
         for marker in ["<<<<<<< ours", "||||||| base", "=======", ">>>>>>> theirs"] {
-            let error = parse_ignore_file(&format!("^a$\n{}\n", marker)).unwrap_err();
-            assert!(error.contains("unresolved conflict marker on line 2"), "{}: {}", marker, error);
-        }
-        for pattern in [".*", "x*", "a|", "|"] {
-            let error = parse_ignore_file(&format!("{}\n", pattern)).unwrap_err();
-            assert!(error.contains("matches the empty string"), "{}: {}", pattern, error);
+            let error = parse_ignore_lines(&format!("a\n{}\n", marker), FILENAME_IGNORE, IgnoreFileKind::Forklift).unwrap_err();
+            assert!(error.contains("\".forkliftignore\" has an unresolved conflict marker on line 2"), "{}: {}", marker, error);
+            let rules = ignore_rules_from(None).unwrap();
+            let content = format!("a\n{}\n", marker);
+            let error = rules.enter(&RuleContext::above_root(), "src", || Ok(Some(content))).err().unwrap();
+            assert!(error.contains("\"src/.gitignore\" has an unresolved conflict marker on line 2"), "{}: {}", marker, error);
         }
     }
 
     #[test]
-    fn a_blank_ignore_line_is_skipped_and_whitespace_around_a_pattern_is_refused() {
-        // A whitespace-only line compiled as a pattern matches every path holding that whitespace.
-        for blank in [" ", "\t", "  \t "] {
-            let rules = parse_ignore_file(&format!("^x$\n{}\n", blank)).unwrap();
-            assert_eq!(rules.len(), 1, "{:?}", blank);
-            assert!(!rules.iter().any(|rule| rule.matches("a b.txt")), "{:?}", blank);
+    fn a_regex_line_refuses_matching_the_empty_string_and_a_glob_line_never_does() {
+        let forklift = |content: &str| parse_ignore_lines(content, FILENAME_IGNORE, IgnoreFileKind::Forklift);
+        for regex in [".*", "x*", "a|", "|", "(a)?"] {
+            let error = forklift(&format!("re:{}\n", regex)).unwrap_err();
+            assert!(error.contains("matches the empty string"), "{}: {}", regex, error);
+            let error = forklift(&format!("!re:{}\n", regex)).unwrap_err();
+            assert!(error.contains("matches the empty string"), "{}: {}", regex, error);
         }
+        let error = forklift("re:(\n").unwrap_err();
+        assert!(error.contains("line 1"), "{}", error);
+        // As gitignore lines these are ordinary patterns.
+        assert_eq!(forklift("# comment\n\n.*\nx*\n").unwrap().len(), 2);
+    }
 
-        // Whitespace around a pattern is refused, naming the line, rather than trimmed or kept.
-        for (content, line) in [("^a$\n^b$ \n", 2), (" ^a$\n", 1), ("  # note\n", 1)] {
-            let error = parse_ignore_file(content).unwrap_err();
-            assert!(error.contains(&format!("line {}: the pattern", line)) && error.contains("starts or ends with whitespace"),
+    #[test]
+    fn a_glob_line_that_reads_as_an_anchored_regex_is_refused_in_the_root_file_only() {
+        let forklift = |content: &str| parse_ignore_lines(content, FILENAME_IGNORE, IgnoreFileKind::Forklift);
+        for line in ["^target", "target$", "^target$", "!^keep", "!keep$", "^x  ", "a\\\\$"] {
+            let error = forklift(&format!("ok\n{}\n", line)).unwrap_err();
+            assert!(error.contains("line 2") && error.contains("reads as a regex") && error.contains("re:"), "{:?}: {}", line, error);
+        }
+        // Escaped, the character is part of a name; inside, it never was an anchor; as a regex
+        // line it is one; and a `.gitignore` means what git means.
+        for line in ["\\^target", "target\\$", "a^b", "a$b", "re:^target$", "!re:keep$"] {
+            assert_eq!(forklift(&format!("{}\n", line)).unwrap().len(), 1, "{:?}", line);
+        }
+        let rules = rules_of("\\^t\nt\\$\n");
+        assert!(walk_excludes(&rules, &[], "^t", false, false) && walk_excludes(&rules, &[], "t$", false, false));
+        assert!(!walk_excludes(&rules, &[], "t", false, false));
+        assert_eq!(parse_ignore_lines("^target$\n", FILENAME_GITIGNORE, IgnoreFileKind::Gitignore).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn whitespace_is_trimmed_from_a_glob_line_and_refused_around_a_regex() {
+        let forklift = |content: &str| parse_ignore_lines(content, FILENAME_IGNORE, IgnoreFileKind::Forklift);
+        // A whitespace-only line is no rule, in either file.
+        for blank in [" ", "  ", "\u{00A0}"] {
+            assert!(forklift(&format!("{}\n", blank)).unwrap().is_empty(), "{:?}", blank);
+        }
+        assert!(parse_ignore_lines("   \n", FILENAME_GITIGNORE, IgnoreFileKind::Gitignore).unwrap().is_empty());
+
+        // A glob line's trailing spaces are trimmed as git trims them, unless escaped.
+        let rules = rules_of("a.log   \ntrail\\ \n");
+        assert!(walk_excludes(&rules, &[], "a.log", false, false));
+        assert!(walk_excludes(&rules, &[], "trail ", false, false) && !walk_excludes(&rules, &[], "trail", false, false));
+
+        // Whitespace around a regex is refused, naming the line, rather than trimmed or kept.
+        for (content, line) in [("re:a\nre:b \n", 2), ("re: a\n", 1), ("!re:a\u{00A0}\n", 1)] {
+            let error = forklift(content).unwrap_err();
+            assert!(error.contains(&format!("line {}: the regex", line)) && error.contains("starts or ends with whitespace"),
                 "{:?}: {}", content, error);
         }
+        assert!(forklift("re:a \n").unwrap_err().contains(r"write it as \x20"));
+        assert!(forklift("re:a\u{00A0}\n").unwrap_err().contains(r"write it as \x{A0}"));
 
-        // A space inside a pattern, or spelled as the escape the refusal suggests, still matches.
-        let rules = parse_ignore_file("^a b\\.txt$\n\\x20x$\n").unwrap();
-        assert_eq!(rules.iter().map(|rule| (rule.line, rule.pattern.as_str())).collect::<Vec<_>>(),
-            [(1, "^a b\\.txt$"), (2, "\\x20x$")]);
-        assert!(rules[0].matches("a b.txt") && !rules[0].matches("ab.txt"));
-        assert!(rules[1].matches("dir/a x") && !rules[1].matches("dir/ax"));
+        // A space inside a regex, or spelled as its escape, still matches.
+        let rules = rules_of("re:a b\\.txt\nre:.*/\\x20x\n");
+        assert!(walk_excludes(&rules, &[], "a b.txt", false, false) && !walk_excludes(&rules, &[], "ab.txt", false, false));
+        assert!(walk_excludes(&rules, &[], "dir/ x", false, false) && !walk_excludes(&rules, &[], "dir/x", false, false));
 
-        // A CRLF file reads as its lines, so its line endings are not whitespace around a pattern.
-        assert_eq!(parse_ignore_file("^a$\r\n^b$\r\n").unwrap().len(), 2);
-
-        // The refusal names the character, so an invisible one is nameable, and its escape.
-        let error = parse_ignore_file("^a$\u{00A0}\n").unwrap_err();
-        assert!(error.contains("whitespace (U+00A0)") && error.contains(r"write it as \x{A0}"), "{}", error);
-        assert!(parse_ignore_file("^a$ \n").unwrap_err().contains(r"write it as \x20"));
+        // A CRLF file reads as its lines.
+        assert_eq!(forklift("re:a\r\nb\r\n").unwrap().len(), 2);
     }
 
     #[test]
-    fn a_control_character_in_an_ignore_pattern_is_refused_and_a_leading_bom_is_skipped() {
+    fn a_control_character_in_the_root_ignore_file_is_refused_and_a_leading_bom_is_skipped() {
+        let forklift = |content: &str| parse_ignore_lines(content, FILENAME_IGNORE, IgnoreFileKind::Forklift);
         // Each is refused wherever it stands, by code point, with the remedy that fits it. Bare-CR
         // line endings read as one line whose rules would never match; a format character makes
         // a rule silently dead, or display as another.
         for (content, c, remedy) in [
-            ("^a$\r^b$\n", "U+000D", "newline line endings"), ("^a$\r", "U+000D", "newline line endings"),
-            ("^a\tb$\n", "U+0009", r"write it as \t"), ("^a$\t\n", "U+0009", r"write it as \t"),
-            ("^a\u{1b}b$\n", "U+001B", r"write it as \x{1B}"),
-            ("^build$\u{200B}\n", "U+200B", r"write it as \x{200B}"),
-            ("^src/\u{202E}a$\n", "U+202E", r"write it as \x{202E}"),
-            ("\u{FEFF}\u{FEFF}^a$\n", "U+FEFF", r"write it as \x{FEFF}"),
+            ("a\rb\n", "U+000D", "newline line endings"), ("re:a\r", "U+000D", "newline line endings"),
+            ("re:a\tb\n", "U+0009", r"write it as \t if the regex needs it"),
+            ("a\tb\n", "U+0009", r"match it with a re: line that writes it as \t"),
+            ("re:a\u{1b}b\n", "U+001B", r"write it as \x{1B}"),
+            ("build\u{200B}\n", "U+200B", r"match it with a re: line that writes it as \x{200B}"),
+            ("re:src/\u{202E}a\n", "U+202E", r"write it as \x{202E} if the regex needs it"),
+            ("\u{FEFF}\u{FEFF}a\n", "U+FEFF", r"writes it as \x{FEFF}"),
         ] {
-            let error = parse_ignore_file(content).unwrap_err();
+            let error = forklift(content).unwrap_err();
             assert!(error.contains("line 1: the pattern") && error.contains(&format!("invisible or control character ({})", c))
                 && error.contains(remedy), "{:?}: {}", content, error);
         }
 
         // A byte order mark is an encoding marker, not part of the first rule or comment.
-        let rules = parse_ignore_file("\u{FEFF}^build(/.*)?$\n").unwrap();
-        assert_eq!(rules[0].pattern, "^build(/.*)?$");
-        assert!(rules[0].matches("build"));
-        assert!(parse_ignore_file("\u{FEFF}# note\n").unwrap().is_empty());
+        let rules = rules_of("\u{FEFF}build\n");
+        assert!(walk_excludes(&rules, &[], "build", true, false));
+        assert!(forklift("\u{FEFF}# note\n").unwrap().is_empty());
         // The format characters real names hold are not refused where a name holds them: the
         // joiners of an emoji sequence and of Persian script, the tags of a flag emoji.
         for name in ["photos/\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}.jpg", "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}",
                      "\u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}.png"] {
-            let rules = parse_ignore_file(&format!("^{}$\n", regex::escape(name))).unwrap();
-            assert!(rules[0].matches(name), "{:?}", name);
+            let rules = rules_of(&format!("/{}\n", name));
+            assert!(walk_excludes(&rules, &[], name, false, false), "{:?}", name);
+            let rules = rules_of(&format!("re:{}\n", regex::escape(name)));
+            assert!(walk_excludes(&rules, &[], name, false, false), "{:?}", name);
         }
         // Anywhere else they are invisible text that leaves the rule dead or disguised, as is a
         // soft hyphen, which hyphenated copied text leaves behind.
         for (content, c) in [
-            ("^build$\u{E0062}\u{E0075}\u{E007F}\n", "U+E0062"), ("^build\u{1F3F4}\u{E0062}$\n", "U+E0062"),
-            ("^\u{1F3F4}\u{E0067}\u{E007F}\u{E0062}$\n", "U+E0067"), ("^build$\u{200D}\n", "U+200D"),
-            ("\u{200C}^build$\n", "U+200C"), ("^a\u{200D}\u{200D}b$\n", "U+200D"), ("^build\u{200D}$\n", "U+200D"),
-            ("^\u{200C}build$\n", "U+200C"), ("^src/\u{200D}gen$\n", "U+200D"), ("^a\u{200D}b$\n", "U+200D"), ("^co\u{AD}op$\n", "U+00AD"),
+            ("build\u{E0062}\u{E0075}\u{E007F}\n", "U+E0062"), ("build\u{1F3F4}\u{E0062}\n", "U+E0062"),
+            ("\u{1F3F4}\u{E0067}\u{E007F}\u{E0062}\n", "U+E0067"), ("build\u{200D}\n", "U+200D"),
+            ("\u{200C}build\n", "U+200C"), ("a\u{200D}\u{200D}b\n", "U+200D"), ("re:build\u{200D}\n", "U+200D"),
+            ("re:\u{200C}build\n", "U+200C"), ("src/\u{200D}gen\n", "U+200D"), ("a\u{200D}b\n", "U+200D"), ("co\u{AD}op\n", "U+00AD"),
         ] {
-            let error = parse_ignore_file(content).unwrap_err();
+            let error = forklift(content).unwrap_err();
             assert!(error.contains(&format!("invisible or control character ({})", c)), "{:?}: {}", content, error);
         }
 
         // Past the start of the file it is no encoding marker, and is refused.
-        let error = parse_ignore_file("^a$\n\u{FEFF}^b$\n").unwrap_err();
+        let error = forklift("a\n\u{FEFF}b\n").unwrap_err();
         assert!(error.contains("line 2: the pattern") && error.contains("(U+FEFF)"), "{}", error);
-    }
 
-    #[test]
-    fn the_covering_rule_is_the_one_coverage_reports() {
-        let rules = ignore_rules_from(Some("^x$\n^\\.git($|/)\n^build$\n")).unwrap();
-        assert_eq!(rules.covering_rule(".git").map(|rule| rule.line), Some(2));
-        assert_eq!(rules.covering_rule("build/sub").map(|rule| (rule.line, rule.pattern.as_str())), Some((3, "^build$")));
-        assert!(rules.covering_rule("src").is_none() && !rules.coverage_of("src").0);
-        assert!(rules.coverage_of("build/sub").0);
-
-        // The first in file order, of two rules matching one key.
-        let rules = ignore_rules_from(Some("^\\.git$\n^\\.g\n")).unwrap();
-        assert_eq!(rules.covering_rule(".git").map(|rule| rule.line), Some(1));
-        // The nearest key first: the rule matching the key itself, before one matching its parent.
-        let rules = ignore_rules_from(Some("^a$\n^a/b$\n")).unwrap();
-        assert_eq!(rules.covering_rule("a/b").map(|rule| rule.line), Some(2));
+        // A `.gitignore` refuses none of these: it means in forklift what it means in git.
+        assert_eq!(parse_ignore_lines("a\tb\nbuild\u{200B}\n", FILENAME_GITIGNORE, IgnoreFileKind::Gitignore).unwrap().len(), 2);
     }
 
     #[test]

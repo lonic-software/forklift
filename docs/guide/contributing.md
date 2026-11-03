@@ -162,7 +162,7 @@ Cutting a release: `pult release` picks the next patch/minor/major from the late
 tag (or run `bin/release <x.y.z> --dry-run` to preflight without touching anything). It
 refuses unless the working tree is clean, `main` is in sync with `origin/main`, and
 [`CHANGELOG.md`](../../CHANGELOG.md) has entries under **Unreleased**, which it then rolls into the new
-version. A pull request that changes something a user would notice adds its entry there.
+version. What earns an entry is listed in [§8](#8-keeping-docs-in-sync).
 
 ---
 
@@ -343,8 +343,25 @@ maintained alongside the code.
 
 ## 8. Keeping docs in sync
 
-Documentation is part of the change, not a follow-up. When a change alters:
+Documentation is part of the change, not a follow-up. Some of it is checked: the generated docs,
+the format census, the guide pages and the links fail CI when stale. The rest is checked by nobody,
+and has been missed for that reason, so a pull request's description says which of the entries below
+it touched, or that none applied. When a change alters:
 
+- **anything a user of a release would notice** → add an entry under **Unreleased** in
+  [`CHANGELOG.md`](../../CHANGELOG.md), in the same pull request. That means:
+  - a command, flag, alias, exit code or `--json` field added, removed or changed in meaning, and any
+    `--json` schema bump (update the schema number the entry names);
+  - an on-disk or wire format change, above all one that makes existing warehouses or remotes
+    refuse;
+  - behaviour a user relies on, such as what is tracked, ignored, staged, refused or overwritten;
+  - a fix to data loss, a security property or trust verification, named on its own line;
+  - something removed.
+
+  Leave out what no user can observe: refactors, tests, CI, internal speed-ups without a measured
+  user-visible effect, and docs-only changes. Many small fixes of one kind share one line. Write
+  for someone deciding whether to upgrade, not as a diff summary; a pull request title is not an
+  entry;
 - **a command's flags, name, or behavior** → update [`cli.md`](cli.md), and run `bin/gen-docs`
   when its name, alias or one-line help changed;
 - **anything [`tutorial.md`](tutorial.md) or [`concepts.md`](concepts.md) runs or shows** →
@@ -360,7 +377,12 @@ Documentation is part of the change, not a follow-up. When a change alters:
   [`../MACHINE_INTERFACE.md`](../MACHINE_INTERFACE.md);
 - **a byte format** → update the spec in [`../format/`](../format/);
 - **a design decision** → record it in [`../DESIGN.html`](../DESIGN.html) with a
-  dated changelog row.
+  dated changelog row (the design's own history, which is not `CHANGELOG.md`), and flip the
+  feature's status chip in its §5 when it lands;
+- **the parallelism of an operation** → update its status in
+  [`../PARALLELIZATION_PLAN.md`](../PARALLELIZATION_PLAN.md);
+- **a performance item listed in [`../PERFORMANCE_BACKLOG.md`](../PERFORMANCE_BACKLOG.md) or a
+  number in [`../BENCHMARK.md`](../BENCHMARK.md)** → update the entry, with the measurement.
 
 The guides intentionally *reference* rather than duplicate `SERVER.md`,
 `MACHINE_INTERFACE.md`, `DESIGN.html`, and `format/`, so there's a single place to

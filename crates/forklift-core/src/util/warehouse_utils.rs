@@ -1483,8 +1483,7 @@ mod tests {
             let name = staging.file_name().unwrap().to_str().unwrap();
             for key in [format!("{}{}", key_prefix, name), format!("{}{}/lock", key_prefix, name),
                         format!("{}{}/.forklift/config/warehouse.toml", key_prefix, name)] {
-                let parent = key.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("");
-                assert!(rules.excludes(&key, false, rules.coverage_of(parent)), "{} must be ignored", key);
+                assert!(rules.excludes(&key, false, false, &file_utils::RuleContext::above_root()), "{} must be ignored", key);
             }
 
             prepare_at(&root).unwrap();

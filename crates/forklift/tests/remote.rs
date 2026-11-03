@@ -508,7 +508,7 @@ fn the_ignore_file_travels_with_the_pallet() {
     let area = TestArea::new("ignore-file-travels");
     let server = Server::start(&area, None);
 
-    let rules = "# build output\n^build(/.*)?$\n";
+    let rules = "# build output\n/build\n";
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/.forkliftignore", rules);
     area.write_file("a/src.txt", "src\n");
@@ -529,7 +529,7 @@ fn the_ignore_file_travels_with_the_pallet() {
     assert!(stdout(&status).contains("matches the inventory"), "{}", stdout(&status));
 
     // An edit to the rules is a change like any other, and reaches the other side.
-    let widened = "# build output\n^build(/.*)?$\n\\.log$\n";
+    let widened = "# build output\n/build\n*.log\n";
     area.write_file("a/.forkliftignore", widened);
     assert_success(&area.forklift("a", &["load", ".forkliftignore"]));
     assert_success(&area.forklift("a", &["stack", "-m", "ignore logs"]));
@@ -545,7 +545,7 @@ fn a_prepared_warehouse_lowers_the_tracked_ignore_file() {
     let area = TestArea::new("ignore-file-lowered");
     let server = Server::start(&area, None);
 
-    let rules = "^build(/.*)?$\n";
+    let rules = "/build\n";
     prepare_warehouse(&area, "a", &server.url);
     area.write_file("a/.forkliftignore", rules);
     area.write_file("a/src.txt", "src\n");
@@ -571,7 +571,7 @@ fn a_sparse_franchise_keeps_the_root_ignore_file_in_scope() {
     let area = TestArea::new("sparse-ignore-file");
     let server = Server::start(&area, None);
 
-    let rules = "^src/build(/.*)?$\n";
+    let rules = "/src/build\n";
     prepare_warehouse(&area, "dev", &server.url);
     area.write_file("dev/.forkliftignore", rules);
     area.write_file("dev/README", "readme v1\n");
@@ -602,7 +602,7 @@ fn a_sparse_franchise_keeps_the_root_ignore_file_in_scope() {
     assert!(stdout(&status).contains("matches the inventory"), "{}", stdout(&status));
 
     // An edit to the rules made in the sparse checkout stacks, lifts and reaches a full one.
-    let widened = "^src/build(/.*)?$\n\\.log$\n";
+    let widened = "/src/build\n*.log\n";
     area.write_file("sparse/.forkliftignore", widened);
     assert_success(&area.forklift("sparse", &["load", ".forkliftignore"]));
     assert_success(&area.forklift("sparse", &["stack", "-m", "ignore logs"]));
@@ -613,7 +613,7 @@ fn a_sparse_franchise_keeps_the_root_ignore_file_in_scope() {
     assert_eq!(area.read_file("dev/docs/guide.md"), "guide v1\n");
 
     // And an edit made on the full side reaches the sparse one.
-    let narrowed = "^src/build(/.*)?$\n";
+    let narrowed = "/src/build\n";
     area.write_file("dev/.forkliftignore", narrowed);
     area.write_file("dev/README", "readme v2\n");
     assert_success(&area.forklift("dev", &["load", "."]));
@@ -636,7 +636,7 @@ fn a_sparse_checkout_unstages_the_root_ignore_file_and_narrows_past_an_edit_to_i
     let area = TestArea::new("sparse-ignore-file-verbs");
     let server = Server::start(&area, None);
 
-    let rules = "^src/build(/.*)?$\n";
+    let rules = "/src/build\n";
     prepare_warehouse(&area, "dev", &server.url);
     area.write_file("dev/.forkliftignore", rules);
     area.write_file("dev/src/a.txt", "a v1\n");
@@ -650,7 +650,7 @@ fn a_sparse_checkout_unstages_the_root_ignore_file_and_narrows_past_an_edit_to_i
 
     // A staged edit to the rules unstages back to the head's version, by name and as part of
     // the root folder — the folder form rebuilds the root shard, whose files are on the spine.
-    area.write_file("sparse/.forkliftignore", "^src/build(/.*)?$\n\\.log$\n");
+    area.write_file("sparse/.forkliftignore", "/src/build\n*.log\n");
     assert_success(&area.forklift("sparse", &["load", ".forkliftignore"]));
     assert_success(&area.forklift("sparse", &["unload", ".forkliftignore"]));
     assert_success(&area.forklift("sparse", &["load", ".forkliftignore"]));
@@ -665,7 +665,7 @@ fn a_sparse_checkout_unstages_the_root_ignore_file_and_narrows_past_an_edit_to_i
     // The edit is still on disk, unstaged; narrowing "docs" away is not blocked by it.
     assert_success(&area.forklift("sparse", &["scope", "narrow", "docs"]));
     assert!(!area.path("sparse/docs").exists(), "the narrowed prefix is de-materialized");
-    assert_eq!(area.read_file("sparse/.forkliftignore"), "^src/build(/.*)?$\n\\.log$\n",
+    assert_eq!(area.read_file("sparse/.forkliftignore"), "/src/build\n*.log\n",
         "the unstaged edit to the rules survives the narrow");
 }
 
@@ -678,7 +678,7 @@ fn a_sparse_warehouse_with_an_unversioned_scope_file_is_refused() {
     let server = Server::start(&area, None);
 
     prepare_warehouse(&area, "dev", &server.url);
-    area.write_file("dev/.forkliftignore", "^src/build(/.*)?$\n");
+    area.write_file("dev/.forkliftignore", "/src/build\n");
     area.write_file("dev/src/a.txt", "a v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
     assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
@@ -8250,7 +8250,7 @@ fn narrow_refuses_to_delete_an_edited_tracked_file_a_rule_covers() {
     assert_success(&area.forklift(".",
         &["clone", &server.url, "sparse", "--only", "src/api", "--only", "docs"]));
 
-    std::fs::write(area.path("sparse/.forkliftignore"), "^docs/gen\\.txt$\n").unwrap();
+    std::fs::write(area.path("sparse/.forkliftignore"), "/docs/gen.txt\n").unwrap();
     std::fs::write(area.path("sparse/docs/gen.txt"), "gen v2 (unsaved)\n").unwrap();
 
     let refused = area.forklift("sparse", &["--json", "scope", "narrow", "docs"]);
