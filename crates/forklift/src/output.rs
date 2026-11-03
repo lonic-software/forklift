@@ -854,12 +854,12 @@ pub struct ForkliftError {
 }
 
 impl ForkliftError {
-    /// A classified error with a next step.
+    /// A classified error with a next step. A blank step is none, as for a refusal.
     pub fn new(code: ErrorCode, message: impl Into<String>, next_step: impl Into<String>) -> ForkliftError {
         ForkliftError {
             code,
             message: message.into(),
-            next_step: Some(next_step.into()),
+            next_step: Some(next_step.into()).filter(|step| !step.trim().is_empty()),
             details: None,
         }
     }
@@ -1195,6 +1195,9 @@ mod tests {
 
         let refusal = CoreError::refusal(forklift_core::error::RefusalCode::OutOfScope, "It failed.", "forklift lower");
         assert_eq!(ForkliftError::from(refusal).next_step.as_deref(), Some("forklift lower"));
+
+        assert_eq!(ForkliftError::new(ErrorCode::Generic, "It failed.", " ").next_step, None);
+        assert_eq!(ForkliftError::new(ErrorCode::Generic, "It failed.", "forklift lower").next_step.as_deref(), Some("forklift lower"));
     }
 
     /// Each closure reason gets its own sentence, and the JSON value names it the same way the
