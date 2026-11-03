@@ -645,11 +645,11 @@ fn parse_trust_anchor(content: &str) -> Result<TrustAnchor, String> {
 
     match doc.get("version").map(|item| item.as_integer()) {
         Some(Some(TRUST_VERSION)) => {}
-        None => return Err("The trust file has no \"version\" entry; an older version of Forklift wrote it.".to_string()),
+        None => return Err("The trust file has no version entry; an older version of Forklift wrote it.".to_string()),
         Some(Some(version)) => return Err(format!(
             "The trust file has version {}, which this version of Forklift does not read.", version
         )),
-        Some(None) => return Err("The trust file's \"version\" entry is present but is not an integer.".to_string()),
+        Some(None) => return Err("The trust file's version entry is present but is not an integer.".to_string()),
     }
 
     let genesis = read_string(&doc, "genesis", "trust file")?;
@@ -2586,11 +2586,11 @@ pub(crate) mod tests {
         assert_eq!(parse_trust_anchor(&encoded).unwrap().genesis, "genesis-hash");
 
         let unversioned = encoded.replacen("version = 1\n", "", 1);
-        let error = parse_trust_anchor(&unversioned).err().expect("an unversioned trust file must be refused");
-        assert!(error.contains("no \"version\" entry"), "{}", error);
+        let error = parse_trust_anchor(&unversioned).expect_err("an unversioned trust file must be refused");
+        assert!(error.contains("no version entry"), "{}", error);
 
         let newer = encoded.replacen("version = 1\n", "version = 2\n", 1);
-        let error = parse_trust_anchor(&newer).err().expect("a trust file at another version must be refused");
+        let error = parse_trust_anchor(&newer).expect_err("a trust file at another version must be refused");
         assert!(error.contains("version 2"), "{}", error);
     }
 

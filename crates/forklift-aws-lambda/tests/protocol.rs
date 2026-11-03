@@ -1614,8 +1614,9 @@ fn batch_offloads_the_bundle_to_a_presigned_url() {
 fn sized_objects(count: usize, size: usize, seed: &str) -> Vec<(String, Vec<u8>)> {
     (0..count)
         .map(|i| {
-            let mut bytes = format!("{seed}-{i}-").into_bytes();
-            bytes.resize(size, b'x');
+            let mut content = format!("{seed}-{i}-").into_bytes();
+            content.resize(size, b'x');
+            let bytes = object_utils::blob_bytes(&content);
             (object_utils::hash_object_bytes(&bytes), bytes)
         })
         .collect()
