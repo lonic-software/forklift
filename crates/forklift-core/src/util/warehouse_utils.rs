@@ -1042,6 +1042,9 @@ const GIT_SELF_IGNORE: &str = "# Written by Forklift, so that git never tracks t
 /// file in any folder of its tree, so this needs no write to the repository's own `.git`. One found
 /// there is kept as it is, whatever it holds: the user may have written it.
 ///
+/// Written like a configuration file, not like a store object: a standing durability taint, which
+/// a configuration write is often the first step out of, must not refuse it.
+///
 /// # Returns
 /// * `Ok(())`      - The file is there.
 /// * `Err(String)` - It could not be checked or written.
@@ -1050,7 +1053,7 @@ pub fn write_git_self_ignore(forklift: &Path) -> Result<(), String> {
 
     match std::fs::symlink_metadata(&path) {
         Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => file_utils::write_file_atomically(&path, GIT_SELF_IGNORE.as_bytes())
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => file_utils::replace_file_atomically(&path, GIT_SELF_IGNORE.as_bytes())
             .map_err(|e| format!("Error while creating \"{}\": {}", path.to_string_lossy(), e)),
         Err(e) => Err(format!("Error while checking \"{}\": {}", path.to_string_lossy(), e)),
     }
