@@ -1,3 +1,4 @@
+// FORK-379 measurement: a forklift-core change (reverted before merge).
 //! Forklift's base logic: objects, inventory, refs, diff/merge, and the trust stack.
 //!
 //! This crate is shared by every head (the client CLI, the server, the serverless
