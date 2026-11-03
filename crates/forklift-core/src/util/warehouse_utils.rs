@@ -986,6 +986,9 @@ fn fill(forklift: &Path, shown: &Path) -> Result<(Vec<String>, Vec<PathBuf>), St
     // Not a note: it is no piece a user asked for, and an open makes it again when it is missing.
     lock_utils::create_format_lock(forklift)?;
 
+    // Not a note either, for the same reason; a prepare run again writes it back.
+    write_git_self_ignore(forklift)?;
+
     let (from, to) = (forklift.to_string_lossy().into_owned(), shown.to_string_lossy().into_owned());
     let respell = |path: &str| match path.strip_prefix(&*from) {
         Some(rest) => format!("{}{}", to, rest),
@@ -1024,6 +1027,36 @@ fn fill(forklift: &Path, shown: &Path) -> Result<(Vec<String>, Vec<PathBuf>), St
     }
 
     Ok((notes, created))
+}
+
+/// The git ignore file in a `.forklift` folder ([`write_git_self_ignore`]).
+pub const FILE_NAME_GIT_SELF_IGNORE: &str = ".gitignore";
+
+/// What [`write_git_self_ignore`] writes: one rule that ignores every entry beside it, itself
+/// included, so git lists nothing of the folder.
+const GIT_SELF_IGNORE: &str = "# Written by Forklift, so that git never tracks this folder.\n*\n";
+
+/// Write a git ignore file into the `.forklift` folder `forklift` unless one is there, so a git
+/// working tree the folder stands in never stages it: `git add -A` would otherwise sweep up a
+/// warehouse's configuration, its remote token included, or a bay's redirect. Git reads an ignore
+/// file in any folder of its tree, so this needs no write to the repository's own `.git`. One found
+/// there is kept as it is, whatever it holds: the user may have written it.
+///
+/// Written like a configuration file, not like a store object: a standing durability taint, which
+/// a configuration write is often the first step out of, must not refuse it.
+///
+/// # Returns
+/// * `Ok(())`      - The file is there.
+/// * `Err(String)` - It could not be checked or written.
+pub fn write_git_self_ignore(forklift: &Path) -> Result<(), String> {
+    let path = forklift.join(FILE_NAME_GIT_SELF_IGNORE);
+
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => file_utils::replace_file_atomically(&path, GIT_SELF_IGNORE.as_bytes())
+            .map_err(|e| format!("Error while creating \"{}\": {}", path.to_string_lossy(), e)),
+        Err(e) => Err(format!("Error while checking \"{}\": {}", path.to_string_lossy(), e)),
+    }
 }
 
 /// Whether `path` is a folder itself, not a link to one, with nothing in it.
