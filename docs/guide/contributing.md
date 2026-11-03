@@ -95,6 +95,17 @@ Notes:
   for a shared core; `cargo nextest run --profile ci --test-threads $((2 * $(nproc 2>/dev/null || sysctl -n hw.ncpu)))`
   reproduces that load locally (the `ci` profile gives the crash suite's kill
   tests two slots each, which only pays at that thread count).
+- CI (`.github/workflows/ci.yml`) splits the tests across runners: one on Linux,
+  two on macOS and four on Windows, each running its share with nextest's
+  `--partition count:K/N`. Doc-tests, Clippy and the guards run once per OS in
+  a separate `lint (<os>)` job. The `ci passed` check is green only when every
+  share, every lint job and the generated-docs check passed, or the run was
+  docs-only; gate a merge on it, not on the individual shares. To rerun the share
+  that failed, say `test (windows-latest, 3/4)`, locally:
+  `cargo nextest run --workspace --profile ci --partition count:3/4`. Which tests
+  land in a share depends only on the list of tests, so `cargo nextest list
+  --partition count:3/4` shows it on any OS, apart from tests that only exist on
+  some platforms.
 - On macOS, `.cargo/config.toml` builds with `-Csplit-debuginfo=packed`: debuginfo
   goes into a `.dSYM` beside each binary instead of object files left in
   `target/debug/deps`. Under the default, every incremental rebuild leaves fresh

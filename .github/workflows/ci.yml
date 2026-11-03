@@ -1,6 +1,7 @@
-# Forklift CI: build + test on Linux, macOS and Windows, plus the formatting guard on Linux, and a
-# check that docs/generated matches what the code generates.
-# Every leg installs rustfmt, though only the Linux one runs the guard; it is one small component.
+# Forklift CI: build + test on Linux, macOS and Windows, the tests split across several runners per
+# OS; doc-tests, Clippy and the guards once per OS; and a check that docs/generated matches what the
+# code generates. `ci passed` sums them up into one check.
+# Every lint leg installs rustfmt, though only the Linux one runs the guard; it is one small component.
 #
 # All dependencies come from crates.io (the private CodeArtifact registry became
 # unnecessary when the CLI moved from `rust-cli-core` to clap), so no credentials or
@@ -31,10 +32,9 @@ env:
 
 jobs:
   # Docs-only pull requests skip the build and tests. This is decided here rather than with
-  # `paths-ignore`, because a workflow that never starts reports no checks at all, and a matrix
-  # job skipped as a whole reports one check under its unexpanded name. Either would leave a
-  # required `test (<os>)` check waiting forever. Instead every matrix job always runs and
-  # reports, and only its steps are skipped.
+  # `paths-ignore`, because a workflow that never starts reports no checks at all, which would
+  # leave `ci passed` (the check to gate on, at the end) waiting forever. Instead the test and lint
+  # jobs are skipped, and `ci passed` accepts the skip only when this job decided it.
   changes:
     # Pushes to main always test; a skipped classifier reads as "code changed" below.
     if: github.event_name == 'pull_request'
@@ -99,61 +99,58 @@ jobs:
       - name: Check docs/generated is current
         run: ./bin/gen-docs --check
 
+  # The test suite, split across runners. A runner's test phase is short of cores rather than
+  # slow per test (on 2026-11-03 Windows summed 3,540 s of tests into 469 s on 4 cores), so each
+  # extra runner divides it almost evenly. Each OS's entries list its share as partition/partitions;
+  # nextest's `count` scheme deals every test binary's tests round-robin across them, which spreads
+  # a binary's slow tests (the crash suite's kill tests) over all of them. Replaying that run's
+  # per-test times over the three schemes put the slowest Windows share at 142–144 s for every one,
+  # against a single longest test of 123 s, so more Windows shares buy little until that test is
+  # faster. To change a count, edit the entries; `ci passed` fails a run whose shares for an OS are
+  # not exactly 1/N to N/N.
   test:
-    name: test (${{ matrix.os }})
+    name: test (${{ matrix.os }}${{ matrix.partitions > 1 && format(', {0}/{1}', matrix.partition, matrix.partitions) || '' }})
     needs: changes
-    # Run even when `changes` was skipped (a push) or failed: a classifier that cannot decide
-    # must test, not leave the required checks unreported.
-    if: ${{ !cancelled() }}
+    # Run when `changes` was skipped (a push) or failed too: a classifier that cannot decide must
+    # test. Only one that succeeded and said `false` skips, and `ci passed` accepts the skip then.
+    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    # A docs-only run only has to report its check, so it does not need the OS it is named after.
-    runs-on: ${{ (needs.changes.result == 'success' && needs.changes.outputs.code == 'false') && 'ubuntu-latest' || matrix.os }}
-    # A hang anywhere in the job (doc-tests included, which nextest does not run) fails here
-    # rather than at GitHub's six-hour limit. A cold-cache Windows run takes about fifteen.
+        include:
+          - { os: ubuntu-latest, partition: 1, partitions: 1 }
+          - { os: macos-latest, partition: 1, partitions: 2 }
+          - { os: macos-latest, partition: 2, partitions: 2 }
+          - { os: windows-latest, partition: 1, partitions: 4 }
+          - { os: windows-latest, partition: 2, partitions: 4 }
+          - { os: windows-latest, partition: 3, partitions: 4 }
+          - { os: windows-latest, partition: 4, partitions: 4 }
+    runs-on: ${{ matrix.os }}
+    # A hang anywhere in the job fails here rather than at GitHub's six-hour limit. A cold-cache
+    # Windows run compiles for about eight minutes before its tests start.
     timeout-minutes: 40
-    env:
-      # Only a classifier that succeeded and said `false` skips; anything else tests. Every
-      # step below is gated on this one value, since a job cannot skip its steps but still
-      # report its check any other way.
-      SKIP_TESTS: ${{ needs.changes.result == 'success' && needs.changes.outputs.code == 'false' }}
     steps:
-      - name: Docs-only change
-        if: env.SKIP_TESTS == 'true'
-        run: echo "Docs-only change, build and tests skipped."
-
       - uses: actions/checkout@v4
-        if: env.SKIP_TESTS != 'true'
 
       - name: Install stable Rust
-        if: env.SKIP_TESTS != 'true'
-        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
+        run: rustup toolchain install stable --profile minimal && rustup default stable
 
-      # The tree is formatted by hand and rustfmt.toml switches rustfmt off; bin/fmt-guard fails if
-      # that guard is missing, or if a second rustfmt config would override it. Its answer does not
-      # depend on the OS, so one leg runs it.
-      - name: Formatting guard
-        if: env.SKIP_TESTS != 'true' && matrix.os == 'ubuntu-latest'
-        run: ./bin/fmt-guard
-
+      # One OS's shares build the same thing under the same cache key, and a key is saved once;
+      # the first share saves it so the others do not race to upload the same files.
       - uses: Swatinem/rust-cache@v2
-        if: env.SKIP_TESTS != 'true'
+        with:
+          save-if: ${{ matrix.partition == 1 }}
 
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
-        if: env.SKIP_TESTS != 'true'
         with:
           tool: cargo-nextest@0.9.146
 
       - name: Build
-        if: env.SKIP_TESTS != 'true'
         run: cargo build --verbose
 
       # nextest runs every test in its own process and the test binaries in parallel, so one
       # slow binary no longer holds up the rest.
       - name: Test
-        if: env.SKIP_TESTS != 'true'
         # Twice as many test threads as cores: many tests spend their time waiting (on a timeout,
         # a server, a child process), not computing, so the default of one per core leaves cores
         # idle. The ci profile gives the crash suite's kill tests two slots each
@@ -165,18 +162,44 @@ jobs:
             ''|0|*[!0-9]*) echo "could not count cores (got '$cores')"; exit 1 ;;
           esac
           echo "cores=$cores test-threads=$(( cores * 2 ))"
-          cargo nextest run --workspace --no-fail-fast --profile ci --test-threads "$(( cores * 2 ))"
+          cargo nextest run --workspace --no-fail-fast --profile ci --test-threads "$(( cores * 2 ))" \
+            --partition "count:${{ matrix.partition }}/${{ matrix.partitions }}"
 
-      # nextest does not run doc-tests.
+  # What is not split: doc-tests (nextest does not run them), Clippy and the guards, once per OS,
+  # beside the test shares rather than on one of them, so no share runs longer than the rest.
+  lint:
+    name: lint (${{ matrix.os }})
+    needs: changes
+    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
+
+      # The tree is formatted by hand and rustfmt.toml switches rustfmt off; bin/fmt-guard fails if
+      # that guard is missing, or if a second rustfmt config would override it. Its answer does not
+      # depend on the OS, so one leg runs it.
+      - name: Formatting guard
+        if: matrix.os == 'ubuntu-latest'
+        run: ./bin/fmt-guard
+
+      - uses: Swatinem/rust-cache@v2
+
       - name: Doc-tests
-        if: env.SKIP_TESTS != 'true'
         run: cargo test --workspace --doc --no-fail-fast
 
       - name: Clippy
-        if: env.SKIP_TESTS != 'true'
         # Style-level lint debt is tracked separately; deny only warnings that indicate
         # correctness issues once the doc-comment cleanup lands. For now, report-only.
         # --all-targets so clippy.toml's bans reach test code too.
+        if: ${{ !cancelled() }}
         run: cargo clippy --workspace --all-targets
 
       # CI builds with the config's rustflags switched off (see RUSTFLAGS above), so this checks
@@ -187,7 +210,7 @@ jobs:
       # cargo's own "-Csplit-debuginfo=unpacked" after it. It runs last so a failure here does not
       # hide what the doc-tests and Clippy would report, and after a failed step too.
       - name: Split debuginfo guard
-        if: ${{ !cancelled() && env.SKIP_TESTS != 'true' && runner.os == 'macOS' }}
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
         shell: bash
         run: |
           probe="$RUNNER_TEMP/split-debuginfo-probe"
@@ -203,3 +226,65 @@ jobs:
           packed=$(count)
           echo "object files left in deps: $default with cargo's default, $packed with the config"
           [ "$default" -gt 0 ] && [ "$packed" -eq 0 ]
+
+  # The one check to gate a merge on. It needs every job above and passes only when each one
+  # passed, or was skipped for a reason that is not a failure: `changes` is skipped on pushes, and
+  # the test and lint jobs are skipped when `changes` succeeded and found a docs-only change. A
+  # matrix job reports one check per entry, and a skipped one a single check under its unexpanded
+  # name, so gating on this name stays the same however the shares are cut.
+  ci-passed:
+    name: ci passed
+    needs: [changes, generated-docs, test, lint]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - name: Check every job
+        shell: bash
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          CODE: ${{ needs.changes.outputs.code }}
+          DOCS: ${{ needs.generated-docs.result }}
+          TEST: ${{ needs.test.result }}
+          LINT: ${{ needs.lint.result }}
+        run: |
+          echo "changes=$CHANGES (code=$CODE) generated-docs=$DOCS test=$TEST lint=$LINT"
+          docs_only=false
+          [ "$CHANGES" = success ] && [ "$CODE" = false ] && docs_only=true
+          ok=true
+          case "$CHANGES" in success|skipped) ;; *) ok=false ;; esac
+          [ "$DOCS" = success ] || ok=false
+          for result in "$TEST" "$LINT"; do
+            if [ "$result" = success ] || { [ "$result" = skipped ] && [ "$docs_only" = true ]; }; then
+              :
+            else
+              ok=false
+            fi
+          done
+          [ "$ok" = true ]
+
+      # A share left out of the matrix would drop its tests without failing anything, so this
+      # reads the names of the test jobs that ran and requires each OS's shares to be exactly
+      # 1/N to N/N (a single unsplit job counts as 1/1).
+      - name: Check the test shares
+        if: ${{ needs.test.result == 'success' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=latest" \
+            --jq '.jobs[].name' > jobs.txt
+          python3 - jobs.txt <<'PY'
+          import re, sys
+          shares = {}
+          for name in open(sys.argv[1]).read().splitlines():
+              m = re.fullmatch(r"test \((\S+?)(?:, (\d+)/(\d+))?\)", name)
+              if m:
+                  shares.setdefault(m[1], []).append((int(m[2] or 1), int(m[3] or 1)))
+          print(shares)
+          bad = [os for os, got in shares.items()
+                 if sorted(got) != [(k, got[0][1]) for k in range(1, got[0][1] + 1)]]
+          if not shares or bad:
+              sys.exit(f"incomplete test shares: {bad or 'no test jobs found'}")
+          PY
