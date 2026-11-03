@@ -101,8 +101,9 @@ sparse walks branch on):
   folder above a prefix. Every non-full scope holds them, so that a sparse checkout always has
   the rules that apply to what it holds and ignores what a full checkout ignores there. Fully
   materialized: descended, staged, verified and merged exactly as a full workspace would. An
-  implicit member is not a declared prefix, so a scope never requires it to be a directory,
-  and one at or under a prefix, or above one, is not a member: the prefix already decides it.
+  implicit member is not a declared prefix, so a scope never requires it to be a directory
+  unless a prefix runs through it, and one at or under a prefix is not listed: the prefix holds
+  it already. A directory of a member's name is in scope whole.
   For prefixes `src/api` and `docs`, the members are `.forkliftignore`, `.gitignore` and
   `src/.gitignore`; `src/web/.gitignore` beside the prefix stays out of scope. Narrowing a
   scope drops each member no kept prefix still needs, with the prefixes.

@@ -46,9 +46,9 @@ pub fn handle_command() -> Result<(), String> {
         bay: globals::active_bay(),
         scoped: !bay_scope.is_full(),
         checkout_scope: bay_scope.prefixes().to_vec(),
-        implicit_scope: bay_scope.implicit_members().iter().map(|path| path.to_string()).collect(),
+        implicit_scope: bay_scope.implicit_members().to_vec(),
         fetch_scope: fetch_scope.prefixes().to_vec(),
-        implicit_fetch_scope: fetch_scope.implicit_members().iter().map(|path| path.to_string()).collect(),
+        implicit_fetch_scope: fetch_scope.implicit_members().to_vec(),
     });
 
     Ok(())

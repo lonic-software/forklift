@@ -817,6 +817,35 @@ fn narrow_takes_a_spine_gitignore_it_no_longer_needs_and_refuses_while_it_is_edi
     assert_eq!(area.read_file("dev/src/api/a.txt"), "a v1\n");
 }
 
+/// What leaves on a narrow is what the narrowed scope stops holding: a dropped prefix a kept one
+/// still holds takes nothing with it.
+///
+/// Revert: remove a dropped prefix a kept one holds → the edit is lost.
+#[test]
+fn narrow_removes_only_what_leaves_the_scope() {
+    let area = TestArea::new("sparse-narrow-leaves");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/lib/sub/s.txt", "s v1\n");
+    area.write_file("dev/docs/guide.md", "guide v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "lib", "--only", "lib/sub", "--only", "docs"]));
+
+    // lib still holds lib/sub, so dropping it removes nothing and keeps the edit in it.
+    area.write_file("sparse/lib/sub/s.txt", "s v2\n");
+    assert_success(&area.forklift("sparse", &["scope", "narrow", "lib/sub"]));
+    assert_eq!(area.read_file("sparse/lib/sub/s.txt"), "s v2\n");
+    let status = area.forklift("sparse", &["--json", "stocktake"]);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert_eq!(json["data"]["unstaged"], serde_json::json!([{"kind": "modified", "path": "lib/sub/s.txt"}]), "{}", stdout(&status));
+    assert_success(&area.forklift("sparse", &["load", "lib/sub/s.txt"]));
+    assert_success(&area.forklift("sparse", &["stack", "-m", "s v2"]));
+}
+
 /// A scope file written before the root ignore file joined every scope is refused on read, rather
 /// than read under today's meaning — under which the never-inventoried ignore file would show as
 /// a removal and the next stack would commit it.

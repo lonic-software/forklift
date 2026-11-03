@@ -92,8 +92,12 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
     scope_utils::set_bay_scope(&narrowed)?;
 
     // De-materialize each dropped subtree: drop its staged shards (so it stops being reported),
-    // then remove its working files. No object-store deletion — narrow frees nothing.
+    // then remove its working files. No object-store deletion — narrow frees nothing. A dropped
+    // prefix a kept one still holds (`a/b` beside a kept `a`) stays in scope, so nothing of it goes.
     for prefix in &dropped {
+        if narrowed.classify(prefix) == ScopeClass::InScope {
+            continue;
+        }
         inventory_utils::remove_inventories_under(prefix)?;
         remove_working_subtree(prefix)?;
     }
@@ -172,8 +176,18 @@ async fn ensure_narrow_targets_are_clean(current: &PathScope,
         return Err(scope_utils::narrow_unclean_refusal(&named(&change.path), "uncommitted tracked changes"));
     }
 
+    // An untracked folder is reported whole, as `dir/`: it blocks when it is leaving itself or
+    // holds a dropped prefix or a member that is, which goes with what is untracked in it.
+    let leaving_targets: Vec<&str> = dropped.iter().chain(leaving_members).map(String::as_str)
+        .filter(|target| leaving(target))
+        .collect();
+    let untracked_leaving = |path: &str| {
+        let key = path.strip_suffix('/').unwrap_or(path);
+        leaving(key) || (key.len() < path.len()
+            && leaving_targets.iter().any(|target| scope_utils::is_strictly_under(target, key)))
+    };
     let untracked: Vec<&str> = unstaged.iter()
-        .filter(|change| change.kind == ChangeKind::Untracked && leaving(&change.path))
+        .filter(|change| change.kind == ChangeKind::Untracked && untracked_leaving(&change.path))
         .map(|change| change.path.as_str())
         .collect();
 

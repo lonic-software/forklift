@@ -215,10 +215,10 @@ impl PathScope {
         // In scope: at or under some in-scope prefix, or an implicit member (an ignore file, so a
         // sparse checkout always holds the rules that apply to it). A directory of that name is in
         // scope whole, as on a full warehouse, where it is ordinary content (or, for the root
-        // ignore file, refused when the rules are read); no member is a place the scope needs a
-        // directory, so this never shadows a spine. `requires_directory` and `subset_of` reason
-        // over the declared prefixes only: every member of a subset's scope is in scope for the
-        // superset, because each ancestor of a prefix is under or above the prefix holding it.
+        // ignore file, refused when the rules are read), even when a prefix runs through it.
+        // `requires_directory` and `subset_of` reason over the declared prefixes only: every
+        // member of a subset's scope is a member of the superset's or under one of its prefixes,
+        // since the superset holds a prefix at or above each of the subset's.
         for prefix in self.prefixes.iter().chain(&self.implicit).map(String::as_str) {
             if is_at_or_under(path, prefix) {
                 return ScopeClass::InScope;
@@ -241,7 +241,7 @@ impl PathScope {
     /// declared as a directory). A tree that has a *file* at such a path is a type change the
     /// sparse scope cannot reason about (§3.1) — the caller refuses with `scope_path_type_changed`.
     pub fn requires_directory(&self, path: &str) -> bool {
-        self.classify(path) == ScopeClass::Spine || self.prefixes.iter().any(|prefix| prefix == path)
+        self.prefixes.iter().any(|prefix| prefix == path || is_strictly_under(prefix, path))
     }
 
     /// Whether this scope is a subset (⊆) of `other` — every path this scope materializes is
@@ -326,9 +326,11 @@ impl PathScope {
 }
 
 /// The implicit members of a scope with these normalized prefixes (see
-/// [`PathScope::implicit_members`]). A candidate at or above a prefix is left out, since the scope
-/// needs a directory there (`a/.gitignore` for the prefix `a/.gitignore/b`), and so is one under a
-/// prefix, which holds it already.
+/// [`PathScope::implicit_members`]). A candidate at or under a prefix is left out, since the prefix
+/// holds it already. One above a prefix (`a/.gitignore` for the prefix `a/.gitignore/b`) stays a
+/// member, so a directory of that name is in scope whole whichever other prefixes the scope has:
+/// leaving it out would make a subset scope, lacking the prefix through it, hold more of it than
+/// the superset does.
 fn implicit_members_of(prefixes: &[String]) -> Vec<String> {
     use crate::util::file_utils::{FILENAME_GITIGNORE, FILENAME_IGNORE};
 
@@ -347,7 +349,7 @@ fn implicit_members_of(prefixes: &[String]) -> Vec<String> {
     }
 
     members.into_iter()
-        .filter(|member| !prefixes.iter().any(|prefix| is_at_or_under(prefix, member) || is_at_or_under(member, prefix)))
+        .filter(|member| !prefixes.iter().any(|prefix| is_at_or_under(member, prefix)))
         .collect()
 }
 
@@ -1006,32 +1008,39 @@ mod tests {
             assert_eq!(scope.classify(path), ScopeClass::OutOfScope, "{}", path);
         }
 
-        // A prefix through a folder of that name keeps the folder a spine: the scope needs a
-        // directory there, so it is no member, and nothing beside the prefix inside it is in scope.
+        // A folder of that name is in scope whole, even with a prefix through it, which still
+        // requires it to be a directory: the member does not depend on the other prefixes.
         let through = PathScope::from_prefixes(["a/.gitignore/b"]);
-        assert_eq!(through.implicit_members(), &[".forkliftignore", ".gitignore", "a/.gitignore/.gitignore"]);
-        assert_eq!(through.classify("a/.gitignore"), ScopeClass::Spine);
+        assert_eq!(through.implicit_members(), &[".forkliftignore", ".gitignore", "a/.gitignore", "a/.gitignore/.gitignore"]);
+        assert_eq!(through.classify("a/.gitignore"), ScopeClass::InScope);
         assert!(through.requires_directory("a/.gitignore"));
-        assert_eq!(through.classify("a/.gitignore/c"), ScopeClass::OutOfScope);
+        assert_eq!(through.classify("a/.gitignore/c"), ScopeClass::InScope);
 
         // The full scope holds everything and lists nothing.
         assert!(PathScope::full().implicit_members().is_empty());
     }
 
-    /// A bay's scope within the fetch scope holds no implicit member the fetch scope lacks, so a
-    /// bay never checks out an ignore file the warehouse never fetched.
+    /// A bay's scope within the fetch scope holds no implicit member the fetch scope lacks, nor
+    /// anything inside a folder of a member's name, so a bay never checks out content the
+    /// warehouse never fetched.
+    ///
+    /// Revert: leave a candidate above a prefix out of the members → the fetch scope holding a
+    /// prefix through `F/.gitignore` reads `F/.gitignore/z` as sealed while the bay holds it.
     #[test]
     fn a_subset_scope_holds_no_member_its_superset_lacks() {
         for (bay, fetch) in [
             (vec!["src/api/v1"], vec!["src/api"]),
             (vec!["src/api/v1", "docs/x"], vec!["src", "docs"]),
             (vec!["a/b/c/d"], vec!["a/b/c/d", "e"]),
+            (vec!["F/x"], vec!["F/x", "F/.gitignore/y"]),
         ] {
             let bay = PathScope::from_prefixes(bay);
             let fetch = PathScope::from_prefixes(fetch);
             assert!(bay.subset_of(&fetch));
             for member in bay.implicit_members() {
-                assert_eq!(fetch.classify(member), ScopeClass::InScope, "{} of {:?} in {:?}", member, bay, fetch);
+                for path in [member.clone(), format!("{}/z", member)] {
+                    assert_eq!(fetch.classify(&path), ScopeClass::InScope, "{} of {:?} in {:?}", path, bay, fetch);
+                }
             }
         }
     }
