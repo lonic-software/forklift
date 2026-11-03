@@ -8,7 +8,10 @@
 //!
 //! The table comes from `--table` or `FORKLIFT_DYNAMODB_TABLE`, the region and credentials from the
 //! usual AWS environment, and `--endpoint-url` (or `FORKLIFT_AWS_ENDPOINT_URL`) points it at another
-//! endpoint. Each warehouse is upgraded in turn, and the run stops at the first that fails.
+//! endpoint. Each warehouse is upgraded in turn; one that fails is reported and the rest are still
+//! upgraded, since every warehouse not yet upgraded is refused. The exit status is non-zero if any
+//! failed. `--takeover` takes over the upgrades on record of the warehouses it names, so it is never
+//! given with `--all`: a run still upgrading some other warehouse would be taken over too.
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -60,6 +63,10 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Arguments, String> {
     }
 
     let table = table.ok_or("no table: pass --table or set FORKLIFT_DYNAMODB_TABLE")?;
+
+    if all && takeover {
+        return Err("--takeover takes over only the warehouses it names; it is never given with --all".to_string());
+    }
 
     match (all, warehouses.is_empty()) {
         (true, false) => Err("name warehouses or pass --all, not both".to_string()),
@@ -123,6 +130,7 @@ fn run(arguments: &Arguments, dynamodb: forklift_aws_lambda::aws::DynamoOps, bri
     }
 
     let options = UpgradeOptions { owner: request_token(), takeover: arguments.takeover, wait: arguments.wait };
+    let mut failed = 0;
 
     for warehouse in &warehouses {
         let store = DynamoRefStore::new(
@@ -133,10 +141,21 @@ fn run(arguments: &Arguments, dynamodb: forklift_aws_lambda::aws::DynamoOps, bri
             bridge.clone(),
         );
 
-        for line in format::upgrade(&store, &CHAIN, warehouse, &options)?.summary() {
-            println!("{}", line);
+        match format::upgrade(&store, &CHAIN, warehouse, &options) {
+            Ok(report) => {
+                for line in report.summary() {
+                    println!("{}", line);
+                }
+            }
+            Err(error) => {
+                eprintln!("{}", error);
+                failed += 1;
+            }
         }
     }
 
-    Ok(())
+    match failed {
+        0 => Ok(()),
+        _ => Err(format!("{} of {} warehouses were not upgraded.", failed, warehouses.len())),
+    }
 }

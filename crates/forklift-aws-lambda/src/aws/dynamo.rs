@@ -80,6 +80,7 @@
 //! and the refusal is read back off that same layout. See `ConditionedTransaction`.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use aws_sdk_dynamodb::config::retry::RetryConfig;
 use aws_sdk_dynamodb::config::timeout::TimeoutConfig;
@@ -1002,10 +1003,23 @@ impl RefStore for DynamoRefStore {
     }
 }
 
+/// The waits before each attempt of a format swap: the first at once, then backing off past what
+/// a burst of pushes holds the format item for.
+const FORMAT_SWAP_WAITS: [Duration; 6] = [
+    Duration::ZERO,
+    Duration::from_millis(100),
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+];
+
 impl FormatStore for DynamoRefStore {
     /// One conditional write of the format item, as a single-action transaction: this crate
-    /// issues every conditional write through `TransactWriteItems`. A transient refusal is an
-    /// error, and the operator runs the upgrade again, resuming from the state on record.
+    /// issues every conditional write through `TransactWriteItems`. Every ref and trust write
+    /// checks the same item, so a busy warehouse refuses the swap transiently; it is re-issued
+    /// under the same token, which makes an attempt that landed answer success rather than a
+    /// moved state. Refused through every attempt, it is an error.
     fn swap_format(&self, expected: &str, new: &str) -> Result<bool, String> {
         let update = Update::builder()
             .set_key(Some(self.key(ENTITY_FORMAT)))
@@ -1017,21 +1031,30 @@ impl FormatStore for DynamoRefStore {
             .expression_attribute_values(":old", s(expected))
             .build()
             .expect("every required Update field is set");
-
-        let mut transaction = ConditionedTransaction::new();
-
-        transaction.push(TransactWriteItem::builder().update(update).build(), Precondition::Format);
+        let token = request_token();
 
         self.bridge.block_on(async {
-            match transaction.send(&self.client, "DynamoDB format swap", &request_token()).await? {
-                None => Ok(true),
-                Some(Refusal::Moved(..)) => Ok(false),
-                Some(Refusal::Transient(cause)) => Err(format!(
-                    "DynamoDB refused the format item's write for a transient reason ({:?}); run \
-                    the upgrade again, and it resumes from the state on record.",
-                    cause
-                )),
+            let mut cause = None;
+
+            for wait in FORMAT_SWAP_WAITS {
+                tokio::time::sleep(wait).await;
+
+                let mut transaction = ConditionedTransaction::new();
+                transaction.push(TransactWriteItem::builder().update(update.clone()).build(), Precondition::Format);
+
+                match transaction.send(&self.client, "DynamoDB format swap", &token).await? {
+                    None => return Ok(true),
+                    Some(Refusal::Moved(..)) => return Ok(false),
+                    Some(Refusal::Transient(transient)) => cause = Some(transient),
+                }
             }
+
+            Err(format!(
+                "DynamoDB refused the format item's write through every attempt ({:?}). It may \
+                still have landed: run the upgrade again, and if it names this run's own upgrade, \
+                add --takeover.",
+                cause
+            ))
         })
     }
 }

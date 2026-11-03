@@ -132,9 +132,10 @@ Lambda, and takes warehouse ids or `--all`:
    write.
 4. It records `F+1`, and takes the next format until it reaches the one it reads.
 
-A state left by another run is refused unless the operator passes `--takeover`, after making sure that
-run has stopped. Takeover puts a new owner in the state and resumes at the first step not done, so
-steps must be idempotent. Steps change only the warehouse's own DynamoDB partition: the bucket's
+A state left by another run is refused unless the operator passes `--takeover` with that warehouse's id,
+after making sure that run has stopped. Takeover puts a new owner in the state, waits again (the run it
+takes over may have stopped before its wait was out), and resumes at the first step not done, so steps
+must be idempotent. A warehouse that fails is reported and the others are still upgraded. Steps change only the warehouse's own DynamoDB partition: the bucket's
 `objects/` and `signatures/` keys are shared by every warehouse and named by their content, and
 `staging/` and `responses/` are transient. An S3 layout change has no in-place path.
 

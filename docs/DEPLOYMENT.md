@@ -434,8 +434,8 @@ pallet touches four items (the format `ConditionCheck`, the pallet `Update`, the
 an untrusted warehouse touches three (no office `ConditionCheck` is built) for 6 WCU. **A
 re-genesis** — `replace_trust`'s own transaction, the format check, a `Put` on the trust item and a
 `ConditionCheck` on the office item — is always three actions, so 6 WCU, on the rarest write this
-warehouse ever takes. Every request also reads the format item strongly consistent first: one read
-capacity unit. **These are a floor, not a
+warehouse ever takes. Every request also reads the format item strongly consistent first, and a
+write reads it again right before its transaction: one read capacity unit each. **These are a floor, not a
 ceiling: both figures assume every item is ≤ 1 KB, and AWS's own write-unit definition
 (`provisioned-capacity-mode.md`, verified) is one WCU per item *per KB*, rounded up — a bigger
 item costs proportionally more, doubled again by the transactional multiplier above.** The
@@ -885,8 +885,10 @@ deployer-supplied, out-of-repo mechanism.
   Lambda's 29-second timeout; raise it if you set that timeout higher) so no request that passed
   the gate before the mark is still running, runs the steps, and records the new format. A
   run that stopped part way leaves its mark, and the warehouse refused; once you are sure that run
-  has stopped, run the binary again with `--takeover` to resume it. Every warehouse in the format
-  the binary reads is left as it is, so running it twice is harmless.
+  has stopped, run the binary again with `--takeover` and that warehouse's id to resume it
+  (`--takeover` is never given with `--all`). A warehouse that fails is reported, the others are
+  still upgraded, and the exit status is non-zero. Every warehouse in the format the binary reads
+  is left as it is, so running it twice is harmless.
 
 ## Verification checklist
 

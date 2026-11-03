@@ -108,7 +108,7 @@ pub fn gate_for<R: RefStore + ?Sized>(refs: &R, reads: u32) -> HeadResult<Format
         Some(FormatState::At(format)) if format == reads => Ok(FormatFence::At(state)),
         Some(FormatState::At(format)) if format < reads => Err(HeadError::service_unavailable(format!(
             "This warehouse is in format {}, older than format {}, the one this deployment reads. \
-            Its operator upgrades it in place with forklift-aws-upgrade; nothing in it was changed.",
+            Its operator has to upgrade it; nothing in it was changed.",
             format, reads
         ))),
         Some(FormatState::At(format)) => Err(HeadError::service_unavailable(format!(
@@ -207,7 +207,10 @@ pub struct AwsUpgradeChain<'a> {
 impl AwsUpgradeChain<'_> {
     /// The oldest format the chain upgrades.
     pub fn floor(&self) -> u32 {
-        self.reads - self.migrations.len() as u32
+        u32::try_from(self.migrations.len())
+            .ok()
+            .and_then(|count| self.reads.checked_sub(count))
+            .expect("a chain has no more migrations than there are formats before the one it reads")
     }
 
     fn migration_from(&self, format: u32) -> Option<&AwsMigration<'_>> {
@@ -402,6 +405,10 @@ pub fn upgrade<S: RefStore + FormatStore>(
 
                 from.get_or_insert(marked_from);
                 took_over.get_or_insert((to, step));
+
+                // The run taken over may have died before its own wait was out, so requests that
+                // gated before its mark may still be running.
+                std::thread::sleep(options.wait);
 
                 (mark, migration, step)
             }
@@ -649,10 +656,24 @@ mod tests {
         assert!(refusal.contains("--takeover"), "{}", refusal);
         assert_eq!(store.read_format().unwrap().as_deref(), Some("1>2 dead 1"));
 
-        let report = upgrade(&store, &chain, "w", &options("me", true)).unwrap();
+        // The run taken over may have died mid-wait, so the takeover waits before its first step.
+        let wait = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let report = upgrade(&store, &chain, "w", &UpgradeOptions { wait, ..options("me", true) }).unwrap();
+        assert!(started.elapsed() >= wait, "the takeover ran its steps without waiting");
         assert_eq!(report.took_over, Some((2, 1)));
         assert_eq!(*ran.lock().unwrap(), vec![2]);
         assert_eq!(store.read_format().unwrap().as_deref(), Some("2"));
+    }
+
+    #[test]
+    #[should_panic(expected = "no more migrations than there are formats")]
+    fn a_chain_longer_than_its_formats_is_refused_loudly() {
+        let step = |_: &StepContext| -> Result<(), String> { Ok(()) };
+        let steps: [AwsUpgradeStep; 1] = [&step];
+        let migrations = [AwsMigration { steps: &steps }, AwsMigration { steps: &steps }];
+
+        AwsUpgradeChain { reads: 1, migrations: &migrations }.floor();
     }
 
     #[test]

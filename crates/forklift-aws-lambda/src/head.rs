@@ -734,19 +734,6 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         ))
     }
 
-    /// The transient refusal of the *anchor write*, as opposed to a ref-update commit.
-    ///
-    /// Separate from [`transient_contention`](Self::transient_contention) because that message
-    /// names a push, a commit and a ref update, and this path is none of the three — a client
-    /// told to "run the push again" for a re-genesis it issued would be looking for an operation
-    /// it never performed.
-    ///
-    /// Reached only once the head's own re-issues are spent, the invocation window cannot afford
-    /// another, or one faulted after an attempt of unknown fate, so the message says the head
-    /// already retried rather than inviting the operator to wonder whether it did.
-    ///
-    /// When `uncertain` — some attempt of this request may yet land — the message claims nothing
-    /// about what was changed and sends the operator to read the anchor first.
     /// A first trust anchor whose plant stayed refused for a transient reason through every attempt.
     fn trust_plant_contention(&self, uncertain: bool) -> HeadError {
         if uncertain {
@@ -764,6 +751,19 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         )
     }
 
+    /// The transient refusal of the *anchor write*, as opposed to a ref-update commit.
+    ///
+    /// Separate from [`transient_contention`](Self::transient_contention) because that message
+    /// names a push, a commit and a ref update, and this path is none of the three — a client
+    /// told to "run the push again" for a re-genesis it issued would be looking for an operation
+    /// it never performed.
+    ///
+    /// Reached only once the head's own re-issues are spent, the invocation window cannot afford
+    /// another, or one faulted after an attempt of unknown fate, so the message says the head
+    /// already retried rather than inviting the operator to wonder whether it did.
+    ///
+    /// When `uncertain` — some attempt of this request may yet land — the message claims nothing
+    /// about what was changed and sends the operator to read the anchor first.
     fn anchor_write_contention(&self, uncertain: bool) -> HeadError {
         if uncertain {
             return HeadError::service_unavailable(format!(
