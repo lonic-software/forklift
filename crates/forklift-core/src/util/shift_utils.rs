@@ -1510,8 +1510,8 @@ fn collect_tree_directories(root_tree: TreeItem,
                 let file_key = join_key(key, name);
 
                 // A spine directory's own files are out of scope and were never materialized, so
-                // they are not inventoried — except the root ignore file, which every scope holds
-                // in scope. Only in-scope files land in a shard.
+                // they are not inventoried — except the ignore files above a prefix, which every
+                // scope holds in scope. Only in-scope files land in a shard.
                 if !scope_is_full && scope.classify(&file_key) != ScopeClass::InScope {
                     continue;
                 }

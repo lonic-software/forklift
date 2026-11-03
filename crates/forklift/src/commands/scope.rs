@@ -46,9 +46,9 @@ pub fn handle_command() -> Result<(), String> {
         bay: globals::active_bay(),
         scoped: !bay_scope.is_full(),
         checkout_scope: bay_scope.prefixes().to_vec(),
-        implicit_scope: bay_scope.implicit_members().iter().map(|path| path.to_string()).collect(),
+        implicit_scope: bay_scope.implicit_members().to_vec(),
         fetch_scope: fetch_scope.prefixes().to_vec(),
-        implicit_fetch_scope: fetch_scope.implicit_members().iter().map(|path| path.to_string()).collect(),
+        implicit_fetch_scope: fetch_scope.implicit_members().to_vec(),
     });
 
     Ok(())
@@ -70,7 +70,8 @@ pub(crate) struct ScopeStatus {
     checkout_scope: Vec<String>,
 
     /// The paths a scoped bay holds in scope without listing them as prefixes: the root ignore
-    /// file, so its rules apply to the checkout. Empty when the bay is not scoped.
+    /// files and the `.gitignore` of each folder above a prefix, so their rules apply to the
+    /// checkout. Empty when the bay is not scoped.
     implicit_scope: Vec<String>,
 
     /// The warehouse's fetch-scope prefixes (empty = fully fetched; a sparse clone records
@@ -78,7 +79,8 @@ pub(crate) struct ScopeStatus {
     fetch_scope: Vec<String>,
 
     /// The paths a sparse fetch scope holds without listing them as prefixes: the root ignore
-    /// file, which the store fetches along with the prefixes. Empty when fully fetched.
+    /// files and the `.gitignore` of each folder above a prefix, which the store fetches along
+    /// with the prefixes. Empty when fully fetched.
     implicit_fetch_scope: Vec<String>,
 }
 

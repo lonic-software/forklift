@@ -1569,9 +1569,10 @@ widen and shrink the fetch scope. Bare `scope` (or `scope status`) shows both.
 The report is read-only. In a plain bay or the main tree it reports the full tree; in a scoped bay it lists
 the in-scope subtree prefixes. The warehouse fetch scope is reported too — *full* for an
 ordinary warehouse (the store holds everything), or the fetched prefixes for a sparse
-(`clone --only`) one. A scoped checkout and a sparse fetch scope also hold the root `.forkliftignore`
-without it being a prefix; the report lists it as always in scope (`implicit_scope` and
-`implicit_fetch_scope` in `--json`). Widen the fetch scope with `scope fetch`; shrink a checkout's
+(`clone --only`) one. A scoped checkout and a sparse fetch scope also hold the ignore files that apply
+to what they hold, without those being prefixes: the root `.forkliftignore` and `.gitignore`, and the
+`.gitignore` of each folder above a prefix (`src/.gitignore` for `src/api`). The report lists them as
+always in scope (`implicit_scope` and `implicit_fetch_scope` in `--json`). Widen the fetch scope with `scope fetch`; shrink a checkout's
 scope with `scope narrow`.
 
 A scope recorded by a Forklift older than the one that put the ignore file in every
@@ -1945,9 +1946,13 @@ this checkout shows. A checkout must keep at least one in-scope path; to stop sc
 open a fresh full checkout. `scope narrow` is the counterpart of a bay's `--scope`, not of `scope fetch`:
 `scope fetch` widens the *fetch scope* (what the warehouse fetched), `scope narrow` shrinks the
 *checkout scope* (what this checkout writes to disk), and the fetch scope stays as it is.
-It refuses (`narrow_unclean`) a subtree holding uncommitted work (staged or unstaged changes, or
-untracked files), and one holding another working
-tree (a folder with its own `.forklift`) at any depth, whatever the ignore rules say.
+It also removes each `.gitignore` the checkout held only for a dropped path: narrowing `src/api` away
+removes `src/.gitignore` unless another kept path is under `src`. That folder stays, with anything
+else in it, and files that `.gitignore` ignored there show as untracked once it is gone.
+It refuses (`narrow_unclean`) a subtree or such a `.gitignore` holding uncommitted work (staged or
+unstaged changes, or untracked files), and one holding another working
+tree (a folder with its own `.forklift`) at any depth, whatever the ignore rules say. Ignored files
+under a dropped path are not uncommitted work: they are removed with it.
 
 ### `scope prune` — reclaim disk from a sparse warehouse
 

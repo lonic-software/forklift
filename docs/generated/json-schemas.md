@@ -4530,14 +4530,14 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "array"
     },
     "implicit_fetch_scope": {
-      "description": "The paths a sparse fetch scope holds without listing them as prefixes: the root ignore\nfile, which the store fetches along with the prefixes. Empty when fully fetched.",
+      "description": "The paths a sparse fetch scope holds without listing them as prefixes: the root ignore\nfiles and the `.gitignore` of each folder above a prefix, which the store fetches along\nwith the prefixes. Empty when fully fetched.",
       "items": {
         "type": "string"
       },
       "type": "array"
     },
     "implicit_scope": {
-      "description": "The paths a scoped bay holds in scope without listing them as prefixes: the root ignore\nfile, so its rules apply to the checkout. Empty when the bay is not scoped.",
+      "description": "The paths a scoped bay holds in scope without listing them as prefixes: the root ignore\nfiles and the `.gitignore` of each folder above a prefix, so their rules apply to the\ncheckout. Empty when the bay is not scoped.",
       "items": {
         "type": "string"
       },

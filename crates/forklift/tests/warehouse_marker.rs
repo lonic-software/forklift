@@ -343,7 +343,7 @@ fn a_full_warehouse_with_a_fetch_scope_is_refused() {
     let area = Area::new("stray-fetch-scope");
     let root = area.warehouse("w");
     let config = root.join(FOLDER_NAME_FORKLIFT_ROOT).join("config");
-    std::fs::write(config.join("fetch-scope"), "/forklift-scope 3\napp\n").unwrap();
+    std::fs::write(config.join("fetch-scope"), "/forklift-scope 4\napp\n").unwrap();
     std::fs::write(root.join("app.txt"), "changed\n").unwrap();
 
     // Load reads the main tree's scope, which is checked against the mode too, so it refuses as

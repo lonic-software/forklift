@@ -2749,7 +2749,7 @@ fn checkout_scopes_in_a_full_warehouse_are_recorded_and_checked() {
     // work (a clean stocktake reads no scope); deleting it is the way out.
     warehouse.write_file("src/web/w.txt", "web v2\n");
     assert_success(&warehouse.run(&["load", "."]));
-    std::fs::write(warehouse.root.join(".forklift").join("scope"), "/forklift-scope 3\nsrc/api\n").unwrap();
+    std::fs::write(warehouse.root.join(".forklift").join("scope"), "/forklift-scope 4\nsrc/api\n").unwrap();
     for args in [&["stocktake"][..], &["stack", "-m", "second"]] {
         let refused = warehouse.run(args);
         assert!(!refused.status.success(), "{:?} must refuse: {}", args, stdout(&refused));
