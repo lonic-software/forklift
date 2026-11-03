@@ -11077,8 +11077,9 @@ fn a_remote_delete_pinned_with_at_deletes_only_that_head() {
 
     let malformed = area.forklift("b", &["pallet", "delete", "feat", "--remote", "--at", &now[..12]]);
     assert!(!malformed.status.success() && stderr(&malformed).contains("takes a pallet's full head"), "{}", stderr(&malformed));
-    let local = area.forklift("b", &["pallet", "delete", "feat", "--at", &now]);
-    assert_eq!(local.status.code(), Some(2), "\"--at\" needs \"--remote\": {}", stderr(&local));
+    let local = area.forklift("a", &["pallet", "delete", "feat", "--at", &now]);
+    assert!(!local.status.success() && stderr(&local).contains("so it takes \"--remote\""), "{}", stderr(&local));
+    assert_eq!(pallet_head(&area, "a", "feat"), now, "\"--at\" without \"--remote\" deletes nothing here");
 }
 
 // Revert: pass an unframed delete error on as it is → it names neither the head nor the pinned

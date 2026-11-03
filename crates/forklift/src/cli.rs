@@ -1162,8 +1162,8 @@ pub enum PalletAction {
                       without \"--force\", one whose work no other pallet here or on the remote \
                       holds. With \"--remote\", delete the remote's pallet instead: it keeps its \
                       history on the remote, and no clone's own pallet changes. It is deleted at \
-                      the head the remote holds when the command reads it, which every outcome \
-                      names; \"--at\" deletes it only at a head you name."
+                      the head the remote holds when the command reads it, which the command \
+                      names however the delete ends; \"--at\" deletes it only at a head you name."
     )]
     Delete {
         /// The pallet to delete
@@ -1182,7 +1182,7 @@ pub enum PalletAction {
         /// With "--remote": delete the pallet only if the remote holds it at this head (a full
         /// parcel hash), refusing if it moved; a pallet already deleted at this head is reported
         /// as done
-        #[arg(long, value_name = "HEAD", requires = "remote")]
+        #[arg(long, value_name = "HEAD")]
         at: Option<String>,
     },
     /// Bring back a deleted pallet at the head its tombstone holds

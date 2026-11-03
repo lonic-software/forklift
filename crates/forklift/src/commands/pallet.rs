@@ -329,9 +329,9 @@ async fn remote_for_deletes(name: &str, verb: &str) -> Result<(RemoteClient, for
 /// held is lost: `pallet restore --remote` brings the pallet back, and a re-creation must descend
 /// from that head. The local pallet of that name, and every other clone's, is left as it is.
 ///
-/// Every outcome names the head: a delete that fails says which head it was for, and where its
-/// fate is unknown, names the rerun pinned to that head — never a bare rerun, which would delete
-/// whatever someone lifted there since.
+/// Once the handshake is read, every outcome names the head: a delete that fails says which head it
+/// was for, and where its fate is unknown, names the rerun pinned to that head — never a bare
+/// rerun, which would delete whatever someone lifted there since.
 pub async fn delete_remote_pallet(name: &str, at: Option<&str>) -> Result<(), String> {
     if let Some(at) = at.filter(|at| !object_utils::is_object_hash(at)) {
         return Err(format!(
@@ -478,8 +478,9 @@ fn delete_failed(why: String, name: &str, head: &str) -> String {
         }
         Some(_) => error::append_to_message(why, &target),
         None => error::append_to_message(why, &format!(
-            "{} Where it is unclear whether it landed, \"forklift pallet delete {} --remote --at {}\" \
-            runs it again at that head only, and reports it done if it landed.",
+            "{} A plain rerun reads the remote anew and deletes whatever it holds then; where it is \
+            unclear whether this delete landed, \"forklift pallet delete {} --remote --at {}\" runs \
+            it again at that head only, and reports it done if it landed.",
             target, name, head
         )),
     }

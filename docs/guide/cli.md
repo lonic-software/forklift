@@ -1242,10 +1242,10 @@ only through a restore or a re-creation from its history. It runs no hooks, so i
 `pallet_deleted` event. With `--json` the delete reports `remote`, `pallet`, `head`, `local_head`
 and `already`, and the restore `pallet`, `head` and `remote`. A delete of a pallet the remote has
 already deleted (as a rerun after a lost answer finds it) reports it done with `already` set, and
-sends nothing. Every outcome names the head: the human `pallet list --remote` shows each live
-pallet's head, a delete reports the head it deleted at, and one that fails says which head it was
-for. A plain rerun deletes the pallet at the head the remote then holds, which after a lost answer
-may be work someone lifted meanwhile; `--at <head>` pins the delete instead. It deletes only if the
+sends nothing. The head is always in view: the human `pallet list --remote` shows each live
+pallet's head, a delete reports the head it deleted at, and one that fails after reading the remote
+says which head it was for. A plain rerun deletes the pallet at the head the remote then holds, which after a lost answer
+may be work someone lifted meanwhile; `--at <head>` pins the delete instead (it takes `--remote`). It deletes only if the
 remote holds the pallet at that head, reports it done if the pallet was deleted at that head (as a
 pinned rerun after a lost answer finds it), and otherwise refuses without sending anything:
 `remote_ahead` (exit 28) when the pallet moved, `pallet_deleted_on_remote` (exit 35) when someone
