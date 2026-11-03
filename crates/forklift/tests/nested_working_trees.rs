@@ -283,7 +283,7 @@ fn stack_refuses_a_metadata_folder_name_below_the_top_level() {
         assert_eq!(warehouse.head("main"), head, "a parcel was stacked");
 
         warehouse.run_ok(&["unload", refused]);
-        warehouse.write(".forkliftignore", &format!("^{}$\n", refused.replace('.', "\\.")));
+        warehouse.write(".forkliftignore", &format!("/{}\n", refused));
         warehouse.run_ok(&["load", "."]);
         warehouse.run_ok(&["stack", "-m", "without it"]);
         assert_ne!(warehouse.head("main"), head);
@@ -391,8 +391,8 @@ fn a_shift_into_an_untracked_nested_working_tree_refuses_and_writes_nothing() {
 fn ignore_variants(parent: &str) -> [(Option<String>, String); 3] {
     [
         (None, format!("{}/sub", parent)),
-        (Some(format!("^{}/sub$\n", parent)), format!("{}/sub", parent)),
-        (Some(format!("^{}/gen$\n", parent)), format!("{}/gen/sub", parent)),
+        (Some(format!("/{}/sub\n", parent)), format!("{}/sub", parent)),
+        (Some(format!("/{}/gen\n", parent)), format!("{}/gen/sub", parent)),
     ]
 }
 
@@ -465,7 +465,7 @@ fn replacing_a_folder_holding_an_ignored_file_refuses_and_writes_nothing() {
     warehouse.run_ok(&["stack", "-m", "file"]);
     warehouse.run_ok(&["shift", "main"]);
 
-    warehouse.write(".forkliftignore", "^a/junk$\n");
+    warehouse.write(".forkliftignore", "/a/junk\n");
     warehouse.write("a/junk", "ignored\n");
 
     let shift = warehouse.run(&["shift", "flip"]);

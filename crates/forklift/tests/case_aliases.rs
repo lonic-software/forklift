@@ -308,7 +308,7 @@ fn a_case_only_directory_rename_is_refused_while_anything_keeps_the_old_director
     let keepers: [(&str, fn(&Warehouse)); 3] = [
         ("untracked", |w| w.write("Docs/extra.txt", "mine\n")),
         ("ignored", |w| {
-            w.write(".forkliftignore", "\\.log$\n");
+            w.write(".forkliftignore", "*.log\n");
             w.write("Docs/build.log", "mine\n");
         }),
         ("empty-dir", |w| std::fs::create_dir(w.root.join("Docs/empty")).unwrap()),
