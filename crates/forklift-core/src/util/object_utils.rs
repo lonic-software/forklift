@@ -923,13 +923,13 @@ pub fn peek_object_header(bytes: &[u8]) -> Result<(ObjectType, usize), PeekError
         .map_err(|e| PeekError::Malformed(format!("Failed to peek object content length: {}", e)))?;
     let after_length = after_type + length_len;
 
-    // The header ends at the null byte `LooseObjectBuilder::write_header` puts right after the
-    // length.
-    if bytes.get(after_length) != Some(&globals::BYTE_NULL) {
-        return Err(PeekError::Malformed("Object header has no terminating null byte.".to_string()));
-    }
+    // The header ends at the next null byte, found the way the object parser finds it
+    // (`parser/object/version/v2024_09_04.rs`, `read_header`): a peek stricter than the parser
+    // would call an object malformed that the parser reads, and skip checks meant for it.
+    let (_, null_read) = byte_utils::read_until_byte_value(after_length, bytes, globals::BYTE_NULL)
+        .ok_or_else(|| PeekError::Malformed("Object header has no terminating null byte.".to_string()))?;
 
-    Ok((object_type, after_length + 1))
+    Ok((object_type, after_length + null_read))
 }
 
 /// Enforce what an object's header decides on the way *into* the store. An object whose version
@@ -1029,6 +1029,10 @@ struct StreamOutcome {
 
     /// The Blake3 hex hash of those bytes (to verify against the claimed hash).
     hash: String,
+
+    /// The object's version, when this build does not read it. Refused only once the hash
+    /// verifies, as the buffered path does, so damaged bytes are reported as damage.
+    unknown_version: Option<u64>,
 }
 
 /// Store an object streamed from `reader`, bounding memory to a small constant regardless of the
@@ -1120,6 +1124,11 @@ pub fn store_object_stream(claimed_hash: &str,
         ));
     }
 
+    if let Some(version) = outcome.unknown_version {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(unknown_version_error(claimed_hash, version));
+    }
+
     // Already present (an idempotent re-import): drop the temp and report the skip.
     if file_utils::does_object_exist(claimed_hash)? {
         let _ = std::fs::remove_file(&temp_path);
@@ -1162,6 +1171,7 @@ fn stream_to_temp(claimed_hash: &str,
     // ceiling-checked mid-stream. `header_len` becomes `Some` once the header parses.
     let mut object_type: Option<ObjectType> = None;
     let mut header_len: usize = 0;
+    let mut unknown_version = None;
     let mut prefix: Vec<u8> = Vec::new();
     let mut block = vec![0u8; 64 * 1024];
 
@@ -1190,10 +1200,11 @@ fn stream_to_temp(claimed_hash: &str,
                     object_type = Some(peeked_type);
                     header_len = peeked_header_len;
                 }
-                // A whole version is judged at once, however short the prefix: the store paths
-                // refuse an object this build could never read.
+                // A whole version is judged at once, however short the prefix: the caller refuses
+                // an object this build could never read, once its hash verifies.
                 Err(PeekError::UnknownVersion(version)) => {
-                    return Err(unknown_version_error(claimed_hash, version));
+                    unknown_version = Some(version);
+                    header_len = usize::MAX;
                 }
                 Err(PeekError::Malformed(_)) if prefix.len() > 4096 => {
                     // Sentinel: give up peeking, but do not fail — an unrecognized header is not a
@@ -1228,7 +1239,7 @@ fn stream_to_temp(claimed_hash: &str,
     // Close the handle before the caller renames it (renaming an open file fails on Windows).
     drop(temp_file);
 
-    Ok(StreamOutcome { read_total, hash: hasher.finalize().to_hex().to_string() })
+    Ok(StreamOutcome { read_total, hash: hasher.finalize().to_hex().to_string(), unknown_version })
 }
 
 /// Whether an ingest should persist the objects it produces (`load`, `park`) or only compute
@@ -2084,6 +2095,43 @@ mod tests {
         let mut reader = OneByteAtATime { remaining: &blob.content, consumed: 0 };
         assert!(store_object_stream(&blob.hash, &mut reader, blob.content.len() as u64).unwrap(),
             "the readable version streams in a byte at a time");
+    }
+
+    /// A damaged object whose first byte now reads as an unknown version is reported by the
+    /// streaming store as a hash mismatch, as the buffered store reports it, not as one a newer
+    /// build wrote.
+    ///
+    /// Revert: refuse the unknown version mid-stream again → the error names the version.
+    #[test]
+    fn store_object_stream_reports_a_damaged_version_byte_as_a_hash_mismatch() {
+        let _scratch = Scratch::new("stream-damaged-version");
+
+        let blob = LooseObjectBuilder::build_blob(&Blob { content: vec![0x45u8; 100] });
+        let (_, damaged) = with_version(&blob, 2);
+
+        let mut reader = OneByteAtATime { remaining: &damaged, consumed: 0 };
+        let err = store_object_stream(&blob.hash, &mut reader, damaged.len() as u64)
+            .expect_err("damaged bytes must be refused");
+        assert!(err.contains("does not match its claimed hash"), "{}", err);
+
+        let err = store_object_bytes(&blob.hash, &damaged).expect_err("damaged bytes must be refused");
+        assert!(err.contains("does not match its claimed hash"), "{}", err);
+    }
+
+    /// The peek finds the end of a header where the object parser does, at the next null, so a
+    /// header with bytes before its null is the type the parser reads it as.
+    ///
+    /// Revert: require the null right after the length → the peek calls it malformed.
+    #[test]
+    fn peek_object_header_ends_the_header_where_the_parser_does() {
+        let blob = LooseObjectBuilder::build_blob(&Blob { content: vec![7u8; 3] });
+        let mut padded = blob.content[..3].to_vec();
+        padded.push(b'X');
+        padded.extend_from_slice(&blob.content[3..]);
+
+        assert_eq!(peek_object_header(&padded), Ok((ObjectType::Blob, 5)));
+        assert_eq!(parser::object::loose_object_parser::parse_blob(&padded).unwrap().content, vec![7u8; 3],
+            "the parser reads it as the same blob");
     }
 
     /// The pack import check refuses an object of an unknown version, and passes the readable one.
