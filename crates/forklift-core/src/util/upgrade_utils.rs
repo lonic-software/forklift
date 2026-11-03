@@ -28,7 +28,8 @@ pub struct UpgradeContext {
 
 /// One step of a migration. It must be idempotent, since a step interrupted part way is run again
 /// from its start, and must sync what it writes before it returns, since returning records it done.
-/// It runs inside the warehouse's storage-root scope, under the format lease held exclusively by
+/// It runs inside the warehouse's storage-root scope, which is per thread: a step that fans work out
+/// enters it on every worker (`globals::StorageRootScope::enter`). It runs under the format lease held exclusively by
 /// this process, so it must not open the warehouse through anything that takes the lease shared
 /// ([`warehouse_utils::open_warehouse_root`] and its kin): that refuses as an upgrade running. A
 /// step may rewrite the marker's mode word, keeping its format and upgrade entries.
@@ -89,6 +90,9 @@ impl UpgradeReport {
         if let Some(resumed) = self.resumed {
             lines.push(match resumed.step {
                 0 => format!("Resumed the unfinished upgrade to format {}, which had done none of its steps.", resumed.target),
+                step if step >= resumed.steps => format!(
+                    "Resumed the unfinished upgrade to format {}, which had done all its steps.", resumed.target
+                ),
                 step => format!("Resumed the unfinished upgrade to format {} at its step {}.", resumed.target, step + 1),
             });
         }
@@ -111,6 +115,9 @@ pub struct ResumedUpgrade {
 
     /// The steps of it already done.
     pub step: u32,
+
+    /// The steps it has in this build.
+    pub steps: u32,
 }
 
 /// Upgrade the warehouse whose root is `root` to `chain.reads`, or resume an upgrade on record. A
@@ -158,7 +165,7 @@ pub fn upgrade_warehouse(root: &Path, head: Head, chain: &UpgradeChain) -> Resul
     ))?;
 
     let from = marker.format;
-    let resumed = marker.upgrade.map(|upgrade| ResumedUpgrade { target: upgrade.target, step: upgrade.step });
+    let mut resumed = marker.upgrade.map(|upgrade| ResumedUpgrade { target: upgrade.target, step: upgrade.step, steps: 0 });
     let mut steps_run = 0;
 
     // Steps resolve storage through the warehouse, wherever the upgrade was started.
@@ -176,6 +183,10 @@ pub fn upgrade_warehouse(root: &Path, head: Head, chain: &UpgradeChain) -> Resul
         };
 
         let migration = migration_for(&marker, upgrade, chain, &shown, &forklift, head)?;
+
+        if let Some(resumed) = resumed.as_mut().filter(|resumed| resumed.target == upgrade.target) {
+            resumed.steps = migration.steps.len() as u32;
+        }
 
         if marker.upgrade.is_none() {
             marker.upgrade = Some(upgrade);
@@ -231,12 +242,18 @@ fn marker_after_step(forklift: &Path, format: u32, upgrade: MarkerUpgrade) -> Re
 fn finished_marker(forklift: &Path, format: u32, done: MarkerUpgrade, chain: &UpgradeChain) -> Result<WarehouseMarker, CoreError> {
     let marker = marker_after_step(forklift, format, done)?;
 
+    // Every rerun of this build would stop here again, so the way out is another build: one whose
+    // migration leaves a mode it reads, which resumes this upgrade where it stands.
     if done.target == chain.reads && warehouse_utils::WarehouseMode::from_word(&marker.mode).is_none() {
-        return Err(format!(
-            "The upgrade of the warehouse in \"{}\" to format {} left the mode \"{}\", which this version of \
-            Forklift does not read; the upgrade stays on record.",
-            forklift.to_string_lossy(), done.target, marker.mode.escape_debug()
-        ).into());
+        return Err(CoreError::refusal(
+            RefusalCode::WarehouseUpgradeIncomplete,
+            format!(
+                "The upgrade of the warehouse in \"{}\" to format {} left the mode \"{}\", which this version of \
+                Forklift does not read, so the upgrade stays on record.",
+                forklift.to_string_lossy(), done.target, marker.mode.escape_debug()
+            ),
+            "Update this Forklift binary to one whose upgrade reads that mode, and run its upgrade; it resumes this one.",
+        ));
     }
 
     Ok(WarehouseMarker { format: done.target, mode: marker.mode, upgrade: None })
@@ -477,7 +494,7 @@ mod tests {
         let chain = LoggedChain::new();
         let report = chain.run(&root).unwrap();
         assert_eq!(chain.taken(), ["b 1@2/1", "c 2@3/0"]);
-        assert_eq!(report, UpgradeReport { from: 1, to: 3, resumed: Some(ResumedUpgrade { target: 2, step: 1 }), steps_run: 2 });
+        assert_eq!(report, UpgradeReport { from: 1, to: 3, resumed: Some(ResumedUpgrade { target: 2, step: 1, steps: 2 }), steps_run: 2 });
         assert_eq!(marker_entries(&root), "format 3\nfull\n");
 
         std::fs::remove_dir_all(&root).ok();
@@ -514,7 +531,7 @@ mod tests {
         let chain = LoggedChain::new();
         let report = chain.run(&root).unwrap();
         assert_eq!(chain.taken(), ["b 1@2/1", "c 2@3/0"]);
-        assert_eq!(report.resumed, Some(ResumedUpgrade { target: 2, step: 1 }));
+        assert_eq!(report.resumed, Some(ResumedUpgrade { target: 2, step: 1, steps: 2 }));
         assert_eq!(marker_entries(&root), "format 3\nfull\n");
 
         std::fs::remove_dir_all(&root).ok();
@@ -612,6 +629,7 @@ mod tests {
     /// build does not read at the format it reads leaves the upgrade on record instead of finishing.
     ///
     /// Revert: carry the mode read before the steps into the finished marker → `full` → red.
+    /// Revert: drop the mode check → the unread mode is recorded at the new format → red.
     #[test]
     fn the_finished_marker_keeps_the_mode_a_step_wrote_and_refuses_one_unread() {
         for (word, finishes) in [("cache", true), ("something-new", false)] {
@@ -632,7 +650,8 @@ mod tests {
                 assert_eq!(marker_entries(&root), format!("format 2\n{}\n", word));
             } else {
                 let error = result.unwrap_err();
-                assert!(error.to_string().contains("does not read; the upgrade stays on record"), "{}", error);
+                assert_eq!(code_of(&error), Some(RefusalCode::WarehouseUpgradeIncomplete), "{}", error);
+                assert!(error.to_string().contains("so the upgrade stays on record"), "{}", error);
                 assert_eq!(marker_entries(&root), format!("format 1\n{}\nupgrading 2 1\n", word));
             }
 
@@ -644,9 +663,10 @@ mod tests {
     /// crash came before its first step finished.
     #[test]
     fn the_summary_names_the_step_a_resume_starts_at() {
-        let report = |step| UpgradeReport { from: 1, to: 2, resumed: Some(ResumedUpgrade { target: 2, step }), steps_run: 1 };
+        let report = |step| UpgradeReport { from: 1, to: 2, resumed: Some(ResumedUpgrade { target: 2, step, steps: 2 }), steps_run: 1 };
         assert_eq!(report(0).summary()[0], "Resumed the unfinished upgrade to format 2, which had done none of its steps.");
         assert_eq!(report(1).summary()[0], "Resumed the unfinished upgrade to format 2 at its step 2.");
+        assert_eq!(report(2).summary()[0], "Resumed the unfinished upgrade to format 2, which had done all its steps.");
         assert_eq!(UpgradeReport { from: 1, to: 1, resumed: None, steps_run: 0 }.summary(),
                    ["The warehouse is in format 1, the one this version reads. Nothing to do."]);
     }

@@ -35,7 +35,7 @@ pieces of its own format under another number.
 
 | Marker | Refusal | Exit | Way out |
 |---|---|---|---|
-| `upgrading` present | `warehouse_upgrade_incomplete` | 42 | Run the upgrade again, with a build that reads the target format. |
+| `upgrading` present | `warehouse_upgrade_incomplete` | 42 | Run the upgrade again, with a build that reads the target format. If this build would finish it but does not upgrade the format it started from, `warehouse_format_older` (40): make the warehouse again. |
 | Older than this build | `warehouse_format_older` | 40 | Run the upgrade; for a format older than any the build upgrades, make the warehouse again. |
 | Newer than this build | `warehouse_format_newer` | 41 | Update the binary. Upgrades are one-way. |
 
@@ -62,9 +62,9 @@ itself:
 5. It records `format F+1` with no upgrade, and takes the next format until it reaches the one it reads.
 
 Run again after a crash or a failed step, the upgrade resumes at the first step not recorded done. Steps
-run with the warehouse as the storage root, wherever the upgrade was started. The mode word is kept,
-unless a step rewrites it; at the format the build reads it must be a mode that build knows, or the
-upgrade stays on record.
+run with the warehouse as the storage root (the CLI also changes into the warehouse root), and a step
+that spreads work over threads enters that root on each. The mode word is kept, unless a step rewrites
+it.
 
 What it cannot carry it refuses, changing nothing:
 
@@ -74,6 +74,7 @@ What it cannot carry it refuses, changing nothing:
 | Older than any format the build upgrades | `warehouse_format_older` | 40 | Make the warehouse again. |
 | Newer than the build | `warehouse_format_newer` | 41 | Update the binary. |
 | `upgrading` to a format newer than the build | `warehouse_upgrade_incomplete` | 42 | Update the binary, and run its upgrade. |
+| Steps done, but the mode left is not one the build reads | `warehouse_upgrade_incomplete` | 42 | Update the binary to one whose upgrade reads that mode; the upgrade stays on record and it resumes there. |
 
 Format 1 is the first format, so the chain this build carries is empty, and nothing older than format 1
 is ever upgraded.

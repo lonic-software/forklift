@@ -537,24 +537,28 @@ fn a_warehouse_in_another_format_is_refused_with_its_own_way_out() {
     let area = Area::new("format-refusals");
     let root = area.warehouse("w");
     let marker = marker_of(&root);
+    // The last field: whether the way out is making the warehouse again, the one row that names prepare.
     let cases = [
         // Older than any format this build upgrades: made again, never sent to the upgrade.
-        ("/forklift-warehouse 3\nformat 0\nfull\n", "warehouse_format_older", 40, "\"forklift prepare\""),
-        ("/forklift-warehouse 3\nformat 2\nfull\n", "warehouse_format_newer", 41, "Update this Forklift"),
+        ("/forklift-warehouse 3\nformat 0\nfull\n", "warehouse_format_older", 40, "\"forklift prepare\"", true),
+        ("/forklift-warehouse 3\nformat 2\nfull\n", "warehouse_format_newer", 41, "Update this Forklift", false),
         // A mode of a format this build does not read is not this build's to judge.
-        ("/forklift-warehouse 3\nformat 2\nsomething-new\n", "warehouse_format_newer", 41, "Update this Forklift"),
-        ("/forklift-warehouse 3\nformat 1\nfull\nupgrading 2 3\n", "warehouse_upgrade_incomplete", 42, "forklift upgrade"),
-        ("/forklift-warehouse 3\nformat 0\nfull\nupgrading 1 0\n", "warehouse_upgrade_incomplete", 42, "forklift upgrade"),
+        ("/forklift-warehouse 3\nformat 2\nsomething-new\n", "warehouse_format_newer", 41, "Update this Forklift", false),
+        ("/forklift-warehouse 3\nformat 1\nfull\nupgrading 2 3\n", "warehouse_upgrade_incomplete", 42, "forklift upgrade", false),
+        // An unfinished upgrade this build would finish, from a format it does not reach.
+        ("/forklift-warehouse 3\nformat 0\nfull\nupgrading 1 0\n", "warehouse_format_older", 40, "\"forklift prepare\"", true),
     ];
 
-    for (content, code, exit, expected) in cases {
+    for (content, code, exit, expected, makes_again) in cases {
         std::fs::write(&marker, content).unwrap();
         let before = listing(&root);
 
         for args in [&["stocktake"][..], &["stack", "-m", "again"], &["prepare"], &["pallet", "list"]] {
             let (_, next_step) = format_refusal(&area, &root, args, code, exit);
             assert!(next_step.contains(expected), "{:?} over {:?}: {}", args, content, next_step);
-            assert!(expected.contains("prepare") || !next_step.contains("prepare"), "{:?} over {:?}: {}", args, content, next_step);
+            if !makes_again {
+                assert!(!next_step.contains("prepare"), "{:?} over {:?}: {}", args, content, next_step);
+            }
         }
         assert_eq!(listing(&root), before, "{:?}: a refused command writes nothing", content);
     }

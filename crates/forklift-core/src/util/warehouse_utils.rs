@@ -247,6 +247,20 @@ pub fn hold_warehouse_format(root: &Path, head: Head) -> Result<lock_utils::Form
 fn judge_format(marker: &WarehouseMarker, root: &Path, head: Head, chain: &upgrade_utils::UpgradeChain) -> Result<(), CoreError> {
     let shown = root.to_string_lossy();
 
+    // An upgrade this build would have to finish from a format its chain does not reach is made
+    // again here, not sent to an upgrade that refuses it.
+    if marker.upgrade.is_some_and(|upgrade| upgrade.target <= chain.reads) && marker.format < chain.floor() {
+        return Err(CoreError::refusal(
+            RefusalCode::WarehouseFormatOlder,
+            format!(
+                "The warehouse at \"{}\" is in format {}, older than any format this version of Forklift \
+                upgrades (format {} and later), and an upgrade of it did not finish.",
+                shown, marker.format, chain.floor()
+            ),
+            head.recreate_step(&root.join(FOLDER_NAME_FORKLIFT_ROOT), root),
+        ));
+    }
+
     if let Some(upgrade) = &marker.upgrade {
         return Err(CoreError::refusal(
             RefusalCode::WarehouseUpgradeIncomplete,
@@ -1699,6 +1713,14 @@ mod tests {
         assert!(step_for(2).contains("\"forklift upgrade\""), "{}", step_for(2));
         assert!(step_for(1).contains("\"forklift prepare\""), "{}", step_for(1));
         assert!(!step_for(1).contains("upgrade"), "{}", step_for(1));
+
+        // The same holds for an upgrade of it that did not finish, when this build would finish it.
+        let unfinished = WarehouseMarker { format: 1, mode: "full".to_string(), upgrade: Some(MarkerUpgrade { target: 2, step: 0 }) };
+        match judge_format(&unfinished, root, Head::Client, &chain) {
+            Err(CoreError::Refusal { code: RefusalCode::WarehouseFormatOlder, next_step, .. }) =>
+                assert!(next_step.contains("\"forklift prepare\""), "{}", next_step),
+            other => panic!("an unfinished upgrade below the floor: {:?}", other),
+        }
     }
 
     /// Classifying decides only that a folder is a warehouse: any format is one, even with a mode

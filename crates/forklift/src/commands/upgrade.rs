@@ -13,6 +13,11 @@ use crate::output::{self, CommandOutput};
 pub fn handle_command() -> Result<(), String> {
     let root = warehouse_utils::find_warehouse_root()?;
 
+    // Like every command that works in a warehouse, run from its root, so storage resolves there on
+    // every thread a migration step uses, not only inside the storage-root scope.
+    std::env::set_current_dir(&root)
+        .map_err(|e| format!("Error while changing into the warehouse at \"{}\": {}", root.to_string_lossy(), e))?;
+
     let report = upgrade_utils::upgrade_warehouse(&root, warehouse_utils::Head::Client, &upgrade_utils::CHAIN)?;
 
     output::emit(&Upgraded {
