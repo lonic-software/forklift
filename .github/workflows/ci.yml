@@ -135,11 +135,53 @@ jobs:
     # A hang anywhere in the job fails here rather than at GitHub's six-hour limit. A cold-cache
     # Windows run compiles for about eight minutes before its tests start.
     timeout-minutes: 40
+    # id-token lets the job sign in to the compile cache below.
+    permissions:
+      contents: read
+      id-token: write
+    # The compile cache (infra/ci-cache): sccache keeps compiled crates in S3, keyed by content,
+    # so a workspace crate a push did not change is not compiled again. rust-cache below keeps
+    # only the dependencies: cargo judges workspace crates by mtime, and a checkout makes every
+    # file new.
+    # GitHub passes no secrets to a pull request from a fork, nor to a run in a fork, so there
+    # the role is empty, the cache steps are skipped, and the job builds as it did before.
+    env:
+      SCCACHE_ROLE_ARN: ${{ secrets.SCCACHE_ROLE_ARN }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
+
+      - name: Sign in to the compile cache
+        if: ${{ env.SCCACHE_ROLE_ARN != '' }}
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ env.SCCACHE_ROLE_ARN }}
+          aws-region: eu-central-1
+
+      - name: Install sccache
+        if: ${{ env.SCCACHE_ROLE_ARN != '' }}
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.18.0
+
+      # Set before rust-cache, whose cache key covers RUST* variables: a run with the cache and
+      # one without keep separate dependency caches rather than overwrite each other's.
+      # SCCACHE_IGNORE_SERVER_IO_ERROR: when the sccache server's answer to a compile cannot be
+      # read, compile without it rather than fail the build.
+      - name: Use the compile cache
+        if: ${{ env.SCCACHE_ROLE_ARN != '' }}
+        shell: bash
+        env:
+          SCCACHE_BUCKET: ${{ secrets.SCCACHE_BUCKET }}
+        run: |
+          {
+            echo "RUSTC_WRAPPER=sccache"
+            echo "SCCACHE_BUCKET=$SCCACHE_BUCKET"
+            echo "SCCACHE_REGION=eu-central-1"
+            echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1"
+          } >> "$GITHUB_ENV"
 
       # The tree is formatted by hand and rustfmt.toml switches rustfmt off; bin/fmt-guard fails if
       # that guard is missing, or if a second rustfmt config would override it. It needs no build,
@@ -220,6 +262,11 @@ jobs:
           packed=$(count)
           echo "object files left in deps: $default with cargo's default, $packed with the config"
           [ "$default" -gt 0 ] && [ "$packed" -eq 0 ]
+
+      # Hits, misses, and the crates sccache would not cache with its reason for each.
+      - name: Compile cache stats
+        if: ${{ !cancelled() && env.SCCACHE_ROLE_ARN != '' }}
+        run: sccache --show-stats
 
   # The one check to gate a merge on. It needs every job above and passes only when each one
   # passed, or was skipped for a reason that is not a failure: `changes` is skipped on pushes, and
