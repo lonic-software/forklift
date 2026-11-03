@@ -816,7 +816,7 @@ fn upgrade_in_a_bay_names_its_warehouse() {
 /// marker is left as it was: a format older than any upgrade reaches is made again, a newer one or
 /// an unfinished upgrade to a newer one needs a newer binary.
 ///
-/// Revert: answer format 0 with the gate's "run the upgrade" → the upgrade names itself → red.
+/// Revert: give the older-format refusal the gate's next step → the upgrade names itself → red.
 #[test]
 fn upgrade_refuses_what_it_cannot_carry_and_says_where_to_go() {
     let area = Area::new("upgrade-refusals");

@@ -392,7 +392,7 @@ mod tests {
     /// A failing step leaves the upgrade on record with the steps before it done, and the next run
     /// resumes at that step, never running a recorded step again.
     ///
-    /// Revert: advance the step counter before running the step → the rerun skips `b` → red.
+    /// Revert: resume one step past the one recorded → the rerun skips `b` → red.
     #[test]
     fn a_failed_step_is_resumed_at_that_step() {
         let root = fresh_warehouse("fail");
@@ -420,8 +420,7 @@ mod tests {
     /// resumes it there. The kill is real: the test runs itself again in a child process whose
     /// step aborts.
     ///
-    /// Revert: record the upgrade only after the first step → the marker reads `format 1` after
-    /// the kill → red.
+    /// Revert: resume one step past the one recorded → the rerun skips `b` → red.
     #[test]
     fn a_process_killed_in_a_step_is_resumed_at_that_step() {
         if let Some(root) = std::env::var_os(CRASH_ROOT) {
@@ -491,7 +490,7 @@ mod tests {
     /// an unfinished upgrade to a newer one, a format older than the chain reaches, an upgrade no
     /// build starts, and more steps done than the migration has.
     ///
-    /// Revert: drop the floor check → the format-0 case indexes past the chain → red.
+    /// Revert: drop any one of the checks → its case runs steps → red.
     #[test]
     fn a_marker_the_chain_cannot_carry_is_refused_unchanged() {
         let cases: [(&str, Option<RefusalCode>, &str); 5] = [
