@@ -1605,7 +1605,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         };
         let target = format!("The delete was for \"{}\" at {}.", bare, old_head);
         let next = format!(
-            "Check the remote's pallets (\"forklift pallet list --remote --json\") before deleting \
+            "Check the pallet's head now (\"forklift pallet list --remote\" shows it) before deleting \
             \"{}\" again.",
             bare
         );

@@ -11033,6 +11033,81 @@ fn a_pallet_deleted_on_the_remote_is_listed_and_lifts_back_only_acknowledged() {
     assert!(listed["data"].get("deleted").is_none(), "the re-creation cleared the tombstone: {}", listed);
 }
 
+// Revert: drop the `--at` check on the live head → the stale pin deletes the newer head; drop it on
+// the tombstone → the pin to another head reports done; print no head in the human listing → its
+// assertion fails.
+#[test]
+fn a_remote_delete_pinned_with_at_deletes_only_that_head() {
+    let area = TestArea::new("remote-delete-at");
+    let server = Server::start(&area, None);
+    let read = remote_with_a_side_pallet(&area, &server);
+    advance_remote(&area, "feat", "feat.txt", "feat v2\n");
+    let now = pallet_head(&area, "server-root", "feat");
+    assert_ne!(read, now);
+
+    let listed = area.forklift("b", &["pallet", "list", "--remote"]);
+    assert_success(&listed);
+    assert!(stdout(&listed).contains(&format!("  feat at {} (not here;", now)), "{}", stdout(&listed));
+
+    // Pinned to the head read before someone lifted: refused, nothing sent.
+    let refused = refusal_of(&area.forklift("b", &["--json", "pallet", "delete", "feat", "--remote", "--at", &read]), 28);
+    assert_eq!(refused["code"], "remote_ahead", "{}", refused);
+    assert_eq!(refused["next_step"], "forklift pallet list --remote", "{}", refused);
+    let message = refused["message"].as_str().unwrap();
+    assert!(message.contains(&format!("is at {}, not at {}", now, read)), "{}", message);
+    assert!(message.contains("\"forklift pallet delete feat --remote --at <head>\""), "{}", message);
+    assert!(!message.contains(&format!("--at {}", now)), "no ready-made delete of a head nobody looked at: {}", message);
+    assert_eq!(pallet_head(&area, "server-root", "feat"), now, "the remote's pallet is untouched");
+
+    let deleted = area.forklift("b", &["--json", "pallet", "delete", "feat", "--remote", "--at", &now]);
+    assert_success(&deleted);
+    assert_eq!(json_of(&deleted)["data"]["head"], now.as_str());
+    assert_eq!(json_of(&deleted)["data"]["already"], false);
+    assert!(!area.path("server-root/.forklift/pallets/feat").exists());
+
+    // A pinned rerun, as after a lost answer, finds it deleted at that head: done.
+    let again = area.forklift("b", &["--json", "pallet", "delete", "feat", "--remote", "--at", &now]);
+    assert_success(&again);
+    assert_eq!(json_of(&again)["data"]["already"], true);
+
+    // Pinned to a head the deletion did not keep: refused, whoever deleted it.
+    let other = refusal_of(&area.forklift("b", &["--json", "pallet", "delete", "feat", "--remote", "--at", &read]), 35);
+    assert_eq!(other["code"], "pallet_deleted_on_remote", "{}", other);
+    assert_eq!(other["next_step"], "forklift pallet list --remote", "{}", other);
+    assert!(other["message"].as_str().unwrap().contains(&format!("is deleted at {}, not at {}", now, read)), "{}", other);
+
+    let malformed = area.forklift("b", &["pallet", "delete", "feat", "--remote", "--at", &now[..12]]);
+    assert!(!malformed.status.success() && stderr(&malformed).contains("takes a pallet's full head"), "{}", stderr(&malformed));
+    let local = area.forklift("a", &["pallet", "delete", "feat", "--at", &now]);
+    assert!(!local.status.success() && stderr(&local).contains("so it takes \"--remote\""), "{}", stderr(&local));
+    assert_eq!(pallet_head(&area, "a", "feat"), now, "\"--at\" without \"--remote\" deletes nothing here");
+}
+
+// Revert: pass an unframed delete error on as it is → it names neither the head nor the pinned
+// rerun.
+#[test]
+fn a_remote_delete_of_unknown_fate_names_its_head_and_the_pinned_rerun() {
+    let area = TestArea::new("remote-delete-unknown");
+    let server = Server::start(&area, None);
+    let feat = remote_with_a_side_pallet(&area, &server);
+
+    let body = "the storage is busy";
+    let proxy = InterceptingProxy::start_seeing(&server.url, move |_, head| {
+        head.starts_with("DELETE").then(|| format!(
+            "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(), body
+        ).into_bytes())
+    });
+    assert_success(&area.forklift("a", &["config", "set", "remote.url", &proxy.url]));
+
+    let failed = area.forklift("a", &["pallet", "delete", "feat", "--remote"]);
+    assert!(!failed.status.success(), "{}", stdout(&failed));
+    let said = stderr(&failed);
+    assert!(said.contains(&format!("The delete was for \"feat\" at {}.", feat)), "{}", said);
+    assert!(said.contains(&format!("\"forklift pallet delete feat --remote --at {}\" runs this delete again at that head only", feat)), "{}", said);
+    assert_eq!(pallet_head(&area, "server-root", "feat"), feat, "the proxy answered for the remote");
+}
+
 // Revert: send no tombstone with the remote restore → the remote refuses it; offer "--recreate" to
 // work that does not descend → the remote refuses that lift instead of the client.
 #[test]

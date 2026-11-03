@@ -2348,6 +2348,11 @@ fn classify_remote_error(status: u16, action: &str, message: String,
 /// local `Error while …` and from a transport failure that repeats (DNS, TLS, a bad body).
 const CONNECTION_FAILED: &str = "the connection to the remote failed: ";
 
+/// How a mutation timeout ends: rerunning the same request converges. A command whose plain rerun
+/// is not that same request (it reads the remote anew first) replaces this with its own advice.
+pub const MUTATION_RERUN_CONVERGES: &str =
+    " It may have already completed there — re-running converges, so retrying is safe.";
+
 /// Whether `message` reports a failure retrying may get past: a timeout, a connection that failed
 /// or a server error (`5xx`) as this module composes them, anywhere in the message (a caller may
 /// have wrapped it). Never a local failure, whatever its text quotes.
@@ -2895,9 +2900,8 @@ impl RemoteClient {
     fn mutation_read_timeout_message(action: &str) -> String {
         format!(
             "Timed out while {}: the request may or may not have fully reached the remote, and \
-            no response arrived. It may have already completed there — re-running converges, so \
-            retrying is safe.",
-            action
+            no response arrived.{}",
+            action, MUTATION_RERUN_CONVERGES
         )
     }
 

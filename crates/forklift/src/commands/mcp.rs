@@ -774,6 +774,7 @@ pub(crate) const HUMAN_ONLY: &[(&str, &str)] = &[
 /// any, and the refusal a lift to a pallet deleted on the remote gives names it as the next step.
 pub(crate) const HUMAN_ONLY_ARGS: &[(&str, &str, &str)] = &[
     ("pallet delete", "remote", "deletes the remote's pallet, which every clone shares: an admin's call, never a sub-agent's"),
+    ("pallet delete", "at", "pins a delete of the remote's pallet, which is not served here"),
 ];
 
 /// The families whose bare form runs the same operation as one of their subcommands, with that
@@ -1729,8 +1730,13 @@ mod tests {
         assert!(refusal.starts_with(&format!("the \"pallet_delete\" tool does not take \"{remote}\": that deletes the remote's pallet")),
                 "{refusal}");
         let description = delete.definition()["description"].as_str().unwrap().to_string();
-        assert!(description.ends_with(&format!("\n\nThe command's \"--{remote}\" is not served here: it deletes the remote's pallet, \
-                                                which every clone shares: an admin's call, never a sub-agent's.")), "{description}");
+        assert!(description.contains(&format!("\n\nThe command's \"--{remote}\" is not served here: it deletes the remote's pallet, \
+                                               which every clone shares: an admin's call, never a sub-agent's.")), "{description}");
+        // The pin of a remote delete goes with it: a tool that cannot delete the remote's pallet
+        // has nothing to pin.
+        assert!(delete.params.iter().all(|param| param.key != "at"));
+        let refusal = delete.refusal(&json!({ "name": "p", "at": "a".repeat(64) })).unwrap();
+        assert!(refusal.starts_with("the \"pallet_delete\" tool does not take \"at\""), "{refusal}");
         assert_eq!(tool("pallet_restore").refusal(&json!({ "name": "p", remote: true })), None);
         assert_eq!(tool("pallet_list").refusal(&json!({ remote: true })), None);
 
