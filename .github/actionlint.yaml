@@ -1,4 +1,4 @@
-# Runner labels actionlint does not know: the Blacksmith runners ci.yml uses.
+# Runner labels actionlint does not know: the Blacksmith runners a ci.yml test entry may name.
 self-hosted-runner:
   labels:
     - blacksmith-6vcpu-macos-latest
