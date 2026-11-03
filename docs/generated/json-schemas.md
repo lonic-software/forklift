@@ -4579,6 +4579,12 @@ A command not listed here either reports only the generic human-message shape `{
       "minimum": 0,
       "type": "integer"
     },
+    "kept_for_deltas": {
+      "description": "Candidates kept because packed content is stored as a delta against them, and would no\nlonger read without them. A later prune does not reclaim them.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
     "kept_for_hauls": {
       "description": "Candidates kept because lifting the unlifted history a haul not yet merged proposes reads\nthem, where no pallet reaches it any more. Lifting cannot free these; once the haul is\nmerged and its target lifted, a later prune does. A closed haul keeps them, since\nreopening it proposes the same head.",
       "format": "uint",
@@ -4603,10 +4609,6 @@ A command not listed here either reports only the generic human-message shape `{
         "type": "string"
       },
       "type": "array"
-    },
-    "repack": {
-      "description": "Whether the run rewrites every pack first (in the preview, would): a packed delta stands on\nan object it frees, which the repack re-encodes so that the delta still reads.",
-      "type": "boolean"
     },
     "retained_shared": {
       "description": "Candidates kept because they are shared (by content hash) with a scope that is still\nfetched, or with a meta pallet. Distinct from `still_packed`: this content stays by\ndesign, not pending a future repack.",
@@ -4646,13 +4648,13 @@ A command not listed here either reports only the generic human-message shape `{
     "scope",
     "freed",
     "would_free",
-    "repack",
     "still_packed",
     "retained_shared",
     "kept_unlifted",
     "kept_for_hauls",
     "kept_for_mirror",
     "kept_for_deleted",
+    "kept_for_deltas",
     "unlifted_pallets",
     "all_resumed"
   ],

@@ -233,7 +233,8 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
             pack_utils::PackScanError::Damaged(e) => format!(
                 "\"forklift store evict\" cannot run while a pack in this warehouse is damaged, since it cannot tell \
                 which packed content stands on what it would free; nothing was changed. Run \
-                \"forklift store compact --all\" to salvage the pack, then \"forklift store evict\" again. {}", e
+                \"forklift store compact --all\" to salvage the pack, or restore or move aside a pack it cannot \
+                salvage, then \"forklift store evict\" again. {}", e
             ),
             pack_utils::PackScanError::Registry(e) => e,
         })?

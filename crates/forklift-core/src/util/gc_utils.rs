@@ -38,9 +38,9 @@ pub struct GcStats {
     /// (an in-flight lift may still be uploading their reachers).
     pub kept_recent: usize,
 
-    /// Unreferenced objects kept because a pack's delta stands on them. Unreachable as they are,
-    /// deleting one would leave that delta unreadable. A full repack re-encodes the delta, and a
-    /// later collection deletes them.
+    /// Unreferenced objects kept because a pack's delta stands on them: deleting one would leave
+    /// that delta unreadable. Once a full repack has re-encoded or dropped the delta, a collection
+    /// deletes them.
     pub kept_for_deltas: usize,
 }
 
@@ -71,7 +71,7 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
     let mut stats = GcStats { scanned: 0, deleted: 0, kept_recent: 0, kept_for_deltas: 0 };
 
     // Read at the first object the sweep would delete: most collections delete nothing.
-    let mut delta_bases: Option<HashSet<String>> = None;
+    let mut delta_bases: Option<pack_utils::PackedDeltaBases> = None;
 
     let folders = std::fs::read_dir(&objects_root)
         .map_err(|e| format!("Error while reading the objects folder: {}", e))?;
@@ -137,7 +137,8 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
                 unread => unread.insert(pack_utils::packed_delta_bases().map_err(|error| match error {
                     pack_utils::PackScanError::Damaged(e) => format!(
                         "gc cannot delete anything while a pack in this warehouse is damaged, since it cannot tell \
-                        which packed content stands on what it would delete. {}", e
+                        which packed content stands on what it would delete; nothing more was deleted. Restore the \
+                        pack or move it aside, then run gc again. {}", e
                     ),
                     pack_utils::PackScanError::Registry(e) => e,
                 })?),
@@ -443,21 +444,26 @@ pub(crate) mod tests {
         assert!(read_fresh(&live.hash).unwrap() == live.content, "the re-encoded delta needs no base");
     }
 
-    /// A damaged pack refuses a sweep that would delete something, and deletes nothing.
+    /// A pack that cannot be read refuses a sweep that would delete something, and deletes nothing.
     ///
-    /// Revert: treat a pack that cannot be read as holding no delta → the garbage is deleted.
+    /// Revert: pass over a pack whose index fails → CorruptBucket deletes the garbage; pass over a
+    /// pack the registry could not load → the other kinds do.
     #[test]
-    fn gc_refuses_to_delete_past_a_damaged_pack() {
-        let _scratch = Scratch::new("delta-damaged");
-        let mut stray = LooseObjectBuilder::build_blob(&Blob { content: b"packed and damaged\n".to_vec() });
-        stray.store().unwrap();
-        pack_as_unreadable(&stray.hash, Unreadable::CorruptBucket);
-        let mut garbage = LooseObjectBuilder::build_blob(&Blob { content: b"loose and unreachable\n".to_vec() });
-        garbage.store().unwrap();
+    fn gc_refuses_to_delete_past_an_unreadable_pack() {
+        for_each_unreadable(|how| {
+            let _scratch = Scratch::new("delta-unreadable");
+            let mut stray = LooseObjectBuilder::build_blob(&Blob { content: b"packed and damaged\n".to_vec() });
+            stray.store().unwrap();
+            pack_as_unreadable(&stray.hash, how);
+            let mut garbage = LooseObjectBuilder::build_blob(&Blob { content: b"loose and unreachable\n".to_vec() });
+            garbage.store().unwrap();
 
-        let Err(error) = collect_garbage(0) else { panic!("a damaged pack refuses") };
-        assert!(error.contains("damaged"), "{}", error);
-        assert!(loose_path(&garbage.hash).exists());
+            let Err(error) = collect_garbage(0) else { return Some(format!("{:?}: a pack that cannot be read refuses", how)) };
+            if !(error.contains("damaged") && error.contains("move it aside")) {
+                return Some(format!("{:?}: {}", how, error));
+            }
+            (!loose_path(&garbage.hash).exists()).then(|| format!("{:?}: the garbage must stay", how))
+        });
     }
 
     impl Drop for Scratch {

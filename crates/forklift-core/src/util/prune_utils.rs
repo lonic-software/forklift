@@ -55,18 +55,13 @@ use crate::util::sealed_utils::{self, SealedSet};
 use crate::util::{
     bay_utils, file_utils, gc_utils, object_utils, office_utils, pack_utils, pallet_utils, recovery_utils,
 };
-use crate::util::lock_utils::{ServeLock, StoreAccessExclusive, StoreLock};
-use crate::util::progress_utils::Progress;
+use crate::util::lock_utils::StoreAccessExclusive;
 
 /// The reclamation a prune would carry out, computed without mutating anything (safe for the
 /// preview an unconfirmed prune shows).
 pub struct PrunePlan {
     /// Present, loose objects to delete: under a pruned path, and needed by no retained scope.
     pub to_free: Vec<String>,
-
-    /// Whether a repack runs before the frees: a packed delta stands on an object of `to_free`,
-    /// and stops decoding once that object is gone unless it is re-encoded first.
-    pub repack: bool,
 
     /// Candidates present only inside a pack. A loose delete cannot reclaim a packed object
     /// (that is a repack concern), so they are counted and reported, never silently dropped.
@@ -101,6 +96,10 @@ pub struct PrunePlan {
     /// `undo` can still put back, reads them. Lifting cannot free these; a later prune does once
     /// the delete can no longer be undone.
     pub kept_for_deleted: usize,
+
+    /// Candidates kept because a packed delta stands on them, and would stop decoding without
+    /// them. A prune does not reclaim them: a repack packs whichever history still reaches.
+    pub kept_for_deltas: usize,
 
     /// The user pallets, as wire names, whose unlifted history changed a pruned path, so that
     /// lifting them (or lowering) lets a later prune free what this one kept. Empty when
@@ -262,20 +261,26 @@ fn plan_from(
     }
 
     // A packed delta can stand on a loose object: an ingest stores a delta against a base it holds
-    // loose. No such delta is itself freed, since the plan frees no packed object. A damaged pack
-    // refuses the run: its deltas cannot be read to say what they stand on, and the repack, which
-    // runs without salvage, would leave it as found.
-    let repack = !to_free.is_empty() && pack_utils::any_packed_delta_against(&to_free.iter().cloned().collect())
-        .map_err(|error| match error {
+    // loose. Filtering keeps to_free's order, and a kept child under a freed parent is at worst
+    // loose garbage. A damaged pack refuses the run: its deltas cannot be read to say what they
+    // stand on.
+    let mut kept_for_deltas = 0usize;
+    if !to_free.is_empty() {
+        let bases = pack_utils::packed_delta_bases().map_err(|error| match error {
             pack_utils::PackScanError::Damaged(e) => format!(
                 "\"forklift scope prune\" cannot run while a pack in this warehouse is damaged, since it cannot tell \
                 which packed content stands on what it would free; nothing was changed. Run \
-                \"forklift store compact --all\" to salvage the pack, then \"forklift scope prune\" again. {}", e
+                \"forklift store compact --all\" to salvage the pack, or restore or move aside a pack it cannot \
+                salvage, then \"forklift scope prune\" again. {}", e
             ),
             pack_utils::PackScanError::Registry(e) => e,
         })?;
+        let candidates = to_free.len();
+        to_free.retain(|hash| !bases.contains(hash));
+        kept_for_deltas = candidates - to_free.len();
+    }
 
-    Ok(PrunePlan { to_free, repack, still_packed, retained_shared, kept_unlifted, kept_for_hauls, kept_for_mirror, kept_for_deleted, unlifted_pallets })
+    Ok(PrunePlan { to_free, still_packed, retained_shared, kept_unlifted, kept_for_hauls, kept_for_mirror, kept_for_deleted, kept_for_deltas, unlifted_pallets })
 }
 
 /// `live_parcels`, then every `held` parcel they do not reach, once: the user history a prune
@@ -483,38 +488,6 @@ fn leading_to_touching(unlifted: &HashSet<String>, touching: &HashSet<String>) -
     }
 
     Ok(leading)
-}
-
-/// Carry out `plan`: re-encode every kept packed delta that stands on an object it frees, when one
-/// does, then free them. The repack first: it reads that base from the loose copy, and a free that
-/// fails after it has lost nothing, so running the prune again finishes.
-///
-/// Holds the locks a full repack takes, which the plan was computed under too: a repack keeps only
-/// what is live when it runs, so nothing may change what is live between the plan and the delete.
-///
-/// # Arguments
-/// * `plan`         - From [`plan_prune`], under the same hold.
-/// * `store_lock`   - The object-store lock, held since before the plan.
-/// * `serve_lock`   - The serve lock, held since before the plan.
-/// * `store_access` - The exclusive store access the plan was computed under, still held.
-/// * `progress`     - Where the repack reports its phases.
-///
-/// # Returns
-/// * `Ok(PruneStats)` - The loose objects deleted.
-/// * `Err(String)`    - If the repack or a free failed. Either way, running the prune again finishes.
-pub fn carry_out(plan: &PrunePlan,
-                 store_lock: &StoreLock,
-                 serve_lock: &ServeLock,
-                 store_access: &StoreAccessExclusive,
-                 progress: &Progress) -> Result<PruneStats, String> {
-    if plan.repack {
-        // Everything the plan frees, not only the bases found: a freed object is present while the
-        // repack runs, so it must not become a target or a path base either.
-        let freed: HashSet<String> = plan.to_free.iter().cloned().collect();
-        pack_utils::repack_evicting(&freed, store_lock, serve_lock, store_access, progress)?;
-    }
-
-    free_objects(&plan.to_free, store_access)
 }
 
 /// Delete the planned loose objects, reclaiming their disk. Content objects (trees, blobs)
@@ -1747,12 +1720,6 @@ mod tests {
         format!("{}{}\n", lines, tail)
     }
 
-    fn carry(plan: &PrunePlan, hold: &StoreAccessExclusive) -> Result<PruneStats, String> {
-        let store_lock = StoreLock::acquire().expect("no other holder in a test root");
-        let serve_lock = ServeLock::acquire().expect("no other holder in a test root");
-        carry_out(plan, &store_lock, &serve_lock, hold, &Progress::NONE)
-    }
-
     /// `src/web/w.txt` a loose blob and `src/api/a.txt` a kept blob, in a pack of its own: a delta
     /// against the web blob when `on_web`, against a blob at no path otherwise. Returns the web
     /// blob, the api blob and the api blob's bytes.
@@ -1785,80 +1752,69 @@ mod tests {
         file_utils::retrieve_object_by_hash_uncached(hash)
     }
 
-    /// A kept packed delta whose base the prune frees stays readable: it is re-encoded first, and
-    /// the base still goes.
+    /// A base a kept packed delta stands on is not freed, so the delta still reads, and the prune
+    /// frees the rest. A delta on something else keeps nothing.
     ///
-    /// Revert: never repack → the base is freed and the delta no longer reads; free before
-    /// repacking → the repack cannot read the base and fails.
+    /// Revert: free the candidates a delta stands on → the first arm's delta no longer reads;
+    /// keep every candidate once a pack holds a delta → the second arm's blob stays.
     #[test]
-    fn a_kept_delta_on_a_freed_base_is_re_encoded_before_the_base_goes() {
-        let _scratch = Scratch::new("delta-on-freed");
-        let (web_blob, api_blob, api_bytes) = prune_over_a_packed_blob(true);
-        let post_prune = PathScope::from_prefixes(["src/api"]);
-        let hold = store_access();
+    fn a_prune_keeps_only_the_loose_objects_a_packed_delta_stands_on() {
+        for on_web in [true, false] {
+            let _scratch = Scratch::new(if on_web { "delta-on-web" } else { "delta-elsewhere" });
+            let (web_blob, api_blob, api_bytes) = prune_over_a_packed_blob(on_web);
+            let post_prune = PathScope::from_prefixes(["src/api"]);
+            let hold = store_access();
 
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &hold).unwrap();
-        assert!(plan.to_free.contains(&web_blob) && !pack_utils::is_in_packs(&web_blob).unwrap(), "sanity: the base is loose only");
-        assert!(plan.repack, "a packed delta stands on it");
+            let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &hold).unwrap();
+            assert_eq!(plan.kept_for_deltas, usize::from(on_web));
+            assert_eq!(plan.to_free.contains(&web_blob), !on_web);
+            assert!(!plan.to_free.is_empty(), "on_web {}: the web tree goes either way", on_web);
 
-        let stats = carry(&plan, &hold).unwrap();
-        assert_eq!(stats.freed, plan.to_free.len());
-        assert!(read_fresh(&web_blob).is_err(), "the base is freed, and no pack took it");
-        assert!(read_fresh(&api_blob).unwrap() == api_bytes, "the kept delta reads back as written");
+            free_objects(&plan.to_free, &hold).unwrap();
+            assert_eq!(loose_exists(&web_blob), on_web);
+            assert!(read_fresh(&api_blob).unwrap() == api_bytes, "on_web {}: the kept delta reads back as written", on_web);
+        }
     }
 
-    /// A kept packed delta on something the prune keeps asks for no repack, and the old pack stays.
+    /// A pack that cannot be read refuses a plan that frees anything, before anything changes, and
+    /// the refusal's ways out let the prune run: moving the pack aside, for every kind; a salvaging
+    /// repack, for a damaged index. A plan that frees nothing has nothing to ask.
     ///
-    /// Revert: repack whenever the plan frees anything → the pack is rewritten and this goes red.
+    /// Revert: pass over a pack whose index fails → CorruptBucket plans; pass over a pack the
+    /// registry could not load → the other kinds plan.
     #[test]
-    fn a_kept_delta_on_a_kept_base_leaves_the_packs_alone() {
-        let _scratch = Scratch::new("delta-on-kept");
-        let (web_blob, api_blob, api_bytes) = prune_over_a_packed_blob(false);
-        let post_prune = PathScope::from_prefixes(["src/api"]);
-        let hold = store_access();
-        let packs_before = pack_files();
-        assert!(!packs_before.is_empty(), "sanity: the delta is packed");
+    fn an_unreadable_pack_refuses_a_plan_that_frees_and_the_named_steps_clear_it() {
+        for_each_unreadable(|how| {
+            let _scratch = Scratch::new("unreadable-pack");
+            let f = build_fixture();
+            pack_as_unreadable(&store_blob("stray\n"), how);
+            let post_prune = PathScope::from_prefixes(["src/api"]);
+            let plan = || plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access());
 
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &hold).unwrap();
-        assert!(plan.to_free.contains(&web_blob), "sanity: the plan frees something");
-        assert!(!plan.repack);
+            let nothing = plan_prune(&["never/fetched".to_string()], &PathScope::from_prefixes(["src"]), &lifted(), &[], &store_access());
+            if !nothing.is_ok_and(|plan| plan.to_free.is_empty()) {
+                return Some(format!("{:?}: nothing to free, nothing to ask", how));
+            }
 
-        carry(&plan, &hold).unwrap();
-        assert_eq!(pack_files(), packs_before);
-        assert!(!loose_exists(&web_blob));
-        assert!(read_fresh(&api_blob).unwrap() == api_bytes);
-    }
+            let Err(error) = plan() else { return Some(format!("{:?}: a prune must refuse", how)) };
+            if !(error.contains("damaged") && error.contains("nothing was changed") && error.contains("store compact --all") && error.contains("move aside")) {
+                return Some(format!("{:?}: {}", how, error));
+            }
 
-    /// A damaged pack refuses a plan that frees anything, before anything changes, and the step the
-    /// refusal names lets the prune run. A plan that frees nothing has nothing to ask.
-    ///
-    /// Revert: pass over a pack whose index fails → the plan is made and this goes red.
-    #[test]
-    fn a_damaged_pack_refuses_a_plan_that_frees_and_compact_all_clears_it() {
-        let _scratch = Scratch::new("damaged");
-        let f = build_fixture();
-        pack_as_unreadable(&store_blob("stray\n"), Unreadable::CorruptBucket);
-        let post_prune = PathScope::from_prefixes(["src/api"]);
-
-        let nothing = plan_prune(&["never/fetched".to_string()], &PathScope::from_prefixes(["src"]), &lifted(), &[], &store_access());
-        assert!(nothing.is_ok_and(|plan| plan.to_free.is_empty()), "nothing to free, nothing to ask");
-
-        let Err(error) = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()) else {
-            panic!("a damaged pack refuses");
-        };
-        assert!(error.contains("damaged") && error.contains("nothing was changed") && error.contains("store compact --all"), "{}", error);
-
-        pack_utils::compact(true, false, true, &Progress::NONE).unwrap();
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
-        assert!(pack_utils::is_in_packs(&f.web_blob).unwrap() && plan.still_packed > 0, "the prune plans again, over what the repack packed");
-    }
-
-    fn pack_files() -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(PathBuf::from(file_utils::get_path_objects_root()).join("pack")).unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        names
+            if matches!(how, Unreadable::CorruptBucket) {
+                pack_utils::compact(true, false, true, &crate::util::progress_utils::Progress::NONE).unwrap();
+            } else {
+                for entry in std::fs::read_dir(PathBuf::from(file_utils::get_path_objects_root()).join("pack")).unwrap() {
+                    std::fs::remove_file(entry.unwrap().path()).unwrap();
+                }
+                pack_utils::forget_warehouse();
+            }
+            match plan() {
+                Ok(plan) if plan.to_free.contains(&f.web_blob) || plan.still_packed > 0 => None,
+                Ok(_) => Some(format!("{:?}: the plan lost the pruned path", how)),
+                Err(error) => Some(format!("{:?}: the named step did not clear it: {}", how, error)),
+            }
+        });
     }
 
     #[test]

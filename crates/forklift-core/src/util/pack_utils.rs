@@ -3391,7 +3391,8 @@ pub enum PackScanError {
 
 /// Whether a pack holds a delta whose base is one of `bases`: a record that stops decoding once
 /// its base is deleted, unless a repack re-encodes it first. Every pack's index is validated even
-/// when `bases` is empty, so a caller about to delete objects learns of a damaged pack first.
+/// when `bases` is empty, so a caller about to delete objects learns of a damaged pack first, and
+/// a pack the registry could not load refuses too.
 ///
 /// # Arguments
 /// * `bases` - Object hashes about to be deleted.
@@ -3406,6 +3407,8 @@ pub fn any_packed_delta_against(bases: &HashSet<String>) -> Result<bool, PackSca
     let wanted: HashSet<[u8; HASH_LEN]> = bases.iter().filter_map(|hash| hash_to_bytes(hash)).collect();
 
     let packs = loaded_packs().map_err(PackScanError::Registry)?;
+    refuse_unscannable_packs(&packs)?;
+
     let mut found = false;
     for pack in packs.packs.iter() {
         let records = pack.records().map_err(PackScanError::Damaged)?;
@@ -3424,27 +3427,48 @@ pub fn any_packed_delta_against(bases: &HashSet<String>) -> Result<bool, PackSca
     Ok(found)
 }
 
+/// The objects packed deltas stand on, from [`packed_delta_bases`].
+pub(crate) struct PackedDeltaBases(HashSet<[u8; HASH_LEN]>);
+
+impl PackedDeltaBases {
+    pub(crate) fn contains(&self, hash: &str) -> bool {
+        hash_to_bytes(hash).is_some_and(|bytes| self.0.contains(&bytes))
+    }
+}
+
 /// Every object a pack's delta stands on: what stops those deltas decoding if it is deleted while
-/// they remain. Every pack's index and record headers are read, so a damaged pack says so rather
-/// than hiding a base.
+/// they remain. A delta nothing reaches counts too, as nothing here says what is live.
 ///
 /// # Returns
-/// * `Ok(HashSet)`        - The hashes of the bases.
-/// * `Err(PackScanError)` - As [`any_packed_delta_against`].
-pub(crate) fn packed_delta_bases() -> Result<HashSet<String>, PackScanError> {
+/// * `Ok(PackedDeltaBases)` - The bases.
+/// * `Err(PackScanError)`   - As [`any_packed_delta_against`].
+pub(crate) fn packed_delta_bases() -> Result<PackedDeltaBases, PackScanError> {
     let packs = loaded_packs().map_err(PackScanError::Registry)?;
+    refuse_unscannable_packs(&packs)?;
+
     let mut bases = HashSet::new();
     for pack in packs.packs.iter() {
         let records = pack.records().map_err(PackScanError::Damaged)?;
         for record in records.iter() {
             let header = read_record_header(pack, record.offset, record.length).map_err(PackScanError::Damaged)?;
-            if let Some(base) = header.base {
-                bases.insert(sign_utils::to_hex(&base));
-            }
+            bases.extend(header.base);
         }
     }
 
-    Ok(bases)
+    Ok(PackedDeltaBases(bases))
+}
+
+/// Refuse a pack the registry could not load: it may hold deltas nothing can list, and its data may
+/// come back.
+fn refuse_unscannable_packs(packs: &PackSet) -> Result<(), PackScanError> {
+    if let Some(pack) = packs.quarantined.first() {
+        return Err(PackScanError::Damaged(format!("The pack index {} has no usable data file.", pack.index_path.display())));
+    }
+    if let Some(pack) = packs.unenumerable.first() {
+        return Err(PackScanError::Damaged(format!("The pack index {} cannot be read.", pack.index_path.display())));
+    }
+
+    Ok(())
 }
 
 /// [`is_in_packs`] against the cached set only, with no revalidation: the first step of a

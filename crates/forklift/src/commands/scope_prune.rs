@@ -1,11 +1,10 @@
 use serde::Serialize;
 use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::util::{bay_utils, journal_utils};
-use forklift_core::util::lock_utils::{ServeLock, StoreAccessLock, StoreLock};
+use forklift_core::util::lock_utils::StoreAccessLock;
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::scope_utils::{self, PathScope, ScopeClass};
 use forklift_core::util::prune_utils;
-use crate::events;
 use crate::output::{self, CommandOutput};
 
 /// Handle `scope prune` (§7.6): the deliberate, destructive counterpart of `scope narrow`.
@@ -40,8 +39,8 @@ use crate::output::{self, CommandOutput};
 /// * `Ok(())`      - If the plan was carried out.
 /// * `Err(String)` - If the plan frees content and `confirm` was not given, the warehouse is not sparse, a path is a live spine ancestor or a
 ///   sub-path of what is still fetched, the last fetched path would be dropped, a checkout
-///   still materializes the path, another process is using the object store, a pack is damaged, or
-///   the remote cannot be reached or is not trusted.
+///   still materializes the path, another process is using the object store, a pack that cannot be
+///   read could stand on what it frees, or the remote cannot be reached or is not trusted.
 pub async fn handle_command(paths: Vec<String>, confirm: bool) -> Result<(), String> {
     // Judged once before the remote is asked, so a local refusal (a full warehouse, a path that is
     // not fetched, a checkout that still needs it) is reported as itself rather than masked by a
@@ -60,14 +59,6 @@ pub async fn handle_command(paths: Vec<String>, confirm: bool) -> Result<(), Str
     // run anywhere between this read and the last deletion. The preview takes it too, so it shows
     // exactly the plan a confirmed run would carry out against the warehouse as it stands now. Never waits: refused while any writer holds
     // the store. `main` takes no shared hold for this command, which would refuse this try.
-    // The store and serve locks come first, in the order a full repack takes them: the plan may
-    // need one, and a repack keeps only what is live when it runs.
-    let store_lock = StoreLock::acquire()?;
-    let serve_lock = ServeLock::acquire().map_err(|e| format!(
-        "\"forklift scope prune\" cannot run while this warehouse root is being served; stop the server first. If \
-        no server is running, the lock below was left by a server, gc or full repack that was killed \
-        and can be removed. {}", e
-    ))?;
     let store_access = StoreAccessLock::try_exclusive()?;
     let PruneRequest { post_prune, to_reclaim, all_resumed } = judge_request(&paths)?;
 
@@ -89,13 +80,13 @@ pub async fn handle_command(paths: Vec<String>, confirm: bool) -> Result<(), Str
             scope: post_prune.prefixes().to_vec(),
             freed: 0,
             would_free: plan.to_free.len(),
-            repack: plan.repack,
             still_packed: plan.still_packed,
             retained_shared: plan.retained_shared,
             kept_unlifted: plan.kept_unlifted,
             kept_for_hauls: plan.kept_for_hauls,
             kept_for_mirror: plan.kept_for_mirror,
             kept_for_deleted: plan.kept_for_deleted,
+            kept_for_deltas: plan.kept_for_deltas,
             unlifted_pallets: plan.unlifted_pallets,
             all_resumed,
         };
@@ -126,7 +117,7 @@ pub async fn handle_command(paths: Vec<String>, confirm: bool) -> Result<(), Str
     // The reverse order could leave an in-scope object missing, which is unsafe.
     scope_utils::set_fetch_scope(&post_prune)?;
 
-    let stats = prune_utils::carry_out(&plan, &store_lock, &serve_lock, &store_access, &events::progress())?;
+    let stats = prune_utils::free_objects(&plan.to_free, &store_access)?;
 
     output::emit(&ScopePruneReport {
         preview: false,
@@ -135,13 +126,13 @@ pub async fn handle_command(paths: Vec<String>, confirm: bool) -> Result<(), Str
         scope: post_prune.prefixes().to_vec(),
         freed: stats.freed,
         would_free: plan.to_free.len(),
-        repack: plan.repack,
         still_packed: plan.still_packed,
         retained_shared: plan.retained_shared,
         kept_unlifted: plan.kept_unlifted,
         kept_for_hauls: plan.kept_for_hauls,
         kept_for_mirror: plan.kept_for_mirror,
         kept_for_deleted: plan.kept_for_deleted,
+        kept_for_deltas: plan.kept_for_deltas,
         unlifted_pallets: plan.unlifted_pallets,
         all_resumed,
     });
@@ -294,10 +285,6 @@ pub(crate) struct ScopePruneReport {
     /// Loose objects the prune frees (equals `freed` after a confirmed run).
     would_free: usize,
 
-    /// Whether the run rewrites every pack first (in the preview, would): a packed delta stands on
-    /// an object it frees, which the repack re-encodes so that the delta still reads.
-    repack: bool,
-
     /// Candidate objects present only inside a pack: a loose delete cannot reclaim them and a
     /// reachability repack keeps them (they are still reachable history), so a scope-aware
     /// repack is future work. Reported so the count is never silently lost.
@@ -330,6 +317,10 @@ pub(crate) struct ScopePruneReport {
     /// does once the delete can no longer be undone.
     kept_for_deleted: usize,
 
+    /// Candidates kept because packed content is stored as a delta against them, and would no
+    /// longer read without them. A later prune does not reclaim them.
+    kept_for_deltas: usize,
+
     /// The pallets whose unlifted history changed the pruned path; lifting them (or lowering) is
     /// what lets a later prune free the rest. Pallets with unlifted work elsewhere are not listed,
     /// and it can be empty when gaps in the history hide which pallet leads to the kept work.
@@ -355,6 +346,13 @@ impl CommandOutput for ScopePruneReport {
             // below names the count and explains the repack is future work.
             println!(
                 "{} pruned; nothing was loose to free — its content is packed, awaiting a repack. \
+                Fetch scope now: {}.",
+                self.pruned.join(", "), self.scope.join(", ")
+            );
+        } else if self.freed == 0 && self.kept_for_deltas > 0 {
+            // Nothing freed because packed content needs what was left; the footer gives the count.
+            println!(
+                "{} pruned, but nothing was freed: packed content is stored against what is left. \
                 Fetch scope now: {}.",
                 self.pruned.join(", "), self.scope.join(", ")
             );
@@ -385,10 +383,6 @@ impl CommandOutput for ScopePruneReport {
                 "Pruned {}; freed {} loose object(s). Fetch scope now: {}.",
                 self.pruned.join(", "), self.freed, self.scope.join(", ")
             );
-        }
-
-        if self.preview && self.repack {
-            println!("It would first rewrite every pack, since packed content is stored against what it frees.");
         }
 
         if self.still_packed > 0 {
@@ -439,6 +433,14 @@ impl CommandOutput for ScopePruneReport {
                 here, which \"forklift undo\" can still bring back; a later prune frees them once that delete \
                 can no longer be undone.",
                 self.kept_for_deleted
+            );
+        }
+
+        if self.kept_for_deltas > 0 {
+            println!(
+                "{} object(s) were kept because packed content is stored as a delta against them and \
+                would no longer read without them; they remain on disk.",
+                self.kept_for_deltas
             );
         }
 
