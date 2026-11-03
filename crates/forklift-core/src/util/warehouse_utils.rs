@@ -907,6 +907,11 @@ fn fill_in_place(forklift: &Path, mode: PrepareMode) -> Result<Vec<String>, Stri
     refuse_bay(forklift)?;
 
     // So can a warehouse of another format, whose number this build's pieces would then stand under.
+    // Leased before the format is read, so no upgrade changes it between the read and the fill.
+    let lease = match read_marker(forklift)? {
+        Some(_) => Some(lock_utils::FormatLease::shared(forklift).map_err(String::from)?),
+        None => None,
+    };
     let _lease = match read_marker(forklift)? {
         Some(marker) if marker.upgrade.is_some() || marker.format != WAREHOUSE_FORMAT => return Err(format!(
             "\"{}\" holds a warehouse in format {}{}, so this version of Forklift, which prepares format {}, \
@@ -915,8 +920,7 @@ fn fill_in_place(forklift: &Path, mode: PrepareMode) -> Result<Vec<String>, Stri
             marker.upgrade.as_ref().map_or(String::new(), |upgrade| format!(" with an upgrade to format {} unfinished", upgrade.target)),
             WAREHOUSE_FORMAT
         )),
-        Some(_) => Some(lock_utils::FormatLease::shared(forklift).map_err(String::from)?),
-        None => None,
+        _ => lease,
     };
 
     let (mut notes, created) = fill(forklift, forklift)?;

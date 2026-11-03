@@ -643,7 +643,9 @@ pub fn prepare_resume(target: &Path, record: Option<&FranchiseRecord>, keep: &Bu
     }
 
     let taints = taint_utils::read_taints(&forklift)?;
-    let discarded = taints.torn || (std::fs::symlink_metadata(&objects).is_ok() && !is_real_dir(&objects)?);
+    // A store another format's build wrote is not this build's to read, whatever it holds.
+    let other_format = record.is_some_and(|record| record.format != warehouse_utils::WAREHOUSE_FORMAT);
+    let discarded = taints.torn || other_format || (std::fs::symlink_metadata(&objects).is_ok() && !is_real_dir(&objects)?);
 
     if discarded {
         file_utils::remove_unfollowed(&objects)?;
@@ -669,9 +671,6 @@ pub fn prepare_resume(target: &Path, record: Option<&FranchiseRecord>, keep: &Bu
     if record.is_none_or(|record| record.genesis.is_none()) {
         remove_signature_sidecars(&objects)?;
     }
-
-    // A bundle another format's build kept may not be what this one would have kept.
-    let other_format = record.is_some_and(|record| record.format != warehouse_utils::WAREHOUSE_FORMAT);
 
     let keep = match keep {
         _ if other_format => &BundleState::None,
@@ -1091,9 +1090,10 @@ mod tests {
         }
     }
 
-    /// A bundle another format's build kept is not resumed: it goes, whatever the record says of it.
+    /// What another format's build fetched is not resumed: its kept bundle and its object store go,
+    /// whatever the record says of them.
     ///
-    /// Revert: keep the bundle whatever format the record names → the download survives → red.
+    /// Revert: keep the bundle, or the store, whatever format the record names → it survives → red.
     #[test]
     fn a_resume_at_another_format_discards_the_kept_bundle() {
         let dir = temp_dir("resume-other-format");
@@ -1101,12 +1101,17 @@ mod tests {
         let partial = BundleState::Partial(PartialBundle { etag: "\"t\"".to_string(), total: 10, length: 4 });
         std::fs::create_dir_all(&bundles).unwrap();
         std::fs::write(bundles.join("partial"), b"abcdef").unwrap();
+        let objects = dir.join(".forklift").join("objects");
+        std::fs::create_dir_all(objects.join("ab")).unwrap();
+        std::fs::write(objects.join("ab/cdef"), b"x").unwrap();
 
         let same = record();
         let other = FranchiseRecord { format: same.format + 1, ..record() };
         assert_eq!(prepare_resume(&dir, Some(&same), &partial), Ok(partial.clone()));
+        assert!(objects.join("ab/cdef").exists());
         assert_eq!(prepare_resume(&dir, Some(&other), &partial), Ok(BundleState::None));
         assert!(!bundles.exists());
+        assert!(!objects.join("ab/cdef").exists(), "the store another format wrote goes too");
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -89,12 +89,18 @@ impl FormatLease {
     }
 }
 
-/// Create the format lease sidecar at `path`, for [`FormatLease::shared`] and for prepare.
+/// Create the format lease sidecar at `path`, for [`FormatLease::shared`] and for prepare. One
+/// already there is opened read-only, so a warehouse this user cannot write is not refused for a
+/// lock it has.
 fn create_format_sidecar(path: &Path) -> Result<std::fs::File, CoreError> {
     let created = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path);
 
     match created {
         Ok(file) => Ok(file),
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem)
+            && path.is_file() => std::fs::File::open(path).map_err(|e| format!(
+                "Error while opening the lock file \"{}\": {}", path.to_string_lossy(), e
+            ).into()),
         Err(e) if matches!(e.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem) => Err(CoreError::refusal(
             RefusalCode::WarehouseLeaseMissing,
             format!(

@@ -739,3 +739,22 @@ fn the_server_holds_the_format_while_it_serves_and_its_other_commands_refuse() {
         assert!(text(&output.stderr).contains("Update this Forklift"), "{:?}: {}", args, text(&output.stderr));
     }
 }
+
+/// `prepare` over a complete warehouse whose format lock this user cannot write has nothing to do,
+/// and is not refused for a lock that is there.
+///
+/// Revert: open the format lock for writing whenever prepare fills → `warehouse_lease_missing` → red.
+#[test]
+#[cfg(unix)]
+fn prepare_over_a_warehouse_with_a_read_only_format_lock_has_nothing_to_do() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let area = Area::new("format-prepare-read-only");
+    let root = area.warehouse("w");
+    let lock = root.join(FOLDER_NAME_FORKLIFT_ROOT).join("format.lock");
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+    let output = area.run(&root, &["prepare"]);
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(output.status.success(), "{}{}", text(&output.stdout), text(&output.stderr));
+}
