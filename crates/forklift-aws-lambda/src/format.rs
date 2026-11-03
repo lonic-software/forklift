@@ -370,7 +370,7 @@ pub fn upgrade<S: RefStore + FormatStore>(
                 if !options.takeover {
                     return Err(format!(
                         "Warehouse {} is being upgraded from format {} to format {} by run {}, at \
-                        step {}. If that run is dead, run the upgrade again with --takeover.",
+                        step {}. If that run is dead, run the upgrade again with --takeover and this warehouse's id.",
                         warehouse, marked_from, to, owner, step
                     ));
                 }
