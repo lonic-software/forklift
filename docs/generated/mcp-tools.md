@@ -34,7 +34,7 @@ Every tool `forklift mcp` serves, generated from the same command definition the
 | `history` | `forklift history` | Print the parcels of a revision, newest first | `revision` (a string)<br>`limit` (an integer of at least 1)<br>`after` (a string)<br>`oneline` (a boolean) |
 | `lift` | `forklift lift` | Upload the current pallet's new parcels to the remote (push) | `recreate` (a boolean) |
 | `load` | `forklift load` | Take the current state of a file or directory into the inventory (stage) | `path` (a string, required) |
-| `lower` | `forklift lower` | Download the remote's new parcels and fast-forward the current pallet, or another (pull) | `pallet` (a string)<br>`expect` (a string)<br>`keep` (an array of strings)<br>`confirm` (a boolean) |
+| `lower` | `forklift lower` | Download the remote's new parcels and fast-forward the current pallet, or another (pull) | `pallet` (a string)<br>`expect` (a string)<br>`keep` (an array of strings)<br>`confirm` (a boolean)<br>`repair` (a boolean) |
 | `manifest` | `forklift manifest` | Facts recorded about a parcel after the fact: notes, approvals, provenance, keyed values |  |
 | `manifest_note` | `forklift manifest note` | Attach a free-form note to a parcel | `revision` (a string, required)<br>`message` (a string, required) |
 | `manifest_approve` | `forklift manifest approve` | Record a signed approval (sign-off) of a parcel | `revision` (a string, required)<br>`message` (a string) |

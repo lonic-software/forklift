@@ -6395,23 +6395,60 @@ pub fn diverged_refusal(pallet: &str, remote_head: &str) -> CoreError {
     )
 }
 
+/// Where a refused head's repair is built ([`head_not_materializable_refusal`]).
+pub enum RepairRoute<'a> {
+    /// By `forklift lower --repair` in this warehouse, for its current pallet.
+    Lower,
+
+    /// By a clone of the remote at this URL with `--repair`, into a new directory: this warehouse
+    /// fetches only part of each tree, so it cannot build the repair, which reads the whole of it.
+    NewClone(&'a str),
+
+    /// By resuming the clone of the remote at this URL that was refused, with `--repair`.
+    ResumeClone(&'a str),
+}
+
 /// The refusal for a remote head of `pallet` that holds `path`, a name that opens the warehouse's
 /// metadata folder, so no client can check it out ([`crate::util::shift_utils::first_unmaterializable_path`]).
 /// Raised before anything is changed for the head, and before a diverged refusal, whose next step
-/// would check the head out.
+/// would check the head out. The next step builds its repair, by `route`.
 ///
 /// # Arguments
 /// * `pallet` - The pallet whose remote head it is.
 /// * `path`   - The first path in the head's tree that opens a metadata folder.
-pub fn head_not_materializable_refusal(pallet: &str, path: &str) -> CoreError {
+/// * `route`  - Where the repair is built.
+pub fn head_not_materializable_refusal(pallet: &str, path: &str, route: RepairRoute) -> CoreError {
+    let (how, next_step) = match route {
+        RepairRoute::Lower => {
+            let command = "forklift lower --repair".to_string();
+
+            (format!("\"{}\" stacks a parcel on it that removes every such name, and \"forklift lift\" then publishes it.", command), command)
+        }
+        RepairRoute::ResumeClone(url) => (
+            "Resuming the clone with --repair stacks a parcel on it that removes every such name, and \
+            \"forklift lift\" there then publishes it.".to_string(),
+            format!("forklift clone {} <directory> --repair", url),
+        ),
+        RepairRoute::NewClone(url) => {
+            let command = format!("forklift clone {} <directory> --repair", url);
+
+            (format!(
+                "This warehouse fetches only part of each tree, so it cannot build the repair; \"{}\" into a new \
+                directory stacks a parcel on it that removes every such name, and \"forklift lift\" there then \
+                publishes it.",
+                command
+            ), command)
+        }
+    };
+
     CoreError::refusal(
         RefusalCode::HeadNotMaterializable,
         format!(
             "The remote's head of pallet \"{}\" holds \"{}\", a name that opens the warehouse's \
-            metadata folder, so no client can check it out. Nothing was changed.",
-            pallet, path
+            metadata folder, so no client can check it out. Nothing was changed. {}",
+            pallet, path, how
         ),
-        "No command in this build repairs such a head, so the pallet stays where it is; lowering again refuses the same way.",
+        next_step,
     )
 }
 

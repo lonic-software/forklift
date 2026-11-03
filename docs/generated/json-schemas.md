@@ -377,6 +377,27 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "string"
         }
       ]
+    },
+    "RepairReport": {
+      "description": "The repair parcel a `--repair` lower stacked.",
+      "properties": {
+        "parcel": {
+          "description": "The repair parcel, whose only parent is the remote head.",
+          "type": "string"
+        },
+        "removed": {
+          "description": "The paths it removed, in name order.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "parcel",
+        "removed"
+      ],
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -446,6 +467,17 @@ A command not listed here either reports only the generic human-message shape `{
     },
     "remote": {
       "type": "string"
+    },
+    "repair": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RepairReport"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The repair parcel checked out instead of the remote's head (`head`), when `--repair` found\na name there no client can check out; `forklift lift` publishes it."
     },
     "scope": {
       "description": "The sparse fetch scope, when this was a sparse (`--only`) clone (empty otherwise).",
@@ -2179,6 +2211,11 @@ A command not listed here either reports only the generic human-message shape `{
           "const": "created",
           "description": "The pallet did not exist here, and now points at the remote head. Only a named lower, of a\npallet other than the current one, creates one.",
           "type": "string"
+        },
+        {
+          "const": "repaired",
+          "description": "The remote head held a name no client can check out, and the pallet now points at a repair\nparcel stacked on it (`repair`); `forklift lift` publishes it.",
+          "type": "string"
         }
       ]
     },
@@ -2257,6 +2294,27 @@ A command not listed here either reports only the generic human-message shape `{
       "required": [
         "pallet",
         "error"
+      ],
+      "type": "object"
+    },
+    "RepairReport": {
+      "description": "The repair parcel a `--repair` lower stacked.",
+      "properties": {
+        "parcel": {
+          "description": "The repair parcel, whose only parent is the remote head.",
+          "type": "string"
+        },
+        "removed": {
+          "description": "The paths it removed, in name order.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "parcel",
+        "removed"
       ],
       "type": "object"
     }
@@ -2347,6 +2405,17 @@ A command not listed here either reports only the generic human-message shape `{
     },
     "pallet": {
       "type": "string"
+    },
+    "repair": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RepairReport"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The repair parcel the pallet now points at, when the outcome is `repaired`. A diverged pallet's\nrepair is refused as `diverged`, which names the pallet it was stacked on."
     }
   },
   "required": [

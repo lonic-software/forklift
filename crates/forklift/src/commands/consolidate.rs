@@ -87,11 +87,14 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
 
     let their_tree_hash = object_utils::load_parcel(&their_head)?.tree_hash;
 
-    // A hand-made ref could point at an office parcel; its tracked-metadata namespace
-    // must never be merged into a working pallet.
-    office_utils::ensure_not_metadata_tree(&their_tree_hash)?;
-
     if merge_utils::is_ancestor(&our_head, &their_head)? {
+        // Whatever the fast-forward takes from a tree that differs from ours could bring in a name
+        // that opens the metadata folder. A hand-made ref could point at an office parcel, whose
+        // top-level one is its tracked-metadata namespace: never merged into a working pallet
+        // either. A merge checks both in `merge_head_into_current`.
+        shift_utils::refuse_unmaterializable_pallet(target, Some(&our_tree_hash), &their_tree_hash)?;
+        office_utils::ensure_not_metadata_tree(&their_tree_hash)?;
+
         let head = fast_forward(&current, &target, &our_head, &our_tree_hash, &their_head, &their_tree_hash, anchor)?;
 
         output::emit(&ConsolidateReport::fast_forward(&current, target, &head));
@@ -104,7 +107,7 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
     // is one of the recognized self-heals — see `load_guard_utils`'s clearing-scope section — so
     // it must never be blocked); the incomplete-load guard for the genuine-merge path below lives
     // inside `merge_head_into_current` itself, covering every caller (consolidate/haul/lift).
-    match merge_head_into_current(&current, &our_head, &their_head, target, true, anchor).await? {
+    match merge_head_into_current(&current, &our_head, &their_head, target, Some(target), true, anchor).await? {
         MergeStatus::Merged(hash) =>
             output::emit(&ConsolidateReport::merged(&current, target, &hash)),
         MergeStatus::Conflicts(conflicts) =>
@@ -244,7 +247,8 @@ pub(crate) enum MergeStatus {
 ///
 /// The caller must have established that this is a genuine divergence (not up-to-date, not
 /// a fast-forward) and that the warehouse is clean. `their_label` names the other side in
-/// messages and the consolidation state (a pallet name, or `"remote"` for a lift).
+/// messages and the consolidation state (a pallet name, or `"remote"` for a lift), and
+/// `their_pallet` the pallet whose repair a head no client can check out on that side names.
 ///
 /// When `apply_conflicts` is false and the merge would conflict, **nothing is touched** and
 /// `Conflicts` is returned — so the optimistic path can bail without dirtying the working
@@ -259,6 +263,7 @@ pub(crate) async fn merge_head_into_current(current: &str,
                                             our_head: &str,
                                             their_head: &str,
                                             their_label: &str,
+                                            their_pallet: Option<&str>,
                                             apply_conflicts: bool,
                                             anchor: file_utils::StatAnchor) -> Result<MergeStatus, String> {
     // This function writes real merge output into the working inventory and only afterwards
@@ -276,6 +281,12 @@ pub(crate) async fn merge_head_into_current(current: &str,
     let our_tree_hash = object_utils::load_parcel(our_head)?.tree_hash;
     let their_tree_hash = object_utils::load_parcel(their_head)?.tree_hash;
 
+    // A name that opens the metadata folder, brought in by their side, is refused with its code
+    // before the merge plans anything, naming the repair of `their_pallet`. A side no repair of a
+    // pallet reaches (a haul's recorded head) is left to the materializer's refusal.
+    if let Some(their_pallet) = their_pallet {
+        shift_utils::refuse_unmaterializable_pallet(their_pallet, Some(&our_tree_hash), &their_tree_hash)?;
+    }
     office_utils::ensure_not_metadata_tree(&their_tree_hash)?;
 
     let base = merge_utils::find_merge_base(our_head, their_head)?

@@ -174,6 +174,19 @@ pub enum Command {
         )]
         cache: bool,
 
+        /// Check out a repair of a remote head no client can check out
+        #[arg(
+            long = "repair",
+            conflicts_with = "only",
+            long_help = "Check out a repair of a remote head no client can check out because it \
+                         holds a name that opens the warehouse's metadata folder (.forklift, at any \
+                         depth): a parcel stacked on the head that removes every such name, which \
+                         \"forklift lift\" then publishes. A head with nothing to repair is checked \
+                         out as it is. Resuming a clone refused for such a head with --repair \
+                         finishes it. Cannot be combined with --only: the repair reads the whole tree."
+        )]
+        repair: bool,
+
         /// Refuse unless the remote's trust anchor is this genesis (an out-of-band pin)
         #[arg(
             long = "expect",
@@ -443,6 +456,19 @@ pub enum Command {
         /// Drop the local changes a "theirs" resolution names (only a "theirs" --keep needs it)
         #[arg(long)]
         confirm: bool,
+
+        /// Repair a remote head no client can check out, by stacking a parcel on it
+        #[arg(
+            long = "repair",
+            long_help = "Repair a remote head no client can check out because it holds a name that \
+                         opens the warehouse's metadata folder (.forklift, at any depth): stack a \
+                         parcel on it that removes every such name, and stand it wherever the lower \
+                         would have stood the head; \"forklift lift\" then publishes it. Where the \
+                         local pallet holds parcels the remote lacks, the repair goes on a new pallet \
+                         <pallet>-remote-<hash> to consolidate. A head with nothing to repair lowers \
+                         as usual. Refused in a sparse warehouse, which never holds the whole tree."
+        )]
+        repair: bool,
     },
 
     /// Facts recorded about a parcel after the fact: notes, approvals, provenance, keyed values

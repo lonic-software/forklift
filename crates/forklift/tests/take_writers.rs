@@ -60,10 +60,17 @@ const WRITERS: &[(&str, &str, Class)] = &[
     ("crates/forklift-core/src/util/tombstone_utils.rs", "restore_pallet", Class::Verifies),
     ("crates/forklift/src/commands/bay.rs", "add", Class::CopiesLocal),
     ("crates/forklift/src/commands/consolidate.rs", "fast_forward", Class::CopiesLocal),
+    // With --repair it writes a repair of the verified head instead, signed as a stack is, under
+    // the same preconditions.
     ("crates/forklift/src/commands/clone.rs", "franchise_into_prepared_target", Class::Verifies),
     ("crates/forklift/src/commands/import_git.rs", "handle_command", Class::RefusesWhenAnchored),
     ("crates/forklift/src/commands/lower.rs", "lower_working_pallet", Class::Verifies),
-    ("crates/forklift/src/commands/lower.rs", "lower_named_pallet", Class::Verifies),
+    // A named lower's write: the verified head, or a repair of it signed as a stack is, under the
+    // preconditions the head was verified with.
+    ("crates/forklift/src/commands/lower.rs", "write_named_head", Class::Verifies),
+    // A repair is signed as a stack is, on a head verified under the preconditions it is written with.
+    ("crates/forklift/src/commands/lower.rs", "repair_pallet", Class::Signs),
+    ("crates/forklift/src/commands/lower.rs", "stack_diverged_repair", Class::Signs),
     // At a hash, verified; at another pallet, that pallet's head.
     ("crates/forklift/src/commands/pallet.rs", "create_pallet", Class::Verifies),
     ("crates/forklift/src/commands/pallet.rs", "create_pallet", Class::CopiesLocal),

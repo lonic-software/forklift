@@ -5,7 +5,7 @@ use crate::model::inventory::{Inventory, InventoryItem};
 use crate::model::tree_item::TreeItem;
 use crate::util::progress_utils::Progress;
 use crate::util::scope_utils::{self, PathScope, ScopeClass};
-use crate::util::{alias_utils, audit_utils, cache_miss, fanout_utils, file_utils, inventory_utils, object_utils, office_utils, tree_utils, warehouse_utils};
+use crate::util::{alias_utils, audit_utils, cache_miss, config_utils, fanout_utils, file_utils, inventory_utils, object_utils, office_utils, tree_utils, warehouse_utils};
 
 /// A single file operation needed to turn one tree into another in the working directory.
 pub enum FileOp {
@@ -145,6 +145,50 @@ pub fn first_unmaterializable_path(from: Option<&str>,
     }
 
     Ok(None)
+}
+
+/// Refuse checking out the head of local pallet `pallet`, whose tree is `to`, over `from` in this
+/// bay's scope, when it would write a name that opens the metadata folder
+/// ([`first_unmaterializable_path`]): `head_not_materializable`, naming the lower that repairs the
+/// remote's head, since a wedged local head is one a lower or a pre-gate writer brought here, or,
+/// in a sparse warehouse, which cannot build the repair, the clone that does. A pallet the remote
+/// does not hold, such as a hand-made ref to a meta pallet's parcel, is deleted instead.
+pub fn refuse_unmaterializable_pallet(pallet: &str, from: Option<&str>, to: &str) -> Result<(), String> {
+    let Some(path) = first_unmaterializable_path(from, to, &scope_utils::current_scope()?)? else {
+        return Ok(());
+    };
+
+    // The name in Rust's quoting, so a character no terminal shows is spelled out.
+    let entry = match path.rsplit_once('/') {
+        Some((directory, name)) => format!("{:?} in {:?}", name, directory),
+        None => format!("{:?}", path),
+    };
+
+    let (how, next_step) = if scope_utils::read_fetch_scope()?.is_full() {
+        let command = format!("forklift lower {} --repair", pallet);
+        (format!("\"{}\" stacks a parcel on the remote's head of the pallet that removes every such name", command), command)
+    } else {
+        let url = config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)?
+            .map(|(url, _)| url)
+            .unwrap_or_else(|| "<url>".to_string());
+        let command = format!("forklift clone {} <directory> --repair", url);
+        (format!(
+            "This warehouse fetches only part of each tree, so it cannot build the repair; \"{}\" into a \
+            new directory checks out a repair of the remote's head of the pallet",
+            command
+        ), command)
+    };
+
+    Err(crate::error::CoreError::refusal(
+        crate::error::RefusalCode::HeadNotMaterializable,
+        format!(
+            "Pallet \"{p}\" holds {entry}, a name that opens the warehouse's metadata folder, so it cannot \
+            be checked out. Nothing was changed. {how}; a pallet the remote does not hold, such as a \
+            hand-made ref to a meta pallet's parcel, is deleted instead (\"forklift pallet delete {p}\").",
+            p = pallet, entry = entry, how = how
+        ),
+        next_step,
+    ).into())
 }
 
 /// What [`diff_directory`] collects.

@@ -266,7 +266,7 @@ async fn try_auto_merge(client: &RemoteClient,
     // already means a genuine, unresolved divergence (checked above), so every path past this
     // point is the same real merge, and the incomplete-load guard lives inside
     // `merge_head_into_current` itself.
-    match consolidate::merge_head_into_current(pallet, head, remote_head, "remote", false, anchor).await? {
+    match consolidate::merge_head_into_current(pallet, head, remote_head, "remote", Some(pallet), false, anchor).await? {
         MergeStatus::Merged(_) => Ok(true),
         MergeStatus::Conflicts(_) => Ok(false),
     }

@@ -492,8 +492,8 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
         Command::Deliver { target, message } => commands::deliver::handle_command(&target, message),
         Command::Diff { staged, targets } => commands::diff::handle_command(staged, &targets, cli.verbose).await,
         Command::Help { .. } => unreachable!("help is answered in `forklift`, before dispatch"),
-        Command::Clone { url, directory, pallet, token, only, cache, expect } =>
-            commands::clone::handle_command(&url, &directory, pallet, token, only, cache, expect).await,
+        Command::Clone { url, directory, pallet, token, only, cache, expect, repair } =>
+            commands::clone::handle_command(&url, &directory, pallet, token, only, cache, expect, repair).await,
         Command::Heal => {
             let store_access = store_access.ok_or("heal ran without its store-access hold.")?;
             commands::heal::handle_command(store_access).await
@@ -512,7 +512,7 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
         },
         Command::Lift { recreate } => commands::lift::handle_command(recreate).await,
         Command::Load { path } => commands::load::handle_command(&path).await,
-        Command::Lower { pallet, expect, keep, confirm } => commands::lower::handle_command(pallet, expect, keep, confirm).await,
+        Command::Lower { pallet, expect, keep, confirm, repair } => commands::lower::handle_command(pallet, expect, keep, confirm, repair).await,
         Command::Manifest { action } => commands::manifest::handle_command(action),
         Command::Haul { action } => commands::haul::handle_command(action).await,
         Command::Mcp { root } => commands::mcp::handle_command(root),

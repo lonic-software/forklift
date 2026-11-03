@@ -163,9 +163,25 @@ force option: the wire is fast-forward only.
 
 The remote's head of the pallet holds an entry named like the warehouse's metadata folder, so no
 client can check it out. A remote refuses such a lift now, so the head is older than that check.
-Nothing was lowered or cloned. No command repairs such a head yet, so leave the pallet where it
-is. A clone refused this way reports `clone_incomplete` with this code as its cause: resume it with
-another `--pallet`, or with an `--only` that leaves the named path out.
+Nothing was lowered or cloned. Repair it, then publish the repair:
+
+```sh
+forklift lower --repair      # or: forklift lower <pallet> --repair, the command the message names
+forklift lift
+```
+
+The repair is a parcel stacked on the remote's head that removes every such entry. If your pallet
+holds parcels the remote's head lacks, they are kept: the repair goes on a new pallet and the lower
+refuses as `diverged`, naming the `forklift consolidate` and `forklift lift` to run. A sparse
+warehouse cannot build the repair, so it names `forklift clone <url> <directory> --repair` into a new
+directory. A clone refused this way reports `clone_incomplete` with this code as its cause: resume
+it with `--repair` (the command its next step names), or with another `--pallet`, or with an `--only`
+that leaves the named path out.
+
+A `shift`, `consolidate` or `lift` refused with this code names `forklift lower <pallet> --repair`
+(in a sparse warehouse, the clone): a named `lower` had moved that pallet onto the head, or the lift
+would have merged it. A pallet the remote does not hold, such as a hand-made ref, is deleted
+instead with `forklift pallet delete <pallet>`.
 
 ### `behind` (exit 26)
 
