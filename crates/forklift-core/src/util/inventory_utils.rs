@@ -367,15 +367,14 @@ pub fn tracked_nested_working_tree_error(key: &str) -> String {
 /// whenever that one is untracked, but a tracked entry of the other type under the same name
 /// must still be reported as gone, which [`RuleVerdict::CoveredOtherType`] tells apart.
 ///
-/// The inventory is consulted first, and the entry's type (`DirEntry::file_type`, no extra
-/// stat on the common platforms) only when a rule covers a name that is tracked, or the rules
-/// leave a directory to be walked: then one more lstat asks whether it is the root of another
-/// working tree. That comes after the rules, so an ignored nested working tree stays
+/// The entry's type (`DirEntry::file_type`, no extra stat on the common platforms) is read
+/// first, for the rules that match only directories. When the rules leave a directory to be
+/// walked, one more lstat asks whether it is the root of another working tree. That comes after the rules, so an ignored nested working tree stays
 /// [`RuleVerdict::Ignored`]; whatever deletes a directory cannot rely on this verdict.
 ///
 /// # Arguments
 /// * `rules`      - The ignore rules.
-/// * `parent`     - The directory's coverage (see [`file_utils::IgnoreRules::coverage_of`]).
+/// * `parent`     - The directory's rule context (see [`file_utils::IgnoreRules::enter`]).
 /// * `shard`      - The directory's shard (`None` when it has none, or it could not be read).
 /// * `entry`      - The entry.
 /// * `name`       - The entry's name.
@@ -388,25 +387,23 @@ pub fn tracked_nested_working_tree_error(key: &str) -> String {
 ///                       directory that has become another working tree's root while some file
 ///                       below it is still tracked (see [`tracked_nested_working_tree_error`]).
 pub fn rule_verdict(rules: &file_utils::IgnoreRules,
-                    parent: file_utils::Coverage,
+                    parent: &file_utils::RuleContext,
                     shard: Option<&Inventory>,
                     entry: &std::fs::DirEntry,
                     name: &str,
                     key: &str,
                     registered: &BTreeSet<String>) -> Result<RuleVerdict, String> {
-    let is_directory = || entry.file_type()
+    let is_directory = entry.file_type()
         .map(|file_type| file_type.is_dir())
-        .map_err(|e| format!("Error while getting the type of \"{}\": {}", key, e));
+        .map_err(|e| format!("Error while getting the type of \"{}\": {}", key, e))?;
 
-    if rules.excludes(key, false, parent) {
+    if rules.excludes(key, is_directory, false, parent) {
         let has_file_entry = shard.is_some_and(|inventory| has_live_entry(inventory, name));
         let is_registered = registered.contains(key);
 
-        if rules.excludes(key, true, parent) || (!has_file_entry && !is_registered) {
+        if rules.excludes(key, is_directory, true, parent) || (!has_file_entry && !is_registered) {
             return Ok(RuleVerdict::Ignored);
         }
-
-        let is_directory = is_directory()?;
 
         if !((is_directory && is_registered) || (!is_directory && has_file_entry)) {
             return Ok(RuleVerdict::CoveredOtherType);
@@ -414,7 +411,7 @@ pub fn rule_verdict(rules: &file_utils::IgnoreRules,
     }
 
     // `DirEntry::file_type` does not follow a symlink, so a link to a working tree is a link.
-    if is_directory()? && warehouse_utils::is_working_tree_root(&entry.path())? {
+    if is_directory && warehouse_utils::is_working_tree_root(&entry.path())? {
         // Once every tracked file below it is staged for removal (the way out the error names),
         // nothing of it is left to report as gone or stale, and it is a boundary like any other.
         if registered.contains(key) && subtree_has_live_entry(key, registered)? {
@@ -505,9 +502,11 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
     // taken before the walk changes it, is what the walk asks whether a directory is tracked.
     let registered = populate_dirty_inventory_paths(&context, path).await?;
 
-    let parent_coverage = match path.split_parent() {
-        Ok((parent, _)) if !path.is_root() => ignore_rules.coverage_of(parent.as_key()),
-        _ => ignore_rules.coverage_of(""),
+    // The loaded folder's parent's context, read from the root down: the `.gitignore` of every
+    // folder above the loaded one applies to it.
+    let parent_context = match path.split_parent() {
+        Ok((parent, _)) if !path.is_root() => ignore_rules.context_of(parent.as_key())?,
+        _ => file_utils::RuleContext::above_root(),
     };
 
     let root_task: InventoryBuilderTask = Box::pin(build_inventory(
@@ -515,7 +514,7 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
         Arc::new(path.clone()),
         Arc::new(ignore_rules),
         Arc::new(registered),
-        parent_coverage,
+        parent_context,
     ));
 
     // `result` accumulates the *first* failure from anywhere in this function — the walk itself,
@@ -1013,13 +1012,14 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
                    path: Arc<WarehousePath>,
                    ignore_rules: Arc<file_utils::IgnoreRules>,
                    registered: Arc<BTreeSet<String>>,
-                   parent_coverage: file_utils::Coverage) -> impl Future<Output = Result<(), String>> + Send {
+                   parent_context: file_utils::RuleContext) -> impl Future<Output = Result<(), String>> + Send {
     async move {
         // Taken before this task stats anything below, so every entry it records from a stat
         // proves itself against it (see `file_utils::StatAnchor`).
         let anchor = file_utils::take_stat_anchor()?;
 
-        let directory = file_utils::read_directory(&path.to_fs_path())?;
+        let fs_path = path.to_fs_path();
+        let directory = file_utils::read_directory_entries(&fs_path)?;
 
         // Only the walk's root can be ignored here: every other directory was already checked
         // by its parent's per-entry filter below. A folder load never force-tracks, so an
@@ -1028,11 +1028,11 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
         // The root is asked as the directory it is, by registration: a stale file entry under its
         // name (a file replaced by this folder) is the parent's business, and the parent's walk
         // stages its removal. Walking the folder for it would only register an empty directory.
-        if !path.is_root() && ignore_rules.excludes(path.as_key(), registered.contains(path.as_key()), parent_coverage) {
+        if !path.is_root() && ignore_rules.excludes(path.as_key(), true, registered.contains(path.as_key()), &parent_context) {
             return Ok(());
         }
 
-        let coverage = ignore_rules.coverage_below(parent_coverage, path.as_key());
+        let context_here = ignore_rules.enter(&parent_context, path.as_key(), || file_utils::read_gitignore_in(&fs_path, &directory))?;
 
         // The existing inventory of this directory (if any) is the stat cache: entries whose
         // file metadata is unchanged are reused without reading or hashing the file.
@@ -1077,11 +1077,7 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
 
         context.dirty_inventory_paths.lock().await.remove(path.as_key());
 
-        for entry_result in directory {
-            let entry = entry_result.map_err(|e|
-                format!("Error while reading directory entry: {}", e)
-            )?;
-
+        for entry in directory {
             let name = file_utils::get_name_for_file_or_directory(&entry)?;
             let entry_path = path.child(&name);
 
@@ -1089,7 +1085,7 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
             // entry of the other type under its name is then staged as removed. So is another
             // working tree's root, whose content is that tree's to track.
             let verdict = rule_verdict(
-                &ignore_rules, coverage, existing_inventory.as_ref(),
+                &ignore_rules, &context_here, existing_inventory.as_ref(),
                 &entry, &name, entry_path.as_key(), &registered,
             )?;
 
@@ -1156,7 +1152,7 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
                     Arc::new(entry_path),
                     Arc::clone(&ignore_rules),
                     Arc::clone(&registered),
-                    coverage,
+                    context_here.clone(),
                 ));
 
                 context.send_task(new_task)?;
@@ -1270,7 +1266,9 @@ pub fn directory_is_safe_to_replace(ledger: &ShardLedger, path: &str) -> Result<
 
     let registered: BTreeSet<String> = ledger.keys().map(str::to_string).collect();
 
-    let ignore_rules = file_utils::get_ignore_rules()?;
+    // The built-in rules alone: every untracked entry blocks, ignored or not, so no user rule can
+    // change the answer, and no `.gitignore` needs reading.
+    let ignore_rules = file_utils::IgnoreRules::built_in_only()?;
 
     directory_has_no_untracked_content(path, &ignore_rules, &registered)
 }
@@ -1283,7 +1281,7 @@ pub fn directory_is_safe_to_replace(ledger: &ShardLedger, path: &str) -> Result<
 ///
 /// # Arguments
 /// * `key`          - The warehouse path key of the directory.
-/// * `ignore_rules` - The ignore rules, read once by the caller.
+/// * `ignore_rules` - The built-in ignore rules, read once by the caller.
 /// * `registered`   - The registered directory keys, read once by the caller.
 fn directory_has_no_untracked_content(key: &str,
                                       ignore_rules: &file_utils::IgnoreRules,
@@ -1297,7 +1295,7 @@ fn directory_has_no_untracked_content(key: &str,
         None => Inventory::new(),
     };
 
-    let coverage = ignore_rules.coverage_of(key);
+    let context = file_utils::RuleContext::above_root();
 
     for entry_result in file_utils::read_directory(&fs_path)? {
         let entry = entry_result.map_err(|e| format!("Error while reading directory entry: {}", e))?;
@@ -1306,7 +1304,7 @@ fn directory_has_no_untracked_content(key: &str,
 
         // Ignored content, an entry that took over a tracked name as the other type, and another
         // working tree's root are all untracked.
-        if !matches!(rule_verdict(ignore_rules, coverage, Some(&inventory), &entry, &name, &entry_key, registered)?, RuleVerdict::Walk) {
+        if !matches!(rule_verdict(ignore_rules, &context, Some(&inventory), &entry, &name, &entry_key, registered)?, RuleVerdict::Walk) {
             return Ok(false);
         }
 

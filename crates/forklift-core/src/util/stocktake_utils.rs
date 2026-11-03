@@ -411,7 +411,7 @@ async fn collect_unstaged_changes_impl(context: ChangeWalkContext)
         String::new(),
         Arc::clone(&keys),
         Arc::clone(&ignore_rules),
-        ignore_rules.coverage_of(""),
+        file_utils::RuleContext::above_root(),
     ));
 
     executor.execute(root_task).await.map_err(|e|
@@ -430,6 +430,49 @@ async fn collect_unstaged_changes_impl(context: ChangeWalkContext)
     Ok((changes, shards))
 }
 
+/// Whether an untracked folder holds anything a load would stage, so stocktake reports it: an
+/// entry no rule hides that is not a folder, or another working tree's root, at any depth. The
+/// descent reads the `.gitignore` of every folder it enters, and stops at the first such entry.
+///
+/// # Arguments
+/// * `ignore_rules`   - The ignore rules.
+/// * `parent_context` - The rule context of the folder's parent.
+/// * `key`            - The warehouse path key of the folder.
+/// * `keys`           - All inventoried directory keys.
+///
+/// # Returns
+/// * `Ok(bool)`    - Whether the folder holds such an entry.
+/// * `Err(String)` - If a folder, an entry's type or a `.gitignore` could not be read.
+fn untracked_directory_has_content(ignore_rules: &file_utils::IgnoreRules,
+                                   parent_context: &file_utils::RuleContext,
+                                   key: &str,
+                                   keys: &BTreeSet<String>) -> Result<bool, String> {
+    let fs_path = std::path::PathBuf::from(key);
+    let entries = file_utils::read_directory_entries(&fs_path)?;
+    let context = ignore_rules.enter(parent_context, key, || file_utils::read_gitignore_in(&fs_path, &entries))?;
+
+    for entry in &entries {
+        let name = file_utils::get_name_for_file_or_directory(entry)?;
+        let entry_key = join_key(key, &name);
+
+        match inventory_utils::rule_verdict(ignore_rules, &context, None, entry, &name, &entry_key, keys)? {
+            inventory_utils::RuleVerdict::Walk => {}
+            inventory_utils::RuleVerdict::Ignored | inventory_utils::RuleVerdict::CoveredOtherType => continue,
+            inventory_utils::RuleVerdict::NestedBoundary => return Ok(true),
+        }
+
+        let is_directory = entry.file_type()
+            .map_err(|e| format!("Error while getting the type of \"{}\": {}", entry_key, e))?
+            .is_dir();
+
+        if !is_directory || untracked_directory_has_content(ignore_rules, &context, &entry_key, keys)? {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 /// The per-directory task of the unstaged walk: reconcile one tracked directory's
 /// working-directory state against its shard and enqueue one task per tracked
 /// subdirectory found on disk.
@@ -439,8 +482,8 @@ async fn collect_unstaged_changes_impl(context: ChangeWalkContext)
 /// * `key`           - The warehouse path key of the directory.
 /// * `keys`          - All inventoried directory keys.
 /// * `ignore_rules`  - The ignore rules.
-/// * `parent_coverage` - The coverage of the directory's parent (see
-///                   `file_utils::IgnoreRules::coverage_of`).
+/// * `parent_context` - The rule context of the directory's parent (see
+///                   `file_utils::IgnoreRules::enter`).
 ///
 /// # Returns
 /// * `Ok(())`      - If the directory was compared.
@@ -449,7 +492,7 @@ fn walk_directory_unstaged(context: Arc<ChangeWalkContext>,
                            key: String,
                            keys: Arc<BTreeSet<String>>,
                            ignore_rules: Arc<file_utils::IgnoreRules>,
-                           parent_coverage: file_utils::Coverage)
+                           parent_context: file_utils::RuleContext)
                            -> impl Future<Output = Result<(), String>> + Send {
     async move {
         let fs_path = if key.is_empty() {
@@ -478,14 +521,14 @@ fn walk_directory_unstaged(context: Arc<ChangeWalkContext>,
         // matches is walked by its own task, never reported "removed" (which fans out into a
         // single-threaded walk of its whole subtree).
         let mut ignored_names: BTreeSet<String> = BTreeSet::new();
-        let coverage = ignore_rules.coverage_below(parent_coverage, &key);
+        let entries = file_utils::read_directory_entries(&fs_path)?;
+        let context_here = ignore_rules.enter(&parent_context, &key, || file_utils::read_gitignore_in(&fs_path, &entries))?;
 
-        for entry_result in file_utils::read_directory(&fs_path)? {
-            let entry = entry_result.map_err(|e| format!("Error while reading directory entry: {}", e))?;
+        for entry in entries {
             let name = file_utils::get_name_for_file_or_directory(&entry)?;
             let entry_key = join_key(&key, &name);
 
-            match inventory_utils::rule_verdict(&ignore_rules, coverage, Some(&inventory), &entry, &name, &entry_key, &keys)? {
+            match inventory_utils::rule_verdict(&ignore_rules, &context_here, Some(&inventory), &entry, &name, &entry_key, &keys)? {
                 inventory_utils::RuleVerdict::Walk => {}
                 inventory_utils::RuleVerdict::Ignored => {
                     ignored_names.insert(name);
@@ -542,10 +585,22 @@ fn walk_directory_unstaged(context: Arc<ChangeWalkContext>,
                         entry_key,
                         Arc::clone(&keys),
                         Arc::clone(&ignore_rules),
-                        coverage,
+                        context_here.clone(),
                     )))?;
                 } else {
-                    found.push(Change::new(ChangeKind::Untracked, format!("{}/", entry_key)));
+                    // An untracked folder is reported as one "<dir>/" only when something below
+                    // it is, as git shows it: a folder holding only ignored content, or only
+                    // empty folders, would add nothing to a load.
+                    let task_context = Arc::clone(&context);
+                    let ignore_rules = Arc::clone(&ignore_rules);
+                    let keys = Arc::clone(&keys);
+                    let context_here = context_here.clone();
+                    context.send_task(Box::pin(async move {
+                        if untracked_directory_has_content(&ignore_rules, &context_here, &entry_key, &keys)? {
+                            task_context.changes.lock().await.push(Change::new(ChangeKind::Untracked, format!("{}/", entry_key)));
+                        }
+                        Ok(())
+                    }))?;
                 }
             }
         }

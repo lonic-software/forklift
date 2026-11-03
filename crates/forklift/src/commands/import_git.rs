@@ -17,7 +17,7 @@ use forklift_core::model::tree_item::TreeItem;
 use forklift_core::parser::object::tree::tree_parser;
 use forklift_core::util::file_utils::BulkStoreSession;
 use forklift_core::util::pack_utils::{IngestBase, IngestStored, StoreIngest};
-use forklift_core::util::{file_utils, inventory_utils, object_utils, office_utils, operation_utils, pallet_utils, shift_utils};
+use forklift_core::util::{inventory_utils, object_utils, office_utils, operation_utils, pallet_utils, shift_utils};
 use forklift_core::util::operation_utils::{Operation, OperationKind};
 use crate::events;
 use crate::output::{self, CommandOutput};
@@ -139,39 +139,9 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
         .or_else(|| imported.first())
         .map(|(_, pallet)| pallet.clone());
 
-    // A colocated git repo keeps its `.git` folder in the working tree; forklift should never
-    // track it. The rule goes into the tracked ignore file, so it is added only when there is a
-    // `.git` folder here to ignore. It is written before the operation below is raised: heal
-    // finishes an interrupted import by building its inventory, and adds no rule. The history is
-    // already imported by now, so a failure to add it is reported as a warning naming the rule,
-    // not as a failed import.
+    // A colocated git repo's `.git` folder needs no rule: forklift's fixed `.git` rule keeps
+    // the walks out of it.
     let mut warnings = converter.warnings;
-    let git_rule = if forklift_core::globals::warehouse_root().join(".git").exists() {
-        match ignore_git_directory() {
-            Ok(GitRule::Refused(e)) => {
-                // Adding the rule by hand would not help: the file stays refused until that
-                // line is fixed, and fixed, it may already cover `.git`.
-                // The reason goes last: a regex error runs over several lines.
-                warnings.push(format!(
-                    "the \".git\" folder is not ignored: \".forkliftignore\" is refused, so it was left \
-                    unchanged. Fix the problem below, then add the rule {} if no rule covers \".git\".\n{}",
-                    GIT_DIRECTORY_PATTERN, e
-                ));
-                None
-            }
-            Ok(rule) => Some(rule),
-            Err(e) => {
-                warnings.push(format!(
-                    "the \".git\" folder is not ignored ({}); add the rule {} to \".forkliftignore\" by hand",
-                    e, GIT_DIRECTORY_PATTERN
-                ));
-                None
-            }
-        }
-    } else {
-        None
-    };
-
     let mut unheld: Vec<String> = Vec::new();
 
     if let Some(pallet) = &current {
@@ -197,13 +167,6 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
         operation_utils::finish()?;
     }
 
-    // A tracked ignore file the rule was just appended to no longer holds its imported content,
-    // but that is the import's own edit, which the report names, not one for `restore` to undo.
-    // An edit the file held before then goes unnamed too; it still reads as changed, and the
-    // report already sends the user to load the file.
-    if matches!(git_rule, Some(GitRule::Added)) {
-        unheld.retain(|key| key != file_utils::FILENAME_IGNORE);
-    }
     if let Some(warning) = unheld_warning(&unheld) {
         warnings.push(warning);
     }
@@ -214,11 +177,6 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
         blobs: converter.blobs.len(),
         pallets: imported.iter().map(|(_, pallet)| pallet.clone()).collect(),
         current,
-        ignored_git: matches!(git_rule, Some(GitRule::Added)),
-        git_already_ignored: match git_rule {
-            Some(GitRule::Present { line, pattern }) => Some(ExistingRule { line, pattern }),
-            _ => None,
-        },
         compacted: packed,
         warnings,
         unheld,
@@ -260,66 +218,6 @@ fn unheld_warning(unheld: &[String]) -> Option<String> {
         discarding what the file holds.",
         unheld.len(), named
     ))
-}
-
-/// The ignore rule for a colocated git repository's metadata folder. It matches `.git`
-/// and what lies under it, never a sibling such as `.github/` or `.gitignore`: those are
-/// tracked content, and ignoring them makes the next `load .` stage their removal.
-const GIT_DIRECTORY_PATTERN: &str = r"^\.git(/.*)?$";
-
-/// What [`ignore_git_directory`] found or did.
-enum GitRule {
-    /// The rule was appended to the ignore file.
-    Added,
-
-    /// A rule already in the file covers `.git`, so nothing was written.
-    Present { line: usize, pattern: String },
-
-    /// The file, or its content, is refused as rules, so nothing was written: appending a rule
-    /// would leave it refused. Holds the reason.
-    Refused(String),
-}
-
-/// Add a `.git` ignore pattern to `.forkliftignore` unless a rule there already covers `.git`,
-/// so a colocated git repository's metadata folder is not treated as untracked content.
-///
-/// # Returns
-/// * `Ok(GitRule)`  - Whether the rule was added, which line already covers `.git`, or why the
-///                    file's content is refused.
-/// * `Err(String)`  - The file could not be read or written.
-fn ignore_git_directory() -> Result<GitRule, String> {
-    let pattern = GIT_DIRECTORY_PATTERN;
-
-    // Only a missing file starts empty: on any other read error, writing would replace the
-    // user's rules with this one.
-    let existing = match file_utils::read_ignore_file() {
-        Ok(existing) => existing.unwrap_or_default(),
-        Err(file_utils::IgnoreFileError::Refused(e)) => return Ok(GitRule::Refused(e)),
-        Err(file_utils::IgnoreFileError::Unreadable(e)) => return Err(e),
-    };
-
-    // Judged as the walks judge it, from the content just read: the rule covering `.git`,
-    // however it is spelled, is the one that keeps the walks out of it.
-    let rules = match file_utils::ignore_rules_from(Some(&existing)) {
-        Ok(rules) => rules,
-        Err(e) => return Ok(GitRule::Refused(e)),
-    };
-    if let Some(rule) = rules.covering_rule(".git") {
-        return Ok(GitRule::Present { line: rule.line, pattern: rule.pattern.clone() });
-    }
-
-    let mut content = existing;
-    if !content.is_empty() && !content.ends_with('\n') {
-        content.push('\n');
-    }
-    content.push_str("# git metadata (added by git import)\n");
-    content.push_str(pattern);
-    content.push('\n');
-
-    std::fs::write(file_utils::ignore_file_path(), content)
-        .map_err(|e| format!("Error while updating the ignore file: {}", e))?;
-
-    Ok(GitRule::Added)
 }
 
 /// A long-lived `git cat-file --batch` process. Every commit, tree and blob is read through
@@ -1170,14 +1068,6 @@ pub(crate) struct ImportReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     current: Option<String>,
 
-    /// Whether a `.git` ignore pattern was added to `.forkliftignore`.
-    ignored_git: bool,
-
-    /// The rule already in `.forkliftignore` that covers `.git`, when one did and so none was
-    /// added.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    git_already_ignored: Option<ExistingRule>,
-
     /// What the pack-direct import wrote (absent with `--no-compact`). The field keeps its
     /// original name: it reports the same fact — the imported store is packed — that the old
     /// post-import compaction pass did.
@@ -1190,22 +1080,9 @@ pub(crate) struct ImportReport {
 
     /// Every checked-out file that does not hold the content imported for it (an uncommitted
     /// edit or deletion, or a file git converted as it checked it out), in tree order. Each reads
-    /// as an unstaged change. The warning names only the first few. A tracked `.forkliftignore`
-    /// the import appended the `.git` rule to is not listed, although it reads as changed, even
-    /// when it also held an edit of its own before the import.
+    /// as an unstaged change. The warning names only the first few.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     unheld: Vec<String>,
-}
-
-/// A rule of the ignore file, by where it stands.
-#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
-#[derive(Serialize)]
-pub(crate) struct ExistingRule {
-    /// The line number, counting from 1.
-    line: usize,
-
-    /// The pattern, as written on that line.
-    pattern: String,
 }
 
 /// The packed-store summary (a slim view of `pack_utils::IngestStats`).
@@ -1242,18 +1119,6 @@ impl CommandOutput for ImportReport {
             for line in lines {
                 println!("           {}", sanitize(line));
             }
-        }
-
-        if self.ignored_git {
-            println!("Added \".git/\" to \".forkliftignore\". Load and stack it to keep the rule in the history.");
-        }
-
-        if let Some(rule) = &self.git_already_ignored {
-            // The pattern is tracked content, so it may have come from a remote.
-            println!(
-                "\".git/\" is already ignored by line {} of \".forkliftignore\": {}",
-                rule.line, sanitize(&rule.pattern)
-            );
         }
 
         if let Some(packed) = &self.compacted {
