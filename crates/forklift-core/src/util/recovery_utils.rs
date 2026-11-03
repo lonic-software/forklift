@@ -7078,7 +7078,7 @@ mod tests {
         let record = mirror_utils::mirror_roots_path();
         std::fs::create_dir_all(forklift.join(crate::globals::FOLDER_NAME_OBJECTS_ROOT)).unwrap();
         crate::util::pallet_utils::write_position_in(&forklift, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
-        std::fs::write(&record, b"forklift mirror roots 99\n").unwrap();
+        std::fs::write(&record, b"/forklift-mirror-roots 99\n").unwrap();
         let record_name = record.display().to_string();
 
         let vanished_hash = "9".repeat(64);

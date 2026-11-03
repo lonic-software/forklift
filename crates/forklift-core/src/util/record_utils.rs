@@ -1,6 +1,6 @@
 //! The shared on-disk form of Forklift's small line-per-entry state files: the out-of-scope
 //! skeleton and consolidation state of a merge in progress, the load-guard marker, scope files,
-//! bay redirects and the inventory metadata. Taint files escape their entries the same way, under
+//! bay redirects, the inventory metadata and the git mirror's roots. Taint files escape their entries the same way, under
 //! a header of their own, but keep their own torn-file reading (see `taint_utils`).
 //!
 //! The entries of these files are names: warehouse paths, pallet labels, filesystem paths. A tree

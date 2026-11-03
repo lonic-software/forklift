@@ -269,5 +269,7 @@ skeleton's reader, which only a partial checkout's consolidation reaches.
 The AWS head's items are frozen the same way, against `AWS_FORMAT`:
 `crates/forklift-aws-lambda/tests/fixtures/aws-format-<N>/items` lists the DynamoDB items a warehouse
 holding a live pallet, a deleted one, the office pallet and a trust anchor is written as, on the
-memory store. The current build must write exactly those items and serve them back. Every older AWS
-format's items must upgrade through the chain and then be served.
+memory store. The current build must write exactly those items and serve them back, and the LocalStack
+suite writes the same warehouse through DynamoDB and requires the very same items there, so the fixture
+holds what DynamoDB stores rather than only the memory store's mapping. Every older AWS format's items
+must upgrade through the chain and then be served.
