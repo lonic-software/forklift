@@ -187,7 +187,8 @@ pub fn old_format_bay_refusal(root: &Path) -> CoreError {
 /// The folder [`old_format_bay_refusal`]'s remedy stages the conversion in.
 const FOLDER_NAME_FORKLIFT_NEW: &str = ".forklift.new";
 
-/// Write a bay's `.forklift` folder, holding its redirect, into its working directory.
+/// Write a bay's `.forklift` folder, holding its redirect and a git ignore file
+/// ([`warehouse_utils::write_git_self_ignore`]), into its working directory.
 ///
 /// The folder is built complete under a fresh temporary sibling name and renamed into place, so a
 /// crash never leaves an empty `.forklift` folder behind, which discovery would take for a
@@ -209,6 +210,7 @@ pub fn write_bay_redirect(bay_dir: &Path, warehouse_root: &Path, name: &str) -> 
         .map_err(|e| format!("Error while creating the bay folder \"{}\": {}", staging.to_string_lossy(), e))?;
 
     let placed = file_utils::write_file_atomically(&staging.join(FILE_NAME_BAY_REDIRECT), &content)
+        .and_then(|()| warehouse_utils::write_git_self_ignore(&staging))
         .and_then(|()| match std::fs::symlink_metadata(&forklift) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Ok(_) => Err(format!("\"{}\" already exists, so the bay cannot be created there.", forklift.to_string_lossy())),

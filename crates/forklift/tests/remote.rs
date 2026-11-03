@@ -471,6 +471,34 @@ fn a_lift_uploads_a_subtree_introduced_by_a_parent_of_both_merge_sides() {
     assert_eq!(area.read_file("verify/b.txt"), "b\n");
 }
 
+/// A clone made into a directory that becomes a git working tree stages nothing of its
+/// `.forklift` folder with `git add -A`, the warehouse configuration with the clone's token
+/// included.
+// Revert: drop the self-ignore from `warehouse_utils::fill` → ".forklift/config/warehouse.toml" is listed.
+#[test]
+fn git_add_all_stages_nothing_of_a_clones_forklift_folder() {
+    let area = TestArea::new("clone-git-self-ignore");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/a.txt", "a\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "a"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    assert_success(&area.forklift(".", &["clone", &server.url, "b", "--token", "secret"]));
+    assert!(area.read_file("b/.forklift/config/warehouse.toml").contains("secret"));
+
+    let git = |args: &[&str]| {
+        let output = Command::new("git").args(args).current_dir(area.path("b")).output()
+            .expect("git must be installed to run this test");
+        assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    assert_eq!(git(&["add", "-A", "-n"]), "add 'a.txt'\n");
+}
+
 /// The ignore file is tracked content, like `.gitignore`: a warehouse that receives a pallet
 /// tracking it gets the remote's rules, by either route a fresh warehouse takes onto a remote
 /// pallet. Both routes prepare the target first, so a `prepare` that wrote a template ignore file

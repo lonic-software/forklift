@@ -4874,6 +4874,53 @@ fn import_git_migrates_a_repo_into_the_warehouse() {
     assert!(!warehouse.run(&["git", "import", "."]).status.success());
 }
 
+/// The paths `git add -A` would stage in the git working tree `root`.
+fn git_would_add(root: &std::path::Path) -> Vec<String> {
+    let output = Command::new("git").args(["add", "-A", "-n"]).current_dir(root).output()
+        .expect("git must be installed to run this test");
+    assert!(output.status.success(), "git add -A -n: {}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8_lossy(&output.stdout).lines()
+        .map(|line| line.trim_start_matches("add ").trim_matches('\'').to_string()).collect()
+}
+
+/// A warehouse and a bay standing in git working trees stage nothing of their `.forklift` folders
+/// with `git add -A`: not the warehouse configuration holding the remote token, nor the bay's
+/// redirect. A prepare run again writes back an ignore file that was deleted, and keeps one the
+/// user wrote.
+// Revert: drop the self-ignore from `fill` → the warehouse lists ".forklift/config/warehouse.toml";
+// drop it from `write_bay_redirect` → the bay lists ".forklift/redirect".
+#[test]
+fn git_add_all_stages_nothing_of_a_forklift_folder() {
+    let warehouse = TestWarehouse::new("git-self-ignore");
+    let root = warehouse.root.clone();
+    git_in(&root, &["init", "-q", "-b", "main"]);
+    warehouse.write_file("a.txt", "hello\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["config", "set", "remote.token", "secret"]));
+    assert!(std::fs::read_to_string(root.join(".forklift/config/warehouse.toml")).unwrap().contains("secret"));
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
+
+    assert_eq!(git_would_add(&root), vec!["a.txt".to_string()]);
+
+    let bay_dir = warehouse.home.join("bay");
+    assert_success(&warehouse.run(&["bay", "add", "feature", bay_dir.to_str().unwrap()]));
+    assert!(bay_dir.join(".forklift/redirect").is_file());
+    git_in(&bay_dir, &["init", "-q", "-b", "main"]);
+    assert_eq!(git_would_add(&bay_dir), vec!["a.txt".to_string()]);
+
+    let ignore = root.join(".forklift/.gitignore");
+    std::fs::remove_file(&ignore).unwrap();
+    assert!(git_would_add(&root).iter().any(|path| path.starts_with(".forklift/")), "the domain is the folder");
+    assert_success(&warehouse.run(&["prepare"]));
+    assert_eq!(git_would_add(&root), vec!["a.txt".to_string()]);
+
+    std::fs::write(&ignore, "config/\n").unwrap();
+    assert_success(&warehouse.run(&["prepare"]));
+    assert_eq!(std::fs::read_to_string(&ignore).unwrap(), "config/\n");
+}
+
 #[test]
 fn import_git_ignores_only_the_git_directory_not_its_dotfile_siblings() {
     // The `.git` rule git import writes must not swallow tracked files that merely start
