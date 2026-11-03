@@ -364,6 +364,7 @@ the first user and key and is self-signed by that key (trust-on-first-use). The 
 file records it:
 
 ```toml
+version = 1
 genesis = "<genesis office parcel hash>"
 enabled_at = 1782205234
 boundary = ["<pallet head hash>", …]
@@ -371,6 +372,8 @@ prior_genesis = "<hash>"   # re-genesis only: the genesis of the chain this anch
 adopts = "<hash>"          # re-genesis only: the old office head, kept as attested history
 ```
 
+- `version` is the shape of the file. A trust file with no version, or another one, is refused
+  rather than read, since a TOML reader would otherwise pass over a key it does not know.
 - `genesis` anchors the office chain; `audit` refuses an office history that does not
   reach it. The genesis has no parents, and every parcel of the chain has at most one and a
   tree holding only `.forklift/tracked/users` and `.forklift/tracked/keys` with their record

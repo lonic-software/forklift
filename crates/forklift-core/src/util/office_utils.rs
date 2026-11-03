@@ -46,6 +46,10 @@ const RECORD_SUFFIX: &str = ".toml";
 /// required — a one-way door (nothing ever removes it).
 pub(crate) const FILE_NAME_TRUST: &str = "trust";
 
+/// The version of the trust file's shape, its required `version` entry. TOML lets a reader pass
+/// over a key it does not know, so without it a later shape would be read as this one.
+const TRUST_VERSION: i64 = 1;
+
 /// What an operator may do. Recorded in the user's tracked office record, so
 /// privileges are signed, audited metadata like everything else in the office.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -638,6 +642,15 @@ pub(crate) fn read_trust_anchor_bytes() -> Result<Option<Vec<u8>>, String> {
 fn parse_trust_anchor(content: &str) -> Result<TrustAnchor, String> {
     let doc: DocumentMut = content.parse()
         .map_err(|e| format!("The trust file is not valid TOML: {}", e))?;
+
+    match doc.get("version").map(|item| item.as_integer()) {
+        Some(Some(TRUST_VERSION)) => {}
+        None => return Err("The trust file has no \"version\" entry; an older version of Forklift wrote it.".to_string()),
+        Some(Some(version)) => return Err(format!(
+            "The trust file has version {}, which this version of Forklift does not read.", version
+        )),
+        Some(None) => return Err("The trust file's \"version\" entry is present but is not an integer.".to_string()),
+    }
 
     let genesis = read_string(&doc, "genesis", "trust file")?;
     let enabled_at = read_integer(&doc, "enabled_at", "trust file")?;
@@ -1295,6 +1308,7 @@ pub(crate) fn write_trust_anchor(anchor: &TrustAnchor) -> Result<(), String> {
 /// Serialize an anchor as the trust file holds it.
 pub fn encode_trust_anchor(anchor: &TrustAnchor) -> String {
     let mut doc = DocumentMut::new();
+    doc["version"] = value(TRUST_VERSION);
     doc["genesis"] = value(anchor.genesis.as_str());
     doc["enabled_at"] = value(anchor.enabled_at);
 
@@ -2266,7 +2280,8 @@ pub(crate) mod tests {
 
         let path = forklift_root().join(FILE_NAME_TRUST);
         std::fs::write(&path,
-            "genesis = \"genesis-hash\"\n\
+            "version = 1\n\
+             genesis = \"genesis-hash\"\n\
              enabled_at = 1\n\
              boundary = [\"a-real-hash\", 7]\n"
         ).unwrap();
@@ -2474,7 +2489,8 @@ pub(crate) mod tests {
 
         let path = forklift_root().join(FILE_NAME_TRUST);
         std::fs::write(&path,
-            "genesis = \"genesis-hash\"\n\
+            "version = 1\n\
+             genesis = \"genesis-hash\"\n\
              enabled_at = 1\n\
              boundary = []\n\
              adopts = 7\n"
@@ -2554,6 +2570,30 @@ pub(crate) mod tests {
         assert!(error.contains("\"tagged_at\""), "the error must name the field: {}", error);
     }
 
+    /// The trust file reads only at its own version: what the encoder writes reads back, and the
+    /// same file with no version or another one is refused before any other entry is read.
+    #[test]
+    fn the_trust_file_reads_only_at_its_own_version() {
+        let anchor = TrustAnchor {
+            genesis: "genesis-hash".to_string(),
+            enabled_at: 1,
+            boundary: vec!["a-head".to_string()],
+            prior_genesis: None,
+            adopts: None,
+        };
+        let encoded = encode_trust_anchor(&anchor);
+        assert!(encoded.starts_with("version = 1\n"), "{}", encoded);
+        assert_eq!(parse_trust_anchor(&encoded).unwrap().genesis, "genesis-hash");
+
+        let unversioned = encoded.replacen("version = 1\n", "", 1);
+        let error = parse_trust_anchor(&unversioned).err().expect("an unversioned trust file must be refused");
+        assert!(error.contains("no \"version\" entry"), "{}", error);
+
+        let newer = encoded.replacen("version = 1\n", "version = 2\n", 1);
+        let error = parse_trust_anchor(&newer).err().expect("a trust file at another version must be refused");
+        assert!(error.contains("version 2"), "{}", error);
+    }
+
     /// Finding F7 (round 3): the trust file's `genesis`/`enabled_at` used to be hand-rolled
     /// required reads with the same `and_then(...).ok_or(...)` shape the four retired sites
     /// used, directly under a comment insisting the parse must be strict. They now route
@@ -2571,7 +2611,8 @@ pub(crate) mod tests {
 
         let path = forklift_root().join(FILE_NAME_TRUST);
         std::fs::write(&path,
-            "genesis = \"genesis-hash\"\n\
+            "version = 1\n\
+             genesis = \"genesis-hash\"\n\
              enabled_at = \"soon\"\n\
              boundary = []\n"
         ).unwrap();
