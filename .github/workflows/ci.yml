@@ -107,11 +107,11 @@ jobs:
   # a binary's slow tests (the crash suite's kill tests) over all of them. Replaying that run's
   # per-test times over the three schemes put the slowest Windows share at 142–144 s for every one,
   # against a single longest test of 123 s, so more Windows shares buy little until that test is
-  # faster. macOS runs on a Blacksmith runner (6 vCPU, Apple silicon) rather than GitHub's: on
-  # 2026-11-03 GitHub's macOS jobs waited five to fifteen minutes for a runner, and some were
-  # never given one, which failed the run. It stays one job, since Blacksmith bills each macOS
-  # minute and a second share would save about two. An entry's `blacksmith` label is used only
-  # for this repository's own branches: a pull request from a fork, or a run in a fork, gets
+  # faster. Every entry runs on GitHub's runners. An entry may set `blacksmith` to a runner label
+  # instead (6 vCPU macOS on Apple silicon was tried on 2026-11-03: no queue, where GitHub's macOS
+  # jobs waited five to fifteen minutes and some were never given a runner), but Blacksmith bills
+  # each minute, about 0.5 USD a macOS run, so macOS's is empty until that cost is agreed. A label
+  # is used only for this repository's own branches: a pull request from a fork, or a run in a fork, gets
   # GitHub's runner, so unreviewed code never runs on a billed one and a fork never asks for a
   # runner it does not have. To change a count, edit the entries; `ci passed` fails a run whose
   # shares for an OS are not exactly 1/N to N/N.
@@ -126,7 +126,7 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest, partition: 1, partitions: 1 }
-          - { os: macos-latest, blacksmith: blacksmith-6vcpu-macos-latest, partition: 1, partitions: 1 }
+          - { os: macos-latest, blacksmith: '', partition: 1, partitions: 1 }
           - { os: windows-latest, partition: 1, partitions: 4 }
           - { os: windows-latest, partition: 2, partitions: 4 }
           - { os: windows-latest, partition: 3, partitions: 4 }
@@ -224,7 +224,7 @@ jobs:
 
       # What is not split runs once per OS, on its last share, reusing that share's build: the
       # doc-tests (nextest does not run them), Clippy and the split-debuginfo guard. Not in a job of
-      # its own, which would add a billed macOS job (see the note on macOS above).
+      # its own, which would need a second macOS runner and its build (see the note on macOS above).
       # The doc-tests and Clippy run after failed tests, but not after a failed build, which they
       # would only repeat.
       - name: Doc-tests
