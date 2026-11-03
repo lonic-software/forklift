@@ -237,11 +237,14 @@ impl PathScope {
     }
 
     /// Whether the scope requires `path` to be a directory for it to stay coherent: `path` is
-    /// a spine ancestor of an in-scope prefix, or is itself an in-scope prefix (which was
-    /// declared as a directory). A tree that has a *file* at such a path is a type change the
-    /// sparse scope cannot reason about (§3.1) — the caller refuses with `scope_path_type_changed`.
+    /// itself an in-scope prefix (which was declared as a directory), or an ancestor of one that
+    /// no broader prefix holds — a spine path, or a member's folder a prefix runs through
+    /// (`a/.gitignore` for the prefix `a/.gitignore/b`). A tree that has a *file* at such a path is
+    /// a type change the sparse scope cannot reason about (§3.1) — the caller refuses with
+    /// `scope_path_type_changed`. Inside a broader prefix, a flip is ordinary content.
     pub fn requires_directory(&self, path: &str) -> bool {
-        self.prefixes.iter().any(|prefix| prefix == path || is_strictly_under(prefix, path))
+        self.prefixes.iter().any(|prefix| prefix == path
+            || (is_strictly_under(prefix, path) && !self.prefixes.iter().any(|broader| is_strictly_under(path, broader))))
     }
 
     /// Whether this scope is a subset (⊆) of `other` — every path this scope materializes is
@@ -973,8 +976,9 @@ mod tests {
         assert_eq!(scope.classify(".forkliftignorex"), ScopeClass::OutOfScope);
         assert_eq!(scope.classify("src/.forkliftignore"), ScopeClass::OutOfScope);
 
-        // Every implicit member is a file whose folder is a spine level, which the spine walkers
-        // keep as in scope, and never a place the scope expects a directory.
+        // Here every implicit member is a file whose folder is a spine level, which the spine
+        // walkers keep as in scope, and no place the scope expects a directory. A prefix through a
+        // member's name is the exception (below, in `the_spine_gitignore_files_are_in_scope_and_no_others`).
         for member in scope.implicit_members() {
             let parent = member.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("");
             assert_eq!(scope.classify(parent), ScopeClass::Spine, "{} must sit at a spine level", member);
@@ -1015,6 +1019,12 @@ mod tests {
         assert_eq!(through.classify("a/.gitignore"), ScopeClass::InScope);
         assert!(through.requires_directory("a/.gitignore"));
         assert_eq!(through.classify("a/.gitignore/c"), ScopeClass::InScope);
+
+        // Inside a broader prefix, an ancestor of a nested prefix is ordinary content, which may
+        // become a file; the nested prefix itself still may not.
+        let nested = PathScope::from_prefixes(["a", "a/b/c"]);
+        assert!(!nested.requires_directory("a/b"));
+        assert!(nested.requires_directory("a/b/c") && nested.requires_directory("a") && nested.requires_directory(""));
 
         // The full scope holds everything and lists nothing.
         assert!(PathScope::full().implicit_members().is_empty());

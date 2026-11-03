@@ -1161,10 +1161,10 @@ fn merge_directory(base: Option<&crate::model::tree_item::TreeItem>,
 
         let path = if key.is_empty() { name.clone() } else { format!("{}/{}", key, name) };
 
-        // A file where the scope needs a directory (an in-scope prefix itself, or a spine
-        // ancestor of one) is a directory→file flip the sparse scope cannot reason about —
-        // refuse rather than guess, before touching content. Never fires in a full bay
-        // or a valid scoped bay (a spine path is always a directory there).
+        // A file where the scope needs a directory (an in-scope prefix itself, or an ancestor of
+        // one no broader prefix holds; see `requires_directory`) is a directory→file flip the
+        // sparse scope cannot reason about — refuse rather than guess, before touching content.
+        // Never fires in a full bay.
         if scope.requires_directory(&path) {
             return Err(scope_utils::type_changed_refusal(&path).into());
         }
