@@ -646,8 +646,9 @@ In a warehouse that `forklift-server` has served, it refuses to undo a `stack`, 
 clones may already rely on the parcel it would take off, and with no ref holding it the server's
 `gc` could free their only copy (the wire is fast-forward-only for the same reason). A pallet
 other than the current one that another bay has moved on since is left alone, so it does not
-refuse the undo, and meta pallets are outside the rule. Take a change out there by stacking a
-parcel that reverts it. An older entry stays out of `undo`'s reach behind it: a pallet deleted
+refuse the undo. Meta pallets count too: a clone still holding the head an undo would take a
+meta pallet off lifts it straight back. Take a change out there by stacking a parcel that reverts
+it, or for a meta pallet by making a new change that reverts it. An older entry stays out of `undo`'s reach behind it: a pallet deleted
 since the warehouse was served comes back with `forklift pallet restore <name>`, and one
 deleted before then with `forklift pallet create <name> <head>`, the head its delete printed, while
 the warehouse still holds it. Undoing a delete or a `shift` is unaffected. Working-tree

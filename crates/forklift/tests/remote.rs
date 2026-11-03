@@ -3138,14 +3138,12 @@ fn a_sparse_warehouse_adopts_in_full_a_meta_parcel_its_user_head_descends_from()
     assert_success(&area.forklift("a", &["lift"]));
 
     // The server's main takes that history while its tags stand one parcel behind it, so a clone
-    // holds the newer tags parcel only through main.
+    // holds the newer tags parcel only through main. Both refs are set on the server's disk, since
+    // the served root refuses a move of its tags back to an ancestor.
     let descends = user_head(&area, "a", "descends");
     let move_tags = |from: &str, to: &str| {
-        let root = area.path("server-root");
-        let _scope = forklift_core::globals::StorageRootScope::enter(&root);
-        forklift_core::util::pallet_utils::update_meta_pallet_head(
-            "tags", Some(from), to, &forklift_core::util::pallet_utils::RefPreconditions::NONE,
-        ).unwrap();
+        assert_eq!(area.read_file("server-root/.forklift/meta/tags").trim(), from);
+        area.write_file("server-root/.forklift/meta/tags", &format!("{}\n", to));
     };
     move_tags(&newer, &older);
     area.write_file("server-root/.forklift/pallets/main", &format!("{}\n", descends));
