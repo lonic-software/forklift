@@ -229,15 +229,8 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
     let delta_on_loose = if plan.to_evict.is_empty() {
         false
     } else {
-        pack_utils::any_packed_delta_against(&loose_only).map_err(|error| match error {
-            pack_utils::PackScanError::Damaged(e) => format!(
-                "\"forklift store evict\" cannot run while a pack in this warehouse is damaged, since it cannot tell \
-                which packed content stands on what it would free; nothing was changed. Run \
-                \"forklift store compact --all\" to salvage the pack, or restore or move aside a pack it cannot \
-                salvage, then \"forklift store evict\" again. {}", e
-            ),
-            pack_utils::PackScanError::Registry(e) => e,
-        })?
+        pack_utils::any_packed_delta_against(&loose_only)
+            .map_err(|error| error.refusal("\"forklift store evict\"", "nothing was changed", true))?
     };
     plan.repack = !plan.to_drop.is_empty() || delta_on_loose;
     plan.to_unseal = sealed_utils::present_recorded(&sealed)?
@@ -1041,8 +1034,11 @@ mod tests {
                 let hold = store_access();
 
                 let Err(error) = plan_evict(&[held], &hold) else { return Some(format!("{:?} packed {}: must refuse", how, packed)) };
-                if !(error.contains("damaged") && error.contains("nothing was changed") && error.contains("move aside")) {
+                if !error.contains("nothing was changed") {
                     return Some(format!("{:?} packed {}: {}", how, packed, error));
+                }
+                if let Some(problem) = pack_utils::tests::refusal_problem(how, &error) {
+                    return Some(problem);
                 }
                 if !sealed_utils::read_sealed().unwrap().is_empty() {
                     return Some(format!("{:?} packed {}: nothing is recorded", how, packed));

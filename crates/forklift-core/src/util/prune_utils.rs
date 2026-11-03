@@ -46,6 +46,8 @@
 //! front-to-back). Under that discipline, a present parent implies every one of its still-listed
 //! children is present too, so an absent node can only mean its whole subtree was already
 //! freed — never a corrupt gap a resumed walk could misinterpret as newly-discovered garbage.
+//! The one exception is an object kept because a packed delta stands on it, which can outlive its
+//! parent or its children: a resumed walk then misses it or stops short, which only frees less.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use crate::enums::dir_entry_type::DirEntryType;
@@ -60,7 +62,8 @@ use crate::util::lock_utils::StoreAccessExclusive;
 /// The reclamation a prune would carry out, computed without mutating anything (safe for the
 /// preview an unconfirmed prune shows).
 pub struct PrunePlan {
-    /// Present, loose objects to delete: under a pruned path, and needed by no retained scope.
+    /// Present, loose objects to delete: under a pruned path, needed by no retained scope, and
+    /// standing under no packed delta.
     pub to_free: Vec<String>,
 
     /// Candidates present only inside a pack. A loose delete cannot reclaim a packed object
@@ -261,20 +264,13 @@ fn plan_from(
     }
 
     // A packed delta can stand on a loose object: an ingest stores a delta against a base it holds
-    // loose. Filtering keeps to_free's order, and a kept child under a freed parent is at worst
-    // loose garbage. A damaged pack refuses the run: its deltas cannot be read to say what they
-    // stand on.
+    // loose. Filtering keeps to_free's order. A kept child under a freed parent is at worst loose
+    // garbage, and a kept parent over freed children reads like a packed one: fetch checks each
+    // object. A pack that cannot be read refuses the run: its deltas cannot say what they stand on.
     let mut kept_for_deltas = 0usize;
     if !to_free.is_empty() {
-        let bases = pack_utils::packed_delta_bases().map_err(|error| match error {
-            pack_utils::PackScanError::Damaged(e) => format!(
-                "\"forklift scope prune\" cannot run while a pack in this warehouse is damaged, since it cannot tell \
-                which packed content stands on what it would free; nothing was changed. Run \
-                \"forklift store compact --all\" to salvage the pack, or restore or move aside a pack it cannot \
-                salvage, then \"forklift scope prune\" again. {}", e
-            ),
-            pack_utils::PackScanError::Registry(e) => e,
-        })?;
+        let bases = pack_utils::packed_delta_bases()
+            .map_err(|error| error.refusal("\"forklift scope prune\"", "nothing was changed", true))?;
         let candidates = to_free.len();
         to_free.retain(|hash| !bases.contains(hash));
         kept_for_deltas = candidates - to_free.len();
@@ -827,7 +823,8 @@ fn retain_recipe_chunks(recipe_hash: &str, retained: &mut HashSet<String>) -> Re
 /// hash the walk cannot find on disk is treated as "already freed by an earlier run" — its
 /// descent is simply skipped, never an error — which is sound only because objects are always
 /// *freed* in the same child-before-parent order this function produces, so an absent node
-/// proves its whole subtree is already gone, not merely that this one object is.
+/// proves its whole subtree is already gone, not merely that this one object is. (Bar an object
+/// kept for a packed delta, which the plan never frees anyway: missing it frees nothing less.)
 ///
 /// Presence here is the plain [`file_utils::does_object_exist`], not the fail-closed sweep form
 /// the retained walks use. An object only an unreadable pack index might hold reads absent, so
@@ -1797,8 +1794,11 @@ mod tests {
             }
 
             let Err(error) = plan() else { return Some(format!("{:?}: a prune must refuse", how)) };
-            if !(error.contains("damaged") && error.contains("nothing was changed") && error.contains("store compact --all") && error.contains("move aside")) {
+            if !error.contains("nothing was changed") {
                 return Some(format!("{:?}: {}", how, error));
+            }
+            if let Some(problem) = pack_utils::tests::refusal_problem(how, &error) {
+                return Some(problem);
             }
 
             if matches!(how, Unreadable::CorruptBucket) {

@@ -271,8 +271,9 @@ revocation by more than about a day.
 - **GC:** `forklift-server gc --root … [--grace-hours 24]` deletes objects no live
   root reaches: no pallet head, tombstone, trust pin, or parked, consolidating or staged work. The
   grace period protects the objects of in-flight lifts. It keeps an unreached object a pack's delta
-  is stored against, counting it in its report, and it deletes nothing while a pack cannot be read:
-  restore the pack or move it aside first. It is **refused
+  is stored against, counting it in its report; a server has no repack command, so that count does
+  not fall. It deletes nothing while a pack cannot be read: restore the pack, or move it aside only
+  if it holds nothing this root needs, and do not bring it back after a sweep has run. It is **refused
   while a server is serving that root** — it would sweep the server's in-flight objects and
   make a concurrent lift fail its ref update — so stop the server, gc, then restart (run it
   in a maintenance window, not against a live server). A hard-killed server leaves a

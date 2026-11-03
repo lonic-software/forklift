@@ -39,8 +39,8 @@ pub struct GcStats {
     pub kept_recent: usize,
 
     /// Unreferenced objects kept because a pack's delta stands on them: deleting one would leave
-    /// that delta unreadable. Once a full repack has re-encoded or dropped the delta, a collection
-    /// deletes them.
+    /// that delta unreadable, even if nothing reaches it. Where a full repack runs, the collection
+    /// after it deletes them; a server has no repack command, so on a server root they stay.
     pub kept_for_deltas: usize,
 }
 
@@ -134,14 +134,8 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
 
             let bases = match &mut delta_bases {
                 Some(bases) => bases,
-                unread => unread.insert(pack_utils::packed_delta_bases().map_err(|error| match error {
-                    pack_utils::PackScanError::Damaged(e) => format!(
-                        "gc cannot delete anything while a pack in this warehouse is damaged, since it cannot tell \
-                        which packed content stands on what it would delete; nothing more was deleted. Restore the \
-                        pack or move it aside, then run gc again. {}", e
-                    ),
-                    pack_utils::PackScanError::Registry(e) => e,
-                })?),
+                unread => unread.insert(pack_utils::packed_delta_bases()
+                    .map_err(|error| error.refusal("gc", "nothing more was deleted", false))?),
             };
 
             if bases.contains(&hash) {
@@ -367,7 +361,7 @@ pub(crate) mod tests {
     use crate::model::blob::Blob;
     use crate::model::parcel::Parcel;
     use crate::model::tree_item::TreeItem;
-    use crate::util::pack_utils::tests::{for_each_unreadable, pack_alone, pack_as_unreadable, Unreadable};
+    use crate::util::pack_utils::tests::{for_each_unreadable, pack_alone, pack_as_unreadable, refusal_problem, Unreadable};
     use std::path::{Path, PathBuf};
 
     /// A fresh warehouse root for one test, entered as the active storage-root scope for its
@@ -459,8 +453,8 @@ pub(crate) mod tests {
             garbage.store().unwrap();
 
             let Err(error) = collect_garbage(0) else { return Some(format!("{:?}: a pack that cannot be read refuses", how)) };
-            if !(error.contains("damaged") && error.contains("move it aside")) {
-                return Some(format!("{:?}: {}", how, error));
+            if let Some(problem) = refusal_problem(how, &error) {
+                return Some(problem);
             }
             (!loose_path(&garbage.hash).exists()).then(|| format!("{:?}: the garbage must stay", how))
         });

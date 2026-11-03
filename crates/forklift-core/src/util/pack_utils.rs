@@ -3385,8 +3385,42 @@ pub fn is_in_packs(hash: &str) -> Result<bool, String> {
 pub enum PackScanError {
     /// A pack's index or one of its record headers could not be read.
     Damaged(String),
+    /// Another build wrote a pack's index in a version this build cannot read.
+    ForeignVersion(String),
     /// The pack registry could not be loaded.
     Registry(String),
+}
+
+impl PackScanError {
+    /// The refusal for a `command` about to delete objects: says what was left alone and what to
+    /// do. A pack holding what the warehouse needs must not be moved aside, as a sweep then reads
+    /// everything beneath it as garbage, and neither may it return after a sweep, as its deltas
+    /// may stand on what the sweep deleted.
+    ///
+    /// # Arguments
+    /// * `command`  - The command, as the message names it.
+    /// * `outcome`  - What the refused run changed.
+    /// * `can_salvage` - Whether `store compact --all` is a step this command's user can take.
+    pub(crate) fn refusal(self, command: &str, outcome: &str, can_salvage: bool) -> String {
+        let why = "since it cannot tell which packed content stands on what it would delete";
+
+        match self {
+            PackScanError::Damaged(e) => format!(
+                "{} cannot run while a pack in this warehouse cannot be read, {}; {}. {}Restore the pack, or move \
+                it out of the pack folder only if it holds nothing this warehouse needs, and do not bring it back \
+                once a sweep has run. {}",
+                command, why, outcome,
+                if can_salvage { "Run \"forklift store compact --all\" to salvage a damaged pack. Otherwise, " } else { "" },
+                e
+            ),
+            PackScanError::ForeignVersion(e) => format!(
+                "{} cannot run while a pack in this warehouse was written by another forklift version, {}; {}. \
+                Run it with a build that reads that version. {}",
+                command, why, outcome, e
+            ),
+            PackScanError::Registry(e) => e,
+        }
+    }
 }
 
 /// Whether a pack holds a delta whose base is one of `bases`: a record that stops decoding once
@@ -3461,11 +3495,14 @@ pub(crate) fn packed_delta_bases() -> Result<PackedDeltaBases, PackScanError> {
 /// Refuse a pack the registry could not load: it may hold deltas nothing can list, and its data may
 /// come back.
 fn refuse_unscannable_packs(packs: &PackSet) -> Result<(), PackScanError> {
+    if let Some(pack) = packs.unenumerable.iter().find(|pack| pack.foreign_version) {
+        return Err(PackScanError::ForeignVersion(format!("Pack index {}: {}", pack.index_path.display(), pack.error)));
+    }
     if let Some(pack) = packs.quarantined.first() {
-        return Err(PackScanError::Damaged(format!("The pack index {} has no usable data file.", pack.index_path.display())));
+        return Err(PackScanError::Damaged(format!("Pack index {}: {}", pack.index_path.display(), pack.error)));
     }
     if let Some(pack) = packs.unenumerable.first() {
-        return Err(PackScanError::Damaged(format!("The pack index {} cannot be read.", pack.index_path.display())));
+        return Err(PackScanError::Damaged(format!("Pack index {}: {}", pack.index_path.display(), pack.error)));
     }
 
     Ok(())
@@ -6511,6 +6548,17 @@ pub(crate) mod tests {
 
     /// Run `case` once per [`Unreadable`] kind and fail with every arm's failure together, so a red
     /// run reports each arm rather than stopping at the first.
+    /// What is wrong with a sweep's refusal over a pack unreadable as `how`, if anything.
+    pub(crate) fn refusal_problem(how: Unreadable, error: &str) -> Option<String> {
+        let right = if matches!(how, Unreadable::ForeignVersion) {
+            error.contains("another forklift version") && !error.contains("move it out")
+        } else {
+            error.contains("cannot be read") && error.contains("holds nothing this warehouse needs") && error.contains("do not bring it back")
+        };
+
+        (!right).then(|| format!("{:?}: {}", how, error))
+    }
+
     pub(crate) fn for_each_unreadable(case: impl Fn(Unreadable) -> Option<String>) {
         let all = [Unreadable::Quarantined, Unreadable::CorruptBucket, Unreadable::ForeignVersion, Unreadable::Unparseable];
         let failures: Vec<String> = all
