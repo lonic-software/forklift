@@ -600,10 +600,11 @@ fn split_detail(text: &str) -> Result<(Option<serde_json::Value>, &str), ()> {
 /// line among others. The step keeps its [`NEXT_STEP_LABEL`], since many are bare commands, and
 /// stays on the message's line, because the text may sit inside a longer one. It is closed in
 /// parentheses, so whatever a caller wrote after it does not read as part of the step. A blank
-/// step folds to the message alone.
+/// step folds to the message alone, and so does a step the message already carries (a remote's
+/// wording, which this build does not control).
 pub fn with_next_step(human: &str, next_step: &str) -> String {
     match next_step.trim() {
-        "" => human.to_string(),
+        step if step.is_empty() || human.contains(step) => human.to_string(),
         step => format!("{} ({}{})", human, NEXT_STEP_LABEL, step),
     }
 }
@@ -1037,7 +1038,9 @@ mod tests {
         assert_eq!(format!("clone failed: {}", cause), "clone failed: Interrupted. (Next step: forklift heal)");
 
         // A refusal relaying a remote's words is built unchecked, whatever they say.
-        CoreError::remote_refusal(RefusalCode::Behind, "Behind. Run forklift lower.", "forklift lower");
+        let remote = CoreError::remote_refusal(RefusalCode::Behind, "Behind. Run forklift lower.", "forklift lower");
+        // Folded, a step the message already carries is not said twice.
+        assert_eq!(remote.to_string(), "Behind. Run forklift lower.");
         assert_eq!(CoreError::Other("plain".into()).to_string(), "plain");
     }
 }
