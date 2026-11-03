@@ -6395,6 +6395,26 @@ pub fn diverged_refusal(pallet: &str, remote_head: &str) -> CoreError {
     )
 }
 
+/// The refusal for a remote head of `pallet` that holds `path`, a name that opens the warehouse's
+/// metadata folder, so no client can check it out ([`crate::util::shift_utils::first_unmaterializable_path`]).
+/// Raised before anything is changed for the head, and before a diverged refusal, whose next step
+/// would check the head out.
+///
+/// # Arguments
+/// * `pallet` - The pallet whose remote head it is.
+/// * `path`   - The first path in the head's tree that opens a metadata folder.
+pub fn head_not_materializable_refusal(pallet: &str, path: &str) -> CoreError {
+    CoreError::refusal(
+        RefusalCode::HeadNotMaterializable,
+        format!(
+            "The remote's head of pallet \"{}\" holds \"{}\", a name that opens the warehouse's \
+            metadata folder, so no client can check it out. Nothing was changed.",
+            pallet, path
+        ),
+        "No command in this build repairs such a head, so the pallet stays where it is; lowering again refuses the same way.",
+    )
+}
+
 /// The other heads a user pallet's lift stops its parcel walk at ([`new_parcels_parents_first`]):
 /// the remote's other live user pallet heads whose parcel is present here. A meta pallet's history
 /// never branches off a user pallet's, so it gets none. A tombstone's head is left out: dropping

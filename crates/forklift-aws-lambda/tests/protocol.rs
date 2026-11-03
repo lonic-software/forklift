@@ -390,60 +390,163 @@ fn a_ref_update_with_a_missing_blob_is_refused() {
     assert_eq!(err.status, Status::Unprocessable);
 }
 
-/// A parcel over `parent` whose root tree holds the metadata folder, stored in `warehouse`: a user
-/// history crafted into the shape of meta history.
-fn store_metadata_root_parcel(warehouse: &Path, parent: &str) -> String {
+/// A blob, tree or parcel built in memory and uploaded to `head` in its wire form.
+fn put_object<O: ObjectStore, R: RefStore>(head: &Head<O, R>,
+                                           object: forklift_core::model::object::loose_object::LooseObject) -> String {
+    head.object_put(&Principal::Static, None, &object.hash, &object.content).expect("upload object");
+    object.hash
+}
+
+fn gate_file<O: ObjectStore, R: RefStore>(head: &Head<O, R>, name: &str, content: &str) -> forklift_core::model::tree_item::TreeItem {
     use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
     use forklift_core::enums::dir_entry_type::DirEntryType;
     use forklift_core::model::blob::Blob;
-    use forklift_core::model::parcel::Parcel;
-    use forklift_core::model::tree_item::TreeItem;
 
-    let _scope = StorageRootScope::enter(warehouse);
-    let mut blob = LooseObjectBuilder::build_blob(&Blob { content: b"crafted\n".to_vec() });
-    blob.store().expect("store the blob");
-    let mut metadata = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
-    metadata.add_child(TreeItem::new("state".to_string(), blob.hash.clone(), DirEntryType::Normal));
-    let mut metadata = LooseObjectBuilder::build_tree(&metadata);
-    metadata.store().expect("store the metadata tree");
-    let mut root = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
-    root.add_child(TreeItem::new(".forklift".to_string(), metadata.hash.clone(), DirEntryType::Tree));
-    let mut root = LooseObjectBuilder::build_tree(&root);
-    root.store().expect("store the root tree");
-    let mut parcel = LooseObjectBuilder::build_parcel(&Parcel {
-        tree_hash: root.hash.clone(),
-        parents: vec![parent.to_string()],
-        actions: Vec::new(),
-        description: None,
-    });
-    parcel.store().expect("store the parcel");
-    parcel.hash
+    let hash = put_object(head, LooseObjectBuilder::build_blob(&Blob { content: content.as_bytes().to_vec() }));
+    forklift_core::model::tree_item::TreeItem::new(name.to_string(), hash, DirEntryType::Normal)
 }
 
-/// A push of a head whose root holds the metadata folder commits: nothing on a server walks it as
-/// metadata, and every client command that would materialize it refuses.
-// Revert: refuse the entry on a ref update again → the update is refused.
+/// An uploaded tree named `name` holding `children`.
+fn gate_dir<O: ObjectStore, R: RefStore>(head: &Head<O, R>,
+                                         name: &str,
+                                         children: Vec<forklift_core::model::tree_item::TreeItem>)
+                                         -> forklift_core::model::tree_item::TreeItem {
+    use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+    use forklift_core::enums::dir_entry_type::DirEntryType;
+
+    let mut tree = forklift_core::model::tree_item::TreeItem::new(name.to_string(), String::new(), DirEntryType::Tree);
+    for child in children {
+        tree.add_child(child);
+    }
+    tree.hash = put_object(head, LooseObjectBuilder::build_tree(&tree));
+    tree
+}
+
+/// An uploaded parcel on `parents` whose root holds `children`.
+fn gate_parcel<O: ObjectStore, R: RefStore>(head: &Head<O, R>,
+                                            parents: &[&str],
+                                            children: Vec<forklift_core::model::tree_item::TreeItem>) -> String {
+    use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+    use forklift_core::model::parcel::Parcel;
+
+    let root = gate_dir(head, "", children);
+    put_object(head, LooseObjectBuilder::build_parcel(&Parcel {
+        tree_hash: root.hash,
+        parents: parents.iter().map(|parent| parent.to_string()).collect(),
+        actions: Vec::new(),
+        description: Some("gate".to_string()),
+    }))
+}
+
+/// Plant `new` on user pallet `name` past the gate, as a writer from before it would have.
+fn plant(refs: &MemoryRefStore, name: &str, new: &str) {
+    let fence = forklift_aws_lambda::format::gate(refs).expect("format gate");
+    let outcome = refs.compare_and_set_head(
+        pallet_utils::PalletNamespace::User, name, ExpectedHead::Unborn, new, OfficePrecondition::NotConsumed, None,
+        &fence, &request_token(),
+    ).expect("plant");
+    assert_eq!(outcome, CasOutcome::Committed);
+}
+
+fn user_head(head: &Head<MemoryObjectStore, MemoryRefStore>, name: &str) -> Option<String> {
+    head.refs.get_head(pallet_utils::PalletNamespace::User, name).unwrap().live().map(str::to_string)
+}
+
+/// A push of a head holding the metadata folder, at the root or below it, is refused, and a clean
+/// head lands beside them.
+// Revert: drop the materializable-head gate from `ref_update` → the crafted heads commit.
 #[test]
-fn a_ref_update_to_a_head_holding_the_metadata_folder_commits() {
-    let area = Area::new("metadata-root");
-    prepare(&area, "wh");
-    area.write_file("wh/a.txt", "alpha\n");
-    area.forklift("wh", &["load", "."]);
-    area.forklift("wh", &["stack", "-m", "first"]);
-    let main_head = harvest(&area.path("wh")).head_of("main").expect("main head");
-    let crafted = store_metadata_root_parcel(&area.path("wh"), &main_head);
-
+fn a_ref_update_to_a_head_holding_the_metadata_folder_is_refused() {
     let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
-    upload_all(&head, &harvest(&area.path("wh")));
-    let lift = RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None };
-    head.ref_update(&Principal::Static, "main", &lift).expect("the control: the clean head lifts");
+    let at_root = gate_parcel(&head, &[], vec![gate_dir(&head, ".forklift", vec![gate_file(&head, "state", "x")])]);
+    let below = gate_parcel(&head, &[], vec![gate_dir(&head, "docs", vec![gate_file(&head, "a", "1"), gate_file(&head, ".ForkLift", "x")])]);
+    let clean = gate_parcel(&head, &[], vec![gate_dir(&head, "docs", vec![gate_file(&head, "a", "1")])]);
 
-    let request = RefUpdateRequest { old_head: Some(main_head.clone()), new_head: crafted.clone(), tombstone: None };
-    head.ref_update(&Principal::Static, "main", &request).expect("the crafted head commits");
-    assert_eq!(
-        head.refs.get_head(pallet_utils::PalletNamespace::User, "main").unwrap().live(),
-        Some(crafted.as_str()),
-    );
+    let request = RefUpdateRequest { old_head: None, new_head: at_root, tombstone: None };
+    let err = head.ref_update(&Principal::Static, "main", &request).expect_err("the root holds .forklift");
+    assert_eq!(err.status, Status::Unprocessable, "{}", err.message);
+    assert!(err.message.contains(r#"holds ".forklift""#), "{}", err.message);
+
+    let request = RefUpdateRequest { old_head: None, new_head: below, tombstone: None };
+    let err = head.ref_update(&Principal::Static, "main", &request).expect_err("docs holds .ForkLift");
+    assert!(err.message.contains(r#"holds "docs/.ForkLift""#), "the path is named whole: {}", err.message);
+    assert_eq!(user_head(&head, "main"), None);
+
+    let request = RefUpdateRequest { old_head: None, new_head: clean.clone(), tombstone: None };
+    head.ref_update(&Principal::Static, "main", &request).expect("the control: a clean head lifts");
+    assert_eq!(user_head(&head, "main"), Some(clean));
+}
+
+/// A creation that names a wedged parcel as its tombstone when none stands, and keeps its tree.
+// Revert: take the base from `request.tombstone` → the creation commits → red.
+#[test]
+fn a_creation_is_judged_against_the_stored_tombstone_never_the_request() {
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    let wedged_tree = vec![gate_file(&head, ".forklift", "x"), gate_file(&head, "a", "1")];
+    let wedged = gate_parcel(&head, &[], wedged_tree.clone());
+    let on_it = gate_parcel(&head, &[&wedged], wedged_tree);
+
+    let request = RefUpdateRequest { old_head: None, new_head: on_it, tombstone: Some(wedged) };
+    let err = head.ref_update(&Principal::Static, "side", &request).expect_err("no tombstone stands");
+    assert_eq!(err.status, Status::Unprocessable, "{}", err.message);
+    assert_eq!(user_head(&head, "side"), None);
+}
+
+/// A wedged head deleted here comes back by a restore: its tree is its stored tombstone's, so
+/// nothing is loaded.
+// Revert: judge a creation against nothing even over a tombstone → the restore is refused → red.
+#[test]
+fn a_restore_of_a_wedged_tombstone_head_is_accepted() {
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    let wedged = gate_parcel(&head, &[], vec![gate_file(&head, ".forklift", "x")]);
+    plant(&head.refs, "side", &wedged);
+    head.delete_pallet(&Principal::Static, "side", &wedged).expect("delete side");
+
+    let restore = RefUpdateRequest { old_head: None, new_head: wedged.clone(), tombstone: Some(wedged.clone()) };
+    head.ref_update(&Principal::Static, "side", &restore).expect("restore side");
+    assert_eq!(user_head(&head, "side"), Some(wedged));
+}
+
+/// A pallet planted with a bad name in `d`: an edit in `d` is refused, an edit in `e` commits. The
+/// old head's trees are read from the object store, never the audit scratch.
+// Revert: skip a name the base already held → the edit in `d` commits → red. Revert: load every
+// subtree whatever the base → the edit in `e` is refused → red.
+#[test]
+fn an_edit_beside_an_old_bad_name_is_refused_and_one_elsewhere_commits() {
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    let d = |f: &str| gate_dir(&head, "d", vec![gate_file(&head, ".forklift", "x"), gate_file(&head, "f", f)]);
+    let e = |g: &str| gate_dir(&head, "e", vec![gate_file(&head, "g", g)]);
+    let wedged = gate_parcel(&head, &[], vec![d("1"), e("1")]);
+    plant(&head.refs, "side", &wedged);
+
+    let beside = gate_parcel(&head, &[&wedged], vec![d("2"), e("1")]);
+    let request = RefUpdateRequest { old_head: Some(wedged.clone()), new_head: beside, tombstone: None };
+    let err = head.ref_update(&Principal::Static, "side", &request).expect_err("an edit beside .forklift");
+    assert_eq!(err.status, Status::Unprocessable, "{}", err.message);
+    assert!(err.message.contains(r#"holds "d/.forklift""#), "{}", err.message);
+
+    let elsewhere = gate_parcel(&head, &[&wedged], vec![d("1"), e("2")]);
+    let request = RefUpdateRequest { old_head: Some(wedged), new_head: elsewhere.clone(), tombstone: None };
+    head.ref_update(&Principal::Static, "side", &request).expect("an edit elsewhere commits");
+    assert_eq!(user_head(&head, "side"), Some(elsewhere));
+}
+
+/// The gate reads the new head's trees from the audit scratch the closure check just filled, so a
+/// wide creation costs no store read per tree beyond the closure check's own.
+// Revert: load the new head's trees through the store → every tree is read twice → red.
+#[test]
+fn the_gate_reads_the_new_heads_trees_from_the_audit_scratch() {
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    let dirs = (0..40).map(|i| gate_dir(&head, &format!("d{}", i), vec![gate_file(&head, "f", &i.to_string())])).collect();
+    let wide = gate_parcel(&head, &[], dirs);
+
+    head.objects.reset_reads();
+    let request = RefUpdateRequest { old_head: None, new_head: wide, tombstone: None };
+    head.ref_update(&Principal::Static, "main", &request).expect("a clean creation lifts");
+    let reads = head.objects.reads();
+
+    // 41 trees and a parcel: a gate reading through the store would add at least 41 more.
+    assert!(reads <= 42 + 5, "{} reads for 41 trees and a parcel", reads);
 }
 
 /// Classify an object as a blob by trying to parse it as a parcel/tree under the source
@@ -1376,14 +1479,16 @@ fn mirror_reads(touches: usize) -> (usize, usize) {
 /// Below the bound it still reads one parcel *body* apiece (`collect_reachable` walks
 /// `old_head`'s ancestry to build the closure check's prune set), but **no trees**. So
 /// lengthening the history by `k` parcels costs a bounded mirror exactly `k` more reads,
-/// while an unbounded one also re-fetches every superseded tree version.
+/// while an unbounded one also re-fetches every superseded tree version. The name gate reads the
+/// old head's changed trees from the store on an update and nothing extra on a creation, a fixed
+/// cost the short history is long enough to outweigh.
 #[test]
 fn the_ref_update_mirror_is_bounded_at_old_head() {
     let extra = 4;
-    let (bounded_short, unbounded_short) = mirror_reads(2);
-    let (bounded_long, unbounded_long) = mirror_reads(2 + extra);
+    let (bounded_short, unbounded_short) = mirror_reads(3);
+    let (bounded_long, unbounded_long) = mirror_reads(3 + extra);
 
-    assert!(bounded_short < unbounded_short, "the bound saves reads even on a short history");
+    assert!(bounded_short < unbounded_short, "the bound saves reads even on a short history: {} vs {}", bounded_short, unbounded_short);
 
     assert_eq!(
         bounded_long - bounded_short,
@@ -1476,7 +1581,9 @@ fn a_pooled_scratch_amortizes_the_mirror_and_is_keyed_by_warehouse() {
     assert_ne!(alpha.root(), beta.root(), "never shared across warehouses");
 
     let area = Area::new("pooled-scratch");
-    layered_warehouse(&area, 4, 3);
+    // A history long enough to dominate the cold read: the name gate re-reads the trees the
+    // update changes on both heads, warm or cold, a cost set by the change, not the history.
+    layered_warehouse(&area, 4, 12);
 
     let old_head =
         harvest(&area.path("wh")).head_of("main").expect("main head");

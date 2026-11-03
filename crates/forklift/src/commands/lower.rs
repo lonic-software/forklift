@@ -8,7 +8,7 @@ use forklift_core::util::remote_utils::{BatchLaneClosure, RemoteClient};
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
     alias_utils, audit_utils, bay_utils, config_utils, file_utils, haul_utils, held_heads, kv_utils, merge_utils, object_utils,
-    operation_utils, pallet_utils, remote_utils, shift_utils, stocktake_utils, take_utils, trust_utils,
+    operation_utils, pallet_utils, remote_utils, scope_utils, shift_utils, stocktake_utils, take_utils, trust_utils,
 };
 use forklift_core::util::take_utils::{FetchAt, TakeTrust};
 use forklift_core::util::operation_utils::{Operation, OperationKind};
@@ -236,8 +236,10 @@ async fn lower_working_pallet(client: &RemoteClient,
 
     if let Some(local) = &local_head {
         if !merge_utils::is_ancestor(local, remote_head)? {
-            // The refusal's next step checks the remote head out on a pallet of its own.
+            // The refusal's next step checks the remote head out on a pallet of its own, so a head
+            // no client can check out is refused as that first.
             remote_utils::fetch_head_content(client, remote_head, progress).await?;
+            refuse_unmaterializable(&pallet, local_tree.as_deref(), &object_utils::load_parcel(remote_head)?.tree_hash)?;
             return Err(remote_utils::diverged_refusal(&pallet, remote_head).into());
         }
     }
@@ -254,7 +256,9 @@ async fn lower_working_pallet(client: &RemoteClient,
     let remote_tree = object_utils::load_parcel(remote_head)?.tree_hash;
 
     // Refused before the marker, so a refusal leaves nothing standing (`materialize_tree` checks
-    // again, finding the same).
+    // again, finding the same). A name that opens the metadata folder is refused as the head's,
+    // before the planning below trips over it.
+    refuse_unmaterializable(&pallet, local_tree.as_deref(), &remote_tree)?;
     let (ops, removed_dirs) = shift_utils::diff_trees(local_tree.as_deref(), &remote_tree)?;
     alias_utils::refuse_collisions("Lowering", &shift_utils::collect_collisions(&ops, &removed_dirs)?)?;
     shift_utils::ensure_writes_present(&ops)?;
@@ -286,6 +290,17 @@ async fn lower_working_pallet(client: &RemoteClient,
     report.outcome = Some(LowerOutcome::Lowered);
 
     Ok(())
+}
+
+/// Refuse the remote head of `pallet`, whose tree is `remote_tree`, with `head_not_materializable`
+/// when checking it out over `local_tree` in this bay's scope would write a name that opens the
+/// metadata folder.
+fn refuse_unmaterializable(pallet: &str, local_tree: Option<&str>, remote_tree: &str) -> Result<(), String> {
+    let Some(path) = shift_utils::first_unmaterializable_path(local_tree, remote_tree, &scope_utils::current_scope()?)? else {
+        return Ok(());
+    };
+
+    Err(remote_utils::head_not_materializable_refusal(pallet, &path).into())
 }
 
 /// Add the remote head a lower was served to the held-heads record, once `pallet`'s ref or the

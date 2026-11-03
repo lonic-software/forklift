@@ -62,7 +62,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 17;
+pub const SCHEMA_VERSION: u32 = 18;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -552,6 +552,10 @@ error_codes! {
 
     /// An upgrade was refused because another process has the warehouse open.
     WarehouseInUse,
+
+    /// The remote's head of a pallet holds an entry named like the metadata folder, so it cannot
+    /// be checked out.
+    HeadNotMaterializable,
 }
 
 impl ErrorCode {
@@ -602,6 +606,7 @@ impl ErrorCode {
             ErrorCode::WarehouseUpgradeRunning => RefusalCode::WarehouseUpgradeRunning.as_str(),
             ErrorCode::WarehouseLeaseMissing => RefusalCode::WarehouseLeaseMissing.as_str(),
             ErrorCode::WarehouseInUse => RefusalCode::WarehouseInUse.as_str(),
+            ErrorCode::HeadNotMaterializable => RefusalCode::HeadNotMaterializable.as_str(),
         }
     }
 
@@ -655,6 +660,7 @@ impl ErrorCode {
             ErrorCode::WarehouseUpgradeRunning => 43,
             ErrorCode::WarehouseLeaseMissing => 44,
             ErrorCode::WarehouseInUse => 45,
+            ErrorCode::HeadNotMaterializable => 46,
         }
     }
 
@@ -775,6 +781,8 @@ impl ErrorCode {
                 "The warehouse's format lease file is missing and this user cannot create it; create it, or restore write access",
             ErrorCode::WarehouseInUse =>
                 "An upgrade found the warehouse open in another process; let it finish, then run the upgrade again",
+            ErrorCode::HeadNotMaterializable =>
+                "The remote's head of the pallet holds an entry named like the warehouse's metadata folder, so it cannot be checked out; nothing was changed",
         }
     }
 
@@ -825,6 +833,7 @@ impl ErrorCode {
             RefusalCode::WarehouseUpgradeRunning => ErrorCode::WarehouseUpgradeRunning,
             RefusalCode::WarehouseLeaseMissing => ErrorCode::WarehouseLeaseMissing,
             RefusalCode::WarehouseInUse => ErrorCode::WarehouseInUse,
+            RefusalCode::HeadNotMaterializable => ErrorCode::HeadNotMaterializable,
         }
     }
 }
@@ -1334,6 +1343,7 @@ mod tests {
             (RefusalCode::WarehouseUpgradeRunning, "warehouse_upgrade_running", 43),
             (RefusalCode::WarehouseLeaseMissing, "warehouse_lease_missing", 44),
             (RefusalCode::WarehouseInUse, "warehouse_in_use", 45),
+            (RefusalCode::HeadNotMaterializable, "head_not_materializable", 46),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

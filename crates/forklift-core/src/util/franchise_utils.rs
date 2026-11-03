@@ -843,7 +843,7 @@ pub fn classify_failure(error: &str) -> (String, Retry) {
     match CoreError::from(error.to_string()) {
         CoreError::Refusal { code, .. } => {
             let retry = match code {
-                RefusalCode::RemoteProtocolViolation | RefusalCode::OnlyPrefixNotFound => Retry::Change,
+                RefusalCode::RemoteProtocolViolation | RefusalCode::OnlyPrefixNotFound | RefusalCode::HeadNotMaterializable => Retry::Change,
                 _ => Retry::Unknown,
             };
 

@@ -310,6 +310,11 @@ refusal_codes! {
     /// serving it, or another upgrade. Nothing was changed; the next step is to let them finish, then
     /// run the upgrade again.
     WarehouseInUse => "warehouse_in_use",
+
+    /// The remote's head of a pallet holds an entry named like the warehouse's metadata folder, so
+    /// no client can check it out. Nothing was changed; the next step repairs the head into one
+    /// without it.
+    HeadNotMaterializable => "head_not_materializable",
 }
 
 impl RefusalCode {

@@ -159,6 +159,14 @@ forklift lift
 `consolidate` exits 0 even when it stops at conflicts, so read what it prints. **Do not** look for a
 force option: the wire is fast-forward only.
 
+### `head_not_materializable` (exit 46)
+
+The remote's head of the pallet holds an entry named like the warehouse's metadata folder, so no
+client can check it out. A remote refuses such a lift now, so the head is older than that check.
+Nothing was lowered or cloned. No command repairs such a head yet, so leave the pallet where it
+is. A clone refused this way reports `clone_incomplete` with this code as its cause: resume it with
+another `--pallet`, or with an `--only` that leaves the named path out.
+
 ### `behind` (exit 26)
 
 Another bay or process moved the pallet past the parcel this bay stands on. Run the `forklift shift`
