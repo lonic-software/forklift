@@ -494,7 +494,10 @@ pub fn claim(target: &Path, record: &FranchiseRecord) -> Result<(), String> {
         Err(e) => return Err(format!("Error while creating \"{}\": {}", target.to_string_lossy(), e)),
     }
 
-    match warehouse_utils::place_forklift(&target.join(FOLDER_NAME_FORKLIFT_ROOT), |staged| write(staged, record))? {
+    // The ignore file goes in before the record, which can hold the clone's token.
+    let built = |staged: &Path| warehouse_utils::write_git_self_ignore(staged).and_then(|()| write(staged, record));
+
+    match warehouse_utils::place_forklift(&target.join(FOLDER_NAME_FORKLIFT_ROOT), built)? {
         Placement::Placed => Ok(()),
         Placement::Taken => Err(taken()),
     }
@@ -595,11 +598,13 @@ pub fn admit(target: &Path) -> Result<Admission, String> {
     }
 }
 
-/// Whether `forklift` holds nothing but the lock, the record and its temps: the shape a run
-/// killed before its record was durable leaves.
+/// Whether `forklift` holds nothing but the lock, the git ignore file, the record and their temps:
+/// the shape a run killed before its record was durable leaves.
 fn holds_only_debris(forklift: &Path) -> Result<bool, String> {
     Ok(list_names(forklift)?.iter().all(|name| {
-        name == FILE_NAME_LOCK || name == FILE_NAME_FRANCHISE || is_temp_of(name, FILE_NAME_FRANCHISE)
+        name == FILE_NAME_LOCK
+            || name == FILE_NAME_FRANCHISE || is_temp_of(name, FILE_NAME_FRANCHISE)
+            || name == warehouse_utils::FILE_NAME_GIT_SELF_IGNORE || is_temp_of(name, warehouse_utils::FILE_NAME_GIT_SELF_IGNORE)
     }))
 }
 
@@ -692,6 +697,7 @@ pub fn prepare_resume(target: &Path, record: Option<&FranchiseRecord>, keep: &Bu
             || name == FILE_NAME_FRANCHISE
             || name == FILE_NAME_LOCK
             || name == lock_utils::FILE_NAME_FORMAT_LOCK
+            || name == warehouse_utils::FILE_NAME_GIT_SELF_IGNORE
             || (*keep != BundleState::None && name == FOLDER_NAME_BUNDLES);
 
         if !kept {
@@ -1320,6 +1326,11 @@ mod tests {
         std::fs::remove_file(dir.join("half-written")).unwrap();
         std::fs::write(forklift.join("lock"), b"1").unwrap();
         assert_eq!(admit(&dir), Ok(Admission::Resume(None)));
+        // The claim's git ignore file, and a temp of it, are the claim's own debris too.
+        std::fs::write(forklift.join(".gitignore"), b"*\n").unwrap();
+        std::fs::write(forklift.join(".gitignore.tmp~1-0"), b"*").unwrap();
+        assert_eq!(admit(&dir), Ok(Admission::Resume(None)));
+        std::fs::remove_file(forklift.join(".gitignore.tmp~1-0")).unwrap();
 
         // A record from another version is refused, never guessed at.
         std::fs::write(record_path(&forklift), b"/forklift-franchise 9\n").unwrap();
@@ -1350,6 +1361,7 @@ mod tests {
         std::fs::write(forklift.join("operation"), b"x").unwrap();
         std::fs::write(forklift.join("lock"), b"1").unwrap();
         std::fs::write(forklift.join("format.lock"), b"").unwrap();
+        std::fs::write(forklift.join(".gitignore"), b"*\n").unwrap();
         std::fs::write(dir.join("half-written"), b"x").unwrap();
         write(&forklift, &record()).unwrap();
 
@@ -1357,7 +1369,8 @@ mod tests {
 
         let mut kept = list_names(&forklift).unwrap();
         kept.sort();
-        assert_eq!(kept, vec!["format.lock", "franchise", "lock", "objects"], "the format lock is held across the sweep");
+        assert_eq!(kept, vec![".gitignore", "format.lock", "franchise", "lock", "objects"],
+            "the format lock is held across the sweep, and the token stays ignored");
         assert_eq!(list_names(&dir).unwrap(), vec![".forklift"]);
         assert!(objects.join("ab/cdef.sig").exists(), "an anchored resume keeps its sidecars");
         assert!(objects.join("pack/t.sigs").exists(), "an anchored resume keeps its signature tables");
@@ -1475,6 +1488,7 @@ mod tests {
         let target = root.join("a/b/c");
         claim(&target, &record()).unwrap();
         assert_eq!(read(&target.join(FOLDER_NAME_FORKLIFT_ROOT)), Ok(Some(record())));
+        assert!(target.join(FOLDER_NAME_FORKLIFT_ROOT).join(".gitignore").is_file(), "the record, which can hold a token, is placed already ignored");
         assert_eq!(list_names(&target).unwrap(), vec![std::ffi::OsString::from(FOLDER_NAME_FORKLIFT_ROOT)],
             "nothing but the claimed folder: the staging name is gone");
 

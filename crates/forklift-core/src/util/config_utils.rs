@@ -725,6 +725,12 @@ pub fn set_value(key: &str, value: &str, scope: ConfigScope) -> Result<String, S
 
     let stored = storable_value(key, value);
 
+    // The warehouse's file can hold a remote token, so it is never written into a folder that
+    // git would stage: a folder that lost its ignore file gets it back first.
+    if scope == ConfigScope::Warehouse {
+        crate::util::warehouse_utils::write_git_self_ignore(&forklift_root())?;
+    }
+
     edit_locked(&path, |path| {
         let mut document = load_document(path)?.unwrap_or_default();
         set_value_in_document(&mut document, section, field, &stored)

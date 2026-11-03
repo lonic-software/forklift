@@ -209,7 +209,7 @@ name in a row is a constant, and every path in every fixture matches a row.
 | `franchise` | rewritable | `franchise_utils::FILE_NAME_FRANCHISE` |
 | `mirror-roots` | rewritable | `mirror_utils::FILE_NAME_MIRROR_ROOTS` |
 | `mirror.git/**` | foreign | `mirror_utils::FOLDER_NAME_MIRROR_REPOSITORY` |
-| `.gitignore`, here and in a bay's own `.forklift` | foreign | `warehouse_utils::FILE_NAME_GIT_SELF_IGNORE` |
+| `.gitignore`, here and in a bay's own folder | foreign | `warehouse_utils::FILE_NAME_GIT_SELF_IGNORE` |
 | `config/`, `config/warehouse.toml` | rewritable | `config_utils::FOLDER_NAME_CONFIG_ROOT`, `config_utils::FILE_NAME_WAREHOUSE_CONFIG`, `scope_utils::FOLDER_NAME_CONFIG` |
 | `config/warehouse.toml.lock` | lock | |
 | `config/fetch-scope` | rewritable | `scope_utils::FILE_NAME_FETCH_SCOPE` |

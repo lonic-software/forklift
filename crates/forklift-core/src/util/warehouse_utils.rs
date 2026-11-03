@@ -1039,8 +1039,8 @@ const GIT_SELF_IGNORE: &str = "# Written by Forklift, so that git never tracks t
 /// Write a git ignore file into the `.forklift` folder `forklift` unless one is there, so a git
 /// working tree the folder stands in never stages it: `git add -A` would otherwise sweep up a
 /// warehouse's configuration, its remote token included, or a bay's redirect. Git reads an ignore
-/// file in any folder of its tree, so this needs no write to the repository's own `.git`. One that
-/// is there is kept as it is, whatever it holds: the user may have written it.
+/// file in any folder of its tree, so this needs no write to the repository's own `.git`. One found
+/// there is kept as it is, whatever it holds: the user may have written it.
 ///
 /// # Returns
 /// * `Ok(())`      - The file is there.

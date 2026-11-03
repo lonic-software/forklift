@@ -4885,10 +4885,11 @@ fn git_would_add(root: &std::path::Path) -> Vec<String> {
 
 /// A warehouse and a bay standing in git working trees stage nothing of their `.forklift` folders
 /// with `git add -A`: not the warehouse configuration holding the remote token, nor the bay's
-/// redirect. A prepare run again writes back an ignore file that was deleted, and keeps one the
-/// user wrote.
+/// redirect. A prepare run again, or a write of the warehouse configuration, writes back an ignore
+/// file that was deleted; a prepare keeps one the user wrote.
 // Revert: drop the self-ignore from `fill` → the warehouse lists ".forklift/config/warehouse.toml";
-// drop it from `write_bay_redirect` → the bay lists ".forklift/redirect".
+// drop it from `write_bay_redirect` → the bay lists ".forklift/redirect"; drop it from
+// `config_utils::set_value` → the token write lists the folder again.
 #[test]
 fn git_add_all_stages_nothing_of_a_forklift_folder() {
     let warehouse = TestWarehouse::new("git-self-ignore");
@@ -4914,6 +4915,11 @@ fn git_add_all_stages_nothing_of_a_forklift_folder() {
     std::fs::remove_file(&ignore).unwrap();
     assert!(git_would_add(&root).iter().any(|path| path.starts_with(".forklift/")), "the domain is the folder");
     assert_success(&warehouse.run(&["prepare"]));
+    assert_eq!(git_would_add(&root), vec!["a.txt".to_string()]);
+
+    // Writing the token back restores a lost ignore file before the token lands.
+    std::fs::remove_file(&ignore).unwrap();
+    assert_success(&warehouse.run(&["config", "set", "remote.token", "other"]));
     assert_eq!(git_would_add(&root), vec!["a.txt".to_string()]);
 
     std::fs::write(&ignore, "config/\n").unwrap();
