@@ -820,10 +820,10 @@ impl std::fmt::Display for RefUpdateError {
             RefUpdateError::Backward { pallet, head } => write!(
                 f,
                 "Refusing to move pallet \"{}\" off {}: this warehouse has been served, so its clones \
-                may rely on that head, and the move {}. Nothing was written. To take a change out, {} \
+                may rely on that head, and {}. Nothing was written. To take a change out, {} \
                 that reverts it.",
                 pallet.to_wire(), head,
-                if pallet.namespace == PalletNamespace::Meta { "takes the pallet back to an older head" } else { "does not descend from it" },
+                if pallet.namespace == PalletNamespace::Meta { "the move takes the pallet back to an older head" } else { "the new head does not descend from it" },
                 if pallet.namespace == PalletNamespace::Meta { "make a new change" } else { "stack a parcel" }
             ),
             RefUpdateError::Failed(message) => f.write_str(message),
