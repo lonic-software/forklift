@@ -831,12 +831,12 @@ fn is_half_undone(entry: &JournalEntry, now: &BayState) -> Result<bool, String> 
     Ok(pallet_utils::get_pallet_head(&before.current_pallet)? != before.current_head)
 }
 
-/// Refuses, in a served warehouse, an undo that would put a pallet back, a meta pallet included.
-/// Every head a journaled operation wrote moved its pallet forward, so putting one back leaves a
-/// head the warehouse's clones may rely on: a clone holding it would lift it straight back, and
-/// for a user pallet nothing would root it once the ref leaves it. The ref write itself is
-/// refused too (see [`pallet_utils::update_pallet_head_in`]), and this refuses before anything is
-/// written. Only a pallet still at the head the operation left counts: one another
+/// Refuses, in a served warehouse, an undo whose put-back the ref core would refuse as moving a
+/// pallet back (see [`pallet_utils::update_pallet_head_in`]), a meta pallet included: it leaves a
+/// head the warehouse's clones may rely on, a clone holding it would lift it straight back, and
+/// for a user pallet nothing would root it once the ref leaves it. The gate asks the core's own
+/// predicate, and refuses before anything is written. Only a pallet still at the head the
+/// operation left counts: one another
 /// writer moved on since is left alone by the put-back, so it moves nothing back. A `shift` is
 /// undone by shifting back, which puts no ref back.
 fn refuse_a_served_rewind(entry: &JournalEntry) -> Result<(), String> {
@@ -852,20 +852,23 @@ fn refuse_a_served_rewind(entry: &JournalEntry) -> Result<(), String> {
 
         let reference = PalletRef::parse(wire)?;
 
-        if pre_head == post_head
-            || pallet_utils::get_pallet_head_in(reference.namespace, &reference.name)?.as_deref() != Some(post_head.as_str())
-            // Read last, so the gate reads the mark only for a pallet it would move back.
-            || !crate::util::tombstone_utils::is_served()? {
+        if pallet_utils::get_pallet_head_in(reference.namespace, &reference.name)?.as_deref() != Some(post_head.as_str())
+            // The ref core's own judgement, read last, so the gate reads the mark only for a
+            // pallet it would move.
+            || pallet_utils::served_backward(reference.namespace, Some(post_head), pre_head)? != Some(true) {
             continue;
         }
 
         return Err(format!(
             "Undoing \"{}\" would move pallet \"{}\" back off the head that operation left, and \
             this warehouse has been served, so its clones may rely on that head. Nothing was undone, \
-            and undo cannot reach an older operation past this one. To take the change out, stack a \
-            parcel that reverts it; a pallet deleted since this warehouse was served comes back \
-            with \"forklift pallet restore <name>\".",
-            entry.op, crate::error::sanitize(&reference.to_wire())
+            and undo cannot reach an older operation past this one. {}",
+            entry.op, crate::error::sanitize(&reference.to_wire()),
+            match reference.namespace {
+                PalletNamespace::Meta => "To take the change out, make a new change that reverts it.",
+                PalletNamespace::User => "To take the change out, stack a parcel that reverts it; a pallet \
+                    deleted since this warehouse was served comes back with \"forklift pallet restore <name>\".",
+            }
         ));
     }
 
@@ -2020,7 +2023,27 @@ mod tests {
         let refused = check_undoable(&entry).unwrap_err();
 
         assert!(refused.contains("has been served") && refused.contains("\"@kv\""), "{}", refused);
+        assert!(refused.contains("make a new change") && !refused.contains("pallet restore"), "{}", refused);
         assert_eq!(pallet_utils::get_meta_pallet_head("kv").unwrap(), Some(second), "nothing was put back");
+    }
+
+    // Revert: refuse every meta put-back in a served root → the gate refuses undoing a move that
+    // left "@kv"'s line, which the ref core would let land.
+    #[test]
+    fn the_gate_passes_putting_a_meta_pallet_back_onto_another_line_in_a_served_root() {
+        let _scratch = Scratch::new("gate-served-meta-line");
+        let (mut entry, _pre, post) = stacked_on_a_child();
+        let base = pallet_utils::tests::stub_parcel("kv");
+        let ours = pallet_utils::tests::child_of(&base, "kv-ours");
+        let replayed = pallet_utils::tests::child_of(&base, "kv-replayed");
+        pallet_utils::update_meta_pallet_head("kv", None, &replayed, &pallet_utils::RefPreconditions::NONE).unwrap();
+
+        // An entry that replayed "@kv" off its line, with the bay at the head it left.
+        entry.before.heads = BTreeMap::from([("main".to_string(), Some(post.clone())), ("@kv".to_string(), Some(ours))]);
+        entry.after.heads = BTreeMap::from([("main".to_string(), Some(post)), ("@kv".to_string(), Some(replayed))]);
+        assert!(crate::util::tombstone_utils::mark_served(false).unwrap());
+
+        check_undoable(&entry).unwrap();
     }
 
     // Revert: read the served mark before judging any wire → an unreadable mark fails a gate

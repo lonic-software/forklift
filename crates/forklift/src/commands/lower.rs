@@ -970,11 +970,20 @@ async fn replay(client: &RemoteClient,
             use pallet_utils::RefUpdateError::*;
 
             let why = match refused {
-                Moved(_) => "another bay or process moved it here meanwhile".to_string(),
+                Moved(_) => "another bay or process moved it here meanwhile",
                 OfficeMoved { .. } | AnchorMoved | PalletsMoved { .. } | WitnessMoved { .. } => {
-                    "the office or the trust anchor it was signed under changed here meanwhile".to_string()
+                    "the office or the trust anchor it was signed under changed here meanwhile"
                 }
-                other => other.to_string(),
+                // A replay lifts a fresh parcel onto the remote head, so it never takes the
+                // pallet back, and only a user pallet has a tombstone or a completeness check:
+                // none of these is expected, and running lower again would not clear one.
+                Backward { .. } | Deleted { .. } | Incomplete { .. } | Failed(_) => {
+                    return Err(format!(
+                        "{} was lifted to the remote, but this warehouse refused to move its local \
+                        head there.",
+                        wire
+                    ));
+                }
             };
 
             return Err(format!(

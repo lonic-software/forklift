@@ -748,8 +748,8 @@ pub enum RefUpdateError {
     /// user pallet's to a parcel that does not descend from it, or a meta pallet's to one of its
     /// ancestors (see [`update_pallet_head_in`]); nothing was written.
     Backward {
-        /// The pallet whose ref was to move, as on the wire (`@`-qualified for a meta pallet).
-        pallet: String,
+        /// The pallet whose ref was to move.
+        pallet: PalletRef,
 
         /// The head it holds, which the move would leave.
         head: String,
@@ -819,14 +819,12 @@ impl std::fmt::Display for RefUpdateError {
             }
             RefUpdateError::Backward { pallet, head } => write!(
                 f,
-                "Refusing to move pallet \"{}\" back off {}: this warehouse has been served, so its \
-                clones may rely on that head. Nothing was written. To take a change out, {} that \
-                reverts it.",
-                pallet, head,
-                match pallet.starts_with(META_QUALIFIER) {
-                    true => "make a new change",
-                    false => "stack a parcel",
-                }
+                "Refusing to move pallet \"{}\" off {}: this warehouse has been served, so its clones \
+                may rely on that head, and the move {}. Nothing was written. To take a change out, {} \
+                that reverts it.",
+                pallet.to_wire(), head,
+                if pallet.namespace == PalletNamespace::Meta { "takes the pallet back to an older head" } else { "does not descend from it" },
+                if pallet.namespace == PalletNamespace::Meta { "make a new change" } else { "stack a parcel" }
             ),
             RefUpdateError::Failed(message) => f.write_str(message),
         }
@@ -1076,8 +1074,9 @@ pub fn update_meta_pallet_head(name: &str,
 ///                                      completely present; nothing was written.
 /// * `Err(RefUpdateError::Deleted)`   - The pallet was deleted in this served warehouse; nothing
 ///                                      was written.
-/// * `Err(RefUpdateError::Backward)`  - A user pallet in this served warehouse would move to a
-///                                      parcel not descending from its head; nothing was written.
+/// * `Err(RefUpdateError::Backward)`  - In this served warehouse, a user pallet would move to a
+///                                      parcel not descending from its head, or a meta pallet to
+///                                      one of its head's ancestors; nothing was written.
 /// * `Err(RefUpdateError::Failed)`    - The name is invalid, `new` is not an object hash, or the
 ///                                      ref could not be locked, read or written (the write may
 ///                                      still have landed: read the ref back to tell).
@@ -1231,7 +1230,7 @@ fn update_pallet_head_checked(
 
         if backward == Some(true) {
             return Err(RefUpdateError::Backward {
-                pallet: PalletRef { namespace, name: name.to_string() }.to_wire(),
+                pallet: PalletRef { namespace, name: name.to_string() },
                 head: expected.unwrap_or_default().to_string(),
             });
         }
@@ -1311,9 +1310,9 @@ fn served_move(expected: Option<&str>, new: &str) -> Result<bool, String> {
 /// For a [`served_move`], whether it moves back off the head it leaves, which refuses it: for a
 /// user pallet, `new` does not descend from that head; for a meta pallet, `new` is one of its
 /// ancestors (see [`update_pallet_head_in`]). `None` for any other write.
-fn served_backward(namespace: PalletNamespace,
-                   expected: Option<&str>,
-                   new: &str) -> Result<Option<bool>, String> {
+pub(crate) fn served_backward(namespace: PalletNamespace,
+                              expected: Option<&str>,
+                              new: &str) -> Result<Option<bool>, String> {
     use crate::util::merge_utils::is_ancestor;
 
     match expected {
@@ -3192,7 +3191,7 @@ pub(crate) mod tests {
 
             let refused = update_pallet_head("main", Some(&next), &base, &RefPreconditions::NONE);
 
-            assert!(matches!(&refused, Err(RefUpdateError::Backward { pallet, head }) if pallet == "main" && *head == next), "{:?}", refused);
+            assert!(matches!(&refused, Err(RefUpdateError::Backward { pallet, head }) if pallet.to_wire() == "main" && *head == next), "{:?}", refused);
             assert_eq!(get_pallet_head("main").unwrap(), Some(next), "nothing was written");
             let _ = std::fs::remove_dir_all(&root);
         }
@@ -3239,8 +3238,8 @@ pub(crate) mod tests {
 
             let refused = update_meta_pallet_head("kv", Some(&next), &base, &RefPreconditions::NONE);
 
-            assert!(matches!(&refused, Err(RefUpdateError::Backward { pallet, head }) if pallet == "@kv" && *head == next), "{:?}", refused);
-            assert!(refused.unwrap_err().to_string().contains("\"@kv\" back off"));
+            assert!(matches!(&refused, Err(RefUpdateError::Backward { pallet, head }) if pallet.to_wire() == "@kv" && *head == next), "{:?}", refused);
+            assert!(refused.unwrap_err().to_string().contains("\"@kv\" off"));
             assert_eq!(get_meta_pallet_head("kv").unwrap(), Some(next), "nothing was written");
             let _ = std::fs::remove_dir_all(&root);
         }
