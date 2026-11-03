@@ -5190,6 +5190,106 @@ fn a_blank_looking_ignore_line_hides_nothing_and_whitespace_around_a_regex_is_re
     }
 }
 
+/// The unstaged paths, then the paths `load .` stages, of a fresh warehouse holding the files.
+fn untracked_then_loaded(name: &str, files: &[(&str, &str)]) -> (Vec<String>, Vec<String>) {
+    let warehouse = TestWarehouse::new(name);
+    assert_success(&warehouse.run(&["prepare"]));
+    for (path, content) in files {
+        warehouse.write_file(path, content);
+    }
+    let untracked = changes(&warehouse, "unstaged").into_iter()
+        .map(|(kind, path)| { assert_eq!(kind, "untracked", "{}", path); path })
+        .collect();
+    assert_success(&warehouse.run(&["load", "."]));
+    let loaded = changes(&warehouse, "staged").into_iter()
+        .map(|(kind, path)| { assert_eq!(kind, "added", "{}", path); path })
+        .collect();
+    (untracked, loaded)
+}
+
+#[test]
+fn ignore_rules_are_gitignore_lines_in_every_ignore_file() {
+    // A plain name hides that name at any depth and nothing it is part of; `*.log` is a glob.
+    let (untracked, loaded) = untracked_then_loaded("ignore-glob", &[
+        (".forkliftignore", "build\n*.log\n"), ("build/x", "x\n"), ("src/build/y", "y\n"),
+        ("rebuild.rs", "r\n"), ("a.log", "l\n"), ("d/b.log", "l\n"), ("d/keep.txt", "k\n"),
+    ]);
+    assert_eq!(untracked, [".forkliftignore", "d/", "rebuild.rs"]);
+    assert_eq!(loaded, [".forkliftignore", "d/keep.txt", "rebuild.rs"]);
+
+    // A nested `.gitignore` acts only within its subtree, and `!` re-includes, except below an
+    // excluded directory.
+    let (_, loaded) = untracked_then_loaded("ignore-nested", &[
+        (".gitignore", "*.log\n!keep.log\nvendor/\n!vendor/keep.log\n"), ("src/.gitignore", "*.tmp\n"),
+        ("src/a.tmp", "t\n"), ("a.tmp", "t\n"), ("src/x.rs", "x\n"),
+        ("keep.log", "k\n"), ("drop.log", "d\n"), ("vendor/keep.log", "k\n"),
+    ]);
+    assert_eq!(loaded, [".gitignore", "a.tmp", "keep.log", "src/.gitignore", "src/x.rs"]);
+
+    // `re:` lines are anchored to the whole key, `\re:` is a literal, and the root ignore file
+    // wins over every `.gitignore`.
+    let (_, loaded) = untracked_then_loaded("ignore-regex", &[
+        (".forkliftignore", "re:build\n\\re:x\n!re:config\\.env\n"), (".gitignore", "*.env\n"),
+        ("build/o", "o\n"), ("rebuild.rs", "r\n"), ("sub/build", "b\n"), ("re:x", "x\n"),
+        ("config.env", "c\n"), ("secret.env", "s\n"),
+    ]);
+    assert_eq!(loaded, [".forkliftignore", ".gitignore", "config.env", "rebuild.rs", "sub/build"]);
+}
+
+#[test]
+fn stocktake_reports_an_untracked_folder_only_when_load_would_stage_something_in_it() {
+    let (untracked, loaded) = untracked_then_loaded("ignore-descent", &[
+        // A venv ignores itself, a folder holds only such venvs, a log sits deep under `*.log`.
+        (".gitignore", "*.log\n"), ("venv/.gitignore", "*\n"), ("venv/bin/python", "p\n"),
+        ("envs/a/.gitignore", "*\n"), ("envs/a/lib/x", "x\n"), ("envs/b/.gitignore", "*\n"),
+        ("logs/sub/a.log", "l\n"), ("mixed/a/b/real.txt", "r\n"), ("mixed/a/c/z.log", "z\n"),
+    ]);
+    assert_eq!(untracked, [".gitignore", "mixed/"]);
+    assert_eq!(loaded, [".gitignore", "mixed/a/b/real.txt"]);
+
+    // An empty chain of folders is not reported either.
+    let warehouse = TestWarehouse::new("ignore-descent-empty");
+    assert_success(&warehouse.run(&["prepare"]));
+    std::fs::create_dir_all(warehouse.root.join("empty/chain/end")).unwrap();
+    warehouse.write_file("a.txt", "a\n");
+    assert_eq!(changes(&warehouse, "unstaged"), [("untracked".to_string(), "a.txt".to_string())]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_gitignore_that_is_no_regular_file_contributes_nothing_and_fails_nothing() {
+    let warehouse = TestWarehouse::new("gitignore-not-a-file");
+    assert_success(&warehouse.run(&["prepare"]));
+    warehouse.write_file("rules", "*\n");
+    std::os::unix::fs::symlink("rules", warehouse.root.join(".gitignore")).unwrap();
+    warehouse.write_file("sub/a.txt", "a\n");
+    std::os::unix::fs::symlink("../rules", warehouse.root.join("sub/.gitignore")).unwrap();
+    warehouse.write_file("dir/.gitignore/inner.txt", "i\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    let staged: Vec<String> = changes(&warehouse, "staged").into_iter().map(|(_, path)| path).collect();
+    assert_eq!(staged, [".gitignore", "dir/.gitignore/inner.txt", "rules", "sub/.gitignore", "sub/a.txt"]);
+
+    // The positive half: the same rules in a regular file are read.
+    std::fs::remove_file(warehouse.root.join("sub/.gitignore")).unwrap();
+    warehouse.write_file("sub/.gitignore", "*\n");
+    warehouse.write_file("sub/b.txt", "b\n");
+    let unstaged = changes(&warehouse, "unstaged");
+    // The tracked `.gitignore` itself reads as changed (from a link to a file); the untracked
+    // file beside it is ignored.
+    assert_eq!(unstaged, [("modified".to_string(), "sub/.gitignore".to_string())]);
+}
+
+#[test]
+fn every_git_folder_is_ignored_and_its_dotfile_siblings_are_not() {
+    let (untracked, loaded) = untracked_then_loaded("ignore-git-folders", &[
+        (".git/HEAD", "ref: refs/heads/main\n"), ("sub/.git/HEAD", "ref: refs/heads/main\n"), ("sub/a.txt", "a\n"),
+        ("lib/.git", "gitdir: ../.git/modules/lib\n"), ("lib/b.txt", "b\n"),
+        (".github/ci.yml", "c\n"), (".gitignore", "*.tmp\n"), (".forkliftignore", "!.git\n!re:(.*/)?\\.git(/.*)?\n"),
+    ]);
+    assert_eq!(untracked, [".forkliftignore", ".github/", ".gitignore", "lib/", "sub/"]);
+    assert_eq!(loaded, [".forkliftignore", ".github/ci.yml", ".gitignore", "lib/b.txt", "sub/a.txt"]);
+}
+
 #[test]
 fn a_conflicted_ignore_file_is_refused_not_read_as_rules() {
     // The ignore file is tracked, so consolidating two edits of it can write conflict markers
