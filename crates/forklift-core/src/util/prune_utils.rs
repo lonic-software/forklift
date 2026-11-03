@@ -1850,7 +1850,7 @@ mod tests {
 
         pack_utils::compact(true, false, true, &Progress::NONE).unwrap();
         let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
-        assert!(plan.to_free.is_empty() && plan.still_packed > 0 || plan.to_free.contains(&f.web_blob), "the prune plans again");
+        assert!(pack_utils::is_in_packs(&f.web_blob).unwrap() && plan.still_packed > 0, "the prune plans again, over what the repack packed");
     }
 
     fn pack_files() -> Vec<String> {
