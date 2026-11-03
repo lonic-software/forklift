@@ -547,8 +547,13 @@ fn render_wrapped_frames(message: &str) -> Option<String> {
 }
 
 /// What follows a frame's detail field, `text`: the detail is one JSON value, and anything after it
-/// was written by a caller that wrapped the frame.
+/// was written by a caller that wrapped the frame. `null` (no detail) is read by hand: a JSON stream
+/// takes a literal run straight into text (`null.`) for a malformed value, and would drop the rest.
 fn after_detail(text: &str) -> &str {
+    if let Some(rest) = text.strip_prefix("null") {
+        return rest;
+    }
+
     let mut values = serde_json::Deserializer::from_str(text).into_iter::<serde_json::Value>();
 
     match values.next() {
@@ -559,15 +564,14 @@ fn after_detail(text: &str) -> &str {
 
 /// Fold a next step into a message, for a text with no field of its own to carry it: a refusal
 /// degraded to `Other` (an unknown code, a frame a caller wrapped) and a failure reported as one
-/// line among others. The step keeps its [`NEXT_STEP_LABEL`], since many are bare commands; it
-/// stays on the message's line, because the text may sit inside a longer one. A blank step folds
-/// to the message alone.
+/// line among others. The step keeps its [`NEXT_STEP_LABEL`], since many are bare commands, and
+/// stays on the message's line, because the text may sit inside a longer one. It is closed in
+/// parentheses, so whatever a caller wrote after it does not read as part of the step. A blank
+/// step folds to the message alone.
 pub fn with_next_step(human: &str, next_step: &str) -> String {
-    // Checked trimmed, kept as written: a wrapped frame's step runs on into the caller's text.
-    if next_step.trim().is_empty() {
-        human.to_string()
-    } else {
-        format!("{} {}{}", human, NEXT_STEP_LABEL, next_step)
+    match next_step.trim() {
+        "" => human.to_string(),
+        step => format!("{} ({}{})", human, NEXT_STEP_LABEL, step),
     }
 }
 
@@ -604,7 +608,7 @@ pub fn sanitize_lines(text: &str) -> String {
     text.lines().map(sanitize).collect::<Vec<_>>().join("\n")
 }
 
-/// The label [`human_failure_text`] puts before a next step. A next step is often a bare command
+/// The label [`human_failure_text`] and [`with_next_step`] put before a next step. A next step is often a bare command
 /// (`forklift lower`), and printed unlabelled under an error it reads as the command that failed.
 pub const NEXT_STEP_LABEL: &str = "Next step: ";
 
@@ -622,9 +626,12 @@ pub fn human_failure_text(message: &str, next_step: Option<&str>) -> String {
 }
 
 /// Build the sentinel frame for a refusal. Re-sanitizes defensively so a `Refusal` assembled
-/// through the struct literal (bypassing [`CoreError::refusal`]) still frames decodably. Detail,
-/// when there is any, is a fourth field of compact JSON — which escapes every control character,
-/// the separator included, so the field needs no sanitizing of its own.
+/// through the struct literal (bypassing [`CoreError::refusal`]) still frames decodably. The
+/// detail is a fourth field of compact JSON, `null` when there is none — which escapes every
+/// control character, the separator included, so the field needs no sanitizing of its own. It is
+/// always written, because it is where the next step ends: a caller that wraps the frame
+/// (`format!("…: {}. More.", e)`) writes after it, and without the field that text would read as
+/// part of the step.
 fn frame(code: &str, message: &str, next_step: &str, details: Option<&serde_json::Value>) -> String {
     let mut framed = format!(
         "{}{}{}{}{}{}",
@@ -636,11 +643,8 @@ fn frame(code: &str, message: &str, next_step: &str, details: Option<&serde_json
         sanitize(next_step),
     );
 
-    if let Some(details) = details {
-        framed.push(REFUSAL_FIELD_SEPARATOR);
-        framed.push_str(&details.to_string());
-    }
-
+    framed.push(REFUSAL_FIELD_SEPARATOR);
+    framed.push_str(&details.map_or_else(|| "null".to_string(), |details| details.to_string()));
     framed
 }
 
@@ -664,7 +668,11 @@ fn deframe_with_details(message: &str) -> Option<(&str, &str, &str, Result<Optio
     let next_step = parts.next()?;
     let details = match parts.next() {
         None => Ok(None),
-        Some(text) => serde_json::from_str(text).map(Some).map_err(|_| ()),
+        Some(text) => match serde_json::from_str(text) {
+            Ok(serde_json::Value::Null) => Ok(None),
+            Ok(details) => Ok(Some(details)),
+            Err(_) => Err(()),
+        },
     };
 
     Some((code, human, next_step, details))
@@ -680,7 +688,7 @@ mod tests {
 
         // The texts survive and the code is dropped, as for an unknown code; the raw frame never
         // reaches output.
-        assert_eq!(CoreError::from(framed), CoreError::Other("changed Next step: verify".to_string()));
+        assert_eq!(CoreError::from(framed), CoreError::Other("changed (Next step: verify)".to_string()));
     }
 
     /// Proves the round trip for every variant the `refusal_codes!` invocation actually declares —
@@ -730,7 +738,7 @@ mod tests {
         let framed = frame("some_future_code", "a human explanation", "do this", None);
         let error: CoreError = framed.into();
 
-        assert_eq!(error, CoreError::Other("a human explanation Next step: do this".to_string()));
+        assert_eq!(error, CoreError::Other("a human explanation (Next step: do this)".to_string()));
         assert!(!error.to_string().contains('\u{1f}'));
     }
 
@@ -793,15 +801,16 @@ mod tests {
     // the message; decode its code too → the wrapped frame claims `cache_miss`; sanitize the
     // whole message → the caller's line break is lost; drop what follows a detail → so is its
     // closing sentence; decode only the first frame → the second's words are lost; take any
-    // prefix for a frame → the text that is not one is reshaped.
+    // prefix for a frame → the text that is not one is reshaped; frame no detail when there is
+    // none → the caller's closing sentence reads as part of the next step.
     #[test]
     fn a_wrapped_frame_reads_as_plain_text_and_claims_no_code() {
         let framed: String = CoreError::refusal(RefusalCode::CacheMiss, "object x is missing", "Wait for it.").into();
-        let wrapped = format!("The tree could not be read: {}. No parcel was made.", framed.trim_end_matches('.'));
+        let wrapped = format!("The tree could not be read: {}. No parcel was made.", framed);
 
         match CoreError::from(wrapped) {
             CoreError::Other(message) => assert_eq!(
-                message, "The tree could not be read: object x is missing Next step: Wait for it. No parcel was made."
+                message, "The tree could not be read: object x is missing (Next step: Wait for it.). No parcel was made."
             ),
             other => panic!("a wrapped frame claims no code: {:?}", other),
         }
@@ -813,7 +822,7 @@ mod tests {
         let wrapped = format!("Two reads failed:\n{} Nothing was written.", detailed);
 
         match CoreError::from(wrapped) {
-            CoreError::Other(message) => assert_eq!(message, "Two reads failed:\nobject y is missing Next step: Wait. Nothing was written."),
+            CoreError::Other(message) => assert_eq!(message, "Two reads failed:\nobject y is missing (Next step: Wait.) Nothing was written."),
             other => panic!("a wrapped frame claims no code: {:?}", other),
         }
 
@@ -825,7 +834,7 @@ mod tests {
 
         match CoreError::from(wrapped) {
             CoreError::Other(message) => assert_eq!(
-                message, format!("Read {} then:\na is missing Next step: Wait for A.\nb is missing Next step: Wait for B.", not_a_frame)
+                message, format!("Read {} then:\na is missing (Next step: Wait for A.)\nb is missing (Next step: Wait for B.)", not_a_frame)
             ),
             other => panic!("wrapped frames claim no code: {:?}", other),
         }
@@ -901,12 +910,12 @@ mod tests {
 
     #[test]
     fn a_folded_next_step_keeps_its_label_on_the_message_line() {
-        assert_eq!(with_next_step("It failed.", "forklift lower"), "It failed. Next step: forklift lower");
+        assert_eq!(with_next_step("It failed.", "forklift lower"), "It failed. (Next step: forklift lower)");
         assert_eq!(with_next_step("It failed.", " "), "It failed.");
 
         // A frame a caller wrapped keeps the label too.
         let wrapped = format!("Could not lift: {}", String::from(CoreError::refusal(RefusalCode::OutOfScope, "It failed.", "forklift lower")));
-        assert_eq!(CoreError::from(wrapped), CoreError::Other("Could not lift: It failed. Next step: forklift lower".to_string()));
+        assert_eq!(CoreError::from(wrapped), CoreError::Other("Could not lift: It failed. (Next step: forklift lower)".to_string()));
     }
 
     #[test]

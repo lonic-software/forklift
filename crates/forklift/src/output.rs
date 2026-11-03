@@ -1280,7 +1280,7 @@ mod tests {
         let error: ForkliftError = frame.into();
 
         assert_eq!(error.code.as_str(), "error"); // ErrorCode::Generic
-        assert_eq!(error.message, "a human explanation Next step: do this");
+        assert_eq!(error.message, "a human explanation (Next step: do this)");
         assert!(!error.message.contains('\u{1f}'), "the raw frame must never leak into the message");
     }
 
