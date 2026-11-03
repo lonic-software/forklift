@@ -660,8 +660,10 @@ fn frame(code: &str, message: &str, next_step: &str, details: Option<&serde_json
 /// Decode a sentinel frame into `(code, message, next_step)`; `None` for any string that is not a
 /// frame. The inverse of [`frame`] without its detail, and the low-level primitive the servers'
 /// wire mapping parses — the wire carries no detail, so a detail field never reaches `next_step`.
-/// Text a caller wrote after the frame (`format!("{} More.", framed)`) joins the message,
-/// [sanitized](sanitize): it is about the failure, and is no part of the step or the detail.
+/// Text a caller wrote after the frame (`format!("{} More.", framed)`) joins the message: it is
+/// about the failure, and is no part of the step or the detail. A frame inside that text is
+/// rendered as a wrapped one is, and the whole is [sanitized](sanitize) to one line, since a
+/// refusal's message is one line.
 pub fn deframe(message: &str) -> Option<(&str, Cow<'_, str>, &str)> {
     deframe_with_details(message).map(|(code, human, next_step, _)| (code, human, next_step))
 }
@@ -684,7 +686,10 @@ fn deframe_with_details(message: &str) -> Option<(&str, Cow<'_, str>, &str, Resu
     };
     let human = match after.trim() {
         "" => Cow::Borrowed(human),
-        _ => Cow::Owned(sanitize(&format!("{}{}", human, after))),
+        _ => {
+            let after = render_wrapped_frames(after).map_or(Cow::Borrowed(after), Cow::Owned);
+            Cow::Owned(sanitize(&format!("{}{}", human, after)))
+        }
     };
 
     Some((code, human, next_step, details))
@@ -923,8 +928,8 @@ mod tests {
 
     /// Text a caller writes after a frame that starts the string (`format!("{} More.", e)`) joins
     /// the message, and the refusal keeps its code, step and detail. Revert: read the detail field
-    /// whole → the detail does not parse, so the text and the code are both lost; join the text to
-    /// the step → it prints as the recovery.
+    /// whole → the detail does not parse, so the text and the code are both lost; join the text
+    /// as it is → a second frame in it prints its framing words and `null`.
     #[test]
     fn text_after_a_leading_frame_joins_its_message() {
         let framed: String = CoreError::refusal(RefusalCode::CacheMiss, "object x is missing.", "Wait for it.").into();
@@ -945,6 +950,13 @@ mod tests {
             ),
         );
         assert_eq!(deframe(&format!("{} More.", framed)).map(|(_, human, _)| human.into_owned()), Some("object x is missing. More.".to_string()));
+
+        // A second frame in that text is rendered, never shown raw.
+        let second: String = CoreError::refusal(RefusalCode::OutOfScope, "b is missing.", "Wait for B.").into();
+        assert_eq!(
+            CoreError::from(format!("{} Also: {}", framed, second)),
+            CoreError::refusal(RefusalCode::CacheMiss, "object x is missing. Also: b is missing. (Next step: Wait for B.)", "Wait for it."),
+        );
     }
 
     #[test]
