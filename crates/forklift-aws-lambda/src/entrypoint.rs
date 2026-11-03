@@ -479,6 +479,12 @@ where
         Err(message) => return error_response(HeadError::internal(message)),
     };
 
+    // Every route reads the warehouse, so every route is refused for a warehouse this build does
+    // not read. A write gates again right before it commits (`format::fenced`).
+    if let Err(error) = crate::format::gate(&head.refs) {
+        return error_response(error);
+    }
+
     if let Err(error) = require_set_up_for(routing, &head, &caller, &route) {
         return error_response(error);
     }

@@ -147,6 +147,10 @@ stay that way by `tests/iam_conformance.rs`'s C11 in the crate). This module ren
 the deployment-conditional statements — KMS (above) and the DLQ send permission (below) — are
 added here, since neither is the product of an unconditional SDK call.
 
+The crate's third policy, `iam/operator.policy.json`, is for the operator who runs
+`forklift-aws-upgrade` to upgrade warehouses to a new format, from their own machine. This module
+deploys no role for it; attach it to the role the operator uses.
+
 ## Variables and outputs
 
 The full, semver-governed contract is in [`variables.tf`](variables.tf) and

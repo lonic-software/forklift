@@ -55,6 +55,7 @@ use forklift_core::util::{
 };
 
 use crate::error::{HeadError, HeadResult};
+use crate::format::fenced;
 use crate::reissue::reissue;
 use crate::scratch::{materialize, materialize_state, Mirror, Scratch};
 use crate::store::{
@@ -573,16 +574,35 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             if office_head.is_some() {
                 return Err(Self::anchor_lost());
             }
-            self.require_adopted_history(&anchor)?;
+            self.require_adopted_history(anchor)?;
 
-            return match self
-                .refs
-                .put_trust_if_absent(&anchor.to_anchor())
-                .map_err(HeadError::internal)?
-            {
+            // Fenced on the warehouse's format like every write, and so a transaction re-issued
+            // like every other: under one token, an attempt of unknown fate that landed makes the
+            // next one find the identical anchor.
+            let planted = anchor.to_anchor();
+            let uncertain = Cell::new(false);
+            let outcome = fenced(
+                &self.refs,
+                |fence| {
+                    reissue(
+                        self.deadline,
+                        |token| self.refs.put_trust_if_absent(&planted, fence, token),
+                        |outcome| match outcome {
+                            TrustOutcome::Transient(cause) => Some(noting_uncertainty(&uncertain, *cause)),
+                            _ => None,
+                        },
+                    )
+                    .or_else(|error| settled_as_transient(&uncertain, error, TrustOutcome::Transient))
+                },
+                |outcome| *outcome == TrustOutcome::FormatMoved,
+            )?;
+
+            return match outcome {
                 TrustOutcome::Established => Ok(TrustResult::Established),
                 TrustOutcome::AlreadyIdentical => Ok(TrustResult::Unchanged),
                 TrustOutcome::Conflict => Err(self.trust_one_way_door()),
+                TrustOutcome::Transient(_) => Err(self.trust_plant_contention(uncertain.get())),
+                TrustOutcome::FormatMoved => unreachable!("`fenced` answers a moved format itself"),
             };
         };
 
@@ -623,17 +643,23 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         // earlier attempt of unknown fate can still commit after a later one is refused.
         let replacement = anchor.to_anchor();
         let uncertain = Cell::new(false);
-        let outcome = reissue(
-            self.deadline,
-            |token| {
-                self.refs.replace_trust(&replacement, &existing_bytes, office_head.as_deref(), token)
+        let outcome = fenced(
+            &self.refs,
+            |fence| {
+                reissue(
+                    self.deadline,
+                    |token| {
+                        self.refs.replace_trust(&replacement, &existing_bytes, office_head.as_deref(), fence, token)
+                    },
+                    |outcome| match outcome {
+                        TrustWriteOutcome::Transient(cause) => Some(noting_uncertainty(&uncertain, *cause)),
+                        _ => None,
+                    },
+                )
+                .or_else(|error| settled_as_transient(&uncertain, error, TrustWriteOutcome::Transient))
             },
-            |outcome| match outcome {
-                TrustWriteOutcome::Transient(cause) => Some(noting_uncertainty(&uncertain, *cause)),
-                _ => None,
-            },
-        )
-        .or_else(|error| settled_as_transient(&uncertain, error, TrustWriteOutcome::Transient))?;
+            |outcome| *outcome == TrustWriteOutcome::FormatMoved,
+        )?;
 
         match outcome {
             TrustWriteOutcome::Replaced => Ok(TrustResult::Established),
@@ -657,6 +683,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 Err(self.adopts_mismatch(anchor.adopts.as_deref(), current.as_deref()))
             }
             TrustWriteOutcome::Transient(_) => Err(self.anchor_write_contention(uncertain.get())),
+            TrustWriteOutcome::FormatMoved => unreachable!("`fenced` answers a moved format itself"),
         }
     }
 
@@ -705,6 +732,23 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             replaced.",
             genesis
         ))
+    }
+
+    /// A first trust anchor whose plant stayed refused for a transient reason through every attempt.
+    fn trust_plant_contention(&self, uncertain: bool) -> HeadError {
+        if uncertain {
+            return HeadError::service_unavailable(format!(
+                "The trust anchor could not be confirmed planted: {} Run the request again: it \
+                finds the anchor planted, or plants it.",
+                UNCONFIRMED
+            ));
+        }
+
+        HeadError::service_unavailable(
+            "The trust anchor could not be planted: the warehouse's storage stayed busy through \
+            every attempt this request could afford. Nothing was changed; run the request again."
+                .to_string(),
+        )
     }
 
     /// The transient refusal of the *anchor write*, as opposed to a ref-update commit.
@@ -1076,25 +1120,32 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         // bounded budget before it is answered (claim C14, arm two; see `reissue.rs`). As for the
         // anchor write, whether any attempt may have landed is tracked across all of them.
         let uncertain = Cell::new(false);
-        let outcome = reissue(
-            self.deadline,
-            |token| {
-                self.refs.compare_and_set_head(
-                    namespace,
-                    &bare,
-                    expected,
-                    &request.new_head,
-                    office_head_for_commit,
-                    anchor_bytes.as_deref(),
-                    token,
+        let outcome = fenced(
+            &self.refs,
+            |fence| {
+                reissue(
+                    self.deadline,
+                    |token| {
+                        self.refs.compare_and_set_head(
+                            namespace,
+                            &bare,
+                            expected,
+                            &request.new_head,
+                            office_head_for_commit,
+                            anchor_bytes.as_deref(),
+                            fence,
+                            token,
+                        )
+                    },
+                    |outcome| match outcome {
+                        CasOutcome::Transient(cause) => Some(noting_uncertainty(&uncertain, *cause)),
+                        _ => None,
+                    },
                 )
+                .or_else(|error| settled_as_transient(&uncertain, error, CasOutcome::Transient))
             },
-            |outcome| match outcome {
-                CasOutcome::Transient(cause) => Some(noting_uncertainty(&uncertain, *cause)),
-                _ => None,
-            },
-        )
-        .or_else(|error| settled_as_transient(&uncertain, error, CasOutcome::Transient))?;
+            |outcome| *outcome == CasOutcome::FormatMoved,
+        )?;
 
         match outcome {
             CasOutcome::Committed => Ok(()),
@@ -1102,6 +1153,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             CasOutcome::OfficeMoved { current } => Err(self.office_moved(&current)),
             CasOutcome::AnchorMoved => Err(self.anchor_moved()),
             CasOutcome::Transient(_) => Err(self.transient_contention(uncertain.get())),
+            CasOutcome::FormatMoved => unreachable!("`fenced` answers a moved format itself"),
         }
     }
 
@@ -1174,24 +1226,31 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             };
 
             let uncertain = Cell::new(false);
-            let outcome = reissue(
-                self.deadline,
-                |token| {
-                    self.refs.delete_head(
-                        PalletNamespace::User,
-                        &bare,
-                        old_head,
-                        office_precondition,
-                        anchor_bytes.as_deref(),
-                        token,
+            let outcome = fenced(
+                &self.refs,
+                |fence| {
+                    reissue(
+                        self.deadline,
+                        |token| {
+                            self.refs.delete_head(
+                                PalletNamespace::User,
+                                &bare,
+                                old_head,
+                                office_precondition,
+                                anchor_bytes.as_deref(),
+                                fence,
+                                token,
+                            )
+                        },
+                        |outcome| match outcome {
+                            CasOutcome::Transient(cause) => Some(noting_uncertainty(&uncertain, *cause)),
+                            _ => None,
+                        },
                     )
+                    .or_else(|error| settled_as_transient(&uncertain, error, CasOutcome::Transient))
                 },
-                |outcome| match outcome {
-                    CasOutcome::Transient(cause) => Some(noting_uncertainty(&uncertain, *cause)),
-                    _ => None,
-                },
-            )
-            .or_else(|error| settled_as_transient(&uncertain, error, CasOutcome::Transient))?;
+                |outcome| *outcome == CasOutcome::FormatMoved,
+            )?;
 
             match outcome {
                 CasOutcome::Committed => return Ok(()),
@@ -1206,6 +1265,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 }
                 CasOutcome::OfficeMoved { current } => return Err(self.office_moved(&current)),
                 CasOutcome::AnchorMoved => return Err(self.anchor_moved()),
+                CasOutcome::FormatMoved => unreachable!("`fenced` answers a moved format itself"),
                 CasOutcome::Transient(_) => {
                     // Under one token an earlier attempt may still have landed: the ref decides.
                     // A ref that left `old_head` some other way is answered as the commit's

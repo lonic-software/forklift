@@ -97,6 +97,51 @@ it exclusively with a try, and refuses if anyone holds it.
 **A warehouse being upgraded must not be in use from another machine.** Whether kernel locks hold on a
 network filesystem is unverified, and read-only locking has only been run on macOS.
 
+## The AWS head
+
+The AWS head has its own format number and its own chain, since what it keeps is DynamoDB items rather
+than files. Each warehouse records its format in one item, `entity = "format"`, in its own partition.
+Its `state` is the format number, or `N>M owner step` while an upgrade from `N` to `M` holds it.
+
+Every request reads that item strongly consistent before anything else, and is refused with a `503`
+unless the state is exactly the format the deployment reads:
+
+| State | The request | Way out |
+|---|---|---|
+| The deployment's format | is served | Nothing to do. |
+| Absent, and nothing stored in the warehouse | is served; its first write records the format | Nothing to do. |
+| Absent, with data stored | is refused | Make the warehouse again under a new id. |
+| Older | is refused | The operator runs `forklift-aws-upgrade`. |
+| Newer | is refused | Update the deployment. |
+| An upgrade | is refused | Wait for the upgrade, or have the operator run it again. |
+| Anything else | is refused | Nothing to guess at: the state was not written by Forklift. |
+
+Every ref and trust write is a transaction whose first action is that check: a `ConditionCheck` on the
+state the request read, which never rewrites it, or, for a new warehouse, a `Put` of the format item
+that holds only while the item is absent. A write whose check fails is gated again, so a write
+prepared before an upgrade began cannot land once it has.
+
+`forklift-aws-upgrade` upgrades a warehouse in place. It runs from an operator's machine, never from a
+Lambda, and takes warehouse ids or `--all`:
+
+1. It replaces the state with `F>F+1 owner 0`, with a fresh owner token, by a compare-and-set.
+2. It waits longer than the control-plane Lambda's timeout (`--wait-secs`, 60 by default), so no
+   request that read the old state is still running.
+3. It runs that format's steps in order, advancing the step in the state after each. Every write a
+   step makes is fenced on the exact state, so an operator whose run was taken over can no longer
+   write.
+4. It records `F+1`, and takes the next format until it reaches the one it reads.
+
+A state left by another run is refused unless the operator passes `--takeover` with that warehouse's id,
+after making sure that run has stopped. Takeover puts a new owner in the state, waits again (the run it
+takes over may have stopped before its wait was out), and resumes at the first step not done, so steps
+must be idempotent. A warehouse that fails is reported and the others are still upgraded. Steps change only the warehouse's own DynamoDB partition: the bucket's
+`objects/` and `signatures/` keys are shared by every warehouse and named by their content, and
+`staging/` and `responses/` are transient. An S3 layout change has no in-place path.
+
+A format break on a deployment refuses every warehouse until each is upgraded. The AWS head's chain is
+empty as well: format 1 is its first format.
+
 ## What a format break ships
 
 A change to what a warehouse keeps on disk ships all of these together:

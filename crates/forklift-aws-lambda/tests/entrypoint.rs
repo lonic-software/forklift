@@ -89,6 +89,14 @@ impl ObjectStore for SharedObjects {
 struct SharedRefs(Arc<MemoryRefStore>);
 
 impl RefStore for SharedRefs {
+    fn read_format(&self) -> Result<Option<String>, String> {
+        self.0.read_format()
+    }
+
+    fn partition_has_items(&self) -> Result<bool, String> {
+        self.0.partition_has_items()
+    }
+
     fn get_head(&self, namespace: PalletNamespace, name: &str) -> Result<RefHead, String> {
         self.0.get_head(namespace, name)
     }
@@ -100,9 +108,10 @@ impl RefStore for SharedRefs {
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.0.compare_and_set_head(namespace, name, expected, new, office_head, anchor, request_token)
+        self.0.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
     }
     fn delete_head(
         &self,
@@ -111,9 +120,10 @@ impl RefStore for SharedRefs {
         old: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.0.delete_head(namespace, name, old, office_head, anchor, request_token)
+        self.0.delete_head(namespace, name, old, office_head, anchor, format, request_token)
     }
     fn list_refs(&self) -> Result<RefListing, String> {
         self.0.list_refs()
@@ -127,17 +137,20 @@ impl RefStore for SharedRefs {
     fn put_trust_if_absent(
         &self,
         anchor: &office_utils::TrustAnchor,
+        format: &forklift_aws_lambda::FormatFence,
+        request_token: &str,
     ) -> Result<TrustOutcome, String> {
-        self.0.put_trust_if_absent(anchor)
+        self.0.put_trust_if_absent(anchor, format, request_token)
     }
     fn replace_trust(
         &self,
         anchor: &office_utils::TrustAnchor,
         expected_anchor: &str,
         office_head: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
-        self.0.replace_trust(anchor, expected_anchor, office_head, request_token)
+        self.0.replace_trust(anchor, expected_anchor, office_head, format, request_token)
     }
 }
 
@@ -1086,6 +1099,7 @@ fn a_shared_bearer_holder_may_move_any_pallet_including_the_office() {
                 &office_head,
                 OfficePrecondition::NotConsumed,
                 Some(stored_anchor.as_str()),
+                &forklift_aws_lambda::format::gate(&*main_fixture.refs).expect("format gate"),
                 &request_token(),
             )
             .expect("seed the office ref directly"),
@@ -1758,4 +1772,132 @@ fn harvest(warehouse: &Path) -> Harvest {
 fn prepare(area: &Area, dir: &str) {
     area.forklift(dir, &["prepare"]);
     area.forklift(dir, &["config", "set", "--global", "operator.identifier", "tester@forklift"]);
+}
+
+/// A store an upgrade marks while a request is committing: after every gate the request makes,
+/// and before the commit's transaction checks its fence, so only that check can refuse it.
+#[derive(Clone)]
+struct MarkedMidRequest(Arc<MemoryRefStore>);
+
+impl RefStore for MarkedMidRequest {
+    fn read_format(&self) -> Result<Option<String>, String> {
+        self.0.read_format()
+    }
+    fn partition_has_items(&self) -> Result<bool, String> {
+        self.0.partition_has_items()
+    }
+    fn get_head(&self, namespace: PalletNamespace, name: &str) -> Result<RefHead, String> {
+        self.0.get_head(namespace, name)
+    }
+    fn compare_and_set_head(
+        &self,
+        namespace: PalletNamespace,
+        name: &str,
+        expected: ExpectedHead<'_>,
+        new: &str,
+        office_head: OfficePrecondition<'_>,
+        anchor: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
+        request_token: &str,
+    ) -> Result<CasOutcome, String> {
+        self.0.set_format(Some("1>2 operator 0"));
+        self.0.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
+    }
+    fn delete_head(
+        &self,
+        namespace: PalletNamespace,
+        name: &str,
+        old: &str,
+        office_head: OfficePrecondition<'_>,
+        anchor: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
+        request_token: &str,
+    ) -> Result<CasOutcome, String> {
+        self.0.delete_head(namespace, name, old, office_head, anchor, format, request_token)
+    }
+    fn list_refs(&self) -> Result<RefListing, String> {
+        self.0.list_refs()
+    }
+    fn default_pallet(&self) -> Result<String, String> {
+        self.0.default_pallet()
+    }
+    fn get_trust(&self) -> Result<Option<(office_utils::TrustAnchor, String)>, String> {
+        self.0.get_trust()
+    }
+    fn put_trust_if_absent(
+        &self,
+        anchor: &office_utils::TrustAnchor,
+        format: &forklift_aws_lambda::FormatFence,
+        request_token: &str,
+    ) -> Result<TrustOutcome, String> {
+        self.0.put_trust_if_absent(anchor, format, request_token)
+    }
+    fn replace_trust(
+        &self,
+        anchor: &office_utils::TrustAnchor,
+        expected_anchor: &str,
+        office_head: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
+        request_token: &str,
+    ) -> Result<TrustWriteOutcome, String> {
+        self.0.replace_trust(anchor, expected_anchor, office_head, format, request_token)
+    }
+}
+
+/// A warehouse's first write stamps its format; a warehouse an upgrade holds, or one in a format
+/// this build does not read, or one holding data with no format at all, is a 503 on every route;
+/// and a ref update that gated before an upgrade marked the warehouse writes nothing.
+#[test]
+fn every_request_is_gated_on_the_warehouse_format() {
+    let area = Area::new("format-gate");
+    prepare(&area, "wh");
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "-m", "first"]);
+
+    let harvest = harvest(&area.path("wh"));
+    let main_head = harvest.head_of("main").expect("main head");
+    let fixture = Fixture::direct();
+
+    assert_eq!(fixture.refs.read_format().unwrap(), None);
+    for (hash, bytes) in &harvest.objects {
+        assert_eq!(status(&fixture.call(put_bytes(&format!("/v1/objects/{}", hash), bytes.clone()))), 201);
+    }
+    let lift = RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None };
+    assert_eq!(status(&fixture.call(post_json("/v1/pallets/main", &lift))), 200);
+    assert_eq!(fixture.refs.read_format().unwrap().as_deref(), Some("1"), "the first write stamps the format");
+
+    for (state, says) in [
+        (Some("1>2 operator 0"), "being upgraded from format 1 to format 2"),
+        (Some("2"), "newer than format 1"),
+        (Some("0"), "older than format 1"),
+        (None, "records no format"),
+    ] {
+        fixture.refs.set_format(state);
+
+        for request in [get("/v1/warehouse"), post_json("/v1/pallets/feature", &lift)] {
+            let response = fixture.call(request);
+            assert_eq!(status(&response), 503, "{:?}", state);
+            let body: serde_json::Value = body_json(&response);
+            assert!(body["error"].as_str().unwrap().contains(says), "{:?}: {}", state, body);
+        }
+    }
+
+    fixture.refs.set_format(Some("1"));
+    assert_eq!(fixture.refs.get_head(PalletNamespace::User, "feature").unwrap(), RefHead::Absent);
+
+    let refs = fixture.refs.clone();
+    let objects = fixture.objects.clone();
+    let response = handle(
+        &fixture.routing,
+        &fixture.auth,
+        move |_| Ok(Head::new(SharedObjects(objects), MarkedMidRequest(refs))),
+        post_json("/v1/pallets/feature", &lift),
+    );
+
+    assert_eq!(status(&response), 503);
+    let body: serde_json::Value = body_json(&response);
+    assert!(body["error"].as_str().unwrap().contains("being upgraded"), "{}", body);
+    assert_eq!(fixture.refs.get_head(PalletNamespace::User, "feature").unwrap(), RefHead::Absent);
+    assert_eq!(fixture.refs.read_format().unwrap().as_deref(), Some("1>2 operator 0"), "the mark stands");
 }

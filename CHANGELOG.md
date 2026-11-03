@@ -25,6 +25,10 @@ Entries are written by hand in the pull request that makes the change, under **U
 - **A warehouse now records its format, and a build reads exactly one.** A warehouse in another format
   is refused before anything in it is read, with its own error code and way out. Warehouses made by
   an earlier build are refused and must be made again: no upgrade reaches back before this change.
+- **The AWS head records each warehouse's format too**, in a DynamoDB item every request reads first,
+  and refuses a warehouse in another format with a `503`. Every ref and trust write is checked against
+  it, so no write lands once an upgrade has begun. Warehouses written by an earlier deployment are
+  refused and must be made again under a new id.
 - Forklift records no display names: `operator.name`, the profile name and `--display-name` are gone.
 
 ### Added
@@ -32,6 +36,8 @@ Entries are written by hand in the pull request that makes the change, under **U
 - `forklift upgrade` and `forklift-server upgrade --root` upgrade a warehouse, with all its bays, to the
   format the build reads, and resume an upgrade that was interrupted. Both refuse while anything else has
   the warehouse open (exit 45). No format before the first is upgraded.
+- `forklift-aws-upgrade` upgrades the warehouses of an AWS deployment in place, from an operator's
+  machine under the new `iam/operator.policy.json`, and resumes an interrupted run with `--takeover`.
 - Partial warehouses: a cache warehouse fetches what it reads from its origin, `store evict` frees what
   the origin holds, and `remote move` moves the origin.
 - `git mirror` keeps a git remote in step, never by force.

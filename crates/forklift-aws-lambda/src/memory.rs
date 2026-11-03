@@ -23,9 +23,9 @@ use forklift_core::util::office_utils::{TrustAnchor, OFFICE_PALLET_NAME};
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef, DEFAULT_PALLET_NAME};
 
 use crate::store::{
-    CasOutcome, ExpectedHead, ObjectAccess, ObjectStore, OffloadedResponse, OfficePrecondition, PromoteOutcome,
-    PutOutcome, PutTarget, RefHead, RefListing, RefStore, SignatureOutcome, TrustOutcome,
-    TrustWriteOutcome,
+    CasOutcome, ExpectedHead, FormatFence, FormatStore, ObjectAccess, ObjectStore, OffloadedResponse,
+    OfficePrecondition, PromoteOutcome, PutOutcome, PutTarget, RefHead, RefListing, RefStore, SignatureOutcome,
+    TrustOutcome, TrustWriteOutcome,
 };
 
 /// An in-memory [`ObjectStore`]. Object bytes are the uncompressed wire form, keyed by hash.
@@ -265,6 +265,9 @@ struct RefState {
     /// precondition is string equality on stored bytes; a fake that kept only a decoded value
     /// could never represent the comparison the real store enforces.
     trust: Option<String>,
+    /// The format item's state, or `None` while the warehouse has none — the item
+    /// `DynamoRefStore` keeps beside the pallets and the anchor.
+    format: Option<String>,
 }
 
 /// An in-memory [`RefStore`]. Pallet heads are keyed by their qualified wire reference
@@ -277,7 +280,7 @@ pub struct MemoryRefStore {
 impl Default for MemoryRefStore {
     fn default() -> MemoryRefStore {
         MemoryRefStore {
-            state: Mutex::new(RefState { pallets: HashMap::new(), trust: None }),
+            state: Mutex::new(RefState { pallets: HashMap::new(), trust: None, format: None }),
             default_pallet: DEFAULT_PALLET_NAME.to_string(),
         }
     }
@@ -287,6 +290,13 @@ impl MemoryRefStore {
     /// A fresh ref store with the default pallet (`main`).
     pub fn new() -> MemoryRefStore {
         MemoryRefStore::default()
+    }
+
+    /// Set the format item's state, or remove the item with `None`, bypassing every fence — the
+    /// stand-in for an upgrade's mark, a build of another format, or a warehouse written before
+    /// formats were recorded.
+    pub fn set_format(&self, state: Option<&str>) {
+        self.state.lock().unwrap().format = state.map(str::to_string);
     }
 
     fn key(namespace: PalletNamespace, name: &str) -> String {
@@ -354,6 +364,23 @@ impl MemoryRefStore {
 }
 
 impl RefState {
+    /// Whether the format item still holds what `fence` expects: the state it names, or no item
+    /// at all for a stamp. Checked before every other precondition, as `DynamoRefStore` places
+    /// the format action first in each transaction.
+    fn format_holds(&self, fence: &FormatFence) -> bool {
+        match fence {
+            FormatFence::At(state) => self.format.as_deref() == Some(state),
+            FormatFence::Stamp(_) => self.format.is_none(),
+        }
+    }
+
+    /// Commit the fence's own write, under the guard that checked it: a stamp records its state.
+    fn apply_format(&mut self, fence: &FormatFence) {
+        if let FormatFence::Stamp(state) = fence {
+            self.format = Some(state.clone());
+        }
+    }
+
     fn entry(&self, key: &str) -> RefHead {
         self.pallets.get(key).cloned().unwrap_or(RefHead::Absent)
     }
@@ -368,6 +395,16 @@ impl RefStore for MemoryRefStore {
         Ok(self.state.lock().unwrap().entry(&Self::key(namespace, name)))
     }
 
+    fn read_format(&self) -> Result<Option<String>, String> {
+        Ok(self.state.lock().unwrap().format.clone())
+    }
+
+    fn partition_has_items(&self) -> Result<bool, String> {
+        let state = self.state.lock().unwrap();
+
+        Ok(!state.pallets.is_empty() || state.trust.is_some() || state.format.is_some())
+    }
+
     // One mutex makes every commit atomic in one step, so there is never an attempt whose
     // fate is unknown and nothing for a request token to deduplicate.
     #[allow(clippy::too_many_arguments)]
@@ -379,12 +416,17 @@ impl RefStore for MemoryRefStore {
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        format: &FormatFence,
         _request_token: &str,
     ) -> Result<CasOutcome, String> {
         let key = Self::key(namespace, name);
         let office = Self::office_condition(&key, office_head);
 
         let mut state = self.state.lock().unwrap();
+
+        if !state.format_holds(format) {
+            return Ok(CasOutcome::FormatMoved);
+        }
 
         // All three preconditions are evaluated, and the commit made, under this one guard —
         // the property this whole struct exists to provide (see `RefState`'s docs).
@@ -405,6 +447,7 @@ impl RefStore for MemoryRefStore {
             return Ok(moved);
         }
 
+        state.apply_format(format);
         state.pallets.insert(key, RefHead::Live(new.to_string()));
 
         Ok(CasOutcome::Committed)
@@ -417,12 +460,18 @@ impl RefStore for MemoryRefStore {
         old: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        format: &FormatFence,
         _request_token: &str,
     ) -> Result<CasOutcome, String> {
         let key = Self::key(namespace, name);
         let office = Self::office_condition(&key, office_head);
 
         let mut state = self.state.lock().unwrap();
+
+        if !state.format_holds(format) {
+            return Ok(CasOutcome::FormatMoved);
+        }
+
         let current = state.entry(&key);
 
         if current.live() != Some(old) {
@@ -433,6 +482,7 @@ impl RefStore for MemoryRefStore {
             return Ok(moved);
         }
 
+        state.apply_format(format);
         state.pallets.insert(key, RefHead::Deleted(old.to_string()));
 
         Ok(CasOutcome::Committed)
@@ -471,10 +521,19 @@ impl RefStore for MemoryRefStore {
         Ok(Some((dto.to_anchor(), json.clone())))
     }
 
-    fn put_trust_if_absent(&self, anchor: &TrustAnchor) -> Result<TrustOutcome, String> {
+    fn put_trust_if_absent(
+        &self,
+        anchor: &TrustAnchor,
+        format: &FormatFence,
+        _request_token: &str,
+    ) -> Result<TrustOutcome, String> {
         let incoming = TrustAnchorDto::from(anchor);
         let json = Self::encode(anchor)?;
         let mut state = self.state.lock().unwrap();
+
+        if !state.format_holds(format) {
+            return Ok(TrustOutcome::FormatMoved);
+        }
 
         match &state.trust {
             Some(existing_json) => {
@@ -487,6 +546,7 @@ impl RefStore for MemoryRefStore {
                 }
             }
             None => {
+                state.apply_format(format);
                 state.trust = Some(json);
                 Ok(TrustOutcome::Established)
             }
@@ -498,6 +558,7 @@ impl RefStore for MemoryRefStore {
         anchor: &TrustAnchor,
         expected_anchor: &str,
         office_head: Option<&str>,
+        format: &FormatFence,
         _request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
         let incoming = TrustAnchorDto::from(anchor);
@@ -505,6 +566,10 @@ impl RefStore for MemoryRefStore {
         let office_key = Self::key(PalletNamespace::Meta, OFFICE_PALLET_NAME);
 
         let mut state = self.state.lock().unwrap();
+
+        if !state.format_holds(format) {
+            return Ok(TrustWriteOutcome::FormatMoved);
+        }
 
         // Both preconditions are evaluated, and the write made, under this one guard — the
         // mirror of the transaction being atomic over both actions. It is also what lets a
@@ -542,9 +607,24 @@ impl RefStore for MemoryRefStore {
             return Ok(TrustWriteOutcome::OfficeMoved { current: current_office });
         }
 
+        state.apply_format(format);
         state.trust = Some(json);
 
         Ok(TrustWriteOutcome::Replaced)
+    }
+}
+
+impl FormatStore for MemoryRefStore {
+    fn swap_format(&self, expected: &str, new: &str) -> Result<bool, String> {
+        let mut state = self.state.lock().unwrap();
+
+        if state.format.as_deref() != Some(expected) {
+            return Ok(false);
+        }
+
+        state.format = Some(new.to_string());
+
+        Ok(true)
     }
 }
 

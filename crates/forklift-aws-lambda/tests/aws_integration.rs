@@ -33,6 +33,8 @@ use aws_smithy_http_client::tls;
 
 use http::{Request, Response};
 
+use forklift_aws_lambda::aws::dynamo::list_warehouses;
+use forklift_aws_lambda::format::{self, UpgradeOptions, AWS_FORMAT};
 use forklift_aws_lambda::reissue::request_token;
 use forklift_aws_lambda::aws::{build_clients, build_stores, AwsConfig, DynamoOps, S3Ops};
 use forklift_aws_lambda::store::{
@@ -41,7 +43,7 @@ use forklift_aws_lambda::store::{
     PutTarget, RefStore, SignatureOutcome, TrustOutcome, TrustWriteOutcome,
 };
 use forklift_aws_lambda::{
-    handle, AsyncBridge, AuthConfig, DynamoRefStore, Head, HeadResult, Routing, S3ObjectStore,
+    handle, AsyncBridge, AuthConfig, DynamoRefStore, FormatFence, FormatStore, Head, HeadResult, Routing, S3ObjectStore,
 };
 
 use forklift_core::globals::StorageRootScope;
@@ -489,14 +491,14 @@ async fn dynamo_ref_store_upholds_the_cas_and_the_trust_door() {
         // `OfficePrecondition`'s docs), while the anchor `ConditionCheck` is always built and
         // resolves to its "absent" mode.
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::User, "main", ExpectedHead::At(&one), &two, OfficePrecondition::NotConsumed, None, &request_token())
+            refs.compare_and_set_head(PalletNamespace::User, "main", ExpectedHead::At(&one), &two, OfficePrecondition::NotConsumed, None, &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &request_token())
                 .expect("cas against a genuinely missing item"),
             CasOutcome::Conflict { current: RefHead::Absent }
         );
 
         // Create, expecting no entry.
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::User, "main", ExpectedHead::Unborn, &one, OfficePrecondition::NotConsumed, None, &request_token())
+            refs.compare_and_set_head(PalletNamespace::User, "main", ExpectedHead::Unborn, &one, OfficePrecondition::NotConsumed, None, &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &request_token())
                 .expect("create"),
             CasOutcome::Committed
         );
@@ -507,21 +509,21 @@ async fn dynamo_ref_store_upholds_the_cas_and_the_trust_door() {
 
         // A replay expecting no entry now conflicts, reporting the current head.
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::User, "main", ExpectedHead::Unborn, &two, OfficePrecondition::NotConsumed, None, &request_token())
+            refs.compare_and_set_head(PalletNamespace::User, "main", ExpectedHead::Unborn, &two, OfficePrecondition::NotConsumed, None, &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &request_token())
                 .expect("replay"),
             CasOutcome::Conflict { current: RefHead::Live(one.clone()) }
         );
 
         // A fast-forward from the right expected commits.
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::User, "main", ExpectedHead::At(&one), &two, OfficePrecondition::NotConsumed, None, &request_token())
+            refs.compare_and_set_head(PalletNamespace::User, "main", ExpectedHead::At(&one), &two, OfficePrecondition::NotConsumed, None, &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &request_token())
                 .expect("ff"),
             CasOutcome::Committed
         );
 
         // A stale expected conflicts, again reporting the actual head.
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::User, "main", ExpectedHead::At(&one), &one, OfficePrecondition::NotConsumed, None, &request_token())
+            refs.compare_and_set_head(PalletNamespace::User, "main", ExpectedHead::At(&one), &one, OfficePrecondition::NotConsumed, None, &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &request_token())
                 .expect("stale"),
             CasOutcome::Conflict { current: RefHead::Live(two.clone()) }
         );
@@ -531,7 +533,7 @@ async fn dynamo_ref_store_upholds_the_cas_and_the_trust_door() {
         // `ConditionCheck` is built regardless of what `office_head` names (the FORK-95 design
         // memo: "no two actions may target the same item").
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::Meta, "office", ExpectedHead::Unborn, &one, OfficePrecondition::NotConsumed, None, &request_token())
+            refs.compare_and_set_head(PalletNamespace::Meta, "office", ExpectedHead::Unborn, &one, OfficePrecondition::NotConsumed, None, &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &request_token())
                 .expect("office"),
             CasOutcome::Committed
         );
@@ -559,9 +561,9 @@ async fn dynamo_ref_store_upholds_the_cas_and_the_trust_door() {
         .to_anchor();
 
         assert!(refs.get_trust().expect("no trust yet").is_none());
-        assert_eq!(refs.put_trust_if_absent(&anchor).expect("plant"), TrustOutcome::Established);
+        assert_eq!(refs.put_trust_if_absent(&anchor, &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &forklift_aws_lambda::reissue::request_token()).expect("plant"), TrustOutcome::Established);
         assert_eq!(
-            refs.put_trust_if_absent(&anchor).expect("idempotent"),
+            refs.put_trust_if_absent(&anchor, &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &forklift_aws_lambda::reissue::request_token()).expect("idempotent"),
             TrustOutcome::AlreadyIdentical
         );
 
@@ -574,7 +576,7 @@ async fn dynamo_ref_store_upholds_the_cas_and_the_trust_door() {
         }
         .to_anchor();
         assert_eq!(
-            refs.put_trust_if_absent(&different).expect("conflict"),
+            refs.put_trust_if_absent(&different, &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &forklift_aws_lambda::reissue::request_token()).expect("conflict"),
             TrustOutcome::Conflict
         );
 
@@ -595,7 +597,7 @@ async fn dynamo_ref_store_upholds_the_cas_and_the_trust_door() {
             .get_head(PalletNamespace::Meta, OFFICE_PALLET_NAME)
             .expect("read the office head");
         assert_eq!(
-            refs.replace_trust(&different, &read_bytes, office_head.live(), &request_token())
+            refs.replace_trust(&different, &read_bytes, office_head.live(), &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &request_token())
                 .expect("replace"),
             TrustWriteOutcome::Replaced
         );
@@ -652,6 +654,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 &office_o1,
                 OfficePrecondition::NotConsumed,
                 None,
+                &forklift_aws_lambda::format::gate(&refs).expect("format gate"),
                 &request_token(),
             )
             .expect("plant the office"),
@@ -667,7 +670,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
         }
         .to_anchor();
         assert_eq!(
-            refs.put_trust_if_absent(&anchor_v1).expect("plant trust"),
+            refs.put_trust_if_absent(&anchor_v1, &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &forklift_aws_lambda::reissue::request_token()).expect("plant trust"),
             TrustOutcome::Established
         );
         let (_decoded, bytes_a1) = refs.get_trust().expect("read trust").expect("present");
@@ -682,6 +685,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 &main_m1,
                 OfficePrecondition::At(&office_o1),
                 Some(&bytes_a1),
+                &forklift_aws_lambda::format::gate(&refs).expect("format gate"),
                 &request_token(),
             )
             .expect("create main under matching preconditions"),
@@ -708,6 +712,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 &office_o2,
                 OfficePrecondition::NotConsumed,
                 Some(&bytes_a1),
+                &forklift_aws_lambda::format::gate(&refs).expect("format gate"),
                 &request_token(),
             )
             .expect("move the office"),
@@ -722,6 +727,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 &main_m2,
                 OfficePrecondition::At(&office_o1), // stale: the office moved to office_o2 just above
                 Some(&bytes_a1),
+                &forklift_aws_lambda::format::gate(&refs).expect("format gate"),
                 &request_token(),
             )
             .expect("stale office precondition"),
@@ -749,7 +755,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
             .get_head(PalletNamespace::Meta, OFFICE_PALLET_NAME)
             .expect("read the office head");
         assert_eq!(
-            refs.replace_trust(&anchor_v2, &bytes_a1, office_now.live(), &request_token())
+            refs.replace_trust(&anchor_v2, &bytes_a1, office_now.live(), &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &request_token())
                 .expect("replace trust"),
             TrustWriteOutcome::Replaced
         );
@@ -763,7 +769,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 ExpectedHead::At(&main_m1),
                 &main_m2,
                 OfficePrecondition::At(&office_o2), // current: matches
-                Some(&bytes_a1),  // stale: the anchor was replaced just above
+                Some(&bytes_a1),  &forklift_aws_lambda::format::gate(&refs).expect("format gate"),  // stale: the anchor was replaced just above
                 &request_token(),
             )
             .expect("stale anchor precondition"),
@@ -786,6 +792,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 &side_s1,
                 OfficePrecondition::At(&office_o2),
                 Some(&bytes_a2),
+                &forklift_aws_lambda::format::gate(&refs).expect("format gate"),
                 &request_token(),
             )
             .expect("create side"),
@@ -799,6 +806,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 &side_s2,
                 OfficePrecondition::At(&office_o2),
                 Some(&bytes_a2),
+                &forklift_aws_lambda::format::gate(&refs).expect("format gate"),
                 &request_token(),
             )
             .expect("move side"),
@@ -812,6 +820,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 &main_m2,
                 OfficePrecondition::At(&office_o2),
                 Some(&bytes_a2),
+                &forklift_aws_lambda::format::gate(&refs).expect("format gate"),
                 &request_token(),
             )
             .expect("main commits under matching preconditions despite side's concurrent moves"),
@@ -830,6 +839,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 &main_m2,
                 OfficePrecondition::At(&office_o2),
                 Some(&bytes_a2),
+                &forklift_aws_lambda::format::gate(&refs).expect("format gate"),
                 &request_token(),
             )
             .expect("stale pallet-head precondition, office and anchor both current"),
@@ -886,7 +896,7 @@ async fn dynamo_ref_store_attributes_the_anchor_writes_preconditions_to_their_po
         .to_anchor();
 
         assert_eq!(
-            refs.put_trust_if_absent(&anchor_v1).expect("plant anchor"),
+            refs.put_trust_if_absent(&anchor_v1, &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &forklift_aws_lambda::reissue::request_token()).expect("plant anchor"),
             TrustOutcome::Established
         );
         let (_decoded, bytes_a1) = refs.get_trust().expect("read trust").expect("present");
@@ -899,6 +909,7 @@ async fn dynamo_ref_store_attributes_the_anchor_writes_preconditions_to_their_po
                 &office_o1,
                 OfficePrecondition::NotConsumed,
                 Some(&bytes_a1),
+                &forklift_aws_lambda::format::gate(&refs).expect("format gate"),
                 &request_token(),
             )
             .expect("lift office to o1"),
@@ -924,6 +935,7 @@ async fn dynamo_ref_store_attributes_the_anchor_writes_preconditions_to_their_po
                 &re_genesis(&genesis_g2, &office_o1),
                 &"0".repeat(64), // never the stored bytes
                 Some(&office_o1),
+                &forklift_aws_lambda::format::gate(&refs).expect("format gate"),
                 &request_token(),
             )
             .expect("stale anchor precondition"),
@@ -941,7 +953,7 @@ async fn dynamo_ref_store_attributes_the_anchor_writes_preconditions_to_their_po
             refs.replace_trust(
                 &re_genesis(&genesis_g2, &office_o2),
                 &bytes_a1,
-                Some(&office_o2), // stale: the office is still at o1
+                Some(&office_o2), &forklift_aws_lambda::format::gate(&refs).expect("format gate"), // stale: the office is still at o1
                 &request_token(),
             )
             .expect("stale office precondition"),
@@ -956,7 +968,7 @@ async fn dynamo_ref_store_attributes_the_anchor_writes_preconditions_to_their_po
         // 3. Both preconditions current: the re-genesis lands. Without this the two refusals
         // above are also satisfied by a store that refuses everything.
         assert_eq!(
-            refs.replace_trust(&re_genesis(&genesis_g2, &office_o1), &bytes_a1, Some(&office_o1), &request_token())
+            refs.replace_trust(&re_genesis(&genesis_g2, &office_o1), &bytes_a1, Some(&office_o1), &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &request_token())
                 .expect("both preconditions current"),
             TrustWriteOutcome::Replaced
         );
@@ -970,7 +982,7 @@ async fn dynamo_ref_store_attributes_the_anchor_writes_preconditions_to_their_po
         // DynamoDB because the comparison is on the bytes DynamoDB actually stored and returned
         // through `ALL_OLD`, which no fake can establish.
         assert_eq!(
-            refs.replace_trust(&re_genesis(&genesis_g2, &office_o1), &bytes_a1, Some(&office_o1), &request_token())
+            refs.replace_trust(&re_genesis(&genesis_g2, &office_o1), &bytes_a1, Some(&office_o1), &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &request_token())
                 .expect("re-issue of an already-planted anchor"),
             TrustWriteOutcome::AlreadyIdentical
         );
@@ -985,13 +997,14 @@ async fn dynamo_ref_store_attributes_the_anchor_writes_preconditions_to_their_po
                 &"6".repeat(64),
                 OfficePrecondition::At(&office_o1),
                 Some(&bytes_a2),
+                &forklift_aws_lambda::format::gate(&refs).expect("format gate"),
                 &request_token(),
             )
             .expect("lift an unrelated pallet"),
             CasOutcome::Committed
         );
         assert_eq!(
-            refs.replace_trust(&re_genesis(&genesis_g3, &office_o1), &bytes_a2, Some(&office_o1), &request_token())
+            refs.replace_trust(&re_genesis(&genesis_g3, &office_o1), &bytes_a2, Some(&office_o1), &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &request_token())
                 .expect("an unrelated pallet's move must not refuse the anchor write"),
             TrustWriteOutcome::Replaced
         );
@@ -1022,6 +1035,119 @@ async fn dynamo_ref_store_upholds_the_tombstone_contract() {
     tokio::task::spawn_blocking(move || tombstones::upholds_the_tombstone_contract(&refs))
         .await
         .expect("the blocking assertions");
+}
+
+/// The format item over real DynamoDB: the stamp a new warehouse's first write records, the fence
+/// a mark trips, the operator's compare-and-set, and the scan `--all` lists warehouses by. The
+/// memory fake evaluates each of these as an `Option` comparison, which says nothing about how
+/// DynamoDB evaluates a `Put` on absence or a `ConditionCheck` on a state, cancels the transaction,
+/// and hands back the item.
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamo_ref_store_records_and_fences_the_warehouse_format() {
+    let Some(endpoint) = endpoint() else {
+        eprintln!("skipping: FORKLIFT_AWS_TEST_ENDPOINT is unset");
+        return;
+    };
+
+    let config = test_config(&endpoint);
+    provision(&config).await;
+
+    let unstamped = unique("warehouse");
+    let (_raw_s3, raw_dynamo) = raw_clients(&config).await;
+    raw_dynamo
+        .put_item()
+        .table_name(&config.table)
+        .item("wh", aws_sdk_dynamodb::types::AttributeValue::S(unstamped.clone()))
+        .item("entity", aws_sdk_dynamodb::types::AttributeValue::S("pallet#main".to_string()))
+        .item("head", aws_sdk_dynamodb::types::AttributeValue::S("1".repeat(64)))
+        .send()
+        .await
+        .expect("plant a pallet with no format beside it");
+
+    let bridge = AsyncBridge::current().expect("a multi-thread runtime");
+    let (_s3, dynamo) = build_clients(&config).await.expect("clients");
+    let (_objects, refs) = build_stores(&config, bridge.clone()).await.expect("stores");
+    let unstamped_refs =
+        DynamoRefStore::new(dynamo.clone(), config.table.clone(), unstamped.clone(), "main".to_string(), bridge.clone());
+    let warehouse = config.warehouse_id.clone();
+    let table = config.table.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let one = "1".repeat(64);
+        let two = "2".repeat(64);
+        let current = AWS_FORMAT.to_string();
+        let mark = format!("{}>{} operator 0", AWS_FORMAT, AWS_FORMAT + 1);
+        let lift = |fence: &FormatFence, expected: ExpectedHead, to: &str| {
+            refs.compare_and_set_head(PalletNamespace::User, "main", expected, to, OfficePrecondition::NotConsumed, None, fence, &request_token())
+                .expect("cas")
+        };
+
+        // A new warehouse: nothing stored, so its first write stamps the format with it.
+        assert_eq!(refs.read_format().expect("read"), None);
+        let stamp = format::gate(&refs).expect("a new warehouse is served");
+        assert_eq!(stamp, FormatFence::Stamp(current.clone()));
+        assert_eq!(lift(&stamp, ExpectedHead::Unborn, &one), CasOutcome::Committed);
+        assert_eq!(refs.read_format().expect("read"), Some(current.clone()));
+
+        // A second stamp finds the item there: the `Put` on absence cancels the transaction, and
+        // the pallet is left as it was.
+        assert_eq!(lift(&stamp, ExpectedHead::At(&one), &two), CasOutcome::FormatMoved);
+        assert_eq!(refs.get_head(PalletNamespace::User, "main").expect("get"), RefHead::Live(one.clone()));
+
+        let at = format::gate(&refs).expect("a stamped warehouse is served");
+        assert_eq!(at, FormatFence::At(current.clone()));
+
+        // The operator's compare-and-set takes the item only from the state it names.
+        assert!(!refs.swap_format(&mark, &current).expect("swap from a state the item does not hold"));
+        assert!(refs.swap_format(&current, &mark).expect("mark"));
+        assert_eq!(refs.read_format().expect("read"), Some(mark.clone()));
+
+        // A write prepared before the mark is refused, on every write path, and the gate refuses.
+        assert_eq!(lift(&at, ExpectedHead::At(&one), &two), CasOutcome::FormatMoved);
+        assert_eq!(refs.get_head(PalletNamespace::User, "main").expect("get"), RefHead::Live(one.clone()));
+        let anchor = TrustAnchorDto {
+            genesis: one.clone(),
+            enabled_at: 1_780_000_000,
+            boundary: vec![one.clone()],
+            prior_genesis: None,
+            adopts: None,
+        }
+        .to_anchor();
+        assert_eq!(refs.put_trust_if_absent(&anchor, &at, &request_token()).expect("plant"), TrustOutcome::FormatMoved);
+        assert!(refs.get_trust().expect("trust").is_none());
+        let refusal = format::gate(&refs).expect_err("a marked warehouse is refused");
+        assert_eq!(refusal.status.as_u16(), 503);
+        assert!(refusal.message.contains("being upgraded"), "{}", refusal.message);
+
+        // A write fenced on the exact mark, as an upgrade step's is, lands.
+        assert_eq!(lift(&FormatFence::At(mark.clone()), ExpectedHead::At(&one), &two), CasOutcome::Committed);
+
+        // This build's chain does not reach the format the mark names, so even a takeover leaves
+        // the mark on record.
+        let options = UpgradeOptions { owner: request_token(), takeover: true, wait: Duration::ZERO };
+        let refusal = format::upgrade(&refs, &format::CHAIN, &warehouse, &options).expect_err("no chain to that format");
+        assert!(refusal.contains("does not do"), "{}", refusal);
+        assert_eq!(refs.read_format().expect("read"), Some(mark.clone()));
+
+        // Once the mark is gone, the upgrade finds the warehouse in the format it reads.
+        assert!(refs.swap_format(&mark, &current).expect("unmark"));
+        let report = format::upgrade(&refs, &format::CHAIN, &warehouse, &options).expect("nothing to do");
+        assert_eq!((report.from, report.to, report.took_over, report.steps_run), (AWS_FORMAT, AWS_FORMAT, None, 0));
+        assert_eq!(format::gate(&refs).expect("served again"), FormatFence::At(current.clone()));
+
+        // A warehouse written with no format beside it is refused, never stamped over.
+        let refusal = format::gate(&unstamped_refs).expect_err("unstamped data is refused");
+        assert_eq!(refusal.status.as_u16(), 503);
+        assert!(refusal.message.contains("records no format"), "{}", refusal.message);
+        assert_eq!(unstamped_refs.read_format().expect("read"), None);
+
+        // `--all` finds both by scanning the table.
+        let mut expected = vec![warehouse.clone(), unstamped.clone()];
+        expected.sort();
+        assert_eq!(list_warehouses(&dynamo, &table, &bridge).expect("scan"), expected);
+    })
+    .await
+    .expect("the blocking test body");
 }
 
 /// FORK-95 slice 4, PR #117 round 2 finding 5: the office `ConditionCheck`'s **unborn** arm,
@@ -1065,7 +1191,7 @@ async fn dynamo_ref_store_conditions_an_anchor_write_on_an_unborn_office() {
         .to_anchor();
 
         assert_eq!(
-            refs.put_trust_if_absent(&anchor_v1).expect("plant anchor"),
+            refs.put_trust_if_absent(&anchor_v1, &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &forklift_aws_lambda::reissue::request_token()).expect("plant anchor"),
             TrustOutcome::Established
         );
         let (_decoded, bytes_a1) = refs.get_trust().expect("read trust").expect("present");
@@ -1088,7 +1214,7 @@ async fn dynamo_ref_store_conditions_an_anchor_write_on_an_unborn_office() {
         // 1. Unborn office, conditioned on unborn: `attribute_not_exists` holds against an item
         // that is not there, and the re-genesis commits.
         assert_eq!(
-            refs.replace_trust(&adopting_nothing, &bytes_a1, None, &request_token())
+            refs.replace_trust(&adopting_nothing, &bytes_a1, None, &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &request_token())
                 .expect("re-genesis against an unborn office"),
             TrustWriteOutcome::Replaced
         );
@@ -1105,6 +1231,7 @@ async fn dynamo_ref_store_conditions_an_anchor_write_on_an_unborn_office() {
                 &office_o1,
                 OfficePrecondition::NotConsumed,
                 Some(&bytes_a2),
+                &forklift_aws_lambda::format::gate(&refs).expect("format gate"),
                 &request_token(),
             )
             .expect("lift office"),
@@ -1121,7 +1248,7 @@ async fn dynamo_ref_store_conditions_an_anchor_write_on_an_unborn_office() {
         .to_anchor();
 
         assert_eq!(
-            refs.replace_trust(&still_adopting_nothing, &bytes_a2, None, &request_token())
+            refs.replace_trust(&still_adopting_nothing, &bytes_a2, None, &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &request_token())
                 .expect("the office is no longer unborn"),
             TrustWriteOutcome::OfficeMoved { current: Some(office_o1.clone()) }
         );

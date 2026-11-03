@@ -19,8 +19,8 @@
 #![deny(dead_code)]
 
 use aws_sdk_dynamodb::operation::get_item::builders::GetItemFluentBuilder;
-use aws_sdk_dynamodb::operation::put_item::builders::PutItemFluentBuilder;
 use aws_sdk_dynamodb::operation::query::builders::QueryFluentBuilder;
+use aws_sdk_dynamodb::operation::scan::builders::ScanFluentBuilder;
 use aws_sdk_dynamodb::operation::transact_write_items::builders::TransactWriteItemsFluentBuilder;
 
 /// The sanctioned DynamoDB capability: a private client, and one method per operation this
@@ -46,12 +46,14 @@ impl DynamoOps {
         self.0.get_item()
     }
 
-    pub(crate) fn put_item(&self) -> PutItemFluentBuilder {
-        self.0.put_item()
-    }
-
     pub(crate) fn query(&self) -> QueryFluentBuilder {
         self.0.query()
+    }
+
+    /// Only the upgrade operator's `--all` scans (`crate::aws::dynamo::list_warehouses`); its
+    /// grant lives in `iam/operator.policy.json`, never in a Lambda's policy.
+    pub(crate) fn scan(&self) -> ScanFluentBuilder {
+        self.0.scan()
     }
 
     /// The commit for [`RefStore::compare_and_set_head`](crate::store::RefStore::compare_and_set_head)

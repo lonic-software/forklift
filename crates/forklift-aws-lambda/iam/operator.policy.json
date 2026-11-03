@@ -1,0 +1,23 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "UpgradeFormat",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:Query",
+        "dynamodb:ConditionCheckItem"
+      ],
+      "Resource": "${table_arn}"
+    },
+    {
+      "Sid": "ListWarehouses",
+      "Effect": "Allow",
+      "Action": "dynamodb:Scan",
+      "Resource": "${table_arn}"
+    }
+  ]
+}
