@@ -2316,6 +2316,21 @@ fn backdate(path: &std::path::Path, seconds: u64) {
     file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(seconds)).unwrap();
 }
 
+/// [`backdate`] every file under `root` outside its `.forklift` and `.git` folders: what waiting
+/// until the files are old enough for the next command's stats to prove them would do, without
+/// the wait.
+fn backdate_tree(root: &std::path::Path, seconds: u64) {
+    for entry in std::fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        let kind = entry.file_type().unwrap();
+        if kind.is_dir() && entry.file_name() != ".forklift" && entry.file_name() != ".git" {
+            backdate_tree(&entry.path(), seconds);
+        } else if kind.is_file() {
+            backdate(&entry.path(), seconds);
+        }
+    }
+}
+
 /// The rollup hash of the shard `key`, read straight off disk.
 fn shard_rollup(warehouse: &TestWarehouse, key: &str) -> Option<String> {
     let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
@@ -2476,7 +2491,7 @@ fn import_git_proves_the_working_tree_against_the_imported_tree() {
 
     // An uncommitted edit of the same size, old enough by import time for its stat to prove it.
     warehouse.write_file("edited.txt", "bbbb\n");
-    std::thread::sleep(std::time::Duration::from_millis(2100));
+    backdate_tree(&root, 30);
 
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
@@ -2613,7 +2628,7 @@ fn import_git_reports_a_file_git_converted_on_checkout_from_the_start() {
     // Old enough by import time for a stat to prove its file. Without this wait every file would
     // be recorded unproven for being too recent, and recording a converted file as proven (the
     // defect this test pins) would read the same as the fix.
-    std::thread::sleep(std::time::Duration::from_millis(2100));
+    backdate_tree(&root, 30);
 
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
@@ -2678,7 +2693,7 @@ fn a_large_tree_lands_every_entry_in_its_own_shard() {
 
     // An uncommitted same-size edit, old enough by import time for its stat to prove it.
     warehouse.write_file("d17/f2.txt", "D17/f2.txt\n");
-    std::thread::sleep(std::time::Duration::from_millis(2100));
+    backdate_tree(&root, 30);
 
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
@@ -2710,7 +2725,7 @@ fn a_large_tree_lands_every_entry_in_its_own_shard() {
 
     // A shift between two pallets on the same parcel writes nothing and rebuilds every shard.
     assert_success(&warehouse.run(&["restore", "--confirm", "d17/f2.txt"]));
-    std::thread::sleep(std::time::Duration::from_millis(2100));
+    backdate(&root.join("d17/f2.txt"), 30);
     assert_success(&warehouse.run(&["pallet", "create", "other"]));
     assert_success(&warehouse.run(&["shift", "main"]));
 
@@ -2813,7 +2828,7 @@ fn a_scoped_bay_over_a_large_tree_inventories_only_its_scope() {
 
     let scoped_dir = warehouse.home.join("bay-scoped");
     assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
-    std::thread::sleep(std::time::Duration::from_millis(2100));
+    backdate_tree(&scoped_dir, 30);
 
     let changes = |dir: &std::path::Path| -> Vec<(String, String)> {
         let status = warehouse.run_at(dir, &["--json", "stocktake"]);
