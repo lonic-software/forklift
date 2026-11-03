@@ -3229,8 +3229,8 @@ fn lifted_with_two_directories(area: &TestArea) -> Server {
 
 /// A head holding the metadata folder at any depth is refused whole, before anything is changed for
 /// it: a lower leaves the bay and the ref where they were, and a clone leaves its pallet head
-/// unwritten, so the clone stays resumable rather than standing at the head half-finished, and the
-/// resume its next step names, with an --only that leaves the path out, finishes it.
+/// unwritten, so the clone stays resumable rather than standing at the head half-finished. Each next
+/// step names the repair, and a resume with an --only that leaves the path out finishes the clone too.
 // Revert: drop `refuse_unmaterializable` before lower's marker → the planning's backstop refuses
 // with no code; drop clone's check → the head is written before the materialize trips.
 #[test]
@@ -3246,7 +3246,7 @@ fn a_lower_and_a_clone_refuse_a_wedged_head_before_changing_anything() {
     assert_eq!(lowered.status.code(), Some(46), "{}{}", stdout(&lowered), stderr(&lowered));
     let value = json_of(&lowered);
     assert_eq!(value["error"]["code"], "head_not_materializable", "{}", value);
-    assert_eq!(value["error"]["next_step"], "No command in this build repairs such a head, so the pallet stays where it is; lowering again refuses the same way.", "{}", value);
+    assert_eq!(value["error"]["next_step"], "forklift lower --repair", "{}", value);
     assert!(value["error"]["message"].as_str().unwrap().contains("\"docs/deep/.forklift\""), "{}", value);
     assert_eq!(user_head(&area, "behind", "main"), before);
     assert_eq!(area.read_file("behind/.forklift/position"), position);
@@ -3258,7 +3258,7 @@ fn a_lower_and_a_clone_refuse_a_wedged_head_before_changing_anything() {
     assert_eq!(value["error"]["code"], "clone_incomplete", "{}", value);
     assert_eq!(value["error"]["details"]["cause_code"], "head_not_materializable", "{}", value);
     assert_eq!(value["error"]["details"]["retry"], "change", "{}", value);
-    assert!(value["error"]["next_step"].as_str().unwrap().contains("with a different --only or --pallet"), "{}", value);
+    assert!(value["error"]["next_step"].as_str().unwrap().contains(&format!("\"forklift clone {} fresh --repair\"", server.url)), "{}", value);
     assert!(value["error"]["message"].as_str().unwrap().contains("\"docs/deep/.forklift\""), "{}", value);
     assert!(!area.path("fresh/.forklift/pallets/main").exists(), "the head is never written");
     assert!(!area.path("fresh/docs").exists());
@@ -3287,7 +3287,7 @@ fn a_diverged_bay_over_a_wedged_remote_is_refused_as_not_materializable() {
     assert_eq!(lowered.status.code(), Some(46), "{}{}", stdout(&lowered), stderr(&lowered));
     let value = json_of(&lowered);
     assert_eq!(value["error"]["code"], "head_not_materializable", "{}", value);
-    assert_eq!(value["error"]["next_step"], "No command in this build repairs such a head, so the pallet stays where it is; lowering again refuses the same way.", "{}", value);
+    assert_eq!(value["error"]["next_step"], "forklift lower --repair", "{}", value);
     assert!(value["error"]["message"].as_str().unwrap().contains("holds \".forklift\""), "{}", value);
     assert_eq!(user_head(&area, "b", "main"), own);
     assert_eq!(area.read_file("b/src/code.txt"), "b's own\n");
@@ -3322,6 +3322,306 @@ fn a_sparse_warehouse_judges_only_what_its_scope_checks_out() {
         assert!(value["error"]["message"].as_str().unwrap().contains(&format!("\"{}\"", path)), "{}", value);
         assert_eq!(user_head(&area, "sparse", "main"), outside);
         area.write_file("server-root/.forklift/pallets/main", &format!("{}\n", outside));
+    }
+}
+
+/// Run each command of a next step joined by "; then ", in `directory`, requiring each to succeed.
+fn run_next_steps(area: &TestArea, directory: &str, next_step: &str) {
+    for step in next_step.split("; then ") {
+        let args: Vec<&str> = step.strip_prefix("forklift ").unwrap_or_else(|| panic!("not a command: {}", step)).split(' ').collect();
+        assert_success(&area.forklift(directory, &args));
+    }
+}
+
+/// Whether the parcel `ancestor` is `descendant` or in its history, read in `warehouse`'s storage.
+fn descends_from(area: &TestArea, warehouse: &str, descendant: &str, ancestor: &str) -> bool {
+    let root = area.path(warehouse);
+    let _scope = forklift_core::globals::StorageRootScope::enter(&root);
+    descendant == ancestor || forklift_core::util::merge_utils::is_ancestor(ancestor, descendant).unwrap()
+}
+
+/// The parents of `parcel`, read in `warehouse`'s storage.
+fn parents_of(area: &TestArea, warehouse: &str, parcel: &str) -> Vec<String> {
+    let root = area.path(warehouse);
+    let _scope = forklift_core::globals::StorageRootScope::enter(&root);
+    forklift_core::util::object_utils::load_parcel(parcel).unwrap().parents
+}
+
+/// The names of the directories in `directory` of `parcel`'s tree, read in `warehouse`'s storage.
+fn directories_in(area: &TestArea, warehouse: &str, parcel: &str, directory: &str) -> Vec<String> {
+    use forklift_core::util::object_utils;
+
+    let root = area.path(warehouse);
+    let _scope = forklift_core::globals::StorageRootScope::enter(&root);
+    let mut tree = object_utils::load_tree(&object_utils::load_parcel(parcel).unwrap().tree_hash).unwrap();
+    for name in directory.split('/') {
+        let hash = tree.get_subtrees().find(|(child, _)| child.as_str() == name).unwrap().1.hash.clone();
+        tree = object_utils::load_tree(&hash).unwrap();
+    }
+    tree.get_subtrees().map(|(name, _)| name.clone()).collect()
+}
+
+/// Lift `warehouse`, then clone the remote into `clone`: the repaired head is accepted, and every
+/// client can check it out. Returns the remote's head of main.
+fn lift_and_clone(area: &TestArea, server: &Server, warehouse: &str, clone: &str) -> String {
+    assert_success(&area.forklift(warehouse, &["lift"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, clone]));
+    assert!(!area.path(&format!("{}/docs/deep", clone)).exists());
+    area.read_file("server-root/.forklift/pallets/main").trim().to_string()
+}
+
+/// A lower --repair whose bay fast-forwards stacks a parcel on the wedged head that removes the bad
+/// name, drops the directory that held nothing else, and moves the pallet and the bay onto it; the
+/// remote accepts its lift, and a clone checks it out.
+// Revert: keep emptied directories in `strip` → "docs/deep" stays, an empty tree in the head.
+#[test]
+fn a_lower_repair_fast_forwards_onto_a_parcel_without_the_name() {
+    let area = TestArea::new("repair-fast-forward");
+    let server = lifted_with_two_directories(&area);
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
+    let wedged = plant_wedged_head(&area, "main", "docs/deep");
+
+    let lowered = area.forklift("b", &["--json", "lower", "--repair"]);
+    assert_success(&lowered);
+    let value = json_of(&lowered)["data"].clone();
+    assert_eq!(value["outcome"], "repaired", "{}", value);
+    assert_eq!(value["head"], wedged.as_str(), "{}", value);
+    assert_eq!(value["repair"]["removed"], serde_json::json!(["docs/deep/.forklift"]), "{}", value);
+    let repair = value["repair"]["parcel"].as_str().unwrap().to_string();
+    assert_eq!(user_head(&area, "b", "main"), repair);
+    assert_eq!(parents_of(&area, "b", &repair), vec![wedged.clone()]);
+    assert!(area.read_file("b/.forklift/position").contains(&repair));
+    assert_eq!(area.read_file("b/docs/readme.txt"), "v1\n");
+    assert_eq!(directories_in(&area, "b", &wedged, "docs"), vec!["deep".to_string()]);
+    assert!(directories_in(&area, "b", &repair, "docs").is_empty(), "a directory the removal emptied is dropped");
+    assert!(!area.path("b/docs/deep").exists());
+    assert_success(&area.forklift("b", &["shift", "main"]));
+
+    assert_eq!(lift_and_clone(&area, &server, "b", "c"), repair);
+    assert_eq!(area.read_file("c/docs/readme.txt"), "v1\n");
+}
+
+/// A lower --repair on a head with nothing to repair lowers as usual, and reports no repair.
+// Revert: repair whatever the head → `repair_head` finds nothing and the lower fails.
+#[test]
+fn a_lower_repair_of_a_clean_head_lowers_as_usual() {
+    let area = TestArea::new("repair-clean-head");
+    let server = lifted_with_two_directories(&area);
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
+    area.write_file("a/src/code.txt", "v2\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "second"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    let lowered = area.forklift("b", &["--json", "lower", "--repair"]);
+    assert_success(&lowered);
+    let value = json_of(&lowered)["data"].clone();
+    assert_eq!(value["outcome"], "lowered", "{}", value);
+    assert!(value.get("repair").is_none(), "{}", value);
+    assert_eq!(user_head(&area, "b", "main"), user_head(&area, "a", "main"));
+    assert_eq!(area.read_file("b/src/code.txt"), "v2\n");
+}
+
+/// A bay behind its pallet's ref, which another bay lowered, is moved from its own base onto the
+/// repair: the ref moves from where it stood, and the bay's files from where they stood.
+// Revert: materialize from the ref's tree rather than the bay's base → the bay's "src/code.txt"
+// keeps the old content while its base names the repair.
+#[test]
+fn a_lower_repair_moves_a_bay_behind_its_ref() {
+    let area = TestArea::new("repair-behind-ref");
+    let server = lifted_with_two_directories(&area);
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
+    let bay_dir = area.path("b-bay");
+    assert_success(&area.forklift("b", &["bay", "add", "w", bay_dir.to_str().unwrap()]));
+    assert_success(&area.forklift("b-bay", &["shift", "main"]));
+
+    area.write_file("a/src/code.txt", "v2\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "second"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_success(&area.forklift("b", &["lower"]));
+    let wedged = plant_wedged_head(&area, "main", "docs/deep");
+
+    let lowered = area.forklift("b-bay", &["--json", "lower", "--repair"]);
+    assert_success(&lowered);
+    let value = json_of(&lowered)["data"].clone();
+    assert_eq!(value["outcome"], "repaired", "{}", value);
+    let repair = value["repair"]["parcel"].as_str().unwrap().to_string();
+    assert_eq!(user_head(&area, "b", "main"), repair);
+    assert_eq!(parents_of(&area, "b", &repair), vec![wedged]);
+    assert_eq!(area.read_file("b-bay/src/code.txt"), "v2\n");
+    assert!(!area.path("b-bay/docs/deep").exists());
+    assert_success(&area.forklift("b-bay", &["shift", "main"]));
+
+    assert_eq!(lift_and_clone(&area, &server, "b-bay", "c"), repair);
+    assert_eq!(area.read_file("c/src/code.txt"), "v2\n");
+}
+
+/// A pallet whose ref holds parcels the wedged head lacks keeps them: the repair goes on a pallet of
+/// its own, the lower refuses as diverged, and running its next steps, from a bay on the pallet at
+/// its ref or one another bay stacked past, lifts a head descending from both.
+// Revert: move the ref onto the repair when it has diverged → the ref's own parcel is dropped, and
+// the refusal never comes.
+#[test]
+fn a_lower_repair_over_a_diverged_ref_keeps_its_parcels() {
+    for stacked_past in [false, true] {
+        let area = TestArea::new(if stacked_past { "repair-stacked-past" } else { "repair-diverged" });
+        let server = lifted_with_two_directories(&area);
+        assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
+
+        // The ref's own parcel, stacked in this bay or in another bay on the same pallet.
+        let stacker = if stacked_past {
+            let bay_dir = area.path("b-bay");
+            assert_success(&area.forklift("b", &["bay", "add", "w", bay_dir.to_str().unwrap()]));
+            assert_success(&area.forklift("b-bay", &["shift", "main"]));
+            "b-bay"
+        } else {
+            "b"
+        };
+        area.write_file(&format!("{}/src/code.txt", stacker), "own\n");
+        assert_success(&area.forklift(stacker, &["load", "."]));
+        assert_success(&area.forklift(stacker, &["stack", "-m", "own"]));
+        let own = user_head(&area, "b", "main");
+        let wedged = plant_wedged_head(&area, "main", "docs/deep");
+
+        let lowered = area.forklift("b", &["--json", "lower", "--repair"]);
+        assert!(!lowered.status.success(), "{}{}", stdout(&lowered), stderr(&lowered));
+        let value = json_of(&lowered);
+        assert_eq!(value["error"]["code"], "diverged", "{}", value);
+        assert_eq!(user_head(&area, "b", "main"), own, "the ref keeps its own parcel");
+        let next_step = value["error"]["next_step"].as_str().unwrap().to_string();
+        assert_eq!(next_step.starts_with("forklift shift main; then "), stacked_past, "{}", next_step);
+        let side = next_step.split("forklift consolidate ").nth(1).unwrap().split(';').next().unwrap().to_string();
+        assert!(side.starts_with("main-remote-"), "{}", next_step);
+        let repair = user_head(&area, "b", &side);
+        assert_eq!(parents_of(&area, "b", &repair), vec![wedged]);
+
+        run_next_steps(&area, "b", &next_step);
+        let head = area.read_file("server-root/.forklift/pallets/main").trim().to_string();
+        assert!(descends_from(&area, "b", &head, &repair) && descends_from(&area, "b", &head, &own));
+        assert_success(&area.forklift(".", &["clone", &server.url, "c"]));
+        assert_eq!(area.read_file("c/src/code.txt"), "own\n");
+        assert!(!area.path("c/docs/deep").exists());
+    }
+}
+
+/// A named lower --repair moves another pallet's ref onto the repair, or, when that ref has diverged,
+/// stacks the repair beside it and names the shift that the consolidation needs first. Before the
+/// repair, a shift or a consolidate of a pallet holding the name refuses with the code, naming it.
+// Revert: drop the check before shift's `move_files` → the shift trips in the materialize, with
+// no code; drop it before consolidate's metadata-tree check → that check refuses with no code.
+#[test]
+fn a_named_lower_repair_reaches_a_pallet_the_bay_is_not_on() {
+    let area = TestArea::new("repair-named");
+    let server = lifted_with_two_directories(&area);
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
+    assert_success(&area.forklift("b", &["pallet", "create", "other"]));
+    let wedged = plant_wedged_head(&area, "main", "docs/deep");
+
+    // A named lower takes the wedged head onto the ref; the backstops then refuse to check it out.
+    assert_success(&area.forklift("b", &["lower", "main"]));
+    assert_eq!(user_head(&area, "b", "main"), wedged);
+    for command in [vec!["--json", "shift", "main"], vec!["--json", "consolidate", "main"]] {
+        let refused = area.forklift("b", &command);
+        assert!(!refused.status.success(), "{:?}: {}{}", command, stdout(&refused), stderr(&refused));
+        let value = json_of(&refused);
+        assert_eq!(value["error"]["code"], "head_not_materializable", "{:?}: {}", command, value);
+        assert_eq!(value["error"]["next_step"], "forklift lower main --repair", "{}", value);
+        assert!(value["error"]["message"].as_str().unwrap().contains("\".forklift\" in \"docs/deep\""), "{}", value);
+    }
+    assert!(area.read_file("b/.forklift/position").contains("other"));
+
+    let lowered = area.forklift("b", &["--json", "lower", "main", "--repair"]);
+    assert_success(&lowered);
+    let value = json_of(&lowered)["data"].clone();
+    assert_eq!(value["outcome"], "repaired", "{}", value);
+    let repair = value["repair"]["parcel"].as_str().unwrap().to_string();
+    assert_eq!(user_head(&area, "b", "main"), repair);
+    assert_eq!(parents_of(&area, "b", &repair), vec![wedged]);
+    assert_success(&area.forklift("b", &["shift", "main"]));
+    assert!(!area.path("b/docs/deep").exists());
+    assert_eq!(lift_and_clone(&area, &server, "b", "c"), repair);
+
+    // A ref that diverged from a second wedged head keeps its parcel.
+    area.write_file("b/src/code.txt", "own\n");
+    assert_success(&area.forklift("b", &["load", "."]));
+    assert_success(&area.forklift("b", &["stack", "-m", "own"]));
+    let own = user_head(&area, "b", "main");
+    assert_success(&area.forklift("b", &["shift", "other"]));
+    plant_wedged_head(&area, "main", "src");
+
+    let lowered = area.forklift("b", &["--json", "lower", "main", "--repair"]);
+    let value = json_of(&lowered);
+    assert_eq!(value["error"]["code"], "diverged", "{}", value);
+    assert_eq!(user_head(&area, "b", "main"), own);
+    let next_step = value["error"]["next_step"].as_str().unwrap().to_string();
+    assert!(next_step.starts_with("forklift shift main; then forklift consolidate main-remote-"), "{}", next_step);
+    run_next_steps(&area, "b", &next_step);
+    let head = area.read_file("server-root/.forklift/pallets/main").trim().to_string();
+    assert!(descends_from(&area, "b", &head, &own));
+    assert_success(&area.forklift(".", &["clone", &server.url, "d"]));
+    assert_eq!(area.read_file("d/src/code.txt"), "own\n");
+}
+
+/// A clone --repair checks out a repair of a wedged head, fresh or resuming a clone the head
+/// refused, and with nothing to repair clones as usual; it reads the whole tree, so it cannot be
+/// combined with --only.
+// Revert: write the remote head rather than the repair in `franchise_into_prepared_target` → the
+// checkout trips on the name.
+#[test]
+fn a_clone_repair_checks_out_a_repair_of_the_head() {
+    let area = TestArea::new("repair-clone");
+    let server = lifted_with_two_directories(&area);
+
+    let cloned = area.forklift(".", &["--json", "clone", &server.url, "plain", "--repair"]);
+    assert_success(&cloned);
+    assert!(json_of(&cloned)["data"].get("repair").is_none(), "{}", stdout(&cloned));
+
+    let wedged = plant_wedged_head(&area, "main", "docs/deep");
+    let cloned = area.forklift(".", &["--json", "clone", &server.url, "fresh", "--repair"]);
+    assert_success(&cloned);
+    let value = json_of(&cloned)["data"].clone();
+    assert_eq!(value["repair"]["removed"], serde_json::json!(["docs/deep/.forklift"]), "{}", value);
+    let repair = value["repair"]["parcel"].as_str().unwrap().to_string();
+    assert_eq!(user_head(&area, "fresh", "main"), repair);
+    assert_eq!(parents_of(&area, "fresh", &repair), vec![wedged.clone()]);
+    assert_eq!(area.read_file("fresh/docs/readme.txt"), "v1\n");
+    assert!(!area.path("fresh/docs/deep").exists());
+
+    let refused = area.forklift(".", &["--json", "clone", &server.url, "resumed"]);
+    assert!(!refused.status.success());
+    let resume = format!("forklift clone {} resumed --repair", server.url);
+    assert!(json_of(&refused)["error"]["next_step"].as_str().unwrap().contains(&resume), "{}", stdout(&refused));
+    run_next_steps(&area, ".", &resume);
+    assert_eq!(parents_of(&area, "resumed", &user_head(&area, "resumed", "main")), vec![wedged]);
+    assert!(!area.path("resumed/docs/deep").exists());
+
+    let combined = area.forklift(".", &["clone", &server.url, "scoped", "--repair", "--only", "src"]);
+    assert!(!combined.status.success(), "{}{}", stdout(&combined), stderr(&combined));
+    assert!(!area.path("scoped").exists());
+
+    assert_eq!(lift_and_clone(&area, &server, "fresh", "c"), repair);
+}
+
+/// A sparse warehouse cannot build a repair, which reads the whole tree, so its lower --repair is
+/// refused before anything is fetched, naming a clone --repair into a new directory; a wedged name
+/// in its scope names that clone too.
+// Revert: drop the sparse check at the top of lower → the repair runs over a tree it does not hold.
+#[test]
+fn a_sparse_lower_repair_names_a_clone_repair() {
+    let area = TestArea::new("repair-sparse");
+    let server = lifted_with_two_directories(&area);
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src"]));
+    plant_wedged_head(&area, "main", "src");
+    let clone = format!("forklift clone {} <directory> --repair", server.url);
+
+    for args in [vec!["--json", "lower"], vec!["--json", "lower", "--repair"]] {
+        let lowered = area.forklift("sparse", &args);
+        assert!(!lowered.status.success(), "{:?}: {}{}", args, stdout(&lowered), stderr(&lowered));
+        let value = json_of(&lowered);
+        let code = if args.len() == 3 { "sparse_workspace" } else { "head_not_materializable" };
+        assert_eq!(value["error"]["code"], code, "{}", value);
+        assert_eq!(value["error"]["next_step"], clone.as_str(), "{}", value);
     }
 }
 

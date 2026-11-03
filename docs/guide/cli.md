@@ -1616,6 +1616,7 @@ forklift clone <url> <dir> --only src/api            # sparse: fetch one subtree
 forklift clone <url> <dir> --only src/api --only docs # several subtrees
 forklift clone <url> <dir> --expect <genesis>          # pin the remote's trust anchor
 forklift clone <url> <dir> --cache                     # a cache (see below)
+forklift clone <url> <dir> --repair                    # check out a repair of a head no client can (see lower)
 ```
 
 Prepares a fresh warehouse in the target directory, remembers the remote, adopts
@@ -1793,6 +1794,7 @@ forklift lower
 forklift lower feature              # bring in, or fast-forward, another pallet; this bay stays put
 forklift lower --expect <genesis>   # refuse unless the remote's trust anchor is this one
 forklift lower --keep @kv:<hash>/<key>=theirs --confirm  # resolve a custom-metadata conflict
+forklift lower --repair             # stack a repair on a head no client can check out
 ```
 
 Fetches the remote's new parcels for the current pallet and fast-forwards to them
@@ -1852,12 +1854,31 @@ name the remote's head already held is refused once a lift changes its directory
 below it, and lifts that leave that directory alone pass. A remote can still hold such a head from
 before it checked. A `lower` of the current pallet and a `clone` refuse it before anything changes,
 with `head_not_materializable` (exit 46), and `lower` does so even when the bay has diverged from
-it. `lower <pallet>` checks nothing out, so it still moves that pallet onto such a head, and
-`shift` to it is refused. No command repairs such a head yet, so
-the pallet stays where it is. A sparse warehouse is refused only for a name its scope would check
-out, or one at the root. A refused clone keeps what it fetched (`clone_incomplete`, with
-`head_not_materializable` as its cause), and resuming it with another `--pallet`, or an `--only`
-that leaves the path out, finishes it.
+it. `lower <pallet>` checks nothing out, so it still moves that pallet onto such a head, and a
+`shift` to it or a `consolidate` of it is refused with the same code. A sparse warehouse is refused
+only for a name its scope would check out, or one at the root. A refused clone keeps what it fetched
+(`clone_incomplete`, with `head_not_materializable` as its cause), and resuming it with another
+`--pallet`, or an `--only` that leaves the path out, finishes it.
+
+**Repairing such a head (`--repair`).** `lower --repair` (or `lower <pallet> --repair`) stacks a
+parcel on the remote's head that removes every such entry, and every directory left empty by the
+removals, and stands it where the lower would have stood the head; `forklift lift` then publishes
+it, and the remote takes it as a fast-forward. The parcel is signed as `stack` would sign it. What
+happens depends on the pallet here:
+
+- **At the remote's head, behind it, or not here yet:** the pallet moves onto the repair (outcome
+  `repaired`), and for the current pallet so does the bay. A bay behind its own pallet is moved
+  from where it stands, so its files are right; one beside it is refused as `behind`.
+- **Holding parcels the remote's head lacks:** they are kept. The repair goes on a new pallet,
+  `<pallet>-remote-<hash>`, and the lower refuses as `diverged`, naming the steps: shift onto the
+  pallet if this bay is not on it at its head, `forklift consolidate <pallet>-remote-<hash>`, then
+  `forklift lift`.
+- **Ahead of the remote, or the head holds nothing to repair:** it lowers as usual.
+
+A sparse warehouse cannot build the repair, which reads the whole tree, so its `lower --repair` is
+refused (`sparse_workspace`) and names `forklift clone <url> <directory> --repair` instead. That
+clone, and a resume of a refused one with `--repair` (the next step a refused clone names), checks
+out the repair rather than the head; `--repair` cannot be combined with `--only`.
 
 The meta pallets sync first, each on its own: one that fails or conflicts is reported, and the
 working pallet still lowers. A diverged `@kv`, `@manifest`, `@tags` or `@haul`

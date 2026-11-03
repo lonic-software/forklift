@@ -12,11 +12,12 @@ use forklift_core::util::scope_utils::PathScope;
 use forklift_core::util::warehouse_utils::PrepareMode;
 use forklift_core::util::{
     bundle_utils, config_utils, file_utils, held_heads, lock_utils, object_utils, operation_utils, origin_utils,
-    pack_utils, pallet_utils, remote_utils, scope_utils, shift_utils, take_utils, trust_utils,
+    pack_utils, pallet_utils, remote_utils, repair_utils, scope_utils, shift_utils, take_utils, trust_utils,
     warehouse_utils,
 };
 use forklift_core::util::operation_utils::{Operation, OperationKind};
 use forklift_core::util::take_utils::{FetchAt, TakeTrust};
+use crate::commands::lower::RepairReport;
 use crate::output::{self, CommandOutput};
 
 /// Handle the clone command: open a local clone of a remote
@@ -69,7 +70,8 @@ pub async fn handle_command(url: &str,
                             token: Option<String>,
                             only: Vec<String>,
                             cache: bool,
-                            expect: Option<String>) -> Result<(), String> {
+                            expect: Option<String>,
+                            repair: bool) -> Result<(), String> {
     // Normalize the sparse scope up front (before any warehouse is created), so a malformed
     // --only refuses cleanly. An empty list is a full (ordinary) clone.
     let fetch_scope = resolve_fetch_scope(&only)?;
@@ -136,7 +138,7 @@ pub async fn handle_command(url: &str,
     // history is fetched — see the check after `fetch_history_at` below.)
     let resolution = resolve_pallet(&info, pallet.clone())?;
 
-    let request = Request { pallet, only: fetch_scope.prefixes().to_vec(), cache };
+    let request = Request { pallet, only: fetch_scope.prefixes().to_vec(), cache, repair };
 
     // The trust binding: the pin, else the genesis the remote announced. A resume whose record
     // holds none (the remote had no anchor) binds to the one it announces now.
@@ -558,6 +560,7 @@ async fn franchise_into_prepared_target(
         scope: fetch_scope.prefixes().to_vec(),
         fetched_objects: 0,
         densify_suggested: false,
+        repair: None,
         batch_lane: None,
     };
 
@@ -661,29 +664,44 @@ async fn franchise_into_prepared_target(
         }
     }
 
-    // Raised before the pallet's head is written, and finished once the tree is materialized. The
-    // clone record outlives it: a clone interrupted anywhere is resumed by `clone`,
-    // which discards the marker with the rest of the attempt.
-    let position = pallet_utils::BayPosition::new(&pallet_name, Some(remote_head.clone()));
     shift_utils::ensure_tree_present(&tree_hash, &scope_utils::current_scope()?)?;
 
     // A head no client can check out is refused before its head is written, so the clone stays
-    // resumable rather than standing at it half-finished: a resume with another --pallet, or an
-    // --only that leaves the path out, finishes it.
-    if let Some(path) = shift_utils::first_unmaterializable_path(None, &tree_hash, &scope_utils::current_scope()?)? {
-        return Err(remote_utils::head_not_materializable_refusal(&pallet_name, &path).into());
+    // resumable rather than standing at it half-finished: a resume with --repair, another --pallet,
+    // or an --only that leaves the path out, finishes it.
+    let repair = attempt.record.request.repair;
+    if !repair {
+        if let Some(path) = shift_utils::first_unmaterializable_path(None, &tree_hash, &scope_utils::current_scope()?)? {
+            return Err(remote_utils::head_not_materializable_refusal(&pallet_name, &path, remote_utils::RepairRoute::ResumeClone(client.url())).into());
+        }
     }
 
+    // With --repair, the clone stands on a parcel stacked on the remote's head that removes every
+    // name no client can check out, which the next lift publishes; a head with none is checked out
+    // as it is.
+    let repair = match repair {
+        true => repair_utils::repair_head(&remote_head)?,
+        false => None,
+    };
+    let (head, tree_hash) = match &repair {
+        Some(repair) => (repair.parcel.clone(), repair.tree.clone()),
+        None => (remote_head.clone(), tree_hash),
+    };
+
+    // Raised before the pallet's head is written, and finished once the tree is materialized. The
+    // clone record outlives it: a clone interrupted anywhere is resumed by `clone`,
+    // which discards the marker with the rest of the attempt.
+    let position = pallet_utils::BayPosition::new(&pallet_name, Some(head.clone()));
     operation_utils::raise(&Operation::new(OperationKind::Franchise, position.clone(), None, position))?;
 
     // A clone fills a fresh warehouse (a resume discarded every ref), so the pallet is unborn
     // here. The write stands only on the trust the history was verified against.
-    pallet_utils::update_pallet_head(&pallet_name, None, &remote_head, &take_utils::installed(&take_trust)?)?;
-    pallet_utils::write_position(&pallet_utils::BayPosition::new(&pallet_name, Some(remote_head.clone())))?;
+    pallet_utils::update_pallet_head(&pallet_name, None, &head, &take_utils::installed(&take_trust)?)?;
+    pallet_utils::write_position(&pallet_utils::BayPosition::new(&pallet_name, Some(head.clone())))?;
 
     // The head this warehouse was filled from is one the remote held, so a scope prune may later
-    // ask whether it still does. Best effort: an unrecorded head only keeps history a prune
-    // could have freed.
+    // ask whether it still does. A repair descends from it, so it is recorded all the same. Best
+    // effort: an unrecorded head only keeps history a prune could have freed.
     if let Err(why) = held_heads::record_held_head(&pallet_name, &remote_head) {
         output::warn_held_head_unrecorded(&why);
     }
@@ -705,6 +723,7 @@ async fn franchise_into_prepared_target(
 
     report.pallet = pallet_name;
     report.head = Some(remote_head.clone());
+    report.repair = repair.map(|repair| RepairReport { parcel: repair.parcel, removed: repair.removed });
     report.fetched_objects = stats.fetched_objects;
     emit_report(&mut report, client);
 
@@ -886,6 +905,11 @@ pub(crate) struct CloneReport {
     /// Loose objects fetched for the materialized pallet.
     fetched_objects: usize,
 
+    /// The repair parcel checked out instead of the remote's head (`head`), when `--repair` found
+    /// a name there no client can check out; `forklift lift` publishes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repair: Option<RepairReport>,
+
     /// Whether the adopted bundle installed native packs straight from the remote's own bulk
     /// ingest — the densify suggestion, human-output only (not part of the JSON contract).
     #[serde(skip)]
@@ -934,6 +958,14 @@ impl CommandOutput for CloneReport {
             );
         }
 
+        if let Some(repair) = &self.repair {
+            println!(
+                "Repaired the remote's head: parcel {} removes \"{}\", which no client can check out, and \
+                is checked out instead. \"forklift lift\" publishes it.",
+                repair.parcel, forklift_core::error::sanitize(&repair.removed.join("\", \""))
+            );
+        }
+
         if !self.scope.is_empty() {
             println!(
                 "Sparse: fetched and materialized only {}. The rest of the tree is sealed by \
@@ -964,14 +996,14 @@ mod tests {
         FranchiseRecord {
             url: "http://example.com:9418".to_string(),
             token: None,
-            request: Request { pallet: None, only: vec!["src/ap".to_string()], cache: false },
+            request: Request { pallet: None, only: vec!["src/ap".to_string()], cache: false, repair: false },
             genesis: Some("abc".to_string()),
             bundle: BundleState::None,
             attempt: Attempt::Failed,
             start_census: 3,
             format: warehouse_utils::WAREHOUSE_FORMAT,
             last_failure: Some(Failure {
-                request: Request { pallet: None, only: vec!["src/ap".to_string()], cache: false },
+                request: Request { pallet: None, only: vec!["src/ap".to_string()], cache: false, repair: false },
                 phase: Phase::Fetch,
                 cause_code: "only_prefix_not_found".to_string(),
                 retry: Retry::Change,

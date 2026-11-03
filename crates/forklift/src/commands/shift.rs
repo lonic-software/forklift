@@ -217,6 +217,8 @@ pub async fn shift_to(target: &str) -> Result<String, String> {
 
     ensure_warehouse_is_clean(current_tree_hash.as_deref()).await?;
 
+    shift_utils::refuse_unmaterializable_pallet(target, current_tree_hash.as_deref(), &target_tree_hash)?;
+
     move_files(
         current_tree_hash.as_deref(), &target_tree_hash, &format!("Shifting to \"{}\"", target), anchor,
         &pallet_utils::BayPosition::new(target, Some(target_head.clone())),

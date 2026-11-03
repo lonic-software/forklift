@@ -158,6 +158,9 @@ pub struct Request {
 
     /// Whether `--cache` was asked for.
     pub cache: bool,
+
+    /// Whether `--repair` was asked for.
+    pub repair: bool,
 }
 
 /// The last failure an attempt recorded.
@@ -281,7 +284,8 @@ impl FranchiseRecord {
                 "token" => token = Some(value),
                 "pallet" => request.pallet = Some(value),
                 "only" => request.only.push(value),
-                "cache" => request.cache = parse_cache(&value).ok_or_else(|| malformed("cache"))?,
+                "cache" => request.cache = parse_flag(&value).ok_or_else(|| malformed("cache"))?,
+                "repair" => request.repair = parse_flag(&value).ok_or_else(|| malformed("repair"))?,
                 "genesis" => genesis = Some(value),
                 "bundle" => bundle = Some(match value.as_str() {
                     "none" | "partial" | "imported" => value,
@@ -298,7 +302,8 @@ impl FranchiseRecord {
                 "census" => start_census = Some(value.parse::<u64>().map_err(|_| malformed("census"))?),
                 "failure.pallet" => failure_request.pallet = Some(value),
                 "failure.only" => failure_request.only.push(value),
-                "failure.cache" => failure_request.cache = parse_cache(&value).ok_or_else(|| malformed("failure.cache"))?,
+                "failure.cache" => failure_request.cache = parse_flag(&value).ok_or_else(|| malformed("failure.cache"))?,
+                "failure.repair" => failure_request.repair = parse_flag(&value).ok_or_else(|| malformed("failure.repair"))?,
                 "failure.phase" => failure_phase = Some(Phase::parse(&value).ok_or_else(|| malformed("failure.phase"))?),
                 "failure.cause" => failure_cause = Some(value),
                 "failure.retry" => failure_retry = Some(Retry::parse(&value).ok_or_else(|| malformed("failure.retry"))?),
@@ -350,10 +355,14 @@ fn push_request(entries: &mut Vec<String>, prefix: &str, request: &Request) {
     if request.cache {
         entries.push(format!("{}cache=true", prefix));
     }
+
+    if request.repair {
+        entries.push(format!("{}repair=true", prefix));
+    }
 }
 
-/// A recorded `cache` entry: written only when set, so `true` is its one value.
-fn parse_cache(value: &str) -> Option<bool> {
+/// A recorded flag entry (`cache`, `repair`): written only when set, so `true` is its one value.
+fn parse_flag(value: &str) -> Option<bool> {
     (value == "true").then_some(true)
 }
 
@@ -889,6 +898,10 @@ pub fn resume_command(url: &str, directory: &str, request: &Request) -> String {
         command.push_str(" --cache");
     }
 
+    if request.repair {
+        command.push_str(" --repair");
+    }
+
     command
 }
 
@@ -927,10 +940,23 @@ pub fn failure_refusal(directory: &str, record: &FranchiseRecord, cause: &str, f
 
     let command = resume_command(&record.url, directory, &record.request);
 
+    // A head no client can check out is checked out repaired, which reads the whole of its tree.
+    let next_step = if failure.cause_code == RefusalCode::HeadNotMaterializable.as_str() && !record.request.repair {
+        let repair = Request { only: Vec::new(), repair: true, ..record.request.clone() };
+
+        format!(
+            "Running it unchanged fails the same way. Run \"{}\" to check out a repair of the head \
+            (what was fetched is kept, and everything else in \"{}\" is replaced), or delete \"{}\".",
+            resume_command(&record.url, directory, &repair), directory, directory
+        )
+    } else {
+        failed_next_step(&command, directory, failure.retry)
+    };
+
     CoreError::refusal_with_details(
         RefusalCode::CloneIncomplete,
         format!("{} The clone did not finish; \"{}\" was kept with what was fetched.", message.trim_end(), directory),
-        failed_next_step(&command, directory, failure.retry),
+        next_step,
         details(directory, Some(&record.url), Some(failure)),
     )
 }
@@ -1046,14 +1072,14 @@ mod tests {
         FranchiseRecord {
             url: "http://example.com:9418".to_string(),
             token: Some("se=cret\nline".to_string()),
-            request: Request { pallet: Some("main".to_string()), only: vec!["docs".to_string(), "src/a b".to_string()], cache: false },
+            request: Request { pallet: Some("main".to_string()), only: vec!["docs".to_string(), "src/a b".to_string()], cache: false, repair: false },
             genesis: Some("abc".to_string()),
             bundle: BundleState::Imported,
             attempt: Attempt::Failed,
             start_census: 42,
             format: warehouse_utils::WAREHOUSE_FORMAT,
             last_failure: Some(Failure {
-                request: Request { pallet: None, only: Vec::new(), cache: true },
+                request: Request { pallet: None, only: Vec::new(), cache: true, repair: false },
                 phase: Phase::Fetch,
                 cause_code: "error".to_string(),
                 retry: Retry::Unknown,
@@ -1406,7 +1432,7 @@ mod tests {
 
     #[test]
     fn the_resume_command_quotes_what_a_shell_would_split() {
-        let request = Request { pallet: Some("it's".to_string()), only: vec!["a b".to_string(), "docs".to_string()], cache: false };
+        let request = Request { pallet: Some("it's".to_string()), only: vec!["a b".to_string(), "docs".to_string()], cache: false, repair: false };
         assert_eq!(
             resume_command("http://h:1", "/tmp/my dir", &request),
             "forklift clone http://h:1 '/tmp/my dir' --pallet 'it'\\''s' --only 'a b' --only docs"

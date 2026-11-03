@@ -87,8 +87,10 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
 
     let their_tree_hash = object_utils::load_parcel(&their_head)?.tree_hash;
 
-    // A hand-made ref could point at an office parcel; its tracked-metadata namespace
-    // must never be merged into a working pallet.
+    // Whatever the merge takes from a tree that differs from ours could bring in a name that opens
+    // the metadata folder. A hand-made ref could point at an office parcel, whose top-level one is
+    // its tracked-metadata namespace: never merged into a working pallet either.
+    shift_utils::refuse_unmaterializable_pallet(target, Some(&our_tree_hash), &their_tree_hash)?;
     office_utils::ensure_not_metadata_tree(&their_tree_hash)?;
 
     if merge_utils::is_ancestor(&our_head, &their_head)? {

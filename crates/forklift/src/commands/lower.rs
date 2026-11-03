@@ -8,7 +8,7 @@ use forklift_core::util::remote_utils::{BatchLaneClosure, RemoteClient};
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
     alias_utils, audit_utils, bay_utils, config_utils, file_utils, haul_utils, held_heads, kv_utils, merge_utils, object_utils,
-    operation_utils, pallet_utils, remote_utils, scope_utils, shift_utils, stocktake_utils, take_utils, trust_utils,
+    operation_utils, pallet_utils, remote_utils, repair_utils, scope_utils, shift_utils, stocktake_utils, take_utils, trust_utils,
 };
 use forklift_core::util::take_utils::{FetchAt, TakeTrust};
 use forklift_core::util::operation_utils::{Operation, OperationKind};
@@ -44,6 +44,8 @@ use crate::output::{self, CommandOutput};
 /// * `keep`   - Conflict resolutions, each `<pallet>:<path>=ours|theirs`.
 /// * `confirm` - Whether a "theirs" resolution may drop the local changes it names. Without it,
 ///              one is refused (`confirmation_required`) before the remote is contacted.
+/// * `repair`  - Whether a remote head no client can check out is repaired: a parcel stacked on it
+///              removes every name that opens the metadata folder (see [`repair_pallet`]).
 ///
 /// # Returns
 /// * `Ok(())`      - If every pallet is now in sync with the remote (or ahead of it).
@@ -52,7 +54,7 @@ use crate::output::{self, CommandOutput};
 ///                   such pallet, the warehouse is dirty, the
 ///                   histories diverged, a meta pallet conflicted or failed to sync, or a transfer
 ///                   failed.
-pub async fn handle_command(pallet: Option<String>, expect: Option<String>, keep: Vec<String>, confirm: bool) -> Result<(), String> {
+pub async fn handle_command(pallet: Option<String>, expect: Option<String>, keep: Vec<String>, confirm: bool, repair: bool) -> Result<(), String> {
     let keeps = parse_keeps(&keep)?;
 
     // Rule 5: a "theirs" resolution destroys local changes nobody else made. One is accepted only
@@ -71,6 +73,21 @@ pub async fn handle_command(pallet: Option<String>, expect: Option<String>, keep
 
     let progress = events::progress();
     let client = RemoteClient::for_warehouse()?;
+
+    // A repair reads the whole of the head's tree, which a sparse warehouse never holds.
+    if repair && !scope_utils::read_fetch_scope()?.is_full() {
+        return Err(CoreError::refusal(
+            RefusalCode::SparseWorkspace,
+            format!(
+                "This warehouse fetches only part of each tree, so it cannot build a repair, which reads \
+                the whole of the head's. \"forklift clone {} <directory> --repair\" builds it in a new \
+                directory.",
+                client.url()
+            ),
+            format!("forklift clone {} <directory> --repair", client.url()),
+        ).into());
+    }
+
     let info = client.fetch_info().await?;
 
     // A named pallet the remote lacks is refused before trust or a meta pallet is written: it is
@@ -81,7 +98,7 @@ pub async fn handle_command(pallet: Option<String>, expect: Option<String>, keep
         if !info.pallets.contains_key(name) {
             remote_utils::check_remote_trust(&client, &info, expect.as_deref())?;
 
-            return Err(remote_lacks_pallet(&info, name, "forklift pallet list --remote").into());
+            return Err(remote_lacks_pallet(&info, name, &missing_named_step(name, repair)?).into());
         }
     }
 
@@ -134,11 +151,13 @@ pub async fn handle_command(pallet: Option<String>, expect: Option<String>, keep
         fetched_objects: 0,
         fetched_signatures: 0,
         batch_lane: None,
+        repair: None,
     };
 
-    let lowered = match named {
-        Some(_) => lower_named_pallet(&client, &info, &mut report, &progress).await,
-        None => lower_working_pallet(&client, &info, &mut report, &progress).await,
+    let lowered = match (named.is_some(), repair) {
+        (named, true) => repair_pallet(&client, &info, named, &mut report, &progress).await,
+        (true, false) => lower_named_pallet(&client, &info, &mut report, &progress).await,
+        (false, false) => lower_working_pallet(&client, &info, &mut report, &progress).await,
     };
 
     report.batch_lane = client.batch_lane_closure();
@@ -239,7 +258,7 @@ async fn lower_working_pallet(client: &RemoteClient,
             // The refusal's next step checks the remote head out on a pallet of its own, so a head
             // no client can check out is refused as that first.
             remote_utils::fetch_head_content(client, remote_head, progress).await?;
-            refuse_unmaterializable(&pallet, local_tree.as_deref(), &object_utils::load_parcel(remote_head)?.tree_hash)?;
+            refuse_unmaterializable(client, &pallet, local_tree.as_deref(), &object_utils::load_parcel(remote_head)?.tree_hash)?;
             return Err(remote_utils::diverged_refusal(&pallet, remote_head).into());
         }
     }
@@ -258,7 +277,7 @@ async fn lower_working_pallet(client: &RemoteClient,
     // Refused before the marker, so a refusal leaves nothing standing (`materialize_tree` checks
     // again, finding the same). A name that opens the metadata folder is refused as the head's,
     // before the planning below trips over it.
-    refuse_unmaterializable(&pallet, local_tree.as_deref(), &remote_tree)?;
+    refuse_unmaterializable(client, &pallet, local_tree.as_deref(), &remote_tree)?;
     let (ops, removed_dirs) = shift_utils::diff_trees(local_tree.as_deref(), &remote_tree)?;
     alias_utils::refuse_collisions("Lowering", &shift_utils::collect_collisions(&ops, &removed_dirs)?)?;
     shift_utils::ensure_writes_present(&ops)?;
@@ -295,12 +314,194 @@ async fn lower_working_pallet(client: &RemoteClient,
 /// Refuse the remote head of `pallet`, whose tree is `remote_tree`, with `head_not_materializable`
 /// when checking it out over `local_tree` in this bay's scope would write a name that opens the
 /// metadata folder.
-fn refuse_unmaterializable(pallet: &str, local_tree: Option<&str>, remote_tree: &str) -> Result<(), String> {
+fn refuse_unmaterializable(client: &RemoteClient, pallet: &str, local_tree: Option<&str>, remote_tree: &str) -> Result<(), String> {
     let Some(path) = shift_utils::first_unmaterializable_path(local_tree, remote_tree, &scope_utils::current_scope()?)? else {
         return Ok(());
     };
 
-    Err(remote_utils::head_not_materializable_refusal(pallet, &path).into())
+    // A sparse warehouse cannot build the repair, so its refusal sends the repair to a new clone.
+    let route = if scope_utils::read_fetch_scope()?.is_full() {
+        remote_utils::RepairRoute::Lower(None)
+    } else {
+        remote_utils::RepairRoute::NewClone(client.url())
+    };
+
+    Err(remote_utils::head_not_materializable_refusal(pallet, &path, route).into())
+}
+
+/// The next step for a named lower of `pallet`, which the remote does not list. A repair of a pallet
+/// whose head here cannot be checked out either has nothing on the remote to repair, so deleting it
+/// is the way out; anything else lists what another name could be.
+fn missing_named_step(pallet: &str, repair: bool) -> Result<String, String> {
+    if repair {
+        if let Some(head) = pallet_utils::get_pallet_head(pallet)? {
+            if repair_utils::first_repairable_path(&head)?.is_some() {
+                return Ok(format!("forklift pallet delete {}", pallet));
+            }
+        }
+    }
+
+    Ok("forklift pallet list --remote".to_string())
+}
+
+/// Lower `report.pallet` with `--repair` (the current pallet unless `named`): when the remote's head
+/// H holds a name no client can check out, stack a parcel R on it that removes every such name
+/// ([`repair_utils::repair_head`]) and stand R wherever the lower would have stood H. A head with
+/// nothing to repair lowers as usual.
+///
+/// It acts on the pallet's ref V, not on where this bay stands, since several bays can share it:
+/// - V unborn, at H or behind it: the ref moves from V to R. For the current pallet, the bay, whose
+///   base must be V or behind it, is moved onto R; a bay whose base is not is refused as behind.
+/// - V holding parcels H lacks: R goes on a new pallet `<p>-remote-<r>`, V and the bay stay, and the
+///   lower refuses as diverged, naming the consolidation whose lift fast-forwards H.
+/// - V ahead of H: the lower runs as usual, finding it ahead.
+async fn repair_pallet(client: &RemoteClient,
+                       info: &forklift_core::model::remote::WarehouseInfo,
+                       named: bool,
+                       report: &mut LowerReport,
+                       progress: &Progress) -> Result<(), String> {
+    let pallet = report.pallet.clone();
+
+    let Some(remote_head) = info.pallets.get(&pallet).cloned() else {
+        return lower_working_pallet(client, info, report, progress).await;
+    };
+
+    report.head = remote_head.clone();
+
+    let stats = remote_utils::fetch_history_scoped(client, &remote_head, &pallet, progress).await?;
+    report.fetched_objects = stats.fetched_objects;
+    report.fetched_signatures = stats.fetched_signatures;
+    report.fetched_objects += remote_utils::fetch_head_content(client, &remote_head, progress).await?.fetched_objects;
+
+    let ref_head = pallet_utils::get_pallet_head(&pallet)?;
+    let behind_remote = match &ref_head {
+        None => true,
+        Some(head) => head == &remote_head || merge_utils::is_ancestor(head, &remote_head)?,
+    };
+    let ahead_of_remote = !behind_remote && merge_utils::is_ancestor(&remote_head, ref_head.as_deref().unwrap_or_default())?;
+
+    if ahead_of_remote || repair_utils::first_repairable_path(&remote_head)?.is_none() {
+        return match named {
+            true => lower_named_pallet(client, info, report, progress).await,
+            false => lower_working_pallet(client, info, report, progress).await,
+        };
+    }
+
+    let position = pallet_utils::read_position()?;
+
+    // The bay moves from its own base to the repair, so it must hold nothing V lacks: a bay behind V
+    // is fine, a bay beside it is refused as behind, as a plain lower refuses it.
+    if !named && behind_remote {
+        if let (Some(base), Some(head)) = (&position.base, &ref_head) {
+            if base != head && !merge_utils::is_ancestor(base, head)? {
+                position.require_current("lowered")?;
+            }
+        }
+    }
+
+    let preconditions = take_utils::verify_take(Some(client), &TakeTrust::local()?, &remote_head, &pallet, FetchAt::Warehouse).await?;
+
+    if named && behind_remote && ref_head.is_none() {
+        refuse_a_bay_on_unborn(&pallet)?;
+    }
+
+    let repair = repair_utils::repair_head(&remote_head)?.ok_or("The remote's head has nothing to repair.")?;
+    report.repair = Some(RepairReport { parcel: repair.parcel.clone(), removed: repair.removed.clone() });
+
+    if !behind_remote {
+        return Err(stack_diverged_repair(&pallet, &remote_head, &repair, &preconditions, &position, ref_head.as_deref())?.into());
+    }
+
+    if named {
+        pallet_utils::update_pallet_head(&pallet, ref_head.as_deref(), &repair.parcel, &preconditions).map_err(|error| error.to_string())?;
+        record_served_head(&pallet, &remote_head);
+        report.outcome = Some(LowerOutcome::Repaired);
+
+        return Ok(());
+    }
+
+    let local_tree = match &position.base {
+        Some(hash) => Some(object_utils::load_parcel(hash)?.tree_hash),
+        None => None,
+    };
+    let anchor = file_utils::take_stat_anchor()?;
+
+    ensure_warehouse_is_clean(local_tree.as_deref()).await?;
+
+    refuse_unmaterializable(client, &pallet, local_tree.as_deref(), &repair.tree)?;
+    let (ops, removed_dirs) = shift_utils::diff_trees(local_tree.as_deref(), &repair.tree)?;
+    alias_utils::refuse_collisions("Lowering", &shift_utils::collect_collisions(&ops, &removed_dirs)?)?;
+    shift_utils::ensure_writes_present(&ops)?;
+
+    // The bay moves from its base, but the ref from V: the marker and the compare-and-set take V.
+    let mut operation = Operation::new(
+        OperationKind::Lower,
+        position.clone(),
+        local_tree.clone(),
+        pallet_utils::BayPosition::new(&pallet, Some(repair.parcel.clone())),
+    );
+    operation.target_tree = Some(repair.tree.clone());
+    operation.expected = ref_head.clone();
+    operation.office = preconditions.office.clone();
+    operation.anchor = preconditions.anchor.clone();
+    operation_utils::raise(&operation)?;
+
+    shift_utils::materialize_tree(local_tree.as_deref(), &repair.tree, "Lowering", anchor, progress)?;
+
+    let written = shift_utils::write_head_or_roll_back(&pallet, ref_head.as_deref(), &repair.parcel, &preconditions, &repair.tree, local_tree.as_deref(), anchor);
+    // The held-heads record keeps H, the head the remote served, which the repair descends from.
+    if written.is_ok() || pallet_utils::get_pallet_head(&pallet).ok().flatten().as_deref() == Some(repair.parcel.as_str()) {
+        record_served_head(&pallet, &remote_head);
+    }
+    written?;
+
+    report.outcome = Some(LowerOutcome::Repaired);
+
+    Ok(())
+}
+
+/// Stack the repair of the remote head `remote_head` of `pallet`, whose ref `ref_head` holds parcels
+/// it lacks, on a pallet of its own, `<pallet>-remote-<r>`, and return the diverged refusal naming
+/// the way on: consolidating it into `pallet` descends from the repair, so the lift of the result
+/// fast-forwards the remote. `pallet` and this bay stay where they are.
+fn stack_diverged_repair(pallet: &str,
+                         remote_head: &str,
+                         repair: &repair_utils::Repair,
+                         preconditions: &pallet_utils::RefPreconditions,
+                         position: &pallet_utils::BayPosition,
+                         ref_head: Option<&str>) -> Result<CoreError, String> {
+    let side = format!("{}-remote-{}", pallet, &repair.parcel[..12.min(repair.parcel.len())]);
+
+    match pallet_utils::update_pallet_head(&side, None, &repair.parcel, preconditions) {
+        Ok(()) => {}
+        // A repair of the same head by the same operator in the same second is the same parcel.
+        Err(pallet_utils::RefUpdateError::Moved(found)) if found.found.as_deref() == Some(repair.parcel.as_str()) => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    record_served_head(&side, remote_head);
+
+    // Consolidate merges into the pallet this bay stands on, which must be current, so the bay is
+    // shifted there first unless it already stands on the pallet at its ref.
+    let on_it = position.pallet == pallet && position.base.as_deref() == ref_head;
+    let mut steps = Vec::new();
+    if !on_it {
+        steps.push(format!("forklift shift {}", pallet));
+    }
+    steps.push(format!("forklift consolidate {}", side));
+    steps.push("forklift lift".to_string());
+
+    Ok(CoreError::refusal(
+        RefusalCode::Diverged,
+        format!(
+            "The local pallet \"{p}\" and the remote have diverged, and the remote's head held a name \
+            no client can check out. Its repair is stacked on the new pallet \"{s}\"; {how}consolidate \
+            it (\"forklift consolidate {s}\"), and lift the result.",
+            p = pallet,
+            s = side,
+            how = if on_it { String::new() } else { format!("shift onto \"{}\" (\"forklift shift {}\"), ", pallet, pallet) },
+        ),
+        steps.join("; then "),
+    ))
 }
 
 /// Add the remote head a lower was served to the held-heads record, once `pallet`'s ref or the
@@ -512,6 +713,21 @@ pub(crate) enum LowerOutcome {
     /// The pallet did not exist here, and now points at the remote head. Only a named lower, of a
     /// pallet other than the current one, creates one.
     Created,
+
+    /// The remote head held a name no client can check out, and the pallet now points at a repair
+    /// parcel stacked on it (`repair`); `forklift lift` publishes it.
+    Repaired,
+}
+
+/// The repair parcel a `--repair` lower stacked.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct RepairReport {
+    /// The repair parcel, whose only parent is the remote head.
+    pub(crate) parcel: String,
+
+    /// The paths it removed, in name order.
+    pub(crate) removed: Vec<String>,
 }
 
 /// A meta pallet that failed to sync, and why.
@@ -620,6 +836,11 @@ pub(crate) struct LowerReport {
     /// Why the remote's batch download stopped being used, when it did. Absent when it stayed open.
     #[serde(skip_serializing_if = "Option::is_none")]
     batch_lane: Option<BatchLaneClosure>,
+
+    /// The repair parcel the pallet now points at, when the outcome is `repaired`. A diverged pallet's
+    /// repair is refused as `diverged`, which names the pallet it was stacked on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repair: Option<RepairReport>,
 }
 
 impl LowerReport {
@@ -703,6 +924,14 @@ impl CommandOutput for LowerReport {
                     "Created pallet \"{}\" at the remote's head {} ({} object(s) and {} signature(s) \
                     fetched); \"forklift shift {}\" moves this bay onto it.",
                     self.pallet, self.head, self.fetched_objects, self.fetched_signatures, self.pallet
+                );
+            }
+            Some(LowerOutcome::Repaired) => {
+                let repair = self.repair.as_ref().map(|repair| (repair.parcel.as_str(), repair.removed.join("\", \""))).unwrap_or_default();
+                println!(
+                    "Repaired the remote's head {} of pallet \"{}\": parcel {} removes \"{}\", which no \
+                    client can check out. \"forklift lift\" publishes it.",
+                    self.head, self.pallet, repair.0, forklift_core::error::sanitize(&repair.1)
                 );
             }
         }

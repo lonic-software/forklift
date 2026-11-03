@@ -147,6 +147,34 @@ pub fn first_unmaterializable_path(from: Option<&str>,
     Ok(None)
 }
 
+/// Refuse checking out the head of local pallet `pallet`, whose tree is `to`, over `from` in this
+/// bay's scope, when it would write a name that opens the metadata folder
+/// ([`first_unmaterializable_path`]): `head_not_materializable`, naming the lower that repairs the
+/// remote's head, since a wedged local head is one a lower or a pre-gate writer brought here.
+pub fn refuse_unmaterializable_pallet(pallet: &str, from: Option<&str>, to: &str) -> Result<(), String> {
+    let Some(path) = first_unmaterializable_path(from, to, &scope_utils::current_scope()?)? else {
+        return Ok(());
+    };
+
+    // The name in Rust's quoting, so a character no terminal shows is spelled out.
+    let entry = match path.rsplit_once('/') {
+        Some((directory, name)) => format!("{:?} in {:?}", name, directory),
+        None => format!("{:?}", path),
+    };
+
+    Err(crate::error::CoreError::refusal(
+        crate::error::RefusalCode::HeadNotMaterializable,
+        format!(
+            "Pallet \"{p}\" holds {entry}, a name that opens the warehouse's metadata folder, so it cannot \
+            be checked out. Nothing was changed. \"forklift lower {p} --repair\" stacks a parcel on the \
+            remote's head of the pallet that removes every such name; a pallet the remote does not hold \
+            is deleted instead (\"forklift pallet delete {p}\").",
+            p = pallet, entry = entry
+        ),
+        format!("forklift lower {} --repair", pallet),
+    ).into())
+}
+
 /// What [`diff_directory`] collects.
 struct Plan<'a> {
     /// The file operations.

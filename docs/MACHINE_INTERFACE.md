@@ -85,7 +85,12 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 18** (current): the `head_not_materializable` error code exists (exit 46). `lower` and
+**Schema 19** (current): `lower --repair` and `clone --repair` exist. `lower` reports the outcome
+`repaired` when it moved the pallet onto a repair of the remote's head, and `lower` and `clone`
+carry `repair` (`parcel`, `removed`) when they checked one out. A `lower --repair` over a diverged
+pallet refuses as `diverged`, its next step naming the new pallet the repair was stacked on.
+
+**Schema 18**: the `head_not_materializable` error code exists (exit 46). `lower` and
 `clone` refuse with it, changing nothing, when the remote's head of the pallet holds an entry named
 like the warehouse's metadata folder, which no client can check out.
 
