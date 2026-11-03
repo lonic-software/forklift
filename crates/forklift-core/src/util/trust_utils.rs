@@ -293,16 +293,9 @@ fn check_expected(subject: &str,
     ))
 }
 
-/// A `trust_changed` refusal. The message ends with the next step, as every refusal's does: a
-/// human sees only the message.
+/// A `trust_changed` refusal.
 fn refusal(message: String, next_step: impl Into<String>, details: TrustDetails) -> CoreError {
-    let next_step = next_step.into();
-    CoreError::refusal_with_details(
-        RefusalCode::TrustChanged,
-        format!("{} {}", message, next_step),
-        next_step,
-        details.to_value(),
-    )
+    CoreError::refusal_with_details(RefusalCode::TrustChanged, message, next_step, details.to_value())
 }
 
 /// The next step of a re-genesis refusal: the one override, bound to the value shown.

@@ -143,8 +143,8 @@ pub fn non_origin_remote_refusal(origin: &str, other: &str) -> CoreError {
         format!(
             "This is a partial warehouse, cloned from \"{}\", and the configured remote is \
             \"{}\". Only the origin was proved to hold the content this warehouse does not, so \
-            Forklift talks to no other remote from here; nothing was changed. {}",
-            origin, other, next_step
+            Forklift talks to no other remote from here; nothing was changed.",
+            origin, other
         ),
         next_step,
     )
@@ -161,8 +161,8 @@ pub fn missing_origin_refusal() -> CoreError {
         format!(
             "This is a partial warehouse, but its origin record (\"{}\" in the warehouse's .forklift \
             folder) is missing, so Forklift cannot tell which remote holds the content this \
-            warehouse does not; nothing was changed. {}",
-            FILE_NAME, next_step
+            warehouse does not; nothing was changed.",
+            FILE_NAME
         ),
         next_step,
     )

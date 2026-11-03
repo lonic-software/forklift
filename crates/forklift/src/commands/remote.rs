@@ -208,7 +208,7 @@ fn running_refusal() -> String {
 
     CoreError::refusal(
         RefusalCode::OriginMovePending,
-        format!("Another move of this warehouse's origin is running; nothing was changed. {}", next_step),
+        "Another move of this warehouse's origin is running; nothing was changed.",
         next_step,
     ).into()
 }

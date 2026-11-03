@@ -258,8 +258,8 @@ fn incomplete_load_refusal(recorded: &BTreeSet<String>) -> CoreError {
         RefusalCode::IncompleteLoad,
         format!(
             "{} did not finish cleanly; committing the staged inventory now could produce an \
-            incomplete result. {}",
-            description, next_step
+            incomplete result.",
+            description
         ),
         next_step,
     )
@@ -280,8 +280,8 @@ fn malformed_marker_refusal(read_error: &str) -> CoreError {
         RefusalCode::IncompleteLoad,
         format!(
             "The incomplete-load marker could not be read ({}); treating this warehouse as \
-            having an incomplete load rather than risk committing an incomplete result. {}",
-            read_error, next_step
+            having an incomplete load rather than risk committing an incomplete result.",
+            read_error
         ),
         next_step,
     )

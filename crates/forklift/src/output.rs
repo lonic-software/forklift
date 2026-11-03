@@ -855,11 +855,15 @@ pub struct ForkliftError {
 
 impl ForkliftError {
     /// A classified error with a next step. A blank step is none, as for a refusal.
+    #[track_caller]
     pub fn new(code: ErrorCode, message: impl Into<String>, next_step: impl Into<String>) -> ForkliftError {
+        let (message, next_step) = (message.into(), next_step.into());
+        debug_assert!(!forklift_core::error::restates_next_step(&message, &next_step),
+                      "An error's message restates its next step: {:?}", message);
         ForkliftError {
             code,
-            message: message.into(),
-            next_step: Some(next_step.into()).filter(|step| !step.trim().is_empty()),
+            message,
+            next_step: Some(next_step).filter(|step| !step.trim().is_empty()),
             details: None,
         }
     }
@@ -1186,6 +1190,18 @@ macro_rules! human {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A head-built error is held to the refusal constructors' rule: its message may not carry its
+    /// next step, which human mode prints on a line of its own. Revert: drop the check → red.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_head_error_whose_message_restates_its_step_is_refused() {
+        let restated = || ForkliftError::new(ErrorCode::Behind, "Behind. Run \"forklift shift main\".", "forklift shift main");
+        assert!(std::panic::catch_unwind(restated).is_err());
+
+        let error = ForkliftError::new(ErrorCode::Behind, "Behind.", "forklift shift main");
+        assert_eq!(error.next_step.as_deref(), Some("forklift shift main"));
+    }
 
     /// A blank step is no recovery: `--json` leaves `next_step` out, as for an error with none.
     #[test]

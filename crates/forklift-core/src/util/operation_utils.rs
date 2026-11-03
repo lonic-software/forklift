@@ -406,16 +406,16 @@ fn standing_refusal_message(path: &Path) -> String {
     match read_at(path) {
         Ok(Some(operation)) => format!(
             "The {} that ran in this bay was interrupted before it finished, so the staged inventory may be \
-            incomplete; changing the bay or committing now could record a wrong result. Run \
-            \"forklift heal\" to finish or undo it.",
+            incomplete; changing the bay or committing now could record a wrong result. The next step \
+            finishes or undoes it.",
             operation.kind.as_str()
         ),
-        Ok(None) => "An operation in this bay was interrupted before it finished. Run \"forklift heal\" \
-            to finish or undo it.".to_string(),
+        Ok(None) => "An operation in this bay was interrupted before it finished. The next step finishes \
+            or undoes it.".to_string(),
         Err(error) => format!(
             "{} An operation in this bay was interrupted, and this version of Forklift cannot tell \
-            which one, so it cannot finish or undo it. Run \"forklift heal\" with the version that \
-            started it.",
+            which one, so it cannot finish or undo it; only the version of Forklift that started it \
+            can.",
             error
         ),
     }

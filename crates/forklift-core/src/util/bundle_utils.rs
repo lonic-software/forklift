@@ -2491,7 +2491,8 @@ mod tests {
         assert_eq!(code, scope_utils::CODE_OVERSIZED_TRANSPORT_UNSUPPORTED);
         assert!(message.contains("big.bin"), "the refusal names the path: {}", message);
         assert!(message.contains(&giant_object.hash), "the refusal names the object: {}", message);
-        assert!(next_step.contains("signed identity"), "states no migration exists: {}", next_step);
+        assert!(message.contains("signed identity"), "states no migration exists: {}", message);
+        assert!(next_step.is_empty(), "nothing moves the object, so there is no step: {}", next_step);
 
         // Nothing was left behind: the bundle file is never renamed into place on failure.
         assert!(!get_latest_bundle_path().exists(), "a refused bundle must not be written");

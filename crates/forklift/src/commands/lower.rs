@@ -78,12 +78,8 @@ pub async fn handle_command(pallet: Option<String>, expect: Option<String>, keep
     if repair && !scope_utils::read_fetch_scope()?.is_full() {
         return Err(CoreError::refusal(
             RefusalCode::SparseWorkspace,
-            format!(
-                "This warehouse fetches only part of each tree, so it cannot build a repair, which reads \
-                the whole of the head's. \"forklift clone {} <directory> --repair\" builds it in a new \
-                directory.",
-                client.url()
-            ),
+            "This warehouse fetches only part of each tree, so it cannot build a repair, which reads the \
+            whole of the head's; the next step builds it in a new directory.",
             format!("forklift clone {} <directory> --repair", client.url()),
         ).into());
     }
@@ -492,7 +488,7 @@ fn stack_diverged_repair(pallet: &str,
             format!(
                 "The remote's head {h} holds a name no client can check out, and its repair could not \
                 be stacked: the pallet \"{s}\" already exists and holds no repair of that head. Delete \
-                it (\"forklift pallet delete {s}\") and lower again.",
+                it, then lower again.",
                 s = side, h = remote_head
             ),
             format!("forklift pallet delete {}", side),
@@ -569,9 +565,9 @@ fn remote_lacks_pallet(info: &forklift_core::model::remote::WarehouseInfo, palle
         return CoreError::refusal(
             RefusalCode::PalletNotFound,
             format!(
-                "The remote's pallet \"{}\" was deleted at {}; the remote still holds its history. \
-                \"forklift pallet restore {} --remote\" brings it back there.",
-                pallet, head, pallet
+                "The remote's pallet \"{}\" was deleted at {}; the remote still holds its history, \
+                and the next step brings it back there.",
+                pallet, head
             ),
             format!("forklift pallet restore {} --remote", pallet),
         );
@@ -585,8 +581,7 @@ fn remote_lacks_pallet(info: &forklift_core::model::remote::WarehouseInfo, palle
     CoreError::refusal(
         RefusalCode::PalletNotFound,
         format!(
-            "The remote has no pallet \"{}\" (it has: {}). \"forklift pallet list --remote\" lists \
-            them.",
+            "The remote has no pallet \"{}\" (it has: {}).",
             pallet,
             if user.is_empty() { "none".to_string() } else { user.join(", ") }
         ),

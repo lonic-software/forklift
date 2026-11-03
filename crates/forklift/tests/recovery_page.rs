@@ -307,9 +307,9 @@ fn a_divergence_is_cleared_by_the_commands_the_page_lists() {
     area.stack("b", "f.txt", "from b\n");
 
     let error = area.refused("b", &["lift"], "diverged", 5);
-    let message = error["message"].as_str().unwrap();
-    let (_, rest) = message.split_once("pallet create ").unwrap();
-    let mut words = rest.split(['"', ' ']);
+    let next_step = error["next_step"].as_str().unwrap();
+    let (_, rest) = next_step.split_once("pallet create ").unwrap();
+    let mut words = rest.split(['"', ' ', ';']);
     let (pallet, hash) = (words.next().unwrap(), words.next().unwrap());
 
     area.ok("b", &["pallet", "create", pallet, hash]);

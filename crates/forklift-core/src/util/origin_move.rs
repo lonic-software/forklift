@@ -316,8 +316,8 @@ pub fn pending_refusal(intent: &Intent) -> CoreError {
         RefusalCode::OriginMovePending,
         format!(
             "A move of this warehouse's origin to \"{}\" has not finished (it was {} when it stopped), \
-            so nothing fetches, talks to the remote or changes what the move checks until it does. {}",
-            target, intent.phase.as_str(), next_step
+            so nothing fetches, talks to the remote or changes what the move checks until it does.",
+            target, intent.phase.as_str()
         ),
         next_step,
     )
@@ -335,8 +335,8 @@ fn damaged_refusal(what: &str) -> CoreError {
         format!(
             "{} It records a move of this warehouse's origin, and how far that move got cannot be \
             told, so nothing fetches, talks to the remote or changes what the move checks until a \
-            move finishes. {}",
-            damaged_message(what), next_step
+            move finishes.",
+            damaged_message(what)
         ),
         next_step,
     )
@@ -353,8 +353,8 @@ fn newer_refusal(what: &str) -> CoreError {
         format!(
             "{} It records a move of this warehouse's origin that a newer Forklift started, so \
             nothing fetches, talks to the remote or changes what the move checks until it \
-            finishes. {}",
-            damaged_message(what), next_step
+            finishes.",
+            damaged_message(what)
         ),
         next_step,
     )

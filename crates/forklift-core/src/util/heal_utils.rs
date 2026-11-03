@@ -113,7 +113,7 @@ use std::os::unix::fs::MetadataExt;
 /// same convention `load_guard_utils::CODE_INCOMPLETE_LOAD` and its siblings use.
 pub const CODE_DURABILITY_TAINT: &str = RefusalCode::DurabilityTaint.as_str();
 
-/// The recovery step every `durability_taint` refusal names — one shared constant so the message
+/// The recovery step every `durability_taint` refusal names — one shared constant so the step
 /// (and the generated docs built from it) and the actual `forklift heal` verb
 /// ([`recovery_utils`](crate::util::recovery_utils)) never drift apart on the command name.
 pub const DURABILITY_TAINT_NEXT_STEP: &str =
@@ -678,8 +678,8 @@ fn torn_refusal(root: &Path) -> CoreError {
         format!(
             "{} under \"{}\": its record is itself incomplete (a crash interrupted the write \
             that would have named every affected path), so the full scope of what needs \
-            restaging is unknown and cannot be healed automatically. {}",
-            taint_utils::GATE_TAINT_MARKER, root.to_string_lossy(), DURABILITY_TAINT_NEXT_STEP
+            restaging is unknown and cannot be healed automatically.",
+            taint_utils::GATE_TAINT_MARKER, root.to_string_lossy()
         ),
         DURABILITY_TAINT_NEXT_STEP,
     )
@@ -694,9 +694,9 @@ fn escalation_refusal(root: &Path, non_content_addressed: &BTreeSet<PathBuf>) ->
         format!(
             "{} under \"{}\": {} recorded path(s) cannot be hash-verified before a lock-free \
             rewrite, so entry-heal cannot restage them safely — a concurrent lock-holding writer \
-            could legitimately be deleting or replacing the same path: {}. {}",
+            could legitimately be deleting or replacing the same path: {}.",
             taint_utils::GATE_TAINT_MARKER, root.to_string_lossy(), non_content_addressed.len(),
-            format_paths(non_content_addressed.iter()), DURABILITY_TAINT_NEXT_STEP
+            format_paths(non_content_addressed.iter())
         ),
         DURABILITY_TAINT_NEXT_STEP,
     )
@@ -707,8 +707,8 @@ fn read_failure_refusal(root: &Path, error: &str) -> CoreError {
         RefusalCode::DurabilityTaint,
         format!(
             "{} under \"{}\", but its record could not be read ({}); treating this warehouse as \
-            unhealed rather than risk trusting unproven state. {}",
-            taint_utils::GATE_TAINT_MARKER, root.to_string_lossy(), error, DURABILITY_TAINT_NEXT_STEP
+            unhealed rather than risk trusting unproven state.",
+            taint_utils::GATE_TAINT_MARKER, root.to_string_lossy(), error
         ),
         DURABILITY_TAINT_NEXT_STEP,
     )
@@ -719,8 +719,8 @@ fn sync_failure_refusal(root: &Path, error: &str) -> CoreError {
         RefusalCode::DurabilityTaint,
         format!(
             "{} under \"{}\": every recorded path restaged cleanly, but making that durable \
-            failed ({}). {}",
-            taint_utils::GATE_TAINT_MARKER, root.to_string_lossy(), error, DURABILITY_TAINT_NEXT_STEP
+            failed ({}).",
+            taint_utils::GATE_TAINT_MARKER, root.to_string_lossy(), error
         ),
         DURABILITY_TAINT_NEXT_STEP,
     )
@@ -750,10 +750,10 @@ fn unhealable_refusal(
     CoreError::refusal(
         RefusalCode::DurabilityTaint,
         format!(
-            "{} under \"{}\": {} could not be healed automatically ({}). {}",
+            "{} under \"{}\": {} could not be healed automatically ({}).",
             taint_utils::GATE_TAINT_MARKER, root.to_string_lossy(),
             vanished.len() + unreadable.len() + hash_mismatch.len() + restage_failed.len(),
-            parts.join("; "), DURABILITY_TAINT_NEXT_STEP
+            parts.join("; ")
         ),
         DURABILITY_TAINT_NEXT_STEP,
     )
@@ -882,7 +882,7 @@ mod tests {
 
         let error = heal_if_tainted()
             .expect_err("a non-content-addressed recorded path must never auto-heal lock-free");
-        assert_durability_taint(&error, &["objects/pack/fake.pack", "forklift heal"]);
+        assert_durability_taint(&error, &["objects/pack/fake.pack"]);
 
         #[cfg(unix)]
         {

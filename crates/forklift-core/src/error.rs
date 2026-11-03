@@ -364,15 +364,18 @@ impl CoreError {
     /// carry through the bridge shim regardless of where the interpolated text came from — a path
     /// read back off disk (a tree or inventory entry) can carry a control character that
     /// `WarehousePath::from_user_input`'s guard never saw.
+    #[track_caller]
     pub fn refusal(
         code: RefusalCode,
         message: impl Into<String>,
         next_step: impl Into<String>,
     ) -> CoreError {
+        let (message, next_step) = (sanitize(&message.into()), sanitize(&next_step.into()));
+        debug_assert!(!restates_next_step(&message, &next_step), "A refusal's message restates its next step: {:?}", message);
         CoreError::Refusal {
             code,
-            message: sanitize(&message.into()),
-            next_step: sanitize(&next_step.into()),
+            message,
+            next_step,
             details: None,
         }
     }
@@ -380,16 +383,19 @@ impl CoreError {
     /// Build a classified refusal that carries structured detail as well — see
     /// [`CoreError::refusal`] for the sanitizing of the two texts. The detail needs none: the frame
     /// carries it as compact JSON, which escapes every control character.
+    #[track_caller]
     pub fn refusal_with_details(
         code: RefusalCode,
         message: impl Into<String>,
         next_step: impl Into<String>,
         details: serde_json::Value,
     ) -> CoreError {
+        let (message, next_step) = (sanitize(&message.into()), sanitize(&next_step.into()));
+        debug_assert!(!restates_next_step(&message, &next_step), "A refusal's message restates its next step: {:?}", message);
         CoreError::Refusal {
             code,
-            message: sanitize(&message.into()),
-            next_step: sanitize(&next_step.into()),
+            message,
+            next_step,
             details: Some(details),
         }
     }
@@ -614,6 +620,16 @@ pub fn sanitize(text: &str) -> String {
 /// body); a render that indents or prefixes each line splits with [`str::lines`] itself.
 pub fn sanitize_lines(text: &str) -> String {
     text.lines().map(sanitize).collect::<Vec<_>>().join("\n")
+}
+
+/// Whether `message` carries `next_step` (a blank step never counts). A head prints the step on a
+/// line of its own under the message, so a message that carries it too shows it twice: this
+/// build's refusals assert they do not, in debug builds, in [`CoreError::refusal`] and
+/// [`CoreError::refusal_with_details`]. A refusal carrying a remote's own words is not this build's
+/// wording, and is built without them.
+pub fn restates_next_step(message: &str, next_step: &str) -> bool {
+    let step = next_step.trim();
+    !step.is_empty() && message.contains(step)
 }
 
 /// The label [`human_failure_text`] and [`with_next_step`] put before a next step. A next step is
@@ -973,5 +989,25 @@ mod tests {
     fn sanitize_lines_keeps_the_lines_and_neutralizes_each() {
         assert_eq!(sanitize_lines("one \x1b[2J\ntwo\r\n\tthree\u{202E}"), "one  [2J\ntwo\n\tthree ");
         assert_eq!(sanitize_lines("single"), "single");
+    }
+
+    /// A message that carries its own next step would print it twice, so this build's refusals
+    /// may not: the debug check in the constructors refuses one. Revert: drop either check → red.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_refusal_whose_message_restates_its_step_is_refused() {
+        let restated = || CoreError::refusal(RefusalCode::Behind, "Behind. Run \"forklift shift main\".", " forklift shift main ");
+        let detailed = || CoreError::refusal_with_details(
+            RefusalCode::TrustChanged, "Changed. Verify it.", "Verify it.", serde_json::json!({}),
+        );
+
+        assert!(std::panic::catch_unwind(restated).is_err());
+        assert!(std::panic::catch_unwind(detailed).is_err());
+
+        // The domain is not empty: a message that does not carry its step, or a blank step, passes.
+        CoreError::refusal(RefusalCode::Behind, "Behind.", "forklift shift main");
+        CoreError::refusal(RefusalCode::Behind, "Behind.", "  ");
+        assert!(!restates_next_step("anything", ""));
+        assert!(restates_next_step("Run x now.", " x "));
     }
 }

@@ -102,13 +102,12 @@ async fn moved_under_merge(pallet: &str, found: Option<&str>) -> Result<Option<S
         format!(
             "Another bay or process moved pallet \"{}\" since this {} started: it was built on {}, \
             and the pallet is now at {}. Nothing was stacked, and the {} is kept: stacking it on the \
-            new head would revert what was stacked there. {}",
+            new head would revert what was stacked there.",
             pallet,
             what,
             base,
             found.unwrap_or("no head"),
-            what,
-            way_out
+            what
         ),
         way_out,
     ).into()))
