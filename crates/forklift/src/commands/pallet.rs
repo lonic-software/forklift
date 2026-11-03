@@ -521,13 +521,13 @@ fn moved_since_read(why: String, name: &str, head: &str, action: RemoteAction) -
         (Some(refusal @ error::RefusalCode::RemoteAhead), RemoteAction::Restore) => (refusal, format!(
             "The remote's pallet \"{}\" changed after this command read it ({}); nothing was changed. \
             Running the restore again acts on what the remote holds now.",
-            name, human.strip_suffix(" Lower and retry.").unwrap_or(human)
+            name, human.strip_suffix(" Lower and retry.").unwrap_or(&human)
         ), action.rerun(name)),
         (Some(refusal @ error::RefusalCode::RemoteAhead), RemoteAction::Delete) => (refusal, format!(
             "The remote's pallet \"{}\" changed after this command read it at {} ({}); nothing was \
             changed. Check what it holds now before deleting it; \"forklift pallet delete {} --remote \
             --at <head>\" deletes it only at the head you checked.",
-            name, head, human.strip_suffix(" Lower and retry.").unwrap_or(human), name
+            name, head, human.strip_suffix(" Lower and retry.").unwrap_or(&human), name
         ), listing),
         (Some(refusal @ error::RefusalCode::PalletDeletedOnRemote), RemoteAction::Restore) => (refusal, format!(
             "The remote's pallet \"{}\" was deleted again after this command read it; nothing was \

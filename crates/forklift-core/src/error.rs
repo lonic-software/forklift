@@ -38,6 +38,7 @@
 //! `forklift`'s `From<CoreError> for ForkliftError` matches [`RefusalCode`] exhaustively, so adding
 //! a code without wiring its exit code is a compile error.
 
+use std::borrow::Cow;
 use std::fmt;
 
 /// The framing that marks a refusal string so a String-typed segment can carry it losslessly and
@@ -434,11 +435,11 @@ impl From<String> for CoreError {
             return match (RefusalCode::from_code(code), details) {
                 (Some(code), Ok(details)) => CoreError::Refusal {
                     code,
-                    message: human.to_string(),
+                    message: human.into_owned(),
                     next_step: next_step.to_string(),
                     details,
                 },
-                _ => CoreError::Other(with_next_step(human, next_step)),
+                _ => CoreError::Other(with_next_step(&human, next_step)),
             };
         }
 
@@ -474,11 +475,10 @@ impl From<CoreError> for String {
     }
 }
 
-/// Append `extra` prose to an error's human-visible message, without corrupting a framed refusal
-/// the way a naive `format!("{} {}", error, extra)` would: [`deframe`] takes the frame's *third*
-/// field to end-of-string, so text appended to the raw string lands in `next_step`, not the
-/// message — where it would be printed under the "Next step" label and returned to a `--json`
-/// consumer as the recovery, which a note about the failure is not. This re-lifts `error`
+/// Append `extra` prose to an error's human-visible message, sanitized as a frame's fields are. A
+/// naive `format!("{} {}", error, extra)` on a framed refusal reads the same once decoded, since
+/// [`deframe`] takes what follows a frame's detail into its message; this is the typed spelling of
+/// it, and the one that sanitizes the extra text before it is framed. This re-lifts `error`
 /// through [`CoreError::from`] first, appends to whichever field is actually the rendered message,
 /// then lowers back to `String` (reframing a `Refusal`) — built entirely from the existing public
 /// `CoreError` API, no new framing primitive. A plain (unframed) `error` round-trips as
@@ -547,18 +547,26 @@ fn render_wrapped_frames(message: &str) -> Option<String> {
 }
 
 /// What follows a frame's detail field, `text`: the detail is one JSON value, and anything after it
-/// was written by a caller that wrapped the frame. `null` (no detail) is read by hand: a JSON stream
-/// takes a literal run straight into text (`null.`) for a malformed value, and would drop the rest.
+/// was written by a caller that wrapped the frame.
 fn after_detail(text: &str) -> &str {
+    split_detail(text).map_or("", |(_, rest)| rest)
+}
+
+/// A frame's detail field, `text`, split into its detail (`None` for `null`) and the text a caller
+/// wrote after it; `Err` when it does not open with a JSON value. `null` is read by hand: a JSON
+/// stream takes a literal run straight into text (`null.`) for a malformed value. Every other
+/// detail is an object, which ends itself.
+fn split_detail(text: &str) -> Result<(Option<serde_json::Value>, &str), ()> {
     if let Some(rest) = text.strip_prefix("null") {
-        return rest;
+        return Ok((None, rest));
     }
 
     let mut values = serde_json::Deserializer::from_str(text).into_iter::<serde_json::Value>();
 
     match values.next() {
-        Some(Ok(_)) => &text[values.byte_offset()..],
-        _ => "",
+        Some(Ok(serde_json::Value::Null)) => Ok((None, &text[values.byte_offset()..])),
+        Some(Ok(details)) => Ok((Some(details), &text[values.byte_offset()..])),
+        _ => Err(()),
     }
 }
 
@@ -608,8 +616,9 @@ pub fn sanitize_lines(text: &str) -> String {
     text.lines().map(sanitize).collect::<Vec<_>>().join("\n")
 }
 
-/// The label [`human_failure_text`] and [`with_next_step`] put before a next step. A next step is often a bare command
-/// (`forklift lower`), and printed unlabelled under an error it reads as the command that failed.
+/// The label [`human_failure_text`] and [`with_next_step`] put before a next step. A next step is
+/// often a bare command (`forklift lower`), and printed unlabelled under an error it reads as the
+/// command that failed.
 pub const NEXT_STEP_LABEL: &str = "Next step: ";
 
 /// What a head prints for a failure in human mode: the message, [sanitized](sanitize_lines), then
@@ -651,7 +660,9 @@ fn frame(code: &str, message: &str, next_step: &str, details: Option<&serde_json
 /// Decode a sentinel frame into `(code, message, next_step)`; `None` for any string that is not a
 /// frame. The inverse of [`frame`] without its detail, and the low-level primitive the servers'
 /// wire mapping parses — the wire carries no detail, so a detail field never reaches `next_step`.
-pub fn deframe(message: &str) -> Option<(&str, &str, &str)> {
+/// Text a caller wrote after the frame (`format!("{} More.", framed)`) joins the message,
+/// [sanitized](sanitize): it is about the failure, and is no part of the step or the detail.
+pub fn deframe(message: &str) -> Option<(&str, Cow<'_, str>, &str)> {
     deframe_with_details(message).map(|(code, human, next_step, _)| (code, human, next_step))
 }
 
@@ -659,20 +670,21 @@ pub fn deframe(message: &str) -> Option<(&str, &str, &str)> {
 /// carries any — `Err(())` when it does not parse as JSON, for the caller to refuse to decode a
 /// refusal from (never a refusal quietly missing the details its code promises).
 #[allow(clippy::type_complexity)]
-fn deframe_with_details(message: &str) -> Option<(&str, &str, &str, Result<Option<serde_json::Value>, ()>)> {
+fn deframe_with_details(message: &str) -> Option<(&str, Cow<'_, str>, &str, Result<Option<serde_json::Value>, ()>)> {
     let rest = message.strip_prefix(REFUSAL_PREFIX)?;
     let mut parts = rest.splitn(4, REFUSAL_FIELD_SEPARATOR);
 
     let code = parts.next()?;
     let human = parts.next()?;
     let next_step = parts.next()?;
-    let details = match parts.next() {
-        None => Ok(None),
-        Some(text) => match serde_json::from_str(text) {
-            Ok(serde_json::Value::Null) => Ok(None),
-            Ok(details) => Ok(Some(details)),
-            Err(_) => Err(()),
-        },
+    let (details, after) = match parts.next().map(split_detail) {
+        None => (Ok(None), ""),
+        Some(Ok((details, after))) => (Ok(details), after),
+        Some(Err(())) => (Err(()), ""),
+    };
+    let human = match after.trim() {
+        "" => Cow::Borrowed(human),
+        _ => Cow::Owned(sanitize(&format!("{}{}", human, after))),
     };
 
     Some((code, human, next_step, details))
@@ -684,7 +696,10 @@ mod tests {
 
     #[test]
     fn a_frame_whose_details_do_not_parse_is_not_decoded_as_a_refusal() {
-        let framed = format!("{}{}{{not json", frame("trust_changed", "changed", "verify", None), REFUSAL_FIELD_SEPARATOR);
+        let framed = format!(
+            "{}trust_changed{}changed{}verify{}{{not json",
+            REFUSAL_PREFIX, REFUSAL_FIELD_SEPARATOR, REFUSAL_FIELD_SEPARATOR, REFUSAL_FIELD_SEPARATOR,
+        );
 
         // The texts survive and the code is dropped, as for an unknown code; the raw frame never
         // reaches output.
@@ -775,10 +790,8 @@ mod tests {
 
     #[test]
     fn append_to_message_extends_the_message_not_the_next_step() {
-        // PR #84 review, findings 2/3: appending via a naive `format!("{} extra", framed)` lands
-        // the extra text in `next_step` (deframe's third field takes the rest of the string), not
-        // in `message` — invisible in human mode, which prints `message` only. This is the
-        // falsifier: red under that naive approach, green under `append_to_message`.
+        // The extra text joins `message`, never `next_step`, where it would print under the
+        // "Next step" label and reach a `--json` consumer as the recovery.
         let original = CoreError::refusal(
             RefusalCode::OversizedTransportUnsupported, "too big", "shrink it",
         );
@@ -906,6 +919,32 @@ mod tests {
 
         // An `Other` has no step, and is made inert like a refusal: it can quote a path or a peer.
         assert_eq!(CoreError::Other("a\x1b[2J\nb".to_string()).human_text(), "a [2J\nb");
+    }
+
+    /// Text a caller writes after a frame that starts the string (`format!("{} More.", e)`) joins
+    /// the message, and the refusal keeps its code, step and detail. Revert: read the detail field
+    /// whole → the detail does not parse, so the text and the code are both lost; join the text to
+    /// the step → it prints as the recovery.
+    #[test]
+    fn text_after_a_leading_frame_joins_its_message() {
+        let framed: String = CoreError::refusal(RefusalCode::CacheMiss, "object x is missing.", "Wait for it.").into();
+
+        assert_eq!(
+            CoreError::from(format!("{} The undo entry is kept.\nRun it again.", framed)),
+            CoreError::refusal(RefusalCode::CacheMiss, "object x is missing. The undo entry is kept. Run it again.", "Wait for it."),
+        );
+
+        let detailed: String = CoreError::refusal_with_details(
+            RefusalCode::CacheMiss, "object y is missing.", "Wait.", serde_json::json!({"hash": "y"})
+        ).into();
+
+        assert_eq!(
+            CoreError::from(format!("{} Nothing was written.", detailed)),
+            CoreError::refusal_with_details(
+                RefusalCode::CacheMiss, "object y is missing. Nothing was written.", "Wait.", serde_json::json!({"hash": "y"})
+            ),
+        );
+        assert_eq!(deframe(&format!("{} More.", framed)).map(|(_, human, _)| human.into_owned()), Some("object x is missing. More.".to_string()));
     }
 
     #[test]
