@@ -5253,13 +5253,20 @@ fn stocktake_lists_an_untracked_folder_holding_one_it_cannot_list() {
     use std::os::unix::fs::PermissionsExt;
     let warehouse = TestWarehouse::new("stocktake-unlistable");
     assert_success(&warehouse.run(&["prepare"]));
+    // `u/locked` cannot even be looked into, `w/unlisted` can be looked into but not listed.
     warehouse.write_file("u/locked/f", "f\n");
     warehouse.write_file("v/.gitignore", "*\n");
-    let locked = warehouse.root.join("u/locked");
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    warehouse.write_file("w/unlisted/f", "f\n");
+    let modes = [("u/locked", 0o000), ("w/unlisted", 0o100)];
+    for (path, mode) in modes {
+        std::fs::set_permissions(warehouse.root.join(path), std::fs::Permissions::from_mode(mode)).unwrap();
+    }
     let unstaged = changes(&warehouse, "unstaged");
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert_eq!(unstaged, [("untracked".to_string(), "u/".to_string())]);
+    for (path, _) in modes {
+        std::fs::set_permissions(warehouse.root.join(path), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let untracked = |path: &str| ("untracked".to_string(), path.to_string());
+    assert_eq!(unstaged, [untracked("u/"), untracked("w/")]);
 }
 
 #[test]
