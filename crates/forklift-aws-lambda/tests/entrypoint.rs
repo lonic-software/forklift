@@ -1774,8 +1774,8 @@ fn prepare(area: &Area, dir: &str) {
     area.forklift(dir, &["config", "set", "--global", "operator.identifier", "tester@forklift"]);
 }
 
-/// A store an upgrade marks while a request is between its gate and its commit: reading the trust
-/// anchor, which every ref update does before it commits, sets the mark.
+/// A store an upgrade marks while a request is committing: after every gate the request makes,
+/// and before the commit's transaction checks its fence, so only that check can refuse it.
 #[derive(Clone)]
 struct MarkedMidRequest(Arc<MemoryRefStore>);
 
@@ -1800,6 +1800,7 @@ impl RefStore for MarkedMidRequest {
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
+        self.0.set_format(Some("1>2 operator 0"));
         self.0.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
     }
     fn delete_head(
@@ -1821,7 +1822,6 @@ impl RefStore for MarkedMidRequest {
         self.0.default_pallet()
     }
     fn get_trust(&self) -> Result<Option<(office_utils::TrustAnchor, String)>, String> {
-        self.0.set_format(Some("1>2 operator 0"));
         self.0.get_trust()
     }
     fn put_trust_if_absent(
