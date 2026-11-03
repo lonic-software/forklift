@@ -35,13 +35,49 @@ pieces of its own format under another number.
 
 | Marker | Refusal | Exit | Way out |
 |---|---|---|---|
-| `upgrading` present | `warehouse_upgrade_incomplete` | 42 | Run the upgrade again, with a build that reads the target format. |
-| Older than this build | `warehouse_format_older` | 40 | Run the upgrade. |
+| `upgrading` present | `warehouse_upgrade_incomplete` | 42 | Run the upgrade again, with a build that reads the target format. If this build would finish it but does not upgrade the format it started from, `warehouse_format_older` (40): make the warehouse again. |
+| Older than this build | `warehouse_format_older` | 40 | Run the upgrade; for a format older than any the build upgrades, make the warehouse again. |
 | Newer than this build | `warehouse_format_newer` | 41 | Update the binary. Upgrades are one-way. |
 
-A `--warehouses` server answers `503` for such a warehouse and serves the others. The upgrade command
-itself is not built yet; the refusals name it ahead of it. No warehouse can reach the first or third
-row without a hand-edited marker until a second format exists.
+A `--warehouses` server answers `503` for such a warehouse and serves the others. No warehouse can
+reach the first or third row without a hand-edited marker until a second format exists.
+
+## The upgrade
+
+`forklift upgrade`, run anywhere in the warehouse's own working tree, and `forklift-server upgrade
+--root <root>` upgrade a warehouse in place. Each is dispatched before the gate and opens the warehouse
+itself:
+
+1. A bay is refused with the warehouse to run it in, since a bay is upgraded with its warehouse. An
+   unfinished clone is refused too (`clone_incomplete`); running the clone again finishes it in the
+   new build's format.
+2. It takes the [lease](#the-lease) exclusively with a try. If anything holds it, the upgrade refuses at
+   once (`warehouse_in_use`, exit 45): every other command, a server serving the warehouse, a bundle
+   or a gc.
+3. It moves one format at a time. Before the first change it records `upgrading F+1 0`, by replacing
+   the marker atomically, so a crash leaves every other command refusing the warehouse.
+4. It runs that format's steps in order. A step is recorded done only after it returns, which is after
+   its writes are synced, so a step can be run again after a crash and must be idempotent. The steps
+   are given the forklift folder and the state folder of every bay.
+5. It records `format F+1` with no upgrade, and takes the next format until it reaches the one it reads.
+
+Run again after a crash or a failed step, the upgrade resumes at the first step not recorded done. Steps
+run with the warehouse as the storage root (the CLI also changes into the warehouse root), and a step
+that spreads work over threads enters that root on each. The mode word is kept, unless a step rewrites
+it.
+
+What it cannot carry it refuses, changing nothing:
+
+| Marker | Refusal | Exit | Way out |
+|---|---|---|---|
+| In the build's format | none | 0 | Nothing to do. |
+| Older than any format the build upgrades | `warehouse_format_older` | 40 | Make the warehouse again. |
+| Newer than the build | `warehouse_format_newer` | 41 | Update the binary. |
+| `upgrading` to a format newer than the build | `warehouse_upgrade_incomplete` | 42 | Update the binary, and run its upgrade. |
+| Steps done, but the mode left is not one the build reads | `warehouse_upgrade_incomplete` | 42 | Update the binary to one whose upgrade reads that mode; the upgrade stays on record and it resumes there. |
+
+Format 1 is the first format, so the chain this build carries is empty, and nothing older than format 1
+is ever upgraded.
 
 ## The lease
 

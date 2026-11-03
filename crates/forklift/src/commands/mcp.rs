@@ -745,6 +745,7 @@ fn progress_notification(token: &Value, progress: f64, message: Option<String>) 
 /// bay-state folder, never the materialized working tree.
 pub(crate) const HUMAN_ONLY: &[(&str, &str)] = &[
     ("prepare", "creates a warehouse, which is setup"),
+    ("upgrade", "changes the format of the whole warehouse, every bay's included, one way, which is setup"),
     ("config", "reads and sets configuration, which is setup"),
     ("profile", "manages identity profiles, which is setup"),
     ("clone", "clones a remote, which is setup"),
@@ -1706,7 +1707,7 @@ mod tests {
                      "office_list", "tag_list", "haul_list", "scope_status", "manifest_set", "pick"] {
             assert!(names.contains(&name), "{name} must be a tool");
         }
-        for name in ["office", "tag", "haul", "scope", "pallet", "office_enroll", "office_regenesis", "prepare",
+        for name in ["office", "tag", "haul", "scope", "pallet", "office_enroll", "office_regenesis", "prepare", "upgrade",
                      "self_schema", "self_update", "self_alias", "self_alias_install", "mcp", "help", "clone"] {
             assert!(!names.contains(&name), "{name} must not be a tool");
         }

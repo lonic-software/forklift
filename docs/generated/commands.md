@@ -117,5 +117,6 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `tag list` |  |  | List every tag (the default) |
 | `undo` |  |  | Undo the last stack, consolidate, pick, shift or pallet delete |
 | `unload` | `ul` |  | Unstage a file or directory (keep your changes) |
+| `upgrade` |  |  | Upgrade the warehouse to the format this version of Forklift reads |
 | `version` |  |  | Print the version of Forklift |
 

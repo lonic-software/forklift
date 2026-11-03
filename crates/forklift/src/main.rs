@@ -564,6 +564,7 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
             None => commands::park::park_changes().await,
         },
         Command::Prepare => commands::prepare::handle_command(cli.verbose),
+        Command::Upgrade => commands::upgrade::handle_command(),
         Command::Remove { path } => commands::remove::handle_command(&path),
         Command::Restore { path, confirm } => commands::restore::handle_command(&path, confirm),
         Command::Scope { action } => match action {

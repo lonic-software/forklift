@@ -64,6 +64,27 @@ again. It refuses a bay's folder too. A new `.forklift/` (or one that is there b
 the next `prepare` in the same directory removes it; one it cannot tell is abandoned
 is left for you to delete.
 
+### `upgrade` — move a warehouse to this version's format
+
+```sh
+forklift upgrade
+```
+
+The marker also records the warehouse's [format](../format/WAREHOUSE_FORMAT.md), and a
+version of Forklift reads exactly one. Every other command refuses a warehouse in an older
+format with `warehouse_format_older` (exit 40) and names this command, when this version can
+upgrade that format. `upgrade` moves the
+warehouse, with all its bays, one format at a time to the one this version reads, and
+finishes an upgrade that was interrupted: run again, it resumes where it stopped. A warehouse
+already in this version's format is left as it is ("Nothing to do.").
+
+Run it in the warehouse's own working tree; in a bay it names the warehouse to run it in. It
+needs the warehouse to itself, so it refuses at once with `warehouse_in_use` (exit 45) while
+any other Forklift command, in the warehouse or a bay, or a server serving it has it open. A
+format older than any this version upgrades is refused with the way to make the warehouse
+again, and a newer one with the advice to update Forklift. Upgrades are one-way. Format 1 is
+the first format, so there is nothing to upgrade yet.
+
 ### `git import` — migrate a git repository
 
 ```sh

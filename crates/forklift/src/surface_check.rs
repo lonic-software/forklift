@@ -211,13 +211,11 @@ fn the_surface_spec_names_exactly_the_binarys_commands() {
 /// roots 1"), and a test's made-up command ("dollar"). A mention is exempt when its leading words
 /// are one of these. Every other mention of `forklift <word>` is a hint and is parsed, so a hint
 /// whose command is renamed fails rather than passing as prose. No entry may be a command path,
-/// or a hint naming that command could hide behind it ([`no_exemption_is_a_command`]). `upgrade` is
-/// named by the format refusals ahead of the command itself, and that test removes it from here
-/// when the command lands.
+/// or a hint naming that command could hide behind it ([`no_exemption_is_a_command`]).
 const NOT_COMMANDS: &[&str] = &[
     "binary", "bundle", "cannot", "created", "does", "dollar", "hook", "is", "key", "knows", "left",
     "manages", "mirror roots", "piped", "process", "records", "recognizes", "reversible", "root",
-    "server", "should", "tree", "upgrade", "warehouse", "was", "with", "writer", "wrote",
+    "server", "should", "tree", "warehouse", "was", "with", "writer", "wrote",
 ];
 
 /// The words of `text` an exemption is matched against: runs of letters, digits and `-`.

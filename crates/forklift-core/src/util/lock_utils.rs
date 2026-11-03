@@ -61,15 +61,7 @@ impl FormatLease {
     ///                       `warehouse_lease_missing` refusal when it is missing and cannot be
     ///                       created, or it could not be opened or locked.
     pub fn shared(forklift: &Path) -> Result<FormatLease, CoreError> {
-        let path = absolute(forklift.join(FILE_NAME_FORMAT_LOCK));
-
-        let file = match std::fs::File::open(&path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => create_format_sidecar(&path)?,
-            Err(e) => return Err(format!(
-                "Error while opening the lock file \"{}\": {}", path.to_string_lossy(), e
-            ).into()),
-        };
+        let (file, path) = open_format_sidecar(forklift)?;
 
         match file.try_lock_shared() {
             Ok(()) => Ok(FormatLease { _file: file }),
@@ -82,11 +74,54 @@ impl FormatLease {
         }
     }
 
+    /// Take the exclusive hold an upgrade works under on the warehouse whose forklift root folder is
+    /// `forklift`. It never waits: a warehouse anyone has open is refused, whoever holds it.
+    ///
+    /// # Returns
+    /// * `Ok(FormatLease)` - The exclusive hold (released when dropped).
+    /// * `Err(CoreError)`  - A `warehouse_in_use` refusal when any other process holds it, a
+    ///                       `warehouse_lease_missing` refusal when it is missing and cannot be
+    ///                       created, or it could not be opened or locked.
+    pub fn exclusive(forklift: &Path) -> Result<FormatLease, CoreError> {
+        let (file, path) = open_format_sidecar(forklift)?;
+
+        match file.try_lock() {
+            Ok(()) => Ok(FormatLease { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(CoreError::refusal(
+                RefusalCode::WarehouseInUse,
+                format!(
+                    "The warehouse at \"{}\" is in use: another Forklift process has it open, a command in \
+                    it or in one of its bays, a server serving it, or another upgrade.",
+                    warehouse_root_of(&path)
+                ),
+                "Let every Forklift command working there finish and stop any server serving it, then run \
+                the upgrade again.",
+            )),
+            Err(std::fs::TryLockError::Error(e)) => Err(lock_error(&path, &e).into()),
+        }
+    }
+
     /// Keep the hold until the process exits, when the kernel releases it. For a process that
     /// opens its warehouse once and works in it to the end; the handle is left open on purpose.
     pub fn hold_until_exit(self) {
         std::mem::forget(self);
     }
+}
+
+/// Open the format lease sidecar in the forklift root folder `forklift` read-only, creating it when
+/// it is missing, and say where it is.
+fn open_format_sidecar(forklift: &Path) -> Result<(std::fs::File, PathBuf), CoreError> {
+    let path = absolute(forklift.join(FILE_NAME_FORMAT_LOCK));
+
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => create_format_sidecar(&path)?,
+        Err(e) => return Err(format!(
+            "Error while opening the lock file \"{}\": {}", path.to_string_lossy(), e
+        ).into()),
+    };
+
+    Ok((file, path))
 }
 
 /// Create the format lease sidecar at `path`, for [`FormatLease::shared`] and for prepare. One
