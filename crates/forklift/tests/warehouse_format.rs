@@ -102,14 +102,13 @@ fn source_constants(crates: &[&str]) -> Vec<(String, String)> {
 /// the second.
 #[test]
 fn every_name_constant_is_in_the_census() {
-    let in_source: BTreeSet<String> = source_constants(&["forklift-core", "forklift", "forklift-server", "forklift-aws-lambda"])
+    let in_source = unique_keys(source_constants(&["forklift-core", "forklift", "forklift-server", "forklift-aws-lambda"])
         .into_iter()
         .filter(|(key, typed)| {
             let name = key.rsplit("::").next().unwrap();
             NAME_PREFIXES.iter().any(|prefix| name.starts_with(prefix)) && typed.contains("str")
         })
-        .map(|(key, _)| key)
-        .collect();
+        .map(|(key, _)| key));
     assert!(in_source.len() > 40, "the scan finds the constants: {:?}", in_source);
 
     let in_census: BTreeSet<String> = census().into_iter().flat_map(|row| row.names).collect();
@@ -121,24 +120,44 @@ fn every_name_constant_is_in_the_census() {
     assert!(stale.is_empty(), "census names that are not constants in the source: {:?}", stale);
 }
 
-/// The record and object versions in the source, by `module::NAME`.
-fn source_versions() -> BTreeMap<String, u64> {
-    source_constants(&["forklift-core"]).into_iter()
-        .filter(|(key, _)| {
-            let name = key.rsplit("::").next().unwrap();
-            (name.contains("VERSION") || name.contains("FORMAT")) && !NOT_VERSIONS.contains(&key.as_str())
-        })
+/// `keys` as a set, failing on one that appears twice: two files with one stem would otherwise
+/// hide each other's constant.
+fn unique_keys(keys: impl IntoIterator<Item = String>) -> BTreeSet<String> {
+    let mut set = BTreeSet::new();
+    for key in keys {
+        assert!(set.insert(key.clone()), "two constants are both {}: rename one, so each is checked", key);
+    }
+    set
+}
+
+/// The record and object versions in the source, by `module::NAME`, each as its value is written:
+/// integer constants named for a version or format, and string constants naming a schema, magic or
+/// header that carry a version number in their text. Protocol versions are not the warehouse's.
+fn source_versions() -> BTreeMap<String, String> {
+    let versions: Vec<(String, String)> = source_constants(&["forklift-core"]).into_iter()
+        .filter(|(key, _)| !NOT_VERSIONS.contains(&key.as_str()))
         .filter_map(|(key, typed)| {
+            let name = key.rsplit("::").next().unwrap();
             let (kind, value) = typed.split_once('=')?;
-            let kind = kind.trim();
-            let integer = ["u8", "u16", "u32", "u64", "i64"].contains(&kind);
-            integer.then(|| (key, value.trim().trim_end_matches(';').parse().unwrap()))
+            let (kind, value) = (kind.trim(), value.trim().trim_end_matches(';').to_string());
+
+            let integer = ["u8", "u16", "u32", "u64", "i64"].contains(&kind)
+                && (name.contains("VERSION") || name.contains("FORMAT"));
+            let text = kind == "&str"
+                && ["SCHEMA", "MAGIC", "HEADER", "VERSION"].iter().any(|word| name.contains(word))
+                && !name.contains("PROTOCOL")
+                && value.chars().any(|c| c.is_ascii_digit());
+
+            (integer || text).then_some((key, value))
         })
-        .collect()
+        .collect();
+
+    unique_keys(versions.iter().map(|(key, _)| key.clone()));
+    versions.into_iter().collect()
 }
 
 fn current_format() -> u64 {
-    source_versions()["warehouse_utils::WAREHOUSE_FORMAT"]
+    source_versions()["warehouse_utils::WAREHOUSE_FORMAT"].parse().unwrap()
 }
 
 fn fixtures_root() -> PathBuf {
@@ -167,13 +186,13 @@ fn the_versions_are_the_current_formats() {
 
     let format = current_format();
     let path = fixtures_root().join(format!("format-{}", format)).join("versions");
-    let snapshot: BTreeMap<String, u64> = std::fs::read_to_string(&path)
+    let snapshot: BTreeMap<String, String> = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("format {} has no version snapshot at {}: {}", format, path.display(), e))
         .lines()
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(|line| {
             let (key, value) = line.split_once(" = ").unwrap_or_else(|| panic!("a snapshot line is NAME = N: {}", line));
-            (key.to_string(), value.parse().unwrap())
+            (key.to_string(), value.to_string())
         })
         .collect();
 
