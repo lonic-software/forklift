@@ -103,6 +103,7 @@ Each of these commands, and every command below it, is a tool for nobody: a pers
 These arguments are left out of their command's tool, which is served without them:
 
 - `remote` of `forklift pallet delete`: it deletes the remote's pallet, which every clone shares: an admin's call, never a sub-agent's.
+- `at` of `forklift pallet delete`: it pins a delete of the remote's pallet, which is not served here.
 
 These families' bare form runs the same operation as one of their subcommands, so only the subcommand is a tool:
 
