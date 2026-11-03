@@ -44,19 +44,19 @@ use crate::util::{
     audit_utils, bundle_utils, byte_utils, delta_utils, fanout_utils, file_utils, graph_utils,
     lock_utils, object_utils, pallet_utils, sign_utils,
 };
-use crate::util::signature_table::{self, SignatureTable, SIGNATURE_TABLE_EXTENSION};
+use crate::util::signature_table::{self, SignatureTable, FILE_EXTENSION_SIGNATURE_TABLE};
 
 /// The folder under the object store that holds packs.
-pub(crate) const PACK_FOLDER_NAME: &str = "pack";
+pub(crate) const FOLDER_NAME_PACK: &str = "pack";
 
 /// The extension of a pack's data file (concatenated object blobs). `pub(crate)` so the
 /// durability-taint recovery walk (`recovery_utils`) can recognize a recorded taint path as a
 /// pack file without duplicating the literal.
-pub(crate) const PACK_DATA_EXTENSION: &str = "pack";
+pub(crate) const FILE_EXTENSION_PACK_DATA: &str = "pack";
 
 /// The extension of a pack's index file (sorted hash → offset/length records). `pub(crate)` for
-/// the same reason as [`PACK_DATA_EXTENSION`].
-pub(crate) const PACK_INDEX_EXTENSION: &str = "idx";
+/// the same reason as [`FILE_EXTENSION_PACK_DATA`].
+pub(crate) const FILE_EXTENSION_PACK_INDEX: &str = "idx";
 
 /// Magic + version prefixing a pack data file (so a truncated or foreign file is rejected).
 const PACK_DATA_MAGIC: &[u8; 8] = b"FORKPACK";
@@ -547,7 +547,7 @@ fn count_partial_signature_tables(threshold: usize, bound: usize) -> Result<usiz
     let mut partial = Vec::new();
     for entry in entries {
         let path = entry.map_err(|e| format!("Error while counting signature tables: {}", e))?.path();
-        if path.extension().and_then(|e| e.to_str()) != Some(SIGNATURE_TABLE_EXTENSION) {
+        if path.extension().and_then(|e| e.to_str()) != Some(FILE_EXTENSION_SIGNATURE_TABLE) {
             continue;
         }
         let mut header = [0u8; 16];
@@ -579,7 +579,7 @@ fn count_pack_files() -> Result<usize, String> {
     let mut count = 0;
     for entry in entries {
         let entry = entry.map_err(|e| format!("Error while counting packs: {}", e))?;
-        if entry.path().extension().and_then(|e| e.to_str()) == Some(PACK_DATA_EXTENSION) {
+        if entry.path().extension().and_then(|e| e.to_str()) == Some(FILE_EXTENSION_PACK_DATA) {
             count += 1;
         }
     }
@@ -1236,7 +1236,7 @@ impl LoadedPack {
     }
 
     fn index_path(&self) -> PathBuf {
-        self.data_path.with_extension(PACK_INDEX_EXTENSION)
+        self.data_path.with_extension(FILE_EXTENSION_PACK_INDEX)
     }
 
     /// The error a reader reports for an index bucket that failed validation. While a full repack
@@ -1419,7 +1419,7 @@ impl PairStamp {
 fn pair_stamp(index_path: &Path) -> PairStamp {
     let read_at = SystemTime::now();
     let index = file_stamp(index_path);
-    let data = file_stamp(&index_path.with_extension(PACK_DATA_EXTENSION));
+    let data = file_stamp(&index_path.with_extension(FILE_EXTENSION_PACK_DATA));
 
     let settles_at = [&index, &data].into_iter()
         .filter_map(|stamp| match stamp {
@@ -1564,7 +1564,7 @@ fn registry() -> &'static Mutex<HashMap<String, Arc<PackSet>>> {
 /// recovery walk (`recovery_utils`) can recognize a recorded taint path as living under it,
 /// without duplicating the folder layout.
 pub(crate) fn pack_folder() -> PathBuf {
-    PathBuf::from(file_utils::get_path_objects_root()).join(PACK_FOLDER_NAME)
+    PathBuf::from(file_utils::get_path_objects_root()).join(FOLDER_NAME_PACK)
 }
 
 /// Read the packs for the active warehouse, loading and caching them on first use. The
@@ -1733,7 +1733,7 @@ static RELOAD_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock
 /// "not current", so the reload that follows reports it as the environment failure it is.
 fn pack_set_is_current(set: &PackSet, folder: &Path) -> Result<bool, String> {
     let broken = set.quarantined.iter()
-        .map(|q| (&q.index_path, &q.stamp, q.failure, q.attempted_at, q.index_path.with_extension(PACK_DATA_EXTENSION)))
+        .map(|q| (&q.index_path, &q.stamp, q.failure, q.attempted_at, q.index_path.with_extension(FILE_EXTENSION_PACK_DATA)))
         .chain(set.unenumerable.iter()
             .map(|u| (&u.index_path, &u.stamp, u.failure, u.attempted_at, u.index_path.clone())))
         // A table has no data file, so its stamp's data half stays `Absent` on both sides.
@@ -2068,14 +2068,14 @@ pub fn forget_warehouse() {
 /// pass is the one thing that lets them see cross-path similarity too, so the marker is a hint
 /// that the win is still on the table, not something anything auto-runs (redelta is a one-shot,
 /// CPU-bound minutes-long pass — out of budget for auto-maintenance's cheap-and-rare contract).
-const DENSIFY_MARKER_NAME: &str = "densify-pending";
+const FILE_NAME_DENSIFY_MARKER: &str = "densify-pending";
 
 /// Record that this store would benefit from a `compact --all --redelta` pass. Best-effort: a
 /// failure here must never fail the ingest that just succeeded, so errors are swallowed — a
 /// missed marker only costs a missed suggestion, never correctness.
 fn mark_densify_pending(pack_folder: &Path) {
     let _ = std::fs::write(
-        pack_folder.join(DENSIFY_MARKER_NAME),
+        pack_folder.join(FILE_NAME_DENSIFY_MARKER),
         "This store was bulk-ingested (git import or a clone bundle install) and has not \
         been through a full delta-compress pass yet. Run \"forklift store compact --all --redelta\" \
         to shrink it further. Safe to delete; it is only a hint.\n",
@@ -2087,14 +2087,14 @@ fn mark_densify_pending(pack_folder: &Path) {
 /// repeated back-to-back on the same store (see the KNOWN GAP note on `retrieve_from_packs`).
 /// Best-effort, same reasoning as `mark_densify_pending`.
 fn clear_densify_pending(pack_folder: &Path) {
-    let _ = std::fs::remove_file(pack_folder.join(DENSIFY_MARKER_NAME));
+    let _ = std::fs::remove_file(pack_folder.join(FILE_NAME_DENSIFY_MARKER));
 }
 
 /// Whether the object store carries the densify-pending marker — surfaced by `store` as a
 /// suggestion. Never consulted to decide behavior; the marker is presence-only and read here as
 /// a plain existence check, not parsed.
 pub fn densify_pending() -> Result<bool, String> {
-    Ok(pack_folder().join(DENSIFY_MARKER_NAME).exists())
+    Ok(pack_folder().join(FILE_NAME_DENSIFY_MARKER).exists())
 }
 
 /// Load every pack in `pack_folder` (its data file and index mapped). A missing pack folder is
@@ -2152,7 +2152,7 @@ fn load_packs_from_disk(pack_folder: &Path, check: IndexCheck) -> Result<PackSet
             names.push(entry.file_name());
         }
 
-        if path.extension().and_then(|e| e.to_str()) == Some(SIGNATURE_TABLE_EXTENSION) {
+        if path.extension().and_then(|e| e.to_str()) == Some(FILE_EXTENSION_SIGNATURE_TABLE) {
             match open_signature_table(&path, check) {
                 Ok(table) => signature_tables.push(table),
                 Err(table) => unreadable_signature_tables.push(table),
@@ -2160,7 +2160,7 @@ fn load_packs_from_disk(pack_folder: &Path, check: IndexCheck) -> Result<PackSet
             continue;
         }
 
-        if path.extension().and_then(|e| e.to_str()) != Some(PACK_INDEX_EXTENSION) {
+        if path.extension().and_then(|e| e.to_str()) != Some(FILE_EXTENSION_PACK_INDEX) {
             continue;
         }
 
@@ -2191,7 +2191,7 @@ fn load_packs_from_disk(pack_folder: &Path, check: IndexCheck) -> Result<PackSet
 fn is_pack_file_name(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()),
-        Some(PACK_INDEX_EXTENSION) | Some(PACK_DATA_EXTENSION) | Some(SIGNATURE_TABLE_EXTENSION)
+        Some(FILE_EXTENSION_PACK_INDEX) | Some(FILE_EXTENSION_PACK_DATA) | Some(FILE_EXTENSION_SIGNATURE_TABLE)
     )
 }
 
@@ -2330,7 +2330,7 @@ enum PairOutcome {
 fn classify_pack_pair(index_path: &Path, check: IndexCheck) -> PairOutcome {
     let stamp = pair_stamp(index_path);
     let attempted_at = Instant::now();
-    let data_path = index_path.with_extension(PACK_DATA_EXTENSION);
+    let data_path = index_path.with_extension(FILE_EXTENSION_PACK_DATA);
 
     let pair_failure = match load_pack_pair_classified(&data_path, index_path) {
         Ok(pack) => match check {
@@ -2594,8 +2594,8 @@ pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
                 ));
             }
 
-            let data_path = temp_path(&folder, PACK_DATA_EXTENSION);
-            let index_path = temp_path(&folder, PACK_INDEX_EXTENSION);
+            let data_path = temp_path(&folder, FILE_EXTENSION_PACK_DATA);
+            let index_path = temp_path(&folder, FILE_EXTENSION_PACK_INDEX);
             staged.push(StagedTransportPack { data_path, index_path });
             let pair = staged.last().expect("the transport staging pair was just pushed");
             copy_exact_to_file(reader, *data_len, &pair.data_path, "pack data")?;
@@ -2646,8 +2646,8 @@ pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
         let mut published_this_run: Vec<PathBuf> = Vec::new();
 
         for (pair, pack_id) in staged.iter().zip(&pack_ids) {
-            let data_final = folder.join(format!("{}.{}", pack_id, PACK_DATA_EXTENSION));
-            let index_final = folder.join(format!("{}.{}", pack_id, PACK_INDEX_EXTENSION));
+            let data_final = folder.join(format!("{}.{}", pack_id, FILE_EXTENSION_PACK_DATA));
+            let index_final = folder.join(format!("{}.{}", pack_id, FILE_EXTENSION_PACK_INDEX));
 
             match (data_final.exists(), index_final.exists()) {
                 (true, true) => {
@@ -2779,8 +2779,16 @@ fn verify_incoming_packs(packs: &[LoadedPack])
         let mut hash = [0u8; HASH_LEN];
         hash.copy_from_slice(locator.hash_of(*entry));
         let bytes = resolve_incoming_object(&hash, &locator, &mut cache, &mut visiting, 0)?;
-        if matches!(object_utils::peek_object_header(&bytes), Ok((ObjectType::Parcel, _))) {
-            parcels.insert(sign_utils::to_hex(&hash));
+        // `resolve_incoming_object` has already refused an unknown version. It is refused here too
+        // rather than skipped, since a parcel left out of this set escapes the signature checks.
+        match object_utils::peek_object_header(&bytes) {
+            Ok((ObjectType::Parcel, _)) => {
+                parcels.insert(sign_utils::to_hex(&hash));
+            }
+            Ok(_) | Err(object_utils::PeekError::Malformed(_)) => {}
+            Err(error @ object_utils::PeekError::UnknownVersion(_)) => {
+                return Err(format!("Incoming object {}: {}", sign_utils::to_hex(&hash), error));
+            }
         }
         hashes.push(hash);
     }
@@ -4260,7 +4268,7 @@ fn open_signature_tables(pack_folder: &Path) -> Result<Vec<TableFile>, String> {
     let mut tables = Vec::new();
     for entry in entries {
         let path = entry.map_err(|e| format!("Error while listing the pack folder: {}", e))?.path();
-        if path.extension().and_then(|e| e.to_str()) != Some(SIGNATURE_TABLE_EXTENSION) {
+        if path.extension().and_then(|e| e.to_str()) != Some(FILE_EXTENSION_SIGNATURE_TABLE) {
             continue;
         }
 
@@ -4575,12 +4583,12 @@ fn write_signature_tables(pack_folder: &Path,
     let mut written: Vec<PathBuf> = Vec::new();
 
     for chunk in entries.chunks(bound.max(1)) {
-        let final_path = pack_folder.join(format!("{}.{}", signature_table::table_id(chunk), SIGNATURE_TABLE_EXTENSION));
+        let final_path = pack_folder.join(format!("{}.{}", signature_table::table_id(chunk), FILE_EXTENSION_SIGNATURE_TABLE));
         if stands(&final_path) {
             names.insert(final_path);
             continue;
         }
-        let temp = temp_path(pack_folder, SIGNATURE_TABLE_EXTENSION);
+        let temp = temp_path(pack_folder, FILE_EXTENSION_SIGNATURE_TABLE);
         write_and_sync(&temp, &signature_table::build(chunk))?;
         file_utils::rename(&temp, &final_path).map_err(|e| format!(
             "Error while finalizing signature table \"{}\": {}", final_path.to_string_lossy(), e
@@ -5922,7 +5930,7 @@ struct PackWriter {
 impl PackWriter {
     /// Start a new pack, writing to a temp data file in the pack folder.
     fn new(pack_folder: &Path) -> Result<PackWriter, String> {
-        let data_temp_path = temp_path(pack_folder, PACK_DATA_EXTENSION);
+        let data_temp_path = temp_path(pack_folder, FILE_EXTENSION_PACK_DATA);
         let file = std::fs::File::create(&data_temp_path).map_err(|e| format!(
             "Error while creating pack file \"{}\": {}", data_temp_path.to_string_lossy(), e
         ))?;
@@ -6035,11 +6043,11 @@ impl PackWriter {
         let pack_id = compute_pack_id(&self.records);
         let index_bytes = build_index_bytes(&self.records);
 
-        let index_temp_path = temp_path(&self.pack_folder, PACK_INDEX_EXTENSION);
+        let index_temp_path = temp_path(&self.pack_folder, FILE_EXTENSION_PACK_INDEX);
         write_and_sync(&index_temp_path, &index_bytes)?;
 
-        let data_final = self.pack_folder.join(format!("{}.{}", pack_id, PACK_DATA_EXTENSION));
-        let index_final = self.pack_folder.join(format!("{}.{}", pack_id, PACK_INDEX_EXTENSION));
+        let data_final = self.pack_folder.join(format!("{}.{}", pack_id, FILE_EXTENSION_PACK_DATA));
+        let index_final = self.pack_folder.join(format!("{}.{}", pack_id, FILE_EXTENSION_PACK_INDEX));
 
         file_utils::rename(&self.data_temp_path, &data_final).map_err(|e| format!(
             "Error while finalizing pack data \"{}\": {}", data_final.to_string_lossy(), e
@@ -6152,8 +6160,8 @@ impl TransportPackBuilder {
 
         for path in finalized.files {
             match path.extension().and_then(|extension| extension.to_str()) {
-                Some(PACK_DATA_EXTENSION) => data_path = Some(path),
-                Some(PACK_INDEX_EXTENSION) => index_path = Some(path),
+                Some(FILE_EXTENSION_PACK_DATA) => data_path = Some(path),
+                Some(FILE_EXTENSION_PACK_INDEX) => index_path = Some(path),
                 _ => {}
             }
         }
@@ -7050,7 +7058,7 @@ pub(crate) mod tests {
         let staging = temp.join("staging");
         std::fs::create_dir_all(&staging).unwrap();
         let mut builder = TransportPackBuilder::new(&staging).unwrap();
-        let content = b"import-transport-taint content".to_vec();
+        let content = crate::util::object_utils::blob_bytes(b"import-transport-taint content");
         let hash = blake3::hash(&content).to_hex().to_string();
         builder.append_full(&hash, &content).unwrap();
         let artifacts = builder.finish().unwrap();
@@ -7372,7 +7380,7 @@ pub(crate) mod tests {
         let pack_path = std::fs::read_dir(pack_folder()).unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .find(|p| p.extension().and_then(|e| e.to_str()) == Some(PACK_DATA_EXTENSION))
+            .find(|p| p.extension().and_then(|e| e.to_str()) == Some(FILE_EXTENSION_PACK_DATA))
             .expect("compact should have written one pack file");
 
         // Locate the blob's own record (index lookup only -- never reads/decodes it, so this
@@ -7526,10 +7534,10 @@ pub(crate) mod tests {
         let pack_a_data = std::fs::read_dir(&folder).unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .find(|p| p.extension().and_then(|e| e.to_str()) == Some(PACK_DATA_EXTENSION))
+            .find(|p| p.extension().and_then(|e| e.to_str()) == Some(FILE_EXTENSION_PACK_DATA))
             .expect("compact should have written one pack file");
         let pack_a_stem = pack_a_data.file_stem().unwrap().to_str().unwrap().to_string();
-        let pack_a_index = pack_a_data.with_extension(PACK_INDEX_EXTENSION);
+        let pack_a_index = pack_a_data.with_extension(FILE_EXTENSION_PACK_INDEX);
 
         // Byte-copy pack A's data+index to a stem that sorts before pack A's own (content-hashed,
         // lowercase-hex) stem -- both files copied verbatim, so the duplicate is initially a valid,
@@ -7537,8 +7545,8 @@ pub(crate) mod tests {
         let dup_stem = "0000000000000000000000000000000000000000000000000000000000000000-dup";
         assert!(dup_stem < pack_a_stem.as_str(),
             "sanity: the duplicate's stem must sort before pack A's for the load order this test needs");
-        let dup_data = folder.join(format!("{}.{}", dup_stem, PACK_DATA_EXTENSION));
-        let dup_index = folder.join(format!("{}.{}", dup_stem, PACK_INDEX_EXTENSION));
+        let dup_data = folder.join(format!("{}.{}", dup_stem, FILE_EXTENSION_PACK_DATA));
+        let dup_index = folder.join(format!("{}.{}", dup_stem, FILE_EXTENSION_PACK_INDEX));
         std::fs::copy(&pack_a_data, &dup_data).unwrap();
         std::fs::copy(&pack_a_index, &dup_index).unwrap();
 
@@ -7614,7 +7622,7 @@ pub(crate) mod tests {
         let packs_remaining: Vec<PathBuf> = std::fs::read_dir(&folder).unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some(PACK_DATA_EXTENSION))
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some(FILE_EXTENSION_PACK_DATA))
             .collect();
         assert_eq!(packs_remaining.len(), 1,
             "sanity: the repack must have consolidated down to exactly one pack file, got {:?}", packs_remaining);
@@ -7828,16 +7836,16 @@ pub(crate) mod tests {
         let pack_a_data = std::fs::read_dir(&folder).unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .find(|p| p.extension().and_then(|e| e.to_str()) == Some(PACK_DATA_EXTENSION))
+            .find(|p| p.extension().and_then(|e| e.to_str()) == Some(FILE_EXTENSION_PACK_DATA))
             .expect("compact should have written one pack file");
         let pack_a_stem = pack_a_data.file_stem().unwrap().to_str().unwrap().to_string();
-        let pack_a_index = pack_a_data.with_extension(PACK_INDEX_EXTENSION);
+        let pack_a_index = pack_a_data.with_extension(FILE_EXTENSION_PACK_INDEX);
 
         let dup_stem = "0000000000000000000000000000000000000000000000000000000000000000-dup";
         assert!(dup_stem < pack_a_stem.as_str(),
             "sanity: the duplicate's stem must sort before pack A's for the load order this test needs");
-        let dup_data = folder.join(format!("{}.{}", dup_stem, PACK_DATA_EXTENSION));
-        let dup_index = folder.join(format!("{}.{}", dup_stem, PACK_INDEX_EXTENSION));
+        let dup_data = folder.join(format!("{}.{}", dup_stem, FILE_EXTENSION_PACK_DATA));
+        let dup_index = folder.join(format!("{}.{}", dup_stem, FILE_EXTENSION_PACK_INDEX));
         std::fs::copy(&pack_a_data, &dup_data).unwrap();
         std::fs::copy(&pack_a_index, &dup_index).unwrap();
 
@@ -7980,10 +7988,10 @@ pub(crate) mod tests {
         let pack_a_data = std::fs::read_dir(&folder).unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .find(|p| p.extension().and_then(|e| e.to_str()) == Some(PACK_DATA_EXTENSION))
+            .find(|p| p.extension().and_then(|e| e.to_str()) == Some(FILE_EXTENSION_PACK_DATA))
             .expect("compact should have written one pack file");
         let pack_a_stem = pack_a_data.file_stem().unwrap().to_str().unwrap().to_string();
-        let pack_a_index = pack_a_data.with_extension(PACK_INDEX_EXTENSION);
+        let pack_a_index = pack_a_data.with_extension(FILE_EXTENSION_PACK_INDEX);
 
         let x_hash_bytes = hash_to_bytes(&x_hash).unwrap();
         invalidate_cache();
@@ -8004,8 +8012,8 @@ pub(crate) mod tests {
         let dup_stem = "0000000000000000000000000000000000000000000000000000000000000000-dup";
         assert!(dup_stem < pack_a_stem.as_str(),
             "sanity: the duplicate's stem must sort before pack A's for the load order this test needs");
-        let dup_data = folder.join(format!("{}.{}", dup_stem, PACK_DATA_EXTENSION));
-        let dup_index = folder.join(format!("{}.{}", dup_stem, PACK_INDEX_EXTENSION));
+        let dup_data = folder.join(format!("{}.{}", dup_stem, FILE_EXTENSION_PACK_DATA));
+        let dup_index = folder.join(format!("{}.{}", dup_stem, FILE_EXTENSION_PACK_INDEX));
         std::fs::copy(&pack_a_data, &dup_data).unwrap();
         std::fs::copy(&pack_a_index, &dup_index).unwrap();
 
@@ -8088,18 +8096,18 @@ pub(crate) mod tests {
         let pack_a_data = std::fs::read_dir(&folder).unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .find(|p| p.extension().and_then(|e| e.to_str()) == Some(PACK_DATA_EXTENSION))
+            .find(|p| p.extension().and_then(|e| e.to_str()) == Some(FILE_EXTENSION_PACK_DATA))
             .expect("compact should have written one pack file");
         let pack_a_stem = pack_a_data.file_stem().unwrap().to_str().unwrap().to_string();
-        let pack_a_index = pack_a_data.with_extension(PACK_INDEX_EXTENSION);
+        let pack_a_index = pack_a_data.with_extension(FILE_EXTENSION_PACK_INDEX);
 
         // A clean (uncorrupted) byte-copy under a stem sorting before A's own -- the crash-window
         // self-duplicate shape, without any corruption.
         let dup_stem = "0000000000000000000000000000000000000000000000000000000000000000-dup";
         assert!(dup_stem < pack_a_stem.as_str(),
             "sanity: the duplicate's stem must sort before pack A's for the load order this test needs");
-        let dup_data = folder.join(format!("{}.{}", dup_stem, PACK_DATA_EXTENSION));
-        let dup_index = folder.join(format!("{}.{}", dup_stem, PACK_INDEX_EXTENSION));
+        let dup_data = folder.join(format!("{}.{}", dup_stem, FILE_EXTENSION_PACK_DATA));
+        let dup_index = folder.join(format!("{}.{}", dup_stem, FILE_EXTENSION_PACK_INDEX));
         std::fs::copy(&pack_a_data, &dup_data).unwrap();
         std::fs::copy(&pack_a_index, &dup_index).unwrap();
 
@@ -8116,7 +8124,7 @@ pub(crate) mod tests {
         let packs_remaining: Vec<PathBuf> = std::fs::read_dir(&folder).unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some(PACK_DATA_EXTENSION))
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some(FILE_EXTENSION_PACK_DATA))
             .collect();
         assert_eq!(packs_remaining.len(), 1,
             "the repack must have consolidated down to exactly one pack file, got {:?}", packs_remaining);
@@ -8231,7 +8239,7 @@ pub(crate) mod tests {
         let packs_remaining: Vec<PathBuf> = std::fs::read_dir(&folder).unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some(PACK_DATA_EXTENSION))
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some(FILE_EXTENSION_PACK_DATA))
             .collect();
         assert_eq!(packs_remaining.len(), 1,
             "the repack must have consolidated down to exactly one pack file, got {:?}", packs_remaining);
@@ -9085,7 +9093,7 @@ pub(crate) mod tests {
         let pack_paths_before: Vec<PathBuf> = std::fs::read_dir(pack_folder()).unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some(PACK_DATA_EXTENSION))
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some(FILE_EXTENSION_PACK_DATA))
             .collect();
         assert_eq!(pack_paths_before.len(), 2, "two incremental packs should exist before the repack");
 
@@ -9097,7 +9105,7 @@ pub(crate) mod tests {
         for old_pack in &pack_paths_before {
             assert!(!old_pack.exists(),
                 "old pack \"{}\" must be physically removed once superseded", old_pack.to_string_lossy());
-            let old_index = old_pack.with_extension(PACK_INDEX_EXTENSION);
+            let old_index = old_pack.with_extension(FILE_EXTENSION_PACK_INDEX);
             assert!(!old_index.exists(),
                 "old index \"{}\" must be physically removed once superseded", old_index.to_string_lossy());
         }
@@ -9396,7 +9404,7 @@ pub(crate) mod tests {
     /// Contents for `count` distinct objects, with their raw and hex hashes.
     fn numbered_objects(tag: &str, count: usize) -> Vec<(Vec<u8>, [u8; HASH_LEN], String)> {
         (0..count).map(|i| {
-            let content = format!("{} object {}", tag, i).into_bytes();
+            let content = crate::util::object_utils::blob_bytes(format!("{} object {}", tag, i).as_bytes());
             let hash = *blake3::hash(&content).as_bytes();
             (content, hash, sign_utils::to_hex(&hash))
         }).collect()
@@ -9414,7 +9422,7 @@ pub(crate) mod tests {
 
     /// Content whose hash falls in `bucket` of `index`.
     fn content_in_bucket(index: &CheckedIndex<Vec<u8>>, bucket: usize, tag: &str) -> (Vec<u8>, String) {
-        (0..).map(|i| format!("{} candidate {}", tag, i).into_bytes())
+        (0..).map(|i| crate::util::object_utils::blob_bytes(format!("{} candidate {}", tag, i).as_bytes()))
             .find(|content| index.bucket_of_hash(blake3::hash(content).as_bytes()) == bucket)
             .map(|content| { let hash = blake3::hash(&content).to_hex().to_string(); (content, hash) })
             .unwrap()
@@ -9572,7 +9580,7 @@ pub(crate) mod tests {
         let mut old_index = PACK_INDEX_MAGIC.to_vec();
         old_index.extend_from_slice(&2u32.to_le_bytes());
         old_index.extend_from_slice(&0u32.to_le_bytes());
-        std::fs::write(folder.join(format!("{}.{}", "ab".repeat(32), PACK_INDEX_EXTENSION)), &old_index).unwrap();
+        std::fs::write(folder.join(format!("{}.{}", "ab".repeat(32), FILE_EXTENSION_PACK_INDEX)), &old_index).unwrap();
         invalidate_cache();
 
         let never_stored = blake3::hash(b"held only by the old pack, perhaps").to_hex().to_string();
@@ -9756,7 +9764,7 @@ pub(crate) mod tests {
             offsets.push(at);
             at += record.len();
         }
-        (pack_folder().join(format!("{}.{}", stem, PACK_INDEX_EXTENSION)), offsets)
+        (pack_folder().join(format!("{}.{}", stem, FILE_EXTENSION_PACK_INDEX)), offsets)
     }
 
     /// The full records of `count` numbered objects that nothing names, to spread a pack over
@@ -9768,7 +9776,7 @@ pub(crate) mod tests {
     /// Destroy the record at `offset` of pack `<stem>`'s data file: its kind byte becomes one no
     /// record has, so the record neither reads nor walks.
     fn destroy_salvage_record(stem: &str, offset: usize) {
-        let path = pack_folder().join(format!("{}.{}", stem, PACK_DATA_EXTENSION));
+        let path = pack_folder().join(format!("{}.{}", stem, FILE_EXTENSION_PACK_DATA));
         let mut data = std::fs::read(&path).unwrap();
         assert!(data[offset] == RECORD_FULL || data[offset] == RECORD_DELTA, "offset {} must start a record", offset);
         data[offset] = 0xEE;
@@ -9981,7 +9989,7 @@ pub(crate) mod tests {
             (blob.hash.clone(), full_record(&blob.content)),
             (tree.hash.clone(), full_record(&tree.content)),
         ]);
-        let data_path = index.with_extension(PACK_DATA_EXTENSION);
+        let data_path = index.with_extension(FILE_EXTENSION_PACK_DATA);
         let mut data = std::fs::read(&data_path).unwrap();
         data.extend_from_slice(b"\xEEtrailing junk");
         std::fs::write(&data_path, data).unwrap();
@@ -10338,7 +10346,7 @@ pub(crate) mod tests {
         assert!(error.contains("could not completely salvage"), "{}", error);
         assert!(error.contains("Nothing was deleted"), "{}", error);
         assert!(error.contains("a-crafted.idx"), "{}", error);
-        assert!(index.exists() && index.with_extension(PACK_DATA_EXTENSION).exists(), "nothing may be deleted");
+        assert!(index.exists() && index.with_extension(FILE_EXTENSION_PACK_DATA).exists(), "nothing may be deleted");
         assert!(is_loose(&blob.hash), "the salvaged copy must stay on disk");
 
         std::fs::remove_dir_all(&temp).ok();
@@ -11094,7 +11102,7 @@ pub(crate) mod tests {
                 .expect("this platform reports directory mtimes");
 
             let entries = vec![(hash_to_bytes(&hash).unwrap(), bytes.clone())];
-            let name = format!("{}.{}", signature_table::table_id(&entries), SIGNATURE_TABLE_EXTENSION);
+            let name = format!("{}.{}", signature_table::table_id(&entries), FILE_EXTENSION_SIGNATURE_TABLE);
             std::fs::write(pack_folder().join(name), signature_table::build(&entries)).unwrap();
             std::fs::remove_file(sidecar_path(&hash)).unwrap();
 

@@ -164,3 +164,113 @@ Home-directory state (`~/.forkliftconfig`, keys) is outside the warehouse format
 tolerant or versioned reader, and no upgrade touches it.
 
 An S3 layout change has no in-place path. It blocks its release until it has its own design.
+
+## The census
+
+Every name Forklift gives a file or folder is classified below. Paths are relative to `.forklift/`.
+`{bay}` is a bay's state folder: nothing for the main tree, `bays/<name>/` for a bay. `<…>` stands for
+part of one name, and `**` for any number of folders. A path ending in `/` is a folder.
+
+Besides the three classes above:
+
+- **Lock**: an empty file only ever locked, never read.
+- **Probe**: rebuilt whenever it cannot be read, and never trusted. A probe lives in the working
+  folder's own `.forklift`, on the volume it measures, so an upgrade cannot reach a bay's probes.
+- **Transient**: lives only while an operation runs, and is swept or replaced by the next one.
+- **Foreign**: in another tool's format; Forklift reads it only through that tool.
+- **Outside**: not in a warehouse at all.
+
+A test holds the source and the [fixtures](#the-fixtures) to this table. Every `FILE_NAME_*`,
+`FOLDER_NAME_*`, `FILE_SUFFIX_*` and `FILE_EXTENSION_*` constant in the source is named in a row, every
+name in a row is a constant, and every path in every fixture matches a row.
+
+<!-- census:start -->
+| Path | Class | Names |
+|---|---|---|
+| `warehouse` | rewritable | `warehouse_utils::FILE_NAME_WAREHOUSE_MARKER` |
+| `format.lock` | lock | `lock_utils::FILE_NAME_FORMAT_LOCK` |
+| `objects/`, `objects/<xx>/`, `objects/<xx>/<hash>` | history-borne | `globals::FOLDER_NAME_OBJECTS_ROOT` |
+| `objects/<xx>/<hash>.sig` | history-borne | `sign_utils::FILE_SUFFIX_SIGNATURE` |
+| `objects/pack/`, `objects/pack/<name>.pack`, `objects/pack/<name>.idx` | history-borne | `pack_utils::FOLDER_NAME_PACK`, `pack_utils::FILE_EXTENSION_PACK_DATA`, `pack_utils::FILE_EXTENSION_PACK_INDEX` |
+| `objects/pack/<name>.sigs` | history-borne | `signature_table::FILE_EXTENSION_SIGNATURE_TABLE` |
+| `objects/pack/densify-pending` | derived | `pack_utils::FILE_NAME_DENSIFY_MARKER` |
+| `objects/pack/.compact-<name>.tmp` | transient | |
+| `pallets/`, `pallets/<name>` | rewritable | `pallet_utils::FOLDER_NAME_PALLETS_ROOT` |
+| `meta/`, `meta/<name>` | rewritable | `pallet_utils::FOLDER_NAME_META_ROOT` |
+| `trust` | rewritable | `office_utils::FILE_NAME_TRUST` |
+| `served` | rewritable | `tombstone_utils::FILE_NAME_SERVED` |
+| `tombstones` | rewritable | `tombstone_utils::FILE_NAME_TOMBSTONES` |
+| `sealed` | rewritable | `sealed_utils::FILE_NAME_SEALED` |
+| `unvouched-heads` | rewritable | `take_utils::FILE_NAME_UNVOUCHED` |
+| `held-heads` | rewritable | `held_heads::FILE_NAME` |
+| `fetched-heads` | rewritable | `fetch_ledger::FILE_NAME_LEDGER` |
+| `origin` | rewritable | `origin_utils::FILE_NAME` |
+| `origin-move` | rewritable | `origin_move::FILE_NAME` |
+| `franchise` | rewritable | `franchise_utils::FILE_NAME_FRANCHISE` |
+| `mirror-roots` | rewritable | `mirror_utils::FILE_NAME_MIRROR_ROOTS` |
+| `mirror.git/**` | foreign | `mirror_utils::FOLDER_NAME_MIRROR_REPOSITORY` |
+| `config/`, `config/warehouse.toml` | rewritable | `config_utils::FOLDER_NAME_CONFIG_ROOT`, `config_utils::FILE_NAME_WAREHOUSE_CONFIG`, `scope_utils::FOLDER_NAME_CONFIG` |
+| `config/warehouse.toml.lock` | lock | |
+| `config/fetch-scope` | rewritable | `scope_utils::FILE_NAME_FETCH_SCOPE` |
+| `taint/`, `taint/<name>` | rewritable | `taint_utils::FOLDER_NAME_TAINT` |
+| `graph/`, `graph/<xx>` | derived | `globals::FOLDER_NAME_GRAPH_ROOT` |
+| `bundles/`, `bundles/latest`, `bundles/partial` | derived | `bundle_utils::FOLDER_NAME_BUNDLES`, `bundle_utils::FILE_NAME_LATEST`, `bundle_utils::FILE_NAME_DOWNLOAD` |
+| `store.lock`, `serve.lock`, `store-access.lock`, `refs.lock`, `mirror.lock`, `origin-move.lock` | lock | `lock_utils::FILE_NAME_STORE_LOCK`, `lock_utils::FILE_NAME_SERVE_LOCK`, `lock_utils::FILE_NAME_STORE_ACCESS_LOCK`, `lock_utils::FILE_NAME_REF_LOCK`, `lock_utils::FILE_NAME_MIRROR_LOCK`, `lock_utils::FILE_NAME_MOVE_LOCK` |
+| `bays/`, `bays/<name>/`, `bays/<name>/path` | rewritable | `globals::FOLDER_NAME_BAYS_ROOT`, `bay_utils::FILE_NAME_BAY_PATH` |
+| `{bay}inventory/`, `{bay}inventory/metadata` | rewritable | `globals::FOLDER_NAME_INVENTORY_ROOT`, `file_utils::FILE_NAME_INVENTORY_METADATA` |
+| `{bay}inventory/inv_/`, `{bay}inventory/inv_/<xx>/`, `{bay}inventory/inv_/<xx>/<hash>/`, `{bay}inventory/inv_/<xx>/<hash>/data` | rewritable | `file_utils::FOLDER_NAME_INVENTORY_STORE`, `file_utils::FILE_NAME_INVENTORY_DATA` |
+| `{bay}inventory/incomplete-load` | rewritable | `load_guard_utils::FILE_NAME_INCOMPLETE_LOAD_MARKER` |
+| `{bay}position` | rewritable | `pallet_utils::FILE_NAME_POSITION` |
+| `{bay}scope` | rewritable | `scope_utils::FILE_NAME_BAY_SCOPE` |
+| `{bay}parked` | rewritable | `park_utils::FILE_NAME_PARKED` |
+| `{bay}cherry-pick` | rewritable | `cherry_pick_utils::FILE_NAME_CHERRY_PICK` |
+| `{bay}consolidation` | rewritable | `merge_utils::FILE_NAME_CONSOLIDATION` |
+| `{bay}consolidation-skeleton` | rewritable | `merge_utils::FILE_NAME_SKELETON` |
+| `{bay}operation` | rewritable | `operation_utils::FILE_NAME_OPERATION` |
+| `{bay}journal.json` | rewritable | `journal_utils::FILE_NAME_JOURNAL` |
+| `{bay}lock` | lock | `lock_utils::FILE_NAME_LOCK`, `franchise_utils::FILE_NAME_LOCK` |
+| `{bay}assembly/**` | transient | `shift_utils::FOLDER_NAME_ASSEMBLY` |
+| `redirect`, in a bay's own `.forklift` | rewritable | `bay_utils::FILE_NAME_BAY_REDIRECT` |
+| `clock`, `exec-probe-<pid>-<n>` | probe | `file_utils::FILE_NAME_CLOCK_PROBE`, `file_utils::FILE_NAME_PREFIX_EXECUTABLE_BIT_PROBE` |
+| `**/<name>.tmp~<pid>-<n>`, `**/<name>.tmp~<pid>-<n>/**` | transient | `warehouse_utils::FILE_NAME_STAGING_LOCK` |
+| `.forklift`, `.forklift.new`, beside a working folder | outside | `globals::FOLDER_NAME_FORKLIFT_ROOT`, `bay_utils::FOLDER_NAME_FORKLIFT_NEW` |
+| `.forklift-server.lock`, in a server's folder of warehouses | outside | `lock_utils::FILE_NAME_BASE_SERVE_LOCK` |
+| `~/.forkliftconfig`, `~/.forklift-keys/`, `<key-id>.key`, `owners.toml`, in the home folder | outside | `config_utils::FILE_NAME_GLOBAL_CONFIG`, `sign_utils::FOLDER_NAME_KEYS`, `sign_utils::FILE_SUFFIX_PRIVATE_KEY`, `sign_utils::FILE_NAME_KEY_OWNERS` |
+<!-- census:end -->
+
+A walk matches a path only against the rows whose path is relative to `.forklift/`; a row that names
+another place says so after its paths.
+
+The versions of what this format writes are frozen with it, in
+`crates/forklift/tests/fixtures/format-<N>/versions`: each record and object version constant and its
+value, each string that carries a version in its text (the bundle header, the schemas of signed meta
+cells), and each record kind or format name a header opens with, since renaming one makes every file
+already written read as having none. Protocol versions are not frozen here: they are the wire's, not the
+warehouse's; nor is the key file's magic, which is home-folder state. A test fails when the source's set differs from the current format's in any way. A changed
+version is a format break, so it ships everything above, and a new snapshot beside the old ones,
+which never change.
+
+## The fixtures
+
+`crates/forklift/tests/fixtures/format-<N>/` holds a warehouse frozen as this format wrote it, one per
+mode (`full`, `sparse`, `cache`), plus a consolidation and a pick left in conflict and a served
+warehouse with a tombstone and a bundle. The `operator` fixture beside them holds the global
+configuration and keys of the enrolled operator who made them. A test opens each of the current
+format's with the current build, reading every record it holds: it lists the parked work, audits the
+trust, reads the scope, the tags and the office, prints a packed file, and finishes the consolidation
+and the pick as that operator. It walks each against the census, before and after. For every older
+format, it runs the upgrade on each and then does the same. Format 1 has no older formats, so that
+loop is empty for now.
+
+The fixtures are made by an ignored test, `freeze_the_current_format_fixtures`, which refuses to
+replace a format's fixtures. A format's fixtures change only by being made again at a new format. Two
+things are not frozen: bays, because a bay's redirect holds an absolute path, and the out-of-scope
+skeleton's reader, which only a partial checkout's consolidation reaches.
+
+The AWS head's items are frozen the same way, against `AWS_FORMAT`:
+`crates/forklift-aws-lambda/tests/fixtures/aws-format-<N>/items` lists the DynamoDB items a warehouse
+holding a live pallet, a deleted one, the office pallet and a trust anchor is written as, on the
+memory store. The current build must write exactly those items and serve them back, and the LocalStack
+suite writes the same warehouse through DynamoDB and requires the very same items there, so the fixture
+holds what DynamoDB stores rather than only the memory store's mapping. Every older AWS format's items
+must upgrade through the chain and then be served.

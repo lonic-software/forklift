@@ -807,7 +807,7 @@ fn is_object_store_path(path: &Path) -> bool {
 /// Delete every signature the store holds: each sidecar (`<hash>.sig`) in the loose store's
 /// fan-out folders, and each signature table (`pack/<id>.sigs`).
 fn remove_signature_sidecars(objects: &Path) -> Result<(), String> {
-    let table_suffix = format!(".{}", signature_table::SIGNATURE_TABLE_EXTENSION);
+    let table_suffix = format!(".{}", signature_table::FILE_EXTENSION_SIGNATURE_TABLE);
 
     let folders = match std::fs::read_dir(objects) {
         Ok(folders) => folders,
@@ -822,7 +822,7 @@ fn remove_signature_sidecars(objects: &Path) -> Result<(), String> {
             continue;
         }
 
-        let is_pack_folder = folder.file_name() == OsStr::new(pack_utils::PACK_FOLDER_NAME);
+        let is_pack_folder = folder.file_name() == OsStr::new(pack_utils::FOLDER_NAME_PACK);
 
         for file in list_names(&folder.path())? {
             let name = file.to_string_lossy();

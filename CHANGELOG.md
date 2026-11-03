@@ -29,6 +29,9 @@ Entries are written by hand in the pull request that makes the change, under **U
   and refuses a warehouse in another format with a `503`. Every ref and trust write is checked against
   it, so no write lands once an upgrade has begun. Warehouses written by an earlier deployment are
   refused and must be made again under a new id.
+- The parked list, a pick in progress and the trust file now record their version, and an object
+  stored at a version this build does not know is refused by name rather than read as damage. Such
+  files written by an earlier build are refused.
 - Forklift records no display names: `operator.name`, the profile name and `--display-name` are gone.
 
 ### Added

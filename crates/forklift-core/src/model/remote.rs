@@ -120,7 +120,9 @@ impl WarehouseInfo {
 }
 
 /// The trust anchor on the wire (the TOML file's fields as JSON). The re-genesis
-/// fields (§8.7) are absent for an original enrollment.
+/// fields (§8.7) are absent for an original enrollment. Like [`WarehouseInfo`], it ignores a field
+/// it does not know, so a new field that changes what an anchor means is a [`PROTOCOL_VERSION`]
+/// bump, never an additive one: an older client would audit against the anchor without it.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrustAnchorDto {
     pub genesis: String,

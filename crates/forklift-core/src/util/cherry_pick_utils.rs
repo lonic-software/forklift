@@ -16,22 +16,26 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use serde::{Deserialize, Serialize};
 use crate::enums::parcel_action_type::ParcelActionType;
 use crate::globals::bay_root;
 use crate::model::operator::Operator;
-use crate::util::{file_utils, object_utils};
+use crate::util::{file_utils, object_utils, record_utils};
 
 /// The name of the cherry-pick-state file (inside the bay root). While a pick is in
-/// progress (its merge left conflicts), it records the source parcel, the intended description,
-/// and the head and pallet the pick was applied to; the next `stack` reads it to complete the pick
-/// single-parent and remove it. A file written before the head and pallet were recorded lacks
-/// those fields and is refused as malformed.
+/// progress (its merge left conflicts), it records the source parcel, the head and pallet the pick
+/// was applied to, and the intended description; the next `stack` reads it to complete the pick
+/// single-parent and remove it.
 const FILE_NAME_CHERRY_PICK: &str = "cherry-pick";
+
+/// The state record kind of the cherry-pick-state file. Its entries are the source, the head, the
+/// pallet, and then the description when there is one.
+const CHERRY_PICK_RECORD: &str = "cherry-pick";
+
+/// The version of the cherry-pick-state record.
+const CHERRY_PICK_VERSION: u32 = 1;
 
 /// A cherry-pick in progress: the source parcel being applied, and the description the
 /// completing `stack` should default to.
-#[derive(Serialize, Deserialize)]
 pub struct CherryPickState {
     /// The parcel whose diff is being applied (its authors are preserved on completion).
     pub source: String,
@@ -80,23 +84,35 @@ pub fn read_state_in(dir: &Path) -> Result<Option<CherryPickState>, String> {
         return Ok(None);
     }
 
-    let content = std::fs::read_to_string(&path)
+    let bytes = std::fs::read(&path)
         .map_err(|e| format!("Error while reading \"{}\": {}", path.to_string_lossy(), e))?;
 
-    let state: CherryPickState = serde_json::from_str(&content).map_err(|_| format!(
+    let malformed = || format!(
         "The pick state file \"{}\" is malformed; remove it to abort the pick.",
         path.to_string_lossy()
+    );
+
+    let entries = record_utils::from_bytes(&bytes, CHERRY_PICK_RECORD, CHERRY_PICK_VERSION).map_err(|e| format!(
+        "The pick state file \"{}\" {} Remove it to abort the pick.", path.to_string_lossy(), e.describe()
     ))?;
 
-    let is_valid = object_utils::is_object_hash(&state.source) && object_utils::is_object_hash(&state.our_head)
-        && crate::util::pallet_utils::validate_pallet_name(&state.our_pallet).is_ok();
+    let mut entries = entries.into_iter();
+    let (Some(source), Some(our_head), Some(our_pallet)) = (entries.next(), entries.next(), entries.next()) else {
+        return Err(malformed());
+    };
+    let description = entries.next();
+    if entries.next().is_some() {
+        return Err(malformed());
+    }
+
+    let is_valid = object_utils::is_object_hash(&source) && object_utils::is_object_hash(&our_head)
+        && crate::util::pallet_utils::validate_pallet_name(&our_pallet).is_ok();
 
     if !is_valid {
-        return Err(format!(
-            "The pick state file \"{}\" is malformed; remove it to abort the pick.",
-            path.to_string_lossy()
-        ));
+        return Err(malformed());
     }
+
+    let state = CherryPickState { source, description, our_head, our_pallet };
 
     Ok(Some(state))
 }
@@ -108,12 +124,17 @@ pub fn read_state_in(dir: &Path) -> Result<Option<CherryPickState>, String> {
 ///
 /// # Returns
 /// * `Ok(())`      - If the state was written.
-/// * `Err(String)` - If the file could not be serialized or written.
+/// * `Err(String)` - If the file could not be written.
 pub fn write_state(state: &CherryPickState) -> Result<(), String> {
-    let json = serde_json::to_string(state)
-        .map_err(|e| format!("Error while serializing the pick state: {}", e))?;
+    file_utils::write_file_atomically(&state_path(), &state_bytes(state))
+}
 
-    file_utils::write_file_atomically(&state_path(), json.as_bytes())
+/// The bytes [`write_state`] writes for `state`.
+pub(crate) fn state_bytes(state: &CherryPickState) -> Vec<u8> {
+    let mut entries = vec![state.source.as_str(), state.our_head.as_str(), state.our_pallet.as_str()];
+    entries.extend(state.description.as_deref());
+
+    record_utils::to_bytes(CHERRY_PICK_RECORD, CHERRY_PICK_VERSION, entries)
 }
 
 /// Remove the cherry-pick state file (a no-op when none exists).
@@ -159,4 +180,79 @@ pub fn collect_source_authors(source: &str, picker: &Operator) -> Result<Vec<Ope
     }
 
     Ok(authors)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("forklift-pick-state-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn state(description: Option<&str>) -> CherryPickState {
+        CherryPickState {
+            source: object_utils::hash_object_bytes(b"source"),
+            description: description.map(str::to_string),
+            our_head: object_utils::hash_object_bytes(b"head"),
+            our_pallet: "main".to_string(),
+        }
+    }
+
+    fn write(dir: &Path, bytes: &[u8]) {
+        std::fs::write(dir.join(FILE_NAME_CHERRY_PICK), bytes).unwrap();
+    }
+
+    /// A state reads back field for field, with a description (one holding a line break included)
+    /// and without one.
+    #[test]
+    fn the_pick_state_record_round_trips() {
+        let dir = scratch("round-trip");
+
+        for description in [Some("a pick\nover two lines"), None] {
+            let written = state(description);
+            write(&dir, &state_bytes(&written));
+            let read = read_state_in(&dir).unwrap().unwrap();
+
+            assert_eq!(read.source, written.source);
+            assert_eq!(read.our_head, written.our_head);
+            assert_eq!(read.our_pallet, written.our_pallet);
+            assert_eq!(read.description, written.description);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A state file without a header, such as the JSON written before it was a record, is refused.
+    #[test]
+    fn a_pick_state_without_a_header_is_refused() {
+        let dir = scratch("unversioned");
+        write(&dir, b"{\"source\":\"x\"}\n");
+
+        let error = read_state_in(&dir).err().unwrap();
+        assert!(error.contains("has no format header"), "{}", error);
+        assert!(error.contains("Remove it to abort the pick."), "{}", error);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record with fewer than three entries or more than four is refused, as is one whose head is
+    /// not a hash.
+    #[test]
+    fn a_pick_state_with_the_wrong_entries_is_refused() {
+        let dir = scratch("entries");
+        let good = state(Some("description"));
+
+        let short = [good.source.as_str(), good.our_head.as_str()];
+        let long = [good.source.as_str(), good.our_head.as_str(), "main", "description", "extra"];
+        let bad_head = [good.source.as_str(), "not-a-hash", "main"];
+
+        for entries in [&short[..], &long[..], &bad_head[..]] {
+            write(&dir, &record_utils::to_bytes(CHERRY_PICK_RECORD, CHERRY_PICK_VERSION, entries.iter().copied()));
+            let error = read_state_in(&dir).err().unwrap_or_else(|| panic!("{:?} must be refused", entries));
+            assert!(error.contains("is malformed"), "{}", error);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

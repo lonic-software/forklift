@@ -272,7 +272,7 @@ fn outcome<'a>(report: &'a serde_json::Value, pallet: &str) -> &'a serde_json::V
 fn record_entries(path: &Path) -> Vec<(String, String)> {
     let text = std::fs::read_to_string(path).unwrap();
     let mut lines = text.lines();
-    assert_eq!(lines.next(), Some("forklift mirror roots 1"), "{}", text);
+    assert_eq!(lines.next(), Some("/forklift-mirror-roots 1"), "{}", text);
 
     lines.map(|line| {
         let (pallet, parcel) = line.split_once(' ').unwrap();

@@ -633,8 +633,8 @@ async fn resolve_the_rest(
     // Resolve every vanished pack's stem: enumerate its surviving index, or escalate.
     let mut pack_candidates: BTreeMap<String, PathBuf> = BTreeMap::new();
     for stem in &pack_stems {
-        let index_relative = stem.with_extension(pack_utils::PACK_INDEX_EXTENSION);
-        let data_relative = stem.with_extension(pack_utils::PACK_DATA_EXTENSION);
+        let index_relative = stem.with_extension(pack_utils::FILE_EXTENSION_PACK_INDEX);
+        let data_relative = stem.with_extension(pack_utils::FILE_EXTENSION_PACK_DATA);
         let index_absolute = root.join(&index_relative);
 
         let enumerated = if index_absolute.exists() {
@@ -1006,7 +1006,7 @@ fn mark_still_dangling(
     }
     if let Some(pack_path) = pack_candidates.get(hash) {
         remainder.insert(pack_path.clone());
-        let index_relative = pack_path.with_extension(pack_utils::PACK_INDEX_EXTENSION);
+        let index_relative = pack_path.with_extension(pack_utils::FILE_EXTENSION_PACK_INDEX);
         if recorded.contains(&index_relative) {
             remainder.insert(index_relative);
         }
@@ -1332,8 +1332,8 @@ fn walk_pack_paths(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
 
         let is_pack_shaped = matches!(
             file.path().extension().and_then(|e| e.to_str()),
-            Some(ext) if ext == pack_utils::PACK_DATA_EXTENSION || ext == pack_utils::PACK_INDEX_EXTENSION
-                || ext == signature_table::SIGNATURE_TABLE_EXTENSION
+            Some(ext) if ext == pack_utils::FILE_EXTENSION_PACK_DATA || ext == pack_utils::FILE_EXTENSION_PACK_INDEX
+                || ext == signature_table::FILE_EXTENSION_SIGNATURE_TABLE
         );
         if !is_pack_shaped {
             continue;
@@ -1392,9 +1392,9 @@ fn classify_vanished(relative: &Path) -> VanishedClass {
     }
 
     match relative.extension().and_then(|ext| ext.to_str()) {
-        Some(ext) if ext == pack_utils::PACK_DATA_EXTENSION => VanishedClass::PackData(relative.with_extension("")),
-        Some(ext) if ext == pack_utils::PACK_INDEX_EXTENSION => VanishedClass::PackIndex(relative.with_extension("")),
-        Some(ext) if ext == signature_table::SIGNATURE_TABLE_EXTENSION => VanishedClass::SignatureTable,
+        Some(ext) if ext == pack_utils::FILE_EXTENSION_PACK_DATA => VanishedClass::PackData(relative.with_extension("")),
+        Some(ext) if ext == pack_utils::FILE_EXTENSION_PACK_INDEX => VanishedClass::PackIndex(relative.with_extension("")),
+        Some(ext) if ext == signature_table::FILE_EXTENSION_SIGNATURE_TABLE => VanishedClass::SignatureTable,
         _ => VanishedClass::Unrecognized,
     }
 }
@@ -4325,7 +4325,7 @@ mod tests {
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
         crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
-        std::fs::write(bay_b_dir.join("parked"), format!("{}\n", target_hash)).unwrap();
+        std::fs::write(bay_b_dir.join("parked"), crate::util::park_utils::parked_bytes(&[&target_hash])).unwrap();
 
         let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
         let referenced = closure_references_any(&targets).unwrap().hashes;
@@ -4362,7 +4362,7 @@ mod tests {
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
         crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
-        std::fs::write(bay_b_dir.join("parked"), b"not-a-valid-hash\n").unwrap();
+        std::fs::write(bay_b_dir.join("parked"), crate::util::park_utils::parked_bytes(&["not-a-valid-hash"])).unwrap();
 
         let targets: BTreeSet<String> = ["a".repeat(64)].into_iter().collect();
         let walk = closure_references_any(&targets)
@@ -6084,7 +6084,7 @@ mod tests {
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
-        let good_content = b"the genuinely correct content for this object".to_vec();
+        let good_content = crate::util::object_utils::blob_bytes(b"the genuinely correct content for this object");
         let hash = object_utils::hash_object_bytes(&good_content);
         let relative = write_corrupt_loose_object(&forklift, &hash);
 
@@ -6135,8 +6135,8 @@ mod tests {
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
-        let good_a = b"the first genuinely correct object's content".to_vec();
-        let good_b = b"the second genuinely correct object's content".to_vec();
+        let good_a = crate::util::object_utils::blob_bytes(b"the first genuinely correct object's content");
+        let good_b = crate::util::object_utils::blob_bytes(b"the second genuinely correct object's content");
         let hash_a = object_utils::hash_object_bytes(&good_a);
         let hash_b = object_utils::hash_object_bytes(&good_b);
         let relative_a = write_corrupt_loose_object(&forklift, &hash_a);
@@ -6204,7 +6204,7 @@ mod tests {
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
-        let good_served = b"the object the remote actually has".to_vec();
+        let good_served = crate::util::object_utils::blob_bytes(b"the object the remote actually has");
         let hash_served = object_utils::hash_object_bytes(&good_served);
         let relative_served = write_corrupt_loose_object(&forklift, &hash_served);
 
@@ -6957,7 +6957,7 @@ mod tests {
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
         crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
-        std::fs::write(bay_b_dir.join("parked"), b"not-a-valid-hash\n").unwrap();
+        std::fs::write(bay_b_dir.join("parked"), crate::util::park_utils::parked_bytes(&["not-a-valid-hash"])).unwrap();
 
         // A genuinely vanished object recorded as tainted, unrelated to bay "b"'s own state — so
         // this run actually drives the closure walk (and so `collect_walk_roots`'s tolerance)
@@ -7036,7 +7036,7 @@ mod tests {
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
         crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
-        std::fs::write(bay_b_dir.join("parked"), format!("{}\nnot-a-valid-hash\n", vanished_hash)).unwrap();
+        std::fs::write(bay_b_dir.join("parked"), crate::util::park_utils::parked_bytes(&[vanished_hash.as_str(), "not-a-valid-hash"])).unwrap();
 
         let vanished_path = loose_remainder_path(&forklift, &vanished_hash).unwrap();
         plant_complete_taint(&forklift, &[vanished_path.to_str().unwrap()]);
@@ -7078,7 +7078,7 @@ mod tests {
         let record = mirror_utils::mirror_roots_path();
         std::fs::create_dir_all(forklift.join(crate::globals::FOLDER_NAME_OBJECTS_ROOT)).unwrap();
         crate::util::pallet_utils::write_position_in(&forklift, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
-        std::fs::write(&record, b"forklift mirror roots 99\n").unwrap();
+        std::fs::write(&record, b"/forklift-mirror-roots 99\n").unwrap();
         let record_name = record.display().to_string();
 
         let vanished_hash = "9".repeat(64);
@@ -7137,7 +7137,7 @@ mod tests {
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
         crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
-        std::fs::write(bay_b_dir.join("parked"), b"not-a-valid-hash\n").unwrap();
+        std::fs::write(bay_b_dir.join("parked"), crate::util::park_utils::parked_bytes(&["not-a-valid-hash"])).unwrap();
 
         plant_torn_taint(&forklift, &[]);
 
@@ -8146,7 +8146,7 @@ mod tests {
 
         let hash = "ab".repeat(32);
         let entries = vec![(pack_utils::hash_to_bytes(&hash).unwrap(), some_signature())];
-        let name = format!("{}.{}", signature_table::table_id(&entries), signature_table::SIGNATURE_TABLE_EXTENSION);
+        let name = format!("{}.{}", signature_table::table_id(&entries), signature_table::FILE_EXTENSION_SIGNATURE_TABLE);
         std::fs::write(pack_utils::pack_folder().join(name), signature_table::build(&entries)).unwrap();
 
         plant_torn_taint(&forklift, &[]);

@@ -11110,7 +11110,7 @@ mod tests {
         // object directly (mirroring `pack_utils`'s own `store_loose` test fixture) rather than via
         // `LooseObjectBuilder`, so the hash is exactly `blake3(pack_resident_content)` and the fake
         // remote below can serve those same raw bytes back under that hash.
-        let pack_resident_content = b"already packed and perfectly fine".to_vec();
+        let pack_resident_content = crate::util::object_utils::blob_bytes(b"already packed and perfectly fine");
         let pack_resident_hash = blake3::hash(&pack_resident_content).to_hex().to_string();
         let (resident_folder, resident_file_name) =
             file_utils::get_path_for_object(&pack_resident_hash).unwrap();
@@ -11127,7 +11127,7 @@ mod tests {
 
         // A hash whose loose dentry is corrupt (content does not hash to its own filename) — the
         // shape `hash_mismatch` classifies as a D4 corrupt candidate upstream.
-        let genuine_content = b"the real bytes this hash belongs to".to_vec();
+        let genuine_content = crate::util::object_utils::blob_bytes(b"the real bytes this hash belongs to");
         let corrupt_hash = blake3::hash(&genuine_content).to_hex().to_string();
         let (corrupt_folder, corrupt_file_name) = file_utils::get_path_for_object(&corrupt_hash).unwrap();
         let wrong_bytes = zstd::encode_all(b"not the genuine bytes at all".as_slice(), 0).unwrap();

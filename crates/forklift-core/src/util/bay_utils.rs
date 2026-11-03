@@ -886,7 +886,7 @@ mod tests {
         let bay_b_dir = bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
         crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
-        std::fs::write(bay_b_dir.join("parked"), format!("{}\n", parked_hash)).unwrap();
+        std::fs::write(bay_b_dir.join("parked"), crate::util::park_utils::parked_bytes(&[&parked_hash])).unwrap();
         let state = crate::util::merge_utils::ConsolidationState {
             their_head: consolidation_hash.clone(), their_pallet: "their-pallet".to_string(), our_head: merge_base.clone(), our_pallet: "main".to_string(),
         };
@@ -899,7 +899,7 @@ mod tests {
         let pick = cherry_pick_utils::CherryPickState {
             source: pick_source.clone(), description: None, our_head: pick_base.clone(), our_pallet: "main".to_string(),
         };
-        std::fs::write(bay_c_dir.join("cherry-pick"), serde_json::to_string(&pick).unwrap()).unwrap();
+        std::fs::write(bay_c_dir.join("cherry-pick"), cherry_pick_utils::state_bytes(&pick)).unwrap();
 
         let dirs = all_bay_state_dirs().unwrap();
         let roots = collect_bay_scoped_parcel_roots(&dirs, BayReadPolicy::FailClosed).unwrap().roots;
@@ -937,7 +937,7 @@ mod tests {
         let bay_b_dir = bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
         crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
-        std::fs::write(bay_b_dir.join("parked"), b"not-a-valid-hash\n").unwrap();
+        std::fs::write(bay_b_dir.join("parked"), crate::util::park_utils::parked_bytes(&["not-a-valid-hash"])).unwrap();
 
         let dirs = all_bay_state_dirs().unwrap();
 

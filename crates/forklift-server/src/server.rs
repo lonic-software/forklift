@@ -3945,7 +3945,7 @@ mod tests {
         let _scope = StorageRootScope::enter(&root);
         let addr = serve_router(token_state(ServeMode::Single(Arc::new(WarehouseHandle::new(root)))), 1 << 20).await;
 
-        let bytes = b"an object the admitted caller uploads in two writes";
+        let bytes: &[u8] = &object_utils::blob_bytes(b"an object the admitted caller uploads in two writes");
         let hash = object_utils::hash_object_bytes(bytes);
         let path = format!("/v1/objects/{hash}");
 
@@ -5375,7 +5375,7 @@ mod tests {
         let hash = {
             let _scope = StorageRootScope::enter(&root);
             warehouse_utils::prepare_warehouse(warehouse_utils::PrepareMode::Full).unwrap();
-            let bytes = b"an object only a pack holds";
+            let bytes: &[u8] = &object_utils::blob_bytes(b"an object only a pack holds");
             let hash = object_utils::hash_object_bytes(bytes);
             object_utils::store_object_bytes(&hash, bytes).unwrap();
             pack_utils::compact(false, false, false, &forklift_core::util::progress_utils::Progress::NONE)
@@ -5425,7 +5425,7 @@ mod tests {
         let (blob, tree) = {
             let handle = resolve_warehouse(&state, &warehouse_params("w1")).unwrap();
             let _scope = StorageRootScope::enter(&handle.root);
-            let bytes = b"an object read while served";
+            let bytes: &[u8] = &object_utils::blob_bytes(b"an object read while served");
             let blob = object_utils::hash_object_bytes(bytes);
             object_utils::store_object_bytes(&blob, bytes).unwrap();
             let tree = object_utils::empty_tree_hash().unwrap();
@@ -6229,14 +6229,14 @@ mod tests {
 
         let state = Arc::new(single_mode_state(fixture.root.clone()));
 
-        let bytes = b"an object an unenrolled operator tries to upload";
-        let hash = object_utils::hash_object_bytes(bytes);
+        let bytes = object_utils::blob_bytes(b"an object an unenrolled operator tries to upload");
+        let hash = object_utils::hash_object_bytes(&bytes);
         let mut params = PathParams::new();
         params.insert("hash".to_string(), hash.clone());
 
         let response = put_object(
             State(Arc::clone(&state)), as_operator("mallory"), Path(params.clone()),
-            Bytes::from_static(bytes)
+            Bytes::from(bytes.clone())
         ).await;
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -6245,7 +6245,7 @@ mod tests {
         assert!(!file_utils::does_object_exist(&hash).unwrap(), "a refused upload must store nothing");
 
         let response = put_object(
-            State(state), as_operator("carol"), Path(params), Bytes::from_static(bytes)
+            State(state), as_operator("carol"), Path(params), Bytes::from(bytes)
         ).await;
 
         assert_eq!(response.status(), StatusCode::CREATED);

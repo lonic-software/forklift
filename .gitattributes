@@ -1,0 +1,2 @@
+# Frozen warehouse fixtures are byte-exact: a line-ending conversion would corrupt them.
+crates/forklift/tests/fixtures/** -text

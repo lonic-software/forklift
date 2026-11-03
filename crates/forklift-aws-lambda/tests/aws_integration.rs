@@ -1037,6 +1037,55 @@ async fn dynamo_ref_store_upholds_the_tombstone_contract() {
         .expect("the blocking assertions");
 }
 
+/// DynamoDB stores exactly the items the current AWS format's fixture froze on the memory store:
+/// the same warehouse, written through `DynamoRefStore`, then read back raw. Without this the
+/// fixture would freeze only the fake's mapping, which could drift from the items DynamoDB holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamo_ref_store_writes_the_frozen_aws_items() {
+    let Some(endpoint) = endpoint() else {
+        eprintln!("skipping: FORKLIFT_AWS_TEST_ENDPOINT is unset");
+        return;
+    };
+
+    let config = test_config(&endpoint);
+    provision(&config).await;
+
+    let bridge = AsyncBridge::current().expect("a multi-thread runtime");
+    let (_objects, refs) = build_stores(&config, bridge).await.expect("stores");
+    tokio::task::spawn_blocking(move || aws_items::populate(&refs)).await.expect("the fixture warehouse");
+
+    let (_raw_s3, raw_dynamo) = raw_clients(&config).await;
+    let queried = raw_dynamo
+        .query()
+        .table_name(&config.table)
+        .key_condition_expression("wh = :wh")
+        .expression_attribute_values(":wh", aws_sdk_dynamodb::types::AttributeValue::S(config.warehouse_id.clone()))
+        .consistent_read(true)
+        .send()
+        .await
+        .expect("query the warehouse's items");
+    assert!(queried.last_evaluated_key().is_none(), "the fixture warehouse fits one page");
+
+    let mut stored = Vec::new();
+    for item in queried.items() {
+        let entity = item.get("entity").and_then(|value| value.as_s().ok()).expect("a sort key").clone();
+        for (attribute, value) in item {
+            if attribute == "wh" || attribute == "entity" {
+                continue;
+            }
+            let value = value.as_s().unwrap_or_else(|_| panic!("{} {} is not a string: {:?}", entity, attribute, value));
+            stored.push((entity.clone(), attribute.clone(), value.clone()));
+        }
+    }
+    stored.sort();
+
+    assert_eq!(stored, aws_items::frozen_items(),
+        "DynamoDB stores other items than AWS format {}'s fixture froze on the memory store", AWS_FORMAT);
+}
+
+#[path = "support/aws_items.rs"]
+mod aws_items;
+
 /// The format item over real DynamoDB: the stamp a new warehouse's first write records, the fence
 /// a mark trips, the operator's compare-and-set, and the scan `--all` lists warehouses by. The
 /// memory fake evaluates each of these as an `Option` comparison, which says nothing about how

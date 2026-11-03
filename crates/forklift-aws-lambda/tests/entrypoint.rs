@@ -891,7 +891,7 @@ fn batch_offloads_or_streams_by_store() {
 fn a_cut_batch_is_marked_with_why_on_both_answers() {
     let objects: Vec<(String, Vec<u8>)> = (0..2)
         .map(|i| {
-            let bytes = format!("truncated-batch-{i}").into_bytes();
+            let bytes = object_utils::blob_bytes(format!("truncated-batch-{i}").as_bytes());
             (object_utils::hash_object_bytes(&bytes), bytes)
         })
         .collect();

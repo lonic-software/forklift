@@ -1,12 +1,18 @@
 use std::path::{Path, PathBuf};
 use crate::globals::bay_root;
-use crate::util::{file_utils, object_utils};
+use crate::util::{file_utils, object_utils, record_utils};
 
-/// The name of the parked-parcels file (inside the forklift root folder): one parcel hash
-/// per line, the last line being the most recently parked one. Parked parcels are regular
-/// parcel objects (their parent is the head they were parked on); this file is the only
+/// The name of the parked-parcels file (inside the forklift root folder): a state record holding
+/// one parcel hash per entry, the last one being the most recently parked. Parked parcels are
+/// regular parcel objects (their parent is the head they were parked on); this file is the only
 /// thing that references them.
 const FILE_NAME_PARKED: &str = "parked";
+
+/// The state record kind of the parked-parcels file.
+const PARKED_RECORD: &str = "parked";
+
+/// The version of the parked-parcels record.
+const PARKED_VERSION: u32 = 1;
 
 /// Get the path of the parked-parcels file (bay-local: parked work belongs to the bay).
 fn get_parked_path() -> PathBuf {
@@ -32,22 +38,18 @@ pub fn read_parked_in(dir: &Path) -> Result<Vec<String>, String> {
         return Ok(Vec::new());
     }
 
-    let content = std::fs::read_to_string(&path)
+    let bytes = std::fs::read(&path)
         .map_err(|e| format!("Error while reading \"{}\": {}", path.to_string_lossy(), e))?;
 
-    let mut hashes: Vec<String> = Vec::new();
+    let hashes = record_utils::from_bytes(&bytes, PARKED_RECORD, PARKED_VERSION).map_err(|e| format!(
+        "The parked-parcels file \"{}\" {} Fix it by hand.", path.to_string_lossy(), e.describe()
+    ))?;
 
-    for line in content.lines() {
-        let is_valid = object_utils::is_object_hash(line);
-
-        if !is_valid {
-            return Err(format!(
-                "The parked-parcels file \"{}\" is malformed; fix it by hand.",
-                path.to_string_lossy()
-            ));
-        }
-
-        hashes.push(line.to_string());
+    if !hashes.iter().all(|hash| object_utils::is_object_hash(hash)) {
+        return Err(format!(
+            "The parked-parcels file \"{}\" is malformed; fix it by hand.",
+            path.to_string_lossy()
+        ));
     }
 
     Ok(hashes)
@@ -81,8 +83,59 @@ pub fn write_parked(hashes: &[String]) -> Result<(), String> {
         };
     }
 
-    let mut content = hashes.join("\n");
-    content.push('\n');
+    file_utils::write_file_atomically(&path, &parked_bytes(hashes))
+}
 
-    file_utils::write_file_atomically(&path, content.as_bytes())
+/// The bytes [`write_parked`] writes for `hashes`.
+pub(crate) fn parked_bytes<S: AsRef<str>>(hashes: &[S]) -> Vec<u8> {
+    record_utils::to_bytes(PARKED_RECORD, PARKED_VERSION, hashes.iter().map(AsRef::as_ref))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("forklift-parked-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn hash(seed: &str) -> String {
+        object_utils::hash_object_bytes(seed.as_bytes())
+    }
+
+    /// The parked list reads back in order from the bytes the writer writes.
+    #[test]
+    fn the_parked_record_round_trips() {
+        let dir = scratch("round-trip");
+        let hashes = vec![hash("first"), hash("second")];
+        std::fs::write(dir.join(FILE_NAME_PARKED), parked_bytes(&hashes)).unwrap();
+
+        assert_eq!(read_parked_in(&dir).unwrap(), hashes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A parked file without a header, the shape written before it was a record, is refused, not
+    /// read as hash lines.
+    #[test]
+    fn a_parked_file_without_a_header_is_refused() {
+        let dir = scratch("unversioned");
+        std::fs::write(dir.join(FILE_NAME_PARKED), format!("{}\n", hash("bare"))).unwrap();
+
+        let error = read_parked_in(&dir).unwrap_err();
+        assert!(error.contains("has no format header"), "{}", error);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_parked_entry_that_is_not_a_hash_is_refused() {
+        let dir = scratch("not-a-hash");
+        std::fs::write(dir.join(FILE_NAME_PARKED), parked_bytes(&[hash("good").as_str(), "not-a-hash"])).unwrap();
+
+        let error = read_parked_in(&dir).unwrap_err();
+        assert!(error.contains("is malformed"), "{}", error);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

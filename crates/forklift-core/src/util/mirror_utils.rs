@@ -11,13 +11,15 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use crate::globals::forklift_root;
-use crate::util::{file_utils, object_utils, pallet_utils};
+use crate::util::{file_utils, object_utils, pallet_utils, record_utils};
 
 /// The record's file name, at the shared `.forklift` root: every bay mirrors into one place.
 pub const FILE_NAME_MIRROR_ROOTS: &str = "mirror-roots";
 
-/// The record's first line. A later format gets a new version, which this build refuses to read.
-const HEADER: &str = "forklift mirror roots 1";
+/// The record's kind and version, in its header. A later format gets a new version, which this
+/// build refuses to read.
+const MIRROR_ROOTS_RECORD: &str = "mirror-roots";
+const MIRROR_ROOTS_VERSION: u32 = 1;
 
 /// Where the record lives.
 pub fn mirror_roots_path() -> PathBuf {
@@ -61,30 +63,23 @@ pub fn read_mirror_roots() -> Result<BTreeMap<String, String>, String> {
 
 /// Replace the record with `roots`, atomically.
 pub fn write_mirror_roots(roots: &BTreeMap<String, String>) -> Result<(), String> {
-    let mut content = format!("{}\n", HEADER);
-    for (pallet, parcel) in roots {
-        content.push_str(&format!("{} {}\n", pallet, parcel));
-    }
+    let lines = roots.iter().map(|(pallet, parcel)| format!("{} {}", pallet, parcel));
 
-    file_utils::write_file_atomically(&mirror_roots_path(), content.as_bytes())
+    file_utils::write_file_atomically(
+        &mirror_roots_path(), &record_utils::to_bytes(MIRROR_ROOTS_RECORD, MIRROR_ROOTS_VERSION, lines),
+    )
 }
 
 fn parse(bytes: &[u8]) -> Result<BTreeMap<String, String>, String> {
-    let text = std::str::from_utf8(bytes).map_err(|_| "it is not UTF-8".to_string())?;
-    let mut lines = text.split_terminator('\n');
-
-    match lines.next() {
-        Some(HEADER) => {}
-        Some(other) => return Err(format!("its first line is \"{}\", not \"{}\"", other, HEADER)),
-        None => return Err("it is empty".to_string()),
-    }
+    let lines = record_utils::from_bytes(bytes, MIRROR_ROOTS_RECORD, MIRROR_ROOTS_VERSION)
+        .map_err(|e| format!("it {}", e.describe().trim_end_matches('.')))?;
 
     let mut roots = BTreeMap::new();
-    for line in lines {
+    for line in &lines {
         let (pallet, parcel) = line.split_once(' ')
             .filter(|(pallet, parcel)| pallet_utils::validate_pallet_name(pallet).is_ok()
                 && object_utils::is_object_hash(parcel))
-            .ok_or(format!("the line \"{}\" is not a pallet name and a parcel hash", line))?;
+            .ok_or(format!("the line \"{}\" is not a pallet name and a parcel hash", line.escape_debug()))?;
 
         if roots.insert(pallet.to_string(), parcel.to_string()).is_some() {
             return Err(format!("it names the pallet \"{}\" twice", pallet));
@@ -141,7 +136,7 @@ mod tests {
 
         assert_eq!(
             std::fs::read_to_string(mirror_roots_path()).unwrap(),
-            format!("forklift mirror roots 1\nmain {}\nrel/x {}\n", "a1".repeat(32), "b2".repeat(32))
+            format!("/forklift-mirror-roots 1\nmain {}\nrel/x {}\n", "a1".repeat(32), "b2".repeat(32))
         );
         assert_eq!(read_mirror_roots().unwrap(), roots);
     }
@@ -154,12 +149,14 @@ mod tests {
         let hash = "c3".repeat(32);
 
         for (content, reason) in [
-            (String::new(), "it is empty".to_string()),
-            (format!("forklift mirror roots 2\nmain {}\n", hash), "forklift mirror roots 2".to_string()),
-            (format!("forklift mirror roots 1\nmain {}\nmain {}\n", hash, hash), "twice".to_string()),
-            ("forklift mirror roots 1\nmain not-a-hash\n".to_string(), "main not-a-hash".to_string()),
-            (format!("forklift mirror roots 1\nBad {}\n", hash), format!("Bad {}", hash)),
-            (format!("forklift mirror roots 1\nmain{}\n", hash), format!("main{}", hash)),
+            (String::new(), "no format header".to_string()),
+            (format!("forklift mirror roots 1\nmain {}\n", hash), "no format header".to_string()),
+            (format!("/forklift-mirror-roots 2\nmain {}\n", hash), "/forklift-mirror-roots 2".to_string()),
+            (format!("/forklift-mirror-roots 1\nmain {}", hash), "cut short".to_string()),
+            (format!("/forklift-mirror-roots 1\nmain {}\nmain {}\n", hash, hash), "twice".to_string()),
+            ("/forklift-mirror-roots 1\nmain not-a-hash\n".to_string(), "main not-a-hash".to_string()),
+            (format!("/forklift-mirror-roots 1\nBad {}\n", hash), format!("Bad {}", hash)),
+            (format!("/forklift-mirror-roots 1\nmain{}\n", hash), format!("main{}", hash)),
         ] {
             std::fs::write(mirror_roots_path(), &content).unwrap();
             let error = read_mirror_roots().expect_err(&content);
@@ -169,6 +166,6 @@ mod tests {
         }
 
         std::fs::write(mirror_roots_path(), [0xff, 0xfe]).unwrap();
-        assert!(read_mirror_roots().unwrap_err().contains("not UTF-8"));
+        assert!(read_mirror_roots().unwrap_err().contains("not valid UTF-8"));
     }
 }

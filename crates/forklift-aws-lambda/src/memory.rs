@@ -22,6 +22,9 @@ use forklift_core::util::object_utils;
 use forklift_core::util::office_utils::{TrustAnchor, OFFICE_PALLET_NAME};
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef, DEFAULT_PALLET_NAME};
 
+use crate::aws::dynamo::{
+    ATTR_ANCHOR, ATTR_DELETED_HEAD, ATTR_HEAD, ATTR_STATE, ENTITY_FORMAT, ENTITY_PALLET_PREFIX, ENTITY_TRUST,
+};
 use crate::store::{
     CasOutcome, ExpectedHead, FormatFence, FormatStore, ObjectAccess, ObjectStore, OffloadedResponse,
     OfficePrecondition, PromoteOutcome, PutOutcome, PutTarget, RefHead, RefListing, RefStore, SignatureOutcome,
@@ -297,6 +300,66 @@ impl MemoryRefStore {
     /// formats were recorded.
     pub fn set_format(&self, state: Option<&str>) {
         self.state.lock().unwrap().format = state.map(str::to_string);
+    }
+
+    /// This store's state as the DynamoDB items `DynamoRefStore` keeps for it: each item's sort
+    /// key, its one payload attribute and that attribute's value, sorted by sort key. What the AWS
+    /// format fixture freezes.
+    pub fn items(&self) -> Vec<(String, String, String)> {
+        let state = self.state.lock().unwrap();
+        let mut items = Vec::new();
+
+        if let Some(format) = &state.format {
+            items.push((ENTITY_FORMAT.to_string(), ATTR_STATE.to_string(), format.clone()));
+        }
+        if let Some(trust) = &state.trust {
+            items.push((ENTITY_TRUST.to_string(), ATTR_ANCHOR.to_string(), trust.clone()));
+        }
+        for (wire, head) in &state.pallets {
+            let entity = format!("{}{}", ENTITY_PALLET_PREFIX, wire);
+            match head {
+                RefHead::Live(head) => items.push((entity, ATTR_HEAD.to_string(), head.clone())),
+                RefHead::Deleted(head) => items.push((entity, ATTR_DELETED_HEAD.to_string(), head.clone())),
+                RefHead::Absent => {}
+            }
+        }
+
+        items.sort();
+        items
+    }
+
+    /// A store holding exactly `items`, as [`Self::items`] lists them.
+    ///
+    /// # Returns
+    /// * `Ok(MemoryRefStore)` - The store.
+    /// * `Err(String)`        - An item this build does not keep: an unknown sort key, a pallet with
+    ///                          no name, an attribute its kind of item does not carry, or a sort key
+    ///                          listed twice.
+    pub fn from_items(items: &[(String, String, String)]) -> Result<MemoryRefStore, String> {
+        let store = MemoryRefStore::new();
+        let mut state = store.state.lock().unwrap();
+
+        let mut seen = std::collections::HashSet::new();
+
+        for (entity, attribute, value) in items {
+            if !seen.insert(entity) {
+                return Err(format!("The item \"{}\" is listed twice.", entity));
+            }
+            let pallet = entity.strip_prefix(ENTITY_PALLET_PREFIX).filter(|wire| !wire.is_empty());
+
+            match (entity.as_str(), pallet, attribute.as_str()) {
+                (ENTITY_FORMAT, _, ATTR_STATE) => state.format = Some(value.clone()),
+                (ENTITY_TRUST, _, ATTR_ANCHOR) => state.trust = Some(value.clone()),
+                (_, Some(wire), ATTR_HEAD) => { state.pallets.insert(wire.to_string(), RefHead::Live(value.clone())); }
+                (_, Some(wire), ATTR_DELETED_HEAD) => {
+                    state.pallets.insert(wire.to_string(), RefHead::Deleted(value.clone()));
+                }
+                _ => return Err(format!("The item \"{}\" carries \"{}\", which this build does not keep.", entity, attribute)),
+            }
+        }
+
+        drop(state);
+        Ok(store)
     }
 
     fn key(namespace: PalletNamespace, name: &str) -> String {
@@ -631,6 +694,29 @@ impl FormatStore for MemoryRefStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn item(entity: &str, attribute: &str, value: &str) -> (String, String, String) {
+        (entity.to_string(), attribute.to_string(), value.to_string())
+    }
+
+    /// A store loads exactly the items it dumps, and refuses an item it would never write.
+    ///
+    /// Revert: drop the duplicate check → the twice-listed pallet loads; drop the empty-name check →
+    /// the bare prefix loads.
+    #[test]
+    fn from_items_loads_only_items_this_store_writes() {
+        let items = vec![item("format", "state", "1"), item("pallet#main", "head", "h"), item("trust", "anchor", "{}")];
+        assert_eq!(MemoryRefStore::from_items(&items).unwrap().items(), items);
+
+        for refused in [
+            vec![item("pallet#main", "head", "h"), item("pallet#main", "deleted_head", "h")],
+            vec![item("pallet#", "head", "h")],
+            vec![item("trust", "head", "h")],
+            vec![item("lease", "state", "1")],
+        ] {
+            assert!(MemoryRefStore::from_items(&refused).is_err(), "{:?}", refused);
+        }
+    }
 
     /// The bulk presence probe (`objects_missing`, the default serial impl the fake inherits and the
     /// commit-gate chunk descent leans on) must return exactly the absent subset of a hash list — the

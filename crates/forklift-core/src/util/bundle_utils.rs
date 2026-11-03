@@ -1600,7 +1600,7 @@ mod tests {
     fn import_stores_a_valid_object_record() {
         let _scratch = Scratch::new("import-object-ok");
 
-        let content = b"hello, bundle";
+        let content: &[u8] = &object_utils::blob_bytes(b"hello, bundle");
         let hash = object_utils::hash_object_bytes(content);
         let bytes = raw_bundle(BUNDLE_HEADER_V3, &record(b'O', &hash, content));
 
@@ -1615,7 +1615,7 @@ mod tests {
     fn import_rejects_a_hash_mismatched_object_record() {
         let _scratch = Scratch::new("import-object-mismatch");
 
-        let content = b"hello, bundle";
+        let content: &[u8] = &object_utils::blob_bytes(b"hello, bundle");
         let wrong_hash = object_utils::hash_object_bytes(b"not the same content");
         let bytes = raw_bundle(BUNDLE_HEADER_V3, &record(b'O', &wrong_hash, content));
 
@@ -1628,7 +1628,7 @@ mod tests {
     fn import_skips_an_object_already_present() {
         let _scratch = Scratch::new("import-object-skip");
 
-        let content = b"already here";
+        let content: &[u8] = &object_utils::blob_bytes(b"already here");
         let hash = object_utils::hash_object_bytes(content);
         object_utils::store_object_bytes(&hash, content).unwrap();
 
@@ -1647,7 +1647,7 @@ mod tests {
         for kind in [b'S', b'D'] {
             let _scratch = Scratch::new("streamed-retired-kind");
 
-            let parcel_content = b"a stand-in parcel object";
+            let parcel_content: &[u8] = &object_utils::blob_bytes(b"a stand-in parcel object");
             let parcel_hash = object_utils::hash_object_bytes(parcel_content);
             object_utils::store_object_bytes(&parcel_hash, parcel_content).unwrap();
 
@@ -1705,7 +1705,7 @@ mod tests {
     fn import_bundle_refuses_every_record_stream_header() {
         let _scratch = Scratch::new("import-record-stream-headers");
 
-        let content = b"record-stream content";
+        let content: &[u8] = &object_utils::blob_bytes(b"record-stream content");
         let hash = object_utils::hash_object_bytes(content);
 
         for header in [BUNDLE_HEADER_V3, "forklift-bundle 2026-07-06", "forklift-bundle 2026-07-03"] {
@@ -1725,7 +1725,7 @@ mod tests {
         let _scratch = Scratch::new("batch-unrequested");
 
         let asked = object_utils::hash_object_bytes(b"asked for");
-        let content = b"never asked for";
+        let content: &[u8] = &object_utils::blob_bytes(b"never asked for");
         let other = object_utils::hash_object_bytes(content);
 
         let bytes = raw_bundle(BUNDLE_HEADER_V3, &record(b'O', &other, content));
@@ -1744,7 +1744,7 @@ mod tests {
     fn a_batch_refuses_an_object_sent_twice() {
         let _scratch = Scratch::new("batch-repeat");
 
-        let content = b"sent twice";
+        let content: &[u8] = &object_utils::blob_bytes(b"sent twice");
         let hash = object_utils::hash_object_bytes(content);
         let mut records = record(b'O', &hash, content);
         records.extend(record(b'O', &hash, content));
@@ -1757,7 +1757,7 @@ mod tests {
     /// duplicates (the Lambda head passes a request through as given) imports.
     #[test]
     fn build_partial_bundle_writes_a_repeated_hash_once() {
-        let content = b"asked for twice";
+        let content: &[u8] = &object_utils::blob_bytes(b"asked for twice");
         let hash = object_utils::hash_object_bytes(content);
 
         let bytes = {
@@ -1838,7 +1838,7 @@ mod tests {
         let fixture = closure_fixture();
         let _scratch = Scratch::new("closure-stray");
 
-        let stray_content = b"outside the closure";
+        let stray_content: &[u8] = &object_utils::blob_bytes(b"outside the closure");
         let stray = object_utils::hash_object_bytes(stray_content);
         let mut records = fixture.records.clone();
         records.extend(record(b'O', &stray, stray_content));
@@ -1873,7 +1873,7 @@ mod tests {
     fn a_full_rollover_pack_round_trips_through_a_native_bundle() {
         let count = pack_utils::PACK_ROLLOVER_OBJECTS;
         let hashes: Vec<String> = (0..count)
-            .map(|index| object_utils::hash_object_bytes(format!("rollover {}", index).as_bytes()))
+            .map(|index| object_utils::hash_object_bytes(&object_utils::blob_bytes(format!("rollover {}", index).as_bytes())))
             .collect();
 
         let bundle = {
@@ -1882,7 +1882,7 @@ mod tests {
             std::fs::create_dir_all(&staging).unwrap();
             let mut builder = pack_utils::TransportPackBuilder::new(&staging).unwrap();
             for (index, hash) in hashes.iter().enumerate() {
-                builder.append_full(hash, format!("rollover {}", index).as_bytes()).unwrap();
+                builder.append_full(hash, &object_utils::blob_bytes(format!("rollover {}", index).as_bytes())).unwrap();
             }
             let artifacts = builder.finish().unwrap();
             assert_eq!(artifacts.len(), 1, "exactly the rollover count fits one pack");
@@ -2606,9 +2606,9 @@ mod tests {
         let mut hashes = Vec::new();
 
         for i in 0..3 {
-            let content = format!("streamed object {} {}", i, "x".repeat(200 * i));
-            let hash = object_utils::hash_object_bytes(content.as_bytes());
-            records.extend(record(b'O', &hash, content.as_bytes()));
+            let content = object_utils::blob_bytes(format!("streamed object {} {}", i, "x".repeat(200 * i)).as_bytes());
+            let hash = object_utils::hash_object_bytes(&content);
+            records.extend(record(b'O', &hash, &content));
             hashes.push(hash);
         }
 
