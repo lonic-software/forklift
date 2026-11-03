@@ -884,6 +884,7 @@ fn a_writer_promoting_themselves_is_forbidden_and_an_admin_promoting_them_is_not
             &by_worker,
             OfficePrecondition::NotConsumed,
             trust.as_ref().map(|(_, raw)| raw.as_str()),
+            &forklift_aws_lambda::format::gate(&head.refs).expect("format gate"),
             &request_token(),
         ),
         Ok(CasOutcome::Committed)
@@ -967,6 +968,7 @@ fn an_office_and_an_anchor_never_exist_apart() {
             &office_head,
             OfficePrecondition::NotConsumed,
             None,
+            &forklift_aws_lambda::format::gate(&*refs).expect("format gate"),
             &request_token(),
         ),
         Ok(CasOutcome::Committed)
@@ -2033,6 +2035,14 @@ struct AsyncRefStore {
 }
 
 impl RefStore for AsyncRefStore {
+    fn read_format(&self) -> Result<Option<String>, String> {
+        self.inner.read_format()
+    }
+
+    fn partition_has_items(&self) -> Result<bool, String> {
+        self.inner.partition_has_items()
+    }
+
     fn get_head(&self, namespace: pallet_utils::PalletNamespace, name: &str) -> Result<RefHead, String> {
         self.bridge.block_on(suspending(|| self.inner.get_head(namespace, name)))
     }
@@ -2045,10 +2055,11 @@ impl RefStore for AsyncRefStore {
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
         self.bridge.block_on(suspending(|| {
-            self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, request_token)
+            self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
         }))
     }
 
@@ -2059,9 +2070,10 @@ impl RefStore for AsyncRefStore {
         old: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.bridge.block_on(suspending(|| self.inner.delete_head(namespace, name, old, office_head, anchor, request_token)))
+        self.bridge.block_on(suspending(|| self.inner.delete_head(namespace, name, old, office_head, anchor, format, request_token)))
     }
     fn list_refs(&self) -> Result<RefListing, String> {
         self.bridge.block_on(suspending(|| self.inner.list_refs()))
@@ -2075,8 +2087,13 @@ impl RefStore for AsyncRefStore {
         self.bridge.block_on(suspending(|| self.inner.get_trust()))
     }
 
-    fn put_trust_if_absent(&self, anchor: &office_utils::TrustAnchor) -> Result<TrustOutcome, String> {
-        self.bridge.block_on(suspending(|| self.inner.put_trust_if_absent(anchor)))
+    fn put_trust_if_absent(
+        &self,
+        anchor: &office_utils::TrustAnchor,
+        format: &forklift_aws_lambda::FormatFence,
+        request_token: &str,
+    ) -> Result<TrustOutcome, String> {
+        self.bridge.block_on(suspending(|| self.inner.put_trust_if_absent(anchor, format, request_token)))
     }
 
     fn replace_trust(
@@ -2084,9 +2101,10 @@ impl RefStore for AsyncRefStore {
         anchor: &office_utils::TrustAnchor,
         expected_anchor: &str,
         office_head: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
-        self.bridge.block_on(suspending(|| self.inner.replace_trust(anchor, expected_anchor, office_head, request_token)))
+        self.bridge.block_on(suspending(|| self.inner.replace_trust(anchor, expected_anchor, office_head, format, request_token)))
     }
 }
 
@@ -2157,6 +2175,14 @@ async fn a_trusted_lift_runs_over_async_backed_stores_from_a_blocking_thread() {
 struct SharedMemoryRefs(Arc<MemoryRefStore>);
 
 impl RefStore for SharedMemoryRefs {
+    fn read_format(&self) -> Result<Option<String>, String> {
+        self.0.read_format()
+    }
+
+    fn partition_has_items(&self) -> Result<bool, String> {
+        self.0.partition_has_items()
+    }
+
     fn get_head(
         &self,
         namespace: pallet_utils::PalletNamespace,
@@ -2173,9 +2199,10 @@ impl RefStore for SharedMemoryRefs {
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.0.compare_and_set_head(namespace, name, expected, new, office_head, anchor, request_token)
+        self.0.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
     }
 
     fn delete_head(
@@ -2185,9 +2212,10 @@ impl RefStore for SharedMemoryRefs {
         old: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.0.delete_head(namespace, name, old, office_head, anchor, request_token)
+        self.0.delete_head(namespace, name, old, office_head, anchor, format, request_token)
     }
     fn list_refs(&self) -> Result<RefListing, String> {
         self.0.list_refs()
@@ -2201,8 +2229,13 @@ impl RefStore for SharedMemoryRefs {
         self.0.get_trust()
     }
 
-    fn put_trust_if_absent(&self, anchor: &office_utils::TrustAnchor) -> Result<TrustOutcome, String> {
-        self.0.put_trust_if_absent(anchor)
+    fn put_trust_if_absent(
+        &self,
+        anchor: &office_utils::TrustAnchor,
+        format: &forklift_aws_lambda::FormatFence,
+        request_token: &str,
+    ) -> Result<TrustOutcome, String> {
+        self.0.put_trust_if_absent(anchor, format, request_token)
     }
 
     fn replace_trust(
@@ -2210,9 +2243,10 @@ impl RefStore for SharedMemoryRefs {
         anchor: &office_utils::TrustAnchor,
         expected_anchor: &str,
         office_head: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
-        self.0.replace_trust(anchor, expected_anchor, office_head, request_token)
+        self.0.replace_trust(anchor, expected_anchor, office_head, format, request_token)
     }
 }
 
@@ -2227,6 +2261,14 @@ struct OfficeMovesAfterTheSnapshot {
 }
 
 impl RefStore for OfficeMovesAfterTheSnapshot {
+    fn read_format(&self) -> Result<Option<String>, String> {
+        self.inner.read_format()
+    }
+
+    fn partition_has_items(&self) -> Result<bool, String> {
+        self.inner.partition_has_items()
+    }
+
     fn get_head(
         &self,
         namespace: pallet_utils::PalletNamespace,
@@ -2260,6 +2302,7 @@ impl RefStore for OfficeMovesAfterTheSnapshot {
                         &self.move_to,
                         OfficePrecondition::NotConsumed,
                         anchor_bytes.as_deref(),
+                        &forklift_aws_lambda::format::gate(&*self.inner).expect("format gate"),
                         &request_token(),
                     )
                     .expect("inject the concurrent office move");
@@ -2282,9 +2325,10 @@ impl RefStore for OfficeMovesAfterTheSnapshot {
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, request_token)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
     }
 
     fn delete_head(
@@ -2294,9 +2338,10 @@ impl RefStore for OfficeMovesAfterTheSnapshot {
         old: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.delete_head(namespace, name, old, office_head, anchor, request_token)
+        self.inner.delete_head(namespace, name, old, office_head, anchor, format, request_token)
     }
     fn list_refs(&self) -> Result<RefListing, String> {
         self.inner.list_refs()
@@ -2310,8 +2355,13 @@ impl RefStore for OfficeMovesAfterTheSnapshot {
         self.inner.get_trust()
     }
 
-    fn put_trust_if_absent(&self, anchor: &office_utils::TrustAnchor) -> Result<TrustOutcome, String> {
-        self.inner.put_trust_if_absent(anchor)
+    fn put_trust_if_absent(
+        &self,
+        anchor: &office_utils::TrustAnchor,
+        format: &forklift_aws_lambda::FormatFence,
+        request_token: &str,
+    ) -> Result<TrustOutcome, String> {
+        self.inner.put_trust_if_absent(anchor, format, request_token)
     }
 
     fn replace_trust(
@@ -2319,9 +2369,10 @@ impl RefStore for OfficeMovesAfterTheSnapshot {
         anchor: &office_utils::TrustAnchor,
         expected_anchor: &str,
         office_head: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
-        self.inner.replace_trust(anchor, expected_anchor, office_head, request_token)
+        self.inner.replace_trust(anchor, expected_anchor, office_head, format, request_token)
     }
 }
 
@@ -2335,6 +2386,14 @@ struct AnchorMovesAfterTheSnapshot {
 }
 
 impl RefStore for AnchorMovesAfterTheSnapshot {
+    fn read_format(&self) -> Result<Option<String>, String> {
+        self.inner.read_format()
+    }
+
+    fn partition_has_items(&self) -> Result<bool, String> {
+        self.inner.partition_has_items()
+    }
+
     fn get_head(
         &self,
         namespace: pallet_utils::PalletNamespace,
@@ -2351,9 +2410,10 @@ impl RefStore for AnchorMovesAfterTheSnapshot {
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, request_token)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
     }
 
     fn delete_head(
@@ -2363,9 +2423,10 @@ impl RefStore for AnchorMovesAfterTheSnapshot {
         old: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.delete_head(namespace, name, old, office_head, anchor, request_token)
+        self.inner.delete_head(namespace, name, old, office_head, anchor, format, request_token)
     }
     fn list_refs(&self) -> Result<RefListing, String> {
         self.inner.list_refs()
@@ -2397,7 +2458,7 @@ impl RefStore for AnchorMovesAfterTheSnapshot {
 
             assert_eq!(
                 self.inner
-                    .replace_trust(&self.move_to, &expected, office_head.live(), &request_token())
+                    .replace_trust(&self.move_to, &expected, office_head.live(), &forklift_aws_lambda::format::gate(&*self.inner).expect("format gate"), &request_token())
                     .expect("inject the concurrent re-genesis"),
                 TrustWriteOutcome::Replaced,
                 "the injected re-genesis must actually land, or the test it feeds proves \
@@ -2408,8 +2469,13 @@ impl RefStore for AnchorMovesAfterTheSnapshot {
         result
     }
 
-    fn put_trust_if_absent(&self, anchor: &office_utils::TrustAnchor) -> Result<TrustOutcome, String> {
-        self.inner.put_trust_if_absent(anchor)
+    fn put_trust_if_absent(
+        &self,
+        anchor: &office_utils::TrustAnchor,
+        format: &forklift_aws_lambda::FormatFence,
+        request_token: &str,
+    ) -> Result<TrustOutcome, String> {
+        self.inner.put_trust_if_absent(anchor, format, request_token)
     }
 
     fn replace_trust(
@@ -2417,9 +2483,10 @@ impl RefStore for AnchorMovesAfterTheSnapshot {
         anchor: &office_utils::TrustAnchor,
         expected_anchor: &str,
         office_head: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
-        self.inner.replace_trust(anchor, expected_anchor, office_head, request_token)
+        self.inner.replace_trust(anchor, expected_anchor, office_head, format, request_token)
     }
 }
 
@@ -2475,6 +2542,14 @@ impl TransientOnCommit {
 }
 
 impl RefStore for TransientOnCommit {
+    fn read_format(&self) -> Result<Option<String>, String> {
+        self.inner.read_format()
+    }
+
+    fn partition_has_items(&self) -> Result<bool, String> {
+        self.inner.partition_has_items()
+    }
+
     fn get_head(
         &self,
         namespace: pallet_utils::PalletNamespace,
@@ -2491,6 +2566,7 @@ impl RefStore for TransientOnCommit {
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
         let attempt = {
@@ -2513,7 +2589,7 @@ impl RefStore for TransientOnCommit {
             return Ok(self.refusal.clone());
         }
 
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, request_token)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
     }
 
     fn delete_head(
@@ -2523,9 +2599,10 @@ impl RefStore for TransientOnCommit {
         old: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.delete_head(namespace, name, old, office_head, anchor, request_token)
+        self.inner.delete_head(namespace, name, old, office_head, anchor, format, request_token)
     }
     fn list_refs(&self) -> Result<RefListing, String> {
         self.inner.list_refs()
@@ -2539,8 +2616,13 @@ impl RefStore for TransientOnCommit {
         self.inner.get_trust()
     }
 
-    fn put_trust_if_absent(&self, anchor: &office_utils::TrustAnchor) -> Result<TrustOutcome, String> {
-        self.inner.put_trust_if_absent(anchor)
+    fn put_trust_if_absent(
+        &self,
+        anchor: &office_utils::TrustAnchor,
+        format: &forklift_aws_lambda::FormatFence,
+        request_token: &str,
+    ) -> Result<TrustOutcome, String> {
+        self.inner.put_trust_if_absent(anchor, format, request_token)
     }
 
     fn replace_trust(
@@ -2548,9 +2630,10 @@ impl RefStore for TransientOnCommit {
         anchor: &office_utils::TrustAnchor,
         expected_anchor: &str,
         office_head: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
-        self.inner.replace_trust(anchor, expected_anchor, office_head, request_token)
+        self.inner.replace_trust(anchor, expected_anchor, office_head, format, request_token)
     }
 }
 
@@ -2951,6 +3034,7 @@ fn an_untrusted_warehouses_concurrent_office_move_does_not_refuse_the_commit() {
             &office_head,
             OfficePrecondition::NotConsumed,
             None,
+            &forklift_aws_lambda::format::gate(&*store).expect("format gate"),
             &request_token(),
         ),
         Ok(CasOutcome::Committed)
@@ -3128,6 +3212,7 @@ fn a_concurrently_moved_unrelated_pallet_does_not_refuse_the_commit() {
                 &"a".repeat(64),
                 OfficePrecondition::At(&office_head),
                 Some(&anchor_bytes),
+                &forklift_aws_lambda::format::gate(&head.refs).expect("format gate"),
                 &request_token(),
             )
             .expect("plant an unrelated pallet"),
@@ -3173,7 +3258,7 @@ fn seeded_trust(office_head: &str) -> (Arc<MemoryRefStore>, TrustAnchorDto, Stri
     };
 
     assert_eq!(
-        store.put_trust_if_absent(&anchor_v1.to_anchor()).expect("plant the incumbent anchor"),
+        store.put_trust_if_absent(&anchor_v1.to_anchor(), &forklift_aws_lambda::format::gate(&*store).expect("format gate"), &forklift_aws_lambda::reissue::request_token()).expect("plant the incumbent anchor"),
         TrustOutcome::Established
     );
 
@@ -3188,6 +3273,7 @@ fn seeded_trust(office_head: &str) -> (Arc<MemoryRefStore>, TrustAnchorDto, Stri
                 office_head,
                 OfficePrecondition::NotConsumed,
                 Some(&bytes),
+                &forklift_aws_lambda::format::gate(&*store).expect("format gate"),
                 &request_token(),
             )
             .expect("lift the office pallet"),
@@ -3370,6 +3456,7 @@ fn a_concurrently_moved_unrelated_pallet_does_not_refuse_the_re_genesis() {
                 &"e".repeat(64),
                 OfficePrecondition::NotConsumed,
                 Some(&bytes),
+                &forklift_aws_lambda::format::gate(&*store).expect("format gate"),
                 &request_token(),
             )
             .expect("lift an unrelated pallet"),
@@ -3423,6 +3510,14 @@ impl TransientOnAnchorWrite {
 }
 
 impl RefStore for TransientOnAnchorWrite {
+    fn read_format(&self) -> Result<Option<String>, String> {
+        self.inner.read_format()
+    }
+
+    fn partition_has_items(&self) -> Result<bool, String> {
+        self.inner.partition_has_items()
+    }
+
     fn get_head(
         &self,
         namespace: pallet_utils::PalletNamespace,
@@ -3439,9 +3534,10 @@ impl RefStore for TransientOnAnchorWrite {
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, request_token)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
     }
 
     fn delete_head(
@@ -3451,9 +3547,10 @@ impl RefStore for TransientOnAnchorWrite {
         old: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.delete_head(namespace, name, old, office_head, anchor, request_token)
+        self.inner.delete_head(namespace, name, old, office_head, anchor, format, request_token)
     }
     fn list_refs(&self) -> Result<RefListing, String> {
         self.inner.list_refs()
@@ -3470,8 +3567,10 @@ impl RefStore for TransientOnAnchorWrite {
     fn put_trust_if_absent(
         &self,
         anchor: &office_utils::TrustAnchor,
+        format: &forklift_aws_lambda::FormatFence,
+        request_token: &str,
     ) -> Result<TrustOutcome, String> {
-        self.inner.put_trust_if_absent(anchor)
+        self.inner.put_trust_if_absent(anchor, format, request_token)
     }
 
     fn replace_trust(
@@ -3479,6 +3578,7 @@ impl RefStore for TransientOnAnchorWrite {
         anchor: &office_utils::TrustAnchor,
         expected_anchor: &str,
         office_head: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
         let attempt = {
@@ -3501,7 +3601,7 @@ impl RefStore for TransientOnAnchorWrite {
             return Ok(self.refusal.clone());
         }
 
-        self.inner.replace_trust(anchor, expected_anchor, office_head, request_token)
+        self.inner.replace_trust(anchor, expected_anchor, office_head, format, request_token)
     }
 }
 
@@ -3519,6 +3619,14 @@ struct AnchorMovedOnAnchorWrite {
 }
 
 impl RefStore for AnchorMovedOnAnchorWrite {
+    fn read_format(&self) -> Result<Option<String>, String> {
+        self.inner.read_format()
+    }
+
+    fn partition_has_items(&self) -> Result<bool, String> {
+        self.inner.partition_has_items()
+    }
+
     fn get_head(
         &self,
         namespace: pallet_utils::PalletNamespace,
@@ -3535,9 +3643,10 @@ impl RefStore for AnchorMovedOnAnchorWrite {
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, request_token)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
     }
 
     fn delete_head(
@@ -3547,9 +3656,10 @@ impl RefStore for AnchorMovedOnAnchorWrite {
         old: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.delete_head(namespace, name, old, office_head, anchor, request_token)
+        self.inner.delete_head(namespace, name, old, office_head, anchor, format, request_token)
     }
     fn list_refs(&self) -> Result<RefListing, String> {
         self.inner.list_refs()
@@ -3566,8 +3676,10 @@ impl RefStore for AnchorMovedOnAnchorWrite {
     fn put_trust_if_absent(
         &self,
         anchor: &office_utils::TrustAnchor,
+        format: &forklift_aws_lambda::FormatFence,
+        request_token: &str,
     ) -> Result<TrustOutcome, String> {
-        self.inner.put_trust_if_absent(anchor)
+        self.inner.put_trust_if_absent(anchor, format, request_token)
     }
 
     fn replace_trust(
@@ -3575,6 +3687,7 @@ impl RefStore for AnchorMovedOnAnchorWrite {
         _anchor: &office_utils::TrustAnchor,
         _expected_anchor: &str,
         _office_head: Option<&str>,
+        _format: &forklift_aws_lambda::FormatFence,
         _request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
         Ok(TrustWriteOutcome::AnchorMoved { current: self.current.clone() })
@@ -4088,6 +4201,14 @@ impl DeleteRace {
 }
 
 impl RefStore for RacesTheDelete {
+    fn read_format(&self) -> Result<Option<String>, String> {
+        self.inner.read_format()
+    }
+
+    fn partition_has_items(&self) -> Result<bool, String> {
+        self.inner.partition_has_items()
+    }
+
     fn get_head(&self, namespace: pallet_utils::PalletNamespace, name: &str) -> Result<RefHead, String> {
         match &self.race {
             DeleteRace::TransientThenUnreadable(_, attempted) if attempted.get() => Err("throttled.".to_string()),
@@ -4103,9 +4224,10 @@ impl RefStore for RacesTheDelete {
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, request_token)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
     }
 
     fn delete_head(
@@ -4115,6 +4237,7 @@ impl RefStore for RacesTheDelete {
         old: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
         match &self.race {
@@ -4122,17 +4245,17 @@ impl RefStore for RacesTheDelete {
                 if let Some(race) = race.borrow_mut().take() {
                     race(&self.inner);
                 }
-                self.inner.delete_head(namespace, name, old, office_head, anchor, request_token)
+                self.inner.delete_head(namespace, name, old, office_head, anchor, format, request_token)
             }
             DeleteRace::LandsThenTransient => {
-                self.inner.delete_head(namespace, name, old, office_head, anchor, request_token)?;
+                self.inner.delete_head(namespace, name, old, office_head, anchor, format, request_token)?;
                 Ok(CasOutcome::Transient(TransientCause::FateUnknown))
             }
             DeleteRace::Transient => Ok(CasOutcome::Transient(TransientCause::FateUnknown)),
             DeleteRace::ThenFault { attempted, .. } if attempted.replace(true) => Err("a fault".to_string()),
             DeleteRace::ThenFault { first, lands, .. } => {
                 if *lands {
-                    self.inner.delete_head(namespace, name, old, office_head, anchor, request_token)?;
+                    self.inner.delete_head(namespace, name, old, office_head, anchor, format, request_token)?;
                 }
                 Ok(CasOutcome::Transient(*first))
             }
@@ -4161,8 +4284,13 @@ impl RefStore for RacesTheDelete {
         self.inner.get_trust()
     }
 
-    fn put_trust_if_absent(&self, anchor: &office_utils::TrustAnchor) -> Result<TrustOutcome, String> {
-        self.inner.put_trust_if_absent(anchor)
+    fn put_trust_if_absent(
+        &self,
+        anchor: &office_utils::TrustAnchor,
+        format: &forklift_aws_lambda::FormatFence,
+        request_token: &str,
+    ) -> Result<TrustOutcome, String> {
+        self.inner.put_trust_if_absent(anchor, format, request_token)
     }
 
     fn replace_trust(
@@ -4170,9 +4298,10 @@ impl RefStore for RacesTheDelete {
         anchor: &office_utils::TrustAnchor,
         expected_anchor: &str,
         office_head: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
-        self.inner.replace_trust(anchor, expected_anchor, office_head, request_token)
+        self.inner.replace_trust(anchor, expected_anchor, office_head, format, request_token)
     }
 }
 
@@ -4199,6 +4328,7 @@ fn racing_lift(from: String, to: String) -> RacingWrite {
                 &to,
                 OfficePrecondition::NotConsumed,
                 None,
+                &forklift_aws_lambda::format::gate(&*store).expect("format gate"),
                 &request_token(),
             )
             .expect("the racing lift");
@@ -4228,7 +4358,7 @@ fn of_two_racing_deletes_the_loser_answers_200() {
     let (store, head, feature_v2, _) = racing_head(&area, |from, _| {
         DeleteRace::before(move |store: &MemoryRefStore| {
             let outcome = store
-                .delete_head(pallet_utils::PalletNamespace::User, "feature", &from, OfficePrecondition::Unborn, None, &request_token())
+                .delete_head(pallet_utils::PalletNamespace::User, "feature", &from, OfficePrecondition::Unborn, None, &forklift_aws_lambda::format::gate(&*store).expect("format gate"), &request_token())
                 .expect("the racing delete");
             assert_eq!(outcome, CasOutcome::Committed);
         })
@@ -4411,6 +4541,7 @@ fn an_office_lift_in_the_bootstrap_window_refuses_a_delete_it_denies() {
                 &feature_head,
                 OfficePrecondition::NotConsumed,
                 anchor.as_deref(),
+                &forklift_aws_lambda::format::gate(&*store).expect("format gate"),
                 &request_token(),
             )
             .expect("seed feature");

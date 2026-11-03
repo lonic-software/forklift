@@ -10,8 +10,8 @@ Every claim below is grounded in `crates/forklift-aws-lambda/src/{entrypoint.rs,
 aws/{s3.rs, dynamo.rs, config.rs}, bin/{control-plane.rs, verifier.rs}}` and
 `crates/forklift-aws-lambda/tests/aws_integration.rs`, current as of this writing. Where the
 code leaves an infrastructure choice open, it is called out as an **operator decision** with a
-recommended default — this crate ships two Lambda binaries and the store code behind them, not
-a Terraform/CDK stack.
+recommended default — this crate ships two Lambda binaries, the operator's upgrade binary and the
+store code behind them, not a Terraform/CDK stack.
 
 ## Architecture overview
 
@@ -75,6 +75,9 @@ so the two racing on one hash is safe — whichever gets there first wins, the o
 |---|---|---|---|
 | Control plane | `forklift-aws-control-plane` | `src/bin/control-plane.rs` | API Gateway (every `/v1/…` and `/lift/{session}/commit` request) |
 | Staging verifier | `forklift-aws-verifier` | `src/bin/verifier.rs` | S3 event notification (`ObjectCreated` on `staging/`) |
+
+A third binary, `forklift-aws-upgrade` (`src/bin/upgrade.rs`), is not a Lambda: an operator runs it
+to upgrade warehouses to a new format ("Operational notes" below).
 
 **Control plane.** A thin adapter: builds the SDK clients once per cold start into a
 process-global cell, converts the `lambda_http` request into the plain `http::Request` the
@@ -329,11 +332,17 @@ docs, and the exact shape `tests/aws_integration.rs`'s `provision()` creates):
 | Attribute | Type | Role |
 |---|---|---|
 | `wh` | `S` | Partition key — the warehouse id |
-| `entity` | `S` | Sort key — `pallet#{qualified-ref}` (e.g. `pallet#main`, `pallet#@office`) or the literal string `trust` |
+| `entity` | `S` | Sort key — `pallet#{qualified-ref}` (e.g. `pallet#main`, `pallet#@office`) or one of the literal strings `trust` and `format` |
 
 Item payload attributes (`head` for a live pallet item, `deleted_head` for a deleted one's
-tombstone, `anchor` — a JSON string — for the trust item) are not part of the key schema and need
-no separate declaration when you create the table; DynamoDB is schemaless beyond the key.
+tombstone, `anchor` — a JSON string — for the trust item, `state` for the format item) are not part
+of the key schema and need no separate declaration when you create the table; DynamoDB is
+schemaless beyond the key.
+
+The format item records the warehouse's format (`docs/format/WAREHOUSE_FORMAT.md`, "The AWS head").
+Every request reads it strongly consistent before anything else and is refused with a `503` unless
+it holds exactly the format the deployment reads; a warehouse with nothing stored is new, and its
+first write records the format.
 
 ### The CAS
 
@@ -350,8 +359,14 @@ actions on one item in the same transaction), and a `ConditionCheck` on the trus
 anchor's stored serialization. DynamoDB either applies the whole transaction with every
 condition holding or applies nothing; on a condition failure
 `ReturnValuesOnConditionCheckFailure=ALL_OLD` hands back the failed item, so the store reports
-which precondition moved without a second round trip. `put_trust_if_absent` is still the
-single-item shape (a conditional `PutItem`) for the one-way trust door.
+which precondition moved without a second round trip. `put_trust_if_absent`, the one-way trust
+door, is a transaction too: a `Put` on the trust item conditioned on its absence.
+
+Every one of these transactions carries one more action, first: the format fence. It is a
+`ConditionCheck` on the format item at the state the request's gate read, or, for a warehouse that
+records no format yet, a `Put` of the format item conditioned on its absence, which records it with
+the warehouse's first write. A transaction whose fence fails is gated again, so a write prepared
+before an upgrade marked the warehouse is refused once it has.
 
 A pallet delete (`delete_head`) is the same transaction. Its `Update` keeps the item and moves its
 `head` into `deleted_head` (`SET deleted_head = :old REMOVE head`), conditioned on `head` still
@@ -359,8 +374,8 @@ being the old head. The office `ConditionCheck` is always built for it: at the o
 delete's authorization read, or, when the office is unborn, on the office item having no head. A
 tombstone is item state, so a creation conditioned on the item's absence refuses it.
 
-`replace_trust` — the one sanctioned overwrite of the anchor, a re-genesis — is the **second**
-transaction this crate issues, added in FORK-95 slice 4: a `Put` on the trust item conditioned
+`replace_trust` — the one sanctioned overwrite of the anchor, a re-genesis — is a transaction
+too, added in FORK-95 slice 4: a `Put` on the trust item conditioned
 on the incumbent anchor's stored bytes, plus a `ConditionCheck` on the office item at the head
 the caller's `adopts` test consumed. Both actions are always built (the trust item and the
 office item are never the same item, so nothing collapses). It was an unconditional `PutItem`
@@ -377,16 +392,12 @@ example policies grant it) and the Service Authorization Reference (whose `Trans
 row maps the *operation* onto the IAM actions `ConditionCheckItem`/`DeleteItem`/`PutItem`/
 `UpdateItem`, and lists no `TransactWriteItems` action at all) — is that permission to call
 `TransactWriteItems` is governed entirely by the permissions for the underlying per-item action
-types the transaction contains. Between them the two transactions carry `Update`, `Put` and
+types the transaction contains. Between them the transactions carry `Update`, `Put` and
 `ConditionCheck` actions, so the deployed role needs `dynamodb:UpdateItem` (the pallet head
-write), `dynamodb:PutItem` (the anchor write) and `dynamodb:ConditionCheckItem` (the office and
-anchor checks) — see the derivation table below.
-
-`dynamodb:PutItem` is derived from the transaction in its own right, not inherited from the
-single-item `put_trust_if_absent` that also needs it. Deriving it only from that one would make
-the anchor write's permission an accident of that call site still existing: retire it and the
-grant would leave the policy as dead, with every conformance check still green and the anchor
-write failing `AccessDenied` in production.
+write), `dynamodb:PutItem` (the anchor writes and the format stamp) and
+`dynamodb:ConditionCheckItem` (the format, office and anchor checks) — see the derivation table
+below. No single-item `PutItem` is issued any more: `PutItem` is granted for the `Put` actions
+these transactions carry.
 
 ### Capacity mode
 
@@ -418,11 +429,13 @@ The one-action transaction against the bare `UpdateItem` isolates the multiplier
 count, and the rest show it applies **per action** and to `ConditionCheck` as well — reported as
 `WriteCapacityUnits`, so a `ConditionCheck` bills against write capacity despite writing
 nothing. Every figure below is that measured `2x` multiplied by the transaction's item count. A trusted lift to a non-office
-pallet touches three items (the pallet `Update`, the office `ConditionCheck`, the anchor
-`ConditionCheck`) for 6 WCU; a lift to `@office` itself or any push on an untrusted warehouse
-touches two (no office `ConditionCheck` is built) for 4 WCU. **A re-genesis** — `replace_trust`'s
-own transaction, a `Put` on the trust item plus a `ConditionCheck` on the office item — is always
-two actions, so 4 WCU, on the rarest write this warehouse ever takes. **These are a floor, not a
+pallet touches four items (the format `ConditionCheck`, the pallet `Update`, the office
+`ConditionCheck`, the anchor `ConditionCheck`) for 8 WCU; a lift to `@office` itself or any push on
+an untrusted warehouse touches three (no office `ConditionCheck` is built) for 6 WCU. **A
+re-genesis** — `replace_trust`'s own transaction, the format check, a `Put` on the trust item and a
+`ConditionCheck` on the office item — is always three actions, so 6 WCU, on the rarest write this
+warehouse ever takes. Every request also reads the format item strongly consistent first: one read
+capacity unit. **These are a floor, not a
 ceiling: both figures assume every item is ≤ 1 KB, and AWS's own write-unit definition
 (`provisioned-capacity-mode.md`, verified) is one WCU per item *per KB*, rounded up — a bigger
 item costs proportionally more, doubled again by the transactional multiplier above.** The
@@ -431,7 +444,7 @@ trust item is the one likely to cross that line in practice: it carries the anch
 re-genesised (`TrustAnchor::boundary`'s own doc), fixed at that size afterward rather than
 growing with ordinary lifts. Each boundary hash costs roughly 70 bytes of JSON, so a warehouse
 with on the order of 16 pallets at enrollment already exceeds 1 KB there — pushing a trusted
-lift's cost above 6 WCU for that item alone, with no change to the item *count* this section
+lift's cost above 8 WCU for that item alone, with no change to the item *count* this section
 derives from. On-demand billing absorbs this without a capacity-planning step; on provisioned
 capacity, size write throughput against how many pallets this warehouse had at its last
 enrollment or re-genesis, not just the fixed item count.
@@ -452,8 +465,8 @@ so a busy table yields a
 `503` the client can act on rather than an API Gateway `504`. The SDK's own retry is switched off
 for these two transactions only — every other DynamoDB and S3 call keeps the SDK default — so
 four attempts are four billed transactions, not up to twelve. Since a cancelled transaction
-still consumes its capacity, the worst case per request is four times the figures above: 24 WCU
-for a trusted lift's commit and 16 for a re-genesis, with items ≤ 1 KB. The expected case is
+still consumes its capacity, the worst case per request is four times the figures above: 32 WCU
+for a trusted lift's commit and 24 for a re-genesis, with items ≤ 1 KB. The expected case is
 still one attempt.
 
 ### TTL
@@ -558,9 +571,11 @@ defense-in-depth choice, entirely orthogonal to what ships in the entrypoint.
 
 ## IAM — least privilege
 
-One policy per Lambda, derived from the actual SDK calls each store method makes. The **canonical,
-enforced** copies are `crates/forklift-aws-lambda/iam/control-plane.policy.json` and
-`crates/forklift-aws-lambda/iam/verifier.policy.json` — `{bucket_arn}`, `{table_arn}`, and
+One policy per Lambda, and one for the operator's upgrade binary, derived from the actual SDK calls
+each store method makes. The **canonical, enforced** copies are
+`crates/forklift-aws-lambda/iam/control-plane.policy.json`,
+`crates/forklift-aws-lambda/iam/verifier.policy.json` and
+`crates/forklift-aws-lambda/iam/operator.policy.json` — `{bucket_arn}`, `{table_arn}`, and
 `{log_group_arn}` are `templatefile()` placeholders for your resource ARNs. Two tests keep them
 honest, so treat what follows as an explanation of *why* each statement exists, not a copy to
 retype: `crates/forklift-aws-lambda/tests/iam_conformance.rs` (C11) asserts the code can only
@@ -578,11 +593,12 @@ Where each action in `iam/control-plane.policy.json` comes from: `HeadObject`/`G
 `staging/*`; `DeleteObject` (staged cleanup, session sweep) → `s3:DeleteObject`; `ListObjectsV2`
 (`discard_session`'s sweep) and `HeadObject`/`GetObject` 404-vs-403 semantics (below) →
 `s3:ListBucket` on the **bucket** resource (not `bucket/*`); `GetItem`/`Query` (ref reads,
-enumeration) → the table ARN, no index ARN needed; `PutItem` → both the one-way trust door's
-single-item write *and* the anchor write transaction's `Put`; the ref-update commit's
-`TransactWriteItems` → `UpdateItem` (the target pallet's own head) and `ConditionCheckItem` (the
-office head and trust anchor `ConditionCheck`s the same transaction carries); the anchor write's
-`TransactWriteItems` → `PutItem` (the trust item) and `ConditionCheckItem` (the office head) —
+enumeration, the format item and the partition check behind it) → the table ARN, no index ARN
+needed; every transaction's format fence → `ConditionCheckItem`, or `PutItem` when it stamps a new
+warehouse; the ref-update commit's `TransactWriteItems` → `UpdateItem` (the target pallet's own
+head) and `ConditionCheckItem` (the office head and trust anchor `ConditionCheck`s the same
+transaction carries); the trust door's and the anchor write's `TransactWriteItems` → `PutItem` (the
+trust item) and `ConditionCheckItem` (the office head) —
 **not** `dynamodb:TransactWriteItems`, which is not a real IAM action; see "The CAS" above for
 why granting it would have been a no-op that left the transaction still refused. The `Logs` statement (`logs:CreateLogGroup`/`logs:CreateLogStream`/
 `logs:PutLogEvents`) is the standard Lambda execution-role grant every function needs to write to
@@ -597,6 +613,17 @@ then clear the staged object once promoted), `s3:GetObject`/`s3:PutObject` on `o
 promoted copy), `s3:ListBucket` on the bucket (404-vs-403 semantics, below — `verify_and_promote`'s
 `key_exists` check against the canonical `objects/{hash}` key, absent by definition for a genuinely
 new object, is a `HeadObject` on a missing key), and the same `Logs` statement as the control plane.
+
+### `forklift-aws-upgrade`
+
+The operator's upgrade binary (below, "Upgrading a warehouse's format") is never deployed as a
+Lambda, and no Terraform in `infra/aws-serverless` attaches its policy: attach
+`iam/operator.policy.json` to the role the operator runs it under. It reads the format item and the
+partition (`GetItem`, `Query`), swaps the format item's state by a single-action transaction
+(`UpdateItem`), and runs migration steps through the same fenced transactions the control plane
+issues (`PutItem`, `UpdateItem`, `ConditionCheckItem`). `dynamodb:Scan` is granted here and in
+neither Lambda's policy: `--all` finds the table's warehouses by scanning it, and nothing a request
+does needs to see past its own warehouse's partition.
 
 ### `s3:ListBucket` on both roles is unconditional, and has to be
 
@@ -840,6 +867,26 @@ deployer-supplied, out-of-repo mechanism.
   `MAX_STAGED_OBJECT_BYTES` (5 GiB) backstop regardless — so it will happily promote a grandfathered giant if one is ever staged. It is mentioned here only
   so you are not surprised by it; there is no operator action this document can recommend beyond
   awareness.
+
+* **Upgrading a warehouse's format.** A deployment that reads a newer format refuses every
+  warehouse in an older one with a `503` until it is upgraded, so a format break is an outage
+  across the stack until every warehouse is upgraded. Deploy the new version, then run its
+  `forklift-aws-upgrade` (built with the crate, `cargo build -p forklift-aws-lambda --release
+  --bin forklift-aws-upgrade`) from a machine with the operator's credentials:
+
+  ```sh
+  forklift-aws-upgrade --table <table> --all
+  forklift-aws-upgrade --table <table> <warehouse-id>...
+  ```
+
+  `FORKLIFT_DYNAMODB_TABLE` and `FORKLIFT_AWS_ENDPOINT_URL` stand in for `--table` and
+  `--endpoint-url`; the region and credentials come from the usual AWS environment. For each
+  warehouse it marks the format item, waits `--wait-secs` (60 by default, past the control-plane
+  Lambda's 29-second timeout; raise it if you set that timeout higher) so no request that passed
+  the gate before the mark is still running, runs the steps, and records the new format. A
+  run that stopped part way leaves its mark, and the warehouse refused; once you are sure that run
+  has stopped, run the binary again with `--takeover` to resume it. Every warehouse in the format
+  the binary reads is left as it is, so running it twice is harmless.
 
 ## Verification checklist
 

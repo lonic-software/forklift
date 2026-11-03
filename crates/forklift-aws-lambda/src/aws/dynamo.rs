@@ -12,6 +12,14 @@
 //! | `<warehouse>` | `pallet#@office` | `head = <hash>`    | a meta pallet head             |
 //! | `<warehouse>` | `pallet#old`     | `deleted_head = …` | a deleted pallet's tombstone   |
 //! | `<warehouse>` | `trust`          | `anchor = <json>`  | the trust anchor               |
+//! | `<warehouse>` | `format`         | `state = <state>`  | the warehouse's format         |
+//!
+//! The format item's `state` is the format number (`1`), or `N>M owner step` while an upgrade
+//! from `N` to `M` holds it (`crate::format`). Every ref and trust write carries a fence on it as
+//! the first action of its transaction: a `ConditionCheck` on the state the request's gate read,
+//! which never rewrites the item and so can never erase an upgrade's mark, or, in a new
+//! warehouse's empty partition, a `Put` stamping it conditioned on its absence ([`FormatFence`]).
+//! Only the upgrade operator rewrites it ([`FormatStore`]).
 //!
 //! The pallet sort key is `pallet#{qualified-ref}` — the same wire form the fake keys on
 //! (`main`, `@office`), unique across the two namespaces. Partitioning by warehouse makes
@@ -34,7 +42,8 @@
 //! [`delete_head`](RefStore::delete_head), the same transaction with a different pallet action —
 //! is a real DynamoDB conditional
 //! write, never a read-then-write — and, as of FORK-95, never a single-item one either. It is
-//! a `TransactWriteItems` of up to three actions: an `Update` on the target pallet's own item
+//! a `TransactWriteItems` of up to four actions: the format fence above, an `Update` on the
+//! target pallet's own item
 //! whose `ConditionExpression` encodes the caller's `expected` (exactly the prior single-item
 //! shape), a `ConditionCheck` on the office pallet's item at the office head the caller's
 //! audit consumed (or at its absence, for a delete whose authority check found the office
@@ -46,15 +55,15 @@
 //! either applies the whole transaction with every condition holding or applies nothing; on a
 //! condition failure `ReturnValuesOnConditionCheckFailure=ALL_OLD` hands back the failed item,
 //! so the store reports which precondition moved without a second round trip.
-//! [`put_trust_if_absent`](RefStore::put_trust_if_absent) is still the single-item shape: a
-//! conditional `PutItem` guarding the one-way trust door.
+//! [`put_trust_if_absent`](RefStore::put_trust_if_absent) is a transaction too, of the format
+//! fence and a `Put` of the trust item conditioned on its absence: the one-way trust door.
 //!
 //! # The anchor write
 //!
 //! [`replace_trust`](RefStore::replace_trust) — the one sanctioned overwrite of the anchor, a
 //! re-genesis — is the store's *second* transaction, and for the same reason: `put_trust`
 //! validates the chain of custody against values that can move before the write lands. It is a
-//! `TransactWriteItems` of exactly two actions: a `Put` on the trust item conditioned on the
+//! `TransactWriteItems` of the format fence and two more actions: a `Put` on the trust item conditioned on the
 //! incumbent anchor's stored bytes, and a `ConditionCheck` on the office item at the head the
 //! `adopts` test consumed. Unlike the CAS above, neither action is ever dropped — the trust item
 //! and the office item are always distinct, so the collapse-to-one-item case cannot arise. It
@@ -63,9 +72,10 @@
 //!
 //! Cancellation reasons on a `TransactionCanceledException` are ordered by the order actions
 //! were requested (AWS API Reference and the pinned `aws-sdk-dynamodb` model agree on this), so
-//! the index an action is pushed at is the index its refusal comes back at. Both transactions
-//! above depend on that, and they order their preconditions *differently* — position 0 is the
-//! target pallet's head in a ref-update commit and the trust anchor in an anchor write. Neither
+//! the index an action is pushed at is the index its refusal comes back at. Every transaction
+//! above depends on that, and they order their preconditions *differently* — after the format
+//! fence, the target pallet's head comes first in a ref-update commit and the trust anchor in an
+//! anchor write. Neither
 //! restates the mapping: each action is pushed together with the precondition it conditions on,
 //! and the refusal is read back off that same layout. See `ConditionedTransaction`.
 
@@ -73,7 +83,6 @@ use std::collections::HashMap;
 
 use aws_sdk_dynamodb::config::retry::RetryConfig;
 use aws_sdk_dynamodb::config::timeout::TimeoutConfig;
-use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_smithy_runtime_api::client::result::SdkError;
 use aws_sdk_dynamodb::types::{
@@ -88,9 +97,10 @@ use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef};
 use crate::aws::dynamo_ops::DynamoOps;
 use crate::aws::sdk::describe;
 use crate::blocking::AsyncBridge;
+use crate::reissue::request_token;
 use crate::store::{
-    CasOutcome, ExpectedHead, OfficePrecondition, RefHead, RefListing, RefStore, TransientCause,
-    TrustOutcome, TrustWriteOutcome, TRANSACTION_ATTEMPT_TIMEOUT,
+    CasOutcome, ExpectedHead, FormatFence, FormatStore, OfficePrecondition, RefHead, RefListing,
+    RefStore, TransientCause, TrustOutcome, TrustWriteOutcome, TRANSACTION_ATTEMPT_TIMEOUT,
 };
 
 /// The partition-key attribute: the warehouse id.
@@ -103,11 +113,15 @@ const ATTR_HEAD: &str = "head";
 const ATTR_DELETED_HEAD: &str = "deleted_head";
 /// A trust item's anchor, as a JSON string.
 const ATTR_ANCHOR: &str = "anchor";
+/// The format item's state.
+const ATTR_STATE: &str = "state";
 
 /// The sort-key prefix of every pallet head; `begins_with` on it is the ref enumeration.
 const ENTITY_PALLET_PREFIX: &str = "pallet#";
 /// The sort key of the single trust item.
 const ENTITY_TRUST: &str = "trust";
+/// The sort key of the single format item.
+const ENTITY_FORMAT: &str = "format";
 
 /// The sort key of a pallet head — `pallet#{wire}`, the qualified reference the fake keys on.
 fn pallet_entity(namespace: PalletNamespace, name: &str) -> String {
@@ -224,8 +238,43 @@ impl DynamoRefStore {
         Ok(output.item)
     }
 
+    /// The format fence's action, the first of every transaction a request writes with: a
+    /// `ConditionCheck` that the format item still holds the state the gate read, or a `Put`
+    /// stamping a new warehouse's item, conditioned on there still being none.
+    fn format_action(&self, fence: &FormatFence) -> TransactWriteItem {
+        match fence {
+            FormatFence::At(state) => {
+                let check = ConditionCheck::builder()
+                    .set_key(Some(self.key(ENTITY_FORMAT)))
+                    .table_name(&self.table)
+                    .condition_expression("#s = :s")
+                    .expression_attribute_names("#s", ATTR_STATE)
+                    .expression_attribute_values(":s", s(state.clone()))
+                    .build()
+                    .expect("every required ConditionCheck field is set");
+
+                TransactWriteItem::builder().condition_check(check).build()
+            }
+            FormatFence::Stamp(state) => {
+                let mut item = self.key(ENTITY_FORMAT);
+                item.insert(ATTR_STATE.to_string(), s(state.clone()));
+
+                let put = Put::builder()
+                    .set_item(Some(item))
+                    .table_name(&self.table)
+                    .condition_expression("attribute_not_exists(#e)")
+                    .expression_attribute_names("#e", ATTR_ENTITY)
+                    .build()
+                    .expect("every required Put field is set");
+
+                TransactWriteItem::builder().put(put).build()
+            }
+        }
+    }
+
     /// The `Update` action against the target pallet's own item, guarded by what the caller
-    /// expects it to hold. Always position 0 of the transaction [`Self::commit`] builds.
+    /// expects it to hold. Always right after the format fence in the transaction
+    /// [`Self::commit`] builds.
     ///
     /// DynamoDB refuses an expression attribute name or value the expressions never use, so each
     /// arm names exactly the attributes its own two expressions mention.
@@ -318,8 +367,8 @@ impl DynamoRefStore {
     }
 
     /// The `Put` action that replaces the trust item, guarded on the incumbent anchor's **stored
-    /// bytes** being exactly what the caller read. Always position 0 of the transaction
-    /// `replace_trust` builds.
+    /// bytes** being exactly what the caller read. Always right after the format fence in the
+    /// transaction `replace_trust` builds.
     ///
     /// A `Put` rather than an `Update` because the anchor item is wholly replaced by a
     /// re-genesis, and the condition is string equality on `anchor` for the same reason the
@@ -379,6 +428,8 @@ impl DynamoRefStore {
 /// literals could not serve the other without a second copy of the same positional reasoning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Precondition {
+    /// The format item's state, as the request's gate read it.
+    Format,
     /// The target pallet's own head, as the caller's `expected` names it.
     PalletHead,
     /// The office pallet's head, as the caller's audit or validation consumed it.
@@ -588,14 +639,15 @@ fn classify(layout: &[Precondition], reasons: &[CancellationReason]) -> Result<R
 
 impl DynamoRefStore {
     /// The one transaction behind both pallet writers — [`RefStore::compare_and_set_head`] and
-    /// [`RefStore::delete_head`]: the action on the pallet's own item, plus the office and
-    /// anchor `ConditionCheck`s.
+    /// [`RefStore::delete_head`]: the format fence, the action on the pallet's own item, plus the
+    /// office and anchor `ConditionCheck`s.
     async fn commit(
         &self,
         entity: &str,
         write: PalletWrite<'_>,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        format: &FormatFence,
         label: &str,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
@@ -624,6 +676,7 @@ impl DynamoRefStore {
         // later reads is built here rather than restated there — see `ConditionedTransaction`.
         let mut transaction = ConditionedTransaction::new();
 
+        transaction.push(self.format_action(format), Precondition::Format);
         transaction.push(self.pallet_update(entity, write), Precondition::PalletHead);
 
         if let Some(office_head) = office_condition {
@@ -647,6 +700,7 @@ impl DynamoRefStore {
                 CasOutcome::OfficeMoved { current: item.as_ref().and_then(head_of) }
             }
             Some(Refusal::Moved(Precondition::Anchor, _)) => CasOutcome::AnchorMoved,
+            Some(Refusal::Moved(Precondition::Format, _)) => CasOutcome::FormatMoved,
         })
     }
 }
@@ -660,6 +714,34 @@ impl RefStore for DynamoRefStore {
         })
     }
 
+    fn read_format(&self) -> Result<Option<String>, String> {
+        self.bridge.block_on(async {
+            Ok(self
+                .get_item(ENTITY_FORMAT)
+                .await?
+                .and_then(|item| item.get(ATTR_STATE).and_then(|value| value.as_s().ok()).cloned()))
+        })
+    }
+
+    fn partition_has_items(&self) -> Result<bool, String> {
+        self.bridge.block_on(async {
+            let page = self
+                .client
+                .query()
+                .table_name(&self.table)
+                .key_condition_expression("#wh = :wh")
+                .expression_attribute_names("#wh", ATTR_WAREHOUSE)
+                .expression_attribute_values(":wh", s(self.warehouse.clone()))
+                .consistent_read(true)
+                .limit(1)
+                .send()
+                .await
+                .map_err(|err| describe("DynamoDB query", err))?;
+
+            Ok(!page.items().is_empty())
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn compare_and_set_head(
         &self,
@@ -669,16 +751,24 @@ impl RefStore for DynamoRefStore {
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        format: &FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
         let entity = pallet_entity(namespace, name);
         let write = PalletWrite::Set { expected, new };
 
-        self.bridge.block_on(
-            self.commit(&entity, write, office_head, anchor, "DynamoDB ref-update commit", request_token),
-        )
+        self.bridge.block_on(self.commit(
+            &entity,
+            write,
+            office_head,
+            anchor,
+            format,
+            "DynamoDB ref-update commit",
+            request_token,
+        ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn delete_head(
         &self,
         namespace: PalletNamespace,
@@ -686,14 +776,21 @@ impl RefStore for DynamoRefStore {
         old: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        format: &FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
         let entity = pallet_entity(namespace, name);
         let write = PalletWrite::Delete { old };
 
-        self.bridge.block_on(
-            self.commit(&entity, write, office_head, anchor, "DynamoDB pallet delete", request_token),
-        )
+        self.bridge.block_on(self.commit(
+            &entity,
+            write,
+            office_head,
+            anchor,
+            format,
+            "DynamoDB pallet delete",
+            request_token,
+        ))
     }
 
     fn list_refs(&self) -> Result<RefListing, String> {
@@ -771,7 +868,12 @@ impl RefStore for DynamoRefStore {
         })
     }
 
-    fn put_trust_if_absent(&self, anchor: &TrustAnchor) -> Result<TrustOutcome, String> {
+    fn put_trust_if_absent(
+        &self,
+        anchor: &TrustAnchor,
+        format: &FormatFence,
+        request_token: &str,
+    ) -> Result<TrustOutcome, String> {
         let dto = TrustAnchorDto::from(anchor);
         let json = serde_json::to_string(&dto)
             .map_err(|err| format!("encoding the trust anchor failed: {}", err))?;
@@ -780,50 +882,47 @@ impl RefStore for DynamoRefStore {
             let mut item = self.key(ENTITY_TRUST);
             item.insert(ATTR_ANCHOR.to_string(), s(json));
 
-            let result = self
-                .client
-                .put_item()
-                .table_name(&self.table)
+            // The one-way door: plant the anchor only when none exists.
+            let put = Put::builder()
                 .set_item(Some(item))
-                // The one-way door: plant the anchor only when none exists.
+                .table_name(&self.table)
                 .condition_expression("attribute_not_exists(#e)")
                 .expression_attribute_names("#e", ATTR_ENTITY)
-                .return_values_on_condition_check_failure(
-                    ReturnValuesOnConditionCheckFailure::AllOld,
-                )
-                .send()
-                .await;
+                .return_values_on_condition_check_failure(ReturnValuesOnConditionCheckFailure::AllOld)
+                .build()
+                .expect("every required Put field is set");
 
-            match result {
-                Ok(_) => Ok(TrustOutcome::Established),
-                Err(err) => match err.as_service_error() {
-                    Some(PutItemError::ConditionalCheckFailedException(failure)) => {
-                        // An anchor already exists. Idempotent for the identical one, refused
-                        // for a different one — the fake's exact split, decided by comparing the
-                        // incumbent DTO with the incoming one.
-                        let existing = failure
-                            .item()
-                            .and_then(|item| item.get(ATTR_ANCHOR))
-                            .and_then(|value| value.as_s().ok());
+            let mut transaction = ConditionedTransaction::new();
 
-                        match existing {
-                            Some(existing_json) => {
-                                let existing_dto: TrustAnchorDto = serde_json::from_str(existing_json)
-                                    .map_err(|err| {
-                                        format!("decoding the stored trust anchor failed: {}", err)
-                                    })?;
+            transaction.push(self.format_action(format), Precondition::Format);
+            transaction.push(TransactWriteItem::builder().put(put).build(), Precondition::Anchor);
 
-                                if existing_dto == dto {
-                                    Ok(TrustOutcome::AlreadyIdentical)
-                                } else {
-                                    Ok(TrustOutcome::Conflict)
-                                }
-                            }
-                            None => Ok(TrustOutcome::Conflict),
+            let refusal = transaction.send(&self.client, "DynamoDB trust plant", request_token).await?;
+
+            match refusal {
+                None => Ok(TrustOutcome::Established),
+                Some(Refusal::Transient(cause)) => Ok(TrustOutcome::Transient(cause)),
+                Some(Refusal::Moved(Precondition::Format, _)) => Ok(TrustOutcome::FormatMoved),
+                // An anchor already exists. Idempotent for the identical one, refused for a
+                // different one — the fake's exact split, decided by comparing the incumbent DTO
+                // with the incoming one.
+                Some(Refusal::Moved(Precondition::Anchor, item)) => match item.as_ref().and_then(anchor_of) {
+                    Some(existing_json) => {
+                        let existing_dto: TrustAnchorDto = serde_json::from_str(&existing_json)
+                            .map_err(|err| format!("decoding the stored trust anchor failed: {}", err))?;
+
+                        if existing_dto == dto {
+                            Ok(TrustOutcome::AlreadyIdentical)
+                        } else {
+                            Ok(TrustOutcome::Conflict)
                         }
                     }
-                    _ => Err(describe("DynamoDB put_item", err)),
+                    None => Ok(TrustOutcome::Conflict),
                 },
+                Some(Refusal::Moved(precondition, _)) => Err(format!(
+                    "DynamoDB trust plant was refused on a {:?} precondition it never built.",
+                    precondition
+                )),
             }
         })
     }
@@ -833,6 +932,7 @@ impl RefStore for DynamoRefStore {
         anchor: &TrustAnchor,
         expected_anchor: &str,
         office_head: Option<&str>,
+        format: &FormatFence,
         request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
         let dto = TrustAnchorDto::from(anchor);
@@ -841,12 +941,13 @@ impl RefStore for DynamoRefStore {
         let office_entity = pallet_entity(PalletNamespace::Meta, OFFICE_PALLET_NAME);
 
         self.bridge.block_on(async {
-            // Two actions, and no third: this write conditions on the two inputs `put_trust`'s
+            // The format fence and two actions, and no fourth: this write conditions on the two inputs `put_trust`'s
             // validation consumed, and on nothing else. Unlike the ref-update commit there is no
             // case that collapses to one item — the trust item and the office item are always
             // distinct — so the office check is never dropped here.
             let mut transaction = ConditionedTransaction::new();
 
+            transaction.push(self.format_action(format), Precondition::Format);
             transaction.push(self.trust_put(&json, expected_anchor), Precondition::Anchor);
             transaction.push(
                 self.office_condition_check(&office_entity, office_head),
@@ -887,6 +988,7 @@ impl RefStore for DynamoRefStore {
                 Some(Refusal::Moved(Precondition::OfficeHead, item)) => {
                     TrustWriteOutcome::OfficeMoved { current: item.as_ref().and_then(head_of) }
                 }
+                Some(Refusal::Moved(Precondition::Format, _)) => TrustWriteOutcome::FormatMoved,
                 // No action of this transaction conditions on a pallet head, so `classify` cannot
                 // name one: the layout it reads is the one pushed above.
                 Some(Refusal::Moved(Precondition::PalletHead, _)) => {
@@ -897,6 +999,78 @@ impl RefStore for DynamoRefStore {
             })
         })
     }
+}
+
+impl FormatStore for DynamoRefStore {
+    /// One conditional write of the format item, as a single-action transaction: this crate
+    /// issues every conditional write through `TransactWriteItems`. A transient refusal is an
+    /// error, and the operator runs the upgrade again, resuming from the state on record.
+    fn swap_format(&self, expected: &str, new: &str) -> Result<bool, String> {
+        let update = Update::builder()
+            .set_key(Some(self.key(ENTITY_FORMAT)))
+            .table_name(&self.table)
+            .update_expression("SET #s = :new")
+            .condition_expression("#s = :old")
+            .expression_attribute_names("#s", ATTR_STATE)
+            .expression_attribute_values(":new", s(new))
+            .expression_attribute_values(":old", s(expected))
+            .build()
+            .expect("every required Update field is set");
+
+        let mut transaction = ConditionedTransaction::new();
+
+        transaction.push(TransactWriteItem::builder().update(update).build(), Precondition::Format);
+
+        self.bridge.block_on(async {
+            match transaction.send(&self.client, "DynamoDB format swap", &request_token()).await? {
+                None => Ok(true),
+                Some(Refusal::Moved(..)) => Ok(false),
+                Some(Refusal::Transient(cause)) => Err(format!(
+                    "DynamoDB refused the format item's write for a transient reason ({:?}); run \
+                    the upgrade again, and it resumes from the state on record.",
+                    cause
+                )),
+            }
+        })
+    }
+}
+
+/// Every warehouse id with an item in `table`: a full `Scan`, projecting only the partition key.
+/// Only the upgrade operator's `--all` calls it, under a role that grants `Scan`, which neither
+/// Lambda's does.
+pub fn list_warehouses(client: &DynamoOps, table: &str, bridge: &AsyncBridge) -> Result<Vec<String>, String> {
+    bridge.block_on(async {
+        let mut warehouses = std::collections::BTreeSet::new();
+        let mut start_key: Option<HashMap<String, AttributeValue>> = None;
+
+        loop {
+            let mut request = client
+                .scan()
+                .table_name(table)
+                .consistent_read(true)
+                .projection_expression("#wh")
+                .expression_attribute_names("#wh", ATTR_WAREHOUSE);
+
+            if let Some(key) = start_key.take() {
+                request = request.set_exclusive_start_key(Some(key));
+            }
+
+            let page = request.send().await.map_err(|err| describe("DynamoDB scan", err))?;
+
+            for item in page.items() {
+                if let Some(id) = item.get(ATTR_WAREHOUSE).and_then(|value| value.as_s().ok()) {
+                    warehouses.insert(id.clone());
+                }
+            }
+
+            match page.last_evaluated_key() {
+                Some(key) if !key.is_empty() => start_key = Some(key.clone()),
+                _ => break,
+            }
+        }
+
+        Ok(warehouses.into_iter().collect())
+    })
 }
 
 #[cfg(test)]

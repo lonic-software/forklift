@@ -79,6 +79,12 @@ name = "forklift-aws-verifier"
 path = "src/bin/verifier.rs"
 required-features = ["lambda"]
 
+# The upgrade operator: run from an operator's machine, never deployed as a Lambda, so it needs
+# none of the runtime crates and builds with the library.
+[[bin]]
+name = "forklift-aws-upgrade"
+path = "src/bin/upgrade.rs"
+
 [dev-dependencies]
 # Following a `307` to a presigned S3 URL by hand in the LocalStack-gated end-to-end test —
 # the workspace's existing (ring-based) client, added only for tests.

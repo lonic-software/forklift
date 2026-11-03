@@ -28,6 +28,10 @@
 //! storage has no directory walk, so ref enumeration is an explicit primitive
 //! ([`RefStore::list_refs`]).
 //!
+//! Every ref and trust write is also fenced on the warehouse's format item (FORK-337): it carries a
+//! [`FormatFence`], the format state the request's gate read, so an upgrade that marks the item
+//! refuses every write prepared before it, and nothing a request writes ever rewrites the mark.
+//!
 //! Every method returns `Result<_, String>`: storage failures are opaque strings that the
 //! [`Head`](crate::Head) turns into a `500`. The verification and CAS *semantics* live in
 //! the head, not the stores — a store only persists and reports.
@@ -200,6 +204,18 @@ pub struct RefListing {
     pub tombstones: Vec<(PalletRef, String)>,
 }
 
+/// The warehouse's format item, as a write conditions on it. Every ref and trust write carries
+/// one, built from the state the request's gate read (`format::gate`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FormatFence {
+    /// The item holds this state, the deployment's format, and must still hold it. A check only:
+    /// a write never rewrites the item, so it can never erase an upgrade's mark.
+    At(String),
+    /// The item is absent and the warehouse's partition was empty: a new warehouse. The write
+    /// stamps the item with this state, on condition that it is still absent.
+    Stamp(String),
+}
+
 /// The outcome of a commit that conditions on every movable input a ref-update audit
 /// consumed — the pallet's own head, the office head, and the trust anchor (FORK-95 design
 /// memo, "The movable inputs: exactly three" / claim C6). A caller needs to know *which*
@@ -222,6 +238,9 @@ pub enum CasOutcome {
     /// call site needs the anchor's new bytes — the caller re-reads and re-decides — so
     /// unlike its two siblings this variant carries no payload.
     AnchorMoved,
+    /// The format item no longer holds what the [`FormatFence`] expected: an upgrade marked it,
+    /// or a concurrent first write stamped it. The caller reads it again.
+    FormatMoved,
     /// The commit was refused for a reason that establishes nothing about whether any of the
     /// three inputs actually moved — on DynamoDB, `TransactionConflict` (another transaction
     /// concurrently touching one of this commit's items, the shared office item principally).
@@ -279,6 +298,8 @@ pub enum TrustWriteOutcome {
     /// have planted an anchor dropping precisely the history that check exists to protect.
     /// Carries the office pallet's actual current head.
     OfficeMoved { current: Option<String> },
+    /// The format item moved, as for [`CasOutcome::FormatMoved`].
+    FormatMoved,
     /// Refused for a reason establishing nothing about whether either input moved — on DynamoDB,
     /// `TransactionConflict` principally. Note this write condition-checks the *same* shared
     /// office item every trusted lift now touches, so a re-genesis merely running alongside an
@@ -328,6 +349,11 @@ pub enum TrustOutcome {
     /// The one sanctioned replacement, a re-genesis, goes through
     /// [`RefStore::replace_trust`].
     Conflict,
+    /// The format item moved, as for [`CasOutcome::FormatMoved`]; nothing was planted.
+    FormatMoved,
+    /// Refused for a reason establishing nothing, as for [`CasOutcome::Transient`], and re-issued
+    /// the same way.
+    Transient(TransientCause),
 }
 
 /// The byte plane: canonical objects and signature sidecars, addressed by hash.
@@ -460,6 +486,14 @@ pub trait RefStore {
     /// What a pallet's ref holds: its live head, its tombstone, or nothing.
     fn get_head(&self, namespace: PalletNamespace, name: &str) -> Result<RefHead, String>;
 
+    /// The state the warehouse's format item holds, read strongly consistent, or `None` when it
+    /// has none.
+    fn read_format(&self) -> Result<Option<String>, String>;
+
+    /// Whether the warehouse's partition holds any item at all, read strongly consistent: what
+    /// tells a new warehouse from one written before formats were recorded.
+    fn partition_has_items(&self) -> Result<bool, String>;
+
     /// Atomically move a pallet head from `expected` to `new`, conditioned on all three of
     /// the invariant's movable inputs still holding what a ref-update audit consumed (a
     /// DynamoDB `TransactWriteItems`; FORK-95 design memo, claim C13):
@@ -481,6 +515,9 @@ pub trait RefStore {
     ///   anchor has no "not consumed" state — every ref update, trusted or not, conditions on
     ///   it (an untrusted push's own precondition is exactly "the anchor is still absent").
     ///
+    /// * `format` — the [`FormatFence`] the request's gate built. A format item that moved
+    ///   commits nothing and is reported as [`CasOutcome::FormatMoved`].
+    ///
     /// A mismatch on any of the three commits nothing and reports *which* input moved via
     /// [`CasOutcome`] — the caller cannot tell a moved pallet head from a moved office head
     /// or a moved anchor without that distinction, and the client-facing refusal differs
@@ -499,6 +536,7 @@ pub trait RefStore {
         new: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        format: &FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String>;
 
@@ -507,6 +545,7 @@ pub trait RefStore {
     /// outcomes: the pallet's own head must still be `old`, the office must still hold what the
     /// delete's authority check read (`OfficePrecondition::Unborn` when it read none), and the
     /// anchor's stored bytes must be unchanged.
+    #[allow(clippy::too_many_arguments)]
     fn delete_head(
         &self,
         namespace: PalletNamespace,
@@ -514,6 +553,7 @@ pub trait RefStore {
         old: &str,
         office_head: OfficePrecondition<'_>,
         anchor: Option<&str>,
+        format: &FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String>;
 
@@ -533,8 +573,14 @@ pub trait RefStore {
     fn get_trust(&self) -> Result<Option<(TrustAnchor, String)>, String>;
 
     /// Plant the trust anchor iff none exists yet (the one-way door). Idempotent for an
-    /// identical anchor; a conflicting one is refused. Atomic, like the head CAS.
-    fn put_trust_if_absent(&self, anchor: &TrustAnchor) -> Result<TrustOutcome, String>;
+    /// identical anchor; a conflicting one is refused. Atomic with the format fence, like the head
+    /// CAS, and re-issued under `request_token` like it.
+    fn put_trust_if_absent(
+        &self,
+        anchor: &TrustAnchor,
+        format: &FormatFence,
+        request_token: &str,
+    ) -> Result<TrustOutcome, String>;
 
     /// Replace the trust anchor — the one sanctioned overwrite, a re-genesis (§8.7).
     ///
@@ -556,12 +602,22 @@ pub trait RefStore {
     ///   "consumed as unborn": `put_trust` reads the office head *unconditionally* on this
     ///   path, so there is no "never consumed" state to confuse it with, and an anchor that
     ///   adopts nothing is one whose validation depended on the office still being unborn.
-    /// * `request_token` — as for [`compare_and_set_head`](RefStore::compare_and_set_head).
+    /// * `format` and `request_token` — as for
+    ///   [`compare_and_set_head`](RefStore::compare_and_set_head).
     fn replace_trust(
         &self,
         anchor: &TrustAnchor,
         expected_anchor: &str,
         office_head: Option<&str>,
+        format: &FormatFence,
         request_token: &str,
     ) -> Result<TrustWriteOutcome, String>;
+}
+
+/// What only the upgrade operator does to a warehouse's format item. Kept apart from [`RefStore`]
+/// so the request path cannot reach it: a request never rewrites the item (see [`FormatFence`]).
+pub trait FormatStore {
+    /// Replace the format item's state `expected` with `new`, as one conditional write: `Ok(false)`
+    /// when the item no longer holds `expected`, and nothing was written.
+    fn swap_format(&self, expected: &str, new: &str) -> Result<bool, String>;
 }

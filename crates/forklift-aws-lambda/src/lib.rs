@@ -45,6 +45,7 @@ pub mod aws;
 pub mod blocking;
 pub mod entrypoint;
 pub mod error;
+pub mod format;
 pub mod store;
 pub mod memory;
 pub mod scratch;
@@ -60,6 +61,6 @@ pub use entrypoint::{
 pub use error::{HeadError, HeadResult, Status};
 pub use head::{BatchCut, BatchDelivery, BatchResult, Head, BATCH_ANSWER_RESERVE, BATCH_BYTE_BUDGET};
 pub use store::{
-    CasOutcome, ObjectAccess, ObjectStore, OffloadedResponse, PromoteOutcome, PutOutcome, PutTarget, RefStore,
-    SignatureOutcome, TransientCause, TrustOutcome,
+    CasOutcome, FormatFence, FormatStore, ObjectAccess, ObjectStore, OffloadedResponse, PromoteOutcome, PutOutcome,
+    PutTarget, RefStore, SignatureOutcome, TransientCause, TrustOutcome,
 };

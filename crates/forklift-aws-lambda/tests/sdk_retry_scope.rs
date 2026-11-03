@@ -123,6 +123,7 @@ async fn the_ref_update_commit_sends_one_request_per_call() {
             &"c".repeat(64),
             OfficePrecondition::NotConsumed,
             None,
+            &forklift_aws_lambda::FormatFence::At("1".to_string()),
             &request_token(),
         )
     })
@@ -146,6 +147,7 @@ async fn a_pallet_delete_sends_one_request_per_call() {
             &"c".repeat(64),
             OfficePrecondition::Unborn,
             None,
+            &forklift_aws_lambda::FormatFence::At("1".to_string()),
             &request_token(),
         )
     })
@@ -162,7 +164,7 @@ async fn the_anchor_write_sends_one_request_per_call() {
     let (refs, counts) = stub_store(Stub::InternalServerError).await;
 
     let outcome = tokio::task::spawn_blocking(move || {
-        refs.replace_trust(&anchor().to_anchor(), "{}", None, &request_token())
+        refs.replace_trust(&anchor().to_anchor(), "{}", None, &forklift_aws_lambda::FormatFence::At("1".to_string()), &request_token())
     })
     .await
     .unwrap();
@@ -201,6 +203,7 @@ async fn a_stalled_transaction_is_abandoned_at_the_attempt_timeout() {
             &"c".repeat(64),
             OfficePrecondition::NotConsumed,
             None,
+            &forklift_aws_lambda::FormatFence::At("1".to_string()),
             &request_token(),
         )
     })

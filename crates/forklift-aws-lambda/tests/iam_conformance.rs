@@ -75,8 +75,9 @@
 //!   `dynamo_ops.rs`). See the `checks` module.
 //! * **Directions A/B (unmapped op, missing grant)** — every op the wrapper impls expose must
 //!   have an entry in [`op_actions`], and every action that entry needs must be granted
-//!   somewhere in the union of the two policy JSONs. Unchanged in spirit from v3; the input to
-//!   direction A is now the wrapper's method-name surface rather than an AST call-site count.
+//!   somewhere in the union of the three policy JSONs (the two Lambdas' and the upgrade
+//!   operator's). Unchanged in spirit from v3; the input to direction A is now the wrapper's
+//!   method-name surface rather than an AST call-site count.
 //! * **Direction C, JSON side (dead grant)** — every `s3:`/`dynamodb:` action either policy
 //!   grants must be required by some derived op, kept from v3 (an over-permissioned policy is
 //!   still worth catching; nothing in the v4 design doc says to drop it, and dropping it would
@@ -124,8 +125,8 @@
 //! *different* action). Future readers adding a new S3 call should ask not only "what action does
 //! this call require to succeed" but "does a *failure* of this call — especially a missing-key
 //! `404` — depend on an action this call doesn't itself name." Per-role attribution is not
-//! checked — only the union across both policies (an action the verifier alone needs but only the
-//! control plane is granted still passes; deriving per-binary sets needs call-graph analysis, not
+//! checked — only the union across the three policies (an action the verifier alone needs but only
+//! the control plane is granted still passes, and only `Scan` is pinned to the operator's policy; deriving per-binary sets needs call-graph analysis, not
 //! a source scan). `Resource`/`Condition` scoping *correctness* is not evaluated beyond the narrow
 //! Deny/Condition polarity check above. And none of this defends against an adversarial committer
 //! reaching for `transmute`/raw pointers to reach the private field directly —
@@ -161,6 +162,9 @@ const DYNAMO_OPS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/aws/dyna
 
 const CONTROL_PLANE_POLICY: &str = include_str!("../iam/control-plane.policy.json");
 const VERIFIER_POLICY: &str = include_str!("../iam/verifier.policy.json");
+/// The upgrade operator's role (`forklift-aws-upgrade`), not a Lambda's: the only grant of
+/// `dynamodb:Scan`, which `--all` needs to find every warehouse in the table.
+const OPERATOR_POLICY: &str = include_str!("../iam/operator.policy.json");
 
 /// Every non-constructor op method's name is required to appear here, mapped to the IAM
 /// action(s) it needs; see the module docs (direction A/B).
@@ -193,18 +197,14 @@ fn op_actions() -> BTreeMap<&'static str, &'static [&'static str]> {
         ("list_objects_v2", &["s3:ListBucket"][..]),
         // DynamoDB (`aws/dynamo_ops.rs`).
         ("get_item", &["dynamodb:GetItem"][..]),
-        ("put_item", &["dynamodb:PutItem"][..]),
         ("query", &["dynamodb:Query"][..]),
-        // This one op issues both of the store's transactions — the ref-update commit
-        // (`Update` + `ConditionCheck`s) and the anchor write (`Put` + `ConditionCheck`) — so
-        // the row is the union of what all three action types need.
-        //
-        // `dynamodb:PutItem` is listed even though the `put_item` op already requires it, and
-        // listing it is not redundant. Deriving it only from that op would make the anchor
-        // write's permission an accident of `put_trust_if_absent` still having a caller: retire
-        // that one, `put_item` goes dead under `#![deny(dead_code)]`, `PutItem` leaves the
-        // policy as a dead grant — and the anchor write starts failing `AccessDenied` in
-        // production with every check in this file still green.
+        ("scan", &["dynamodb:Scan"][..]),
+        // This one op issues every one of the store's transactions — the ref-update commit
+        // (`Update` + `ConditionCheck`s), the anchor writes (`Put` + `ConditionCheck`s), the
+        // format fence (a `ConditionCheck`, or a `Put` stamping a new warehouse) and the
+        // operator's format swap (`Update`) — so the row is the union of what all three action
+        // types need. `dynamodb:PutItem` comes only from here: the single-item `put_item` op went
+        // dead when the trust plant became a transaction carrying the format fence.
         (
             "transact_write_items",
             &["dynamodb:ConditionCheckItem", "dynamodb:PutItem", "dynamodb:UpdateItem"][..],
@@ -1176,15 +1176,15 @@ fn iam_policies_match_the_wrapper_op_surface() {
         unmapped,
     );
 
-    let granted: BTreeSet<String> = granted_actions(CONTROL_PLANE_POLICY, REVIEWED_CONDITIONED_SIDS)
-        .union(&granted_actions(VERIFIER_POLICY, REVIEWED_CONDITIONED_SIDS))
-        .cloned()
+    let granted: BTreeSet<String> = [CONTROL_PLANE_POLICY, VERIFIER_POLICY, OPERATOR_POLICY]
+        .iter()
+        .flat_map(|policy| granted_actions(policy, REVIEWED_CONDITIONED_SIDS))
         .collect();
 
     let missing = missing_grants(&derived, &actions, &granted);
     assert!(
         missing.is_empty(),
-        "the wrapper's derived operations require action(s) {:?} that neither policy JSON grants \
+        "the wrapper's derived operations require action(s) {:?} that no policy JSON grants \
          — a missing grant.",
         missing,
     );
@@ -1196,6 +1196,22 @@ fn iam_policies_match_the_wrapper_op_surface() {
          Remove it, or add the wrapper op that needs it.",
         dead,
     );
+}
+
+/// The union above cannot say *which* role holds a grant, and `dynamodb:Scan` is the one whose
+/// home matters: a Lambda that can scan the table can read every warehouse's refs and trust,
+/// while each request is scoped to one partition. Only the operator's policy may grant it.
+#[test]
+fn only_the_operator_policy_grants_scan() {
+    for (name, policy) in [("control-plane", CONTROL_PLANE_POLICY), ("verifier", VERIFIER_POLICY)] {
+        assert!(
+            !granted_actions(policy, REVIEWED_CONDITIONED_SIDS).contains("dynamodb:Scan"),
+            "{}.policy.json grants dynamodb:Scan; only operator.policy.json may",
+            name,
+        );
+    }
+
+    assert!(granted_actions(OPERATOR_POLICY, REVIEWED_CONDITIONED_SIDS).contains("dynamodb:Scan"));
 }
 
 /// PR #82 review, finding 1: a **per-file** check that each policy individually grants an
