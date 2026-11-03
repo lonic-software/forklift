@@ -85,7 +85,10 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 19** (current): `lower --repair` and `clone --repair` exist. `lower` reports the outcome
+**Schema 20** (current): `git import` reports no `ignored_git` or `git_already_ignored`, since
+it no longer writes an ignore rule for the `.git` folder: every `.git` folder is always ignored.
+
+**Schema 19**: `lower --repair` and `clone --repair` exist. `lower` reports the outcome
 `repaired` when it moved the pallet onto a repair of the remote's head, and `lower` and `clone`
 carry `repair` (`parcel`, `removed`) when they checked one out. A `lower --repair` over a diverged
 pallet refuses as `diverged`, its next step naming the new pallet the repair was stacked on.

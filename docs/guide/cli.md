@@ -315,7 +315,10 @@ Persian or Indic name is fine, as is a flag emoji). A `re:` line is also refused
 starts or ends with whitespace, which would be part of the regex (`re:build ` never matches
 `build`; write a space the regex needs at its edge as `\x20`, and a tab as `\t`), or when it matches
 the empty string (`re:.*`, `re:x*`), which is no path. The error names the character's code point
-and its escape, so an invisible one can be found. A byte order mark at the start of either file is
+and its escape, so an invisible one can be found. A `.forkliftignore` line without `re:` that starts
+with `^` or ends with `$` reads as a regex written before ignore files spoke gitignore, so it is
+refused rather than matched as a name; write `re:` before it, or `\^` and `\$` for a name that holds
+the character. A byte order mark at the start of either file is
 skipped.
 
 As in git, a rule covers only **untracked** paths. A path inside a folder a rule

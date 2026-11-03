@@ -22,13 +22,14 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 - Destructive operations preview by default and act with `--confirm`; without it they exit 39.
 - `restore --staged` is gone; use `unload`.
 - MCP tools are generated from the command tree.
-- `--json` documents are now at schema 19.
+- `--json` documents are now at schema 20.
 - **Ignore files speak gitignore.** Every line of `.forkliftignore` is a gitignore line, and every
   `.gitignore` in the tree is honoured where it stands; `.forkliftignore` is read last and wins over
   them. A regex is written as a `re:` or `!re:` line, matched against the whole path. Matching is
   case-sensitive on every system. A `.git` folder or file is ignored at any depth by a rule no file
   can remove, so `git import` no longer writes one into `.forkliftignore`. `stocktake` reports an
-  untracked folder only when `load .` would stage something in it.
+  untracked folder only when `load .` would stage something in it. A `.forkliftignore` line that
+  reads as an old regex, starting with `^` or ending with `$`, is refused rather than misread.
 - A failure printed for a person shows its next step on its own labelled line, in both heads, and the
   message no longer restates it.
 - **A warehouse now records its format, and a build reads exactly one.** A warehouse in another format

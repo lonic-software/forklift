@@ -5247,6 +5247,21 @@ fn ignore_rules_are_gitignore_lines_in_every_ignore_file() {
     assert_eq!(loaded, [".forkliftignore", ".gitignore", "config.env", "keep.tmp", "rebuild.rs", "sub/build"]);
 }
 
+#[cfg(unix)]
+#[test]
+fn stocktake_lists_an_untracked_folder_holding_one_it_cannot_list() {
+    use std::os::unix::fs::PermissionsExt;
+    let warehouse = TestWarehouse::new("stocktake-unlistable");
+    assert_success(&warehouse.run(&["prepare"]));
+    warehouse.write_file("u/locked/f", "f\n");
+    warehouse.write_file("v/.gitignore", "*\n");
+    let locked = warehouse.root.join("u/locked");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let unstaged = changes(&warehouse, "unstaged");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(unstaged, [("untracked".to_string(), "u/".to_string())]);
+}
+
 #[test]
 fn loading_a_folder_honours_the_gitignore_files_above_it() {
     let warehouse = TestWarehouse::new("ignore-load-folder");
@@ -7804,7 +7819,7 @@ fn json_mode_wraps_every_result_in_a_versioned_envelope() {
     let value = json(&prepared);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 19);
+    assert_eq!(value["schema"], 20);
     assert_eq!(value["command"], "prepare");
     assert_eq!(value["ok"], true);
     assert!(value["data"]["created"].is_array());
@@ -7846,7 +7861,7 @@ fn json_errors_carry_a_stable_code_and_a_deterministic_exit_code() {
     // failed, so a consumer classifies by the same header on either outcome.
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 19);
+    assert_eq!(value["schema"], 20);
     assert_eq!(value["command"], "stocktake");
     assert!(value.get("data").is_none(), "a failure carries no data: {}", value);
 }
@@ -7890,7 +7905,7 @@ fn a_usage_error_under_json_is_one_failure_document_with_exit_2() {
     let value = json(&unknown);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 19);
+    assert_eq!(value["schema"], 20);
     assert_eq!(value["ok"], false);
     assert!(value["command"].is_null(), "no known command was named: {}", value);
     assert_eq!(value["error"]["code"], "usage");
@@ -8098,7 +8113,7 @@ fn every_json_document_starts_with_the_header_in_its_documented_order() {
     let warehouse = TestWarehouse::new("json-key-order");
 
     // The order is checked on the raw text: a parsed `Value` would hide it.
-    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 19,\n  \"command\": ";
+    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 20,\n  \"command\": ";
 
     for args in [&["--json", "version"][..], &["--json", "bogus"], &["--json", "stocktake"]] {
         let output = warehouse.run(args);

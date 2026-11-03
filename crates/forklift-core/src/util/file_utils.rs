@@ -3828,8 +3828,10 @@ impl From<IgnoreFileError> for String {
     }
 }
 
-/// Which ignore file a content was read from: the root ignore file keeps forklift's refusals and
-/// takes regex lines, while a `.gitignore` means in forklift what it means in git.
+/// Which ignore file a content was read from: the root ignore file refuses control and invisible
+/// characters, edge whitespace on a regex line and a glob line that reads as a regex, and takes
+/// regex lines, while a `.gitignore` means in forklift what it means in git. Both refuse conflict
+/// markers.
 #[derive(Clone, Copy, PartialEq)]
 enum IgnoreFileKind {
     Forklift,
@@ -3962,6 +3964,15 @@ fn parse_ignore_lines(content: &str, label: &str, kind: IgnoreFileKind) -> Resul
         }
 
         let Some((negated, regex)) = regex_line else {
+            if reads_as_anchored_regex(line) {
+                return Err(format!(
+                    "\"{}\", line {}: the pattern {:?} reads as a regex, but a line without the {} \
+                    prefix is a gitignore pattern, so it would match only a name holding that `^` or \
+                    `$`. Prefix it with {} if it is a regex, or write the character as `\\^` or `\\$` \
+                    if it is part of a name.",
+                    label, index + 1, line, REGEX_LINE_PREFIX, REGEX_LINE_PREFIX
+                ));
+            }
             rules.extend(parse_glob_line(line).map_err(|e| format!("\"{}\", line {}: {}", label, index + 1, e))?);
             continue;
         };
@@ -4031,6 +4042,19 @@ fn parse_glob_line(line: &str) -> Result<Option<IgnoreFileRule>, String> {
     };
 
     Ok(Some(IgnoreFileRule { negated, matcher: RuleMatcher::Glob { directory_only, basename, regex } }))
+}
+
+/// Whether a glob line reads as an anchored regex of the old `.forkliftignore` format: past a
+/// leading `!`, it starts with `^` or ends with a `$` no backslash escapes. Read as a glob, such a
+/// line would match only names holding the character, so the rule it meant would be lost silently.
+fn reads_as_anchored_regex(line: &str) -> bool {
+    let pattern = trim_trailing_spaces(line);
+    let pattern = pattern.strip_prefix('!').unwrap_or(pattern);
+    let Some(body) = pattern.strip_suffix('$') else {
+        return pattern.starts_with('^');
+    };
+    let escapes = body.bytes().rev().take_while(|b| *b == b'\\').count();
+    pattern.starts_with('^') || escapes % 2 == 0
 }
 
 /// The line without its trailing spaces, except one escaped by a backslash, as git trims them.
@@ -5212,6 +5236,24 @@ mod tests {
         assert!(error.contains("line 1"), "{}", error);
         // As gitignore lines these are ordinary patterns.
         assert_eq!(forklift("# comment\n\n.*\nx*\n").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_glob_line_that_reads_as_an_anchored_regex_is_refused_in_the_root_file_only() {
+        let forklift = |content: &str| parse_ignore_lines(content, FILENAME_IGNORE, IgnoreFileKind::Forklift);
+        for line in ["^target", "target$", "^target$", "!^keep", "!keep$", "^x  ", "a\\\\$"] {
+            let error = forklift(&format!("ok\n{}\n", line)).unwrap_err();
+            assert!(error.contains("line 2") && error.contains("reads as a regex") && error.contains("re:"), "{:?}: {}", line, error);
+        }
+        // Escaped, the character is part of a name; inside, it never was an anchor; as a regex
+        // line it is one; and a `.gitignore` means what git means.
+        for line in ["\\^target", "target\\$", "a^b", "a$b", "re:^target$", "!re:keep$"] {
+            assert_eq!(forklift(&format!("{}\n", line)).unwrap().len(), 1, "{:?}", line);
+        }
+        let rules = rules_of("\\^t\nt\\$\n");
+        assert!(walk_excludes(&rules, &[], "^t", false, false) && walk_excludes(&rules, &[], "t$", false, false));
+        assert!(!walk_excludes(&rules, &[], "t", false, false));
+        assert_eq!(parse_ignore_lines("^target$\n", FILENAME_GITIGNORE, IgnoreFileKind::Gitignore).unwrap().len(), 1);
     }
 
     #[test]

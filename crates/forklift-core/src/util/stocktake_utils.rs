@@ -441,29 +441,33 @@ async fn collect_unstaged_changes_impl(context: ChangeWalkContext)
 /// * `keys`           - All inventoried directory keys.
 ///
 /// # Returns
-/// * `Ok(bool)`    - Whether the folder holds such an entry.
-/// * `Err(String)` - If a folder, an entry's type or a `.gitignore` could not be read.
+/// * `Ok(bool)`    - Whether the folder holds such an entry; `true` for one holding a folder that
+///                   cannot be listed or an entry that cannot be inspected.
+/// * `Err(String)` - If an entry's name or a `.gitignore` could not be read.
 fn untracked_directory_has_content(ignore_rules: &file_utils::IgnoreRules,
                                    parent_context: &file_utils::RuleContext,
                                    key: &str,
                                    keys: &BTreeSet<String>) -> Result<bool, String> {
     let fs_path = std::path::PathBuf::from(key);
-    let entries = file_utils::read_directory_entries(&fs_path)?;
+    // A folder that cannot be listed or an entry that cannot be inspected may hold anything, so the
+    // folder is reported, as before the descent existed and as git reports it, rather than failing
+    // the whole stocktake. Nothing below an untracked folder is registered, so no refusal is lost.
+    let Ok(entries) = file_utils::read_directory_entries(&fs_path) else {
+        return Ok(true);
+    };
     let context = ignore_rules.enter(parent_context, key, || file_utils::read_gitignore_in(&fs_path, &entries))?;
 
     for entry in &entries {
         let name = file_utils::get_name_for_file_or_directory(entry)?;
         let entry_key = join_key(key, &name);
 
-        match inventory_utils::rule_verdict(ignore_rules, &context, None, entry, &name, &entry_key, keys)? {
-            inventory_utils::RuleVerdict::Walk => {}
-            inventory_utils::RuleVerdict::Ignored | inventory_utils::RuleVerdict::CoveredOtherType => continue,
-            inventory_utils::RuleVerdict::NestedBoundary => return Ok(true),
+        match inventory_utils::rule_verdict(ignore_rules, &context, None, entry, &name, &entry_key, keys) {
+            Ok(inventory_utils::RuleVerdict::Walk) => {}
+            Ok(inventory_utils::RuleVerdict::Ignored | inventory_utils::RuleVerdict::CoveredOtherType) => continue,
+            Ok(inventory_utils::RuleVerdict::NestedBoundary) | Err(_) => return Ok(true),
         }
 
-        let is_directory = entry.file_type()
-            .map_err(|e| format!("Error while getting the type of \"{}\": {}", entry_key, e))?
-            .is_dir();
+        let is_directory = entry.file_type().map(|file_type| file_type.is_dir()).unwrap_or(false);
 
         if !is_directory || untracked_directory_has_content(ignore_rules, &context, &entry_key, keys)? {
             return Ok(true);
