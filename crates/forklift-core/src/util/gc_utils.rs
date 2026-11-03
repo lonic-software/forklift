@@ -39,8 +39,8 @@ pub struct GcStats {
     pub kept_recent: usize,
 
     /// Unreferenced objects kept because a pack's delta stands on them: deleting one would leave
-    /// that delta unreadable, even if nothing reaches it. Where a full repack runs, the collection
-    /// after it deletes them; a server has no repack command, so on a server root they stay.
+    /// that delta unreadable, even if nothing reaches it. The collection after a full repack deletes
+    /// them.
     pub kept_for_deltas: usize,
 }
 
@@ -135,7 +135,7 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
             let bases = match &mut delta_bases {
                 Some(bases) => bases,
                 unread => unread.insert(pack_utils::packed_delta_bases()
-                    .map_err(|error| error.refusal("gc", "nothing more was deleted", false))?),
+                    .map_err(|error| error.refusal("gc", "nothing more was deleted"))?),
             };
 
             if bases.contains(&hash) {

@@ -230,7 +230,7 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
         false
     } else {
         pack_utils::any_packed_delta_against(&loose_only)
-            .map_err(|error| error.refusal("\"forklift store evict\"", "nothing was changed", true))?
+            .map_err(|error| error.refusal("\"forklift store evict\"", "nothing was changed"))?
     };
     plan.repack = !plan.to_drop.is_empty() || delta_on_loose;
     plan.to_unseal = sealed_utils::present_recorded(&sealed)?

@@ -3398,19 +3398,17 @@ impl PackScanError {
     /// may stand on what the sweep deleted.
     ///
     /// # Arguments
-    /// * `command`  - The command, as the message names it.
-    /// * `outcome`  - What the refused run changed.
-    /// * `can_salvage` - Whether `store compact --all` is a step this command's user can take.
-    pub(crate) fn refusal(self, command: &str, outcome: &str, can_salvage: bool) -> String {
+    /// * `command` - The command, as the message names it.
+    /// * `outcome` - What the refused run changed.
+    pub(crate) fn refusal(self, command: &str, outcome: &str) -> String {
         let why = "since it cannot tell which packed content stands on what it would delete";
 
         match self {
             PackScanError::Damaged(e) => format!(
-                "{} cannot run while a pack in this warehouse cannot be read, {}; {}. {}Restore the pack, or move \
-                it out of the pack folder only if it holds nothing this warehouse needs, and do not bring it back \
+                "{} cannot run while a pack in this warehouse cannot be read, {}; {}. Run \"forklift store compact --all\" to salvage a damaged pack; \
+                otherwise restore the pack, or move it out of the pack folder only if it holds nothing this warehouse needs, and do not bring it back \
                 once a sweep has run. {}",
                 command, why, outcome,
-                if can_salvage { "Run \"forklift store compact --all\" to salvage a damaged pack. Otherwise, " } else { "" },
                 e
             ),
             PackScanError::ForeignVersion(e) => format!(
@@ -6546,8 +6544,6 @@ pub(crate) mod tests {
         artifacts.remove(0)
     }
 
-    /// Run `case` once per [`Unreadable`] kind and fail with every arm's failure together, so a red
-    /// run reports each arm rather than stopping at the first.
     /// What is wrong with a sweep's refusal over a pack unreadable as `how`, if anything.
     pub(crate) fn refusal_problem(how: Unreadable, error: &str) -> Option<String> {
         let right = if matches!(how, Unreadable::ForeignVersion) {
@@ -6559,6 +6555,8 @@ pub(crate) mod tests {
         (!right).then(|| format!("{:?}: {}", how, error))
     }
 
+    /// Run `case` once per [`Unreadable`] kind and fail with every arm's failure together, so a red
+    /// run reports each arm rather than stopping at the first.
     pub(crate) fn for_each_unreadable(case: impl Fn(Unreadable) -> Option<String>) {
         let all = [Unreadable::Quarantined, Unreadable::CorruptBucket, Unreadable::ForeignVersion, Unreadable::Unparseable];
         let failures: Vec<String> = all

@@ -270,7 +270,7 @@ fn plan_from(
     let mut kept_for_deltas = 0usize;
     if !to_free.is_empty() {
         let bases = pack_utils::packed_delta_bases()
-            .map_err(|error| error.refusal("\"forklift scope prune\"", "nothing was changed", true))?;
+            .map_err(|error| error.refusal("\"forklift scope prune\"", "nothing was changed"))?;
         let candidates = to_free.len();
         to_free.retain(|hash| !bases.contains(hash));
         kept_for_deltas = candidates - to_free.len();
@@ -824,7 +824,7 @@ fn retain_recipe_chunks(recipe_hash: &str, retained: &mut HashSet<String>) -> Re
 /// descent is simply skipped, never an error — which is sound only because objects are always
 /// *freed* in the same child-before-parent order this function produces, so an absent node
 /// proves its whole subtree is already gone, not merely that this one object is. (Bar an object
-/// kept for a packed delta, which the plan never frees anyway: missing it frees nothing less.)
+/// kept for a packed delta, which the plan never frees anyway: missing it never frees more.)
 ///
 /// Presence here is the plain [`file_utils::does_object_exist`], not the fail-closed sweep form
 /// the retained walks use. An object only an unreadable pack index might hold reads absent, so

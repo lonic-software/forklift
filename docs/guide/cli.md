@@ -2247,7 +2247,7 @@ garbage. `scope prune` and `forklift-server gc` refuse the same way. Both also r
 while any pack cannot be read, needed or not, since it could hold a delta stored against what
 they would delete; a pack another forklift version wrote needs a build that reads it. `gc` keeps a
 garbage object a readable pack's delta stands on until a full repack has re-encoded or dropped that
-delta, and a server has no repack command, so on a server root it stays. `forklift store` lists the
+delta. `forklift store` lists the
 pack under `quarantined_packs`, `damaged_packs`, `unenumerable_indexes` or
 `foreign_version_indexes`; once the pack is restored, or moved aside if it holds nothing this
 warehouse needs (a sweep reads what only it holds as absent, and everything beneath as garbage), the
