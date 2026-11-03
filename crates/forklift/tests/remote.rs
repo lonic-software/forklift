@@ -591,9 +591,9 @@ fn a_sparse_franchise_keeps_the_root_ignore_file_in_scope() {
     assert_success(&scope);
     let scope_json: serde_json::Value = serde_json::from_str(&stdout(&scope)).unwrap();
     assert_eq!(scope_json["data"]["checkout_scope"], serde_json::json!(["src"]), "{}", stdout(&scope));
-    assert_eq!(scope_json["data"]["implicit_scope"], serde_json::json!([".forkliftignore"]), "{}", stdout(&scope));
+    assert_eq!(scope_json["data"]["implicit_scope"], serde_json::json!([".forkliftignore", ".gitignore"]), "{}", stdout(&scope));
     assert_eq!(scope_json["data"]["fetch_scope"], serde_json::json!(["src"]), "{}", stdout(&scope));
-    assert_eq!(scope_json["data"]["implicit_fetch_scope"], serde_json::json!([".forkliftignore"]), "{}", stdout(&scope));
+    assert_eq!(scope_json["data"]["implicit_fetch_scope"], serde_json::json!([".forkliftignore", ".gitignore"]), "{}", stdout(&scope));
 
     // The rules are in force: an ignored build folder inside the scope reads clean.
     area.write_file("sparse/src/build/out.txt", "generated\n");
@@ -669,6 +669,154 @@ fn a_sparse_checkout_unstages_the_root_ignore_file_and_narrows_past_an_edit_to_i
         "the unstaged edit to the rules survives the narrow");
 }
 
+/// A sparse clone holds the `.gitignore` of every folder above its scope, so it ignores exactly
+/// what a full checkout ignores there: each is fetched and materialized, an edit to one stacks and
+/// travels both ways, and a `.gitignore` beside the scope stays sealed.
+#[test]
+fn a_sparse_franchise_holds_the_spine_gitignore_files_and_ignores_what_a_full_one_does() {
+    let area = TestArea::new("sparse-spine-gitignore");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/.gitignore", "*.log\n");
+    area.write_file("dev/src/.gitignore", "build/\n");
+    area.write_file("dev/src/api/.gitignore", "tmp/\n");
+    area.write_file("dev/src/api/a.txt", "a v1\n");
+    area.write_file("dev/src/web/.gitignore", "*.txt\n");
+    area.write_file("dev/src/web/w.md", "w v1\n");
+    area.write_file("dev/docs/guide.md", "guide v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
+    assert_eq!(area.read_file("sparse/.gitignore"), "*.log\n", "the root .gitignore is materialized");
+    assert_eq!(area.read_file("sparse/src/.gitignore"), "build/\n", "a spine .gitignore is materialized");
+    assert_eq!(area.read_file("sparse/src/api/.gitignore"), "tmp/\n");
+    assert!(!area.path("sparse/src/web").exists(), "a .gitignore beside the scope stays sealed");
+    assert!(!area.path("sparse/docs").exists());
+
+    let scope = area.forklift("sparse", &["--json", "scope"]);
+    assert_success(&scope);
+    let scope_json: serde_json::Value = serde_json::from_str(&stdout(&scope)).unwrap();
+    let implicit = serde_json::json!([".forkliftignore", ".gitignore", "src/.gitignore"]);
+    assert_eq!(scope_json["data"]["implicit_scope"], implicit, "{}", stdout(&scope));
+    assert_eq!(scope_json["data"]["implicit_fetch_scope"], implicit, "{}", stdout(&scope));
+
+    // Each level's rules are in force in both checkouts alike, and an unignored file still shows.
+    for checkout in ["dev", "sparse"] {
+        for file in ["src/api/x.log", "src/api/build/out.o", "src/api/tmp/t", "src/api/deep/build/o"] {
+            area.write_file(&format!("{}/{}", checkout, file), "generated\n");
+        }
+        area.write_file(&format!("{}/src/api/new.txt", checkout), "new\n");
+        let status = area.forklift(checkout, &["--json", "stocktake"]);
+        assert_success(&status);
+        let json: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+        assert_eq!(json["data"]["staged_count"], serde_json::json!(0), "{}: {}", checkout, stdout(&status));
+        assert_eq!(json["data"]["unstaged"], serde_json::json!([{"kind": "untracked", "path": "src/api/new.txt"}]),
+            "{}: {}", checkout, stdout(&status));
+        std::fs::remove_file(area.path(&format!("{}/src/api/new.txt", checkout))).unwrap();
+    }
+
+    // An edit to a spine .gitignore made in the sparse checkout stacks, lifts and reaches a full one.
+    area.write_file("sparse/src/.gitignore", "build/\n*.o\n");
+    assert_success(&area.forklift("sparse", &["load", "src/.gitignore"]));
+    assert_success(&area.forklift("sparse", &["stack", "-m", "ignore objects"]));
+    assert_success(&area.forklift("sparse", &["lift"]));
+    assert_success(&area.forklift("dev", &["lower"]));
+    assert_eq!(area.read_file("dev/src/.gitignore"), "build/\n*.o\n");
+    assert_eq!(area.read_file("dev/src/web/.gitignore"), "*.txt\n", "the sealed .gitignore survives the sparse stack");
+    assert_eq!(area.read_file("dev/docs/guide.md"), "guide v1\n");
+
+    // And an edit made on the full side reaches the sparse one.
+    area.write_file("dev/.gitignore", "*.log\n*.tmp\n");
+    assert_success(&area.forklift("dev", &["load", ".gitignore"]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "ignore tmp"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+    assert_success(&area.forklift("sparse", &["lower"]));
+    assert_eq!(area.read_file("sparse/.gitignore"), "*.log\n*.tmp\n");
+
+    let status = area.forklift("sparse", &["--json", "stocktake"]);
+    assert_success(&status);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert_eq!(json["data"]["staged_count"], serde_json::json!(0), "{}", stdout(&status));
+}
+
+/// Narrowing a prefix away takes the `.gitignore` of each folder no kept path is under with it, so
+/// it refuses while that file holds uncommitted work, and otherwise removes the file and its staged
+/// entry, after which a scoped stack goes through.
+#[test]
+fn narrow_takes_a_spine_gitignore_it_no_longer_needs_and_refuses_while_it_is_edited() {
+    let area = TestArea::new("sparse-narrow-spine-gitignore");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/.gitignore", "*.log\n");
+    area.write_file("dev/src/.gitignore", "build/\n");
+    area.write_file("dev/src/api/a.txt", "a v1\n");
+    area.write_file("dev/docs/guide.md", "guide v1\n");
+    area.write_file("dev/lib/l.txt", "l v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    assert_success(&area.forklift(".",
+        &["clone", &server.url, "sparse", "--only", "src/api", "--only", "docs", "--only", "lib"]));
+    assert_eq!(area.read_file("sparse/src/.gitignore"), "build/\n");
+
+    // A staged edit to it blocks narrowing src/api away, naming the file, and survives.
+    area.write_file("sparse/src/.gitignore", "build/\n*.o\n");
+    assert_success(&area.forklift("sparse", &["load", "src/.gitignore"]));
+    let refused = area.forklift("sparse", &["--json", "scope", "narrow", "src/api"]);
+    assert_eq!(refused.status.code(), Some(12), "narrow_unclean exits 12: {}", stderr(&refused));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&refused)).unwrap();
+    assert_eq!(json["error"]["code"], "narrow_unclean", "{}", stdout(&refused));
+    assert!(json["error"]["message"].as_str().unwrap().contains("\"src/.gitignore\""), "{}", stdout(&refused));
+    assert_eq!(area.read_file("sparse/src/.gitignore"), "build/\n*.o\n");
+    assert!(area.path("sparse/src/api/a.txt").exists(), "nothing is removed by a refused narrow");
+
+    // Unstaged, the edit still blocks it.
+    assert_success(&area.forklift("sparse", &["unload", "src/.gitignore"]));
+    let refused = area.forklift("sparse", &["--json", "scope", "narrow", "src/api"]);
+    assert_eq!(refused.status.code(), Some(12), "{}", stderr(&refused));
+
+    // The rules it keeps do not block narrowing docs away: the narrowed scope still holds them.
+    area.write_file("sparse/.gitignore", "*.log\n*.tmp\n");
+    assert_success(&area.forklift("sparse", &["scope", "narrow", "docs"]));
+    assert_eq!(area.read_file("sparse/.gitignore"), "*.log\n*.tmp\n");
+    area.write_file("sparse/.gitignore", "*.log\n");
+
+    // Reverted, the narrow goes through: the file and its staged entry leave with the prefix,
+    // and the folder stays with what else is in it.
+    area.write_file("sparse/src/.gitignore", "build/\n");
+    area.write_file("sparse/src/build/out.o", "generated\n");
+    assert_success(&area.forklift("sparse", &["scope", "narrow", "src/api"]));
+    assert!(!area.path("sparse/src/.gitignore").exists(), "the spine .gitignore leaves with the prefix");
+    assert!(!area.path("sparse/src/api").exists());
+    assert_eq!(area.read_file("sparse/src/build/out.o"), "generated\n", "the folder keeps what is not tracked");
+    let scope = area.forklift("sparse", &["--json", "scope"]);
+    let scope_json: serde_json::Value = serde_json::from_str(&stdout(&scope)).unwrap();
+    assert_eq!(scope_json["data"]["implicit_scope"], serde_json::json!([".forkliftignore", ".gitignore"]), "{}", stdout(&scope));
+
+    // No removal is staged for it, and what it ignored is no longer ignored: the rules left too.
+    let status = area.forklift("sparse", &["--json", "stocktake"]);
+    assert_success(&status);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert_eq!(json["data"]["staged_count"], serde_json::json!(0), "{}", stdout(&status));
+    assert_eq!(json["data"]["unstaged"], serde_json::json!([{"kind": "untracked", "path": "src/"}]), "{}", stdout(&status));
+    std::fs::remove_dir_all(area.path("sparse/src")).unwrap();
+
+    // A scoped stack goes through, and a full checkout keeps the file.
+    area.write_file("sparse/lib/l.txt", "l v2\n");
+    assert_success(&area.forklift("sparse", &["load", "lib/l.txt"]));
+    assert_success(&area.forklift("sparse", &["stack", "-m", "lib v2"]));
+    assert_success(&area.forklift("sparse", &["lift"]));
+    assert_success(&area.forklift("dev", &["lower"]));
+    assert_eq!(area.read_file("dev/lib/l.txt"), "l v2\n");
+    assert_eq!(area.read_file("dev/src/.gitignore"), "build/\n");
+    assert_eq!(area.read_file("dev/src/api/a.txt"), "a v1\n");
+}
+
 /// A scope file written before the root ignore file joined every scope is refused on read, rather
 /// than read under today's meaning — under which the never-inventoried ignore file would show as
 /// a removal and the next stack would commit it.
@@ -687,16 +835,19 @@ fn a_sparse_warehouse_with_an_unversioned_scope_file_is_refused() {
     assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src"]));
 
     // Rewrite the recorded scopes in the unversioned form an older Forklift wrote.
-    for file in ["sparse/.forklift/config/fetch-scope", "sparse/.forklift/scope"] {
-        assert!(area.path(file).exists(), "the sparse clone records {}", file);
-        std::fs::write(area.path(file), "src\n").unwrap();
-    }
+    // So is format 3, whose scopes left the spine .gitignore files out.
+    for contents in ["src\n", "/forklift-scope 3\nsrc\n"] {
+        for file in ["sparse/.forklift/config/fetch-scope", "sparse/.forklift/scope"] {
+            assert!(area.path(file).exists(), "the sparse clone records {}", file);
+            std::fs::write(area.path(file), contents).unwrap();
+        }
 
-    for verb in [&["stocktake"][..], &["stack", "-m", "nothing"][..]] {
-        let refused = area.forklift("sparse", verb);
-        assert!(!refused.status.success(), "{:?} must refuse: {}", verb, stdout(&refused));
-        assert!(stderr(&refused).contains("older version of Forklift"), "{:?}: {}", verb, stderr(&refused));
-        assert!(stderr(&refused).contains("Clone the remote again"), "{:?}: {}", verb, stderr(&refused));
+        for verb in [&["stocktake"][..], &["stack", "-m", "nothing"][..]] {
+            let refused = area.forklift("sparse", verb);
+            assert!(!refused.status.success(), "{:?} must refuse {:?}: {}", verb, contents, stdout(&refused));
+            assert!(stderr(&refused).contains("older version of Forklift"), "{:?}: {}", verb, stderr(&refused));
+            assert!(stderr(&refused).contains("Clone the remote again"), "{:?}: {}", verb, stderr(&refused));
+        }
     }
 }
 
@@ -6208,7 +6359,7 @@ fn an_unscoped_bay_in_a_sparse_warehouse_is_refused_up_front() {
     assert!(message.contains("Name paths within the fetch scope (src/api)") && !message.contains("plain bay"), "{}", message);
 
     assert_success(&area.forklift("sparse", &["bay", "add", "plain", bay_dir.to_str().unwrap(), "--scope", "src/api"]));
-    assert_eq!(area.read_file("sparse/.forklift/bays/plain/scope"), "/forklift-scope 3\nsrc/api\n");
+    assert_eq!(area.read_file("sparse/.forklift/bays/plain/scope"), "/forklift-scope 4\nsrc/api\n");
 }
 
 /// A `--cache` clone is a partial warehouse, as a sparse one is: it skips the bundle, writes

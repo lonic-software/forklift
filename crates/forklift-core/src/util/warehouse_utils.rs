@@ -1652,7 +1652,7 @@ mod tests {
     #[test]
     fn prepare_records_the_mode_and_a_partial_one_writes_its_origin_and_scopes_first() {
         let scope = PathScope::from_prefixes(["src"]);
-        let written = b"/forklift-scope 3\nsrc\n".to_vec();
+        let written = b"/forklift-scope 4\nsrc\n".to_vec();
 
         let root = fresh_dir("modes");
         let origin = "http://origin.example";
