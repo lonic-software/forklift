@@ -3501,7 +3501,7 @@ fn a_lower_repair_over_a_diverged_ref_keeps_its_parcels() {
         let side = next_step.split("forklift consolidate ").nth(1).unwrap().split(';').next().unwrap().to_string();
         assert!(side.starts_with("main-repair-"), "{}", next_step);
         let repair = user_head(&area, "b", &side);
-        assert_eq!(parents_of(&area, "b", &repair), vec![wedged]);
+        assert_eq!(parents_of(&area, "b", &repair), vec![wedged.clone()]);
 
         // A rerun finds the repair it stacked rather than stacking another.
         let pallets = std::fs::read_dir(area.path("b/.forklift/pallets")).unwrap().count();
