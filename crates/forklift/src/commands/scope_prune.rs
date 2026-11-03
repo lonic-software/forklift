@@ -40,8 +40,8 @@ use crate::output::{self, CommandOutput};
 /// * `Ok(())`      - If the plan was carried out.
 /// * `Err(String)` - If the plan frees content and `confirm` was not given, the warehouse is not sparse, a path is a live spine ancestor or a
 ///   sub-path of what is still fetched, the last fetched path would be dropped, a checkout
-///   still materializes the path, another process is using the object store, or the remote cannot
-///   be reached or is not trusted.
+///   still materializes the path, another process is using the object store, a pack is damaged, or
+///   the remote cannot be reached or is not trusted.
 pub async fn handle_command(paths: Vec<String>, confirm: bool) -> Result<(), String> {
     // Judged once before the remote is asked, so a local refusal (a full warehouse, a path that is
     // not fetched, a checkout that still needs it) is reported as itself rather than masked by a

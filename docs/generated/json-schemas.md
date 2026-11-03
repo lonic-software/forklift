@@ -4604,6 +4604,10 @@ A command not listed here either reports only the generic human-message shape `{
       },
       "type": "array"
     },
+    "repack": {
+      "description": "Whether the run rewrites every pack first (in the preview, would): a packed delta stands on\nan object it frees, which the repack re-encodes so that the delta still reads.",
+      "type": "boolean"
+    },
     "retained_shared": {
       "description": "Candidates kept because they are shared (by content hash) with a scope that is still\nfetched, or with a meta pallet. Distinct from `still_packed`: this content stays by\ndesign, not pending a future repack.",
       "format": "uint",
@@ -4642,6 +4646,7 @@ A command not listed here either reports only the generic human-message shape `{
     "scope",
     "freed",
     "would_free",
+    "repack",
     "still_packed",
     "retained_shared",
     "kept_unlifted",
