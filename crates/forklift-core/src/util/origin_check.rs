@@ -207,8 +207,8 @@ fn incomplete_refusal(url: &str, missing: &HashSet<String>) -> CoreError {
         RefusalCode::OriginMoveIncomplete,
         format!(
             "\"{}\" does not hold {} object(s) this warehouse lacks and relies on its origin for ({}{}), \
-            so it cannot be the origin; the origin was left where it was. {}",
-            url, named.len(), shown.join(", "), more, next_step
+            so it cannot be the origin; the origin was left where it was.",
+            url, named.len(), shown.join(", "), more
         ),
         next_step,
         serde_json::json!({

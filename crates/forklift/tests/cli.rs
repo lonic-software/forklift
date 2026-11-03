@@ -8057,10 +8057,12 @@ fn the_help_command_under_json_answers_like_the_help_flag() {
     assert_eq!(value["ok"], false);
     assert_eq!(value["error"]["code"], "usage");
 
-    // Without --json a person still gets the way forward in the message itself.
+    // Without --json a person gets the way forward once, as the labelled next step.
     let human = warehouse.run(&["help", "bogus"]);
     assert_eq!(human.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&human.stderr).contains("Use \"forklift help\""), "{:?}", human);
+    let stderr = String::from_utf8_lossy(&human.stderr);
+    assert!(stderr.contains("Next step: Run \"forklift help\""), "{:?}", human);
+    assert_eq!(stderr.matches("forklift help").count(), 1, "{:?}", human);
 }
 
 #[test]

@@ -543,7 +543,8 @@ fn moved_since_read(why: String, name: &str, head: &str, action: RemoteAction) -
         _ => return why,
     };
 
-    error::CoreError::refusal(refusal, message, next_step).into()
+    // The message can carry the remote's own words, which this build does not word.
+    error::CoreError::remote_refusal(refusal, message, next_step).into()
 }
 
 /// Bring user pallet `name`, deleted on the configured remote, back there at the head its tombstone

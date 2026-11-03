@@ -449,7 +449,7 @@ pub fn require_staged_content_present(root: &TreeItem, head_tree_hash: Option<&s
         )
     };
 
-    Err(CoreError::refusal(RefusalCode::StagedContentMissing, format!("{} {}", message, next_step), next_step))
+    Err(CoreError::refusal(RefusalCode::StagedContentMissing, message, next_step))
 }
 
 /// The walk behind [`require_staged_content_present`]: append `(path, hash, chunked)` for every

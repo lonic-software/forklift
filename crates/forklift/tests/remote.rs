@@ -5983,9 +5983,9 @@ fn a_sparse_workspace_refuses_to_lift_to_a_non_origin_remote() {
     assert_eq!(forced.status.code(), Some(11), "an originless sparse lift exits 11: {}", stderr(&forced));
     let json: serde_json::Value = serde_json::from_str(&stdout(&forced)).unwrap();
     assert_eq!(json["error"]["code"], "non_origin_remote", "{}", stdout(&forced));
-    let message = json["error"]["message"].as_str().unwrap();
-    assert!(message.contains("origin record") && message.contains("remote move <url>"),
-        "the refusal names the missing record and the way out: {}", message);
+    assert!(json["error"]["message"].as_str().unwrap().contains("origin record")
+            && json["error"]["next_step"].as_str().unwrap().contains("remote move <url>"),
+        "the refusal names the missing record and the way out: {}", json);
 }
 
 /// Every command that talks to a remote from a partial warehouse talks only to its origin: pointed
@@ -7237,10 +7237,10 @@ fn assert_move_pending(area: &TestArea,
     assert_eq!(refused.status.code(), Some(37), "{:?} ({:?}): {}{}", args, phase, stdout(&refused), stderr(&refused));
     let json = json_of(&refused);
     assert_eq!(json["error"]["code"], "origin_move_pending", "{:?}: {}", args, json);
-    let message = json["error"]["message"].as_str().unwrap();
-    assert!(message.contains("remote move http://new-origin.example"), "{:?}: {}", args, message);
-    assert_eq!(message.contains("remote abort"), phase == forklift_core::util::origin_move::Phase::Checking,
-        "{:?}: only a checking move can be abandoned: {}", args, message);
+    let next_step = json["error"]["next_step"].as_str().unwrap();
+    assert!(next_step.contains("remote move http://new-origin.example"), "{:?}: {}", args, json);
+    assert_eq!(next_step.contains("remote abort"), phase == forklift_core::util::origin_move::Phase::Checking,
+        "{:?}: only a checking move can be abandoned: {}", args, json);
     assert!(forklift_dir_snapshot(area, directory) == before, "{:?} ({:?}) changes nothing", args, phase);
 }
 
@@ -7492,7 +7492,8 @@ fn a_move_to_a_server_lacking_content_refuses_and_leaves_the_origin() {
     assert!(json["error"]["details"]["missing"].as_array().unwrap().contains(&serde_json::json!(four_root)), "{}", json);
     assert_eq!(json["error"]["details"]["missing_count"], json["error"]["details"]["missing"].as_array().unwrap().len());
     let message = json["error"]["message"].as_str().unwrap();
-    assert!(message.contains(&four_root) && message.contains("server's side"), "{}", message);
+    assert!(message.contains(&four_root), "{}", message);
+    assert!(json["error"]["next_step"].as_str().unwrap().contains("server's side"), "{}", json);
     assert!(!move_stands(&area, "cached"));
     assert_eq!(origin_of(&area, "cached").as_deref(), Some(server.url.as_str()));
     assert_eq!(configured_remote(&area, "cached"), server.url);
@@ -7701,7 +7702,7 @@ fn a_stopped_move_is_abandoned_only_while_checking_and_finished_by_the_next() {
 
     std::fs::remove_file(area.path("cached/.forklift/origin")).unwrap();
     let missing = area.forklift("cached", &["--json", "lower"]);
-    assert!(json_of(&missing)["error"]["message"].as_str().unwrap().contains("remote move <url>"), "{}", stdout(&missing));
+    assert!(json_of(&missing)["error"]["next_step"].as_str().unwrap().contains("remote move <url>"), "{}", stdout(&missing));
     assert_success(&area.forklift("cached", &["remote", "move", &copy.url]));
     assert_eq!(origin_of(&area, "cached").as_deref(), Some(copy.url.as_str()));
     assert_success(&area.forklift("cached", &["lower"]));

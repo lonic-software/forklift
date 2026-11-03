@@ -2335,11 +2335,8 @@ fn classify_remote_error(status: u16, action: &str, message: String,
     let wrapped = format!("The remote refused {} ({}): {}", action, status, message);
 
     match code.as_deref().and_then(RefusalCode::from_code) {
-        Some(code) => String::from(CoreError::refusal(code, wrapped, next_step.unwrap_or_default())),
-        None => match next_step {
-            Some(next_step) if !next_step.is_empty() => format!("{} {}", wrapped, next_step),
-            _ => wrapped,
-        },
+        Some(code) => String::from(CoreError::remote_refusal(code, wrapped, next_step.unwrap_or_default())),
+        None => crate::error::with_next_step(&wrapped, next_step.as_deref().unwrap_or_default()),
     }
 }
 
@@ -6263,18 +6260,18 @@ pub fn acknowledged_tombstone(info: &WarehouseInfo,
     let (message, next_step) = match descends {
         true => (format!(
             "The remote's pallet \"{}\" was deleted at {}, and the name stays reserved for that \
-            history. This warehouse's work descends from it: \"forklift lift --recreate\" re-creates \
-            the pallet with it, acknowledging the deletion. {} Nothing was lifted.",
+            history. This warehouse's work descends from it: the next step re-creates the pallet \
+            with it, acknowledging the deletion. {} Nothing was lifted.",
             pallet, head, drop
         ), "forklift lift --recreate".to_string()),
         false => (format!(
             "The remote's pallet \"{}\" was deleted at {}, and the name stays reserved for that \
-            history, which this warehouse's work does not descend from{}. \"forklift pallet restore \
-            {} --remote\" brings the pallet back on the remote; lower it and consolidate \
-            it into this work, then lift. {} Nothing was lifted.",
+            history, which this warehouse's work does not descend from{}. The next step brings the \
+            pallet back on the remote; lower it and consolidate it into this work, then lift. {} \
+            Nothing was lifted.",
             pallet, head,
             if recreate { ", so \"--recreate\" cannot re-create it" } else { "" },
-            pallet, drop
+            drop
         ), format!("forklift pallet restore {} --remote", pallet)),
     };
 
@@ -6301,7 +6298,7 @@ async fn lift_pallet_inner(client: &RemoteClient,
         if !file_utils::does_object_exist(remote_head)? {
             return Err(pallet_utils::remote_ahead_refusal(format!(
                 "The remote's pallet \"{}\" has parcels this warehouse does not know \
-                (head {}). \"forklift lower\" first.",
+                (head {}); lower them first.",
                 pallet, remote_head
             )).into());
         }
@@ -6314,7 +6311,7 @@ async fn lift_pallet_inner(client: &RemoteClient,
             // nothing: it says what it could not decide, and that lowering brings the history in.
             return Err(match merge_utils::is_ancestor(local_head, remote_head) {
                 Ok(true) => pallet_utils::remote_ahead_refusal(format!(
-                    "The remote's pallet \"{}\" is ahead of this warehouse's (head {}). \"forklift lower\" \
+                    "The remote's pallet \"{}\" is ahead of this warehouse's (head {}); lower its parcels \
                     first.",
                     pallet, remote_head
                 )),
@@ -6370,7 +6367,7 @@ pub fn diverged_refusal(pallet: &str, remote_head: &str) -> CoreError {
         return CoreError::refusal(
             RefusalCode::Diverged,
             format!(
-                "The local pallet \"{}\" and the remote have diverged. \"forklift lower\" reconciles it; \
+                "The local pallet \"{}\" and the remote have diverged. The next step reconciles it; \
                 then lift again.",
                 pallet
             ),
@@ -6381,11 +6378,10 @@ pub fn diverged_refusal(pallet: &str, remote_head: &str) -> CoreError {
     CoreError::refusal(
         RefusalCode::Diverged,
         format!(
-            "The local pallet \"{p}\" and the remote have diverged. The remote parcels are \
-            fetched; make the remote head its own pallet (\"forklift pallet create {p}-remote-{s} {s}\", \
-            which moves this bay onto it), shift back (\"forklift shift {p}\"), consolidate it \
-            (\"forklift consolidate {p}-remote-{s}\"), and lift the result.",
-            p = pallet, s = short
+            "The local pallet \"{}\" and the remote have diverged. The remote parcels are fetched; \
+            the next step makes the remote head its own pallet (creating it moves this bay onto it), \
+            shifts back, consolidates it and lifts the result.",
+            pallet
         ),
         format!(
             "forklift pallet create {p}-remote-{s} {s}; then forklift shift {p}; then forklift \
@@ -6422,23 +6418,20 @@ pub fn head_not_materializable_refusal(pallet: &str, path: &str, route: RepairRo
         RepairRoute::Lower => {
             let command = "forklift lower --repair".to_string();
 
-            (format!("\"{}\" stacks a parcel on it that removes every such name, and \"forklift lift\" then publishes it.", command), command)
+            ("The next step stacks a parcel on it that removes every such name, and \"forklift lift\" then publishes \
+            it.".to_string(), command)
         }
         RepairRoute::ResumeClone(url) => (
-            "Resuming the clone with --repair stacks a parcel on it that removes every such name, and \
+            "The next step resumes the clone, stacking a parcel on it that removes every such name, and \
             \"forklift lift\" there then publishes it.".to_string(),
             format!("forklift clone {} <directory> --repair", url),
         ),
-        RepairRoute::NewClone(url) => {
-            let command = format!("forklift clone {} <directory> --repair", url);
-
-            (format!(
-                "This warehouse fetches only part of each tree, so it cannot build the repair; \"{}\" into a new \
-                directory stacks a parcel on it that removes every such name, and \"forklift lift\" there then \
-                publishes it.",
-                command
-            ), command)
-        }
+        RepairRoute::NewClone(url) => (
+            "This warehouse fetches only part of each tree, so it cannot build the repair; the next step clones \
+            the remote into a new directory, stacking a parcel on it that removes every such name, and \
+            \"forklift lift\" there then publishes it.".to_string(),
+            format!("forklift clone {} <directory> --repair", url),
+        ),
     };
 
     CoreError::refusal(
@@ -8594,6 +8587,17 @@ mod tests {
         assert_eq!(CoreError::from(classified.clone()), CoreError::Other(classified));
     }
 
+    /// A code this build does not know (a newer server's) still shows its next step, labelled as
+    /// one rather than run on after the message. Revert: append the step bare → red.
+    #[test]
+    fn an_unknown_codes_next_step_is_labelled() {
+        let classified = classify_remote_error(
+            409, "the lift", "a newer refusal".to_string(),
+            Some("brand_new_code".to_string()), Some("do the new thing".to_string()),
+        );
+        assert_eq!(classified, "The remote refused the lift (409): a newer refusal (Next step: do the new thing)");
+    }
+
     /// A server error is transient however it is wrapped; a refusal the server meant is not, nor
     /// is a local failure whose text merely mentions a status.
     #[test]
@@ -9631,7 +9635,8 @@ mod tests {
 
         assert_eq!(code, scope_utils::CODE_OVERSIZED_TRANSPORT_UNSUPPORTED);
         assert!(message.contains(&hash), "the refusal names the object: {}", message);
-        assert!(next_step.contains("signed identity"), "states no migration exists: {}", next_step);
+        assert!(message.contains("signed identity"), "states no migration exists: {}", message);
+        assert!(next_step.is_empty(), "nothing moves the object, so there is no step: {}", next_step);
     }
 
     /// The same refusal on `upload_to_targets` (the presigned-PUT staging path) — the other of

@@ -165,18 +165,15 @@ pub fn refuse_unmaterializable_pallet(pallet: &str, from: Option<&str>, to: &str
     };
 
     let (how, next_step) = if scope_utils::read_fetch_scope()?.is_full() {
-        let command = format!("forklift lower {} --repair", pallet);
-        (format!("\"{}\" stacks a parcel on the remote's head of the pallet that removes every such name", command), command)
+        ("The next step stacks a parcel on the remote's head of the pallet that removes every such name".to_string(),
+         format!("forklift lower {} --repair", pallet))
     } else {
         let url = config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)?
             .map(|(url, _)| url)
             .unwrap_or_else(|| "<url>".to_string());
-        let command = format!("forklift clone {} <directory> --repair", url);
-        (format!(
-            "This warehouse fetches only part of each tree, so it cannot build the repair; \"{}\" into a \
-            new directory checks out a repair of the remote's head of the pallet",
-            command
-        ), command)
+        ("This warehouse fetches only part of each tree, so it cannot build the repair; the next step clones the \
+         remote into a new directory, checking out a repair of the remote's head of the pallet".to_string(),
+         format!("forklift clone {} <directory> --repair", url))
     };
 
     Err(crate::error::CoreError::refusal(

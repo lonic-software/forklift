@@ -78,12 +78,8 @@ pub async fn handle_command(pallet: Option<String>, expect: Option<String>, keep
     if repair && !scope_utils::read_fetch_scope()?.is_full() {
         return Err(CoreError::refusal(
             RefusalCode::SparseWorkspace,
-            format!(
-                "This warehouse fetches only part of each tree, so it cannot build a repair, which reads \
-                the whole of the head's. \"forklift clone {} <directory> --repair\" builds it in a new \
-                directory.",
-                client.url()
-            ),
+            "This warehouse fetches only part of each tree, so it cannot build a repair, which reads the \
+            whole of the head's; the next step builds it in a new directory.",
             format!("forklift clone {} <directory> --repair", client.url()),
         ).into());
     }
@@ -492,7 +488,7 @@ fn stack_diverged_repair(pallet: &str,
             format!(
                 "The remote's head {h} holds a name no client can check out, and its repair could not \
                 be stacked: the pallet \"{s}\" already exists and holds no repair of that head. Delete \
-                it (\"forklift pallet delete {s}\") and lower again.",
+                it, then lower again.",
                 s = side, h = remote_head
             ),
             format!("forklift pallet delete {}", side),
@@ -563,15 +559,16 @@ fn remote_pallet_head<'a>(info: &'a forklift_core::model::remote::WarehouseInfo,
 /// naming the ones it has. `next_step` is the remedy at the site: `lift` publishes a current
 /// pallet with something stacked, `pallet list --remote` lists what another name could be. A pallet
 /// deleted on the remote is refused naming the deletion and its restore instead.
+#[track_caller]
 fn remote_lacks_pallet(info: &forklift_core::model::remote::WarehouseInfo, pallet: &str, next_step: &str) -> CoreError {
     // A deleted pallet's history is still there, under its tombstone: restoring it is the way on.
     if let Some(head) = info.tombstone(pallet) {
         return CoreError::refusal(
             RefusalCode::PalletNotFound,
             format!(
-                "The remote's pallet \"{}\" was deleted at {}; the remote still holds its history. \
-                \"forklift pallet restore {} --remote\" brings it back there.",
-                pallet, head, pallet
+                "The remote's pallet \"{}\" was deleted at {}; the remote still holds its history, \
+                and the next step brings it back there.",
+                pallet, head
             ),
             format!("forklift pallet restore {} --remote", pallet),
         );
@@ -582,13 +579,16 @@ fn remote_lacks_pallet(info: &forklift_core::model::remote::WarehouseInfo, palle
         .filter(|name| !name.starts_with(pallet_utils::META_QUALIFIER))
         .collect();
 
+    // The listing is pointed at unless it is the step itself.
+    let listing = if next_step.contains("pallet list --remote") { "" } else { " \"forklift pallet list --remote\" lists them." };
+
     CoreError::refusal(
         RefusalCode::PalletNotFound,
         format!(
-            "The remote has no pallet \"{}\" (it has: {}). \"forklift pallet list --remote\" lists \
-            them.",
+            "The remote has no pallet \"{}\" (it has: {}).{}",
             pallet,
-            if user.is_empty() { "none".to_string() } else { user.join(", ") }
+            if user.is_empty() { "none".to_string() } else { user.join(", ") },
+            listing
         ),
         next_step,
     )
@@ -791,15 +791,10 @@ pub(crate) struct MetaPalletFailure {
 }
 
 impl MetaPalletFailure {
-    /// A failure carrying a refusal's human message, and its next step when the message does not
-    /// already say it: the frame never reaches the `--json` report or the joined error, which
-    /// carries no code of its own.
+    /// A failure carrying a refusal's human message with its next step folded in: the frame never
+    /// reaches the `--json` report or the joined error, which carries no code of its own.
     pub(crate) fn new(pallet: String, error: String) -> MetaPalletFailure {
-        let error = match forklift_core::error::CoreError::from(error) {
-            forklift_core::error::CoreError::Refusal { message, next_step, .. }
-                if !message.contains(&next_step) => forklift_core::error::with_next_step(&message, &next_step),
-            other => other.to_string(),
-        };
+        let error = forklift_core::error::CoreError::from(error).to_string();
 
         MetaPalletFailure { pallet, error }
     }

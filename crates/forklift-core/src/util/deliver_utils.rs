@@ -262,8 +262,7 @@ fn ensure_target_covered(target: &str,
         RefusalCode::TargetNotCovered,
         format!(
             "\"{target}\" holds changes \"{source}\" has not seen, and delivering would undo them. \
-            Consolidate \"{target}\" into \"{source}\" first (\"forklift consolidate {target}\"), \
-            then deliver."
+            Consolidate \"{target}\" into \"{source}\" first, then deliver."
         ),
         format!("forklift consolidate {target}"),
     ).into())

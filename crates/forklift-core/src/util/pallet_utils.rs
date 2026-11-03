@@ -324,19 +324,18 @@ pub fn behind_refusal(pallet: &str, base: Option<&str>, head: Option<&str>, oper
         RefusalCode::Behind,
         format!(
             "This bay is behind pallet \"{}\": its files stand on {}, but the pallet is at {}, moved \
-            since by another bay or process. Nothing was {}. Run \"forklift shift {}\" to catch up, \
-            then try again.",
+            since by another bay or process. Nothing was {}; catch up, then try again.",
             pallet,
             base.map(|base| format!("parcel {}", base)).unwrap_or("no parcel".to_string()),
             head.map(|head| format!("parcel {}", head)).unwrap_or("no parcel".to_string()),
-            operation,
-            pallet
+            operation
         ),
         catch_up_step(pallet),
     )
 }
 
 /// A [`RefusalCode::RemoteAhead`] refusal saying `message`: `lower` brings the remote's parcels in.
+#[track_caller]
 pub fn remote_ahead_refusal(message: String) -> CoreError {
     CoreError::refusal(RefusalCode::RemoteAhead, message, "forklift lower")
 }
@@ -354,8 +353,8 @@ pub fn pallet_not_found_refusal(reference: &PalletRef) -> CoreError {
         return CoreError::refusal(
             RefusalCode::PalletNotFound,
             format!(
-                "No meta pallet \"{}\" exists in this warehouse. \"forklift lower\" syncs the remote's \
-                meta pallets.",
+                "No meta pallet \"{}\" exists in this warehouse. The next step syncs the remote's meta \
+                pallets.",
                 wire
             ),
             "forklift lower",
@@ -375,8 +374,8 @@ pub fn pallet_not_found_refusal(reference: &PalletRef) -> CoreError {
             RefusalCode::PalletNotFound,
             format!(
                 "No pallet named \"{p}\" exists in this warehouse (or it has nothing stacked). If the \
-                remote has one, \"forklift lower {p}\" brings it in; \"forklift pallet create {p}\" \
-                creates a new one.",
+                remote has one, the next step brings it in; \"forklift pallet create {p}\" creates a new \
+                one.",
                 p = wire
             ),
             format!("forklift lower {}", wire),
@@ -386,8 +385,8 @@ pub fn pallet_not_found_refusal(reference: &PalletRef) -> CoreError {
     CoreError::refusal(
         RefusalCode::PalletNotFound,
         format!(
-            "No pallet named \"{p}\" exists in this warehouse (or it has nothing stacked). \
-            \"forklift pallet create {p}\" creates it.",
+            "No pallet named \"{p}\" exists in this warehouse (or it has nothing stacked); the next \
+            step creates it.",
             p = wire
         ),
         format!("forklift pallet create {}", wire),
@@ -411,9 +410,9 @@ pub fn pallet_moved_refusal(current: Option<&str>, expected: Option<&str>) -> Co
 pub fn pallet_deleted_refusal(pallet: &str, head: &str, offers_drop: bool) -> CoreError {
     deleted_on_remote(pallet, format!(
         "Pallet \"{}\" was deleted on this remote at {}, and the name stays reserved for that \
-        history. \"forklift pallet restore {} --remote\" brings it back; otherwise use \
-        another name for new work{}. Nothing was written.",
-        pallet, head, pallet, tombstone_drop_clause(pallet, offers_drop)
+        history. The next step brings it back; otherwise use another name for new work{}. Nothing \
+        was written.",
+        pallet, head, tombstone_drop_clause(pallet, offers_drop)
     ))
 }
 
@@ -426,16 +425,16 @@ pub fn pallet_recreation_refusal(pallet: &str, head: &str, acknowledged: bool, o
         false => format!(
             "Pallet \"{}\" was deleted on this remote at {}, and the name stays reserved for that \
             history: re-creating it must acknowledge the deletion (\"forklift lift --recreate\", for \
-            work that descends from it). \"forklift pallet restore {} --remote\" brings it back \
-            instead; otherwise lift the work under another name{}. Nothing was written.",
-            pallet, head, pallet, drop
+            work that descends from it). The next step brings it back instead; otherwise lift the work \
+            under another name{}. Nothing was written.",
+            pallet, head, drop
         ),
         true => format!(
             "Pallet \"{}\" was deleted on this remote at {}, and the new head does not descend from \
-            it: the name stays reserved for that history. \"forklift pallet restore {} --remote\" \
-            brings it back, to lower and consolidate into this work; otherwise lift the work under \
-            another name{}. Nothing was written.",
-            pallet, head, pallet, drop
+            it: the name stays reserved for that history. The next step brings it back, to lower and \
+            consolidate into this work; otherwise lift the work under another name{}. Nothing was \
+            written.",
+            pallet, head, drop
         ),
     };
 
@@ -455,6 +454,7 @@ fn tombstone_drop_clause(pallet: &str, offers_drop: bool) -> String {
 }
 
 /// The [`RefusalCode::PalletDeletedOnRemote`] refusal carrying `message`, for user pallet `pallet`.
+#[track_caller]
 fn deleted_on_remote(pallet: &str, message: String) -> CoreError {
     CoreError::refusal(
         RefusalCode::PalletDeletedOnRemote,
@@ -653,7 +653,7 @@ impl RefMoved {
 
         CoreError::refusal(
             RefusalCode::Behind,
-            format!("{} Run \"forklift shift {}\" to catch up, then try again.", self, pallet),
+            format!("{} Catch up, then try again.", self),
             catch_up_step(&pallet),
         )
     }

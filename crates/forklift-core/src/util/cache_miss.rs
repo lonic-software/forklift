@@ -282,7 +282,8 @@ fn refill_with(hook: Option<&FetchHook>, absent: &[String]) -> Result<bool, Stri
 
     match fetched {
         Fetched::Done => {}
-        Fetched::Unreachable { origin, why } => return Err(CoreError::refusal(
+        // `why` can carry the origin's own words, which this build does not word.
+        Fetched::Unreachable { origin, why } => return Err(CoreError::remote_refusal(
             RefusalCode::CacheMiss,
             format!(
                 "{} not in this cache warehouse, and its origin could not be reached to fetch {}: {}",

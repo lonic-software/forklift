@@ -36,10 +36,7 @@ pub fn handle_command(path: &[String]) -> Result<(), ForkliftError> {
             )),
             Resolved::Unknown => return Err(ForkliftError::new(
                 ErrorCode::Usage,
-                format!(
-                    "Unknown command: {}. Use \"forklift help\" for a list of available commands.",
-                    path.join(" ")
-                ),
+                format!("Unknown command: {}.", path.join(" ")),
                 "Run \"forklift help\" for a list of available commands.",
             )),
         };

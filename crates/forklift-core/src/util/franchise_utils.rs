@@ -934,14 +934,19 @@ fn failed_next_step(command: &str, directory: &str, retry: Retry) -> String {
 /// The `clone_incomplete` refusal for a clone's own failure after its claim: `cause` with
 /// the directory kept, and the next step `retry` earns.
 pub fn failure_refusal(directory: &str, record: &FranchiseRecord, cause: &str, failure: &Failure) -> CoreError {
+    let repairs = failure.cause_code == RefusalCode::HeadNotMaterializable.as_str() && !record.request.repair;
+
+    // The cause's own way out stays with it, folded in: resuming the clone may not get past it.
+    // A head no client can check out is the exception, since the clone's own step is that way out.
     let message = match CoreError::from(cause.to_string()) {
-        CoreError::Refusal { message, .. } | CoreError::Other(message) => message,
+        CoreError::Refusal { message, .. } if repairs => message,
+        cause => cause.to_string(),
     };
 
     let command = resume_command(&record.url, directory, &record.request);
 
     // A head no client can check out is checked out repaired, which reads the whole of its tree.
-    let next_step = if failure.cause_code == RefusalCode::HeadNotMaterializable.as_str() && !record.request.repair {
+    let next_step = if repairs {
         let repair = Request { only: Vec::new(), repair: true, ..record.request.clone() };
 
         format!(
@@ -1085,6 +1090,26 @@ mod tests {
                 retry: Retry::Unknown,
             }),
         }
+    }
+
+    // Revert: embed the cause's message alone → its way out is lost; fold it always → a repair
+    // cause names the repair twice.
+    #[test]
+    fn a_clone_failure_keeps_its_causes_way_out_unless_the_clones_step_is_it() {
+        let failure = |code: RefusalCode| Failure {
+            request: Request::default(), phase: Phase::Fetch, cause_code: code.as_str().to_string(), retry: Retry::Unknown,
+        };
+        let message = |code: RefusalCode, step: &str| {
+            let cause = String::from(CoreError::refusal(code, "The cause.", step));
+            match failure_refusal("dir", &record(), &cause, &failure(code)) {
+                CoreError::Refusal { message, .. } => message,
+                other => panic!("expected a refusal, got {:?}", other),
+            }
+        };
+
+        assert!(message(RefusalCode::DurabilityTaint, "forklift heal").contains("(Next step: forklift heal)"));
+        let repair = message(RefusalCode::HeadNotMaterializable, "forklift clone x dir --repair");
+        assert!(repair.starts_with("The cause. The clone did not finish"), "{}", repair);
     }
 
     #[test]

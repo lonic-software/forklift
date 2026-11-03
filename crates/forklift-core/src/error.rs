@@ -364,7 +364,47 @@ impl CoreError {
     /// carry through the bridge shim regardless of where the interpolated text came from — a path
     /// read back off disk (a tree or inventory entry) can carry a control character that
     /// `WarehousePath::from_user_input`'s guard never saw.
+    #[track_caller]
     pub fn refusal(
+        code: RefusalCode,
+        message: impl Into<String>,
+        next_step: impl Into<String>,
+    ) -> CoreError {
+        let (message, next_step) = (sanitize(&message.into()), sanitize(&next_step.into()));
+        debug_assert!(!restates_next_step(&message, &next_step), "A refusal's message restates its next step: {:?}", message);
+        CoreError::Refusal {
+            code,
+            message,
+            next_step,
+            details: None,
+        }
+    }
+
+    /// Build a classified refusal that carries structured detail as well — see
+    /// [`CoreError::refusal`] for the sanitizing of the two texts. The detail needs none: the frame
+    /// carries it as compact JSON, which escapes every control character.
+    #[track_caller]
+    pub fn refusal_with_details(
+        code: RefusalCode,
+        message: impl Into<String>,
+        next_step: impl Into<String>,
+        details: serde_json::Value,
+    ) -> CoreError {
+        let (message, next_step) = (sanitize(&message.into()), sanitize(&next_step.into()));
+        debug_assert!(!restates_next_step(&message, &next_step), "A refusal's message restates its next step: {:?}", message);
+        CoreError::Refusal {
+            code,
+            message,
+            next_step,
+            details: Some(details),
+        }
+    }
+
+    /// A refusal relaying a remote's own words — its message, or a caller's text built around it.
+    /// [Sanitized](sanitize) as [`CoreError::refusal`] is, but without its debug check that the
+    /// message does not restate the step: that check is about this build's wording, and a remote
+    /// (another version, another head) may word its message any way it likes.
+    pub fn remote_refusal(
         code: RefusalCode,
         message: impl Into<String>,
         next_step: impl Into<String>,
@@ -376,32 +416,17 @@ impl CoreError {
             details: None,
         }
     }
-
-    /// Build a classified refusal that carries structured detail as well — see
-    /// [`CoreError::refusal`] for the sanitizing of the two texts. The detail needs none: the frame
-    /// carries it as compact JSON, which escapes every control character.
-    pub fn refusal_with_details(
-        code: RefusalCode,
-        message: impl Into<String>,
-        next_step: impl Into<String>,
-        details: serde_json::Value,
-    ) -> CoreError {
-        CoreError::Refusal {
-            code,
-            message: sanitize(&message.into()),
-            next_step: sanitize(&next_step.into()),
-            details: Some(details),
-        }
-    }
 }
 
 impl fmt::Display for CoreError {
-    /// Renders the human message only — a `Refusal` shows its `message` (no code, no next step, no
-    /// frame), an `Other` shows its string. A head prints a failure through
-    /// [`human_failure_text`], which adds the next step on a line of its own.
+    /// Renders the error as one line of text — a `Refusal` shows its `message` with its next step
+    /// [folded in](with_next_step) (no code, no frame), an `Other` shows its string. A message no
+    /// longer carries its own step, so text that embeds an error (a clone's failure naming its
+    /// cause) keeps the cause's way out this way. A head prints a failure through
+    /// [`human_failure_text`] instead, which puts the next step on a line of its own.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CoreError::Refusal { message, .. } => f.write_str(message),
+            CoreError::Refusal { message, next_step, .. } => f.write_str(&with_next_step(message, next_step)),
             CoreError::Other(message) => f.write_str(message),
         }
     }
@@ -575,10 +600,11 @@ fn split_detail(text: &str) -> Result<(Option<serde_json::Value>, &str), ()> {
 /// line among others. The step keeps its [`NEXT_STEP_LABEL`], since many are bare commands, and
 /// stays on the message's line, because the text may sit inside a longer one. It is closed in
 /// parentheses, so whatever a caller wrote after it does not read as part of the step. A blank
-/// step folds to the message alone.
+/// step folds to the message alone, and so does a step the message already carries (a remote's
+/// wording, which this build does not control).
 pub fn with_next_step(human: &str, next_step: &str) -> String {
     match next_step.trim() {
-        "" => human.to_string(),
+        step if step.is_empty() || human.contains(step) => human.to_string(),
         step => format!("{} ({}{})", human, NEXT_STEP_LABEL, step),
     }
 }
@@ -614,6 +640,16 @@ pub fn sanitize(text: &str) -> String {
 /// body); a render that indents or prefixes each line splits with [`str::lines`] itself.
 pub fn sanitize_lines(text: &str) -> String {
     text.lines().map(sanitize).collect::<Vec<_>>().join("\n")
+}
+
+/// Whether `message` carries `next_step` (a blank step never counts). A head prints the step on a
+/// line of its own under the message, so a message that carries it too shows it twice: this
+/// build's refusals assert they do not, in debug builds, in [`CoreError::refusal`] and
+/// [`CoreError::refusal_with_details`]. A refusal carrying a remote's own words is not this build's
+/// wording, and is built with [`CoreError::remote_refusal`], which does not check.
+pub fn restates_next_step(message: &str, next_step: &str) -> bool {
+    let step = next_step.trim();
+    !step.is_empty() && message.contains(step)
 }
 
 /// The label [`human_failure_text`] and [`with_next_step`] put before a next step. A next step is
@@ -726,9 +762,9 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_displays_its_human_message_only() {
+    fn a_refusal_displays_its_message_and_folded_step_without_its_frame() {
         let error = CoreError::refusal(RefusalCode::OutOfScope, "the message", "the next step");
-        assert_eq!(error.to_string(), "the message");
+        assert_eq!(error.to_string(), "the message (Next step: the next step)");
         assert!(!error.to_string().contains('\u{1f}'));
     }
 
@@ -973,5 +1009,38 @@ mod tests {
     fn sanitize_lines_keeps_the_lines_and_neutralizes_each() {
         assert_eq!(sanitize_lines("one \x1b[2J\ntwo\r\n\tthree\u{202E}"), "one  [2J\ntwo\n\tthree ");
         assert_eq!(sanitize_lines("single"), "single");
+    }
+
+    /// A message that carries its own next step would print it twice, so this build's refusals
+    /// may not: the debug check in the constructors refuses one. Revert: drop either check → red.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_refusal_whose_message_restates_its_step_is_refused() {
+        let restated = || CoreError::refusal(RefusalCode::Behind, "Behind. Run \"forklift shift main\".", " forklift shift main ");
+        let detailed = || CoreError::refusal_with_details(
+            RefusalCode::TrustChanged, "Changed. Verify it.", "Verify it.", serde_json::json!({}),
+        );
+
+        assert!(std::panic::catch_unwind(restated).is_err());
+        assert!(std::panic::catch_unwind(detailed).is_err());
+
+        // The domain is not empty: a message that does not carry its step, or a blank step, passes.
+        CoreError::refusal(RefusalCode::Behind, "Behind.", "forklift shift main");
+        CoreError::refusal(RefusalCode::Behind, "Behind.", "  ");
+        assert!(!restates_next_step("anything", ""));
+        assert!(restates_next_step("Run x now.", " x "));
+    }
+
+    // Revert: Display shows the message alone → text embedding a refusal loses its way out.
+    #[test]
+    fn an_embedded_refusal_keeps_its_next_step() {
+        let cause = CoreError::refusal(RefusalCode::IncompleteLoad, "Interrupted.", "forklift heal");
+        assert_eq!(format!("clone failed: {}", cause), "clone failed: Interrupted. (Next step: forklift heal)");
+
+        // A refusal relaying a remote's words is built unchecked, whatever they say.
+        let remote = CoreError::remote_refusal(RefusalCode::Behind, "Behind. Run forklift lower.", "forklift lower");
+        // Folded, a step the message already carries is not said twice.
+        assert_eq!(remote.to_string(), "Behind. Run forklift lower.");
+        assert_eq!(CoreError::Other("plain".into()).to_string(), "plain");
     }
 }

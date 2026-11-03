@@ -181,8 +181,7 @@ pub fn old_format_bay_refusal(root: &Path) -> CoreError {
         ),
     };
 
-    // The conversion stays in the message too: a human reads only the message.
-    CoreError::refusal(RefusalCode::NotAWarehouse, format!("{} {}", intro, next_step), next_step)
+    CoreError::refusal(RefusalCode::NotAWarehouse, intro, next_step)
 }
 
 /// The folder [`old_format_bay_refusal`]'s remedy stages the conversion in.

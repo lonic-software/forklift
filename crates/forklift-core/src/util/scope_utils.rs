@@ -626,6 +626,7 @@ pub fn is_cache_mode() -> Result<bool, String> {
 /// * `code`      - The stable [`RefusalCode`].
 /// * `message`   - The human explanation.
 /// * `next_step` - The machine-actionable recovery step.
+#[track_caller]
 pub fn refusal(code: RefusalCode, message: impl Into<String>, next_step: impl Into<String>) -> CoreError {
     CoreError::refusal(code, message, next_step)
 }
@@ -646,8 +647,8 @@ pub fn type_changed_refusal(path: &str) -> CoreError {
         RefusalCode::ScopePathTypeChanged,
         format!(
             "The path \"{}\" is no longer a directory (or is now one) at this revision; the \
-            sparse scope is no longer valid there. {}",
-            path, next_step
+            sparse scope is no longer valid there.",
+            path
         ),
         next_step,
     )
@@ -659,7 +660,7 @@ pub fn out_of_scope_refusal(path: &str) -> CoreError {
 
     refusal(
         RefusalCode::OutOfScope,
-        format!("The path \"{}\" is outside this bay's checkout scope. {}", path, next_step),
+        format!("The path \"{}\" is outside this bay's checkout scope.", path),
         next_step,
     )
 }
@@ -676,8 +677,8 @@ pub fn out_of_scope_conflict_refusal(path: &str) -> CoreError {
         RefusalCode::OutOfScopeConflict,
         format!(
             "The path \"{}\" changed on both sides outside this bay's checkout scope; a \
-            scoped bay cannot merge it without the content. {}",
-            path, next_step
+            scoped bay cannot merge it without the content.",
+            path
         ),
         next_step,
     )
@@ -688,7 +689,7 @@ pub fn out_of_scope_conflict_refusal(path: &str) -> CoreError {
 pub fn sparse_workspace_refusal(verb: &str, next_step: &str) -> CoreError {
     refusal(
         RefusalCode::SparseWorkspace,
-        format!("\"{}\" is not supported in a scoped (sparse) bay yet. {}", verb, next_step),
+        format!("\"{}\" is not supported in a scoped (sparse) bay yet.", verb),
         next_step,
     )
 }
@@ -715,8 +716,8 @@ pub fn narrow_unclean_refusal(path: &str, blocked_by: &str) -> CoreError {
         RefusalCode::NarrowUnclean,
         format!(
             "\"{}\" has {} that scope narrow would otherwise delete; it refuses to discard \
-            uncommitted work. {}",
-            path, blocked_by, next_step
+            uncommitted work.",
+            path, blocked_by
         ),
         next_step,
     )
@@ -749,8 +750,8 @@ pub fn scope_prune_blocked_refusal(path: &str, blockers: &str, main_tree_blocks:
     refusal(
         RefusalCode::ScopePruneBlocked,
         format!(
-            "\"{}\" is still in the checkout scope of {}; pruning it would break that checkout. {}",
-            path, blockers, next_step
+            "\"{}\" is still in the checkout scope of {}; pruning it would break that checkout.",
+            path, blockers
         ),
         next_step,
     )
@@ -776,8 +777,8 @@ pub fn chunked_transport_refusal(path: &str) -> CoreError {
         RefusalCode::ChunkedTransportUnsupported,
         format!(
             "\"{}\" is a large file stored in chunks, and a bundle never carries a chunked file's \
-            chunks. {}",
-            path, next_step
+            chunks.",
+            path
         ),
         next_step,
     )
@@ -802,8 +803,8 @@ pub fn chunked_remote_refusal(path: &str) -> CoreError {
         RefusalCode::ChunkedTransportUnsupported,
         format!(
             "\"{}\" is a large file stored in chunks, and this remote does not support chunked \
-            large files. {}",
-            path, next_step
+            large files.",
+            path
         ),
         next_step,
     )
@@ -825,8 +826,8 @@ pub fn commit_pagination_unsupported_refusal(staged_count: usize) -> CoreError {
         RefusalCode::CommitPaginationUnsupported,
         format!(
             "This lift needs to stage {} objects, above the {}-object cap a single commit batch \
-            supports, and this remote does not advertise support for paginated commits. {}",
-            staged_count, crate::model::remote::MAX_MISSING_BATCH, next_step
+            supports, and this remote does not advertise support for paginated commits.",
+            staged_count, crate::model::remote::MAX_MISSING_BATCH
         ),
         next_step,
     )
@@ -844,17 +845,17 @@ pub fn commit_pagination_unsupported_refusal(staged_count: usize) -> CoreError {
 /// * `what` - What is being refused (a path, a hash, or both — whatever the caller has in hand).
 /// * `len`  - The object's actual byte length.
 pub fn oversized_transport_refusal(what: &str, len: u64) -> CoreError {
-    let next_step = "This object predates the whole-object size limit. It stays readable and \
-        checkout-able locally, but no migration exists that would preserve its signed identity, \
-        so it cannot be sent to a remote or into a bundle.".to_string();
-
+    // No step: nothing moves such an object, so the message says why rather than what to do.
     refusal(
         RefusalCode::OversizedTransportUnsupported,
         format!(
-            "{} is {} bytes, above the {}-byte whole-object ceiling. {}",
-            what, len, crate::util::object_utils::MAX_OBJECT_BYTES, next_step
+            "{} is {} bytes, above the {}-byte whole-object ceiling. This object predates the \
+            whole-object size limit. It stays readable and checkout-able locally, but no migration \
+            exists that would preserve its signed identity, so it cannot be sent to a remote or \
+            into a bundle.",
+            what, len, crate::util::object_utils::MAX_OBJECT_BYTES
         ),
-        next_step,
+        "",
     )
 }
 
@@ -1089,7 +1090,8 @@ mod tests {
         assert_eq!(code, RefusalCode::OversizedTransportUnsupported);
         assert!(message.contains("big.bin"), "what is named: {}", message);
         assert!(message.contains("ceiling"), "the message explains why: {}", message);
-        assert!(next_step.contains("signed identity"), "the recovery states no migration exists: {}", next_step);
+        assert!(message.contains("signed identity"), "the message states no migration exists: {}", message);
+        assert!(next_step.is_empty(), "nothing moves the object, so there is no step: {}", next_step);
     }
 
     #[test]
