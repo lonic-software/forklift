@@ -117,21 +117,24 @@ Notes:
 
 ### Keeping tests fast
 
-CI runs the whole suite on three OSes on every push to a pull request, and a pull request
-gets several pushes, so every second a test spends is paid many times over. The suite
-once took 12–14 minutes a run, 7–10 of them running tests, most of that tests waiting
-out real timeouts or writing far more files than they checked; fixing those cut the test
-run to about two minutes on every OS. Write new tests so that work does not have to be done again.
+CI runs the whole suite on three OSes on every push to a pull request that changes code,
+and a pull request gets several pushes, so every second a test spends is paid many times
+over. Much of the suite's time has gone to tests waiting out real timeouts or writing far
+more files than they checked. Write new tests so that work does not have to be done again.
 
-**The budget.** A test finishes in about a second on Linux and in at most **10 s on the
-Windows CI runner**, which is two to five times slower than Linux on the same test and
-is where the suite's time goes. A test that needs more says why in a comment above it:
-what it does that takes the time, and why a smaller version would not catch the same
-failure. The SLOW and failure limits in `.config/nextest.toml` are a backstop against
+**The budget.** A new or changed test finishes in about a second on Linux and in at most
+**10 s on the Windows CI runner**, which is where the suite's time goes. Windows is not a
+fixed multiple of Linux: on the main run of 2026-11-03 the same test took about four times
+as long at the median, eight times or more for one test in ten, and 22 times for
+`walk_tree_survives_a_pathologically_deep_tree`, so a test that fits on Linux can still
+blow the budget there. A test that needs more says why in a comment above it: what it does
+that takes the time, and why a smaller version would not catch the same failure. Not every
+existing test meets this yet (37 took over 10 s on Windows in that run); do not take one of
+them as the model for a new test. The SLOW and failure limits in `.config/nextest.toml` are a backstop against
 hangs, not the budget: a test can be well inside them and still too slow.
 
 **Check the time where it is paid.** Every test's time is in the CI log: nextest prints
-`PASS [ 12.368s]` before each name. Before merging a pull request that adds or changes
+`PASS [  12.368s]` before each name. Before merging a pull request that adds or changes
 tests, look up those tests in the `test (windows-latest)` job. A local run on a fast
 machine does not tell you what Windows will take.
 
@@ -147,9 +150,10 @@ machine does not tell you what Windows will take.
   and an overall deadline, so the test ends as soon as the thing happens.
 - **Make a limit something the test can set small.** A test that crosses a cap, a depth
   or a size passes a small value of it rather than building a fixture past the
-  production one. The deep-tree walk test checks stack safety on a small thread stack at
-  depth 2,000 instead of writing 50,000 files (226 s on Windows); a fixture of about
-  2,000 loose objects took 4 s on Linux and over 120 s on Windows.
+  production one. `walk_tree_survives_a_pathologically_deep_tree` checks stack safety on
+  a small thread stack at depth 2,000 instead of a tree 50,000 levels deep (226 s on
+  Windows); a fixture of about 2,000 loose objects took 4 s on Linux and was killed at the
+  two-minute limit on Windows.
 - **Write only what the code under test reads.** No blob contents for a check that looks
   only at tree shape, no history beyond the parcels the assertion needs.
 - **Launch through the helpers.** `forklift_command()` and `server_command()` turn fsync
@@ -164,8 +168,8 @@ machine does not tell you what Windows will take.
   Before adding an integration test, check whether an existing one already crosses the
   same wiring; if so, add an assertion to it instead of a new test.
 - **Repetition is the cost.** A test that repeats a run to catch a race or a crash at a
-  random point (the crash suite's kill tests) uses the fewest rounds that still catch the
-  failure, and says in a comment how the count was chosen.
+  random point uses the fewest rounds that still catch the failure, and says in a comment
+  how the count was chosen.
 
 ### Formatting
 
