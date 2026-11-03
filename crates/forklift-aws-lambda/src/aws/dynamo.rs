@@ -1034,7 +1034,16 @@ impl FormatStore for DynamoRefStore {
         let token = request_token();
 
         self.bridge.block_on(async {
-            let mut cause = None;
+            // Once an attempt's fate is unknown, or one is still running, the swap may land
+            // however the rest end: what the operator is told next has to say so.
+            let mut uncertain = false;
+            let may_have_landed = |message: String| {
+                format!(
+                    "{} The format item may now hold \"{}\", this run's own state: if running the \
+                    upgrade again reports it, add --takeover.",
+                    message, new
+                )
+            };
 
             for wait in FORMAT_SWAP_WAITS {
                 tokio::time::sleep(wait).await;
@@ -1042,19 +1051,26 @@ impl FormatStore for DynamoRefStore {
                 let mut transaction = ConditionedTransaction::new();
                 transaction.push(TransactWriteItem::builder().update(update.clone()).build(), Precondition::Format);
 
-                match transaction.send(&self.client, "DynamoDB format swap", &token).await? {
-                    None => return Ok(true),
-                    Some(Refusal::Moved(..)) => return Ok(false),
-                    Some(Refusal::Transient(transient)) => cause = Some(transient),
+                match transaction.send(&self.client, "DynamoDB format swap", &token).await {
+                    Ok(None) => return Ok(true),
+                    Ok(Some(Refusal::Moved(..))) => return Ok(false),
+                    Ok(Some(Refusal::Transient(TransientCause::Contended))) => {}
+                    Ok(Some(Refusal::Transient(TransientCause::InProgress | TransientCause::FateUnknown))) => {
+                        uncertain = true
+                    }
+                    Err(error) if uncertain => return Err(may_have_landed(error)),
+                    Err(error) => return Err(error),
                 }
             }
 
-            Err(format!(
-                "DynamoDB refused the format item's write through every attempt ({:?}). It may \
-                still have landed: run the upgrade again, and if it names this run's own upgrade, \
-                add --takeover.",
-                cause
-            ))
+            let message = "DynamoDB refused the format item's write through every attempt: the \
+                warehouse stayed busy."
+                .to_string();
+
+            match uncertain {
+                true => Err(may_have_landed(message)),
+                false => Err(format!("{} Nothing was changed; run the upgrade again.", message)),
+            }
         })
     }
 }
