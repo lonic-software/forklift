@@ -386,10 +386,16 @@ async fn repair_pallet(client: &RemoteClient,
     };
 
     if !repairable {
-        return match named {
+        // The plain lower fetches again, finding present what was fetched here, so it counts both.
+        let fetched = (report.fetched_objects, report.fetched_signatures);
+        let lowered = match named {
             true => lower_named_pallet(client, info, report, progress).await,
             false => lower_working_pallet(client, info, report, progress).await,
         };
+        report.fetched_objects += fetched.0;
+        report.fetched_signatures += fetched.1;
+
+        return lowered;
     }
 
     let position = pallet_utils::read_position()?;
@@ -475,13 +481,25 @@ fn stack_diverged_repair(pallet: &str,
                          ref_head: Option<&str>) -> Result<CoreError, String> {
     let side = format!("{}-repair-{}", pallet, &remote_head[..12.min(remote_head.len())]);
 
-    let stacked = match pallet_utils::get_pallet_head(&side)? {
-        Some(head) => object_utils::load_parcel(&head)?.parents == [remote_head],
-        None => false,
-    };
-    if !stacked {
-        let repair = repair_utils::repair_head(remote_head)?.ok_or("The remote's head has nothing to repair.")?;
-        pallet_utils::update_pallet_head(&side, None, &repair.parcel, preconditions).map_err(|error| error.to_string())?;
+    // A pallet already there holds the repair a rerun stacked, or work built on it.
+    match pallet_utils::get_pallet_head(&side)? {
+        Some(head) if merge_utils::is_ancestor(remote_head, &head)? => {}
+        Some(_) => return Err(format!(
+            "Pallet \"{s}\" already exists and holds no repair of the remote's head {h}, so no repair was \
+            stacked. Delete it (\"forklift pallet delete {s}\") and lower again.",
+            s = side, h = remote_head
+        )),
+        None => {
+            let repair = repair_utils::repair_head(remote_head)?.ok_or("The remote's head has nothing to repair.")?;
+            match pallet_utils::update_pallet_head(&side, None, &repair.parcel, preconditions) {
+                Ok(()) => {}
+                // A failed write can still have landed: decided by reading the ref back.
+                Err(pallet_utils::RefUpdateError::Failed(error)) if pallet_utils::get_pallet_head(&side)?.as_deref() != Some(repair.parcel.as_str()) =>
+                    return Err(format!("Pallet \"{}\" was not created: {}", side, error)),
+                Err(pallet_utils::RefUpdateError::Failed(_)) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
     }
     record_served_head(&side, remote_head);
 

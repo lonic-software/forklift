@@ -284,7 +284,7 @@ async fn consolidate(id: &str) -> Result<(), String> {
     // The "already merged" shortcut above only ever touches the `@haul` meta-pallet, never the
     // working inventory, so it needs no exemption. Past this point the incomplete-load guard
     // lives inside `merge_head_into_current` itself.
-    match consolidate::merge_head_into_current(&current, &target_head, &haul.head, &haul.opened.source, true, anchor).await? {
+    match consolidate::merge_head_into_current(&current, &target_head, &haul.head, &haul.opened.source, None, true, anchor).await? {
         MergeStatus::Merged(parcel) => {
             record(&parcel)?;
             output::emit(&Merged { id: haul.id.clone(), merge_parcel: parcel, already: false });

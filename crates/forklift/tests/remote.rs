@@ -3510,6 +3510,13 @@ fn a_lower_repair_over_a_diverged_ref_keeps_its_parcels() {
         assert_eq!(user_head(&area, "b", &side), repair);
         assert_eq!(std::fs::read_dir(area.path("b/.forklift/pallets")).unwrap().count(), pallets);
 
+        // One holding something else is never overwritten.
+        area.write_file(&format!("b/.forklift/pallets/{}", side), &format!("{}\n", own));
+        let taken = area.forklift("b", &["lower", "--repair"]);
+        assert!(stderr(&taken).contains(&format!("forklift pallet delete {}", side)), "{}{}", stdout(&taken), stderr(&taken));
+        assert_eq!(user_head(&area, "b", &side), own);
+        area.write_file(&format!("b/.forklift/pallets/{}", side), &format!("{}\n", repair));
+
         run_next_steps(&area, "b", &next_step);
         let head = area.read_file("server-root/.forklift/pallets/main").trim().to_string();
         assert!(descends_from(&area, "b", &head, &repair) && descends_from(&area, "b", &head, &own));
