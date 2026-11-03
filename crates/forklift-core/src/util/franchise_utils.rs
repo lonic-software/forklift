@@ -542,7 +542,8 @@ pub enum Admission {
     Fresh,
 
     /// An unfinished clone: its record, or `None` for a run that stopped before its record was
-    /// durable (its `.forklift` holds nothing but the lock, record temps and an unreadable record).
+    /// durable (its `.forklift` holds nothing but the lock, record temps, an unreadable record, and the git ignore file
+    /// the claim wrote and its temps).
     Resume(Option<FranchiseRecord>),
 }
 
@@ -631,8 +632,8 @@ fn list_names(dir: &Path) -> Result<Vec<std::ffi::OsString>, String> {
 ///    records. Without an anchor to verify against (`record` is `None`, or recorded no genesis),
 ///    every kept signature, sidecar or table, is deleted too, so the resume fetches them again
 ///    exactly as a fresh clone would.
-/// 2. Every entry of `.forklift` but the object store, the record, the held lock, the format lock
-///    and, unless `keep` is [`BundleState::None`], the bundles. Refs above all: the history walk stops at any
+/// 2. Every entry of `.forklift` but the object store, the record, the held lock, the format lock,
+///    the git ignore file that keeps the record's token out of git, and, unless `keep` is [`BundleState::None`], the bundles. Refs above all: the history walk stops at any
 ///    parcel a local ref holds, and a ref an earlier attempt wrote is complete only at that
 ///    attempt's scope.
 /// 3. Every entry of the bundles but the one file `keep` names: the download, cut back to the
