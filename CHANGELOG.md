@@ -4,7 +4,8 @@ Notable changes to Forklift, for people who use it. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Before 1.0, any release can change commands,
 on-disk formats and the wire protocol, with no migration.
 
-Entries are written by hand in the pull request that makes the change, under **Unreleased**.
+Entries are written by hand in the pull request that makes the change, under **Unreleased**. What
+earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keeping-docs-in-sync).
 `bin/release` turns that section into the new version and refuses a release if it is empty.
 
 ## [Unreleased]
