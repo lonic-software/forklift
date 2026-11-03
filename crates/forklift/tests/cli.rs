@@ -5237,6 +5237,22 @@ fn ignore_rules_are_gitignore_lines_in_every_ignore_file() {
 }
 
 #[test]
+fn loading_a_folder_honours_the_gitignore_files_above_it() {
+    let warehouse = TestWarehouse::new("ignore-load-folder");
+    assert_success(&warehouse.run(&["prepare"]));
+    warehouse.write_file(".gitignore", "*.log\n");
+    warehouse.write_file("src/.gitignore", "gen/\n");
+    warehouse.write_file("src/deep/a.log", "l\n");
+    warehouse.write_file("src/deep/gen/x", "x\n");
+    warehouse.write_file("src/deep/b.rs", "b\n");
+    for folder in ["src/deep", "src"] {
+        assert_success(&warehouse.run(&["load", folder]));
+    }
+    let staged: Vec<String> = changes(&warehouse, "staged").into_iter().map(|(_, path)| path).collect();
+    assert_eq!(staged, ["src/.gitignore", "src/deep/b.rs"]);
+}
+
+#[test]
 fn stocktake_reports_an_untracked_folder_only_when_load_would_stage_something_in_it() {
     let (untracked, loaded) = untracked_then_loaded("ignore-descent", &[
         // A venv ignores itself, a folder holds only such venvs, a log sits deep under `*.log`.
