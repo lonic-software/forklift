@@ -20,6 +20,10 @@ const NOT_VERSIONS: [&str; 2] = ["pack_utils::PLAUSIBLE_VERSION_LIMIT", "signatu
 /// The modes every format freezes a fixture of.
 const MODES: [&str; 3] = ["full", "sparse", "cache"];
 
+/// The fixture holding the operator every other fixture was made by: their global configuration
+/// and keys, so a fixture's pending work can be finished and signed.
+const OPERATOR: &str = "operator";
+
 /// The first line of a fixture archive.
 const ARCHIVE_HEADER: &str = "forklift-fixture 1";
 
@@ -349,8 +353,8 @@ fn forklift(scratch: &Scratch, dir: &Path, args: &[&str]) -> Output {
     forklift_command()
         .args(args)
         .current_dir(dir)
-        .env("FORKLIFT_GLOBAL_CONFIG", scratch.0.join("global.toml"))
-        .env("FORKLIFT_KEYS_DIR", scratch.0.join("keys"))
+        .env("FORKLIFT_GLOBAL_CONFIG", scratch.0.join(OPERATOR).join("global.toml"))
+        .env("FORKLIFT_KEYS_DIR", scratch.0.join(OPERATOR).join("keys"))
         .output()
         .unwrap()
 }
@@ -360,13 +364,19 @@ fn succeeded(output: &Output, what: &str) {
         String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
 }
 
-/// The fixtures every format freezes, and the commands that open each.
+/// The fixtures every format freezes, and the commands that open each: between them they read every
+/// record a fixture holds, so a reader that refuses its own format's bytes fails here.
 fn fixtures() -> Vec<(&'static str, Vec<Vec<&'static str>>)> {
-    let reads = || vec![vec!["stocktake"], vec!["history"], vec!["pallet", "list"]];
+    let reads = || vec![
+        vec!["stocktake"], vec!["history"], vec!["pallet", "list"], vec!["park", "list"], vec!["audit"],
+        vec!["tag"], vec!["office"], vec!["scope"], vec!["store", "status"], vec!["show", "main:src/one.txt"],
+    ];
+    let finish = |name| vec![vec!["load", "."], vec!["stack", "-m", name], vec!["history"]];
+
     let mut fixtures: Vec<_> = MODES.iter().map(|mode| (*mode, reads())).collect();
-    fixtures.push(("consolidating", vec![vec!["conflicts"], vec!["stocktake"]]));
-    fixtures.push(("picking", vec![vec!["stocktake"], vec!["history"]]));
-    fixtures.push(("served", vec![vec!["history"], vec!["pallet", "list"]]));
+    fixtures.push(("consolidating", [vec![vec!["conflicts"]], finish("consolidated")].concat()));
+    fixtures.push(("picking", finish("picked")));
+    fixtures.push(("served", reads()));
     fixtures
 }
 
@@ -376,6 +386,7 @@ fn open_and_walk(archive: &Path, commands: &[Vec<&str>], upgrade: bool) {
     let scratch = Scratch::new(&format!("fixture-{}", name));
     let warehouse = scratch.0.join("w");
     unpack_fixture(archive, &warehouse);
+    unpack_fixture(&archive.with_file_name(format!("{}.fixture", OPERATOR)), &scratch.0.join(OPERATOR));
 
     let before = unclassified(&warehouse);
     assert!(before.is_empty(), "{}: paths no census row matches: {:?}", archive.display(), before);
@@ -545,6 +556,7 @@ fn freeze_the_current_format_fixtures() {
         assert!(left.is_empty(), "{}: paths no census row matches: {:?}", name, left);
         pack_fixture(&warehouse, &folder.join(format!("{}.fixture", name)));
     }
+    pack_fixture(&at(OPERATOR), &folder.join(format!("{}.fixture", OPERATOR)));
 
     let mut versions = format!("# The versions format {} writes. Frozen: never edit this file.\n", current_format());
     for (key, value) in source_versions() {

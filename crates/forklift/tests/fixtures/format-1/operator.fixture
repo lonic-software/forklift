@@ -1,0 +1,13 @@
+forklift-fixture 1
+F global.toml 43
+[operator]
+identifier = "fixture@forklift"
+
+F global.toml.lock 0
+
+D keys
+F keys/41350895bc8cf75bea53c8443709308d29048d52b7dbb5664cf179fb36c06797.key 64
+2ac59b86799f831151f44100e956e9259a29f7ad046d55dc5364bfc5b457fb23
+F keys/owners.toml 86
+41350895bc8cf75bea53c8443709308d29048d52b7dbb5664cf179fb36c06797 = "fixture@forklift"
+
