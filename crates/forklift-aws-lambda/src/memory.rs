@@ -332,14 +332,20 @@ impl MemoryRefStore {
     ///
     /// # Returns
     /// * `Ok(MemoryRefStore)` - The store.
-    /// * `Err(String)`        - An item this build does not keep: an unknown sort key, or an
-    ///                          attribute its kind of item does not carry.
+    /// * `Err(String)`        - An item this build does not keep: an unknown sort key, a pallet with
+    ///                          no name, an attribute its kind of item does not carry, or a sort key
+    ///                          listed twice.
     pub fn from_items(items: &[(String, String, String)]) -> Result<MemoryRefStore, String> {
         let store = MemoryRefStore::new();
         let mut state = store.state.lock().unwrap();
 
+        let mut seen = std::collections::HashSet::new();
+
         for (entity, attribute, value) in items {
-            let pallet = entity.strip_prefix(ENTITY_PALLET_PREFIX);
+            if !seen.insert(entity) {
+                return Err(format!("The item \"{}\" is listed twice.", entity));
+            }
+            let pallet = entity.strip_prefix(ENTITY_PALLET_PREFIX).filter(|wire| !wire.is_empty());
 
             match (entity.as_str(), pallet, attribute.as_str()) {
                 (ENTITY_FORMAT, _, ATTR_STATE) => state.format = Some(value.clone()),
@@ -688,6 +694,29 @@ impl FormatStore for MemoryRefStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn item(entity: &str, attribute: &str, value: &str) -> (String, String, String) {
+        (entity.to_string(), attribute.to_string(), value.to_string())
+    }
+
+    /// A store loads exactly the items it dumps, and refuses an item it would never write.
+    ///
+    /// Revert: drop the duplicate check → the twice-listed pallet loads; drop the empty-name check →
+    /// the bare prefix loads.
+    #[test]
+    fn from_items_loads_only_items_this_store_writes() {
+        let items = vec![item("format", "state", "1"), item("pallet#main", "head", "h"), item("trust", "anchor", "{}")];
+        assert_eq!(MemoryRefStore::from_items(&items).unwrap().items(), items);
+
+        for refused in [
+            vec![item("pallet#main", "head", "h"), item("pallet#main", "deleted_head", "h")],
+            vec![item("pallet#", "head", "h")],
+            vec![item("trust", "head", "h")],
+            vec![item("lease", "state", "1")],
+        ] {
+            assert!(MemoryRefStore::from_items(&refused).is_err(), "{:?}", refused);
+        }
+    }
 
     /// The bulk presence probe (`objects_missing`, the default serial impl the fake inherits and the
     /// commit-gate chunk descent leans on) must return exactly the absent subset of a hash list — the
