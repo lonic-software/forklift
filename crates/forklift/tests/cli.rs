@@ -7776,7 +7776,7 @@ fn json_mode_wraps_every_result_in_a_versioned_envelope() {
     let value = json(&prepared);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 15);
+    assert_eq!(value["schema"], 16);
     assert_eq!(value["command"], "prepare");
     assert_eq!(value["ok"], true);
     assert!(value["data"]["created"].is_array());
@@ -7818,7 +7818,7 @@ fn json_errors_carry_a_stable_code_and_a_deterministic_exit_code() {
     // failed, so a consumer classifies by the same header on either outcome.
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 15);
+    assert_eq!(value["schema"], 16);
     assert_eq!(value["command"], "stocktake");
     assert!(value.get("data").is_none(), "a failure carries no data: {}", value);
 }
@@ -7847,7 +7847,7 @@ fn a_usage_error_under_json_is_one_failure_document_with_exit_2() {
     let value = json(&unknown);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 15);
+    assert_eq!(value["schema"], 16);
     assert_eq!(value["ok"], false);
     assert!(value["command"].is_null(), "no known command was named: {}", value);
     assert_eq!(value["error"]["code"], "usage");
@@ -8053,7 +8053,7 @@ fn every_json_document_starts_with_the_header_in_its_documented_order() {
     let warehouse = TestWarehouse::new("json-key-order");
 
     // The order is checked on the raw text: a parsed `Value` would hide it.
-    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 15,\n  \"command\": ";
+    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 16,\n  \"command\": ";
 
     for args in [&["--json", "version"][..], &["--json", "bogus"], &["--json", "stocktake"]] {
         let output = warehouse.run(args);
@@ -14005,7 +14005,7 @@ fn haul_merge_of_a_head_this_warehouse_does_not_hold_names_where_to_get_it() {
 fn prepare_marks_the_warehouse_and_staging_leftovers_are_never_tracked() {
     let warehouse = TestWarehouse::new("staging-leftovers");
     assert_success(&warehouse.run(&["prepare"]));
-    assert_eq!(std::fs::read_to_string(warehouse.root.join(".forklift/warehouse")).unwrap(), "/forklift-warehouse 2\nfull\n");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join(".forklift/warehouse")).unwrap(), "/forklift-warehouse 3\nformat 1\nfull\n");
 
     warehouse.write_file(".forklift.tmp~9-9/lock", "");
     warehouse.write_file(".forklift.tmp~9-9/.forklift/franchise", "x\n");

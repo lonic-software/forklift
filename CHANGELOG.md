@@ -21,7 +21,10 @@ Entries are written by hand in the pull request that makes the change, under **U
 - Destructive operations preview by default and act with `--confirm`; without it they exit 39.
 - `restore --staged` is gone; use `unload`.
 - MCP tools are generated from the command tree.
-- `--json` documents are now at schema 15.
+- `--json` documents are now at schema 16.
+- **A warehouse now records its format, and a build reads exactly one.** A warehouse in another format
+  is refused before anything in it is read, with its own error code and way out. Warehouses made by
+  an earlier build are refused and must be made again: no upgrade reaches back before this change.
 - Forklift records no display names: `operator.name`, the profile name and `--display-name` are gone.
 
 ### Added

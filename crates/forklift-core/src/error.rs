@@ -284,6 +284,27 @@ refusal_codes! {
     /// `--confirm` destroys it. `lower` refuses whenever a resolution names `theirs`, before it
     /// knows whether that drops anything.
     ConfirmationRequired => "confirmation_required",
+
+    /// The warehouse is in an older format than the one this build reads. A build reads exactly one
+    /// format, so nothing was read or written. The next step upgrades it in place.
+    WarehouseFormatOlder => "warehouse_format_older",
+
+    /// The warehouse is in a newer format than the one this build reads: a newer Forklift upgraded
+    /// it, and upgrades are one-way. Nothing was read or written. The next step updates this binary.
+    WarehouseFormatNewer => "warehouse_format_newer",
+
+    /// An upgrade of this warehouse was started and did not finish, so what it holds may be part
+    /// one format and part another. Every command but the upgrade refuses until it has; running the
+    /// upgrade again resumes it.
+    WarehouseUpgradeIncomplete => "warehouse_upgrade_incomplete",
+
+    /// Another process is upgrading this warehouse right now. Nothing waits on it; the next step is
+    /// to run the command again once it finishes.
+    WarehouseUpgradeRunning => "warehouse_upgrade_running",
+
+    /// The warehouse's format lease file is missing and this user cannot create it, so no command can
+    /// be kept safe from an upgrade. The next step creates the file or restores write access.
+    WarehouseLeaseMissing => "warehouse_lease_missing",
 }
 
 impl RefusalCode {

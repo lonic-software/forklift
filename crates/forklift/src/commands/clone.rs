@@ -150,6 +150,7 @@ pub async fn handle_command(url: &str,
         bundle: BundleState::None,
         attempt: Attempt::Running,
         start_census: 0,
+        format: warehouse_utils::WAREHOUSE_FORMAT,
         last_failure: None,
     };
 
@@ -456,8 +457,9 @@ fn readmit(directory: &str, absolute_target: &Path, url: &str, expected: &Expect
 
 /// Clear what an earlier attempt left (see `franchise_utils::prepare_resume`) and record this
 /// attempt's start: its request, its trust binding, and the census its progress is measured from.
-/// Until the start is recorded, a failure records the earlier attempt's bundle and census, so a
-/// resume that fails while clearing claims nothing it did not keep.
+/// Until the start is recorded, a failure records the earlier attempt's bundle, census and format,
+/// so a resume that fails while clearing claims nothing it did not keep, and the next one clears
+/// another format's leftovers again.
 fn start_attempt(attempt: &mut FranchiseAttempt,
                  absolute_target: &Path,
                  previous: Option<&FranchiseRecord>,
@@ -465,8 +467,13 @@ fn start_attempt(attempt: &mut FranchiseAttempt,
     if let Some(previous) = previous {
         attempt.record.bundle = keep.clone();
         attempt.record.start_census = previous.start_census;
+        attempt.record.format = previous.format;
         attempt.bundle_at_start = keep.clone();
     }
+
+    // Before anything is swept: the sweep keeps the sidecar, and this keeps it held. An unfinished
+    // clone passes no open gate, so nothing else takes the lease here.
+    lock_utils::FormatLease::shared(&attempt.forklift).map_err(String::from)?.hold_until_exit();
 
     let kept = franchise_utils::prepare_resume(absolute_target, previous, keep).map_err(|e| {
         // Clearing stopped partway: the bundle counts as kept only if what it needs still is.
@@ -479,6 +486,7 @@ fn start_attempt(attempt: &mut FranchiseAttempt,
     attempt.record.bundle = kept.clone();
     attempt.bundle_at_start = kept;
     attempt.record.start_census = franchise_utils::census(&attempt.forklift)?;
+    attempt.record.format = warehouse_utils::WAREHOUSE_FORMAT;
     attempt.record.attempt = Attempt::Running;
 
     franchise_utils::write(&attempt.forklift, &attempt.record)
@@ -953,6 +961,7 @@ mod tests {
             bundle: BundleState::None,
             attempt: Attempt::Failed,
             start_census: 3,
+            format: warehouse_utils::WAREHOUSE_FORMAT,
             last_failure: Some(Failure {
                 request: Request { pallet: None, only: vec!["src/ap".to_string()], cache: false },
                 phase: Phase::Fetch,
@@ -1072,6 +1081,13 @@ mod tests {
         assert_eq!(resumed.record.bundle, BundleState::Imported);
         assert_eq!(resumed.bundle_at_start, BundleState::Imported);
         assert_eq!(resumed.record.start_census, 7);
+
+        // Nor does it claim this build's format over what another format's build left: the next
+        // resume must clear that again.
+        let older = FranchiseRecord { format: warehouse_utils::WAREHOUSE_FORMAT + 1, ..previous.clone() };
+        let mut other = attempt(recorded.clone());
+        assert!(start_attempt(&mut other, &target, Some(&older), &BundleState::Imported).is_err());
+        assert_eq!(other.record.format, older.format);
 
         // A resume that was not keeping the bundle (a sparse one) never claims it.
         let mut sparse = attempt(recorded.clone());

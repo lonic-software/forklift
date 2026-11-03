@@ -41,7 +41,7 @@ use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::pallet_utils::{
     AnchorPrecondition, BoundaryScope, OfficePrecondition, PalletsPrecondition, RefPreconditions, RefUpdateError,
 };
-use forklift_core::util::lock_utils::{self, BaseServeLock, ServeLock, StoreAccessLock};
+use forklift_core::util::lock_utils::{self, BaseServeLock, FormatLease, ServeLock, StoreAccessLock};
 use forklift_core::util::{
     audit_utils, body_utils, bay_utils, bundle_utils, file_utils, franchise_utils, hook_utils, merge_utils, meta_tree,
     object_utils, office_utils, origin_utils, pack_utils, pallet_utils, scope_utils, sealed_utils, sign_utils, tree_utils, warehouse_utils,
@@ -75,6 +75,10 @@ struct WarehouseHandle {
     /// about to delete. (Scope-prune, the other deleter, runs only on a sparse warehouse, which is
     /// never served.)
     _store_access: Option<StoreAccessLock>,
+
+    /// The format lease for this root, held for the handle's lifetime, so nothing upgrades a
+    /// warehouse while it is served. `None` exactly when the two above are.
+    _format_lease: Option<FormatLease>,
 }
 
 impl WarehouseHandle {
@@ -87,6 +91,7 @@ impl WarehouseHandle {
             bundling: std::sync::atomic::AtomicBool::new(false),
             _serve_lock: None,
             _store_access: None,
+            _format_lease: None,
         }
     }
 
@@ -122,13 +127,24 @@ impl WarehouseHandle {
     /// is recorded, and the push-downs that record without one start only from entries already
     /// there, or run only in a cache; with neither an entry nor an origin, nothing adds one.
     fn serving(root: PathBuf, wait: bool) -> Result<WarehouseHandle, ServingRefusal> {
+        use forklift_core::error::RefusalCode;
         // Acquire inside the root's storage scope so the locks land at this warehouse's store
         // root (the scope is synchronous and never held across an `.await`; both guards keep an
         // absolute path or an open file, so they stay valid once the scope drops).
-        let (serve_lock, store_access) = {
+        let (serve_lock, store_access, format_lease) = {
             // An unfinished clone has not finished fetching, so even one marked full may lack
             // what its heads name: it is refused before anything it holds is trusted.
             franchise_utils::gate(&root).map_err(|e| ServingRefusal::Unfinished(String::from(e)))?;
+
+            // A `--warehouses` route reaches here having only classified the root, which takes any
+            // format. Before anything in the warehouse is read as this build's format.
+            let format_lease = warehouse_utils::hold_warehouse_format(&root, warehouse_utils::Head::Server)
+                .map_err(|e| match &e {
+                    forklift_core::error::CoreError::Refusal { code: RefusalCode::WarehouseFormatOlder | RefusalCode::WarehouseFormatNewer
+                         | RefusalCode::WarehouseUpgradeIncomplete | RefusalCode::WarehouseUpgradeRunning, .. } =>
+                        ServingRefusal::OtherFormat(String::from(e)),
+                    _ => ServingRefusal::Unreadable(String::from(e)),
+                })?;
 
             let _scope = StorageRootScope::enter(&root);
 
@@ -154,11 +170,12 @@ impl WarehouseHandle {
                 ));
             }
 
-            (serve_lock, store_access)
+            (serve_lock, store_access, format_lease)
         };
         let mut handle = WarehouseHandle::new(root);
         handle._serve_lock = Some(serve_lock);
         handle._store_access = Some(store_access);
+        handle._format_lease = Some(format_lease);
         Ok(handle)
     }
 }
@@ -172,6 +189,10 @@ enum ServingRefusal {
 
     /// It holds a clone that has not finished: it is resumed or deleted first.
     Unfinished(String),
+
+    /// It is in a format this build does not read, or an upgrade of it has not finished or is
+    /// running. One whose format could not be checked is [`ServingRefusal::Unreadable`]. The others this server holds are served all the same.
+    OtherFormat(String),
 
     /// Its warehouse marker, fetch scope, sealed-object record or origin record could not be read,
     /// or its served mark could not be read or written.
@@ -196,6 +217,7 @@ impl ServingRefusal {
         match self {
             ServingRefusal::Busy(reason)
             | ServingRefusal::Unfinished(reason)
+            | ServingRefusal::OtherFormat(reason)
             | ServingRefusal::Unreadable(reason) => reason,
             ServingRefusal::Partial => format!(
                 "{} is a partial warehouse: it was cloned with --only or --cache, so it may \
@@ -737,12 +759,15 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
     let mode = match (options.root, options.warehouses) {
         (Some(root), None) => {
             // Anything there but a warehouse is refused before any lock is taken.
-            let root = open_root(&root)?;
+            // Its lease is kept until the handle holds its own, so no upgrade starts in between.
+            let opened = open_root(&root)?;
+            let root = opened.root.clone();
 
             // Hold the serve lock for the served root for the process lifetime: a second
             // server on the same root is refused here rather than silently breaking the CAS.
             let handle = WarehouseHandle::serving(root.clone(), true)
                 .map_err(|refusal| refusal.message(&format!("\"{}\"", root.to_string_lossy())))?;
+            drop(opened);
             ServeMode::Single(Arc::new(handle))
         }
         (None, Some(base)) => {
@@ -1176,8 +1201,9 @@ pub(crate) fn canonical_root(root: &str) -> Result<PathBuf, String> {
 
 /// Open the warehouse at `root`, the one way `serve --root`, `bundle` and `gc` take their root:
 /// resolved to an absolute path, then judged by core's gate before anything in it is read, written
-/// or locked, so anything there but a warehouse is refused with a next step for this server.
-pub(crate) fn open_root(root: &str) -> Result<PathBuf, String> {
+/// or locked, so anything there but a warehouse is refused with a next step for this server. The
+/// caller holds the result for as long as it works there.
+pub(crate) fn open_root(root: &str) -> Result<warehouse_utils::OpenedWarehouse, String> {
     let resolved = canonical_root(root)?;
     Ok(warehouse_utils::open_warehouse_root(&resolved, warehouse_utils::Head::Server)?)
 }
@@ -1816,6 +1842,19 @@ fn resolve_warehouse(state: &AppState,
                     id
                 ),
             ),
+            // Not the gate's own refusal: its next step names this server's directories and a
+            // command only its operator can run. The cause goes to the log for the same reason.
+            ServingRefusal::OtherFormat(reason) => {
+                tracing::error!(warehouse = %id, %reason, "the warehouse is not served: its format");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "Warehouse \"{}\" is unavailable: it is not in the format this server reads, or \
+                        it is being upgraded. The server's operator has to upgrade it or this server.",
+                        id
+                    ),
+                )
+            }
             ServingRefusal::Unreadable(reason) => internal(reason),
             refusal @ (ServingRefusal::Partial | ServingRefusal::Sealed(_) | ServingRefusal::Origin) => (
                 StatusCode::CONFLICT,
@@ -4800,7 +4839,7 @@ mod tests {
         std::fs::create_dir_all(&bay).unwrap();
         std::fs::write(bay.join(bay_utils::FILE_NAME_BAY_REDIRECT), b"x").unwrap();
         mark_warehouse(&base.join("newer"));
-        std::fs::write(base.join("newer").join(FOLDER_NAME_FORKLIFT_ROOT).join(warehouse_utils::FILE_NAME_WAREHOUSE_MARKER), b"/forklift-warehouse 2\n").unwrap();
+        std::fs::write(base.join("newer").join(FOLDER_NAME_FORKLIFT_ROOT).join(warehouse_utils::FILE_NAME_WAREHOUSE_MARKER), b"/forklift-warehouse 99\n").unwrap();
         let error = resolve_warehouse(&state, &warehouse_params("bay")).err().unwrap();
         assert_eq!(error.0, StatusCode::CONFLICT, "{}", error.1);
         // One that cannot be judged is offered no remedy that would destroy it.
@@ -4902,7 +4941,7 @@ mod tests {
         let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
         std::fs::create_dir_all(forklift.join("config")).unwrap();
         std::fs::write(forklift.join(warehouse_utils::FILE_NAME_WAREHOUSE_MARKER),
-            format!("/forklift-warehouse 2\n{}\n", mode)).unwrap();
+            format!("/forklift-warehouse 3\nformat 1\n{}\n", mode)).unwrap();
     }
 
     /// A multi-mode state over `base` that keeps at most `cap` warehouses live while any is idle,
@@ -4928,6 +4967,77 @@ mod tests {
 
     fn serve_lock_exists(base: &std::path::Path, id: &str) -> bool {
         base.join(id).join(FOLDER_NAME_FORKLIFT_ROOT).join("serve.lock").exists()
+    }
+
+    /// One warehouse in another format is answered as unavailable, without this server's paths,
+    /// and every other warehouse is still served.
+    ///
+    /// Revert: resolve past the format check → the other format is served as this build's → red.
+    #[test]
+    fn a_warehouse_in_another_format_is_unavailable_and_the_others_are_served() {
+        let base = scratch_dir("other-format");
+        let state = capped_state(&base, 8, &["fine", "newer", "older", "halfway"]);
+        for (id, marker) in [("newer", "/forklift-warehouse 3\nformat 2\nfull\n"),
+                             ("older", "/forklift-warehouse 3\nformat 0\nfull\n"),
+                             ("halfway", "/forklift-warehouse 3\nformat 1\nfull\nupgrading 2 0\n")] {
+            std::fs::write(base.join(id).join(FOLDER_NAME_FORKLIFT_ROOT).join(warehouse_utils::FILE_NAME_WAREHOUSE_MARKER), marker).unwrap();
+            let error = resolve_warehouse(&state, &warehouse_params(id)).err().unwrap();
+            assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE, "{}: {}", id, error.1);
+            assert!(!error.1.contains(base.to_str().unwrap()), "{}: {}", id, error.1);
+        }
+
+        resolve_warehouse(&state, &warehouse_params("fine")).unwrap();
+        assert_eq!(live_ids(&state), ["fine".to_string()].into());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A warehouse whose format cannot be checked is a server fault, never answered as another
+    /// format: a lost format lock the server cannot make again is a 500.
+    ///
+    /// Revert: answer every failure of the format check as another format → 503 → red.
+    #[test]
+    #[cfg(unix)]
+    fn a_format_that_cannot_be_checked_is_a_server_fault() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = scratch_dir("format-unchecked");
+        let state = capped_state(&base, 8, &["w"]);
+        let forklift = base.join("w").join(FOLDER_NAME_FORKLIFT_ROOT);
+        let _ = std::fs::remove_file(forklift.join("format.lock"));
+        std::fs::set_permissions(&forklift, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let error = resolve_warehouse(&state, &warehouse_params("w")).err().unwrap();
+        std::fs::set_permissions(&forklift, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR, "{}", error.1);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A served warehouse keeps its format lease until it is let go: an upgrade cannot start under
+    /// it, and can once the server has stopped serving it.
+    ///
+    /// Revert: let `serving` drop the lease it took → the exclusive lock lands while served → red.
+    #[test]
+    fn a_served_warehouse_holds_its_format_until_it_is_let_go() {
+        let base = scratch_dir("format-lease");
+        let state = capped_state(&base, 1, &["w1", "w2"]);
+        let exclusive = |id: &str| {
+            let file = std::fs::File::open(base.join(id).join(FOLDER_NAME_FORKLIFT_ROOT).join("format.lock")).unwrap();
+            file.try_lock().is_ok()
+        };
+
+        drop(resolve_warehouse(&state, &warehouse_params("w1")).unwrap());
+        assert!(!exclusive("w1"), "serving w1 holds its format");
+
+        drop(resolve_warehouse(&state, &warehouse_params("w2")).unwrap());
+        assert!(exclusive("w1"), "w1 was let go");
+        assert!(!exclusive("w2"));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A warehouse a request still holds is never let go, however full the registry; an idle one

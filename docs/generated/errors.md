@@ -52,4 +52,9 @@ Exit code 17 is reserved for a future feature and is not yet assigned to any cod
 | `origin_move_pending` | 37 | A move of a partial warehouse's origin has not finished; "forklift remote move <url>" finishes it, "forklift remote abort" abandons one that has not started rewriting |
 | `origin_move_incomplete` | 38 | The server a partial warehouse's origin was to move to lacks content the warehouse relies on its origin to hold; the origin was left where it was, and copying the old server's warehouse to the new one, server-side, lets the move run again |
 | `confirmation_required` | 39 | A destructive command had something to destroy (for lower, a resolution named theirs) and was run without --confirm; it showed what it would destroy, changed nothing, and running it again with --confirm destroys it |
+| `warehouse_format_older` | 40 | The warehouse is in an older format than this build reads; "forklift upgrade" moves it to this one |
+| `warehouse_format_newer` | 41 | The warehouse is in a newer format than this build reads; update this binary |
+| `warehouse_upgrade_incomplete` | 42 | An upgrade of the warehouse did not finish, and every other command refuses; "forklift upgrade" resumes it |
+| `warehouse_upgrade_running` | 43 | Another process is upgrading the warehouse right now; run the command again once it finishes |
+| `warehouse_lease_missing` | 44 | The warehouse's format lease file is missing and this user cannot create it; create it, or restore write access |
 

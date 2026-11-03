@@ -19,7 +19,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::{FOLDER_NAME_FORKLIFT_ROOT, FOLDER_NAME_OBJECTS_ROOT};
-use crate::util::{file_utils, pack_utils, record_utils, remote_utils, signature_table, taint_utils, warehouse_utils};
+use crate::util::{file_utils, lock_utils, pack_utils, record_utils, remote_utils, signature_table, taint_utils, warehouse_utils};
 use crate::util::bundle_utils::{FILE_NAME_DOWNLOAD, FILE_NAME_LATEST, FOLDER_NAME_BUNDLES};
 use crate::util::remote_utils::PartialBundle;
 use crate::util::warehouse_utils::Placement;
@@ -30,7 +30,7 @@ pub const FILE_NAME_FRANCHISE: &str = "franchise";
 
 /// The [`record_utils`] kind and version of the record.
 const FRANCHISE_RECORD: &str = "franchise";
-const FRANCHISE_VERSION: u32 = 2;
+const FRANCHISE_VERSION: u32 = 3;
 
 /// The name of the warehouse lock file, which a resume keeps: it is the resume's own.
 const FILE_NAME_LOCK: &str = "lock";
@@ -203,11 +203,15 @@ pub struct FranchiseRecord {
 
     /// The last failure recorded, carried over unchanged by an attempt's start.
     pub last_failure: Option<Failure>,
+
+    /// The warehouse format of the build that wrote this record. A resume at another format
+    /// discards what the earlier attempt kept beside the object store ([`prepare_resume`]).
+    pub format: u32,
 }
 
 impl FranchiseRecord {
     fn to_bytes(&self) -> Vec<u8> {
-        let mut entries: Vec<String> = vec![format!("url={}", self.url)];
+        let mut entries: Vec<String> = vec![format!("format={}", self.format), format!("url={}", self.url)];
 
         if let Some(token) = &self.token {
             entries.push(format!("token={}", token));
@@ -251,6 +255,7 @@ impl FranchiseRecord {
 
         let malformed = |what: &str| MarkerError::Torn(format!("has a malformed entry ({}).", what));
 
+        let mut format = None;
         let mut url = None;
         let mut token = None;
         let mut request = Request::default();
@@ -271,6 +276,7 @@ impl FranchiseRecord {
             let value = value.to_string();
 
             match key {
+                "format" => format = Some(value.parse::<u32>().map_err(|_| malformed("format"))?),
                 "url" => url = Some(value),
                 "token" => token = Some(value),
                 "pallet" => request.pallet = Some(value),
@@ -327,6 +333,7 @@ impl FranchiseRecord {
             attempt: attempt.ok_or_else(|| malformed("attempt"))?,
             start_census: start_census.ok_or_else(|| malformed("census"))?,
             last_failure,
+            format: format.ok_or_else(|| malformed("format"))?,
         })
     }
 }
@@ -610,8 +617,8 @@ fn list_names(dir: &Path) -> Result<Vec<std::ffi::OsString>, String> {
 ///    records. Without an anchor to verify against (`record` is `None`, or recorded no genesis),
 ///    every kept signature, sidecar or table, is deleted too, so the resume fetches them again
 ///    exactly as a fresh clone would.
-/// 2. Every entry of `.forklift` but the object store, the record, the held lock and, unless
-///    `keep` is [`BundleState::None`], the bundles. Refs above all: the history walk stops at any
+/// 2. Every entry of `.forklift` but the object store, the record, the held lock, the format lock
+///    and, unless `keep` is [`BundleState::None`], the bundles. Refs above all: the history walk stops at any
 ///    parcel a local ref holds, and a ref an earlier attempt wrote is complete only at that
 ///    attempt's scope.
 /// 3. Every entry of the bundles but the one file `keep` names: the download, cut back to the
@@ -636,7 +643,9 @@ pub fn prepare_resume(target: &Path, record: Option<&FranchiseRecord>, keep: &Bu
     }
 
     let taints = taint_utils::read_taints(&forklift)?;
-    let discarded = taints.torn || (std::fs::symlink_metadata(&objects).is_ok() && !is_real_dir(&objects)?);
+    // A store another format's build wrote is not this build's to read, whatever it holds.
+    let other_format = record.is_some_and(|record| record.format != warehouse_utils::WAREHOUSE_FORMAT);
+    let discarded = taints.torn || other_format || (std::fs::symlink_metadata(&objects).is_ok() && !is_real_dir(&objects)?);
 
     if discarded {
         file_utils::remove_unfollowed(&objects)?;
@@ -664,6 +673,7 @@ pub fn prepare_resume(target: &Path, record: Option<&FranchiseRecord>, keep: &Bu
     }
 
     let keep = match keep {
+        _ if other_format => &BundleState::None,
         BundleState::Imported if discarded => &BundleState::None,
         keep => keep,
     };
@@ -672,6 +682,7 @@ pub fn prepare_resume(target: &Path, record: Option<&FranchiseRecord>, keep: &Bu
         let kept = name == FOLDER_NAME_OBJECTS_ROOT
             || name == FILE_NAME_FRANCHISE
             || name == FILE_NAME_LOCK
+            || name == lock_utils::FILE_NAME_FORMAT_LOCK
             || (*keep != BundleState::None && name == FOLDER_NAME_BUNDLES);
 
         if !kept {
@@ -1040,6 +1051,7 @@ mod tests {
             bundle: BundleState::Imported,
             attempt: Attempt::Failed,
             start_census: 42,
+            format: warehouse_utils::WAREHOUSE_FORMAT,
             last_failure: Some(Failure {
                 request: Request { pallet: None, only: Vec::new(), cache: true },
                 phase: Phase::Fetch,
@@ -1074,6 +1086,47 @@ mod tests {
 
         for torn in [text.replacen("failure.cache=true\n", "failure.cache=false\n", 1),
                      text.replacen("failure.cache=true\n", "failure.cache=\n", 1)] {
+            assert!(matches!(FranchiseRecord::from_bytes(torn.as_bytes()), Err(MarkerError::Torn(_))), "{}", torn);
+        }
+    }
+
+    /// What another format's build fetched is not resumed: its kept bundle and its object store go,
+    /// whatever the record says of them.
+    ///
+    /// Revert: keep the bundle, or the store, whatever format the record names → it survives → red.
+    #[test]
+    fn a_resume_at_another_format_discards_the_kept_bundle() {
+        let dir = temp_dir("resume-other-format");
+        let bundles = dir.join(".forklift").join("bundles");
+        let partial = BundleState::Partial(PartialBundle { etag: "\"t\"".to_string(), total: 10, length: 4 });
+        std::fs::create_dir_all(&bundles).unwrap();
+        std::fs::write(bundles.join("partial"), b"abcdef").unwrap();
+        let objects = dir.join(".forklift").join("objects");
+        std::fs::create_dir_all(objects.join("ab")).unwrap();
+        std::fs::write(objects.join("ab/cdef"), b"x").unwrap();
+
+        let same = record();
+        let other = FranchiseRecord { format: same.format + 1, ..record() };
+        assert_eq!(prepare_resume(&dir, Some(&same), &partial), Ok(partial.clone()));
+        assert!(objects.join("ab/cdef").exists());
+        assert_eq!(prepare_resume(&dir, Some(&other), &partial), Ok(BundleState::None));
+        assert!(!bundles.exists());
+        assert!(!objects.join("ab/cdef").exists(), "the store another format wrote goes too");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A record says which format wrote it; one that does not, or not as a number, is torn rather
+    /// than taken for this build's.
+    ///
+    /// Revert: default a missing `format` to this build's → red.
+    #[test]
+    fn a_record_without_a_readable_format_is_torn() {
+        let text = String::from_utf8(record().to_bytes()).unwrap();
+        let entry = format!("format={}\n", warehouse_utils::WAREHOUSE_FORMAT);
+        assert!(text.contains(&entry), "{}", text);
+
+        for torn in [text.replacen(&entry, "", 1), text.replacen(&entry, "format=one\n", 1), text.replacen(&entry, "format=\n", 1)] {
             assert!(matches!(FranchiseRecord::from_bytes(torn.as_bytes()), Err(MarkerError::Torn(_))), "{}", torn);
         }
     }
@@ -1132,11 +1185,11 @@ mod tests {
         assert!(matches!(FranchiseRecord::from_bytes(&bytes[..bytes.len() - 1]), Err(MarkerError::Torn(_))));
 
         // Another version, and a field this build does not know: foreign.
-        let other = String::from_utf8(bytes.clone()).unwrap().replacen("/forklift-franchise 2", "/forklift-franchise 3", 1);
+        let other = String::from_utf8(bytes.clone()).unwrap().replacen("/forklift-franchise 3", "/forklift-franchise 4", 1);
         assert!(matches!(FranchiseRecord::from_bytes(other.as_bytes()), Err(MarkerError::Foreign(_))));
 
-        // A version-1 record, from before a download was kept, is foreign like any other.
-        let first = String::from_utf8(bytes.clone()).unwrap().replacen("/forklift-franchise 2", "/forklift-franchise 1", 1);
+        // A version-2 record, from before the record named its format, is foreign like any other.
+        let first = String::from_utf8(bytes.clone()).unwrap().replacen("/forklift-franchise 3", "/forklift-franchise 2", 1);
         assert_ne!(first.as_bytes(), &bytes[..]);
         assert!(matches!(FranchiseRecord::from_bytes(first.as_bytes()), Err(MarkerError::Foreign(_))));
 
@@ -1211,7 +1264,7 @@ mod tests {
         assert_eq!(admit(&dir), Ok(Admission::Resume(Some(record()))));
 
         // A torn record is debris only while nothing else stands.
-        std::fs::write(record_path(&forklift), b"/forklift-franchise 2\nurl=x").unwrap();
+        std::fs::write(record_path(&forklift), b"/forklift-franchise 3\nurl=x").unwrap();
         assert!(admit(&dir).is_err(), "a torn record beside other entries is refused");
         std::fs::remove_file(dir.join("half-written")).unwrap();
         std::fs::write(forklift.join("lock"), b"1").unwrap();
@@ -1245,6 +1298,7 @@ mod tests {
         std::fs::write(forklift.join("pallets/main"), b"x").unwrap();
         std::fs::write(forklift.join("operation"), b"x").unwrap();
         std::fs::write(forklift.join("lock"), b"1").unwrap();
+        std::fs::write(forklift.join("format.lock"), b"").unwrap();
         std::fs::write(dir.join("half-written"), b"x").unwrap();
         write(&forklift, &record()).unwrap();
 
@@ -1252,7 +1306,7 @@ mod tests {
 
         let mut kept = list_names(&forklift).unwrap();
         kept.sort();
-        assert_eq!(kept, vec!["franchise", "lock", "objects"]);
+        assert_eq!(kept, vec!["format.lock", "franchise", "lock", "objects"], "the format lock is held across the sweep");
         assert_eq!(list_names(&dir).unwrap(), vec![".forklift"]);
         assert!(objects.join("ab/cdef.sig").exists(), "an anchored resume keeps its sidecars");
         assert!(objects.join("pack/t.sigs").exists(), "an anchored resume keeps its signature tables");

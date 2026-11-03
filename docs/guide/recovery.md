@@ -324,6 +324,32 @@ with `--confirm` if you mean it.
 
 No `.forklift` here or in any parent. Change into the warehouse, or run `forklift prepare` to make one.
 
+### `warehouse_format_older` (exit 40)
+
+The warehouse is in an older [format](../format/WAREHOUSE_FORMAT.md) than this build reads. Nothing was
+read or changed. The refusal names the upgrade command to run. Format 1 is the first format, so no
+warehouse is older yet.
+
+### `warehouse_format_newer` (exit 41)
+
+A newer Forklift made or upgraded this warehouse, and upgrades are one-way. Update this binary.
+
+### `warehouse_upgrade_incomplete` (exit 42)
+
+An upgrade stopped before it finished, so the warehouse is between two formats and every command
+refuses it. The refusal names the upgrade command to run with a build that reads the target format;
+it resumes the upgrade. No upgrade can have started yet, since format 1 is the first format.
+
+### `warehouse_upgrade_running` (exit 43)
+
+Another process holds `.forklift/format.lock` exclusively, which is what an upgrade does. Run the
+command again once it finishes. A process that dies releases the lock.
+
+### `warehouse_lease_missing` (exit 44)
+
+`.forklift/format.lock` is gone and the folder cannot be written, so Forklift cannot make it again.
+Restore write access to `.forklift`, or create that empty file there.
+
 ### `empty_history` (exit 19)
 
 The pallet has nothing stacked yet, so there is no history to show. `load` and `stack` something.

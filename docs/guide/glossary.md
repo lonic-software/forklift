@@ -272,6 +272,7 @@ Forklift has several locks, each guarding a different thing.
 | Warehouse lock (git: `index.lock`) | one bay's inventory and working directory |
 | Ref lock (`refs.lock`) | pallets and other state every bay shares |
 | Object-store lock (`store.lock`) | the object store, against overlapping compactions |
+| Format lock (`format.lock`) | the warehouse's format: every process that opens the warehouse holds it shared until it exits, and an upgrade takes it exclusively, so neither works under the other |
 | Store-access lock (`store-access.lock`) | the object store, ordering commands that write objects against those that delete them (`store compact --all`, `scope prune`, `store evict`, gc) |
 | Config lock | one config file |
 | Serve lock (`serve.lock`) | a warehouse a server is serving; gc and `store compact --all` also take it while they run |

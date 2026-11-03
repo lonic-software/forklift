@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use crate::error::{CoreError, RefusalCode};
 use crate::globals::{self, forklift_root, FOLDER_NAME_FORKLIFT_ROOT};
-use crate::util::{alias_utils, bay_utils, config_utils, file_utils, franchise_utils, origin_utils, pallet_utils, record_utils, scope_utils};
+use crate::util::{alias_utils, bay_utils, config_utils, file_utils, franchise_utils, lock_utils, origin_utils, pallet_utils, record_utils, scope_utils};
 use crate::util::record_utils::RecordError;
 use crate::util::scope_utils::PathScope;
 
@@ -127,10 +127,11 @@ pub fn enter_warehouse() -> Result<(), String> {
             // has no cure to offer, and an invalid one names its own way out.
             let redirect = bay_utils::read_bay_redirect(&forklift)?;
             let shared = open_bay_warehouse(&root, &redirect).map_err(String::from)?;
-            globals::set_bay_context(shared.join(FOLDER_NAME_FORKLIFT_ROOT), forklift, redirect.name);
+            shared.lease.hold_until_exit();
+            globals::set_bay_context(shared.root.join(FOLDER_NAME_FORKLIFT_ROOT), forklift, redirect.name);
         }
         _ => {
-            open_warehouse_root(&root, Head::Client).map_err(String::from)?;
+            open_warehouse_root(&root, Head::Client).map_err(String::from)?.lease.hold_until_exit();
         }
     }
 
@@ -158,6 +159,14 @@ impl Head {
         match self {
             Head::Client => format!("\"forklift prepare\" in \"{}\"", root.to_string_lossy()),
             Head::Server => format!("\"forklift-server prepare\" with --root \"{}\"", root.to_string_lossy()),
+        }
+    }
+
+    /// The command that upgrades the warehouse at `root` (absolute) in place, quoted for a next step.
+    fn upgrade_command(self, root: &Path) -> String {
+        match self {
+            Head::Client => format!("\"forklift upgrade\" in \"{}\"", root.to_string_lossy()),
+            Head::Server => format!("\"forklift-server upgrade\" with --root \"{}\"", root.to_string_lossy()),
         }
     }
 
@@ -197,6 +206,78 @@ impl Head {
     }
 }
 
+/// A warehouse [`open_warehouse_root`] opened: the caller keeps `lease` for as long as it works
+/// there, since nothing else keeps an upgrade from changing the format under it.
+#[derive(Debug)]
+pub struct OpenedWarehouse {
+    pub root: PathBuf,
+    pub lease: lock_utils::FormatLease,
+}
+
+/// Take the format lease of the warehouse at `root`, then judge its format. The lease comes first,
+/// so the format read cannot change while the caller relies on it. The one gate between a marked
+/// warehouse and everything that reads it, for what classifies a warehouse by itself too: a
+/// `--warehouses` server reaches its warehouses that way.
+///
+/// # Returns
+/// * `Ok(FormatLease)` - The warehouse is in the one format this build reads, and stays so.
+/// * `Err(CoreError)`  - A refusal of [`judge_format`] or of [`lock_utils::FormatLease::shared`], or
+///                       the marker could not be read or is gone.
+pub fn hold_warehouse_format(root: &Path, head: Head) -> Result<lock_utils::FormatLease, CoreError> {
+    let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
+    let lease = lock_utils::FormatLease::shared(&forklift)?;
+
+    let marker = read_marker(&forklift)?.ok_or_else(|| format!(
+        "The warehouse marker in \"{}\" was removed while the warehouse was being opened.", forklift.to_string_lossy()
+    ))?;
+
+    judge_format(&marker, &shown_root(root), head)?;
+
+    Ok(lease)
+}
+
+/// Whether a build reading [`WAREHOUSE_FORMAT`] may use a warehouse with `marker`, whose absolute
+/// root is `root`. Next steps are written for `head`.
+///
+/// # Returns
+/// * `Ok(())`         - It may.
+/// * `Err(CoreError)` - A `warehouse_upgrade_incomplete`, `warehouse_format_older` or
+///                      `warehouse_format_newer` refusal.
+fn judge_format(marker: &WarehouseMarker, root: &Path, head: Head) -> Result<(), CoreError> {
+    let shown = root.to_string_lossy();
+
+    if let Some(upgrade) = &marker.upgrade {
+        return Err(CoreError::refusal(
+            RefusalCode::WarehouseUpgradeIncomplete,
+            format!(
+                "An upgrade of the warehouse at \"{}\" from format {} to format {} did not finish.",
+                shown, marker.format, upgrade.target
+            ),
+            format!("Run {} with a build that reads format {}; it resumes the upgrade.", head.upgrade_command(root), upgrade.target),
+        ));
+    }
+
+    match marker.format.cmp(&WAREHOUSE_FORMAT) {
+        std::cmp::Ordering::Equal => Ok(()),
+        std::cmp::Ordering::Less => Err(CoreError::refusal(
+            RefusalCode::WarehouseFormatOlder,
+            format!(
+                "The warehouse at \"{}\" is in format {}, older than the format {} this version of Forklift reads.",
+                shown, marker.format, WAREHOUSE_FORMAT
+            ),
+            format!("Run {}.", head.upgrade_command(root)),
+        )),
+        std::cmp::Ordering::Greater => Err(CoreError::refusal(
+            RefusalCode::WarehouseFormatNewer,
+            format!(
+                "The warehouse at \"{}\" is in format {}, newer than the format {} this version of Forklift reads.",
+                shown, marker.format, WAREHOUSE_FORMAT
+            ),
+            "Update this Forklift binary to one that reads that format.",
+        )),
+    }
+}
+
 /// Open the warehouse whose root is `root`, the one way every head decides that a directory is a
 /// warehouse. Only the `.forklift` at `root` is judged ([`bay_utils::classify_forklift`]); a bay's
 /// redirect is never followed, so a bay's folder is refused here like any other non-warehouse. A
@@ -204,17 +285,19 @@ impl Head {
 /// have written one yet. Next steps are written for `head`.
 ///
 /// # Returns
-/// * `Ok(PathBuf)`     - `root`: its `.forklift` holds a warehouse marker this build reads.
-/// * `Err(CoreError)`  - A `not_a_warehouse` refusal naming the absolute root, a
-///                       `clone_incomplete` refusal, the older bay format's refusal, or the
-///                       `.forklift` could not be judged.
-pub fn open_warehouse_root(root: &Path, head: Head) -> Result<PathBuf, CoreError> {
+/// * `Ok(OpenedWarehouse)` - `root`: its `.forklift` holds a warehouse in the one format this build
+///                           reads, and the lease that keeps it there.
+/// * `Err(CoreError)`      - A `not_a_warehouse` refusal naming the absolute root, a
+///                           `clone_incomplete` refusal, the older bay format's refusal, a refusal
+///                           of [`hold_warehouse_format`], or the `.forklift` could not be judged.
+pub fn open_warehouse_root(root: &Path, head: Head) -> Result<OpenedWarehouse, CoreError> {
     let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
 
     match bay_utils::classify_forklift(&forklift)? {
         bay_utils::ForkliftKind::Warehouse => {
             franchise_utils::gate(root)?;
-            Ok(root.to_path_buf())
+            let lease = hold_warehouse_format(root, head)?;
+            Ok(OpenedWarehouse { root: root.to_path_buf(), lease })
         }
         bay_utils::ForkliftKind::Unprepared => {
             franchise_utils::gate(root)?;
@@ -256,9 +339,9 @@ pub fn open_warehouse_root(root: &Path, head: Head) -> Result<PathBuf, CoreError
 /// to get a working bay back.
 ///
 /// # Returns
-/// * `Ok(PathBuf)`    - The warehouse root the redirect names.
-/// * `Err(CoreError)` - As [`open_warehouse_root`], naming the warehouse the redirect names.
-fn open_bay_warehouse(bay_root: &Path, redirect: &bay_utils::BayRedirect) -> Result<PathBuf, CoreError> {
+/// * `Ok(OpenedWarehouse)` - The warehouse the redirect names.
+/// * `Err(CoreError)`      - As [`open_warehouse_root`], naming the warehouse the redirect names.
+fn open_bay_warehouse(bay_root: &Path, redirect: &bay_utils::BayRedirect) -> Result<OpenedWarehouse, CoreError> {
     let target = &redirect.warehouse_root;
     let target_forklift = target.join(FOLDER_NAME_FORKLIFT_ROOT);
     let bay = shown_root(bay_root);
@@ -319,22 +402,25 @@ fn open_bay_warehouse(bay_root: &Path, redirect: &bay_utils::BayRedirect) -> Res
 /// Refuse a directory `forklift prepare` (or `forklift-server prepare`) is asked to make a
 /// warehouse of, when what stands there is not for prepare to take: an unfinished clone, a
 /// bay's folder, or a `.forklift` with something in it but no warehouse marker. A missing or empty
-/// `.forklift` is prepared, and so is a warehouse, which prepare completes.
+/// `.forklift` is prepared, and so is a warehouse in this build's format, which prepare completes;
+/// one in another format is refused, since completing it would add this format's pieces under
+/// the other's number.
 ///
 /// [`prepare_warehouse`] itself does not ask this: clone, the server's create and the Lambda
 /// scratch fill folders they made or claimed themselves.
 ///
 /// # Returns
 /// * `Ok(())`         - Prepare may run at `root`.
-/// * `Err(CoreError)` - A `clone_incomplete` or `not_a_warehouse` refusal, or the `.forklift`
-///                      could not be judged.
+/// * `Err(CoreError)` - A `clone_incomplete` or `not_a_warehouse` refusal, a refusal of
+///                      [`hold_warehouse_format`], or the `.forklift` could not be judged.
 pub fn check_preparable(root: &Path, head: Head) -> Result<(), CoreError> {
     franchise_utils::gate(root)?;
 
     let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
 
     match bay_utils::classify_forklift(&forklift)? {
-        bay_utils::ForkliftKind::Absent | bay_utils::ForkliftKind::Warehouse => Ok(()),
+        bay_utils::ForkliftKind::Absent => Ok(()),
+        bay_utils::ForkliftKind::Warehouse => hold_warehouse_format(root, head).map(|_| ()),
         bay_utils::ForkliftKind::Unprepared if is_empty_folder(&forklift)? => Ok(()),
         bay_utils::ForkliftKind::Unprepared => Err(unprepared_refusal(root, head)?),
         bay_utils::ForkliftKind::OldFormatBay if head == Head::Server => Err(forklift_file_refusal(root, head)),
@@ -476,11 +562,16 @@ pub fn cwd_relative_to_root() -> PathBuf {
 /// the warehouse holds of the history it names ([`WarehouseMode`]): written last, so a folder
 /// holding it holds every piece of a warehouse.
 pub const FILE_NAME_WAREHOUSE_MARKER: &str = "warehouse";
-/// The record kind and format version of the warehouse marker (see [`record_utils`]). Version 2
-/// holds exactly one entry, the mode's word. Version 1 held none and is refused: it predates the
-/// mode, and reading it as any mode would be a guess.
+/// The record kind and format version of the warehouse marker (see [`record_utils`]). Version 3 is
+/// frozen: every future build must read it to tell a warehouse of another format from anything else.
+/// It holds `format N`, then the mode's word, then an `upgrading M S` entry while an upgrade to format
+/// `M` stands at step `S`. Versions 1 and 2 recorded no format and are refused: they are older than
+/// the first format any build upgrades from.
 const WAREHOUSE_MARKER_RECORD: &str = "warehouse";
-const WAREHOUSE_MARKER_VERSION: u32 = 2;
+const WAREHOUSE_MARKER_VERSION: u32 = 3;
+
+/// The one warehouse format this build reads (docs/format/WAREHOUSE_FORMAT.md).
+pub const WAREHOUSE_FORMAT: u32 = 1;
 
 /// What a warehouse holds of the history it names, fixed when it is prepared and recorded in its
 /// marker. The marker is the one file whose absence makes a warehouse unopenable, so the mode
@@ -535,25 +626,64 @@ impl PrepareMode<'_> {
 /// The lock file in a staging folder of [`place_forklift`], held while the folder is in use.
 const FILE_NAME_STAGING_LOCK: &str = "lock";
 
-/// Whether the `.forklift` folder `forklift` holds a warehouse marker. A marker this build cannot
-/// read is an error, never taken for one or for none: it may be a newer Forklift's.
-///
-/// # Returns
-/// * `Ok(true)`    - It holds a marker this build reads.
-/// * `Ok(false)`   - It holds none.
-/// * `Err(String)` - The marker cannot be read, or is in a format this build does not know.
-pub fn has_warehouse_marker(forklift: &Path) -> Result<bool, String> {
-    read_warehouse_marker(forklift).map(|mode| mode.is_some())
+/// What a warehouse marker records, read through its frozen framing, whatever the format.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WarehouseMarker {
+    /// The warehouse's format.
+    format: u32,
+
+    /// The mode's word. Only [`WAREHOUSE_FORMAT`]'s words are this build's to interpret.
+    mode: String,
+
+    /// The upgrade that was started and has not finished.
+    upgrade: Option<MarkerUpgrade>,
 }
 
-/// The mode the warehouse marker in `forklift` records.
+/// An upgrade recorded in a warehouse marker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MarkerUpgrade {
+    /// The format it moves to.
+    target: u32,
+
+    /// The steps of it that have finished.
+    step: u32,
+}
+
+/// A marker's number as its writer spells it: plain decimal digits, no sign and no leading zero.
+fn parse_marker_number(text: &str) -> Option<u32> {
+    let canonical = text.bytes().all(|byte| byte.is_ascii_digit()) && (text == "0" || !text.starts_with('0'));
+
+    canonical.then(|| text.parse().ok()).flatten()
+}
+
+/// Parse a marker's entries, per the framing frozen at record version 3.
+fn parse_marker_entries(entries: &[String]) -> Result<WarehouseMarker, String> {
+    let (format, mode, upgrade) = match entries {
+        [format, mode] => (format, mode, None),
+        [format, mode, upgrade] => (format, mode, Some(upgrade)),
+        _ => return Err(format!("holds {} entries where it should hold its format, its mode and at most one upgrade.", entries.len())),
+    };
+
+    let format = format.strip_prefix("format ").and_then(parse_marker_number)
+        .ok_or_else(|| format!("names no format where it should (\"{}\").", format.escape_debug()))?;
+
+    let upgrade = upgrade.map(|entry| {
+        entry.strip_prefix("upgrading ").and_then(|rest| rest.split_once(' '))
+            .and_then(|(target, step)| Some(MarkerUpgrade { target: parse_marker_number(target)?, step: parse_marker_number(step)? }))
+            .ok_or_else(|| format!("holds a malformed upgrade (\"{}\").", entry.escape_debug()))
+    }).transpose()?;
+
+    Ok(WarehouseMarker { format, mode: mode.clone(), upgrade })
+}
+
+/// The warehouse marker in `forklift`, read through its frozen framing. It says nothing about
+/// whether this build may use the warehouse: [`judge_format`] does.
 ///
 /// # Returns
-/// * `Ok(Some(mode))` - It holds a marker this build reads.
-/// * `Ok(None)`       - It holds none.
-/// * `Err(String)`    - The marker cannot be read, is in a format this build does not know, or
-///                      does not name exactly one mode this build knows.
-pub fn read_warehouse_marker(forklift: &Path) -> Result<Option<WarehouseMode>, String> {
+/// * `Ok(Some(marker))` - It holds a marker.
+/// * `Ok(None)`         - It holds none.
+/// * `Err(String)`      - The marker cannot be read, or its framing is not the frozen one.
+fn read_marker(forklift: &Path) -> Result<Option<WarehouseMarker>, String> {
     let path = forklift.join(FILE_NAME_WAREHOUSE_MARKER);
 
     let bytes = match std::fs::read(&path) {
@@ -568,20 +698,63 @@ pub fn read_warehouse_marker(forklift: &Path) -> Result<Option<WarehouseMode>, S
     );
 
     match record_utils::from_bytes(&bytes, WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION) {
-        Ok(entries) => match entries.as_slice() {
-            [word] => WarehouseMode::from_word(word).map(Some).ok_or_else(|| unknown(format!(
-                "names a mode this version of Forklift does not know (\"{}\").", word.escape_debug()
-            ))),
-            _ => Err(unknown(format!("holds {} entries where it should hold one, its mode.", entries.len()))),
-        },
-        Err(RecordError::OtherVersion(header)) if header == record_utils::header(WAREHOUSE_MARKER_RECORD, 1) => Err(format!(
+        Ok(entries) => parse_marker_entries(&entries).map(Some).map_err(unknown),
+        Err(RecordError::OtherVersion(header))
+            if (1..WAREHOUSE_MARKER_VERSION).any(|version| header == record_utils::header(WAREHOUSE_MARKER_RECORD, version)) => Err(format!(
             "The warehouse marker \"{}\" was written by an older version of Forklift, before the marker \
-            recorded what a warehouse holds, so Forklift does not use \"{}\". Make the warehouse again with \
-            this version: clone it again, or prepare a new one and lower its history into it.",
+            recorded the warehouse's format, so Forklift does not use \"{}\". No upgrade reaches back that \
+            far. Make the warehouse again with this version: clone it again, or prepare a new one and lower \
+            its history into it.",
             path.to_string_lossy(), forklift.to_string_lossy()
         )),
         Err(e) => Err(unknown(e.describe())),
     }
+}
+
+/// The mode a marker of this build's format records.
+fn mode_of(marker: &WarehouseMarker, forklift: &Path) -> Result<WarehouseMode, String> {
+    WarehouseMode::from_word(&marker.mode).ok_or_else(|| format!(
+        "The warehouse marker in \"{}\" names a mode this version of Forklift does not know (\"{}\"), so \
+        Forklift cannot tell what it holds.", forklift.to_string_lossy(), marker.mode.escape_debug()
+    ))
+}
+
+/// Whether the `.forklift` folder `forklift` holds a warehouse marker, of any format: this decides
+/// only that the folder is a warehouse. A marker that cannot be read is an error, never taken for
+/// one or for none, and so is a mode the marker's own format says this build should know.
+///
+/// # Returns
+/// * `Ok(true)`    - It holds a marker.
+/// * `Ok(false)`   - It holds none.
+/// * `Err(String)` - The marker cannot be read, or is not in the frozen framing.
+pub fn has_warehouse_marker(forklift: &Path) -> Result<bool, String> {
+    match read_marker(forklift)? {
+        Some(marker) if marker.format == WAREHOUSE_FORMAT => mode_of(&marker, forklift).map(|_| true),
+        Some(_) => Ok(true),
+        None => Ok(false),
+    }
+}
+
+/// The mode the warehouse marker in `forklift` records.
+///
+/// # Returns
+/// * `Ok(Some(mode))` - It holds a marker of this build's format.
+/// * `Ok(None)`       - It holds none.
+/// * `Err(String)`    - The marker cannot be read, is in another format, whose words this build
+///                      does not interpret, or does not name a mode this build knows.
+pub fn read_warehouse_marker(forklift: &Path) -> Result<Option<WarehouseMode>, String> {
+    let Some(marker) = read_marker(forklift)? else {
+        return Ok(None);
+    };
+
+    if marker.format != WAREHOUSE_FORMAT {
+        return Err(format!(
+            "The warehouse marker in \"{}\" records format {}, and this version of Forklift reads format {}.",
+            forklift.to_string_lossy(), marker.format, WAREHOUSE_FORMAT
+        ));
+    }
+
+    mode_of(&marker, forklift).map(Some)
 }
 
 /// The mode of the warehouse in scope. A forklift root with no marker is an error, never a full
@@ -597,7 +770,9 @@ pub fn warehouse_mode() -> Result<WarehouseMode, String> {
 
 /// Write the warehouse marker recording `mode` in `forklift`, atomically and synced with its folder.
 fn write_warehouse_marker(forklift: &Path, mode: WarehouseMode) -> Result<(), String> {
-    let bytes = record_utils::to_bytes(WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION, [mode.word()]);
+    let bytes = record_utils::to_bytes(
+        WAREHOUSE_MARKER_RECORD, WAREHOUSE_MARKER_VERSION, [format!("format {}", WAREHOUSE_FORMAT).as_str(), mode.word()]
+    );
 
     file_utils::replace_file_atomically(&forklift.join(FILE_NAME_WAREHOUSE_MARKER), &bytes)
         .map_err(|e| format!("Error while marking \"{}\" as a warehouse: {}", forklift.to_string_lossy(), e))
@@ -731,6 +906,21 @@ fn fill_in_place(forklift: &Path, mode: PrepareMode) -> Result<Vec<String>, Stri
     // Checked again here, not only before: a bay's folder can be put in place since.
     refuse_bay(forklift)?;
 
+    // So can a warehouse of another format, whose number this build's pieces would then stand under.
+    // Leased before the format is read, so no upgrade changes it between the read and the fill. The
+    // sidecar is every format's, so taking it adds nothing another format would not read.
+    let _lease = lock_utils::FormatLease::shared(forklift).map_err(String::from)?;
+    match read_marker(forklift)? {
+        Some(marker) if marker.upgrade.is_some() || marker.format != WAREHOUSE_FORMAT => return Err(format!(
+            "\"{}\" holds a warehouse in format {}{}, so this version of Forklift, which prepares format {}, \
+            cannot complete it.",
+            forklift.to_string_lossy(), marker.format,
+            marker.upgrade.as_ref().map_or(String::new(), |upgrade| format!(" with an upgrade to format {} unfinished", upgrade.target)),
+            WAREHOUSE_FORMAT
+        )),
+        _ => (),
+    }
+
     let (mut notes, created) = fill(forklift, forklift)?;
 
     // Each created folder and every folder between it and `forklift`, once each, deepest first.
@@ -760,6 +950,9 @@ fn fill_in_place(forklift: &Path, mode: PrepareMode) -> Result<Vec<String>, Stri
 fn fill(forklift: &Path, shown: &Path) -> Result<(Vec<String>, Vec<PathBuf>), String> {
     let mut notes: Vec<String> = Vec::new();
     let mut created: Vec<PathBuf> = Vec::new();
+
+    // Not a note: it is no piece a user asked for, and an open makes it again when it is missing.
+    lock_utils::create_format_lock(forklift)?;
 
     let (from, to) = (forklift.to_string_lossy().into_owned(), shown.to_string_lossy().into_owned());
     let respell = |path: &str| match path.strip_prefix(&*from) {
@@ -1111,6 +1304,10 @@ mod tests {
         dir
     }
 
+    fn list_names_for_test(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect()
+    }
+
     fn prepare_at(root: &Path) -> Result<Vec<String>, String> {
         let _scope = globals::StorageRootScope::enter(root);
         prepare_warehouse(PrepareMode::Full)
@@ -1140,7 +1337,7 @@ mod tests {
         let notes = prepare_at(&root).unwrap();
 
         assert_eq!(has_warehouse_marker(&forklift), Ok(true));
-        assert_eq!(std::fs::read(forklift.join(FILE_NAME_WAREHOUSE_MARKER)).unwrap(), b"/forklift-warehouse 2\nfull\n");
+        assert_eq!(std::fs::read(forklift.join(FILE_NAME_WAREHOUSE_MARKER)).unwrap(), b"/forklift-warehouse 3\nformat 1\nfull\n");
         for piece in ["objects", "inventory", "config"] {
             assert!(forklift.join(piece).is_dir(), "{} must be in place", piece);
         }
@@ -1305,15 +1502,16 @@ mod tests {
         let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
         std::fs::create_dir_all(&forklift).unwrap();
 
-        // No mode, two modes, a word this build does not know, a newer version, the v1 marker that
-        // recorded no mode at all, and no record header.
-        for bad in ["/forklift-warehouse 2\n", "/forklift-warehouse 2\nfull\nsparse\n",
-                    "/forklift-warehouse 2\nshallow\n", "/forklift-warehouse 3\nfull\n",
-                    "/forklift-warehouse 1\n", "/forklift-warehouse 2", "warehouse\n"] {
+        // No mode, two modes, a word this build does not know, no format, a newer version, the
+        // markers from before the format was recorded, and no record header.
+        for bad in ["/forklift-warehouse 3\nformat 1\n", "/forklift-warehouse 3\nformat 1\nfull\nsparse\n",
+                    "/forklift-warehouse 3\nformat 1\nshallow\n", "/forklift-warehouse 3\nfull\n",
+                    "/forklift-warehouse 4\nformat 1\nfull\n", "/forklift-warehouse 2\nfull\n",
+                    "/forklift-warehouse 1\n", "/forklift-warehouse 3", "warehouse\n"] {
             std::fs::write(forklift.join(FILE_NAME_WAREHOUSE_MARKER), bad).unwrap();
 
             let error = has_warehouse_marker(&forklift).unwrap_err();
-            assert!(error.starts_with("The warehouse marker \""), "{}", error);
+            assert!(error.starts_with("The warehouse marker "), "{}", error);
             assert!(bay_utils::classify_forklift(&forklift).is_err(), "{:?} classified", bad);
             assert!(prepare_at(&root).is_err(), "{:?} prepared over", bad);
             assert_eq!(std::fs::read_to_string(forklift.join(FILE_NAME_WAREHOUSE_MARKER)).unwrap(), bad);
@@ -1326,7 +1524,7 @@ mod tests {
 
         for mode in [WarehouseMode::Full, WarehouseMode::Sparse, WarehouseMode::Cache] {
             std::fs::write(forklift.join(FILE_NAME_WAREHOUSE_MARKER),
-                format!("/forklift-warehouse 2\n{}\n", mode.word())).unwrap();
+                format!("/forklift-warehouse 3\nformat 1\n{}\n", mode.word())).unwrap();
             assert_eq!(read_warehouse_marker(&forklift), Ok(Some(mode)));
             assert_eq!(bay_utils::classify_forklift(&forklift), Ok(bay_utils::ForkliftKind::Warehouse));
         }
@@ -1349,6 +1547,7 @@ mod tests {
             bundle: franchise_utils::BundleState::None,
             attempt: franchise_utils::Attempt::Running,
             start_census: 0,
+            format: WAREHOUSE_FORMAT,
             last_failure: None,
         };
 
@@ -1433,6 +1632,53 @@ mod tests {
         assert_eq!(read_warehouse_marker(&forklift), Ok(Some(WarehouseMode::Sparse)));
         assert_eq!(scope_files(&forklift), (None, Some(written)));
         assert_eq!(origin_in(&target), None);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A warehouse put in place of another format between the check and the fill is not completed:
+    /// this build's pieces would stand under a number that does not describe them.
+    ///
+    /// Revert: drop the backstop from `fill_in_place` → the missing folders are made → red.
+    #[test]
+    fn preparing_over_another_format_adds_nothing() {
+        for (marker, expected) in [("/forklift-warehouse 3\nformat 2\nfull\n", "format 2"),
+                                   ("/forklift-warehouse 3\nformat 1\nfull\nupgrading 2 0\n", "upgrade to format 2 unfinished")] {
+            let root = fresh_dir("prepare-other-format");
+            let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
+            std::fs::create_dir_all(&forklift).unwrap();
+            std::fs::write(forklift.join(FILE_NAME_WAREHOUSE_MARKER), marker).unwrap();
+
+            let error = prepare_at(&root).unwrap_err();
+            assert!(error.contains(expected), "{}", error);
+            // The lease's sidecar is the only thing it may make: every format shares it.
+            let mut left = list_names_for_test(&forklift);
+            left.retain(|name| name != lock_utils::FILE_NAME_FORMAT_LOCK);
+            assert_eq!(left, [FILE_NAME_WAREHOUSE_MARKER], "{:?}", marker);
+
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// Classifying decides only that a folder is a warehouse: any format is one, even with a mode
+    /// this build has never heard of, while a mode the current format should know is an error.
+    ///
+    /// Revert: judge the mode at every format → a newer warehouse's mode is unreadable, not newer → red.
+    #[test]
+    fn a_marker_of_another_format_is_a_warehouse_whatever_its_mode() {
+        let root = fresh_dir("marker-classify");
+        let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
+        std::fs::create_dir_all(&forklift).unwrap();
+        let marker = forklift.join(FILE_NAME_WAREHOUSE_MARKER);
+
+        for accepted in ["/forklift-warehouse 3\nformat 2\nfull\n", "/forklift-warehouse 3\nformat 2\nsomething-new\n",
+                         "/forklift-warehouse 3\nformat 0\nsomething-old\n", "/forklift-warehouse 3\nformat 1\nfull\n"] {
+            std::fs::write(&marker, accepted).unwrap();
+            assert_eq!(has_warehouse_marker(&forklift), Ok(true), "{:?}", accepted);
+        }
+
+        std::fs::write(&marker, "/forklift-warehouse 3\nformat 1\nsomething-new\n").unwrap();
+        assert!(has_warehouse_marker(&forklift).is_err());
 
         std::fs::remove_dir_all(&root).ok();
     }
