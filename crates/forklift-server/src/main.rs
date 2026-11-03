@@ -622,8 +622,8 @@ fn prepare(root: &str) -> Result<(), String> {
 
 /// Build the bundle served at `/v1/bundles/latest`.
 fn bundle(root: &str) -> Result<(), String> {
-    let resolved = server::open_root(root)?;
-    let _scope = forklift_core::globals::StorageRootScope::enter(&resolved);
+    let opened = server::open_root(root)?;
+    let _scope = forklift_core::globals::StorageRootScope::enter(&opened.root);
 
     // Unlike `gc`, `bundle` is safe to run against a live server and is deliberately *not*
     // serve-locked: it never deletes an object, it writes the bundle atomically (temp +
@@ -646,8 +646,8 @@ fn bundle(root: &str) -> Result<(), String> {
 
 /// Collect unreferenced objects.
 fn gc(root: &str, grace_hours: u64) -> Result<(), String> {
-    let resolved = server::open_root(root)?;
-    let _scope = forklift_core::globals::StorageRootScope::enter(&resolved);
+    let opened = server::open_root(root)?;
+    let _scope = forklift_core::globals::StorageRootScope::enter(&opened.root);
 
     // Refuse while a server is serving this root: gc would sweep the server's in-flight
     // staged objects, and a lift slower than the grace period then fails its ref update. Held for
@@ -668,8 +668,8 @@ fn gc(root: &str, grace_hours: u64) -> Result<(), String> {
 
 /// List the tombstones of the warehouse at `root`.
 fn list_tombstones(root: &str) -> Result<(), String> {
-    let resolved = server::open_root(root)?;
-    let _scope = forklift_core::globals::StorageRootScope::enter(&resolved);
+    let opened = server::open_root(root)?;
+    let _scope = forklift_core::globals::StorageRootScope::enter(&opened.root);
 
     let tombstones = forklift_core::util::tombstone_utils::read_tombstones()?;
 
@@ -686,8 +686,8 @@ fn list_tombstones(root: &str) -> Result<(), String> {
 
 /// Drop deleted pallet `name`'s tombstone in the warehouse at `root`.
 fn drop_tombstone(root: &str, name: &str) -> Result<(), String> {
-    let resolved = server::open_root(root)?;
-    let _scope = forklift_core::globals::StorageRootScope::enter(&resolved);
+    let opened = server::open_root(root)?;
+    let _scope = forklift_core::globals::StorageRootScope::enter(&opened.root);
 
     let head = forklift_core::util::tombstone_utils::drop_tombstone(name)?;
 
@@ -1397,8 +1397,8 @@ mod tests {
         let refused = server::open_root(root.to_str().unwrap()).unwrap_err();
         assert_eq!(refusal(refused).0, forklift_core::error::RefusalCode::NotAWarehouse);
 
-        std::fs::write(forklift.join(forklift_core::util::warehouse_utils::FILE_NAME_WAREHOUSE_MARKER), b"/forklift-warehouse 2\nfull\n").unwrap();
-        assert_eq!(server::open_root(root.to_str().unwrap()).unwrap(), std::fs::canonicalize(&root).unwrap());
+        std::fs::write(forklift.join(forklift_core::util::warehouse_utils::FILE_NAME_WAREHOUSE_MARKER), b"/forklift-warehouse 3\nformat 1\nfull\n").unwrap();
+        assert_eq!(server::open_root(root.to_str().unwrap()).unwrap().root, std::fs::canonicalize(&root).unwrap());
 
         let _ = std::fs::remove_dir_all(&root);
     }

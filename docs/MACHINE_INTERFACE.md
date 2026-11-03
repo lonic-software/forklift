@@ -85,7 +85,12 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 15** (current): the `confirmation_required` error code exists (exit 39). A destructive
+**Schema 16** (current): the `warehouse_format_older` (exit 40), `warehouse_format_newer` (exit 41),
+`warehouse_upgrade_incomplete` (exit 42), `warehouse_upgrade_running` (exit 43) and
+`warehouse_lease_missing` (exit 44) error codes exist. A warehouse marker now records the warehouse's
+format, and a build refuses any format but its own.
+
+**Schema 15**: the `confirmation_required` error code exists (exit 39). A destructive
 command run without `--confirm` while it has something to destroy refuses with it, its preview in
 `details`: `restore` that would discard a change, `lower` with a `theirs` resolution, `scope prune`
 that would free content, and `office regenesis`, which exited 1 before. `scope prune` loses

@@ -201,6 +201,9 @@ forklift behaves predictably. From `DESIGN.html` §2:
   objects on a liveness or scope decision — a full repack, `gc`, `scope prune`, `store evict` —
   takes it exclusively with a try and refuses beside a writer. Bay lock first,
   store access second.
+- **A build reads exactly one warehouse format.** `WAREHOUSE_FORMAT` is checked when a warehouse is
+  opened, and the open holds `format.lock` shared until the process exits. A change to anything a
+  warehouse keeps on disk starts from [the format contract](../format/WAREHOUSE_FORMAT.md).
 - **The remote is untrusted storage + thin verifiers.** Anything a client uploads
   is unverified until the server checks it (hash, signature, privileges). Anything
   a client downloads is verifiable offline (content addressing + signatures).

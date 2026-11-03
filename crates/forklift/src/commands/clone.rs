@@ -150,6 +150,7 @@ pub async fn handle_command(url: &str,
         bundle: BundleState::None,
         attempt: Attempt::Running,
         start_census: 0,
+        format: warehouse_utils::WAREHOUSE_FORMAT,
         last_failure: None,
     };
 
@@ -467,6 +468,10 @@ fn start_attempt(attempt: &mut FranchiseAttempt,
         attempt.record.start_census = previous.start_census;
         attempt.bundle_at_start = keep.clone();
     }
+
+    // Before anything is swept: the sweep keeps the sidecar, and this keeps it held. An unfinished
+    // clone passes no open gate, so nothing else takes the lease here.
+    lock_utils::FormatLease::shared(&attempt.forklift).map_err(String::from)?.hold_until_exit();
 
     let kept = franchise_utils::prepare_resume(absolute_target, previous, keep).map_err(|e| {
         // Clearing stopped partway: the bundle counts as kept only if what it needs still is.
@@ -953,6 +958,7 @@ mod tests {
             bundle: BundleState::None,
             attempt: Attempt::Failed,
             start_census: 3,
+            format: warehouse_utils::WAREHOUSE_FORMAT,
             last_failure: Some(Failure {
                 request: Request { pallet: None, only: vec!["src/ap".to_string()], cache: false },
                 phase: Phase::Fetch,

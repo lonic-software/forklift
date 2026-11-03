@@ -62,7 +62,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 15;
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -534,6 +534,21 @@ error_codes! {
     /// A destructive command had something to destroy (for `lower`, a resolution named `theirs`)
     /// and was run without `--confirm`; it showed what it would destroy and changed nothing.
     ConfirmationRequired,
+
+    /// The warehouse is in an older format than this build reads; `forklift upgrade` moves it on.
+    WarehouseFormatOlder,
+
+    /// The warehouse is in a newer format than this build reads; this binary needs updating.
+    WarehouseFormatNewer,
+
+    /// An upgrade of the warehouse did not finish; every command but the upgrade refuses.
+    WarehouseUpgradeIncomplete,
+
+    /// Another process is upgrading the warehouse right now.
+    WarehouseUpgradeRunning,
+
+    /// The warehouse's format lease file is missing and this user cannot create it.
+    WarehouseLeaseMissing,
 }
 
 impl ErrorCode {
@@ -578,6 +593,11 @@ impl ErrorCode {
             ErrorCode::OriginMovePending => RefusalCode::OriginMovePending.as_str(),
             ErrorCode::OriginMoveIncomplete => RefusalCode::OriginMoveIncomplete.as_str(),
             ErrorCode::ConfirmationRequired => RefusalCode::ConfirmationRequired.as_str(),
+            ErrorCode::WarehouseFormatOlder => RefusalCode::WarehouseFormatOlder.as_str(),
+            ErrorCode::WarehouseFormatNewer => RefusalCode::WarehouseFormatNewer.as_str(),
+            ErrorCode::WarehouseUpgradeIncomplete => RefusalCode::WarehouseUpgradeIncomplete.as_str(),
+            ErrorCode::WarehouseUpgradeRunning => RefusalCode::WarehouseUpgradeRunning.as_str(),
+            ErrorCode::WarehouseLeaseMissing => RefusalCode::WarehouseLeaseMissing.as_str(),
         }
     }
 
@@ -625,6 +645,11 @@ impl ErrorCode {
             ErrorCode::OriginMovePending => 37,
             ErrorCode::OriginMoveIncomplete => 38,
             ErrorCode::ConfirmationRequired => 39,
+            ErrorCode::WarehouseFormatOlder => 40,
+            ErrorCode::WarehouseFormatNewer => 41,
+            ErrorCode::WarehouseUpgradeIncomplete => 42,
+            ErrorCode::WarehouseUpgradeRunning => 43,
+            ErrorCode::WarehouseLeaseMissing => 44,
         }
     }
 
@@ -733,6 +758,16 @@ impl ErrorCode {
                 "A destructive command had something to destroy (for lower, a resolution named \
                  theirs) and was run without --confirm; it showed what it would destroy, changed nothing, and running it again with --confirm \
                  destroys it",
+            ErrorCode::WarehouseFormatOlder =>
+                "The warehouse is in an older format than this build reads; \"forklift upgrade\" moves it to this one",
+            ErrorCode::WarehouseFormatNewer =>
+                "The warehouse is in a newer format than this build reads; update this binary",
+            ErrorCode::WarehouseUpgradeIncomplete =>
+                "An upgrade of the warehouse did not finish, and every other command refuses; \"forklift upgrade\" resumes it",
+            ErrorCode::WarehouseUpgradeRunning =>
+                "Another process is upgrading the warehouse right now; run the command again once it finishes",
+            ErrorCode::WarehouseLeaseMissing =>
+                "The warehouse's format lease file is missing and this user cannot create it; create it, or restore write access",
         }
     }
 
@@ -777,6 +812,11 @@ impl ErrorCode {
             RefusalCode::OriginMovePending => ErrorCode::OriginMovePending,
             RefusalCode::OriginMoveIncomplete => ErrorCode::OriginMoveIncomplete,
             RefusalCode::ConfirmationRequired => ErrorCode::ConfirmationRequired,
+            RefusalCode::WarehouseFormatOlder => ErrorCode::WarehouseFormatOlder,
+            RefusalCode::WarehouseFormatNewer => ErrorCode::WarehouseFormatNewer,
+            RefusalCode::WarehouseUpgradeIncomplete => ErrorCode::WarehouseUpgradeIncomplete,
+            RefusalCode::WarehouseUpgradeRunning => ErrorCode::WarehouseUpgradeRunning,
+            RefusalCode::WarehouseLeaseMissing => ErrorCode::WarehouseLeaseMissing,
         }
     }
 }
@@ -1280,6 +1320,11 @@ mod tests {
             (RefusalCode::OriginMovePending, "origin_move_pending", 37),
             (RefusalCode::OriginMoveIncomplete, "origin_move_incomplete", 38),
             (RefusalCode::ConfirmationRequired, "confirmation_required", 39),
+            (RefusalCode::WarehouseFormatOlder, "warehouse_format_older", 40),
+            (RefusalCode::WarehouseFormatNewer, "warehouse_format_newer", 41),
+            (RefusalCode::WarehouseUpgradeIncomplete, "warehouse_upgrade_incomplete", 42),
+            (RefusalCode::WarehouseUpgradeRunning, "warehouse_upgrade_running", 43),
+            (RefusalCode::WarehouseLeaseMissing, "warehouse_lease_missing", 44),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

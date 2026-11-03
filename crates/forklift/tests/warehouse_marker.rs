@@ -2,7 +2,9 @@
 //! `prepare` writes last. These tests check that every other `.forklift` is refused as
 //! `not_a_warehouse` before anything is written, with a next step that names the root it refused
 //! and that works when followed: an empty folder, an unmarked one, a bay whose redirect names
-//! something that is not a warehouse, and an empty folder inside a warehouse.
+//! something that is not a warehouse, and an empty folder inside a warehouse. A warehouse whose
+//! marker records a format this build does not read is a warehouse, and is refused as that, with the
+//! way out its condition calls for.
 
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -306,10 +308,14 @@ fn an_unreadable_marker_is_not_answered_with_prepare() {
     let area = Area::new("unreadable");
     let root = area.warehouse("w");
     let marker = root.join(FOLDER_NAME_FORKLIFT_ROOT).join("warehouse");
-    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "/forklift-warehouse 2\nfull\n");
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "/forklift-warehouse 3\nformat 1\nfull\n");
 
-    for bad in ["/forklift-warehouse 2\n", "/forklift-warehouse 2\nfull\ncache\n", "/forklift-warehouse 2\nshallow\n",
-                "/forklift-warehouse 1\n"] {
+    let old_records = ["/forklift-warehouse 1\n", "/forklift-warehouse 2\nfull\n"];
+    for bad in ["/forklift-warehouse 3\n", "/forklift-warehouse 3\nfull\n", "/forklift-warehouse 3\nformat 1\n",
+                "/forklift-warehouse 3\nformat 1\nfull\ncache\n", "/forklift-warehouse 3\nformat one\nfull\n",
+                "/forklift-warehouse 3\nformat 01\nfull\n", "/forklift-warehouse 3\nformat 1\nshallow\n",
+                "/forklift-warehouse 3\nformat 1\nfull\nupgrading 2\n", "/forklift-warehouse 99\nformat 1\nfull\n",
+                old_records[0], old_records[1]] {
         std::fs::write(&marker, bad).unwrap();
         let before = listing(&root);
 
@@ -319,8 +325,8 @@ fn an_unreadable_marker_is_not_answered_with_prepare() {
             let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_ne!(value["error"]["code"], "not_a_warehouse", "{}", value);
             let message = value["error"]["message"].as_str().unwrap();
-            assert!(message.starts_with("The warehouse marker \""), "{}", value);
-            assert_eq!(message.contains("older version of Forklift"), bad == "/forklift-warehouse 1\n", "{}", value);
+            assert!(message.starts_with("The warehouse marker "), "{}", value);
+            assert_eq!(message.contains("older version of Forklift"), old_records.contains(&bad), "{}", value);
             assert!(!value["error"]["next_step"].as_str().unwrap_or("").contains("prepare"), "{}", value);
         }
         assert_eq!(listing(&root), before, "{:?}: a refused command writes nothing", bad);
@@ -496,5 +502,240 @@ fn the_server_serves_no_unmarked_root() {
         assert!(next_step.starts_with(expected), "{:?}", stderr);
         assert!(!stderr.contains("\"forklift prepare\"") && !stderr.contains("git import"), "{:?}", stderr);
         assert_eq!(listing(root), before, "refused before any lock is taken");
+    }
+}
+
+/// Run `args` (with `--json`) in `dir`, assert the refusal's code and exit, and return its next step.
+fn format_refusal(area: &Area, dir: &Path, args: &[&str], code: &str, exit: i32) -> (String, String) {
+    let output = area.run(dir, &[&["--json"][..], args].concat());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|_| panic!("{:?}: not one JSON document: {}{}", args, text(&output.stdout), text(&output.stderr)));
+    assert_eq!(value["error"]["code"], code, "{:?}: {}", args, value);
+    assert_eq!(output.status.code(), Some(exit), "{:?}: {}", args, value);
+
+    (value["error"]["message"].as_str().unwrap().to_string(), value["error"]["next_step"].as_str().unwrap_or("").to_string())
+}
+
+fn marker_of(root: &Path) -> PathBuf {
+    root.join(FOLDER_NAME_FORKLIFT_ROOT).join("warehouse")
+}
+
+/// Hold the warehouse's format lock exclusively, as an upgrade does.
+fn hold_format_exclusively(root: &Path) -> std::fs::File {
+    let file = std::fs::File::open(root.join(FOLDER_NAME_FORKLIFT_ROOT).join("format.lock")).unwrap();
+    file.try_lock().unwrap();
+    file
+}
+
+/// A warehouse in any format but this build's is refused before anything is read or written, with
+/// the remedy its side of the difference calls for, and a resume is never answered as a plain
+/// difference: the upgrade on record outranks the format.
+///
+/// Revert: let `judge_format` pass another format → the stocktake reads it → red.
+#[test]
+fn a_warehouse_in_another_format_is_refused_with_its_own_way_out() {
+    let area = Area::new("format-refusals");
+    let root = area.warehouse("w");
+    let marker = marker_of(&root);
+    let cases = [
+        ("/forklift-warehouse 3\nformat 0\nfull\n", "warehouse_format_older", 40, "forklift upgrade"),
+        ("/forklift-warehouse 3\nformat 2\nfull\n", "warehouse_format_newer", 41, "Update this Forklift"),
+        // A mode of a format this build does not read is not this build's to judge.
+        ("/forklift-warehouse 3\nformat 2\nsomething-new\n", "warehouse_format_newer", 41, "Update this Forklift"),
+        ("/forklift-warehouse 3\nformat 1\nfull\nupgrading 2 3\n", "warehouse_upgrade_incomplete", 42, "forklift upgrade"),
+        ("/forklift-warehouse 3\nformat 0\nfull\nupgrading 1 0\n", "warehouse_upgrade_incomplete", 42, "forklift upgrade"),
+    ];
+
+    for (content, code, exit, expected) in cases {
+        std::fs::write(&marker, content).unwrap();
+        let before = listing(&root);
+
+        for args in [&["stocktake"][..], &["stack", "-m", "again"], &["prepare"], &["pallet", "list"]] {
+            let (_, next_step) = format_refusal(&area, &root, args, code, exit);
+            assert!(next_step.contains(expected), "{:?} over {:?}: {}", args, content, next_step);
+            assert!(!next_step.contains("prepare"), "{:?} over {:?}: {}", args, content, next_step);
+        }
+        assert_eq!(listing(&root), before, "{:?}: a refused command writes nothing", content);
+    }
+}
+
+/// A bay works on its warehouse's format, so it answers to that warehouse's marker through its
+/// redirect, and its next step names the warehouse, which is what an upgrade runs on.
+///
+/// Revert: judge a bay by its own state folder → the bay's stocktake runs → red.
+#[test]
+fn a_bay_is_refused_on_its_warehouses_format() {
+    let area = Area::new("format-bay");
+    let root = area.warehouse("w");
+    let bay = area.path("bay");
+    area.run_ok(&root, &["bay", "add", "feature", bay.to_str().unwrap()]);
+    area.run_ok(&bay, &["stocktake"]);
+
+    std::fs::write(marker_of(&root), "/forklift-warehouse 3\nformat 1\nfull\nupgrading 2 0\n").unwrap();
+    let (_, next_step) = format_refusal(&area, &bay, &["stocktake"], "warehouse_upgrade_incomplete", 42);
+    assert!(next_step.contains(&format!("\"forklift upgrade\" in \"{}\"", root.display())), "{}", next_step);
+
+    std::fs::write(marker_of(&root), "/forklift-warehouse 3\nformat 2\nfull\n").unwrap();
+    format_refusal(&area, &bay, &["stocktake"], "warehouse_format_newer", 41);
+}
+
+/// While an upgrade holds the format lock a command refuses at once rather than wait for it, and
+/// runs again as soon as the lock is let go.
+///
+/// Revert: let the open go on when the lock is held → the stocktake runs under the upgrade → red.
+#[test]
+fn a_command_refuses_at_once_while_an_upgrade_holds_the_format() {
+    let area = Area::new("format-running");
+    let root = area.warehouse("w");
+    let held = hold_format_exclusively(&root);
+
+    let started = std::time::Instant::now();
+    format_refusal(&area, &root, &["stocktake"], "warehouse_upgrade_running", 43);
+    assert!(started.elapsed() < std::time::Duration::from_secs(30), "waited {:?}", started.elapsed());
+
+    drop(held);
+    area.run_ok(&root, &["stocktake"]);
+}
+
+/// `prepare` writes the format lock, and a warehouse that lost it gets it back when it can be
+/// written. One that cannot is refused for what it is, not read without a lease.
+///
+/// Revert: treat a missing sidecar as no upgrade running, without recreating it → it stays gone → red.
+#[test]
+#[cfg(unix)]
+fn a_lost_format_lock_is_made_again_or_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let area = Area::new("format-sidecar");
+    let root = area.warehouse("w");
+    let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
+    let lock = forklift.join("format.lock");
+    assert!(lock.exists(), "prepare writes the format lock");
+
+    std::fs::remove_file(&lock).unwrap();
+    area.run_ok(&root, &["stocktake"]);
+    assert!(lock.exists(), "the first command makes it again");
+
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::set_permissions(&forklift, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let refused = area.run(&root, &["--json", "pallet", "list"]);
+    std::fs::set_permissions(&forklift, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(value["error"]["code"], "warehouse_lease_missing", "{}", value);
+    assert_eq!(refused.status.code(), Some(44), "{}", value);
+}
+
+/// A warehouse that cannot be written can still be read: the lease needs no write access to a lock
+/// that is already there.
+///
+/// Revert: open the sidecar for writing → permission denied on a read-only warehouse → red.
+#[test]
+#[cfg(unix)]
+fn a_read_only_warehouse_still_takes_the_lease() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let area = Area::new("format-read-only");
+    let root = area.warehouse("w");
+    let lock = root.join(FOLDER_NAME_FORKLIFT_ROOT).join("format.lock");
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+    let opened = forklift_core::util::lock_utils::FormatLease::shared(&root.join(FOLDER_NAME_FORKLIFT_ROOT));
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+    opened.unwrap();
+}
+
+/// `prepare` over a warehouse in another format neither joins it nor adds to it.
+///
+/// Revert: let `check_preparable` read only the marker's presence → `prepare` answers "already" → red.
+#[test]
+fn prepare_refuses_a_warehouse_in_another_format_and_adds_nothing() {
+    let area = Area::new("format-prepare");
+    let root = area.warehouse("w");
+    std::fs::write(marker_of(&root), "/forklift-warehouse 3\nformat 2\nfull\n").unwrap();
+    let before = listing(&root);
+
+    format_refusal(&area, &root, &["prepare"], "warehouse_format_newer", 41);
+    assert_eq!(listing(&root), before);
+    assert_eq!(std::fs::read_to_string(marker_of(&root)).unwrap(), "/forklift-warehouse 3\nformat 2\nfull\n");
+}
+
+/// A marker from before the marker recorded a format is told it has no upgrade, whichever older
+/// version wrote it.
+///
+/// Revert: answer an old marker with the older-format refusal → the message names an upgrade → red.
+#[test]
+fn a_marker_from_before_formats_is_told_to_make_the_warehouse_again() {
+    let area = Area::new("format-record-v2");
+    let root = area.warehouse("w");
+
+    for old in ["/forklift-warehouse 2\nfull\n", "/forklift-warehouse 1\n"] {
+        std::fs::write(marker_of(&root), old).unwrap();
+        let output = area.run(&root, &["--json", "stocktake"]);
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains("Make the warehouse again"), "{}", value);
+        assert!(message.contains("No upgrade reaches back"), "{}", value);
+    }
+}
+
+/// The server refuses a warehouse in another format with the server's own remedy, before serving.
+///
+/// Revert: drop the format judgment from the server's open → the server serves it → the deadline fires → red.
+#[test]
+fn the_server_serves_no_warehouse_in_another_format() {
+    let area = Area::new("format-server");
+    let root = area.warehouse("w");
+
+    for (content, expected) in [("/forklift-warehouse 3\nformat 0\nfull\n", "forklift-server upgrade"),
+                                ("/forklift-warehouse 3\nformat 2\nfull\n", "Update this Forklift")] {
+        std::fs::write(marker_of(&root), content).unwrap();
+        let mut serving = std::process::Command::new(common::server_binary())
+            .args(["serve", "--root", root.to_str().unwrap(), "--addr", "127.0.0.1:0", "--open"])
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while serving.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() > deadline {
+                let _ = serving.kill();
+                let _ = serving.wait();
+                panic!("forklift-server served a warehouse marked {:?}", content);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let served = serving.wait_with_output().unwrap();
+        assert!(!served.status.success());
+        assert!(text(&served.stderr).contains(expected), "{:?}: {}", content, text(&served.stderr));
+    }
+}
+
+/// Every other way the server takes a root refuses another format too, and a running server keeps
+/// an upgrade out for as long as it serves.
+///
+/// Revert: let the handle drop its lease → the exclusive lock lands under the running server → red.
+#[test]
+fn the_server_holds_the_format_while_it_serves_and_its_other_commands_refuse() {
+    use std::io::BufRead;
+
+    let area = Area::new("format-server-held");
+    let root = area.warehouse("w");
+    let lock = root.join(FOLDER_NAME_FORKLIFT_ROOT).join("format.lock");
+
+    let mut serving = std::process::Command::new(common::server_binary())
+        .args(["serve", "--root", root.to_str().unwrap(), "--addr", "127.0.0.1:0", "--open"])
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(serving.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    let during = std::fs::File::open(&lock).unwrap().try_lock().is_ok();
+    let _ = serving.kill();
+    let _ = serving.wait();
+    assert!(!line.is_empty(), "the server started");
+    assert!(!during, "an upgrade could start under a running server");
+    std::fs::File::open(&lock).unwrap().try_lock().unwrap();
+
+    std::fs::write(marker_of(&root), "/forklift-warehouse 3\nformat 2\nfull\n").unwrap();
+    for args in [&["gc", "--root"][..], &["bundle", "--root"]] {
+        let output = std::process::Command::new(common::server_binary())
+            .args(args).arg(&root).output().unwrap();
+        assert!(!output.status.success(), "{:?}", args);
+        assert!(text(&output.stderr).contains("Update this Forklift"), "{:?}: {}", args, text(&output.stderr));
     }
 }
