@@ -309,6 +309,13 @@ tracked-metadata formats each have a spec in `format/`. When you change one:
 - Update the spec in `format/` so it stays byte-accurate.
 - Additive protocol endpoints (old servers `404`, clients fall back) don't need a
   version bump; document the fallback.
+- A new file or folder name is a `FILE_NAME_*`, `FOLDER_NAME_*`, `FILE_SUFFIX_*` or
+  `FILE_EXTENSION_*` constant with a row in the census of
+  [the format contract](../format/WAREHOUSE_FORMAT.md#the-census); a test fails
+  until it has one. A changed record or object version fails the frozen
+  `versions` snapshot until `WAREHOUSE_FORMAT` is bumped, and a bump needs the new
+  format's fixtures made with `freeze_the_current_format_fixtures` (and, for the
+  AWS head, `freeze_the_current_aws_format_fixture` after an `AWS_FORMAT` bump).
 - Pre-release, forklift does **not** carry legacy-tolerance code for its own
   older on-disk formats (there are no external users yet). This is a deliberate
   decision — see the `DESIGN.html` §8.14 note — so a format change may require

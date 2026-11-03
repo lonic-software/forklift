@@ -251,10 +251,21 @@ which never change.
 
 `crates/forklift/tests/fixtures/format-<N>/` holds a warehouse frozen as this format wrote it, one per
 mode (`full`, `sparse`, `cache`), plus a consolidation and a pick left in conflict and a served
-warehouse with a tombstone and a bundle. A test opens each of the current format's with the current
-build, and walks each against the census, before and after. For every older format, it runs the
-upgrade on each and then does the same. Format 1 has no older formats, so that loop is empty for now.
+warehouse with a tombstone and a bundle. The `operator` fixture beside them holds the global
+configuration and keys of the enrolled operator who made them. A test opens each of the current
+format's with the current build, reading every record it holds: it lists the parked work, audits the
+trust, reads the scope, the tags and the office, prints a packed file, and finishes the consolidation
+and the pick as that operator. It walks each against the census, before and after. For every older
+format, it runs the upgrade on each and then does the same. Format 1 has no older formats, so that
+loop is empty for now.
 
 The fixtures are made by an ignored test, `freeze_the_current_format_fixtures`, which refuses to
-replace a format's folder that exists. A format's fixtures change only by being made again at a new
-format. Bays are not frozen: a bay's redirect holds an absolute path.
+replace a format's fixtures. A format's fixtures change only by being made again at a new format. Two
+things are not frozen: bays, because a bay's redirect holds an absolute path, and the out-of-scope
+skeleton's reader, which only a partial checkout's consolidation reaches.
+
+The AWS head's items are frozen the same way, against `AWS_FORMAT`:
+`crates/forklift-aws-lambda/tests/fixtures/aws-format-<N>/items` lists the DynamoDB items a warehouse
+holding a live pallet, a deleted one, the office pallet and a trust anchor is written as, on the
+memory store. The current build must write exactly those items and serve them back. Every older AWS
+format's items must upgrade through the chain and then be served.
