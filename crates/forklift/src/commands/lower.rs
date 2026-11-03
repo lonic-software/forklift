@@ -967,9 +967,14 @@ async fn replay(client: &RemoteClient,
         Ok(()) => {}
         Err(pallet_utils::RefUpdateError::Failed(why)) => return Err(why),
         Err(refused) => {
+            use pallet_utils::RefUpdateError::*;
+
             let why = match refused {
-                pallet_utils::RefUpdateError::Moved(_) => "another bay or process moved it here meanwhile",
-                _ => "the office or the trust anchor it was signed under changed here meanwhile",
+                Moved(_) => "another bay or process moved it here meanwhile".to_string(),
+                OfficeMoved { .. } | AnchorMoved | PalletsMoved { .. } | WitnessMoved { .. } => {
+                    "the office or the trust anchor it was signed under changed here meanwhile".to_string()
+                }
+                other => other.to_string(),
             };
 
             return Err(format!(

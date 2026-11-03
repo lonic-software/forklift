@@ -831,11 +831,12 @@ fn is_half_undone(entry: &JournalEntry, now: &BayState) -> Result<bool, String> 
     Ok(pallet_utils::get_pallet_head(&before.current_pallet)? != before.current_head)
 }
 
-/// Refuses, in a served warehouse, an undo that would put a user pallet back. Every head a
-/// journaled operation wrote moved its pallet forward, so putting one back leaves a head the
-/// warehouse's clones may rely on, which nothing would root once the ref leaves it; the ref write
-/// itself is refused too (see [`pallet_utils::update_pallet_head_in`]), and this refuses before
-/// anything is written. Only a pallet still at the head the operation left counts: one another
+/// Refuses, in a served warehouse, an undo that would put a pallet back, a meta pallet included.
+/// Every head a journaled operation wrote moved its pallet forward, so putting one back leaves a
+/// head the warehouse's clones may rely on: a clone holding it would lift it straight back, and
+/// for a user pallet nothing would root it once the ref leaves it. The ref write itself is
+/// refused too (see [`pallet_utils::update_pallet_head_in`]), and this refuses before anything is
+/// written. Only a pallet still at the head the operation left counts: one another
 /// writer moved on since is left alone by the put-back, so it moves nothing back. A `shift` is
 /// undone by shifting back, which puts no ref back.
 fn refuse_a_served_rewind(entry: &JournalEntry) -> Result<(), String> {
@@ -852,8 +853,7 @@ fn refuse_a_served_rewind(entry: &JournalEntry) -> Result<(), String> {
         let reference = PalletRef::parse(wire)?;
 
         if pre_head == post_head
-            || reference.namespace != PalletNamespace::User
-            || pallet_utils::get_pallet_head(&reference.name)?.as_deref() != Some(post_head.as_str())
+            || pallet_utils::get_pallet_head_in(reference.namespace, &reference.name)?.as_deref() != Some(post_head.as_str())
             // Read last, so the gate reads the mark only for a pallet it would move back.
             || !crate::util::tombstone_utils::is_served()? {
             continue;
@@ -865,7 +865,7 @@ fn refuse_a_served_rewind(entry: &JournalEntry) -> Result<(), String> {
             and undo cannot reach an older operation past this one. To take the change out, stack a \
             parcel that reverts it; a pallet deleted since this warehouse was served comes back \
             with \"forklift pallet restore <name>\".",
-            entry.op, crate::error::sanitize(&reference.name)
+            entry.op, crate::error::sanitize(&reference.to_wire())
         ));
     }
 
@@ -2000,6 +2000,27 @@ mod tests {
         move_elsewhere("aside", &pallet_utils::tests::child_of(&second, "later"));
 
         check_undoable(&entry).unwrap();
+    }
+
+    // Revert: count user wires only → the gate passes an undo that would put "@kv" back.
+    #[test]
+    fn the_gate_refuses_putting_a_meta_pallet_back_in_a_served_root() {
+        let _scratch = Scratch::new("gate-served-meta");
+        let (mut entry, _pre, post) = stacked_on_a_child();
+        let first = pallet_utils::tests::stub_parcel("kv");
+        let second = pallet_utils::tests::child_of(&first, "kv-next");
+        pallet_utils::update_meta_pallet_head("kv", None, &second, &pallet_utils::RefPreconditions::NONE).unwrap();
+
+        // An entry that moved only "@kv", with the bay at the head it left.
+        entry.before.heads = BTreeMap::from([("main".to_string(), Some(post.clone())), ("@kv".to_string(), Some(first))]);
+        entry.after.heads = BTreeMap::from([("main".to_string(), Some(post)), ("@kv".to_string(), Some(second.clone()))]);
+        check_undoable(&entry).unwrap();
+        assert!(crate::util::tombstone_utils::mark_served(false).unwrap());
+
+        let refused = check_undoable(&entry).unwrap_err();
+
+        assert!(refused.contains("has been served") && refused.contains("\"@kv\""), "{}", refused);
+        assert_eq!(pallet_utils::get_meta_pallet_head("kv").unwrap(), Some(second), "nothing was put back");
     }
 
     // Revert: read the served mark before judging any wire → an unreadable mark fails a gate
