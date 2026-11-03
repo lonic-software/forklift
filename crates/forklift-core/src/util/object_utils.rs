@@ -907,20 +907,21 @@ fn unknown_version_error(claimed_hash: &str, version: u64) -> String {
 /// * `Err(PeekError::UnknownVersion)`  - If the version is one this build does not read.
 /// * `Err(PeekError::Malformed)`       - If the version, type or length is malformed or cut short.
 pub fn peek_object_header(bytes: &[u8]) -> Result<(ObjectType, usize), PeekError> {
-    peek_header(bytes, true)
+    let (object_type, header_len) = peek_object_header_prefix(bytes)?;
+
+    Ok((object_type, header_len.unwrap_or(bytes.len())))
 }
 
 /// [`peek_object_header`] over the first bytes of an object still arriving. A header is only
-/// known to end once its null has arrived, so until then the prefix reads as malformed.
+/// known to end once its null has arrived, so until then its length is unknown.
 ///
 /// # Returns
+/// * `Ok((ObjectType, Some(usize)))`  - The type and the header length, its null included.
+/// * `Ok((ObjectType, None))`         - The type, with the null still to come: every byte so far is
+///                                      header.
 /// * `Err(PeekError::UnknownVersion)` - As soon as the version is whole, however short the prefix.
-/// * Otherwise as [`peek_object_header`], with a prefix not yet holding the null `Malformed`.
-fn peek_object_header_prefix(prefix: &[u8]) -> Result<(ObjectType, usize), PeekError> {
-    peek_header(prefix, false)
-}
-
-fn peek_header(bytes: &[u8], whole: bool) -> Result<(ObjectType, usize), PeekError> {
+/// * `Err(PeekError::Malformed)`      - If the version, type or length is malformed or cut short.
+fn peek_object_header_prefix(bytes: &[u8]) -> Result<(ObjectType, Option<usize>), PeekError> {
     let (version, version_len) = byte_utils::number_from_vlq_bytes(0, bytes)
         .map_err(|e| PeekError::Malformed(format!("Failed to peek object version: {}", e)))?;
 
@@ -942,11 +943,7 @@ fn peek_header(bytes: &[u8], whole: bool) -> Result<(ObjectType, usize), PeekErr
     // or misplace its payload, and skip checks meant for it.
     let null_at = bytes[after_length.min(bytes.len())..].iter().position(|byte| *byte == globals::BYTE_NULL);
 
-    match null_at {
-        Some(at) => Ok((object_type, after_length + at + 1)),
-        None if whole => Ok((object_type, bytes.len().max(after_length))),
-        None => Err(PeekError::Malformed("The object header's null has not arrived yet.".to_string())),
-    }
+    Ok((object_type, null_at.map(|at| after_length + at + 1)))
 }
 
 /// Enforce what an object's header decides on the way *into* the store. An object whose version
@@ -1188,6 +1185,9 @@ fn stream_to_temp(claimed_hash: &str,
     // ceiling-checked mid-stream. `header_len` becomes `Some` once the header parses.
     let mut object_type: Option<ObjectType> = None;
     let mut header_len: usize = 0;
+    // The header's type is known but its null has not arrived: each block is searched for it, and
+    // counted as header until then, however far the header runs.
+    let mut awaiting_null = false;
     let mut unknown_version = None;
     let mut prefix: Vec<u8> = Vec::new();
     let mut block = vec![0u8; 64 * 1024];
@@ -1207,15 +1207,29 @@ fn stream_to_temp(claimed_hash: &str,
             .map_err(|e| format!("Error while writing a streamed object: {}", e))?;
         read_total += read as u64;
 
-        // Peek the header once (a real header terminates within a handful of bytes; if it has not
-        // parsed within a small prefix the object is not a recognizable chunk, so stop trying and
-        // let the read-side parser enforce the ceiling on anything read back as a chunk).
-        if object_type.is_none() && header_len == 0 {
+        // Peek the header once its version, type and length have arrived, then follow it to its
+        // null, however far that is. If those three have not parsed within a small prefix the
+        // object is not a recognizable chunk, so stop trying and let the read-side parser enforce
+        // the ceiling on anything read back as a chunk.
+        if awaiting_null {
+            match data.iter().position(|byte| *byte == globals::BYTE_NULL) {
+                Some(at) => {
+                    header_len += at + 1;
+                    awaiting_null = false;
+                }
+                None => header_len += data.len(),
+            }
+        } else if object_type.is_none() && header_len == 0 {
             prefix.extend_from_slice(data);
             match peek_object_header_prefix(&prefix) {
-                Ok((peeked_type, peeked_header_len)) => {
+                Ok((peeked_type, Some(peeked_header_len))) => {
                     object_type = Some(peeked_type);
                     header_len = peeked_header_len;
+                }
+                Ok((peeked_type, None)) => {
+                    object_type = Some(peeked_type);
+                    header_len = prefix.len();
+                    awaiting_null = true;
                 }
                 // A whole version is judged at once, however short the prefix: the caller refuses
                 // an object this build could never read, once its hash verifies.
@@ -2155,8 +2169,8 @@ mod tests {
         let unterminated = &padded[..4];
         assert_eq!(peek_object_header(unterminated), Ok((ObjectType::Blob, 4)));
         assert_eq!(peek_object_header(&padded[..3]), Ok((ObjectType::Blob, 3)));
-        assert!(matches!(peek_object_header_prefix(unterminated), Err(PeekError::Malformed(_))));
-        assert_eq!(peek_object_header_prefix(&padded), Ok((ObjectType::Blob, 5)));
+        assert_eq!(peek_object_header_prefix(unterminated), Ok((ObjectType::Blob, None)));
+        assert_eq!(peek_object_header_prefix(&padded), Ok((ObjectType::Blob, Some(5))));
     }
 
     /// A chunk whose padded header arrives over several reads is measured from where its header
@@ -2189,6 +2203,28 @@ mod tests {
         assert_eq!(enforce_header_policy(&hash, &padded), Ok(()), "the buffered store takes it");
         store_object_stream(&hash, &mut Trickle { bytes: &padded, at: 0 }, padded.len() as u64)
             .expect("the streaming store takes it too");
+    }
+
+    /// A chunk whose header runs on past the first read's worth of bytes is still measured from its
+    /// null, so an over-size one is refused streamed as it is buffered.
+    ///
+    /// Revert: give up on a header whose null is not in the first few kilobytes → the streaming
+    /// store takes the over-size chunk.
+    #[test]
+    fn store_object_stream_refuses_an_over_size_chunk_behind_a_long_header() {
+        let _scratch = Scratch::new("stream-long-header-chunk");
+        let chunk = LooseObjectBuilder::build_chunk(&crate::model::chunk::Chunk { content: vec![3u8; chunk_utils::MAX_CHUNK_BYTES + 1] });
+        let null = chunk.content.iter().position(|byte| *byte == globals::BYTE_NULL).unwrap();
+        let mut padded = chunk.content[..null].to_vec();
+        padded.extend_from_slice(&vec![b'X'; 200 * 1024]);
+        padded.extend_from_slice(&chunk.content[null..]);
+        let hash = hash_object_bytes(&padded);
+
+        let err = enforce_header_policy(&hash, &padded).expect_err("the buffered store refuses it");
+        assert!(err.contains("chunk ceiling"), "{}", err);
+        let err = store_object_stream(&hash, &mut padded.as_slice(), padded.len() as u64)
+            .expect_err("the streaming store refuses it too");
+        assert!(err.contains("chunk ceiling"), "{}", err);
     }
 
     /// The pack import check refuses an object of an unknown version, and passes the readable one.
