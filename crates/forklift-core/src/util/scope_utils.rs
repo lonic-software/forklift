@@ -241,7 +241,8 @@ impl PathScope {
     /// no broader prefix holds — a spine path, or a member's folder a prefix runs through
     /// (`a/.gitignore` for the prefix `a/.gitignore/b`). A tree that has a *file* at such a path is
     /// a type change the sparse scope cannot reason about (§3.1) — the caller refuses with
-    /// `scope_path_type_changed`. Inside a broader prefix, a flip is ordinary content.
+    /// `scope_path_type_changed`. Inside a broader prefix, a flip at an ancestor of a nested prefix
+    /// is ordinary content; one at the nested prefix itself still refuses.
     pub fn requires_directory(&self, path: &str) -> bool {
         self.prefixes.iter().any(|prefix| prefix == path
             || (is_strictly_under(prefix, path) && !self.prefixes.iter().any(|broader| is_strictly_under(path, broader))))
