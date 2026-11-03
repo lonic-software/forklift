@@ -553,8 +553,8 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
             Some(PalletAction::List { all, remote: true }) => commands::pallet::list_remote_pallets(all).await,
             Some(PalletAction::Create { name, revision }) =>
                 commands::pallet::create_pallet(&name, revision.as_deref()).await,
-            Some(PalletAction::Delete { name, remote: true, .. }) => commands::pallet::delete_remote_pallet(&name).await,
-            Some(PalletAction::Delete { name, force, remote: false }) => commands::pallet::delete_pallet(&name, force).await,
+            Some(PalletAction::Delete { name, remote: true, at, .. }) => commands::pallet::delete_remote_pallet(&name, at.as_deref()).await,
+            Some(PalletAction::Delete { name, force, remote: false, .. }) => commands::pallet::delete_pallet(&name, force).await,
             Some(PalletAction::Restore { name, remote: true }) => commands::pallet::restore_remote_pallet(&name).await,
             Some(PalletAction::Restore { name, remote: false }) => commands::pallet::restore_pallet(&name),
         },

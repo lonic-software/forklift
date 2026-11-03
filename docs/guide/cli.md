@@ -1242,10 +1242,18 @@ only through a restore or a re-creation from its history. It runs no hooks, so i
 `pallet_deleted` event. With `--json` the delete reports `remote`, `pallet`, `head`, `local_head`
 and `already`, and the restore `pallet`, `head` and `remote`. A delete of a pallet the remote has
 already deleted (as a rerun after a lost answer finds it) reports it done with `already` set, and
-sends nothing. A rerun deletes the pallet at the head the remote then holds, so after a lost answer
-check that head first (`pallet list --remote --json`): the pallet may have moved, or been deleted and
-created again, meanwhile. A serverless remote whose storage could not settle a delete answers with
-an error naming the head the delete was for, and sends you to that listing before deleting again.
+sends nothing. Every outcome names the head: the human `pallet list --remote` shows each live
+pallet's head, a delete reports the head it deleted at, and one that fails says which head it was
+for. A plain rerun deletes the pallet at the head the remote then holds, which after a lost answer
+may be work someone lifted meanwhile; `--at <head>` pins the delete instead. It deletes only if the
+remote holds the pallet at that head, reports it done if the pallet was deleted at that head (as a
+pinned rerun after a lost answer finds it), and otherwise refuses without sending anything:
+`remote_ahead` (exit 28) when the pallet moved, `pallet_deleted_on_remote` (exit 35) when someone
+else deleted it at another head, each naming `pallet list --remote` to look first. An error that leaves the
+delete's fate unknown — a timeout, a lost connection, a `5xx` — names that pinned rerun, and a
+refusal saying the pallet moved since the command read it names the listing, never a bare rerun. A
+serverless remote whose storage could not settle a delete answers with an error naming the head the
+delete was for, and sends you to that listing before deleting again.
 
 A pallet deleted on the remote is not lowered or lifted as if it had never existed.
 `lower <name>` refuses with `pallet_not_found`, saying it was deleted and naming

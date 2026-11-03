@@ -4387,7 +4387,7 @@ fn a_delete_of_unknown_fate_is_settled_by_the_ref() {
     assert!(err.message.contains(&format!("The delete was for \"feature\" at {}.", feature_v2)), "{}", err.message);
     assert!(err.message.contains(&format!("still live at {} when", feature_v2)), "{}", err.message);
     assert!(
-        err.message.ends_with("Check the remote's pallets (\"forklift pallet list --remote --json\") before deleting \"feature\" again."),
+        err.message.ends_with("Check the pallet's head now (\"forklift pallet list --remote\" shows it) before deleting \"feature\" again."),
         "{}",
         err.message
     );
