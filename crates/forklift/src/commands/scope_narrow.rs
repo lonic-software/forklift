@@ -1,14 +1,15 @@
 use serde::Serialize;
 use forklift_core::error::CoreError;
 use forklift_core::util::path_utils::WarehousePath;
-use forklift_core::util::scope_utils::PathScope;
+use forklift_core::util::scope_utils::{PathScope, ScopeClass};
 use forklift_core::util::stocktake_utils::ChangeKind;
 use std::path::Path;
 use forklift_core::util::{inventory_utils, object_utils, office_utils, pallet_utils, scope_utils, stocktake_utils};
 use crate::output::{self, CommandOutput};
 
 /// Handle `scope narrow` (§7.6): shrink this checkout's scope, dropping
-/// subtree path(s) and de-materializing their files. This frees nothing in the shared object
+/// subtree path(s) and de-materializing their files, and the `.gitignore` of every folder above
+/// them that no kept path is under any more. This frees nothing in the shared object
 /// store — the dropped content is ordinary reachable history, not garbage — it only shrinks what
 /// this checkout shows. Bay-local and reversible: widen the bay again with `bay add --scope` on a
 /// fresh checkout, or `scope fetch` the warehouse and re-scope.
@@ -71,16 +72,23 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
         }
     }
 
-    // Refuse before touching anything if a dropped subtree holds uncommitted work: narrow has
-    // no working-directory-preserving path (unlike `shift`, which only ever writes what a target
-    // tree names), so a delete here is unconditional and would otherwise silently destroy staged,
-    // unstaged or untracked content. Every prefix is checked before any is de-materialized, so a
-    // clean prefix earlier in the list is never dropped ahead of a later one that turns out dirty.
-    for prefix in &dropped {
-        ensure_narrow_target_is_clean(prefix).await?;
-    }
-
     let narrowed = PathScope::from_prefixes(keep);
+
+    // What leaves the checkout is every path the current scope holds and the narrowed one does
+    // not: each dropped subtree, and each implicit member the narrowed scope no longer holds (the
+    // `.gitignore` of a folder no kept path is under).
+    let leaving_members: Vec<String> = current.implicit_members().iter()
+        .filter(|member| narrowed.classify(member) != ScopeClass::InScope)
+        .cloned()
+        .collect();
+
+    // Refuse before touching anything if any of it holds uncommitted work: narrow has no
+    // working-directory-preserving path (unlike `shift`, which only ever writes what a target
+    // tree names), so a delete here is unconditional and would otherwise silently destroy staged,
+    // unstaged or untracked content. All of it is checked before any is de-materialized, so a
+    // clean prefix earlier in the list is never dropped ahead of a later one that turns out dirty.
+    ensure_narrow_targets_are_clean(&current, &narrowed, &dropped, &leaving_members).await?;
+
     scope_utils::set_bay_scope(&narrowed)?;
 
     // De-materialize each dropped subtree: drop its staged shards (so it stops being reported),
@@ -88,6 +96,17 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
     for prefix in &dropped {
         inventory_utils::remove_inventories_under(prefix)?;
         remove_working_subtree(prefix)?;
+    }
+
+    // And each leaving member with its staged entry: a staged entry left behind would sit in the
+    // staged tree outside the scope, which a scoped stack refuses. Its folder is out of the narrowed
+    // scope whole (a kept path under it would keep the member), so every shard at or under the
+    // folder leaves too. The folder itself stays, with whatever else is in it.
+    for member in &leaving_members {
+        let folder = member.rsplit_once('/').map(|(folder, _)| folder).unwrap_or("");
+        debug_assert!(!folder.is_empty() && narrowed.classify(folder) == ScopeClass::OutOfScope, "{}", member);
+        inventory_utils::remove_inventories_under(folder)?;
+        remove_working_path(member)?;
     }
 
     output::emit(&ScopeNarrowReport {
@@ -98,23 +117,42 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
-/// Refuse to narrow away `prefix` while it holds uncommitted work: staged changes, unstaged
-/// changes to tracked files, or untracked files anywhere under it. Matches the codebase's own
-/// precedent (`shift` refuses rather than overwrite untracked content) — narrow's delete is
-/// unconditional once it decides to act, so the decision itself must be conservative.
-async fn ensure_narrow_target_is_clean(prefix: &str) -> Result<(), CoreError> {
+/// Refuse to narrow while what leaves the checkout holds uncommitted work: staged changes,
+/// unstaged changes to tracked files, or untracked files under a dropped prefix or at a leaving
+/// member. Matches the codebase's own precedent (`shift` refuses rather than overwrite untracked
+/// content) — narrow's delete is unconditional once it decides to act, so the decision itself must
+/// be conservative.
+///
+/// # Arguments
+/// * `current`         - The checkout's scope before the narrow.
+/// * `narrowed`        - Its scope after.
+/// * `dropped`         - The prefixes dropped, each refused by name.
+/// * `leaving_members` - The implicit members leaving with them, each refused by name.
+async fn ensure_narrow_targets_are_clean(current: &PathScope,
+                                         narrowed: &PathScope,
+                                         dropped: &[String],
+                                         leaving_members: &[String]) -> Result<(), CoreError> {
     // Before the change walks, which an ignore rule can blind to another working tree's root.
-    if let Some(holder) = find_nested_working_tree(Path::new(prefix)).map_err(CoreError::from)? {
-        return Err(scope_utils::narrow_unclean_refusal(
-            prefix,
-            &format!("another working tree at \"{}\" (it holds a metadata folder)", holder),
-        ));
+    for prefix in dropped.iter().chain(leaving_members) {
+        if let Some(holder) = find_nested_working_tree(Path::new(prefix)).map_err(CoreError::from)? {
+            return Err(scope_utils::narrow_unclean_refusal(
+                prefix,
+                &format!("another working tree at \"{}\" (it holds a metadata folder)", holder),
+            ));
+        }
     }
 
-    // A pure path test, not a one-prefix scope's classifier: every scope also holds the root
-    // ignore file in scope, and a change to that file is not a change inside the subtree being
-    // narrowed. An ancestor of `prefix` is excluded for the same reason.
-    let under = |path: &str| scope_utils::is_at_or_under(path, prefix);
+    // Through both classifiers, not a path test against the prefixes: an implicit member the
+    // narrowed scope still holds (the root ignore files, a `.gitignore` above a kept path) stays,
+    // so a change to it blocks nothing, while one it no longer holds leaves with the prefixes.
+    let leaving = |path: &str| current.classify(path) == ScopeClass::InScope
+        && narrowed.classify(path) != ScopeClass::InScope;
+    // The path a refusal names: the dropped prefix holding the change, or the member itself.
+    let named = |path: &str| dropped.iter().find(|prefix| scope_utils::is_at_or_under(path, prefix))
+        .or_else(|| leaving_members.iter().find(|member| scope_utils::is_at_or_under(path, member)))
+        .map(String::as_str)
+        .unwrap_or(path)
+        .to_string();
 
     // The tree this bay holds: its base, not the pallet's ref, which another bay can move.
     let position = pallet_utils::read_position()?;
@@ -123,30 +161,28 @@ async fn ensure_narrow_target_is_clean(prefix: &str) -> Result<(), CoreError> {
         None => None,
     };
 
-    let staged_dirty = stocktake_utils::collect_staged_changes(head_tree.as_deref()).await?
-        .into_iter()
-        .any(|change| under(&change.path));
-
+    let staged = stocktake_utils::collect_staged_changes(head_tree.as_deref()).await?;
     let unstaged = stocktake_utils::collect_unstaged_changes().await?;
 
-    let unstaged_tracked_dirty = unstaged.iter()
-        .any(|change| change.kind != ChangeKind::Untracked
-            && under(&change.path));
+    let tracked_dirty = staged.iter()
+        .chain(unstaged.iter().filter(|change| change.kind != ChangeKind::Untracked))
+        .find(|change| leaving(&change.path));
 
-    if staged_dirty || unstaged_tracked_dirty {
-        return Err(scope_utils::narrow_unclean_refusal(prefix, "uncommitted tracked changes"));
+    if let Some(change) = tracked_dirty {
+        return Err(scope_utils::narrow_unclean_refusal(&named(&change.path), "uncommitted tracked changes"));
     }
 
     let untracked: Vec<&str> = unstaged.iter()
-        .filter(|change| change.kind == ChangeKind::Untracked
-            && under(&change.path))
+        .filter(|change| change.kind == ChangeKind::Untracked && leaving(&change.path))
         .map(|change| change.path.as_str())
         .collect();
 
-    if !untracked.is_empty() {
+    if let Some(first) = untracked.first() {
+        let blocker = named(first);
+        let held: Vec<&str> = untracked.iter().copied().filter(|path| named(path) == blocker).collect();
         return Err(scope_utils::narrow_unclean_refusal(
-            prefix,
-            &format!("untracked file(s) ({})", untracked.join(", ")),
+            &blocker,
+            &format!("untracked file(s) ({})", held.join(", ")),
         ));
     }
 
@@ -204,6 +240,18 @@ fn remove_working_subtree(prefix: &str) -> Result<(), String> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("Error while de-materializing \"{}\": {}", prefix, e)),
+    }
+}
+
+/// Remove a leaving member from the working tree (relative to the checkout root the process
+/// entered): its file, or the whole folder when a folder has its name, which is in scope whole. A
+/// member already gone is the desired outcome.
+fn remove_working_path(path: &str) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => remove_working_subtree(path),
+        Ok(_) => std::fs::remove_file(path).map_err(|e| format!("Error while de-materializing \"{}\": {}", path, e)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("Error while de-materializing \"{}\": {}", path, e)),
     }
 }
 
