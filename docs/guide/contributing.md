@@ -312,7 +312,7 @@ tracked-metadata formats each have a spec in `format/`. When you change one:
 - A new file or folder name is a `FILE_NAME_*`, `FOLDER_NAME_*`, `FILE_SUFFIX_*` or
   `FILE_EXTENSION_*` constant with a row in the census of
   [the format contract](../format/WAREHOUSE_FORMAT.md#the-census); a test fails
-  until it has one. A changed record or object version fails the frozen
+  until it has one. A changed record or object version, or a renamed record kind, fails the frozen
   `versions` snapshot until `WAREHOUSE_FORMAT` is bumped, and a bump needs the new
   format's fixtures made with `freeze_the_current_format_fixtures` (and, for the
   AWS head, `freeze_the_current_aws_format_fixture` after an `AWS_FORMAT` bump).

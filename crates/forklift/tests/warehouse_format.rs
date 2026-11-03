@@ -13,9 +13,12 @@ use common::{forklift_command, repository_root, server_binary, test_command};
 /// The prefixes of a constant that names a file or folder.
 const NAME_PREFIXES: [&str; 4] = ["FILE_NAME", "FOLDER_NAME", "FILE_SUFFIX", "FILE_EXTENSION"];
 
-/// Version constants that are not a version something is written at: the bound past which a header
-/// is read as damage rather than as a newer version.
-const NOT_VERSIONS: [&str; 2] = ["pack_utils::PLAUSIBLE_VERSION_LIMIT", "signature_table::PLAUSIBLE_VERSION_LIMIT"];
+/// Constants the version scan would take that are not a warehouse format's: the bound past which a
+/// header is read as damage rather than as a newer version, and the key file's magic, which is
+/// home-folder state outside the warehouse format that no upgrade touches.
+const NOT_VERSIONS: [&str; 3] = [
+    "pack_utils::PLAUSIBLE_VERSION_LIMIT", "signature_table::PLAUSIBLE_VERSION_LIMIT", "sign_utils::KEY_FILE_MAGIC",
+];
 
 /// The modes every format freezes a fixture of.
 const MODES: [&str; 3] = ["full", "sparse", "cache"];
@@ -130,9 +133,11 @@ fn unique_keys(keys: impl IntoIterator<Item = String>) -> BTreeSet<String> {
     set
 }
 
-/// The record and object versions in the source, by `module::NAME`, each as its value is written:
-/// integer constants named for a version or format, and string constants naming a schema, magic or
-/// header that carry a version number in their text. Protocol versions are not the warehouse's.
+/// The record and object versions in the source, and the names their headers carry, by
+/// `module::NAME`, each as its value is written: integer constants named for a version or format;
+/// string constants naming a schema, magic or header that carry a version number in their text; and
+/// the record kinds and format names a header opens with, since renaming one makes every file
+/// already written read as having no header. Protocol versions are not the warehouse's.
 fn source_versions() -> BTreeMap<String, String> {
     let versions: Vec<(String, String)> = source_constants(&["forklift-core"]).into_iter()
         .filter(|(key, _)| !NOT_VERSIONS.contains(&key.as_str()))
@@ -147,8 +152,10 @@ fn source_versions() -> BTreeMap<String, String> {
                 && ["SCHEMA", "MAGIC", "HEADER", "VERSION"].iter().any(|word| name.contains(word))
                 && !name.contains("PROTOCOL")
                 && value.chars().any(|c| c.is_ascii_digit());
+            let header_name = kind == "&str"
+                && (name.ends_with("RECORD") || (name.contains("FORMAT") && !name.starts_with("FILE_NAME")));
 
-            (integer || text).then_some((key, value))
+            (integer || text || header_name).then_some((key, value))
         })
         .collect();
 

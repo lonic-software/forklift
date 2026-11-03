@@ -243,9 +243,10 @@ another place says so after its paths.
 
 The versions of what this format writes are frozen with it, in
 `crates/forklift/tests/fixtures/format-<N>/versions`: each record and object version constant and its
-value, and each string that carries a version in its text (the bundle header, the key file's magic, the
-schemas of signed meta cells). Protocol versions are not frozen here: they are the wire's, not the
-warehouse's. A test fails when the source's set differs from the current format's in any way. A changed
+value, each string that carries a version in its text (the bundle header, the schemas of signed meta
+cells), and each record kind or format name a header opens with, since renaming one makes every file
+already written read as having none. Protocol versions are not frozen here: they are the wire's, not the
+warehouse's; nor is the key file's magic, which is home-folder state. A test fails when the source's set differs from the current format's in any way. A changed
 version is a format break, so it ships everything above, and a new snapshot beside the old ones,
 which never change.
 
