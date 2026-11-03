@@ -138,6 +138,13 @@ jobs:
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
 
+      # The tree is formatted by hand and rustfmt.toml switches rustfmt off; bin/fmt-guard fails if
+      # that guard is missing, or if a second rustfmt config would override it. It needs no build,
+      # so it runs first, and its answer does not depend on the OS, so one leg runs it.
+      - name: Formatting guard
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: ./bin/fmt-guard
+
       # One OS's shares build under the same cache key, and a key is saved once. The last share
       # saves it: it is the one that also builds for the doc-tests and Clippy, so the cache holds
       # their artifacts too, and no two shares race to upload the same files.
@@ -150,6 +157,7 @@ jobs:
           tool: cargo-nextest@0.9.146
 
       - name: Build
+        id: build
         run: cargo build --verbose
 
       # nextest runs every test in its own process and the test binaries in parallel, so one
@@ -170,24 +178,19 @@ jobs:
             --partition "count:${{ matrix.partition }}/${{ matrix.partitions }}"
 
       # What is not split runs once per OS, on its last share, reusing that share's build: the
-      # doc-tests (nextest does not run them), Clippy and the guards. Not in a job of its own, which
-      # would add a macOS job to wait for a runner (see the note on macOS above).
-      - name: Formatting guard
-        # The tree is formatted by hand and rustfmt.toml switches rustfmt off; bin/fmt-guard fails
-        # if that guard is missing, or if a second rustfmt config would override it. Its answer
-        # does not depend on the OS, so one leg runs it.
-        if: ${{ !cancelled() && matrix.os == 'ubuntu-latest' }}
-        run: ./bin/fmt-guard
-
+      # doc-tests (nextest does not run them), Clippy and the split-debuginfo guard. Not in a job of
+      # its own, which would add a macOS job to wait for a runner (see the note on macOS above).
+      # The doc-tests and Clippy run after failed tests, but not after a failed build, which they
+      # would only repeat.
       - name: Doc-tests
-        if: ${{ !cancelled() && matrix.partition == matrix.partitions }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.partition == matrix.partitions }}
         run: cargo test --workspace --doc --no-fail-fast
 
       - name: Clippy
         # Style-level lint debt is tracked separately; deny only warnings that indicate
         # correctness issues once the doc-comment cleanup lands. For now, report-only.
         # --all-targets so clippy.toml's bans reach test code too.
-        if: ${{ !cancelled() && matrix.partition == matrix.partitions }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.partition == matrix.partitions }}
         run: cargo clippy --workspace --all-targets
 
       # CI builds with the config's rustflags switched off (see RUSTFLAGS above), so this checks
@@ -217,7 +220,8 @@ jobs:
 
   # The one check to gate a merge on. It needs every job above and passes only when each one
   # passed, or was skipped for a reason that is not a failure: `changes` is skipped on pushes, and
-  # the test jobs are skipped when `changes` succeeded and found a docs-only change. A
+  # the test jobs are skipped when `changes` succeeded and found a docs-only change. A failed
+  # `changes` is accepted when the tests ran and passed, since that is what its failure asks for. A
   # matrix job reports one check per entry, and a skipped one a single check under its unexpanded
   # name, so gating on this name stays the same however the shares are cut.
   ci-passed:
@@ -240,7 +244,7 @@ jobs:
           docs_only=false
           [ "$CHANGES" = success ] && [ "$CODE" = false ] && docs_only=true
           ok=true
-          case "$CHANGES" in success|skipped) ;; *) ok=false ;; esac
+          case "$CHANGES" in success|skipped|failure) ;; *) ok=false ;; esac
           [ "$DOCS" = success ] || ok=false
           if ! { [ "$TEST" = success ] || { [ "$TEST" = skipped ] && [ "$docs_only" = true ]; }; }; then
             ok=false
@@ -262,9 +266,13 @@ jobs:
           import re, sys
           shares = {}
           for name in open(sys.argv[1]).read().splitlines():
+              if not name.startswith("test ("):
+                  continue
+              # A test job whose name this cannot read fails the check rather than drop out of it.
               m = re.fullmatch(r"test \((\S+?)(?:, (\d+)/(\d+))?\)", name)
-              if m:
-                  shares.setdefault(m[1], []).append((int(m[2] or 1), int(m[3] or 1)))
+              if not m:
+                  sys.exit(f"cannot read the share of test job {name!r}")
+              shares.setdefault(m[1], []).append((int(m[2] or 1), int(m[3] or 1)))
           print(shares)
           bad = [os for os, got in shares.items()
                  if sorted(got) != [(k, got[0][1]) for k in range(1, got[0][1] + 1)]]

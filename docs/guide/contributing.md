@@ -94,15 +94,16 @@ Notes:
   slots each, which only pays at that thread count).
 - CI (`.github/workflows/ci.yml`) splits the Windows tests across four runners,
   each running its share with nextest's `--partition count:K/N`; Linux and macOS
-  run theirs in one job each. The last share of each OS also runs the doc-tests,
-  Clippy and the guards. The `ci passed` check is green only when every share and
-  the generated-docs check passed, or the run was docs-only; gate a merge on it,
-  not on the individual shares. To rerun the share that failed, say
-  `test (windows-latest, 3/4)`, locally:
-  `cargo nextest run --workspace --profile ci --partition count:3/4`. Which tests
-  land in a share depends only on the list of tests, so `cargo nextest list
-  --partition count:3/4` shows it on any OS, apart from tests that only exist on
-  some platforms.
+  run theirs in one job each. The last share of each OS also runs the doc-tests
+  and Clippy; the formatting guard runs on Linux and the split-debuginfo guard on
+  macOS. The `ci passed` check is green only when every share and the
+  generated-docs check passed, or the run was docs-only; gate a merge on it, not
+  on the individual shares. To rerun a failed share, say
+  `test (windows-latest, 3/4)`, run its failing tests by name, or on Windows the
+  whole share: `cargo nextest run --workspace --profile ci --partition count:3/4`.
+  The share holds every fourth test of each test binary, so on another OS a test
+  that exists only on some platforms shifts the rest of its binary into other
+  shares, and `--partition count:3/4` there runs a different set.
 - On macOS, `.cargo/config.toml` builds with `-Csplit-debuginfo=packed`: debuginfo
   goes into a `.dSYM` beside each binary instead of object files left in
   `target/debug/deps`. Under the default, every incremental rebuild leaves fresh
