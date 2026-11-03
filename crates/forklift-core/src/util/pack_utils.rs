@@ -7058,7 +7058,7 @@ pub(crate) mod tests {
         let staging = temp.join("staging");
         std::fs::create_dir_all(&staging).unwrap();
         let mut builder = TransportPackBuilder::new(&staging).unwrap();
-        let content = b"import-transport-taint content".to_vec();
+        let content = crate::util::object_utils::blob_bytes(b"import-transport-taint content");
         let hash = blake3::hash(&content).to_hex().to_string();
         builder.append_full(&hash, &content).unwrap();
         let artifacts = builder.finish().unwrap();
@@ -9404,7 +9404,7 @@ pub(crate) mod tests {
     /// Contents for `count` distinct objects, with their raw and hex hashes.
     fn numbered_objects(tag: &str, count: usize) -> Vec<(Vec<u8>, [u8; HASH_LEN], String)> {
         (0..count).map(|i| {
-            let content = format!("{} object {}", tag, i).into_bytes();
+            let content = crate::util::object_utils::blob_bytes(format!("{} object {}", tag, i).as_bytes());
             let hash = *blake3::hash(&content).as_bytes();
             (content, hash, sign_utils::to_hex(&hash))
         }).collect()
@@ -9422,7 +9422,7 @@ pub(crate) mod tests {
 
     /// Content whose hash falls in `bucket` of `index`.
     fn content_in_bucket(index: &CheckedIndex<Vec<u8>>, bucket: usize, tag: &str) -> (Vec<u8>, String) {
-        (0..).map(|i| format!("{} candidate {}", tag, i).into_bytes())
+        (0..).map(|i| crate::util::object_utils::blob_bytes(format!("{} candidate {}", tag, i).as_bytes()))
             .find(|content| index.bucket_of_hash(blake3::hash(content).as_bytes()) == bucket)
             .map(|content| { let hash = blake3::hash(&content).to_hex().to_string(); (content, hash) })
             .unwrap()

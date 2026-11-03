@@ -698,6 +698,13 @@ pub fn get_blob_for_file(file_name: &str,
     )
 }
 
+/// The loose bytes of a blob holding `content`: an object the store accepts, for a test that needs
+/// stored bytes and not merely hashed ones.
+#[cfg(test)]
+pub(crate) fn blob_bytes(content: &[u8]) -> Vec<u8> {
+    LooseObjectBuilder::build_blob(&Blob { content: content.to_vec() }).content
+}
+
 /// The Blake3 hex hash of raw (uncompressed) object bytes — the object's identity.
 ///
 /// # Arguments

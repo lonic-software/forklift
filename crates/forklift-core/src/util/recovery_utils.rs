@@ -4325,7 +4325,7 @@ mod tests {
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
         crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
-        std::fs::write(bay_b_dir.join("parked"), format!("{}\n", target_hash)).unwrap();
+        std::fs::write(bay_b_dir.join("parked"), crate::util::park_utils::parked_bytes(&[&target_hash])).unwrap();
 
         let targets: BTreeSet<String> = [target_hash.clone()].into_iter().collect();
         let referenced = closure_references_any(&targets).unwrap().hashes;
@@ -4362,7 +4362,7 @@ mod tests {
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
         crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
-        std::fs::write(bay_b_dir.join("parked"), b"not-a-valid-hash\n").unwrap();
+        std::fs::write(bay_b_dir.join("parked"), crate::util::park_utils::parked_bytes(&["not-a-valid-hash"])).unwrap();
 
         let targets: BTreeSet<String> = ["a".repeat(64)].into_iter().collect();
         let walk = closure_references_any(&targets)
@@ -6084,7 +6084,7 @@ mod tests {
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
-        let good_content = b"the genuinely correct content for this object".to_vec();
+        let good_content = crate::util::object_utils::blob_bytes(b"the genuinely correct content for this object");
         let hash = object_utils::hash_object_bytes(&good_content);
         let relative = write_corrupt_loose_object(&forklift, &hash);
 
@@ -6135,8 +6135,8 @@ mod tests {
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
-        let good_a = b"the first genuinely correct object's content".to_vec();
-        let good_b = b"the second genuinely correct object's content".to_vec();
+        let good_a = crate::util::object_utils::blob_bytes(b"the first genuinely correct object's content");
+        let good_b = crate::util::object_utils::blob_bytes(b"the second genuinely correct object's content");
         let hash_a = object_utils::hash_object_bytes(&good_a);
         let hash_b = object_utils::hash_object_bytes(&good_b);
         let relative_a = write_corrupt_loose_object(&forklift, &hash_a);
@@ -6204,7 +6204,7 @@ mod tests {
         crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
         let forklift = forklift_root();
 
-        let good_served = b"the object the remote actually has".to_vec();
+        let good_served = crate::util::object_utils::blob_bytes(b"the object the remote actually has");
         let hash_served = object_utils::hash_object_bytes(&good_served);
         let relative_served = write_corrupt_loose_object(&forklift, &hash_served);
 
@@ -6957,7 +6957,7 @@ mod tests {
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
         crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
-        std::fs::write(bay_b_dir.join("parked"), b"not-a-valid-hash\n").unwrap();
+        std::fs::write(bay_b_dir.join("parked"), crate::util::park_utils::parked_bytes(&["not-a-valid-hash"])).unwrap();
 
         // A genuinely vanished object recorded as tainted, unrelated to bay "b"'s own state — so
         // this run actually drives the closure walk (and so `collect_walk_roots`'s tolerance)
@@ -7036,7 +7036,7 @@ mod tests {
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
         crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
-        std::fs::write(bay_b_dir.join("parked"), format!("{}\nnot-a-valid-hash\n", vanished_hash)).unwrap();
+        std::fs::write(bay_b_dir.join("parked"), crate::util::park_utils::parked_bytes(&[vanished_hash.as_str(), "not-a-valid-hash"])).unwrap();
 
         let vanished_path = loose_remainder_path(&forklift, &vanished_hash).unwrap();
         plant_complete_taint(&forklift, &[vanished_path.to_str().unwrap()]);
@@ -7137,7 +7137,7 @@ mod tests {
         let bay_b_dir = bay_utils::bay_state_dir("b");
         std::fs::create_dir_all(&bay_b_dir).unwrap();
         crate::util::pallet_utils::write_position_in(&bay_b_dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
-        std::fs::write(bay_b_dir.join("parked"), b"not-a-valid-hash\n").unwrap();
+        std::fs::write(bay_b_dir.join("parked"), crate::util::park_utils::parked_bytes(&["not-a-valid-hash"])).unwrap();
 
         plant_torn_taint(&forklift, &[]);
 

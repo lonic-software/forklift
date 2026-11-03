@@ -1572,7 +1572,7 @@ mod tests {
         let dir = crate::util::bay_utils::bay_state_dir(bay);
         std::fs::create_dir_all(&dir).unwrap();
         crate::util::pallet_utils::write_position_in(&dir, &crate::util::pallet_utils::BayPosition::new("main", None)).unwrap();
-        std::fs::write(dir.join("parked"), format!("{}\n", parcel)).unwrap();
+        std::fs::write(dir.join("parked"), crate::util::park_utils::parked_bytes(&[&parcel])).unwrap();
         parcel
     }
 

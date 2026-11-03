@@ -39,11 +39,13 @@ one, the way out. Every writer replaces its file atomically, so a crash never le
 ## Files
 | File | Kind | Entries |
 |------|------|---------|
+| `cherry-pick` (bay-local) | `cherry-pick` | The parcel being picked, the head and then the pallet it is applied to, then the description the completing `stack` defaults to, when there is one. |
 | `consolidation` (bay-local) | `consolidation` | The head parcel hash of the pallet being consolidated in, then its name. |
 | `consolidation-skeleton` (bay-local) | `consolidation-skeleton` | One out-of-scope entry of a scoped merge per line: `S <code> <hash> <path>` or `D <path>`. The whole line is the escaped entry. |
 | `inventory/incomplete-load` (bay-local) | `marker` | The warehouse path key of each load root left incomplete; the root is the empty entry. |
 | `inventory/metadata` (bay-local) | `inventory-metadata` | The warehouse path key of every directory with an inventory shard; the root is `./`. |
 | `redirect` (in a bay's own `.forklift` folder) | `bay` | The warehouse root, then the bay's name. Its presence is what makes the folder a bay's rather than a warehouse's; its header is how reading one refuses a stray file instead of misreading it as a bay. |
+| `parked` (bay-local) | `parked` | One parked parcel hash per entry, the most recently parked last. |
 | `path` (in a bay's state folder) | `bay-path` | The bay's working directory. |
 | `position` (bay-local) | `position` | The current pallet's name, then the bay's base: the parcel its files stand on, empty while the pallet is unborn. See [pallet refs](PALLET_REFS.md). |
 | `scope` (bay-local), `.forklift/config/fetch-scope` | `scope` | See [the scope file format](SCOPE_FILE_FORMAT.md), which adds an empty-file rule of its own and says which of these files must exist. |
@@ -62,5 +64,4 @@ read is not refused but counts as torn, which makes the next recovery check ever
 ## Not state records
 Some other line-per-entry files keep formats of their own, because no entry of theirs can hold
 a line break:
-- **`parked`** (bay-local) lists object hashes.
 - **Pallet refs** hold a hash; pallet and tag names are validated and cannot hold a line break.
