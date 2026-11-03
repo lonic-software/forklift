@@ -1306,6 +1306,10 @@ mod tests {
         dir
     }
 
+    fn list_names_for_test(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect()
+    }
+
     fn prepare_at(root: &Path) -> Result<Vec<String>, String> {
         let _scope = globals::StorageRootScope::enter(root);
         prepare_warehouse(PrepareMode::Full)
@@ -1649,7 +1653,10 @@ mod tests {
 
             let error = prepare_at(&root).unwrap_err();
             assert!(error.contains(expected), "{}", error);
-            assert_eq!(std::fs::read_dir(&forklift).unwrap().count(), 1, "{:?}", marker);
+            // The lease's sidecar is the only thing it may make: every format shares it.
+            let mut left = list_names_for_test(&forklift);
+            left.retain(|name| name != lock_utils::FILE_NAME_FORMAT_LOCK);
+            assert_eq!(left, [FILE_NAME_WAREHOUSE_MARKER], "{:?}", marker);
 
             std::fs::remove_dir_all(&root).ok();
         }
