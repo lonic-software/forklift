@@ -1,5 +1,6 @@
 //! What holds the AWS head's format still: the DynamoDB items each format writes, frozen per
 //! [`AWS_FORMAT`] on the memory fake (docs/format/WAREHOUSE_FORMAT.md, "The fixtures").
+//! `aws_integration.rs` checks that DynamoDB stores the same items.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -7,19 +8,21 @@ use std::time::Duration;
 
 use forklift_aws_lambda::format::{gate, upgrade, UpgradeOptions, AWS_FORMAT, CHAIN};
 use forklift_aws_lambda::memory::MemoryRefStore;
-use forklift_aws_lambda::store::{
-    CasOutcome, ExpectedHead, FormatFence, OfficePrecondition, RefHead, RefStore, TrustOutcome,
-};
+use forklift_aws_lambda::store::{FormatFence, RefHead, RefStore};
 use forklift_core::model::remote::TrustAnchorDto;
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::pallet_utils::PalletNamespace;
 
-fn fixtures_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
-}
+#[path = "support/aws_items.rs"]
+mod aws_items;
 
-fn items_path(format: u32) -> PathBuf {
-    fixtures_root().join(format!("aws-format-{}", format)).join("items")
+use aws_items::{fixtures_root, frozen_items, hash, items_path, populate, read_items};
+
+/// The fixture warehouse, on the memory store.
+fn populated() -> MemoryRefStore {
+    let refs = MemoryRefStore::new();
+    populate(&refs);
+    refs
 }
 
 /// Each `aws-format-<N>` folder of fixtures, by `N`.
@@ -33,64 +36,12 @@ fn fixture_formats() -> BTreeMap<u32, PathBuf> {
         .collect()
 }
 
-/// The items a fixture file lists, one per line: sort key, attribute and value, tab-separated.
-fn read_items(path: &PathBuf) -> Vec<(String, String, String)> {
-    std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("no AWS fixture at {}: {}", path.display(), e))
-        .lines()
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(|line| {
-            let mut fields = line.splitn(3, '\t');
-            let mut field = || fields.next().unwrap_or_else(|| panic!("an item line has three fields: {}", line)).to_string();
-            (field(), field(), field())
-        })
-        .collect()
-}
-
 fn write_items(items: &[(String, String, String)]) -> String {
     let mut text = format!("# The DynamoDB items AWS format {} writes. Frozen: never edit this file.\n", AWS_FORMAT);
     for (entity, attribute, value) in items {
         text.push_str(&format!("{}\t{}\t{}\n", entity, attribute, value));
     }
     text
-}
-
-fn hash(digit: char) -> String {
-    digit.to_string().repeat(64)
-}
-
-/// A warehouse holding every kind of item: the format, a live pallet, a deleted one, the office
-/// pallet and the trust anchor, each written through the store's own write paths.
-fn populate() -> MemoryRefStore {
-    let refs = MemoryRefStore::new();
-    let fence = || gate(&refs).expect("the fixture warehouse is served");
-    let set = |namespace, name, new: &str| {
-        let outcome = refs.compare_and_set_head(
-            namespace, name, ExpectedHead::Unborn, new, OfficePrecondition::NotConsumed, None, &fence(), "fixture",
-        ).unwrap();
-        assert!(matches!(outcome, CasOutcome::Committed), "{:?}", outcome);
-    };
-
-    set(PalletNamespace::User, "main", &hash('1'));
-    set(PalletNamespace::User, "gone", &hash('2'));
-    set(PalletNamespace::Meta, OFFICE_PALLET_NAME, &hash('3'));
-
-    let deleted = refs.delete_head(
-        PalletNamespace::User, "gone", &hash('2'), OfficePrecondition::NotConsumed, None, &fence(), "fixture",
-    ).unwrap();
-    assert!(matches!(deleted, CasOutcome::Committed), "{:?}", deleted);
-
-    let anchor = TrustAnchorDto {
-        genesis: hash('4'),
-        enabled_at: 1_780_000_000,
-        boundary: vec![hash('5')],
-        prior_genesis: Some(hash('6')),
-        adopts: Some(hash('7')),
-    };
-    let trust = refs.put_trust_if_absent(&anchor.to_anchor(), &fence(), "fixture").unwrap();
-    assert!(matches!(trust, TrustOutcome::Established), "{:?}", trust);
-
-    refs
 }
 
 /// This build writes exactly the items its format's fixture froze, so no item, attribute, sort key,
@@ -100,8 +51,8 @@ fn populate() -> MemoryRefStore {
 /// assertion shows the item.
 #[test]
 fn this_build_writes_the_frozen_items() {
-    let frozen = read_items(&items_path(AWS_FORMAT));
-    let written = populate().items();
+    let frozen = frozen_items();
+    let written = populated().items();
 
     assert_eq!(written, frozen,
         "the items this build writes differ from AWS format {}'s, which never change. A changed item is a \
@@ -113,7 +64,7 @@ fn this_build_writes_the_frozen_items() {
 /// Revert: make the gate refuse its own state, or the anchor fail to decode → the assertion.
 #[test]
 fn this_build_serves_the_frozen_items() {
-    let refs = MemoryRefStore::from_items(&read_items(&items_path(AWS_FORMAT))).unwrap();
+    let refs = MemoryRefStore::from_items(&frozen_items()).unwrap();
     assert_eq!(gate(&refs).unwrap(), FormatFence::At(AWS_FORMAT.to_string()));
 
     assert_eq!(refs.get_head(PalletNamespace::User, "main").unwrap(), RefHead::Live(hash('1')));
@@ -154,5 +105,5 @@ fn freeze_the_current_aws_format_fixture() {
     assert!(!path.exists(), "{} is already frozen", path.display());
 
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, write_items(&populate().items())).unwrap();
+    std::fs::write(&path, write_items(&populated().items())).unwrap();
 }
