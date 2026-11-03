@@ -329,7 +329,10 @@ pub fn report_error(error: &ForkliftError) {
     match mode() {
         // A message can quote a record or a remote's answer, so the human copy is made inert
         // here, at the one place every error is printed; the JSON body stays exact.
-        OutputMode::Human => eprintln!("{}", forklift_core::error::sanitize_lines(&error.message)),
+        OutputMode::Human => eprintln!(
+            "{}",
+            forklift_core::error::human_failure_text(&error.message, error.next_step.as_deref())
+        ),
         OutputMode::Json => print_document::<()>(None, Some(ErrorBody {
             code: error.code.as_str(),
             message: &error.message,

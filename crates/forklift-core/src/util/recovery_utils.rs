@@ -486,10 +486,8 @@ fn pack_health_warning_lines() -> Result<Vec<String>, String> {
 /// constructors). Reuses [`CoreError::refusal`] to re-sanitize the assembled message rather than
 /// hand-rolling that guarantee a second time — idempotent on the already-clean parts.
 ///
-/// Both output modes actually read this from `message`, not `next_step`: `forklift`'s human-mode
-/// error report (`output::report_error`) prints only `error.message`, never `next_step` — so text
-/// meant to reach a human operator (as opposed to `next_step`'s narrower "what a machine-readable
-/// `--json` consumer surfaces as its own field" role) has to live in `message` to be seen at all.
+/// The warnings go in `message`, not `next_step`: they describe the store, and `next_step` is the
+/// refusal's own recovery, which a head prints under its label and a `--json` consumer follows.
 fn with_pack_warnings(error: CoreError, pack_warnings: &[String]) -> CoreError {
     if pack_warnings.is_empty() {
         return error;

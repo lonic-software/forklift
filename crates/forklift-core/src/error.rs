@@ -396,7 +396,8 @@ impl CoreError {
 
 impl fmt::Display for CoreError {
     /// Renders the human message only — a `Refusal` shows its `message` (no code, no next step, no
-    /// frame), an `Other` shows its string. This is byte-for-byte what a head prints for a failure.
+    /// frame), an `Other` shows its string. A head prints a failure through
+    /// [`human_failure_text`], which adds the next step on a line of its own.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CoreError::Refusal { message, .. } => f.write_str(message),
@@ -465,8 +466,8 @@ impl From<CoreError> for String {
 /// Append `extra` prose to an error's human-visible message, without corrupting a framed refusal
 /// the way a naive `format!("{} {}", error, extra)` would: [`deframe`] takes the frame's *third*
 /// field to end-of-string, so text appended to the raw string lands in `next_step`, not the
-/// message — and a head's human-mode renderer prints `message` only (`next_step` is JSON-only), so
-/// the appended note would be silently invisible to a human operator. This re-lifts `error`
+/// message — where it would be printed under the "Next step" label and returned to a `--json`
+/// consumer as the recovery, which a note about the failure is not. This re-lifts `error`
 /// through [`CoreError::from`] first, appends to whichever field is actually the rendered message,
 /// then lowers back to `String` (reframing a `Refusal`) — built entirely from the existing public
 /// `CoreError` API, no new framing primitive. A plain (unframed) `error` round-trips as
@@ -588,6 +589,23 @@ pub fn sanitize(text: &str) -> String {
 /// body); a render that indents or prefixes each line splits with [`str::lines`] itself.
 pub fn sanitize_lines(text: &str) -> String {
     text.lines().map(sanitize).collect::<Vec<_>>().join("\n")
+}
+
+/// The label [`human_failure_text`] puts before a next step. A next step is often a bare command
+/// (`forklift lower`), and printed unlabelled under an error it reads as the command that failed.
+pub const NEXT_STEP_LABEL: &str = "Next step: ";
+
+/// What a head prints for a failure in human mode: the message, then the next step on a line of
+/// its own after [`NEXT_STEP_LABEL`], both [sanitized](sanitize_lines). A missing or blank next
+/// step adds no line. Every head prints a failure through this, so a person at a terminal sees the
+/// same recovery a `--json` consumer reads from `next_step`.
+pub fn human_failure_text(message: &str, next_step: Option<&str>) -> String {
+    let message = sanitize_lines(message);
+
+    match next_step.map(str::trim).filter(|step| !step.is_empty()) {
+        Some(step) => format!("{}\n{}{}", message, NEXT_STEP_LABEL, sanitize_lines(step)),
+        None => message,
+    }
 }
 
 /// Build the sentinel frame for a refusal. Re-sanitizes defensively so a `Refusal` assembled
@@ -841,6 +859,19 @@ mod tests {
         for kept in ["héllo wörld", "日本語", "\u{2027}\u{202F}\u{2065}\u{206A}", "", "plain", "\tindented"] {
             assert_eq!(sanitize(kept), kept);
         }
+    }
+
+    #[test]
+    fn a_failure_prints_its_next_step_on_a_labelled_line_of_its_own() {
+        assert_eq!(human_failure_text("It failed.", Some("forklift lower")), "It failed.\nNext step: forklift lower");
+
+        // No step, or a blank one, adds no line: `ForkliftError::new` wraps any step in `Some`.
+        assert_eq!(human_failure_text("It failed.", None), "It failed.");
+        assert_eq!(human_failure_text("It failed.", Some("")), "It failed.");
+        assert_eq!(human_failure_text("It failed.", Some(" \t")), "It failed.");
+
+        // The step is made inert like the message: it can quote a path or a remote's answer.
+        assert_eq!(human_failure_text("a\x1b[2J", Some("b\x1b[2J")), "a [2J\nNext step: b [2J");
     }
 
     #[test]

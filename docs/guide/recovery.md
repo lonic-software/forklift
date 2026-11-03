@@ -2,8 +2,9 @@
 
 Something refused, or something looks broken. Find the code below and do what its entry says.
 
-Every failure prints a message and exits with a fixed status, and almost every message names its next
-step. With `--json`, the same code is in `error.code` and the step in `error.next_step`. The
+Every failure prints a message and exits with a fixed status, and almost every failure prints its next
+step on a line of its own, after `Next step:`. With `--json`, the same code is in `error.code` and
+the step in `error.next_step`. The
 [table of error and exit codes](../generated/errors.md) lists them all; this page says what to do
 about each one.
 

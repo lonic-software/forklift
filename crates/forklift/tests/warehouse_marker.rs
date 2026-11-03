@@ -385,7 +385,7 @@ fn the_server_prints_a_refusal_without_its_frame() {
         "{}\" holds no warehouse marker: it was made before warehouses were marked, or is not a warehouse.",
         std::path::MAIN_SEPARATOR_STR.to_string() + FOLDER_NAME_FORKLIFT_ROOT
     )), "{:?}", stderr);
-    assert!(next_step.starts_with("Move "), "{:?}", stderr);
+    assert!(next_step.starts_with("Next step: Move "), "{:?}", stderr);
     assert!(!stderr.contains('\u{1f}') && !stderr.contains("not_a_warehouse"), "{:?}", stderr);
 }
 
@@ -480,7 +480,7 @@ fn the_server_serves_no_unmarked_root() {
     let old = area.dir("old");
     std::fs::create_dir_all(old.join(FOLDER_NAME_FORKLIFT_ROOT).join("objects")).unwrap();
 
-    for (root, expected) in [(&empty, "Run \"forklift-server prepare\" with --root "), (&old, "Move ")] {
+    for (root, expected) in [(&empty, "Next step: Run \"forklift-server prepare\" with --root "), (&old, "Next step: Move ")] {
         let before = listing(root);
         // Waited on with a deadline: a server that took the folder for a warehouse would serve it forever.
         let mut serving = std::process::Command::new(common::server_binary())
