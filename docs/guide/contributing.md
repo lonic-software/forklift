@@ -161,6 +161,15 @@ machine does not tell you what Windows will take.
 - **Wait on the event, not the clock.** A `sleep` long enough to be safe on a loaded
   runner is far too long everywhere else. Poll for the condition with a short interval
   and an overall deadline, so the test ends as soon as the thing happens.
+- **Age a file by setting its mtime.** A stat is proven only once the file is a couple of
+  seconds older than the command that records it. A test that needs a proven stat moves
+  the file's mtime into the past (`backdate` and `backdate_tree` in `cli.rs`) rather than
+  sleeping until it is old enough.
+- **Count the syncs of an in-process test.** Unit tests run with fsync on, so that the
+  sync calls are exercised, and every real write pays for one. Seed a large starting state
+  by writing it directly, and push only the few writes the assertion is about through the
+  code under test. The journal cap test spent 24 s on Windows filling the journal one
+  synced write at a time.
 - **Make a limit something the test can set small.** A test that crosses a cap, a depth
   or a size passes a small value of it rather than building a fixture past the
   production one. `walk_tree_survives_a_pathologically_deep_tree` checks stack safety on

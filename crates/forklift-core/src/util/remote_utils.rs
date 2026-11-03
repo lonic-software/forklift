@@ -15561,18 +15561,30 @@ mod tests {
     /// `presence_body_budget`'s figure for that call's cap; without it both calls wait out the
     /// whole 20s trickle and the ceiling trips. The lower bound pins that the total is counted
     /// from the status line: counted from the request, it would fire `HEAD_DELAY` early.
+    ///
+    /// The budgets are narrower than [`FAST`]: the test waits out the body total twice, and at
+    /// `FAST`'s object silence budget that cost 13s. The silence budget stays over seven times
+    /// the trickle's gap.
     #[test]
     fn presence_answers_give_up_on_a_remote_that_never_stops_trickling() {
-        const HEAD_DELAY: std::time::Duration = std::time::Duration::from_millis(1_200);
+        const HEAD_DELAY: std::time::Duration = std::time::Duration::from_millis(600);
+        let patience = std::time::Duration::from_millis(1_100);
+        let budgets = Budgets {
+            object_read: std::time::Duration::from_millis(1_200),
+            batch_head_patience: patience,
+            retryable_head_patience: patience,
+            commit_attempt_allowance: patience,
+            ..FAST
+        };
 
         let hashes = vec!["a".repeat(64)];
-        assert!(HEAD_DELAY < FAST.connect + FAST.retryable_head_patience, "the headers land inside the head-wait");
+        assert!(HEAD_DELAY < budgets.connect + patience, "the headers land inside the head-wait");
         for (call, per_hash) in [
             ("missing_objects", MISSING_BODY_BYTES_PER_HASH),
             ("upload_targets", UPLOAD_TARGETS_BODY_BYTES_PER_HASH),
         ] {
             let url = start_trickling_remote_after(HEAD_DELAY, 100, std::time::Duration::from_millis(200));
-            let client = RemoteClient::new_test_with_budgets(&url, FAST);
+            let client = RemoteClient::new_test_with_budgets(&url, budgets);
             let budget = client.presence_body_budget(body_utils::per_item_body_cap(hashes.len(), per_hash));
             let hard_ceiling = HEAD_DELAY + budget + std::time::Duration::from_secs(8);
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();

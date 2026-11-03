@@ -409,7 +409,10 @@ fn fixtures() -> Vec<(&'static str, Vec<Vec<&'static str>>)> {
 /// Open the fixture at `archive` and walk it against the census, before and after.
 fn open_and_walk(archive: &Path, commands: &[Vec<&str>], upgrade: bool) {
     let name = archive.file_stem().unwrap().to_string_lossy().into_owned();
-    let scratch = Scratch::new(&format!("fixture-{}", name));
+    // Named by format as well as mode: fixtures open concurrently, and every format has the same
+    // mode names.
+    let format = archive.parent().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+    let scratch = Scratch::new(&format!("fixture-{}-{}", format, name));
     let warehouse = scratch.0.join("w");
     unpack_fixture(archive, &warehouse);
     unpack_fixture(&archive.with_file_name(format!("{}.fixture", OPERATOR)), &scratch.0.join(OPERATOR));
@@ -430,7 +433,8 @@ fn open_and_walk(archive: &Path, commands: &[Vec<&str>], upgrade: bool) {
 }
 
 /// The current format has a fixture of every mode, and the current build opens each one, which
-/// holds only paths the census classifies.
+/// holds only paths the census classifies. The fixtures open on threads of their own: each is
+/// dozens of launches, which on Windows cost 30s run one after another.
 ///
 /// Revert: drop a census row a fixture needs → the walk names the path; make the build refuse the
 /// format → the commands fail.
@@ -438,11 +442,13 @@ fn open_and_walk(archive: &Path, commands: &[Vec<&str>], upgrade: bool) {
 fn the_current_format_fixtures_open() {
     let folder = fixtures_root().join(format!("format-{}", current_format()));
 
-    for (name, commands) in fixtures() {
-        let archive = folder.join(format!("{}.fixture", name));
-        assert!(archive.is_file(), "format {} has no {} fixture: run freeze_the_current_format_fixtures", current_format(), name);
-        open_and_walk(&archive, &commands, false);
-    }
+    std::thread::scope(|threads| {
+        for (name, commands) in fixtures() {
+            let archive = folder.join(format!("{}.fixture", name));
+            assert!(archive.is_file(), "format {} has no {} fixture: run freeze_the_current_format_fixtures", current_format(), name);
+            threads.spawn(move || open_and_walk(&archive, &commands, false));
+        }
+    });
 }
 
 /// Every older format's fixtures upgrade to the current format and then open. Format 1 is the first,

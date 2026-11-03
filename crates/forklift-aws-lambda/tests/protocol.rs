@@ -4414,15 +4414,16 @@ impl RefStore for RacesTheDelete {
 }
 
 /// `feature` lifted at `feature_v2` in a shared store, and a head over that store that races its
-/// delete as `race` says.
-fn racing_head(area: &Area, race: impl FnOnce(String, String) -> DeleteRace) -> (Arc<MemoryRefStore>, Head<MemoryObjectStore, RacesTheDelete>, String, String) {
-    let (harvest, main_head, feature_v2, feature_v3) = feature_warehouse(area);
+/// delete as `race` says. Built from a [`feature_warehouse`] the caller harvests once, so a test
+/// that races several deletes builds one warehouse rather than one per race.
+fn racing_head(warehouse: &(Harvest, String, String, String), race: impl FnOnce(String, String) -> DeleteRace) -> (Arc<MemoryRefStore>, Head<MemoryObjectStore, RacesTheDelete>, String, String) {
+    let (harvest, main_head, feature_v2, feature_v3) = warehouse;
     let store = Arc::new(MemoryRefStore::new());
-    lifted_feature(SharedMemoryRefs(store.clone()), &harvest, &main_head, &feature_v2);
+    lifted_feature(SharedMemoryRefs(store.clone()), harvest, main_head, feature_v2);
 
     let head = Head::new(MemoryObjectStore::new(), RacesTheDelete { inner: store.clone(), race: race(feature_v2.clone(), feature_v3.clone()) });
-    upload_all(&head, &harvest);
-    (store, head, feature_v2, feature_v3)
+    upload_all(&head, harvest);
+    (store, head, feature_v2.clone(), feature_v3.clone())
 }
 
 /// A lift of `feature` from `from` to `to`, raced against a delete.
@@ -4448,9 +4449,9 @@ fn racing_lift(from: String, to: String) -> RacingWrite {
 /// lift stands.
 #[test]
 fn a_lift_racing_the_delete_refuses_it_as_moved() {
-    let area = Area::new("delete-races-lift");
+    let warehouse = feature_warehouse(&Area::new("delete-races-lift"));
     let (store, head, feature_v2, feature_v3) =
-        racing_head(&area, |from, to| DeleteRace::Before(RefCell::new(Some(racing_lift(from, to)))));
+        racing_head(&warehouse, |from, to| DeleteRace::Before(RefCell::new(Some(racing_lift(from, to)))));
 
     let err = head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect_err("the pallet moved");
     assert_eq!(err.status, Status::Conflict);
@@ -4462,8 +4463,8 @@ fn a_lift_racing_the_delete_refuses_it_as_moved() {
 /// since that tombstone is what it asked for.
 #[test]
 fn of_two_racing_deletes_the_loser_answers_200() {
-    let area = Area::new("delete-races-delete");
-    let (store, head, feature_v2, _) = racing_head(&area, |from, _| {
+    let warehouse = feature_warehouse(&Area::new("delete-races-delete"));
+    let (store, head, feature_v2, _) = racing_head(&warehouse, |from, _| {
         DeleteRace::before(move |store: &MemoryRefStore| {
             let outcome = store
                 .delete_head(pallet_utils::PalletNamespace::User, "feature", &from, OfficePrecondition::Unborn, None, &forklift_aws_lambda::format::gate(&*store).expect("format gate"), &request_token())
@@ -4482,13 +4483,11 @@ fn of_two_racing_deletes_the_loser_answers_200() {
 /// nothing is in doubt.
 #[test]
 fn a_delete_of_unknown_fate_is_settled_by_the_ref() {
-    let area = Area::new("delete-transient-landed");
-    let (store, head, feature_v2, _) = racing_head(&area, |_, _| DeleteRace::LandsThenTransient);
+    let warehouse = feature_warehouse(&Area::new("delete-fate-unknown"));
+    let (store, head, feature_v2, _) = racing_head(&warehouse, |_, _| DeleteRace::LandsThenTransient);
     head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect("an attempt landed");
     assert_eq!(store.get_head(pallet_utils::PalletNamespace::User, "feature").expect("get"), RefHead::Deleted(feature_v2));
-
-    let area = Area::new("delete-transient-not-landed");
-    let (store, head, feature_v2, _) = racing_head(&area, |_, _| DeleteRace::Transient);
+    let (store, head, feature_v2, _) = racing_head(&warehouse, |_, _| DeleteRace::Transient);
     let err = head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect_err("nothing landed");
     assert_eq!(err.status, Status::ServiceUnavailable, "{}", err.message);
     assert!(err.message.contains(&format!("The delete was for \"feature\" at {}.", feature_v2)), "{}", err.message);
@@ -4505,8 +4504,7 @@ fn a_delete_of_unknown_fate_is_settled_by_the_ref() {
         (TransientCause::FateUnknown, "could not be confirmed"),
         (TransientCause::Contended, "None of its attempts was applied"),
     ] {
-        let area = Area::new("delete-transient-unreadable");
-        let (_, head, feature_v2, _) = racing_head(&area, |_, _| DeleteRace::TransientThenUnreadable(cause, Cell::new(false)));
+        let (_, head, feature_v2, _) = racing_head(&warehouse, |_, _| DeleteRace::TransientThenUnreadable(cause, Cell::new(false)));
         let err = head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect_err("the ref cannot be read");
         assert_eq!(err.status, Status::ServiceUnavailable, "{}", err.message);
         assert!(err.message.contains(says), "{}", err.message);
@@ -4517,28 +4515,20 @@ fn a_delete_of_unknown_fate_is_settled_by_the_ref() {
     // A fault on the re-issue does not hide an attempt of unknown fate before it: the ref decides
     // whether it landed. After contention the fault is the answer.
     let fault = |first, lands| move |_: String, _: String| DeleteRace::ThenFault { first, lands, attempted: Cell::new(false) };
-
-    let area = Area::new("delete-lands-then-fault");
-    let (_, head, feature_v2, _) = racing_head(&area, fault(TransientCause::FateUnknown, true));
+    let (_, head, feature_v2, _) = racing_head(&warehouse, fault(TransientCause::FateUnknown, true));
     head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect("the first attempt landed");
-
-    let area = Area::new("delete-unknown-then-fault");
-    let (_, head, feature_v2, _) = racing_head(&area, fault(TransientCause::FateUnknown, false));
+    let (_, head, feature_v2, _) = racing_head(&warehouse, fault(TransientCause::FateUnknown, false));
     let err = head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect_err("nothing landed");
     assert_eq!(err.status, Status::ServiceUnavailable, "{}", err.message);
     assert!(err.message.contains("could not be confirmed"), "{}", err.message);
     assert!(err.message.contains(&format!("The delete was for \"feature\" at {}.", feature_v2)), "{}", err.message);
     assert!(!err.message.contains("None of its attempts was applied"), "{}", err.message);
     assert!(err.message.contains(&format!("still live at {} when", feature_v2)), "{}", err.message);
-
-    let area = Area::new("delete-contended-then-fault");
-    let (_, head, feature_v2, _) = racing_head(&area, fault(TransientCause::Contended, false));
+    let (_, head, feature_v2, _) = racing_head(&warehouse, fault(TransientCause::Contended, false));
     let err = head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect_err("the fault");
     assert_eq!(err.status, Status::Internal, "{}", err.message);
-
-    let area = Area::new("delete-transient-moved");
     let (_, head, feature_v2, _) =
-        racing_head(&area, |from, to| DeleteRace::TransientAfter(RefCell::new(Some(racing_lift(from, to)))));
+        racing_head(&warehouse, |from, to| DeleteRace::TransientAfter(RefCell::new(Some(racing_lift(from, to)))));
     let err = head.delete_pallet(&Principal::Static, "feature", &feature_v2).expect_err("the pallet moved");
     assert_eq!(err.status, Status::Conflict, "{}", err.message);
     assert_eq!(code_and_next_step(&err.message).0, "remote_ahead", "{}", err.message);
