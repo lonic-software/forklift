@@ -1479,14 +1479,16 @@ fn mirror_reads(touches: usize) -> (usize, usize) {
 /// Below the bound it still reads one parcel *body* apiece (`collect_reachable` walks
 /// `old_head`'s ancestry to build the closure check's prune set), but **no trees**. So
 /// lengthening the history by `k` parcels costs a bounded mirror exactly `k` more reads,
-/// while an unbounded one also re-fetches every superseded tree version.
+/// while an unbounded one also re-fetches every superseded tree version. The name gate reads the
+/// old head's changed trees from the store on an update and nothing extra on a creation, a fixed
+/// cost the short history is long enough to outweigh.
 #[test]
 fn the_ref_update_mirror_is_bounded_at_old_head() {
     let extra = 4;
-    let (bounded_short, unbounded_short) = mirror_reads(2);
-    let (bounded_long, unbounded_long) = mirror_reads(2 + extra);
+    let (bounded_short, unbounded_short) = mirror_reads(3);
+    let (bounded_long, unbounded_long) = mirror_reads(3 + extra);
 
-    assert!(bounded_short < unbounded_short, "the bound saves reads even on a short history");
+    assert!(bounded_short < unbounded_short, "the bound saves reads even on a short history: {} vs {}", bounded_short, unbounded_short);
 
     assert_eq!(
         bounded_long - bounded_short,
