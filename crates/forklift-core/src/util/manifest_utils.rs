@@ -372,7 +372,6 @@ fn validate_entry(entry: &ManifestEntry) -> Result<(), String> {
     Ok(())
 }
 
-/// The operator a stamped key belongs to.
 /// The pallet rules of `@manifest`: the cell layout, the value shapes, and ownership — a parcel
 /// may add, change or remove cells only under its own writer's `<op>` directory, whatever schema
 /// they carry, and a known entry only at the id its content derives.

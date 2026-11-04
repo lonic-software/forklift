@@ -303,7 +303,9 @@ impl CommandOutput for KvLog {
                 (None, None, _) => String::new(),
             };
 
-            println!("{} {} {} {}", kv_utils::short(&change.parcel), when, sanitize(&change.operator), what);
+            let unsigned = if change.signer.is_none() { " (unsigned)" } else { "" };
+
+            println!("{} {} {}{} {}", kv_utils::short(&change.parcel), when, sanitize(&change.operator), unsigned, what);
         }
     }
 }

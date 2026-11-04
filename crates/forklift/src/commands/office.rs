@@ -6,7 +6,7 @@ use forklift_core::util::office_utils::{IdentityClass, OfficeState, RevocationRe
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::pallet_utils::{AnchorPrecondition, BoundaryScope, PalletsPrecondition, RefPreconditions};
 use forklift_core::util::remote_utils::{self, RemoteClient};
-use forklift_core::util::{audit_utils, config_utils, office_utils, pallet_utils, sign_utils, trust_utils};
+use forklift_core::util::{audit_utils, config_utils, meta_tree, office_utils, pallet_utils, sign_utils, trust_utils};
 use crate::output::{self, CommandOutput};
 
 // The office command — the warehouse office manages the personnel records: users and
@@ -35,6 +35,25 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
     // office vouches for, and no head accepts an anchor over one.
     if pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?.is_some() {
         return Err(audit_utils::LOST_ANCHOR.to_string());
+    }
+
+    // Metadata recorded before enrollment is unsigned, and an office admits only signed meta
+    // parcels: enrolling over it would leave every such pallet unverifiable, failing later and
+    // far from here. Refuse until enroll can admit it.
+    let mut unsigned = Vec::new();
+
+    for name in meta_tree::META_PALLET_NAMES.iter().filter(|name| **name != OFFICE_PALLET_NAME) {
+        if pallet_utils::get_meta_pallet_head(name)?.is_some() {
+            unsigned.push(format!("@{}", name));
+        }
+    }
+
+    if !unsigned.is_empty() {
+        return Err(format!(
+            "This warehouse holds metadata recorded without enrollment ({}). Enrolling over \
+            unsigned metadata is not supported yet: the office would refuse it from then on.",
+            unsigned.join(", ")
+        ));
     }
 
     // Everything reachable from the current pallet heads is the pre-trust history:

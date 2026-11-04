@@ -10008,7 +10008,15 @@ fn metadata_works_unsigned_in_a_warehouse_that_never_enrolled() {
     let haul = json(&warehouse.run(&["haul", "show", &id, "--json"]));
     assert_eq!(haul["data"]["reviews"][0]["unsigned"], true, "{}", haul);
     assert!(stdout(&warehouse.run(&["haul", "show", &id])).contains("test@forklift (unsigned)"));
+    let log = stdout(&warehouse.run(&["manifest", "log", "main", "ci"]));
+    assert!(log.contains("test@forklift (unsigned)"), "{}", log);
 
+    // Enrolling over unsigned metadata would leave it unverifiable, so it refuses up front and
+    // establishes no trust: unsigned writes still work afterwards.
+    let enroll = warehouse.run(&["office", "enroll"]);
+    assert!(!enroll.status.success(), "{}", stdout(&enroll));
+    assert!(stderr(&enroll).contains("(@manifest, @haul, @tags, @kv)"), "{}", stderr(&enroll));
+    assert_success(&warehouse.run(&["tag", "create", "v2.0", "main"]));
 }
 
 #[test]
