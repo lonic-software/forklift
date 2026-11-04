@@ -12724,10 +12724,7 @@ mod tests {
     /// write access. It catches a sync that errors, not one removed.
     #[test]
     fn download_bundle_syncs_a_complete_bundle() {
-        assert!(
-            file_utils::fsync_enabled(),
-            "this test exists to run the fsync-on path; unset FORKLIFT_FSYNC to run it"
-        );
+        let _syncs = file_utils::real_syncs();
         let remote = CannedBodyRemote::start(b"a complete bundle");
         let client = fast_client(&remote.url);
         let dest = std::env::temp_dir().join(format!(

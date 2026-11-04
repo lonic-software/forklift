@@ -4905,7 +4905,6 @@ mod tests {
     /// metadata names `key`.
     #[cfg(unix)]
     fn assert_registration_waits_for_the_sync_of(key: &str, folder: &Path) {
-        assert!(file_utils::fsync_enabled(), "FORKLIFT_FSYNC turns fsync off for the in-process tests; unset it");
         assert!(folder.is_dir(), "{} exists", folder.display());
 
         let fault = file_utils::DirSyncFaultGuard::failing_exactly(folder);

@@ -383,14 +383,16 @@ struct TaintFaultState {
 /// so neither a stale guard from a previous test on a reused thread, nor this guard's own
 /// arming once the test that created it is done, can bleed into another test.
 #[cfg(test)]
-struct TaintFaultGuard;
+struct TaintFaultGuard {
+    _syncs: file_utils::RealSyncs,
+}
 
 #[cfg(test)]
 impl TaintFaultGuard {
     /// Record every taint file [`sync_taint_file`] is asked to sync; fail none of them.
     fn recording() -> Self {
         TAINT_WRITE_FAULT.with(|f| *f.borrow_mut() = TaintFaultState { attempted: Vec::new(), fail_needle: None });
-        TaintFaultGuard
+        TaintFaultGuard { _syncs: file_utils::real_syncs() }
     }
 
     /// Record every taint file, and fail (with a distinctive error, no filesystem access) any
@@ -400,7 +402,7 @@ impl TaintFaultGuard {
             attempted: Vec::new(),
             fail_needle: Some(needle.to_string()),
         });
-        TaintFaultGuard
+        TaintFaultGuard { _syncs: file_utils::real_syncs() }
     }
 }
 

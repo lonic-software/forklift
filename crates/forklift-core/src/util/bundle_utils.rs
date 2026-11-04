@@ -2285,8 +2285,6 @@ mod tests {
     /// The bundle imports, every version reading back.
     #[test]
     fn a_bundle_deltas_each_version_against_the_last_at_its_path_and_caps_the_chain() {
-        // Nothing here is about durability, and the 55-parcel history paid a sync per write.
-        let _syncs = file_utils::skip_syncs_on_this_thread();
         let source = Scratch::new("bundle-delta-chain");
 
         let shared: Vec<u8> = (0..4096u32).map(|i| b'a' + (i.wrapping_mul(2654435761) >> 27) as u8).collect();
