@@ -11424,43 +11424,55 @@ fn a_re_signed_lift_whose_local_head_did_not_move_catches_up_without_a_conflict(
 }
 
 /// A lift that re-signs and lands metadata and then fails on the working pallet still names the
-/// cells the remote now holds re-signed, in its error.
+/// cells the remote now holds re-signed: in its error, or for a human, in the lines printed
+/// before it when the working pallet's own lift is what failed.
 #[test]
 fn a_lift_that_fails_after_re_signing_names_the_cells_that_landed() {
-    let area = TestArea::new("unsigned-meta-resign-then-fail");
-    let server = Server::start(&area, None);
+    for (json, diverged) in [(false, false), (true, false), (false, true), (true, true)] {
+        let area = TestArea::new(&format!("unsigned-meta-resign-then-fail-{}-{}", json, diverged));
+        let server = Server::start(&area, None);
 
-    prepare_warehouse(&area, "a", &server.url);
-    area.write_file("a/code.txt", "v1\n");
-    assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
-    assert_success(&area.forklift("a", &["manifest", "set", "main", "ci", "green"]));
-    assert_success(&area.forklift("a", &["lift"]));
+        prepare_warehouse(&area, "a", &server.url);
+        area.write_file("a/code.txt", "v1\n");
+        assert_success(&area.forklift("a", &["load", "."]));
+        assert_success(&area.forklift("a", &["stack", "-m", "base"]));
+        assert_success(&area.forklift("a", &["manifest", "set", "main", "ci", "green"]));
+        assert_success(&area.forklift("a", &["lift"]));
 
-    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
-    assert_success(&area.forklift("b", &["manifest", "set", "main", "ci", "blue"]));
-    assert_success(&area.forklift(".", &["clone", &server.url, "c"]));
-    assert_success(&area.forklift("c", &["office", "enroll"]));
-    assert_success(&area.forklift("c", &["lift"]));
-    assert_success(&area.forklift("b", &["lower"]));
+        assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
+        assert_success(&area.forklift("b", &["manifest", "set", "main", "ci", "blue"]));
+        assert_success(&area.forklift(".", &["clone", &server.url, "c"]));
+        assert_success(&area.forklift("c", &["office", "enroll"]));
+        assert_success(&area.forklift("c", &["lift"]));
+        assert_success(&area.forklift("b", &["lower"]));
 
-    // The clone's position names a pallet with nothing stacked, so the working lift fails.
-    let position = area.read_file("b/.forklift/position");
-    let header = position.lines().next().unwrap().to_string();
-    std::fs::write(area.path("b/.forklift/position"), format!("{}\nfresh\n\n", header)).unwrap();
+        if diverged {
+            // Both sides change one line: the auto-merge cannot, and the working lift fails.
+            assert_success(&area.forklift("a", &["lower"]));
+            area.write_file("a/code.txt", "remote\n");
+            assert_success(&area.forklift("a", &["load", "."]));
+            assert_success(&area.forklift("a", &["stack", "-m", "remote"]));
+            assert_success(&area.forklift("a", &["lift"]));
+            area.write_file("b/code.txt", "local\n");
+            assert_success(&area.forklift("b", &["load", "."]));
+            assert_success(&area.forklift("b", &["stack", "-m", "local"]));
+        } else {
+            // The clone's position names a pallet with nothing stacked.
+            let position = area.read_file("b/.forklift/position");
+            let header = position.lines().next().unwrap().to_string();
+            std::fs::write(area.path("b/.forklift/position"), format!("{}\nfresh\n\n", header)).unwrap();
+        }
 
-    for json in [false, true] {
         let args: &[&str] = if json { &["--json", "lift"] } else { &["lift"] };
         let failed = area.forklift("b", args);
         assert!(!failed.status.success(), "{}", stdout(&failed));
-        // JSON carries the error on stdout.
-        let said = if json { stdout(&failed) } else { stderr(&failed) };
-        assert!(said.contains("has nothing stacked yet"), "{}", said);
-        // The first lift landed the replay; the second has nothing re-signed to name.
-        assert_eq!(said.contains("the remote now holds @kv ") && said.contains("re-signed under your current key"), !json,
-                   "{}", said);
+        let said = format!("{}{}", stdout(&failed), stderr(&failed));
+        assert!(said.contains(if diverged { "diverged" } else { "has nothing stacked yet" }), "{}", said);
+        let named = said.contains("the remote now holds @kv ") && said.contains("re-signed under your current key");
+        let printed = stdout(&failed).contains("Re-signed @kv ");
+        assert!(if json || !diverged { named && !printed } else { printed && !named }, "{}: {}", diverged, said);
+        assert_eq!(remote_pallet_head(&server, "@kv"), Some(area.read_file("b/.forklift/meta/kv").trim().to_string()));
     }
-    assert_eq!(remote_pallet_head(&server, "@kv"), Some(area.read_file("b/.forklift/meta/kv").trim().to_string()));
 }
 
 /// Another operator's change from before trust is never re-signed: the lift names it, and keeping
