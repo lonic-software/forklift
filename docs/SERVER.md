@@ -179,6 +179,13 @@ only and never enter the tracked metadata:
 "<token>" = "mate@lonic.net"
 ```
 
+A token authorizes transport, not authorship. It decides whose role the server applies to a
+request; it never decides who a parcel is attributed to, which is the parcel's signer in the office.
+The two are independent: a client holding one operator's token can lift parcels signed by a
+different enrolled identity, and each is attributed to its signer. Issue one token per person so
+the server applies each person's role, and rely on signatures for who did what
+(`docs/guide/team.md` walks a team through both).
+
 What an operator may do derives from their **role** in the target warehouse's office
 (admin / writer / reader, plus per-pallet grants) — see
 `docs/format/TRACKED_METADATA.md`. Roles are managed with `forklift office admit

@@ -8,7 +8,14 @@
 //! every platform CI covers. Only the commands it knows are allowed, and only words a
 //! shell would pass through unchanged; anything else is a failure that names the command, never a
 //! skipped step or a step that runs differently from the reader's.
+//!
+//! A page that follows several people marks whose machine each block runs on with a line
+//! `<!-- machine: NAME -->` between blocks, which a rendered page does not show; each machine
+//! has a folder, a global configuration and keys of its own. A value one command prints and a later
+//! one reuses, such as a key, is written `<name>`: in the output a page shows, it stands for one
+//! word and binds it, and in a later command it is replaced by what it bound.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -17,7 +24,7 @@ use crate::common;
 use common::{fence, forklift_command, repository_root, server_binary, tracked_pages};
 
 /// The pages under `docs/guide/` this test runs, each from an empty folder.
-const RUN_PAGES: &[&str] = &["tutorial.md", "concepts.md"];
+const RUN_PAGES: &[&str] = &["tutorial.md", "concepts.md", "team.md"];
 
 /// The address the pages tell the reader to serve on. The test serves on a port the server picks
 /// itself, so a busy 7171 on a CI machine cannot fail it, and rewrites this address wherever a
@@ -32,28 +39,95 @@ const ELISION: char = '…';
 struct Step {
     /// 1-based line number of the `$` line in the page, for failure messages.
     line: usize,
+    /// The machine the step runs on, from the last `<!-- machine: NAME -->` line above it; `None`
+    /// on a page that has none.
+    machine: Option<String>,
     command: String,
     expected: Vec<String>,
+}
+
+/// Whether `text`, the inside of an HTML comment, reads as a machine marker: after any hyphens
+/// and spaces, it starts with `machine` in any case, not as part of a hyphenated word such as
+/// `machine-readable`. A near miss such as `machines: bob` reads as one, to be refused.
+fn names_a_machine(text: &str) -> bool {
+    let text = text.trim_start_matches(|c: char| c == '-' || c.is_whitespace());
+    text.get(..7).is_some_and(|word| word.eq_ignore_ascii_case("machine"))
+        && !text[7..].starts_with('-')
+}
+
+/// The machine a `<!-- machine: NAME -->` line names, `None` for any other line, and an error
+/// for a line that reads like one but is not exactly one, so a mistyped marker cannot leave its
+/// blocks running on the previous machine.
+fn machine_marker(line: &str) -> Result<Option<String>, String> {
+    let trimmed = line.trim();
+    if !trimmed.strip_prefix("<!--").is_some_and(names_a_machine) {
+        return Ok(None);
+    }
+    let name = trimmed
+        .strip_prefix("<!-- machine: ")
+        .and_then(|rest| rest.strip_suffix(" -->"))
+        .filter(|name| is_name(name) && line == trimmed);
+    match name {
+        Some(name) => Ok(Some(name.to_string())),
+        None => Err("write a machine marker as `<!-- machine: NAME -->`, alone on its line, with a \
+            lowercase name".to_string()),
+    }
+}
+
+/// Whether `text` is a machine or placeholder name: a lowercase letter, then lowercase letters,
+/// digits and hyphens.
+fn is_name(text: &str) -> bool {
+    text.starts_with(|c: char| c.is_ascii_lowercase())
+        && text.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 /// Read the page's steps. Every fenced block must be a `console` block fenced with backticks at
 /// the start of the line, and must open with a `$` line; no `$` line may sit outside one, however
 /// it is indented, and there may be no indented code block. Otherwise a command the page shows,
 /// in a block of another kind or one nested in a list item, would be skipped without a word.
+/// On a page with machine markers, the first comes before the first block, so no block runs on a
+/// machine the page never named.
 fn parse_steps(page: &str) -> Result<Vec<Step>, String> {
     let mut steps: Vec<Step> = Vec::new();
+    let mut machine: Option<String> = None;
     let mut in_block = false;
-    // Whether an indented line here would start a code block: after a blank line, a heading or
-    // a fence, where it cannot continue a paragraph.
+    // Whether the line is inside an HTML comment that opened on an earlier line.
+    let mut in_comment = false;
+    // Whether an indented line here would start a code block: after a blank line, a heading, a
+    // fence or a one-line comment, where it cannot continue a paragraph.
     let mut code_may_start = true;
 
     for (index, line) in page.lines().enumerate() {
         let number = index + 1;
         let trimmed = line.trim_start();
+        // Indented four spaces or more, a `<!--` is the text of a code block, not a comment.
+        let opens_comment = trimmed.starts_with("<!--") && line.len() - trimmed.len() < 4;
+        let one_line_comment = opens_comment && trimmed.trim_end().ends_with("-->");
         let starts_code = std::mem::replace(
             &mut code_may_start,
-            trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("```"),
+            trimmed.is_empty()
+                || trimmed.starts_with('#')
+                || trimmed.starts_with("```")
+                || one_line_comment,
         );
+
+        if in_comment || (!in_block && opens_comment && !one_line_comment) {
+            if names_a_machine(trimmed.trim_start_matches("<!--")) {
+                return Err(format!(
+                    "line {}: a machine marker split over lines; write it as \
+                    `<!-- machine: NAME -->` on one line", number
+                ));
+            }
+            // Open after this line if a comment opens after the last one closes.
+            in_comment = match (line.rfind("<!--"), line.rfind("-->")) {
+                (Some(open), Some(close)) => open > close,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => in_comment,
+            };
+            code_may_start = !in_comment;
+            continue;
+        }
 
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             if trimmed.len() != line.len() || trimmed.starts_with("~~~") {
@@ -71,7 +145,12 @@ fn parse_steps(page: &str) -> Result<Vec<Step>, String> {
                 in_block = false;
             } else if info == "console" {
                 in_block = true;
-                steps.push(Step { line: number, command: String::new(), expected: Vec::new() });
+                steps.push(Step {
+                    line: number,
+                    machine: machine.clone(),
+                    command: String::new(),
+                    expected: Vec::new(),
+                });
             } else {
                 return Err(format!(
                     "line {}: a \"{}\" block; every block on the page is a console block, \
@@ -82,6 +161,17 @@ fn parse_steps(page: &str) -> Result<Vec<Step>, String> {
         }
 
         if !in_block {
+            let marker = machine_marker(line).map_err(|e| format!("line {}: {}", number, e))?;
+            if let Some(name) = marker {
+                if machine.is_none() && !steps.is_empty() {
+                    return Err(format!(
+                        "line {}: a machine marker after the first block; name the first \
+                        block's machine too", number
+                    ));
+                }
+                machine = Some(name);
+                continue;
+            }
             if trimmed.starts_with("$ ") {
                 return Err(format!("line {}: a command outside a console block", number));
             }
@@ -104,7 +194,12 @@ fn parse_steps(page: &str) -> Result<Vec<Step>, String> {
                     step.line = number;
                     step.command = command.to_string();
                 }
-                None => steps.push(Step { line: number, command: command.to_string(), expected: Vec::new() }),
+                None => steps.push(Step {
+                    line: number,
+                    machine: machine.clone(),
+                    command: command.to_string(),
+                    expected: Vec::new(),
+                }),
             }
         } else {
             match steps.last_mut() {
@@ -117,9 +212,34 @@ fn parse_steps(page: &str) -> Result<Vec<Step>, String> {
     if in_block {
         return Err("the last console block is never closed".to_string());
     }
+    if in_comment {
+        return Err("a comment is never closed, which hides the rest of the page".to_string());
+    }
 
     if let Some(step) = steps.iter().find(|step| step.command.is_empty()) {
         return Err(format!("line {}: an empty console block", step.line));
+    }
+
+    // A placeholder is there to carry a value to a later use, so one used once is a typo, which
+    // would otherwise bind any word and check nothing.
+    let mut uses: HashMap<&str, (usize, usize)> = HashMap::new();
+    for step in &steps {
+        // A step's output lines are the lines straight after its `$` line.
+        let lines = std::iter::once(&step.command).chain(&step.expected).zip(step.line..);
+        for (text, line) in lines {
+            let mut rest = text.as_str();
+            while let Some((_, end, name)) = next_placeholder(rest) {
+                uses.entry(name).or_insert((line, 0)).1 += 1;
+                rest = &rest[end..];
+            }
+        }
+    }
+    let once = uses.iter().filter(|(_, (_, count))| *count == 1);
+    if let Some((name, (line, _))) = once.min_by_key(|(_, (line, _))| *line) {
+        return Err(format!(
+            "line {}: <{}> is used only once; a placeholder carries a value to a later use",
+            line, name
+        ));
     }
 
     Ok(steps)
@@ -190,34 +310,149 @@ fn shell_divergence(command: &str) -> Option<String> {
     None
 }
 
-/// Whether `actual` is `pattern` with each [`ELISION`] standing for any text, including none.
-fn line_matches(pattern: &str, actual: &str) -> bool {
-    let mut pieces = pattern.split(ELISION);
-    let first = pieces.next().unwrap_or("");
-    let rest: Vec<&str> = pieces.collect();
-
-    let Some((last, middle)) = rest.split_last() else {
-        return pattern == actual;
-    };
-
-    let Some(mut remaining) = actual.strip_prefix(first) else {
-        return false;
-    };
-
-    for piece in middle {
-        match remaining.find(piece) {
-            Some(at) => remaining = &remaining[at + piece.len()..],
-            None => return false,
-        }
-    }
-
-    remaining.ends_with(last)
+/// One piece of a line of output the page shows.
+#[derive(Debug)]
+enum Piece<'a> {
+    Text(&'a str),
+    /// [`ELISION`]: any text, including none.
+    Elided,
+    /// `<name>`: one word, the same wherever the name appears.
+    Placeholder(&'a str),
 }
 
-/// Whether the printed lines match the page's lines one for one.
-fn output_matches(expected: &[String], actual: &[String]) -> bool {
-    expected.len() == actual.len()
-        && expected.iter().zip(actual).all(|(pattern, line)| line_matches(pattern, line))
+/// Where the next `<name>` in `text` is, with the name; a `<` not followed by a name and `>` is
+/// plain text.
+fn next_placeholder(text: &str) -> Option<(usize, usize, &str)> {
+    let mut from = 0;
+    while let Some(start) = text[from..].find('<').map(|at| from + at) {
+        if let Some(length) = text[start + 1..].find('>') {
+            let name = &text[start + 1..start + 1 + length];
+            if is_name(name) {
+                return Some((start, start + length + 2, name));
+            }
+        }
+        from = start + 1;
+    }
+    None
+}
+
+fn pieces(pattern: &str) -> Vec<Piece<'_>> {
+    let mut pieces = Vec::new();
+    for (index, text) in pattern.split(ELISION).enumerate() {
+        if index > 0 {
+            pieces.push(Piece::Elided);
+        }
+        let mut rest = text;
+        while let Some((start, end, name)) = next_placeholder(rest) {
+            pieces.push(Piece::Text(&rest[..start]));
+            pieces.push(Piece::Placeholder(name));
+            rest = &rest[end..];
+        }
+        pieces.push(Piece::Text(rest));
+    }
+    pieces
+}
+
+/// Whether `actual` matches `pieces`, binding placeholders not yet in `bound`; on a match,
+/// `bound` holds the new bindings too, and otherwise it is as it was. `previous` is the character
+/// just before `actual` in the line, if any.
+fn pieces_match(
+    pieces: &[Piece],
+    actual: &str,
+    previous: Option<char>,
+    bound: &mut HashMap<String, String>,
+) -> bool {
+    let Some((piece, rest)) = pieces.split_first() else {
+        return actual.is_empty();
+    };
+    let last = |text: &str| text.chars().next_back().or(previous);
+
+    match piece {
+        Piece::Text(text) => actual
+            .strip_prefix(text)
+            .is_some_and(|after| pieces_match(rest, after, last(text), bound)),
+        Piece::Elided => actual
+            .char_indices()
+            .map(|(at, _)| at)
+            .chain([actual.len()])
+            .any(|at| pieces_match(rest, &actual[at..], last(&actual[..at]), bound)),
+        Piece::Placeholder(name) => {
+            // A word starts and ends where no letter or digit is next to it, so a bound `0c80`
+            // is neither the start nor the end of `dead0c80c7`.
+            if previous.is_some_and(char::is_alphanumeric) {
+                return false;
+            }
+            let ends_word =
+                |after: &str| !after.starts_with(|c: char| c.is_alphanumeric());
+            if let Some(value) = bound.get(*name).cloned() {
+                let after = actual.strip_prefix(value.as_str()).filter(|after| ends_word(after));
+                return after.is_some_and(|after| pieces_match(rest, after, last(&value), bound));
+            }
+            // The longest word first, so `<key>.` binds the key without the full stop.
+            let word = actual.find(char::is_whitespace).unwrap_or(actual.len());
+            let mut ends: Vec<usize> =
+                actual[..word].char_indices().map(|(at, c)| at + c.len_utf8()).collect();
+            ends.retain(|&end| ends_word(&actual[end..]));
+            ends.reverse();
+            for end in ends {
+                bound.insert(name.to_string(), actual[..end].to_string());
+                if pieces_match(rest, &actual[end..], last(&actual[..end]), bound) {
+                    return true;
+                }
+                bound.remove(*name);
+            }
+            false
+        }
+    }
+}
+
+/// Whether `actual` is `pattern` with each [`ELISION`] standing for any text, including none, and
+/// each `<name>` for one word, bound on its first use and the same on every later one.
+fn line_matches(pattern: &str, actual: &str, bound: &mut HashMap<String, String>) -> bool {
+    pieces_match(&pieces(pattern), actual, None, bound)
+}
+
+/// Whether the printed lines match the page's lines one for one; on a match, `bound` holds the
+/// placeholders they bound, and otherwise it is as it was. Each line binds the first way it
+/// matches.
+fn output_matches(
+    expected: &[String],
+    actual: &[String],
+    bound: &mut HashMap<String, String>,
+) -> bool {
+    let mut trial = bound.clone();
+    let matched = expected.len() == actual.len()
+        && expected.iter().zip(actual).all(|(pattern, line)| {
+            line_matches(pattern, line, &mut trial)
+        });
+    if matched {
+        *bound = trial;
+    }
+    matched
+}
+
+/// `command` with each `<name>` replaced by what it bound, or why it cannot be: a name nothing
+/// bound yet, or one inside quotes, where a reader's shell would pass `<name>` on as it is.
+fn substitute(command: &str, bound: &HashMap<String, String>) -> Result<String, String> {
+    let mut result = String::new();
+    let mut rest = command;
+    while let Some((start, end, name)) = next_placeholder(rest) {
+        let before = &command[..command.len() - rest.len() + start];
+        let quote = before.chars().fold(None, |quote, c| match (quote, c) {
+            (None, '\'' | '"') => Some(c),
+            (Some(open), _) if open == c => None,
+            _ => quote,
+        });
+        if quote.is_some() {
+            return Err(format!("<{}> is inside quotes, where a shell would not replace it", name));
+        }
+        let value = bound.get(name).ok_or_else(|| format!("no output above binds <{}>", name))?;
+        result.push_str(&rest[..start]);
+        result.push_str(value);
+        rest = &rest[end..];
+    }
+    result.push_str(rest);
+    Ok(result)
 }
 
 /// What a reader sees: line endings normalised, trailing blank lines and trailing spaces dropped.
@@ -248,19 +483,53 @@ impl Drop for Server {
     }
 }
 
-/// The reader's machine: a scratch folder, their current folder inside it, and a global
-/// configuration and key folder of their own, so the run never touches the developer's.
+/// The reader's machines, each a scratch folder with a global configuration and key folder of its
+/// own, so the run never touches the developer's, and a current folder inside it. Commands run on
+/// the current machine, the one the page last named.
 struct Reader {
     /// The page being run, as failure messages name it.
     page: String,
     area: PathBuf,
+    /// The current machine, `None` on a page that names none.
+    machine: Option<String>,
+    /// The current machine's folder, holding its global configuration and keys.
+    home: PathBuf,
     cwd: PathBuf,
+    /// The folder and current folder of every other machine the page has used.
+    others: HashMap<Option<String>, (PathBuf, PathBuf)>,
+    /// What each `<name>` in the output so far stood for.
+    bound: HashMap<String, String>,
     /// Where the page's server really listens, once it has started.
     address: Option<String>,
     servers: Vec<Server>,
 }
 
+/// A new machine's folder and current folder, made empty: the run area itself on a page that
+/// names no machine.
+fn machine_folders(area: &Path, machine: &Option<String>) -> (PathBuf, PathBuf) {
+    let home = match machine {
+        Some(name) => area.join("machines").join(name),
+        None => area.to_path_buf(),
+    };
+    let cwd = home.join("reader");
+    std::fs::create_dir_all(&cwd).unwrap();
+    (home, cwd)
+}
+
 impl Reader {
+    /// Make `machine` the current one, giving it an empty folder the first time.
+    fn switch_to(&mut self, machine: Option<String>) {
+        if machine == self.machine {
+            return;
+        }
+        let (home, cwd) =
+            self.others.remove(&machine).unwrap_or_else(|| machine_folders(&self.area, &machine));
+        let previous = std::mem::replace(&mut self.machine, machine);
+        let home = std::mem::replace(&mut self.home, home);
+        let cwd = std::mem::replace(&mut self.cwd, cwd);
+        self.others.insert(previous, (home, cwd));
+    }
+
     /// The reader's environment: none of the developer's forklift settings, debug switches or log
     /// filters, which would change what a command prints.
     fn environment(&self, command: &mut Command) {
@@ -274,8 +543,8 @@ impl Reader {
         command
             .current_dir(&self.cwd)
             .env("FORKLIFT_FSYNC", "0")
-            .env("FORKLIFT_GLOBAL_CONFIG", self.area.join("global.toml"))
-            .env("FORKLIFT_KEYS_DIR", self.area.join("keys"))
+            .env("FORKLIFT_GLOBAL_CONFIG", self.home.join("global.toml"))
+            .env("FORKLIFT_KEYS_DIR", self.home.join("keys"))
             .stdin(Stdio::null());
     }
 
@@ -435,19 +704,31 @@ fn run_page(name: &str) {
     let _ = std::fs::remove_dir_all(&area);
     std::fs::create_dir_all(&area).unwrap();
 
+    // The run starts on the first block's machine.
+    let machine = steps.first().and_then(|step| step.machine.clone());
+    let (home, cwd) = machine_folders(&area, &machine);
     let mut reader = Reader {
         page: label.clone(),
         area: area.clone(),
-        cwd: area.join("reader"),
+        machine,
+        home,
+        cwd,
+        others: HashMap::new(),
+        bound: HashMap::new(),
         address: None,
         servers: Vec::new(),
     };
-    std::fs::create_dir(&reader.cwd).unwrap();
 
     for step in &steps {
+        reader.switch_to(step.machine.clone());
+        let command = substitute(&reader.localize(&step.command), &reader.bound)
+            .unwrap_or_else(|why| {
+                panic!("{} line {}: `{}`: {}", label, step.line, step.command, why)
+            });
         let step = Step {
             line: step.line,
-            command: reader.localize(&step.command),
+            machine: step.machine.clone(),
+            command,
             expected: step.expected.clone(),
         };
 
@@ -456,7 +737,7 @@ fn run_page(name: &str) {
         let expected: Vec<String> = step.expected.iter().map(|line| reader.localize(line)).collect();
 
         assert!(
-            status == Some(0) && output_matches(&expected, &printed),
+            status == Some(0) && output_matches(&expected, &printed, &mut reader.bound),
             "{} line {}: `{}` exited {:?} and printed\n{}\n\nThe page shows\n{}{}",
             label, step.line, step.command, status, printed.join("\n"), expected.join("\n"),
             reader.server_trouble()
@@ -480,6 +761,11 @@ fn tutorial_runs_as_written() {
 #[test]
 fn concepts_run_as_written() {
     run_page("concepts.md");
+}
+
+#[test]
+fn team_runs_as_written() {
+    run_page("team.md");
 }
 
 /// A page that shows commands in a `console` block promises they run as shown, so a page with one
@@ -512,27 +798,145 @@ fn every_page_with_console_blocks_is_run() {
 
 #[test]
 fn elision_stands_for_any_text_within_one_line() {
-    assert!(line_matches("Stacked parcel … on pallet \"main\".", "Stacked parcel 8faf on pallet \"main\"."));
-    assert!(line_matches("…", ""));
-    assert!(line_matches("a … b … c", "a 1 b 2 c"));
-    assert!(line_matches("exact", "exact"));
+    let matches = |pattern: &str, actual: &str| line_matches(pattern, actual, &mut HashMap::new());
 
-    assert!(!line_matches("Stacked parcel … on pallet \"main\".", "Stacked parcel 8faf on pallet \"shout\"."));
-    assert!(!line_matches("exact", "exact "));
-    assert!(!line_matches("a…a", "a"));
-    assert!(!line_matches("a … b … c", "a 1 c 2 b"));
+    let stacked = "Stacked parcel … on pallet \"main\".";
+    assert!(matches(stacked, "Stacked parcel 8faf on pallet \"main\"."));
+    assert!(matches("…", ""));
+    assert!(matches("a … b … c", "a 1 b 2 c"));
+    assert!(matches("exact", "exact"));
+
+    assert!(!matches(stacked, "Stacked parcel 8faf on pallet \"shout\"."));
+    assert!(!matches("exact", "exact "));
+    assert!(!matches("a…a", "a"));
+    assert!(!matches("a … b … c", "a 1 c 2 b"));
+}
+
+#[test]
+fn a_placeholder_stands_for_one_word_and_binds_it() {
+    let mut bound = HashMap::new();
+    assert!(line_matches("Key id: <key>.", "Key id: 0c80c7.", &mut bound));
+    assert_eq!(bound["key"], "0c80c7");
+
+    // A second use, in the same line or a later one, is the word the first one bound.
+    assert!(line_matches("key <key> again", "key 0c80c7 again", &mut bound));
+    assert!(!line_matches("key <key>", "key 0c80c8", &mut bound));
+    assert!(!line_matches("key <key>…", "key 0c80c7d", &mut bound));
+    let mut short = HashMap::from([("key".to_string(), "0c80".to_string())]);
+    assert!(!line_matches("key <key>…", "key 0c80c7", &mut short));
+    assert!(line_matches("key <key>…", "key 0c80, then", &mut short));
+    assert!(!line_matches("key …<key>", "key dead0c80", &mut short));
+    assert!(!line_matches("key x<key>", "key x0c80", &mut short));
+    assert!(line_matches("key …<key>", "key (0c80", &mut short));
+    assert!(line_matches("<a> and <a>", "x and x", &mut HashMap::new()));
+    assert!(!line_matches("<a> and <a>", "x and y", &mut HashMap::new()));
+
+    // One word: never empty, never across a space.
+    assert!(!line_matches("id: <id>", "id: ", &mut HashMap::new()));
+    assert!(!line_matches("id: <id>", "id: two words", &mut HashMap::new()));
+    assert!(line_matches("id: <id> …", "id: two words", &mut HashMap::new()));
+    assert!(!line_matches("id: <id>c", "id: abc", &mut HashMap::new()));
+
+    // A failed match binds nothing, and text that is not a name is plain text.
+    let mut untouched = HashMap::new();
+    assert!(!line_matches("<a> b", "x c", &mut untouched));
+    assert!(untouched.is_empty());
+    let usage = "Usage: forklift <COMMAND> < x>";
+    assert!(line_matches(usage, usage, &mut untouched));
+    assert!(!line_matches("Usage: forklift <COMMAND>", "Usage: forklift prepare", &mut untouched));
 }
 
 #[test]
 fn output_must_match_line_for_line() {
     let lines = |text: &str| text.lines().map(str::to_string).collect::<Vec<_>>();
+    let matches = |expected: &[String], actual: &[String]| {
+        output_matches(expected, actual, &mut HashMap::new())
+    };
 
-    assert!(output_matches(&lines("…\nb"), &lines("a\nb")));
-    assert!(output_matches(&[], &[]));
+    assert!(matches(&lines("…\nb"), &lines("a\nb")));
+    assert!(matches(&[], &[]));
 
-    assert!(!output_matches(&[], &lines("unexpected")));
-    assert!(!output_matches(&lines("…"), &lines("a\nb")));
-    assert!(!output_matches(&lines("a\nb"), &lines("a")));
+    assert!(!matches(&[], &lines("unexpected")));
+    assert!(!matches(&lines("…"), &lines("a\nb")));
+    assert!(!matches(&lines("a\nb"), &lines("a")));
+
+    // A step that does not match keeps none of the bindings its first lines made.
+    let mut bound = HashMap::new();
+    assert!(!output_matches(&lines("<a>\nb"), &lines("x\nc"), &mut bound));
+    assert!(bound.is_empty());
+    assert!(output_matches(&lines("<a>\n<a>"), &lines("x\nx"), &mut bound));
+    assert_eq!(bound["a"], "x");
+}
+
+#[test]
+fn a_command_uses_what_its_placeholders_bound() {
+    let bound = HashMap::from([
+        ("key".to_string(), "0c80".to_string()),
+        ("pop".to_string(), "b82c".to_string()),
+    ]);
+
+    assert_eq!(
+        substitute("forklift office admit bob <key> <pop>", &bound).unwrap(),
+        "forklift office admit bob 0c80 b82c"
+    );
+    assert_eq!(substitute("forklift prepare", &bound).unwrap(), "forklift prepare");
+    assert!(substitute("forklift admit <key> <genesis>", &bound).unwrap_err().contains("binds"));
+
+    // Inside quotes a shell passes `<key>` on as it is, so the test cannot replace it.
+    assert!(substitute("echo 'id <key>' > notes", &bound).unwrap_err().contains("quotes"));
+    assert!(substitute("echo \"id <key>\" > notes", &bound).unwrap_err().contains("quotes"));
+    assert_eq!(substitute("echo 'a' <key> > notes", &bound).unwrap(), "echo 'a' 0c80 > notes");
+
+    // Text that is not a name stays, for the shell check to refuse.
+    assert_eq!(substitute("cat <Notes>", &bound).unwrap(), "cat <Notes>");
+}
+
+#[test]
+fn machine_markers_name_the_machine_each_block_runs_on() {
+    let page = "<!-- machine: ada -->\n```console\n$ a\n```\n\
+        <!-- machine: bob-2 -->\n```console\n$ b\n$ c\n```\n";
+    let steps = parse_steps(page).unwrap();
+    let machines: Vec<Option<&str>> = steps.iter().map(|step| step.machine.as_deref()).collect();
+    assert_eq!(machines, [Some("ada"), Some("bob-2"), Some("bob-2")]);
+
+    let steps = parse_steps("```console\n$ a\n```\n<!-- a comment about machines -->\n").unwrap();
+    assert_eq!(steps[0].machine, None);
+
+    let refused = |page: &str| parse_steps(page).is_err();
+    assert!(refused("```console\n$ a\n```\n<!-- machine: ada -->\n```console\n$ b\n```\n"));
+    assert!(refused("<!-- machine: Ada -->\n"));
+    assert!(refused("<!-- machine:ada -->\n"));
+    assert!(refused("<!--machine: ada-->\n"));
+    assert!(refused("<!-- Machine: ada -->\n"));
+    assert!(refused("<!-- machine: ada bob -->\n"));
+    assert!(refused("  <!-- machine: ada -->\n"));
+    assert!(refused("<!---machine: ada -->\n"));
+    assert!(refused("<!--\nmachine: ada\n-->\n"));
+    assert!(refused("<!-- machine: ada\n-->\n"));
+    assert!(refused("<!-- machines: bob -->\n"));
+    assert!(refused("<!-- machine bob -->\n"));
+
+    // A comment that never closes hides the rest of the page; one that closes and reopens on a
+    // line stays open; one indented as code is not a comment.
+    assert!(refused("<!-- a note -\n```console\n$ a\n```\n"));
+    let hidden = "<!--\na\n--> <!-- b\n```console\n$ hidden\n```\n-->\n";
+    assert!(parse_steps(hidden).unwrap().is_empty());
+    assert!(refused("text\n\n    <!-- example\n```console\n$ a\n```\n-->\n"));
+
+    // Other comments are prose, on one line or several, and an indented line after a comment
+    // starts a code block as it would after a blank line.
+    assert!(parse_steps("<!-- machine-readable output -->\n<!-- A machine differs -->\n").is_ok());
+    assert!(parse_steps("<!--\nA note about the machine.\n-->\n").is_ok());
+    assert!(refused("<!-- machine: ada -->\n    forklift lower\n"));
+}
+
+#[test]
+fn a_placeholder_used_once_is_refused() {
+    let page = "```console\n$ a\nid <id>\n$ b <id>\nrecheck <idd>\n```\n";
+    let error = parse_steps(page).unwrap_err();
+    assert!(error.contains("line 5: <idd> is used only once"), "{}", error);
+
+    assert!(parse_steps("```console\n$ a\nid <id>\n$ b <id>\n```\n").is_ok());
 }
 
 #[test]
