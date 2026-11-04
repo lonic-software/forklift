@@ -8,26 +8,27 @@
 //! exception by design: a rebuildable, checksummed cache, renamed into place with no barrier
 //! (`building_the_commit_graph_pays_no_durability_barrier` pins that).
 //!
-//! A unit test can assert the atomic-write contract (see `file_utils`), but only a real,
-//! externally killed process exercises the whole `stack` pipeline under interruption. This test
-//! SIGKILLs `stack` at a spread of delays that straddle the object-write/ref-update window, and
-//! after each kill asserts the store is still internally consistent and usable. The assertions
-//! hold at *every* kill point, so the test cannot flake — whether a given kill lands inside the
-//! interesting window only affects coverage, never pass/fail. A crash that genuinely corrupted
-//! the store (a torn object, a partial ref) is the only thing that fails it.
+//! A unit test can assert the atomic-write contract (see `file_utils`), but only a real process
+//! stopped partway exercises a whole command's publish order. The crash tests below stop `stack`,
+//! `load` and `park` at each rename they make in turn (`FORKLIFT_DEBUG_CRASH_AT_RENAME`, see
+//! `file_utils::crash_point`), and after each stop assert the store is still internally consistent
+//! and usable. A rename is where a written file becomes visible, so this stops a command once at
+//! each of its publishes, in the same order on every machine wherever it publishes from one
+//! thread; where threads rename concurrently, the scheduler picks which rename is the Nth.
+//! Killing the process at guessed delays, which these tests did before, reached a given state only
+//! when the timing happened to land there: with the blob barrier of `load` moved after its shard
+//! publish, 20 kills caught the bug in 4 runs out of 14.
 //!
-//! The kill delays themselves *are* calibrated, though: a fixed millisecond spread that straddles
-//! the write window on a fast dev laptop can land entirely before the first `stack` ever finishes
-//! on a slow/cold CI runner, in which case no kill ever exercises the durable-ref-advance path and
-//! the sanity guard below (rightly) refuses to pass. So before spawning any kills, this test times
-//! a few uninterrupted `stack` runs on the same corpus in the same warehouse and derives the delay
-//! spread from that measurement — proportional to how slow *this* machine actually is. If the
-//! guard still trips (measurement noise, a GC pause, whatever), it retries once with a
-//! re-measured, wider spread before failing for real.
+//! What the stops do not reach: a step that is not a rename (a file written or removed in place),
+//! and a power loss. A stopped process leaves everything it wrote to the kernel in place, synced
+//! or not, so these tests check the order of publishes, not of syncs. The `file_utils` unit tests
+//! pin the syncs inside one batch; that a command finishes one batch's syncs before it publishes
+//! what depends on them is checked by review, not by a test.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Command, Output};
+
+use forklift_core::util::file_utils::CRASH_POINT_EXIT_CODE;
 
 const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
 
@@ -51,7 +52,9 @@ impl Area {
     }
 
     /// A command in the warehouse with the isolated global config and key directory, and fsync
-    /// forced on: durability is what this suite checks, so a `FORKLIFT_FSYNC=0` in the
+    /// forced on: a crash point keeps unsynced writes, so fsync does not change what a stop
+    /// leaves, but the publish order under test is that of the synced path the binary ships with,
+    /// and the barrier counts below count only synced barriers. A `FORKLIFT_FSYNC=0` in the
     /// environment the tests were started from must not reach the binary.
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(FORKLIFT);
@@ -68,9 +71,9 @@ impl Area {
         self.command(args).output().unwrap()
     }
 
-    /// A crashed `stack` leaves the warehouse lock behind (SIGKILL runs no destructor), exactly as
-    /// a real power loss would; the operator clears it. Do the same before the next command so the
-    /// lock is never the reason a later step fails — we are testing store integrity, not the lock.
+    /// A crashed command leaves the warehouse lock behind (no destructor runs), exactly as a real
+    /// power loss would; the operator clears it. Do the same before the next command so the lock
+    /// is never the reason a later step fails — we are testing store integrity, not the lock.
     fn clear_stale_lock(&self) {
         let _ = std::fs::remove_file(self.warehouse().join(".forklift").join("lock"));
     }
@@ -111,29 +114,71 @@ impl Drop for Area {
     }
 }
 
-/// Lines in the `stack` test's single corpus file, about four megabytes.
-const STACK_CORPUS_LINES: usize = 90_000;
+/// The most crash points one command is stepped through before the test gives up on it ever
+/// completing.
+const MAX_CRASH_POINTS: usize = 500;
 
-/// Lines in each of the 24 files the `load` and `park` tests spread their corpus over, about a
-/// megabyte each.
+/// Run `args` in `area` once per rename it makes, stopped just before the first rename, then the
+/// second, and so on, until a run makes fewer renames than its crash point and completes.
+/// `prepare` runs before each attempt with the attempt's crash point, and `check` after it with
+/// whether the run stopped there. Returns how many runs stopped.
 ///
-/// The corpus is one line repeated, so it compresses to an object of a few kilobytes: the line
-/// count sets how long hashing and compression take, not how many bytes are fsynced. What the
-/// size has to buy is a run long enough that the calibrated kill delays, at least
-/// `MIN_STEP_MS` apart, still fall inside it rather than in process startup or after the end;
-/// shrinking it trades exactly that away.
-const SPREAD_CORPUS_LINES: usize = 22_500;
+/// A run that neither stops at its crash point nor succeeds fails the test: the command under test
+/// is given a state it can complete from, and the crash point is the only thing allowed to stop it.
+fn crash_at_every_rename(
+    area: &Area,
+    args: &[&str],
+    mut prepare: impl FnMut(usize),
+    mut check: impl FnMut(usize, bool),
+) -> usize {
+    for at in 1..=MAX_CRASH_POINTS {
+        prepare(at);
 
-/// Overwrite a corpus file with a fresh payload of `lines` lines so each call under test
-/// (calibration or real) has real hashing/compression/write work to do. The tag ends with the
-/// file's directory and name, so the files of one round differ: identical files would be stored
-/// as one content-addressed blob, and a kill round would cover one object write rather than one
-/// per file. Only the last two path components go in, so the content does not depend on the
-/// temp directory and is the same on every run and OS.
-fn rewrite_corpus(file: &Path, base_line: &str, lines: usize, tag: &str) {
-    let dir = file.parent().and_then(|p| p.file_name()).unwrap().to_str().unwrap();
-    let name = file.file_name().unwrap().to_str().unwrap();
-    std::fs::write(file, format!("{}{} {}/{}\n", base_line.repeat(lines), tag, dir, name)).unwrap();
+        let output = area.command(args).env("FORKLIFT_DEBUG_CRASH_AT_RENAME", at.to_string()).output().unwrap();
+        let stopped = output.status.code() == Some(CRASH_POINT_EXIT_CODE);
+
+        assert!(stopped || output.status.success(),
+            "{args:?} stopped before rename {at} must exit {CRASH_POINT_EXIT_CODE} or complete, \
+             exited {:?}, stderr: {}", output.status.code(), String::from_utf8_lossy(&output.stderr));
+
+        check(at, stopped);
+
+        if !stopped {
+            return at - 1;
+        }
+    }
+
+    panic!("{args:?} still had a rename left after {MAX_CRASH_POINTS} crash points");
+}
+
+/// Overwrite each corpus file with content unique to it and to `tag`, so every run under test has a
+/// real change in every file to hash, store and publish. Identical files would be stored as one
+/// content-addressed blob, so the content names the file's directory and name, and only those two
+/// components, so it is the same on every run and OS.
+fn rewrite_corpus(files: &[PathBuf], tag: &str) {
+    for file in files {
+        let dir = file.parent().and_then(|p| p.file_name()).unwrap().to_str().unwrap();
+        let name = file.file_name().unwrap().to_str().unwrap();
+        std::fs::write(file, format!("{tag} {dir}/{name}\n")).unwrap();
+    }
+}
+
+/// A corpus of `dirs` directories holding `files_per_dir` files each, written under `warehouse`.
+/// Several directories are what `load`'s walk runs concurrently, one task per directory.
+fn spread_corpus(warehouse: &Path, dirs: usize, files_per_dir: usize) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+
+    for dir in 0..dirs {
+        let dir_path = warehouse.join(format!("dir{dir}"));
+        std::fs::create_dir_all(&dir_path).unwrap();
+
+        for f in 0..files_per_dir {
+            files.push(dir_path.join(format!("file{f}.dat")));
+        }
+    }
+
+    rewrite_corpus(&files, "seed");
+    files
 }
 
 /// The current pallet head, if one exists yet.
@@ -143,334 +188,91 @@ fn current_head(warehouse: &Path) -> Option<String> {
         .map(|h| h.trim().to_string())
 }
 
-/// Time a few uninterrupted `stack` runs on the same corpus, in the same warehouse the kill loop
-/// will use, and return the slowest of them. Using the max (not the mean/median) biases the
-/// resulting delay spread wide rather than narrow: undershooting the true duration is what causes
-/// every kill to land before the write ever starts, which is exactly the flake this is guarding
-/// against. Each call fully completes and folds into the real history — that's fine, it's the same
-/// warehouse the kill loop continues from, just with a known head established before it starts.
-fn calibrate_stack_duration(area: &Area, file: &Path, base_line: &str, label: &str, samples: usize) -> Duration {
-    // The caller may be re-entering right after a kill spread whose last kill landed mid-write and
-    // left `.forklift/lock` behind (SIGKILL runs no destructor) — `run_kill_spread` only clears the
-    // stale lock at the *start* of its own next iteration, so a caller that jumps straight from a
-    // spread into recalibration (the attempt-1-landed-nothing retry) would otherwise hit a locked
-    // warehouse on the very first `load`/`stack` below. Clear it here too, same as `run_kill_spread`
-    // does, so calibration never fails on a lock left behind by the run it's re-measuring after.
+/// The same check `crash_at_every_rename` makes of a stopped run, made of the binary's own exit:
+/// stopping before a rename the run reaches stops it, with the crash point's exit code and nothing
+/// after it published; a crash point past the run's last rename never fires. Without this, a hook
+/// that never fired would let every crash test pass on its first, complete run.
+#[test]
+fn a_crash_point_stops_the_run_before_that_rename() {
+    let area = Area::new("crash-point");
+    assert!(area.run(&["prepare"]).status.success());
+    assert!(area.run(&["config", "set", "operator.identifier", "crash@forklift"]).status.success());
+
+    std::fs::write(area.warehouse().join("file.txt"), "content\n").unwrap();
+    assert!(area.run(&["load", "."]).status.success());
+
+    let stopped = area.command(&["stack", "-m", "stopped"]).env("FORKLIFT_DEBUG_CRASH_AT_RENAME", "1").output().unwrap();
+    assert_eq!(stopped.status.code(), Some(CRASH_POINT_EXIT_CODE),
+        "a stack stopped before its first rename must exit with the crash point's code, stderr: {}",
+        String::from_utf8_lossy(&stopped.stderr));
+    assert_eq!(current_head(&area.warehouse()), None, "a stack stopped before its first rename publishes no head");
+
     area.clear_stale_lock();
-
-    let mut slowest = Duration::ZERO;
-    for i in 0..samples {
-        rewrite_corpus(file, base_line, STACK_CORPUS_LINES, &format!("{label} {i}"));
-        let load = area.run(&["load", "."]);
-        assert!(load.status.success(), "calibration load failed: {}", String::from_utf8_lossy(&load.stderr));
-
-        let start = Instant::now();
-        let stack = area.run(&["stack", "-m", &format!("{label} {i}")]);
-        let elapsed = start.elapsed();
-        assert!(stack.status.success(),
-            "calibration stack failed: {}", String::from_utf8_lossy(&stack.stderr));
-
-        slowest = slowest.max(elapsed);
-    }
-    slowest
-}
-
-/// Derive `count` kill delays spread across at least `[low_frac, high_frac]` of one measured,
-/// uninterrupted `stack` duration, so the spread scales with how slow *this* machine actually is
-/// instead of assuming a fixed millisecond budget. The fractions set a *floor* for the spread, not
-/// an exact bound: consecutive delays are never closer than `MIN_STEP_MS` apart (Windows' ~15ms
-/// timer-tick granularity quantizes finer sleeps away, which would collapse several
-/// nominally-distinct delays onto the same wall-clock kill point), and on a fast measurement that
-/// floor dominates the requested step, stretching the top of the spread well past `high_frac`. That
-/// overshoot is desirable, not a bug to tighten: a fast machine gets extra post-completion coverage
-/// at negligible cost, and the guard needs some kills to land after completion regardless of how
-/// small the measured duration was.
-fn kill_delay_spread(measured: Duration, count: usize, low_frac: f64, high_frac: f64) -> Vec<Duration> {
-    const MIN_STEP_MS: u64 = 15;
-    assert!(count >= 2);
-
-    let measured_ms = (measured.as_millis() as u64).max(1);
-    let low = ((measured_ms as f64) * low_frac).round().max(1.0) as u64;
-    let high = ((measured_ms as f64) * high_frac).round().max(low as f64 + 1.0) as u64;
-    let step = ((high - low) / (count as u64 - 1)).max(MIN_STEP_MS);
-
-    (0..count as u64).map(|i| Duration::from_millis(low + step * i)).collect()
-}
-
-/// The calibration math in isolation, without spawning any processes: a spread derived from a
-/// slow measurement must actually reach further out than one derived from a fast measurement
-/// (the whole point — no more hard-coded 80ms ceiling that a slow runner can't clear), a spread
-/// must never step by less than Windows' timer granularity, and widening the fractions (the
-/// retry) must reach further than the original spread for the same measurement.
-#[test]
-fn kill_delay_spread_scales_with_measured_duration() {
-    let fast = kill_delay_spread(Duration::from_micros(500), 24, 0.02, 1.30);
-    assert_eq!(fast.first(), Some(&Duration::from_millis(1)));
-    assert!(fast.windows(2).all(|w| w[1] - w[0] >= Duration::from_millis(15)),
-        "delays must never step by less than one Windows timer tick: {fast:?}");
-
-    // A slow, 800ms measurement (a loaded/cold CI runner) must spread proportionally further out —
-    // not stay capped at whatever a fast dev laptop's measurement would have produced.
-    let slow = kill_delay_spread(Duration::from_millis(800), 24, 0.02, 1.30);
-    assert!(slow.last().unwrap() > &Duration::from_millis(900),
-        "a slow measurement must produce a proportionally wide spread: {slow:?}");
-    assert!(slow.windows(2).all(|w| w[1] > w[0]), "delays must be strictly increasing: {slow:?}");
-    assert!(slow.last() > fast.last(), "a slower measurement must reach further than a fast one");
-
-    // The bounded retry (wider fractions) must reach further still for the same measurement.
-    let retry = kill_delay_spread(Duration::from_millis(800), 24, 0.0, 2.5);
-    assert!(retry.last() > slow.last(), "the retry spread must widen beyond the first attempt");
-}
-
-/// Run one spread of kills against `area`, asserting consistency after every one. Returns how many
-/// of them landed *after* a stack's ref update had already completed (a distinct new head appeared
-/// between two consecutive checks) — the signal that the durable path, not just the
-/// killed-before-anything path, was actually exercised. `prior_head` carries the last observed head
-/// across calls (including across calibration bursts) so that head established before this spread
-/// ran is never mistaken for one this spread produced.
-fn run_kill_spread(
-    area: &Area,
-    file: &Path,
-    base_line: &str,
-    warehouse: &Path,
-    delays: &[Duration],
-    commit_tag: &str,
-    prior_head: &mut Option<String>,
-) -> usize {
-    let mut advanced = 0usize;
-
-    for (i, delay) in delays.iter().enumerate() {
-        // 1. Recover from the previous kill and check it left the store consistent.
-        area.clear_stale_lock();
-        area.assert_consistent(&format!("after {commit_tag} kill #{i}"));
-
-        // A head that advanced must be a *new* parcel, never a rewritten/rolled-back one.
-        let head_now = current_head(warehouse);
-        if let (Some(now), Some(prev)) = (&head_now, prior_head.as_ref()) {
-            if now != prev {
-                advanced += 1;
-            }
-        } else if head_now.is_some() && prior_head.is_none() {
-            advanced += 1;
-        }
-        *prior_head = head_now;
-
-        // A kill between the head write and the position write leaves the bay behind its own
-        // parcel, with files that already match it; catching up records the head, and is a no-op
-        // otherwise. Without it every later stack would be refused as stale.
-        let caught_up = area.run(&["shift", "main"]);
-        assert!(caught_up.status.success(), "catch-up after {commit_tag} kill #{i} failed: {}",
-            String::from_utf8_lossy(&caught_up.stderr));
-
-        // 2. Make a fresh change and stage it.
-        rewrite_corpus(file, base_line, STACK_CORPUS_LINES, &format!("{commit_tag} {i}"));
-        let load = area.run(&["load", "."]);
-        assert!(load.status.success(), "load failed: {}", String::from_utf8_lossy(&load.stderr));
-
-        // 3. Spawn the stack and SIGKILL it mid-flight.
-        let mut child = area.command(&["stack", "-m", &format!("{commit_tag} commit {i}")])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-
-        std::thread::sleep(*delay);
-
-        let _ = child.kill(); // a no-op if it already finished
-        let _ = child.wait();
-    }
-
-    advanced
+    let completed = area.command(&["stack", "-m", "completed"]).env("FORKLIFT_DEBUG_CRASH_AT_RENAME", "100000").output().unwrap();
+    assert!(completed.status.success(), "a crash point past the last rename must never fire, stderr: {}",
+        String::from_utf8_lossy(&completed.stderr));
+    assert!(current_head(&area.warehouse()).is_some());
 }
 
 #[test]
-fn killing_stack_midway_never_corrupts_the_store() {
+fn stopping_stack_at_every_rename_never_corrupts_the_store() {
     let area = Area::new("stack");
     let warehouse = area.warehouse();
-    let file = warehouse.join("big.dat");
-
-    // A few megabytes so the run is long enough that some of the kills below land inside the
-    // write window rather than always before or after it (see `SPREAD_CORPUS_LINES` for what the
-    // size does and does not scale).
-    let base_line = "the quick brown fox jumps over the lazy dog\n";
-    rewrite_corpus(&file, base_line, STACK_CORPUS_LINES, "seed");
+    let files = spread_corpus(&warehouse, 2, 2);
 
     assert!(area.run(&["prepare"]).status.success());
     assert!(area.run(&["config", "set", "operator.identifier", "crash@forklift"]).status.success());
 
-    const DELAY_COUNT: usize = 24;
+    // One stack first, so the runs below build on a parent and move an existing head.
+    assert!(area.run(&["load", "."]).status.success());
+    assert!(area.run(&["stack", "-m", "base"]).status.success());
+    let base = current_head(&warehouse);
 
-    // Attempt 1: measure how long an uninterrupted `stack` actually takes on this machine, then
-    // spread the kills across ~2%..130% of that — wide enough to straddle the write window whether
-    // it's microseconds (a fast laptop) or hundreds of milliseconds (a cold, loaded CI runner).
-    let measured_1 = calibrate_stack_duration(&area, &file, base_line, "calibration-1", 3);
-    let delays_1 = kill_delay_spread(measured_1, DELAY_COUNT, 0.02, 1.30);
-    let mut prior_head = current_head(&warehouse);
+    let mut head_before = base.clone();
+    let mut advanced_by_a_stop = 0usize;
 
-    let mut advanced = run_kill_spread(&area, &file, base_line, &warehouse, &delays_1, "a", &mut prior_head);
+    let stopped = crash_at_every_rename(&area, &["stack", "-m", "under test"],
+        |at| {
+            // Recover from the previous stop and check it left the store consistent.
+            area.clear_stale_lock();
+            area.assert_consistent(&format!("before stack crash point {at}"));
 
-    // The guard below exists so this test can't silently pass by always killing before any real
-    // work started. If the first spread never landed a completed stack, that's most likely
-    // measurement noise (a cold cache on the very first calibration run, a scheduler hiccup) rather
-    // than a structural problem — so re-measure and try a wider spread once, bounded, before
-    // failing for real.
-    let mut measured_2 = None;
-    let mut delays_2 = None;
-    if advanced == 0 {
-        let measured = calibrate_stack_duration(&area, &file, base_line, "calibration-2", 3);
-        let delays = kill_delay_spread(measured, DELAY_COUNT, 0.0, 2.5);
-        // Recalibration itself completes real, uninterrupted stack calls — re-anchor the baseline
-        // so the retry's own writes are never mistaken for a kill's ref update, same as attempt 1.
-        prior_head = current_head(&warehouse);
-        advanced += run_kill_spread(&area, &file, base_line, &warehouse, &delays, "b", &mut prior_head);
-        measured_2 = Some(measured);
-        delays_2 = Some(delays);
-    }
+            // A stop between the head write and the position write leaves the bay behind its own
+            // parcel, with files that already match it; catching up records the head, and is a
+            // no-op otherwise. Without it every later stack would be refused as stale.
+            let caught_up = area.run(&["shift", "main"]);
+            assert!(caught_up.status.success(), "catch-up before stack crash point {at} failed: {}",
+                String::from_utf8_lossy(&caught_up.stderr));
 
-    // 4. Final recovery: the store must still accept a clean write, and every object reachable from
-    //    the final head must read back (git export walks the whole graph — parcels, trees, blobs —
-    //    so a torn object anywhere would fail here via the read-side hash check).
+            rewrite_corpus(&files, &format!("stack {at}"));
+            let load = area.run(&["load", "."]);
+            assert!(load.status.success(), "load failed: {}", String::from_utf8_lossy(&load.stderr));
+        },
+        |_, stopped| {
+            let head_now = current_head(&warehouse);
+            if stopped && head_now != head_before {
+                advanced_by_a_stop += 1;
+            }
+            head_before = head_now;
+        });
+
+    assert!(stopped >= 2, "stack must have been stopped at its renames, it was stopped {stopped} times");
+    // A stop after the head write and before the renames that follow it is the state the catch-up
+    // above exists for; without one, that durable-head path was never reached.
+    assert!(advanced_by_a_stop >= 1, "no stopped stack left its head moved, so no stop came after the head write");
+    assert_ne!(current_head(&warehouse), base, "the completed stack must have moved the head");
+
+    // Final recovery: every object reachable from the final head must read back (git export walks
+    // the whole graph — parcels, trees, blobs — so a torn or missing object anywhere fails here via
+    // the read-side hash check).
     area.clear_stale_lock();
     area.assert_consistent("final");
-
-    let caught_up = area.run(&["shift", "main"]);
-    assert!(caught_up.status.success(), "the final catch-up failed: {}", String::from_utf8_lossy(&caught_up.stderr));
-    assert!(area.run(&["load", "."]).status.success());
-    let recover = area.run(&["stack", "-m", "recover"]);
-    let recovered_ok = recover.status.success()
-        || String::from_utf8_lossy(&recover.stderr).contains("Nothing to stack");
-    assert!(recovered_ok, "the store must accept a write after the crashes, stderr: {}",
-        String::from_utf8_lossy(&recover.stderr));
-
-    area.assert_consistent("after recovery stack");
 
     let export_dir = area.root.join("git-export");
     let export = area.run(&["git", "export", export_dir.to_str().unwrap()]);
     assert!(export.status.success(),
         "git export must read every committed object without a torn read, stderr: {}",
         String::from_utf8_lossy(&export.stderr));
-
-    // Sanity: across the run at least one kill fell after a completed ref update, so the durable
-    // path (not just the "killed before anything" path) was actually exercised.
-    assert!(advanced >= 1,
-        "no stack ever completed across {} attempt(s) — the write window was never exercised. \
-         attempt 1: measured {measured_1:?} uninterrupted, tried delays {delays_1:?}.{}",
-        if measured_2.is_some() { 2 } else { 1 },
-        match (measured_2, delays_2) {
-            (Some(m), Some(d)) => format!(" attempt 2: measured {m:?} uninterrupted, tried delays {d:?}."),
-            _ => String::new(),
-        });
-}
-
-/// Time a few uninterrupted `load .` runs over the given multi-directory corpus and return the
-/// slowest — the same reasoning as [`calibrate_stack_duration`], aimed at `load`'s own parallel
-/// per-directory walk instead of `stack`'s tree build. Rewriting every file with a fresh tag each
-/// sample keeps real hashing/compression/staging work on the table for every run, exactly as
-/// `calibrate_stack_duration` does for its single corpus file.
-fn calibrate_load_duration(area: &Area, files: &[PathBuf], base_line: &str, label: &str, samples: usize) -> Duration {
-    area.clear_stale_lock();
-
-    let mut slowest = Duration::ZERO;
-    for i in 0..samples {
-        for file in files {
-            rewrite_corpus(file, base_line, SPREAD_CORPUS_LINES, &format!("{label} {i}"));
-        }
-
-        let start = Instant::now();
-        let load = area.run(&["load", "."]);
-        let elapsed = start.elapsed();
-        assert!(load.status.success(), "calibration load failed: {}", String::from_utf8_lossy(&load.stderr));
-
-        slowest = slowest.max(elapsed);
-    }
-    slowest
-}
-
-/// Run one spread of kills against `load .`, asserting store consistency after every one — the
-/// `load` counterpart of [`run_kill_spread`]. `load` has no ref of its own to compare a "did it
-/// advance" signal against (`stack` does — the pallet head), so instead every iteration tries to
-/// build directly on whatever the (possibly interrupted) load left behind: `stack` it, with no
-/// healing re-load first. This is deliberate, not an oversight — a healing re-load could mask
-/// exactly the bug this test exists to catch, since the stat-cache fast path
-/// (`is_entry_unchanged`) trusts an already-published shard's proven entries without re-reading
-/// their files, so a second `load .` would not necessarily re-touch (or heal) a shard a first,
-/// interrupted `load .` already made durable and visible. `stack` itself never verifies a blob's
-/// existence (it only carries hashes forward into tree entries), so the sharp check is deferred
-/// to a final `git export` after the whole spread (DESIGN.html §5.0 D item 10, finding #1) —
-/// see the caller.
-///
-/// Returns how many iterations produced a completed `stack` (the signal that this iteration's
-/// kill left something a later step could — and did — build on, not just "killed before
-/// anything"). Each iteration ends by loading and stacking everything, so the next one starts
-/// with nothing staged: a `stack` that succeeds can only be committing what that iteration's
-/// killed load staged, never the previous iteration's heal.
-///
-/// The incomplete-load guard (`load_guard_utils`) durably marks a load's root the instant it
-/// starts — before this test's kill ever lands — precisely so a killed `load` is caught even
-/// though it never got to report an error; a real `stack` now refuses on exactly the state this
-/// function deliberately builds on. That marker is a different concern from the one under test
-/// here (inventory completeness, not object/blob durability), so it is removed by hand — not
-/// healed by a re-load, which the comment above already rules out for a different reason — right
-/// before each iteration's direct `stack`, to keep exercising the same torn/missing-blob check
-/// this test always has.
-fn run_load_kill_spread(
-    area: &Area,
-    files: &[PathBuf],
-    base_line: &str,
-    delays: &[Duration],
-    commit_tag: &str,
-) -> usize {
-    let mut stacked = 0usize;
-
-    // Commit whatever calibration left staged, so the first iteration's `stack`, like every
-    // later one, can only succeed on what its own killed load staged.
-    area.clear_stale_lock();
-    settle(area, &format!("{commit_tag} settle"));
-
-    for (i, delay) in delays.iter().enumerate() {
-        // 1. Recover from the previous iteration's kill and check it left the store consistent.
-        area.clear_stale_lock();
-        area.assert_consistent(&format!("after {commit_tag} kill #{i}"));
-
-        // 2. A fresh change to every file in the corpus, so the walk below has real work to do
-        //    across every directory, not just the ones already touched by an earlier iteration.
-        for file in files {
-            rewrite_corpus(file, base_line, SPREAD_CORPUS_LINES, &format!("{commit_tag} {i}"));
-        }
-
-        // 3. Spawn the load and SIGKILL it mid-flight.
-        let mut child = area.command(&["load", "."])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-
-        std::thread::sleep(*delay);
-
-        let _ = child.kill(); // a no-op if it already finished
-        let _ = child.wait();
-
-        // 4. Build directly on whatever the (possibly interrupted) load left behind — no healing
-        //    re-load first (see the doc comment above for why). The incomplete-load marker a
-        //    killed load leaves behind is a different, orthogonal concern (see the function's own
-        //    doc comment) — removed by hand so `stack` still reaches the torn/missing-blob check
-        //    this test exists for, instead of refusing on the marker before ever getting there.
-        area.clear_stale_lock();
-        let _ = std::fs::remove_file(
-            forklift_core::util::load_guard_utils::marker_path_under(&area.warehouse())
-        );
-
-        if stack_or_nothing(area, &format!("{commit_tag} commit {i}")) {
-            stacked += 1;
-        }
-
-        // 5. Stage and commit the working directory's current content with an uninterrupted
-        //    `load .` and `stack`, so leftover partial state from this iteration's kill never
-        //    carries over as ambiguity, and nothing is staged when the next iteration starts.
-        settle(area, &format!("{commit_tag} heal {i}"));
-    }
-
-    stacked
 }
 
 /// An uninterrupted `load .` and a `stack` of whatever it staged, so nothing is left staged for
@@ -494,68 +296,60 @@ fn stack_or_nothing(area: &Area, message: &str) -> bool {
 }
 
 /// Extends the crash-consistency spine to `load`'s parallel per-directory walk (DESIGN.html §5.0
-/// D item 10, finding #1): every changed file's blob is now staged into the walk's own shared
-/// batch (`InventoryBuilderContext::batch`) instead of paying its own atomic-write barrier, and
-/// that same batch is what the walk's single-threaded join point later publishes shard content
-/// through — so a blob and the shard that references it can land in the very same durability
-/// barrier. This test exists to prove that sharing never lets a shard become durable and visible
-/// while a blob it references is still just an unpublished temp file: SIGKILL `load` at a spread
-/// of delays straddling its write window, and after every kill, stack and (at the end) export
-/// whatever survived — a torn or missing blob referenced by any committed tree fails the
-/// read-side hash check `git export` performs on every object it walks.
+/// D item 10, finding #1): every changed file's blob is staged into the walk's own shared batch
+/// (`InventoryBuilderContext::blob_batch`), which the join point finishes before it publishes any
+/// shard naming those blobs. This test proves no shard ever becomes visible while a blob it
+/// references is still an unpublished temp file: stop `load` at every rename, and after each stop
+/// build directly on whatever it left behind.
+///
+/// That build is a `stack`, with no healing re-load first. A healing re-load could mask exactly the
+/// bug this test exists to catch, since the stat-cache fast path (`is_entry_unchanged`) trusts an
+/// already-published shard's proven entries without re-reading their files, so a second `load .`
+/// would not necessarily re-touch (or heal) a shard a stopped `load .` already made visible.
+/// `stack` refuses staged content missing from the store, and the final `git export` reads every
+/// committed object back.
+///
+/// The incomplete-load guard (`load_guard_utils`) durably marks a load's root before anything else
+/// it publishes, precisely so a stopped `load` is caught even though it never got to report an
+/// error, and a real `stack` refuses on it. That marker is a different concern from the one under
+/// test here (inventory completeness, not blob durability), so it is removed by hand right before
+/// each direct `stack`, to keep reaching the missing-blob check.
 #[test]
-fn killing_load_midway_never_leaves_a_shard_referencing_a_missing_or_torn_blob() {
+fn stopping_load_at_every_rename_never_leaves_a_shard_referencing_a_missing_or_torn_blob() {
     let area = Area::new("load");
     let warehouse = area.warehouse();
-
-    // Several directories with several files each: `load`'s walk (DESIGN.html §5.0 D item 10,
-    // finding #1) runs one concurrent task per directory, each staging its own changed files'
-    // blobs into the same shared batch — this corpus shape is what actually exercises that
-    // concurrency, unlike `stack`'s crash test above (a single flat file is enough there, since
-    // `stack`'s object write concurrency comes from its tree build, not this walk).
-    let base_line = "the quick brown fox jumps over the lazy dog\n";
-    let mut files: Vec<PathBuf> = Vec::new();
-
-    for dir in 0..6 {
-        let dir_path = warehouse.join(format!("dir{dir}"));
-        std::fs::create_dir_all(&dir_path).unwrap();
-
-        for f in 0..4 {
-            let file = dir_path.join(format!("file{f}.dat"));
-            rewrite_corpus(&file, base_line, SPREAD_CORPUS_LINES, "seed");
-            files.push(file);
-        }
-    }
+    let files = spread_corpus(&warehouse, 2, 2);
 
     assert!(area.run(&["prepare"]).status.success());
     assert!(area.run(&["config", "set", "operator.identifier", "crash@forklift"]).status.success());
+    settle(&area, "base");
 
-    const DELAY_COUNT: usize = 20;
+    let mut stacked = 0usize;
 
-    // Attempt 1: measure how long an uninterrupted `load .` actually takes on this machine, then
-    // spread the kills across ~2%..130% of that — see `calibrate_stack_duration`'s doc comment
-    // for why this scales with the machine instead of assuming a fixed millisecond budget.
-    let measured_1 = calibrate_load_duration(&area, &files, base_line, "calibration-1", 3);
-    let delays_1 = kill_delay_spread(measured_1, DELAY_COUNT, 0.02, 1.30);
+    let stopped = crash_at_every_rename(&area, &["load", "."],
+        |at| {
+            area.clear_stale_lock();
+            area.assert_consistent(&format!("before load crash point {at}"));
+            rewrite_corpus(&files, &format!("load {at}"));
+        },
+        |at, _| {
+            area.clear_stale_lock();
+            let _ = std::fs::remove_file(
+                forklift_core::util::load_guard_utils::marker_path_under(&area.warehouse())
+            );
 
-    let mut stacked = run_load_kill_spread(&area, &files, base_line, &delays_1, "a");
+            if stack_or_nothing(&area, &format!("load {at} commit")) {
+                stacked += 1;
+            }
 
-    // Same bounded-retry guard as the `stack` crash test: if the first spread never landed a
-    // completed stack, re-measure and try a wider spread once before failing for real.
-    let mut measured_2 = None;
-    let mut delays_2 = None;
-    if stacked == 0 {
-        let measured = calibrate_load_duration(&area, &files, base_line, "calibration-2", 3);
-        let delays = kill_delay_spread(measured, DELAY_COUNT, 0.0, 2.5);
-        stacked += run_load_kill_spread(&area, &files, base_line, &delays, "b");
-        measured_2 = Some(measured);
-        delays_2 = Some(delays);
-    }
+            // Stage and commit the working directory's current content uninterrupted, so nothing
+            // a stop left staged carries over, and nothing is staged when the next run starts.
+            settle(&area, &format!("load {at} heal"));
+        });
 
-    // Final recovery and the sharp check: every object reachable from every pallet's history —
-    // including every blob any kill's `load` ever staged and published — must read back. A shard
-    // durably referencing a missing or torn blob fails here via `git export`'s read-side hash
-    // check, exactly as it would for `stack`'s crash test above.
+    assert!(stopped >= 2, "load must have been stopped at its renames, it was stopped {stopped} times");
+    assert!(stacked >= 1, "the completed load must have staged something a stack committed");
+
     area.clear_stale_lock();
     area.assert_consistent("final");
 
@@ -564,44 +358,6 @@ fn killing_load_midway_never_leaves_a_shard_referencing_a_missing_or_torn_blob()
     assert!(export.status.success(),
         "git export must read every committed object without a torn or missing blob, stderr: {}",
         String::from_utf8_lossy(&export.stderr));
-
-    // Sanity: across the run at least one kill left something a later `stack` actually built on,
-    // so the shared blob/shard batch's write window (not just the "killed before anything" path)
-    // was actually exercised.
-    assert!(stacked >= 1,
-        "no load-then-stack ever completed across {} attempt(s) — the write window was never \
-         exercised. attempt 1: measured {measured_1:?} uninterrupted, tried delays {delays_1:?}.{}",
-        if measured_2.is_some() { 2 } else { 1 },
-        match (measured_2, delays_2) {
-            (Some(m), Some(d)) => format!(" attempt 2: measured {m:?} uninterrupted, tried delays {d:?}."),
-            _ => String::new(),
-        });
-}
-
-/// Time a few uninterrupted `park` pushes over the given multi-directory corpus and return the
-/// slowest — the `park` counterpart of [`calibrate_load_duration`]. Each sample parks, then
-/// immediately pops (a `park` needs a clean, unparked tracked state to push a *new* parcel), so
-/// every sample pays the same real work an uninterrupted `park` does.
-fn calibrate_park_duration(area: &Area, files: &[PathBuf], base_line: &str, label: &str, samples: usize) -> Duration {
-    area.clear_stale_lock();
-
-    let mut slowest = Duration::ZERO;
-    for i in 0..samples {
-        for file in files {
-            rewrite_corpus(file, base_line, SPREAD_CORPUS_LINES, &format!("{label} {i}"));
-        }
-
-        let start = Instant::now();
-        let park = area.run(&["park"]);
-        let elapsed = start.elapsed();
-        assert!(park.status.success(), "calibration park failed: {}", String::from_utf8_lossy(&park.stderr));
-
-        let pop = area.run(&["park", "pop"]);
-        assert!(pop.status.success(), "calibration park pop failed: {}", String::from_utf8_lossy(&pop.stderr));
-
-        slowest = slowest.max(elapsed);
-    }
-    slowest
 }
 
 /// The number of parked parcels currently recorded, read directly via `forklift-core` (not the
@@ -618,112 +374,24 @@ fn operation_standing(warehouse: &Path) -> bool {
     forklift_core::util::operation_utils::read().unwrap().is_some()
 }
 
-/// Run one spread of kills against `park`, asserting store consistency after every one — the
-/// `park` counterpart of [`run_load_kill_spread`]. Whether a given iteration's `park` actually
-/// committed (staged the tree/parcel object batch, wrote the signature, and appended to the
-/// parked list) is read directly off `.forklift/parked`'s length rather than inferred the way the
-/// `load` test infers it via a later `stack` — `park` has its own ref-adjacent record to check
-/// directly, so no proxy is needed.
-///
-/// When an iteration's `park` did commit, this pops it right back — a real read of every tree and
-/// blob the parcel references (`shift_utils::diff_trees`/`apply_file_op` walk the tree and
-/// materialize every file's content), the sharp check that a torn or missing object referenced by
-/// the newly committed parcel fails loudly on (DESIGN.html §5.0 D item 10, finding #3). When it
-/// did not commit, `park`'s reset-to-head step (the only thing that touches the working
-/// directory's tracked file *content*) never ran — it only ever runs after the parked-list write
-/// already succeeded — so the working directory still holds this iteration's rewritten content
-/// untouched. A kill inside park's operation bracket also leaves its marker, so `heal` settles
-/// it before the next iteration (see the loop body).
-///
-/// Returns how many iterations produced a durably committed park.
-fn run_park_kill_spread(
-    area: &Area,
-    files: &[PathBuf],
-    base_line: &str,
-    warehouse: &Path,
-    delays: &[Duration],
-    tag: &str,
-) -> usize {
-    let mut parked = 0usize;
-
-    for (i, delay) in delays.iter().enumerate() {
-        area.clear_stale_lock();
-        area.assert_consistent(&format!("after park {tag} kill #{i}"));
-
-        for file in files {
-            rewrite_corpus(file, base_line, SPREAD_CORPUS_LINES, &format!("park-{tag} {i}"));
-        }
-
-        let before = parked_count(warehouse);
-
-        let mut child = area.command(&["park"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-
-        std::thread::sleep(*delay);
-
-        let _ = child.kill(); // a no-op if it already finished
-        let _ = child.wait();
-
-        area.clear_stale_lock();
-
-        // A kill inside park's bracket leaves its operation marker, and every later park refuses
-        // until heal settles it: back to where it was if the parked list does not name the parcel
-        // yet, forward to the head if it does. Rolling forward finishes the reset, so the pop below
-        // runs over a clean bay either way.
-        if operation_standing(warehouse) {
-            let heal = area.run(&["heal"]);
-            assert!(heal.status.success(), "park {tag} kill #{i}: heal must settle the interrupted park, stderr: {}",
-                String::from_utf8_lossy(&heal.stderr));
-            assert!(!operation_standing(warehouse), "park {tag} kill #{i}: heal must clear the marker");
-        }
-
-        let after = parked_count(warehouse);
-
-        if after > before {
-            parked += 1;
-
-            let pop = area.run(&["park", "pop"]);
-            assert!(pop.status.success(),
-                "park {tag} kill #{i}: pop of a park that committed durably must read back every \
-                 object it referenced, stderr: {}", String::from_utf8_lossy(&pop.stderr));
-        }
-    }
-
-    parked
-}
-
 /// Extends the crash-consistency spine to `park` push's own object batch (DESIGN.html §5.0 D
-/// item 10, finding #3): every tree object and the parcel object are now staged into one shared
-/// `WriteBatch`, finished once before the signature sidecar and the parked-list record — the same
-/// pattern `stack`'s crash test above already covers for `stack`, applied here to `park`'s own
-/// distinct code path (and `refresh_tracked_entries`'s own separate blob batch, finished before
-/// any shard it rewrites becomes visible). SIGKILL `park` at a spread of delays straddling its
-/// write window, and after every kill either see no new parked entry (nothing to check) or pop
-/// the one that did commit — reading back every tree and blob it references, which fails loudly
-/// on a torn or missing object.
+/// item 10, finding #3): every tree object and the parcel object are staged into one shared
+/// `WriteBatch`, finished once before the signature sidecar and the parked-list record, and
+/// `refresh_tracked_entries`'s own blob batch is finished before any shard it rewrites becomes
+/// visible. Stop `park` at every rename, and after each stop either see no new parked entry
+/// (nothing to check) or pop the one that did commit — a real read of every tree and blob the
+/// parcel references, which fails loudly on a torn or missing object.
+///
+/// A stop inside park's operation bracket leaves its marker, and every later park refuses until
+/// heal settles it: back to where it was if the parked list does not name the parcel yet, forward
+/// to the head if it does. Rolling forward finishes the reset, so the pop runs over a clean bay
+/// either way. When the park did not commit, its reset-to-head step (the only thing that touches
+/// tracked file content) never ran, so the working directory still holds this run's content.
 #[test]
-fn killing_park_midway_never_leaves_a_parked_parcel_referencing_a_missing_or_torn_object() {
+fn stopping_park_at_every_rename_never_leaves_a_parked_parcel_referencing_a_missing_or_torn_object() {
     let area = Area::new("park");
     let warehouse = area.warehouse();
-
-    // Several directories with several files each — the same shape `load`'s crash test above
-    // uses, so `park`'s own `refresh_tracked_entries` walk has real, spread-out work to rehash.
-    let base_line = "the quick brown fox jumps over the lazy dog\n";
-    let mut files: Vec<PathBuf> = Vec::new();
-
-    for dir in 0..6 {
-        let dir_path = warehouse.join(format!("dir{dir}"));
-        std::fs::create_dir_all(&dir_path).unwrap();
-
-        for f in 0..4 {
-            let file = dir_path.join(format!("file{f}.dat"));
-            rewrite_corpus(&file, base_line, SPREAD_CORPUS_LINES, "seed");
-            files.push(file);
-        }
-    }
+    let files = spread_corpus(&warehouse, 2, 2);
 
     assert!(area.run(&["prepare"]).status.success());
     assert!(area.run(&["config", "set", "operator.identifier", "crash@forklift"]).status.success());
@@ -732,42 +400,41 @@ fn killing_park_midway_never_leaves_a_parked_parcel_referencing_a_missing_or_tor
     assert!(area.run(&["load", "."]).status.success());
     assert!(area.run(&["stack", "-m", "base"]).status.success());
 
-    const DELAY_COUNT: usize = 20;
+    let before = std::cell::Cell::new(0usize);
+    let mut parked = 0usize;
 
-    // Attempt 1: measure how long an uninterrupted `park` actually takes on this machine, then
-    // spread the kills across ~2%..130% of that — see `calibrate_stack_duration`'s doc comment
-    // for why this scales with the machine instead of assuming a fixed millisecond budget.
-    let measured_1 = calibrate_park_duration(&area, &files, base_line, "calibration-1", 3);
-    let delays_1 = kill_delay_spread(measured_1, DELAY_COUNT, 0.02, 1.30);
+    let stopped = crash_at_every_rename(&area, &["park"],
+        |at| {
+            area.clear_stale_lock();
+            area.assert_consistent(&format!("before park crash point {at}"));
+            rewrite_corpus(&files, &format!("park {at}"));
+            before.set(parked_count(&warehouse));
+        },
+        |at, _| {
+            area.clear_stale_lock();
 
-    let mut parked = run_park_kill_spread(&area, &files, base_line, &warehouse, &delays_1, "a");
+            if operation_standing(&warehouse) {
+                let heal = area.run(&["heal"]);
+                assert!(heal.status.success(), "park crash point {at}: heal must settle the interrupted park, stderr: {}",
+                    String::from_utf8_lossy(&heal.stderr));
+                assert!(!operation_standing(&warehouse), "park crash point {at}: heal must clear the marker");
+            }
 
-    // Same bounded-retry guard as the `stack`/`load` crash tests: if the first spread never
-    // landed a completed park, re-measure and try a wider spread once before failing for real.
-    let mut measured_2 = None;
-    let mut delays_2 = None;
-    if parked == 0 {
-        let measured = calibrate_park_duration(&area, &files, base_line, "calibration-2", 3);
-        let delays = kill_delay_spread(measured, DELAY_COUNT, 0.0, 2.5);
-        parked += run_park_kill_spread(&area, &files, base_line, &warehouse, &delays, "b");
-        measured_2 = Some(measured);
-        delays_2 = Some(delays);
-    }
+            if parked_count(&warehouse) > before.get() {
+                parked += 1;
+
+                let pop = area.run(&["park", "pop"]);
+                assert!(pop.status.success(),
+                    "park crash point {at}: pop of a park that committed must read back every object \
+                     it referenced, stderr: {}", String::from_utf8_lossy(&pop.stderr));
+            }
+        });
+
+    assert!(stopped >= 2, "park must have been stopped at its renames, it was stopped {stopped} times");
+    assert!(parked >= 1, "the completed park must have been parked and popped");
 
     area.clear_stale_lock();
     area.assert_consistent("final");
-
-    // Sanity: across the run at least one kill left a park that actually committed and was
-    // successfully read back by a pop, so the shared object batch's write window (not just the
-    // "killed before anything" path) was actually exercised.
-    assert!(parked >= 1,
-        "no park ever committed across {} attempt(s) — the write window was never exercised. \
-         attempt 1: measured {measured_1:?} uninterrupted, tried delays {delays_1:?}.{}",
-        if measured_2.is_some() { 2 } else { 1 },
-        match (measured_2, delays_2) {
-            (Some(m), Some(d)) => format!(" attempt 2: measured {m:?} uninterrupted, tried delays {d:?}."),
-            _ => String::new(),
-        });
 }
 
 /// The `barrier-count: N` line the `FORKLIFT_DEBUG_BARRIER_COUNT` debug hook prints to stderr

@@ -385,10 +385,56 @@ const HELD_RENAME_MAX_DELAY: std::time::Duration = std::time::Duration::from_mil
 /// else removes during a wait fails the next attempt with `NotFound`. On Unix an open handle never
 /// blocks a rename, and this is a plain `std::fs::rename`.
 pub fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> std::io::Result<()> {
-    let (from, to) = (from.as_ref(), to.as_ref());
+    crash_point();
+    rename_held(from.as_ref(), to.as_ref())
+}
 
+/// [`rename`] without its [`crash_point`], for [`rename_no_replace`]'s fallback, which already
+/// passed one for the same rename.
+fn rename_held(from: &Path, to: &Path) -> std::io::Result<()> {
     #[allow(clippy::disallowed_methods)] // the one sanctioned call: this is the wrapper
     retry_while_held(|| std::fs::rename(from, to), is_held_by_another_process, || source_remains(from))
+}
+
+/// The exit code of a process that stopped at its [`crash_point`].
+pub const CRASH_POINT_EXIT_CODE: i32 = 86;
+
+/// Renames this process has started, counted by [`crash_point`].
+static RENAME_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Undocumented, test-only debug hook: under `FORKLIFT_DEBUG_CRASH_AT_RENAME=N` (N from 1; any
+/// other value is ignored), the process exits with [`CRASH_POINT_EXIT_CODE`] just before its Nth
+/// rename, running no destructor, so it leaves the store as a crash there would: this rename and
+/// every later one did not land. A rename another thread started earlier and has not finished may
+/// or may not land, as in a real crash, and when threads rename concurrently which rename is the
+/// Nth is up to the scheduler.
+///
+/// Every publish of a file goes through [`rename`] or [`rename_no_replace`], so stepping N from 1
+/// until a run completes stops a command once at each of its publishes, in its own order where it
+/// publishes from one thread, instead of wherever a kill at a guessed delay happens to land. What
+/// it does not stop between are steps that are not renames: a file written or removed in place.
+/// And an exit keeps everything the kernel already holds, so it models a process crash, not a
+/// power loss: the order of the syncs is not what it checks.
+fn crash_point() {
+    static AT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+
+    let at = AT.get_or_init(|| std::env::var("FORKLIFT_DEBUG_CRASH_AT_RENAME").ok()
+        .and_then(|n| n.parse().ok()).filter(|&n| n > 0));
+
+    if let Some(at) = *at {
+        let nth = RENAME_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+
+        if nth == at {
+            std::process::exit(CRASH_POINT_EXIT_CODE);
+        }
+
+        // Another thread's rename past the crash point must not land while the exit runs.
+        if nth > at {
+            loop {
+                std::thread::park();
+            }
+        }
+    }
 }
 
 /// Whether a rename's source still stands, so another attempt can still move it.
@@ -446,6 +492,8 @@ fn retry_while_held<T>(
 /// retries it). On another Unix, and on a volume that refuses the flag, a check runs just before a
 /// plain rename, so an empty folder created between the two is replaced.
 pub fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    crash_point();
+
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -496,7 +544,7 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
 
     #[cfg(not(windows))]
     match std::fs::symlink_metadata(to) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => rename(from, to),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => rename_held(from, to),
         Ok(_) => Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists)),
         Err(e) => Err(e),
     }
