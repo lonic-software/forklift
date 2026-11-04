@@ -29,8 +29,8 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   `lower` merges the remote's head in and stacks the merge, and `lift` publishes it: two commands
   where there used to be five and a leftover pallet. A merge that conflicts stops with
   `merge_conflicts` (exit 47) and the consolidation in progress; `stack` completes it and `abort`
-  abandons it. Changes to tracked files refuse the merge, and `consolidate`, with `conflict`
-  (exit 4). `lower --repair` merges its repair the same way instead of stacking it on a pallet of
+  abandons it. Changes to tracked files refuse the merge with `conflict` (exit 4), as they
+  now refuse `consolidate`, `pick`, `haul consolidate` and `shift`. `lower --repair` merges its repair the same way instead of stacking it on a pallet of
   its own.
 - `restore --staged` is gone; use `unload`.
 - MCP tools are generated from the command tree.

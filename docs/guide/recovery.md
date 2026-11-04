@@ -343,9 +343,9 @@ A checkout still uses that path. Narrow that checkout first, as the message says
 
 ### `conflict` (exit 4)
 
-Your working state blocks this: unresolved conflicts, or changes to tracked files the command would
-overwrite (a `consolidate`, or a `lower` merging a diverged head). Run `forklift stocktake` to see
-which. Finish with `load` and `stack`, set the work aside with
+You have changes to tracked files, staged or not, that the command would overwrite: a
+`consolidate`, `pick`, `haul consolidate`, `shift`, or a `lower` merging a diverged head. Nothing was
+changed. Run `forklift stocktake` to see them. Finish with `load` and `stack`, set the work aside with
 `forklift park`, or discard it with `forklift restore`.
 
 ### `confirmation_required` (exit 39)

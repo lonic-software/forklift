@@ -1555,6 +1555,7 @@ fn a_diverged_lower_merges_and_stops_on_a_conflict() {
     assert_eq!(conflicted.status.code(), Some(47), "{}{}", stdout(&conflicted), stderr(&conflicted));
     let value = json_of(&conflicted);
     assert_eq!(value["error"]["code"], "merge_conflicts", "{}", value);
+    assert!(value["error"]["message"].as_str().unwrap().contains("conflict markers: base.txt."), "{}", value);
     assert_eq!(value["error"]["details"]["paths"], serde_json::json!(["base.txt"]), "{}", value);
     assert_eq!(user_head(&area, "b", "main"), ours, "a conflict stacks nothing");
     let stocktake = json_of(&area.forklift("b", &["--json", "stocktake"]));
@@ -1659,10 +1660,14 @@ fn a_dirty_diverged_lower_refuses_and_writes_nothing() {
     let stocktake = json_of(&area.forklift("b", &["--json", "stocktake"]));
     assert!(stocktake["data"]["consolidation_in_progress"].is_null(), "{}", stocktake);
 
-    // Consolidate's own check refuses with the same code.
-    let consolidate = area.forklift("b", &["--json", "consolidate", "side"]);
-    assert_eq!(consolidate.status.code(), Some(4), "{}{}", stdout(&consolidate), stderr(&consolidate));
-    assert_eq!(json_of(&consolidate)["error"]["code"], "conflict");
+    // Consolidate's and shift's own checks refuse with the same code, each naming itself again.
+    for command in ["consolidate", "shift"] {
+        let refused = area.forklift("b", &["--json", command, "side"]);
+        assert_eq!(refused.status.code(), Some(4), "{}{}", stdout(&refused), stderr(&refused));
+        let value = json_of(&refused);
+        assert_eq!(value["error"]["code"], "conflict", "{}", value);
+        assert_eq!(value["error"]["next_step"], format!("forklift park; then forklift {} side", command).as_str());
+    }
 
     // Its next step clears it.
     run_next_steps(&area, "b", "forklift park; then forklift lower");

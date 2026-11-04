@@ -2,7 +2,7 @@ use serde::Serialize;
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{alias_utils, cherry_pick_utils, file_utils, inventory_utils, merge_utils, object_utils, operation_utils, pallet_utils, shift_utils, stocktake_utils};
 use forklift_core::util::operation_utils::{Operation, OperationKind};
-use crate::commands::merge_abort;
+use crate::commands::{consolidate, merge_abort};
 use crate::output::{self, CommandOutput};
 
 /// Handle the shift command (git's "checkout"): materialize the head tree of the target
@@ -216,7 +216,7 @@ pub async fn shift_to(target: &str) -> Result<String, String> {
     // Anchored before the cleanliness check, so a file edited after it is never trusted.
     let anchor = file_utils::take_stat_anchor()?;
 
-    ensure_warehouse_is_clean(current_tree_hash.as_deref()).await?;
+    consolidate::ensure_warehouse_is_clean(current_tree_hash.as_deref(), "shifting", &format!("forklift shift {}", target)).await?;
 
     shift_utils::refuse_unmaterializable_pallet(target, current_tree_hash.as_deref(), &target_tree_hash)?;
 
@@ -268,29 +268,9 @@ fn move_files(from_tree: Option<&str>,
     operation_utils::finish()
 }
 
-/// Ensure there are no staged or unstaged changes (untracked files are allowed).
-///
-/// # Arguments
-/// * `current_tree_hash` - The tree hash of the current pallet's head (or `None`).
-///
-/// # Returns
-/// * `Ok(())`      - If the warehouse is clean.
-/// * `Err(String)` - If there are changes that a shift would overwrite.
-async fn ensure_warehouse_is_clean(current_tree_hash: Option<&str>) -> Result<(), String> {
-    if !has_local_changes(current_tree_hash).await? {
-        return Ok(());
-    }
-
-    Err(
-        "There are local changes that shifting would overwrite. Stack them, restore them, \
-        or park them first (see \"forklift stocktake\" for the details).".to_string()
-    )
-}
-
-
 /// Whether the bay has staged changes against `tree_hash` (`None` for the empty tree) or unstaged
 /// ones (untracked files do not count).
-async fn has_local_changes(tree_hash: Option<&str>) -> Result<bool, String> {
+pub(crate) async fn has_local_changes(tree_hash: Option<&str>) -> Result<bool, String> {
     let (staged, unstaged) = tokio::try_join!(has_staged_changes(tree_hash), has_unstaged_changes())?;
 
     Ok(staged || unstaged)

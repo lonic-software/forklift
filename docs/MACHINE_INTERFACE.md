@@ -86,7 +86,8 @@ exit status alone. Forklift has no prompt that handles a cancellation itself, so
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
 **Schema 21** (current): the `merge_conflicts` error code exists (exit 47), and `conflict` (exit 4)
-gains producers: `consolidate` and a merging `lower` refuse with it over changes to tracked files.
+gains producers: `consolidate`, `pick`, `haul consolidate`, `shift` and a merging `lower` refuse
+with it over changes to tracked files, naming `forklift park` and the command again.
 A `lower` of the current pallet that has diverged from the remote merges the remote's head in,
 reporting the outcome `merged` and the merge parcel as `merged`; a conflicting merge refuses with
 `merge_conflicts`, its paths in `details.paths`, and leaves the consolidation in progress. A

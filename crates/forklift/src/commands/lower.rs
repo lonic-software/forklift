@@ -252,7 +252,7 @@ async fn lower_working_pallet(client: &RemoteClient,
         if !merge_utils::is_ancestor(local, remote_head)? {
             // The merge checks the remote head's tree out alongside this one, so a head no client
             // can check out is refused as that first, naming its repair.
-            remote_utils::fetch_head_content(client, remote_head, progress).await?;
+            report.fetched_objects += remote_utils::fetch_head_content(client, remote_head, progress).await?.fetched_objects;
             refuse_unmaterializable(client, &pallet, local_tree.as_deref(), &object_utils::load_parcel(remote_head)?.tree_hash)?;
 
             return merge_diverged(client, &pallet, local, remote_head, "forklift lower", report, |_| Ok(remote_head.clone())).await;
@@ -414,12 +414,6 @@ async fn repair_pallet(client: &RemoteClient,
         }
     }
 
-    let preconditions = take_utils::verify_take(Some(client), &TakeTrust::local()?, &remote_head, &pallet, FetchAt::Warehouse).await?;
-
-    if named && behind_remote && ref_head.is_none() {
-        refuse_a_bay_on_unborn(&pallet)?;
-    }
-
     if !behind_remote {
         if named {
             return Err(CoreError::refusal(
@@ -445,6 +439,12 @@ async fn repair_pallet(client: &RemoteClient,
 
             Ok(repair.parcel)
         }).await;
+    }
+
+    let preconditions = take_utils::verify_take(Some(client), &TakeTrust::local()?, &remote_head, &pallet, FetchAt::Warehouse).await?;
+
+    if named && behind_remote && ref_head.is_none() {
+        refuse_a_bay_on_unborn(&pallet)?;
     }
 
     // The head write carries the take's preconditions, which are the signing's too: an unsigned
@@ -516,7 +516,7 @@ async fn merge_diverged(client: &RemoteClient,
 
     // Anchored before the cleanliness check, so a file edited after it is never trusted.
     let anchor = file_utils::take_stat_anchor()?;
-    consolidate::ensure_warehouse_is_clean(&our_tree, "merging the remote's head in", command).await?;
+    consolidate::ensure_warehouse_is_clean(Some(&our_tree), "merging the remote's head in", command).await?;
 
     // The remote's head becomes a parent of the merge parcel, so it is verified before anything is
     // merged. The merge's own write is conditioned by `stack`, which judges it again.
@@ -537,8 +537,8 @@ async fn merge_diverged(client: &RemoteClient,
 }
 
 /// The label a merge of the remote's head records as its other side, in the consolidation state
-/// and the merge parcel's description.
-const REMOTE_LABEL: &str = "remote";
+/// and the merge parcel's description: this lower's and the lift's auto-merge alike.
+pub(crate) const REMOTE_LABEL: &str = "remote";
 
 /// The [`RefusalCode::MergeConflicts`] refusal for a merge of the remote's head into `pallet` that
 /// conflicts on `paths`, now left in progress.
@@ -547,10 +547,10 @@ fn merge_conflicts_refusal(pallet: &str, paths: &[String]) -> String {
         RefusalCode::MergeConflicts,
         format!(
             "The local pallet \"{}\" and the remote had diverged, and merging the remote's head in \
-            conflicts on {} path(s), now holding conflict markers. Resolve them, load and stack them, \
-            then lift; or abandon the merge with \"{}\".",
+            conflicts on these paths, now holding conflict markers: {}. Resolve them, load and stack \
+            them, then lift; or abandon the merge with \"{}\".",
             pallet,
-            paths.len(),
+            paths.join(", "),
             merge_abort::ABORT_COMMAND
         ),
         "forklift load <path>; then forklift stack; then forklift lift",
@@ -653,8 +653,8 @@ async fn lower_named_pallet(client: &RemoteClient,
             return Ok(());
         }
 
-        // Not the working pallet's refusal: its remedy creates a pallet and shifts this bay, which a
-        // named lower promised to leave alone. The reconciliation happens on the pallet itself.
+        // Not merged as the working pallet is: the merge writes this bay's files, which a named lower
+        // promised to leave alone. The reconciliation happens on the pallet itself.
         if !merge_utils::is_ancestor(local, remote_head)? {
             return Err(CoreError::refusal(
                 RefusalCode::Diverged,

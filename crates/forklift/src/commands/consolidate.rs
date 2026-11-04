@@ -6,14 +6,13 @@ use forklift_core::enums::inventory_item_state::InventoryItemState;
 use forklift_core::model::blob::Blob;
 use forklift_core::util::merge_utils::{ConsolidationState, MergeAction};
 use forklift_core::util::operation_utils::{Operation, OperationKind};
-use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
     alias_utils, cache_miss, cherry_pick_utils, file_utils, inventory_utils, load_guard_utils, merge_utils, object_utils,
-    office_utils, operation_utils, pallet_utils, scope_utils, shift_utils, stack_utils, stocktake_utils,
+    office_utils, operation_utils, pallet_utils, scope_utils, shift_utils, stack_utils,
 };
 use forklift_core::util::shift_utils::HeadWrite;
 use forklift_core::util::stack_utils::StackError;
-use crate::commands::merge_abort;
+use crate::commands::{merge_abort, shift};
 use crate::output::{self, CommandOutput};
 
 /// Handle the consolidate command (git's "merge"; warehouse workers consolidate loads
@@ -83,7 +82,7 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
     // Anchored before the cleanliness check, so a file edited after it is never trusted.
     let anchor = file_utils::take_stat_anchor()?;
 
-    ensure_warehouse_is_clean(&our_tree_hash, "consolidating", &format!("forklift consolidate {}", target)).await?;
+    ensure_warehouse_is_clean(Some(&our_tree_hash), "consolidating", &format!("forklift consolidate {}", target)).await?;
 
     if merge_utils::is_ancestor(&their_head, &our_head)? {
         output::emit(&ConsolidateReport::up_to_date(&current, target));
@@ -446,11 +445,11 @@ pub(crate) async fn stack_completion(description: Option<String>,
     }
 }
 
-/// Ensure there are no staged or unstaged changes (untracked files are allowed) — the
+/// Whether there are no staged or unstaged changes (untracked files are allowed) — the
 /// precondition for a merge that materializes into the working directory. Public within
 /// the crate so `lift`'s optimistic path can check before auto-merging.
 pub(crate) async fn is_warehouse_clean(our_tree_hash: &str) -> Result<bool, String> {
-    ensure_warehouse_is_clean(our_tree_hash, "merging", "").await.map(|_| true).or(Ok(false))
+    Ok(!shift::has_local_changes(Some(our_tree_hash)).await?)
 }
 
 /// Fast-forward the current pallet to their head: materialize the tree difference and
@@ -496,18 +495,13 @@ fn fast_forward(current: &str,
     Ok(their_head.to_string())
 }
 
-/// Ensure there are no staged or unstaged changes (untracked files are allowed), refusing with
-/// `conflict` otherwise: a merge writes the bay's files and inventory, which hold them. `doing`
-/// names the operation in the message ("consolidating"), and `command` is the one the next step
-/// runs again once the changes are parked.
-pub(crate) async fn ensure_warehouse_is_clean(our_tree_hash: &str, doing: &str, command: &str) -> Result<(), String> {
-    let staged = stocktake_utils::collect_staged_changes(Some(our_tree_hash)).await?;
-    let unstaged: Vec<_> = stocktake_utils::collect_unstaged_changes().await?
-        .into_iter()
-        .filter(|change| change.kind != ChangeKind::Untracked)
-        .collect();
-
-    if staged.is_empty() && unstaged.is_empty() {
+/// Ensure there are no staged or unstaged changes against `our_tree_hash` (`None` for the empty
+/// tree; untracked files are allowed), refusing with `conflict` otherwise: every command that
+/// writes the bay's files and inventory wholesale (a merge, a pick, a shift) would write over them.
+/// `doing` names the operation in the message ("consolidating"), and `command` is the one the next
+/// step runs again once the changes are parked.
+pub(crate) async fn ensure_warehouse_is_clean(our_tree_hash: Option<&str>, doing: &str, command: &str) -> Result<(), String> {
+    if !shift::has_local_changes(our_tree_hash).await? {
         return Ok(());
     }
 

@@ -95,12 +95,7 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
     // before the check, so a file edited after it is never trusted.
     let anchor = file_utils::take_stat_anchor()?;
 
-    if !consolidate::is_warehouse_clean(&our_tree).await? {
-        return Err(
-            "There are local changes that a pick would overwrite. Stack them, restore \
-            them, or park them first (see \"forklift stocktake\" for the details).".to_string()
-        );
-    }
+    consolidate::ensure_warehouse_is_clean(Some(&our_tree), "a pick", &format!("forklift pick {}", revision)).await?;
 
     // The pick's base is the source's first-parent tree (its "before"); an empty tree for a
     // root parcel, so every file it introduces is new relative to nothing.
