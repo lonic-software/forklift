@@ -2553,8 +2553,8 @@ mod tests {
     }
 
     /// The journal starts full, written directly, and the pushes past the cap go through
-    /// `push_if_changed`: every push is a real ref write and journal write with fsync on, so
-    /// filling the journal that way too cost 24 s on Windows. Mutation: drop the drain → red (110
+    /// `push_if_changed`: every push is a real ref write and journal write, and when unit tests
+    /// still ran with fsync on, filling the journal that way too cost 24 s on Windows. Mutation: drop the drain → red (110
     /// entries); drain the newest instead → red (the last push is gone).
     #[test]
     fn the_journal_is_capped_at_max_entries() {

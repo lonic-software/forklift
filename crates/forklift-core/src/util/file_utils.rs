@@ -6226,11 +6226,9 @@ mod tests {
     // through `fsync_dir_data`'s test-only fault injection (`DirSyncFaultGuard`,
     // `dir_sync_attempts`, `dir_sync_count`) — see their doc comments. All Unix-only: that
     // injection point does not exist on non-Unix targets (`fsync_dir_data` doesn't either).
-    // Nothing in this binary ever sets `FORKLIFT_FSYNC` (unlike the separate
-    // `write_batch_fsync_off` integration test binary, a different process), and `fsync_enabled`
-    // defaults to on when the variable is absent — so every `fsync_dir_data` call below is live
-    // rather than vacuously skipped, unless the process was launched with `FORKLIFT_FSYNC` already
-    // set to an off value in its inherited environment (a caller's problem, not this binary's).
+    // An armed `DirSyncFaultGuard` holds `real_syncs`, so every `fsync_dir_data` call below is
+    // live rather than vacuously skipped; with `FORKLIFT_FSYNC` set to an off value, arming it
+    // panics instead.
 
     #[test]
     #[cfg(unix)]

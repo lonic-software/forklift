@@ -1399,6 +1399,7 @@ mod tests {
         let object_path = forklift.join("objects").join("99").join("00112233");
 
         let _fault = TaintFaultGuard::recording();
+        assert!(file_utils::fsync_enabled(), "the armed rig runs real syncs");
         record_taint(&[object_path.as_path()]).unwrap();
         assert_eq!(taint_write_attempts().len(), 1, "a successful write must still be observed");
     }

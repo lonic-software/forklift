@@ -74,9 +74,9 @@ Notes:
   suite much faster: `forklift_command()` in `crates/forklift/tests/common/mod.rs`
   (and `server_command()` in `remote.rs`) sets it. Launch through those helpers,
   not `Command::new(FORKLIFT)`. The exception is `crash_consistency.rs`, the
-  durability suite, which forces fsync on. In-process tests leave fsync on, so
-  they are what still runs the sync calls; a sync call that no in-process test
-  reaches needs one.
+  durability suite, which forces fsync on. forklift-core's own unit tests skip
+  every sync too, unless the test holds `file_utils::real_syncs()`; see
+  [Keeping tests fast](#keeping-tests-fast).
 - The hardening test spine is worth knowing when touching the object store,
   the parsers, or the parallel walks: `crates/forklift-core/tests/fuzz_formats.rs`
   fuzzes every parse entry point (must never panic) and checks round-trip
@@ -172,17 +172,20 @@ machine does not tell you what Windows will take.
   seconds older than the command that records it. A test that needs a proven stat moves
   the file's mtime into the past (`backdate` and `backdate_tree` in `cli.rs`) rather than
   sleeping until it is old enough.
-- **Count the syncs of an in-process test.** Unit tests run with fsync on, so that the
-  sync calls are exercised, and every real write pays for one. Seed a large starting state
-  by writing it directly, and push only the few writes the assertion is about through the
-  code under test. The journal cap test spent 24 s on Windows filling the journal one
-  synced write at a time. A fixture whose tests check nothing about durability can skip
-  its own thread's syncs with `file_utils::skip_syncs_on_this_thread()`, as the office
-  fixture in `audit_utils.rs` does: its 39 tests took about 4 s each in a parallel run and
-  0.2 s without the syncs. It also disarms the injected sync faults, so a test that arms
-  one must not hold it. It helps only where the test's own syncs are the cost. Under a
-  parallel run every write also waits on the other tests' syncs, so a test that takes
-  0.1 s alone can take 14 s in the full suite while syncing almost nothing itself.
+- **Turn on real syncs only in a test about them.** forklift-core's unit tests skip every
+  sync unless the test holds `file_utils::real_syncs()`. Under a parallel run every sync
+  waits on all the others: with syncs on in every test, a test that took 0.1 s alone took
+  14 s in the full suite, and the suite summed 947 s against 236 s without them. Hold the
+  guard in a test that checks a sync call site: that it syncs, what a failed sync does, a
+  barrier count, or a sync through a particular handle (the Windows write-handle bug). The
+  sync fault rigs (`SyncDirFaultGuard`, `DirSyncFaultGuard`, `TaintFaultGuard`) hold it
+  while armed, so a test that arms one runs real syncs. The switch is process-wide, so the
+  code under test syncs on every thread it spawns. A new sync call site needs a test that
+  holds the guard and reaches it; to check, put a `panic!` inside the site's
+  `fsync_enabled()` branch and run `cargo nextest run -p forklift-core --lib`, and some
+  test must fail. The other crates' in-process tests, and forklift-core's own `tests/`
+  suites, still run with fsync on, so count their syncs: seed a large starting state by writing it directly, and push only the few
+  writes the assertion is about through the code under test.
 - **Make a limit something the test can set small.** A test that crosses a cap, a depth
   or a size passes a small value of it rather than building a fixture past the
   production one. `walk_tree_survives_a_pathologically_deep_tree` checks stack safety on
