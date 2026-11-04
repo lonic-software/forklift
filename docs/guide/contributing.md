@@ -103,6 +103,14 @@ Notes:
   The share holds every fourth test of each test binary, so on another OS a test
   that exists only on some platforms shifts the rest of its binary into other
   shares, and `--partition count:3/4` there runs a different set.
+- CI links on Windows with `rust-lld` (lld-link) instead of MSVC's `link.exe`, set by
+  `CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER` in `ci.yml` (Linux already links with `rust-lld`
+  by default and macOS with Apple's linker). Every push rebuilds all the workspace's test binaries,
+  since the build cache keeps only dependencies, so links are paid on each run: on 2026-11-04 the
+  switch took the Windows test build from about 527 s to 464 s of summed build time per share and
+  about 20 s off each share's build time, while the forklift-core library, which does not link,
+  built in the same time. Release builds (`release.yml`) and local builds keep `link.exe`. Changing the
+  variable changes the build cache's key, so the first run after it builds cold.
 - On macOS, `.cargo/config.toml` builds with `-Csplit-debuginfo=packed`: debuginfo
   goes into a `.dSYM` beside each binary instead of object files left in
   `target/debug/deps`. Under the default, every incremental rebuild leaves fresh

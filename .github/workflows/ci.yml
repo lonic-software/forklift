@@ -30,6 +30,12 @@ env:
   # later is not used here either: give it to CI in this variable too. The macOS leg's "Split
   # debuginfo guard" step checks the setting itself, with this variable unset.
   RUSTFLAGS: ""
+  # Windows links with rust-lld (lld-link) rather than MSVC's link.exe; Linux already uses rust-lld
+  # by default and macOS Apple's linker. A linker setting is not a rustflag, so the empty
+  # RUSTFLAGS above leaves it on. Measured with warm caches on 2026-11-04, it cut the Windows test
+  # build by about 12% of summed unit time, roughly 20 s per share (docs/guide/contributing.md).
+  # CI only: release.yml keeps link.exe for the shipped binaries.
+  CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: rust-lld
 
 jobs:
   # Docs-only pull requests skip the build and tests. This is decided here rather than with
