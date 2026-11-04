@@ -81,7 +81,9 @@ Which parcels a pallet accepts depends on the warehouse's trust state:
    key, is refused: with no office there is nothing to verify it against. The pallet rules
    that judge roles (who may cut a tag, who may record a merge) do not apply, because there
    are no roles; the rules that judge authorship (only the opener writes `opened`, a review
-   lives under its writer's directory) apply to the declared operator.
+   lives under its writer's directory) apply to the declared operator. Nothing binds that
+   operator to whoever lifts the parcel, so these rules keep a parcel consistent with the name
+   it declares; they do not establish that the name is true.
 2. **Anchor lost** — no trust anchor while an office exists. Every write and every content
    check refuses until trust is restored.
 3. **Trusted** — an anchor and an office. Every parcel stacked after trust was established must
