@@ -212,7 +212,7 @@ fn a_scoped_stack_is_byte_reproducible_and_matches_a_full_stack() {
             let _ = std::fs::remove_dir_all(&scoped_dir);
             scoped_tree
         })).collect();
-        runs.into_iter().map(|run| run.join().unwrap()).collect()
+        runs.into_iter().map(|run| run.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))).collect()
     });
 
     assert!(hashes.iter().all(|hash| *hash == hashes[0]),
