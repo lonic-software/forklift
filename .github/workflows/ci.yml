@@ -106,8 +106,9 @@ jobs:
   # nextest's `count` scheme deals every test binary's tests round-robin across them, which spreads
   # a binary's slow tests over all of them. Replaying that run's
   # per-test times over the three schemes put the slowest Windows share at 142–144 s for every one,
-  # against a single longest test of 123 s, so more Windows shares buy little until that test is
-  # faster. Every entry runs on GitHub's runners. An entry may set `blacksmith` to a runner label
+  # against a single longest test of 123 s, so more Windows shares bought little until that test
+  # was faster. FORK-380 has since shortened the slowest tests; re-measure before changing the
+  # share count. Every entry runs on GitHub's runners. An entry may set `blacksmith` to a runner label
   # instead (6 vCPU macOS on Apple silicon was tried on 2026-11-03: no queue, where GitHub's macOS
   # jobs waited five to fifteen minutes and some were never given a runner), but Blacksmith bills
   # each minute, about 0.5 USD a macOS run, so macOS's is empty until that cost is agreed. A label

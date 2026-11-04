@@ -948,7 +948,10 @@ proving a killed `load` never leaves a shard durably referencing a blob that isn
 `park`-targeted spread (`killing_park_midway_never_leaves_a_parked_parcel_referencing_a_missing_or_torn_object`)
 covering the same property for `park`'s own object batch — every kill that lands after the
 parked-list record becomes durable is popped right back, a real read of every tree and blob
-the parcel references. Review round 2's own finding #7 note: those SIGKILL tests structurally
+the parcel references. (Since FORK-380 these are
+`stopping_load_at_every_rename_…` and `stopping_park_at_every_rename_…`, which stop the
+command before each of its renames in turn instead of killing it at timed delays.) Review
+round 2's own finding #7 note: those SIGKILL tests structurally
 cannot catch a directory-fsync-*ordering* hazard (a kill leaves every completed rename
 kernel-visible regardless of fsync order) — the finding #7 fix for `load` was verified by
 code inspection instead, and `park`'s analogous hazard was verified absent the same way.

@@ -402,19 +402,24 @@ pub const CRASH_POINT_EXIT_CODE: i32 = 86;
 /// Renames this process has started, counted by [`crash_point`].
 static RENAME_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Undocumented, test-only debug hook: under `FORKLIFT_DEBUG_CRASH_AT_RENAME=N`, the process exits
-/// with [`CRASH_POINT_EXIT_CODE`] just before its Nth rename, running no destructor, so it leaves
-/// the store exactly as a crash there would: every earlier rename landed, this one and every later
-/// one did not.
+/// Undocumented, test-only debug hook: under `FORKLIFT_DEBUG_CRASH_AT_RENAME=N` (N from 1; any
+/// other value is ignored), the process exits with [`CRASH_POINT_EXIT_CODE`] just before its Nth
+/// rename, running no destructor, so it leaves the store as a crash there would: this rename and
+/// every later one did not land. A rename another thread started earlier and has not finished may
+/// or may not land, as in a real crash, and when threads rename concurrently which rename is the
+/// Nth is up to the scheduler.
 ///
 /// Every publish of a file goes through [`rename`] or [`rename_no_replace`], so stepping N from 1
-/// until a run completes visits every state a crash can leave behind, one per publish, where
-/// killing the process at a guessed delay lands on whichever state the timing allows. What it does
-/// not stop between are steps that are not renames: a file written or removed in place.
+/// until a run completes stops a command once at each of its publishes, in its own order where it
+/// publishes from one thread, instead of wherever a kill at a guessed delay happens to land. What
+/// it does not stop between are steps that are not renames: a file written or removed in place.
+/// And an exit keeps everything the kernel already holds, so it models a process crash, not a
+/// power loss: the order of the syncs is not what it checks.
 fn crash_point() {
     static AT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
 
-    let at = AT.get_or_init(|| std::env::var("FORKLIFT_DEBUG_CRASH_AT_RENAME").ok().and_then(|n| n.parse().ok()));
+    let at = AT.get_or_init(|| std::env::var("FORKLIFT_DEBUG_CRASH_AT_RENAME").ok()
+        .and_then(|n| n.parse().ok()).filter(|&n| n > 0));
 
     if let Some(at) = *at {
         let nth = RENAME_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;

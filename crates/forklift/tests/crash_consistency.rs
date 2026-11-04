@@ -10,13 +10,18 @@
 //!
 //! A unit test can assert the atomic-write contract (see `file_utils`), but only a real process
 //! stopped partway exercises a whole command's publish order. The crash tests below stop `stack`,
-//! `load` and `park` at every rename they make in turn (`FORKLIFT_DEBUG_CRASH_AT_RENAME`, see
+//! `load` and `park` at each rename they make in turn (`FORKLIFT_DEBUG_CRASH_AT_RENAME`, see
 //! `file_utils::crash_point`), and after each stop assert the store is still internally consistent
-//! and usable. A rename is where a written file becomes visible, so stepping through every one
-//! visits every state such a crash can leave, in order and on every machine. Killing the process
-//! at guessed delays, which these tests did before, reached a given state only when the timing
-//! happened to land there: with the blob barrier of `load` moved after its shard publish, 20 kills
-//! caught the bug in 4 runs out of 14.
+//! and usable. A rename is where a written file becomes visible, so this stops a command once at
+//! each of its publishes, the same way on every machine. Killing the process at guessed delays,
+//! which these tests did before, reached a given state only when the timing happened to land
+//! there: with the blob barrier of `load` moved after its shard publish, 20 kills caught the bug in
+//! 4 runs out of 14.
+//!
+//! What the stops do not reach: a step that is not a rename (a file written or removed in place),
+//! and a power loss. A stopped process leaves everything it wrote to the kernel in place, synced
+//! or not, so these tests check the order of publishes; the order of the syncs that make them
+//! survive a power loss is what the barrier unit tests in `file_utils` pin.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -45,7 +50,9 @@ impl Area {
     }
 
     /// A command in the warehouse with the isolated global config and key directory, and fsync
-    /// forced on: durability is what this suite checks, so a `FORKLIFT_FSYNC=0` in the
+    /// forced on: a crash point keeps unsynced writes, so fsync does not change what a stop
+    /// leaves, but the publish order under test is that of the synced path the binary ships with,
+    /// and the barrier counts below count only synced barriers. A `FORKLIFT_FSYNC=0` in the
     /// environment the tests were started from must not reach the binary.
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(FORKLIFT);
@@ -219,6 +226,9 @@ fn stopping_stack_at_every_rename_never_corrupts_the_store() {
     assert!(area.run(&["stack", "-m", "base"]).status.success());
     let base = current_head(&warehouse);
 
+    let mut head_before = base.clone();
+    let mut advanced_by_a_stop = 0usize;
+
     let stopped = crash_at_every_rename(&area, &["stack", "-m", "under test"],
         |at| {
             // Recover from the previous stop and check it left the store consistent.
@@ -236,9 +246,18 @@ fn stopping_stack_at_every_rename_never_corrupts_the_store() {
             let load = area.run(&["load", "."]);
             assert!(load.status.success(), "load failed: {}", String::from_utf8_lossy(&load.stderr));
         },
-        |_, _| {});
+        |_, stopped| {
+            let head_now = current_head(&warehouse);
+            if stopped && head_now != head_before {
+                advanced_by_a_stop += 1;
+            }
+            head_before = head_now;
+        });
 
     assert!(stopped >= 2, "stack must have been stopped at its renames, it was stopped {stopped} times");
+    // A stop after the head write and before the renames that follow it is the state the catch-up
+    // above exists for; without one, that durable-head path was never reached.
+    assert!(advanced_by_a_stop >= 1, "no stopped stack left its head moved, so no stop came after the head write");
     assert_ne!(current_head(&warehouse), base, "the completed stack must have moved the head");
 
     // Final recovery: every object reachable from the final head must read back (git export walks

@@ -81,7 +81,7 @@ Notes:
   the parsers, or the parallel walks: `crates/forklift-core/tests/fuzz_formats.rs`
   fuzzes every parse entry point (must never panic) and checks round-trip
   fidelity; `crash_consistency.rs` stops `stack`, `load` and `park` before each of
-  their renames in turn to prove every state a crash leaves is consistent; `determinism.rs` pins deterministic tree hashes,
+  their renames in turn and checks the store after every stop; `determinism.rs` pins deterministic tree hashes,
   byte-reproducible repacks, and the warehouse-lock refusal. A parser or
   format change should keep the fuzzer green; if you add a length-prefixed field,
   bound it with a `checked_add` (never `start + length` before the bounds check).
@@ -193,7 +193,9 @@ machine does not tell you what Windows will take.
   (see `crash_at_every_rename` in `crash_consistency.rs`). Killing it after a guessed
   delay costs a long corpus and many rounds, and still lands on the one state that matters
   only by luck: the crash suite's kills caught a reordered `load` publish in 4 runs out of
-  14, and stopping at every rename catches it on every run, in half a second.
+  14, and stopping at every rename catches it on every run, in half a second. The stops
+  reach renames only: a step that writes or removes a file in place needs its own check,
+  and so does the order of syncs, since a stopped process loses nothing it wrote.
 - **Repetition is the cost.** A test that repeats a run to catch a race uses the fewest
   rounds that still catch the failure, and says in a comment how the count was chosen.
 
