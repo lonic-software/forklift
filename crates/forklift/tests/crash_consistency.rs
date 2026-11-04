@@ -255,7 +255,8 @@ fn stopping_stack_at_every_rename_never_corrupts_the_store() {
 
     // Each step below is a process launch, about a third of a second each on the Windows runner,
     // so the checks between stops are only the ones that read what a stopped `stack` can leave:
-    // the head, the parcel chain, and (when the stop moved the head) the head's parcel and tree.
+    // the head, the parcel chain, the inventory, and (when the stop moved the head) the head's
+    // parcel and tree.
     // Every head a run writes is an ancestor of the final one, so the final `git export` reads
     // every object any stop published.
     let stopped = crash_at_every_rename(&area, &["stack", "-m", "under test"],
@@ -266,6 +267,8 @@ fn stopping_stack_at_every_rename_never_corrupts_the_store() {
             if area.assert_head_whole(&context).is_some() {
                 area.assert_history_reads(&context);
             }
+            // The next `load .` rewrites the shards, so a torn one is seen here or not at all.
+            area.assert_stocktake_reads(&context);
 
             // A stop between the head write and the position write leaves the bay behind its own
             // parcel, with files that already match it; catching up records the head, reading its
@@ -352,9 +355,9 @@ fn stack_or_nothing(area: &Area, message: &str) -> bool {
 fn stopping_load_at_every_rename_never_leaves_a_shard_referencing_a_missing_or_torn_blob() {
     let area = Area::new("load");
     let warehouse = area.warehouse();
-    // Two directories, for the concurrent walk; one file each, since every blob goes through the
-    // one shared batch, so more files add stops inside it rather than a different state.
-    let files = spread_corpus(&warehouse, 2, 1);
+    // Two directories, for the concurrent walk, of two files each, so a shard can name a blob that
+    // is durable beside one that is not.
+    let files = spread_corpus(&warehouse, 2, 2);
 
     assert!(area.run(&["prepare"]).status.success());
     assert!(area.run(&["config", "set", "operator.identifier", "crash@forklift"]).status.success());
@@ -362,11 +365,11 @@ fn stopping_load_at_every_rename_never_leaves_a_shard_referencing_a_missing_or_t
 
     let mut stacked = 0usize;
 
-    // No consistency check runs between stops: each stop is checked by the `stack` right after it
-    // and then healed by an uninterrupted `settle`, so a check before the next run would see only
-    // what `settle` left. Each process launch costs about a third of a second on the Windows
-    // runner. Every stack here builds on the last, so the final `git export` reads every object
-    // any of them committed.
+    // Each stop is checked by the `stack` right after it, then healed by an uninterrupted `settle`,
+    // and the inventory `settle` leaves must read; the next run's rewrite would hide a shard the
+    // heal left wrong. Each process launch costs about a third of a second on the Windows runner,
+    // so that is all. Every stack here builds on the last, so the final `git export` reads every
+    // object any of them committed.
     let stopped = crash_at_every_rename(&area, &["load", "."],
         |at| {
             area.clear_stale_lock();
@@ -385,6 +388,7 @@ fn stopping_load_at_every_rename_never_leaves_a_shard_referencing_a_missing_or_t
             // Stage and commit the working directory's current content uninterrupted, so nothing
             // a stop left staged carries over, and nothing is staged when the next run starts.
             settle(&area, &format!("load {at} heal"));
+            area.assert_stocktake_reads(&format!("after load {at} heal"));
         });
 
     assert!(stopped >= 2, "load must have been stopped at its renames, it was stopped {stopped} times");

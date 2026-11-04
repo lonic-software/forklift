@@ -326,7 +326,7 @@ fn states() -> Vec<State> {
 #[test]
 fn stack_and_park_refuse_a_pair_and_its_remedy_clears_it() {
     std::thread::scope(|threads| {
-        for state in states() {
+        let states: Vec<_> = states().into_iter().map(|state| {
             threads.spawn(move || {
                 let warehouse = Warehouse::new(state.name, state.tracked);
                 if !warehouse.bites() {
@@ -361,7 +361,11 @@ fn stack_and_park_refuse_a_pair_and_its_remedy_clears_it() {
                 let staged = warehouse.stocktake();
                 assert!(section(&staged, STAGED).contains(&state.moved), "{}: the pop must re-stage the move: {}",
                         state.name, staged);
-            });
+            })
+        }).collect();
+        // Joined here, not by the scope, so a failing state's own message is the test's failure.
+        for state in states {
+            state.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         }
     });
 }

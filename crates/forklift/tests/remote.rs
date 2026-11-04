@@ -1896,6 +1896,10 @@ fn tags_sync_hold_the_admin_rule_at_admission_and_never_move() {
 
 }
 
+/// A haul and its comments ride the @haul pallet across a remote: a clone carries it, a diverged
+/// lift is lowered and replayed, and a close or a merge racing an update is a conflict on the
+/// haul's state cell, never a state recorded at a head it did not reach.
+///
 /// Over the Windows time budget on purpose (13.4 and 13.3 s on the Windows CI runner in two runs,
 /// 0.7 s alone on an M-series Mac): it is about 60 launches, which is where the Windows time goes.
 /// Each race it pins (a diverged lift, a close racing an update, a merge racing an update) starts

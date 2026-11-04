@@ -169,8 +169,8 @@ fn a_scoped_stack_is_byte_reproducible_and_matches_a_full_stack() {
     // subtree, then splices the out-of-scope siblings back by hash. Two properties must hold under
     // the worker pool's scheduling: independent runs reassemble the *same* content address, and it
     // is byte-identical to a full workspace stacking the same change (the stage-1 invariant).
-    // The runs are independent, about twelve launches each, so they run on threads of their own:
-    // one after another they took about 12 s on the Windows CI runner.
+    // The runs are independent, each in a base of its own and about twelve launches long, so they
+    // run on threads of their own: one after another they took about 12 s on the Windows CI runner.
     let hashes: Vec<String> = std::thread::scope(|threads| {
         let runs: Vec<_> = (0..3).map(|run| threads.spawn(move || {
             let warehouse = Warehouse::new(&format!("scoped-{run}"));
@@ -180,8 +180,8 @@ fn a_scoped_stack_is_byte_reproducible_and_matches_a_full_stack() {
             warehouse.run_ok(&["stack", "-m", "base"]);
 
             let siblings = warehouse.root.parent().unwrap();
-            let full_dir = siblings.join(format!("full-bay-{run}"));
-            let scoped_dir = siblings.join(format!("scoped-bay-{run}"));
+            let full_dir = siblings.join("full-bay");
+            let scoped_dir = siblings.join("scoped-bay");
             let _ = std::fs::remove_dir_all(&full_dir);
             let _ = std::fs::remove_dir_all(&scoped_dir);
 
