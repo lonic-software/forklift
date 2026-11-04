@@ -827,6 +827,7 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
 mod tests {
     use super::*;
     use crate::test_support::{self, Warehouse};
+    use forklift_core::util::stocktake_utils;
 
     thread_local! {
         /// Runs once just before `fast_forward` writes the pallet's head: an error stands for a
