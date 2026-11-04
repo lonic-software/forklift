@@ -2020,6 +2020,8 @@ mod tests {
     /// aggregate pack and does not explode its objects into individually-fsynced loose files.
     #[test]
     fn build_bundle_then_import_bundle_round_trips_directly_into_a_native_pack() {
+        // Runs the bundle envelope's syncs for real: the unit tests skip syncs otherwise.
+        let _syncs = crate::util::file_utils::real_syncs();
         let (bundle_bytes, _, _) = build_tiny_native_bundle("bundle-roundtrip-src");
         assert!(bundle_bytes.starts_with(format!("{}\n", BUNDLE_HEADER).as_bytes()));
 
