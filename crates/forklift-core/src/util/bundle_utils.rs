@@ -1869,6 +1869,11 @@ mod tests {
     ///
     /// Mutation: compute `MAX_TRANSPORT_INDEX_BYTES` for one record fewer → the full pack's index no
     /// longer equals the cap (red), so the import would refuse it as over the cap.
+    ///
+    /// Over the Windows time budget on purpose (24.5 s on the Windows CI runner, 2.9 s alone on an
+    /// M-series Mac; its own syncs are not the cost): it builds, bundles and imports 100,000
+    /// records, because the cap it pins is a constant derived from the production rollover count,
+    /// and only a pack of exactly that many records has an index of exactly the cap.
     #[test]
     fn a_full_rollover_pack_round_trips_through_a_native_bundle() {
         let count = pack_utils::PACK_ROLLOVER_OBJECTS;
@@ -2280,6 +2285,8 @@ mod tests {
     /// The bundle imports, every version reading back.
     #[test]
     fn a_bundle_deltas_each_version_against_the_last_at_its_path_and_caps_the_chain() {
+        // Nothing here is about durability, and the 55-parcel history paid a sync per write.
+        let _syncs = file_utils::skip_syncs_on_this_thread();
         let source = Scratch::new("bundle-delta-chain");
 
         let shared: Vec<u8> = (0..4096u32).map(|i| b'a' + (i.wrapping_mul(2654435761) >> 27) as u8).collect();

@@ -222,22 +222,21 @@ fn a_root_entry_some_file_system_opens_as_the_metadata_folder_is_refused() {
     }
 }
 
+/// The positive twin: names one step from an alias are ordinary on every file system. They share
+/// one warehouse and one shift, since a refusal of any of them refuses the whole shift.
 #[test]
 fn a_root_entry_that_only_resembles_a_metadata_alias_still_shifts() {
-    // The positive twin: names one step from an alias are ordinary on every file system.
-    for (index, name) in ["forkli~5", "forkli~0", "forkli~12", "FORKLIF~1", "forklift", ".forklifts",
+    let names: Vec<&str> = ["forkli~5", "forkli~0", "forkli~12", "FORKLIF~1", "forklift", ".forklifts",
         ".fork-lift", "x:.forklift", "focbb8~1", "focbb9~0", "focbb9~123", "~1", "f~1", "foc~1",
-        "focbb~1"].into_iter().enumerate()
-    {
-        #[cfg(windows)]
-        if name.contains(':') {
-            continue;
-        }
+        "focbb~1"].into_iter()
+        .filter(|name| !cfg!(windows) || !name.contains(':'))
+        .collect();
 
-        let warehouse = Warehouse::new(&format!("metadata-near-alias-{}", index));
-        warehouse.craft_pallet(|blob| vec![subtree(name, blob)]);
+    let warehouse = Warehouse::new("metadata-near-alias");
+    warehouse.craft_pallet(|blob| names.iter().map(|name| subtree(name, blob)).collect());
 
-        warehouse.run_ok(&["shift", "evil"]);
+    warehouse.run_ok(&["shift", "evil"]);
+    for name in names {
         assert!(warehouse.root.join(name).join("escaped.txt").exists(), "{:?} was not written", name);
     }
 }

@@ -89,26 +89,37 @@ impl Area {
     /// (an atomic ref write never leaves a partial one), and the commands that read the committed
     /// tree and history succeed (a torn object would fail the read-side hash check).
     fn assert_consistent(&self, context: &str) {
-        let head_path = self.warehouse().join(".forklift").join("pallets").join("main");
-        if let Ok(head) = std::fs::read_to_string(&head_path) {
-            let head = head.trim();
-            assert!(
-                head.len() == 64 && head.bytes().all(|b| b.is_ascii_hexdigit()),
-                "{context}: the pallet head must be a whole hash, found {head:?}",
-            );
-
-            let history = self.run(&["history"]);
-            assert!(history.status.success(),
-                "{context}: history must read the parcel chain, stderr: {}",
-                String::from_utf8_lossy(&history.stderr));
+        if let Some(head) = self.assert_head_whole(context) {
+            self.assert_history_reads(context);
 
             // `history` follows the position, which need not be `main`.
-            let peek = self.run(&["store", "peek", head]);
+            let peek = self.run(&["store", "peek", &head]);
             assert!(peek.status.success(),
                 "{context}: peek of the head parcel must succeed, stderr: {}",
                 String::from_utf8_lossy(&peek.stderr));
         }
 
+        self.assert_stocktake_reads(context);
+    }
+
+    /// The pallet head, if one exists, asserted to be a whole 64-hex hash.
+    fn assert_head_whole(&self, context: &str) -> Option<String> {
+        let head = current_head(&self.warehouse())?;
+        assert!(
+            head.len() == 64 && head.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{context}: the pallet head must be a whole hash, found {head:?}",
+        );
+        Some(head)
+    }
+
+    fn assert_history_reads(&self, context: &str) {
+        let history = self.run(&["history"]);
+        assert!(history.status.success(),
+            "{context}: history must read the parcel chain, stderr: {}",
+            String::from_utf8_lossy(&history.stderr));
+    }
+
+    fn assert_stocktake_reads(&self, context: &str) {
         let stocktake = self.run(&["stocktake"]);
         assert!(stocktake.status.success(),
             "{context}: stocktake must read the head tree, stderr: {}",
@@ -222,11 +233,19 @@ fn a_crash_point_stops_the_run_before_that_rename() {
     assert!(current_head(&area.warehouse()).is_some());
 }
 
+/// A `stack` stopped before any of its renames leaves a whole head, a parcel chain and inventory
+/// that read, and objects that all read back once a later stack completes.
+///
+/// Over the Windows time budget on purpose (12.2 s on the Windows CI runner, 0.8 s alone on an
+/// M-series Mac): it stops `stack` at each of its 9 renames, and each stop is about five launches,
+/// the stopped run and the checks of what only that stop can leave (see the comment in the body).
 #[test]
 fn stopping_stack_at_every_rename_never_corrupts_the_store() {
     let area = Area::new("stack");
     let warehouse = area.warehouse();
-    let files = spread_corpus(&warehouse, 2, 2);
+    // One file: `stack` stages every tree into one batch it finishes before the head write, so more
+    // files add stops inside that batch, not a different state to stop in.
+    let files = spread_corpus(&warehouse, 1, 1);
 
     assert!(area.run(&["prepare"]).status.success());
     assert!(area.run(&["config", "set", "operator.identifier", "crash@forklift"]).status.success());
@@ -238,19 +257,34 @@ fn stopping_stack_at_every_rename_never_corrupts_the_store() {
 
     let mut head_before = base.clone();
     let mut advanced_by_a_stop = 0usize;
+    let moved_by_the_last_stop = std::cell::Cell::new(false);
 
+    // Each step below is a process launch, about a third of a second each on the Windows runner,
+    // so the checks between stops are only the ones that read what a stopped `stack` can leave:
+    // the head, the parcel chain, the inventory, and (when the stop moved the head) the head's
+    // parcel and tree.
+    // Every head a run writes is an ancestor of the final one, so the final `git export` reads
+    // every object any stop published.
     let stopped = crash_at_every_rename(&area, &["stack", "-m", "under test"],
         |at| {
             // Recover from the previous stop and check it left the store consistent.
             area.clear_stale_lock();
-            area.assert_consistent(&format!("before stack crash point {at}"));
+            let context = format!("before stack crash point {at}");
+            if area.assert_head_whole(&context).is_some() {
+                area.assert_history_reads(&context);
+            }
+            // The next `load .` rewrites the shards, so a torn one is seen here or not at all.
+            area.assert_stocktake_reads(&context);
 
             // A stop between the head write and the position write leaves the bay behind its own
-            // parcel, with files that already match it; catching up records the head, and is a
-            // no-op otherwise. Without it every later stack would be refused as stale.
-            let caught_up = area.run(&["shift", "main"]);
-            assert!(caught_up.status.success(), "catch-up before stack crash point {at} failed: {}",
-                String::from_utf8_lossy(&caught_up.stderr));
+            // parcel, with files that already match it; catching up records the head, reading its
+            // parcel and tree. Without it every later stack would be refused as stale. Any other
+            // stop leaves nothing to catch up to.
+            if moved_by_the_last_stop.get() {
+                let caught_up = area.run(&["shift", "main"]);
+                assert!(caught_up.status.success(), "catch-up before stack crash point {at} failed: {}",
+                    String::from_utf8_lossy(&caught_up.stderr));
+            }
 
             rewrite_corpus(&files, &format!("stack {at}"));
             let load = area.run(&["load", "."]);
@@ -258,7 +292,8 @@ fn stopping_stack_at_every_rename_never_corrupts_the_store() {
         },
         |_, stopped| {
             let head_now = current_head(&warehouse);
-            if stopped && head_now != head_before {
+            moved_by_the_last_stop.set(stopped && head_now != head_before);
+            if moved_by_the_last_stop.get() {
                 advanced_by_a_stop += 1;
             }
             head_before = head_now;
@@ -322,10 +357,18 @@ fn stack_or_nothing(area: &Area, message: &str) -> bool {
 /// error, and a real `stack` refuses on it. That marker is a different concern from the one under
 /// test here (inventory completeness, not blob durability), so it is removed by hand right before
 /// each direct `stack`, to keep reaching the missing-blob check.
+///
+/// Over the Windows time budget on purpose (18.3 s on the Windows CI runner, 1.0 s alone on an
+/// M-series Mac): it stops `load` at each of its 8 renames, and each stop is five launches: the
+/// stopped run, the `stack` that checks it, the `load` and `stack` that heal it, and the stocktake
+/// of what the heal left. A smaller corpus loses the shard that names a durable blob beside one
+/// that is not.
 #[test]
 fn stopping_load_at_every_rename_never_leaves_a_shard_referencing_a_missing_or_torn_blob() {
     let area = Area::new("load");
     let warehouse = area.warehouse();
+    // Two directories, for the concurrent walk, of two files each, so a shard can name a blob that
+    // is durable beside one that is not.
     let files = spread_corpus(&warehouse, 2, 2);
 
     assert!(area.run(&["prepare"]).status.success());
@@ -334,10 +377,14 @@ fn stopping_load_at_every_rename_never_leaves_a_shard_referencing_a_missing_or_t
 
     let mut stacked = 0usize;
 
+    // Each stop is checked by the `stack` right after it, then healed by an uninterrupted `settle`,
+    // and the inventory `settle` leaves must read; the next run's rewrite would hide a shard the
+    // heal left wrong. Each process launch costs about a third of a second on the Windows runner,
+    // so that is all. Every stack here builds on the last, so the final `git export` reads every
+    // object any of them committed.
     let stopped = crash_at_every_rename(&area, &["load", "."],
         |at| {
             area.clear_stale_lock();
-            area.assert_consistent(&format!("before load crash point {at}"));
             rewrite_corpus(&files, &format!("load {at}"));
         },
         |at, _| {
@@ -353,6 +400,7 @@ fn stopping_load_at_every_rename_never_leaves_a_shard_referencing_a_missing_or_t
             // Stage and commit the working directory's current content uninterrupted, so nothing
             // a stop left staged carries over, and nothing is staged when the next run starts.
             settle(&area, &format!("load {at} heal"));
+            area.assert_stocktake_reads(&format!("after load {at} heal"));
         });
 
     assert!(stopped >= 2, "load must have been stopped at its renames, it was stopped {stopped} times");
@@ -399,7 +447,9 @@ fn operation_standing(warehouse: &Path) -> bool {
 fn stopping_park_at_every_rename_never_leaves_a_parked_parcel_referencing_a_missing_or_torn_object() {
     let area = Area::new("park");
     let warehouse = area.warehouse();
-    let files = spread_corpus(&warehouse, 2, 2);
+    // One file: park stages its trees and parcel into one batch, so more files add stops inside
+    // it rather than a different state.
+    let files = spread_corpus(&warehouse, 1, 1);
 
     assert!(area.run(&["prepare"]).status.success());
     assert!(area.run(&["config", "set", "operator.identifier", "crash@forklift"]).status.success());
@@ -413,8 +463,11 @@ fn stopping_park_at_every_rename_never_leaves_a_parked_parcel_referencing_a_miss
 
     let stopped = crash_at_every_rename(&area, &["park"],
         |at| {
+            // `park` never moves the head, so between stops only the bay it resets is checked,
+            // after the heal or pop that follows each stop; the head and history are checked once,
+            // at the end. Each process launch costs about a third of a second on Windows.
             area.clear_stale_lock();
-            area.assert_consistent(&format!("before park crash point {at}"));
+            area.assert_stocktake_reads(&format!("before park crash point {at}"));
             rewrite_corpus(&files, &format!("park {at}"));
             before.set(parked_count(&warehouse));
         },

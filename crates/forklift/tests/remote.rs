@@ -1773,6 +1773,11 @@ fn manifest_syncs_across_remotes_and_replays_when_diverged() {
 /// The tag rules across a remote: the server admits a tag only from a signer who is an admin
 /// as it admits it, while a warehouse adopting tags already admitted keeps one whose tagger has
 /// been demoted since; and a name both sides tagged replays only by keeping the remote's tag.
+///
+/// Over the Windows time budget on purpose (16.8 and 10.0 s on the Windows CI runner in two runs,
+/// 0.5 s alone on an M-series Mac): it is about 46 launches, which is where the Windows time goes.
+/// The demotion and the replay act on tags and admins the steps before them enrolled and lifted,
+/// so splitting it would rebuild that state for every part.
 #[test]
 fn tags_sync_hold_the_admin_rule_at_admission_and_never_move() {
     let area = TestArea::new("tags-remote");
@@ -1891,6 +1896,15 @@ fn tags_sync_hold_the_admin_rule_at_admission_and_never_move() {
 
 }
 
+/// A haul and its comments ride the @haul pallet across a remote: a clone carries it, a diverged
+/// lift is lowered and replayed, and a close or a merge racing an update is a conflict on the
+/// haul's state cell, never a state recorded at a head it did not reach.
+///
+/// Over the Windows time budget on purpose (13.4 and 13.3 s on the Windows CI runner in two runs,
+/// 0.7 s alone on an M-series Mac): it is about 60 launches, which is where the Windows time goes.
+/// Each race it pins (a diverged lift, a close racing an update, a merge racing an update) starts
+/// from the haul history the steps before it built, so splitting it would rebuild that history for
+/// every part.
 #[test]
 fn hauls_sync_across_remotes_and_replay_when_diverged() {
     let area = TestArea::new("haul-remote");
@@ -7476,6 +7490,12 @@ fn assert_move_pending(area: &TestArea,
 /// listing and the cache's read succeed) → red; drop the removal funnel → the forced delete
 /// removes its pallet (the sparse one too: its head is in the ledger already, so nothing is
 /// written there) → red; drop the ledger funnel → the undo runs → red.
+///
+/// Over the Windows time budget on purpose (12.0 and 11.5 s on the Windows CI runner in two runs,
+/// 0.8 s alone on an M-series Mac): it is about 75 launches, which is where the Windows time goes.
+/// Thirty of them are the refusals, fifteen commands in each phase, each one launch. The promise is
+/// per command, and which of the three funnels a command passes through is free to change, so each
+/// command is checked rather than one per funnel.
 #[test]
 fn a_pending_move_of_the_origin_refuses_every_remote_client_and_every_writer_it_checks() {
     use forklift_core::util::origin_move::Phase;

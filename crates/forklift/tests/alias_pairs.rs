@@ -320,44 +320,54 @@ fn states() -> Vec<State> {
 }
 
 /// From each state, stack and park are refused with nothing changed, the remedy they name clears
-/// the pair, and the work then parks and pops back as the move it was.
+/// the pair, and the work then parks and pops back as the move it was. Each state is about 18
+/// launches in a warehouse of its own, so the states run on threads of their own: one after another
+/// they took up to 17.5 s on Windows.
 #[test]
 fn stack_and_park_refuse_a_pair_and_its_remedy_clears_it() {
-    for state in states() {
-        let warehouse = Warehouse::new(state.name, state.tracked);
-        if !warehouse.bites() {
-            return;
+    std::thread::scope(|threads| {
+        let states: Vec<_> = states().into_iter().map(|state| {
+            threads.spawn(move || {
+                let warehouse = Warehouse::new(state.name, state.tracked);
+                if !warehouse.bites() {
+                    return;
+                }
+
+                warehouse.stage_other_work();
+                (state.reach)(&warehouse);
+
+                let (head, parked, stocktake, disk) =
+                    (warehouse.head(), warehouse.parked(), warehouse.stocktake(), warehouse.disk());
+
+                for command in [&["stack", "-m", "pair"][..], &["park"][..]] {
+                    let output = warehouse.run(command);
+                    assert_pair_refusal(&output, state.pair, state.remedy);
+
+                    assert_eq!(warehouse.head(), head, "{}: a refused {} moves no head", state.name, command[0]);
+                    assert_eq!(warehouse.parked(), parked, "{}: a refused {} parks nothing", state.name, command[0]);
+                    assert_eq!(warehouse.stocktake(), stocktake, "{}: a refused {} stages nothing", state.name, command[0]);
+                    assert_eq!(warehouse.disk(), disk, "{}: a refused {} touches no file", state.name, command[0]);
+                }
+
+                for args in state.remedy {
+                    warehouse.run_ok(args);
+                }
+
+                warehouse.run_ok(&["park"]);
+                assert!(warehouse.path(state.parked_file).is_file(), "{}: the parked file is gone: {:?}",
+                        state.name, warehouse.disk());
+                warehouse.run_ok(&["park", "pop"]);
+
+                let staged = warehouse.stocktake();
+                assert!(section(&staged, STAGED).contains(&state.moved), "{}: the pop must re-stage the move: {}",
+                        state.name, staged);
+            })
+        }).collect();
+        // Joined here, not by the scope, so a failing state's own message is the test's failure.
+        for state in states {
+            state.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         }
-
-        warehouse.stage_other_work();
-        (state.reach)(&warehouse);
-
-        let (head, parked, stocktake, disk) =
-            (warehouse.head(), warehouse.parked(), warehouse.stocktake(), warehouse.disk());
-
-        for command in [&["stack", "-m", "pair"][..], &["park"][..]] {
-            let output = warehouse.run(command);
-            assert_pair_refusal(&output, state.pair, state.remedy);
-
-            assert_eq!(warehouse.head(), head, "{}: a refused {} moves no head", state.name, command[0]);
-            assert_eq!(warehouse.parked(), parked, "{}: a refused {} parks nothing", state.name, command[0]);
-            assert_eq!(warehouse.stocktake(), stocktake, "{}: a refused {} stages nothing", state.name, command[0]);
-            assert_eq!(warehouse.disk(), disk, "{}: a refused {} touches no file", state.name, command[0]);
-        }
-
-        for args in state.remedy {
-            warehouse.run_ok(args);
-        }
-
-        warehouse.run_ok(&["park"]);
-        assert!(warehouse.path(state.parked_file).is_file(), "{}: the parked file is gone: {:?}",
-                state.name, warehouse.disk());
-        warehouse.run_ok(&["park", "pop"]);
-
-        let staged = warehouse.stocktake();
-        assert!(section(&staged, STAGED).contains(&state.moved), "{}: the pop must re-stage the move: {}",
-                state.name, staged);
-    }
+    });
 }
 
 /// A remedy confined to the pair leaves unrelated work where it was: the unstaged edit stays

@@ -989,6 +989,11 @@ fn unmirrorable_pallets_are_skipped_without_refs() {
 /// but feat's head is not in main's history on the Forklift remote, so it is a divergence.
 ///
 /// Revert: drop the check that git's parcel is in the pallet's lifted history → "already ahead".
+///
+/// Over the Windows time budget (10.3 and 11.2 s on the Windows CI runner in two runs, 0.6 s alone on an
+/// M-series Mac): about 17 launches of forklift and the server, and each `git mirror` run starts
+/// git processes of its own. Most of them are the [`Fixture`], the least any mirror run needs: a
+/// server, a warehouse with a lifted parcel, and a git repository to mirror to.
 #[test]
 fn a_fast_forward_to_another_pallet_is_a_divergence() {
     let fixture = Fixture::new("other-pallet");
@@ -1014,6 +1019,11 @@ fn a_fast_forward_to_another_pallet_is_a_divergence() {
 /// by an explicit run and by lift's trigger, not left holding the one pallet the run touched.
 ///
 /// Revert: start from an empty record when it cannot be read → the trigger leaves only main.
+///
+/// Over the Windows time budget (10.5 and 11.3 s on the Windows CI runner in two runs, 0.8 s alone on an
+/// M-series Mac): about 19 launches of forklift and the server, and each `git mirror` run starts
+/// git processes of its own. Most of them are the [`Fixture`], the least any mirror run needs: a
+/// server, a warehouse with a lifted parcel, and a git repository to mirror to.
 #[test]
 fn an_unreadable_roots_record_is_rebuilt_from_the_exported_refs() {
     let fixture = Fixture::new("record");
@@ -1230,6 +1240,11 @@ fn files_under(dir: &Path) -> Vec<PathBuf> {
 /// office stripped), and the mirror refuses main without exporting it.
 ///
 /// Revert: let the mirror skip `verify_take`, and git's main moves to the unsigned parcel.
+///
+/// Over the Windows time budget (10.5 and 10.3 s on the Windows CI runner in two runs, 0.6 s alone on an
+/// M-series Mac): about 21 launches of forklift and the server, and each `git mirror` run starts
+/// git processes of its own. Most of them are the [`Fixture`], the least any mirror run needs: a
+/// server, a warehouse with a lifted parcel, and a git repository to mirror to.
 #[test]
 fn a_head_the_anchor_does_not_vouch_for_is_never_exported() {
     let fixture = Fixture::new("unverified");
