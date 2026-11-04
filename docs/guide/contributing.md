@@ -198,6 +198,16 @@ machine does not tell you what Windows will take.
   integration test per path that proves the command reaches the rule and reports it.
   Before adding an integration test, check whether an existing one already crosses the
   same wiring; if so, add an assertion to it instead of a new test.
+- **Check one built state in one test.** nextest runs every test in a process of its own,
+  so tests cannot share a fixture: two tests that build the same state to check different
+  things about it pay for the whole build twice. Build it once and make every check in
+  that test. Put the checks that only read the state first, and the ones that damage it
+  last, undoing each damage before the next so that every failure has one cause.
+  `a_sparse_audit_states_its_boundary_and_re_verifies_in_scope_content` in `remote.rs`
+  replaced five tests that each built the same signed warehouse and sparse clone. Keep
+  tests apart when a check changes the state in a way the test cannot undo: a refused
+  command that has already fetched from the remote, for instance, leaves the next command
+  a different starting point than a first contact would.
 - **Crash at each step, not at a random time.** To test what a crash leaves behind, stop
   the command before each of its renames in turn with `FORKLIFT_DEBUG_CRASH_AT_RENAME`
   (see `crash_at_every_rename` in `crash_consistency.rs`). Killing it after a guessed

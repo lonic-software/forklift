@@ -3413,8 +3413,8 @@ mod tests {
     ///
     /// This is deliberately *not* built through the CLI/clone machinery the way the
     /// sibling `remote.rs` tests are (see
-    /// `a_partial_clone_missing_an_unrelated_boundary_head_still_audits_the_vouched_parcel`'s
-    /// doc for why that path cannot reach this case): `office retire` always folds the
+    /// `a_partial_clone_missing_an_unrelated_boundary_head_still_audits_and_reads_the_parcel_as_vouched`'s
+    /// comments for why that path cannot reach this case): `office retire` always folds the
     /// audited pallet's own current head into the boundary, and that head — being the pallet
     /// under audit's own history — is guaranteed present and, being at or after any
     /// legitimately pre-revocation parcel on that same pallet, always sufficient to vouch it
