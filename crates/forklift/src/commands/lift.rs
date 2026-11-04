@@ -80,12 +80,10 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
 
         let Some(head) = local_head else {
             lift_meta(&client, &info, haul_utils::HAUL_PALLET_NAME, None, &mut meta).await;
-            let MetaLifts { failed: meta_failed, .. } = meta;
-
-            return Err(lower::with_meta_failures(format!(
+            return Err(with_meta_outcome(format!(
                 "Pallet \"{}\" has nothing stacked yet; there is nothing to lift.",
                 pallet
-            ), &meta_failed));
+            ), &meta.resigned, &meta.failed));
         };
 
         let remote_head = info.pallets.get(&pallet).cloned();
@@ -103,7 +101,7 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
                     Ok(false) => {}
                     Err(why) => {
                         lift_meta(&client, &info, haul_utils::HAUL_PALLET_NAME, None, &mut meta).await;
-                        return Err(lower::with_meta_failures(why, &meta.failed));
+                        return Err(with_meta_outcome(why, &meta.resigned, &meta.failed));
                     }
                 }
             }
@@ -145,11 +143,15 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
                 report.uploaded_signatures = stats.uploaded_signatures;
             }
             Err(why) => {
-                if !output::is_json() {
+                // The human lines name the re-signed cells; JSON has only the error to carry them.
+                let resigned: &[String] = if output::is_json() {
+                    &report.meta_resigned
+                } else {
                     report.render_meta();
-                }
+                    &[]
+                };
 
-                return Err(lower::with_meta_failures(why, &report.meta_failed));
+                return Err(with_meta_outcome(why, resigned, &report.meta_failed));
             }
         }
 
@@ -169,6 +171,21 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
 
         return Ok(());
     }
+}
+
+/// A lift's error, naming the cells a replay re-signed onto the remote before it — they landed,
+/// so they are not first heard of on the next lift — and any meta pallet that failed.
+fn with_meta_outcome(error: String, resigned: &[String], failed: &[MetaPalletFailure]) -> String {
+    let error = if resigned.is_empty() {
+        error
+    } else {
+        forklift_core::error::append_to_message(error, &format!(
+            "Also: the remote now holds {} re-signed under your current key.",
+            resigned.join(", ")
+        ))
+    };
+
+    lower::with_meta_failures(error, failed)
 }
 
 /// What lifting the meta pallets did.

@@ -1727,13 +1727,11 @@ fn detect_conflicts_with(base: Option<&str>,
 /// schema and value, `theirs` signed by a key `office` tracks, and both stamps resolving to the
 /// same operator — the rule [`restamp_for_replay`] re-signs by, so a cell a replay re-signed
 /// matches its local original, written without a key or under a key since rotated. A key
-/// revoked as compromised resolves to no operator, and a cell that does not parse matches
-/// nothing.
+/// revoked as compromised resolves to no operator, and a cell that cannot be loaded or does not
+/// parse matches nothing, so the walk reports the conflict it would without this rule.
 pub fn same_cell_re_signed(ours: &str, theirs: &str, office: &OfficeState) -> Result<bool, String> {
-    let (Ok(ours), Ok(theirs)) = (
-        parse_cell(&object_utils::load_blob(ours)?.content),
-        parse_cell(&object_utils::load_blob(theirs)?.content),
-    ) else {
+    let cell = |hash: &str| object_utils::load_blob(hash).ok().and_then(|blob| parse_cell(&blob.content).ok());
+    let (Some(ours), Some(theirs)) = (cell(ours), cell(theirs)) else {
         return Ok(false);
     };
 
@@ -1969,8 +1967,7 @@ pub fn restamp_for_replay(changes: &[CellChange],
     let mut edits = Vec::new();
 
     let signing = match writer {
-        MetaWriter::Signed { office, signer } => Some((office, office.find_key(&signer.key_id)
-            .ok_or(format!("The signing key {} is not tracked in the office.", signer.key_id))?)),
+        MetaWriter::Signed { office, signer } => Some((office, &signer.key_id)),
         MetaWriter::Unsigned => None,
     };
 
@@ -1988,13 +1985,16 @@ pub fn restamp_for_replay(changes: &[CellChange],
             continue;
         }
 
-        let Some((office, current)) = signing else {
+        let Some((office, signer_key_id)) = signing else {
             return Err(format!(
                 "The cell {} is stamped {}, so it cannot be re-stamped by {}. Keep theirs at this \
                 path to discard the local change.",
                 change.path, describe_stamp(&envelope.stamp), describe_own(&own)
             ));
         };
+
+        let current = office.find_key(signer_key_id)
+            .ok_or(format!("The signing key {} is not tracked in the office.", signer_key_id))?;
 
         match &envelope.stamp {
             Stamp::Operator(identifier) if *identifier != current.operator => {
@@ -2137,9 +2137,9 @@ pub fn replay_meta_pallet(pallet: &str,
 
     verify_meta_content(pallet, rules, writer.office_state(), &[], Admission::Admit, theirs, &parcel)
         .map_err(|why| format!(
-            "{} An operator the office lets make this change can make it instead, or keep theirs at \
-            this path to discard the local change.",
-            why
+            "{} An operator the office lets make this change can make it instead{}.",
+            why,
+            if theirs.is_some() { ", or keep theirs at the refused path to discard the local change" } else { "" }
         ))?;
 
     Ok(Some(parcel))
@@ -3560,6 +3560,21 @@ mod tests {
     }
 
     #[test]
+    fn a_signing_key_is_looked_up_only_for_a_cell_it_re_signs() {
+        let _scratch = Scratch::new("replay-untracked-key");
+        let (alice, stale) = (Key::new("alice", 1), Key::new("alice", 5));
+        let office = office(&[&alice.record]);
+
+        let unset_only = [CellChange { path: "x".to_string(), before: Some(cell(alice.id(), "old")), after: None }];
+        let edits = restamp_for_replay(&unset_only, &signed_writer(&office, &stale), &actor("alice")).unwrap();
+        assert!(matches!(edits.as_slice(), [CellEdit::Unset { path }] if path == "x"));
+
+        let unsigned = [CellChange { path: "x".to_string(), before: None, after: Some(declared_cell("alice", "mine")) }];
+        let why = restamp_for_replay(&unsigned, &signed_writer(&office, &stale), &actor("alice")).unwrap_err();
+        assert!(why.contains("is not tracked in the office"), "{}", why);
+    }
+
+    #[test]
     fn a_cell_the_remote_already_holds_re_signed_is_no_conflict() {
         let _scratch = Scratch::new("replay-re-signed");
         let (old, new, bob) = (Key::new("alice", 1), Key::new("alice", 4), Key::new("bob", 2));
@@ -3579,6 +3594,11 @@ mod tests {
         let seen = detect_conflicts(None, ours_cells.as_deref(), theirs_cells.as_deref(), Some(&before)).unwrap();
         assert!(seen.conflicts.is_empty());
         assert_eq!(decision_at(&seen, "x"), Some(Decision::ReSigned));
+
+        // A cell that cannot be loaded matches nothing: the conflict is reported, not an error.
+        let missing = cells(&[("x", &"ab".repeat(32))]);
+        let unloaded = detect_conflicts(None, ours_cells.as_deref(), missing.as_deref(), Some(&before)).unwrap();
+        assert_eq!(unloaded.conflicts.len(), 1);
 
         // Across a rotation the old key still vouches for the same operator.
         let rotated = office(&[&old.revoked(RevocationReason::Retirement, vec![theirs.clone()]), &new.record, &bob.record]);
