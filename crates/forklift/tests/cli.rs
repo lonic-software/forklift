@@ -3598,8 +3598,8 @@ fn an_unwritable_commit_graph_never_fails_a_query() {
 /// query at a time rewrote each shard once per parcel in it; the batched pass writes each shard
 /// once for the generation records and once per filter batch. A history long enough to put
 /// several parcels in every shard tells the two apart. The graph is cut to its 16 one-hex shards
-/// so that 64 parcels do it: at the real 256 it took 600, whose import alone was most of the
-/// test's 20 s on the Windows runner.
+/// so that 64 parcels do it: at the real 256 it took 600, and the test ran 20 s on the Windows
+/// runner.
 #[test]
 fn a_cold_blame_writes_each_commit_graph_shard_a_bounded_number_of_times() {
     use std::io::Write;
