@@ -211,8 +211,8 @@ A token and a signing key answer different questions, and neither stands in for 
 - The **signature** on each parcel says who made it. `audit` and every client verify it against the
   office, whoever lifted the parcel.
 
-So the token a parcel arrived with says nothing about who wrote it: a parcel signed by Ada and
-lifted with Bob's token is Ada's parcel. Give each person their own token so the server can apply
+So the token a parcel arrived with says nothing about who wrote it: a parcel signed by Bob and
+lifted with Ada's token is Bob's parcel. Give each person their own token so the server can apply
 their role, and rely on the signatures, not the tokens, for who did what.
 
 ## Where to go next

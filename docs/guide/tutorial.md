@@ -267,7 +267,7 @@ Prepared warehouse at "server".
 
 Open a **second terminal** in the same folder and start the server there. Leave it running. With
 `--open` it accepts anyone, which is fine on your own machine and nowhere else (see
-[Running a server](../SERVER.md) for tokens):
+[A team: from zero to working together](team.md) for a server with tokens):
 
 ```console
 $ forklift-server serve --root server --addr 127.0.0.1:7171 --open
@@ -325,6 +325,7 @@ Reference: [Working with remotes](cli.md#6-working-with-remotes).
 
 ## 8. Where to go next
 
+- [`team.md`](team.md): a server with a token per person, and a second person joining.
 - [`concepts.md`](concepts.md): what forklift does that git cannot, and where each part is documented.
 - [`glossary.md`](glossary.md): every forklift term, with its git equivalent.
 - [`cli.md`](cli.md): every command and flag, by workflow.
