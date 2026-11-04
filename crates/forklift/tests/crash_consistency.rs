@@ -233,6 +233,12 @@ fn a_crash_point_stops_the_run_before_that_rename() {
     assert!(current_head(&area.warehouse()).is_some());
 }
 
+/// A `stack` stopped before any of its renames leaves a whole head, a parcel chain and inventory
+/// that read, and objects that all read back once a later stack completes.
+///
+/// Over the Windows time budget on purpose (12.2 s on the Windows CI runner, 0.8 s alone on an
+/// M-series Mac): it stops `stack` at each of its 9 renames, and each stop is about five launches,
+/// the stopped run and the checks of what only that stop can leave (see the comment in the body).
 #[test]
 fn stopping_stack_at_every_rename_never_corrupts_the_store() {
     let area = Area::new("stack");
@@ -351,6 +357,12 @@ fn stack_or_nothing(area: &Area, message: &str) -> bool {
 /// error, and a real `stack` refuses on it. That marker is a different concern from the one under
 /// test here (inventory completeness, not blob durability), so it is removed by hand right before
 /// each direct `stack`, to keep reaching the missing-blob check.
+///
+/// Over the Windows time budget on purpose (18.3 s on the Windows CI runner, 1.0 s alone on an
+/// M-series Mac): it stops `load` at each of its 8 renames, and each stop is five launches: the
+/// stopped run, the `stack` that checks it, the `load` and `stack` that heal it, and the stocktake
+/// of what the heal left. A smaller corpus loses the shard that names a durable blob beside one
+/// that is not.
 #[test]
 fn stopping_load_at_every_rename_never_leaves_a_shard_referencing_a_missing_or_torn_blob() {
     let area = Area::new("load");
