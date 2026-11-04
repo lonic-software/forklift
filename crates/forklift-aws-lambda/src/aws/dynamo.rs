@@ -1119,7 +1119,8 @@ mod tests {
 
     /// The table's key attributes are the deployment's key schema, which no upgrade step can change:
     /// a new one is a new table. The items under them are frozen per AWS format by
-    /// `tests/aws_format.rs`, on the memory store, which keeps them under these same names.
+    /// `tests/integration/aws_format.rs`, on the memory store, which keeps them under these same
+    /// names.
     #[test]
     fn the_key_schema_is_the_deployments() {
         assert_eq!((ATTR_WAREHOUSE, ATTR_ENTITY), ("wh", "entity"));

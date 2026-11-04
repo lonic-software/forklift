@@ -1,6 +1,6 @@
 //! [`S3Ops`] — the sanctioned S3 operation surface, and nothing else.
 //!
-//! C11 (`tests/iam_conformance.rs`) is the fourth specification of the IAM conformance
+//! C11 (`tests/integration/iam_conformance.rs`) is the fourth specification of the IAM conformance
 //! guarantee. The first three were source scanners of increasing sophistication, and each
 //! shipped a hole a scanner cannot see past: a macro body (`syn` never parses `ExprMacro`
 //! tokens), a free function taking a raw client as a parameter (no `self.client` receiver to
@@ -38,8 +38,8 @@
 //! # What makes this module's own claim checkable, not just asserted
 //!
 //! Composing three separate, narrow properties — none of which alone would be enough — is the
-//! actual guarantee, and each one has a committed test (`tests/iam_conformance.rs`) that goes
-//! red if the property breaks:
+//! actual guarantee, and each one has a committed test (`tests/integration/iam_conformance.rs`)
+//! that goes red if the property breaks:
 //!
 //! 1. **Parse totality.** `syn`'s only blind spot is macro-call tokens (`ExprMacro`), so the
 //!    one guarantee-bearing property this file needs from parsing is that it contains *zero*
@@ -67,9 +67,9 @@
 //! # Residuals — not claimed to be closed here
 //!
 //! This module (plus its `dynamo_ops` sibling and the IAM-action map in
-//! `tests/iam_conformance.rs`) closes the *completeness* question: every operation this crate
-//! can possibly perform is exactly the set the scanner enumerates, and every one of those must
-//! be mapped and granted. It does **not** check that `op_actions()`'s op → IAM-action mapping
+//! `tests/integration/iam_conformance.rs`) closes the *completeness* question: every operation this
+//! crate can possibly perform is exactly the set the scanner enumerates, and every one of those
+//! must be mapped and granted. It does **not** check that `op_actions()`'s op → IAM-action mapping
 //! is *itself correct* (a typo'd action there still passes); it does not attribute an action to
 //! the specific role (control plane vs. verifier) that needs it, only the union; it says
 //! nothing about `Resource`/`Condition` scoping correctness; and it is not a defense against an
@@ -97,9 +97,10 @@ use aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder;
 /// allowed to perform. See the module docs for why the private field plus `pub(crate)` methods
 /// is the mechanism, not merely documentation of intent — and note that being the mechanism is
 /// exactly why both halves of it (the field carrying no `pub` at all, and every op method being
-/// exactly `pub(crate)`, not `pub`) are themselves asserted by `tests/iam_conformance.rs`, not
-/// merely documented here: a flipped visibility keyword is a silent reopening of escape 3
-/// otherwise, and nothing in the type system stops a future edit from doing it by accident.
+/// exactly `pub(crate)`, not `pub`) are themselves asserted by
+/// `tests/integration/iam_conformance.rs`, not merely documented here: a flipped visibility keyword
+/// is a silent reopening of escape 3 otherwise, and nothing in the type system stops a future edit
+/// from doing it by accident.
 #[derive(Clone, Debug)]
 pub struct S3Ops(aws_sdk_s3::Client);
 

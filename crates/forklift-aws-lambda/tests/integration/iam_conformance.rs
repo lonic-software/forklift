@@ -160,11 +160,11 @@ const SRC_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
 const S3_OPS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/aws/s3_ops.rs");
 const DYNAMO_OPS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/aws/dynamo_ops.rs");
 
-const CONTROL_PLANE_POLICY: &str = include_str!("../iam/control-plane.policy.json");
-const VERIFIER_POLICY: &str = include_str!("../iam/verifier.policy.json");
+const CONTROL_PLANE_POLICY: &str = include_str!("../../iam/control-plane.policy.json");
+const VERIFIER_POLICY: &str = include_str!("../../iam/verifier.policy.json");
 /// The upgrade operator's role (`forklift-aws-upgrade`), not a Lambda's: the only grant of
 /// `dynamodb:Scan`, which `--all` needs to find every warehouse in the table.
-const OPERATOR_POLICY: &str = include_str!("../iam/operator.policy.json");
+const OPERATOR_POLICY: &str = include_str!("../../iam/operator.policy.json");
 
 /// Every non-constructor op method's name is required to appear here, mapped to the IAM
 /// action(s) it needs; see the module docs (direction A/B).

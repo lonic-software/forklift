@@ -373,7 +373,7 @@ fn parse_fsync_setting(value: Option<&str>) -> bool {
 /// of the barrier it counts (see both increment sites): with fsync off there is no durability
 /// wait to amortize, so counting a "barrier" there would count work that never happened. Not a
 /// performance feature: a cheap, always-on observability hook — see [`barrier_count`] — that lets
-/// the batching work's tests (`crates/forklift/tests/crash_consistency.rs`'s
+/// the batching work's tests (`crates/forklift/tests/integration/crash_consistency.rs`'s
 /// `load_pays_a_constant_number_of_barriers_regardless_of_changed_file_count`, and a maintainer
 /// running `FORKLIFT_DEBUG_BARRIER_COUNT=1`) prove a burst of N writes actually collapsed to a
 /// constant number of barriers, not just that the resulting state happens to be correct.

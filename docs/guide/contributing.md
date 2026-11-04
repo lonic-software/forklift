@@ -64,8 +64,8 @@ Notes:
 - The remote integration tests (`crates/forklift/tests/remote.rs`) spawn a real
   `forklift-server` process next to the `forklift` binary, so run tests via a
   **workspace build** (plain `cargo test`), not a single-crate build. The crash
-  (`crates/forklift/tests/crash_consistency.rs`) and determinism
-  (`crates/forklift/tests/determinism.rs`) suites likewise drive the real binary.
+  (`crates/forklift/tests/integration/crash_consistency.rs`) and determinism
+  (`crates/forklift/tests/integration/determinism.rs`) suites likewise drive the real binary.
 - Integration tests isolate state with `FORKLIFT_GLOBAL_CONFIG` and
   `FORKLIFT_KEYS_DIR` env vars pointed at a scratch directory, so they never
   touch a developer's real config or keys. Use the same pattern for new tests
@@ -77,6 +77,13 @@ Notes:
   durability suite, which forces fsync on. forklift-core's own unit tests skip
   every sync too, unless the test holds `file_utils::real_syncs()`; see
   [Keeping tests fast](#keeping-tests-fast).
+- Each file directly under a crate's `tests/` builds as its own test binary, which CI
+  compiles and links on every run. So a new integration test file for the CLI or the
+  lambda head goes into that crate's `tests/integration/` as a module of its
+  `main.rs`, not beside it. Give a file a binary of its own only when it changes
+  process-wide state (the working directory, environment variables, resource limits):
+  `cargo test` runs a binary's tests on threads of one process, so that state would
+  leak into the other tests. The `main.rs` of each says which files stay outside and why.
 - The hardening test spine is worth knowing when touching the object store,
   the parsers, or the parallel walks: `crates/forklift-core/tests/fuzz_formats.rs`
   fuzzes every parse entry point (must never panic) and checks round-trip
@@ -483,10 +490,10 @@ it touched, or that none applied. When a change alters:
 - **a command's flags, name, or behavior** → update [`cli.md`](cli.md), and run `bin/gen-docs`
   when its name, alias or one-line help changed;
 - **anything [`tutorial.md`](tutorial.md) or [`concepts.md`](concepts.md) runs or shows** →
-  update the page. The `guide_pages` test in `crates/forklift/tests/` runs each page's commands
-  in order and fails when one fails or prints something other than the page shows. Any page that
-  gains a `console` block must live in `docs/guide/` and be added to that test's `RUN_PAGES`,
-  which it enforces;
+  update the page. The `guide_pages` test in `crates/forklift/tests/integration/` runs each page's
+  commands in order and fails when one fails or prints something other than the page shows. Any
+  page that gains a `console` block must live in `docs/guide/` and be added to that test's
+  `RUN_PAGES`, which it enforces;
 - **a heading another page links to** → fix the links. The `doc_links` test reads every `.md` page
   in the repository and fails on a relative link to a missing file or a missing heading;
 - **trust / office / key behavior** → update [`trust-and-identity.md`](trust-and-identity.md);

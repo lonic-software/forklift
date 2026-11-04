@@ -3,15 +3,16 @@
 //! The DynamoDB sibling of [`S3Ops`](crate::aws::s3_ops::S3Ops): see that module's docs for the
 //! full mechanism (a private client field, `pub(crate)` one-line delegations to the SDK's own
 //! fluent builders, and the three checked properties — parse totality, the item-kind allowlist,
-//! and the per-method shape check — `tests/iam_conformance.rs` verifies over this file). Nothing
-//! here is DynamoDB-specific except which operations are sanctioned and how the client is built
-//! (no path-style addressing quirk — that is an S3/LocalStack peculiarity, not a DynamoDB one).
+//! and the per-method shape check — `tests/integration/iam_conformance.rs` verifies over this
+//! file). Nothing here is DynamoDB-specific except which operations are sanctioned and how the
+//! client is built (no path-style addressing quirk — that is an S3/LocalStack peculiarity, not a
+//! DynamoDB one).
 //!
 //! `#![deny(dead_code)]`, scoped to **this file** (below, not on the crate — `lib.rs` carries
 //! only `#![forbid(unsafe_code)]`), is what would catch an op method nothing calls; the crate's
-//! `tests/iam_conformance.rs` derives the operation set straight from this impl's non-constructor
-//! method names, so a new method here is either mapped and granted or the conformance test goes
-//! red — see that file's module docs for directions A/B/C.
+//! `tests/integration/iam_conformance.rs` derives the operation set straight from this impl's
+//! non-constructor method names, so a new method here is either mapped and granted or the
+//! conformance test goes red — see that file's module docs for directions A/B/C.
 
 // Direction C (a dead grant nothing calls) is rustc's job, not a scanner's: an op method below
 // that nothing in the crate calls is a **build error** here, not a passing test. Scoped to this
@@ -25,8 +26,9 @@ use aws_sdk_dynamodb::operation::transact_write_items::builders::TransactWriteIt
 
 /// The sanctioned DynamoDB capability: a private client, and one method per operation this
 /// crate is allowed to perform. Both halves of the privacy — the field carrying no `pub`, and
-/// every op method being exactly `pub(crate)` — are asserted by `tests/iam_conformance.rs`, not
-/// merely documented; see [`S3Ops`](crate::aws::s3_ops::S3Ops)'s docs for why.
+/// every op method being exactly `pub(crate)` — are asserted by
+/// `tests/integration/iam_conformance.rs`, not merely documented; see
+/// [`S3Ops`](crate::aws::s3_ops::S3Ops)'s docs for why.
 #[derive(Clone, Debug)]
 pub struct DynamoOps(aws_sdk_dynamodb::Client);
 

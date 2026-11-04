@@ -10,7 +10,7 @@
 
 use std::process::Output;
 
-mod common;
+use crate::common;
 use common::forklift_command;
 
 struct TestWarehouse {

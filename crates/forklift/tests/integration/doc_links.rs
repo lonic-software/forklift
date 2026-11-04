@@ -6,7 +6,7 @@
 //! listed here.
 
 #[allow(dead_code)] // The half of the module that launches binaries is not used here.
-mod common;
+use crate::common;
 
 use common::{prose_lines, repository_root, tracked_pages};
 use std::collections::{HashMap, HashSet};

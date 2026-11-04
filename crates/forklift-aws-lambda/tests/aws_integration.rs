@@ -97,10 +97,10 @@ fn test_config(endpoint: &str) -> AwsConfig {
 ///
 /// This crate's own `S3Ops::build`/`DynamoOps::build` do the equivalent construction, but their
 /// op methods are `pub(crate)` — invisible from this integration-test crate by design (see
-/// `tests/iam_conformance.rs`'s module docs on why: it is exactly what stops a bin from calling
-/// an unaudited op directly). Duplicating the small connector-construction snippet here, rather
-/// than exposing a raw-client constructor from the crate's public API, is deliberate: the latter
-/// would reopen the exact hole C11 v4 closes for anything else that imported it.
+/// `tests/integration/iam_conformance.rs`'s module docs on why: it is exactly what stops a bin from
+/// calling an unaudited op directly). Duplicating the small connector-construction snippet here,
+/// rather than exposing a raw-client constructor from the crate's public API, is deliberate: the
+/// latter would reopen the exact hole C11 v4 closes for anything else that imported it.
 async fn raw_clients(config: &AwsConfig) -> (aws_sdk_s3::Client, aws_sdk_dynamodb::Client) {
     let http_client = aws_smithy_http_client::Builder::new()
         .tls_provider(tls::Provider::Rustls(tls::rustls_provider::CryptoMode::Ring))

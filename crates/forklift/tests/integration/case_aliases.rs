@@ -20,7 +20,7 @@ use forklift_core::model::parcel::Parcel;
 use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::pallet_utils;
 
-mod common;
+use crate::common;
 use common::forklift_command;
 
 struct Warehouse {

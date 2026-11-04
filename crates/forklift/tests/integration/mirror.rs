@@ -14,7 +14,7 @@ use forklift_core::util::gc_utils;
 
 const FORKLIFT: &str = env!("CARGO_BIN_EXE_forklift");
 
-mod common;
+use crate::common;
 use common::{forklift_command, server_binary};
 
 /// The git config file every launch here reads as its global one: none.

@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::process::Output;
 
-mod common;
+use crate::common;
 use common::forklift_command;
 
 struct Warehouse {

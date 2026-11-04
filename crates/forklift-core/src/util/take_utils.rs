@@ -17,10 +17,10 @@
 //! The known-verified set that keeps a held take incremental is every local user-pallet head.
 //! It is sound only while every writer of a user-pallet ref either signs the head it writes,
 //! copies an existing local head, verifies the head here, or refuses while an anchor is held; the
-//! writer-invariant test in `crates/forklift/tests/take_writers.rs` keeps that list. Heads that
-//! were already here when an anchor arrived from a remote were written under none of those, so
-//! the install judges them first ([`record_unvouched_heads`]) and the set leaves out the ones the
-//! anchor does not vouch for, and everything built on them.
+//! writer-invariant test in `crates/forklift/tests/integration/take_writers.rs` keeps that list.
+//! Heads that were already here when an anchor arrived from a remote were written under none of
+//! those, so the install judges them first ([`record_unvouched_heads`]) and the set leaves out the
+//! ones the anchor does not vouch for, and everything built on them.
 //!
 //! A partial client — a sparse one, or one that never fetched some pallet — can lack the boundary
 //! ancestry a verdict needs. The verdict then names the boundary it could not resolve

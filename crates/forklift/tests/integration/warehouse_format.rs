@@ -2,7 +2,7 @@
 //! Forklift gives a file, the snapshot of the versions a format writes, and the frozen fixtures each
 //! format leaves behind.
 
-mod common;
+use crate::common;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader};
