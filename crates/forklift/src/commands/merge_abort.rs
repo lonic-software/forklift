@@ -112,14 +112,19 @@ pub(crate) async fn abort(kind: MergeKind, confirm: bool, command: &str) -> Resu
     if position.pallet != recorded.our_pallet || position.base.as_deref() != Some(recorded.our_head.as_str()) {
         return Err(format!(
             "The {} was started on pallet \"{}\" at {}, but this bay stands on \"{}\" at {}. Nothing was \
-            aborted: the abort puts back that head's files, and would put them over another one's.",
+            aborted: the abort puts back that head's files, and would put them over another one's. To \
+            abandon it and leave every file as it is, {}.",
             kind.noun(), recorded.our_pallet, recorded.our_head, position.pallet,
-            position.base.as_deref().unwrap_or("no parcel")
+            position.base.as_deref().unwrap_or("no parcel"), removal_hint(kind)
         ));
     }
 
     let our_tree = object_utils::load_parcel(&recorded.our_head)?.tree_hash;
-    let (written, their_tree) = merge_output(&recorded, &our_tree)?;
+    let (written, their_tree) = merge_output(&recorded, &our_tree).map_err(|e| format!(
+        "Cannot abort the {}: what it wrote cannot be worked out ({}). Nothing was aborted. To abandon it \
+        and leave every file as it is, {}.",
+        kind.noun(), e, removal_hint(kind)
+    ))?;
 
     // Every path the merge wrote, and every conflict it left staged whatever the recompute says.
     let mut touched: BTreeSet<String> = written.keys().cloned().collect();
@@ -391,6 +396,14 @@ fn emptied_directories(removed: &[String], our_tree: &str) -> Result<Vec<String>
     dirs.sort_by_key(|dir| std::cmp::Reverse(dir.matches('/').count()));
 
     Ok(dirs)
+}
+
+/// How to abandon the `kind` of merge without the abort: remove its state files.
+fn removal_hint(kind: MergeKind) -> String {
+    match kind {
+        MergeKind::Consolidation => merge_utils::state_removal_hint_in(&forklift_core::globals::bay_root()),
+        MergeKind::Pick => cherry_pick_utils::state_removal_hint(),
+    }
 }
 
 /// The refusal for an abort with nothing of `kind` in progress, naming the other kind's abort when

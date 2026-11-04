@@ -2,6 +2,7 @@ use serde::Serialize;
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{alias_utils, cherry_pick_utils, file_utils, inventory_utils, merge_utils, object_utils, operation_utils, pallet_utils, shift_utils, stocktake_utils};
 use forklift_core::util::operation_utils::{Operation, OperationKind};
+use crate::commands::merge_abort::MergeKind;
 use crate::output::{self, CommandOutput};
 
 /// Handle the shift command (git's "checkout"): materialize the head tree of the target
@@ -164,17 +165,17 @@ pub(crate) fn refuse_mid_merge(doing: &str) -> Result<(), String> {
     if merge_utils::read_consolidation_state()?.is_some() {
         return Err(format!(
             "A consolidation is in progress. Complete it (resolve, \"forklift load\", \"forklift stack\") or abort it \
-            ({}) before {}.",
-            merge_utils::abort_hint_in(&forklift_core::globals::bay_root()),
+            (\"{}\") before {}.",
+            MergeKind::Consolidation.abort_command(),
             doing
         ));
     }
 
     if cherry_pick_utils::read_state()?.is_some() {
         return Err(format!(
-            "A pick is in progress. Resolve its conflicts and \"forklift stack\", or {} to abort it, \
+            "A pick is in progress. Resolve its conflicts and \"forklift stack\", or \"{}\" to abort it, \
             before {}.",
-            cherry_pick_utils::abort_hint(),
+            MergeKind::Pick.abort_command(),
             doing
         ));
     }

@@ -6,6 +6,7 @@ use forklift_core::util::{
 };
 use forklift_core::util::operation_utils::OperationKind;
 use crate::commands::consolidate;
+use crate::commands::merge_abort::MergeKind;
 use crate::output::{self, CommandOutput};
 
 /// Handle the pick command (§9.1 #8): apply a parcel's diff onto the current pallet
@@ -49,16 +50,19 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
     // in-progress consolidation or another in-progress pick.
     if merge_utils::read_consolidation_state()?.is_some() {
         return Err(
-            "A consolidation is in progress. Complete it (resolve, \"forklift load\", \"forklift stack\") or abort \
-            it before picking.".to_string()
+            format!(
+                "A consolidation is in progress. Complete it (resolve, \"forklift load\", \"forklift stack\") or \
+                abort it (\"{}\") before picking.",
+                MergeKind::Consolidation.abort_command()
+            )
         );
     }
 
     if cherry_pick_utils::read_state()?.is_some() {
         return Err(format!(
-            "A pick is already in progress. Resolve its conflicts and \"forklift stack\", or {} to \
+            "A pick is already in progress. Resolve its conflicts and \"forklift stack\", or \"{}\" to \
             abort it.",
-            cherry_pick_utils::abort_hint()
+            MergeKind::Pick.abort_command()
         ));
     }
 
@@ -252,8 +256,8 @@ impl CommandOutput for Picked {
 
                 println!(
                     "\nResolve the conflicts, \"forklift load\" the resolved files, then \"forklift stack\" to \
-                    complete the pick (or {} to abort it).",
-                    cherry_pick_utils::abort_hint()
+                    complete the pick (or \"{}\" to abort it).",
+                    MergeKind::Pick.abort_command()
                 );
             }
         }

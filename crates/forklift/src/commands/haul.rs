@@ -381,7 +381,10 @@ impl CommandOutput for MergeConflicts {
         for path in &self.conflicts {
             println!("  {}", path);
         }
-        println!("Resolve them, \"forklift stack\", then re-run \"forklift haul consolidate\" to record the merge.");
+        println!(
+            "Resolve them, \"forklift stack\", then re-run \"forklift haul consolidate\" to record the merge \
+            (or \"forklift consolidate --abort\" to abort it)."
+        );
     }
 }
 

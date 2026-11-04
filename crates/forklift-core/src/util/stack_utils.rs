@@ -249,8 +249,8 @@ pub async fn stack_parcel(description: Option<String>,
     // pallet since (any of them, not only `shift`) must not get it stacked onto another one.
     if expected_base.is_none() {
         let started_on = match (&consolidation, &cherry_pick) {
-            (Some(state), _) => Some(("consolidation", &state.our_pallet, merge_utils::abort_hint_in(&bay_root()))),
-            (None, Some(state)) => Some(("pick", &state.our_pallet, cherry_pick_utils::abort_hint())),
+            (Some(state), _) => Some(("consolidation", &state.our_pallet, merge_utils::state_removal_hint_in(&bay_root()))),
+            (None, Some(state)) => Some(("pick", &state.our_pallet, cherry_pick_utils::state_removal_hint())),
             (None, None) => None,
         };
 
@@ -504,7 +504,7 @@ pub async fn stack_parcel(description: Option<String>,
                     "The pick in progress cannot be completed: its source parcel {} cannot \
                     be read ({}). Nothing was stacked. Abort the pick ({}); stacking its changes \
                     after that records you as their only author.",
-                    state.source, e, cherry_pick_utils::abort_hint()
+                    state.source, e, cherry_pick_utils::state_removal_hint()
                 ))
             })?;
 
