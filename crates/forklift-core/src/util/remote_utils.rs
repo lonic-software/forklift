@@ -6315,7 +6315,7 @@ async fn lift_pallet_inner(client: &RemoteClient,
                     first.",
                     pallet, remote_head
                 )),
-                Ok(false) => diverged_refusal(pallet, remote_head),
+                Ok(false) => diverged_refusal(pallet),
                 Err(e) => CoreError::Other(format!(
                     "Could not tell whether the remote's pallet \"{}\" (head {}) is ahead of this \
                     warehouse's or diverged from it: {}. \"forklift lower\" brings in the remote's history, \
@@ -6349,12 +6349,10 @@ async fn lift_pallet_inner(client: &RemoteClient,
 
 /// The [`RefusalCode::Diverged`] refusal for `pallet` (its wire name), whose local head and the
 /// remote's `remote_head` both hold parcels the other lacks; the remote's are already local. A
-/// working pallet merges the remote head in through a pallet of its own, which `lower` refuses to
-/// do implicitly; a meta pallet with replay rules is reconciled by `lower` itself. The office and
+/// working pallet, which a lift raises this for only from a bay standing on it, has the remote head
+/// merged in by `lower`; a meta pallet with replay rules is reconciled by `lower` itself. The office and
 /// any other meta pallet have no merge, so theirs is an unclassified error: no command fixes it.
-pub fn diverged_refusal(pallet: &str, remote_head: &str) -> CoreError {
-    let short = &remote_head[..12.min(remote_head.len())];
-
+pub fn diverged_refusal(pallet: &str) -> CoreError {
     if let Some(name) = pallet.strip_prefix(pallet_utils::META_QUALIFIER) {
         if meta_tree::meta_rules(name).is_none() {
             return CoreError::Other(format!(
@@ -6379,15 +6377,10 @@ pub fn diverged_refusal(pallet: &str, remote_head: &str) -> CoreError {
         RefusalCode::Diverged,
         format!(
             "The local pallet \"{}\" and the remote have diverged. The remote parcels are fetched; \
-            the next step makes the remote head its own pallet (creating it moves this bay onto it), \
-            shifts back, consolidates it and lifts the result.",
+            lowering merges the remote's head into the pallet, and the lift after it publishes the merge.",
             pallet
         ),
-        format!(
-            "forklift pallet create {p}-remote-{s} {s}; then forklift shift {p}; then forklift \
-            consolidate {p}-remote-{s}; then forklift lift",
-            p = pallet, s = short
-        ),
+        "forklift lower; then forklift lift",
     )
 }
 
@@ -8280,16 +8273,14 @@ mod tests {
     // "lower", which refuses it.
     #[test]
     fn only_a_pallet_with_a_merge_classifies_its_divergence() {
-        let head = "a".repeat(64);
-        let code = |pallet: &str| match diverged_refusal(pallet, &head) {
+        let code = |pallet: &str| match diverged_refusal(pallet) {
             CoreError::Refusal { code, next_step, .. } => Some((code, next_step)),
             CoreError::Other(_) => None,
         };
 
         assert_eq!(code("@office"), None);
         assert_eq!(code("@kv"), Some((RefusalCode::Diverged, "forklift lower".to_string())));
-        assert!(code("main").is_some_and(|(code, step)| code == RefusalCode::Diverged
-            && step.starts_with("forklift pallet create main-remote-aaaaaaaaaaaa aaaaaaaaaaaa; then forklift shift main;")));
+        assert_eq!(code("main"), Some((RefusalCode::Diverged, "forklift lower; then forklift lift".to_string())));
     }
     use std::path::PathBuf;
     use std::sync::Mutex;

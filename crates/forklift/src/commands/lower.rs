@@ -11,7 +11,8 @@ use forklift_core::util::{
 };
 use forklift_core::util::take_utils::{FetchAt, TakeTrust};
 use forklift_core::util::operation_utils::{Operation, OperationKind};
-use crate::commands::{office, shift};
+use crate::commands::consolidate::{self, MergeStatus};
+use crate::commands::{merge_abort, office, shift};
 use crate::events;
 use crate::output::{self, CommandOutput};
 
@@ -30,8 +31,10 @@ use crate::output::{self, CommandOutput};
 /// conflicts or fails stops only itself; the working pallet still lowers, and the command
 /// then fails with the most severe outcome.
 ///
-/// A diverged working pallet is never merged implicitly: lower reports it and the operator
-/// consolidates deliberately.
+/// A diverged working pallet has the remote's head merged into it, as `consolidate` would merge a
+/// pallet ([`merge_diverged`]): a clean merge is stacked, and a conflicting one is left in progress
+/// and refused as `merge_conflicts`, naming how to complete or abandon it. Local changes to tracked
+/// files are refused (`conflict`) before anything is merged, where a fast-forward carries them.
 ///
 /// Naming a pallet other than the current one obtains or updates that pallet's ref alone (see
 /// [`lower_named_pallet`]); this bay, its files and its inventory stay where they are.
@@ -147,6 +150,7 @@ pub async fn handle_command(pallet: Option<String>, expect: Option<String>, keep
         fetched_signatures: 0,
         batch_lane: None,
         repair: None,
+        merged: None,
     };
 
     let lowered = match (named.is_some(), repair) {
@@ -246,11 +250,12 @@ async fn lower_working_pallet(client: &RemoteClient,
 
     if let Some(local) = &local_head {
         if !merge_utils::is_ancestor(local, remote_head)? {
-            // The refusal's next step checks the remote head out on a pallet of its own, so a head
-            // no client can check out is refused as that first.
+            // The merge checks the remote head's tree out alongside this one, so a head no client
+            // can check out is refused as that first, naming its repair.
             remote_utils::fetch_head_content(client, remote_head, progress).await?;
             refuse_unmaterializable(client, &pallet, local_tree.as_deref(), &object_utils::load_parcel(remote_head)?.tree_hash)?;
-            return Err(remote_utils::diverged_refusal(&pallet, remote_head).into());
+
+            return merge_diverged(client, &pallet, local, remote_head, "forklift lower", report, |_| Ok(remote_head.clone())).await;
         }
     }
 
@@ -350,8 +355,9 @@ fn missing_named_step(pallet: &str, repair: bool) -> Result<String, String> {
 /// It acts on the pallet's ref V, not on where this bay stands, since several bays can share it:
 /// - V unborn, at H or behind it: the ref moves from V to R. For the current pallet, the bay, whose
 ///   base must be V or behind it, is moved onto R; a bay whose base is not is refused as behind.
-/// - V holding parcels H lacks: R goes on a new pallet `<p>-remote-<r>`, V and the bay stay, and the
-///   lower refuses as diverged, naming the consolidation whose lift fast-forwards H.
+/// - V holding parcels H lacks: for the current pallet, R is merged into V as a diverged lower merges
+///   H ([`merge_diverged`]), from a bay standing at V; a named pallet is refused as diverged, naming
+///   the shift onto it and this lower, since a named lower leaves the bay alone.
 /// - V ahead of H: the lower runs as usual, finding it ahead.
 async fn repair_pallet(client: &RemoteClient,
                        info: &forklift_core::model::remote::WarehouseInfo,
@@ -415,7 +421,30 @@ async fn repair_pallet(client: &RemoteClient,
     }
 
     if !behind_remote {
-        return Err(stack_diverged_repair(&pallet, &remote_head, &preconditions, &position, ref_head.as_deref())?.into());
+        if named {
+            return Err(CoreError::refusal(
+                RefusalCode::Diverged,
+                format!(
+                    "The local pallet \"{p}\" and the remote have diverged, and the remote's head holds a \
+                    name no client can check out. Lowering it with --repair from the pallet itself merges \
+                    the repair in.",
+                    p = pallet
+                ),
+                format!("forklift shift {}; then forklift lower --repair", pallet),
+            ).into());
+        }
+
+        // The merge is built on the tree this bay holds, and moves the pallet from there.
+        position.require_current("lowered")?;
+        shift::refuse_mid_merge("lowering")?;
+
+        let ours = ref_head.clone().ok_or("A diverged pallet has a head.")?;
+        return merge_diverged(client, &pallet, &ours, &remote_head, "forklift lower --repair", report, |report| {
+            let repair = repair_utils::repair_head(&remote_head)?.ok_or("The remote's head has nothing to repair.")?;
+            report.repair = Some(RepairReport { parcel: repair.parcel.clone(), removed: repair.removed });
+
+            Ok(repair.parcel)
+        }).await;
     }
 
     // The head write carries the take's preconditions, which are the signing's too: an unsigned
@@ -470,76 +499,63 @@ async fn repair_pallet(client: &RemoteClient,
     Ok(())
 }
 
-/// Stack the repair of the remote head `remote_head` of `pallet`, whose ref `ref_head` holds parcels
-/// it lacks, on a pallet of its own, `<pallet>-repair-<head>`, and return the diverged refusal naming
-/// the way on: consolidating it into `pallet` descends from the repair, so the lift of the result
-/// fast-forwards the remote. `pallet` and this bay stay where they are. The pallet is named for the
-/// head, so a rerun finds the repair it stacked rather than stacking another.
-fn stack_diverged_repair(pallet: &str,
-                         remote_head: &str,
-                         preconditions: &pallet_utils::RefPreconditions,
-                         position: &pallet_utils::BayPosition,
-                         ref_head: Option<&str>) -> Result<CoreError, String> {
-    let side = format!("{}-repair-{}", pallet, &remote_head[..12.min(remote_head.len())]);
+/// Merge into `pallet`, which this bay stands on at `ours`, the parcel `theirs` builds: the remote's
+/// head `served`, or a repair stacked on it. The warehouse must hold no changes to tracked files,
+/// since the merge writes the bay's files and inventory; `command` is the lower the refusal's next
+/// step runs again once they are parked. A clean merge is stacked and reported `merged`, and the
+/// pallet then descends from `served`, so a lift fast-forwards it. A conflicting merge is left in
+/// progress and refused as `merge_conflicts`.
+async fn merge_diverged(client: &RemoteClient,
+                        pallet: &str,
+                        ours: &str,
+                        served: &str,
+                        command: &str,
+                        report: &mut LowerReport,
+                        theirs: impl FnOnce(&mut LowerReport) -> Result<String, String>) -> Result<(), String> {
+    let our_tree = object_utils::load_parcel(ours)?.tree_hash;
 
-    // A pallet already there is reused only when it holds the repair a rerun stacked, or work built
-    // on it: past the remote's head, and holding no name the repair removes.
-    match pallet_utils::get_pallet_head(&side)? {
-        Some(head) if head != remote_head
-            && merge_utils::is_ancestor(remote_head, &head)?
-            && repair_utils::first_repairable_path(&head)?.is_none() => {}
-        Some(_) => return Err(CoreError::refusal(
-            RefusalCode::HeadNotMaterializable,
-            format!(
-                "The remote's head {h} holds a name no client can check out, and its repair could not \
-                be stacked: the pallet \"{s}\" already exists and holds no repair of that head. Delete \
-                it, then lower again.",
-                s = side, h = remote_head
-            ),
-            format!("forklift pallet delete {}", side),
-        ).into()),
-        None => {
-            let repair = repair_utils::repair_head(remote_head)?.ok_or("The remote's head has nothing to repair.")?;
-            match pallet_utils::update_pallet_head(&side, None, &repair.parcel, preconditions) {
-                Ok(()) => {}
-                // A failed write can still have landed: decided by reading the ref back.
-                Err(pallet_utils::RefUpdateError::Failed(error)) => match pallet_utils::get_pallet_head(&side) {
-                    Ok(head) if head.as_deref() == Some(repair.parcel.as_str()) => {}
-                    Ok(_) => return Err(format!("Pallet \"{}\" was not created: {}", side, error)),
-                    Err(read) => return Err(format!(
-                        "Creating pallet \"{}\" failed ({}), and reading it back failed too ({}); it may or \
-                        may not hold parcel {}.",
-                        side, error, read, repair.parcel
-                    )),
-                },
-                Err(error) => return Err(error.to_string()),
-            }
+    // Anchored before the cleanliness check, so a file edited after it is never trusted.
+    let anchor = file_utils::take_stat_anchor()?;
+    consolidate::ensure_warehouse_is_clean(&our_tree, "merging the remote's head in", command).await?;
+
+    // The remote's head becomes a parent of the merge parcel, so it is verified before anything is
+    // merged. The merge's own write is conditioned by `stack`, which judges it again.
+    take_utils::verify_take(Some(client), &TakeTrust::local()?, served, pallet, FetchAt::Warehouse).await?;
+
+    let theirs = theirs(report)?;
+
+    match consolidate::merge_head_into_current(pallet, ours, &theirs, REMOTE_LABEL, Some(pallet), true, anchor).await? {
+        MergeStatus::Merged(parcel) => {
+            record_served_head(pallet, served);
+            report.merged = Some(parcel);
+            report.outcome = Some(LowerOutcome::Merged);
+
+            Ok(())
         }
+        MergeStatus::Conflicts(paths) => Err(merge_conflicts_refusal(pallet, &paths)),
     }
-    record_served_head(&side, remote_head);
+}
 
-    // Consolidate merges into the pallet this bay stands on, which must be current, so the bay is
-    // shifted there first unless it already stands on the pallet at its ref.
-    let on_it = position.pallet == pallet && position.base.as_deref() == ref_head;
-    let mut steps = Vec::new();
-    if !on_it {
-        steps.push(format!("forklift shift {}", pallet));
-    }
-    steps.push(format!("forklift consolidate {}", side));
-    steps.push("forklift lift".to_string());
+/// The label a merge of the remote's head records as its other side, in the consolidation state
+/// and the merge parcel's description.
+const REMOTE_LABEL: &str = "remote";
 
-    Ok(CoreError::refusal(
-        RefusalCode::Diverged,
+/// The [`RefusalCode::MergeConflicts`] refusal for a merge of the remote's head into `pallet` that
+/// conflicts on `paths`, now left in progress.
+fn merge_conflicts_refusal(pallet: &str, paths: &[String]) -> String {
+    CoreError::refusal_with_details(
+        RefusalCode::MergeConflicts,
         format!(
-            "The local pallet \"{p}\" and the remote have diverged, and the remote's head held a name \
-            no client can check out. Its repair is stacked on the pallet \"{s}\"; {how}consolidate \
-            it (\"forklift consolidate {s}\"), and lift the result.",
-            p = pallet,
-            s = side,
-            how = if on_it { String::new() } else { format!("shift onto \"{}\" (\"forklift shift {}\"), ", pallet, pallet) },
+            "The local pallet \"{}\" and the remote had diverged, and merging the remote's head in \
+            conflicts on {} path(s), now holding conflict markers. Resolve them, load and stack them, \
+            then lift; or abandon the merge with \"{}\".",
+            pallet,
+            paths.len(),
+            merge_abort::ABORT_COMMAND
         ),
-        steps.join("; then "),
-    ))
+        "forklift load <path>; then forklift stack; then forklift lift",
+        serde_json::json!({ "paths": paths }),
+    ).into()
 }
 
 /// Add the remote head a lower was served to the held-heads record, once `pallet`'s ref or the
@@ -644,8 +660,7 @@ async fn lower_named_pallet(client: &RemoteClient,
                 RefusalCode::Diverged,
                 format!(
                     "The local pallet \"{p}\" and the remote have diverged; the remote parcels are \
-                    fetched. Reconcile it on the pallet: shift onto it (\"forklift shift {p}\"), then \
-                    \"forklift lower\" names the steps.",
+                    fetched. Lowering it from the pallet itself merges the remote's head in.",
                     p = pallet
                 ),
                 format!("forklift shift {}; then forklift lower", pallet),
@@ -772,6 +787,11 @@ pub(crate) enum LowerOutcome {
     /// The remote head held a name no client can check out, and the pallet now points at a repair
     /// parcel stacked on it (`repair`); `forklift lift` publishes it.
     Repaired,
+
+    /// The local pallet and the remote had diverged, and the remote's head (or, with `repair`, a
+    /// repair stacked on it) was merged in cleanly: the merge parcel (`merged`) is stacked, and
+    /// `forklift lift` publishes it.
+    Merged,
 }
 
 /// The repair parcel a `--repair` lower stacked.
@@ -887,10 +907,14 @@ pub(crate) struct LowerReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     batch_lane: Option<BatchLaneClosure>,
 
-    /// The repair parcel the pallet now points at, when the outcome is `repaired`. A diverged pallet's
-    /// repair is refused as `diverged`, which names the pallet it was stacked on.
+    /// The repair parcel the pallet now points at, when the outcome is `repaired`, or the one merged
+    /// in, when it is `merged` from a diverged pallet's repair.
     #[serde(skip_serializing_if = "Option::is_none")]
     repair: Option<RepairReport>,
+
+    /// The merge parcel stacked, when the outcome is `merged`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merged: Option<String>,
 }
 
 impl LowerReport {
@@ -982,6 +1006,17 @@ impl CommandOutput for LowerReport {
                     "Repaired the remote's head {} of pallet \"{}\": parcel {} removes \"{}\", which no \
                     client can check out. \"forklift lift\" publishes it.",
                     self.head, self.pallet, repair.0, forklift_core::error::sanitize(&repair.1)
+                );
+            }
+            Some(LowerOutcome::Merged) => {
+                let theirs = match &self.repair {
+                    Some(repair) => format!("a repair ({}) of the remote's head {}", repair.parcel, self.head),
+                    None => format!("the remote's head {}", self.head),
+                };
+                println!(
+                    "Merged {} into pallet \"{}\", which had diverged from it: parcel {} ({} object(s) and {} \
+                    signature(s) fetched). \"forklift lift\" publishes it.",
+                    theirs, self.pallet, self.merged.as_deref().unwrap_or_default(), self.fetched_objects, self.fetched_signatures
                 );
             }
         }

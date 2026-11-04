@@ -316,6 +316,15 @@ refusal_codes! {
     /// no client can check it out. Nothing was changed; the next step repairs the head into one
     /// without it.
     HeadNotMaterializable => "head_not_materializable",
+
+    /// The working state blocks the command: staged or unstaged changes to tracked files that a
+    /// merge would have to write over. Nothing was changed; the next step sets the changes aside.
+    Conflict => "conflict",
+
+    /// `lower` merged the remote's diverged head into the pallet and the merge conflicts: the
+    /// markers are written and the consolidation is left in progress. The refusal's details name
+    /// the conflicted paths; the next step completes the merge or abandons it.
+    MergeConflicts => "merge_conflicts",
 }
 
 impl RefusalCode {
