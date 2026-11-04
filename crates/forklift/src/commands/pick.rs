@@ -114,7 +114,7 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
         return Err(format!("Parcel {} makes no changes; there is nothing to pick.", short));
     }
 
-    let source_label = format!("pick {}", &source[..source.len().min(10)]);
+    let source_label = conflict_label(&source);
 
     // A cherry-pick refuses in a scoped bay (above), so the merge always runs at full scope —
     // every path is in scope and materialized, exactly today's behavior.
@@ -271,6 +271,12 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
         crate::docgen::OutputSchema::of::<Picked>(),
     ]
+}
+
+/// The label a pick's conflict markers give the picked side. `abort` recomputes the pick's output
+/// with it and compares that with the working files, so the two must never differ.
+pub(crate) fn conflict_label(source: &str) -> String {
+    format!("pick {}", &source[..source.len().min(10)])
 }
 
 #[cfg(test)]

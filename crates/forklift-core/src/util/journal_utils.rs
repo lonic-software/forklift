@@ -109,12 +109,21 @@ impl BayState {
     /// The bay as it is now. Its head is the bay's base — the tree it holds — never a fresh read of
     /// the pallet's ref, which another bay can move without touching this bay.
     fn read() -> Result<BayState, String> {
+        Self::read_with(true)
+    }
+
+    /// The bay as it is now, with any consolidation's skeleton left empty and unread.
+    fn read_without_skeleton() -> Result<BayState, String> {
+        Self::read_with(false)
+    }
+
+    fn read_with(skeleton: bool) -> Result<BayState, String> {
         let position = pallet_utils::read_position()?;
 
         Ok(BayState {
             current_pallet: position.pallet,
             current_head: position.base,
-            consolidation: read_consolidation()?,
+            consolidation: read_consolidation(skeleton)?,
             cherry_pick: read_cherry_pick()?,
         })
     }
@@ -146,13 +155,16 @@ impl Snapshot {
 
 /// The bay's consolidation in progress, as journaled. Its skeleton is required, exactly as the
 /// completing stack requires it: a state without one is a broken merge, never an empty skeleton.
-fn read_consolidation() -> Result<Option<ConsolidationInProgress>, String> {
+fn read_consolidation(with_skeleton: bool) -> Result<Option<ConsolidationInProgress>, String> {
     let Some(state) = merge_utils::read_consolidation_state()? else {
         return Ok(None);
     };
 
-    let skeleton = String::from_utf8(OutOfScopeSkeleton::read_required()?.to_bytes())
-        .map_err(|_| "The out-of-scope skeleton does not serialize as text.".to_string())?;
+    let skeleton = match with_skeleton {
+        true => String::from_utf8(OutOfScopeSkeleton::read_required()?.to_bytes())
+            .map_err(|_| "The out-of-scope skeleton does not serialize as text.".to_string())?,
+        false => String::new(),
+    };
 
     Ok(Some(ConsolidationInProgress {
         their_head: state.their_head,
@@ -224,7 +236,7 @@ pub fn capture() -> Result<Snapshot, String> {
     let snapshot = Snapshot {
         current_pallet: position.pallet,
         heads,
-        consolidation: read_consolidation()?,
+        consolidation: read_consolidation(true)?,
         cherry_pick: read_cherry_pick()?,
     };
 
@@ -290,7 +302,7 @@ pub fn push_if_changed(op: &str, mut before: Snapshot) -> Result<(), String> {
     let mut after = Snapshot {
         current_pallet: position.pallet,
         heads: BTreeMap::new(),
-        consolidation: read_consolidation()?,
+        consolidation: read_consolidation(true)?,
         cherry_pick: read_cherry_pick()?,
     };
 
@@ -443,7 +455,7 @@ pub fn delete_entry(wire: &str, head: &str) -> Result<JournalEntry, String> {
     let mut after = Snapshot {
         current_pallet: position.pallet,
         heads,
-        consolidation: read_consolidation()?,
+        consolidation: read_consolidation(true)?,
         cherry_pick: read_cherry_pick()?,
     };
     let mut before = after.clone();
@@ -744,20 +756,14 @@ pub fn pop_if_it_left_in_progress() -> Result<bool, String> {
         return Ok(false);
     }
 
-    // As `BayState::read`, without the skeleton: an abort clears whatever it holds, and is the way
-    // out of one that is missing or unreadable.
-    let position = pallet_utils::read_position()?;
-    let consolidation = merge_utils::read_consolidation_state()?;
-    let after = entry.after.bay_state();
-    let same_consolidation = match (&consolidation, &after.consolidation) {
-        (None, None) => true,
-        (Some(now), Some(then)) => now.their_head == then.their_head && now.their_pallet == then.their_pallet
-            && now.our_head == then.our_head && now.our_pallet == then.our_pallet,
-        _ => false,
-    };
+    // Without the skeleton: an abort clears whatever it holds, and is the way out of one that is
+    // missing or unreadable.
+    let mut after = entry.after.bay_state();
+    if let Some(consolidation) = after.consolidation.as_mut() {
+        consolidation.skeleton.clear();
+    }
 
-    if position.pallet != after.current_pallet || position.base != after.current_head || !same_consolidation
-        || read_cherry_pick()? != after.cherry_pick {
+    if BayState::read_without_skeleton()? != after {
         return Ok(false);
     }
 

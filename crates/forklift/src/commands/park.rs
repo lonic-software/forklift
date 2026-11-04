@@ -36,7 +36,7 @@ pub async fn park_changes() -> Result<(), String> {
 
     if merge_utils::read_consolidation_state()?.is_some() {
         return Err(
-            "A consolidation is in progress; complete it (or abort it) before parking.".to_string()
+            "A consolidation is in progress; complete it with \"forklift stack\", or abandon it with \"forklift abort\", before parking.".to_string()
         );
     }
 

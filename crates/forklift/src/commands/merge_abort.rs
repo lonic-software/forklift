@@ -12,7 +12,7 @@ use forklift_core::util::{
     cherry_pick_utils, file_utils, inventory_utils, journal_utils, load_guard_utils, merge_utils, object_utils,
     pallet_utils, scope_utils, shift_utils, stocktake_utils,
 };
-use crate::commands::{consolidate, restore};
+use crate::commands::{consolidate, pick, restore};
 use crate::output::{self, CommandOutput};
 
 /// Which kind of in-progress merge an abort abandons.
@@ -292,9 +292,10 @@ fn merge_output(recorded: &Recorded, our_tree: &str) -> Result<(BTreeMap<String,
     let (base_tree, their_tree, label, scope) = match &recorded.source {
         Source::Pallet(their_head) => {
             let their_tree = object_utils::load_parcel(their_head)?.tree_hash;
-            let Some(base) = merge_utils::find_merge_base(&recorded.our_head, their_head)? else {
-                return Ok((BTreeMap::new(), their_tree));
-            };
+            // A consolidation that stopped at conflicts had a base; without one nothing it wrote
+            // could be told from a local change, and every one of them would be carried.
+            let base = merge_utils::find_merge_base(&recorded.our_head, their_head)?
+                .ok_or("its two heads no longer share any history here".to_string())?;
 
             (
                 object_utils::load_parcel(&base)?.tree_hash,
@@ -310,7 +311,7 @@ fn merge_output(recorded: &Recorded, our_tree: &str) -> Result<(BTreeMap<String,
                 None => object_utils::empty_tree_hash()?,
             };
 
-            (base_tree, parcel.tree_hash, format!("pick {}", &source[..source.len().min(10)]), scope_utils::PathScope::full())
+            (base_tree, parcel.tree_hash, pick::conflict_label(source), scope_utils::PathScope::full())
         },
     };
 
