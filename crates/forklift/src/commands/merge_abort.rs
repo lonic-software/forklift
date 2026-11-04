@@ -69,8 +69,8 @@ pub async fn handle_command(confirm: bool) -> Result<(), String> {
 /// other content (a resolution, loaded or not; a file re-created where the merge deleted it) is
 /// work the merge cannot reproduce, so it is listed and nothing is changed unless `confirm` is set.
 /// The merge is recomputed from the recorded state to know what it wrote; should the recompute
-/// differ from the original (the bay's scope changed since), it can only list more, or put back
-/// a path already at its pre-merge content.
+/// differ from the original (the bay's scope changed since), it can only list more, or leave a
+/// path the original wrote as a local change, carried like any other.
 ///
 /// The abort runs under a merge's operation marker, so `heal` finishes one that was interrupted
 /// the way it rolls back an interrupted merge (see `operation_utils`). The journal entry of the
@@ -483,10 +483,12 @@ mod tests {
     use super::*;
     use crate::test_support::{self, Warehouse};
 
+    type Seam = Option<Box<dyn FnOnce() -> Result<(), String>>>;
+
     thread_local! {
         /// Run after the abort rebuilt the inventory and before it clears the in-progress state:
         /// where an interrupted abort stops.
-        pub(super) static BEFORE_STATE_CLEAR: RefCell<Option<Box<dyn FnOnce() -> Result<(), String>>>> = RefCell::new(None);
+        pub(super) static BEFORE_STATE_CLEAR: RefCell<Seam> = RefCell::new(None);
     }
 
     /// An abort interrupted after it put the files back, with the consolidation state still
