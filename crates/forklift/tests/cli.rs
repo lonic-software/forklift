@@ -5774,13 +5774,15 @@ fn export_git_writes_tags_as_annotated_git_tags() {
     assert_success(&warehouse.run(&["tag", "create", "a..b", "main"]));
     assert_success(&warehouse.run(&["tag", "create", "rc", "main"]));
     assert_success(&warehouse.run(&["tag", "create", "RC", &first]));
+    // Its case partner is left out for another reason, so no ref of it can collide.
+    assert_success(&warehouse.run(&["tag", "create", "Side-1", "main"]));
     assert_success(&warehouse.run(&["pallet", "delete", "side", "--force"]));
 
     let out = warehouse.root.join("exported");
     let exported = warehouse.run(&["--json", "git", "export", out.to_str().unwrap()]);
     assert_success(&exported);
     let data = &json(&exported)["data"];
-    assert_eq!(data["tags"], serde_json::json!(["v1.0", "v2"]));
+    assert_eq!(data["tags"], serde_json::json!(["Side-1", "v1.0", "v2"]));
     let skipped: std::collections::BTreeMap<String, String> = data["skipped_tags"].as_array().unwrap().iter()
         .map(|tag| (tag["name"].as_str().unwrap().to_string(), tag["reason"].as_str().unwrap().to_string()))
         .collect();
@@ -5799,7 +5801,7 @@ fn export_git_writes_tags_as_annotated_git_tags() {
 
     // Both are annotated tags (tag objects), each over its own parcel's commit.
     assert_eq!(git(&["for-each-ref", "--format=%(objecttype) %(refname)", "refs/tags"]),
-        "tag refs/tags/v1.0\ntag refs/tags/v2\n");
+        "tag refs/tags/Side-1\ntag refs/tags/v1.0\ntag refs/tags/v2\n");
     assert_eq!(git(&["rev-parse", "v1.0^{commit}"]), git(&["rev-parse", "main~1"]));
     assert_eq!(git(&["rev-parse", "v2^{commit}"]), git(&["rev-parse", "main"]));
 
@@ -5819,8 +5821,45 @@ fn export_git_writes_tags_as_annotated_git_tags() {
     git(&["fsck", "--strict"]);
 
     let human = stdout(&warehouse.run(&["git", "export", warehouse.root.join("again").to_str().unwrap()]));
-    assert!(human.contains("Exported 2 tag(s)"), "{}", human);
+    assert!(human.contains("Exported 3 tag(s)"), "{}", human);
     assert!(human.contains("warning: tag \"side-1\" was not exported"), "{}", human);
+}
+
+/// A tag's tagger is the operator the office binds its key to, read strictly: an office that cannot
+/// be read leaves every tag out with one warning, and one that lacks the key leaves that tag out,
+/// while the branches are exported either way.
+#[test]
+fn export_git_leaves_tags_out_when_the_office_cannot_name_their_tagger() {
+    let warehouse = TestWarehouse::new("export-git-tags-office");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    warehouse.write_file("a.txt", "one\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "first"]));
+    assert_success(&warehouse.run(&["office", "enroll"]));
+    assert_success(&warehouse.run(&["tag", "create", "v1", "main"]));
+
+    let office_head = warehouse.root.join(".forklift").join("meta").join("office");
+    let export = |name: &str| -> serde_json::Value {
+        let exported = warehouse.run(&["--json", "git", "export", warehouse.root.join(name).to_str().unwrap()]);
+        assert_success(&exported);
+        json(&exported)["data"].clone()
+    };
+
+    std::fs::write(&office_head, "not a parcel hash\n").unwrap();
+    let damaged = export("damaged");
+    assert_eq!(damaged["branches"], serde_json::json!(["main"]));
+    assert_eq!(damaged["tags"], serde_json::json!([]));
+    assert!(damaged["unreadable_tags"].as_str().unwrap().contains("the office that names their taggers"), "{}", damaged);
+    let human = stdout(&warehouse.run(&["git", "export", warehouse.root.join("damaged-human").to_str().unwrap()]));
+    assert!(human.contains("warning: no tag was exported: the office"), "{}", human);
+
+    std::fs::remove_file(&office_head).unwrap();
+    let unborn = export("unborn");
+    assert_eq!(unborn["tags"], serde_json::json!([]));
+    let skipped = &unborn["skipped_tags"][0];
+    assert_eq!(skipped["name"], "v1");
+    assert!(skipped["reason"].as_str().unwrap().contains("is not in this warehouse's office"), "{}", unborn);
 }
 
 #[test]

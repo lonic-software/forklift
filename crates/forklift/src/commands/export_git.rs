@@ -146,26 +146,31 @@ fn export_tags(repo: &GitRepo, exporter: &Exporter) -> Result<TagExport, String>
     // (a retired key stays in the office). Read strictly, so a machine whose office cannot be read
     // or lacks the key leaves the tag out instead of writing a different tagger, and a different
     // tag object, than every other machine.
-    let read = match tag_utils::read_tags().and_then(|read| Ok((read, office_utils::read_office_state()?))) {
+    let read = match tag_utils::read_tags() {
         Ok(read) => read,
         Err(why) => {
-            export.unreadable = Some(why);
+            export.unreadable = Some(format!("the tags could not be read: {}", why));
             return Ok(export);
         }
     };
-    let (read, office) = read;
-
     export.skipped = read.unreadable.iter()
         .map(|tag| SkippedTag { name: tag.name.clone(), reason: format!("it cannot be read: {}", tag.reason) })
         .collect();
-
-    // Git keeps a loose ref as a file, so on a filesystem that folds case `V1` would overwrite
-    // `v1`. Such names are left out on every filesystem, so the export is the same everywhere.
-    let mut folded: HashMap<String, usize> = HashMap::new();
-    for attributed in &read.tags {
-        *folded.entry(attributed.tag.name.to_ascii_lowercase()).or_default() += 1;
+    if read.tags.is_empty() {
+        return Ok(export);
     }
 
+    let office = match office_utils::read_office_state() {
+        Ok(office) => office,
+        Err(why) => {
+            export.unreadable = Some(format!("the office that names their taggers could not be read: {}", why));
+            return Ok(export);
+        }
+    };
+
+    // The tags that could be written: on an exported parcel, by a key the office holds, under a
+    // name git accepts.
+    let mut writable: Vec<(&AttributedTag, &str, &str, String)> = Vec::new();
     for attributed in &read.tags {
         let name = &attributed.tag.name;
         let skip = |reason: String| SkippedTag { name: name.clone(), reason };
@@ -180,12 +185,6 @@ fn export_tags(repo: &GitRepo, exporter: &Exporter) -> Result<TagExport, String>
             continue;
         };
 
-        if folded[&name.to_ascii_lowercase()] > 1 {
-            export.skipped.push(skip("another tag's name differs from it only in case, which git cannot \
-                keep apart on every filesystem".to_string()));
-            continue;
-        }
-
         // Forklift's tag names are a superset of git's: `a..b` and `v1.lock` are refused there.
         let refname = format!("refs/tags/{}", name);
         if !repo.output(&["check-ref-format", &refname])?.status.success() {
@@ -193,12 +192,41 @@ fn export_tags(repo: &GitRepo, exporter: &Exporter) -> Result<TagExport, String>
             continue;
         }
 
+        writable.push((attributed, commit, &key.operator, refname));
+    }
+
+    // Git keeps a loose ref as a file, so on a filesystem that folds case `V1` would overwrite
+    // `v1`. Two such tags are both left out, on every filesystem, so the export is the same
+    // everywhere.
+    let mut folded: HashMap<String, usize> = HashMap::new();
+    for (attributed, ..) in &writable {
+        *folded.entry(attributed.tag.name.to_ascii_lowercase()).or_default() += 1;
+    }
+
+    for (attributed, commit, tagger, refname) in writable {
+        let name = &attributed.tag.name;
+        let skip = |reason: String| SkippedTag { name: name.clone(), reason };
+
+        if folded[&name.to_ascii_lowercase()] > 1 {
+            export.skipped.push(skip("another tag's name differs from it only in case, which git cannot \
+                keep apart on every filesystem".to_string()));
+            continue;
+        }
+
         // Git checks a tag object's text (a message holding a NUL, say), and a ref name can still
-        // be one the filesystem refuses (`con` on Windows): either leaves that tag out.
-        let written = exporter.write_tag(commit, &key.operator, attributed)
-            .and_then(|object| repo.run_as_user(&["update-ref", &refname, &object]));
-        match written {
+        // be one the filesystem refuses (`con` on Windows): either leaves that tag out. A ref write
+        // can land and still report failure, so the ref read back decides.
+        let object = match exporter.write_tag(commit, tagger, attributed) {
+            Ok(object) => object,
+            Err(refused) => {
+                export.skipped.push(skip(refused));
+                continue;
+            }
+        };
+        match repo.run_as_user(&["update-ref", &refname, &object]) {
             Ok(_) => export.exported.push(name.clone()),
+            Err(_) if repo.run(&["rev-parse", "--verify", "-q", &refname], None)
+                .is_ok_and(|landed| landed.trim() == object) => export.exported.push(name.clone()),
             Err(refused) => export.skipped.push(skip(refused)),
         }
     }
@@ -835,7 +863,7 @@ impl CommandOutput for ExportReport {
             println!("  warning: tag \"{}\" was not exported: {}.", skipped.name, sanitize(&skipped.reason));
         }
         if let Some(why) = &self.unreadable_tags {
-            println!("  warning: no tag was exported: the tags could not be read: {}.", sanitize(why));
+            println!("  warning: no tag was exported: {}.", sanitize(why));
         }
 
         if let Some(current) = &self.current {
