@@ -6,24 +6,26 @@ use serde::Serialize;
 use forklift_core::enums::dir_entry_type::DirEntryType;
 use forklift_core::enums::parcel_action_type::ParcelActionType;
 use forklift_core::model::parcel::Parcel;
+use forklift_core::error::sanitize;
+use forklift_core::util::tag_utils::{self, AttributedTag};
 use forklift_core::util::{file_utils, object_utils, pallet_utils};
 use crate::output::{self, CommandOutput};
 
 /// The export layout version: the `export/<N>` every exported commit's parcel line names. It covers
 /// every rule that fixes an exported object's bytes: the message shape and its parcel line, the
-/// identity mapping, the date form (pre-1970 written as the epoch), the parent rule, the type-to-mode map, chunked-blob assembly
-/// and filter-free hashing. Two builds on one layout write identical objects for the same parcel, so
+/// identity mapping, the date form (pre-1970 written as the epoch), the parent rule, the type-to-mode map, chunked-blob assembly,
+/// filter-free hashing and the tag object's shape. Two builds on one layout write identical objects for the same parcel, so
 /// a change to any of those rules bumps it (the golden tip-hash test fails until it does).
 pub(crate) const EXPORT_LAYOUT: u32 = 1;
 
 /// Handle the git export command (§7.8): one-way export of this warehouse's history into a
 /// new git repository — the escape hatch that makes trying forklift reversible. Parcels
-/// become commits, trees become trees, blobs become blobs, and each *user* pallet becomes
-/// a branch.
+/// become commits, trees become trees, blobs become blobs, each *user* pallet becomes
+/// a branch, and each tag on an exported parcel becomes an annotated git tag.
 ///
 /// It is deliberately lossy in this direction: git has no home for forklift's signed
-/// office, the `@manifest` (approvals / provenance) or per-parcel signatures, so those are
-/// dropped — the guarantee is "your code history is never trapped", not a lossless round
+/// office, the `@manifest` (approvals / provenance) or per-parcel and per-tag signatures, so
+/// those are dropped — the guarantee is "your code history is never trapped", not a lossless round
 /// trip. Requires `git` on PATH.
 ///
 /// The objects are deterministic (§9.8): every commit ends in a line naming its parcel and the
@@ -90,6 +92,8 @@ pub fn handle_command(path: &str) -> Result<(), String> {
         branches.push(name.clone());
     }
 
+    let (tags, skipped_tags) = export_tags(&repo, &exporter)?;
+
     // Check out the current pallet's branch (or the first), materializing a working tree.
     let current = pallet_utils::read_position().ok().map(|position| position.pallet)
         .filter(|name| branches.iter().any(|branch| branch == name))
@@ -106,10 +110,62 @@ pub fn handle_command(path: &str) -> Result<(), String> {
         trees: exporter.trees_written,
         blobs: exporter.blobs_written,
         branches,
+        tags,
+        skipped_tags,
         current,
     });
 
     Ok(())
+}
+
+/// Write every tag at the local `@tags` head whose subject this export wrote as an annotated git
+/// tag, and name every other one with the reason it was left out. A tag never brings history of
+/// its own: one on a parcel no exported branch holds is left out, not exported with that parcel.
+/// Tag refs write no object, so like the branches they are set under the user's configuration.
+///
+/// # Returns
+/// * `Ok((Vec<String>, Vec<SkippedTag>))` - The tags exported, and the tags left out.
+/// * `Err(String)`                        - If the tags could not be read, or git failed.
+fn export_tags(repo: &GitRepo, exporter: &Exporter) -> Result<(Vec<String>, Vec<SkippedTag>), String> {
+    let read = tag_utils::read_tags()?;
+
+    let mut exported: Vec<String> = Vec::new();
+    let mut skipped: Vec<SkippedTag> = read.unreadable.iter()
+        .map(|tag| SkippedTag { name: tag.name.clone(), reason: format!("it cannot be read: {}", tag.reason) })
+        .collect();
+
+    for attributed in &read.tags {
+        let name = &attributed.tag.name;
+
+        let Some(commit) = exporter.commit_of(&attributed.tag.subject) else {
+            skipped.push(SkippedTag {
+                name: name.clone(),
+                reason: format!("its parcel {} is on no exported branch", attributed.tag.subject),
+            });
+            continue;
+        };
+
+        // Forklift's tag names are a superset of git's: `a..b` and `v1.lock` are refused there.
+        let refname = format!("refs/tags/{}", name);
+        if !repo.output(&["check-ref-format", &refname])?.status.success() {
+            skipped.push(SkippedTag { name: name.clone(), reason: "git does not accept it as a tag name".to_string() });
+            continue;
+        }
+
+        // Git checks a tag object's text (a message holding a NUL, say): a refusal leaves that
+        // tag out rather than fail an export whose branches are already written.
+        let object = match exporter.write_tag(commit, attributed) {
+            Ok(object) => object,
+            Err(refused) => {
+                skipped.push(SkippedTag { name: name.clone(), reason: refused });
+                continue;
+            }
+        };
+        repo.run_as_user(&["update-ref", &refname, &object])?;
+        exported.push(name.clone());
+    }
+
+    Ok((exported, skipped))
 }
 
 /// The variables that tell git which repository to act on. A git call into a repository Forklift
@@ -315,6 +371,13 @@ impl<'a> Exporter<'a> {
     /// The commit `parcel` was written or seeded as in this run, if it was.
     pub(crate) fn commit_of(&self, parcel: &str) -> Option<&str> {
         self.exported.get(parcel).map(|exported| exported.commit.as_str())
+    }
+
+    /// Write `attributed` as an annotated tag object over `commit` (a commit this run wrote),
+    /// returning the tag object's hash. Written under the isolated configuration, like every
+    /// object.
+    pub(crate) fn write_tag(&self, commit: &str, attributed: &AttributedTag) -> Result<String, String> {
+        Ok(self.repo.run(&["mktag"], Some(tag_object(commit, attributed).as_bytes()))?.trim().to_string())
     }
 
     /// Write one parcel as a git commit (its parents must already be written).
@@ -585,6 +648,33 @@ fn commit_message(parcel: &Parcel, parcel_hash: &str) -> String {
     }
 }
 
+/// The last line of every exported tag's message: the key the tag was signed with, which git has no
+/// place for, and the export layout it was written in.
+fn tag_line(signer: &str) -> String {
+    format!("Forklift-Tag-Signer: {} export/{}", signer, EXPORT_LAYOUT)
+}
+
+/// The annotated tag object for `attributed` over `commit`. The tagger is the tag's attributed
+/// operator (its key id when the local office does not know the key), written as a commit's author
+/// is; the date is the tag's own; the message is the tag's, without trailing newlines, a blank line,
+/// and the tag line (only the tag line when the message is empty).
+fn tag_object(commit: &str, attributed: &AttributedTag) -> String {
+    let tag = &attributed.tag;
+
+    let email = without_crud(&attributed.tagger);
+    let name = if email.is_empty() { "forklift".to_string() } else { email.clone() };
+
+    let message = match tag.message.trim_end_matches('\n') {
+        "" => format!("{}\n", tag_line(&attributed.signer)),
+        message => format!("{}\n\n{}\n", message, tag_line(&attributed.signer)),
+    };
+
+    format!(
+        "object {}\ntype commit\ntag {}\ntagger {} <{}> {} +0000\n\n{}",
+        commit, tag.name, name, email, tag.tagged_at.max(0), message
+    )
+}
+
 /// `items` with repeats removed, first occurrence kept, in order.
 pub(crate) fn distinct(items: &[String]) -> Vec<&String> {
     let mut seen = HashSet::new();
@@ -674,6 +764,13 @@ pub(crate) struct ExportReport {
     /// The branches created (one per user pallet).
     branches: Vec<String>,
 
+    /// The tags exported as annotated git tags.
+    tags: Vec<String>,
+
+    /// The tags left out, each with why.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    skipped_tags: Vec<SkippedTag>,
+
     /// The branch checked out (the current pallet).
     #[serde(skip_serializing_if = "Option::is_none")]
     current: Option<String>,
@@ -686,6 +783,15 @@ impl CommandOutput for ExportReport {
             self.commits, self.path, self.branches.len(), self.trees, self.blobs
         );
 
+        if !self.tags.is_empty() {
+            println!("Exported {} tag(s) as annotated git tags.", self.tags.len());
+        }
+
+        // An unreadable tag's reason quotes the cell, which is another operator's text.
+        for skipped in &self.skipped_tags {
+            println!("  warning: tag \"{}\" was not exported: {}.", skipped.name, sanitize(&skipped.reason));
+        }
+
         if let Some(current) = &self.current {
             println!("Checked out \"{}\".", current);
         }
@@ -695,6 +801,16 @@ impl CommandOutput for ExportReport {
             not exported — git has no equivalent."
         );
     }
+}
+
+/// A tag the export left out.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct SkippedTag {
+    name: String,
+
+    /// Why it was left out.
+    reason: String,
 }
 
 
@@ -989,5 +1105,32 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert!(!litter.contains(&path), "a taken name was reused: {}", path.display());
         assert!(contents.iter().all(|content| content == b"litter"), "litter is left as it was");
+    }
+
+    /// The tag object is fixed text: a change to its shape changes every exported tag's hash, which
+    /// bumps the export layout. The tagger is cleaned as an author is, and falls back to "forklift".
+    #[test]
+    fn a_tag_object_is_written_in_a_fixed_shape() {
+        use forklift_core::util::tag_utils::Tag;
+
+        let tag = |tagger: &str, message: &str, tagged_at: i64| AttributedTag {
+            tag: Tag { name: "v1.0".to_string(), subject: "p".to_string(), message: message.to_string(), tagged_at },
+            tagger: tagger.to_string(),
+            signer: "k1".to_string(),
+        };
+        let commit = "c".repeat(40);
+
+        assert_eq!(
+            tag_object(&commit, &tag("ada@example", "the release\n\n", 1_700_000_000)),
+            format!(
+                "object {}\ntype commit\ntag v1.0\ntagger ada@example <ada@example> 1700000000 +0000\n\n\
+                the release\n\nForklift-Tag-Signer: k1 export/1\n",
+                commit
+            )
+        );
+        assert_eq!(
+            tag_object(&commit, &tag("<>", "", -5)),
+            format!("object {}\ntype commit\ntag v1.0\ntagger forklift <> 0 +0000\n\nForklift-Tag-Signer: k1 export/1\n", commit)
+        );
     }
 }

@@ -5741,6 +5741,83 @@ fn export_git_keeps_tree_names_with_line_breaks_tabs_and_quotes() {
     assert_eq!(exported, expected);
 }
 
+/// Every tag on an exported parcel becomes an annotated git tag over that parcel's commit, with its
+/// message, tagger and date; every other tag is named with why it was left out: one on a parcel no
+/// exported branch holds, and one git does not accept as a tag name.
+#[test]
+fn export_git_writes_tags_as_annotated_git_tags() {
+    let warehouse = TestWarehouse::new("export-git-tags");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+
+    warehouse.write_file("a.txt", "one\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "first"]));
+    let first = pallet_head_hash(&warehouse, "main");
+    warehouse.write_file("a.txt", "two\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "second"]));
+
+    assert_success(&warehouse.run(&["pallet", "create", "side"]));
+    warehouse.write_file("a.txt", "side\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "on side"]));
+    let side = pallet_head_hash(&warehouse, "side");
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    assert_success(&warehouse.run(&["office", "enroll"]));
+    // Tagged below the head, so the tag must follow its own parcel, not the branch.
+    assert_success(&warehouse.run(&["tag", "create", "v1.0", &first, "-m", "the first release"]));
+    assert_success(&warehouse.run(&["tag", "create", "v2", "main"]));
+    assert_success(&warehouse.run(&["tag", "create", "side-1", &side]));
+    assert_success(&warehouse.run(&["tag", "create", "a..b", "main"]));
+    assert_success(&warehouse.run(&["pallet", "delete", "side", "--force"]));
+
+    let out = warehouse.root.join("exported");
+    let exported = warehouse.run(&["--json", "git", "export", out.to_str().unwrap()]);
+    assert_success(&exported);
+    let data = &json(&exported)["data"];
+    assert_eq!(data["tags"], serde_json::json!(["v1.0", "v2"]));
+    let skipped: Vec<(String, String)> = data["skipped_tags"].as_array().unwrap().iter()
+        .map(|tag| (tag["name"].as_str().unwrap().to_string(), tag["reason"].as_str().unwrap().to_string()))
+        .collect();
+    assert_eq!(skipped.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["a..b", "side-1"]);
+    assert!(skipped[0].1.contains("git does not accept"), "{:?}", skipped);
+    assert!(skipped[1].1.contains(&side) && skipped[1].1.contains("no exported branch"), "{:?}", skipped);
+
+    let git = |args: &[&str]| -> String {
+        let output = Command::new("git").args(args).current_dir(&out).output()
+            .expect("git must be installed to run this test");
+        assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    // Both are annotated tags (tag objects), each over its own parcel's commit.
+    assert_eq!(git(&["for-each-ref", "--format=%(objecttype) %(refname)", "refs/tags"]),
+        "tag refs/tags/v1.0\ntag refs/tags/v2\n");
+    assert_eq!(git(&["rev-parse", "v1.0^{commit}"]), git(&["rev-parse", "main~1"]));
+    assert_eq!(git(&["rev-parse", "v2^{commit}"]), git(&["rev-parse", "main"]));
+
+    // The message, the tagger and the date are the tag's own; the signer key gets the last line.
+    let shown = json(&warehouse.run(&["--json", "tag", "show", "v1.0"]));
+    let signer = shown["data"]["signer"].as_str().unwrap();
+    let body = git(&["cat-file", "tag", "v1.0"]);
+    assert!(body.ends_with(&format!("\n\nthe first release\n\nForklift-Tag-Signer: {} export/1\n", signer)), "{}", body);
+    assert_eq!(git(&["for-each-ref", "--format=%(taggeremail)", "refs/tags/v1.0"]), "<test@forklift>\n");
+    let tagged_at = chrono::DateTime::parse_from_rfc3339(shown["data"]["tagged_at"].as_str().unwrap()).unwrap();
+    assert_eq!(git(&["for-each-ref", "--format=%(taggerdate:unix)", "refs/tags/v1.0"]).trim(),
+        tagged_at.timestamp().to_string());
+    // A tag with no message carries only the signer line.
+    let unmessaged = git(&["cat-file", "tag", "v2"]);
+    assert_eq!(unmessaged.split_once("\n\n").unwrap().1, format!("Forklift-Tag-Signer: {} export/1\n", signer));
+
+    git(&["fsck", "--strict"]);
+
+    let human = stdout(&warehouse.run(&["git", "export", warehouse.root.join("again").to_str().unwrap()]));
+    assert!(human.contains("Exported 2 tag(s)"), "{}", human);
+    assert!(human.contains("warning: tag \"side-1\" was not exported"), "{}", human);
+}
+
 #[test]
 fn self_update_check_reports_without_mutating() {
     // A global command — no warehouse needed. The env override injects "the latest
