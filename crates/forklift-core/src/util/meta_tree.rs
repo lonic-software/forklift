@@ -488,6 +488,9 @@ pub enum Decision {
     /// No present side is a cell: descended into.
     Recurse,
 
+    /// Ours and theirs are one cell, theirs re-signed ([`same_cell_re_signed`]): agreement.
+    ReSigned,
+
     /// Both changed, differently.
     Conflict,
 }
@@ -1535,6 +1538,20 @@ impl<'b> LegacyHistory<'b> {
 
     /// Refuse the unsigned parcel `hash` unless the boundary reaches it.
     fn require(&mut self, pallet: &str, hash: &str) -> Result<(), String> {
+        if self.reaches(pallet, hash)? {
+            return Ok(());
+        }
+
+        Err(format!(
+            "Parcel {} on @{} carries no signature and was stacked after trust was established. \
+            Every meta parcel stacked under an office must be signed by a key of the office.",
+            hash, pallet
+        ))
+    }
+
+    /// Whether the boundary reaches the parcel `hash`. A walk that crossed an absent reference
+    /// refuses instead of answering.
+    fn reaches(&mut self, pallet: &str, hash: &str) -> Result<bool, String> {
         if self.reachable.is_none() {
             let (reachable, gaps) = audit_utils::collect_reachable_present_noting_gaps(self.boundary)?;
             self.reachable = Some((reachable, gaps.into_iter().next()));
@@ -1543,7 +1560,7 @@ impl<'b> LegacyHistory<'b> {
         let (reachable, gap) = self.reachable.as_ref().expect("collected above");
 
         if reachable.contains(hash) {
-            return Ok(());
+            return Ok(true);
         }
 
         // A walk that crossed an absent reference cannot tell this parcel is outside: the missing
@@ -1557,12 +1574,34 @@ impl<'b> LegacyHistory<'b> {
             ));
         }
 
-        Err(format!(
-            "Parcel {} on @{} carries no signature and was stacked after trust was established. \
-            Every meta parcel stacked under an office must be signed by a key of the office.",
-            hash, pallet
-        ))
+        Ok(false)
     }
+}
+
+/// Whether a meta pallet's parcels from `old_head` (exclusive; `None` from the root) to `new_head`
+/// hold one with no signature that `legacy_boundary`, the anchor's boundary, does not reach:
+/// history written here before trust that the anchor does not vouch for. A store under an office
+/// refuses such a parcel, so only a replay that signs its cells can bring it to one.
+pub fn holds_unvouched_parcels(pallet: &str,
+                               legacy_boundary: &[String],
+                               old_head: Option<&str>,
+                               new_head: &str) -> Result<bool, String> {
+    let mut legacy = LegacyHistory::new(legacy_boundary);
+    let mut cursor = Some(new_head.to_string());
+
+    while let Some(hash) = cursor {
+        if Some(hash.as_str()) == old_head {
+            break;
+        }
+
+        if sign_utils::load_raw_parcel_signature(&hash)?.is_none() && !legacy.reaches(pallet, &hash)? {
+            return Ok(true);
+        }
+
+        cursor = object_utils::load_parcel(&hash)?.parents.first().cloned();
+    }
+
+    Ok(false)
 }
 
 /// Rule (b) for a store that never enrolled: the parcel carries no signature, and its Author and
@@ -1662,22 +1701,74 @@ fn verify_meta_signature<'o>(pallet: &str,
 }
 
 /// The three-tree walk over `cells/` trees: every path both sides changed differently since
-/// `base` (`None` is the empty tree). It compares entry hashes only, never loads a cell, and
-/// never descends into a subtree both sides agree on. It names conflicts; it resolves none.
+/// `base` (`None` is the empty tree). It compares entry hashes, and never descends into a subtree
+/// both sides agree on. It loads a cell only where two cells would otherwise conflict, to ask
+/// whether they are one cell re-signed ([`same_cell_re_signed`], under `office`). It names
+/// conflicts; it resolves none.
 pub fn detect_conflicts(base: Option<&str>,
                         ours: Option<&str>,
-                        theirs: Option<&str>) -> Result<WalkOutcome, String> {
-    detect_conflicts_with(base, ours, theirs, &mut |path, hash| load_level(path, hash, false))
+                        theirs: Option<&str>,
+                        office: Option<&OfficeState>) -> Result<WalkOutcome, String> {
+    detect_conflicts_with(base, ours, theirs, office, &mut |path, hash| load_level(path, hash, false))
 }
 
 fn detect_conflicts_with(base: Option<&str>,
                          ours: Option<&str>,
                          theirs: Option<&str>,
+                         office: Option<&OfficeState>,
                          load: &mut dyn FnMut(&str, &str) -> Result<Level, String>) -> Result<WalkOutcome, String> {
     let mut outcome = WalkOutcome { decisions: Vec::new(), conflicts: Vec::new() };
-    walk_entry("", root_entry(base), root_entry(ours), root_entry(theirs), load, &mut outcome)?;
+    walk_entry("", root_entry(base), root_entry(ours), root_entry(theirs), office, load, &mut outcome)?;
 
     Ok(outcome)
+}
+
+/// Whether the local cell `ours` and the remote cell `theirs` are one cell re-signed: the same
+/// schema and value, `theirs` signed by a key `office` tracks, and both stamps resolving to the
+/// same operator — the rule [`restamp_for_replay`] re-signs by, so a cell a replay re-signed
+/// matches its local original, written without a key or under a key since rotated. A key
+/// revoked as compromised resolves to no operator, and a cell that does not parse matches
+/// nothing.
+pub fn same_cell_re_signed(ours: &str, theirs: &str, office: &OfficeState) -> Result<bool, String> {
+    let (Ok(ours), Ok(theirs)) = (
+        parse_cell(&object_utils::load_blob(ours)?.content),
+        parse_cell(&object_utils::load_blob(theirs)?.content),
+    ) else {
+        return Ok(false);
+    };
+
+    if !matches!(theirs.stamp, Stamp::Signer(_)) {
+        return Ok(false);
+    }
+
+    let (Some(ours_operator), Some(theirs_operator)) =
+        (re_signable_operator(&ours.stamp, office), re_signable_operator(&theirs.stamp, office)) else {
+        return Ok(false);
+    };
+
+    Ok(ours_operator == theirs_operator
+        && ours.schema == theirs.schema
+        && ours.value.to_string() == theirs.value.to_string())
+}
+
+/// The operator a cell's stamp lets a replay re-sign for: the one an unsigned cell declares, or
+/// the owner of a key `office` tracks that was not revoked as compromised.
+fn re_signable_operator<'a>(stamp: &'a Stamp, office: &'a OfficeState) -> Option<&'a str> {
+    match stamp {
+        Stamp::Operator(identifier) => Some(identifier),
+        Stamp::Signer(key_id) => office.find_key(key_id)
+            .filter(|key| !matches!(key.revocation_reason, Some(RevocationReason::Compromise)))
+            .map(|key| key.operator.as_str()),
+    }
+}
+
+/// [`same_cell_re_signed`] over two entries: both cells, and one cell re-signed. Without an office
+/// nothing is re-signed, so entries match only by hash.
+fn same_entry_re_signed(ours: &Entry, theirs: &Entry, office: Option<&OfficeState>) -> Result<bool, String> {
+    match (ours, theirs, office) {
+        (Entry::Blob(ours), Entry::Blob(theirs), Some(office)) => same_cell_re_signed(ours, theirs, office),
+        _ => Ok(false),
+    }
 }
 
 /// The walk at one position. Rows apply in order; the first match wins.
@@ -1688,7 +1779,12 @@ fn detect_conflicts_with(base: Option<&str>,
 /// | B | B | X | take theirs |
 /// | B | X | B | take ours |
 /// | no present side is a cell | | | recurse |
+/// | B | X | X re-signed | agreement |
 /// | B | X | Y | conflict |
+///
+/// The re-signed row ([`same_cell_re_signed`], under `office`) is the only one that loads a
+/// cell: a local cell a replay already re-signed onto the remote — whose head move then failed —
+/// is the same change, not a conflict with itself.
 ///
 /// The recurse row asks that no *present* side be a cell, rather than that both ours and
 /// theirs be subtrees: an absent side (or one emptied to absence) must still be descended into,
@@ -1700,6 +1796,7 @@ fn walk_entry(path: &str,
               base: Entry,
               ours: Entry,
               theirs: Entry,
+              office: Option<&OfficeState>,
               load: &mut dyn FnMut(&str, &str) -> Result<Level, String>,
               outcome: &mut WalkOutcome) -> Result<(), String> {
     let base = normalize(base);
@@ -1734,11 +1831,17 @@ fn walk_entry(path: &str,
                 base_level.get(name).cloned().unwrap_or(Entry::Absent),
                 ours_level.get(name).cloned().unwrap_or(Entry::Absent),
                 theirs_level.get(name).cloned().unwrap_or(Entry::Absent),
+                office,
                 load,
                 outcome,
             )?;
         }
 
+        return Ok(());
+    }
+
+    if same_entry_re_signed(&ours, &theirs, office)? {
+        outcome.decisions.push((path.to_string(), Decision::ReSigned));
         return Ok(());
     }
 
@@ -1764,12 +1867,14 @@ fn walk_entry(path: &str,
 ///   would; `Theirs` is always the way out.
 ///
 /// A `keep` naming a path it cannot apply to is refused, so a stale resolution never passes
-/// silently.
+/// silently. A local cell theirs already holds re-signed (under `office`, see
+/// [`same_cell_re_signed`]) is no change to replay.
 pub fn plan_net_changes(base: Option<&str>,
                         ours: Option<&str>,
                         theirs: Option<&str>,
+                        office: Option<&OfficeState>,
                         keep: &BTreeMap<String, KeepSide>) -> Result<Vec<CellChange>, ReplayError> {
-    let walk = detect_conflicts(base, ours, theirs)?;
+    let walk = detect_conflicts(base, ours, theirs, office)?;
     let local = net_diff(base, ours)?;
 
     for (path, side) in keep {
@@ -1820,7 +1925,7 @@ pub fn plan_net_changes(base: Option<&str>,
         let theirs_now = resolve_entry(theirs, &change.path)?;
 
         // Both sides already agree here: nothing to replay.
-        if ours_now == theirs_now {
+        if ours_now == theirs_now || same_entry_re_signed(&ours_now, &theirs_now, office)? {
             continue;
         }
 
@@ -1852,16 +1957,22 @@ pub fn plan_net_changes(base: Option<&str>,
 
 /// Turn planned changes into edits stamped by `writer` for `actor`, re-stamping each replayed
 /// cell. A cell already carrying the writer's stamp is replayed as it is. A signed writer
-/// re-signs any other key stamp only when it resolves, in this office, to the signer's own
-/// operator under a key that is active or was revoked for retirement — so a key rotation never
-/// wedges a replay. A cell stamped by another operator, by a key revoked as compromised, or —
-/// for a signed writer — written without a key, cannot honestly be re-stamped, and is refused
-/// by path.
+/// re-signs any other stamp only when it resolves, in this office, to the signer's own operator:
+/// a cell that operator wrote without a key, or one signed by their key that is active or was
+/// revoked for retirement — so neither enrolling nor a key rotation wedges a replay. A cell
+/// stamped by another operator, by a key revoked as compromised, or — for an unsigned writer —
+/// by anyone else at all, cannot honestly be re-stamped, and is refused by path.
 pub fn restamp_for_replay(changes: &[CellChange],
                           writer: &MetaWriter,
                           actor: &Operator) -> Result<Vec<CellEdit>, String> {
     let own = writer.stamp(actor);
     let mut edits = Vec::new();
+
+    let signing = match writer {
+        MetaWriter::Signed { office, signer } => Some((office, office.find_key(&signer.key_id)
+            .ok_or(format!("The signing key {} is not tracked in the office.", signer.key_id))?)),
+        MetaWriter::Unsigned => None,
+    };
 
     for change in changes {
         let Some(blob) = &change.after else {
@@ -1877,7 +1988,7 @@ pub fn restamp_for_replay(changes: &[CellChange],
             continue;
         }
 
-        let (MetaWriter::Signed { office, signer }, Stamp::Signer(key_id)) = (writer, &envelope.stamp) else {
+        let Some((office, current)) = signing else {
             return Err(format!(
                 "The cell {} is stamped {}, so it cannot be re-stamped by {}. Keep theirs at this \
                 path to discard the local change.",
@@ -1885,29 +1996,41 @@ pub fn restamp_for_replay(changes: &[CellChange],
             ));
         };
 
-        let current = office.find_key(&signer.key_id)
-            .ok_or(format!("The signing key {} is not tracked in the office.", signer.key_id))?;
+        match &envelope.stamp {
+            Stamp::Operator(identifier) if *identifier != current.operator => {
+                return Err(format!(
+                    "The cell {} was written without a key by another operator ({}), so it cannot \
+                    be re-signed under your key. Keep theirs at this path to discard the local \
+                    change.",
+                    change.path, identifier
+                ));
+            }
+            Stamp::Operator(_) => {}
+            Stamp::Signer(key_id) => {
+                let stamp = office.find_key(key_id).ok_or(format!(
+                    "The cell {} is stamped with key {}, which the office does not track, so it \
+                    cannot be re-signed. Keep theirs at this path to discard the local change.",
+                    change.path, key_id
+                ))?;
 
-        let stamp = office.find_key(key_id).ok_or(format!(
-            "The cell {} is stamped with key {}, which the office does not track, so it cannot be \
-            re-signed. Keep theirs at this path to discard the local change.",
-            change.path, key_id
-        ))?;
+                if stamp.operator != current.operator {
+                    return Err(format!(
+                        "The cell {} was written by another operator (key {}), so it cannot be \
+                        re-signed under your key. Keep theirs at this path to discard the local \
+                        change.",
+                        change.path, key_id
+                    ));
+                }
 
-        if stamp.operator != current.operator {
-            return Err(format!(
-                "The cell {} was written by another operator (key {}), so it cannot be re-signed \
-                under your key. Keep theirs at this path to discard the local change.",
-                change.path, key_id
-            ));
-        }
-
-        if matches!(stamp.revocation_reason, Some(RevocationReason::Compromise)) {
-            return Err(format!(
-                "The cell {} is stamped with key {}, which was revoked as compromised, so it \
-                cannot be re-signed. Keep theirs at this path to discard the local change.",
-                change.path, key_id
-            ));
+                if matches!(stamp.revocation_reason, Some(RevocationReason::Compromise)) {
+                    return Err(format!(
+                        "The cell {} is stamped with key {}, which was revoked as compromised, so \
+                        it cannot be re-signed. Keep theirs at this path to discard the local \
+                        change.",
+                        change.path, key_id
+                    ));
+                }
+            }
         }
 
         edits.push(CellEdit::Set {
@@ -1930,7 +2053,7 @@ fn describe_own(stamp: &Stamp) -> String {
 /// What a replay of the local net change onto a remote head would apply, planned before
 /// anything is signed.
 pub struct ReplayPlan {
-    theirs: String,
+    theirs: Option<String>,
     theirs_cells: Option<String>,
     changes: Vec<CellChange>,
 }
@@ -1949,8 +2072,10 @@ impl ReplayPlan {
 }
 
 /// Plan the replay of the local net change since `base` (the chains' common ancestor, `None`
-/// when they share none) onto the remote head `theirs` (see [`plan_net_changes`]). Needs no
-/// signing key, so a resolution that drops every local change never needs one.
+/// when they share none) onto the remote head `theirs` (see [`plan_net_changes`]), or onto
+/// nothing when the remote holds no head yet. `office` is the trust the cells are compared
+/// under (see [`same_cell_re_signed`]). Needs no signing key, so a resolution that drops every
+/// local change never needs one.
 ///
 /// # Returns
 /// * `Ok(ReplayPlan)` - The changes to apply, possibly none.
@@ -1959,23 +2084,32 @@ pub fn plan_replay(pallet: &str,
                    rules: &dyn PalletRules,
                    base: Option<&str>,
                    ours: &str,
-                   theirs: &str,
+                   theirs: Option<&str>,
+                   office: Option<&OfficeState>,
                    keep: &BTreeMap<String, KeepSide>) -> Result<ReplayPlan, ReplayError> {
     let base_cells = match base {
         Some(base) => read_pallet_spine(pallet, base, rules.kind())?.cells,
         None => None,
     };
     let ours_cells = read_pallet_spine(pallet, ours, rules.kind())?.cells;
-    let theirs_cells = read_pallet_spine(pallet, theirs, rules.kind())?.cells;
+    let theirs_cells = match theirs {
+        Some(theirs) => read_pallet_spine(pallet, theirs, rules.kind())?.cells,
+        None => None,
+    };
 
-    let changes = plan_net_changes(base_cells.as_deref(), ours_cells.as_deref(), theirs_cells.as_deref(), keep)?;
+    let changes = plan_net_changes(
+        base_cells.as_deref(), ours_cells.as_deref(), theirs_cells.as_deref(), office, keep,
+    )?;
 
-    Ok(ReplayPlan { theirs: theirs.to_string(), theirs_cells, changes })
+    Ok(ReplayPlan { theirs: theirs.map(str::to_string), theirs_cells, changes })
 }
 
 /// Stack a planned replay onto its remote head as one parcel by `writer` whose only parent is
-/// that head. The local parcels themselves never leave the clone. The new parcel passes
-/// [`verify_meta_content`] against the head before it is returned; no head moves.
+/// that head — or, when the remote holds no head, as a root parcel holding the local cells,
+/// which may be none: a pallet whose every local cell was kept as theirs still gets a signed
+/// head to replace the unvouched one. The local parcels themselves never leave the clone. The
+/// new parcel passes [`verify_meta_content`] against the head before it is returned; no head
+/// moves.
 ///
 /// # Returns
 /// * `Ok(Some(hash))` - The replayed parcel.
@@ -1987,20 +2121,26 @@ pub fn replay_meta_pallet(pallet: &str,
                           plan: &ReplayPlan,
                           actor: &Operator,
                           description: &str) -> Result<Option<String>, ReplayError> {
-    let theirs = plan.theirs.as_str();
+    let theirs = plan.theirs.as_deref();
     let theirs_cells = &plan.theirs_cells;
 
     let edits = restamp_for_replay(&plan.changes, writer, actor)?;
     let new_cells = apply_edits(theirs_cells.as_deref(), &edits)?;
 
-    if new_cells == *theirs_cells {
+    if theirs.is_some() && new_cells == *theirs_cells {
         return Ok(None);
     }
 
     let tree = store_meta_tree(rules.kind().format_marker().as_bytes(), new_cells.as_deref())?;
-    let parcel = stack_meta_parcel(tree, vec![theirs.to_string()], actor, description, writer.signer())?;
+    let parcel = stack_meta_parcel(tree, theirs.into_iter().map(str::to_string).collect(), actor, description,
+                                   writer.signer())?;
 
-    verify_meta_content(pallet, rules, writer.office_state(), &[], Admission::Admit, Some(theirs), &parcel)?;
+    verify_meta_content(pallet, rules, writer.office_state(), &[], Admission::Admit, theirs, &parcel)
+        .map_err(|why| format!(
+            "{} An operator the office lets make this change can make it instead, or keep theirs at \
+            this path to discard the local change.",
+            why
+        ))?;
 
     Ok(Some(parcel))
 }
@@ -2268,7 +2408,7 @@ mod tests {
              ours: &str,
              theirs: &str,
              keep: &[(&str, KeepSide)]) -> Result<Option<String>, ReplayError> {
-        let changes = plan_net_changes(base, Some(ours), Some(theirs), &keep_of(keep))?;
+        let changes = plan_net_changes(base, Some(ours), Some(theirs), None, &keep_of(keep))?;
         let edits: Vec<CellEdit> = changes.into_iter()
             .map(|change| match change.after {
                 Some(blob) => CellEdit::Set { path: change.path, blob },
@@ -2440,7 +2580,7 @@ mod tests {
         let theirs = tree(&[("disputed", b(&theirs_disputed)), ("untouched", t(&untouched))]);
 
         let mut loaded: Vec<String> = Vec::new();
-        let outcome = detect_conflicts_with(Some(&base), Some(&ours), Some(&theirs), &mut |path, hash| {
+        let outcome = detect_conflicts_with(Some(&base), Some(&ours), Some(&theirs), None, &mut |path, hash| {
             loaded.push(hash.to_string());
             load_level(path, hash, false)
         }).unwrap();
@@ -2468,7 +2608,7 @@ mod tests {
         let ours = tree(&[("ab", t(&ours_ab))]);
         let theirs = tree(&[("ab", t(&theirs_ab))]);
 
-        let outcome = detect_conflicts(Some(&base), Some(&ours), Some(&theirs)).unwrap();
+        let outcome = detect_conflicts(Some(&base), Some(&ours), Some(&theirs), None).unwrap();
         assert!(outcome.conflicts.is_empty(), "spurious conflict: {:?}", outcome.conflicts);
         assert_eq!(decision_at(&outcome, "ab"), Some(Decision::Recurse));
 
@@ -2517,7 +2657,7 @@ mod tests {
         let ours = tree(&[("ab", t(&ours_ab))]);
         let theirs = tree(&[("ab", t(&theirs_ab))]);
 
-        let outcome = detect_conflicts(Some(&base), Some(&ours), Some(&theirs)).unwrap();
+        let outcome = detect_conflicts(Some(&base), Some(&ours), Some(&theirs), None).unwrap();
         assert!(outcome.conflicts.is_empty(), "conflicts: {:?}", outcome.conflicts);
         assert_eq!(decision_at(&outcome, "ab"), Some(Decision::Recurse));
 
@@ -3251,7 +3391,7 @@ mod tests {
               keep: &[(&str, KeepSide)],
               signer: &Key) -> Result<Option<String>, ReplayError> {
         let base = linear_common_ancestor(ours, theirs).unwrap();
-        let plan = plan_replay(PALLET, &TestRules, base.as_deref(), ours, theirs, &keep_of(keep))?;
+        let plan = plan_replay(PALLET, &TestRules, base.as_deref(), ours, Some(theirs), Some(office), &keep_of(keep))?;
 
         replay_meta_pallet(PALLET, &TestRules, &signed_writer(office, signer), &plan, &actor(&signer.record.operator), "replay")
     }
@@ -3353,6 +3493,103 @@ mod tests {
         let replayed = replay(&office, &ours, &theirs, &[("c", KeepSide::Theirs)], &alice).unwrap().unwrap();
         let state = read_meta_state(PALLET, &replayed, &TestRules).unwrap();
         assert_eq!(state.cells.keys().collect::<Vec<_>>(), vec!["a", "seed", "y"]);
+    }
+
+    /// Write `edits` without a key as `operator`, onto the local head.
+    fn write_unsigned(operator: &str, edits: &[CellEdit]) -> String {
+        stack_meta_edits(PALLET, &TestRules, &MetaWriter::Unsigned, edits, &actor(operator), "write")
+            .unwrap().unwrap()
+    }
+
+    /// Replay the whole local chain `ours` onto a remote that holds no head.
+    fn replay_onto_nothing(office: &OfficeState,
+                           ours: &str,
+                           keep: &[(&str, KeepSide)],
+                           signer: &Key) -> Result<Option<String>, ReplayError> {
+        let plan = plan_replay(PALLET, &TestRules, None, ours, None, Some(office), &keep_of(keep))?;
+
+        replay_meta_pallet(PALLET, &TestRules, &signed_writer(office, signer), &plan, &actor(&signer.record.operator), "replay")
+    }
+
+    #[test]
+    fn a_signed_replay_re_signs_the_writers_own_unsigned_cells_as_a_root_parcel() {
+        let _scratch = Scratch::new("replay-own-unsigned");
+        let alice = Key::new("alice", 1);
+        let office = office(&[&alice.record]);
+
+        write_unsigned("alice", &[set("x", &declared_cell("alice", "draft"))]);
+        let ours = write_unsigned("alice", &[set("x", &declared_cell("alice", "mine"))]);
+
+        let root = replay_onto_nothing(&office, &ours, &[], &alice).unwrap().unwrap();
+
+        assert!(object_utils::load_parcel(&root).unwrap().parents.is_empty());
+        assert!(sign_utils::load_raw_parcel_signature(&root).unwrap().is_some());
+        verify(&office, None, &root).unwrap();
+        assert_eq!(at(&cells_of(&root), "x"), b(&cell(alice.id(), "mine")));
+
+        // An unsigned writer re-stamps nothing it did not write itself.
+        let plan = plan_replay(PALLET, &TestRules, None, &ours, None, None, &keep_of(&[])).unwrap();
+        let other = refusal(replay_meta_pallet(PALLET, &TestRules, &MetaWriter::Unsigned, &plan, &actor("bob"), "replay"));
+        assert!(other.contains("The cell x ") && other.contains("operator alice"), "{}", other);
+    }
+
+    #[test]
+    fn another_operators_unsigned_cell_is_never_re_signed_and_keeping_every_cell_leaves_an_empty_root() {
+        let _scratch = Scratch::new("replay-other-unsigned");
+        let alice = Key::new("alice", 1);
+        let office = office(&[&alice.record]);
+
+        // Locally, Bob's unsigned write arrived first, then Alice wrote her own.
+        let adopted = forge_unsigned(&[], cells(&[("b", &declared_cell("bob", "his"))]).as_deref(), "bob");
+        pallet_utils::update_meta_pallet_head(PALLET, None, &adopted, &pallet_utils::RefPreconditions::NONE).unwrap();
+        let ours = write_unsigned("alice", &[set("x", &declared_cell("alice", "mine"))]);
+
+        let why = refusal(replay_onto_nothing(&office, &ours, &[], &alice));
+        assert!(why.contains("The cell b ") && why.contains("another operator (bob)") && why.contains("Keep theirs"), "{}", why);
+
+        let kept = replay_onto_nothing(&office, &ours, &[("b", KeepSide::Theirs)], &alice).unwrap().unwrap();
+        let state = read_meta_state(PALLET, &kept, &TestRules).unwrap();
+        assert_eq!(state.cells.keys().collect::<Vec<_>>(), vec!["x"]);
+
+        // Every local change dropped still stacks a signed root, to replace the unvouched head.
+        let empty = replay_onto_nothing(&office, &ours, &[("b", KeepSide::Theirs), ("x", KeepSide::Theirs)], &alice)
+            .unwrap().unwrap();
+        assert_eq!(cells_of(&empty), None);
+        assert!(sign_utils::load_raw_parcel_signature(&empty).unwrap().is_some());
+        verify(&office, None, &empty).unwrap();
+    }
+
+    #[test]
+    fn a_cell_the_remote_already_holds_re_signed_is_no_conflict() {
+        let _scratch = Scratch::new("replay-re-signed");
+        let (old, new, bob) = (Key::new("alice", 1), Key::new("alice", 4), Key::new("bob", 2));
+        let before = office(&[&old.record, &bob.record]);
+
+        let ours = write_unsigned("alice", &[set("x", &declared_cell("alice", "mine"))]);
+
+        // A replay landed on the remote, then the local head move failed.
+        let theirs = replay_onto_nothing(&before, &ours, &[], &old).unwrap().unwrap();
+
+        assert!(replay(&before, &ours, &theirs, &[], &old).unwrap().is_none());
+
+        // Without an office the walk compares by hash, and the two cells conflict.
+        let (ours_cells, theirs_cells) = (cells_of(&ours), cells_of(&theirs));
+        let blind = detect_conflicts(None, ours_cells.as_deref(), theirs_cells.as_deref(), None).unwrap();
+        assert_eq!(blind.conflicts.len(), 1);
+        let seen = detect_conflicts(None, ours_cells.as_deref(), theirs_cells.as_deref(), Some(&before)).unwrap();
+        assert!(seen.conflicts.is_empty());
+        assert_eq!(decision_at(&seen, "x"), Some(Decision::ReSigned));
+
+        // Across a rotation the old key still vouches for the same operator.
+        let rotated = office(&[&old.revoked(RevocationReason::Retirement, vec![theirs.clone()]), &new.record, &bob.record]);
+        assert!(replay(&rotated, &ours, &theirs, &[], &new).unwrap().is_none());
+
+        // A compromised key, or another operator's key, vouches for nobody: a real conflict.
+        let compromised = office(&[&old.revoked(RevocationReason::Compromise, vec![theirs.clone()]), &new.record, &bob.record]);
+        assert!(matches!(replay(&compromised, &ours, &theirs, &[], &new), Err(ReplayError::Conflicts(_))));
+
+        let bobs = forge(&[], &kv(), cells(&[("x", &cell(bob.id(), "mine"))]).as_deref(), &bob.signer());
+        assert!(matches!(replay(&before, &ours, &bobs, &[], &old), Err(ReplayError::Conflicts(_))));
     }
 
     #[test]
