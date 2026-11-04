@@ -23,6 +23,11 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   values and hauls are folded into the trust boundary and stay valid; everything written after
   enrolling is signed. A server's first enroll does the same. A `lower` that adopts a remote's
   anchor names any local metadata the anchor does not vouch for in a `meta_unvouched` warning.
+- **`lift` re-signs your metadata from before trust.** Entries you recorded unsigned before the
+  remote enrolled are replayed under your key as the lift sends them, and listed as re-signed;
+  another operator's are refused by path, and `lower --keep @<pallet>:<path>=theirs --confirm`
+  drops them, even from a pallet the remote does not hold yet. Without a key, the refusal says
+  how to get one admitted.
 - **The command surface was redesigned, with no aliases for the old names.** Families get subcommands:
   `pallet create/list/delete/restore`, `store status/compact/peek/evict`,
   `git import/export/mirror`, `scope fetch/narrow/prune/status`, `self alias/schema/update`,

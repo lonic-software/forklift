@@ -2069,11 +2069,6 @@ fn tags_sync_hold_the_admin_rule_at_admission_and_never_move() {
     assert_success(&area.forklift("b", &["config", "set", "operator.identifier", worker_id]));
     assert_success(&area.forklift("b", &["tag", "create", "v1.0", "main", "-m", "release"]));
 
-    // Before its first lift the remote has no @tags at all, so there is no side to keep.
-    let unlifted = area.forklift("b", &["lower", "--keep", "@tags:v1.0=theirs", "--confirm"]);
-    assert!(!unlifted.status.success(), "{}", stdout(&unlifted));
-    assert!(stderr(&unlifted).contains("@tags is not on the remote yet"), "{}", stderr(&unlifted));
-
     let lifted = area.forklift("b", &["lift"]);
     assert_success(&lifted);
     assert!(stdout(&lifted).contains("Lifted the @tags pallet"), "{}", stdout(&lifted));
@@ -2495,10 +2490,10 @@ fn a_held_haul_merge_names_a_drop_that_keeps_the_rest_of_the_haul() {
     assert_eq!(remote_pallet_head(&server, "@haul"), Some(area.read_file("a/.forklift/meta/haul").trim().to_string()));
 }
 
-/// A remote with no @haul yet gives "lower --keep" no remote side to keep, so a merge held on
-/// its first lift names only lifting the target.
+/// A merge held on the first lift of @haul names dropping it too: with no remote side, keeping
+/// "theirs" replays the rest of the pallet as the remote's first parcel.
 #[test]
-fn a_held_haul_merge_on_a_remote_without_haul_names_no_drop() {
+fn a_held_haul_merge_on_a_remote_without_haul_drops_to_a_first_parcel() {
     let area = TestArea::new("haul-held-first");
     let server = Server::start(&area, None);
     haul_warehouse(&area, &server);
@@ -2513,8 +2508,15 @@ fn a_held_haul_merge_on_a_remote_without_haul_names_no_drop() {
     let why = stderr(&held);
     assert!(why.contains(&format!("haul {} merged as", &id[..12])), "{}", why);
     assert!(why.contains("an operator who may write the target lifts it"), "{}", why);
-    assert!(!why.contains("--keep"), "{}", why);
+    let drop = format!("\"forklift lower --keep @haul:{}=theirs --confirm\"", id);
+    assert!(why.contains(&drop), "{}", why);
     assert_eq!(remote_pallet_head(&server, "@haul"), None);
+
+    let dropped = area.forklift("a", &["lower", "--keep", &format!("@haul:{}=theirs", id), "--confirm"]);
+    assert_success(&dropped);
+    assert!(stdout(&dropped).contains("Replayed the local @haul"), "{}", stdout(&dropped));
+    assert_eq!(remote_pallet_head(&server, "@haul"), Some(area.read_file("a/.forklift/meta/haul").trim().to_string()));
+    assert!(!area.forklift("a", &["haul", "show", &id]).status.success(), "the haul is dropped");
 }
 
 /// A fresh remote admits the whole @haul history against today's office, so a merge whose signer
@@ -11324,16 +11326,207 @@ fn unsigned_metadata_lifts_and_lowers_through_a_server_that_never_enrolled() {
     assert!(stdout(&area.forklift("d", &["tag", "show", "v1.0"])).contains("tester@forklift (unsigned)"));
 
     // The clone's change was not part of what the anchor vouches for: taking the anchor names
-    // it, keeps it, and its lift is refused.
+    // it and keeps it.
     let lowered = area.forklift("b", &["--json", "lower"]);
     assert_success(&lowered);
     let warning = stderr(&lowered);
     assert!(warning.contains("\"meta_unvouched\"") && warning.contains("\"@kv\"") && !warning.contains("\"@tags\""), "{}", warning);
     assert!(!warning.contains("\"pallets_unvouched\""), "{}", warning);
     assert_eq!(stdout(&area.forklift("b", &["manifest", "get", "main", "ci"])).trim(), "blue");
+
+    // An operator with no key here can only get one, or drop the change the remote has a head
+    // to keep.
+    assert_success(&area.forklift("b", &["config", "set", "operator.identifier", "bob@forklift"]));
+    let keyless = area.forklift("b", &["lift"]);
+    assert!(!keyless.status.success(), "{}", stdout(&keyless));
+    let said = stderr(&keyless);
+    assert!(said.contains("\"forklift profile keygen\""), "{}", said);
+    assert!(said.contains("\"forklift lower --keep @kv:") && said.contains("/ci=theirs --confirm\""), "{}", said);
+    assert_success(&area.forklift("b", &["config", "unset", "operator.identifier"]));
+
+    // Its operator holds a key now, so the lift re-signs the change and lands it as one signed
+    // parcel on the remote head; the unvouched parcel never leaves the clone.
+    let remote_kv = remote_pallet_head(&server, "@kv").expect("the remote holds @kv");
+    let lifted = area.forklift("b", &["lift"]);
+    assert_success(&lifted);
+    assert!(stdout(&lifted).contains("Lifted the @kv pallet") && stdout(&lifted).contains("Re-signed @kv "), "{}", stdout(&lifted));
+    let kv = area.read_file("b/.forklift/meta/kv").trim().to_string();
+    assert_eq!(remote_pallet_head(&server, "@kv"), Some(kv.clone()));
+    assert_ne!(kv, remote_kv);
+
+    // Once landed, there is nothing left to lift or lower.
+    let again = area.forklift("b", &["lift"]);
+    assert_success(&again);
+    assert!(!stdout(&again).contains("@kv") && !stdout(&again).contains("Re-signed"), "{}", stdout(&again));
+    assert_success(&area.forklift("b", &["lower"]));
+    assert_eq!(area.read_file("b/.forklift/meta/kv").trim(), kv);
+
+    assert_success(&area.forklift("d", &["lower"]));
+    assert_eq!(stdout(&area.forklift("d", &["manifest", "get", "main", "ci"])).trim(), "blue");
+    let audit = area.forklift("d", &["audit", "@kv"]);
+    assert_eq!(audit.status.code(), Some(0), "{}{}", stdout(&audit), stderr(&audit));
+}
+
+/// A lift that re-signed a cell and landed it on the remote, but could not move the local head
+/// after, says which cells the remote now holds re-signed; the next lower recognises them as the
+/// local change itself rather than a conflict with it.
+#[test]
+fn a_re_signed_lift_whose_local_head_did_not_move_catches_up_without_a_conflict() {
+    let area = TestArea::new("unsigned-meta-resign-failed");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/code.txt", "v1\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
+    assert_success(&area.forklift("a", &["manifest", "set", "main", "ci", "green"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    // The clone records a change before trust, and lowers the enrolled office after.
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
+    assert_success(&area.forklift("b", &["manifest", "set", "main", "ci", "blue"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "c"]));
+    assert_success(&area.forklift("c", &["office", "enroll"]));
+    assert_success(&area.forklift("c", &["lift"]));
+    assert_success(&area.forklift("b", &["lower"]));
+    let unvouched = area.read_file("b/.forklift/meta/kv").trim().to_string();
+
+    // Just as the remote takes the replay, something else moves the clone's @kv.
+    let remote_kv = remote_pallet_head(&server, "@kv").expect("the remote holds @kv");
+    let kv_ref = area.path("b/.forklift/meta/kv");
+    let moved = std::sync::atomic::AtomicBool::new(false);
+    let proxy = InterceptingProxy::start_seeing(&server.url, move |path, head| {
+        let ref_update = head.starts_with("POST") && path == "/v1/pallets/%40kv";
+        if ref_update && !moved.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            std::fs::write(&kv_ref, format!("{}\n", remote_kv)).unwrap();
+        }
+        None
+    });
+    assert_success(&area.forklift("b", &["config", "set", "remote.url", &proxy.url]));
+
+    let failed = area.forklift("b", &["lift"]);
+    assert!(!failed.status.success(), "{}", stdout(&failed));
+    let said = stderr(&failed);
+    assert!(said.contains("its local head was not moved") && said.contains("re-signed under your current key"), "{}", said);
+    assert!(said.contains("The remote holds @kv "), "{}", said);
+    let replayed = remote_pallet_head(&server, "@kv").expect("the remote holds the replay");
+
+    // Put the unvouched head back: the remote holds its change re-signed, so lower adopts.
+    area.write_file("b/.forklift/meta/kv", &format!("{}\n", unvouched));
+    let lowered = area.forklift("b", &["lower"]);
+    assert_success(&lowered);
+    assert!(!stderr(&lowered).contains("conflict"), "{}", stderr(&lowered));
+    assert_eq!(area.read_file("b/.forklift/meta/kv").trim(), replayed);
+    assert_eq!(stdout(&area.forklift("b", &["manifest", "get", "main", "ci"])).trim(), "blue");
+    let again = area.forklift("b", &["lift"]);
+    assert_success(&again);
+    assert!(!stdout(&again).contains("@kv"), "{}", stdout(&again));
+}
+
+/// A lift that re-signs and lands metadata and then fails on the working pallet still names the
+/// cells the remote now holds re-signed: in its error, or for a human, in the lines printed
+/// before it when the working pallet's own lift is what failed.
+#[test]
+fn a_lift_that_fails_after_re_signing_names_the_cells_that_landed() {
+    for (json, diverged) in [(false, false), (true, false), (false, true), (true, true)] {
+        let area = TestArea::new(&format!("unsigned-meta-resign-then-fail-{}-{}", json, diverged));
+        let server = Server::start(&area, None);
+
+        prepare_warehouse(&area, "a", &server.url);
+        area.write_file("a/code.txt", "v1\n");
+        assert_success(&area.forklift("a", &["load", "."]));
+        assert_success(&area.forklift("a", &["stack", "-m", "base"]));
+        assert_success(&area.forklift("a", &["manifest", "set", "main", "ci", "green"]));
+        assert_success(&area.forklift("a", &["lift"]));
+
+        assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
+        assert_success(&area.forklift("b", &["manifest", "set", "main", "ci", "blue"]));
+        assert_success(&area.forklift(".", &["clone", &server.url, "c"]));
+        assert_success(&area.forklift("c", &["office", "enroll"]));
+        assert_success(&area.forklift("c", &["lift"]));
+        assert_success(&area.forklift("b", &["lower"]));
+
+        if diverged {
+            // Both sides change one line: the auto-merge cannot, and the working lift fails.
+            assert_success(&area.forklift("a", &["lower"]));
+            area.write_file("a/code.txt", "remote\n");
+            assert_success(&area.forklift("a", &["load", "."]));
+            assert_success(&area.forklift("a", &["stack", "-m", "remote"]));
+            assert_success(&area.forklift("a", &["lift"]));
+            area.write_file("b/code.txt", "local\n");
+            assert_success(&area.forklift("b", &["load", "."]));
+            assert_success(&area.forklift("b", &["stack", "-m", "local"]));
+        } else {
+            // The clone's position names a pallet with nothing stacked.
+            let position = area.read_file("b/.forklift/position");
+            let header = position.lines().next().unwrap().to_string();
+            std::fs::write(area.path("b/.forklift/position"), format!("{}\nfresh\n\n", header)).unwrap();
+        }
+
+        let args: &[&str] = if json { &["--json", "lift"] } else { &["lift"] };
+        let failed = area.forklift("b", args);
+        assert!(!failed.status.success(), "{}", stdout(&failed));
+        let said = format!("{}{}", stdout(&failed), stderr(&failed));
+        assert!(said.contains(if diverged { "diverged" } else { "has nothing stacked yet" }), "{}", said);
+        let named = said.contains("the remote now holds @kv ") && said.contains("re-signed under your current key");
+        let printed = stdout(&failed).contains("Re-signed @kv ");
+        assert!(if json || !diverged { named && !printed } else { printed && !named }, "{}: {}", diverged, said);
+        assert_eq!(remote_pallet_head(&server, "@kv"), Some(area.read_file("b/.forklift/meta/kv").trim().to_string()));
+    }
+}
+
+/// Another operator's change from before trust is never re-signed: the lift names it, and keeping
+/// theirs drops it even from a pallet the remote does not hold yet, leaving a signed root with
+/// no cells in place of the unvouched head.
+#[test]
+fn another_operators_pre_trust_change_drops_to_an_empty_signed_root() {
+    let area = TestArea::new("unsigned-meta-empty-root");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/code.txt", "v1\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    // On the clone, someone else tags without a key; then the remote enrolls.
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
+    assert_success(&area.forklift("b", &["config", "set", "operator.identifier", "bob@forklift"]));
+    assert_success(&area.forklift("b", &["tag", "create", "v1.0", "main"]));
+    assert_success(&area.forklift("b", &["config", "unset", "operator.identifier"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "c"]));
+    assert_success(&area.forklift("c", &["office", "enroll"]));
+    assert_success(&area.forklift("c", &["lift"]));
+    assert_success(&area.forklift("b", &["lower"]));
+
+    // With no remote head even dropping the change needs a key, to sign the empty root.
+    assert_success(&area.forklift("b", &["config", "set", "operator.identifier", "bob@forklift"]));
+    let keyless = area.forklift("b", &["lift"]);
+    assert!(!keyless.status.success(), "{}", stdout(&keyless));
+    let said = stderr(&keyless);
+    assert!(said.contains("\"forklift profile keygen\"") && said.contains("\"forklift office admit\""), "{}", said);
+    assert!(!said.contains("--keep"), "{}", said);
+    assert_success(&area.forklift("b", &["config", "unset", "operator.identifier"]));
+
     let refused = area.forklift("b", &["lift"]);
     assert!(!refused.status.success(), "{}", stdout(&refused));
-    assert!(stderr(&refused).contains("after trust was established"), "{}", stderr(&refused));
+    let said = stderr(&refused);
+    assert!(said.contains("The cell v1.0 ") && said.contains("another operator (bob@forklift)"), "{}", said);
+    assert_eq!(remote_pallet_head(&server, "@tags"), None);
+
+    let dropped = area.forklift("b", &["lower", "--keep", "@tags:v1.0=theirs", "--confirm"]);
+    assert_success(&dropped);
+    let root = area.read_file("b/.forklift/meta/tags").trim().to_string();
+    assert_eq!(remote_pallet_head(&server, "@tags"), Some(root));
+    assert!(!stdout(&area.forklift("b", &["tag", "list"])).contains("v1.0"));
+
+    let again = area.forklift("b", &["lift"]);
+    assert_success(&again);
+    assert!(!stdout(&again).contains("@tags"), "{}", stdout(&again));
+    let audit = area.forklift("c", &["lower"]);
+    assert_success(&audit);
+    let audit = area.forklift("c", &["audit", "@tags"]);
+    assert_eq!(audit.status.code(), Some(0), "{}{}", stdout(&audit), stderr(&audit));
 }
 
 #[test]

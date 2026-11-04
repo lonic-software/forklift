@@ -899,7 +899,7 @@ pub(crate) struct LowerReport {
     meta_replayed: Vec<String>,
 
     /// Cells a replay re-signed under the current key, as `<pallet> <path>`: their stamp was
-    /// one of the operator's own older keys.
+    /// one of the operator's own older keys, or the operator's own from before trust.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     meta_restamped: Vec<String>,
 
@@ -1135,7 +1135,7 @@ struct MetaSync {
 }
 
 /// How one diverged meta pallet was reconciled.
-enum Reconciled {
+pub(crate) enum Reconciled {
     /// Replayed onto the remote head and lifted.
     Replayed,
 
@@ -1167,15 +1167,31 @@ async fn sync_meta(client: &RemoteClient,
     // resolution names it. Then it replays onto the remote head like a diverged one, which is
     // how "theirs" drops a local change the remote will not admit (a tag cut by an admin who
     // was demoted before lifting it).
-    let named_ahead = adopt.ahead.iter().filter(|(name, _)| keeps.contains_key(name));
+    // A pallet the remote does not hold yet has no remote side, yet a resolution may name it:
+    // "theirs" there drops local changes from the root parcel the replay stacks in place of the
+    // local chain.
+    let named_ahead = adopt.ahead.iter()
+        .filter(|(name, _)| keeps.contains_key(name))
+        .map(|(name, remote_head)| (name.clone(), Some(remote_head.as_str())));
+    let named_unborn = keeps.keys()
+        .filter(|name| !info.pallets.contains_key(&pallet_utils::PalletRef::meta(name.as_str()).to_wire()))
+        .filter(|name| matches!(pallet_utils::get_meta_pallet_head(name), Ok(Some(_))))
+        .map(|name| (name.clone(), None));
+    let replays: Vec<(String, Option<&str>)> = adopt.diverged.iter()
+        .map(|(name, remote_head)| (name.clone(), Some(remote_head.as_str())))
+        .chain(named_ahead)
+        .chain(named_unborn)
+        .collect();
     let no_keeps = BTreeMap::new();
 
-    for (name, remote_head) in adopt.diverged.iter().chain(named_ahead) {
+    for (name, remote_head) in &replays {
         let wire = pallet_utils::PalletRef::meta(name).to_wire();
         let keep = keeps.get(name).unwrap_or(&no_keeps);
 
         let reconciled = match meta_tree::meta_rules(name) {
-            Some(rules) => replay(client, info, name, rules, remote_head, keep, &mut sync.restamped).await,
+            Some(rules) => {
+                replay(client, info, name, rules, *remote_head, None, "lower", keep, &mut sync.restamped).await
+            }
             None => Err(format!("The @{} pallet diverged from the remote and has no rules to replay it.", name)),
         };
 
@@ -1191,7 +1207,8 @@ async fn sync_meta(client: &RemoteClient,
     // failed for a reason of its own.
     for pallet in keeps.keys() {
         let wire = pallet_utils::PalletRef::meta(pallet).to_wire();
-        let replayed = adopt.diverged.iter().chain(&adopt.ahead).any(|(name, _)| name == pallet);
+        let replayed = replays.iter().any(|(name, _)| name == pallet)
+            || adopt.ahead.iter().any(|(name, _)| name == pallet);
 
         if replayed || sync.failed.iter().any(|failure| failure.pallet == wire) {
             continue;
@@ -1199,10 +1216,6 @@ async fn sync_meta(client: &RemoteClient,
 
         let error = match pallet_utils::get_meta_pallet_head(pallet) {
             Err(error) => error,
-            Ok(Some(_)) if !info.pallets.contains_key(&wire) => format!(
-                "{} is not on the remote yet, so there is no remote side for --keep to keep.",
-                wire
-            ),
             Ok(_) => format!(
                 "{} holds no local change the remote lacks, so there is nothing for --keep to \
                 resolve.",
@@ -1216,23 +1229,39 @@ async fn sync_meta(client: &RemoteClient,
     sync
 }
 
-/// Replay a meta pallet's local net change onto the remote head and lift the result. The
-/// remote's new parcels were verified when they were adopted. The local head moves only once
-/// the remote has accepted the replayed parcel.
-async fn replay(client: &RemoteClient,
-                info: &forklift_core::model::remote::WarehouseInfo,
-                name: &str,
-                rules: &'static dyn PalletRules,
-                remote_head: &str,
-                keep: &BTreeMap<String, KeepSide>,
-                restamped: &mut Vec<String>) -> Result<Reconciled, String> {
+/// Replay a meta pallet's local net change onto the remote head — or, when the remote holds no
+/// head (`None`), as a root parcel — and lift the result. The remote's new parcels were
+/// verified when they were adopted. The local head moves only once the remote has accepted the
+/// replayed parcel. `landed` is `(pallet, head)` for a working pallet lifted just before, which
+/// stands in for the handshake's head of it when a `@haul` merge record waits for it;
+/// `command` is the one to run again once such a record can go.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn replay(client: &RemoteClient,
+                           info: &forklift_core::model::remote::WarehouseInfo,
+                           name: &str,
+                           rules: &'static dyn PalletRules,
+                           remote_head: Option<&str>,
+                           landed: Option<(&str, &str)>,
+                           command: &str,
+                           keep: &BTreeMap<String, KeepSide>,
+                           restamped: &mut Vec<String>) -> Result<Reconciled, String> {
     let wire = pallet_utils::PalletRef::meta(name).to_wire();
     let local = pallet_utils::get_meta_pallet_head(name)?
         .ok_or(format!("{} has no local head to replay.", wire))?;
 
-    let base = meta_tree::linear_common_ancestor(&local, remote_head)?;
+    let base = match remote_head {
+        Some(remote_head) => meta_tree::linear_common_ancestor(&local, remote_head)?,
+        None => None,
+    };
 
-    let plan = match meta_tree::plan_replay(name, rules, base.as_deref(), &local, remote_head, keep) {
+    // Planned under the office alone, so a resolution that drops every local change needs no key;
+    // the office also recognises a local cell the remote already holds re-signed.
+    let office = audit_utils::local_meta_office()?;
+    let planned = meta_tree::plan_replay(
+        name, rules, base.as_deref(), &local, remote_head, office.as_ref().map(|office| &office.state), keep,
+    );
+
+    let plan = match planned {
         Ok(plan) => plan,
         Err(ReplayError::Conflicts(conflicts)) => {
             return Ok(Reconciled::Conflicts(describe_conflicts(&wire, rules, &conflicts)?));
@@ -1241,8 +1270,9 @@ async fn replay(client: &RemoteClient,
     };
 
     // Every local change is on the remote already or dropped by a resolution. Nothing is signed,
-    // so an operator the office no longer lets sign can still drop what the remote refuses.
-    if plan.is_empty() {
+    // so an operator the office no longer lets sign can still drop what the remote refuses. With
+    // no remote head there is nothing to move to: the replay stacks an empty root instead.
+    if let (true, Some(remote_head)) = (plan.is_empty(), remote_head) {
         pallet_utils::update_meta_pallet_head(name, Some(&local), remote_head, &pallet_utils::RefPreconditions::NONE)?;
         return Ok(Reconciled::Adopted);
     }
@@ -1252,7 +1282,10 @@ async fn replay(client: &RemoteClient,
     let local_cells = meta_tree::cells_at(name, &local, rules)?;
 
     if name == haul_utils::HAUL_PALLET_NAME {
-        let remote_target_head = |target: &str| info.pallets.get(target).cloned();
+        let remote_target_head = |target: &str| match landed {
+            Some((pallet, head)) if pallet == target => Some(head.to_string()),
+            _ => info.pallets.get(target).cloned(),
+        };
         let held = haul_utils::held_merges(plan.changes(), local_cells.as_deref(), &remote_target_head)?;
 
         if !held.is_empty() {
@@ -1262,22 +1295,34 @@ async fn replay(client: &RemoteClient,
 
             return Err(format!(
                 "{}. Once the remote's target holds the parcel (an operator who may write it lifts it \
-                there) and this warehouse holds that head ({} fetches it), run \"forklift lower\" \
+                there) and this warehouse holds that head ({} fetches it), run \"forklift {}\" \
                 again; or drop the record with {}.",
-                haul_utils::describe_held(&held), targets.join(" and "), haul_utils::drop_held(&held)
+                haul_utils::describe_held(&held), targets.join(" and "), command, haul_utils::drop_held(&held)
             ));
         }
     }
 
     let actor = config_utils::get_operator()?;
-    let writer = meta_writer(&actor)?;
+    let writer = match office {
+        None => MetaWriter::Unsigned,
+        Some(office) => {
+            let (_, signing_key_id) = office::signing_key_in(&office, &actor)
+                .map_err(|why| no_key_refusal(why, &wire, rules, &plan, remote_head.is_some()))?;
 
-    let description = format!("Replayed the local {} onto the remote's.", wire);
+            MetaWriter::Signed { office, signer: MetaSigner::local(&signing_key_id) }
+        }
+    };
+
+    let description = match remote_head {
+        Some(_) => format!("Replayed the local {} onto the remote's.", wire),
+        None => format!("Replayed the local {} as the remote's first parcel.", wire),
+    };
     let replayed = meta_tree::replay_meta_pallet(name, rules, &writer, &plan, &actor, &description);
 
     let parcel = match replayed {
         Ok(Some(parcel)) => parcel,
         Ok(None) => {
+            let remote_head = remote_head.ok_or(format!("The replay of {} onto no remote head stacked nothing.", wire))?;
             pallet_utils::update_meta_pallet_head(name, Some(&local), remote_head, &pallet_utils::RefPreconditions::NONE)?;
             return Ok(Reconciled::Adopted);
         }
@@ -1292,8 +1337,12 @@ async fn replay(client: &RemoteClient,
     let own = writer.stamp(&actor);
     let mut resigned = Vec::new();
 
+    let remote_cells = match remote_head {
+        Some(remote_head) => meta_tree::cells_at(name, remote_head, rules)?,
+        None => None,
+    };
     let changes = meta_tree::net_diff(
-        meta_tree::cells_at(name, remote_head, rules)?.as_deref(),
+        remote_cells.as_deref(),
         meta_tree::cells_at(name, &parcel, rules)?.as_deref(),
     )?;
 
@@ -1308,7 +1357,15 @@ async fn replay(client: &RemoteClient,
         }
     }
 
-    remote_utils::lift_pallet(client, &wire, &parcel, Some(remote_head), None, info, &Progress::NONE).await?;
+    remote_utils::lift_pallet(client, &wire, &parcel, remote_head, None, info, &Progress::NONE).await?;
+
+    // The remote now holds the re-signed cells whatever happens to the local head, so a refusal
+    // below names them too.
+    let resigned_note = match resigned.is_empty() {
+        true => String::new(),
+        false => format!(" The remote holds {} re-signed under your current key.", resigned.join(", ")),
+    };
+
     // Conditioned on the trust state the replay was written and checked under, as every meta
     // write is. The remote already holds the replay, so a refusal says so rather than "nothing was
     // written".
@@ -1329,22 +1386,47 @@ async fn replay(client: &RemoteClient,
                 Backward { .. } | Deleted { .. } | Incomplete { .. } => {
                     return Err(format!(
                         "{} was lifted to the remote, but this warehouse refused to move its local \
-                        head there. {}",
-                        wire, refused
+                        head there.{} {}",
+                        wire, resigned_note, refused
                     ));
                 }
             };
 
             return Err(format!(
-                "{} was lifted to the remote, but its local head was not moved: {}. Run \"forklift \
+                "{} was lifted to the remote, but its local head was not moved: {}.{} Run \"forklift \
                 lower\" again to catch up.",
-                wire, why
+                wire, why, resigned_note
             ));
         }
     }
     restamped.extend(resigned);
 
     Ok(Reconciled::Replayed)
+}
+
+/// A replay that needs a signing key the operator does not have: the way to get one, and — when
+/// the remote has a head to keep — the resolutions that drop each local change instead.
+fn no_key_refusal(why: String,
+                  wire: &str,
+                  rules: &dyn PalletRules,
+                  plan: &meta_tree::ReplayPlan,
+                  remote_has_head: bool) -> String {
+    let mut next = format!(
+        "Replaying the local {} needs a signing key: create one with \"forklift profile keygen\", \
+        and have an admin run the \"forklift office admit\" it prints",
+        wire
+    );
+
+    if remote_has_head {
+        let keeps: Vec<String> = plan.changes().iter()
+            .map(|change| format!("--keep {}:{}=theirs", wire, rules.display_path(&change.path)))
+            .collect();
+        next.push_str(&format!(
+            "; or drop the local changes with \"forklift lower {} --confirm\"", keeps.join(" ")
+        ));
+    }
+
+    forklift_core::error::append_to_message(why, &format!("{}.", next))
 }
 
 /// Who writes a meta pallet here, by the warehouse's trust state: under trust, the verified office

@@ -104,11 +104,19 @@ head moves.
 
 Diverged heads are not merged. The local net change since the common ancestor is replayed onto
 the remote head as one new parcel, and each replayed cell is re-stamped by the current writer.
-A cell already carrying the writer's own stamp is kept as is. Under trust a key stamp may be
-re-signed only when it resolves to the same operator under a key that is active or was
-retired, never one revoked as compromised; any other re-stamp refuses. Paths that both sides
-changed differently refuse until each is resolved, keeping ours or theirs; keeping theirs at a
-subject resolves every conflict beneath it.
+A cell already carrying the writer's own stamp is kept as is. Under trust a stamp may be
+re-signed only when it resolves to the writer's own operator: an `operator` stamp naming it, or
+a key stamp under one of its keys that is active or was retired, never one revoked as
+compromised; any other re-stamp refuses. A local cell the remote already holds re-signed by
+this rule — same schema and value — is the same change, not a conflict with it. Paths that both
+sides changed differently refuse until each is resolved, keeping ours or theirs; keeping theirs
+at a subject resolves every conflict beneath it.
+
+Under trust, a lift of a meta pallet whose new parcels include an unsigned one outside the
+boundary (metadata recorded before the remote enrolled) replays it the same way instead of
+lifting it, onto the remote head, or as a root parcel when the remote holds none. A replay that
+keeps theirs at every local path onto a remote with no head still stacks that root, with no
+cells, so the signed head replaces the unvouched one.
 
 A server, the serverless head and a client adopting or lowering a pallet on this format run
 `verify_meta_content` in the trust state they hold, from the head they hold. The meta pallet
