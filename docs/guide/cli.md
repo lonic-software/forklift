@@ -349,8 +349,8 @@ inside that folder. Nothing under `.forklift/` can be loaded at all.
 Forklift ships a short `fl` alias (`f` and `l` are both left-hand home row —
 quicker to type than `git`). It is a **shell-agnostic symlink** next to the
 `forklift` binary (a `.cmd` shim on Windows, where a symlink needs elevated
-privilege), not a per-shell alias — it works from scripts, non-interactive
-shells and every shell dialect alike, and one `ls`/`rm` finds or removes it. In PowerShell,
+privilege), not a per-shell alias — it works from scripts and non-interactive
+shells, not only the shell it was set up in, and one `ls`/`rm` finds or removes it. In PowerShell,
 the built-in `fl` alias (`Format-List`) wins over any program named `fl`.
 
 Every installer (the curl script, `pult install`, and `self update` — see
