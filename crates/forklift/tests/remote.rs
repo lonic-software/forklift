@@ -1605,7 +1605,7 @@ fn signed_history_round_trips_and_the_server_audits() {
 }
 
 #[test]
-fn optimistic_lift_auto_merges_a_disjoint_divergence_after_a_complete_load_but_stops_on_overlap() {
+fn optimistic_lift_auto_merges_a_disjoint_divergence_but_stops_on_overlap() {
     let area = TestArea::new("optimistic");
     let server = Server::start(&area, None);
 
@@ -1630,32 +1630,6 @@ fn optimistic_lift_auto_merges_a_disjoint_divergence_after_a_complete_load_but_s
     area.write_file("b/from_b.txt", "b\n");
     assert_success(&area.forklift("b", &["load", "."]));
     assert_success(&area.forklift("b", &["stack", "-m", "b's file"]));
-
-    // But not over an incomplete load. The auto-merge (`lift::try_auto_merge`) calls the same
-    // `merge_head_into_current` `consolidate` and `cherry-pick` do: it writes merge output into
-    // the working inventory and only afterwards records consolidation state, before ever
-    // reaching `stack_utils::stack_parcel`'s own late guard. The up-front guard at the call site
-    // must refuse before any of that runs, exactly like the `consolidate`/`cherry-pick`/`haul
-    // merge` cases in `cli.rs`. A load killed outright partway through its walk is simulated by
-    // its marker (see `load_guard_utils::marker_path_under`'s doc comment for why that is a
-    // faithful stand-in).
-    let marker_path = forklift_core::util::load_guard_utils::marker_path_under(&area.path("b"));
-    std::fs::write(&marker_path, "./\n").unwrap();
-
-    let refused = area.forklift("b", &["--json", "lift"]);
-    assert!(!refused.status.success(), "the lift must refuse, not auto-merge over an incomplete load");
-    assert_eq!(refused.status.code(), Some(20));
-    let value: serde_json::Value = serde_json::from_str(&stdout(&refused)).unwrap();
-    assert_eq!(value["error"]["code"], "incomplete_load");
-    assert!(
-        !area.path("b/.forklift/consolidation").exists(),
-        "the optimistic auto-merge's consolidation state must not be written while an \
-        incomplete load is outstanding"
-    );
-    assert!(!area.path("b/from_a.txt").exists(), "the auto-merge must not have applied anything");
-
-    // Healing the load lets the lift auto-merge normally.
-    std::fs::remove_file(&marker_path).unwrap();
     let lifted = area.forklift("b", &["lift"]);
     assert_success(&lifted);
     assert!(stdout(&lifted).contains("auto-merged"), "{}", stdout(&lifted));
@@ -1681,6 +1655,67 @@ fn optimistic_lift_auto_merges_a_disjoint_divergence_after_a_complete_load_but_s
     assert!(!refused.status.success(), "an overlapping divergence must not auto-merge");
     assert!(stderr(&refused).contains("diverged") && stderr(&refused).contains("pallet create"), "{}", stderr(&refused));
     assert_eq!(area.read_file("b/shared.txt"), "from b\n"); // untouched — no half-merge
+}
+
+/// The optimistic auto-merge (`lift::try_auto_merge`) calls the same shared
+/// `merge_head_into_current` `consolidate` and `cherry-pick` do: it writes real merge output
+/// into the working inventory and only afterwards records consolidation state
+/// (`.forklift/consolidation`), before ever reaching `stack_utils::stack_parcel`'s own late
+/// guard. The up-front guard added at the call site in `lift::try_auto_merge` must refuse
+/// before any of that runs: reverting it makes the state-file assertion below go red, exactly
+/// like the `consolidate`/`cherry-pick`/`haul merge` cases in `cli.rs`.
+#[test]
+fn optimistic_lift_refuses_on_an_incomplete_load_before_writing_consolidation_state() {
+    let area = TestArea::new("optimistic-incomplete-load");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/shared.txt", "base\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "initial"]));
+    assert_success(&area.forklift("a", &["office", "enroll"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
+
+    // A publishes a change to a file only it touches.
+    area.write_file("a/from_a.txt", "a\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "a's file"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    // B, still at the base, stacks a disjoint change of its own — the remote has diverged, and
+    // the change is disjoint, so an ordinary lift would auto-merge (optimistic lift, §7.7).
+    area.write_file("b/from_b.txt", "b\n");
+    assert_success(&area.forklift("b", &["load", "."]));
+    assert_success(&area.forklift("b", &["stack", "-m", "b's file"]));
+
+    // Simulate a load killed outright partway through its walk in B's warehouse (see
+    // `load_guard_utils::marker_path_under`'s doc comment for why this is a faithful stand-in
+    // for a real interrupted load, driven through a spawned `forklift` subprocess).
+    let marker_path = forklift_core::util::load_guard_utils::marker_path_under(&area.path("b"));
+    std::fs::write(&marker_path, "./\n").unwrap();
+
+    let lifted = area.forklift("b", &["--json", "lift"]);
+    assert!(!lifted.status.success(), "the lift must refuse, not auto-merge over an incomplete load");
+    assert_eq!(lifted.status.code(), Some(20));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&lifted)).unwrap();
+    assert_eq!(value["error"]["code"], "incomplete_load");
+
+    // The auto-merge must not have gotten far enough to write its own in-progress state, or to
+    // apply anything to the working directory.
+    assert!(
+        !area.path("b/.forklift/consolidation").exists(),
+        "the optimistic auto-merge's consolidation state must not be written while an \
+        incomplete load is outstanding"
+    );
+    assert!(!area.path("b/from_a.txt").exists(), "the auto-merge must not have applied anything");
+
+    // Healing the load lets the lift auto-merge normally.
+    std::fs::remove_file(&marker_path).unwrap();
+    let healed = area.forklift("b", &["lift"]);
+    assert_success(&healed);
+    assert!(stdout(&healed).contains("auto-merged"), "{}", stdout(&healed));
 }
 
 #[test]
@@ -5218,22 +5253,18 @@ fn a_sparse_franchise_degrades_touches_to_unknown_out_of_scope() {
 fn a_partial_clone_missing_an_unrelated_boundary_head_still_audits_and_reads_the_parcel_as_vouched() {
     // The presence guard, end to end: a distrust boundary can name a head this store never has
     // at all, and that absent head must never turn a parcel a *present* boundary head already
-    // vouches for into "unresolved" — let alone "suspect" — even though `audit_utils`'s own
-    // gap-tolerance is any-gap, not narrowed to interior gaps (PR #121 round 1 tried narrowing
-    // to interior-only and PR #121 round 2 reverted it — see `audit_utils::verify_pallet_
-    // history`'s `boundary_gap` doc: an absent head can genuinely be the thing that would have
-    // vouched for some OTHER parcel, so the walk-wide gap flag has to stay any-gap).
+    // vouches for into "unresolved" — let alone "suspect" — nor make `audit` refuse it, even
+    // though `audit_utils`'s own gap-tolerance is any-gap, not narrowed to interior gaps (see
+    // `audit_utils::verify_pallet_history`'s `boundary_gap` doc: an absent head can genuinely
+    // be the thing that would have vouched for some OTHER parcel, so the walk-wide gap flag has
+    // to stay any-gap).
     //
-    // What actually makes THIS parcel read "vouched" rather than "unresolved" is
-    // `QueryContext::fill_boundary` asking `vouched` before `resolvable` (see that method's
-    // doc): the agent's main-line parcel is vouched by `main`'s own present boundary head
-    // directly, so `vouched` answers `true` regardless of the unrelated, absent `side`-pallet
-    // head elsewhere in the same boundary — `resolvable` is never even consulted for this
-    // parcel. This was `a_partial_clone_missing_a_boundary_head_reads_signer_boundary_as_
-    // unresolved`, which pinned the PRE-REORDER behaviour: `fill_boundary` used to ask
-    // `resolvable` unconditionally, so a single absent head anywhere in the boundary — however
-    // irrelevant to this parcel — made every parcel under that key read "unresolved". The
-    // fixture is unchanged; only the assertions invert.
+    // What actually keeps THIS parcel vouched is that both readers ask `vouched` before they
+    // ask about gaps: `QueryContext::fill_boundary` asks it before `resolvable`, and
+    // `verify_pallet_history`'s `DistrustBoundary` arm consults `unresolved_head` only when
+    // `vouched` is false. The agent's main-line parcel is vouched by `main`'s own present
+    // boundary head directly, so `vouched` answers `true` regardless of the unrelated, absent
+    // `side`-pallet head elsewhere in the same boundary, and the gap is never consulted.
     //
     // Construction note (a deviation from the original sketch, which tried to manufacture
     // this by un-stacking a side-pallet parcel with `undo` *after* retiring past it): a
@@ -5274,8 +5305,8 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_audits_and_reads_the
         "--agent", "--supervisor", "tester@forklift",
     ]));
 
-    // The agent's main-line parcel — this is the one whose boundary classification the test
-    // actually checks. It stays reachable from `main` throughout.
+    // The agent's main-line parcel — this is the one whose boundary classification and audit
+    // the test checks. It stays reachable from `main` throughout.
     assert_success(&area.forklift("dev", &["config", "set", "operator.identifier", "agent@forklift"]));
     area.write_file("dev/agent-main.txt", "agent main work\n");
     assert_success(&area.forklift("dev", &["load", "agent-main.txt"]));
@@ -8582,6 +8613,8 @@ fn a_sparse_audit_states_its_boundary_and_re_verifies_in_scope_content() {
     let tampered = area.forklift("sparse", &["audit"]);
     assert!(!tampered.status.success(),
         "a corrupted in-scope tree must fail the sparse audit: {}", stdout(&tampered));
+    assert!(stderr(&tampered).contains(&api_tree),
+        "the refusal must name the tampered tree, not some other damage: {}", stderr(&tampered));
 }
 
 #[test]

@@ -202,10 +202,12 @@ machine does not tell you what Windows will take.
   so tests cannot share a fixture: two tests that build the same state to check different
   things about it pay for the whole build twice. Build it once and make every check in
   that test. Put the checks that only read the state first, and the ones that damage it
-  last, undoing each damage before the next so that every failure has one cause. The five
-  sparse-audit tests in `remote.rs` each built the same signed warehouse and sparse clone,
-  and took 16 s together on Windows. Keep tests apart when their states diverge early, or
-  when a failure in one check would hide a failure in the other.
+  last, undoing each damage before the next so that every failure has one cause.
+  `a_sparse_audit_states_its_boundary_and_re_verifies_in_scope_content` in `remote.rs`
+  replaced five tests that each built the same signed warehouse and sparse clone. Keep
+  tests apart when a check changes the state a later one needs to see fresh: a refused
+  command that has already fetched from the remote, for instance, leaves the next command
+  a different starting point than a first contact would.
 - **Crash at each step, not at a random time.** To test what a crash leaves behind, stop
   the command before each of its renames in turn with `FORKLIFT_DEBUG_CRASH_AT_RENAME`
   (see `crash_at_every_rename` in `crash_consistency.rs`). Killing it after a guessed
