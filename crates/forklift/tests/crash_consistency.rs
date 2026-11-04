@@ -61,9 +61,8 @@ impl Area {
     }
 
     /// Run a command that sets up or checks the state the command under test runs on, with fsync
-    /// off. Those commands always run to completion, so a sync changes nothing they leave behind,
-    /// and on the Windows runner the syncs of the crash tests' many setup and check commands were
-    /// most of their time.
+    /// off. Those commands always run to completion, so a sync changes nothing they leave behind;
+    /// the crash tests run several of them at every crash point, and each would pay for its syncs.
     fn run(&self, args: &[&str]) -> Output {
         self.command_with_fsync(args, "0").output().unwrap()
     }
