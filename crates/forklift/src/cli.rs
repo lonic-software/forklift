@@ -426,8 +426,13 @@ pub enum Command {
                       that pallet and creates or fast-forwards its ref alone: this bay, its files \
                       and its inventory stay where they are, and \"forklift shift\" moves onto it. On first \
                       contact with a trusted remote its trust anchor is adopted (one-way, like \
-                      \"forklift office enroll\"), and the adopted genesis is reported. A diverged pallet is \
-                      reported, never merged implicitly. A diverged metadata pallet (@kv, @tags, \
+                      \"forklift office enroll\"), and the adopted genesis is reported. When the current \
+                      pallet has diverged from the remote, the remote's head is merged in and the \
+                      merge stacked; a merge that conflicts stops with a merge_conflicts error (exit \
+                      47) and the consolidation in progress, which \"forklift stack\" completes and \
+                      \"forklift abort\" abandons. Changes to tracked files refuse that merge with a \
+                      conflict error (exit 4). A named pallet that diverged is refused, naming the \
+                      shift onto it. A diverged metadata pallet (@kv, @tags, \
                       @manifest, @haul) replays the local changes onto the remote's; paths both \
                       sides changed refuse the lower with a meta_conflict error (exit 24) naming \
                       every pallet, path and both sides, until --keep resolves each one."
@@ -480,8 +485,8 @@ pub enum Command {
                          opens the warehouse's metadata folder (.forklift, at any depth): stack a \
                          parcel on it that removes every such name, and stand it wherever the lower \
                          would have stood the head; \"forklift lift\" then publishes it. Where the \
-                         local pallet holds parcels the remote lacks, the repair goes on a new pallet \
-                         <pallet>-remote-<hash> to consolidate. A head with nothing to repair lowers \
+                         local pallet holds parcels the remote lacks, the repair is merged into it as \
+                         a diverged lower merges the remote's head. A head with nothing to repair lowers \
                          as usual. Refused in a sparse warehouse, which never holds the whole tree."
         )]
         repair: bool,

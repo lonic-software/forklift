@@ -17,7 +17,7 @@ Exit code 17 is reserved for a future feature and is not yet assigned to any cod
 | `error` | 1 | Anything without a more specific classification yet |
 | `usage` | 2 | The command line could not be parsed (an unknown command, a missing or invalid argument) |
 | `not_a_warehouse` | 3 | The command needs a warehouse; this directory is none |
-| `conflict` | 4 | Working state blocks the operation (unresolved / dirty) |
+| `conflict` | 4 | Changes to tracked files block the operation, which would write over them; nothing was changed |
 | `diverged` | 5 | The local pallet and the remote's both hold parcels the other lacks; nothing was lifted or lowered |
 | `warehouse_locked` | 6 | Another forklift process holds the warehouse lock |
 | `out_of_scope` | 7 | A path argument is outside a scoped (sparse) bay's scope |
@@ -59,4 +59,5 @@ Exit code 17 is reserved for a future feature and is not yet assigned to any cod
 | `warehouse_lease_missing` | 44 | The warehouse's format lease file is missing and this user cannot create it; create it, or restore write access |
 | `warehouse_in_use` | 45 | An upgrade found the warehouse open in another process; let it finish, then run the upgrade again |
 | `head_not_materializable` | 46 | The remote's head of the pallet holds an entry named like the warehouse's metadata folder, so it cannot be checked out; nothing was changed |
+| `merge_conflicts` | 47 | Lowering merged the remote's diverged head in, and the merge conflicts; the consolidation is left in progress |
 

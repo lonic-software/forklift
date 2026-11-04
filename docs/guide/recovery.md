@@ -147,18 +147,25 @@ The remote holds parcels you have not lowered, and you have nothing new. Run `fo
 
 ### `diverged` (exit 5)
 
-You and the remote both hold parcels the other lacks, and they do not merge by themselves. Nothing
-was lifted or lowered. The message spells out the exact commands, with the hash filled in:
+You and the remote both hold parcels the other lacks, and `lift` could not merge them by itself.
+Nothing was lifted. Merge the remote's head in, then publish the merge:
 
 ```sh
-forklift pallet create main-remote-<hash> <hash>   # the remote's head, as its own pallet; moves you onto it
-forklift shift main
-forklift consolidate main-remote-<hash>            # resolve any conflicts, load them, then stack
+forklift lower    # merges the remote's head into your pallet and stacks the merge
 forklift lift
 ```
 
-`consolidate` exits 0 even when it stops at conflicts, so read what it prints. **Do not** look for a
-force option: the wire is fast-forward only.
+If the merge conflicts, `lower` stops with `merge_conflicts` (exit 47). **Do not** look for a force
+option: the wire is fast-forward only. A `lower <pallet>` of a pallet this bay is not on refuses as
+`diverged` instead, naming `forklift shift <pallet>` first.
+
+### `merge_conflicts` (exit 47)
+
+`lower` merged the remote's diverged head into your pallet, and both sides changed the same paths.
+The error's `details.paths` lists them, and the consolidation stays in progress, as a conflicting
+`consolidate` leaves it. Resolve each path, `forklift load` it, then `forklift stack` to complete
+the merge and `forklift lift` to publish it. `forklift abort` abandons the merge and puts your
+pallet back as it was.
 
 ### `head_not_materializable` (exit 46)
 
@@ -172,8 +179,8 @@ forklift lift
 ```
 
 The repair is a parcel stacked on the remote's head that removes every such entry. If your pallet
-holds parcels the remote's head lacks, they are kept: the repair goes on a new pallet and the lower
-refuses as `diverged`, naming the `forklift consolidate` and `forklift lift` to run. A sparse
+holds parcels the remote's head lacks, they are kept: the lower merges the repair into your pallet,
+as it merges a diverged head. A sparse
 warehouse cannot build the repair, so it names `forklift clone <url> <directory> --repair` into a new
 directory. A clone refused this way reports `clone_incomplete` with this code as its cause: resume
 it with `--repair` (the command its next step names), or with another `--pallet`, or with an `--only`
@@ -336,8 +343,9 @@ A checkout still uses that path. Narrow that checkout first, as the message says
 
 ### `conflict` (exit 4)
 
-Your working state blocks this: unresolved conflicts, or changes the command would overwrite. Run
-`forklift stocktake` to see which. Finish with `load` and `stack`, set the work aside with
+Your working state blocks this: unresolved conflicts, or changes to tracked files the command would
+overwrite (a `consolidate`, or a `lower` merging a diverged head). Run `forklift stocktake` to see
+which. Finish with `load` and `stack`, set the work aside with
 `forklift park`, or discard it with `forklift restore`.
 
 ### `confirmation_required` (exit 39)
