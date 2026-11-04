@@ -1,9 +1,9 @@
-//! Meta pallets as signed state trees.
+//! Meta pallets as attributed state trees.
 //!
 //! A meta pallet works the way the office already does: each parcel's tree is the
 //! pallet's complete current state, so reading the state means reading the head parcel's tree
 //! and nothing else. The chain is linear (every parcel has at most one parent), and a write
-//! stacks one signed parcel on the head.
+//! stacks one parcel on the head: signed under trust, unsigned in a warehouse that never enrolled.
 //!
 //! The tree keeps the `.forklift/tracked/` spine (so the content guard still refuses to
 //! materialize a meta parcel into a working copy), and under it sit exactly two entries:
@@ -12,14 +12,17 @@
 //! - `cells/`, the state, omitted when empty. A cell is one blob at a pallet-defined path, and
 //!   the path is the cell's identity.
 //!
-//! A cell blob is a TOML envelope: `signer` (the key id of whoever wrote the value), `schema`
-//! (a short name for the value's shape) and a `[value]` table. The envelope carries no time —
-//! the time is the parcel's — so one signer writing one value always produces the same bytes.
+//! A cell blob is a TOML envelope: exactly one stamp naming whoever wrote the value — `signer`
+//! (a key id) or `operator` (an operator identifier, for a value written without a key) — then
+//! `schema` (a short name for the value's shape) and a `[value]` table. The envelope carries no
+//! time — the time is the parcel's — so one writer writing one value always produces the same
+//! bytes.
 //!
-//! The signer stamp is trustworthy only because every parcel passes [`verify_meta_content`]:
-//! a parcel may add or change only cells stamped with its own, verified, signing key. Over a
-//! linear chain that is an induction — every cell at a verified head names the key of the
-//! parcel that last wrote that path.
+//! The stamp is trustworthy only as far as [`verify_meta_content`] makes it: a parcel may add or
+//! change only cells stamped with its own attribution — its verified signing key, or, for an
+//! unsigned parcel, the operator its own actions name. Over a linear chain that is an induction —
+//! every cell at a checked head names the attribution of the parcel that last wrote that path. A
+//! key stamp is forge-proof; an operator stamp is only as honest as the operator who declared it.
 //!
 //! Divergence is reconciled without merge parcels: [`detect_conflicts`] walks base, ours and
 //! theirs and names every path both sides changed differently, [`plan_replay`] plans the local
@@ -43,6 +46,7 @@ use crate::model::parcel_action::ParcelAction;
 use crate::model::tree_item::TreeItem;
 use crate::util::audit_utils::{self, DistrustBoundaryMemo, SignatureTrust, VerifiedOffice};
 use crate::util::office_utils::{KeyRecord, OfficeState, RevocationReason, TrustAnchor};
+use crate::util::pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions};
 use crate::util::sign_utils::ParcelSignature;
 use crate::util::{haul_utils, kv_utils, manifest_utils, object_utils, office_utils, pallet_utils, sign_utils, tag_utils};
 
@@ -60,8 +64,9 @@ const TREE_NAME_CELLS: &str = "cells";
 const FORMAT_PREFIX: &str = "forklift-meta";
 const FORMAT_VERSION: u32 = 1;
 
-/// The cell envelope's three fields — and the only three it may have.
+/// The cell envelope's fields: exactly one of the two stamps, then the schema and the value.
 const FIELD_SIGNER: &str = "signer";
+const FIELD_OPERATOR: &str = "operator";
 const FIELD_SCHEMA: &str = "schema";
 const FIELD_VALUE: &str = "value";
 
@@ -186,11 +191,40 @@ pub fn validate_cell_path(path: &str) -> Result<(), String> {
     path.split('/').try_for_each(validate_component)
 }
 
+/// Who a cell names as the writer of its value.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Stamp {
+    /// The key id of the key that signed the parcel which wrote the value.
+    Signer(String),
+
+    /// The operator identifier an unsigned parcel declared: the value was written without a key.
+    Operator(String),
+}
+
+impl Stamp {
+    /// The key id, for a key stamp.
+    pub fn key_id(&self) -> Option<&str> {
+        match self {
+            Stamp::Signer(key_id) => Some(key_id),
+            Stamp::Operator(_) => None,
+        }
+    }
+
+    /// The operator the stamp names: a key's operator as `office` records it (the key id when
+    /// the office does not know the key), or the declared identifier.
+    pub fn operator_in(&self, office: &OfficeState) -> String {
+        match self {
+            Stamp::Signer(key_id) => office.find_key(key_id).map(|key| key.operator.clone()).unwrap_or(key_id.clone()),
+            Stamp::Operator(identifier) => identifier.clone(),
+        }
+    }
+}
+
 /// A parsed cell envelope.
 #[derive(Clone, Debug)]
 pub struct CellEnvelope {
-    /// The key id of whoever wrote this value.
-    pub signer: String,
+    /// Who wrote this value.
+    pub stamp: Stamp,
 
     /// The value's shape, for example `kv.text 1`.
     pub schema: String,
@@ -199,11 +233,16 @@ pub struct CellEnvelope {
     pub value: Table,
 }
 
-/// Encode a cell envelope. Deterministic: the same signer, schema and value always give the
+/// Encode a cell envelope. Deterministic: the same stamp, schema and value always give the
 /// same bytes, which is what lets the sync walk read identical cells as agreement.
-pub fn encode_cell(signer: &str, schema: &str, value: &Table) -> Vec<u8> {
+pub fn encode_cell(stamp: &Stamp, schema: &str, value: &Table) -> Vec<u8> {
     let mut document = DocumentMut::new();
-    document.insert(FIELD_SIGNER, toml_edit::value(signer));
+
+    match stamp {
+        Stamp::Signer(key_id) => document.insert(FIELD_SIGNER, toml_edit::value(key_id)),
+        Stamp::Operator(identifier) => document.insert(FIELD_OPERATOR, toml_edit::value(identifier)),
+    };
+
     document.insert(FIELD_SCHEMA, toml_edit::value(schema));
 
     let mut value = value.clone();
@@ -213,8 +252,8 @@ pub fn encode_cell(signer: &str, schema: &str, value: &Table) -> Vec<u8> {
     document.to_string().into_bytes()
 }
 
-/// Parse a cell envelope, strictly: exactly the three fields, a 64-hex signer, a non-empty
-/// schema string and a `[value]` table.
+/// Parse a cell envelope, strictly: exactly one stamp — a 64-hex `signer` or a non-empty
+/// `operator` — a non-empty schema string and a `[value]` table, and no other field.
 pub fn parse_cell(bytes: &[u8]) -> Result<CellEnvelope, String> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| "the cell is not valid UTF-8".to_string())?;
@@ -223,18 +262,32 @@ pub fn parse_cell(bytes: &[u8]) -> Result<CellEnvelope, String> {
         .map_err(|error: toml_edit::TomlError| format!("the cell is not valid TOML ({})", error.message()))?;
 
     if let Some((key, _)) = document.iter()
-        .find(|(key, _)| ![FIELD_SIGNER, FIELD_SCHEMA, FIELD_VALUE].contains(key)) {
+        .find(|(key, _)| ![FIELD_SIGNER, FIELD_OPERATOR, FIELD_SCHEMA, FIELD_VALUE].contains(key)) {
         return Err(format!("the cell has an unexpected field \"{}\"", key));
     }
 
-    let signer = match document.get(FIELD_SIGNER) {
-        Some(item) => item.as_str().ok_or("the cell's signer is not a string".to_string())?,
-        None => return Err("the cell names no signer".to_string()),
-    };
+    let stamp = match (document.get(FIELD_SIGNER), document.get(FIELD_OPERATOR)) {
+        (Some(_), Some(_)) => return Err("the cell names both a signer and an operator".to_string()),
+        (None, None) => return Err("the cell names no signer and no operator".to_string()),
+        (Some(item), None) => {
+            let signer = item.as_str().ok_or("the cell's signer is not a string".to_string())?;
 
-    if signer.len() != 64 || !signer.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) {
-        return Err(format!("the cell's signer \"{}\" is not a key id", signer));
-    }
+            if signer.len() != 64 || !signer.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) {
+                return Err(format!("the cell's signer \"{}\" is not a key id", signer));
+            }
+
+            Stamp::Signer(signer.to_string())
+        }
+        (None, Some(item)) => {
+            let operator = item.as_str().ok_or("the cell's operator is not a string".to_string())?;
+
+            if operator.is_empty() {
+                return Err("the cell's operator is empty".to_string());
+            }
+
+            Stamp::Operator(operator.to_string())
+        }
+    };
 
     let schema = match document.get(FIELD_SCHEMA) {
         Some(item) => item.as_str().ok_or("the cell's schema is not a string".to_string())?,
@@ -251,7 +304,7 @@ pub fn parse_cell(bytes: &[u8]) -> Result<CellEnvelope, String> {
         None => return Err("the cell has no value table".to_string()),
     };
 
-    Ok(CellEnvelope { signer: signer.to_string(), schema: schema.to_string(), value })
+    Ok(CellEnvelope { stamp, schema: schema.to_string(), value })
 }
 
 /// The per-pallet half of the content check, and of reading. Each meta pallet supplies
@@ -312,16 +365,45 @@ pub enum Admission {
     Audit,
 }
 
+/// Who wrote a parcel, as the content check established it.
+#[derive(Clone, Copy)]
+pub enum Attribution<'a> {
+    /// The office key that signed the parcel, verified.
+    Signed(&'a KeyRecord),
+
+    /// The parcel carries no signature: the operator its Author and Stack actions both name.
+    /// Only as honest as that operator.
+    Declared(&'a str),
+}
+
+impl<'a> Attribution<'a> {
+    /// The operator the parcel is attributed to: the signing key's operator, or the declared one.
+    pub fn operator(&self) -> &'a str {
+        match self {
+            Attribution::Signed(key) => &key.operator,
+            Attribution::Declared(identifier) => identifier,
+        }
+    }
+
+    /// The stamp every cell the parcel writes must carry.
+    fn stamp(&self) -> Stamp {
+        match self {
+            Attribution::Signed(key) => Stamp::Signer(key.key_id.clone()),
+            Attribution::Declared(identifier) => Stamp::Operator(identifier.to_string()),
+        }
+    }
+}
+
 /// Everything a pallet's rules see about one parcel.
 pub struct ParcelChange<'a> {
     /// The parcel's hash.
     pub parcel: &'a str,
 
-    /// The verified key that signed it.
-    pub signer: &'a KeyRecord,
+    /// Who wrote it.
+    pub attribution: Attribution<'a>,
 
-    /// The office it was verified against.
-    pub office: &'a OfficeState,
+    /// The office it was checked against, or `None` in a warehouse that never enrolled.
+    pub office: Option<&'a OfficeState>,
 
     /// The parent's `cells/` tree (`None` for a root parcel or an empty parent).
     pub parent_cells: Option<&'a str>,
@@ -336,6 +418,19 @@ pub struct ParcelChange<'a> {
     pub admission: Admission,
 }
 
+impl<'a> ParcelChange<'a> {
+    /// The office a rule about the writer's current role is checked against, with the operator
+    /// whose role it is. `None` when no role rule applies: adopted history (a role may have
+    /// changed since), no office, or an unsigned parcel — which has no role to check, before
+    /// trust or as history from before it.
+    pub fn role_check(&self) -> Option<(&'a OfficeState, &'a str)> {
+        match (self.admission, self.office, self.attribution) {
+            (Admission::Admit, Some(office), Attribution::Signed(key)) => Some((office, &key.operator)),
+            _ => None,
+        }
+    }
+}
+
 /// One cell as a reader sees it. A bad cell never stops the others from reading.
 #[derive(Clone, Debug)]
 pub enum CellRead {
@@ -344,7 +439,7 @@ pub enum CellRead {
 
     /// A well-formed cell whose schema this build does not know — written by a newer forklift.
     Unknown {
-        signer: String,
+        stamp: Stamp,
         schema: String,
     },
 
@@ -463,10 +558,10 @@ impl CellEdit {
 }
 
 /// Encode and store a cell, and return the edit that sets it.
-pub fn set_cell(path: &str, signer: &str, schema: &str, value: &Table) -> Result<CellEdit, String> {
+pub fn set_cell(path: &str, stamp: &Stamp, schema: &str, value: &Table) -> Result<CellEdit, String> {
     Ok(CellEdit::Set {
         path: path.to_string(),
-        blob: store_blob(&encode_cell(signer, schema, value))?,
+        blob: store_blob(&encode_cell(stamp, schema, value))?,
     })
 }
 
@@ -493,6 +588,73 @@ impl<'a> MetaSigner<'a> {
     pub fn new(key_id: &str,
                sign: impl Fn(&str) -> Result<ParcelSignature, String> + 'a) -> MetaSigner<'a> {
         MetaSigner { key_id: key_id.to_string(), sign: Box::new(sign) }
+    }
+}
+
+/// Who writes a meta parcel, by the trust state of the warehouse writing it.
+pub enum MetaWriter<'a> {
+    /// The warehouse holds trust: the parcel is signed, and checked against the verified office.
+    Signed {
+        office: VerifiedOffice,
+        signer: MetaSigner<'a>,
+    },
+
+    /// The warehouse never enrolled (no anchor, an unborn office): the parcel carries no
+    /// signature and its cells are stamped with the writing operator.
+    Unsigned,
+}
+
+impl<'a> MetaWriter<'a> {
+    /// The verified office, for a signed writer.
+    pub fn office(&self) -> Option<&VerifiedOffice> {
+        match self {
+            MetaWriter::Signed { office, .. } => Some(office),
+            MetaWriter::Unsigned => None,
+        }
+    }
+
+    /// The stamp the cells this writer writes for `actor` carry.
+    pub fn stamp(&self, actor: &Operator) -> Stamp {
+        match self {
+            MetaWriter::Signed { signer, .. } => Stamp::Signer(signer.key_id.clone()),
+            MetaWriter::Unsigned => Stamp::Operator(actor.identifier.clone()),
+        }
+    }
+
+    /// The operator a parcel this writer stacks for `actor` is attributed to: the signing key's
+    /// operator in the office, or the actor itself when unsigned.
+    pub fn operator(&self, actor: &Operator) -> Result<String, String> {
+        match self {
+            MetaWriter::Signed { office, signer } => office.find_key(&signer.key_id)
+                .map(|key| key.operator.clone())
+                .ok_or(format!("The signing key {} is not tracked in the office.", signer.key_id)),
+            MetaWriter::Unsigned => Ok(actor.identifier.clone()),
+        }
+    }
+
+    /// The preconditions a head this writer moves lands under: the office it was judged against
+    /// still standing, or — unsigned — still no anchor and still no office, so a concurrent
+    /// enroll refuses the unsigned write rather than landing it under trust.
+    pub fn preconditions(&self) -> RefPreconditions {
+        match self {
+            MetaWriter::Signed { office, .. } => office.preconditions(),
+            MetaWriter::Unsigned => RefPreconditions {
+                office: OfficePrecondition::At(None),
+                anchor: AnchorPrecondition::Absent,
+                pallets: PalletsPrecondition::NotConsumed,
+            },
+        }
+    }
+
+    fn signer(&self) -> Option<&MetaSigner<'a>> {
+        match self {
+            MetaWriter::Signed { signer, .. } => Some(signer),
+            MetaWriter::Unsigned => None,
+        }
+    }
+
+    fn office_state(&self) -> Option<&OfficeState> {
+        self.office().map(|office| &office.state)
     }
 }
 
@@ -1064,7 +1226,7 @@ fn collect_cells(path: &str,
 fn classify_cell(bytes: &[u8], rules: &dyn PalletRules) -> CellRead {
     match parse_cell(bytes) {
         Ok(envelope) if rules.knows_schema(&envelope.schema) => CellRead::Readable(envelope),
-        Ok(envelope) => CellRead::Unknown { signer: envelope.signer, schema: envelope.schema },
+        Ok(envelope) => CellRead::Unknown { stamp: envelope.stamp, schema: envelope.schema },
         Err(why) => CellRead::Malformed(why),
     }
 }
@@ -1084,12 +1246,13 @@ fn store_meta_tree(format_marker: &[u8], cells: Option<&str>) -> Result<String, 
     store_level(&root)
 }
 
-/// Build, store and sign one parcel over a tree. It does not move any head.
-fn stack_signed_parcel(tree_hash: String,
-                       parents: Vec<String>,
-                       actor: &Operator,
-                       description: &str,
-                       signer: &MetaSigner) -> Result<String, String> {
+/// Build and store one parcel over a tree, signed when a signer is given. It does not move any
+/// head.
+fn stack_meta_parcel(tree_hash: String,
+                     parents: Vec<String>,
+                     actor: &Operator,
+                     description: &str,
+                     signer: Option<&MetaSigner>) -> Result<String, String> {
     let timestamp = Utc::now();
 
     let parcel = Parcel {
@@ -1115,6 +1278,10 @@ fn stack_signed_parcel(tree_hash: String,
     let mut object = LooseObjectBuilder::build_parcel(&parcel);
     object.store()?;
 
+    let Some(signer) = signer else {
+        return Ok(object.hash);
+    };
+
     let signature = (signer.sign)(&object.hash)?;
 
     if signature.key_id != signer.key_id {
@@ -1129,26 +1296,25 @@ fn stack_signed_parcel(tree_hash: String,
     Ok(object.hash)
 }
 
-/// Apply edits to a meta pallet's local head and stack the result as one signed parcel, then
-/// move the head. The new parcel passes [`verify_meta_content`] before the head moves, so a
+/// Apply edits to a meta pallet's local head and stack the result as one parcel by `writer`,
+/// then move the head. The new parcel passes [`verify_meta_content`] before the head moves, so a
 /// write can never leave a head its own reader would refuse — and the head moves only while the
-/// office it was checked against still stands (its head and the trust anchor), so a key retired
-/// or a re-genesis in another bay meanwhile refuses the write rather than landing one. Writes
-/// edit only the paths they name: every other cell, including ones this build cannot read, is
-/// carried through byte for byte. The caller holds the warehouse lock.
+/// trust state it was checked against still stands ([`MetaWriter::preconditions`]), so a key
+/// retired, a re-genesis in another bay, or an enroll meanwhile refuses the write rather than
+/// landing one. Writes edit only the paths they name: every other cell, including ones this
+/// build cannot read, is carried through byte for byte. The caller holds the warehouse lock.
 ///
 /// # Returns
 /// * `Ok(Some(hash))` - The new head.
 /// * `Ok(None)`       - The edits changed nothing, so nothing was stacked.
 /// * `Err(String)`    - If the head cannot be read, an edit is refused, the parcel fails
-///                      the content check, or the head or the office moved meanwhile.
+///                      the content check, or the head or the trust state moved meanwhile.
 pub fn stack_meta_edits(pallet: &str,
                         rules: &dyn PalletRules,
-                        office: &VerifiedOffice,
+                        writer: &MetaWriter,
                         edits: &[CellEdit],
                         actor: &Operator,
-                        description: &str,
-                        signer: &MetaSigner) -> Result<Option<String>, String> {
+                        description: &str) -> Result<Option<String>, String> {
     let head = pallet_utils::get_meta_pallet_head(pallet)?;
 
     let cells = match &head {
@@ -1163,10 +1329,10 @@ pub fn stack_meta_edits(pallet: &str,
     }
 
     let tree = store_meta_tree(rules.kind().format_marker().as_bytes(), new_cells.as_deref())?;
-    let parcel = stack_signed_parcel(tree, head.iter().cloned().collect(), actor, description, signer)?;
+    let parcel = stack_meta_parcel(tree, head.iter().cloned().collect(), actor, description, writer.signer())?;
 
-    verify_meta_content(pallet, rules, office, Admission::Admit, head.as_deref(), &parcel)?;
-    pallet_utils::update_meta_pallet_head(pallet, head.as_deref(), &parcel, &office.preconditions())?;
+    verify_meta_content(pallet, rules, writer.office_state(), Admission::Admit, head.as_deref(), &parcel)?;
+    pallet_utils::update_meta_pallet_head(pallet, head.as_deref(), &parcel, &writer.preconditions())?;
 
     Ok(Some(parcel))
 }
@@ -1175,10 +1341,12 @@ pub fn stack_meta_edits(pallet: &str,
 /// `new_head` must
 ///
 /// - (a) have at most one parent, and descend from `old_head`;
-/// - (b) carry a signature that verifies against its key in the office, and, if that key is
-///   revoked, lie inside the revocation's distrust boundary;
+/// - (b) be attributed by the trust state `office` stands for. With an office, it carries a
+///   signature that verifies against its key in the office and, if that key is revoked, lies
+///   inside the revocation's distrust boundary. With none — a warehouse that never enrolled — it
+///   carries no signature, and its Author and Stack actions name one operator;
 /// - (c) stamp every cell it adds or changes, relative to its parent (the empty tree for a
-///   root), with that same key;
+///   root), with that attribution: the signing key, or the declared operator;
 /// - (d) keep its parent's format marker, which must be the one these rules name;
 /// - (e) write only envelopes that parse, in a canonical tree (valid names, plain cell blobs,
 ///   no empty subtrees);
@@ -1191,7 +1359,7 @@ pub fn stack_meta_edits(pallet: &str,
 /// `old_head` is a head that already passed this check.
 pub fn verify_meta_content(pallet: &str,
                            rules: &dyn PalletRules,
-                           office: &OfficeState,
+                           office: Option<&OfficeState>,
                            admission: Admission,
                            old_head: Option<&str>,
                            new_head: &str) -> Result<(), String> {
@@ -1236,7 +1404,11 @@ pub fn verify_meta_content(pallet: &str,
     let mut distrust_boundaries = DistrustBoundaryMemo::new();
 
     for (hash, parcel) in &chain {
-        let signer = verify_meta_signature(pallet, hash, office, &mut distrust_boundaries)?;
+        let attribution = match office {
+            Some(office) => Attribution::Signed(verify_meta_signature(pallet, hash, office, &mut distrust_boundaries)?),
+            None => declared_attribution(pallet, hash, parcel)?,
+        };
+        let stamp = attribution.stamp();
 
         let spine = match read_spine(&parcel.tree_hash)? {
             Ok(spine) => spine,
@@ -1278,19 +1450,18 @@ pub fn verify_meta_content(pallet: &str,
                 "Parcel {} on @{} writes a malformed cell at {}: {}.", hash, pallet, change.path, why
             ))?;
 
-            if envelope.signer != signer.key_id {
+            if envelope.stamp != stamp {
                 return Err(format!(
-                    "Parcel {} on @{} writes the cell {} stamped with key {}, but the parcel is \
-                    signed with key {}. A parcel may only write cells stamped with its own \
-                    signing key.",
-                    hash, pallet, change.path, envelope.signer, signer.key_id
+                    "Parcel {} on @{} writes the cell {} stamped {}, but the parcel is {}. A \
+                    parcel may only write cells stamped with its own writer.",
+                    hash, pallet, change.path, describe_stamp(&envelope.stamp), describe_writer(&attribution)
                 ));
             }
         }
 
         rules.check(&ParcelChange {
             parcel: hash,
-            signer,
+            attribution,
             office,
             parent_cells: parent_cells.as_deref(),
             cells: spine.cells.as_deref(),
@@ -1304,27 +1475,77 @@ pub fn verify_meta_content(pallet: &str,
     Ok(())
 }
 
-/// The content check for a meta pallet's update on a store that holds the office: the
-/// office chain must verify against the anchor, and the pallet's new parcels against that
-/// office. A meta pallet exists only under an office, so a missing anchor or an unborn
-/// office refuses rather than skipping the check. Returns the verified office.
+/// The content check for a meta pallet's update, by the store's trust state. With an anchor and
+/// an office, the office chain must verify against the anchor and the pallet's new parcels
+/// against that office. With neither — a store that never enrolled — the new parcels must be
+/// unsigned. An anchor without an office, or an office without an anchor, refuses rather than
+/// skipping the check. Returns the verified office, if there is one.
 pub fn verify_meta_update(pallet: &str,
-                               rules: &dyn PalletRules,
-                               admission: Admission,
-                               anchor: Option<&TrustAnchor>,
-                               office_head: Option<&str>,
-                               old_head: Option<&str>,
-                               new_head: &str) -> Result<OfficeState, String> {
-    let (Some(anchor), Some(office_head)) = (anchor, office_head) else {
-        return Err(format!(
-            "@{} needs an office: establish trust and lift the office before syncing it.", pallet
-        ));
+                          rules: &dyn PalletRules,
+                          admission: Admission,
+                          anchor: Option<&TrustAnchor>,
+                          office_head: Option<&str>,
+                          old_head: Option<&str>,
+                          new_head: &str) -> Result<Option<OfficeState>, String> {
+    let office = match (anchor, office_head) {
+        (Some(anchor), Some(office_head)) => Some(audit_utils::verify_office_chain_memoized(anchor, office_head)?),
+        (None, None) => None,
+        (Some(_), None) => return Err(format!(
+            "@{} cannot be checked: trust is established but the office is unborn. Lift the \
+            office before syncing it.",
+            pallet
+        )),
+        (None, Some(_)) => return Err(format!(
+            "@{} cannot be checked: the office exists but its trust anchor is missing.", pallet
+        )),
     };
 
-    let office = audit_utils::verify_office_chain_memoized(anchor, office_head)?;
-    verify_meta_content(pallet, rules, &office, admission, old_head, new_head)?;
+    verify_meta_content(pallet, rules, office.as_ref(), admission, old_head, new_head)?;
 
     Ok(office)
+}
+
+/// Rule (b) for a store that never enrolled: the parcel carries no signature, and its Author and
+/// Stack actions — every action it has — name one operator, who it is attributed to.
+fn declared_attribution<'p>(pallet: &str, hash: &str, parcel: &'p Parcel) -> Result<Attribution<'p>, String> {
+    if sign_utils::load_raw_parcel_signature(hash)?.is_some() {
+        return Err(format!(
+            "Parcel {} on @{} is signed, but this warehouse has no office to verify a key against. \
+            Until trust is established, a meta parcel carries no signature.",
+            hash, pallet
+        ));
+    }
+
+    let authored = parcel.actions.iter().any(|action| matches!(action.action, ParcelActionType::Author));
+    let stacked = parcel.actions.iter().any(|action| matches!(action.action, ParcelActionType::Stack));
+    let identifier = parcel.actions.first().map(|action| action.operator.identifier.as_str()).unwrap_or("");
+
+    if identifier.is_empty() || !authored || !stacked
+        || parcel.actions.iter().any(|action| action.operator.identifier != identifier) {
+        return Err(format!(
+            "Parcel {} on @{} carries no signature, and its Author and Stack actions do not name \
+            one operator, so it cannot be attributed to anyone.",
+            hash, pallet
+        ));
+    }
+
+    Ok(Attribution::Declared(identifier))
+}
+
+/// A cell's stamp, for a refusal.
+fn describe_stamp(stamp: &Stamp) -> String {
+    match stamp {
+        Stamp::Signer(key_id) => format!("with key {}", key_id),
+        Stamp::Operator(identifier) => format!("unsigned by operator {}", identifier),
+    }
+}
+
+/// A parcel's attribution, for a refusal.
+fn describe_writer(attribution: &Attribution) -> String {
+    match attribution {
+        Attribution::Signed(key) => format!("signed with key {}", key.key_id),
+        Attribution::Declared(identifier) => format!("unsigned, written by operator {}", identifier),
+    }
 }
 
 /// Rule (b): the parcel's signature verifies against its key in the office, and a revoked key
@@ -1566,18 +1787,17 @@ pub fn plan_net_changes(base: Option<&str>,
     Ok(changes)
 }
 
-/// Turn planned changes into edits signed by `signer_key_id`, re-stamping each replayed cell.
-/// A cell already stamped with that key is replayed as it is. Any other stamp is re-signed only
-/// when it resolves, in this office, to the signer's own operator under a key that is active or
-/// was revoked for retirement — so a key rotation never wedges a replay. A cell stamped by
-/// another operator, or by a key revoked as compromised, cannot honestly be re-signed, and is
-/// refused by path.
+/// Turn planned changes into edits stamped by `writer` for `actor`, re-stamping each replayed
+/// cell. A cell already carrying the writer's stamp is replayed as it is. A signed writer
+/// re-signs any other key stamp only when it resolves, in this office, to the signer's own
+/// operator under a key that is active or was revoked for retirement — so a key rotation never
+/// wedges a replay. A cell stamped by another operator, by a key revoked as compromised, or —
+/// for a signed writer — written without a key, cannot honestly be re-stamped, and is refused
+/// by path.
 pub fn restamp_for_replay(changes: &[CellChange],
-                          office: &OfficeState,
-                          signer_key_id: &str) -> Result<Vec<CellEdit>, String> {
-    let current = office.find_key(signer_key_id)
-        .ok_or(format!("The signing key {} is not tracked in the office.", signer_key_id))?;
-
+                          writer: &MetaWriter,
+                          actor: &Operator) -> Result<Vec<CellEdit>, String> {
+    let own = writer.stamp(actor);
     let mut edits = Vec::new();
 
     for change in changes {
@@ -1589,22 +1809,33 @@ pub fn restamp_for_replay(changes: &[CellChange],
         let envelope = parse_cell(&object_utils::load_blob(blob)?.content)
             .map_err(|why| format!("The cell {} cannot be replayed: {}.", change.path, why))?;
 
-        if envelope.signer == signer_key_id {
+        if envelope.stamp == own {
             edits.push(CellEdit::Set { path: change.path.clone(), blob: blob.clone() });
             continue;
         }
 
-        let stamp = office.find_key(&envelope.signer).ok_or(format!(
+        let (MetaWriter::Signed { office, signer }, Stamp::Signer(key_id)) = (writer, &envelope.stamp) else {
+            return Err(format!(
+                "The cell {} is stamped {}, so it cannot be re-stamped by {}. Keep theirs at this \
+                path to discard the local change.",
+                change.path, describe_stamp(&envelope.stamp), describe_own(&own)
+            ));
+        };
+
+        let current = office.find_key(&signer.key_id)
+            .ok_or(format!("The signing key {} is not tracked in the office.", signer.key_id))?;
+
+        let stamp = office.find_key(key_id).ok_or(format!(
             "The cell {} is stamped with key {}, which the office does not track, so it cannot be \
             re-signed. Keep theirs at this path to discard the local change.",
-            change.path, envelope.signer
+            change.path, key_id
         ))?;
 
         if stamp.operator != current.operator {
             return Err(format!(
                 "The cell {} was written by another operator (key {}), so it cannot be re-signed \
                 under your key. Keep theirs at this path to discard the local change.",
-                change.path, envelope.signer
+                change.path, key_id
             ));
         }
 
@@ -1612,17 +1843,25 @@ pub fn restamp_for_replay(changes: &[CellChange],
             return Err(format!(
                 "The cell {} is stamped with key {}, which was revoked as compromised, so it \
                 cannot be re-signed. Keep theirs at this path to discard the local change.",
-                change.path, envelope.signer
+                change.path, key_id
             ));
         }
 
         edits.push(CellEdit::Set {
             path: change.path.clone(),
-            blob: store_blob(&encode_cell(signer_key_id, &envelope.schema, &envelope.value))?,
+            blob: store_blob(&encode_cell(&own, &envelope.schema, &envelope.value))?,
         });
     }
 
     Ok(edits)
+}
+
+/// A writer's own stamp, for a refusal.
+fn describe_own(stamp: &Stamp) -> String {
+    match stamp {
+        Stamp::Signer(key_id) => format!("your key {}", key_id),
+        Stamp::Operator(identifier) => format!("you (operator {}) without a key", identifier),
+    }
 }
 
 /// What a replay of the local net change onto a remote head would apply, planned before
@@ -1671,9 +1910,9 @@ pub fn plan_replay(pallet: &str,
     Ok(ReplayPlan { theirs: theirs.to_string(), theirs_cells, changes })
 }
 
-/// Stack a planned replay onto its remote head as one parcel signed by `signer` whose only
-/// parent is that head. The local parcels themselves never leave the clone. The new parcel
-/// passes [`verify_meta_content`] against the head before it is returned; no head moves.
+/// Stack a planned replay onto its remote head as one parcel by `writer` whose only parent is
+/// that head. The local parcels themselves never leave the clone. The new parcel passes
+/// [`verify_meta_content`] against the head before it is returned; no head moves.
 ///
 /// # Returns
 /// * `Ok(Some(hash))` - The replayed parcel.
@@ -1681,15 +1920,14 @@ pub fn plan_replay(pallet: &str,
 /// * `Err(..)`        - A refusal.
 pub fn replay_meta_pallet(pallet: &str,
                           rules: &dyn PalletRules,
-                          office: &OfficeState,
+                          writer: &MetaWriter,
                           plan: &ReplayPlan,
                           actor: &Operator,
-                          description: &str,
-                          signer: &MetaSigner) -> Result<Option<String>, ReplayError> {
+                          description: &str) -> Result<Option<String>, ReplayError> {
     let theirs = plan.theirs.as_str();
     let theirs_cells = &plan.theirs_cells;
 
-    let edits = restamp_for_replay(&plan.changes, office, &signer.key_id)?;
+    let edits = restamp_for_replay(&plan.changes, writer, actor)?;
     let new_cells = apply_edits(theirs_cells.as_deref(), &edits)?;
 
     if new_cells == *theirs_cells {
@@ -1697,9 +1935,9 @@ pub fn replay_meta_pallet(pallet: &str,
     }
 
     let tree = store_meta_tree(rules.kind().format_marker().as_bytes(), new_cells.as_deref())?;
-    let parcel = stack_signed_parcel(tree, vec![theirs.to_string()], actor, description, signer)?;
+    let parcel = stack_meta_parcel(tree, vec![theirs.to_string()], actor, description, writer.signer())?;
 
-    verify_meta_content(pallet, rules, office, Admission::Admit, Some(theirs), &parcel)?;
+    verify_meta_content(pallet, rules, writer.office_state(), Admission::Admit, Some(theirs), &parcel)?;
 
     Ok(Some(parcel))
 }
@@ -1865,9 +2103,14 @@ mod tests {
         table
     }
 
+    /// The stamp of a cell written under `key_id`.
+    fn key_stamp(key_id: &str) -> Stamp {
+        Stamp::Signer(key_id.to_string())
+    }
+
     /// Store a `kv.text 1` cell stamped with `key_id`.
     fn cell(key_id: &str, content: &str) -> String {
-        store_blob(&encode_cell(key_id, TEXT, &text(content))).unwrap()
+        store_blob(&encode_cell(&key_stamp(key_id), TEXT, &text(content))).unwrap()
     }
 
     fn set(path: &str, blob: &str) -> CellEdit {
@@ -1892,12 +2135,12 @@ mod tests {
     fn forge(parents: &[&str], format: &str, cells: Option<&str>, signer: &MetaSigner) -> String {
         let tree = store_meta_tree(format.as_bytes(), cells).unwrap();
 
-        stack_signed_parcel(
+        stack_meta_parcel(
             tree,
             parents.iter().map(|parent| parent.to_string()).collect(),
             &actor(&format!("forger-{}", signer.key_id)),
             "forged",
-            signer,
+            Some(signer),
         ).unwrap()
     }
 
@@ -1911,16 +2154,21 @@ mod tests {
     }
 
     fn verify(office: &OfficeState, old_head: Option<&str>, new_head: &str) -> Result<(), String> {
-        verify_meta_content(PALLET, &TestRules, office, Admission::Admit, old_head, new_head)
+        verify_meta_content(PALLET, &TestRules, Some(office), Admission::Admit, old_head, new_head)
     }
 
     fn write(office: &OfficeState, key: &Key, edits: &[CellEdit]) -> Result<Option<String>, String> {
-        stack_meta_edits(PALLET, &TestRules, &VerifiedOffice::unconditioned(office.clone()), edits, &actor(&key.record.operator), "write", &key.signer())
+        stack_meta_edits(PALLET, &TestRules, &signed_writer(office, key), edits, &actor(&key.record.operator), "write")
+    }
+
+    /// A writer signing as `key` under `office`, as a client with established trust.
+    fn signed_writer<'a>(office: &OfficeState, key: &'a Key) -> MetaWriter<'a> {
+        MetaWriter::Signed { office: VerifiedOffice::unconditioned(office.clone()), signer: key.signer() }
     }
 
     fn signer_of(read: &CellRead) -> &str {
         match read {
-            CellRead::Readable(envelope) => &envelope.signer,
+            CellRead::Readable(envelope) => envelope.stamp.key_id().expect("a signed cell"),
             other => panic!("expected a readable cell, got {:?}", other),
         }
     }
@@ -2262,18 +2510,18 @@ mod tests {
     fn one_signer_writing_one_value_gives_identical_bytes() {
         let signer = "a".repeat(64);
 
-        let first = encode_cell(&signer, TEXT, &text("hello"));
-        assert_eq!(first, encode_cell(&signer, TEXT, &text("hello")));
-        assert_ne!(first, encode_cell(&"b".repeat(64), TEXT, &text("hello")), "who said it is part of the cell");
+        let first = encode_cell(&key_stamp(&signer), TEXT, &text("hello"));
+        assert_eq!(first, encode_cell(&key_stamp(&signer), TEXT, &text("hello")));
+        assert_ne!(first, encode_cell(&key_stamp(&"b".repeat(64)), TEXT, &text("hello")), "who said it is part of the cell");
 
         let parsed = parse_cell(&first).unwrap();
-        assert_eq!(parsed.signer, signer);
+        assert_eq!(parsed.stamp, Stamp::Signer(signer.clone()));
         assert_eq!(parsed.schema, TEXT);
         assert_eq!(parsed.value.get("text").and_then(|item| item.as_str()), Some("hello"));
 
         // Re-encoding a parsed cell reproduces it, so a re-stamp changes only the signer.
-        assert_eq!(encode_cell(&parsed.signer, &parsed.schema, &parsed.value), first);
-        assert_eq!(parse_cell(&encode_cell(&signer, TEXT, &Table::new())).unwrap().value.len(), 0);
+        assert_eq!(encode_cell(&parsed.stamp, &parsed.schema, &parsed.value), first);
+        assert_eq!(parse_cell(&encode_cell(&key_stamp(&signer), TEXT, &Table::new())).unwrap().value.len(), 0);
     }
 
     #[test]
@@ -2360,7 +2608,7 @@ mod tests {
         let alice = Key::new("alice", 1);
         let office = office(&[&alice.record]);
 
-        let future = store_blob(&encode_cell(alice.id(), "kv.future 9", &text("?"))).unwrap();
+        let future = store_blob(&encode_cell(&key_stamp(alice.id()), "kv.future 9", &text("?"))).unwrap();
         write(&office, &alice, &[set("x", &cell(alice.id(), "1")), set("future", &future)]).unwrap();
         let head = write(&office, &alice, &[set("y", &cell(alice.id(), "2"))]).unwrap().unwrap();
 
@@ -2407,7 +2655,7 @@ mod tests {
         let signer = alice.signer();
 
         let malformed = blob("signer = [");
-        let unknown = store_blob(&encode_cell(alice.id(), "kv.future 9", &text("?"))).unwrap();
+        let unknown = store_blob(&encode_cell(&key_stamp(alice.id()), "kv.future 9", &text("?"))).unwrap();
         let root = cells(&[("good", &cell(alice.id(), "ok")), ("broken", &malformed), ("future", &unknown)]);
         let head = forge(&[], &kv(), root.as_deref(), &signer);
 
@@ -2429,7 +2677,7 @@ mod tests {
         // An old-format pallet: the spine, but no marker — whatever sits beneath it.
         let old_tracked = tree(&[("ab", t(&tree(&[("note", b(&blob("old"))) ])))]);
         let old_tree = tree(&[(".forklift", t(&tree(&[("tracked", t(&old_tracked))])))]);
-        let old = stack_signed_parcel(old_tree, Vec::new(), &actor("alice"), "old", &signer).unwrap();
+        let old = stack_meta_parcel(old_tree, Vec::new(), &actor("alice"), "old", Some(&signer)).unwrap();
         let error = read_meta_state(PALLET, &old, &TestRules).unwrap_err();
         assert!(error.contains("@kv") && error.contains("older forklift"), "{}", error);
 
@@ -2442,7 +2690,7 @@ mod tests {
         assert!(error.contains("holds tags metadata"), "{}", error);
 
         // An older forklift's join parcel had an empty tree.
-        let join = stack_signed_parcel(tree(&[]), Vec::new(), &actor("alice"), "join", &signer).unwrap();
+        let join = stack_meta_parcel(tree(&[]), Vec::new(), &actor("alice"), "join", Some(&signer)).unwrap();
         assert!(read_meta_state(PALLET, &join, &TestRules).unwrap_err().contains("older forklift"));
 
         // Any other shape without a marker is a corrupt spine, not an older forklift's.
@@ -2456,7 +2704,7 @@ mod tests {
         ];
 
         for (corrupt_tree, why) in corrupt_spines {
-            let corrupt = stack_signed_parcel(corrupt_tree, Vec::new(), &actor("alice"), "corrupt", &signer).unwrap();
+            let corrupt = stack_meta_parcel(corrupt_tree, Vec::new(), &actor("alice"), "corrupt", Some(&signer)).unwrap();
             let error = read_meta_state(PALLET, &corrupt, &TestRules).unwrap_err();
             assert!(error.contains(why) && !error.contains("older forklift"), "{}", error);
         }
@@ -2604,6 +2852,128 @@ mod tests {
         verify(&office, Some(&head), &beside).unwrap();
     }
 
+    /// Store a `kv.text 1` cell stamped with the declared operator `operator`, as a warehouse
+    /// that never enrolled writes it.
+    fn declared_cell(operator: &str, content: &str) -> String {
+        store_blob(&encode_cell(&Stamp::Operator(operator.to_string()), TEXT, &text(content))).unwrap()
+    }
+
+    /// An unsigned kv parcel over `cells` whose actions name `operator`, built without the
+    /// content check.
+    fn forge_unsigned(parents: &[&str], cells: Option<&str>, operator: &str) -> String {
+        let tree = store_meta_tree(kv().as_bytes(), cells).unwrap();
+
+        stack_meta_parcel(
+            tree,
+            parents.iter().map(|parent| parent.to_string()).collect(),
+            &actor(operator),
+            "declared",
+            None,
+        ).unwrap()
+    }
+
+    /// The content check of a warehouse that never enrolled: no office.
+    fn verify_unenrolled(old_head: Option<&str>, new_head: &str) -> Result<(), String> {
+        verify_meta_content(PALLET, &TestRules, None, Admission::Admit, old_head, new_head)
+    }
+
+    #[test]
+    fn without_an_office_a_write_is_unsigned_and_stamped_with_its_operator() {
+        let _scratch = Scratch::new("unsigned-write");
+
+        let head = stack_meta_edits(
+            PALLET, &TestRules, &MetaWriter::Unsigned, &[set("x", &declared_cell("alice", "1"))],
+            &actor("alice"), "write",
+        ).unwrap().unwrap();
+
+        verify_unenrolled(None, &head).unwrap();
+        assert!(sign_utils::load_raw_parcel_signature(&head).unwrap().is_none());
+
+        let state = read_meta_state(PALLET, &head, &TestRules).unwrap();
+        assert!(matches!(&state.cells["x"], CellRead::Readable(envelope)
+            if envelope.stamp == Stamp::Operator("alice".to_string())));
+        assert_eq!(MetaWriter::Unsigned.stamp(&actor("alice")), Stamp::Operator("alice".to_string()));
+
+        // The writer runs the same check on its own parcel: a cell stamped as someone else
+        // refuses before any head moves.
+        let error = stack_meta_edits(
+            PALLET, &TestRules, &MetaWriter::Unsigned, &[set("y", &declared_cell("bob", "2"))],
+            &actor("alice"), "write",
+        ).unwrap_err();
+        assert!(error.contains("operator bob") && error.contains("operator alice"), "{}", error);
+    }
+
+    #[test]
+    fn a_declared_cell_naming_another_operator_is_refused() {
+        let _scratch = Scratch::new("verify-declared-forged");
+        let head = forge_unsigned(&[], cells(&[("x", &declared_cell("alice", "1"))]).as_deref(), "alice");
+        verify_unenrolled(None, &head).unwrap();
+        let base = cells_of(&head).unwrap();
+
+        // Bob writes a value and declares it Alice's.
+        let forged_cells = apply_edits(Some(&base), &[set("z", &declared_cell("alice", "said by alice"))]).unwrap();
+        let forged = forge_unsigned(&[&head], forged_cells.as_deref(), "bob");
+        let error = verify_unenrolled(Some(&head), &forged).unwrap_err();
+        assert!(error.contains(" z ") && error.contains("operator alice") && error.contains("operator bob"), "{}", error);
+
+        // The same write under his own name is fine.
+        let own_cells = apply_edits(Some(&base), &[set("z", &declared_cell("bob", "said by bob"))]).unwrap();
+        let own = forge_unsigned(&[&head], own_cells.as_deref(), "bob");
+        verify_unenrolled(Some(&head), &own).unwrap();
+
+        // A parcel whose Author and Stack name different operators is attributed to nobody, so
+        // a cell stamped with either one refuses.
+        for (stamped, missing) in [("alice", None), ("alice", Some(ParcelActionType::Stack)), ("", None)] {
+            let tree = store_meta_tree(kv().as_bytes(), cells(&[("x", &declared_cell(stamped, "1"))]).as_deref());
+            let timestamp = Utc::now();
+            let action = |identifier: &str, action: ParcelActionType| ParcelAction {
+                operator: actor(identifier),
+                action,
+                description: None,
+                timestamp,
+            };
+            let actions = match (stamped, &missing) {
+                (_, Some(_)) => vec![action("alice", ParcelActionType::Author)],
+                ("", None) => vec![action("", ParcelActionType::Author), action("", ParcelActionType::Stack)],
+                _ => vec![action("alice", ParcelActionType::Author), action("bob", ParcelActionType::Stack)],
+            };
+            let mut object = LooseObjectBuilder::build_parcel(&Parcel {
+                tree_hash: tree.unwrap(),
+                parents: Vec::new(),
+                actions,
+                description: None,
+            });
+            object.store().unwrap();
+
+            let error = verify_unenrolled(None, &object.hash).unwrap_err();
+            assert!(error.contains("do not name one operator"), "{}", error);
+        }
+    }
+
+    #[test]
+    fn without_an_office_a_signature_or_a_key_stamp_is_refused() {
+        let _scratch = Scratch::new("verify-unenrolled-signed");
+        let alice = Key::new("alice", 1);
+
+        // A signed parcel: there is no office to verify its key against.
+        let signed = forge(&[], &kv(), cells(&[("x", &cell(alice.id(), "1"))]).as_deref(), &alice.signer());
+        let error = verify_unenrolled(None, &signed).unwrap_err();
+        assert!(error.contains("is signed") && error.contains("no office"), "{}", error);
+
+        // An unsigned parcel carrying a key stamp would let anyone claim a key's authority.
+        let stamped = forge_unsigned(&[], cells(&[("x", &cell(alice.id(), "1"))]).as_deref(), "alice");
+        let error = verify_unenrolled(None, &stamped).unwrap_err();
+        assert!(error.contains(&format!("with key {}", alice.id())) && error.contains("operator alice"), "{}", error);
+
+        // And the other way: under an office, an unsigned parcel and a declared stamp refuse.
+        let office = office(&[&alice.record]);
+        let declared = forge_unsigned(&[], cells(&[("x", &declared_cell("alice", "1"))]).as_deref(), "alice");
+        assert!(verify(&office, None, &declared).unwrap_err().contains("carries no signature"));
+        let mixed = forge(&[], &kv(), cells(&[("x", &declared_cell("alice", "1"))]).as_deref(), &alice.signer());
+        let error = verify(&office, None, &mixed).unwrap_err();
+        assert!(error.contains("unsigned by operator alice") && error.contains(alice.id()), "{}", error);
+    }
+
     #[test]
     fn a_subtree_copied_to_a_new_subject_is_refused() {
         let _scratch = Scratch::new("verify-copy-subject");
@@ -2696,7 +3066,7 @@ mod tests {
         assert!(error.contains("malformed cell at bad"), "{}", error);
 
         // An unknown schema is not malformed: a newer forklift may write it, and it is kept.
-        let future = store_blob(&encode_cell(alice.id(), "kv.future 9", &text("?"))).unwrap();
+        let future = store_blob(&encode_cell(&key_stamp(alice.id()), "kv.future 9", &text("?"))).unwrap();
         let newer = forge(&[&head], &kv(), cells(&[("x", &good), ("future", &future)]).as_deref(), &alice.signer());
         verify(&office, Some(&head), &newer).unwrap();
     }
@@ -2778,7 +3148,7 @@ mod tests {
         let base = linear_common_ancestor(ours, theirs).unwrap();
         let plan = plan_replay(PALLET, &TestRules, base.as_deref(), ours, theirs, &keep_of(keep))?;
 
-        replay_meta_pallet(PALLET, &TestRules, office, &plan, &actor(&signer.record.operator), "replay", &signer.signer())
+        replay_meta_pallet(PALLET, &TestRules, &signed_writer(office, signer), &plan, &actor(&signer.record.operator), "replay")
     }
 
     fn refusal(result: Result<Option<String>, ReplayError>) -> String {
@@ -2995,7 +3365,7 @@ mod tests {
         table.insert("message", toml_edit::value("release"));
         table.insert("tagged_at", toml_edit::value(7));
 
-        store_blob(&encode_cell(key_id, tag_utils::TAG_SCHEMA, &table)).unwrap()
+        store_blob(&encode_cell(&key_stamp(key_id), tag_utils::TAG_SCHEMA, &table)).unwrap()
     }
 
     /// A signed `@tags` parcel on `parents` whose cells are the parent's with `edits` applied.
@@ -3011,7 +3381,7 @@ mod tests {
                    admission: Admission,
                    old_head: Option<&str>,
                    new_head: &str) -> Result<(), String> {
-        verify_meta_content("tags", &tag_utils::TagsRules, office, admission, old_head, new_head)
+        verify_meta_content("tags", &tag_utils::TagsRules, Some(office), admission, old_head, new_head)
     }
 
     #[test]
@@ -3075,7 +3445,7 @@ mod tests {
         let mut table = Table::new();
         table.insert("body", toml_edit::value(body));
 
-        store_blob(&encode_cell(key_id, kind.schema(), &table)).unwrap()
+        store_blob(&encode_cell(&key_stamp(key_id), kind.schema(), &table)).unwrap()
     }
 
     fn note_entry(subject: &str, kind: manifest_utils::ManifestKind, body: &str) -> manifest_utils::ManifestEntry {
@@ -3098,7 +3468,7 @@ mod tests {
     }
 
     fn verify_manifest(office: &OfficeState, old_head: Option<&str>, new_head: &str) -> Result<(), String> {
-        verify_meta_content("manifest", &manifest_utils::ManifestRules, office, Admission::Admit, old_head, new_head)
+        verify_meta_content("manifest", &manifest_utils::ManifestRules, Some(office), Admission::Admit, old_head, new_head)
     }
 
     #[test]
@@ -3121,7 +3491,7 @@ mod tests {
 
         // Bob writing into Alice's directory is refused whatever the cell holds — including a
         // schema this build cannot read, which would otherwise squat the id Alice's note derives.
-        let squatted = store_blob(&encode_cell(bob.id(), "manifest.note 2", &text("lgtm"))).unwrap();
+        let squatted = store_blob(&encode_cell(&key_stamp(bob.id()), "manifest.note 2", &text("lgtm"))).unwrap();
         for (path, blob) in [
             (cell_path("alice", &approval), note_cell(bob.id(), ManifestKind::Approval, "")),
             (cell_path("alice", &note), note_cell(bob.id(), ManifestKind::Note, "lgtm")),
@@ -3179,7 +3549,7 @@ mod tests {
 
     /// Store a haul cell of `schema` stamped with `key_id`.
     fn haul_cell(key_id: &str, schema: &str, value: &Table) -> String {
-        store_blob(&encode_cell(key_id, schema, value)).unwrap()
+        store_blob(&encode_cell(&key_stamp(key_id), schema, value)).unwrap()
     }
 
     fn haul_parcel(parent: Option<&str>, key: &Key, edits: &[CellEdit]) -> String {
@@ -3191,7 +3561,7 @@ mod tests {
     }
 
     fn verify_haul(office: &OfficeState, old_head: Option<&str>, new_head: &str) -> Result<(), String> {
-        verify_meta_content("haul", &haul_utils::HaulRules, office, Admission::Admit, old_head, new_head)
+        verify_meta_content("haul", &haul_utils::HaulRules, Some(office), Admission::Admit, old_head, new_head)
     }
 
     fn proposal(opener: &str) -> haul_utils::Opened {
@@ -3473,7 +3843,7 @@ mod tests {
             assert!(error.contains(&format!("records a merge into main, but is signed by {}, {}", key.record.operator, why)), "{}", error);
 
             // Adopting what a remote already admitted audits the record, not its writer.
-            verify_meta_content("haul", &haul_utils::HaulRules, &office, Admission::Audit, Some(&head), &merged).unwrap();
+            verify_meta_content("haul", &haul_utils::HaulRules, Some(&office), Admission::Audit, Some(&head), &merged).unwrap();
         }
 
         // Closing and reopening stay anyone's.
@@ -3619,12 +3989,12 @@ mod tests {
         let alice = Key::new("alice", 1);
         let office = office_with_roles(&[(&alice, office_utils::Role::Admin)]);
         let subject = "ab".repeat(32);
-        let newer = store_blob(&encode_cell(alice.id(), "tags.tag 2", &text("from a newer forklift"))).unwrap();
+        let newer = store_blob(&encode_cell(&key_stamp(alice.id()), "tags.tag 2", &text("from a newer forklift"))).unwrap();
 
-        stack_meta_edits("tags", &tag_utils::TagsRules, &VerifiedOffice::unconditioned(office.clone()), &[
+        stack_meta_edits("tags", &tag_utils::TagsRules, &signed_writer(&office, &alice), &[
             set("v1.0", &tag_cell(alice.id(), &subject)),
             set("v2.0", &newer),
-        ], &actor("alice"), "tags", &alice.signer()).unwrap().unwrap();
+        ], &actor("alice"), "tags").unwrap().unwrap();
 
         let read = tag_utils::read_tags().unwrap();
         assert_eq!(read.tags.iter().map(|tag| tag.tag.name.as_str()).collect::<Vec<_>>(), vec!["v1.0"]);
@@ -3636,12 +4006,12 @@ mod tests {
 
         let note = note_entry(&subject, ManifestKind::Note, "lgtm");
         let newer_path = format!("{}/{}/review/{}", &subject[..2], subject, manifest_utils::operator_leaf("alice"));
-        let newer = store_blob(&encode_cell(alice.id(), "manifest.review 1", &text("a newer kind"))).unwrap();
+        let newer = store_blob(&encode_cell(&key_stamp(alice.id()), "manifest.review 1", &text("a newer kind"))).unwrap();
 
-        stack_meta_edits("manifest", &manifest_utils::ManifestRules, &VerifiedOffice::unconditioned(office.clone()), &[
+        stack_meta_edits("manifest", &manifest_utils::ManifestRules, &signed_writer(&office, &alice), &[
             set(&cell_path("alice", &note), &note_cell(alice.id(), ManifestKind::Note, "lgtm")),
             set(&newer_path, &newer),
-        ], &actor("alice"), "manifest", &alice.signer()).unwrap().unwrap();
+        ], &actor("alice"), "manifest").unwrap().unwrap();
 
         let read = manifest_utils::read_manifest().unwrap();
         assert_eq!(read.entries.len(), 1);

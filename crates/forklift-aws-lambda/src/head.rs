@@ -814,8 +814,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     ///   audit checks, and it differs by pallet: for the office pallet, every office-modifying
     ///   parcel's *signer* is checked against the office role it held as of that parcel's own
     ///   signing (`verify_office_chain`); for a meta pallet (`meta_tree::meta_rules`), every new
-    ///   parcel passes `verify_meta_content` against the verified office, and the pallet is
-    ///   refused outright without one; for any other pallet, a parcel is accepted when it is
+    ///   parcel passes `verify_meta_content` by the trust state — against the verified office,
+    ///   or as unsigned in a warehouse that never enrolled; for any other pallet, a parcel is accepted when it is
     ///   either validly signed by a key the office currently tracks and has not revoked, or
     ///   unsigned/untracked-key but reachable from the trust boundary (tolerated as legacy), or
     ///   signed by a revoked key but reachable from that revocation's own distrust boundary
@@ -1089,10 +1089,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             }
 
             // 3. Trust: a trusted warehouse accepts nothing a local audit would reject. A
-            // meta pallet exists only under an office, so it is checked even without
-            // an anchor — and refused for the lack of one. Its content check subsumes the
-            // signature audit: every new parcel is signed by an office key, stamps only its own
-            // cells, and keeps the pallet's rules.
+            // meta pallet is checked by the warehouse's trust state, even without an anchor:
+            // under trust every new parcel is signed by an office key, in a warehouse that never
+            // enrolled it is unsigned and declares one operator, and either way it stamps only
+            // its own cells and keeps the pallet's rules. The content check subsumes the
+            // signature audit.
             if let Some(rules) = pallet_rules {
                 meta_tree::verify_meta_update(
                     &bare,

@@ -2953,10 +2953,11 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                     }
                 }
             } else if let Some(rules) = pallet_rules {
-                // A meta pallet exists only under an office, so a missing anchor or
-                // office refuses here instead of skipping the check. Its content check subsumes
-                // the signature audit below: every new parcel must be signed by an office key,
-                // stamp only its own cells, and keep the pallet's rules.
+                // A meta pallet is checked by the warehouse's trust state, never skipped: under
+                // trust every new parcel must be signed by an office key, in a warehouse that
+                // never enrolled it must be unsigned and declare one operator, and either way it
+                // stamps only its own cells and keeps the pallet's rules. The content check
+                // subsumes the signature audit below.
                 meta_tree::verify_meta_update(
                     &bare,
                     rules,
@@ -7597,16 +7598,16 @@ mod tests {
             forklift_core::util::sign_utils::sign_parcel_hash(&fixture.admin_key_id, hash)
         });
         let edit = meta_tree::set_cell(
-            &kv_utils::cell_path(&"c".repeat(64), "ci"), &bob_key_id, kv_utils::KV_TEXT_SCHEMA,
-            &kv_utils::text_value("green")
+            &kv_utils::cell_path(&"c".repeat(64), "ci"), &meta_tree::Stamp::Signer(bob_key_id.clone()),
+            kv_utils::KV_TEXT_SCHEMA, &kv_utils::text_value("green")
         ).unwrap();
 
+        let writer = meta_tree::MetaWriter::Signed { office, signer };
         let refused = meta_tree::stack_meta_edits(
-            kv_utils::KV_PALLET_NAME, &kv_utils::KvRules, &office, &[edit], &fixture.admin, "forged",
-            &signer
+            kv_utils::KV_PALLET_NAME, &kv_utils::KvRules, &writer, &[edit], &fixture.admin, "forged"
         );
         assert!(refused.is_err(), "the writer must refuse its own forged stamp");
-        drop(signer);
+        drop(writer);
 
         let new_head = forged.into_inner().expect("the forged parcel was signed");
         let response = post_ref_update(

@@ -170,7 +170,7 @@ fn export_tags(repo: &GitRepo, exporter: &Exporter) -> Result<TagExport, String>
 
     // The tags that could be written: on an exported parcel, by a key the office holds, under a
     // name git accepts.
-    let mut writable: Vec<(&AttributedTag, &str, &str, String)> = Vec::new();
+    let mut writable: Vec<(&AttributedTag, &str, &office_utils::KeyRecord, String)> = Vec::new();
     for attributed in &read.tags {
         let name = &attributed.tag.name;
         let skip = |reason: String| SkippedTag { name: name.clone(), reason };
@@ -180,8 +180,13 @@ fn export_tags(repo: &GitRepo, exporter: &Exporter) -> Result<TagExport, String>
             continue;
         };
 
-        let Some(key) = office.find_key(&attributed.signer) else {
-            export.skipped.push(skip(format!("its signer key {} is not in this warehouse's office", attributed.signer)));
+        let Some(signer) = &attributed.signer else {
+            export.skipped.push(skip("it was written without a key".to_string()));
+            continue;
+        };
+
+        let Some(key) = office.find_key(signer) else {
+            export.skipped.push(skip(format!("its signer key {} is not in this warehouse's office", signer)));
             continue;
         };
 
@@ -192,7 +197,7 @@ fn export_tags(repo: &GitRepo, exporter: &Exporter) -> Result<TagExport, String>
             continue;
         }
 
-        writable.push((attributed, commit, &key.operator, refname));
+        writable.push((attributed, commit, key, refname));
     }
 
     // Git keeps a loose ref as a file, so on a filesystem that folds case `V1` would overwrite
@@ -203,7 +208,7 @@ fn export_tags(repo: &GitRepo, exporter: &Exporter) -> Result<TagExport, String>
         *folded.entry(attributed.tag.name.to_ascii_lowercase()).or_default() += 1;
     }
 
-    for (attributed, commit, tagger, refname) in writable {
+    for (attributed, commit, key, refname) in writable {
         let name = &attributed.tag.name;
         let skip = |reason: String| SkippedTag { name: name.clone(), reason };
 
@@ -216,7 +221,7 @@ fn export_tags(repo: &GitRepo, exporter: &Exporter) -> Result<TagExport, String>
         // Git checks a tag object's text (a message holding a NUL, say), and a ref name can still
         // be one the filesystem refuses (`con` on Windows): either leaves that tag out. A ref write
         // can land and still report failure, so the ref read back decides.
-        let object = match exporter.write_tag(commit, tagger, attributed) {
+        let object = match exporter.write_tag(commit, &key.operator, &key.key_id, attributed) {
             Ok(object) => object,
             Err(refused) => {
                 export.skipped.push(skip(refused));
@@ -440,10 +445,14 @@ impl<'a> Exporter<'a> {
     }
 
     /// Write `attributed` as an annotated tag object over `commit` (a commit this run wrote) by
-    /// `tagger` (the operator the office binds its signer key to), returning the tag object's hash.
-    /// Written under the isolated configuration, like every object.
-    pub(crate) fn write_tag(&self, commit: &str, tagger: &str, attributed: &AttributedTag) -> Result<String, String> {
-        Ok(self.repo.run(&["mktag"], Some(tag_object(commit, tagger, attributed).as_bytes()))?.trim().to_string())
+    /// `tagger` (the operator the office binds its signer key to) under `signer` (that key's id),
+    /// returning the tag object's hash. Written under the isolated configuration, like every object.
+    pub(crate) fn write_tag(&self,
+                            commit: &str,
+                            tagger: &str,
+                            signer: &str,
+                            attributed: &AttributedTag) -> Result<String, String> {
+        Ok(self.repo.run(&["mktag"], Some(tag_object(commit, tagger, signer, attributed).as_bytes()))?.trim().to_string())
     }
 
     /// Write one parcel as a git commit (its parents must already be written).
@@ -723,16 +732,17 @@ fn tag_line(signer: &str) -> String {
     format!("Forklift-Tag-Signer: {} export/{}", signer, EXPORT_LAYOUT)
 }
 
-/// The annotated tag object for `attributed` over `commit`. The tagger is `tagger`'s identity, as
-/// a commit's author is; the date is the tag's own; the message is the tag's, without trailing
-/// newlines, a blank line, and the tag line (only the tag line when the message is empty).
-fn tag_object(commit: &str, tagger: &str, attributed: &AttributedTag) -> String {
+/// The annotated tag object for `attributed` over `commit`, signed by key `signer`. The tagger is
+/// `tagger`'s identity, as a commit's author is; the date is the tag's own; the message is the
+/// tag's, without trailing newlines, a blank line, and the tag line (only the tag line when the
+/// message is empty).
+fn tag_object(commit: &str, tagger: &str, signer: &str, attributed: &AttributedTag) -> String {
     let tag = &attributed.tag;
     let (name, email) = git_identity(tagger);
 
     let message = match tag.message.trim_end_matches('\n') {
-        "" => format!("{}\n", tag_line(&attributed.signer)),
-        message => format!("{}\n\n{}\n", message, tag_line(&attributed.signer)),
+        "" => format!("{}\n", tag_line(signer)),
+        message => format!("{}\n\n{}\n", message, tag_line(signer)),
     };
 
     format!(
@@ -1192,12 +1202,12 @@ mod tests {
         let tag = |message: &str, tagged_at: i64| AttributedTag {
             tag: Tag { name: "v1.0".to_string(), subject: "p".to_string(), message: message.to_string(), tagged_at },
             tagger: "ignored".to_string(),
-            signer: "k1".to_string(),
+            signer: Some("k1".to_string()),
         };
         let commit = "c".repeat(40);
 
         assert_eq!(
-            tag_object(&commit, "ada@example", &tag("the release\n\n", 1_700_000_000)),
+            tag_object(&commit, "ada@example", "k1", &tag("the release\n\n", 1_700_000_000)),
             format!(
                 "object {}\ntype commit\ntag v1.0\ntagger ada@example <ada@example> 1700000000 +0000\n\n\
                 the release\n\nForklift-Tag-Signer: k1 export/1\n",
@@ -1205,7 +1215,7 @@ mod tests {
             )
         );
         assert_eq!(
-            tag_object(&commit, "<>", &tag("", -5)),
+            tag_object(&commit, "<>", "k1", &tag("", -5)),
             format!("object {}\ntype commit\ntag v1.0\ntagger forklift <> 0 +0000\n\nForklift-Tag-Signer: k1 export/1\n", commit)
         );
     }

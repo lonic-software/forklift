@@ -1400,6 +1400,10 @@ A command not listed here either reports only the generic human-message shape `{
         "commented_at": {
           "format": "int64",
           "type": "integer"
+        },
+        "unsigned": {
+          "description": "As [`ReviewLine::unsigned`].",
+          "type": "boolean"
         }
       },
       "required": [
@@ -1454,6 +1458,10 @@ A command not listed here either reports only the generic human-message shape `{
         "reviewed_at": {
           "format": "int64",
           "type": "integer"
+        },
+        "unsigned": {
+          "description": "Present and `true` when the review was written without a key, so its author is only\ndeclared.",
+          "type": "boolean"
         },
         "verdict": {
           "type": "string"
@@ -2306,8 +2314,15 @@ A command not listed here either reports only the generic human-message shape `{
     "MetaConflictSide": {
       "description": "One side's value at a conflicted path.",
       "properties": {
+        "operator": {
+          "description": "The operator a readable value written without a key declares.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "signer": {
-          "description": "The key id the value is stamped with, when there is a readable value.",
+          "description": "The key id the value is stamped with, when there is a readable value written with a key.",
           "type": [
             "string",
             "null"
@@ -2552,7 +2567,7 @@ A command not listed here either reports only the generic human-message shape `{
 {
   "$defs": {
     "EntryView": {
-      "description": "One manifest entry in a view, with its forge-proof author.",
+      "description": "One manifest entry in a view, with its author: forge-proof when signed, declared when not.",
       "properties": {
         "author": {
           "type": "string"
@@ -2586,6 +2601,13 @@ A command not listed here either reports only the generic human-message shape `{
           ]
         },
         "session": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "signer": {
+          "description": "The key id the entry is stamped with; absent when it was written without a key (in a\nwarehouse that never enrolled), so its author is only declared.",
           "type": [
             "string",
             "null"
@@ -2747,8 +2769,15 @@ A command not listed here either reports only the generic human-message shape `{
     "key": {
       "type": "string"
     },
+    "operator": {
+      "description": "The operator a value written without a key declares (in a warehouse that never enrolled).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "signer": {
-      "description": "The key id the value is stamped with.",
+      "description": "The key id the value is stamped with; absent for a value written without a key.",
       "type": [
         "string",
         "null"
@@ -2792,8 +2821,15 @@ A command not listed here either reports only the generic human-message shape `{
         "key": {
           "type": "string"
         },
+        "operator": {
+          "description": "The operator a value written without a key declares (in a warehouse that never enrolled).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "signer": {
-          "description": "The key id the value is stamped with.",
+          "description": "The key id the value is stamped with; absent for a value written without a key.",
           "type": [
             "string",
             "null"
@@ -5851,8 +5887,11 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "string"
         },
         "signer": {
-          "description": "The key id the tag is signed with.",
-          "type": "string"
+          "description": "The key id the tag is signed with; absent when the tag was written without a key (in a\nwarehouse that never enrolled), so its tagger is only declared.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "subject": {
           "description": "The parcel the tag points at.",
@@ -5867,7 +5906,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "string"
         },
         "tagger": {
-          "description": "The tagger's pseudonymous operator id (the chain's record), or the key id when the\noffice does not know the key.",
+          "description": "The tagger's pseudonymous operator id (the chain's record), or the key id when the\noffice does not know the key. For an unsigned tag, the operator it declares.",
           "type": "string"
         },
         "tagger_name": {
@@ -5889,7 +5928,6 @@ A command not listed here either reports only the generic human-message shape `{
         "name",
         "subject",
         "tagger",
-        "signer",
         "tagged_at"
       ],
       "type": "object"
@@ -5952,8 +5990,11 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "string"
     },
     "signer": {
-      "description": "The key id the tag is signed with.",
-      "type": "string"
+      "description": "The key id the tag is signed with; absent when the tag was written without a key (in a\nwarehouse that never enrolled), so its tagger is only declared.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "subject": {
       "description": "The parcel the tag points at.",
@@ -5968,7 +6009,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "string"
     },
     "tagger": {
-      "description": "The tagger's pseudonymous operator id (the chain's record), or the key id when the\noffice does not know the key.",
+      "description": "The tagger's pseudonymous operator id (the chain's record), or the key id when the\noffice does not know the key. For an unsigned tag, the operator it declares.",
       "type": "string"
     },
     "tagger_name": {
@@ -5990,7 +6031,6 @@ A command not listed here either reports only the generic human-message shape `{
     "name",
     "subject",
     "tagger",
-    "signer",
     "tagged_at"
   ],
   "title": "TagView",

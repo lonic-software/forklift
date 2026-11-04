@@ -1,24 +1,25 @@
-//! Signed tags / releases (§9.4d): a named, signed pointer at a parcel.
+//! Tags / releases (§9.4d): a named pointer at a parcel, signed once trust is established.
 //!
 //! A tag marks a parcel — a release, a milestone — with a name. The Forklift twist is the
-//! same one the manifest uses: the tag is a signed cell on a meta pallet (`@tags`, on the
-//! meta-tree substrate, `meta_tree`), so who tagged it is the cell's signer stamp, not a
-//! self-declared field, and it is **verifiable offline against the office chain**.
+//! same one the manifest uses: the tag is a cell on a meta pallet (`@tags`, on the meta-tree
+//! substrate, `meta_tree`), so who tagged it is the cell's stamp. Under trust that stamp is a
+//! signing key, not a self-declared field, and it is **verifiable offline against the office
+//! chain**; in a warehouse that never enrolled it is the operator the unsigned parcel declares.
 //!
 //! A tag sits at `cells/<name>` and holds a `tags.tag 1` value: the subject, the message and
 //! when it was tagged. No parcel may change or remove an existing tag, wherever the content check
-//! runs, so a tag name is immutable everywhere. And a parcel that adds a tag must be signed by an
-//! Admin of the office as it stands when the parcel is admitted (the release convention): when a
-//! client writes or replays it, and when a remote moves its head. A client adopting history the
-//! remote admitted does not re-check the role, so a later demotion never wedges it; that leaves
-//! the role, like every office privilege, as the remote enforces it.
+//! runs, so a tag name is immutable everywhere. And a signed parcel that adds a tag must be signed
+//! by an Admin of the office as it stands when the parcel is admitted (the release convention):
+//! when a client writes or replays it, and when a remote moves its head. A client adopting history
+//! the remote admitted does not re-check the role, so a later demotion never wedges it; that
+//! leaves the role, like every office privilege, as the remote enforces it. Without an office
+//! there are no roles, so an unsigned tag is checked for none.
 
 use toml_edit::{value, Table};
 use crate::model::operator::Operator;
 use crate::util::meta_tree::{
-    self, Admission, CellEnvelope, CellRead, MetaKind, MetaSigner, PalletRules, ParcelChange,
+    self, CellEnvelope, CellRead, MetaKind, MetaWriter, PalletRules, ParcelChange,
 };
-use crate::util::audit_utils::VerifiedOffice;
 use crate::util::office_utils::{self, OfficeState, Role};
 use crate::util::object_utils;
 
@@ -36,9 +37,9 @@ const FIELD_SUBJECT: &str = "subject";
 const FIELD_MESSAGE: &str = "message";
 const FIELD_TAGGED_AT: &str = "tagged_at";
 
-/// One signed tag: a named pointer at a subject parcel. Carries no tagger field — the
-/// tagger is the signer stamped on its cell, which is forge-proof, unlike a self-declared
-/// string.
+/// One tag: a named pointer at a subject parcel. Carries no tagger field — the tagger is the
+/// stamp on its cell: a signer, which is forge-proof unlike a self-declared string, or in a
+/// warehouse that never enrolled the writer's declared operator.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Tag {
     /// The tag name (a release label, e.g. `v1.2.0`). Immutable once created.
@@ -54,17 +55,17 @@ pub struct Tag {
     pub tagged_at: i64,
 }
 
-/// A tag together with its forge-proof authorship.
+/// A tag together with its authorship: forge-proof when signed, declared when not.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct AttributedTag {
     pub tag: Tag,
 
-    /// The operator whose key the cell is stamped with, or the key id when the office does not
-    /// know that key.
+    /// The operator whose key the cell is stamped with (the key id when the office does not know
+    /// that key), or the operator an unsigned cell declares.
     pub tagger: String,
 
-    /// The key id the cell is stamped with.
-    pub signer: String,
+    /// The key id the cell is stamped with, or `None` when the tag was written without a key.
+    pub signer: Option<String>,
 }
 
 /// A tag cell this build cannot read: a newer schema, or a malformed cell. It is listed, never
@@ -157,9 +158,8 @@ impl PalletRules for TagsRules {
 
             let Some(after) = &cell.after else { continue };
 
-            if change.admission == Admission::Admit {
-                let operator = &change.signer.operator;
-                let is_admin = change.office.find_user(operator)
+            if let Some((office, operator)) = change.role_check() {
+                let is_admin = office.find_user(operator)
                     .is_some_and(|user| matches!(user.role, Role::Admin));
 
                 if !is_admin {
@@ -191,29 +191,28 @@ impl PalletRules for TagsRules {
     }
 }
 
-/// Create a tag, as one signed cell on the local `@tags` head. The caller holds the warehouse
-/// lock and passes the verified office; the content check refuses a signer who is not an
-/// admin, and a name that already exists.
+/// Create a tag, as one cell on the local `@tags` head stamped by `writer`. The caller holds
+/// the warehouse lock; the content check refuses a signer who is not an admin, and a name that
+/// already exists.
 pub fn record_tag(tag: &Tag,
-                  office: &VerifiedOffice,
-                  actor: &Operator,
-                  signer: &MetaSigner) -> Result<String, String> {
+                  writer: &MetaWriter,
+                  actor: &Operator) -> Result<String, String> {
     validate_tag_name(&tag.name)?;
 
     if !object_utils::is_object_hash(&tag.subject) {
         return Err(format!("\"{}\" is not a full parcel hash.", tag.subject));
     }
 
-    let edit = meta_tree::set_cell(&tag.name, &signer.key_id, TAG_SCHEMA, &tag_value(tag))?;
+    let edit = meta_tree::set_cell(&tag.name, &writer.stamp(actor), TAG_SCHEMA, &tag_value(tag))?;
     let description = format!("tag {} {}", tag.name, tag.subject);
 
-    meta_tree::stack_meta_edits(TAGS_PALLET_NAME, &TagsRules, office, &[edit], actor, &description, signer)?
+    meta_tree::stack_meta_edits(TAGS_PALLET_NAME, &TagsRules, writer, &[edit], actor, &description)?
         .ok_or(format!("Tag \"{}\" already exists.", tag.name))
 }
 
 /// Read every tag at the local head, attributed through the office (read best-effort, so a
-/// tag whose key the local office does not know is attributed by key id), with every cell this
-/// build cannot read. An unborn pallet reads as empty.
+/// tag whose key the local office does not know is attributed by key id) or by the operator an
+/// unsigned cell declares, with every cell this build cannot read. An unborn pallet reads as empty.
 pub fn read_tags() -> Result<TagsRead, String> {
     let Some(state) = meta_tree::read_meta_head(TAGS_PALLET_NAME, &TagsRules)? else {
         return Ok(TagsRead::default());
@@ -227,7 +226,7 @@ pub fn read_tags() -> Result<TagsRead, String> {
     for (name, cell) in state.cells {
         let parsed = match cell {
             CellRead::Readable(envelope) => parse_value(&name, &envelope.value)
-                .map(|tag| (tag, envelope.signer))
+                .map(|tag| (tag, envelope.stamp))
                 .map_err(|why| format!("the value {}", why)),
             CellRead::Unknown { schema, .. } =>
                 Err(format!("written with the schema \"{}\", which this forklift does not know", schema)),
@@ -235,10 +234,10 @@ pub fn read_tags() -> Result<TagsRead, String> {
         };
 
         match parsed {
-            Ok((tag, signer)) => read.tags.push(AttributedTag {
+            Ok((tag, stamp)) => read.tags.push(AttributedTag {
                 tag,
-                tagger: office.find_key(&signer).map(|key| key.operator.clone()).unwrap_or(signer.clone()),
-                signer,
+                tagger: stamp.operator_in(&office),
+                signer: stamp.key_id().map(str::to_string),
             }),
             Err(reason) => read.unreadable.push(UnreadableTag { name, reason }),
         }

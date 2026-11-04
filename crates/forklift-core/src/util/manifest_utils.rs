@@ -10,15 +10,14 @@
 //! the cell `approval/<op>` itself. Every other kind is multi-valued and lives at
 //! `<kind>/<op>/<id>`, where `id` is derived from the entry, so identical entries from one writer
 //! collapse and the same text from two writers never shares a cell. Who wrote an entry is its
-//! cell's signer stamp; the pallet rule below lets a parcel write or remove cells only under its
-//! own signer's `<op>`, whatever schema a cell carries, so no writer can occupy another's path.
+//! cell's stamp; the pallet rule below lets a parcel write or remove cells only under its own
+//! writer's `<op>`, whatever schema a cell carries, so no writer can occupy another's path.
 
 use toml_edit::{value, Table};
 use crate::model::operator::Operator;
 use crate::util::meta_tree::{
-    self, CellRead, MetaKind, MetaSigner, PalletRules, ParcelChange,
+    self, CellRead, MetaKind, MetaWriter, PalletRules, ParcelChange,
 };
-use crate::util::audit_utils::VerifiedOffice;
 use crate::util::office_utils::{self, OfficeState};
 use crate::util::object_utils;
 
@@ -109,9 +108,9 @@ pub struct Delivery {
 }
 
 /// Machine-authorship provenance (§7.2): how a parcel came to be. Present only on a
-/// `Provenance` entry. Because the entry is signed, this is *evidence* — combined with the
+/// `Provenance` entry. When the entry is signed, this is *evidence* — combined with the
 /// agent-class identity of the signer (§7.1), it answers "which model produced this
-/// change, under whose supervision" forge-proof and offline.
+/// change, under whose supervision" forge-proof and offline. Unsigned, it is a declaration.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Provenance {
     /// The model that produced the change — the compliance-critical field.
@@ -129,8 +128,8 @@ pub struct Provenance {
 }
 
 /// One post-metadata statement about a subject parcel. Deliberately carries no author
-/// field: the author is the signer stamped on the entry's cell, which is forge-proof, unlike a
-/// self-declared string.
+/// field: the author is the stamp on the entry's cell — a signer, which is forge-proof unlike a
+/// self-declared string, or in a warehouse that never enrolled the writer's declared operator.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ManifestEntry {
     /// The parcel this entry is about.
@@ -153,17 +152,17 @@ pub struct ManifestEntry {
     pub delivery: Option<Delivery>,
 }
 
-/// An entry together with its forge-proof authorship.
+/// An entry together with its authorship: forge-proof when signed, declared when not.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct AttributedEntry {
     pub entry: ManifestEntry,
 
-    /// The operator whose key the cell is stamped with, or the key id when the office does not
-    /// know that key.
+    /// The operator whose key the cell is stamped with (the key id when the office does not know
+    /// that key), or the operator an unsigned cell declares.
     pub author: String,
 
-    /// The key id the cell is stamped with.
-    pub signer: String,
+    /// The key id the cell is stamped with, or `None` when the entry was written without a key.
+    pub signer: Option<String>,
 }
 
 /// A manifest cell this build cannot read: a newer kind or schema, or a malformed cell. It is
@@ -374,12 +373,8 @@ fn validate_entry(entry: &ManifestEntry) -> Result<(), String> {
 }
 
 /// The operator a stamped key belongs to.
-fn operator_of<'o>(office: &'o OfficeState, key_id: &str) -> Option<&'o str> {
-    office.find_key(key_id).map(|key| key.operator.as_str())
-}
-
 /// The pallet rules of `@manifest`: the cell layout, the value shapes, and ownership — a parcel
-/// may add, change or remove cells only under its own signer's `<op>` directory, whatever schema
+/// may add, change or remove cells only under its own writer's `<op>` directory, whatever schema
 /// they carry, and a known entry only at the id its content derives.
 pub struct ManifestRules;
 
@@ -393,7 +388,7 @@ impl PalletRules for ManifestRules {
     }
 
     fn check(&self, change: &ParcelChange<'_>) -> Result<(), String> {
-        let owner = operator_leaf(&change.signer.operator);
+        let owner = operator_leaf(change.attribution.operator());
 
         for cell in change.changes {
             let path = parse_cell_path(&cell.path)?;
@@ -464,33 +459,27 @@ impl PalletRules for ManifestRules {
 
 }
 
-/// Record an entry, as one signed cell edit on the local `@manifest` head. The caller holds
-/// the warehouse lock and passes the verified office.
+/// Record an entry, as one cell edit on the local `@manifest` head stamped by `writer`. The
+/// caller holds the warehouse lock.
 ///
 /// # Returns
 /// * `Ok(Some(hash))` - The new head.
-/// * `Ok(None)`       - The signer had already recorded exactly this entry.
+/// * `Ok(None)`       - The writer had already recorded exactly this entry.
 pub fn record_entry(entry: &ManifestEntry,
-                    office: &VerifiedOffice,
+                    writer: &MetaWriter,
                     actor: &Operator,
-                    description: &str,
-                    signer: &MetaSigner) -> Result<Option<String>, String> {
+                    description: &str) -> Result<Option<String>, String> {
     validate_entry(entry)?;
 
-    let operator = office.find_key(&signer.key_id)
-        .ok_or(format!("The signing key {} is not in the office.", signer.key_id))?
-        .operator
-        .clone();
+    let path = cell_path(&writer.operator(actor)?, entry);
+    let edit = meta_tree::set_cell(&path, &writer.stamp(actor), entry.kind.schema(), &entry_value(entry))?;
 
-    let path = cell_path(&operator, entry);
-    let edit = meta_tree::set_cell(&path, &signer.key_id, entry.kind.schema(), &entry_value(entry))?;
-
-    meta_tree::stack_meta_edits(MANIFEST_PALLET_NAME, &ManifestRules, office, &[edit], actor, description, signer)
+    meta_tree::stack_meta_edits(MANIFEST_PALLET_NAME, &ManifestRules, writer, &[edit], actor, description)
 }
 
 /// Read the manifest at the local head: every entry, attributed through the office (read
-/// best-effort, so an entry whose key the local office does not know is attributed by key id),
-/// and every cell this build cannot read. An unborn manifest reads as empty.
+/// best-effort, so an entry whose key the local office does not know is attributed by key id)
+/// or by the operator an unsigned cell declares, and every cell this build cannot read. An unborn manifest reads as empty.
 pub fn read_manifest() -> Result<ManifestRead, String> {
     let Some(state) = meta_tree::read_meta_head(MANIFEST_PALLET_NAME, &ManifestRules)? else {
         return Ok(ManifestRead::default());
@@ -545,8 +534,8 @@ pub fn read_manifest() -> Result<ManifestRead, String> {
         match parse_value(parsed.subject, kind, &envelope.value) {
             Ok(entry) => read.entries.push(AttributedEntry {
                 entry,
-                author: operator_of(&office, &envelope.signer).unwrap_or(&envelope.signer).to_string(),
-                signer: envelope.signer,
+                author: envelope.stamp.operator_in(&office),
+                signer: envelope.stamp.key_id().map(str::to_string),
             }),
             Err(why) => unreadable(format!("the value {}", why)),
         }

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::model::operator::Operator;
-use forklift_core::util::meta_tree::{self, CellRead, Entry, KeepSide, MetaConflict, MetaSigner, PalletRules, ReplayError};
+use forklift_core::util::meta_tree::{self, CellRead, Entry, KeepSide, MetaConflict, MetaSigner, MetaWriter, PalletRules, ReplayError, Stamp};
 use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{BatchLaneClosure, RemoteClient};
 use forklift_core::util::{
@@ -845,9 +845,13 @@ pub(crate) struct MetaConflictSide {
     #[serde(skip_serializing_if = "Option::is_none")]
     value: Option<String>,
 
-    /// The key id the value is stamped with, when there is a readable value.
+    /// The key id the value is stamped with, when there is a readable value written with a key.
     #[serde(skip_serializing_if = "Option::is_none")]
     signer: Option<String>,
+
+    /// The operator a readable value written without a key declares.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operator: Option<String>,
 }
 
 /// A path both sides changed differently since they last agreed.
@@ -975,12 +979,15 @@ impl LowerReport {
 }
 
 fn describe_side(side: &MetaConflictSide) -> String {
-    match (&side.value, &side.signer) {
-        (Some(value), Some(signer)) => format!(
+    match (&side.value, &side.signer, &side.operator) {
+        (Some(value), Some(signer), _) => format!(
             "\"{}\" (key {})", forklift_core::error::sanitize(value), kv_utils::short(signer)
         ),
-        (Some(value), None) => format!("\"{}\"", forklift_core::error::sanitize(value)),
-        (None, _) => "(removed)".to_string(),
+        (Some(value), None, Some(operator)) => format!(
+            "\"{}\" (unsigned, by {})", forklift_core::error::sanitize(value), forklift_core::error::sanitize(operator)
+        ),
+        (Some(value), None, None) => format!("\"{}\"", forklift_core::error::sanitize(value)),
+        (None, _, _) => "(removed)".to_string(),
     }
 }
 
@@ -1260,12 +1267,10 @@ async fn replay(client: &RemoteClient,
     }
 
     let actor = config_utils::get_operator()?;
-    let (office, signing_key_id) = verified_signing_office(&actor)?;
+    let writer = meta_writer(&actor)?;
 
     let description = format!("Replayed the local {} onto the remote's.", wire);
-    let signer = MetaSigner::local(&signing_key_id);
-
-    let replayed = meta_tree::replay_meta_pallet(name, rules, &office, &plan, &actor, &description, &signer);
+    let replayed = meta_tree::replay_meta_pallet(name, rules, &writer, &plan, &actor, &description);
 
     let parcel = match replayed {
         Ok(Some(parcel)) => parcel,
@@ -1281,6 +1286,7 @@ async fn replay(client: &RemoteClient,
 
     // The cells the replay re-signed: in the replayed parcel under the current key, stamped
     // with another key on the local side. Reported only once the replay is lifted.
+    let own = writer.stamp(&actor);
     let mut resigned = Vec::new();
 
     let changes = meta_tree::net_diff(
@@ -1292,17 +1298,18 @@ async fn replay(client: &RemoteClient,
         let Some(after) = &change.after else { continue };
 
         if let Some(CellRead::Readable(local_cell)) = meta_tree::read_cell_in(local_cells.as_deref(), &change.path, rules)? {
-            if local_cell.signer != signing_key_id
-                && matches!(meta_tree::read_cell_blob(after, rules)?, CellRead::Readable(ref cell) if cell.signer == signing_key_id) {
+            if local_cell.stamp != own
+                && matches!(meta_tree::read_cell_blob(after, rules)?, CellRead::Readable(ref cell) if cell.stamp == own) {
                 resigned.push(format!("{} {}", wire, rules.display_path(&change.path)));
             }
         }
     }
 
     remote_utils::lift_pallet(client, &wire, &parcel, Some(remote_head), None, info, &Progress::NONE).await?;
-    // Conditioned on the office the replay was signed and checked under, as every meta write is.
-    // The remote already holds the replay, so a refusal says so rather than "nothing was written".
-    match pallet_utils::update_meta_pallet_head(name, Some(&local), &parcel, &office.preconditions()) {
+    // Conditioned on the trust state the replay was written and checked under, as every meta
+    // write is. The remote already holds the replay, so a refusal says so rather than "nothing was
+    // written".
+    match pallet_utils::update_meta_pallet_head(name, Some(&local), &parcel, &writer.preconditions()) {
         Ok(()) => {}
         Err(refused) => {
             use pallet_utils::RefUpdateError::*;
@@ -1337,37 +1344,59 @@ async fn replay(client: &RemoteClient,
     Ok(Reconciled::Replayed)
 }
 
-/// The office, verified against the anchor, and the operator's signing key in it. A converted
-/// pallet's writes, and the key that signs them, are judged against the verified office, never the
-/// unverified local read.
-pub(crate) fn verified_signing_office(actor: &Operator) -> Result<(audit_utils::VerifiedOffice, String), String> {
-    let office = audit_utils::verified_local_office()?;
+/// Who writes a meta pallet here, by the warehouse's trust state: under trust, the verified office
+/// and the operator's signing key in it — judged against the verified office, never the
+/// unverified local read, and refusing an operator with no usable key; in a warehouse that never
+/// enrolled, the operator unsigned. An office whose anchor is gone refuses.
+pub(crate) fn meta_writer(actor: &Operator) -> Result<MetaWriter<'static>, String> {
+    let Some(office) = audit_utils::local_meta_office()? else {
+        return Ok(MetaWriter::Unsigned);
+    };
+
     let (_, signing_key_id) = office::signing_key_in(&office, actor)?;
 
-    Ok((office, signing_key_id))
+    Ok(MetaWriter::Signed { office, signer: MetaSigner::local(&signing_key_id) })
+}
+
+/// [`meta_writer`] for a command only writers and admins may run: under trust, an operator the
+/// office does not hold, or holds as a reader, is refused (`may` names what they may not do).
+/// Without trust there are no roles, so any operator writes.
+pub(crate) fn writing_meta_writer(actor: &Operator, may: &str) -> Result<MetaWriter<'static>, String> {
+    let writer = meta_writer(actor)?;
+
+    if let Some(office) = writer.office() {
+        let user = office.find_user(&actor.identifier).ok_or(format!(
+            "\"{}\" is not enrolled; ask an enrolled operator to admit you.", actor.identifier
+        ))?;
+
+        if user.role == forklift_core::util::office_utils::Role::Reader {
+            return Err(format!("\"{}\" is a reader; only writers and admins may {}.", user.identifier, may));
+        }
+    }
+
+    Ok(writer)
 }
 
 fn describe_conflicts(wire: &str,
                       rules: &dyn PalletRules,
                       conflicts: &[MetaConflict]) -> Result<MetaPalletConflicts, String> {
+    let stamped = |value: String, stamp: Stamp| match stamp {
+        Stamp::Signer(key_id) => MetaConflictSide { value: Some(value), signer: Some(key_id), operator: None },
+        Stamp::Operator(identifier) => MetaConflictSide { value: Some(value), signer: None, operator: Some(identifier) },
+    };
+    let bare = |value: Option<String>| MetaConflictSide { value, signer: None, operator: None };
+
     let side = |entry: &Entry| -> Result<MetaConflictSide, String> {
         Ok(match entry {
             Entry::Blob(blob) => match meta_tree::read_cell_blob(blob, rules)? {
-                CellRead::Readable(envelope) => MetaConflictSide {
-                    value: Some(rules.display_value(&envelope)),
-                    signer: Some(envelope.signer),
-                },
-                CellRead::Unknown { signer, schema } => MetaConflictSide {
-                    value: Some(format!("(a {} value this forklift cannot read)", schema)),
-                    signer: Some(signer),
-                },
-                CellRead::Malformed(why) => MetaConflictSide {
-                    value: Some(format!("(malformed: {})", why)),
-                    signer: None,
-                },
+                CellRead::Readable(envelope) => stamped(rules.display_value(&envelope), envelope.stamp),
+                CellRead::Unknown { stamp, schema } => {
+                    stamped(format!("(a {} value this forklift cannot read)", schema), stamp)
+                }
+                CellRead::Malformed(why) => bare(Some(format!("(malformed: {})", why))),
             },
-            Entry::Tree(_) => MetaConflictSide { value: Some("(several values)".to_string()), signer: None },
-            Entry::Absent => MetaConflictSide { value: None, signer: None },
+            Entry::Tree(_) => bare(Some("(several values)".to_string())),
+            Entry::Absent => bare(None),
         })
     };
 

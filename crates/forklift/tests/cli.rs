@@ -4684,10 +4684,6 @@ fn manifest_records_signed_post_metadata_on_a_meta_pallet() {
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "-m", "first parcel"]));
 
-    // Recording requires an enrolled signing key — before enrollment it is refused.
-    let before = warehouse.run(&["manifest", "approve", "main", "-m", "ok"]);
-    assert!(!before.status.success(), "manifest must require trust: {}", stderr(&before));
-
     assert_success(&warehouse.run(&["office", "enroll"]));
 
     // An approval and a note about the current parcel.
@@ -9965,6 +9961,57 @@ fn blame_reads_the_identity_class_of_an_agent_authored_line() {
 }
 
 #[test]
+fn metadata_works_unsigned_in_a_warehouse_that_never_enrolled() {
+    let warehouse = TestWarehouse::new("unsigned-meta");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    warehouse.write_file("base.txt", "base\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
+    warehouse.write_file("feature.txt", "feat\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "feature work"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+
+    // Before any enrollment, every metadata write succeeds — there are no roles to check, so
+    // tagging needs no admin and a keyed value no writer.
+    for args in [
+        &["tag", "create", "v1.0", "main", "-m", "first"][..],
+        &["manifest", "set", "main", "ci", "green"][..],
+        &["manifest", "approve", "main", "-m", "LGTM"][..],
+        &["haul", "open", "--target", "main", "--source", "feature", "--title", "Add feature"][..],
+    ] {
+        let output = warehouse.run(args);
+        assert_eq!(output.status.code(), Some(0), "{:?}: {}", args, stderr(&output));
+    }
+
+    // Each record reads back as unsigned, by the declared operator, and never as signed.
+    let tag = json(&warehouse.run(&["tag", "show", "v1.0", "--json"]));
+    assert_eq!(tag["data"]["tagger"], "test@forklift", "{}", tag);
+    assert!(tag["data"].get("signer").is_none(), "{}", tag);
+    let shown = stdout(&warehouse.run(&["tag", "show", "v1.0"]));
+    assert!(shown.contains("test@forklift (unsigned)"), "{}", shown);
+
+    let value = json(&warehouse.run(&["manifest", "get", "main", "ci", "--json"]));
+    assert_eq!(value["data"]["operator"], "test@forklift", "{}", value);
+    assert!(value["data"].get("signer").is_none(), "{}", value);
+
+    let manifest = json(&warehouse.run(&["manifest", "show", "main", "--json"]));
+    let approval = &manifest["data"]["entries"][0];
+    assert_eq!(approval["author"], "test@forklift", "{}", manifest);
+    assert!(approval.get("signer").is_none(), "{}", manifest);
+    assert!(stdout(&warehouse.run(&["manifest", "show", "main"])).contains("test@forklift (unsigned)"));
+
+    let id = json(&warehouse.run(&["haul", "list", "--json"]))["data"]["hauls"][0]["id"].as_str().unwrap().to_string();
+    assert_success(&warehouse.run(&["haul", "review", &id, "--approve", "-m", "ship it"]));
+    let haul = json(&warehouse.run(&["haul", "show", &id, "--json"]));
+    assert_eq!(haul["data"]["reviews"][0]["unsigned"], true, "{}", haul);
+    assert!(stdout(&warehouse.run(&["haul", "show", &id])).contains("test@forklift (unsigned)"));
+
+}
+
+#[test]
 fn tags_are_signed_admin_only_and_verify_offline() {
     let warehouse = TestWarehouse::new("tags");
     warehouse.write_file("a.txt", "one\n");
@@ -9972,10 +10019,6 @@ fn tags_are_signed_admin_only_and_verify_offline() {
     configure_operator(&warehouse);
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "-m", "first parcel"]));
-
-    // A tag is signed, so before trust it is refused.
-    let before = warehouse.run(&["tag", "create", "v1.0", "main", "-m", "first"]);
-    assert!(!before.status.success(), "a tag must require trust: {}", stderr(&before));
 
     assert_success(&warehouse.run(&["office", "enroll"])); // test@forklift becomes admin
 

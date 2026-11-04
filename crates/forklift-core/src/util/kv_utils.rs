@@ -3,14 +3,13 @@
 //! The first pallet on the meta-tree substrate (`meta_tree`). A cell sits at
 //! `<s[0..2]>/<s>/<key>` under `cells/`, where `s` is the full hash of the parcel the value is
 //! about, and holds a `kv.text 1` value: one `text` field of UTF-8. Any writer may set or unset
-//! any cell; who wrote a value is its signer stamp, which the content check keeps honest.
+//! any cell; who wrote a value is its cell's stamp, which the content check keeps honest.
 
 use toml_edit::{value, Item, Table};
 use crate::model::operator::Operator;
 use crate::util::meta_tree::{
-    self, CellEdit, CellEnvelope, CellRead, MetaKind, MetaSigner, PalletRules, ParcelChange,
+    self, CellEdit, CellEnvelope, CellRead, MetaKind, MetaWriter, PalletRules, ParcelChange, Stamp,
 };
-use crate::util::audit_utils::VerifiedOffice;
 use crate::util::{object_utils, pallet_utils, sign_utils};
 
 /// The name of the custom metadata pallet, reached as `@kv`.
@@ -194,48 +193,47 @@ pub struct KvEntry {
     pub key: String,
     pub value: KvValue,
 
-    /// The key id the cell is stamped with; `None` when the envelope does not parse.
-    pub signer: Option<String>,
+    /// Who wrote the value; `None` when the envelope does not parse.
+    pub stamp: Option<Stamp>,
 }
 
-fn read_value(read: CellRead) -> (KvValue, Option<String>) {
+fn read_value(read: CellRead) -> (KvValue, Option<Stamp>) {
     match read {
         CellRead::Readable(envelope) => match text_of(&envelope.value) {
-            Ok(text) => (KvValue::Text(text), Some(envelope.signer)),
-            Err(why) => (KvValue::Malformed(format!("the value {}", why)), Some(envelope.signer)),
+            Ok(text) => (KvValue::Text(text), Some(envelope.stamp)),
+            Err(why) => (KvValue::Malformed(format!("the value {}", why)), Some(envelope.stamp)),
         },
-        CellRead::Unknown { signer, schema } => (KvValue::Unknown { schema }, Some(signer)),
+        CellRead::Unknown { stamp, schema } => (KvValue::Unknown { schema }, Some(stamp)),
         CellRead::Malformed(why) => (KvValue::Malformed(why), None),
     }
 }
 
-/// Set a key on a subject, as one signed parcel on the local `@kv` head. The caller holds the
-/// warehouse lock and passes the verified office.
+/// Set a key on a subject, as one parcel by `writer` on the local `@kv` head. The caller holds
+/// the warehouse lock.
 ///
 /// # Returns
 /// * `Ok(Some(hash))` - The new head.
-/// * `Ok(None)`       - The key already held exactly this value from this signer.
+/// * `Ok(None)`       - The key already held exactly this value from this writer.
 pub fn set(subject: &str,
            key: &str,
            text: &str,
-           office: &VerifiedOffice,
-           actor: &Operator,
-           signer: &MetaSigner) -> Result<Option<String>, String> {
+           writer: &MetaWriter,
+           actor: &Operator) -> Result<Option<String>, String> {
     validate_key(key)?;
     validate_value(text)?;
 
-    let edit = meta_tree::set_cell(&cell_path(subject, key), &signer.key_id, KV_TEXT_SCHEMA, &text_value(text))?;
+    let edit = meta_tree::set_cell(&cell_path(subject, key), &writer.stamp(actor), KV_TEXT_SCHEMA, &text_value(text))?;
     let description = format!("manifest set {} {}", subject, key);
 
-    meta_tree::stack_meta_edits(KV_PALLET_NAME, &KvRules, office, &[edit], actor, &description, signer)
+    meta_tree::stack_meta_edits(KV_PALLET_NAME, &KvRules, writer, &[edit], actor, &description)
 }
 
-/// Remove a key from a subject, as one signed parcel. A key that holds no value is an error.
+/// Remove a key from a subject, as one parcel by `writer`. A key that holds no value is an
+/// error.
 pub fn unset(subject: &str,
              key: &str,
-             office: &VerifiedOffice,
-             actor: &Operator,
-             signer: &MetaSigner) -> Result<String, String> {
+             writer: &MetaWriter,
+             actor: &Operator) -> Result<String, String> {
     validate_key(key)?;
 
     if get(subject, key)?.is_none() {
@@ -245,7 +243,7 @@ pub fn unset(subject: &str,
     let edit = CellEdit::Unset { path: cell_path(subject, key) };
     let description = format!("manifest unset {} {}", subject, key);
 
-    meta_tree::stack_meta_edits(KV_PALLET_NAME, &KvRules, office, &[edit], actor, &description, signer)?
+    meta_tree::stack_meta_edits(KV_PALLET_NAME, &KvRules, writer, &[edit], actor, &description)?
         .ok_or(format!("{} has no value for the key \"{}\".", short(subject), key))
 }
 
@@ -258,9 +256,9 @@ pub fn get(subject: &str, key: &str) -> Result<Option<KvEntry>, String> {
     };
 
     Ok(meta_tree::read_cell(KV_PALLET_NAME, &head, &KvRules, &cell_path(subject, key))?.map(|read| {
-        let (value, signer) = read_value(read);
+        let (value, stamp) = read_value(read);
 
-        KvEntry { subject: subject.to_string(), key: key.to_string(), value, signer }
+        KvEntry { subject: subject.to_string(), key: key.to_string(), value, stamp }
     }))
 }
 
@@ -280,8 +278,8 @@ pub fn list(subject: Option<&str>) -> Result<Vec<KvEntry>, String> {
             continue;
         }
 
-        let (value, signer) = read_value(read);
-        entries.push(KvEntry { subject: cell_subject, key, value, signer });
+        let (value, stamp) = read_value(read);
+        entries.push(KvEntry { subject: cell_subject, key, value, stamp });
     }
 
     Ok(entries)

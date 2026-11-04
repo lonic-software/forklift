@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use forklift_core::error::sanitize;
 use forklift_core::util::kv_utils::short;
-use forklift_core::util::meta_tree::MetaSigner;
 use forklift_core::util::office_utils::{OfficeState, Role};
 use forklift_core::util::tag_utils::{AttributedTag, Tag, UnreadableTag};
 use forklift_core::util::{config_utils, file_utils, office_utils, pallet_utils, remote_utils, tag_utils};
@@ -53,17 +52,20 @@ fn create(name: &str, revision: Option<String>, message: Option<String>) -> Resu
     };
 
     let operator = config_utils::get_operator()?;
-    let (office, signing_key_id) = lower::verified_signing_office(&operator)?;
+    let writer = lower::meta_writer(&operator)?;
 
-    let is_admin = office.find_user(&operator.identifier)
-        .is_some_and(|user| matches!(user.role, Role::Admin));
+    // Under trust, a release is signed by an admin key. Without it there are no roles.
+    if let Some(office) = writer.office() {
+        let is_admin = office.find_user(&operator.identifier)
+            .is_some_and(|user| matches!(user.role, Role::Admin));
 
-    if !is_admin {
-        return Err(format!(
-            "Only an admin may create a tag (a release is signed by an admin key); \"{}\" is not \
-            an admin in this office.",
-            operator.identifier
-        ));
+        if !is_admin {
+            return Err(format!(
+                "Only an admin may create a tag (a release is signed by an admin key); \"{}\" is not \
+                an admin in this office.",
+                operator.identifier
+            ));
+        }
     }
 
     if let Some(existing) = tag_utils::find_tag(name)? {
@@ -80,7 +82,7 @@ fn create(name: &str, revision: Option<String>, message: Option<String>) -> Resu
         tagged_at: chrono::Utc::now().timestamp(),
     };
 
-    let tags_head = tag_utils::record_tag(&tag, &office, &operator, &MetaSigner::local(&signing_key_id))?;
+    let tags_head = tag_utils::record_tag(&tag, &writer, &operator)?;
 
     output::emit(&Created { name: name.to_string(), subject, tags_head });
 
@@ -240,7 +242,7 @@ pub(crate) struct TagView {
     message: String,
 
     /// The tagger's pseudonymous operator id (the chain's record), or the key id when the
-    /// office does not know the key.
+    /// office does not know the key. For an unsigned tag, the operator it declares.
     tagger: String,
 
     /// The resolved display name, when a resolution hook supplied one.
@@ -251,8 +253,10 @@ pub(crate) struct TagView {
     #[serde(skip_serializing_if = "Option::is_none")]
     tagger_role: Option<String>,
 
-    /// The key id the tag is signed with.
-    signer: String,
+    /// The key id the tag is signed with; absent when the tag was written without a key (in a
+    /// warehouse that never enrolled), so its tagger is only declared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signer: Option<String>,
 
     /// The tag creation time as RFC 3339 (UTC).
     tagged_at: String,
@@ -283,14 +287,16 @@ impl TagView {
         }
     }
 
-    /// The tagger label: display name (or operator id), plus role when known. Sanitized: the
-    /// display name is a remote directory lookup, so it can carry another operator's text.
+    /// The tagger label: display name (or operator id), plus role when known, or "unsigned" for a
+    /// tag written without a key. Sanitized: the display name is a remote directory lookup, so it
+    /// can carry another operator's text.
     fn tagger_label(&self) -> String {
         let who = sanitize(self.tagger_name.as_deref().unwrap_or(&self.tagger));
 
-        match &self.tagger_role {
-            Some(role) => format!("{} ({})", who, role),
-            None => who,
+        match (&self.tagger_role, &self.signer) {
+            (_, None) => format!("{} (unsigned)", who),
+            (Some(role), Some(_)) => format!("{} ({})", who, role),
+            (None, Some(_)) => who,
         }
     }
 }

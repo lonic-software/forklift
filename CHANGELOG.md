@@ -12,6 +12,13 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Changed
 
+- **Tags, the manifest, keyed values and hauls work without enrolling.** In a warehouse that
+  never ran `office enroll`, `tag create`, `manifest note/approve/provenance/set/unset` and every
+  `haul` command now record unsigned entries naming your configured operator, instead of
+  refusing. There are no roles until you enroll, so anyone may tag or record a merge. Readers
+  mark these entries `(unsigned)`, and in `--json` the `signer` field is absent (hauls carry
+  `"unsigned": true`). Once a warehouse has an office, every entry is signed as before. `git
+  export` skips unsigned tags.
 - **The command surface was redesigned, with no aliases for the old names.** Families get subcommands:
   `pallet create/list/delete/restore`, `store status/compact/peek/evict`,
   `git import/export/mirror`, `scope fetch/narrow/prune/status`, `self alias/schema/update`,

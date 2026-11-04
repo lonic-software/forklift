@@ -8077,7 +8077,7 @@ pub fn is_local_ahead(remote_head: &str, local_head: &str) -> Result<bool, Strin
 
 /// Whether the content check this store can run itself refuses a meta pallet's lift: its local
 /// head is ahead of `remote_head` and a new parcel breaks the pallet's rules against the local
-/// verified office (an admission the office no longer grants, say). `false` when the check
+/// trust state (an admission the office no longer grants, say). `false` when the check
 /// passes, when the pallet is not ahead, or when it cannot be run here, so a failed lift for
 /// any other reason (a transfer, a remote that moved) is never taken for a refusal.
 pub fn lift_refused_by_content(name: &str, remote_head: Option<&str>) -> bool {
@@ -8092,9 +8092,10 @@ pub fn lift_refused_by_content(name: &str, remote_head: Option<&str>) -> bool {
             return Ok(false);
         }
 
-        let office = crate::util::audit_utils::verified_local_office()?;
+        let office = crate::util::audit_utils::local_meta_office()?;
+        let office = office.as_ref().map(|office| &office.state);
 
-        Ok(meta_tree::verify_meta_content(name, rules, &office, meta_tree::Admission::Admit, Some(remote_head), &local).is_err())
+        Ok(meta_tree::verify_meta_content(name, rules, office, meta_tree::Admission::Admit, Some(remote_head), &local).is_err())
     };
 
     refused().unwrap_or(false)

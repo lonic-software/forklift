@@ -11275,7 +11275,7 @@ fn parcel_hash(area: &TestArea, dir: &str, revision: &str) -> String {
 }
 
 #[test]
-fn kv_needs_an_office_and_refuses_readers() {
+fn kv_refuses_readers_under_an_office() {
     let area = TestArea::new("kv-office");
     let server = Server::start(&area, None);
 
@@ -11284,10 +11284,6 @@ fn kv_needs_an_office_and_refuses_readers() {
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "-m", "base"]));
 
-    // No office: a write is refused before anything is stacked.
-    let refused = area.forklift("a", &["manifest", "set", "main", "ci", "green"]);
-    assert!(!refused.status.success(), "a kv write without an office must be refused");
-    assert!(stderr(&refused).contains("office"), "{}", stderr(&refused));
     assert!(stdout(&area.forklift("a", &["manifest", "keys"])).contains("No custom metadata"));
 
     assert_success(&area.forklift("a", &["office", "enroll"]));

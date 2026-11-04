@@ -4,8 +4,6 @@ use forklift_core::error::{sanitize, sanitize_lines};
 use forklift_core::util::manifest_utils::{
     self, AttributedEntry, ManifestEntry, ManifestKind, ManifestRead, Provenance, UnreadableEntry,
 };
-use forklift_core::util::meta_tree::MetaSigner;
-use forklift_core::util::office_utils::Role;
 use forklift_core::util::{config_utils, pallet_utils};
 use crate::cli::ManifestAction;
 use crate::commands::{kv, lower};
@@ -20,15 +18,15 @@ use crate::output::{self, CommandOutput};
 /// * `manifest`                          - list the whole manifest.
 /// * `manifest set/get/unset/keys/log`   - keyed values on `@kv` ([`kv`]).
 ///
-/// Authorship is the entry's signer stamp, so `manifest` needs no author argument — you
-/// record as yourself, verifiably.
+/// Authorship is the entry's stamp, so `manifest` needs no author argument — you record as
+/// yourself: verifiably under trust, as a declared operator in a warehouse that never enrolled.
 ///
 /// # Arguments
 /// * `action` - The subcommand (`None` lists the whole manifest).
 ///
 /// # Returns
 /// * `Ok(())`      - If the command was handled.
-/// * `Err(String)` - If trust is not established, the revision is unknown, or an object
+/// * `Err(String)` - If the trust anchor is lost, the revision is unknown, or an object
 ///                   could not be read or signed.
 pub fn handle_command(action: Option<ManifestAction>) -> Result<(), String> {
     match action {
@@ -64,19 +62,8 @@ fn record(revision: &str, kind: ManifestKind, body: String, provenance: Option<P
     let subject = pallet_utils::resolve_revision(revision)?;
 
     let actor = config_utils::get_operator()?;
-    let (office, signing_key_id) = lower::verified_signing_office(&actor)?;
-
-    let user = office.find_user(&actor.identifier).ok_or(format!(
-        "\"{}\" is not enrolled; ask an enrolled operator to admit you.", actor.identifier
-    ))?;
-
-    if user.role == Role::Reader {
-        return Err(format!(
-            "\"{}\" is a reader; only writers and admins may record manifest entries.", user.identifier
-        ));
-    }
-
-    let actor_id = user.identifier.clone();
+    let writer = lower::writing_meta_writer(&actor, "record manifest entries")?;
+    let actor_id = actor.identifier.clone();
 
     // Only provenance carries a time; identical entries of the other kinds collapse.
     let recorded_at = (kind == ManifestKind::Provenance).then(|| Utc::now().timestamp());
@@ -95,8 +82,7 @@ fn record(revision: &str, kind: ManifestKind, body: String, provenance: Option<P
         kind.as_str(), subject, actor_id
     );
 
-    let signer = MetaSigner::local(&signing_key_id);
-    let head = manifest_utils::record_entry(&entry, &office, &actor, &description, &signer)?;
+    let head = manifest_utils::record_entry(&entry, &writer, &actor, &description)?;
     let unchanged = head.is_none();
 
     // The record already stood: the head that holds it.
@@ -234,13 +220,18 @@ impl From<&UnreadableEntry> for UnreadableView {
     }
 }
 
-/// One manifest entry in a view, with its forge-proof author.
+/// One manifest entry in a view, with its author: forge-proof when signed, declared when not.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
 pub(crate) struct EntryView {
     kind: String,
     subject: String,
     author: String,
+
+    /// The key id the entry is stamped with; absent when it was written without a key (in a
+    /// warehouse that never enrolled), so its author is only declared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signer: Option<String>,
 
     /// When a provenance entry was recorded (Unix seconds); only provenance carries a time.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -275,6 +266,7 @@ impl From<&AttributedEntry> for EntryView {
             kind: attributed.entry.kind.as_str().to_string(),
             subject: attributed.entry.subject.clone(),
             author: attributed.author.clone(),
+            signer: attributed.signer.clone(),
             recorded_at: attributed.entry.recorded_at,
             body: attributed.entry.body.clone(),
             model: provenance.map(|p| p.model.clone()),
@@ -321,9 +313,11 @@ impl CommandOutput for ManifestView {
             };
             let rest: Vec<&str> = body_lines.collect();
 
+            let unsigned = if entry.signer.is_none() { " (unsigned)" } else { "" };
+
             println!(
-                "  {:<10}{}  {}{}{}",
-                entry.kind, where_clause, sanitize(&entry.author), body,
+                "  {:<10}{}  {}{}{}{}",
+                entry.kind, where_clause, sanitize(&entry.author), unsigned, body,
                 if rest.is_empty() && !body.is_empty() { "\"" } else { "" }
             );
 

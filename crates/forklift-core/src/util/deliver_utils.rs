@@ -19,7 +19,7 @@ use crate::model::operator::Operator;
 use crate::model::parcel::Parcel;
 use crate::model::parcel_action::ParcelAction;
 use crate::util::manifest_utils::{Delivery, ManifestEntry, ManifestKind};
-use crate::util::meta_tree::MetaSigner;
+use crate::util::meta_tree::{MetaSigner, MetaWriter};
 use crate::util::office_utils::Role;
 use crate::util::{audit_utils, config_utils, manifest_utils, merge_utils, object_utils,
                   office_utils, pallet_utils, sign_utils, stack_utils};
@@ -190,8 +190,8 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
         "Delivered {} checkpoint(s) from \"{}\" as parcel {}.",
         checkpoints, source, object.hash
     );
-    let signer = MetaSigner::local(&signing_key_id);
-    let recorded = manifest_utils::record_entry(&entry, &office, &operator, &manifest_description, &signer)?;
+    let writer = MetaWriter::Signed { office: office.clone(), signer: MetaSigner::local(&signing_key_id) };
+    let recorded = manifest_utils::record_entry(&entry, &writer, &operator, &manifest_description)?;
     let manifest_head = match recorded {
         Some(head) => head,
         // The record already stood: the head that holds it.
