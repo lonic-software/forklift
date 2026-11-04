@@ -8,6 +8,7 @@
 [commands]
 # One top-level name per line. A family is written `name: subcommand subcommand …`, and a family
 # inside a family as its full path on a line after its parent's: `self alias: install …`.
+abort
 audit
 bay: add remove
 blame
@@ -76,6 +77,7 @@ park
 # guarantee that exists now, and no Forklift command can bring it back from this warehouse alone.
 # When only one mode of a command is destructive, the entry names the flag and value selecting it.
 restore
+abort
 scope prune
 office regenesis
 office accept-regenesis

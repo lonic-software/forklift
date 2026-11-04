@@ -9,6 +9,7 @@ pub mod scope_narrow;
 pub mod lower;
 pub mod park;
 pub mod consolidate;
+pub mod merge_abort;
 pub mod pick;
 pub mod compact;
 pub mod store;

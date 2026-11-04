@@ -6,6 +6,7 @@ use forklift_core::util::{
 };
 use forklift_core::util::operation_utils::OperationKind;
 use crate::commands::consolidate;
+use crate::commands::merge_abort;
 use crate::output::{self, CommandOutput};
 
 /// Handle the pick command (§9.1 #8): apply a parcel's diff onto the current pallet
@@ -49,16 +50,19 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
     // in-progress consolidation or another in-progress pick.
     if merge_utils::read_consolidation_state()?.is_some() {
         return Err(
-            "A consolidation is in progress. Complete it (resolve, \"forklift load\", \"forklift stack\") or abort \
-            it before picking.".to_string()
+            format!(
+                "A consolidation is in progress. Complete it (resolve, \"forklift load\", \"forklift stack\") or \
+                abort it (\"{}\") before picking.",
+                merge_abort::ABORT_COMMAND
+            )
         );
     }
 
     if cherry_pick_utils::read_state()?.is_some() {
         return Err(format!(
-            "A pick is already in progress. Resolve its conflicts and \"forklift stack\", or {} to \
+            "A pick is already in progress. Resolve its conflicts and \"forklift stack\", or \"{}\" to \
             abort it.",
-            cherry_pick_utils::abort_hint()
+            merge_abort::ABORT_COMMAND
         ));
     }
 
@@ -110,7 +114,7 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
         return Err(format!("Parcel {} makes no changes; there is nothing to pick.", short));
     }
 
-    let source_label = format!("pick {}", &source[..source.len().min(10)]);
+    let source_label = conflict_label(&source);
 
     // A cherry-pick refuses in a scoped bay (above), so the merge always runs at full scope —
     // every path is in scope and materialized, exactly today's behavior.
@@ -252,8 +256,8 @@ impl CommandOutput for Picked {
 
                 println!(
                     "\nResolve the conflicts, \"forklift load\" the resolved files, then \"forklift stack\" to \
-                    complete the pick (or {} to abort it).",
-                    cherry_pick_utils::abort_hint()
+                    complete the pick (or \"{}\" to abort it).",
+                    merge_abort::ABORT_COMMAND
                 );
             }
         }
@@ -267,6 +271,12 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
     vec![
         crate::docgen::OutputSchema::of::<Picked>(),
     ]
+}
+
+/// The label a pick's conflict markers give the picked side. `abort` recomputes the pick's output
+/// with it and compares that with the working files, so the two must never differ.
+pub(crate) fn conflict_label(source: &str) -> String {
+    format!("pick {}", &source[..source.len().min(10)])
 }
 
 #[cfg(test)]

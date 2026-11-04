@@ -117,7 +117,8 @@ impl CommandOutput for StocktakeReport {
 
         if let Some(their_pallet) = &self.consolidation_in_progress {
             println!(
-                "A consolidation with pallet \"{}\" is in progress; \"forklift stack\" completes it.",
+                "A consolidation with pallet \"{}\" is in progress; \"forklift stack\" completes it, and \
+                \"forklift abort\" abandons it.",
                 their_pallet
             );
         }

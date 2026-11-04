@@ -8012,9 +8012,9 @@ fn a_usage_error_under_json_is_one_failure_document_with_exit_2() {
     assert!(usage.contains("Usage: forklift"), "details keep clap's full text: {}", usage);
     assert!(stderr(&unknown).is_empty(), "nothing else is printed: {}", stderr(&unknown));
 
-    // A bad argument to a command named by alias (`a` is `audit`), with `--json` after the
+    // A bad argument to a command named by prefix (`au` is `audit`), with `--json` after the
     // command: the flag is found wherever it sits, and the header carries the canonical name.
-    let bad_argument = warehouse.run(&["a", "--nope", "--json"]);
+    let bad_argument = warehouse.run(&["au", "--nope", "--json"]);
     assert_eq!(bad_argument.status.code(), Some(2));
     let value = json(&bad_argument);
     assert_eq!(value["error"]["code"], "usage");
@@ -14222,4 +14222,230 @@ fn prepare_marks_the_warehouse_and_staging_leftovers_are_never_tracked() {
     assert_success(&warehouse.run(&["load", "."]));
     let status = json(&warehouse.run(&["--json", "stocktake"]));
     assert_eq!(status["data"]["staged"], serde_json::json!([{"kind": "added", "path": "sub/keep.txt"}]), "{}", status);
+}
+
+/// A warehouse on "main" holding a consolidation of "other" stopped at a conflict on f.txt; h.txt
+/// and k.txt are tracked and untouched by the merge, and a pallet "spare" exists.
+fn a_conflicted_consolidation(name: &str) -> TestWarehouse {
+    let warehouse = TestWarehouse::new(name);
+    warehouse.write_file("f.txt", "base\n");
+    warehouse.write_file("h.txt", "h\n");
+    warehouse.write_file("k.txt", "k\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
+    assert_success(&warehouse.run(&["pallet", "create", "spare"]));
+    assert_success(&warehouse.run(&["pallet", "create", "other"]));
+    warehouse.write_file("f.txt", "theirs\n");
+    assert_success(&warehouse.run(&["load", "f.txt"]));
+    assert_success(&warehouse.run(&["stack", "-m", "theirs"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+    warehouse.write_file("f.txt", "ours\n");
+    assert_success(&warehouse.run(&["load", "f.txt"]));
+    assert_success(&warehouse.run(&["stack", "-m", "ours"]));
+
+    let merge = warehouse.run(&["consolidate", "other"]);
+    assert_success(&merge);
+    assert!(stdout(&merge).contains("conflict: f.txt") && stdout(&merge).contains("forklift abort"),
+        "the conflict report names the abort: {}", stdout(&merge));
+
+    warehouse
+}
+
+/// The paths `stocktake --json` lists as staged and as unstaged.
+fn staged_and_unstaged(warehouse: &TestWarehouse) -> (Vec<String>, Vec<String>) {
+    let status = json(&warehouse.run(&["--json", "stocktake"]));
+    let paths = |key: &str| status["data"][key].as_array().into_iter().flatten()
+        .map(|change| change["path"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+
+    (paths("staged"), paths("unstaged"))
+}
+
+#[test]
+fn abort_puts_back_what_the_merge_touched_and_keeps_every_other_change() {
+    let warehouse = a_conflicted_consolidation("abort-keeps-others");
+
+    // Staged during the merge on paths it never touched, and one change left unstaged: the
+    // completing stack would take the first two, so the abort keeps all three as they are.
+    warehouse.write_file("h.txt", "h edited\n");
+    warehouse.write_file("g.txt", "new\n");
+    assert_success(&warehouse.run(&["load", "h.txt"]));
+    assert_success(&warehouse.run(&["load", "g.txt"]));
+    warehouse.write_file("k.txt", "k edited\n");
+
+    let aborted = warehouse.run(&["abort"]);
+    assert_success(&aborted);
+    assert!(stdout(&aborted).contains("Aborted the consolidation of \"other\" into \"main\""), "{}", stdout(&aborted));
+
+    assert_eq!(read(&warehouse, "f.txt"), "ours\n");
+    assert_eq!((read(&warehouse, "h.txt"), read(&warehouse, "g.txt"), read(&warehouse, "k.txt")),
+        ("h edited\n".to_string(), "new\n".to_string(), "k edited\n".to_string()));
+    assert_eq!(staged_and_unstaged(&warehouse), (vec!["g.txt".to_string(), "h.txt".to_string()], vec!["k.txt".to_string()]),
+        "staged changes stay staged and the unstaged one stays unstaged");
+    assert!(!stdout(&warehouse.run(&["stocktake"])).contains("in progress"), "no consolidation stays in progress");
+
+    let again = warehouse.run(&["abort"]);
+    assert_eq!(again.status.code(), Some(1));
+    assert!(stderr(&again).contains("No consolidation or pick is in progress"), "{}", stderr(&again));
+
+    // Nothing of the abandoned merge is recorded: consolidating again meets the same conflict.
+    assert_success(&warehouse.run(&["load", "k.txt"]));
+    assert_success(&warehouse.run(&["stack", "-m", "kept"]));
+    let merge = warehouse.run(&["consolidate", "other"]);
+    assert!(stdout(&merge).contains("conflict: f.txt"), "{}{}", stdout(&merge), stderr(&merge));
+}
+
+#[test]
+fn abort_refuses_to_discard_a_resolution_until_confirmed() {
+    let warehouse = a_conflicted_consolidation("abort-confirm");
+    warehouse.write_file("f.txt", "resolved\n");
+    assert_success(&warehouse.run(&["load", "f.txt"]));
+
+    let refused = warehouse.run(&["abort"]);
+    assert_eq!(refused.status.code(), Some(39), "{}", stderr(&refused));
+    assert!(stdout(&refused).contains("  f.txt"), "the refusal lists the resolution: {}", stdout(&refused));
+    assert!(stderr(&refused).contains("forklift abort --confirm"), "{}", stderr(&refused));
+    assert_eq!(read(&warehouse, "f.txt"), "resolved\n", "a refused abort changes nothing");
+    assert!(stdout(&warehouse.run(&["stocktake"])).contains("in progress"), "the consolidation stays in progress");
+
+    // The refusal is about the resolution, not the merge's own conflict output.
+    let confirmed = warehouse.run(&["abort", "--confirm"]);
+    assert_success(&confirmed);
+    assert!(stdout(&confirmed).contains("Discarded"), "{}", stdout(&confirmed));
+    assert_eq!(read(&warehouse, "f.txt"), "ours\n");
+    assert_eq!(staged_and_unstaged(&warehouse), (vec![], vec![]));
+}
+
+#[test]
+fn undo_of_a_conflicted_consolidate_aborts_it_and_then_reaches_the_stack_before() {
+    let warehouse = a_conflicted_consolidation("abort-undo");
+    let conflicted = read(&warehouse, "f.txt");
+    warehouse.write_file("f.txt", "resolved\n");
+
+    let refused = warehouse.run(&["undo"]);
+    assert_eq!(refused.status.code(), Some(39), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("forklift abort --confirm"), "{}", stderr(&refused));
+    assert_eq!(read(&warehouse, "f.txt"), "resolved\n", "a refused undo changes nothing");
+
+    // Back at what the merge wrote, the undo needs no confirmation.
+    warehouse.write_file("f.txt", &conflicted);
+    let undone = warehouse.run(&["undo"]);
+    assert_success(&undone);
+    assert!(stdout(&undone).contains("Undid consolidate") && stdout(&undone).contains("aborted"), "{}", stdout(&undone));
+    assert_eq!(read(&warehouse, "f.txt"), "ours\n");
+    assert_eq!(staged_and_unstaged(&warehouse), (vec![], vec![]));
+
+    let next = warehouse.run(&["undo"]);
+    assert_success(&next);
+    assert!(stdout(&next).contains("Undid stack") && stdout(&next).contains("(ours)"), "{}", stdout(&next));
+}
+
+#[test]
+fn an_abort_under_a_pallet_delete_leaves_both_undoable() {
+    let warehouse = a_conflicted_consolidation("abort-under-delete");
+    assert_success(&warehouse.run(&["pallet", "delete", "spare"]));
+
+    assert_success(&warehouse.run(&["abort"]));
+
+    let undelete = warehouse.run(&["undo"]);
+    assert_success(&undelete);
+    assert!(stdout(&undelete).contains("Undid delete"), "{}", stdout(&undelete));
+
+    let unstack = warehouse.run(&["undo"]);
+    assert_success(&unstack);
+    assert!(stdout(&unstack).contains("Undid stack") && stdout(&unstack).contains("(ours)"),
+        "the consolidate's entry went with the abort: {}", stdout(&unstack));
+}
+
+/// `undo` reads the skeleton with the consolidation, and its refusal names the abort: the abort
+/// must not need it, or that way out would loop.
+#[test]
+fn abort_works_with_the_skeleton_missing() {
+    let warehouse = a_conflicted_consolidation("abort-no-skeleton");
+    std::fs::remove_file(warehouse.root.join(".forklift/consolidation-skeleton")).unwrap();
+
+    let undo = warehouse.run(&["undo"]);
+    assert!(!undo.status.success() && stderr(&undo).contains("\"forklift abort\""),
+        "the skeleton refusal names the abort: {}", stderr(&undo));
+
+    assert_success(&warehouse.run(&["abort"]));
+    assert_eq!(read(&warehouse, "f.txt"), "ours\n");
+
+    let unstack = warehouse.run(&["undo"]);
+    assert!(stdout(&unstack).contains("Undid stack") && stdout(&unstack).contains("(ours)"), "{}", stderr(&unstack));
+}
+
+#[test]
+fn abort_puts_a_file_back_over_the_folder_their_side_made_of_it() {
+    let warehouse = TestWarehouse::new("abort-file-folder");
+    warehouse.write_file("f.txt", "base\n");
+    warehouse.write_file("d", "d\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
+    assert_success(&warehouse.run(&["pallet", "create", "other"]));
+    assert_success(&warehouse.run(&["remove", "d"]));
+    std::fs::remove_file(warehouse.root.join("d")).unwrap();
+    warehouse.write_file("d/f", "x\n");
+    warehouse.write_file("f.txt", "theirs\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "theirs"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+    warehouse.write_file("f.txt", "ours\n");
+    assert_success(&warehouse.run(&["load", "f.txt"]));
+    assert_success(&warehouse.run(&["stack", "-m", "ours"]));
+    assert_success(&warehouse.run(&["consolidate", "other"]));
+    assert!(warehouse.root.join("d").is_dir(), "sanity: the merge made d a folder");
+
+    // A file of the user's own in the folder would be deleted: refused before any write.
+    warehouse.write_file("d/notes.txt", "n\n");
+    let refused = warehouse.run(&["abort"]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(stderr(&refused).contains("d/notes.txt"), "{}", stderr(&refused));
+    assert_eq!(read(&warehouse, "d/f"), "x\n", "a refused abort changes nothing");
+
+    std::fs::remove_file(warehouse.root.join("d/notes.txt")).unwrap();
+    assert_success(&warehouse.run(&["abort"]));
+    assert_eq!(read(&warehouse, "d"), "d\n");
+    assert_eq!(staged_and_unstaged(&warehouse), (vec![], vec![]));
+}
+
+#[test]
+fn abort_puts_back_a_conflicted_pick() {
+    let warehouse = a_conflicted_consolidation("pick-abort");
+    assert_success(&warehouse.run(&["abort"]));
+    let source = pallet_head_hash(&warehouse, "other");
+
+    let pick = warehouse.run(&["pick", &source]);
+    assert_success(&pick);
+    assert!(stdout(&pick).contains("forklift abort"), "the conflict report names the abort: {}", stdout(&pick));
+
+    let aborted = warehouse.run(&["abort"]);
+    assert_success(&aborted);
+    assert!(stdout(&aborted).contains("Aborted the pick"), "{}", stdout(&aborted));
+    assert_eq!(read(&warehouse, "f.txt"), "ours\n");
+    assert_eq!(staged_and_unstaged(&warehouse), (vec![], vec![]));
+
+    let unstack = warehouse.run(&["undo"]);
+    assert!(stdout(&unstack).contains("Undid stack") && stdout(&unstack).contains("(ours)"), "{}", stdout(&unstack));
+}
+
+#[test]
+fn park_refuses_a_pick_in_progress_even_with_its_conflicts_resolved() {
+    let warehouse = a_conflicted_consolidation("pick-park");
+    assert_success(&warehouse.run(&["abort"]));
+    let source = pallet_head_hash(&warehouse, "other");
+    assert_success(&warehouse.run(&["pick", &source]));
+
+    warehouse.write_file("f.txt", "resolved\n");
+    assert_success(&warehouse.run(&["load", "f.txt"]));
+
+    let refused = warehouse.run(&["park"]);
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("A pick is in progress") && stderr(&refused).contains("forklift abort"),
+        "{}", stderr(&refused));
+    assert_eq!(read(&warehouse, "f.txt"), "resolved\n", "nothing was parked");
 }

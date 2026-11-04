@@ -12,6 +12,7 @@ use forklift_core::util::{
 };
 use forklift_core::util::shift_utils::HeadWrite;
 use forklift_core::util::stack_utils::StackError;
+use crate::commands::merge_abort;
 use crate::output::{self, CommandOutput};
 
 /// Handle the consolidate command (git's "merge"; warehouse workers consolidate loads
@@ -46,16 +47,19 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
 
     if merge_utils::read_consolidation_state()?.is_some() {
         return Err(format!(
-            "A consolidation is already in progress. Resolve its conflicts and \"forklift stack\", or {} \
-            to abort it.",
-            merge_utils::abort_hint_in(&forklift_core::globals::bay_root())
+            "A consolidation is already in progress. Resolve its conflicts and \"forklift stack\", or \
+            \"{}\" to abort it.",
+            merge_abort::ABORT_COMMAND
         ));
     }
 
     if forklift_core::util::cherry_pick_utils::read_state()?.is_some() {
         return Err(
-            "A pick is in progress. Complete it (resolve, \"forklift load\", \"forklift stack\") or abort \
-            it before consolidating.".to_string()
+            format!(
+                "A pick is in progress. Complete it (resolve, \"forklift load\", \"forklift stack\") or abort \
+                it (\"{}\") before consolidating.",
+                merge_abort::ABORT_COMMAND
+            )
         );
     }
 
@@ -225,7 +229,8 @@ impl CommandOutput for ConsolidateReport {
 
                 println!(
                     "\nResolve the conflicts, \"forklift load\" the resolved files, then \"forklift stack\" to \
-                    complete the consolidation."
+                    complete the consolidation (or \"{}\" to abort it).",
+                    merge_abort::ABORT_COMMAND
                 );
             }
         }

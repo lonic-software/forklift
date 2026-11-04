@@ -664,6 +664,58 @@ A command not listed here either reports only the generic human-message shape `{
 }
 ```
 
+## `abort`
+
+### `Aborted`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The result of an abort.",
+  "properties": {
+    "discarded": {
+      "description": "With --confirm: the files whose changes since the merge were discarded.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "head": {
+      "description": "The pallet head the touched files are back at.",
+      "type": "string"
+    },
+    "kind": {
+      "description": "What was aborted: `consolidation` or `pick`.",
+      "type": "string"
+    },
+    "other": {
+      "description": "The other side: the consolidated pallet (or haul source), or the picked parcel.",
+      "type": "string"
+    },
+    "pallet": {
+      "description": "The pallet the merge was started on, current still.",
+      "type": "string"
+    },
+    "restored": {
+      "description": "How many paths the merge touched, each now back at the head.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "kind",
+    "other",
+    "pallet",
+    "head",
+    "restored",
+    "discarded"
+  ],
+  "title": "Aborted",
+  "type": "object"
+}
+```
+
 ## `consolidate`
 
 ### `ConsolidateReport`
@@ -5920,6 +5972,15 @@ A command not listed here either reports only the generic human-message shape `{
     "pallet": {
       "description": "The pallet that is current after the undo.",
       "type": "string"
+    },
+    "put_back": {
+      "description": "For a reversed `consolidate` or `pick` that stopped at conflicts: how many files it touched,\neach now back at the head.",
+      "format": "uint",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
     },
     "restored": {
       "description": "For a reversed `delete`, the pallet that was deleted.",

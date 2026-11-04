@@ -394,6 +394,7 @@ fn command_schemas(name: &str) -> Option<Vec<OutputSchema>> {
     use crate::commands;
 
     Some(match name {
+        "abort" => commands::merge_abort::__docgen_schemas(),
         "audit" => commands::audit::__docgen_schemas(),
         "bay" => commands::bay::__docgen_schemas(),
         "blame" => commands::blame::__docgen_schemas(),

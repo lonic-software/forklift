@@ -18,6 +18,7 @@ Every tool `forklift mcp` serves, generated from the same command definition the
 | `bay_remove` | `forklift bay remove` | De-register a bay (its pallet ref and materialized files are kept) | `name` (a string, required) |
 | `blame` | `forklift blame` | Show, for each line of a file, the parcel and author that last changed it | `path` (a string, required)<br>`rev` (a string) |
 | `conflicts` | `forklift conflicts` | List the files left in conflict by an unresolved consolidation |  |
+| `abort` | `forklift abort` | Abandon the consolidation or pick in progress, putting back what it changed | `confirm` (a boolean) |
 | `consolidate` | `forklift consolidate` | Consolidate (merge) another pallet into the current one | `pallet` (a string, required) |
 | `deliver` | `forklift deliver` | Squash the current draft pallet onto a target as one clean parcel, keeping the trail | `target` (a string, required)<br>`message` (a string) |
 | `diff` | `forklift diff` | Show line-by-line changes | `staged` (a boolean)<br>`targets` (an array of strings) |

@@ -64,13 +64,13 @@ async fn moved_under_merge(pallet: &str, found: Option<&str>) -> Result<Option<S
         (Some(state), _) => (
             "consolidation",
             state.our_head,
-            merge_utils::abort_hint_in(&bay_root()),
+            merge_utils::state_removal_hint_in(&bay_root()),
             "merge again (\"forklift consolidate\", or the \"forklift haul consolidate\" or \"forklift lift\" that started it)".to_string(),
         ),
         (None, Some(state)) => (
             "pick",
             state.our_head,
-            cherry_pick_utils::abort_hint(),
+            cherry_pick_utils::state_removal_hint(),
             format!("pick {} again", state.source),
         ),
         (None, None) => return Ok(None),

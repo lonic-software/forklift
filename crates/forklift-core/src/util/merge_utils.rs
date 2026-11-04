@@ -65,9 +65,11 @@ const SKELETON_RECORD: &str = "consolidation-skeleton";
 // bump `journal_utils::JOURNAL_VERSION` with it, so an old journal is named as another version.
 const SKELETON_VERSION: u32 = 1;
 
-/// How to abort the consolidation whose files live in the bay-local state dir `dir`: remove both
-/// of them. A phrase such as `remove "<a>" and "<b>"`, naming that bay's own paths.
-pub fn abort_hint_in(dir: &Path) -> String {
+/// How to abandon the consolidation whose files live in the bay-local state dir `dir` without
+/// putting anything back: remove both of them. A phrase such as `remove "<a>" and "<b>"`, naming
+/// that bay's own paths. For where `abort` cannot run: an unreadable state, or a bay
+/// no longer at the head the merge was built on.
+pub fn state_removal_hint_in(dir: &Path) -> String {
     format!(
         "remove \"{}\" and \"{}\"",
         dir.join(FILE_NAME_CONSOLIDATION).to_string_lossy(),
@@ -75,11 +77,14 @@ pub fn abort_hint_in(dir: &Path) -> String {
     )
 }
 
-/// The way out of an unreadable consolidation in `dir`: both of its files go, and the merge
-/// starts over.
+/// The way out of an unreadable consolidation state in `dir`: both of its files go, and the merge
+/// starts over. The abort cannot run: it reads what the state recorded.
 fn abort_remedy_in(dir: &Path) -> String {
-    format!("Abort the consolidation ({}) and consolidate again.", abort_hint_in(dir))
+    format!("Abandon the consolidation ({}) and consolidate again.", state_removal_hint_in(dir))
 }
+
+/// The way out of a missing or unreadable skeleton: the abort, which never reads it.
+const SKELETON_REMEDY: &str = "Abort the consolidation (\"forklift abort\") and consolidate again.";
 
 /// Get the path of the consolidation-state file (bay-local: a merge in progress belongs
 /// to the bay resolving it).
@@ -279,7 +284,7 @@ format!(
                     missing — most likely an interrupted write (a crash mid-merge). The completing \
                     stack cannot tell what out-of-scope entries the merge resolved, so it refuses \
                     rather than silently drop them. {}",
-                    path.to_string_lossy(), abort_remedy_in(&bay_root())
+                    path.to_string_lossy(), SKELETON_REMEDY
                 )
             } else {
                 format!("Error while reading \"{}\": {}", path.to_string_lossy(), e)
@@ -322,7 +327,7 @@ format!(
     ///
     /// `path` is where `bytes` were read from; an error names it, and the way out in its bay.
     pub fn from_bytes(bytes: &[u8], path: &Path) -> Result<OutOfScopeSkeleton, String> {
-        let remedy = abort_remedy_in(path.parent().unwrap_or(Path::new("")));
+        let remedy = SKELETON_REMEDY;
         let lines = record_utils::from_bytes(bytes, SKELETON_RECORD, SKELETON_VERSION).map_err(|e| format!(
             "The consolidation skeleton file \"{}\" {} {}", path.to_string_lossy(), e.describe(), remedy
         ))?;
@@ -1884,11 +1889,11 @@ mod tests {
         // A version-1 state (no base) is refused by its version, never read without one.
         std::fs::write(get_consolidation_state_path(), record_utils::to_bytes(CONSOLIDATION_RECORD, 1, ["ab".repeat(32), "feature".to_string()])).unwrap();
         let error = read_consolidation_state().err().expect("a version-1 state file must be refused");
-        assert!(error.contains("does not know") && error.contains("Abort the consolidation"), "{}", error);
+        assert!(error.contains("does not know") && error.contains("Abandon the consolidation"), "{}", error);
 
         std::fs::write(get_consolidation_state_path(), format!("{}\nfeature\n", "ab".repeat(32))).unwrap();
         let error = read_consolidation_state().err().expect("a headerless state file must be refused");
-        assert!(error.contains("has no format header") && error.contains("Abort the consolidation"), "{}", error);
+        assert!(error.contains("has no format header") && error.contains("Abandon the consolidation"), "{}", error);
 
         std::fs::remove_dir_all(&temp).ok();
     }

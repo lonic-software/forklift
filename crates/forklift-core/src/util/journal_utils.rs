@@ -109,12 +109,21 @@ impl BayState {
     /// The bay as it is now. Its head is the bay's base — the tree it holds — never a fresh read of
     /// the pallet's ref, which another bay can move without touching this bay.
     fn read() -> Result<BayState, String> {
+        Self::read_with(true)
+    }
+
+    /// The bay as it is now, with any consolidation's skeleton left empty and unread.
+    fn read_without_skeleton() -> Result<BayState, String> {
+        Self::read_with(false)
+    }
+
+    fn read_with(skeleton: bool) -> Result<BayState, String> {
         let position = pallet_utils::read_position()?;
 
         Ok(BayState {
             current_pallet: position.pallet,
             current_head: position.base,
-            consolidation: read_consolidation()?,
+            consolidation: read_consolidation(skeleton)?,
             cherry_pick: read_cherry_pick()?,
         })
     }
@@ -146,13 +155,16 @@ impl Snapshot {
 
 /// The bay's consolidation in progress, as journaled. Its skeleton is required, exactly as the
 /// completing stack requires it: a state without one is a broken merge, never an empty skeleton.
-fn read_consolidation() -> Result<Option<ConsolidationInProgress>, String> {
+fn read_consolidation(with_skeleton: bool) -> Result<Option<ConsolidationInProgress>, String> {
     let Some(state) = merge_utils::read_consolidation_state()? else {
         return Ok(None);
     };
 
-    let skeleton = String::from_utf8(OutOfScopeSkeleton::read_required()?.to_bytes())
-        .map_err(|_| "The out-of-scope skeleton does not serialize as text.".to_string())?;
+    let skeleton = match with_skeleton {
+        true => String::from_utf8(OutOfScopeSkeleton::read_required()?.to_bytes())
+            .map_err(|_| "The out-of-scope skeleton does not serialize as text.".to_string())?,
+        false => String::new(),
+    };
 
     Ok(Some(ConsolidationInProgress {
         their_head: state.their_head,
@@ -224,7 +236,7 @@ pub fn capture() -> Result<Snapshot, String> {
     let snapshot = Snapshot {
         current_pallet: position.pallet,
         heads,
-        consolidation: read_consolidation()?,
+        consolidation: read_consolidation(true)?,
         cherry_pick: read_cherry_pick()?,
     };
 
@@ -290,7 +302,7 @@ pub fn push_if_changed(op: &str, mut before: Snapshot) -> Result<(), String> {
     let mut after = Snapshot {
         current_pallet: position.pallet,
         heads: BTreeMap::new(),
-        consolidation: read_consolidation()?,
+        consolidation: read_consolidation(true)?,
         cherry_pick: read_cherry_pick()?,
     };
 
@@ -443,7 +455,7 @@ pub fn delete_entry(wire: &str, head: &str) -> Result<JournalEntry, String> {
     let mut after = Snapshot {
         current_pallet: position.pallet,
         heads,
-        consolidation: read_consolidation()?,
+        consolidation: read_consolidation(true)?,
         cherry_pick: read_cherry_pick()?,
     };
     let mut before = after.clone();
@@ -719,6 +731,53 @@ pub fn pop() -> Result<Option<JournalEntry>, String> {
     }
 
     Ok(popped)
+}
+
+/// Remove the most recent entry other than a pallet delete when it is the operation that left the
+/// bay's consolidation or pick in progress (a consolidate or pick that stopped at conflicts), and
+/// the bay is still exactly where it left it — for an abort, which abandons that operation outside
+/// `undo`. Kept, the entry would refuse every later undo: the bay no longer holds the consolidation
+/// its after records. Deletes above it stay, in order: a pallet can be deleted while a merge waits,
+/// and its undo depends on no bay state. Any other entry is left alone, so a rerun of an
+/// interrupted abort, whose entry is already gone, removes nothing more.
+///
+/// # Returns
+/// * `Ok(true)`    - The entry was removed.
+/// * `Ok(false)`   - No such entry is the latest, or the journal is empty.
+/// * `Err(String)` - If the journal or the bay's state could not be read, or the journal rewritten.
+pub fn pop_if_it_left_in_progress() -> Result<bool, String> {
+    let mut entries = read()?;
+    let Some(index) = entries.iter().rposition(|entry| entry.op != DELETE_OP) else {
+        return Ok(false);
+    };
+    let entry = &entries[index];
+
+    if !left_in_progress(entry) {
+        return Ok(false);
+    }
+
+    // Without the skeleton: an abort clears whatever it holds, and is the way out of one that is
+    // missing or unreadable.
+    let mut after = entry.after.bay_state();
+    if let Some(consolidation) = after.consolidation.as_mut() {
+        consolidation.skeleton.clear();
+    }
+
+    if BayState::read_without_skeleton()? != after {
+        return Ok(false);
+    }
+
+    entries.remove(index);
+    write(&entries)?;
+    Ok(true)
+}
+
+/// Whether `entry`'s operation started the consolidation or pick its after snapshot holds: one it
+/// stopped at conflicts, leaving the in-progress state as its only change to the bay.
+pub fn left_in_progress(entry: &JournalEntry) -> bool {
+    entry.op != DELETE_OP
+        && ((entry.after.consolidation.is_some() && entry.before.consolidation.is_none())
+            || (entry.after.cherry_pick.is_some() && entry.before.cherry_pick.is_none()))
 }
 
 /// Whether the bay is still exactly where `entry`'s operation left it: the same current pallet,

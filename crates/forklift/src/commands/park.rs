@@ -7,10 +7,11 @@ use forklift_core::model::parcel_action::ParcelAction;
 use forklift_core::util::shift_utils::FileOp;
 use serde::Serialize;
 use forklift_core::util::{
-    alias_utils, config_utils, file_utils, inventory_utils, load_guard_utils, merge_utils, object_utils,
+    alias_utils, cherry_pick_utils, config_utils, file_utils, inventory_utils, load_guard_utils, merge_utils, object_utils,
     operation_utils, pallet_utils, park_utils, scope_utils, shift_utils, sign_utils, stack_utils, tree_utils,
 };
 use forklift_core::util::operation_utils::{Operation, OperationKind};
+use crate::commands::merge_abort;
 use crate::output::{self, CommandOutput};
 
 // The park command (git's "stash"; a forklift operator parks the truck). One public
@@ -34,10 +35,18 @@ pub async fn park_changes() -> Result<(), String> {
     // Park writes no pallet head, so only the key is kept.
     let signing_key_id = stack_utils::resolve_signing_key(&operator)?.key_id().map(str::to_string);
 
-    if merge_utils::read_consolidation_state()?.is_some() {
-        return Err(
-            "A consolidation is in progress; complete it (or abort it) before parking.".to_string()
-        );
+    // Parked, a merge's output would leave its state behind, for a later stack or abort to act on
+    // a bay that no longer holds it.
+    let in_progress = match (merge_utils::read_consolidation_state()?, cherry_pick_utils::read_state()?) {
+        (Some(_), _) => Some("consolidation"),
+        (None, Some(_)) => Some("pick"),
+        (None, None) => None,
+    };
+    if let Some(what) = in_progress {
+        return Err(format!(
+            "A {} is in progress; complete it with \"forklift stack\", or abandon it with \"{}\", before parking.",
+            what, merge_abort::ABORT_COMMAND
+        ));
     }
 
     if inventory_utils::has_conflict_entries()? {

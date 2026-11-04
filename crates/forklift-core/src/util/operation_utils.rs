@@ -577,7 +577,7 @@ fn recover_operation(operation: &Operation) -> Result<(RecoveryOutcome, Vec<Stri
             Some(tree) if object_utils::load_tree(tree).is_err() => roll_back(operation),
             target_tree => {
                 let target_tree = tree_or_empty(target_tree.as_deref())?;
-                put_back(&tree_or_empty(operation.source_tree.as_deref())?, &target_tree)?;
+                put_back(&tree_or_empty(operation.source_tree.as_deref())?, &target_tree, &[])?;
                 let unheld = rebuild_staging(Some(&target_tree), &[])?;
                 pallet_utils::write_position(&operation.target)?;
                 Ok((RecoveryOutcome::RolledForward, unheld))
@@ -596,7 +596,7 @@ fn recover_operation(operation: &Operation) -> Result<(RecoveryOutcome, Vec<Stri
                 // The work is safe in the list, so the reset to the head is finished: a file still
                 // holding the parked content goes back to the head.
                 let head_tree = tree_or_empty(operation.source_tree.as_deref())?;
-                put_back(&object_utils::load_parcel(parcel)?.tree_hash, &head_tree)?;
+                put_back(&object_utils::load_parcel(parcel)?.tree_hash, &head_tree, &[])?;
                 Ok((RecoveryOutcome::RolledForward, rebuild_staging(Some(&head_tree), &[])?))
             } else {
                 // The working files were never touched, and staging holds only what they hold.
@@ -623,7 +623,7 @@ fn recover_operation(operation: &Operation) -> Result<(RecoveryOutcome, Vec<Stri
 
             if landed {
                 let target_tree = tree_or_empty(operation.target_tree.as_deref())?;
-                put_back(&tree_or_empty(operation.source_tree.as_deref())?, &target_tree)?;
+                put_back(&tree_or_empty(operation.source_tree.as_deref())?, &target_tree, &operation.carried)?;
                 let unheld = rebuild_staging(Some(&target_tree), &operation.carried)?;
                 pallet_utils::record_landed(&operation.target.pallet, new)?;
                 Ok((RecoveryOutcome::RolledForward, unheld))
@@ -655,7 +655,7 @@ fn recover_operation(operation: &Operation) -> Result<(RecoveryOutcome, Vec<Stri
         OperationKind::BayCreation => {
             // A bay being created holds no work of its own, so its files are written outright.
             if let Some(tree) = &operation.target_tree {
-                put_back(&object_utils::empty_tree_hash()?, tree)?;
+                put_back(&object_utils::empty_tree_hash()?, tree, &[])?;
             }
 
             Ok((RecoveryOutcome::RolledForward, rebuild_staging(operation.target_tree.as_deref(), &[])?))
@@ -689,7 +689,7 @@ fn roll_back(operation: &Operation) -> Result<(RecoveryOutcome, Vec<String>), St
     };
 
     if let Some(written_from) = written_from {
-        put_back(&written_from, &source_tree)?;
+        put_back(&written_from, &source_tree, &operation.carried)?;
     }
 
     let unheld = rebuild_staging(Some(&source_tree), &operation.carried)?;
@@ -715,9 +715,12 @@ fn clear_in_progress_state(operation: &Operation) -> Result<(), String> {
 /// directory still holds what the operation could have left there: `from`'s content, `to`'s (then
 /// the path is done already), or nothing. A file holding anything else is the user's work since the
 /// crash, or an untracked file where `to` adds one, so it is left alone, and the rebuild after
-/// reports it as a local change.
-fn put_back(from: &str, to: &str) -> Result<(), String> {
+/// reports it as a local change. A `carried` path is never touched: it holds the user's own change,
+/// which may match either tree (an abort carries an edit back to the other side's content, or a
+/// deletion), and the rebuild keeps its entry.
+fn put_back(from: &str, to: &str, carried: &[CarriedEntry]) -> Result<(), String> {
     let (ops, removed_dirs) = shift_utils::diff_trees(Some(from), to)?;
+    let carried: std::collections::HashSet<&str> = carried.iter().map(|carried| carried.path.as_str()).collect();
 
     // Every file not at a tree's content, a missing one included, comes back from its rebuild.
     let unheld = |tree: &str| -> Result<std::collections::HashSet<String>, String> {
@@ -726,7 +729,9 @@ fn put_back(from: &str, to: &str) -> Result<(), String> {
     let (off_from, off_to) = (unheld(from)?, unheld(to)?);
     let present = |path: &str| crate::globals::warehouse_root().join(path).symlink_metadata().is_ok();
 
-    let ops: Vec<FileOp> = ops.into_iter().filter_map(|op| match op {
+    let ops: Vec<FileOp> = ops.into_iter().filter(|op| match op {
+        FileOp::Write { path, .. } | FileOp::Remove { path } => !carried.contains(path.as_str()),
+    }).filter_map(|op| match op {
         FileOp::Write { path, hash, item_type, is_new } => {
             let writable = off_to.contains(&path) && (!present(&path) || (!is_new && !off_from.contains(&path)));
             writable.then_some(FileOp::Write { path, hash, item_type, is_new: false })
