@@ -1131,6 +1131,22 @@ pub(crate) mod tests {
         assert_eq!(anchor.boundary, vec![elsewhere]);
     }
 
+    // Revert: enroll installs under `BoundaryScope::UserPallets` → the anchor is written while
+    // "@tags" holds a head it does not vouch for.
+    #[test]
+    fn an_enroll_whose_metadata_moved_writes_nothing() {
+        let office = Office::new("office-enroll-meta-moved");
+        let tags = test_support::store_parcel(&test_support::store_tree("t", b"t\n"), &[]);
+        AFTER_BOUNDARY_READ.with(|seam| seam.set(Some(Box::new(move || {
+            pallet_utils::update_meta_pallet_head("tags", None, &tags, &RefPreconditions::NONE).unwrap();
+        }))));
+
+        let error = office.enroll().expect_err("a meta pallet moved after the boundary read must refuse the enroll");
+
+        assert_eq!(office_utils::read_trust_anchor().unwrap(), None, "no anchor may be written");
+        assert!(error.contains("moved pallet \"@tags\""), "{}", error);
+    }
+
     // Revert: rotate passes `PalletsPrecondition::NotConsumed` → the office moves past a boundary
     // that does not vouch for the new head of "main".
     #[test]
