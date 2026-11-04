@@ -158,7 +158,7 @@ pub fn resolve_signing_key(operator: &Operator) -> Result<Signing, String> {
 /// Whether `description` would record a parcel with no description: absent, or nothing but
 /// whitespace. [`stack_parcel`] refuses such a parcel.
 pub fn is_blank(description: Option<&str>) -> bool {
-    description.map_or(true, |description| description.trim().is_empty())
+    description.is_none_or(|description| description.trim().is_empty())
 }
 
 /// Refuse a blank `-m` given to a command whose message becomes a parcel's description (`stack`,
@@ -209,9 +209,9 @@ fn default_description_of(consolidation: Option<&ConsolidationState>,
 /// # Returns
 /// * `Ok((String, String))` - The new parcel's hash and the pallet it was stacked on.
 /// * `Err(StackError)`      - If there is nothing to stack, no description was given or supplied by
-///                            a merge or pick in progress, the operator identity is not
-///                            configured, conflicts are unresolved, an operation failed, or the
-///                            head write did not go through (`StackError::HeadWrite`).
+///   a merge or pick in progress, the operator identity is not configured, conflicts are
+///   unresolved, an operation failed, or the head write did not go through
+///   (`StackError::HeadWrite`).
 pub async fn stack_parcel(description: Option<String>,
                           expected_base: Option<&str>) -> Result<(String, String), StackError> {
     // The cheapest possible pre-check runs first: a `load` that started but never finished
