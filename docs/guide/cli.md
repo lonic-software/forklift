@@ -1775,6 +1775,7 @@ the command refuses with exit 36 (`cache_miss`) and names the origin: run it aga
 origin is back. Some commands report it as a plain error that names the origin instead. What a
 command fetched before refusing stays in the cache; a read-only command changes nothing else, and
 those listed above refuse before their first change to the bay, leaving it as it was.
+[A cache warehouse](cache.md) walks through one from clone to `store evict`.
 
 When the remote's bundle installs native packs straight into the new warehouse, `clone`
 tips the same densify suggestion `git import` does: those packs are the far end's own bulk

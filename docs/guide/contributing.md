@@ -489,8 +489,8 @@ it touched, or that none applied. When a change alters:
   entry;
 - **a command's flags, name, or behavior** → update [`cli.md`](cli.md), and run `bin/gen-docs`
   when its name, alias or one-line help changed;
-- **anything [`tutorial.md`](tutorial.md), [`concepts.md`](concepts.md) or [`team.md`](team.md)
-  runs or shows** → update the page. The `guide_pages` test in
+- **anything [`tutorial.md`](tutorial.md), [`concepts.md`](concepts.md), [`team.md`](team.md) or
+  [`cache.md`](cache.md) runs or shows** → update the page. The `guide_pages` test in
   `crates/forklift/tests/integration/` runs each page's commands in order and fails when one fails
   or prints something other than the page shows. Any page that gains a `console` block must live
   in `docs/guide/` and be added to that test's `RUN_PAGES`, which it enforces. A page that follows
