@@ -13,15 +13,17 @@
 //! `load` and `park` at each rename they make in turn (`FORKLIFT_DEBUG_CRASH_AT_RENAME`, see
 //! `file_utils::crash_point`), and after each stop assert the store is still internally consistent
 //! and usable. A rename is where a written file becomes visible, so this stops a command once at
-//! each of its publishes, the same way on every machine. Killing the process at guessed delays,
+//! each of its publishes, in the same order on every machine wherever it publishes from one
+//! thread; where threads rename concurrently, the scheduler picks which rename is the Nth. Killing the process at guessed delays,
 //! which these tests did before, reached a given state only when the timing happened to land
 //! there: with the blob barrier of `load` moved after its shard publish, 20 kills caught the bug in
 //! 4 runs out of 14.
 //!
 //! What the stops do not reach: a step that is not a rename (a file written or removed in place),
 //! and a power loss. A stopped process leaves everything it wrote to the kernel in place, synced
-//! or not, so these tests check the order of publishes; the order of the syncs that make them
-//! survive a power loss is what the barrier unit tests in `file_utils` pin.
+//! or not, so these tests check the order of publishes, not of syncs. The `file_utils` unit tests
+//! pin the syncs inside one batch; that a command finishes one batch's syncs before it publishes
+//! what depends on them is checked by review, not by a test.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
