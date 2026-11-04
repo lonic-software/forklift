@@ -55,6 +55,12 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Added
 
+- **`forklift abort` abandons a consolidation or pick that stopped at conflicts.** The files the merge
+  touched go back to the pallet head and nothing is left in progress; changes to other files are kept.
+  It refuses without `--confirm` (exit 39) where it would throw away what you changed since, such as a
+  resolution. `undo` right after such a consolidate or pick now aborts it, where it used to drop the
+  record of the merge and leave the files it wrote, conflict markers included. Removing `.forklift/consolidation` or `.forklift/cherry-pick` by
+  hand is no longer the way out, except where the abort cannot run, and those refusals say so.
 - `forklift upgrade` and `forklift-server upgrade --root` upgrade a warehouse, with all its bays, to the
   format the build reads, and resume an upgrade that was interrupted. Both refuse while anything else has
   the warehouse open (exit 45). No format before the first is upgraded.

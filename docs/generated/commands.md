@@ -12,6 +12,7 @@ Every `forklift` command and subcommand, generated from the same command definit
 
 | Command | Alias | Hidden alias | Does |
 |---|---|---|---|
+| `abort` |  |  | Abandon the consolidation or pick in progress, putting back what it changed |
 | `audit` |  |  | Verify the warehouse's signed history offline |
 | `bay` |  |  | Manage bays: parallel working directories bound to this warehouse |
 | `bay add` |  |  | Open a new bay (a new working directory on a new pallet) |

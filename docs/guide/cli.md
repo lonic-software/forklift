@@ -637,6 +637,10 @@ stored), so `undo` can walk them back one at a time. Only the refs the command i
 recorded: a pallet another bay moved while it ran is never part of the entry, so `undo` never
 reverts it.
 
+- Reversing a **`consolidate`** or **`pick`** that stopped at conflicts **aborts** it, as
+  `forklift abort` does: the files it touched go back to the head and nothing is left in
+  progress. It refuses where that would throw away a change you made since; `abort --confirm`
+  does it anyway. The next `undo` then reaches the operation before.
 - Reversing a **`stack`**, **`consolidate`** or **`pick`** is a *soft reset*: the head moves back while
   the working directory and inventory are kept, so the undone changes are staged again
   (like git's `reset --soft HEAD~1`). This is how a **merge is reversed** too — merge
@@ -1359,7 +1363,8 @@ Merges another pallet's head into the current pallet:
 - Otherwise a **three-way merge** against the common ancestor. Clean merges stack
   a two-parent merge parcel immediately. Conflicts are written into the working
   files with diff3 markers, the entries enter a conflict state, and the
-  consolidation stays in progress until you resolve, `load`, and `stack`.
+  consolidation stays in progress until you resolve, `load`, and `stack`, or until
+  `forklift abort` abandons it.
 
 The executable bit merges like content: the side that changed a file's bit from the
 common ancestor wins, so a `chmod -x` on one side survives an edit on the other, for
@@ -1407,8 +1412,36 @@ preserved** and you are recorded as the stacker (the same author/stacker split a
 applied by three-way merge, so a **clean** pick is stacked immediately as a single-parent
 parcel; a **conflicting** one writes diff3 markers and leaves a pick in progress —
 resolve, `load`, and `stack` to complete it (still single-parent, still author-preserving),
-or remove `.forklift/cherry-pick` to abort. A pick whose changes are already present is
+or run `forklift abort` to abandon it. A pick whose changes are already present is
 refused. Requires a clean warehouse. git's `cherry-pick` still runs it, unlisted.
+
+### `abort` — abandon a consolidation or pick in progress
+
+```sh
+forklift abort             # abandon the merge or pick that stopped at conflicts
+forklift abort --confirm   # ...even where it would throw away what you changed since
+```
+
+Abandons the consolidation or pick in progress in this bay, however it was started: a
+`haul consolidate` or a `lift` auto-merge leaves an ordinary consolidation behind. Every file
+the merge wrote or left conflicted goes back to the pallet head, in the working directory and
+the inventory alike, and the files it added are deleted. Nothing about it is recorded: no
+parcel, and nothing left in progress. Changes to any other file stay as they were, staged or
+not, so an edit made while resolving is kept.
+
+A file the merge touched that you changed since it stopped — a resolution, an edit, a `load`
+— would be thrown away, so `abort` lists those files and refuses without `--confirm`
+(`confirmation_required`, exit 39). It also refuses, touching nothing, where putting the head
+back would delete a file it does not account for: an untracked file inside a folder the merge
+made out of one of the head's files. Move that file aside first.
+
+`abort` cannot run when the pallet has moved since the merge started (another bay stacked on
+it), when the other side's parcel is no longer readable, or when the record of what is in
+progress is unreadable. Each of those refusals names the file to remove instead, which ends
+the merge and leaves every file as it is.
+
+`undo` right after a consolidate or pick that stopped at conflicts runs the same abort, and
+refuses where it would need `--confirm`.
 
 ### `conflicts` — list unresolved conflicts
 
