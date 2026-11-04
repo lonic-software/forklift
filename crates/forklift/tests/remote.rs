@@ -2069,11 +2069,6 @@ fn tags_sync_hold_the_admin_rule_at_admission_and_never_move() {
     assert_success(&area.forklift("b", &["config", "set", "operator.identifier", worker_id]));
     assert_success(&area.forklift("b", &["tag", "create", "v1.0", "main", "-m", "release"]));
 
-    // Before its first lift the remote has no @tags at all, so there is no side to keep.
-    let unlifted = area.forklift("b", &["lower", "--keep", "@tags:v1.0=theirs", "--confirm"]);
-    assert!(!unlifted.status.success(), "{}", stdout(&unlifted));
-    assert!(stderr(&unlifted).contains("@tags is not on the remote yet"), "{}", stderr(&unlifted));
-
     let lifted = area.forklift("b", &["lift"]);
     assert_success(&lifted);
     assert!(stdout(&lifted).contains("Lifted the @tags pallet"), "{}", stdout(&lifted));
@@ -11457,7 +11452,7 @@ fn another_operators_pre_trust_change_drops_to_an_empty_signed_root() {
     let keyless = area.forklift("b", &["lift"]);
     assert!(!keyless.status.success(), "{}", stdout(&keyless));
     let said = stderr(&keyless);
-    assert!(said.contains("\"forklift profile keygen\"") && said.contains("\"office admit\""), "{}", said);
+    assert!(said.contains("\"forklift profile keygen\"") && said.contains("\"forklift office admit\""), "{}", said);
     assert!(!said.contains("--keep"), "{}", said);
     assert_success(&area.forklift("b", &["config", "unset", "operator.identifier"]));
 

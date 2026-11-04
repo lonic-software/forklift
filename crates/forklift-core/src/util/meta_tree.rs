@@ -1783,7 +1783,7 @@ fn same_entry_re_signed(ours: &Entry, theirs: &Entry, office: Option<&OfficeStat
 /// | B | X | Y | conflict |
 ///
 /// The re-signed row ([`same_cell_re_signed`], under `office`) is the only one that loads a
-/// cell: a local cell a replay already re-signed onto the remote — whose head move then failed —
+/// cell: a local cell a replay already re-signed onto the remote, whose head move then failed,
 /// is the same change, not a conflict with itself.
 ///
 /// The recurse row asks that no *present* side be a cell, rather than that both ours and

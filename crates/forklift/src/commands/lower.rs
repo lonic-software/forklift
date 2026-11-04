@@ -1413,7 +1413,7 @@ fn no_key_refusal(why: String,
                   remote_has_head: bool) -> String {
     let mut next = format!(
         "Replaying the local {} needs a signing key: create one with \"forklift profile keygen\", \
-        and have an admin run the \"office admit\" it prints",
+        and have an admin run the \"forklift office admit\" it prints",
         wire
     );
 
