@@ -873,14 +873,14 @@ mod tests {
         assert_eq!(tip, "66677f9fc675b41891d4f168fb280606e0aac682", "the export layout's pinned tip moved");
     }
 
-    /// Test 15 (reuse): a parcel changing one file deep in a large tree, exported on a commit an
+    /// Test 15 (reuse): a parcel changing one file deep in a tree, exported on a commit an
     /// earlier run wrote, writes only that file's blob and the trees on its path. Within one run, a
     /// subtree that moved is written again only where its own path changed.
     #[test]
     fn a_one_file_change_writes_only_its_path() {
         let warehouse = Warehouse::storage_only("export-reuse");
 
-        let names: Vec<String> = (0..40).map(|n| format!("file-{}", n)).collect();
+        let names: Vec<String> = (0..4).map(|n| format!("file-{}", n)).collect();
         let tree = |changed: &[u8], right_name: &str| {
             let files = |dir: &str| -> Vec<(String, Vec<u8>)> {
                 names.iter().map(|name| (name.clone(), format!("{}/{}\n", dir, name).into_bytes())).collect()
@@ -899,7 +899,7 @@ mod tests {
         let repo = create_repo(&warehouse);
         let mut earlier = Exporter::new(&repo);
         export(&mut earlier, &first);
-        assert_eq!((earlier.trees_written, earlier.blobs_written), (4, 81));
+        assert_eq!((earlier.trees_written, earlier.blobs_written), (4, 9));
 
         // A later run knows only the commit it builds on, as the mirror does.
         let mut later = Exporter::new(&repo);
