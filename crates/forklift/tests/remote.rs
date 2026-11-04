@@ -1703,7 +1703,7 @@ fn a_stale_ref_update_is_a_remote_ahead_refusal_on_the_wire() {
 
 #[test]
 fn a_scoped_merge_lifts_without_reading_the_out_of_scope_object() {
-    // A scoped bay's merge-then-lift, end to end: a scoped bay consolidates a diverged remote "work"
+    // A scoped bay's merge-then-lift, end to end: a scoped bay's lower merges a diverged remote "work"
     // head that changed an out-of-scope subtree (adopting it by hash into the merge), then lifts.
     // The lift's negotiation walk must prune that subtree against the merge's second parent — the
     // remote head it is lifting against — and never load it. To prove that, the out-of-scope
@@ -1739,15 +1739,10 @@ fn a_scoped_merge_lifts_without_reading_the_out_of_scope_object() {
     assert_success(&area.forklift("dev-work", &["load", "."]));
     assert_success(&area.forklift("dev-work", &["stack", "-m", "dev edits api"]));
 
-    // Lower fetches the diverged remote head (with its out-of-scope object) and reports the
-    // divergence; make that head a pallet and consolidate it into work — the scoped bay adopts the
-    // out-of-scope subtree by hash into the stacked merge parcel.
-    let lowered = area.forklift("dev-work", &["lower"]);
-    assert!(!lowered.status.success(), "the divergence must be reported: {}", stdout(&lowered));
-
-    assert_success(&area.forklift("dev-work", &["pallet", "create", "incoming", &remote_web_head]));
-    assert_success(&area.forklift("dev-work", &["shift", "work"]));
-    assert_success(&area.forklift("dev-work", &["consolidate", "incoming"]));
+    // Lower fetches the diverged remote head (with its out-of-scope object) and merges it into
+    // work — the scoped bay adopts the out-of-scope subtree by hash into the stacked merge parcel.
+    let lowered = area.forklift("dev-work", &["--json", "lower"]);
+    assert_eq!(json_of(&lowered)["data"]["outcome"], "merged", "{}", stdout(&lowered));
 
     // Make the out-of-scope object impossible to read (a sparse store would never have fetched it):
     // the merge already committed its hash, so the lift must not need its bytes.
@@ -8493,11 +8488,9 @@ fn a_merge_second_parent_below_the_remote_head_lifts_from_a_sparse_store() {
     assert_success(&area.forklift("sparse", &["load", "."]));
     assert_success(&area.forklift("sparse", &["stack", "-m", "sparse edits api (1)"]));
 
-    let lowered = area.forklift("sparse", &["lower"]);
-    assert!(!lowered.status.success(), "the first divergence must be reported");
-    assert_success(&area.forklift("sparse", &["pallet", "create", "incoming1", &p2]));
-    assert_success(&area.forklift("sparse", &["shift", "main"]));
-    assert_success(&area.forklift("sparse", &["consolidate", "incoming1"]));
+    let lowered = area.forklift("sparse", &["--json", "lower"]);
+    assert_eq!(json_of(&lowered)["data"]["outcome"], "merged", "the first divergence merges: {}", stdout(&lowered));
+    assert_eq!(parents_of(&area, "sparse", &pallet_head(&area, "sparse", "main"))[1], p2);
 
     // The remote moves forward again, on top of p2 — so p2 becomes an interior ancestor of the
     // new remote head, reachable in the sparse workspace only through the first merge's parent.
@@ -8509,11 +8502,9 @@ fn a_merge_second_parent_below_the_remote_head_lifts_from_a_sparse_store() {
     let p3 = pallet_head(&area, "up", "main");
 
     // The sparse workspace merges p3 too — building the second merge whose ancestry re-reaches p2.
-    let lowered = area.forklift("sparse", &["lower"]);
-    assert!(!lowered.status.success(), "the second divergence must be reported");
-    assert_success(&area.forklift("sparse", &["pallet", "create", "incoming2", &p3]));
-    assert_success(&area.forklift("sparse", &["shift", "main"]));
-    assert_success(&area.forklift("sparse", &["consolidate", "incoming2"]));
+    let lowered = area.forklift("sparse", &["--json", "lower"]);
+    assert_eq!(json_of(&lowered)["data"]["outcome"], "merged", "the second divergence merges: {}", stdout(&lowered));
+    assert_eq!(parents_of(&area, "sparse", &pallet_head(&area, "sparse", "main"))[1], p3);
 
     // p2's out-of-scope subtree was never fetched into the sparse store.
     assert!(!object_present(&area, "sparse", &sealed_web),
