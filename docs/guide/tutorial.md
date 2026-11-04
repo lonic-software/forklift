@@ -23,6 +23,13 @@ $ forklift --version
 forklift …
 ```
 
+**Tip: type `fl`.** The installers also put a short name for the CLI, `fl`, next to `forklift`, so
+`fl stocktake` is `forklift stocktake`. If `fl` is not there (you installed another way, or set
+`FORKLIFT_NO_ALIAS=1`), `forklift self alias install` creates it; see
+[`self alias`](cli.md#self-alias--the-fl-short-name). In PowerShell, `fl` already means
+`Format-List`, which wins over a program of that name, so type `forklift` there. This page writes
+`forklift` in full, so its commands work as pasted everywhere.
+
 You need no account and no configuration. Forklift identifies you by an opaque **operator id**,
 minted the first time you record anything. One machine can act as different operators in different
 warehouses: see `profile` in [Identity, signing, and agents](cli.md#7-identity-signing-and-agents).
@@ -326,6 +333,7 @@ Reference: [Working with remotes](cli.md#6-working-with-remotes).
 ## 8. Where to go next
 
 - [`team.md`](team.md): a server with a token per person, and a second person joining.
+- [`cache.md`](cache.md): a clone that keeps the whole history but only the files you use.
 - [`concepts.md`](concepts.md): what forklift does that git cannot, and where each part is documented.
 - [`glossary.md`](glossary.md): every forklift term, with its git equivalent.
 - [`cli.md`](cli.md): every command and flag, by workflow.

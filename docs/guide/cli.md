@@ -349,8 +349,9 @@ inside that folder. Nothing under `.forklift/` can be loaded at all.
 Forklift ships a short `fl` alias (`f` and `l` are both left-hand home row —
 quicker to type than `git`). It is a **shell-agnostic symlink** next to the
 `forklift` binary (a `.cmd` shim on Windows, where a symlink needs elevated
-privilege), not a per-shell alias — it works from scripts, non-interactive
-shells and every shell dialect alike, and one `ls`/`rm` finds or removes it.
+privilege), not a per-shell alias — it works from scripts and non-interactive
+shells, not only the shell it was set up in, and one `ls`/`rm` finds or removes it. In PowerShell,
+the built-in `fl` alias (`Format-List`) wins over any program named `fl`.
 
 Every installer (the curl script, `pult install`, and `self update` — see
 [`self update`](#self-update--check-for-and-apply-a-newer-release)) creates it
@@ -1775,6 +1776,7 @@ the command refuses with exit 36 (`cache_miss`) and names the origin: run it aga
 origin is back. Some commands report it as a plain error that names the origin instead. What a
 command fetched before refusing stays in the cache; a read-only command changes nothing else, and
 those listed above refuse before their first change to the bay, leaving it as it was.
+[A cache warehouse](cache.md) walks through one from clone to `store evict`.
 
 When the remote's bundle installs native packs straight into the new warehouse, `clone`
 tips the same densify suggestion `git import` does: those packs are the far end's own bulk

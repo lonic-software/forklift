@@ -16,6 +16,7 @@ machine/agent interface).
 |----------|------|
 | New to forklift | [`tutorial.md`](tutorial.md) — one project from `prepare` to `lift` and `lower`, in 15 minutes |
 | Setting up a team on a server | [`team.md`](team.md) — tokens, an office, and a second person joining, from zero |
+| Working on a large project without its whole history on disk | [`cache.md`](cache.md) — a cache warehouse: every parcel, only the files you use |
 | Deciding whether forklift fits | [`concepts.md`](concepts.md) — what it does that git cannot, with runnable examples |
 | A user learning the CLI | [`cli.md`](cli.md) — every command, by workflow, with examples |
 | Looking up what a term means | [`glossary.md`](glossary.md) — Forklift's terms, with their git equivalents |

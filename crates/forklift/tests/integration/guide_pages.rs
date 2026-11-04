@@ -24,7 +24,7 @@ use crate::common;
 use common::{fence, forklift_command, repository_root, server_binary, tracked_pages};
 
 /// The pages under `docs/guide/` this test runs, each from an empty folder.
-const RUN_PAGES: &[&str] = &["tutorial.md", "concepts.md", "team.md"];
+const RUN_PAGES: &[&str] = &["tutorial.md", "concepts.md", "team.md", "cache.md"];
 
 /// The address the pages tell the reader to serve on. The test serves on a port the server picks
 /// itself, so a busy 7171 on a CI machine cannot fail it, and rewrites this address wherever a
@@ -766,6 +766,11 @@ fn concepts_run_as_written() {
 #[test]
 fn team_runs_as_written() {
     run_page("team.md");
+}
+
+#[test]
+fn cache_runs_as_written() {
+    run_page("cache.md");
 }
 
 /// A page that shows commands in a `console` block promises they run as shown, so a page with one

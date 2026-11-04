@@ -239,7 +239,8 @@ before freeing anything. See
 
 **Cache warehouse** (also: cache mode). A warehouse cloned with `--cache`: it keeps every
 parcel and signature, but content only for what a bay has checked out or a command has read. It
-holds the rest by hash and fetches it from its origin on demand.
+holds the rest by hash and fetches it from its origin on demand. [`cache.md`](cache.md) walks
+through one.
 
 ## Durability and recovery
 
