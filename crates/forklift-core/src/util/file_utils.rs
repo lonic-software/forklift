@@ -5599,14 +5599,13 @@ mod tests {
 
     /// This crate's unit tests skip syncs unless one holds `real_syncs`, and the guard turns
     /// them on for every thread, including one the code under test spawns, until the last guard
-    /// is dropped. The first check counts only when no guard was alive on either side of the
-    /// read, which only `cargo test` can break: nextest runs every test in a process of its own.
+    /// is dropped. The first check runs only where this test has its process to itself, as under
+    /// nextest: under `cargo test` another test may hold a guard, or take and drop one, at any
+    /// moment.
     #[test]
     fn syncs_run_only_while_a_real_syncs_guard_lives() {
-        let before = REAL_SYNCS.load(std::sync::atomic::Ordering::SeqCst);
-        let enabled = fsync_enabled();
-        if before == 0 && REAL_SYNCS.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-            assert!(!enabled, "with no guard alive, a unit test skips its syncs");
+        if std::env::var("NEXTEST_EXECUTION_MODE").as_deref() == Ok("process-per-test") {
+            assert!(!fsync_enabled(), "with no guard alive, a unit test skips its syncs");
         }
 
         let outer = real_syncs();
