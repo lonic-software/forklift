@@ -490,8 +490,8 @@ it touched, or that none applied. When a change alters:
 - **a command's flags, name, or behavior** → update [`cli.md`](cli.md), and run `bin/gen-docs`
   when its name, alias or one-line help changed;
 - **anything [`tutorial.md`](tutorial.md) or [`concepts.md`](concepts.md) runs or shows** →
-  update the page. The `guide_pages` test in `crates/forklift/tests/` runs each page's commands
-  in order and fails when one fails or prints something other than the page shows. Any page that
+  update the page. The `guide_pages` test in `crates/forklift/tests/integration/` runs each page's
+  commands in order and fails when one fails or prints something other than the page shows. Any page that
   gains a `console` block must live in `docs/guide/` and be added to that test's `RUN_PAGES`,
   which it enforces;
 - **a heading another page links to** → fix the links. The `doc_links` test reads every `.md` page
