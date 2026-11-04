@@ -421,10 +421,11 @@ pub async fn record_unvouched_meta_heads(client: &RemoteClient,
             name, rules, Some(office_state), &anchor.boundary, meta_tree::Admission::Audit, None, &head
         ).is_err());
 
-        // Once for every pallet, and each head on its own: one the remote cannot serve stays
+        // Only when the boundary has a gap, since a refusal past a complete boundary is final;
+        // once for every pallet, and each head on its own: one the remote cannot serve stays
         // missing, and the verdict past it stays a refusal.
         let mut refused_now = refused();
-        if refused_now && !fetched {
+        if refused_now && !fetched && !audit_utils::collect_reachable_present_noting_gaps(&anchor.boundary)?.1.is_empty() {
             fetched = true;
             for boundary_head in &anchor.boundary {
                 let _ = remote_utils::fetch_history_scoped(client, boundary_head, &format!("{}{}", pallet_utils::META_QUALIFIER, name), &Progress::NONE).await;
