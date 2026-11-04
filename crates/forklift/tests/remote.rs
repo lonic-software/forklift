@@ -2495,10 +2495,10 @@ fn a_held_haul_merge_names_a_drop_that_keeps_the_rest_of_the_haul() {
     assert_eq!(remote_pallet_head(&server, "@haul"), Some(area.read_file("a/.forklift/meta/haul").trim().to_string()));
 }
 
-/// A remote with no @haul yet gives "lower --keep" no remote side to keep, so a merge held on
-/// its first lift names only lifting the target.
+/// A merge held on the first lift of @haul names dropping it too: with no remote side, keeping
+/// "theirs" replays the rest of the pallet as the remote's first parcel.
 #[test]
-fn a_held_haul_merge_on_a_remote_without_haul_names_no_drop() {
+fn a_held_haul_merge_on_a_remote_without_haul_drops_to_a_first_parcel() {
     let area = TestArea::new("haul-held-first");
     let server = Server::start(&area, None);
     haul_warehouse(&area, &server);
@@ -2513,8 +2513,15 @@ fn a_held_haul_merge_on_a_remote_without_haul_names_no_drop() {
     let why = stderr(&held);
     assert!(why.contains(&format!("haul {} merged as", &id[..12])), "{}", why);
     assert!(why.contains("an operator who may write the target lifts it"), "{}", why);
-    assert!(!why.contains("--keep"), "{}", why);
+    let drop = format!("\"forklift lower --keep @haul:{}=theirs --confirm\"", id);
+    assert!(why.contains(&drop), "{}", why);
     assert_eq!(remote_pallet_head(&server, "@haul"), None);
+
+    let dropped = area.forklift("a", &["lower", "--keep", &format!("@haul:{}=theirs", id), "--confirm"]);
+    assert_success(&dropped);
+    assert!(stdout(&dropped).contains("Replayed the local @haul"), "{}", stdout(&dropped));
+    assert_eq!(remote_pallet_head(&server, "@haul"), Some(area.read_file("a/.forklift/meta/haul").trim().to_string()));
+    assert!(!area.forklift("a", &["haul", "show", &id]).status.success(), "the haul is dropped");
 }
 
 /// A fresh remote admits the whole @haul history against today's office, so a merge whose signer
