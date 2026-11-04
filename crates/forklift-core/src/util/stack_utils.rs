@@ -13,6 +13,8 @@ use crate::util::audit_utils::{self, VerifiedOffice};
 use crate::util::office_utils::TrustAnchor;
 use crate::util::take_utils::{self, FetchAt, TakeTrust};
 use crate::util::pallet_utils::{AnchorPrecondition, RefPreconditions, RefUpdateError};
+use crate::util::merge_utils::ConsolidationState;
+use crate::util::cherry_pick_utils::CherryPickState;
 
 /// Why [`stack_parcel`] failed: its head write did not go through (which a merge or pick
 /// completion has to settle, see `consolidate`'s caller), or anything else.
@@ -153,6 +155,38 @@ pub fn resolve_signing_key(operator: &Operator) -> Result<Signing, String> {
     Ok(Signing::Signed { key_id, anchor, office })
 }
 
+/// Whether `description` would record a parcel with no description: absent, or nothing but
+/// whitespace. [`stack_parcel`] refuses such a parcel.
+pub fn is_blank(description: Option<&str>) -> bool {
+    description.is_none_or(|description| description.trim().is_empty())
+}
+
+/// Refuse a blank `-m` given to a command whose message becomes a parcel's description (`stack`,
+/// `pick`, `deliver`), before the command changes anything: it would record a parcel that
+/// `history` shows with no description at all.
+pub fn refuse_blank_description(description: Option<&str>) -> Result<(), String> {
+    match description {
+        Some(_) if is_blank(description) => Err(
+            "Nothing was changed: a parcel's description cannot be blank. Give one with \
+            \"-m <description>\".".to_string()
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// The description a completing `stack` records when the user gives none: a consolidation's is
+/// the one a clean consolidation records ([`merge_utils::consolidation_description`]), and a
+/// pick's is the one it stored (the source parcel's, unless the pick was given one). `None` when
+/// neither is in progress, or the pick's source had no description.
+fn default_description_of(consolidation: Option<&ConsolidationState>,
+                          cherry_pick: Option<&CherryPickState>) -> Option<String> {
+    match (consolidation, cherry_pick) {
+        (Some(state), _) => Some(merge_utils::consolidation_description(&state.their_pallet, &state.our_pallet)),
+        (None, Some(state)) => state.description.clone(),
+        (None, None) => None,
+    }
+}
+
 /// Stack the inventory as a new parcel on the current pallet: build the tree objects,
 /// create the parcel (recording the configured operator), advance the pallet head, and
 /// clean up the consumed staged state.
@@ -174,9 +208,10 @@ pub fn resolve_signing_key(operator: &Operator) -> Result<Signing, String> {
 ///
 /// # Returns
 /// * `Ok((String, String))` - The new parcel's hash and the pallet it was stacked on.
-/// * `Err(StackError)`      - If there is nothing to stack, the operator identity is not
-///                            configured, conflicts are unresolved, an operation failed, or the
-///                            head write did not go through (`StackError::HeadWrite`).
+/// * `Err(StackError)`      - If there is nothing to stack, no description was given or supplied by
+///   a merge or pick in progress, the operator identity is not configured, conflicts are
+///   unresolved, an operation failed, or the head write did not go through
+///   (`StackError::HeadWrite`).
 pub async fn stack_parcel(description: Option<String>,
                           expected_base: Option<&str>) -> Result<(String, String), StackError> {
     // The cheapest possible pre-check runs first: a `load` that started but never finished
@@ -258,6 +293,16 @@ pub async fn stack_parcel(description: Option<String>,
                 what, our_head, position.base.as_deref().unwrap_or("no parcel")
             )));
         }
+    }
+
+    // A parcel without a description shows as a blank line in `history`. Refused here, before the
+    // tree build, so a forgotten -m costs no time on a large inventory.
+    let description = description.or_else(|| default_description_of(consolidation.as_ref(), cherry_pick.as_ref()));
+    if is_blank(description.as_deref()) {
+        return Err(StackError::Other(
+            "Nothing was stacked: a parcel needs a description, and none was given. Stack again with \
+            one: \"forklift stack -m <description>\".".to_string()
+        ));
     }
 
     // The parcel the new one stacks on. Merge output staged by an earlier command was built on the
@@ -445,9 +490,6 @@ pub async fn stack_parcel(description: Option<String>,
 
         parents.push(state.their_head.clone());
     }
-
-    // A cherry-pick's completing `stack` defaults to the pick's stored description.
-    let description = description.or_else(|| cherry_pick.as_ref().and_then(|cp| cp.description.clone()));
 
     // Authorship convention: every parcel records its author(s) as explicit Author
     // actions, even when the author and the stacker are the same operator (like git,

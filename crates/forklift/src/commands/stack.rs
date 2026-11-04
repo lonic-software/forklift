@@ -19,12 +19,15 @@ use crate::output::{self, CommandOutput};
 /// rolling it back would destroy the user's resolutions; the error names the way out.
 ///
 /// # Arguments
-/// * `message` - The (optional) parcel description, from `-m/--message`.
+/// * `message` - The parcel description, from `-m/--message`: required unless a consolidation or
+///   pick in progress supplies one, and never blank.
 ///
 /// # Returns
 /// * `Ok(())`      - If the parcel was stacked successfully.
 /// * `Err(String)` - If there was an error while handling the command.
 pub async fn handle_command(message: Option<String>) -> Result<(), String> {
+    stack_utils::refuse_blank_description(message.as_deref())?;
+
     let (parcel, pallet) = match stack_utils::stack_parcel(message, None).await {
         Ok(stacked) => stacked,
         Err(StackError::HeadWrite { error: RefUpdateError::Moved(moved), .. }) => {

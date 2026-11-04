@@ -802,11 +802,12 @@ pub enum Command {
         visible_alias = "s",
         alias = "commit",
         long_about = "Stack the inventory as a new parcel (commit) on the current pallet, with the \
-                      configured operator recorded as the author. A consolidation in progress is \
-                      completed by this command."
+                      configured operator recorded as the author and the -m text as its description. \
+                      A consolidation or pick in progress is completed by this command, and \
+                      supplies the description when -m is not given; otherwise -m is required."
     )]
     Stack {
-        /// The parcel's description
+        /// The parcel's description (needed unless a merge or pick in progress supplies one)
         #[arg(short = 'm', long)]
         message: Option<String>,
     },

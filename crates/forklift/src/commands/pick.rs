@@ -2,6 +2,7 @@ use serde::Serialize;
 use forklift_core::util::cherry_pick_utils::{self, CherryPickState};
 use forklift_core::util::{
     file_utils, load_guard_utils, merge_utils, object_utils, office_utils, operation_utils, pallet_utils,
+    stack_utils,
 };
 use forklift_core::util::operation_utils::OperationKind;
 use crate::commands::consolidate;
@@ -32,6 +33,7 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
     // while a load that started but never finished cleanly is still recorded
     // (`load_guard_utils`).
     load_guard_utils::check_no_incomplete_load()?;
+    stack_utils::refuse_blank_description(message.as_deref())?;
 
     // A pick applies a diff (the merge machinery) into the working directory, which could
     // touch out-of-scope paths a scoped bay never materialized, so it refuses here.
@@ -129,12 +131,21 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
     let ledger = consolidate::ensure_no_untracked_collisions(&actions, &source_label)?;
     consolidate::ensure_actions_present(&actions)?;
 
+    // The completing parcel's message: the -m override, else the source's own message. A source
+    // with none (a git commit imported with an empty message, say) needs -m, asked for before the
+    // pick applies anything, since the stack completing it would refuse.
+    let description = message.or_else(|| source_parcel.description.clone());
+    if stack_utils::is_blank(description.as_deref()) {
+        return Err(format!(
+            "Nothing was picked: {} has no description to carry over. Pick it with one: \
+            \"forklift pick {} -m <description>\".",
+            short, short
+        ));
+    }
+
     consolidate::raise_merge_marker(OperationKind::CherryPick, &current, &our_head, &our_tree, &theirs_tree)?;
 
     let mut conflicts = consolidate::apply_merge_actions(&ledger, &actions)?;
-
-    // The completing parcel's message: the -m override, else the source's own message.
-    let description = message.or_else(|| source_parcel.description.clone());
 
     // Record the pick so `stack` completes it single-parent, preserving the source's
     // authors — whether it completes now (clean) or after the user resolves conflicts.

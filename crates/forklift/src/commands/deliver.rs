@@ -19,6 +19,8 @@ use crate::output::{self, CommandOutput};
 /// * `Err(String)` - If there is nothing to deliver, the target moved after the draft
 ///                   forked, trust is not established, or an operation failed.
 pub fn handle_command(target: &str, message: Option<String>) -> Result<(), String> {
+    forklift_core::util::stack_utils::refuse_blank_description(message.as_deref())?;
+
     // Delivering makes the target the current pallet.
     crate::commands::shift::refuse_mid_merge("delivering")?;
 
