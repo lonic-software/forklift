@@ -541,4 +541,49 @@ mod tests {
         assert!(merge_utils::read_consolidation_state().unwrap().is_none(), "heal clears the consolidation");
         assert!(operation_utils::read().unwrap().is_none(), "recovery clears the marker");
     }
+
+    /// The abort carries the changes made to paths the merge left alone, and `heal` finishing an
+    /// interrupted one must keep them, even an edit back to the other side's content or a
+    /// deletion, which a merge's own roll-back would take for its output and put back.
+    #[test]
+    fn heal_of_an_interrupted_abort_keeps_the_changes_it_carried() {
+        let warehouse = Warehouse::with_working_tree("merge-abort-crash-carried");
+        test_support::configure_operator();
+
+        let base = test_support::store_parcel(&test_support::store_files(&[
+            ("a.txt", b"base\n"), ("c.txt", b"base\n"), ("d.txt", b"base\n"),
+        ]), &[]);
+        let our_tree = test_support::store_files(&[("a.txt", b"ours\n"), ("c.txt", b"mine\n"), ("d.txt", b"mine\n")]);
+        let our_head = test_support::store_parcel(&our_tree, &[&base]);
+        let their_head = test_support::store_parcel(
+            &test_support::store_files(&[("a.txt", b"theirs\n"), ("c.txt", b"base\n"), ("d.txt", b"base\n")]),
+            &[&base],
+        );
+
+        pallet_utils::update_pallet_head("main", None, &our_head, &pallet_utils::RefPreconditions::NONE).unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(our_head.clone()))).unwrap();
+        pallet_utils::update_pallet_head("feature", None, &their_head, &pallet_utils::RefPreconditions::NONE).unwrap();
+        test_support::check_out(&our_tree);
+
+        test_support::block_on(consolidate::handle_command("feature")).unwrap();
+        assert!(merge_utils::read_consolidation_state().unwrap().is_some(), "sanity: the merge stopped at a conflict");
+
+        // Made while the merge waits, to paths only our side changed: the merge left both alone.
+        std::fs::write(warehouse.root.join("c.txt"), b"base\n").unwrap();
+        std::fs::remove_file(warehouse.root.join("d.txt")).unwrap();
+
+        BEFORE_STATE_CLEAR.with(|seam| seam.replace(Some(Box::new(|| Err("crashed".to_string())))));
+        let error = test_support::block_on(abort(MergeKind::Consolidation, false, ABORT_COMMAND))
+            .unwrap_err();
+        assert_eq!(error, "crashed");
+        operation_utils::forget_raised_for_tests();
+
+        let recovery = operation_utils::recover().unwrap().expect("a marker stands");
+        assert_eq!((recovery.operation, recovery.outcome), (OperationKind::Merge, RecoveryOutcome::RolledBack));
+
+        assert!(test_support::file_holds(&warehouse.root, "a.txt", b"ours\n"), "the merge's own file goes back");
+        assert!(test_support::file_holds(&warehouse.root, "c.txt", b"base\n"), "the edit back to their content is kept");
+        assert!(!warehouse.root.join("d.txt").exists(), "the deletion is kept");
+        assert!(merge_utils::read_consolidation_state().unwrap().is_none(), "heal clears the consolidation");
+    }
 }
