@@ -2151,6 +2151,13 @@ A command not listed here either reports only the generic human-message shape `{
       },
       "type": "array"
     },
+    "meta_resigned": {
+      "description": "The cells (`<pallet> <path>`) a meta pallet's lift re-signed under the current key: written\nhere before trust was established, and replayed under it.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "mirror": {
       "anyOf": [
         {
@@ -2467,7 +2474,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "array"
     },
     "meta_restamped": {
-      "description": "Cells a replay re-signed under the current key, as `<pallet> <path>`: their stamp was\none of the operator's own older keys.",
+      "description": "Cells a replay re-signed under the current key, as `<pallet> <path>`: their stamp was\none of the operator's own older keys, or the operator's own from before trust.",
       "items": {
         "type": "string"
       },

@@ -899,7 +899,7 @@ pub(crate) struct LowerReport {
     meta_replayed: Vec<String>,
 
     /// Cells a replay re-signed under the current key, as `<pallet> <path>`: their stamp was
-    /// one of the operator's own older keys.
+    /// one of the operator's own older keys, or the operator's own from before trust.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     meta_restamped: Vec<String>,
 

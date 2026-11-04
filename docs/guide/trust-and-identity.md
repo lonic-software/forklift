@@ -189,8 +189,10 @@ in the store, unreferenced. Run `audit` where the history came from.
   later take counts its history, or anything built on it, as already verified.
   The command names each such pallet in a `pallets_unvouched` warning. Metadata
   recorded here unsigned before the remote enrolled is judged the same way at
-  first contact and named in a `meta_unvouched` warning; it stays, but a lift of
-  it to the trusted remote is refused.
+  first contact and named in a `meta_unvouched` warning; it stays, and `lift`
+  re-signs your own entries under your key as it lifts them. Another operator's
+  unsigned entry is never re-signed: the lift names it, and `lower --keep
+  @<pallet>:<path>=theirs --confirm` drops it.
 - A merge signed here makes the merged history this warehouse's, so the `stack`
   that completes a conflicted merge judges the merged head again under the
   office it signs under: a key revoked since the merge began refuses it.
