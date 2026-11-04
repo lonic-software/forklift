@@ -3751,17 +3751,25 @@ fn lift_and_clone(area: &TestArea, server: &Server, warehouse: &str, clone: &str
 
 /// A lower --repair whose bay fast-forwards stacks a parcel on the wedged head that removes the bad
 /// name, drops the directory that held nothing else, and moves the pallet and the bay onto it; the
-/// remote accepts its lift, and a clone checks it out.
-// Revert: keep emptied directories in `strip` → "docs/deep" stays, an empty tree in the head.
+/// remote accepts its lift, and a clone checks it out. A staged file the repair leaves alone is
+/// carried through it.
+// Reverts: keep emptied directories in `strip` → "docs/deep" stays, an empty tree in the head; the
+// repair's materialize without the carried entries → the staged file is dropped.
 #[test]
 fn a_lower_repair_fast_forwards_onto_a_parcel_without_the_name() {
     let area = TestArea::new("repair-fast-forward");
     let server = lifted_with_two_directories(&area);
     assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
     let wedged = plant_wedged_head(&area, "main", "docs/deep");
+    area.write_file("b/mine.txt", "mine\n");
+    assert_success(&area.forklift("b", &["load", "mine.txt"]));
 
     let lowered = area.forklift("b", &["--json", "lower", "--repair"]);
     assert_success(&lowered);
+    let status = json_of(&area.forklift("b", &["--json", "stocktake"]));
+    assert_eq!(status["data"]["staged"], serde_json::json!([{"kind": "added", "path": "mine.txt"}]), "{}", status);
+    assert_success(&area.forklift("b", &["unload", "mine.txt"]));
+    std::fs::remove_file(area.path("b/mine.txt")).unwrap();
     let value = json_of(&lowered)["data"].clone();
     assert_eq!(value["outcome"], "repaired", "{}", value);
     assert_eq!(value["head"], wedged.as_str(), "{}", value);

@@ -1547,7 +1547,8 @@ mod carry_tests {
     }
 
     // Reverts: heal's roll-forward, or its roll-back, rebuilds without the marker's carried
-    // entries → the staged changes are dropped.
+    // entries → it reports the carried files as not holding their content, and drops the staged
+    // changes.
     #[test]
     fn heal_keeps_the_local_changes_of_an_interrupted_lower_rolled_either_way() {
         for (name, moved) in [("lower-carry-heal-forward", false), ("lower-carry-heal-back", true)] {
