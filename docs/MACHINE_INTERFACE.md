@@ -921,6 +921,11 @@ Example session:
   history of a pallet this warehouse already held, or that history could not be read to judge it, with `details` `{ "pallets": ["<name>", …] }`.
   Those pallets stay as they are; a take of their history into another pallet is refused
   (`history_unverified`). The command's own result stands and its exit code is unchanged.
+* A `lower` that adopts a remote's trust anchor on first contact writes a `meta_unvouched` warning to
+  the same channel when the anchor does not vouch for a meta pallet's head this warehouse already
+  held (metadata recorded unsigned before the remote enrolled), with `details`
+  `{ "pallets": ["@<name>", …] }`. The metadata stays as it is; a lift of it to that remote is
+  refused. The command's own result stands and its exit code is unchanged.
 * A `lift`, `lower` or `clone` whose remote head could not be added to the warehouse's
   held-heads record (`.forklift/held-heads`, the remote heads it lifted to or was served by a lower,
   up to date or ahead included, or a clone) writes a `held_head_unrecorded` warning to the same channel; `message` names the cause. The command's own

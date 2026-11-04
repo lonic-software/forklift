@@ -1051,11 +1051,12 @@ forklift manifest log main ci              # every change to a key, newest first
 The rest of the `manifest` family: free-form text values, keyed by parcel and key, for whatever your tooling wants to record — a CI
 result, a ticket, a review state. A key is one name of at most 128 bytes; a value is UTF-8 text of
 at most 64 KiB. Values live on the `@kv` meta pallet and sync like the manifest, but **each value
-is signed by whoever wrote it**: every write is a parcel signed with your key, and a remote
-refuses any value stamped by a key other than the one that signed it. Writing needs an enrolled
-signing key and a writer or admin role (a reader may only read), and the office must exist —
-`@kv` is never kept without one. A value about a parcel this warehouse does not hold stays
-readable and removable by its full hash.
+is signed by whoever wrote it** once the warehouse has an office: every write is a parcel signed
+with your key, and a remote refuses any value stamped by a key other than the one that signed it.
+Writing then needs an enrolled signing key and a writer or admin role (a reader may only read). In
+a warehouse that never enrolled, values are written unsigned and name your configured operator;
+`office enroll` later keeps them as history from before trust. A value about a parcel this
+warehouse does not hold stays readable and removable by its full hash.
 
 If two people change `@kv` concurrently, `lower` replays your changes onto the remote's and
 lifts them, as long as they touched different keys. When both changed the same key, `lower`

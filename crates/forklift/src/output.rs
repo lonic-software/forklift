@@ -1129,6 +1129,37 @@ fn pallets_unvouched_warning_text(mode: OutputMode, pallets: &[String]) -> Strin
     }
 }
 
+/// The warning code of [`warn_meta_unvouched`].
+pub const CODE_META_UNVOUCHED: &str = "meta_unvouched";
+
+/// Name the local meta pallets a trust anchor just taken from a remote on first contact does not
+/// vouch for: metadata recorded here before the remote enrolled, outside the anchor's boundary.
+/// On the stderr side-channel, as [`warn_pallets_unvouched`]; the exit code stays the command's.
+pub fn warn_meta_unvouched(pallets: &[String]) {
+    if !pallets.is_empty() {
+        eprintln!("{}", meta_unvouched_warning_text(mode(), pallets));
+    }
+}
+
+/// The pure half of [`warn_meta_unvouched`], asserted in both modes without capturing stderr.
+fn meta_unvouched_warning_text(mode: OutputMode, pallets: &[String]) -> String {
+    let names: Vec<String> = pallets.iter().map(|pallet| format!("\"{}\"", forklift_core::error::sanitize(pallet))).collect();
+    let message = format!(
+        "The trust anchor this warehouse now holds does not vouch for the metadata recorded here \
+        before the remote established trust, in {}, or it could not be read to judge it. It stays \
+        as it is, but a lift of it is refused: under trust, every new meta parcel is signed.",
+        names.join(", ")
+    );
+    let next_step = "Re-signing metadata recorded before trust is not supported yet.";
+
+    match mode {
+        OutputMode::Human => format!("Warning: {} {}", message, next_step),
+        OutputMode::Json => warning_envelope(
+            CODE_META_UNVOUCHED, &message, next_step, Some(&serde_json::json!({ "pallets": pallets })),
+        ),
+    }
+}
+
 /// Announce a trust anchor adopted on first contact (`lower`, `clone`). Adoption is never
 /// silent: this names the adopted value, so a reader can check it out of band, and under `--json`
 /// it is a warning document on stderr whose `details` carry the value — the command's own result
@@ -1582,6 +1613,22 @@ mod tests {
         fields.sort();
         assert_eq!(fields, ["details", "lonic_json", "message", "next_step", "tool", "warning"], "{json}");
         assert_eq!(parsed["warning"], "pallets_unvouched");
+        assert_eq!(parsed["details"], serde_json::json!({ "pallets": pallets }));
+    }
+
+    #[test]
+    fn the_meta_unvouched_warning_names_every_meta_pallet_in_both_modes() {
+        let pallets = vec!["@haul".to_string(), "@tags\u{1b}]0;x\u{7}".to_string()];
+
+        let human = meta_unvouched_warning_text(OutputMode::Human, &pallets);
+        assert!(human.starts_with("Warning: "), "{}", human);
+        assert!(human.contains("\"@haul\""), "{}", human);
+        assert!(!human.contains("pallet delete"), "a meta pallet is never deleted: {}", human);
+        assert!(!human.chars().any(char::is_control), "a pallet name reached the terminal raw: {:?}", human);
+
+        let json = meta_unvouched_warning_text(OutputMode::Json, &pallets);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["warning"], "meta_unvouched");
         assert_eq!(parsed["details"], serde_json::json!({ "pallets": pallets }));
     }
 }

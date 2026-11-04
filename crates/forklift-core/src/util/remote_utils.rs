@@ -7505,9 +7505,9 @@ pub struct PreparedTrust {
     /// The transfer stats of the office history fetch.
     fetch: FetchStats,
 
-    /// At first contact, every local user-pallet head judged against the anchor
-    /// ([`PreparedTrust::judge_local_heads`]); the install stands only while the user pallets
-    /// hold no other.
+    /// At first contact, every local pallet head but the office's judged against the anchor
+    /// ([`PreparedTrust::judge_local_heads`]); the install stands only while those pallets hold no
+    /// other.
     judged_heads: Option<Vec<String>>,
 }
 
@@ -7632,8 +7632,9 @@ impl PreparedTrust {
         })
     }
 
-    /// At first contact, judge every local user-pallet head against the anchor about to be
-    /// installed, recording the ones it does not vouch for ([`take_utils::record_unvouched_heads`]).
+    /// At first contact, judge every local pallet head but the office's against the anchor about
+    /// to be installed, recording the ones it does not vouch for
+    /// ([`take_utils::record_unvouched_heads`], [`take_utils::record_unvouched_meta_heads`]).
     /// A first-contact [`Self::commit`] refuses without it. Nothing to do with an anchor held.
     ///
     /// # Arguments
@@ -7653,7 +7654,10 @@ impl PreparedTrust {
             .expect("first contact verified an office");
         let office_state = self.office_state.as_ref().expect("first contact verified an office");
 
-        let judgement = take_utils::record_unvouched_heads(client, anchor, office_head, office_state, verified).await?;
+        let mut judgement = take_utils::record_unvouched_heads(client, anchor, office_head, office_state, verified).await?;
+        let meta = take_utils::record_unvouched_meta_heads(anchor, office_state)?;
+        judgement.judged.extend(meta.judged);
+        judgement.unvouched.extend(meta.unvouched);
         self.judged_heads = Some(judgement.judged);
 
         Ok(judgement.unvouched)
@@ -7677,7 +7681,8 @@ impl PreparedTrust {
             // landed (a write can land and fail) is announced in its error for the same reason; one
             // that did not land holds nothing, and the next sync adopts and announces it.
             (Some(remote_trust), _) => {
-                // A pallet that moved since its head was judged would be taken as vouched for.
+                // A pallet that moved since its head was judged — a meta pallet included — would
+                // be taken as vouched for.
                 let Some(judged) = self.judged_heads.clone() else {
                     return Err(
                         "The local pallets were not judged against the remote's trust anchor, so \
@@ -7692,7 +7697,7 @@ impl PreparedTrust {
                     new_office,
                     pallets: pallet_utils::PalletsPrecondition::WithinBoundary {
                         boundary: judged,
-                        scope: pallet_utils::BoundaryScope::UserPallets,
+                        scope: pallet_utils::BoundaryScope::AllButOffice,
                     },
                 });
 
@@ -8092,10 +8097,13 @@ pub fn lift_refused_by_content(name: &str, remote_head: Option<&str>) -> bool {
             return Ok(false);
         }
 
-        let office = crate::util::audit_utils::local_meta_office()?;
-        let office = office.as_ref().map(|office| &office.state);
+        let trust = crate::util::audit_utils::local_meta_trust()?;
+        let office = trust.as_ref().map(|(_, office)| &office.state);
+        let boundary = trust.as_ref().map(|(anchor, _)| anchor.boundary.as_slice()).unwrap_or(&[]);
 
-        Ok(meta_tree::verify_meta_content(name, rules, office, meta_tree::Admission::Admit, Some(remote_head), &local).is_err())
+        Ok(meta_tree::verify_meta_content(
+            name, rules, office, boundary, meta_tree::Admission::Admit, Some(remote_head), &local
+        ).is_err())
     };
 
     refused().unwrap_or(false)

@@ -1331,7 +1331,7 @@ pub fn stack_meta_edits(pallet: &str,
     let tree = store_meta_tree(rules.kind().format_marker().as_bytes(), new_cells.as_deref())?;
     let parcel = stack_meta_parcel(tree, head.iter().cloned().collect(), actor, description, writer.signer())?;
 
-    verify_meta_content(pallet, rules, writer.office_state(), Admission::Admit, head.as_deref(), &parcel)?;
+    verify_meta_content(pallet, rules, writer.office_state(), &[], Admission::Admit, head.as_deref(), &parcel)?;
     pallet_utils::update_meta_pallet_head(pallet, head.as_deref(), &parcel, &writer.preconditions())?;
 
     Ok(Some(parcel))
@@ -1343,8 +1343,10 @@ pub fn stack_meta_edits(pallet: &str,
 /// - (a) have at most one parent, and descend from `old_head`;
 /// - (b) be attributed by the trust state `office` stands for. With an office, it carries a
 ///   signature that verifies against its key in the office and, if that key is revoked, lies
-///   inside the revocation's distrust boundary. With none — a warehouse that never enrolled — it
-///   carries no signature, and its Author and Stack actions name one operator;
+///   inside the revocation's distrust boundary — or it carries none and is history from before
+///   trust: reachable from `legacy_boundary`, the anchor's boundary, by exact ancestry. With no
+///   office — a warehouse that never enrolled — it carries no signature. An unsigned parcel's
+///   Author and Stack actions name one operator;
 /// - (c) stamp every cell it adds or changes, relative to its parent (the empty tree for a
 ///   root), with that attribution: the signing key, or the declared operator;
 /// - (d) keep its parent's format marker, which must be the one these rules name;
@@ -1356,10 +1358,12 @@ pub fn stack_meta_edits(pallet: &str,
 /// is never skipped because the same hash was verified somewhere else: a copy to a new path is
 /// a change, and its stamps must be the copier's.
 ///
-/// `old_head` is a head that already passed this check.
+/// `old_head` is a head that already passed this check. A writer checking the parcel it just
+/// signed passes an empty `legacy_boundary`: nothing it stacks under an office is pre-trust.
 pub fn verify_meta_content(pallet: &str,
                            rules: &dyn PalletRules,
                            office: Option<&OfficeState>,
+                           legacy_boundary: &[String],
                            admission: Admission,
                            old_head: Option<&str>,
                            new_head: &str) -> Result<(), String> {
@@ -1402,10 +1406,17 @@ pub fn verify_meta_content(pallet: &str,
     };
 
     let mut distrust_boundaries = DistrustBoundaryMemo::new();
+    let mut legacy = LegacyHistory::new(legacy_boundary);
 
     for (hash, parcel) in &chain {
         let attribution = match office {
-            Some(office) => Attribution::Signed(verify_meta_signature(pallet, hash, office, &mut distrust_boundaries)?),
+            Some(office) => match verify_meta_signature(pallet, hash, office, &mut distrust_boundaries)? {
+                Some(key) => Attribution::Signed(key),
+                None => {
+                    legacy.require(pallet, hash)?;
+                    declared_operator(pallet, hash, parcel)?
+                }
+            },
             None => declared_attribution(pallet, hash, parcel)?,
         };
         let stamp = attribution.stamp();
@@ -1477,8 +1488,8 @@ pub fn verify_meta_content(pallet: &str,
 
 /// The content check for a meta pallet's update, by the store's trust state. With an anchor and
 /// an office, the office chain must verify against the anchor and the pallet's new parcels
-/// against that office. With neither — a store that never enrolled — the new parcels must be
-/// unsigned. An anchor without an office, or an office without an anchor, refuses rather than
+/// against that office, unsigned ones only inside the anchor's boundary. With neither — a store
+/// that never enrolled — the new parcels must be unsigned. An anchor without an office, or an office without an anchor, refuses rather than
 /// skipping the check. Returns the verified office, if there is one.
 pub fn verify_meta_update(pallet: &str,
                           rules: &dyn PalletRules,
@@ -1500,9 +1511,58 @@ pub fn verify_meta_update(pallet: &str,
         )),
     };
 
-    verify_meta_content(pallet, rules, office.as_ref(), admission, old_head, new_head)?;
+    let boundary = anchor.map(|anchor| anchor.boundary.as_slice()).unwrap_or(&[]);
+    verify_meta_content(pallet, rules, office.as_ref(), boundary, admission, old_head, new_head)?;
 
     Ok(office)
+}
+
+/// The unsigned parcels a store under an office still admits: those reachable from the anchor's
+/// boundary, the history from before trust — the rule `verify_pallet_history` applies to user
+/// pallets, by exact ancestry and never by time. The closure is collected only once an unsigned
+/// parcel turns up, so an all-signed update never pays for it.
+struct LegacyHistory<'b> {
+    boundary: &'b [String],
+
+    /// The parcels reachable from the boundary, and the first reference the walk found absent.
+    reachable: Option<(HashSet<String>, Option<String>)>,
+}
+
+impl<'b> LegacyHistory<'b> {
+    fn new(boundary: &'b [String]) -> LegacyHistory<'b> {
+        LegacyHistory { boundary, reachable: None }
+    }
+
+    /// Refuse the unsigned parcel `hash` unless the boundary reaches it.
+    fn require(&mut self, pallet: &str, hash: &str) -> Result<(), String> {
+        if self.reachable.is_none() {
+            let (reachable, gaps) = audit_utils::collect_reachable_present_noting_gaps(self.boundary)?;
+            self.reachable = Some((reachable, gaps.into_iter().next()));
+        }
+
+        let (reachable, gap) = self.reachable.as_ref().expect("collected above");
+
+        if reachable.contains(hash) {
+            return Ok(());
+        }
+
+        // A walk that crossed an absent reference cannot tell this parcel is outside: the missing
+        // object may be what would have put it inside.
+        if let Some(missing) = gap {
+            return Err(format!(
+                "Parcel {} on @{} carries no signature, and this store cannot resolve the trust \
+                boundary (boundary parcel {} is not present locally), so it cannot tell whether \
+                the parcel predates trust. Verify against a store with the full history.",
+                hash, pallet, missing
+            ));
+        }
+
+        Err(format!(
+            "Parcel {} on @{} carries no signature and was stacked after trust was established. \
+            Every meta parcel stacked under an office must be signed by a key of the office.",
+            hash, pallet
+        ))
+    }
 }
 
 /// Rule (b) for a store that never enrolled: the parcel carries no signature, and its Author and
@@ -1516,6 +1576,12 @@ fn declared_attribution<'p>(pallet: &str, hash: &str, parcel: &'p Parcel) -> Res
         ));
     }
 
+    declared_operator(pallet, hash, parcel)
+}
+
+/// An unsigned parcel's attribution: the one operator its Author and Stack actions — every
+/// action it has — name.
+fn declared_operator<'p>(pallet: &str, hash: &str, parcel: &'p Parcel) -> Result<Attribution<'p>, String> {
     let authored = parcel.actions.iter().any(|action| matches!(action.action, ParcelActionType::Author));
     let stacked = parcel.actions.iter().any(|action| matches!(action.action, ParcelActionType::Stack));
     let identifier = parcel.actions.first().map(|action| action.operator.identifier.as_str()).unwrap_or("");
@@ -1549,22 +1615,23 @@ fn describe_writer(attribution: &Attribution) -> String {
 }
 
 /// Rule (b): the parcel's signature verifies against its key in the office, and a revoked key
-/// signed it inside the revocation's distrust boundary. Returns the verified key. The caller has
-/// already loaded the parcel's body, so only the signature is read here.
+/// signed it inside the revocation's distrust boundary. Returns the verified key, or `None` for a
+/// parcel with no signature, which only the trust boundary can admit. The caller has already
+/// loaded the parcel's body, so only the signature is read here.
 fn verify_meta_signature<'o>(pallet: &str,
                              hash: &str,
                              office: &'o OfficeState,
-                             distrust_boundaries: &mut DistrustBoundaryMemo) -> Result<&'o KeyRecord, String> {
+                             distrust_boundaries: &mut DistrustBoundaryMemo) -> Result<Option<&'o KeyRecord>, String> {
     match audit_utils::classify_signature_trust(hash, office)? {
         SignatureTrust::Verified { key_id } => {
-            Ok(office.find_key(&key_id).expect("classify_signature_trust found this key"))
+            Ok(Some(office.find_key(&key_id).expect("classify_signature_trust found this key")))
         }
 
         SignatureTrust::SignedRevoked { key_id } => {
             let key = office.find_key(&key_id).expect("classify_signature_trust found this key");
 
             if distrust_boundaries.vouched(key, hash)? {
-                return Ok(key);
+                return Ok(Some(key));
             }
 
             if let Some(missing) = distrust_boundaries.unresolved_head(key)? {
@@ -1585,11 +1652,7 @@ fn verify_meta_signature<'o>(pallet: &str,
             ))
         }
 
-        SignatureTrust::Unsigned => Err(format!(
-            "Parcel {} on @{} carries no signature. Every meta parcel must be signed by a key of \
-            the office.",
-            hash, pallet
-        )),
+        SignatureTrust::Unsigned => Ok(None),
 
         SignatureTrust::UnknownKey { key_id } => Err(format!(
             "Parcel {} on @{} is signed with key {}, which the office does not track.",
@@ -1937,7 +2000,7 @@ pub fn replay_meta_pallet(pallet: &str,
     let tree = store_meta_tree(rules.kind().format_marker().as_bytes(), new_cells.as_deref())?;
     let parcel = stack_meta_parcel(tree, vec![theirs.to_string()], actor, description, writer.signer())?;
 
-    verify_meta_content(pallet, rules, writer.office_state(), Admission::Admit, Some(theirs), &parcel)?;
+    verify_meta_content(pallet, rules, writer.office_state(), &[], Admission::Admit, Some(theirs), &parcel)?;
 
     Ok(Some(parcel))
 }
@@ -2154,7 +2217,7 @@ mod tests {
     }
 
     fn verify(office: &OfficeState, old_head: Option<&str>, new_head: &str) -> Result<(), String> {
-        verify_meta_content(PALLET, &TestRules, Some(office), Admission::Admit, old_head, new_head)
+        verify_meta_content(PALLET, &TestRules, Some(office), &[], Admission::Admit, old_head, new_head)
     }
 
     fn write(office: &OfficeState, key: &Key, edits: &[CellEdit]) -> Result<Option<String>, String> {
@@ -2874,7 +2937,7 @@ mod tests {
 
     /// The content check of a warehouse that never enrolled: no office.
     fn verify_unenrolled(old_head: Option<&str>, new_head: &str) -> Result<(), String> {
-        verify_meta_content(PALLET, &TestRules, None, Admission::Admit, old_head, new_head)
+        verify_meta_content(PALLET, &TestRules, None, &[], Admission::Admit, old_head, new_head)
     }
 
     #[test]
@@ -3381,7 +3444,7 @@ mod tests {
                    admission: Admission,
                    old_head: Option<&str>,
                    new_head: &str) -> Result<(), String> {
-        verify_meta_content("tags", &tag_utils::TagsRules, Some(office), admission, old_head, new_head)
+        verify_meta_content("tags", &tag_utils::TagsRules, Some(office), &[], admission, old_head, new_head)
     }
 
     #[test]
@@ -3468,7 +3531,7 @@ mod tests {
     }
 
     fn verify_manifest(office: &OfficeState, old_head: Option<&str>, new_head: &str) -> Result<(), String> {
-        verify_meta_content("manifest", &manifest_utils::ManifestRules, Some(office), Admission::Admit, old_head, new_head)
+        verify_meta_content("manifest", &manifest_utils::ManifestRules, Some(office), &[], Admission::Admit, old_head, new_head)
     }
 
     #[test]
@@ -3561,7 +3624,7 @@ mod tests {
     }
 
     fn verify_haul(office: &OfficeState, old_head: Option<&str>, new_head: &str) -> Result<(), String> {
-        verify_meta_content("haul", &haul_utils::HaulRules, Some(office), Admission::Admit, old_head, new_head)
+        verify_meta_content("haul", &haul_utils::HaulRules, Some(office), &[], Admission::Admit, old_head, new_head)
     }
 
     fn proposal(opener: &str) -> haul_utils::Opened {
@@ -3843,7 +3906,7 @@ mod tests {
             assert!(error.contains(&format!("records a merge into main, but is signed by {}, {}", key.record.operator, why)), "{}", error);
 
             // Adopting what a remote already admitted audits the record, not its writer.
-            verify_meta_content("haul", &haul_utils::HaulRules, Some(&office), Admission::Audit, Some(&head), &merged).unwrap();
+            verify_meta_content("haul", &haul_utils::HaulRules, Some(&office), &[], Admission::Audit, Some(&head), &merged).unwrap();
         }
 
         // Closing and reopening stay anyone's.
