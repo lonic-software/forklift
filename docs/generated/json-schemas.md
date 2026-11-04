@@ -1093,7 +1093,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "integer"
     },
     "unreadable_tags": {
-      "description": "Why no tag was exported, when the tags or the office that names their taggers could not be\nread.",
+      "description": "Why no tag was exported, when the tags could not be read.",
       "type": [
         "string",
         "null"

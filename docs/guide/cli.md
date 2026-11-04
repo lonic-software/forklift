@@ -172,18 +172,21 @@ so a parcel stamped earlier exports as 1970-01-01.
 Each tag on an exported parcel becomes an **annotated git tag** over that parcel's commit, with
 the tag's message and date, and as tagger the operator the office binds its signing key to,
 written as an author is. Git cannot check a Forklift signature, so the tag's last line names the
-key that signed it. A tag is left out, and named in a warning with the reason, when its parcel is
-on no exported branch (a deleted pallet's), when this warehouse's office does not hold its key,
-when git does not accept its name (`a..b`, `v1.lock`), when the name of another tag that would be
-exported differs from it only in case (`v1` and `V1` would share one file on macOS and Windows),
-or when this build cannot read it. If the tags, or the office that names their taggers, cannot be
-read at all, the branches are still exported, with one warning.
+key that signed it. An unsigned tag (one recorded before the warehouse enrolled) is exported too,
+with the operator it declares as tagger and a last line marking it unsigned instead of naming a
+key, so it needs no office. A signed tag is left out, and named in a warning with the reason, when
+this warehouse's office does not hold its key or cannot be read. Any tag is left out the same way
+when its parcel is on no exported branch (a deleted pallet's), when git does not accept its name
+(`a..b`, `v1.lock`), when the name of another tag that would be exported differs from it only in
+case (`v1` and `V1` would share one file on macOS and Windows), or when this build cannot read it.
+If the tags cannot be read at all, the branches are still exported, with one warning.
 
 The export is deterministic: the same history exports to the same commit hashes on any
 machine, whatever your own git configuration says (it is shut out of every object write).
 Each commit message ends in a `Forklift-Parcel: <parcel> export/<N>` line naming the parcel
 it came from and the export format it was written in, and each tag message in a
-`Forklift-Tag-Signer: <key> export/<N>` line.
+`Forklift-Tag-Signer: <key> export/<N>` line (`Forklift-Tag-Unsigned: export/<N>` for an unsigned
+tag).
 
 ### `git mirror` — keep a git remote in step
 
