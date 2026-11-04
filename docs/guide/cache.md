@@ -12,9 +12,10 @@ A cache picks *which versions* to hold. To hold only *some folders* of every ver
 clone (`clone --only`) instead; see [`clone`](cli.md#clone--clone-a-remote-warehouse).
 
 This page follows one person on one machine, as the [tutorial](tutorial.md) does, and assumes you
-have read it. As there, each `$` line is a command and the lines under it are what forklift prints. A
-`…` stands for text that differs on your machine. A word in angle brackets, such as `<first>`,
-stands for a value forklift prints that a later command uses: copy it from your own output.
+have read it. As there, each `$` line is a command and the lines under it are what forklift
+prints. A `…` stands for text that differs on your machine. A word in angle brackets, such as
+`<first>`, stands for a value forklift prints that a later command uses: copy it from your own
+output.
 
 The test suite runs this page, as it runs the tutorial
 (`crates/forklift/tests/integration/guide_pages.rs`), so the page cannot drift from the CLI.
@@ -180,9 +181,14 @@ It keeps the files of every checkout, every parcel and signature, the office and
 and anything only this warehouse has, such as stacked work not lifted yet. It first asks the origin
 which history it holds, so it never frees something the origin could not give back.
 
-The first draft is gone from the disk, and reading it fetches it again:
+The first draft is gone from the disk, held by its hash again, and reading it fetches it again:
 
 ```console
+$ forklift audit
+Office chain verified back to genesis ….
+Pallet "main" verified: 3 signed parcel(s) valid.
+This warehouse is a cache: it may lack content its history reaches. Signatures are verified in full; every tree it holds was re-hashed and every blob and chunk it names confirmed present, except those held by hash below.
+… absent object(s) are held by hash alone: each is pinned to the hash a parent that is present commits, but is not on disk, and nothing beneath it was checked.
 $ forklift show <first>:maps/forest.map
 forest, first draft
 ```
@@ -191,10 +197,11 @@ Stop the server with Ctrl-C when you are done.
 
 ## When the origin cannot be reached
 
-A cache can do everything offline except read what it does not hold. Run `show <first>:maps/forest.map`
-again with the server stopped after an eviction, and it refuses with exit 36 (`cache_miss`): the
-object "is not in this cache warehouse, and its origin could not be reached to fetch it", and the
-next step it names is to run the command again once the origin can be reached.
+A cache can do everything offline except read what it does not hold. Run
+`show <first>:maps/forest.map` again with the server stopped after an eviction, and it refuses
+with exit 36 (`cache_miss`): the object "is not in this cache warehouse, and its origin could not
+be reached to fetch it", and the next step it names is to run the command again once the origin
+can be reached.
 
 Run it again once the origin is back. A command that refuses this way has changed nothing in the
 working folder; whatever it fetched before refusing stays in the cache. `store evict` needs the
@@ -205,8 +212,9 @@ origin too, and refuses without it.
 A cache never checked that any other server holds what it lacks, so it lifts to, lowers from and
 fetches from its origin alone. Pointing `remote.url` anywhere else makes those commands refuse with
 exit 11 (`non_origin_remote`), naming both servers. If the project moves to a new server, move the
-cache with it, with `forklift remote move https://new.example.com`. It checks that the new server holds everything this cache lacks before it changes anything. A cache
-also cannot be served by `forklift-server` or mirrored to git: clone a full copy for that.
+cache with it, with `forklift remote move https://new.example.com`. It checks that the new server
+holds everything this cache lacks before it changes anything. A cache also cannot be served by
+`forklift-server` or mirrored to git: clone a full copy for that.
 
 ## Where to go next
 
