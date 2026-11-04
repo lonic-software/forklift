@@ -1026,6 +1026,8 @@ mod tests {
     /// evicted object → the packed case plans.
     #[test]
     fn an_unreadable_pack_refuses_the_plan() {
+        // Nothing here is about durability, and the eight warehouses it builds paid a sync per write.
+        let _syncs = file_utils::skip_syncs_on_this_thread();
         pack_utils::tests::for_each_unreadable(|how| {
             for packed in [false, true] {
                 let _scratch = Scratch::new(if packed { "damaged-packed" } else { "damaged-loose" });

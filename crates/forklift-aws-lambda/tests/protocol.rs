@@ -761,6 +761,10 @@ fn a_haul_lifts_only_under_the_office() {
 /// A `@tags` lift is checked against the office the head holds as it admits it: a tag whose
 /// tagger is an admin there is admitted, and the same tag under an office that has demoted the
 /// tagger since is refused.
+///
+/// Over the Windows time budget until FORK-384 (25.8 s and 10.6 s on the Windows CI runner in two runs):
+/// most of its time is syncs, 1.2 s alone on an M-series Mac with fsync on and 0.15 s with it off.
+/// FORK-384 tracks the per-object syncs of the scratch mirror these tests write through.
 #[test]
 fn a_tag_is_admitted_only_from_an_admin_of_the_held_office() {
     let area = Area::new("tags");
@@ -816,6 +820,10 @@ fn a_tag_is_admitted_only_from_an_admin_of_the_held_office() {
 /// A haul merge is admitted only from a writer of its target under the held office: the same
 /// @haul head is admitted under the office that let its signer write `main`, and refused under the
 /// office that ungranted it since.
+///
+/// Over the Windows time budget until FORK-384 (30.2 s and 12.5 s on the Windows CI runner in two runs):
+/// most of its time is syncs, 1.5 s alone on an M-series Mac with fsync on and 0.21 s with it off.
+/// FORK-384 tracks the per-object syncs of the scratch mirror these tests write through.
 #[test]
 fn a_haul_merge_is_admitted_only_from_a_writer_of_its_target() {
     let area = Area::new("haul-merge");
@@ -1482,6 +1490,10 @@ fn mirror_reads(touches: usize) -> (usize, usize) {
 /// while an unbounded one also re-fetches every superseded tree version. The name gate reads the
 /// old head's changed trees from the store on an update and nothing extra on a creation, a fixed
 /// cost the short history is long enough to outweigh.
+///
+/// Over the Windows time budget until FORK-384 (14.5 s and 16.3 s on the Windows CI runner in two runs):
+/// most of its time is syncs, 1.5 s alone on an M-series Mac with fsync on and 0.36 s with it off.
+/// FORK-384 tracks the per-object syncs of the scratch mirror these tests write through.
 #[test]
 fn the_ref_update_mirror_is_bounded_at_old_head() {
     let extra = 4;
@@ -2993,6 +3005,10 @@ fn a_concurrent_office_move_refuses_the_commit_as_office_moved_not_pallet_moved(
 /// conditioned on that same head, so the revocation moving the office refuses the commit rather
 /// than racing it. Were the gate to judge an office read of its own, earlier than the one the
 /// commit is conditioned on, the writer whose grant was just revoked would land the move.
+///
+/// Over the Windows time budget until FORK-384 (19.8 s and 21.5 s on the Windows CI runner in two runs):
+/// most of its time is syncs, 3.0 s alone on an M-series Mac with fsync on and 0.25 s with it off.
+/// FORK-384 tracks the per-object syncs of the scratch mirror these tests write through.
 #[test]
 fn a_grant_revoked_between_the_move_gate_and_the_commit_refuses_the_move() {
     let area = Area::new("grant-revoked-mid-update");
@@ -4481,6 +4497,10 @@ fn of_two_racing_deletes_the_loser_answers_200() {
 /// ref: it answers `200` when an attempt landed, `503` when none did and the pallet is still live
 /// or the ref cannot be read either, and `remote_ahead` when the pallet moved meanwhile, since then
 /// nothing is in doubt.
+///
+/// Over the Windows time budget until FORK-384 (9.9 s and 10.1 s on the Windows CI runner in two
+/// runs): it races eight deletes, each through a head of its own over one built warehouse, and 1.0 s
+/// of its 2.8 s alone on an M-series Mac is syncs, which FORK-384 tracks for the scratch mirror.
 #[test]
 fn a_delete_of_unknown_fate_is_settled_by_the_ref() {
     let warehouse = feature_warehouse(&Area::new("delete-fate-unknown"));
@@ -4583,6 +4603,10 @@ fn rostered_feature_warehouse(area: &Area) -> (Harvest, String, String, String) 
 /// An `@office` lift that leaves the caller's authority as it was, landing between the delete's
 /// read and its commit, refuses that commit; the delete decides again from a fresh read and
 /// answers `200`, as the direct head's does.
+///
+/// Over the Windows time budget until FORK-384 (10.4 s and 11.2 s on the Windows CI runner in two runs):
+/// most of its time is syncs, 1.4 s alone on an M-series Mac with fsync on and 0.24 s with it off.
+/// FORK-384 tracks the per-object syncs of the scratch mirror these tests write through.
 #[test]
 fn an_office_lift_racing_the_delete_is_decided_again() {
     let area = Area::new("delete-redecides");

@@ -187,7 +187,11 @@ machine does not tell you what Windows will take.
   off (above); a test that builds its own `Command` pays for every sync. Each launch of a
   binary costs much more on Windows than on Linux, so a loop over launches is where a
   Windows run spends its time: launch once with many paths rather than many times with
-  one.
+  one. A list of names or inputs that must all be accepted goes into one fixture and one
+  command, not a warehouse each. Independent fixtures that one test needs, such as the
+  states of a matrix or the repeated runs of a determinism check, run on threads of their
+  own with `std::thread::scope`, since each is a chain of launches that waits on nothing
+  the others do.
 - **Test at the cheapest level that can fail.** An integration test launches real
   binaries and pays for every launch; a unit test of the same function pays for none.
   Put the cases of a rule (every input shape, every edge) in unit tests, and keep one
@@ -201,7 +205,11 @@ machine does not tell you what Windows will take.
   only by luck: the crash suite's kills caught a reordered `load` publish in 4 runs out of
   14, and stopping at every rename catches it on every run, in half a second. The stops
   reach renames only: a step that writes or removes a file in place needs its own check,
-  and so does the order of syncs, since a stopped process loses nothing it wrote.
+  and so does the order of syncs, since a stopped process loses nothing it wrote. Check
+  at each stop only what that stop alone can show. Every check is a launch per stop, and
+  a check of state that the next command heals, or that the closing read covers anyway,
+  buys nothing: the `stack` and `load` crash tests took about 20 s each on Windows, when
+  most of the six or seven launches at each stop were checks.
 - **Repetition is the cost.** A test that repeats a run to catch a race uses the fewest
   rounds that still catch the failure, and says in a comment how the count was chosen.
 
