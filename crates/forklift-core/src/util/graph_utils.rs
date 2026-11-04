@@ -156,7 +156,8 @@ struct Shard {
     /// The graph root this shard belongs to, so it is flushed back to the right warehouse even
     /// when a single process (a server) serves several.
     root: String,
-    /// The 2-hex prefix this shard holds.
+    /// The hex prefix this shard holds: [`SHARD_PREFIX_LEN`] characters, fewer under the debug
+    /// override [`shard_prefix_len`] reads.
     prefix: String,
     /// hash (hex) -> record.
     records: HashMap<String, Record>,
@@ -221,9 +222,28 @@ pub fn shard_write_count() -> u64 {
     SHARD_WRITES.load(Ordering::Relaxed)
 }
 
-/// The shard prefix for a parcel hash (its first [`SHARD_PREFIX_LEN`] hex characters).
+/// The shard prefix for a parcel hash: its first [`shard_prefix_len`] hex characters.
 fn shard_prefix(hash: &str) -> String {
-    hash[..SHARD_PREFIX_LEN.min(hash.len())].to_string()
+    hash[..shard_prefix_len().min(hash.len())].to_string()
+}
+
+/// [`SHARD_PREFIX_LEN`], unless the undocumented, test-only `FORKLIFT_DEBUG_GRAPH_SHARD_PREFIX_LEN`
+/// names a length from 1 up to it (any other value is ignored). Fewer shards put several parcels
+/// in each from a short history, which is what tells a write per shard from a write per parcel;
+/// at the real width that takes hundreds of parcels. Read once per process, and only by a debug
+/// build: shard files do not record their width, so a graph written under the override is one a
+/// normal run cannot read, and a release binary must never write one.
+fn shard_prefix_len() -> usize {
+    static LEN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+    *LEN.get_or_init(|| shard_prefix_len_when(cfg!(debug_assertions),
+        std::env::var("FORKLIFT_DEBUG_GRAPH_SHARD_PREFIX_LEN").ok().as_deref()))
+}
+
+/// [`shard_prefix_len`] for a build that does or does not honour the override, given its value.
+fn shard_prefix_len_when(debug_build: bool, setting: Option<&str>) -> usize {
+    setting.filter(|_| debug_build).and_then(|n| n.parse().ok())
+        .filter(|n| (1..=SHARD_PREFIX_LEN).contains(n)).unwrap_or(SHARD_PREFIX_LEN)
 }
 
 /// The on-disk path of the shard file for a given prefix, under the current graph root.
@@ -1153,6 +1173,15 @@ fn fnv1a(bytes: &[u8], seed: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_debug_build_narrows_the_shards() {
+        assert_eq!(shard_prefix_len_when(true, Some("1")), 1);
+        assert_eq!(shard_prefix_len_when(false, Some("1")), SHARD_PREFIX_LEN);
+        assert_eq!(shard_prefix_len_when(true, None), SHARD_PREFIX_LEN);
+        assert_eq!(shard_prefix_len_when(true, Some("0")), SHARD_PREFIX_LEN);
+        assert_eq!(shard_prefix_len_when(true, Some("3")), SHARD_PREFIX_LEN);
+    }
 
     #[test]
     fn a_shard_round_trips_through_serialization() {

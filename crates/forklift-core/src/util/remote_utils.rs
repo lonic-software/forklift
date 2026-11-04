@@ -11706,16 +11706,30 @@ mod tests {
         Budgets { read: WIDE_READ, ..fast_budgets(routes_through_tor) }.checked()
     }
 
-    /// The budgets the stalled-error-body tests arm with. [`FAST`] has no error-body budget a
-    /// second clear of every rival on both sides (see [`error_body_bracket`]), and a
-    /// connect bound as small as [`FAST`]'s leaves the connect-forgotten rival under a second
-    /// below whatever allowance is picked, so these widen both. [`error_body_bracket`] checks their
-    /// separation from every rival it lists rather than this doc stating it.
+    /// The budgets the stalled-error-body tests arm with: 3.5 s, the connect bound plus the
+    /// error-body allowance, which they wait out. [`FAST`] has no error-body budget a second clear
+    /// of every rival on both sides (see [`error_body_bracket`]), so these set every figure. The
+    /// armed sum sits in the one gap under the production 5 s connect bound: a second above the
+    /// connect bound forgotten (2.5 s) and the production 2 s minimum attempt folded with it
+    /// (4.5 s), and a second below those. Every other allowance is at least 4.5 s, as one under
+    /// 2 s folded with the connect bound, or one within a second of 3.5 s on its own, would land
+    /// beside the armed sum. The silence budget (the connect bound plus `object_read`) is above
+    /// the error-body budget, as production's is. [`error_body_bracket`] checks the separation
+    /// from every rival it lists rather than this doc stating it.
     fn stalled_error_body_budgets() -> Budgets {
+        let millis = std::time::Duration::from_millis;
         Budgets {
-            connect: std::time::Duration::from_millis(2_900),
-            error_body_read: std::time::Duration::from_millis(8_550),
-            ..FAST
+            connect: millis(2_500),
+            read: millis(4_600),
+            object_read: millis(15_700),
+            batch_head_patience: millis(6_100),
+            error_body_read: millis(1_000),
+            upload_silence: millis(7_100),
+            retryable_head_patience: millis(8_100),
+            commit_deadline: millis(9_100),
+            commit_attempt_allowance: millis(5_100),
+            min_commit_attempt: millis(4_700),
+            throttle_patience: millis(6_600),
         }
         .checked()
     }
@@ -13901,9 +13915,7 @@ mod tests {
     #[test]
     fn missing_objects_bounds_the_error_body_read_after_a_wedged_500() {
         let remote = SilentErrorBodyRemote::start();
-        // The silence budget the presence call's client carries (connect + `object_read`) above
-        // the error-body budget, as production's is; the shared fixture's is below it.
-        let budgets = Budgets { object_read: std::time::Duration::from_millis(15_700), ..stalled_error_body_budgets() }.checked();
+        let budgets = stalled_error_body_budgets();
         let client = RemoteClient::new_test_with_budgets(&remote.url, budgets);
         // Any real hash string works — the fixture never inspects the body.
         let hashes = vec!["a".repeat(64)];
@@ -13962,9 +13974,7 @@ mod tests {
     #[test]
     fn commit_lift_bounds_the_error_body_read_after_a_wedged_422() {
         let remote = SilentErrorBodyRemote::start_with("HTTP/1.1 422 Unprocessable Entity");
-        // The silence budget the commit's client carries (connect + `object_read`) above the
-        // error-body budget, as production's is; the shared fixture's is below it.
-        let budgets = Budgets { object_read: std::time::Duration::from_millis(15_700), ..stalled_error_body_budgets() }.checked();
+        let budgets = stalled_error_body_budgets();
         let client = RemoteClient::new_test_with_budgets(&remote.url, budgets);
         // The attempt's head-wait bound, looser than the error-body budget as production's can be.
         let attempt = std::time::Duration::from_millis(16_300);

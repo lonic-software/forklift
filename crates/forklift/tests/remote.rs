@@ -6904,6 +6904,11 @@ fn lift_feature(area: &TestArea) -> (String, String, [String; 2]) {
 /// Revert: drop shift's or the fast-forward's presence phase → it removes `docs/one.txt` and
 /// raises its marker before the first write meets the absent blob; drop the merge's → it raises
 /// its marker first.
+///
+/// Over the 10 s budget on the Windows runner (16 s on 2026-11-03), where each refusal adds about
+/// 4 s: it dials the stopped origin twice, and the same setup without the refusals takes about
+/// 5 s there. The three refusals are three presence phases, each of which has to be the one that
+/// refuses, and the origin has to be unreachable rather than answering with an error.
 #[test]
 fn a_cache_shift_with_its_origin_unreachable_refuses_before_it_changes_anything() {
     let area = TestArea::new("cache-phase-offline");
@@ -7069,6 +7074,10 @@ fn a_cache_merge_fetches_its_trees_by_level_and_its_blobs_in_one_batch() {
 ///
 /// Revert: drop the planners' prefetch → the same refusals come from the planners' reads, so
 /// this stays green: it pins the code and the unchanged bay, not which fetch refused.
+///
+/// Over the 10 s budget on the Windows runner (19 s on 2026-11-03) for the reason
+/// [`a_cache_shift_with_its_origin_unreachable_refuses_before_it_changes_anything`] is: three
+/// refusals by an unreachable origin, each a planner of its own.
 #[test]
 fn a_cache_shift_over_absent_trees_with_its_origin_unreachable_refuses_unchanged() {
     let area = TestArea::new("cache-plan-offline");

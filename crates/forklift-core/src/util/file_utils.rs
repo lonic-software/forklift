@@ -301,8 +301,44 @@ pub fn hash_from_object_path(path: &Path) -> Option<String> {
 /// serves many warehouses in one process, so it must not hang off a per-warehouse config lookup on
 /// the write hot path.
 pub fn fsync_enabled() -> bool {
+    #[cfg(test)]
+    if SYNCS_SKIPPED.with(std::cell::Cell::get) {
+        return false;
+    }
+
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| parse_fsync_setting(std::env::var("FORKLIFT_FSYNC").ok().as_deref()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static SYNCS_SKIPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Skips this thread's syncs while the returned guard lives, as `FORKLIFT_FSYNC=0` does for a
+/// process; threads it spawns still sync. Test-only, for a fixture whose tests check nothing about
+/// durability: the in-process tests run with fsync on because they are what runs the sync calls,
+/// and under a parallel run every sync waits on the others, so a fixture that writes a whole
+/// warehouse took seconds per test, most of them in syncs. It also turns off the injected sync
+/// faults, which only fire on a sync that runs, so a test that arms one must not hold the guard.
+/// The guard is not `Send`: dropped on another thread it would restore that thread's setting.
+#[cfg(test)]
+pub(crate) fn skip_syncs_on_this_thread() -> SyncsSkipped {
+    SyncsSkipped { previous: SYNCS_SKIPPED.replace(true), _this_thread: std::marker::PhantomData }
+}
+
+/// The guard [`skip_syncs_on_this_thread`] returns; dropping it restores the thread's setting.
+#[cfg(test)]
+pub(crate) struct SyncsSkipped {
+    previous: bool,
+    _this_thread: std::marker::PhantomData<*const ()>,
+}
+
+#[cfg(test)]
+impl Drop for SyncsSkipped {
+    fn drop(&mut self) {
+        SYNCS_SKIPPED.set(self.previous);
+    }
 }
 
 /// Parse a `FORKLIFT_FSYNC` value: absent — or anything other than an explicit off token — means
@@ -5539,6 +5575,19 @@ mod tests {
     #[test]
     fn in_process_tests_run_with_fsync_on() {
         assert!(fsync_enabled(), "FORKLIFT_FSYNC turns fsync off for the in-process tests; unset it");
+    }
+
+    /// The guard skips the syncs of its own thread only, and only while it lives; a nested one
+    /// restores the outer one's setting, not fsync on.
+    #[test]
+    fn skipped_syncs_are_scoped_to_the_guard_and_its_thread() {
+        let outer = skip_syncs_on_this_thread();
+        assert!(!fsync_enabled(), "the guard's thread skips its syncs");
+        assert!(std::thread::spawn(fsync_enabled).join().unwrap(), "a thread it spawns still syncs");
+        drop(skip_syncs_on_this_thread());
+        assert!(!fsync_enabled(), "dropping a nested guard keeps the outer one's setting");
+        drop(outer);
+        assert!(fsync_enabled(), "dropping the guard turns syncs back on");
     }
 
     #[test]

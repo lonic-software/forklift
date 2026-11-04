@@ -51,24 +51,31 @@ impl Area {
         self.root.join("warehouse")
     }
 
-    /// A command in the warehouse with the isolated global config and key directory, and fsync
-    /// forced on: a crash point keeps unsynced writes, so fsync does not change what a stop
-    /// leaves, but the publish order under test is that of the synced path the binary ships with,
-    /// and the barrier counts below count only synced barriers. A `FORKLIFT_FSYNC=0` in the
-    /// environment the tests were started from must not reach the binary.
+    /// The command under test, in the warehouse with the isolated global config and key
+    /// directory, and fsync forced on: a crash point keeps unsynced writes, so fsync does not
+    /// change what a stop leaves, but the publish order under test is that of the synced path the
+    /// binary ships with, and the barrier counts below count only synced barriers. A
+    /// `FORKLIFT_FSYNC=0` in the environment the tests were started from must not reach it.
     fn command(&self, args: &[&str]) -> Command {
+        self.command_with_fsync(args, "1")
+    }
+
+    /// Run a command that sets up or checks the state the command under test runs on, with fsync
+    /// off. Those commands always run to completion, so a sync changes nothing they leave behind;
+    /// the crash tests run several of them at every crash point, and each would pay for its syncs.
+    fn run(&self, args: &[&str]) -> Output {
+        self.command_with_fsync(args, "0").output().unwrap()
+    }
+
+    fn command_with_fsync(&self, args: &[&str], fsync: &str) -> Command {
         let mut command = Command::new(FORKLIFT);
         command
             .args(args)
             .current_dir(self.warehouse())
-            .env("FORKLIFT_FSYNC", "1")
+            .env("FORKLIFT_FSYNC", fsync)
             .env("FORKLIFT_GLOBAL_CONFIG", self.root.join("home").join("global-config.toml"))
             .env("FORKLIFT_KEYS_DIR", self.root.join("home").join("keys"));
         command
-    }
-
-    fn run(&self, args: &[&str]) -> Output {
-        self.command(args).output().unwrap()
     }
 
     /// A crashed command leaves the warehouse lock behind (no destructor runs), exactly as a real
@@ -95,6 +102,7 @@ impl Area {
                 "{context}: history must read the parcel chain, stderr: {}",
                 String::from_utf8_lossy(&history.stderr));
 
+            // `history` follows the position, which need not be `main`.
             let peek = self.run(&["store", "peek", head]);
             assert!(peek.status.success(),
                 "{context}: peek of the head parcel must succeed, stderr: {}",
@@ -450,6 +458,22 @@ fn barrier_count(output: &std::process::Output) -> u64 {
         .unwrap()
 }
 
+/// The barrier counts `count_for` measures over 1 and over 10 files per directory, each in its
+/// own warehouse, measured at the same time: each fixture is a few seconds of launches on the
+/// Windows runner, and they share nothing. Barriers are counted per process, so neither run's
+/// count includes the other's.
+fn barrier_counts_for_1_and_10(count_for: impl Fn(usize) -> u64 + Sync) -> (u64, u64) {
+    std::thread::scope(|scope| {
+        let one = scope.spawn(|| count_for(1));
+        let ten = scope.spawn(|| count_for(10));
+        let counts = (one.join(), ten.join());
+        match counts {
+            (Ok(one), Ok(ten)) => (one, ten),
+            (Err(panic), _) | (_, Err(panic)) => std::panic::resume_unwind(panic),
+        }
+    })
+}
+
 /// One `load` run over a fixed set of directories, each holding `files_per_dir` already-tracked
 /// files that are all given real content changes before the measured `load .`, with
 /// `FORKLIFT_DEBUG_BARRIER_COUNT=1` set — returns the barrier count that run paid.
@@ -500,8 +524,7 @@ fn load_barrier_count_for(files_per_dir: usize) -> u64 {
 /// file count the way the pre-batching baseline did).
 #[test]
 fn load_pays_a_constant_number_of_barriers_regardless_of_changed_file_count() {
-    let count_1 = load_barrier_count_for(1);
-    let count_10 = load_barrier_count_for(10);
+    let (count_1, count_10) = barrier_counts_for_1_and_10(load_barrier_count_for);
 
     assert_eq!(count_1, count_10,
         "load's barrier count must not scale with the number of changed files: {count_1} for 1 \
@@ -564,8 +587,7 @@ fn restore_barrier_count_for(files_per_dir: usize) -> u64 {
 /// shard publish per file.
 #[test]
 fn restore_pays_a_constant_number_of_barriers_regardless_of_restored_file_count() {
-    let count_1 = restore_barrier_count_for(1);
-    let count_10 = restore_barrier_count_for(10);
+    let (count_1, count_10) = barrier_counts_for_1_and_10(restore_barrier_count_for);
 
     assert_eq!(count_1, count_10,
         "restore's barrier count must not scale with the number of restored files: {count_1} for 1 \
@@ -632,8 +654,7 @@ fn park_pop_barrier_count_for(files_per_dir: usize) -> u64 {
 /// grow with the number of files it writes — before the batch it paid one shard publish per file.
 #[test]
 fn park_pop_pays_a_constant_number_of_barriers_regardless_of_file_count() {
-    let count_1 = park_pop_barrier_count_for(1);
-    let count_10 = park_pop_barrier_count_for(10);
+    let (count_1, count_10) = barrier_counts_for_1_and_10(park_pop_barrier_count_for);
 
     assert_eq!(count_1, count_10,
         "park pop's barrier count must not scale with the number of files it writes: {count_1} \
@@ -681,7 +702,7 @@ fn park_pop_whose_staging_fails_keeps_the_parcel_parked() {
         return;
     }
 
-    let output = area.run(&["park", "pop"]);
+    let output = area.command(&["park", "pop"]).output().unwrap();
     std::fs::set_permissions(&shard_folder, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -729,7 +750,7 @@ fn consolidate_whose_action_fails_stages_nothing() {
         return;
     }
 
-    let output = area.run(&["consolidate", "feature"]);
+    let output = area.command(&["consolidate", "feature"]).output().unwrap();
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -892,8 +913,7 @@ fn cherry_pick_barrier_count_for(files_per_dir: usize) -> u64 {
 /// publish per action.
 #[test]
 fn consolidate_pays_a_constant_number_of_barriers_regardless_of_action_count() {
-    let count_1 = consolidate_barrier_count_for(1);
-    let count_10 = consolidate_barrier_count_for(10);
+    let (count_1, count_10) = barrier_counts_for_1_and_10(consolidate_barrier_count_for);
 
     assert_eq!(count_1, count_10,
         "consolidate's barrier count must not scale with the number of merge actions: {count_1} \
@@ -927,8 +947,7 @@ fn consolidate_with_conflicts_pays_a_constant_number_of_barriers_regardless_of_a
         barrier_count(&output)
     };
 
-    let count_1 = count_for(1);
-    let count_10 = count_for(10);
+    let (count_1, count_10) = barrier_counts_for_1_and_10(count_for);
 
     assert_eq!(count_1, count_10,
         "a conflicting consolidate's barrier count must not scale with the number of merge actions: \
@@ -939,8 +958,7 @@ fn consolidate_with_conflicts_pays_a_constant_number_of_barriers_regardless_of_a
 /// `cherry-pick` applies the same merge actions through the same batch.
 #[test]
 fn cherry_pick_pays_a_constant_number_of_barriers_regardless_of_action_count() {
-    let count_1 = cherry_pick_barrier_count_for(1);
-    let count_10 = cherry_pick_barrier_count_for(10);
+    let (count_1, count_10) = barrier_counts_for_1_and_10(cherry_pick_barrier_count_for);
 
     assert_eq!(count_1, count_10,
         "cherry-pick's barrier count must not scale with the number of merge actions: {count_1} \
@@ -979,7 +997,7 @@ fn a_merge_conflict_clears_the_rollups_above_it() {
     assert_eq!(before_json["data"]["staged_count"], 0, "{before_json}");
     assert_eq!(before_json["data"]["unstaged_count"], 0, "{before_json}");
 
-    let output = area.run(&["consolidate", "feature"]);
+    let output = area.command(&["consolidate", "feature"]).output().unwrap();
     assert!(output.status.success(), "consolidate failed: {}", String::from_utf8_lossy(&output.stderr));
     assert!(warehouse.join(".forklift").join("consolidation").exists(), "the merge stopped on its conflict");
 
@@ -1015,7 +1033,7 @@ fn consolidate_whose_staging_fails_records_nothing_in_progress() {
         return;
     }
 
-    let output = area.run(&["consolidate", "feature"]);
+    let output = area.command(&["consolidate", "feature"]).output().unwrap();
     std::fs::set_permissions(&shard_folder, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let stderr = String::from_utf8_lossy(&output.stderr);

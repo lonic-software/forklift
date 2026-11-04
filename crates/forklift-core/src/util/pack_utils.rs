@@ -2612,15 +2612,8 @@ pub(crate) fn import_transport_packs<R: Read>(reader: &mut R,
         }
 
         let (hashes, parcels) = verify_incoming_packs(&incoming)?;
-        let mut stored_objects = 0;
-        let mut skipped_objects = 0;
-        for hash in &hashes {
-            if file_utils::does_object_exist(&sign_utils::to_hex(hash))? {
-                skipped_objects += 1;
-            } else {
-                stored_objects += 1;
-            }
-        }
+        let skipped_objects = objects_already_held(&hashes)?;
+        let stored_objects = hashes.len() - skipped_objects;
 
         // Each pack's published name, from the index just validated.
         let pack_ids: Vec<String> = incoming.iter().map(pack_id_of).collect::<Result<_, _>>()?;
@@ -4333,6 +4326,25 @@ fn parcel_presence(set: &PackSet, hash: &str, hash_bytes: &[u8; HASH_LEN]) -> Pr
         || !set.unenumerable.is_empty();
 
     if packed { Presence::Packed } else { Presence::Absent }
+}
+
+/// Below this many objects, an import counts the ones the store already holds on the calling
+/// thread: each check is a stat or two, too little to pay for spawning workers.
+const HELD_PARALLEL_THRESHOLD: usize = 1024;
+
+/// How many of `hashes` the store already holds, checked in parallel
+/// ([`fanout_utils::fanout_map`]) for a large batch. An import checks every object it carries,
+/// and into a store that holds few of them each check stats a loose path that is not there; for
+/// a full pack of [`PACK_ROLLOVER_OBJECTS`] that was the slowest step of the import.
+fn objects_already_held(hashes: &[[u8; HASH_LEN]]) -> Result<usize, String> {
+    let held = |hash: &[u8; HASH_LEN]| file_utils::does_object_exist(&sign_utils::to_hex(hash));
+    let answers: Vec<Result<bool, String>> = if hashes.len() < HELD_PARALLEL_THRESHOLD {
+        hashes.iter().map(held).collect()
+    } else {
+        fanout_utils::fanout_map(hashes, held)
+    };
+
+    answers.into_iter().try_fold(0, |count, answer| Ok(count + usize::from(answer?)))
 }
 
 /// Below this many parcels, a repack probes their presence on the calling thread: each probe is a
