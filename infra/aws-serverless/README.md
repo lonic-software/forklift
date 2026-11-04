@@ -142,10 +142,10 @@ never become fetchable).
 
 `iam/control-plane.policy.json` and `iam/verifier.policy.json`, in
 `crates/forklift-aws-lambda/`, are derived from the crate's own SDK call sites (and enforced to
-stay that way by `tests/iam_conformance.rs`'s C11 in the crate). This module renders them with
-`templatefile()` and never hand-writes the S3/DynamoDB/Logs statements they already contain. Only
-the deployment-conditional statements — KMS (above) and the DLQ send permission (below) — are
-added here, since neither is the product of an unconditional SDK call.
+stay that way by `tests/integration/iam_conformance.rs`'s C11 in the crate). This module renders
+them with `templatefile()` and never hand-writes the S3/DynamoDB/Logs statements they already
+contain. Only the deployment-conditional statements — KMS (above) and the DLQ send permission
+(below) — are added here, since neither is the product of an unconditional SDK call.
 
 The crate's third policy, `iam/operator.policy.json`, is for the operator who runs
 `forklift-aws-upgrade` to upgrade warehouses to a new format, from their own machine. This module
@@ -331,6 +331,6 @@ Two independent reasons, either one sufficient on its own:
 
 Vendoring the IAM JSON into this directory would close the first gap but not the second, while
 opening a new one: a second copy of security-sensitive IAM policy whose equality with the crate's
-own copy is enforced only by `tests/iam_conformance.rs`'s C11 (in the crate), which a registry
-consumer never runs — so the vendored copy could silently drift from what the Lambda code actually
-does. Not worth it for a gap that stays open either way.
+own copy is enforced only by `tests/integration/iam_conformance.rs`'s C11 (in the crate), which a
+registry consumer never runs — so the vendored copy could silently drift from what the Lambda code
+actually does. Not worth it for a gap that stays open either way.

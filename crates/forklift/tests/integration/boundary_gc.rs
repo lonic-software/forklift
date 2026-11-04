@@ -59,7 +59,7 @@ use forklift_core::globals::StorageRootScope;
 use forklift_core::enums::parcel_action_type::ParcelActionType;
 use forklift_core::util::{audit_utils, file_utils, gc_utils, object_utils, office_utils};
 
-mod common;
+use crate::common;
 use common::forklift_command;
 
 struct Warehouse {

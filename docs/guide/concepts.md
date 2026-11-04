@@ -12,8 +12,8 @@ For a side-by-side comparison with git, jujutsu, sapling and pijul, see
 
 The examples build one small warehouse from section to section. As in the tutorial, each `$` line
 is a command, the lines under it are what forklift prints, and a `…` stands for text that differs
-on your machine. The test suite runs this page (`crates/forklift/tests/guide_pages.rs`), so the
-examples cannot drift from the CLI.
+on your machine. The test suite runs this page (`crates/forklift/tests/integration/guide_pages.rs`),
+so the examples cannot drift from the CLI.
 
 ```console
 $ mkdir shop

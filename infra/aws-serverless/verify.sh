@@ -61,8 +61,8 @@
 # applies clean in Layer 1/2 and is only ever caught here. Unlike KMS, there is no narrower variant
 # to consider — the grant cannot be prefix-conditioned at all (s3:prefix is not in the request
 # context HeadObject/GetObject authorize against; see docs/DEPLOYMENT.md and
-# crates/forklift-aws-lambda/tests/iam_conformance.rs for the full account, including how a
-# per-file conformance test now pins it directly, and iam/*.policy.json for the actual grant).
+# crates/forklift-aws-lambda/tests/integration/iam_conformance.rs for the full account, including
+# how a per-file conformance test now pins it directly, and iam/*.policy.json for the actual grant).
 # This script's existing round trip already exercises it end to end: every step below HEADs or
 # GETs at least one key that does not yet exist at the point of the call (a fresh object being
 # lifted, the canonical key `verify_and_promote` checks before promoting) — there is no separate

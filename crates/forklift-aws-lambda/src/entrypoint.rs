@@ -11,10 +11,10 @@
 //! on a blocking thread (`spawn_blocking` — every `Head` method blocks on
 //! its store's futures), and converts the response back.
 //!
-//! That split is what makes the control plane testable without AWS: `tests/entrypoint.rs`
-//! replays the whole protocol walk through [`handle`] against the in-memory fakes, and
-//! `tests/aws_integration.rs` drives the same function against real S3 + DynamoDB. The
-//! router never learns which store it is over.
+//! That split is what makes the control plane testable without AWS:
+//! `tests/integration/entrypoint.rs` replays the whole protocol walk through [`handle`] against the
+//! in-memory fakes, and `tests/aws_integration.rs` drives the same function against real S3 +
+//! DynamoDB. The router never learns which store it is over.
 //!
 //! # Where the bytes go
 //!

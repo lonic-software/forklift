@@ -29,7 +29,7 @@ use std::process::Output;
 use forklift_core::globals::StorageRootScope;
 use forklift_core::util::{file_utils, gc_utils};
 
-mod common;
+use crate::common;
 use common::forklift_command;
 
 struct Warehouse {

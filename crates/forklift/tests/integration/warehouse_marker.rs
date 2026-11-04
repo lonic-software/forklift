@@ -12,7 +12,7 @@ use std::process::Output;
 use forklift_core::globals::FOLDER_NAME_FORKLIFT_ROOT;
 use forklift_core::util::bay_utils;
 
-mod common;
+use crate::common;
 use common::forklift_command;
 
 /// A test area: a scratch folder with its own global configuration and keys.

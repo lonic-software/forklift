@@ -222,12 +222,13 @@ contention.** Two things decide almost every row:
      hashed, not just their logical value, and that can only be caught by testing at the scale
      where it actually engages, which a small synthetic corpus will not do.
 
-   **Byte-identity verification.** `repacking_is_byte_reproducible` (`crates/forklift/tests/determinism.rs`)
-   passes unchanged. Additionally verified end-to-end on the synthetic corpus: `compact` then
-   `compact --all` (twice) with the pre-change binary, and again with the post-change binary,
-   comparing SHA-256 of every `.pack`/`.idx` file — **identical hashes, both for the fresh pack
-   and for the steady-state repack.** This is the strongest test available short of a formal
-   proof: real binaries, real files, real hashes, not just the unit test's assertion.
+   **Byte-identity verification.** `repacking_is_byte_reproducible`
+   (`crates/forklift/tests/integration/determinism.rs`) passes unchanged. Additionally verified
+   end-to-end on the synthetic corpus: `compact` then `compact --all` (twice) with the pre-change
+   binary, and again with the post-change binary, comparing SHA-256 of every `.pack`/`.idx` file —
+   **identical hashes, both for the fresh pack and for the steady-state repack.** This is the
+   strongest test available short of a formal proof: real binaries, real files, real hashes, not
+   just the unit test's assertion.
 
    **Measured (18 cores, 401-parcel/7442-object synthetic corpus, 5 runs each, min/median ms):**
 

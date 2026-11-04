@@ -13,7 +13,7 @@ use forklift_core::model::remote::TrustAnchorDto;
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::pallet_utils::PalletNamespace;
 
-#[path = "support/aws_items.rs"]
+#[path = "../support/aws_items.rs"]
 mod aws_items;
 
 use aws_items::{fixtures_root, frozen_items, hash, items_path, populate, read_items};

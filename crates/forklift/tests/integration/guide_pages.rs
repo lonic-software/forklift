@@ -13,7 +13,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 
-mod common;
+use crate::common;
 use common::{fence, forklift_command, repository_root, server_binary, tracked_pages};
 
 /// The pages under `docs/guide/` this test runs, each from an empty folder.

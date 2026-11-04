@@ -9,9 +9,9 @@ prints. A `…` stands for text that differs on your machine, such as hashes, id
 commands are written for a POSIX shell:
 the macOS or Linux terminal, or Git Bash on Windows.
 
-The test suite runs this page. `crates/forklift/tests/guide_pages.rs` executes every command block
-below, in order, and fails if any command fails or prints something other than what is shown here,
-so the page cannot drift from the CLI.
+The test suite runs this page. `crates/forklift/tests/integration/guide_pages.rs` executes every
+command block below, in order, and fails if any command fails or prints something other than what is
+shown here, so the page cannot drift from the CLI.
 
 ## 1. Before you start
 

@@ -927,7 +927,7 @@ total against main.
 **Barrier-count sanity.** A process-wide debug counter (`file_utils::barrier_count`,
 `FORKLIFT_DEBUG_BARRIER_COUNT=1`) now backs a real assertion instead of only a manual
 measurement (finding #10) —
-`crates/forklift/tests/crash_consistency.rs::load_pays_a_constant_number_of_barriers_regardless_of_changed_file_count`
+`crates/forklift/tests/integration/crash_consistency.rs::load_pays_a_constant_number_of_barriers_regardless_of_changed_file_count`
 asserts `load`'s barrier count is identical whether 1 or 10 files change in each of 5
 already-tracked directories. The count itself moved from PR A's constant 2 (phase A +
 phase B) to a constant **3** (blob barrier + phase A + phase B — finding #7's fix, see
@@ -942,7 +942,7 @@ diff) found and fixed a real data-loss bug (finding #1) and a real staleness-wid
 (finding #6) in the code that sweep produced — see the round-2 findings under item 3 above,
 and "Review findings, round 2" below for the full list, including the two findings verified
 and refuted. PR A's own crash-consistency coverage stands unchanged:
-`crates/forklift/tests/crash_consistency.rs` gained a `load`-targeted SIGKILL spread
+`crates/forklift/tests/integration/crash_consistency.rs` gained a `load`-targeted SIGKILL spread
 (`killing_load_midway_never_leaves_a_shard_referencing_a_missing_or_torn_blob`)
 proving a killed `load` never leaves a shard durably referencing a blob that isn't, and a
 `park`-targeted spread (`killing_park_midway_never_leaves_a_parked_parcel_referencing_a_missing_or_torn_object`)

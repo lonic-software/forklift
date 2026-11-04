@@ -2,14 +2,14 @@
 //! through `PULT_EVENTS`, read back line by line. The channel exists on macOS and Linux only.
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 
-mod channel;
+use crate::channel;
 
 use std::os::fd::OwnedFd;
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
-mod common;
+use crate::common;
 use common::forklift_command;
 
 /// The longest line the emitter may write, newline included.

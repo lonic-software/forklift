@@ -18,9 +18,10 @@
 //! implementation design lives in docs/DESIGN.html §4.6.
 //!
 //! `unsafe` is never needed here — the crate `forbid`s it below — so C11 (the IAM conformance
-//! test, `tests/iam_conformance.rs`) can rely on ordinary rustc privacy and doesn't have to
-//! defend against a committer reaching for `transmute`/raw pointers to smuggle a client past a
-//! private field. It defends against a mistake, not an adversary; see that test's module docs.
+//! test, `tests/integration/iam_conformance.rs`) can rely on ordinary rustc privacy and doesn't
+//! have to defend against a committer reaching for `transmute`/raw pointers to smuggle a client
+//! past a private field. It defends against a mistake, not an adversary; see that test's module
+//! docs.
 //!
 //! # Architecture (the testable spine)
 //!

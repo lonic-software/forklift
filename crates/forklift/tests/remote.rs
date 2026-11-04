@@ -11169,7 +11169,7 @@ fn franchise_into_an_absolute_target_path_succeeds() {
 }
 
 /// `lift` and `lower` report their phases on a `PULT_EVENTS` channel (the channel itself — fd
-/// validation, a vanished reader — is covered in `tests/events.rs`).
+/// validation, a vanished reader — is covered in `tests/integration/events.rs`).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[path = "channel/mod.rs"]
 mod channel;

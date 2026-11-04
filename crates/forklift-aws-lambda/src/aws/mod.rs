@@ -12,7 +12,7 @@
 //! * [`config`] — [`AwsConfig`] and [`build_clients`]/[`build_stores`], which turn it into the
 //!   two stores. `config.rs` names zero raw-client tokens — it only ever asks [`s3_ops`]/
 //!   [`dynamo_ops`] to build themselves (see those modules' docs on why that split is the
-//!   mechanism behind C11 v4, `tests/iam_conformance.rs`).
+//!   mechanism behind C11 v4, `tests/integration/iam_conformance.rs`).
 //! * [`s3_ops`] / [`dynamo_ops`] — [`S3Ops`]/[`DynamoOps`]: the sanctioned operation surface,
 //!   each a private SDK client behind one inherent impl of one-line delegations. Nothing
 //!   outside these two files, anywhere in the crate, can name an S3/DynamoDB operation these

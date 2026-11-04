@@ -578,11 +578,11 @@ each store method makes. The **canonical, enforced** copies are
 `crates/forklift-aws-lambda/iam/operator.policy.json` — `{bucket_arn}`, `{table_arn}`, and
 `{log_group_arn}` are `templatefile()` placeholders for your resource ARNs. Two tests keep them
 honest, so treat what follows as an explanation of *why* each statement exists, not a copy to
-retype: `crates/forklift-aws-lambda/tests/iam_conformance.rs` (C11) asserts the code can only
-reach the SDK operations these wrapper types expose, and that set is exactly what the JSON grants;
-`infra/aws-serverless/tests/main.tftest.hcl`'s C6 asserts the Terraform-deployed policy equals an
-independent `templatefile()` render of the same JSON. If you deploy by hand instead of via the
-`infra/aws-serverless` module, attach the JSON files directly — do not retype a policy from this
+retype: `crates/forklift-aws-lambda/tests/integration/iam_conformance.rs` (C11) asserts the code can
+only reach the SDK operations these wrapper types expose, and that set is exactly what the JSON
+grants; `infra/aws-serverless/tests/main.tftest.hcl`'s C6 asserts the Terraform-deployed policy
+equals an independent `templatefile()` render of the same JSON. If you deploy by hand instead of via
+the `infra/aws-serverless` module, attach the JSON files directly — do not retype a policy from this
 page.
 
 ### `forklift-aws-control-plane`
@@ -648,9 +648,10 @@ roles need it: the control plane's own `HeadObject`/`GetObject` calls need it di
 verifier's async `verify_and_promote` calls `key_exists` on the canonical key — which does not
 exist yet for a genuinely new object — so omitting it from the verifier fails promotion silently
 and asynchronously, the same failure shape KMS omission produces (see "KMS" above).
-`crates/forklift-aws-lambda/tests/iam_conformance.rs`'s module docs record this as a class of its
-own: an IAM action a call site needs for its **error semantics**, not to perform the operation —
-invisible to any op→action mapping, because the op genuinely only calls `GetObject`/`HeadObject`.
+`crates/forklift-aws-lambda/tests/integration/iam_conformance.rs`'s module docs record this as a
+class of its own: an IAM action a call site needs for its **error semantics**, not to perform the
+operation — invisible to any op→action mapping, because the op genuinely only calls
+`GetObject`/`HeadObject`.
 
 **What this actually grants, stated plainly:** `s3:ListBucket` on the bucket resource (not
 `bucket/*`) lets its holder enumerate every key in the entire bucket via `ListObjectsV2` — both

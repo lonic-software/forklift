@@ -117,8 +117,9 @@ impl AwsConfig {
 /// This function — and this whole file — names no raw client type. That is deliberate: the two
 /// wrapper modules ([`s3_ops`](crate::aws::s3_ops), [`dynamo_ops`](crate::aws::dynamo_ops)) are
 /// the *only* places `aws_sdk_s3::Client`/`aws_sdk_dynamodb::Client` may appear anywhere in
-/// `src/` (`tests/iam_conformance.rs`'s smuggling guard asserts exactly that); `SdkConfig`/
-/// `tls::Provider`/`Region` are not that type, so building them here does not reopen it.
+/// `src/` (`tests/integration/iam_conformance.rs`'s smuggling guard asserts exactly that);
+/// `SdkConfig`/`tls::Provider`/`Region` are not that type, so building them here does not reopen
+/// it.
 ///
 /// Must be called inside a tokio runtime.
 ///

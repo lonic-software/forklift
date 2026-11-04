@@ -24,7 +24,7 @@ use forklift_core::util::scope_utils::PathScope;
 use forklift_core::util::audit_utils::SealedTolerance;
 use forklift_core::util::sealed_utils::SealOp;
 
-mod common;
+use crate::common;
 use common::forklift_command;
 
 /// The chunk threshold (bytes): content at or above this is stored chunked. Mirrors

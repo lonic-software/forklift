@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 
-mod common;
+use crate::common;
 use common::{forklift_command, repository_root, server_binary};
 
 struct Area {
