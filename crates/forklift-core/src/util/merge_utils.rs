@@ -44,6 +44,13 @@ pub struct ConsolidationState {
     pub our_pallet: String,
 }
 
+/// The description of the parcel that completes a consolidation of `their_label` into
+/// `our_pallet` when the user gives none: the one a clean consolidation records, and the default
+/// of the `stack` that completes a conflicted one.
+pub fn consolidation_description(their_label: &str, our_pallet: &str) -> String {
+    format!("Consolidated \"{}\" into \"{}\".", their_label, our_pallet)
+}
+
 /// The [`record_utils`] kind and version of the consolidation-state file: the other side's head,
 /// then its label, which may be a haul's source and so may hold any character, then our head and
 /// our pallet.

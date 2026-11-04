@@ -354,7 +354,7 @@ pub(crate) async fn merge_head_into_current(current: &str,
         #[cfg(test)]
         tests::BEFORE_MERGE_STACK.with(|seam| seam.take().map(|seam| seam()));
 
-        let description = format!("Consolidated \"{}\" into \"{}\".", their_label, current);
+        let description = merge_utils::consolidation_description(their_label, current);
         let hash = stack_completion(Some(description), our_head, &our_tree_hash, anchor).await?;
 
         Ok(MergeStatus::Merged(hash))

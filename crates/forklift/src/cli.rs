@@ -255,7 +255,7 @@ pub enum Command {
         target: String,
 
         /// The delivered parcel's message
-        #[arg(short = 'm', long)]
+        #[arg(short = 'm', long, value_parser = parcel_description)]
         message: Option<String>,
     },
 
@@ -557,7 +557,7 @@ pub enum Command {
         revision: String,
 
         /// The new parcel's message (default: the source parcel's message)
-        #[arg(short = 'm', long)]
+        #[arg(short = 'm', long, value_parser = parcel_description)]
         message: Option<String>,
     },
 
@@ -802,12 +802,13 @@ pub enum Command {
         visible_alias = "s",
         alias = "commit",
         long_about = "Stack the inventory as a new parcel (commit) on the current pallet, with the \
-                      configured operator recorded as the author. A consolidation in progress is \
-                      completed by this command."
+                      configured operator recorded as the author and the -m text as its description. \
+                      A consolidation or pick in progress is completed by this command, and \
+                      supplies the description when -m is not given; otherwise -m is required."
     )]
     Stack {
-        /// The parcel's description
-        #[arg(short = 'm', long)]
+        /// The parcel's description (needed unless a merge or pick in progress supplies one)
+        #[arg(short = 'm', long, value_parser = parcel_description)]
         message: Option<String>,
     },
 
@@ -2229,6 +2230,33 @@ impl Command {
             Command::Pick { .. } => Some("pick"),
             Command::Shift { .. } => Some("shift"),
             _ => None,
+        }
+    }
+}
+
+/// The value parser of every `-m` that becomes a parcel's description (`stack`, `pick`,
+/// `deliver`): a blank one is refused as a usage error, since it would record a parcel that
+/// `history` shows with no description at all.
+fn parcel_description(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() {
+        return Err("a parcel's description cannot be blank".to_string());
+    }
+
+    Ok(value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+    use super::Cli;
+
+    #[test]
+    fn every_parcel_description_refuses_a_blank_message() {
+        for command in [&["stack"][..], &["pick", "main"], &["deliver", "main"]] {
+            for (message, accepted) in [("", false), (" \t", false), ("a description", true)] {
+                let args = ["forklift"].iter().chain(command).chain(&["-m", message]).copied().collect::<Vec<_>>();
+                assert_eq!(Cli::command().try_get_matches_from(&args).is_ok(), accepted, "{:?}", args);
+            }
         }
     }
 }

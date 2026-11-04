@@ -3729,6 +3729,48 @@ fn consolidate_conflicts_are_marked_and_resolved_by_stacking() {
     assert!(final_status.contains("The working directory matches the inventory"));
 }
 
+// A parcel always records a description: a bare `stack` refuses and changes nothing, a blank -m
+// is a usage error, and the stack that completes a conflicted consolidation, given no -m,
+// records the description a clean consolidation records.
+#[test]
+fn stack_needs_a_description_unless_a_consolidation_supplies_one() {
+    let warehouse = TestWarehouse::new("stack-description");
+    warehouse.write_file("file.txt", "one\ntwo\nthree\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+
+    let bare = warehouse.run(&["stack"]);
+    assert!(!bare.status.success());
+    assert!(stderr(&bare).contains("a parcel needs a description, and none was given"), "{}", stderr(&bare));
+    for blank in ["", "  "] {
+        let refused = warehouse.run(&["stack", "-m", blank]);
+        assert_eq!(refused.status.code(), Some(2), "{:?}: {}", blank, stderr(&refused));
+        assert!(stderr(&refused).contains("a parcel's description cannot be blank"), "{}", stderr(&refused));
+    }
+    assert!(!warehouse.root.join(".forklift/pallets/main").exists(), "a refused stack must record no parcel");
+
+    // Nothing was consumed: the staged change stacks once given a description.
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
+
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
+    warehouse.write_file("file.txt", "one\nTHEIRS\nthree\n");
+    assert_success(&warehouse.run(&["load", "file.txt"]));
+    assert_success(&warehouse.run(&["stack", "-m", "theirs"]));
+    assert_success(&warehouse.run(&["shift", "main"]));
+    warehouse.write_file("file.txt", "one\nOURS\nthree\n");
+    assert_success(&warehouse.run(&["load", "file.txt"]));
+    assert_success(&warehouse.run(&["stack", "-m", "ours"]));
+    assert!(stdout(&warehouse.run(&["consolidate", "feature"])).contains("conflict: file.txt"));
+
+    warehouse.write_file("file.txt", "one\nresolved\nthree\n");
+    assert_success(&warehouse.run(&["load", "file.txt"]));
+    assert_success(&warehouse.run(&["stack"]));
+
+    let history = json(&warehouse.run(&["--json", "history"]));
+    assert_eq!(history["data"]["entries"][0]["description"], "Consolidated \"feature\" into \"main\".", "{}", history);
+}
+
 #[test]
 fn park_saves_and_reapplies_work_in_progress() {
     let warehouse = TestWarehouse::new("park");
@@ -9843,13 +9885,15 @@ fn cherry_pick_conflicts_are_marked_and_completed_by_stacking() {
     // A stack is refused while the conflict is unresolved.
     assert!(!warehouse.run(&["stack", "-m", "premature"]).status.success());
 
-    // Resolving, loading and stacking completes the pick as a single-parent parcel.
+    // Resolving, loading and stacking completes the pick as a single-parent parcel, which given
+    // no -m carries the source parcel's description.
     warehouse.write_file("f.txt", "alpha\nbeta-RESOLVED\ngamma\n");
     assert_success(&warehouse.run(&["load", "."]));
-    assert_success(&warehouse.run(&["stack", "-m", "resolved pick"]));
+    assert_success(&warehouse.run(&["stack"]));
 
     let head = json(&warehouse.run(&["--json", "history"]));
     let top = &head["data"]["entries"][0];
+    assert_eq!(top["description"], "feature edits beta", "{}", head);
     assert!(top["consolidates"].as_array().map_or(true, |c| c.is_empty()), "must be single-parent");
     assert!(!warehouse.root.join(".forklift/cherry-pick").exists(), "the cherry-pick state must be cleared");
 }
