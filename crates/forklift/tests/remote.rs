@@ -1605,7 +1605,7 @@ fn signed_history_round_trips_and_the_server_audits() {
 }
 
 #[test]
-fn optimistic_lift_auto_merges_a_disjoint_divergence_but_stops_on_overlap() {
+fn optimistic_lift_auto_merges_a_disjoint_divergence_after_a_complete_load_but_stops_on_overlap() {
     let area = TestArea::new("optimistic");
     let server = Server::start(&area, None);
 
@@ -1630,6 +1630,32 @@ fn optimistic_lift_auto_merges_a_disjoint_divergence_but_stops_on_overlap() {
     area.write_file("b/from_b.txt", "b\n");
     assert_success(&area.forklift("b", &["load", "."]));
     assert_success(&area.forklift("b", &["stack", "-m", "b's file"]));
+
+    // But not over an incomplete load. The auto-merge (`lift::try_auto_merge`) calls the same
+    // `merge_head_into_current` `consolidate` and `cherry-pick` do: it writes merge output into
+    // the working inventory and only afterwards records consolidation state, before ever
+    // reaching `stack_utils::stack_parcel`'s own late guard. The up-front guard at the call site
+    // must refuse before any of that runs, exactly like the `consolidate`/`cherry-pick`/`haul
+    // merge` cases in `cli.rs`. A load killed outright partway through its walk is simulated by
+    // its marker (see `load_guard_utils::marker_path_under`'s doc comment for why that is a
+    // faithful stand-in).
+    let marker_path = forklift_core::util::load_guard_utils::marker_path_under(&area.path("b"));
+    std::fs::write(&marker_path, "./\n").unwrap();
+
+    let refused = area.forklift("b", &["--json", "lift"]);
+    assert!(!refused.status.success(), "the lift must refuse, not auto-merge over an incomplete load");
+    assert_eq!(refused.status.code(), Some(20));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&refused)).unwrap();
+    assert_eq!(value["error"]["code"], "incomplete_load");
+    assert!(
+        !area.path("b/.forklift/consolidation").exists(),
+        "the optimistic auto-merge's consolidation state must not be written while an \
+        incomplete load is outstanding"
+    );
+    assert!(!area.path("b/from_a.txt").exists(), "the auto-merge must not have applied anything");
+
+    // Healing the load lets the lift auto-merge normally.
+    std::fs::remove_file(&marker_path).unwrap();
     let lifted = area.forklift("b", &["lift"]);
     assert_success(&lifted);
     assert!(stdout(&lifted).contains("auto-merged"), "{}", stdout(&lifted));
@@ -1655,67 +1681,6 @@ fn optimistic_lift_auto_merges_a_disjoint_divergence_but_stops_on_overlap() {
     assert!(!refused.status.success(), "an overlapping divergence must not auto-merge");
     assert!(stderr(&refused).contains("diverged") && stderr(&refused).contains("pallet create"), "{}", stderr(&refused));
     assert_eq!(area.read_file("b/shared.txt"), "from b\n"); // untouched — no half-merge
-}
-
-/// The optimistic auto-merge (`lift::try_auto_merge`) calls the same shared
-/// `merge_head_into_current` `consolidate` and `cherry-pick` do: it writes real merge output
-/// into the working inventory and only afterwards records consolidation state
-/// (`.forklift/consolidation`), before ever reaching `stack_utils::stack_parcel`'s own late
-/// guard. The up-front guard added at the call site in `lift::try_auto_merge` must refuse
-/// before any of that runs: reverting it makes the state-file assertion below go red, exactly
-/// like the `consolidate`/`cherry-pick`/`haul merge` cases in `cli.rs`.
-#[test]
-fn optimistic_lift_refuses_on_an_incomplete_load_before_writing_consolidation_state() {
-    let area = TestArea::new("optimistic-incomplete-load");
-    let server = Server::start(&area, None);
-
-    prepare_warehouse(&area, "a", &server.url);
-    area.write_file("a/shared.txt", "base\n");
-    assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "-m", "initial"]));
-    assert_success(&area.forklift("a", &["office", "enroll"]));
-    assert_success(&area.forklift("a", &["lift"]));
-
-    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
-
-    // A publishes a change to a file only it touches.
-    area.write_file("a/from_a.txt", "a\n");
-    assert_success(&area.forklift("a", &["load", "."]));
-    assert_success(&area.forklift("a", &["stack", "-m", "a's file"]));
-    assert_success(&area.forklift("a", &["lift"]));
-
-    // B, still at the base, stacks a disjoint change of its own — the remote has diverged, and
-    // the change is disjoint, so an ordinary lift would auto-merge (optimistic lift, §7.7).
-    area.write_file("b/from_b.txt", "b\n");
-    assert_success(&area.forklift("b", &["load", "."]));
-    assert_success(&area.forklift("b", &["stack", "-m", "b's file"]));
-
-    // Simulate a load killed outright partway through its walk in B's warehouse (see
-    // `load_guard_utils::marker_path_under`'s doc comment for why this is a faithful stand-in
-    // for a real interrupted load, driven through a spawned `forklift` subprocess).
-    let marker_path = forklift_core::util::load_guard_utils::marker_path_under(&area.path("b"));
-    std::fs::write(&marker_path, "./\n").unwrap();
-
-    let lifted = area.forklift("b", &["--json", "lift"]);
-    assert!(!lifted.status.success(), "the lift must refuse, not auto-merge over an incomplete load");
-    assert_eq!(lifted.status.code(), Some(20));
-    let value: serde_json::Value = serde_json::from_str(&stdout(&lifted)).unwrap();
-    assert_eq!(value["error"]["code"], "incomplete_load");
-
-    // The auto-merge must not have gotten far enough to write its own in-progress state, or to
-    // apply anything to the working directory.
-    assert!(
-        !area.path("b/.forklift/consolidation").exists(),
-        "the optimistic auto-merge's consolidation state must not be written while an \
-        incomplete load is outstanding"
-    );
-    assert!(!area.path("b/from_a.txt").exists(), "the auto-merge must not have applied anything");
-
-    // Healing the load lets the lift auto-merge normally.
-    std::fs::remove_file(&marker_path).unwrap();
-    let healed = area.forklift("b", &["lift"]);
-    assert_success(&healed);
-    assert!(stdout(&healed).contains("auto-merged"), "{}", stdout(&healed));
 }
 
 #[test]
@@ -5250,7 +5215,7 @@ fn a_sparse_franchise_degrades_touches_to_unknown_out_of_scope() {
 }
 
 #[test]
-fn a_partial_clone_missing_an_unrelated_boundary_head_still_reads_signer_boundary_as_vouched() {
+fn a_partial_clone_missing_an_unrelated_boundary_head_still_audits_and_reads_the_parcel_as_vouched() {
     // The presence guard, end to end: a distrust boundary can name a head this store never has
     // at all, and that absent head must never turn a parcel a *present* boundary head already
     // vouches for into "unresolved" — let alone "suspect" — even though `audit_utils`'s own
@@ -5325,6 +5290,10 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_reads_signer_boundar
     area.write_file("dev/side.txt", "side work\n");
     assert_success(&area.forklift("dev", &["load", "side.txt"]));
     assert_success(&area.forklift("dev", &["stack", "-m", "side work"]));
+    let side_head = std::fs::read_to_string(area.path("dev/.forklift/pallets/side"))
+        .expect("the side pallet has a head")
+        .trim()
+        .to_string();
 
     // Retire the agent's key: the distrust boundary snapshots every current pallet head —
     // main's and side's alike, published or not.
@@ -5362,6 +5331,7 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_reads_signer_boundar
          to its real answer: {}",
         origin_report
     );
+    assert_success(&area.forklift("dev", &["audit"]));
 
     assert_success(&area.forklift("dev", &["lift"]));
 
@@ -5370,6 +5340,32 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_reads_signer_boundar
     // at all.
     let franchised = area.forklift(".", &["clone", &server.url, "clone"]);
     assert_success(&franchised);
+    assert!(
+        !object_store_path(&area, "clone", &side_head).exists(),
+        "the side pallet's head must genuinely be absent from the clone for this test to mean \
+         anything"
+    );
+
+    // `audit` must not refuse just because *some* boundary head is missing — only when the
+    // parcel under test cannot be vouched *without* it. `side`'s head never reaching the
+    // clone must not stop `audit` from passing: the agent's main-line parcel is reachable from
+    // main's own present boundary snapshot regardless.
+    //
+    // The complementary case — a boundary that genuinely *cannot* be resolved for the parcel
+    // under test, where `audit` must refuse honestly rather than allege tampering — cannot be
+    // built from this fixture: a shipped `office retire` always folds the audited pallet's OWN
+    // current head into the boundary, so that entry is trivially present here. It is exercised
+    // directly against `verify_pallet_history` in `audit_utils::tests`, and end to end by
+    // `retiring_a_signer_then_lifting_only_a_replacement_pallet_refuses_instead_of_accusing`
+    // below, whose audited pallet is never lifted at all.
+    let audit_on_clone = area.forklift("clone", &["audit"]);
+    assert!(
+        audit_on_clone.status.success(),
+        "a missing boundary head that this parcel's vouching does not need must never make \
+         audit refuse: {}",
+        stderr(&audit_on_clone)
+    );
+    assert!(stdout(&audit_on_clone).contains("verified"), "{}", stdout(&audit_on_clone));
 
     let on_clone = area.forklift("clone", &["--json", "query", "main", "--class", "agent"]);
     assert_success(&on_clone);
@@ -5412,132 +5408,6 @@ fn a_partial_clone_missing_an_unrelated_boundary_head_still_reads_signer_boundar
             value, must_match, report
         );
     }
-}
-
-#[test]
-fn a_partial_clone_missing_an_unrelated_boundary_head_still_audits_the_vouched_parcel() {
-    // `audit` must not refuse just because *some* boundary head is missing — only when the
-    // parcel under test cannot be vouched *without* it. `audit`'s own asymmetric, vouched-first
-    // ordering (below, `verify_pallet_history`'s `DistrustBoundary` arm) means it never even
-    // asks whether the boundary is resolvable in the common case: `vouched` decides it directly.
-    // `query`'s `fill_boundary` now asks in the same order (see that method's doc) — before
-    // this fix it asked `resolvable` unconditionally, which made the *whole boundary's*
-    // resolvability (not just what this parcel needs) the gate, over-firing "unresolved" for
-    // parcels an absent, unrelated head had nothing to do with; see
-    // `a_partial_clone_missing_an_unrelated_boundary_head_still_reads_signer_boundary_as_vouched`,
-    // which shares this fixture and pins that fix directly. This construction reuses that same
-    // partial-clone fixture (a never-lifted local "side" pallet's head sits in the boundary
-    // alongside main's own) to pin the `audit`-side analogue: the agent's main-line parcel is
-    // vouched by main's own boundary snapshot alone, so `audit` must pass on the clone even
-    // though `side`'s head never arrived there — the missing head is irrelevant to this parcel,
-    // and an audit that refused anyway would be a regression.
-    //
-    // The complementary case — a boundary that genuinely *cannot* be resolved for the parcel
-    // under test, where `audit` must refuse honestly rather than allege tampering — is exercised
-    // both directly against `verify_pallet_history` in `audit_utils::tests` (a hand-built
-    // `KeyRecord` and object store, chosen there because a shipped `office retire` always folds
-    // the audited pallet's OWN current head into the boundary, so that particular entry is
-    // trivially present through ordinary tooling) and, end to end through real CLI/server
-    // machinery, by `retiring_a_signer_then_lifting_only_a_replacement_pallet_refuses_instead_
-    // of_accusing` below (Construction D): there, the audited parcel's own pallet is never
-    // lifted at all, so even its own retirement-time boundary entry is absent on the server —
-    // the "same pallet's own snapshot is always present" shape this fixture relies on is a
-    // property of THIS construction (the audited pallet, main, is the one that keeps getting
-    // lifted), not a universal guarantee; a pallet that stops being the one advanced and lifted
-    // can lose even its own boundary entry.
-    let area = TestArea::new("audit-boundary-unresolved");
-    let server = Server::start(&area, None);
-
-    prepare_warehouse(&area, "dev", &server.url);
-    area.write_file("dev/base.txt", "base\n");
-    assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "-m", "base"]));
-    assert_success(&area.forklift("dev", &["office", "enroll"]));
-
-    // Admit an agent.
-    assert_success(&area.forklift("dev", &["config", "set", "operator.identifier", "agent@forklift"]));
-    let keygen = area.forklift("dev", &["profile", "keygen"]);
-    assert_success(&keygen);
-    let admit_args: Vec<String> = stdout(&keygen)
-        .lines()
-        .find(|line| line.trim_start().starts_with("office admit "))
-        .expect("keygen prints the admit line")
-        .split_whitespace()
-        .skip(2)
-        .map(str::to_string)
-        .collect();
-    assert_success(&area.forklift("dev", &["config", "set", "operator.identifier", "tester@forklift"]));
-    assert_success(&area.forklift("dev", &[
-        "office", "admit", &admit_args[0], &admit_args[1], &admit_args[2],
-        "--agent", "--supervisor", "tester@forklift",
-    ]));
-
-    // The agent's main-line parcel: it stays reachable from `main` throughout, and is the one
-    // whose revoked-key signature `audit` must resolve against the distrust boundary.
-    assert_success(&area.forklift("dev", &["config", "set", "operator.identifier", "agent@forklift"]));
-    area.write_file("dev/agent-main.txt", "agent main work\n");
-    assert_success(&area.forklift("dev", &["load", "agent-main.txt"]));
-    assert_success(&area.forklift("dev", &["stack", "-m", "agent main work"]));
-
-    // A second, local-only pallet: its head will sit in the retirement's boundary below but
-    // will never reach the remote — nothing ever lifts `side`.
-    assert_success(&area.forklift("dev", &["pallet", "create", "side"]));
-    area.write_file("dev/side.txt", "side work\n");
-    assert_success(&area.forklift("dev", &["load", "side.txt"]));
-    assert_success(&area.forklift("dev", &["stack", "-m", "side work"]));
-    let side_head = std::fs::read_to_string(area.path("dev/.forklift/pallets/side"))
-        .expect("the side pallet has a head")
-        .trim()
-        .to_string();
-
-    // Retire the agent's key: the distrust boundary snapshots every current pallet head —
-    // main's and side's alike, published or not.
-    assert_success(&area.forklift("dev", &["config", "set", "operator.identifier", "tester@forklift"]));
-    let listing = area.forklift("dev", &["--json", "office", "list"]);
-    assert_success(&listing);
-    let listing: serde_json::Value = serde_json::from_str(&stdout(&listing)).unwrap();
-    let agent_key_id = listing["data"]["users"]
-        .as_array().unwrap().iter()
-        .find(|user| user["identifier"] == "agent@forklift")
-        .expect("the agent is enrolled")
-        ["keys"][0]["key_id"]
-        .as_str().unwrap().to_string();
-    assert_success(&area.forklift("dev", &["office", "retire", &agent_key_id, "--offline"]));
-
-    // Back to `main` (only it ever gets lifted; `side` and its head stay purely local).
-    assert_success(&area.forklift("dev", &["shift", "main"]));
-
-    // On the origin, where the side pallet's head is still right there, the agent's
-    // main-line parcel is fully resolvable and legitimately vouched — audit passes.
-    let audit_on_origin = area.forklift("dev", &["audit"]);
-    assert_success(&audit_on_origin);
-
-    assert_success(&area.forklift("dev", &["lift"]));
-
-    // A fresh clone: an ordinary (non-sparse) clone fetches only what the remote
-    // actually knows about — `side` was never lifted, so its head never reaches the clone.
-    let franchised = area.forklift(".", &["clone", &server.url, "clone"]);
-    assert_success(&franchised);
-    assert!(
-        !object_store_path(&area, "clone", &side_head).exists(),
-        "the side pallet's head must genuinely be absent from the clone for this test to mean \
-         anything"
-    );
-
-    // `side`'s head never reaching the clone must not stop `audit` from passing: the agent's
-    // main-line parcel is reachable from main's own present boundary snapshot regardless.
-    let audit_on_clone = area.forklift("clone", &["audit"]);
-    assert!(
-        audit_on_clone.status.success(),
-        "a missing boundary head that this parcel's vouching does not need must never make \
-         audit refuse: {}",
-        stderr(&audit_on_clone)
-    );
-    assert!(
-        stdout(&audit_on_clone).contains("verified"),
-        "{}",
-        stdout(&audit_on_clone)
-    );
 }
 
 /// Construction T (PR #121 round 2): the trust-arm honest refusal, reproduced end to end
@@ -5852,39 +5722,6 @@ fn retiring_a_signer_then_lifting_only_a_replacement_pallet_refuses_instead_of_a
         "with A1's ancestry now present, the identical query must read A0 as vouched: {}",
         report
     );
-}
-
-#[test]
-fn a_sparse_franchise_still_audits() {
-    // The meta/office carve-out: a sparse clone fetches office and every meta pallet at full
-    // scope, so a trusted warehouse's offline audit still passes — the office chain is verified
-    // with full content, exactly as a full clone would.
-    let area = TestArea::new("sparse-audit");
-    let server = Server::start(&area, None);
-
-    prepare_warehouse(&area, "dev", &server.url);
-    area.write_file("dev/src/api/a.txt", "api v1\n");
-    area.write_file("dev/src/web/w.txt", "web v1\n");
-    assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "-m", "pre-trust base"]));
-
-    // Establish trust: every parcel from here is signed, and the office pallet carries the keys.
-    assert_success(&area.forklift("dev", &["office", "enroll"]));
-    area.write_file("dev/src/api/a.txt", "api v2 signed\n");
-    assert_success(&area.forklift("dev", &["load", "src/api/a.txt"]));
-    assert_success(&area.forklift("dev", &["stack", "-m", "signed parcel"]));
-    assert_success(&area.forklift("dev", &["lift"]));
-
-    let franchised = area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]);
-    assert_success(&franchised);
-    assert!(stdout(&franchised).contains("Adopted the remote's trust anchor"), "{}", stdout(&franchised));
-
-    // The audit reads the office chain's full content (present via the carve-out) and the user
-    // pallet's signatures (parcels are always fully present) — it passes on the sparse store.
-    let audit = area.forklift("sparse", &["audit"]);
-    assert_success(&audit);
-    assert!(stdout(&audit).contains("Office chain verified"), "{}", stdout(&audit));
-    assert!(stdout(&audit).contains("verified"), "{}", stdout(&audit));
 }
 
 #[test]
@@ -8637,13 +8474,12 @@ fn lift_from_a_sparse_workspace_with_no_remote_configured_reports_the_plain_erro
         "{}", stdout(&failed));
 }
 
+/// One trusted warehouse, cloned sparse and in full, and everything an audit says about each.
+/// The fixture is built once: the checks below only read it until the last two, which damage
+/// the sparse store, one at a time.
 #[test]
-fn a_sparse_audit_names_its_scope_boundary() {
-    // Sparse-audit honesty: signatures are verified in full and in-scope content is verified by
-    // re-hash, but the rest is sealed by hash — and the audit says so in a distinct statement a
-    // full-clone audit never prints. A sealed out-of-scope subtree does not fail the audit; the
-    // human output and the --json envelope both carry the scope boundary.
-    let area = TestArea::new("sparse-audit-boundary");
+fn a_sparse_audit_states_its_boundary_and_re_verifies_in_scope_content() {
+    let area = TestArea::new("sparse-audit");
     let server = Server::start(&area, None);
 
     prepare_warehouse(&area, "dev", &server.url);
@@ -8651,6 +8487,8 @@ fn a_sparse_audit_names_its_scope_boundary() {
     area.write_file("dev/src/web/w.txt", "web v1\n");
     assert_success(&area.forklift("dev", &["load", "."]));
     assert_success(&area.forklift("dev", &["stack", "-m", "pre-trust base"]));
+
+    // Establish trust: every parcel from here is signed, and the office pallet carries the keys.
     assert_success(&area.forklift("dev", &["office", "enroll"]));
     area.write_file("dev/src/api/a.txt", "api v2 signed\n");
     assert_success(&area.forklift("dev", &["load", "src/api/a.txt"]));
@@ -8659,13 +8497,38 @@ fn a_sparse_audit_names_its_scope_boundary() {
 
     let head = pallet_head(&area, "dev", "main");
     let web_tree = path_object_hash(&area, "dev", &head, "src/web");
+    let api_tree = path_object_hash(&area, "dev", &head, "src/api");
+    let api_blob = path_object_hash(&area, "dev", &head, "src/api/a.txt");
 
-    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
+    let franchised = area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]);
+    assert_success(&franchised);
+    assert!(stdout(&franchised).contains("Adopted the remote's trust anchor"), "{}", stdout(&franchised));
+    assert_success(&area.forklift(".", &["clone", &server.url, "full"]));
+
+    // The referee: a full (unscoped) store's audit is byte-for-byte what it always was — no
+    // scope boundary line, no scope field — so a sparse pass can never be confused for one.
+    let audit = area.forklift("full", &["audit"]);
+    assert_success(&audit);
+    let report = stdout(&audit);
+    assert!(report.contains("Office chain verified"), "{}", report);
+    assert!(!report.contains("sparse"), "a full-store audit must not print the sparse boundary: {}", report);
+    assert!(!report.contains("sealed by hash"), "{}", report);
+
+    let audit_json = area.forklift("full", &["--json", "audit"]);
+    assert_success(&audit_json);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&audit_json)).unwrap();
+    assert!(json["data"]["scope"].is_null(),
+        "a full-store audit --json carries no scope field: {}", stdout(&audit_json));
 
     // The out-of-scope subtree was sealed, not fetched — yet the audit passes over it.
     assert!(!object_present(&area, "sparse", &web_tree),
         "the out-of-scope subtree must be sealed, not fetched");
 
+    // The meta/office carve-out: a sparse clone fetches office and every meta pallet at full
+    // scope, so the office chain is verified with full content, exactly as a full clone would.
+    // Signatures are verified in full and in-scope content by re-hash, but the rest is sealed
+    // by hash — and the audit says so in a distinct statement a full-clone audit never prints.
+    // The human output and the --json envelope both carry the scope boundary.
     let audit = area.forklift("sparse", &["audit"]);
     assert_success(&audit);
     let report = stdout(&audit);
@@ -8685,39 +8548,35 @@ fn a_sparse_audit_names_its_scope_boundary() {
     assert_eq!(scope["in_scope_content"], serde_json::json!("verified"), "{}", stdout(&audit_json));
     assert_eq!(scope["out_of_scope_content"], serde_json::json!("sealed"), "{}", stdout(&audit_json));
     assert_eq!(scope["enforcement"], serde_json::json!("advisory"), "{}", stdout(&audit_json));
-}
 
-#[test]
-fn a_sparse_audit_fails_on_a_tampered_in_scope_tree() {
-    // The scoped closure loads every in-scope tree, and a content-addressed read re-hashes it,
-    // so a corrupted in-scope subtree object is caught — the seal covers only what was never
-    // fetched, never the in-scope content the audit re-verifies.
-    let area = TestArea::new("sparse-audit-tamper");
-    let server = Server::start(&area, None);
+    // The limitation, stated honestly: audit presence-checks blobs, it does not re-read their
+    // content — so a present-but-corrupted in-scope blob passes the closure check (true of a
+    // full-store audit too) and is caught only when it is next actually read. The blob's bytes
+    // are put back afterwards, so the tamper below is the only damage the last audit sees.
+    let blob_path = object_store_path(&area, "sparse", &api_blob);
+    let blob_bytes = std::fs::read(&blob_path).unwrap();
+    std::fs::write(&blob_path, b"corrupted-not-valid-zstd").unwrap();
+    {
+        let sparse_head = pallet_head(&area, "sparse", "main");
+        let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("sparse"));
+        let fetch_scope = forklift_core::util::scope_utils::read_fetch_scope().unwrap();
 
-    prepare_warehouse(&area, "dev", &server.url);
-    area.write_file("dev/src/api/a.txt", "api v1\n");
-    area.write_file("dev/src/web/w.txt", "web v1\n");
-    assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "-m", "pre-trust base"]));
-    assert_success(&area.forklift("dev", &["office", "enroll"]));
-    area.write_file("dev/src/api/a.txt", "api v2 signed\n");
-    assert_success(&area.forklift("dev", &["load", "src/api/a.txt"]));
-    assert_success(&area.forklift("dev", &["stack", "-m", "signed parcel"]));
-    assert_success(&area.forklift("dev", &["lift"]));
+        // Closure passes: the blob is present, and a normal audit only presence-checks blobs.
+        forklift_core::util::audit_utils::verify_parcel_closure_scoped(&sparse_head, None, &fetch_scope, false, None)
+            .expect("a present (if content-corrupted) in-scope blob passes the presence-only closure check");
 
-    let head = pallet_head(&area, "dev", "main");
-    let api_tree = path_object_hash(&area, "dev", &head, "src/api");
-    let api_blob = path_object_hash(&area, "dev", &head, "src/api/a.txt");
-
-    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
-
-    // A healthy sparse audit first — the store is valid.
+        // Reading it does catch the corruption — the content-addressed read re-hashes.
+        assert!(forklift_core::util::object_utils::load_blob(&api_blob).is_err(),
+            "the corrupted blob must fail when it is actually read");
+    }
+    std::fs::write(&blob_path, &blob_bytes).unwrap();
     assert_success(&area.forklift("sparse", &["audit"]));
 
-    // Overwrite the in-scope subtree object with another valid object's bytes: the read
-    // decompresses cleanly, but the re-hash no longer matches the name it was fetched under.
-    let blob_bytes = std::fs::read(object_store_path(&area, "sparse", &api_blob)).unwrap();
+    // The scoped closure loads every in-scope tree, and a content-addressed read re-hashes it,
+    // so a corrupted in-scope subtree object is caught — the seal covers only what was never
+    // fetched, never the in-scope content the audit re-verifies. Overwrite the in-scope subtree
+    // object with another valid object's bytes: the read decompresses cleanly, but the re-hash
+    // no longer matches the name it was fetched under.
     std::fs::write(object_store_path(&area, "sparse", &api_tree), &blob_bytes).unwrap();
 
     let tampered = area.forklift("sparse", &["audit"]);
@@ -8764,46 +8623,6 @@ fn a_sparse_audit_checks_each_path_of_a_shared_spine_tree() {
         stdout(&audit));
     assert!(format!("{}{}", stdout(&audit), stderr(&audit)).contains(&y_blob),
         "the failure names the missing blob: {}{}", stdout(&audit), stderr(&audit));
-}
-
-#[test]
-fn a_content_corrupted_in_scope_blob_passes_closure_but_fails_on_read() {
-    // The limitation, stated honestly: audit presence-checks blobs, it does not re-read their
-    // content — so a present-but-corrupted in-scope blob passes the closure check (true of a
-    // full-store audit too) and is caught only when it is next actually read.
-    let area = TestArea::new("sparse-audit-blob");
-    let server = Server::start(&area, None);
-
-    prepare_warehouse(&area, "dev", &server.url);
-    area.write_file("dev/src/api/a.txt", "api v1\n");
-    area.write_file("dev/src/web/w.txt", "web v1\n");
-    assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "-m", "pre-trust base"]));
-    assert_success(&area.forklift("dev", &["office", "enroll"]));
-    area.write_file("dev/src/api/a.txt", "api v2 signed\n");
-    assert_success(&area.forklift("dev", &["load", "src/api/a.txt"]));
-    assert_success(&area.forklift("dev", &["stack", "-m", "signed parcel"]));
-    assert_success(&area.forklift("dev", &["lift"]));
-
-    let head = pallet_head(&area, "dev", "main");
-    let api_blob = path_object_hash(&area, "dev", &head, "src/api/a.txt");
-
-    assert_success(&area.forklift(".", &["clone", &server.url, "sparse", "--only", "src/api"]));
-    let sparse_head = pallet_head(&area, "sparse", "main");
-
-    // Corrupt the blob's bytes but leave the file present — a degraded-on-disk in-scope blob.
-    std::fs::write(object_store_path(&area, "sparse", &api_blob), b"corrupted-not-valid-zstd").unwrap();
-
-    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("sparse"));
-    let fetch_scope = forklift_core::util::scope_utils::read_fetch_scope().unwrap();
-
-    // Closure passes: the blob is present, and a normal audit only presence-checks blobs.
-    forklift_core::util::audit_utils::verify_parcel_closure_scoped(&sparse_head, None, &fetch_scope, false, None)
-        .expect("a present (if content-corrupted) in-scope blob passes the presence-only closure check");
-
-    // Reading it does catch the corruption — the content-addressed read re-hashes.
-    assert!(forklift_core::util::object_utils::load_blob(&api_blob).is_err(),
-        "the corrupted blob must fail when it is actually read");
 }
 
 #[test]
@@ -8860,40 +8679,6 @@ fn path_maybe_changed_absorbs_an_absent_out_of_scope_object() {
         assert_eq!(std::fs::metadata(&shard).unwrap().ino(), inode,
             "a filter that stays unknown must not rewrite its shard on every query");
     }
-}
-
-#[test]
-fn a_full_store_audit_omits_the_sparse_boundary() {
-    // The referee: a full (unscoped) store's audit is byte-for-byte what it always was — no
-    // scope boundary line, no scope field — so a sparse pass can never be confused for one.
-    let area = TestArea::new("full-audit-referee");
-    let server = Server::start(&area, None);
-
-    prepare_warehouse(&area, "dev", &server.url);
-    area.write_file("dev/src/api/a.txt", "api v1\n");
-    area.write_file("dev/src/web/w.txt", "web v1\n");
-    assert_success(&area.forklift("dev", &["load", "."]));
-    assert_success(&area.forklift("dev", &["stack", "-m", "pre-trust base"]));
-    assert_success(&area.forklift("dev", &["office", "enroll"]));
-    area.write_file("dev/src/api/a.txt", "api v2 signed\n");
-    assert_success(&area.forklift("dev", &["load", "src/api/a.txt"]));
-    assert_success(&area.forklift("dev", &["stack", "-m", "signed parcel"]));
-    assert_success(&area.forklift("dev", &["lift"]));
-
-    assert_success(&area.forklift(".", &["clone", &server.url, "full"]));
-
-    let audit = area.forklift("full", &["audit"]);
-    assert_success(&audit);
-    let report = stdout(&audit);
-    assert!(report.contains("Office chain verified"), "{}", report);
-    assert!(!report.contains("sparse"), "a full-store audit must not print the sparse boundary: {}", report);
-    assert!(!report.contains("sealed by hash"), "{}", report);
-
-    let audit_json = area.forklift("full", &["--json", "audit"]);
-    assert_success(&audit_json);
-    let json: serde_json::Value = serde_json::from_str(&stdout(&audit_json)).unwrap();
-    assert!(json["data"]["scope"].is_null(),
-        "a full-store audit --json carries no scope field: {}", stdout(&audit_json));
 }
 
 #[test]
