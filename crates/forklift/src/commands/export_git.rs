@@ -8,16 +8,16 @@ use forklift_core::enums::parcel_action_type::ParcelActionType;
 use forklift_core::model::parcel::Parcel;
 use forklift_core::error::sanitize;
 use forklift_core::util::tag_utils::{self, AttributedTag};
-use forklift_core::util::{file_utils, object_utils, pallet_utils};
+use forklift_core::util::{file_utils, object_utils, office_utils, pallet_utils};
 use crate::output::{self, CommandOutput};
 
 /// The export layout version: the `export/<N>` every exported commit's parcel line and every
 /// exported tag's signer line names. It covers every rule that fixes an exported object's bytes:
 /// the message shape and its parcel line, the identity mapping, the date form (pre-1970 written as
-/// the epoch), the parent rule, the type-to-mode map, chunked-blob assembly, filter-free hashing and
-/// the tag object's shape. Two builds on one layout write identical objects for the same parcel, so
-/// a change to any of those rules bumps it (the golden tip-hash and tag-object tests fail until it
-/// does).
+/// the epoch), the parent rule, the type-to-mode map, chunked-blob assembly, filter-free hashing
+/// and the tag object's shape. Two builds on one layout write identical objects for the same
+/// parcel, so a change to any of those rules bumps it (the golden tip-hash and tag-object tests
+/// fail until it does).
 pub(crate) const EXPORT_LAYOUT: u32 = 1;
 
 /// Handle the git export command (§7.8): one-way export of this warehouse's history into a
@@ -94,7 +94,7 @@ pub fn handle_command(path: &str) -> Result<(), String> {
         branches.push(name.clone());
     }
 
-    let (tags, skipped_tags) = export_tags(&repo, &exporter)?;
+    let tags = export_tags(&repo, &exporter)?;
 
     // Check out the current pallet's branch (or the first), materializing a working tree.
     let current = pallet_utils::read_position().ok().map(|position| position.pallet)
@@ -112,12 +112,20 @@ pub fn handle_command(path: &str) -> Result<(), String> {
         trees: exporter.trees_written,
         blobs: exporter.blobs_written,
         branches,
-        tags,
-        skipped_tags,
+        tags: tags.exported,
+        skipped_tags: tags.skipped,
+        unreadable_tags: tags.unreadable,
         current,
     });
 
     Ok(())
+}
+
+/// The tags an export wrote, the ones it left out, and why none were read when they could not be.
+struct TagExport {
+    exported: Vec<String>,
+    skipped: Vec<SkippedTag>,
+    unreadable: Option<String>,
 }
 
 /// Write every tag at the local `@tags` head whose subject this export wrote as an annotated git
@@ -125,49 +133,77 @@ pub fn handle_command(path: &str) -> Result<(), String> {
 /// its own: one on a parcel no exported branch holds is left out, not exported with that parcel.
 /// Tag refs write no object, so like the branches they are set under the user's configuration.
 ///
+/// The branches are already written when this runs, so nothing about a tag fails the export: tags
+/// that cannot be read at all are one warning, and a tag git refuses is left out with git's reason.
+///
 /// # Returns
-/// * `Ok((Vec<String>, Vec<SkippedTag>))` - The tags exported, and the tags left out.
-/// * `Err(String)`                        - If the tags could not be read, or git failed.
-fn export_tags(repo: &GitRepo, exporter: &Exporter) -> Result<(Vec<String>, Vec<SkippedTag>), String> {
-    let read = tag_utils::read_tags()?;
+/// * `Ok(TagExport)` - The tags exported, the tags left out, and why none were read.
+/// * `Err(String)`   - If git could not be run.
+fn export_tags(repo: &GitRepo, exporter: &Exporter) -> Result<TagExport, String> {
+    let mut export = TagExport { exported: Vec::new(), skipped: Vec::new(), unreadable: None };
 
-    let mut exported: Vec<String> = Vec::new();
-    let mut skipped: Vec<SkippedTag> = read.unreadable.iter()
+    // The tagger is the operator the office binds the signer key to, a binding that never changes
+    // (a retired key stays in the office). Read strictly, so a machine whose office cannot be read
+    // or lacks the key leaves the tag out instead of writing a different tagger, and a different
+    // tag object, than every other machine.
+    let read = match tag_utils::read_tags().and_then(|read| Ok((read, office_utils::read_office_state()?))) {
+        Ok(read) => read,
+        Err(why) => {
+            export.unreadable = Some(why);
+            return Ok(export);
+        }
+    };
+    let (read, office) = read;
+
+    export.skipped = read.unreadable.iter()
         .map(|tag| SkippedTag { name: tag.name.clone(), reason: format!("it cannot be read: {}", tag.reason) })
         .collect();
 
+    // Git keeps a loose ref as a file, so on a filesystem that folds case `V1` would overwrite
+    // `v1`. Such names are left out on every filesystem, so the export is the same everywhere.
+    let mut folded: HashMap<String, usize> = HashMap::new();
+    for attributed in &read.tags {
+        *folded.entry(attributed.tag.name.to_ascii_lowercase()).or_default() += 1;
+    }
+
     for attributed in &read.tags {
         let name = &attributed.tag.name;
+        let skip = |reason: String| SkippedTag { name: name.clone(), reason };
 
         let Some(commit) = exporter.commit_of(&attributed.tag.subject) else {
-            skipped.push(SkippedTag {
-                name: name.clone(),
-                reason: format!("its parcel {} is on no exported branch", attributed.tag.subject),
-            });
+            export.skipped.push(skip(format!("its parcel {} is on no exported branch", attributed.tag.subject)));
             continue;
         };
+
+        let Some(key) = office.find_key(&attributed.signer) else {
+            export.skipped.push(skip(format!("its signer key {} is not in this warehouse's office", attributed.signer)));
+            continue;
+        };
+
+        if folded[&name.to_ascii_lowercase()] > 1 {
+            export.skipped.push(skip("another tag's name differs from it only in case, which git cannot \
+                keep apart on every filesystem".to_string()));
+            continue;
+        }
 
         // Forklift's tag names are a superset of git's: `a..b` and `v1.lock` are refused there.
         let refname = format!("refs/tags/{}", name);
         if !repo.output(&["check-ref-format", &refname])?.status.success() {
-            skipped.push(SkippedTag { name: name.clone(), reason: "git does not accept it as a tag name".to_string() });
+            export.skipped.push(skip("git does not accept it as a tag name".to_string()));
             continue;
         }
 
-        // Git checks a tag object's text (a message holding a NUL, say): a refusal leaves that
-        // tag out rather than fail an export whose branches are already written.
-        let object = match exporter.write_tag(commit, attributed) {
-            Ok(object) => object,
-            Err(refused) => {
-                skipped.push(SkippedTag { name: name.clone(), reason: refused });
-                continue;
-            }
-        };
-        repo.run_as_user(&["update-ref", &refname, &object])?;
-        exported.push(name.clone());
+        // Git checks a tag object's text (a message holding a NUL, say), and a ref name can still
+        // be one the filesystem refuses (`con` on Windows): either leaves that tag out.
+        let written = exporter.write_tag(commit, &key.operator, attributed)
+            .and_then(|object| repo.run_as_user(&["update-ref", &refname, &object]));
+        match written {
+            Ok(_) => export.exported.push(name.clone()),
+            Err(refused) => export.skipped.push(skip(refused)),
+        }
     }
 
-    Ok((exported, skipped))
+    Ok(export)
 }
 
 /// The variables that tell git which repository to act on. A git call into a repository Forklift
@@ -375,11 +411,11 @@ impl<'a> Exporter<'a> {
         self.exported.get(parcel).map(|exported| exported.commit.as_str())
     }
 
-    /// Write `attributed` as an annotated tag object over `commit` (a commit this run wrote),
-    /// returning the tag object's hash. Written under the isolated configuration, like every
-    /// object.
-    pub(crate) fn write_tag(&self, commit: &str, attributed: &AttributedTag) -> Result<String, String> {
-        Ok(self.repo.run(&["mktag"], Some(tag_object(commit, attributed).as_bytes()))?.trim().to_string())
+    /// Write `attributed` as an annotated tag object over `commit` (a commit this run wrote) by
+    /// `tagger` (the operator the office binds its signer key to), returning the tag object's hash.
+    /// Written under the isolated configuration, like every object.
+    pub(crate) fn write_tag(&self, commit: &str, tagger: &str, attributed: &AttributedTag) -> Result<String, String> {
+        Ok(self.repo.run(&["mktag"], Some(tag_object(commit, tagger, attributed).as_bytes()))?.trim().to_string())
     }
 
     /// Write one parcel as a git commit (its parents must already be written).
@@ -600,24 +636,27 @@ fn create_export_temp(recipe_hash: &str, counter: &std::sync::atomic::AtomicU64)
 }
 
 /// The (name, email) and unix time of a parcel's authoring action (`want_author`) or its
-/// stacking action, falling back to the first action of any kind (every parcel has one).
-///
-/// Forklift records no names, so both name and email are the operator id, cleaned the way git cleans
-/// an identity so git writes it as given. An id that cleans to nothing, which git refuses as a name,
-/// is named "forklift".
+/// stacking action, falling back to the first action of any kind (every parcel has one), as the
+/// [`git_identity`] of its operator.
 fn action_identity(parcel: &Parcel, want_author: bool) -> ((String, String), i64) {
     let action = parcel.actions.iter()
         .find(|action| matches!(action.action, ParcelActionType::Author) == want_author)
         .or_else(|| parcel.actions.first());
 
     match action {
-        Some(action) => {
-            let email = without_crud(&action.operator.identifier);
-            let name = if email.is_empty() { "forklift".to_string() } else { email.clone() };
-            ((name, email), action.timestamp.timestamp())
-        }
+        Some(action) => (git_identity(&action.operator.identifier), action.timestamp.timestamp()),
         None => (("forklift".to_string(), "forklift@localhost".to_string()), 0),
     }
+}
+
+/// The (name, email) git writes for an operator id. Forklift records no names, so both are the id,
+/// cleaned the way git cleans an identity so git writes it as given. An id that cleans to nothing,
+/// which git refuses as a name, is named "forklift".
+fn git_identity(identifier: &str) -> (String, String) {
+    let email = without_crud(identifier);
+    let name = if email.is_empty() { "forklift".to_string() } else { email.clone() };
+
+    (name, email)
 }
 
 /// `value` as git writes it into an identity (ident.c): trimmed of "crud" (control characters,
@@ -656,15 +695,12 @@ fn tag_line(signer: &str) -> String {
     format!("Forklift-Tag-Signer: {} export/{}", signer, EXPORT_LAYOUT)
 }
 
-/// The annotated tag object for `attributed` over `commit`. The tagger is the tag's attributed
-/// operator (its key id when the local office does not know the key), written as a commit's
-/// author is; the date is the tag's own; the message is the tag's, without trailing newlines, a
-/// blank line, and the tag line (only the tag line when the message is empty).
-fn tag_object(commit: &str, attributed: &AttributedTag) -> String {
+/// The annotated tag object for `attributed` over `commit`. The tagger is `tagger`'s identity, as
+/// a commit's author is; the date is the tag's own; the message is the tag's, without trailing
+/// newlines, a blank line, and the tag line (only the tag line when the message is empty).
+fn tag_object(commit: &str, tagger: &str, attributed: &AttributedTag) -> String {
     let tag = &attributed.tag;
-
-    let email = without_crud(&attributed.tagger);
-    let name = if email.is_empty() { "forklift".to_string() } else { email.clone() };
+    let (name, email) = git_identity(tagger);
 
     let message = match tag.message.trim_end_matches('\n') {
         "" => format!("{}\n", tag_line(&attributed.signer)),
@@ -773,6 +809,11 @@ pub(crate) struct ExportReport {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     skipped_tags: Vec<SkippedTag>,
 
+    /// Why no tag was exported, when the tags or the office that names their taggers could not be
+    /// read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unreadable_tags: Option<String>,
+
     /// The branch checked out (the current pallet).
     #[serde(skip_serializing_if = "Option::is_none")]
     current: Option<String>,
@@ -793,6 +834,9 @@ impl CommandOutput for ExportReport {
         for skipped in &self.skipped_tags {
             println!("  warning: tag \"{}\" was not exported: {}.", skipped.name, sanitize(&skipped.reason));
         }
+        if let Some(why) = &self.unreadable_tags {
+            println!("  warning: no tag was exported: the tags could not be read: {}.", sanitize(why));
+        }
 
         if let Some(current) = &self.current {
             println!("Checked out \"{}\".", current);
@@ -809,6 +853,7 @@ impl CommandOutput for ExportReport {
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
 pub(crate) struct SkippedTag {
+    /// The tag's name.
     name: String,
 
     /// Why it was left out.
@@ -1116,15 +1161,15 @@ mod tests {
     fn a_tag_object_is_written_in_a_fixed_shape() {
         use forklift_core::util::tag_utils::Tag;
 
-        let tag = |tagger: &str, message: &str, tagged_at: i64| AttributedTag {
+        let tag = |message: &str, tagged_at: i64| AttributedTag {
             tag: Tag { name: "v1.0".to_string(), subject: "p".to_string(), message: message.to_string(), tagged_at },
-            tagger: tagger.to_string(),
+            tagger: "ignored".to_string(),
             signer: "k1".to_string(),
         };
         let commit = "c".repeat(40);
 
         assert_eq!(
-            tag_object(&commit, &tag("ada@example", "the release\n\n", 1_700_000_000)),
+            tag_object(&commit, "ada@example", &tag("the release\n\n", 1_700_000_000)),
             format!(
                 "object {}\ntype commit\ntag v1.0\ntagger ada@example <ada@example> 1700000000 +0000\n\n\
                 the release\n\nForklift-Tag-Signer: k1 export/1\n",
@@ -1132,7 +1177,7 @@ mod tests {
             )
         );
         assert_eq!(
-            tag_object(&commit, &tag("<>", "", -5)),
+            tag_object(&commit, "<>", &tag("", -5)),
             format!("object {}\ntype commit\ntag v1.0\ntagger forklift <> 0 +0000\n\nForklift-Tag-Signer: k1 export/1\n", commit)
         );
     }

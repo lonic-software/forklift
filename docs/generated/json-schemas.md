@@ -1026,6 +1026,7 @@ A command not listed here either reports only the generic human-message shape `{
       "description": "A tag the export left out.",
       "properties": {
         "name": {
+          "description": "The tag's name.",
           "type": "string"
         },
         "reason": {
@@ -1090,6 +1091,13 @@ A command not listed here either reports only the generic human-message shape `{
       "format": "uint",
       "minimum": 0,
       "type": "integer"
+    },
+    "unreadable_tags": {
+      "description": "Why no tag was exported, when the tags or the office that names their taggers could not be\nread.",
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "required": [

@@ -5743,7 +5743,8 @@ fn export_git_keeps_tree_names_with_line_breaks_tabs_and_quotes() {
 
 /// Every tag on an exported parcel becomes an annotated git tag over that parcel's commit, with its
 /// message, tagger and date; every other tag is named with why it was left out: one on a parcel no
-/// exported branch holds, and one git does not accept as a tag name.
+/// exported branch holds, one git does not accept as a tag name, and two whose names differ only in
+/// case, which one loose ref file would hold on a filesystem that folds case.
 #[test]
 fn export_git_writes_tags_as_annotated_git_tags() {
     let warehouse = TestWarehouse::new("export-git-tags");
@@ -5771,6 +5772,8 @@ fn export_git_writes_tags_as_annotated_git_tags() {
     assert_success(&warehouse.run(&["tag", "create", "v2", "main"]));
     assert_success(&warehouse.run(&["tag", "create", "side-1", &side]));
     assert_success(&warehouse.run(&["tag", "create", "a..b", "main"]));
+    assert_success(&warehouse.run(&["tag", "create", "rc", "main"]));
+    assert_success(&warehouse.run(&["tag", "create", "RC", &first]));
     assert_success(&warehouse.run(&["pallet", "delete", "side", "--force"]));
 
     let out = warehouse.root.join("exported");
@@ -5778,12 +5781,14 @@ fn export_git_writes_tags_as_annotated_git_tags() {
     assert_success(&exported);
     let data = &json(&exported)["data"];
     assert_eq!(data["tags"], serde_json::json!(["v1.0", "v2"]));
-    let skipped: Vec<(String, String)> = data["skipped_tags"].as_array().unwrap().iter()
+    let skipped: std::collections::BTreeMap<String, String> = data["skipped_tags"].as_array().unwrap().iter()
         .map(|tag| (tag["name"].as_str().unwrap().to_string(), tag["reason"].as_str().unwrap().to_string()))
         .collect();
-    assert_eq!(skipped.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["a..b", "side-1"]);
-    assert!(skipped[0].1.contains("git does not accept"), "{:?}", skipped);
-    assert!(skipped[1].1.contains(&side) && skipped[1].1.contains("no exported branch"), "{:?}", skipped);
+    assert_eq!(skipped.keys().map(String::as_str).collect::<Vec<_>>(), ["RC", "a..b", "rc", "side-1"]);
+    assert!(skipped["a..b"].contains("git does not accept"), "{:?}", skipped);
+    assert!(skipped["RC"].contains("only in case") && skipped["rc"].contains("only in case"), "{:?}", skipped);
+    assert!(skipped["side-1"].contains(&side) && skipped["side-1"].contains("no exported branch"), "{:?}", skipped);
+    assert!(data.get("unreadable_tags").is_none(), "{}", data);
 
     let git = |args: &[&str]| -> String {
         let output = Command::new("git").args(args).current_dir(&out).output()
