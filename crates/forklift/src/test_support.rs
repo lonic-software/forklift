@@ -123,7 +123,7 @@ pub(crate) fn check_out(tree: &str) {
 
     let position = BayPosition::new("main", None);
     operation_utils::raise(&Operation::new(OperationKind::Shift, position.clone(), None, position)).unwrap();
-    shift_utils::materialize_tree(None, tree, "Test", file_utils::take_stat_anchor().unwrap(), &Progress::NONE).unwrap();
+    shift_utils::materialize_tree(None, tree, "Test", file_utils::take_stat_anchor().unwrap(), &Progress::NONE, &[]).unwrap();
     operation_utils::finish().unwrap();
 }
 

@@ -131,7 +131,7 @@ fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(),
     // for it rather than staging against a half-made tree or clearing an assembly in flight.
     let _bay_lock = lock_utils::WarehouseLock::acquire()?;
 
-    shift_utils::materialize_tree(None, &tree, "Creating the bay", file_utils::take_stat_anchor()?, &Progress::NONE)?;
+    shift_utils::materialize_tree(None, &tree, "Creating the bay", file_utils::take_stat_anchor()?, &Progress::NONE, &[])?;
     operation_utils::finish()?;
 
     output::emit(&BayCreated {

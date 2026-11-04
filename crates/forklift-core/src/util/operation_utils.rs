@@ -27,8 +27,10 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 use crate::error::{CoreError, RefusalCode};
+use crate::enums::dir_entry_type::DirEntryType;
+use crate::enums::inventory_item_state::InventoryItemState;
 use crate::util::pallet_utils::{self, AnchorPrecondition, BayPosition, OfficePrecondition, RefPreconditions};
-use crate::util::shift_utils::{self, FileOp, TreeProvenance};
+use crate::util::shift_utils::{self, CarriedEntry, CarriedItem, FileOp, TreeProvenance};
 use crate::util::{cherry_pick_utils, file_utils, inventory_utils, merge_utils, object_utils, park_utils, record_utils};
 
 /// The name of the marker file in the bay-local state dir.
@@ -36,7 +38,7 @@ const FILE_NAME_OPERATION: &str = "operation";
 
 /// The [`record_utils`] kind and version of the marker file.
 const OPERATION_RECORD: &str = "operation";
-const OPERATION_VERSION: u32 = 2;
+const OPERATION_VERSION: u32 = 3;
 
 /// The operations that raise the marker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,6 +130,10 @@ pub struct Operation {
     /// roll-forward of it — is conditioned on, so a change to either since rolls the take back.
     pub office: OfficePrecondition,
     pub anchor: AnchorPrecondition,
+
+    /// Lower: the local changes it carries across its staging rebuild, which every rebuild that
+    /// settles it, heal's included, carries too.
+    pub carried: Vec<CarriedEntry>,
 }
 
 impl Operation {
@@ -146,6 +152,7 @@ impl Operation {
             their_tree: None,
             office: OfficePrecondition::NotConsumed,
             anchor: AnchorPrecondition::NotConsumed,
+            carried: Vec::new(),
         }
     }
 
@@ -179,14 +186,25 @@ impl Operation {
                 AnchorPrecondition::Absent => "absent".to_string(),
                 AnchorPrecondition::Bytes(bytes) => format!("bytes {}", crate::util::sign_utils::to_hex(bytes)),
             },
-        ])
+        ].into_iter().chain(self.carried.iter().flat_map(|carried| match &carried.entry {
+            // Three entries each: the path, then the hash and the "<type> <state>" codes, both
+            // empty for a path the inventory held no entry for.
+            Some(item) => [carried.path.clone(), item.hash.clone(), format!("{} {}", item.item_type.get_code(), item.state.get_code())],
+            None => [carried.path.clone(), String::new(), String::new()],
+        })))
     }
 
     fn from_bytes(bytes: &[u8]) -> Result<Operation, String> {
         let entries = record_utils::from_bytes(bytes, OPERATION_RECORD, OPERATION_VERSION).map_err(|e| e.describe())?;
 
+        if entries.len() < 13 || (entries.len() - 13) % 3 != 0 {
+            return Err("is malformed.".to_string());
+        }
+
+        let mut entries = entries.into_iter();
         let [kind, phase, source_pallet, source_base, source_tree, target_pallet, target_base, target_tree, expected, parked, their_tree, office, anchor] =
-            <[String; 13]>::try_from(entries).map_err(|_| "is malformed.".to_string())?;
+            std::array::from_fn(|_| entries.next().expect("counted above"));
+        let carried: Vec<String> = entries.collect();
 
         let kind = OperationKind::parse(&kind).ok_or(format!("names an operation this version of Forklift does not know (\"{}\").", kind.escape_debug()))?;
 
@@ -231,6 +249,31 @@ impl Operation {
                     _ => return Err("is malformed.".to_string()),
                 },
             },
+            carried: carried.chunks(3).map(|fields| {
+                let [path, hash, codes] = fields else { unreachable!("counted above") };
+
+                let entry = match (hash.as_str(), codes.as_str()) {
+                    ("", "") => None,
+                    (hash, codes) if object_utils::is_object_hash(hash) => {
+                        let (item_type, state) = codes.split_once(' ')
+                            .and_then(|(item_type, state)| Some((item_type.parse().ok()?, state.parse().ok()?)))
+                            .ok_or("is malformed.".to_string())?;
+
+                        Some(CarriedItem {
+                            hash: hash.to_string(),
+                            item_type: DirEntryType::from_code(item_type).map_err(|_| "is malformed.".to_string())?,
+                            state: InventoryItemState::from_code(state).map_err(|_| "is malformed.".to_string())?,
+                        })
+                    }
+                    _ => return Err("is malformed.".to_string()),
+                };
+
+                if path.is_empty() {
+                    return Err("is malformed.".to_string());
+                }
+
+                Ok(CarriedEntry { path: path.clone(), entry })
+            }).collect::<Result<_, _>>()?,
         })
     }
 }
@@ -535,7 +578,7 @@ fn recover_operation(operation: &Operation) -> Result<(RecoveryOutcome, Vec<Stri
             target_tree => {
                 let target_tree = tree_or_empty(target_tree.as_deref())?;
                 put_back(&tree_or_empty(operation.source_tree.as_deref())?, &target_tree)?;
-                let unheld = rebuild_staging(Some(&target_tree))?;
+                let unheld = rebuild_staging(Some(&target_tree), &[])?;
                 pallet_utils::write_position(&operation.target)?;
                 Ok((RecoveryOutcome::RolledForward, unheld))
             }
@@ -554,7 +597,7 @@ fn recover_operation(operation: &Operation) -> Result<(RecoveryOutcome, Vec<Stri
                 // holding the parked content goes back to the head.
                 let head_tree = tree_or_empty(operation.source_tree.as_deref())?;
                 put_back(&object_utils::load_parcel(parcel)?.tree_hash, &head_tree)?;
-                Ok((RecoveryOutcome::RolledForward, rebuild_staging(Some(&head_tree))?))
+                Ok((RecoveryOutcome::RolledForward, rebuild_staging(Some(&head_tree), &[])?))
             } else {
                 // The working files were never touched, and staging holds only what they hold.
                 Ok((RecoveryOutcome::Cleared, Vec::new()))
@@ -581,7 +624,7 @@ fn recover_operation(operation: &Operation) -> Result<(RecoveryOutcome, Vec<Stri
             if landed {
                 let target_tree = tree_or_empty(operation.target_tree.as_deref())?;
                 put_back(&tree_or_empty(operation.source_tree.as_deref())?, &target_tree)?;
-                let unheld = rebuild_staging(Some(&target_tree))?;
+                let unheld = rebuild_staging(Some(&target_tree), &operation.carried)?;
                 pallet_utils::record_landed(&operation.target.pallet, new)?;
                 Ok((RecoveryOutcome::RolledForward, unheld))
             } else {
@@ -598,7 +641,7 @@ fn recover_operation(operation: &Operation) -> Result<(RecoveryOutcome, Vec<Stri
             if landed {
                 let parcel = operation.target.base.as_deref().expect("landed implies a completing parcel");
                 let tree = object_utils::load_parcel(parcel)?.tree_hash;
-                let unheld = rebuild_staging(Some(&tree))?;
+                let unheld = rebuild_staging(Some(&tree), &[])?;
 
                 // As `stack` orders it: the in-progress state comes off before the position moves.
                 clear_in_progress_state(operation)?;
@@ -615,12 +658,12 @@ fn recover_operation(operation: &Operation) -> Result<(RecoveryOutcome, Vec<Stri
                 put_back(&object_utils::empty_tree_hash()?, tree)?;
             }
 
-            Ok((RecoveryOutcome::RolledForward, rebuild_staging(operation.target_tree.as_deref())?))
+            Ok((RecoveryOutcome::RolledForward, rebuild_staging(operation.target_tree.as_deref(), &[])?))
         }
 
         OperationKind::ImportGit => {
             // Raised before the position, so the position may still be the earlier one.
-            let unheld = rebuild_staging(operation.target_tree.as_deref())?;
+            let unheld = rebuild_staging(operation.target_tree.as_deref(), &[])?;
             pallet_utils::write_position(&operation.target)?;
             Ok((RecoveryOutcome::RolledForward, unheld))
         }
@@ -648,7 +691,7 @@ fn roll_back(operation: &Operation) -> Result<(RecoveryOutcome, Vec<String>), St
         put_back(&written_from, &source_tree)?;
     }
 
-    let unheld = rebuild_staging(Some(&source_tree))?;
+    let unheld = rebuild_staging(Some(&source_tree), &operation.carried)?;
     clear_in_progress_state(operation)?;
     pallet_utils::write_position(&operation.source)?;
 
@@ -703,19 +746,20 @@ fn tree_or_empty(tree: Option<&str>) -> Result<String, String> {
 }
 
 /// Rebuild staging from `tree` (the empty tree for `None`), re-proving every file, so a file a
-/// crash left at other content reads as a local change and is never staged.
+/// crash left at other content reads as a local change and is never staged. The `carried` local
+/// changes the operation left alone keep their entries, and are not reported as unheld.
 ///
 /// # Returns
 /// * `Ok(Vec<String>)` - The tracked files the working directory does not hold at `tree`'s content.
 /// * `Err(String)`     - If the tree could not be loaded, a file could not be read, or the rewrite
 ///                       failed.
-fn rebuild_staging(tree: Option<&str>) -> Result<Vec<String>, String> {
+fn rebuild_staging(tree: Option<&str>, carried: &[CarriedEntry]) -> Result<Vec<String>, String> {
     let tree = match tree {
         Some(tree) => tree.to_string(),
         None => object_utils::empty_tree_hash()?,
     };
 
-    let built = shift_utils::build_inventories_for_tree(&tree, TreeProvenance::Verify)?;
+    let built = shift_utils::build_inventories_carrying(&tree, TreeProvenance::Verify, carried)?;
     inventory_utils::replace_all_inventories(&built.shards)?;
 
     Ok(built.unheld)

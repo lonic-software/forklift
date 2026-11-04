@@ -5,14 +5,13 @@ use forklift_core::model::operator::Operator;
 use forklift_core::util::meta_tree::{self, CellRead, Entry, KeepSide, MetaConflict, MetaSigner, PalletRules, ReplayError};
 use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{BatchLaneClosure, RemoteClient};
-use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
     alias_utils, audit_utils, bay_utils, config_utils, file_utils, haul_utils, held_heads, kv_utils, merge_utils, object_utils,
-    operation_utils, pallet_utils, remote_utils, repair_utils, scope_utils, shift_utils, stocktake_utils, take_utils, trust_utils,
+    operation_utils, pallet_utils, remote_utils, repair_utils, scope_utils, shift_utils, take_utils, trust_utils,
 };
 use forklift_core::util::take_utils::{FetchAt, TakeTrust};
 use forklift_core::util::operation_utils::{Operation, OperationKind};
-use crate::commands::office;
+use crate::commands::{office, shift};
 use crate::events;
 use crate::output::{self, CommandOutput};
 
@@ -220,17 +219,18 @@ async fn lower_working_pallet(client: &RemoteClient,
 
     let local_head = position.base.clone();
 
-    // Refuse before fetching anything: a dirty warehouse would be overwritten by the
-    // fast-forward, and the operator should resolve that first.
     let local_tree = match &local_head {
         Some(hash) => Some(object_utils::load_parcel(hash)?.tree_hash),
         None => None,
     };
 
-    // Anchored before the cleanliness check, so a file edited after it is never trusted.
+    // Anchored before the local changes are collected, so a file edited after it is never trusted.
     let anchor = file_utils::take_stat_anchor()?;
 
-    ensure_warehouse_is_clean(local_tree.as_deref()).await?;
+    // A merge in progress is completed on the head it started from. The local changes are judged
+    // against the remote's once its tree is known.
+    shift::refuse_mid_merge("lowering")?;
+    let carried = shift_utils::collect_carried(local_tree.as_deref()).await?;
 
     // Path-pruned in a sparse warehouse (out-of-scope content stays sealed), whole in a full one
     // — a full fetch scope makes this byte-identical to the unscoped fetch — and in a cache only
@@ -275,6 +275,7 @@ async fn lower_working_pallet(client: &RemoteClient,
     // before the planning below trips over it.
     refuse_unmaterializable(client, &pallet, local_tree.as_deref(), &remote_tree)?;
     let (ops, removed_dirs) = shift_utils::diff_trees(local_tree.as_deref(), &remote_tree)?;
+    refuse_carried_overlaps(&carried, &ops, &removed_dirs)?;
     alias_utils::refuse_collisions("Lowering", &shift_utils::collect_collisions(&ops, &removed_dirs)?)?;
     shift_utils::ensure_writes_present(&ops)?;
 
@@ -289,13 +290,14 @@ async fn lower_working_pallet(client: &RemoteClient,
     operation.expected = local_head.clone();
     operation.office = preconditions.office.clone();
     operation.anchor = preconditions.anchor.clone();
+    operation.carried = carried.clone();
     operation_utils::raise(&operation)?;
 
-    shift_utils::materialize_tree(local_tree.as_deref(), &remote_tree, "Lowering", anchor, progress)?;
+    shift_utils::materialize_tree(local_tree.as_deref(), &remote_tree, "Lowering", anchor, progress, &carried)?;
 
     // A compare-and-set against the head this lower started from; the working tree goes back to
     // where it was if the pallet did not move (another bay moved it first, or the write failed).
-    let written = shift_utils::write_head_or_roll_back(&pallet, local_head.as_deref(), remote_head, &preconditions, &remote_tree, local_tree.as_deref(), anchor);
+    let written = shift_utils::write_head_or_roll_back(&pallet, local_head.as_deref(), remote_head, &preconditions, &remote_tree, local_tree.as_deref(), anchor, &carried);
     // A write that reported an error can still have landed; the ref read back decides.
     if written.is_ok() || pallet_utils::get_pallet_head(&pallet).ok().flatten().as_deref() == Some(remote_head.as_str()) {
         record_served_head(&pallet, remote_head);
@@ -431,10 +433,12 @@ async fn repair_pallet(client: &RemoteClient,
     };
     let anchor = file_utils::take_stat_anchor()?;
 
-    ensure_warehouse_is_clean(local_tree.as_deref()).await?;
+    shift::refuse_mid_merge("lowering")?;
+    let carried = shift_utils::collect_carried(local_tree.as_deref()).await?;
 
     refuse_unmaterializable(client, &pallet, local_tree.as_deref(), &repair.tree)?;
     let (ops, removed_dirs) = shift_utils::diff_trees(local_tree.as_deref(), &repair.tree)?;
+    refuse_carried_overlaps(&carried, &ops, &removed_dirs)?;
     alias_utils::refuse_collisions("Lowering", &shift_utils::collect_collisions(&ops, &removed_dirs)?)?;
     shift_utils::ensure_writes_present(&ops)?;
 
@@ -449,11 +453,12 @@ async fn repair_pallet(client: &RemoteClient,
     operation.expected = ref_head.clone();
     operation.office = preconditions.office.clone();
     operation.anchor = preconditions.anchor.clone();
+    operation.carried = carried.clone();
     operation_utils::raise(&operation)?;
 
-    shift_utils::materialize_tree(local_tree.as_deref(), &repair.tree, "Lowering", anchor, progress)?;
+    shift_utils::materialize_tree(local_tree.as_deref(), &repair.tree, "Lowering", anchor, progress, &carried)?;
 
-    let written = shift_utils::write_head_or_roll_back(&pallet, ref_head.as_deref(), &repair.parcel, &preconditions, &repair.tree, local_tree.as_deref(), anchor);
+    let written = shift_utils::write_head_or_roll_back(&pallet, ref_head.as_deref(), &repair.parcel, &preconditions, &repair.tree, local_tree.as_deref(), anchor, &carried);
     // The held-heads record keeps H, the head the remote served, which the repair descends from.
     if written.is_ok() || pallet_utils::get_pallet_head(&pallet).ok().flatten().as_deref() == Some(repair.parcel.as_str()) {
         record_served_head(&pallet, &remote_head);
@@ -985,30 +990,28 @@ impl CommandOutput for LowerReport {
     }
 }
 
-/// Ensure there are no staged or unstaged changes (untracked files are allowed) — the
-/// same rule shift and consolidate apply before they move the working directory.
-///
-/// # Arguments
-/// * `current_tree_hash` - The tree hash of the current pallet's head (or `None`).
-///
-/// # Returns
-/// * `Ok(())`      - If the warehouse is clean.
-/// * `Err(String)` - If there are changes that lowering would overwrite.
-async fn ensure_warehouse_is_clean(current_tree_hash: Option<&str>) -> Result<(), String> {
-    let staged = stocktake_utils::collect_staged_changes(current_tree_hash).await?;
-    let unstaged: Vec<_> = stocktake_utils::collect_unstaged_changes().await?
-        .into_iter()
-        .filter(|change| change.kind != ChangeKind::Untracked)
-        .collect();
+/// Refuse a lower whose diff (`ops` and `removed_dirs`) reaches a path with a local change: it
+/// cannot write or remove that path, or the directory around it, and keep the change. Changes
+/// the diff leaves alone are carried across it. Untracked files are judged by the collision check.
+fn refuse_carried_overlaps(carried: &[shift_utils::CarriedEntry], ops: &[shift_utils::FileOp], removed_dirs: &[String]) -> Result<(), String> {
+    let overlaps = shift_utils::carried_overlaps(carried, ops, removed_dirs);
 
-    if staged.is_empty() && unstaged.is_empty() {
+    if overlaps.is_empty() {
         return Ok(());
     }
 
-    Err(
-        "There are local changes that lowering would overwrite. Stack them, restore \
-        them, or park them first (see \"forklift stocktake\" for the details).".to_string()
-    )
+    const SHOWN: usize = 10;
+    let mut named = overlaps.iter().take(SHOWN).map(|path| format!("\"{}\"", path)).collect::<Vec<_>>().join(", ");
+    if overlaps.len() > SHOWN {
+        named.push_str(&format!(" and {} more", overlaps.len() - SHOWN));
+    }
+
+    Err(format!(
+        "Lowering would change {}, which {} local changes. Stack them, restore them, or park them \
+        first (see \"forklift stocktake\" for the details).",
+        named,
+        if overlaps.len() == 1 { "has" } else { "have" }
+    ))
 }
 
 /// Conflict resolutions, by bare pallet name, then cell path.

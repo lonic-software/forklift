@@ -1,10 +1,13 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use crate::enums::dir_entry_type::DirEntryType;
+use crate::enums::inventory_item_state::InventoryItemState;
 use crate::model::inventory::{Inventory, InventoryItem};
 use crate::model::tree_item::TreeItem;
 use crate::util::progress_utils::Progress;
 use crate::util::scope_utils::{self, PathScope, ScopeClass};
+use crate::util::stocktake_utils::{self, ChangeKind};
 use crate::util::{alias_utils, audit_utils, cache_miss, config_utils, fanout_utils, file_utils, inventory_utils, object_utils, office_utils, tree_utils, warehouse_utils};
 
 /// A single file operation needed to turn one tree into another in the working directory.
@@ -1302,6 +1305,85 @@ pub fn remove_empty_directories(removed_dirs: &[String]) {
     }
 }
 
+/// A path whose staging entry a head-moving operation carries across its rebuild: a staged or
+/// unstaged local change the operation's diff leaves alone (see [`carried_overlaps`]), so the
+/// rebuilt staging keeps it a change rather than recording the target tree's entry over it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CarriedEntry {
+    /// Its warehouse path key.
+    pub path: String,
+
+    /// The entry the inventory held for it before the operation, or `None` where it held none (a
+    /// staged move's old path, say), which the rebuild then leaves out.
+    pub entry: Option<CarriedItem>,
+}
+
+/// What a [`CarriedEntry`] keeps of an inventory entry. Its stat is not kept: the rebuild records
+/// the entry stale, so the next comparison hashes the file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CarriedItem {
+    pub hash: String,
+    pub item_type: DirEntryType,
+
+    /// A staged removal is an entry at [`InventoryItemState::Deleted`], kept as one.
+    pub state: InventoryItemState,
+}
+
+/// Collect the local changes of the bay standing on `head_tree` as carried entries: the path of
+/// every staged change and every unstaged one but an untracked file, with a move's old path, each
+/// with the entry the inventory holds for it now.
+pub async fn collect_carried(head_tree: Option<&str>) -> Result<Vec<CarriedEntry>, String> {
+    let staged = stocktake_utils::collect_staged_changes(head_tree).await?;
+    let unstaged = stocktake_utils::collect_unstaged_changes().await?;
+
+    let mut paths: BTreeSet<String> = BTreeSet::new();
+
+    for change in staged.iter().chain(unstaged.iter().filter(|change| change.kind != ChangeKind::Untracked)) {
+        paths.insert(change.path.clone());
+        paths.extend(change.moved_from.clone());
+    }
+
+    let mut shards: HashMap<String, Inventory> = HashMap::new();
+
+    paths.into_iter().map(|path| {
+        let (dir, name) = path.rsplit_once('/').unwrap_or(("", path.as_str()));
+
+        if !shards.contains_key(dir) {
+            shards.insert(dir.to_string(), stocktake_utils::load_shard_or_empty(dir)?);
+        }
+
+        let entry = shards[dir].get_item_by_name(name).map(|item| CarriedItem {
+            hash: item.hash.clone(),
+            item_type: item.item_type,
+            state: item.state,
+        });
+
+        Ok(CarriedEntry { path, entry })
+    }).collect()
+}
+
+/// The carried paths that `ops` and `removed_dirs` (a diff, see [`diff_trees`]) reach: one an op
+/// writes or removes, one that is an ancestor of an op's path (a file where the diff makes a
+/// directory) or lies under one (a directory where it makes a file), and one under a removed
+/// directory. In the order of `carried`. A carried path the diff reaches cannot be carried across
+/// it, so its operation refuses.
+pub fn carried_overlaps<'a>(carried: &'a [CarriedEntry], ops: &[FileOp], removed_dirs: &[String]) -> Vec<&'a str> {
+    let op_paths: BTreeSet<&str> = ops.iter().map(op_path).collect();
+    let removed: HashSet<&str> = removed_dirs.iter().map(String::as_str).collect();
+
+    let reached = |path: &str| -> bool {
+        let beneath = format!("{}/", path);
+        let op_beneath = op_paths.range::<str, _>((Bound::Included(beneath.as_str()), Bound::Unbounded))
+            .next()
+            .is_some_and(|op| op.starts_with(&beneath));
+
+        op_paths.contains(path) || op_beneath || inventory_utils::ancestor_keys_root_first(path).iter()
+            .any(|ancestor| op_paths.contains(ancestor.as_str()) || removed.contains(ancestor.as_str()))
+    };
+
+    carried.iter().map(|entry| entry.path.as_str()).filter(|path| reached(path)).collect()
+}
+
 /// Where the working files a tree's shards are built over came from — what makes each tree
 /// entry's hash true of its file, which an entry recorded from a stat presumes.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1350,6 +1432,19 @@ pub struct TreeInventories {
 ///                           file read or its metadata gathered.
 pub fn build_inventories_for_tree(root_tree_hash: &str,
                                   provenance: TreeProvenance) -> Result<TreeInventories, String> {
+    build_inventories_carrying(root_tree_hash, provenance, &[])
+}
+
+/// [`build_inventories_for_tree`], with `carried` in place of the tree's entries at their paths:
+/// a carried path is never stat'ed or read, so a carried file missing from disk is no error. Each
+/// one with an entry is recorded stale at the state it had (see
+/// [`inventory_utils::build_stale_inventory_item`]), in a shard of its own where the tree has no
+/// directory there; one without is left out. Every shard holding a carried path, and each of its
+/// ancestors, loses its rollup: its content is no longer the tree's, and a rollup left equal to
+/// the tree's would let a stocktake skip the carried change.
+pub fn build_inventories_carrying(root_tree_hash: &str,
+                                  provenance: TreeProvenance,
+                                  carried: &[CarriedEntry]) -> Result<TreeInventories, String> {
     let root_tree = object_utils::load_tree(root_tree_hash)?;
 
     // In a scoped checkout only the in-scope subtree(s) are inventoried; the spine is descended
@@ -1361,6 +1456,11 @@ pub fn build_inventories_for_tree(root_tree_hash: &str,
     let mut files: Vec<TreeFile> = Vec::new();
 
     collect_tree_directories(root_tree, root_tree_hash, &scope, &mut shards, &mut files)?;
+
+    if !carried.is_empty() {
+        let carried_paths: HashSet<&str> = carried.iter().map(|entry| entry.path.as_str()).collect();
+        files.retain(|file| !carried_paths.contains(file.key.as_str()));
+    }
 
     // Written files share the caller's anchor, taken before its cleanliness check. Verified files
     // share one taken after every tree is loaded, before any file's stat.
@@ -1417,7 +1517,27 @@ pub fn build_inventories_for_tree(root_tree_hash: &str,
         fanout_utils::prefetch_in_order(&files, usize::MAX, usize::MAX, record, |_| 1, gather)?;
     }
 
-    Ok(TreeInventories { shards: shards.into_iter().collect(), unheld })
+    let mut shards: BTreeMap<String, Inventory> = shards.into_iter().collect();
+
+    for carried in carried {
+        let (dir, name) = carried.path.rsplit_once('/').unwrap_or(("", carried.path.as_str()));
+
+        if let Some(entry) = &carried.entry {
+            let item = InventoryItem {
+                state: entry.state,
+                ..inventory_utils::build_stale_inventory_item(name, entry.hash.clone(), entry.item_type)
+            };
+            shards.entry(dir.to_string()).or_insert_with(Inventory::new).add_item(item);
+        }
+
+        for key in inventory_utils::ancestor_keys_root_first(dir).iter().map(String::as_str).chain([dir]) {
+            if let Some(shard) = shards.get_mut(key) {
+                shard.clear_rollup();
+            }
+        }
+    }
+
+    Ok(TreeInventories { shards, unheld })
 }
 
 /// Below this many files, a tree's written files are recorded on the calling thread. Each is a
@@ -1593,6 +1713,8 @@ fn join_key(key: &str, name: &str) -> String {
 /// * `anchor`     - Taken before the caller's cleanliness check against `from_tree` (or before
 ///                  this call, where nothing was checked) — see [`TreeProvenance::Written`].
 /// * `progress`   - Where to report the file writes and the inventory rebuild.
+/// * `carried`    - The local changes the diff leaves alone, kept in the rebuilt staging (see
+///                  [`build_inventories_carrying`]); empty where the bay had none.
 ///
 /// # Returns
 /// * `Ok(())`      - If the working directory and the inventory now match `to_tree`.
@@ -1601,7 +1723,8 @@ pub fn materialize_tree(from_tree: Option<&str>,
                         to_tree: &str,
                         operation: &str,
                         anchor: file_utils::StatAnchor,
-                        progress: &Progress) -> Result<(), String> {
+                        progress: &Progress,
+                        carried: &[CarriedEntry]) -> Result<(), String> {
     let (ops, removed_dirs) = diff_trees(from_tree, to_tree)?;
 
     alias_utils::refuse_collisions(operation, &collect_collisions(&ops, &removed_dirs)?)?;
@@ -1621,7 +1744,7 @@ pub fn materialize_tree(from_tree: Option<&str>,
 
     progress.status("Rebuilding the inventory");
 
-    let shards = build_inventories_for_tree(to_tree, TreeProvenance::Written(anchor))?.shards;
+    let shards = build_inventories_carrying(to_tree, TreeProvenance::Written(anchor), carried)?.shards;
 
     crate::util::inventory_utils::replace_all_inventories(&shards)?;
 
@@ -1654,14 +1777,15 @@ pub fn ensure_tree_present(to_tree: &str, scope: &PathScope) -> Result<(), Strin
 /// was already materialized, recording `new` as the bay's base once it stands, and putting the working tree and inventory back at `start_tree` (the tree of
 /// `expected`, or the empty tree for an unborn pallet) if the pallet did not end up at `new` (see
 /// [`settle_head_write`], which decides that). The write carries `preconditions`, so a refused one
-/// rolls back too.
+/// rolls back too. `carried` is what the materialize carried, which a rollback carries back.
 pub fn write_head_or_roll_back(pallet: &str,
                                expected: Option<&str>,
                                new: &str,
                                preconditions: &crate::util::pallet_utils::RefPreconditions,
                                written_tree: &str,
                                start_tree: Option<&str>,
-                               anchor: file_utils::StatAnchor) -> Result<(), String> {
+                               anchor: file_utils::StatAnchor,
+                               carried: &[CarriedEntry]) -> Result<(), String> {
     let Err(error) = crate::util::pallet_utils::update_pallet_head(pallet, expected, new, preconditions) else {
         crate::util::pallet_utils::record_landed(pallet, new)?;
         return crate::util::operation_utils::finish();
@@ -1669,7 +1793,7 @@ pub fn write_head_or_roll_back(pallet: &str,
 
     // Every outcome settles the bay, so the operation's marker comes off; an error from the
     // settling itself leaves it for `forklift heal`.
-    let settled = settle_head_write(pallet, new, error, written_tree, start_tree, anchor)?;
+    let settled = settle_head_write(pallet, new, error, written_tree, start_tree, anchor, carried)?;
     crate::util::operation_utils::finish()?;
 
     match settled {
@@ -1698,8 +1822,8 @@ pub enum HeadWrite {
 /// of `new`) was already materialized. A failed write can still have landed, so the outcome is
 /// decided by reading the pallet back, never inferred from the error: at `new`, the tree is kept
 /// and the bay's position records `new` as its base; anywhere else, the working tree and inventory are put back at `start_tree` (the empty tree for
-/// `None`). Runs under the bay lock, so nothing else touched the bay since `written_tree` was
-/// materialized.
+/// `None`), keeping `carried` (what the materialize of `written_tree` carried) in its staging. Runs
+/// under the bay lock, so nothing else touched the bay since `written_tree` was materialized.
 ///
 /// # Returns
 /// * `Ok(HeadWrite)` - The bay matches the pallet's head again; see the variant for what happened.
@@ -1711,7 +1835,8 @@ pub fn settle_head_write(pallet: &str,
                          error: crate::util::pallet_utils::RefUpdateError,
                          written_tree: &str,
                          start_tree: Option<&str>,
-                         anchor: file_utils::StatAnchor) -> Result<HeadWrite, String> {
+                         anchor: file_utils::StatAnchor,
+                         carried: &[CarriedEntry]) -> Result<HeadWrite, String> {
     use crate::util::pallet_utils::{self, RefUpdateError};
 
     // Wherever the tree is kept at `new`, the bay now stands on it.
@@ -1753,7 +1878,7 @@ pub fn settle_head_write(pallet: &str,
     // it must not read as an operation that finished.
     let rolled_back = start.and_then(|start| {
         crate::util::operation_utils::mark_rolling_back()?;
-        materialize_tree(Some(written_tree), &start, "Rolling back", anchor, &Progress::NONE)
+        materialize_tree(Some(written_tree), &start, "Rolling back", anchor, &Progress::NONE, carried)
     });
 
     match rolled_back {
@@ -1786,7 +1911,7 @@ mod tests {
 
         // The trees name no stored objects: a rollback would fail loudly, so Ok proves none ran.
         write_head_or_roll_back("main", Some(&start), &new, &crate::util::pallet_utils::RefPreconditions::NONE, &"c".repeat(64), Some(&"d".repeat(64)),
-                                file_utils::StatAnchor::Unproven)
+                                file_utils::StatAnchor::Unproven, &[])
             .expect("a move another bay already made must stand");
         assert_eq!(crate::util::pallet_utils::get_pallet_head("main").unwrap(), Some(new));
 

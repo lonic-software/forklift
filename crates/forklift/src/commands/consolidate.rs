@@ -414,7 +414,7 @@ pub(crate) async fn stack_completion(description: Option<String>,
         Err(StackError::HeadWrite { error, pallet, parcel, tree }) => (error, pallet, parcel, tree),
     };
 
-    match shift_utils::settle_head_write(&pallet, &parcel, error, &tree, Some(our_tree), anchor)? {
+    match shift_utils::settle_head_write(&pallet, &parcel, error, &tree, Some(our_tree), anchor, &[])? {
         HeadWrite::Stands => {
             operation_utils::finish()?;
             Ok(parcel)
@@ -485,7 +485,7 @@ fn fast_forward(current: &str,
 
     // A compare-and-set against the head this consolidation started from; the bay's work above
     // is undone if the pallet did not move (another bay moved it first, or the write failed).
-    shift_utils::write_head_or_roll_back(current, Some(our_head), their_head, &pallet_utils::RefPreconditions::NONE, their_tree_hash, Some(our_tree_hash), anchor)?;
+    shift_utils::write_head_or_roll_back(current, Some(our_head), their_head, &pallet_utils::RefPreconditions::NONE, their_tree_hash, Some(our_tree_hash), anchor, &[])?;
 
     Ok(their_head.to_string())
 }
