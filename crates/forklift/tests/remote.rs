@@ -1168,6 +1168,41 @@ fn a_lower_refused_over_an_untracked_file_leaves_nothing_standing() {
     assert!(stderr(&stacked).contains("Nothing to stack"), "no operation may stand: {}", stderr(&stacked));
 }
 
+// SPIKE (FORK-372): local changes the remote's new parcels leave alone survive a lower, staged
+// and unstaged as they were.
+#[test]
+fn spike_a_lower_keeps_changes_the_remote_left_alone() {
+    let area = TestArea::new("lower-keeps-disjoint");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/app.txt", "app v1\n");
+    area.write_file("a/bob.txt", "bob v1\n");
+    area.write_file("a/staged.txt", "staged v1\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "first"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
+
+    area.write_file("a/app.txt", "app v2\n");
+    assert_success(&area.forklift("a", &["load", "app.txt"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "second"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    area.write_file("b/bob.txt", "bob mine\n");
+    area.write_file("b/staged.txt", "staged mine\n");
+    assert_success(&area.forklift("b", &["load", "staged.txt"]));
+
+    let lowered = area.forklift("b", &["lower"]);
+    eprintln!("LOWER: {}{}", stdout(&lowered), stderr(&lowered));
+    let status = area.forklift("b", &["--json", "stocktake"]);
+    eprintln!("STOCKTAKE: {}", stdout(&status));
+    assert_success(&lowered);
+    assert_eq!(area.read_file("b/app.txt"), "app v2\n");
+    let json: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert_eq!(json["data"]["unstaged"], serde_json::json!([{"kind": "modified", "path": "bob.txt"}]), "{}", stdout(&status));
+}
+
 // A bay whose pallet another bay already lowered to the remote's head is behind, not up to date.
 // Revert: lower's "up to date" check on the pallet's ref ahead of its currency check → it reports
 // up to date and the bay's files stay behind.
