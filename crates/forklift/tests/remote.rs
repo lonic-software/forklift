@@ -1168,17 +1168,30 @@ fn a_lower_refused_over_an_untracked_file_leaves_nothing_standing() {
     assert!(stderr(&stacked).contains("Nothing to stack"), "no operation may stand: {}", stderr(&stacked));
 }
 
-// SPIKE (FORK-372): local changes the remote's new parcels leave alone survive a lower, staged
-// and unstaged as they were.
+/// Push mtime `seconds` into the past, so the next command's stat can prove the file's content.
+fn backdate(path: &std::path::Path, seconds: u64) {
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(seconds)).unwrap();
+}
+
+/// A bay whose remote moved only `app.txt` lowers past every local change the new parcel leaves
+/// alone, and each comes through as it was: an unstaged edit, an unstaged removal, a staged edit,
+/// a staged removal, a staged move into a new nested directory and a staged new file in one.
+///
+/// Reverts: the lower's whole-bay clean check back → refused; the carried build dropped → the
+/// staged changes are demoted to unstaged ones and the backdated edit to `bob.txt`, proved
+/// against the tree's hash, vanishes; the rollup clear dropped → the unstaged removal hides
+/// behind the root's rollup; the kept state dropped → the staged removal comes back as unstaged.
 #[test]
-fn spike_a_lower_keeps_changes_the_remote_left_alone() {
+fn a_lower_keeps_the_local_changes_the_remote_left_alone() {
     let area = TestArea::new("lower-keeps-disjoint");
     let server = Server::start(&area, None);
 
     prepare_warehouse(&area, "a", &server.url);
-    area.write_file("a/app.txt", "app v1\n");
-    area.write_file("a/bob.txt", "bob v1\n");
-    area.write_file("a/staged.txt", "staged v1\n");
+    for (path, content) in [("app.txt", "app v1\n"), ("bob.txt", "bob v1\n"), ("staged.txt", "staged v1\n"),
+                            ("gone.txt", "gone\n"), ("lost.txt", "lost\n"), ("mv/from.txt", "moving\n")] {
+        area.write_file(&format!("a/{}", path), content);
+    }
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "-m", "first"]));
     assert_success(&area.forklift("a", &["lift"]));
@@ -1189,22 +1202,115 @@ fn spike_a_lower_keeps_changes_the_remote_left_alone() {
     assert_success(&area.forklift("a", &["stack", "-m", "second"]));
     assert_success(&area.forklift("a", &["lift"]));
 
-    area.write_file("b/bob.txt", "bob mine\n");
-    // An edit old enough that a stat taken now proves whatever hash it is recorded with.
-    let bob = area.path("b/bob.txt");
-    std::fs::OpenOptions::new().write(true).open(&bob).unwrap()
-        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60)).unwrap();
     area.write_file("b/staged.txt", "staged mine\n");
-    assert_success(&area.forklift("b", &["load", "staged.txt"]));
+    std::fs::remove_file(area.path("b/gone.txt")).unwrap();
+    std::fs::create_dir_all(area.path("b/new/deep")).unwrap();
+    std::fs::rename(area.path("b/mv/from.txt"), area.path("b/new/deep/to.txt")).unwrap();
+    area.write_file("b/fresh/nested/new.txt", "fresh\n");
+    assert_success(&area.forklift("b", &["load", "."]));
+    area.write_file("b/bob.txt", "bob mine\n");
+    // Old enough that a stat taken now proves whatever hash it is recorded with.
+    backdate(&area.path("b/bob.txt"), 60);
+    std::fs::remove_file(area.path("b/lost.txt")).unwrap();
+    let before = stdout(&area.forklift("b", &["--json", "stocktake"]));
+
+    assert_success(&area.forklift("b", &["lower"]));
+    assert_eq!(area.read_file("b/app.txt"), "app v2\n");
+    assert_eq!(area.read_file("b/bob.txt"), "bob mine\n");
+    let status = area.forklift("b", &["--json", "stocktake"]);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+    let was: serde_json::Value = serde_json::from_str(&before).unwrap();
+    assert_eq!(json["data"]["staged"], was["data"]["staged"], "{}", stdout(&status));
+    assert_eq!(json["data"]["staged"].as_array().map(Vec::len), Some(4), "{}", stdout(&status));
+    assert_eq!(json["data"]["unstaged"], serde_json::json!([{"kind": "modified", "path": "bob.txt"}, {"kind": "removed", "path": "lost.txt"}]),
+               "{}", stdout(&status));
+}
+
+/// A lower whose remote parcel touches a local change refuses, naming every such path and none
+/// it leaves alone, and changes nothing: a staged and an unstaged edit the remote overwrites, a
+/// staged new file where the remote creates a directory, one where it creates a file in place of
+/// the new file's directory, and one under a directory the remote removes.
+///
+/// Reverts: the descendant half of the overlap rule dropped → `flip` goes unnamed; its ancestor
+/// half dropped → `d/new.txt` and `old/new.txt` go unnamed.
+#[test]
+fn a_lower_over_a_local_change_it_would_touch_refuses_and_changes_nothing() {
+    let area = TestArea::new("lower-overlap");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    for (path, content) in [("app.txt", "app v1\n"), ("app2.txt", "app2 v1\n"), ("old/x.txt", "x\n"), ("safe.txt", "safe\n")] {
+        area.write_file(&format!("a/{}", path), content);
+    }
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "first"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
+
+    area.write_file("a/app.txt", "app v2\n");
+    area.write_file("a/app2.txt", "app2 v2\n");
+    area.write_file("a/flip/inner.txt", "theirs\n");
+    area.write_file("a/d", "theirs\n");
+    std::fs::remove_dir_all(area.path("a/old")).unwrap();
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "second"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    area.write_file("b/app.txt", "app mine\n");
+    area.write_file("b/flip", "mine\n");
+    area.write_file("b/d/new.txt", "mine\n");
+    area.write_file("b/old/new.txt", "mine\n");
+    assert_success(&area.forklift("b", &["load", "."]));
+    area.write_file("b/app2.txt", "app2 mine\n");
+    area.write_file("b/safe.txt", "safe mine\n");
+    let before = stdout(&area.forklift("b", &["--json", "stocktake"]));
 
     let lowered = area.forklift("b", &["lower"]);
-    eprintln!("LOWER: {}{}", stdout(&lowered), stderr(&lowered));
-    let status = area.forklift("b", &["--json", "stocktake"]);
-    eprintln!("STOCKTAKE: {}", stdout(&status));
-    assert_success(&lowered);
-    assert_eq!(area.read_file("b/app.txt"), "app v2\n");
-    let json: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
-    assert_eq!(json["data"]["unstaged"], serde_json::json!([{"kind": "modified", "path": "bob.txt"}]), "{}", stdout(&status));
+    assert!(!lowered.status.success(), "{}", stdout(&lowered));
+    let message = stderr(&lowered);
+    for named in ["\"app.txt\"", "\"app2.txt\"", "\"flip\"", "\"d/new.txt\"", "\"old/new.txt\""] {
+        assert!(message.contains(named), "{} must be named: {}", named, message);
+    }
+    assert!(!message.contains("safe.txt"), "{}", message);
+    assert_eq!(area.read_file("b/app.txt"), "app mine\n");
+    assert_eq!(area.read_file("b/app2.txt"), "app2 mine\n");
+    assert_eq!(area.read_file("b/d/new.txt"), "mine\n");
+    assert_eq!(stdout(&area.forklift("b", &["--json", "stocktake"])), before);
+}
+
+/// A lower in a bay with a consolidation in progress is refused as that, before anything else.
+///
+/// Revert: drop lower's mid-merge refusal → it is refused as diverged instead, a refusal whose next
+/// step (consolidating the remote's head) cannot run while this merge stands.
+#[test]
+fn a_lower_during_a_consolidation_is_refused() {
+    let area = TestArea::new("lower-mid-merge");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/app.txt", "app v1\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "first"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
+    area.write_file("a/other.txt", "theirs\n");
+    assert_success(&area.forklift("a", &["load", "other.txt"]));
+    assert_success(&area.forklift("a", &["stack", "-m", "second"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    assert_success(&area.forklift("b", &["pallet", "create", "side"]));
+    area.write_file("b/app.txt", "side\n");
+    assert_success(&area.forklift("b", &["load", "app.txt"]));
+    assert_success(&area.forklift("b", &["stack", "-m", "side"]));
+    assert_success(&area.forklift("b", &["shift", "main"]));
+    area.write_file("b/app.txt", "main\n");
+    assert_success(&area.forklift("b", &["load", "app.txt"]));
+    assert_success(&area.forklift("b", &["stack", "-m", "main"]));
+    let consolidated = area.forklift("b", &["consolidate", "side"]);
+    assert!(area.path("b/.forklift/consolidation").exists(), "{}{}", stdout(&consolidated), stderr(&consolidated));
+
+    let lowered = area.forklift("b", &["lower"]);
+    assert!(!lowered.status.success() && stderr(&lowered).contains("A consolidation is in progress"), "{}", stderr(&lowered));
 }
 
 // A bay whose pallet another bay already lowered to the remote's head is behind, not up to date.
