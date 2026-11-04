@@ -224,13 +224,8 @@ async fn lower_working_pallet(client: &RemoteClient,
         None => None,
     };
 
-    // Anchored before the local changes are collected, so a file edited after it is never trusted.
-    let anchor = file_utils::take_stat_anchor()?;
-
-    // A merge in progress is completed on the head it started from. The local changes are judged
-    // against the remote's once its tree is known.
+    // A merge in progress is completed on the head it started from.
     shift::refuse_mid_merge("lowering")?;
-    let carried = shift_utils::collect_carried(local_tree.as_deref()).await?;
 
     // Path-pruned in a sparse warehouse (out-of-scope content stays sealed), whole in a full one
     // — a full fetch scope makes this byte-identical to the unscoped fetch — and in a cache only
@@ -274,6 +269,11 @@ async fn lower_working_pallet(client: &RemoteClient,
     // again, finding the same). A name that opens the metadata folder is refused as the head's,
     // before the planning below trips over it.
     refuse_unmaterializable(client, &pallet, local_tree.as_deref(), &remote_tree)?;
+
+    // Collected once the remote's tree is known, so an edit made during the fetch is judged too.
+    // Anchored before that, so a file edited after it is never trusted.
+    let anchor = file_utils::take_stat_anchor()?;
+    let carried = shift_utils::collect_carried(local_tree.as_deref()).await?;
     let (ops, removed_dirs) = shift_utils::diff_trees(local_tree.as_deref(), &remote_tree)?;
     refuse_carried_overlaps(&carried, &ops, &removed_dirs)?;
     alias_utils::refuse_collisions("Lowering", &shift_utils::collect_collisions(&ops, &removed_dirs)?)?;
@@ -1001,7 +1001,7 @@ fn refuse_carried_overlaps(carried: &[shift_utils::CarriedEntry], ops: &[shift_u
     }
 
     const SHOWN: usize = 10;
-    let mut named = overlaps.iter().take(SHOWN).map(|path| format!("\"{}\"", path)).collect::<Vec<_>>().join(", ");
+    let mut named = overlaps.iter().take(SHOWN).map(|path| format!("\"{}\"", path.escape_debug())).collect::<Vec<_>>().join(", ");
     if overlaps.len() > SHOWN {
         named.push_str(&format!(" and {} more", overlaps.len() - SHOWN));
     }

@@ -1333,8 +1333,7 @@ pub struct CarriedItem {
 /// every staged change and every unstaged one but an untracked file, with a move's old path, each
 /// with the entry the inventory holds for it now.
 pub async fn collect_carried(head_tree: Option<&str>) -> Result<Vec<CarriedEntry>, String> {
-    let staged = stocktake_utils::collect_staged_changes(head_tree).await?;
-    let unstaged = stocktake_utils::collect_unstaged_changes().await?;
+    let (staged, unstaged) = tokio::try_join!(stocktake_utils::collect_staged_changes(head_tree), stocktake_utils::collect_unstaged_changes())?;
 
     let mut paths: BTreeSet<String> = BTreeSet::new();
 
