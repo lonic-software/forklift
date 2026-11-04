@@ -307,15 +307,11 @@ fn a_divergence_is_cleared_by_the_commands_the_page_lists() {
     area.stack("b", "f.txt", "from b\n");
 
     let error = area.refused("b", &["lift"], "diverged", 5);
-    let next_step = error["next_step"].as_str().unwrap();
-    let (_, rest) = next_step.split_once("pallet create ").unwrap();
-    let mut words = rest.split(['"', ' ', ';']);
-    let (pallet, hash) = (words.next().unwrap(), words.next().unwrap());
+    assert_eq!(error["next_step"], "forklift lower; then forklift lift");
 
-    area.ok("b", &["pallet", "create", pallet, hash]);
-    area.ok("b", &["shift", "main"]);
-    // A conflict stops the consolidation, which still exits 0.
-    assert!(area.ok("b", &["consolidate", pallet]).contains("conflict"));
+    // The lower merges the remote's head in and stops on the conflict.
+    let error = area.refused("b", &["lower"], "merge_conflicts", 47);
+    assert_eq!(error["details"]["paths"], serde_json::json!(["f.txt"]));
     area.write("b/f.txt", "both\n");
     area.ok("b", &["load", "f.txt"]);
     area.ok("b", &["stack", "-m", "both"]);

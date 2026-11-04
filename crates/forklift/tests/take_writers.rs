@@ -70,7 +70,6 @@ const WRITERS: &[(&str, &str, Class)] = &[
     ("crates/forklift/src/commands/lower.rs", "write_named_head", Class::Verifies),
     // A repair is signed as a stack is, on a head verified under the preconditions it is written with.
     ("crates/forklift/src/commands/lower.rs", "repair_pallet", Class::Signs),
-    ("crates/forklift/src/commands/lower.rs", "stack_diverged_repair", Class::Signs),
     // At a hash, verified; at another pallet, that pallet's head.
     ("crates/forklift/src/commands/pallet.rs", "create_pallet", Class::Verifies),
     ("crates/forklift/src/commands/pallet.rs", "create_pallet", Class::CopiesLocal),
