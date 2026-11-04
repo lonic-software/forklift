@@ -1835,19 +1835,27 @@ fn a_batch_always_carries_one_object_and_absent_ones_do_not_mark_it() {
     assert_eq!(bundled(&area, "late", answer, &hashes[2..]), hashes[2..3]);
 }
 
+/// The invocation deadline and answer reserve of the slow-store batch tests. The cut comes once
+/// only the reserve is left, 1 s in, a few 300 ms reads into twelve. All twelve take 3.6 s, well
+/// inside the deadline, so a head that ignores the deadline or its reserve answers whole and
+/// unmarked. The reserve is wide so that a loaded runner's scheduling delay cannot carry the
+/// answer past the deadline.
+fn deadline_window() -> (std::time::Duration, std::time::Duration) {
+    (std::time::Duration::from_secs(10), std::time::Duration::from_secs(9))
+}
+
 /// The deadline counts lookups of objects the store lacks: a batch of them over a slow store
-/// stops when the deadline nears, marked, rather than running past it while it carries nothing.
+/// stops when the deadline nears, marked, rather than running on while it carries nothing.
 /// Revert: let the deadline rule in `batch_answer_cut` wait for a carried object → all twelve
-/// lookups run, past the deadline, and the answer is unmarked.
+/// lookups run and the answer is unmarked.
 #[test]
 fn a_batch_of_absent_objects_over_a_slow_store_answers_before_the_invocation_deadline() {
     let hashes: Vec<String> = synthetic_objects(12, "slow-absent").into_iter().map(|(hash, _)| hash).collect();
 
-    let window = std::time::Duration::from_secs(3);
+    let head = seeded_head(MemoryObjectStore::new().with_read_delay(std::time::Duration::from_millis(300)), &[]);
+    let (window, reserve) = deadline_window();
     let started = std::time::SystemTime::now();
-    let head = seeded_head(MemoryObjectStore::new().with_read_delay(std::time::Duration::from_millis(300)), &[])
-        .with_batch_limits(u64::MAX, std::time::Duration::from_secs(2))
-        .with_deadline(started + window);
+    let head = head.with_batch_limits(u64::MAX, reserve).with_deadline(started + window);
 
     let answer = head.batch(&hashes).expect("batch");
     let elapsed = started.elapsed().expect("a forward clock");
@@ -1858,22 +1866,18 @@ fn a_batch_of_absent_objects_over_a_slow_store_answers_before_the_invocation_dea
 
 /// A batch over a slow store stops mirroring when the invocation deadline nears, and answers
 /// before the deadline with a marked, strict subset.
-/// Revert: drop the deadline rule from `batch_answer_cut` → all twelve reads run, past the
-/// deadline, and the answer is whole.
+/// Revert: drop the deadline rule from `batch_answer_cut` → all twelve reads run and the answer
+/// is whole.
 #[test]
 fn a_batch_over_a_slow_store_answers_before_the_invocation_deadline() {
     let area = Area::new("batch-deadline");
     let objects = sized_objects(12, 1024, "slow");
     let hashes: Vec<String> = objects.iter().map(|(hash, _)| hash.clone()).collect();
 
-    let window = std::time::Duration::from_secs(3);
+    let head = seeded_head(MemoryObjectStore::new().with_read_delay(std::time::Duration::from_millis(300)), &objects);
+    let (window, reserve) = deadline_window();
     let started = std::time::SystemTime::now();
-    let head = seeded_head(
-        MemoryObjectStore::new().with_read_delay(std::time::Duration::from_millis(300)),
-        &objects,
-    )
-    .with_batch_limits(u64::MAX, std::time::Duration::from_secs(2))
-    .with_deadline(started + window);
+    let head = head.with_batch_limits(u64::MAX, reserve).with_deadline(started + window);
 
     let answer = head.batch(&hashes).expect("batch");
     let elapsed = started.elapsed().expect("a forward clock");
