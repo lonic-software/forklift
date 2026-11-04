@@ -168,7 +168,12 @@ machine does not tell you what Windows will take.
   sync calls are exercised, and every real write pays for one. Seed a large starting state
   by writing it directly, and push only the few writes the assertion is about through the
   code under test. The journal cap test spent 24 s on Windows filling the journal one
-  synced write at a time.
+  synced write at a time. A fixture whose tests check nothing about durability can skip
+  its own thread's syncs with `file_utils::skip_syncs_on_this_thread()`, as the office
+  fixture in `audit_utils.rs` does: its 39 tests took about 4 s each in a parallel run and
+  0.2 s without the syncs. It helps only where the test's own syncs are the cost. Under a
+  parallel run every write also waits on the other tests' syncs, so a test that takes
+  0.1 s alone can take 14 s in the full suite while syncing almost nothing itself.
 - **Make a limit something the test can set small.** A test that crosses a cap, a depth
   or a size passes a small value of it rather than building a fixture past the
   production one. `walk_tree_survives_a_pathologically_deep_tree` checks stack safety on
