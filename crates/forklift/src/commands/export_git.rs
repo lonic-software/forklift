@@ -196,8 +196,8 @@ fn export_tags(repo: &GitRepo, exporter: &Exporter) -> Result<TagExport, String>
     }
 
     // Git keeps a loose ref as a file, so on a filesystem that folds case `V1` would overwrite
-    // `v1`. Two such tags are both left out, on every filesystem, so the export is the same
-    // everywhere.
+    // `v1`. Two such tags are both left out, on every filesystem, so the export does not depend
+    // on the one it is written to.
     let mut folded: HashMap<String, usize> = HashMap::new();
     for (attributed, ..) in &writable {
         *folded.entry(attributed.tag.name.to_ascii_lowercase()).or_default() += 1;
