@@ -1887,6 +1887,8 @@ fn a_batch_over_a_slow_store_answers_before_the_invocation_deadline() {
     let carried = bundled(&area, "deadline", answer, &hashes);
     assert!(!carried.is_empty() && carried.len() < hashes.len(), "a strict, non-empty subset: {}", carried.len());
     assert_eq!(carried, hashes[..carried.len()], "a prefix, in request order");
+    // One read per carried object holds because `seeded_head` gives the head an ephemeral scratch,
+    // which never already holds an object; a pooled one would let objects skip the store.
     assert_eq!(head.objects.reads(), carried.len(), "it read nothing past the cut");
 }
 
