@@ -31,7 +31,7 @@ env:
   # debuginfo guard" step checks the setting itself, with this variable unset.
   RUSTFLAGS: ""
   # Windows links with rust-lld (lld-link) rather than MSVC's link.exe; Linux already uses rust-lld
-  # by default and macOS Apple's ld-prime. A linker setting is not a rustflag, so the empty
+  # by default and macOS Apple's linker. A linker setting is not a rustflag, so the empty
   # RUSTFLAGS above leaves it on. Measured with warm caches on 2026-11-04, it cut the Windows test
   # build by about 12% of summed unit time, roughly 20 s per share (docs/guide/contributing.md).
   # CI only: release.yml keeps link.exe for the shipped binaries.

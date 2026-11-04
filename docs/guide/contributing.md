@@ -108,7 +108,7 @@ Notes:
   by default and macOS with Apple's linker). Every push rebuilds all the workspace's test binaries,
   since the build cache keeps only dependencies, so links are paid on each run: on 2026-11-04 the
   switch took the Windows test build from about 527 s to 464 s of summed build time per share and
-  about 20 s off each share's wall clock, while the library crates, which do not link, built in
+  about 20 s off each share's build time, while the library crates, which do not link, built in
   the same time. Release builds (`release.yml`) and local builds keep `link.exe`. Changing the
   variable changes the build cache's key, so the first run after it builds cold.
 - On macOS, `.cargo/config.toml` builds with `-Csplit-debuginfo=packed`: debuginfo
