@@ -11,11 +11,13 @@ use forklift_core::util::tag_utils::{self, AttributedTag};
 use forklift_core::util::{file_utils, object_utils, pallet_utils};
 use crate::output::{self, CommandOutput};
 
-/// The export layout version: the `export/<N>` every exported commit's parcel line names. It covers
-/// every rule that fixes an exported object's bytes: the message shape and its parcel line, the
-/// identity mapping, the date form (pre-1970 written as the epoch), the parent rule, the type-to-mode map, chunked-blob assembly,
-/// filter-free hashing and the tag object's shape. Two builds on one layout write identical objects for the same parcel, so
-/// a change to any of those rules bumps it (the golden tip-hash test fails until it does).
+/// The export layout version: the `export/<N>` every exported commit's parcel line and every
+/// exported tag's signer line names. It covers every rule that fixes an exported object's bytes:
+/// the message shape and its parcel line, the identity mapping, the date form (pre-1970 written as
+/// the epoch), the parent rule, the type-to-mode map, chunked-blob assembly, filter-free hashing and
+/// the tag object's shape. Two builds on one layout write identical objects for the same parcel, so
+/// a change to any of those rules bumps it (the golden tip-hash and tag-object tests fail until it
+/// does).
 pub(crate) const EXPORT_LAYOUT: u32 = 1;
 
 /// Handle the git export command (§7.8): one-way export of this warehouse's history into a
@@ -25,8 +27,8 @@ pub(crate) const EXPORT_LAYOUT: u32 = 1;
 ///
 /// It is deliberately lossy in this direction: git has no home for forklift's signed
 /// office, the `@manifest` (approvals / provenance) or per-parcel and per-tag signatures, so
-/// those are dropped — the guarantee is "your code history is never trapped", not a lossless round
-/// trip. Requires `git` on PATH.
+/// those are dropped — the guarantee is "your code history is never trapped", not a lossless
+/// round trip. Requires `git` on PATH.
 ///
 /// The objects are deterministic (§9.8): every commit ends in a line naming its parcel and the
 /// export layout, and no git configuration or environment of the user's reaches an object write, so
@@ -655,9 +657,9 @@ fn tag_line(signer: &str) -> String {
 }
 
 /// The annotated tag object for `attributed` over `commit`. The tagger is the tag's attributed
-/// operator (its key id when the local office does not know the key), written as a commit's author
-/// is; the date is the tag's own; the message is the tag's, without trailing newlines, a blank line,
-/// and the tag line (only the tag line when the message is empty).
+/// operator (its key id when the local office does not know the key), written as a commit's
+/// author is; the date is the tag's own; the message is the tag's, without trailing newlines, a
+/// blank line, and the tag line (only the tag line when the message is empty).
 fn tag_object(commit: &str, attributed: &AttributedTag) -> String {
     let tag = &attributed.tag;
 
@@ -1108,7 +1110,8 @@ mod tests {
     }
 
     /// The tag object is fixed text: a change to its shape changes every exported tag's hash, which
-    /// bumps the export layout. The tagger is cleaned as an author is, and falls back to "forklift".
+    /// bumps the export layout. The tagger is cleaned as an author is, and falls back to
+    /// "forklift".
     #[test]
     fn a_tag_object_is_written_in_a_fixed_shape() {
         use forklift_core::util::tag_utils::Tag;
