@@ -9999,7 +9999,11 @@ fn picking_a_parcel_with_no_description_needs_a_message() {
     assert_eq!(main_head(), before);
     assert!(!root.join("b.txt").exists() && !root.join(".forklift/cherry-pick").exists(), "a refused pick must apply nothing");
 
-    assert_success(&warehouse.run(&["pick", "feature", "-m", "feature's file"]));
+    // The command the refusal suggests, run as given, picks it.
+    let message = stderr(&refused);
+    let suggested = message.split("\"forklift pick ").nth(1).and_then(|rest| rest.split(" -m <description>\"").next())
+        .unwrap_or_else(|| panic!("the refusal suggests no command: {}", message));
+    assert_success(&warehouse.run(&["pick", suggested, "-m", "feature's file"]));
     let history = json(&warehouse.run(&["--json", "history"]));
     assert_eq!(history["data"]["entries"][0]["description"], "feature's file", "{}", history);
 }

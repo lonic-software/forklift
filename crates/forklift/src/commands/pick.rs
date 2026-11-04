@@ -139,7 +139,7 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
         return Err(format!(
             "Nothing was picked: {} has no description to carry over. Pick it with one: \
             \"forklift pick {} -m <description>\".",
-            short, revision
+            short, short
         ));
     }
 

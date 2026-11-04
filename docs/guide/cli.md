@@ -562,7 +562,7 @@ Builds tree objects from the inventory (bottom-up, staged removals excluded,
 empty directories pruned), creates a parcel (recording you as the author with a
 timestamp), advances the current pallet's head, and cleans up consumed staged
 state. Every parcel `stack` records has a description, given with `-m`; a blank one is refused before
-anything changes, as it is by `pick` and `deliver`. Without `-m`, `stack` refuses and changes
+anything changes, as it is by `pick` and `deliver`. Without `-m`, `stack` refuses and records
 nothing, unless it completes a merge or pick in progress that supplies the description. If a
 consolidation is in progress, `stack` completes it, and without `-m` the parcel records the
 description a clean consolidation would have recorded (`Consolidated "feature" into "main".`). A

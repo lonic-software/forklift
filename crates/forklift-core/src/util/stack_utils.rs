@@ -295,6 +295,16 @@ pub async fn stack_parcel(description: Option<String>,
         }
     }
 
+    // A parcel without a description shows as a blank line in `history`. Refused before the tree
+    // build, which is the costly part and writes objects a refused stack would leave behind.
+    let description = description.or_else(|| default_description_of(consolidation.as_ref(), cherry_pick.as_ref()));
+    if is_blank(description.as_deref()) {
+        return Err(StackError::Other(
+            "Nothing was stacked: a parcel needs a description, and none was given. Stack again with \
+            one: \"forklift stack -m <description>\".".to_string()
+        ));
+    }
+
     // The parcel the new one stacks on. Merge output staged by an earlier command was built on the
     // head recorded when it started, which the check above holds equal to the base.
     let head = match (expected_base, &consolidation, &cherry_pick) {
@@ -479,16 +489,6 @@ pub async fn stack_parcel(description: Option<String>,
         }
 
         parents.push(state.their_head.clone());
-    }
-
-    // A parcel without a description shows as a blank line in `history`, and a pallet's first
-    // parcel cannot be undone.
-    let description = description.or_else(|| default_description_of(consolidation.as_ref(), cherry_pick.as_ref()));
-    if is_blank(description.as_deref()) {
-        return Err(StackError::Other(
-            "Nothing was stacked: a parcel needs a description, and none was given. Stack again with \
-            one: \"forklift stack -m <description>\".".to_string()
-        ));
     }
 
     // Authorship convention: every parcel records its author(s) as explicit Author
