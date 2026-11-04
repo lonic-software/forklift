@@ -662,19 +662,23 @@ pub(crate) struct SyncDirFaultGuard {
 impl SyncDirFaultGuard {
     /// Record every directory [`sync_dir`] is asked to sync; fail none of them.
     pub(crate) fn recording() -> Self {
+        // Before arming: a panic here must leave nothing armed.
+        let syncs = real_syncs();
         SYNC_DIR_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState { attempted: Vec::new(), fail_needle: None, fail_exact: false });
-        SyncDirFaultGuard { _syncs: real_syncs() }
+        SyncDirFaultGuard { _syncs: syncs }
     }
 
     /// Record every directory, and fail (with a distinctive error, no filesystem access) any
     /// whose path contains `needle`.
     pub(crate) fn failing(needle: &str) -> Self {
+        // Before arming: a panic here must leave nothing armed.
+        let syncs = real_syncs();
         SYNC_DIR_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState {
             attempted: Vec::new(),
             fail_needle: Some(needle.to_string()),
             fail_exact: false,
         });
-        SyncDirFaultGuard { _syncs: real_syncs() }
+        SyncDirFaultGuard { _syncs: syncs }
     }
 }
 
@@ -1620,31 +1624,37 @@ pub(crate) struct DirSyncFaultGuard {
 impl DirSyncFaultGuard {
     /// Record every directory `fsync_dir_data` is asked to sync; fail none of them.
     pub(crate) fn recording() -> Self {
+        // Before arming: a panic here must leave nothing armed.
+        let syncs = real_syncs();
         DIR_SYNC_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState { attempted: Vec::new(), fail_needle: None, fail_exact: false });
-        DirSyncFaultGuard { _syncs: real_syncs() }
+        DirSyncFaultGuard { _syncs: syncs }
     }
 
     /// Record every directory, and fail (with a distinctive error, no filesystem access) any
     /// whose path contains `needle`.
     pub(crate) fn failing(needle: &str) -> Self {
+        // Before arming: a panic here must leave nothing armed.
+        let syncs = real_syncs();
         DIR_SYNC_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState {
             attempted: Vec::new(),
             fail_needle: Some(needle.to_string()),
             fail_exact: false,
         });
-        DirSyncFaultGuard { _syncs: real_syncs() }
+        DirSyncFaultGuard { _syncs: syncs }
     }
 
     /// Record every directory, and fail only `dir` itself. A folder's path is contained in every
     /// path below it, so [`failing`](Self::failing) cannot fail a folder without failing its
     /// descendants too.
     pub(crate) fn failing_exactly(dir: &Path) -> Self {
+        // Before arming: a panic here must leave nothing armed.
+        let syncs = real_syncs();
         DIR_SYNC_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState {
             attempted: Vec::new(),
             fail_needle: Some(dir.to_string_lossy().into_owned()),
             fail_exact: true,
         });
-        DirSyncFaultGuard { _syncs: real_syncs() }
+        DirSyncFaultGuard { _syncs: syncs }
     }
 }
 
@@ -5589,12 +5599,14 @@ mod tests {
 
     /// This crate's unit tests skip syncs unless one holds `real_syncs`, and the guard turns
     /// them on for every thread, including one the code under test spawns, until the last guard
-    /// is dropped. The first check is skipped while another test holds a guard, which only
-    /// `cargo test` allows: nextest runs every test in a process of its own.
+    /// is dropped. The first check counts only when no guard was alive on either side of the
+    /// read, which only `cargo test` can break: nextest runs every test in a process of its own.
     #[test]
     fn syncs_run_only_while_a_real_syncs_guard_lives() {
-        if REAL_SYNCS.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-            assert!(!fsync_enabled(), "with no guard alive, a unit test skips its syncs");
+        let before = REAL_SYNCS.load(std::sync::atomic::Ordering::SeqCst);
+        let enabled = fsync_enabled();
+        if before == 0 && REAL_SYNCS.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(!enabled, "with no guard alive, a unit test skips its syncs");
         }
 
         let outer = real_syncs();

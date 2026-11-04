@@ -184,8 +184,10 @@ machine does not tell you what Windows will take.
   holds the guard and reaches it; to check, put a `panic!` inside the site's
   `fsync_enabled()` branch and run `cargo nextest run -p forklift-core --lib`, and some
   test must fail. The other crates' in-process tests, and forklift-core's own `tests/`
-  suites, still run with fsync on, so count their syncs: seed a large starting state by writing it directly, and push only the few
-  writes the assertion is about through the code under test.
+  suites, still run with fsync on, so count their syncs: seed a large starting state by
+  writing it directly, and push only the few writes the assertion is about through the code
+  under test. Under `cargo test` a guard another test holds turns syncs on for yours too, so
+  a test that only passes with syncs on must hold the guard itself.
 - **Make a limit something the test can set small.** A test that crosses a cap, a depth
   or a size passes a small value of it rather than building a fixture past the
   production one. `walk_tree_survives_a_pathologically_deep_tree` checks stack safety on

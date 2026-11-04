@@ -391,18 +391,22 @@ struct TaintFaultGuard {
 impl TaintFaultGuard {
     /// Record every taint file [`sync_taint_file`] is asked to sync; fail none of them.
     fn recording() -> Self {
+        // Before arming: a panic here must leave nothing armed.
+        let syncs = file_utils::real_syncs();
         TAINT_WRITE_FAULT.with(|f| *f.borrow_mut() = TaintFaultState { attempted: Vec::new(), fail_needle: None });
-        TaintFaultGuard { _syncs: file_utils::real_syncs() }
+        TaintFaultGuard { _syncs: syncs }
     }
 
     /// Record every taint file, and fail (with a distinctive error, no filesystem access) any
     /// whose path contains `needle`.
     fn failing(needle: &str) -> Self {
+        // Before arming: a panic here must leave nothing armed.
+        let syncs = file_utils::real_syncs();
         TAINT_WRITE_FAULT.with(|f| *f.borrow_mut() = TaintFaultState {
             attempted: Vec::new(),
             fail_needle: Some(needle.to_string()),
         });
-        TaintFaultGuard { _syncs: file_utils::real_syncs() }
+        TaintFaultGuard { _syncs: syncs }
     }
 }
 

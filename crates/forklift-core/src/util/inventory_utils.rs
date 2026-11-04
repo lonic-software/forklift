@@ -4585,7 +4585,7 @@ mod tests {
         let attempts = file_utils::dir_sync_attempts();
         drop(syncs);
 
-        if cfg!(unix) && file_utils::fsync_enabled() {
+        if cfg!(unix) {
             assert!(attempts.contains(&folder.parent().unwrap().to_path_buf()),
                 "the fan-out folder holding a's new shard folder is synced: {attempts:?}");
         }
