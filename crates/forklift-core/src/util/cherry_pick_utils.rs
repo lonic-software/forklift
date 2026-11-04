@@ -57,7 +57,7 @@ fn state_path() -> PathBuf {
 }
 
 /// How to abandon the pick in progress in this bay without putting anything back: a phrase such as
-/// `remove "<path>"`, naming the bay's own state file. For where `pick --abort` cannot run: an
+/// `remove "<path>"`, naming the bay's own state file. For where `abort` cannot run: an
 /// unreadable state or source parcel, or a bay no longer at the head the pick was applied on.
 pub fn state_removal_hint() -> String {
     format!("remove \"{}\"", state_path().to_string_lossy())

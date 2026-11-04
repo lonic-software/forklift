@@ -147,7 +147,7 @@ $ forklift consolidate shout
 Consolidating "shout" into "main" produced 1 conflict(s):
   conflict: readme.md
 
-Resolve the conflicts, "forklift load" the resolved files, then "forklift stack" to complete the consolidation.
+Resolve the conflicts, "forklift load" the resolved files, then "forklift stack" to complete the consolidation (or "forklift abort" to abort it).
 $ cat readme.md
 <<<<<<< main
 Hello, forklift and friends!
@@ -160,7 +160,7 @@ $ forklift conflicts
 Unresolved conflicts (1):
   readme.md (base …, ours …, theirs …)
 
-Resolve each file, "forklift load" it, then "forklift stack" to complete the consolidation.
+Resolve each file, "forklift load" it, then "forklift stack" to complete the consolidation (or "forklift abort" to abort it).
 ```
 
 Resolve it by writing the file you want, then load and stack. The stack completes the

@@ -13,9 +13,9 @@ use crate::output::{self, CommandOutput};
 /// * Reversing a `stack`, `consolidate` or `cherry-pick` is a **soft reset**: the pallet head
 ///   moves back while the working directory and inventory are kept, so the undone changes end
 ///   up staged again (this is how a merge is reversed too).
-/// * Reversing a `consolidate` or `pick` that stopped at conflicts aborts it, as
-///   `consolidate --abort` and `pick --abort` do: the files it touched go back to the head, and it
-///   refuses rather than discard changes made to them since.
+/// * Reversing a `consolidate` or `pick` that stopped at conflicts aborts it, as `abort` does: the
+///   files it touched go back to the head, and it refuses rather than discard changes made to
+///   them since.
 /// * Reversing a `shift` moves back to the previous pallet, re-materializing its tree
 ///   (it refuses if the working directory is dirty, exactly like a forward `shift`).
 /// * Reversing a pallet delete brings the pallet back at the head it was deleted at, without
@@ -117,7 +117,7 @@ pub async fn handle_command(as_name: Option<&str>) -> Result<(), String> {
             true => MergeKind::Consolidation,
             false => MergeKind::Pick,
         };
-        let aborted = merge_abort::abort(kind, false, kind.abort_command()).await?;
+        let aborted = merge_abort::abort(kind, false, merge_abort::ABORT_COMMAND).await?;
 
         output::emit(&Undone {
             op: entry.op,

@@ -67,7 +67,7 @@ const SKELETON_VERSION: u32 = 1;
 
 /// How to abandon the consolidation whose files live in the bay-local state dir `dir` without
 /// putting anything back: remove both of them. A phrase such as `remove "<a>" and "<b>"`, naming
-/// that bay's own paths. For where `consolidate --abort` cannot run: an unreadable state, or a bay
+/// that bay's own paths. For where `abort` cannot run: an unreadable state, or a bay
 /// no longer at the head the merge was built on.
 pub fn state_removal_hint_in(dir: &Path) -> String {
     format!(
@@ -84,7 +84,7 @@ fn abort_remedy_in(dir: &Path) -> String {
 }
 
 /// The way out of a missing or unreadable skeleton: the abort, which never reads it.
-const SKELETON_REMEDY: &str = "Abort the consolidation (\"forklift consolidate --abort\") and consolidate again.";
+const SKELETON_REMEDY: &str = "Abort the consolidation (\"forklift abort\") and consolidate again.";
 
 /// Get the path of the consolidation-state file (bay-local: a merge in progress belongs
 /// to the bay resolving it).
@@ -1889,7 +1889,7 @@ mod tests {
         // A version-1 state (no base) is refused by its version, never read without one.
         std::fs::write(get_consolidation_state_path(), record_utils::to_bytes(CONSOLIDATION_RECORD, 1, ["ab".repeat(32), "feature".to_string()])).unwrap();
         let error = read_consolidation_state().err().expect("a version-1 state file must be refused");
-        assert!(error.contains("does not know") && error.contains("Abort the consolidation"), "{}", error);
+        assert!(error.contains("does not know") && error.contains("Abandon the consolidation"), "{}", error);
 
         std::fs::write(get_consolidation_state_path(), format!("{}\nfeature\n", "ab".repeat(32))).unwrap();
         let error = read_consolidation_state().err().expect("a headerless state file must be refused");

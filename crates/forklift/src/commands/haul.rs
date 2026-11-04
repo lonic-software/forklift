@@ -383,7 +383,7 @@ impl CommandOutput for MergeConflicts {
         }
         println!(
             "Resolve them, \"forklift stack\", then re-run \"forklift haul consolidate\" to record the merge \
-            (or \"forklift consolidate --abort\" to abort it)."
+            (or \"forklift abort\" to abort it)."
         );
     }
 }

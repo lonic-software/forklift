@@ -394,16 +394,14 @@ fn command_schemas(name: &str) -> Option<Vec<OutputSchema>> {
     use crate::commands;
 
     Some(match name {
+        "abort" => commands::merge_abort::__docgen_schemas(),
         "audit" => commands::audit::__docgen_schemas(),
         "bay" => commands::bay::__docgen_schemas(),
         "blame" => commands::blame::__docgen_schemas(),
         "clone" => commands::clone::__docgen_schemas(),
         "config" => commands::config::__docgen_schemas(),
         "conflicts" => commands::conflicts::__docgen_schemas(),
-        "consolidate" => [
-            commands::consolidate::__docgen_schemas(),
-            commands::merge_abort::__docgen_schemas(),
-        ].into_iter().flatten().collect(),
+        "consolidate" => commands::consolidate::__docgen_schemas(),
         "deliver" => commands::deliver::__docgen_schemas(),
         "diff" => commands::diff::__docgen_schemas(),
         "git" => [
@@ -425,10 +423,7 @@ fn command_schemas(name: &str) -> Option<Vec<OutputSchema>> {
         "office" => commands::office::__docgen_schemas(),
         "pallet" => commands::pallet::__docgen_schemas(),
         "park" => commands::park::__docgen_schemas(),
-        "pick" => [
-            commands::pick::__docgen_schemas(),
-            commands::merge_abort::__docgen_schemas(),
-        ].into_iter().flatten().collect(),
+        "pick" => commands::pick::__docgen_schemas(),
         "prepare" => commands::prepare::__docgen_schemas(),
         "profile" => commands::profile::__docgen_schemas(),
         "remove" => commands::remove::__docgen_schemas(),

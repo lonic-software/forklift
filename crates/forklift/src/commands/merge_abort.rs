@@ -25,15 +25,10 @@ pub enum MergeKind {
     Pick,
 }
 
-impl MergeKind {
-    /// The command that aborts this kind, as the user types it.
-    pub fn abort_command(self) -> &'static str {
-        match self {
-            MergeKind::Consolidation => "forklift consolidate --abort",
-            MergeKind::Pick => "forklift pick --abort",
-        }
-    }
+/// The command that aborts a merge in progress, as the user types it.
+pub const ABORT_COMMAND: &str = "forklift abort";
 
+impl MergeKind {
     fn noun(self) -> &'static str {
         match self {
             MergeKind::Consolidation => "consolidation",
@@ -42,19 +37,24 @@ impl MergeKind {
     }
 }
 
-/// Handle `consolidate --abort` and `pick --abort`: abandon the merge in progress, putting back
-/// what it changed (see [`abort`]), and report it.
+/// Handle `abort`: abandon the consolidation or pick in progress, putting back what it changed
+/// (see [`abort`]), and report it. A bay holds at most one: each refuses to start over the other.
 ///
 /// # Arguments
-/// * `kind`    - Which kind of merge to abort.
 /// * `confirm` - Whether to discard the changes made since the merge to the files it touched.
 ///
 /// # Returns
 /// * `Ok(())`      - If the merge was aborted.
-/// * `Err(String)` - If none of that kind is in progress, the abort would discard changes made
-///                   since the merge and `confirm` is not set, or the abort failed.
-pub async fn handle_command(kind: MergeKind, confirm: bool) -> Result<(), String> {
-    let aborted = abort(kind, confirm, kind.abort_command()).await?;
+/// * `Err(String)` - If no merge is in progress, the abort would discard changes made since the
+///                   merge and `confirm` is not set, or the abort failed.
+pub async fn handle_command(confirm: bool) -> Result<(), String> {
+    let kind = match (merge_utils::read_consolidation_state()?, cherry_pick_utils::read_state()?) {
+        (Some(_), _) => MergeKind::Consolidation,
+        (None, Some(_)) => MergeKind::Pick,
+        (None, None) => return Err("No consolidation or pick is in progress; there is nothing to abort.".to_string()),
+    };
+
+    let aborted = abort(kind, confirm, ABORT_COMMAND).await?;
     output::emit(&aborted);
     Ok(())
 }
@@ -103,7 +103,7 @@ pub(crate) async fn abort(kind: MergeKind, confirm: bool, command: &str) -> Resu
             other: state.source.clone(),
             source: Source::Parcel(state.source),
         },
-        (_, consolidation, pick) => return Err(nothing_to_abort(kind, consolidation.is_some(), pick.is_some())),
+        _ => return Err(format!("No {} is in progress; there is nothing to abort.", kind.noun())),
     };
 
     load_guard_utils::check_no_incomplete_load()?;
@@ -406,20 +406,6 @@ fn removal_hint(kind: MergeKind) -> String {
     }
 }
 
-/// The refusal for an abort with nothing of `kind` in progress, naming the other kind's abort when
-/// that one is.
-fn nothing_to_abort(kind: MergeKind, consolidation: bool, pick: bool) -> String {
-    match kind {
-        MergeKind::Consolidation if pick => format!(
-            "No consolidation is in progress, but a pick is: \"{}\" aborts it.", MergeKind::Pick.abort_command()
-        ),
-        MergeKind::Pick if consolidation => format!(
-            "No pick is in progress, but a consolidation is: \"{}\" aborts it.", MergeKind::Consolidation.abort_command()
-        ),
-        _ => format!("No {} is in progress; there is nothing to abort.", kind.noun()),
-    }
-}
-
 /// The `confirmation_required` refusal for an abort that would discard the changes made since the
 /// merge to `files`, which its details list, naming `command` with `--confirm`.
 fn discard_refusal(kind: MergeKind, files: &[String], command: &str) -> String {
@@ -444,7 +430,7 @@ fn discard_refusal(kind: MergeKind, files: &[String], command: &str) -> String {
 
 /// The result of an abort.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub(crate) struct Aborted {
     /// What was aborted: `consolidation` or `pick`.
     kind: String,
@@ -492,10 +478,65 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use forklift_core::util::operation_utils::RecoveryOutcome;
+    use forklift_core::util::stocktake_utils;
+    use super::*;
+    use crate::test_support::{self, Warehouse};
 
     thread_local! {
         /// Run after the abort rebuilt the inventory and before it clears the in-progress state:
         /// where an interrupted abort stops.
         pub(super) static BEFORE_STATE_CLEAR: RefCell<Option<Box<dyn FnOnce() -> Result<(), String>>>> = RefCell::new(None);
+    }
+
+    /// An abort interrupted after it put the files back, with the consolidation state still
+    /// recorded, must not read as a take-ours resolution: `stack` would record a merge parcel
+    /// holding none of their changes. The marker refuses the stack, and `heal` finishes the abort.
+    #[test]
+    fn an_abort_interrupted_before_clearing_the_state_cannot_be_stacked_and_heal_finishes_it() {
+        let warehouse = Warehouse::with_working_tree("merge-abort-crash");
+        test_support::configure_operator();
+
+        let base = test_support::store_parcel(&test_support::store_files(&[("a.txt", b"base\n"), ("b.txt", b"base\n")]), &[]);
+        let our_tree = test_support::store_files(&[("a.txt", b"ours\n"), ("b.txt", b"base\n")]);
+        let our_head = test_support::store_parcel(&our_tree, &[&base]);
+        let their_head = test_support::store_parcel(
+            &test_support::store_files(&[("a.txt", b"theirs\n"), ("b.txt", b"theirs\n"), ("new.txt", b"new\n")]),
+            &[&base],
+        );
+
+        pallet_utils::update_pallet_head("main", None, &our_head, &pallet_utils::RefPreconditions::NONE).unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", Some(our_head.clone()))).unwrap();
+        pallet_utils::update_pallet_head("feature", None, &their_head, &pallet_utils::RefPreconditions::NONE).unwrap();
+        test_support::check_out(&our_tree);
+
+        test_support::block_on(consolidate::handle_command("feature")).unwrap();
+        assert!(merge_utils::read_consolidation_state().unwrap().is_some(), "sanity: the merge stopped at a conflict");
+
+        BEFORE_STATE_CLEAR.with(|seam| seam.replace(Some(Box::new(|| Err("crashed".to_string())))));
+        let error = test_support::block_on(abort(MergeKind::Consolidation, false, ABORT_COMMAND))
+            .unwrap_err();
+        assert_eq!(error, "crashed");
+        operation_utils::forget_raised_for_tests();
+
+        assert!(merge_utils::read_consolidation_state().unwrap().is_some(), "sanity: the crash left the state recorded");
+        let refused = test_support::block_on(crate::commands::stack::handle_command(Some("after crash".to_string())))
+            .expect_err("a stack over an interrupted abort must be refused");
+        assert!(refused.contains("forklift heal"), "{}", refused);
+        assert_eq!(pallet_utils::get_pallet_head("main").unwrap().as_deref(), Some(our_head.as_str()));
+
+        let recovery = operation_utils::recover().unwrap().expect("a marker stands");
+        assert_eq!((recovery.operation, recovery.outcome), (OperationKind::Merge, RecoveryOutcome::RolledBack));
+
+        assert!(test_support::file_holds(&warehouse.root, "a.txt", b"ours\n")
+                && test_support::file_holds(&warehouse.root, "b.txt", b"base\n")
+                && !warehouse.root.join("new.txt").exists(),
+            "the working tree must be back at the head the merge started from");
+        let staged = test_support::block_on(stocktake_utils::collect_staged_changes(Some(&our_tree))).unwrap();
+        let unstaged = test_support::block_on(stocktake_utils::collect_unstaged_changes()).unwrap();
+        assert!(staged.is_empty() && unstaged.is_empty(),
+            "the inventory must be back at our tree: staged {:?}, unstaged {:?}", staged.len(), unstaged.len());
+        assert!(merge_utils::read_consolidation_state().unwrap().is_none(), "heal clears the consolidation");
+        assert!(operation_utils::read().unwrap().is_none(), "recovery clears the marker");
     }
 }
