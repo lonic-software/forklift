@@ -23,10 +23,12 @@ $ forklift --version
 forklift …
 ```
 
-**Tip: type `fl`.** Most people alias `forklift` to something shorter. In bash or zsh, add
-`alias fl=forklift` to your `~/.bashrc` or `~/.zshrc`; in PowerShell, add `Set-Alias fl forklift`
-to your `$PROFILE`. This page writes `forklift` in full, so its commands work as pasted, with or
-without the alias.
+**Tip: type `fl`.** The installers also put a short name for the CLI, `fl`, next to `forklift`, so
+`fl stocktake` is `forklift stocktake`. If `fl` is not there (you installed another way, or set
+`FORKLIFT_NO_ALIAS=1`), `forklift self alias install` creates it; see
+[`self alias`](cli.md#self-alias--the-fl-short-name). In PowerShell, `fl` already means
+`Format-List`, which wins over a program of that name, so type `forklift` there. This page writes
+`forklift` in full, so its commands work as pasted everywhere.
 
 You need no account and no configuration. Forklift identifies you by an opaque **operator id**,
 minted the first time you record anything. One machine can act as different operators in different

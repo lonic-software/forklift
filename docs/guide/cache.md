@@ -18,7 +18,8 @@ prints. A `…` stands for text that differs on your machine. A word in angle br
 output.
 
 The test suite runs this page, as it runs the tutorial
-(`crates/forklift/tests/integration/guide_pages.rs`), so the page cannot drift from the CLI.
+(`crates/forklift/tests/integration/guide_pages.rs`), so the page cannot drift from the CLI. The
+two sections after the last step describe refusals, which it does not run.
 
 ## 1. A project with some history
 
@@ -144,12 +145,12 @@ This warehouse is a cache: it may lack content its history reaches. Signatures a
 
 `diff`, `shift` and every other command that reads content do the same. A command that writes
 files into the working folder, such as `shift` or `lower`, fetches everything it is about to write
-in one batch first, so it never stops halfway through changing the folder.
+in one batch first, so a file it cannot fetch stops it before it changes anything.
 
 ## 5. Work as usual
 
-Stacking, lifting and lowering work as in any clone. A lift from a cache uploads only the new work,
-and a lower fetches the new head's files and nothing older:
+Stacking, lifting and lowering work as in any clone, and a lift from a cache uploads only the new
+work:
 
 ```console
 $ echo 'castle, with a moat' > maps/castle.map
@@ -163,32 +164,33 @@ Lifted pallet "main" to …: 1 new parcel(s), … object(s) and 1 signature(s) u
 ## 6. Give the disk back
 
 What a read fetched stays, so a cache grows as you look at older versions. `store evict` deletes
-whatever the origin holds and nothing here needs, and records each object it frees by its hash, so a
-later read fetches it again. `--dry-run` shows what it would free:
+whatever the origin holds and nothing here needs, and records what it freed, so a later read
+fetches it again. `--dry-run` shows what it would free:
 
 ```console
 $ forklift store evict --dry-run
-Dry run: evicting would free … object(s).
-… object(s) were kept because a checkout's files stand on them.
-… object(s) were kept for metadata, trust records, staged work, or a parked or in-progress operation.
+Dry run: evicting would free 6 object(s).
+5 object(s) were kept because a checkout's files stand on them.
+7 object(s) were kept for metadata, trust records, staged work, or a parked or in-progress operation.
 $ forklift store evict
-Evicted … object(s), freeing … B; reading one fetches it again from the origin.
-… object(s) were kept because a checkout's files stand on them.
-… object(s) were kept for metadata, trust records, staged work, or a parked or in-progress operation.
+Evicted 6 object(s), freeing … B; reading one fetches it again from the origin.
+5 object(s) were kept because a checkout's files stand on them.
+7 object(s) were kept for metadata, trust records, staged work, or a parked or in-progress operation.
 ```
 
 It keeps the files of every checkout, every parcel and signature, the office and other metadata,
 and anything only this warehouse has, such as stacked work not lifted yet. It first asks the origin
 which history it holds, so it never frees something the origin could not give back.
 
-The first draft is gone from the disk, held by its hash again, and reading it fetches it again:
+Both older versions are gone from the disk: `audit` counts the two parcels' folders as held by
+hash alone, and reading the first draft fetches it again:
 
 ```console
 $ forklift audit
 Office chain verified back to genesis ….
 Pallet "main" verified: 3 signed parcel(s) valid.
 This warehouse is a cache: it may lack content its history reaches. Signatures are verified in full; every tree it holds was re-hashed and every blob and chunk it names confirmed present, except those held by hash below.
-… absent object(s) are held by hash alone: each is pinned to the hash a parent that is present commits, but is not on disk, and nothing beneath it was checked.
+2 absent object(s) are held by hash alone: each is pinned to the hash a parent that is present commits, but is not on disk, and nothing beneath it was checked.
 $ forklift show <first>:maps/forest.map
 forest, first draft
 ```
@@ -203,8 +205,9 @@ with exit 36 (`cache_miss`): the object "is not in this cache warehouse, and its
 be reached to fetch it", and the next step it names is to run the command again once the origin
 can be reached.
 
-Run it again once the origin is back. A command that refuses this way has changed nothing in the
-working folder; whatever it fetched before refusing stays in the cache. `store evict` needs the
+Run it again once the origin is back. A read such as `show` changes nothing else, and a command
+that writes the working folder refuses before its first change to it; whatever either fetched
+before refusing stays in the cache. `store evict` needs the
 origin too, and refuses without it.
 
 ## A cache talks only to its origin
