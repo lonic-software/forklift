@@ -11332,6 +11332,16 @@ fn unsigned_metadata_lifts_and_lowers_through_a_server_that_never_enrolled() {
     assert!(!warning.contains("\"pallets_unvouched\""), "{}", warning);
     assert_eq!(stdout(&area.forklift("b", &["manifest", "get", "main", "ci"])).trim(), "blue");
 
+    // An operator with no key here can only get one, or drop the change the remote has a head
+    // to keep.
+    assert_success(&area.forklift("b", &["config", "set", "operator.identifier", "bob@forklift"]));
+    let keyless = area.forklift("b", &["lift"]);
+    assert!(!keyless.status.success(), "{}", stdout(&keyless));
+    let said = stderr(&keyless);
+    assert!(said.contains("\"forklift profile keygen\""), "{}", said);
+    assert!(said.contains("\"forklift lower --keep @kv:") && said.contains("/ci=theirs --confirm\""), "{}", said);
+    assert_success(&area.forklift("b", &["config", "unset", "operator.identifier"]));
+
     // Its operator holds a key now, so the lift re-signs the change and lands it as one signed
     // parcel on the remote head; the unvouched parcel never leaves the clone.
     let remote_kv = remote_pallet_head(&server, "@kv").expect("the remote holds @kv");
@@ -11409,6 +11419,60 @@ fn a_re_signed_lift_whose_local_head_did_not_move_catches_up_without_a_conflict(
     let again = area.forklift("b", &["lift"]);
     assert_success(&again);
     assert!(!stdout(&again).contains("@kv"), "{}", stdout(&again));
+}
+
+/// Another operator's change from before trust is never re-signed: the lift names it, and keeping
+/// theirs drops it even from a pallet the remote does not hold yet, leaving a signed root with
+/// no cells in place of the unvouched head.
+#[test]
+fn another_operators_pre_trust_change_drops_to_an_empty_signed_root() {
+    let area = TestArea::new("unsigned-meta-empty-root");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/code.txt", "v1\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    // On the clone, someone else tags without a key; then the remote enrolls.
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
+    assert_success(&area.forklift("b", &["config", "set", "operator.identifier", "bob@forklift"]));
+    assert_success(&area.forklift("b", &["tag", "create", "v1.0", "main"]));
+    assert_success(&area.forklift("b", &["config", "unset", "operator.identifier"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "c"]));
+    assert_success(&area.forklift("c", &["office", "enroll"]));
+    assert_success(&area.forklift("c", &["lift"]));
+    assert_success(&area.forklift("b", &["lower"]));
+
+    // With no remote head even dropping the change needs a key, to sign the empty root.
+    assert_success(&area.forklift("b", &["config", "set", "operator.identifier", "bob@forklift"]));
+    let keyless = area.forklift("b", &["lift"]);
+    assert!(!keyless.status.success(), "{}", stdout(&keyless));
+    let said = stderr(&keyless);
+    assert!(said.contains("\"forklift profile keygen\"") && said.contains("\"office admit\""), "{}", said);
+    assert!(!said.contains("--keep"), "{}", said);
+    assert_success(&area.forklift("b", &["config", "unset", "operator.identifier"]));
+
+    let refused = area.forklift("b", &["lift"]);
+    assert!(!refused.status.success(), "{}", stdout(&refused));
+    let said = stderr(&refused);
+    assert!(said.contains("The cell v1.0 ") && said.contains("another operator (bob@forklift)"), "{}", said);
+    assert_eq!(remote_pallet_head(&server, "@tags"), None);
+
+    let dropped = area.forklift("b", &["lower", "--keep", "@tags:v1.0=theirs", "--confirm"]);
+    assert_success(&dropped);
+    let root = area.read_file("b/.forklift/meta/tags").trim().to_string();
+    assert_eq!(remote_pallet_head(&server, "@tags"), Some(root));
+    assert!(!stdout(&area.forklift("b", &["tag", "list"])).contains("v1.0"));
+
+    let again = area.forklift("b", &["lift"]);
+    assert_success(&again);
+    assert!(!stdout(&again).contains("@tags"), "{}", stdout(&again));
+    let audit = area.forklift("c", &["lower"]);
+    assert_success(&audit);
+    let audit = area.forklift("c", &["audit", "@tags"]);
+    assert_eq!(audit.status.code(), Some(0), "{}{}", stdout(&audit), stderr(&audit));
 }
 
 #[test]
