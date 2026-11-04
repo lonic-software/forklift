@@ -46,12 +46,13 @@ struct Step {
     expected: Vec<String>,
 }
 
-/// Whether `text`, the inside of an HTML comment, reads as a machine marker: `machine` in any
-/// case, then a colon, after any hyphens and spaces.
+/// Whether `text`, the inside of an HTML comment, reads as a machine marker: after any hyphens
+/// and spaces, it starts with `machine` in any case, not as part of a hyphenated word such as
+/// `machine-readable`. A near miss such as `machines: bob` reads as one, to be refused.
 fn names_a_machine(text: &str) -> bool {
     let text = text.trim_start_matches(|c: char| c == '-' || c.is_whitespace());
     text.get(..7).is_some_and(|word| word.eq_ignore_ascii_case("machine"))
-        && text[7..].trim_start().starts_with(':')
+        && !text[7..].starts_with('-')
 }
 
 /// The machine a `<!-- machine: NAME -->` line names, `None` for any other line, and an error
@@ -99,7 +100,9 @@ fn parse_steps(page: &str) -> Result<Vec<Step>, String> {
     for (index, line) in page.lines().enumerate() {
         let number = index + 1;
         let trimmed = line.trim_start();
-        let one_line_comment = trimmed.starts_with("<!--") && trimmed.trim_end().ends_with("-->");
+        // Indented four spaces or more, a `<!--` is the text of a code block, not a comment.
+        let opens_comment = trimmed.starts_with("<!--") && line.len() - trimmed.len() < 4;
+        let one_line_comment = opens_comment && trimmed.trim_end().ends_with("-->");
         let starts_code = std::mem::replace(
             &mut code_may_start,
             trimmed.is_empty()
@@ -108,14 +111,20 @@ fn parse_steps(page: &str) -> Result<Vec<Step>, String> {
                 || one_line_comment,
         );
 
-        if in_comment || (!in_block && trimmed.starts_with("<!--") && !one_line_comment) {
+        if in_comment || (!in_block && opens_comment && !one_line_comment) {
             if names_a_machine(trimmed.trim_start_matches("<!--")) {
                 return Err(format!(
                     "line {}: a machine marker split over lines; write it as \
                     `<!-- machine: NAME -->` on one line", number
                 ));
             }
-            in_comment = !line.contains("-->");
+            // Open after this line if a comment opens after the last one closes.
+            in_comment = match (line.rfind("<!--"), line.rfind("-->")) {
+                (Some(open), Some(close)) => open > close,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => in_comment,
+            };
             code_may_start = !in_comment;
             continue;
         }
@@ -203,6 +212,9 @@ fn parse_steps(page: &str) -> Result<Vec<Step>, String> {
     if in_block {
         return Err("the last console block is never closed".to_string());
     }
+    if in_comment {
+        return Err("a comment is never closed, which hides the rest of the page".to_string());
+    }
 
     if let Some(step) = steps.iter().find(|step| step.command.is_empty()) {
         return Err(format!("line {}: an empty console block", step.line));
@@ -212,10 +224,12 @@ fn parse_steps(page: &str) -> Result<Vec<Step>, String> {
     // would otherwise bind any word and check nothing.
     let mut uses: HashMap<&str, (usize, usize)> = HashMap::new();
     for step in &steps {
-        for text in std::iter::once(&step.command).chain(&step.expected) {
+        // A step's output lines are the lines straight after its `$` line.
+        let lines = std::iter::once(&step.command).chain(&step.expected).zip(step.line..);
+        for (text, line) in lines {
             let mut rest = text.as_str();
             while let Some((_, end, name)) = next_placeholder(rest) {
-                uses.entry(name).or_insert((step.line, 0)).1 += 1;
+                uses.entry(name).or_insert((line, 0)).1 += 1;
                 rest = &rest[end..];
             }
         }
@@ -340,29 +354,39 @@ fn pieces(pattern: &str) -> Vec<Piece<'_>> {
 }
 
 /// Whether `actual` matches `pieces`, binding placeholders not yet in `bound`; on a match,
-/// `bound` holds the new bindings too, and otherwise it is as it was.
-fn pieces_match(pieces: &[Piece], actual: &str, bound: &mut HashMap<String, String>) -> bool {
+/// `bound` holds the new bindings too, and otherwise it is as it was. `previous` is the character
+/// just before `actual` in the line, if any.
+fn pieces_match(
+    pieces: &[Piece],
+    actual: &str,
+    previous: Option<char>,
+    bound: &mut HashMap<String, String>,
+) -> bool {
     let Some((piece, rest)) = pieces.split_first() else {
         return actual.is_empty();
     };
+    let last = |text: &str| text.chars().next_back().or(previous);
 
     match piece {
-        Piece::Text(text) => {
-            actual.strip_prefix(text).is_some_and(|after| pieces_match(rest, after, bound))
-        }
+        Piece::Text(text) => actual
+            .strip_prefix(text)
+            .is_some_and(|after| pieces_match(rest, after, last(text), bound)),
         Piece::Elided => actual
             .char_indices()
             .map(|(at, _)| at)
             .chain([actual.len()])
-            .any(|at| pieces_match(rest, &actual[at..], bound)),
+            .any(|at| pieces_match(rest, &actual[at..], last(&actual[..at]), bound)),
         Piece::Placeholder(name) => {
-            // A word ends where a letter or digit does not follow, so a bound `0c80` is not the
-            // start of `0c80c7`.
+            // A word starts and ends where no letter or digit is next to it, so a bound `0c80`
+            // is neither the start nor the end of `dead0c80c7`.
+            if previous.is_some_and(char::is_alphanumeric) {
+                return false;
+            }
             let ends_word =
                 |after: &str| !after.starts_with(|c: char| c.is_alphanumeric());
             if let Some(value) = bound.get(*name).cloned() {
                 let after = actual.strip_prefix(value.as_str()).filter(|after| ends_word(after));
-                return after.is_some_and(|after| pieces_match(rest, after, bound));
+                return after.is_some_and(|after| pieces_match(rest, after, last(&value), bound));
             }
             // The longest word first, so `<key>.` binds the key without the full stop.
             let word = actual.find(char::is_whitespace).unwrap_or(actual.len());
@@ -372,7 +396,7 @@ fn pieces_match(pieces: &[Piece], actual: &str, bound: &mut HashMap<String, Stri
             ends.reverse();
             for end in ends {
                 bound.insert(name.to_string(), actual[..end].to_string());
-                if pieces_match(rest, &actual[end..], bound) {
+                if pieces_match(rest, &actual[end..], last(&actual[..end]), bound) {
                     return true;
                 }
                 bound.remove(*name);
@@ -385,7 +409,7 @@ fn pieces_match(pieces: &[Piece], actual: &str, bound: &mut HashMap<String, Stri
 /// Whether `actual` is `pattern` with each [`ELISION`] standing for any text, including none, and
 /// each `<name>` for one word, bound on its first use and the same on every later one.
 fn line_matches(pattern: &str, actual: &str, bound: &mut HashMap<String, String>) -> bool {
-    pieces_match(&pieces(pattern), actual, bound)
+    pieces_match(&pieces(pattern), actual, None, bound)
 }
 
 /// Whether the printed lines match the page's lines one for one; on a match, `bound` holds the
@@ -801,6 +825,9 @@ fn a_placeholder_stands_for_one_word_and_binds_it() {
     let mut short = HashMap::from([("key".to_string(), "0c80".to_string())]);
     assert!(!line_matches("key <key>…", "key 0c80c7", &mut short));
     assert!(line_matches("key <key>…", "key 0c80, then", &mut short));
+    assert!(!line_matches("key …<key>", "key dead0c80", &mut short));
+    assert!(!line_matches("key x<key>", "key x0c80", &mut short));
+    assert!(line_matches("key …<key>", "key (0c80", &mut short));
     assert!(line_matches("<a> and <a>", "x and x", &mut HashMap::new()));
     assert!(!line_matches("<a> and <a>", "x and y", &mut HashMap::new()));
 
@@ -886,10 +913,19 @@ fn machine_markers_name_the_machine_each_block_runs_on() {
     assert!(refused("<!---machine: ada -->\n"));
     assert!(refused("<!--\nmachine: ada\n-->\n"));
     assert!(refused("<!-- machine: ada\n-->\n"));
+    assert!(refused("<!-- machines: bob -->\n"));
+    assert!(refused("<!-- machine bob -->\n"));
+
+    // A comment that never closes hides the rest of the page; one that closes and reopens on a
+    // line stays open; one indented as code is not a comment.
+    assert!(refused("<!-- a note -\n```console\n$ a\n```\n"));
+    let hidden = "<!--\na\n--> <!-- b\n```console\n$ hidden\n```\n-->\n";
+    assert!(parse_steps(hidden).unwrap().is_empty());
+    assert!(refused("text\n\n    <!-- example\n```console\n$ a\n```\n-->\n"));
 
     // Other comments are prose, on one line or several, and an indented line after a comment
     // starts a code block as it would after a blank line.
-    assert!(parse_steps("<!-- machine-readable output -->\n<!-- Machines differ -->\n").is_ok());
+    assert!(parse_steps("<!-- machine-readable output -->\n<!-- A machine differs -->\n").is_ok());
     assert!(parse_steps("<!--\nA note about the machine.\n-->\n").is_ok());
     assert!(refused("<!-- machine: ada -->\n    forklift lower\n"));
 }
@@ -898,7 +934,7 @@ fn machine_markers_name_the_machine_each_block_runs_on() {
 fn a_placeholder_used_once_is_refused() {
     let page = "```console\n$ a\nid <id>\n$ b <id>\nrecheck <idd>\n```\n";
     let error = parse_steps(page).unwrap_err();
-    assert!(error.contains("line 4: <idd> is used only once"), "{}", error);
+    assert!(error.contains("line 5: <idd> is used only once"), "{}", error);
 
     assert!(parse_steps("```console\n$ a\nid <id>\n$ b <id>\n```\n").is_ok());
 }
