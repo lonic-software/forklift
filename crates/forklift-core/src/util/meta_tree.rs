@@ -2967,6 +2967,48 @@ mod tests {
     }
 
     #[test]
+    fn under_trust_an_unsigned_parcel_is_admitted_only_from_inside_the_boundary() {
+        let _scratch = Scratch::new("verify-legacy");
+        let alice = Key::new("alice", 1);
+        let office = office(&[&alice.record]);
+        let under = |boundary: &[String], old: Option<&str>, new: &str| {
+            verify_meta_content(PALLET, &TestRules, Some(&office), boundary, Admission::Admit, old, new)
+        };
+
+        let first = forge_unsigned(&[], cells(&[("x", &declared_cell("alice", "1"))]).as_deref(), "alice");
+        let second_cells = apply_edits(Some(&cells_of(&first).unwrap()), &[set("y", &declared_cell("alice", "2"))]).unwrap();
+        let second = forge_unsigned(&[&first], second_cells.as_deref(), "alice");
+
+        // Reachable from the boundary: written before the warehouse enrolled.
+        under(&[first.clone()], None, &first).unwrap();
+        under(&[second.clone()], None, &second).unwrap();
+
+        // Stacked past it, or with no boundary at all, it was written after trust.
+        for (boundary, refused) in [(vec![first.clone()], &second), (Vec::new(), &first)] {
+            let error = under(&boundary, None, &second).unwrap_err();
+            assert!(error.contains(refused.as_str()) && error.contains("after trust was established"), "{}", error);
+        }
+
+        // A signed parcel continues the pre-trust history, leaving its cells as they are.
+        let signed_cells = apply_edits(Some(&cells_of(&first).unwrap()), &[set("z", &cell(alice.id(), "3"))]).unwrap();
+        let signed = forge(&[&first], &kv(), signed_cells.as_deref(), &alice.signer());
+        under(&[first.clone()], Some(&first), &signed).unwrap();
+        under(&[first.clone()], None, &signed).unwrap();
+
+        // Inside the boundary a parcel is still judged as declared: a cell naming another
+        // operator refuses.
+        let forged_cells = apply_edits(Some(&cells_of(&first).unwrap()), &[set("w", &declared_cell("bob", "4"))]).unwrap();
+        let forged = forge_unsigned(&[&first], forged_cells.as_deref(), "alice");
+        let error = under(&[forged.clone()], None, &forged).unwrap_err();
+        assert!(error.contains("operator bob"), "{}", error);
+
+        // A boundary this store cannot resolve says so, rather than alleging anything.
+        let never = object_utils::hash_object_bytes(b"a boundary head this store never had");
+        let error = under(&[never.clone()], None, &first).unwrap_err();
+        assert!(error.contains(&never) && error.contains("cannot resolve"), "{}", error);
+    }
+
+    #[test]
     fn a_declared_cell_naming_another_operator_is_refused() {
         let _scratch = Scratch::new("verify-declared-forged");
         let head = forge_unsigned(&[], cells(&[("x", &declared_cell("alice", "1"))]).as_deref(), "alice");
@@ -3464,6 +3506,34 @@ mod tests {
         // Admitted history is audited without the role rule: a tagger demoted since is no
         // reason to refuse what an admit already took.
         verify_tags(&office, Admission::Audit, Some(&by_admin), &by_writer).unwrap();
+    }
+
+    #[test]
+    fn a_tag_from_before_trust_is_admitted_without_its_role_and_a_signed_one_is_not() {
+        let _scratch = Scratch::new("tags-legacy");
+        let (alice, bob) = (Key::new("alice", 1), Key::new("bob", 2));
+        let office = office_with_roles(&[(&alice, office_utils::Role::Admin), (&bob, office_utils::Role::Writer)]);
+        let subject = "ab".repeat(32);
+
+        // Bob tagged before the warehouse enrolled, when there were no roles.
+        let mut table = Table::new();
+        table.insert("subject", toml_edit::value(&subject));
+        table.insert("message", toml_edit::value("release"));
+        table.insert("tagged_at", toml_edit::value(7));
+        let declared = store_blob(&encode_cell(&Stamp::Operator("bob".to_string()), tag_utils::TAG_SCHEMA, &table)).unwrap();
+        let cells = cells(&[("v1.0", &declared)]);
+        let tree = store_meta_tree(MetaKind::Tags.format_marker().as_bytes(), cells.as_deref()).unwrap();
+        let legacy = stack_meta_parcel(tree, Vec::new(), &actor("bob"), "tag", None).unwrap();
+
+        let boundary = [legacy.clone()];
+        verify_meta_content("tags", &tag_utils::TagsRules, Some(&office), &boundary, Admission::Admit, None, &legacy).unwrap();
+
+        // The same writer signing a tag after trust is held to the role rule.
+        let signed = tags_parcel(Some(&legacy), &bob, &[set("v1.1", &tag_cell(bob.id(), &subject))]);
+        let error = verify_meta_content(
+            "tags", &tag_utils::TagsRules, Some(&office), &boundary, Admission::Admit, Some(&legacy), &signed,
+        ).unwrap_err();
+        assert!(error.contains("v1.1") && error.contains("not an admin"), "{}", error);
     }
 
     #[test]
