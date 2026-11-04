@@ -8012,9 +8012,9 @@ fn a_usage_error_under_json_is_one_failure_document_with_exit_2() {
     assert!(usage.contains("Usage: forklift"), "details keep clap's full text: {}", usage);
     assert!(stderr(&unknown).is_empty(), "nothing else is printed: {}", stderr(&unknown));
 
-    // A bad argument to a command named by alias (`a` is `audit`), with `--json` after the
+    // A bad argument to a command named by prefix (`au` is `audit`), with `--json` after the
     // command: the flag is found wherever it sits, and the header carries the canonical name.
-    let bad_argument = warehouse.run(&["a", "--nope", "--json"]);
+    let bad_argument = warehouse.run(&["au", "--nope", "--json"]);
     assert_eq!(bad_argument.status.code(), Some(2));
     let value = json(&bad_argument);
     assert_eq!(value["error"]["code"], "usage");
