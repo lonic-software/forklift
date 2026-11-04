@@ -350,7 +350,8 @@ Forklift ships a short `fl` alias (`f` and `l` are both left-hand home row —
 quicker to type than `git`). It is a **shell-agnostic symlink** next to the
 `forklift` binary (a `.cmd` shim on Windows, where a symlink needs elevated
 privilege), not a per-shell alias — it works from scripts, non-interactive
-shells and every shell dialect alike, and one `ls`/`rm` finds or removes it.
+shells and every shell dialect alike, and one `ls`/`rm` finds or removes it. The one exception
+is PowerShell, whose built-in `fl` alias (`Format-List`) wins over any program named `fl`.
 
 Every installer (the curl script, `pult install`, and `self update` — see
 [`self update`](#self-update--check-for-and-apply-a-newer-release)) creates it
