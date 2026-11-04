@@ -81,7 +81,9 @@ Which parcels a pallet accepts depends on the warehouse's trust state:
    key, is refused: with no office there is nothing to verify it against. The pallet rules
    that judge roles (who may cut a tag, who may record a merge) do not apply, because there
    are no roles; the rules that judge authorship (only the opener writes `opened`, a review
-   lives under its writer's directory) apply to the declared operator.
+   lives under its writer's directory) apply to the declared operator. Nothing binds that
+   operator to whoever lifts the parcel, so these rules keep a parcel consistent with the name
+   it declares; they do not establish that the name is true.
 2. **Anchor lost** — no trust anchor while an office exists. Every write and every content
    check refuses until trust is restored.
 3. **Trusted** — an anchor and an office. Every parcel stacked after trust was established must
@@ -95,7 +97,8 @@ Which parcels a pallet accepts depends on the warehouse's trust state:
 In every state a parcel's format must stay its parent's, and its changed envelopes must parse,
 in a canonical tree with no empty subtrees. `verify_meta_content` checks each parcel this way,
 so by induction over the linear chain every cell at an accepted head names the writer that put
-it there: verifiably under trust, as declared when the warehouse never enrolled. A client
+it there: verifiably when a signed parcel wrote it, and only as declared when an unsigned one
+did (in a warehouse that never enrolled, or before a trusted one's boundary). A client
 writes in the state it reads, and its write refuses if an office or anchor appears before the
 head moves.
 
@@ -259,6 +262,9 @@ The pallet rules, checked wherever the content check runs:
   strictly valid value. A cell name not listed above is refused, so no cell is stored that no
   rule covers.
 
+For an unsigned parcel, "the operator" in these rules is the operator the parcel declares, so
+they hold the parcel to its own declaration; only a signature holds the writer to it.
+
 A review or comment of a newer schema is carried, and listed as unreadable. When a haul's
 `opened` or `state` cannot be read, the whole haul is listed as unreadable and every
 command addressing it refuses. Conflicts are resolved at any path from `<h>` down to a cell;
@@ -267,8 +273,10 @@ a haul's state — a close, a reopen, an update, a merge — are a conflict on `
 `ours` over the opener's update replays the old head, so only the opener can; anyone else keeps
 `theirs` and runs the merge or close again.
 
-A `merged` status names the parcel the merge stacked. The record is a signed claim by a writer of
-the target; a reader judges it on read against what its own warehouse holds, as its merge proof:
+A `merged` status names the parcel the merge stacked. Under trust the record is a signed claim by
+a writer of the target; an unsigned one is only as honest as the operator it declares, and in a
+warehouse that never enrolled anyone may record it. Either way, a reader judges it on read
+against what its own warehouse holds, as its merge proof:
 
 - `verified` — the parcel contains the haul's head, and the local target contains the parcel;
 - `refuted` (`head_not_contained`) — the parcel is held here and does not contain the head;
@@ -417,7 +425,14 @@ adopts = "<hash>"          # re-genesis only: the old office head, kept as attes
   office chain as attested history (see the trust guide, "Recovery: re-genesis").
 
 ## Threat model
-What local trust does and does not defend against, by attacker capability:
+What local trust does and does not defend against, by attacker capability. This is the model
+for parcels written under trust. A warehouse that never enrolled detects only damage: a hash
+exposes a byte changed inside an object, but anyone with write access can replace history with
+a self-consistent rewrite, and anyone who can lift can write parcels and cells under any
+operator's name. In a trusted warehouse the unsigned history from before the boundary is fixed
+by the anchor's `boundary` while that anchor stands, so it cannot be rewritten or added to, but
+the operator names in it were never checked. A re-genesis replaces the anchor and its boundary;
+class 2 below covers one made by an attacker.
 
 1. **No private keys, no warehouse write access** — cannot forge anything. Every object
    is content-addressed and every parcel is signed: modifying a byte changes the hash,
