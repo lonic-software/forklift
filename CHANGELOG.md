@@ -20,6 +20,11 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   `profile keygen`. Recorded text is always `-m`. Unique prefixes of command names work. See
   `docs/generated/commands.md`.
 - Destructive operations preview by default and act with `--confirm`; without it they exit 39.
+- **`lower` keeps your local changes.** It no longer needs a clean warehouse: staged and unstaged
+  changes the remote's new parcels leave alone come through the lower as they were. A lower that
+  would write, remove or replace a path holding a local change, or a folder above or below one,
+  refuses, names those paths and changes nothing. A lower during a consolidation or pick in
+  progress is refused.
 - `restore --staged` is gone; use `unload`.
 - MCP tools are generated from the command tree.
 - `--json` documents are now at schema 20.

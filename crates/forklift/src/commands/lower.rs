@@ -1457,3 +1457,120 @@ mod tests {
         }
     }
 }
+
+/// A lower's local changes outlive every way its head write can end other than landing: the
+/// rollback a moved pallet forces, and heal's roll-forward or roll-back of an interrupted lower,
+/// each rebuild staging from the marker's carried entries.
+#[cfg(test)]
+mod carry_tests {
+    use forklift_core::util::operation_utils::{self, Operation, OperationKind, RecoveryOutcome};
+    use forklift_core::util::pallet_utils::{self, BayPosition, RefPreconditions};
+    use forklift_core::util::{file_utils, progress_utils::Progress, shift_utils, stocktake_utils};
+    use crate::test_support::{self, Warehouse};
+
+    /// The trees and heads of a bay on main at `start`, one parcel behind `remote`, which changes
+    /// only `app.txt`.
+    struct Behind { start_tree: String, start: String, remote_tree: String, remote: String }
+
+    /// Check `start` out on main, then stage an edit and a removal and leave an edit unstaged,
+    /// none of them to `app.txt`.
+    fn a_bay_behind_with_local_changes() -> Behind {
+        test_support::configure_operator();
+        let files = |app: &'static [u8]| [("app.txt", app), ("bob.txt", b"bob v1\n" as &[u8]), ("staged.txt", b"staged v1\n"), ("gone.txt", b"gone\n")];
+        let start_tree = test_support::store_files(&files(b"app v1\n"));
+        let start = test_support::store_parcel(&start_tree, &[]);
+        let remote_tree = test_support::store_files(&files(b"app v2\n"));
+        let remote = test_support::store_parcel(&remote_tree, &[&start]);
+
+        pallet_utils::update_pallet_head("main", None, &start, &RefPreconditions::NONE).unwrap();
+        pallet_utils::write_position(&BayPosition::new("main", Some(start.clone()))).unwrap();
+        test_support::check_out(&start_tree);
+
+        std::fs::write("staged.txt", "staged mine\n").unwrap();
+        std::fs::remove_file("gone.txt").unwrap();
+        test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
+        std::fs::write("bob.txt", "bob mine\n").unwrap();
+        // Old enough that a stat taken now proves whatever hash it is recorded with.
+        std::fs::OpenOptions::new().write(true).open("bob.txt").unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60)).unwrap();
+
+        Behind { start_tree, start, remote_tree, remote }
+    }
+
+    /// The bay's staged and unstaged changes against `tree`, as their JSON.
+    fn changes(tree: &str) -> (serde_json::Value, serde_json::Value) {
+        let staged = test_support::block_on(stocktake_utils::collect_staged_changes(Some(tree))).unwrap();
+        let unstaged = test_support::block_on(stocktake_utils::collect_unstaged_changes()).unwrap();
+        (serde_json::to_value(staged).unwrap(), serde_json::to_value(unstaged).unwrap())
+    }
+
+    /// Raise the lower's marker and write the remote's files, as a lower does before its head
+    /// write; returns the anchor and the carried entries.
+    fn lower_files(behind: &Behind) -> (file_utils::StatAnchor, Vec<shift_utils::CarriedEntry>) {
+        let anchor = file_utils::take_stat_anchor().unwrap();
+        let carried = test_support::block_on(shift_utils::collect_carried(Some(&behind.start_tree))).unwrap();
+        assert_eq!(carried.len(), 3, "{:?}", carried);
+
+        let mut operation = Operation::new(OperationKind::Lower, BayPosition::new("main", Some(behind.start.clone())),
+                                           Some(behind.start_tree.clone()), BayPosition::new("main", Some(behind.remote.clone())));
+        operation.target_tree = Some(behind.remote_tree.clone());
+        operation.expected = Some(behind.start.clone());
+        operation.carried = carried.clone();
+        operation_utils::raise(&operation).unwrap();
+
+        shift_utils::materialize_tree(Some(&behind.start_tree), &behind.remote_tree, "Lowering", anchor, &Progress::NONE, &carried).unwrap();
+        (anchor, carried)
+    }
+
+    /// Another bay moves main past the lower's start before its head write.
+    fn move_main_elsewhere(behind: &Behind) {
+        let elsewhere = test_support::store_parcel(&test_support::store_tree("other.txt", b"other\n"), &[&behind.start]);
+        pallet_utils::update_pallet_head("main", Some(&behind.start), &elsewhere, &RefPreconditions::NONE).unwrap();
+    }
+
+    // Revert: the rollback rebuilds without the carried entries → the staged changes are dropped.
+    #[test]
+    fn a_lower_rolled_back_by_a_moved_pallet_keeps_the_local_changes() {
+        let warehouse = Warehouse::with_working_tree("lower-carry-rollback");
+        let behind = a_bay_behind_with_local_changes();
+        let before = changes(&behind.start_tree);
+
+        let (anchor, carried) = lower_files(&behind);
+        assert_eq!(changes(&behind.remote_tree), before, "the lower itself carries them");
+        move_main_elsewhere(&behind);
+        shift_utils::write_head_or_roll_back("main", Some(&behind.start), &behind.remote, &RefPreconditions::NONE,
+                                             &behind.remote_tree, Some(&behind.start_tree), anchor, &carried)
+            .expect_err("a pallet another bay moved must roll the lower back");
+
+        assert!(test_support::file_holds(&warehouse.root, "app.txt", b"app v1\n"));
+        assert_eq!(changes(&behind.start_tree), before);
+    }
+
+    // Reverts: heal's roll-forward, or its roll-back, rebuilds without the marker's carried
+    // entries → the staged changes are dropped.
+    #[test]
+    fn heal_keeps_the_local_changes_of_an_interrupted_lower_rolled_either_way() {
+        for (name, moved) in [("lower-carry-heal-forward", false), ("lower-carry-heal-back", true)] {
+            let warehouse = Warehouse::with_working_tree(name);
+            let behind = a_bay_behind_with_local_changes();
+            let before = changes(&behind.start_tree);
+
+            lower_files(&behind);
+            operation_utils::forget_raised_for_tests();
+            if moved {
+                move_main_elsewhere(&behind);
+            }
+            let recovery = operation_utils::recover().unwrap().expect("the lower's marker stands");
+
+            let (outcome, tree, app) = match moved {
+                false => (RecoveryOutcome::RolledForward, &behind.remote_tree, b"app v2\n"),
+                true => (RecoveryOutcome::RolledBack, &behind.start_tree, b"app v1\n"),
+            };
+            assert_eq!(recovery.outcome, outcome, "{}", name);
+            assert!(recovery.unheld.is_empty(), "{}: {:?}", name, recovery.unheld);
+            assert!(test_support::file_holds(&warehouse.root, "app.txt", app), "{}", name);
+            assert_eq!(changes(tree), before, "{}", name);
+            drop(warehouse);
+        }
+    }
+}

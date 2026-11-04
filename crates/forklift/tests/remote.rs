@@ -565,7 +565,8 @@ fn a_prepared_warehouse_lowers_the_tracked_ignore_file() {
 
 /// A sparse clone whose scope leaves out the root holds the root ignore file in scope all
 /// the same: it is fetched and materialized, its rules are in force, and an edit to it stacks
-/// and travels both ways, while the other root files stay sealed.
+/// and travels both ways, while the other root files stay sealed. A staged edit in scope the
+/// remote leaves alone is carried through the sparse lower.
 #[test]
 fn a_sparse_franchise_keeps_the_root_ignore_file_in_scope() {
     let area = TestArea::new("sparse-ignore-file");
@@ -619,13 +620,17 @@ fn a_sparse_franchise_keeps_the_root_ignore_file_in_scope() {
     assert_success(&area.forklift("dev", &["load", "."]));
     assert_success(&area.forklift("dev", &["stack", "-m", "drop the log rule"]));
     assert_success(&area.forklift("dev", &["lift"]));
+    // A staged edit in scope that the remote's parcel leaves alone is carried through the lower.
+    area.write_file("sparse/src/a.txt", "a mine\n");
+    assert_success(&area.forklift("sparse", &["load", "src"]));
     assert_success(&area.forklift("sparse", &["lower"]));
     assert_eq!(area.read_file("sparse/.forkliftignore"), narrowed);
     assert!(!area.path("sparse/README").exists(), "the lowered root file stays sealed");
 
-    let status = area.forklift("sparse", &["stocktake"]);
-    assert_success(&status);
-    assert!(stdout(&status).contains("matches the inventory"), "{}", stdout(&status));
+    let status = area.forklift("sparse", &["--json", "stocktake"]);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert_eq!(json["data"]["staged"], serde_json::json!([{"kind": "modified", "path": "src/a.txt"}]), "{}", stdout(&status));
+    assert!(json["data"].get("unstaged").is_none(), "{}", stdout(&status));
 }
 
 /// The root ignore file is in scope without being a declared prefix, so the sparse verbs that

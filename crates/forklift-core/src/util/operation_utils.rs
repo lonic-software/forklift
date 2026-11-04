@@ -677,8 +677,9 @@ fn recover_operation(operation: &Operation) -> Result<(RecoveryOutcome, Vec<Stri
 fn roll_back(operation: &Operation) -> Result<(RecoveryOutcome, Vec<String>), String> {
     let source_tree = tree_or_empty(operation.source_tree.as_deref())?;
 
-    // Each of these checked the bay clean against the source before it wrote a file, so a file
-    // holding the tree it was writing is its output, and goes back. A merge's file that took both
+    // Each of these checked every path it writes clean against the source before it wrote a file
+    // (a lower carries local changes only where it writes nothing), so a file holding the tree it
+    // was writing is its output, and goes back. A merge's file that took both
     // sides' changes holds neither tree, so it stays, reported as a local change, beside any edit
     // made since the crash.
     let written_from = match operation.kind {
@@ -827,6 +828,35 @@ mod tests {
         let text = String::from_utf8(operation.to_bytes()).unwrap();
         let unknown = format!("{}bytes zz\n", text.trim_end_matches('\n').rsplit_once('\n').unwrap().0.to_string() + "\n");
         assert_eq!(Operation::from_bytes(unknown.as_bytes()), Err("is malformed.".to_string()));
+    }
+
+    // Revert: write the carried entries but drop them on the read → the round trip loses them.
+    #[test]
+    fn a_lower_record_reads_back_the_changes_it_carries() {
+        let mut operation = operation();
+        operation.kind = OperationKind::Lower;
+        operation.carried = vec![
+            CarriedEntry { path: "app.txt".to_string(), entry: Some(CarriedItem { hash: "f".repeat(64), item_type: DirEntryType::Executable, state: InventoryItemState::Normal }) },
+            CarriedEntry { path: "gone.txt".to_string(), entry: Some(CarriedItem { hash: "e".repeat(64), item_type: DirEntryType::Normal, state: InventoryItemState::Deleted }) },
+            CarriedEntry { path: "mv/from.txt".to_string(), entry: None },
+        ];
+        assert_eq!(Operation::from_bytes(&operation.to_bytes()), Ok(operation.clone()));
+
+        let text = String::from_utf8(operation.to_bytes()).unwrap();
+        let lines: Vec<&str> = text.strip_suffix('\n').unwrap().split('\n').collect();
+        let with_last = |last: &[&str]| [&lines[..lines.len() - 3], last].concat().join("\n") + "\n";
+        assert_eq!(with_last(&lines[lines.len() - 3..]), text, "the edits below change only the last entry");
+        for malformed in [
+            with_last(&["mv/from.txt", ""]),
+            with_last(&["mv/from.txt", "", "1 0"]),
+            with_last(&["mv/from.txt", &"e".repeat(64), ""]),
+            with_last(&["mv/from.txt", &"e".repeat(64), "1"]),
+            with_last(&["mv/from.txt", &"e".repeat(64), "1 99"]),
+            with_last(&["mv/from.txt", "zz", "1 0"]),
+            with_last(&["", "", ""]),
+        ] {
+            assert_eq!(Operation::from_bytes(malformed.as_bytes()), Err("is malformed.".to_string()), "{}", malformed);
+        }
     }
 
     #[test]

@@ -1895,6 +1895,18 @@ pub fn settle_head_write(pallet: &str,
 mod tests {
     use super::*;
 
+    // Reverts: drop the descendant half → "flip" goes unnamed; drop the ancestor half → "d/new.txt"
+    // and "old/new.txt" do.
+    #[test]
+    fn a_carried_path_overlaps_an_op_on_it_above_it_or_below_it_and_nothing_else() {
+        let write = |path: &str| FileOp::Write { path: path.to_string(), hash: "a".repeat(64), item_type: DirEntryType::Normal, is_new: true };
+        let ops = [write("app.txt"), write("flip/inner.txt"), write("d"), FileOp::Remove { path: "old/x.txt".to_string() }, write("ab/c.txt")];
+        let carried: Vec<CarriedEntry> = ["a", "app.txt", "d/new.txt", "d2/x.txt", "fli", "flip", "flip.txt", "old/new.txt", "old/x.txt", "safe.txt"]
+            .into_iter().map(|path| CarriedEntry { path: path.to_string(), entry: None }).collect();
+
+        assert_eq!(carried_overlaps(&carried, &ops, &["old".to_string()]), ["app.txt", "d/new.txt", "flip", "old/new.txt", "old/x.txt"]);
+    }
+
     #[test]
     fn a_head_write_another_bay_already_made_stands_and_touches_no_tree() {
         let root = std::env::temp_dir().join(format!("forklift-shift-same-move-{}", std::process::id()));
