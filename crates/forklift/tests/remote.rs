@@ -1190,6 +1190,10 @@ fn spike_a_lower_keeps_changes_the_remote_left_alone() {
     assert_success(&area.forklift("a", &["lift"]));
 
     area.write_file("b/bob.txt", "bob mine\n");
+    // An edit old enough that a stat taken now proves whatever hash it is recorded with.
+    let bob = area.path("b/bob.txt");
+    std::fs::OpenOptions::new().write(true).open(&bob).unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60)).unwrap();
     area.write_file("b/staged.txt", "staged mine\n");
     assert_success(&area.forklift("b", &["load", "staged.txt"]));
 
