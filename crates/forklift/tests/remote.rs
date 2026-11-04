@@ -1185,8 +1185,8 @@ fn backdate(path: &std::path::Path, seconds: u64) {
 ///
 /// Reverts: the lower's whole-bay clean check back → refused; the carried build dropped → the
 /// staged changes are demoted to unstaged ones and the backdated edit to `bob.txt`, proved
-/// against the tree's hash, vanishes; the rollup clear dropped → the unstaged removal hides
-/// behind the root's rollup; the kept state dropped → the staged removal comes back as unstaged.
+/// against the tree's hash, vanishes; the rollup clear dropped → every staged change hides behind
+/// the root's rollup, which still names the remote's tree; the kept state dropped → the staged removal comes back as unstaged.
 #[test]
 fn a_lower_keeps_the_local_changes_the_remote_left_alone() {
     let area = TestArea::new("lower-keeps-disjoint");
