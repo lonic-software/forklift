@@ -409,6 +409,7 @@ pub async fn record_unvouched_meta_heads(client: &RemoteClient,
     let mut judgement = LocalJudgement { judged: Vec::new(), unvouched: Vec::new() };
     let mut unvouched = Vec::new();
     let mut fetched = false;
+    let mut has_gap: Option<bool> = None;
 
     // Every meta ref on disk, as the install's precondition lists them.
     for name in pallet_utils::list_meta_pallets()?.iter().filter(|name| *name != office_utils::OFFICE_PALLET_NAME) {
@@ -423,9 +424,15 @@ pub async fn record_unvouched_meta_heads(client: &RemoteClient,
 
         // Only when the boundary has a gap, since a refusal past a complete boundary is final;
         // once for every pallet, and each head on its own: one the remote cannot serve stays
-        // missing, and the verdict past it stays a refusal.
+        // missing, and the verdict past it stays a refusal. A boundary that cannot be read is
+        // not refetched either: the head stays unvouched, as a refused one does.
         let mut refused_now = refused();
-        if refused_now && !fetched && !audit_utils::collect_reachable_present_noting_gaps(&anchor.boundary)?.1.is_empty() {
+        let gapped = refused_now && !fetched && *has_gap.get_or_insert_with(|| {
+            audit_utils::collect_reachable_present_noting_gaps(&anchor.boundary)
+                .map(|(_, gaps)| !gaps.is_empty())
+                .unwrap_or(false)
+        });
+        if gapped {
             fetched = true;
             for boundary_head in &anchor.boundary {
                 let _ = remote_utils::fetch_history_scoped(client, boundary_head, &format!("{}{}", pallet_utils::META_QUALIFIER, name), &Progress::NONE).await;
