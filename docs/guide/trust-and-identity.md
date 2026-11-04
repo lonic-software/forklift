@@ -45,13 +45,16 @@ Contents:
   signing off" — a full lockout is handled by re-genesis (§9) or by archiving and
   re-preparing the warehouse.
 
-Before enrolling, the operator an unsigned parcel or metadata cell names is who
-*claims* to have written it, like a git author line, and nothing checks the claim.
-A server does not match it to the token that lifted it, because lifting other
-people's history is ordinary: a merge carries a colleague's parcels, and a relay
-or mirror carries everyone's. The rules that keep a review or manifest entry under
-its writer's directory check that a parcel agrees with the name it declares, not
-that the name is true. Enrolling is what turns the name into proof.
+The operator an unsigned parcel or metadata cell names is who *claims* to have
+written it, like a git author line, and nothing checks that the claim is true. A
+server does not match it to the token that lifted it, because lifting other
+people's history is ordinary: lifting work you lowered from a colleague carries
+their parcels, and a relay or mirror carries everyone's parcels and metadata. The
+rules that keep a review or manifest entry under its writer's directory check only
+that a parcel agrees with the name it declares. This stays true after enrolling for
+everything unsigned from before the anchor: enrolling makes every parcel written
+*after* it prove its writer, but it does not prove who wrote the history it vouches
+for.
 
 ---
 

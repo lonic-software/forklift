@@ -97,7 +97,8 @@ Which parcels a pallet accepts depends on the warehouse's trust state:
 In every state a parcel's format must stay its parent's, and its changed envelopes must parse,
 in a canonical tree with no empty subtrees. `verify_meta_content` checks each parcel this way,
 so by induction over the linear chain every cell at an accepted head names the writer that put
-it there: verifiably under trust, as declared when the warehouse never enrolled. A client
+it there: verifiably when a signed parcel wrote it, and only as declared when an unsigned one
+did (in a warehouse that never enrolled, or before a trusted one's boundary). A client
 writes in the state it reads, and its write refuses if an office or anchor appears before the
 head moves.
 
@@ -261,6 +262,9 @@ The pallet rules, checked wherever the content check runs:
   strictly valid value. A cell name not listed above is refused, so no cell is stored that no
   rule covers.
 
+For an unsigned parcel, "the operator" in these rules is the operator the parcel declares, so
+they hold the parcel to its own declaration; only a signature holds the writer to it.
+
 A review or comment of a newer schema is carried, and listed as unreadable. When a haul's
 `opened` or `state` cannot be read, the whole haul is listed as unreadable and every
 command addressing it refuses. Conflicts are resolved at any path from `<h>` down to a cell;
@@ -269,8 +273,10 @@ a haul's state — a close, a reopen, an update, a merge — are a conflict on `
 `ours` over the opener's update replays the old head, so only the opener can; anyone else keeps
 `theirs` and runs the merge or close again.
 
-A `merged` status names the parcel the merge stacked. The record is a signed claim by a writer of
-the target; a reader judges it on read against what its own warehouse holds, as its merge proof:
+A `merged` status names the parcel the merge stacked. Under trust the record is a signed claim by
+a writer of the target; an unsigned one is only as honest as the operator it declares, and in a
+warehouse that never enrolled anyone may record it. Either way, a reader judges it on read
+against what its own warehouse holds, as its merge proof:
 
 - `verified` — the parcel contains the haul's head, and the local target contains the parcel;
 - `refuted` (`head_not_contained`) — the parcel is held here and does not contain the head;
@@ -419,7 +425,10 @@ adopts = "<hash>"          # re-genesis only: the old office head, kept as attes
   office chain as attested history (see the trust guide, "Recovery: re-genesis").
 
 ## Threat model
-What local trust does and does not defend against, by attacker capability:
+What local trust does and does not defend against, by attacker capability. This is the model
+for parcels written under trust. A warehouse that never enrolled, and the unsigned history
+from before a trusted one's boundary, defend only content: hashes still expose a changed byte,
+but anyone who can lift can write parcels and cells under any operator's name.
 
 1. **No private keys, no warehouse write access** — cannot forge anything. Every object
    is content-addressed and every parcel is signed: modifying a byte changes the hash,
