@@ -281,16 +281,18 @@ pub async fn stack_parcel(description: Option<String>,
         }
 
         let started_at = match (&consolidation, &cherry_pick) {
-            (Some(state), _) => Some(("consolidation", &state.our_head)),
-            (None, Some(state)) => Some(("pick", &state.our_head)),
+            (Some(state), _) => Some(("consolidation", &state.our_head, merge_utils::state_removal_hint_in(&bay_root()))),
+            (None, Some(state)) => Some(("pick", &state.our_head, cherry_pick_utils::state_removal_hint())),
             (None, None) => None,
         };
 
-        if let Some((what, our_head)) = started_at.filter(|(_, our_head)| position.base.as_ref() != Some(*our_head)) {
+        // Not "forklift abort": it puts back the head the merge was built on, which the bay no
+        // longer stands on, so it refuses here too.
+        if let Some((what, our_head, abandon)) = started_at.filter(|(_, our_head, _)| position.base.as_ref() != Some(*our_head)) {
             return Err(StackError::Other(format!(
                 "This {} was started on parcel {}, but this bay's files stand on {}. Nothing was \
-                stacked. Abort it, then redo it from where the bay stands.",
-                what, our_head, position.base.as_deref().unwrap_or("no parcel")
+                stacked. Abandon it ({}), then redo it from where the bay stands.",
+                what, our_head, position.base.as_deref().unwrap_or("no parcel"), abandon
             )));
         }
     }

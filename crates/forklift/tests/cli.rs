@@ -14432,3 +14432,20 @@ fn abort_puts_back_a_conflicted_pick() {
     let unstack = warehouse.run(&["undo"]);
     assert!(stdout(&unstack).contains("Undid stack") && stdout(&unstack).contains("(ours)"), "{}", stdout(&unstack));
 }
+
+#[test]
+fn park_refuses_a_pick_in_progress_even_with_its_conflicts_resolved() {
+    let warehouse = a_conflicted_consolidation("pick-park");
+    assert_success(&warehouse.run(&["abort"]));
+    let source = pallet_head_hash(&warehouse, "other");
+    assert_success(&warehouse.run(&["pick", &source]));
+
+    warehouse.write_file("f.txt", "resolved\n");
+    assert_success(&warehouse.run(&["load", "f.txt"]));
+
+    let refused = warehouse.run(&["park"]);
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("A pick is in progress") && stderr(&refused).contains("forklift abort"),
+        "{}", stderr(&refused));
+    assert_eq!(read(&warehouse, "f.txt"), "resolved\n", "nothing was parked");
+}
