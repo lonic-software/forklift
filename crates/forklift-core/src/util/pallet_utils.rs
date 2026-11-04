@@ -3348,20 +3348,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_removal_refuses_inside_a_bulk_store_session() {
-        let (root, _scope) = scratch("remove-bulk");
-        update_pallet_head("main", None, &hash('a'), &RefPreconditions::NONE).unwrap();
-
-        let session = file_utils::BulkStoreSession::open().unwrap();
-        let refused = remove_pallet_head_in(PalletNamespace::User, "main", &hash('a'), &RefPreconditions::NONE, Some(&deleting("main", &hash('a'))));
-        drop(session);
-
-        assert!(matches!(&refused, Err(RefUpdateError::Failed(message)) if message.contains("bulk store session")), "{:?}", refused);
-        assert_eq!(get_pallet_head("main").unwrap(), Some(hash('a')));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn a_witness_precondition_refuses_once_its_pallet_moved_and_lands_while_it_holds() {
         let (root, _scope) = scratch("remove-witness");
         update_pallet_head("victim", None, &hash('a'), &RefPreconditions::NONE).unwrap();

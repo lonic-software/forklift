@@ -247,3 +247,37 @@ fn the_sealed_object_record_is_written_through_an_open_session() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn a_pallet_removal_refuses_inside_a_session() {
+    use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+    use forklift_core::enums::dir_entry_type::DirEntryType;
+    use forklift_core::model::parcel::Parcel;
+    use forklift_core::model::tree_item::TreeItem;
+    use forklift_core::util::pallet_utils::{self, PalletNamespace, RefPreconditions, RefUpdateError};
+
+    // A removal's records must be durable before the unlink, and a session would only stage them.
+    let _guard = lock_session();
+    let root = std::env::temp_dir().join(format!("forklift-bulk-remove-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let _scope = StorageRootScope::enter(&root);
+    forklift_core::util::warehouse_utils::prepare_warehouse(forklift_core::util::warehouse_utils::PrepareMode::Full).unwrap();
+
+    let mut tree = LooseObjectBuilder::build_tree(&TreeItem::new(String::new(), String::new(), DirEntryType::Tree));
+    tree.store().unwrap();
+    let mut parcel = LooseObjectBuilder::build_parcel(&Parcel {
+        tree_hash: tree.hash.clone(), parents: Vec::new(), actions: Vec::new(), description: None,
+    });
+    parcel.store().unwrap();
+    pallet_utils::update_pallet_head("main", None, &parcel.hash, &RefPreconditions::NONE).unwrap();
+
+    let session = BulkStoreSession::open().unwrap();
+    let refused = pallet_utils::remove_pallet_head_in(PalletNamespace::User, "main", &parcel.hash, &RefPreconditions::NONE, None);
+    drop(session);
+
+    assert!(matches!(&refused, Err(RefUpdateError::Failed(message)) if message.contains("bulk store session")), "{:?}", refused);
+    assert_eq!(pallet_utils::get_pallet_head("main").unwrap(), Some(parcel.hash.clone()));
+
+    std::fs::remove_dir_all(&root).ok();
+}
