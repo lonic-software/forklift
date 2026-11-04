@@ -1209,8 +1209,8 @@ fn a_lower_keeps_the_local_changes_the_remote_left_alone() {
 
     area.write_file("b/staged.txt", "staged mine\n");
     std::fs::remove_file(area.path("b/gone.txt")).unwrap();
-    std::fs::create_dir_all(area.path("b/new/deep")).unwrap();
-    std::fs::rename(area.path("b/mv/from.txt"), area.path("b/new/deep/to.txt")).unwrap();
+    std::fs::remove_file(area.path("b/mv/from.txt")).unwrap();
+    area.write_file("b/new/deep/to.txt", "moving\n");
     area.write_file("b/fresh/nested/new.txt", "fresh\n");
     assert_success(&area.forklift("b", &["load", "."]));
     area.write_file("b/bob.txt", "bob mine\n");

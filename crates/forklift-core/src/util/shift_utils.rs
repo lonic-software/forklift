@@ -1710,8 +1710,9 @@ fn join_key(key: &str, name: &str) -> String {
 ///                  empty/unborn state).
 /// * `to_tree`    - The tree to materialize.
 /// * `operation`  - What is running (for the collision error message).
-/// * `anchor`     - Taken before the caller's cleanliness check against `from_tree` (or before
-///                  this call, where nothing was checked) — see [`TreeProvenance::Written`].
+/// * `anchor`     - Taken before the caller's cleanliness check against `from_tree`, or its
+///                  collection of the local changes it carries (or before this call, where
+///                  nothing was checked) — see [`TreeProvenance::Written`].
 /// * `progress`   - Where to report the file writes and the inventory rebuild.
 /// * `carried`    - The local changes the diff leaves alone, kept in the rebuilt staging (see
 ///                  [`build_inventories_carrying`]); empty where the bay had none.
