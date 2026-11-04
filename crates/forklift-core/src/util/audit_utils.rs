@@ -3633,6 +3633,8 @@ mod tests {
     /// root (exactly what `office enroll` produces), trust established.
     struct PrivilegeFixture {
         _scope: crate::globals::StorageRootScope,
+        // Its tests check what the office chain admits, not what reaches the disk.
+        _syncs_skipped: file_utils::SyncsSkipped,
         // `None` when a caller is holding `PRIVILEGE_KEYS_ENV_LOCK` itself in an outer
         // scope that must outlive this fixture (see `build`'s doc comment) — otherwise
         // `Some`, and the fixture releases the lock as part of its own drop, in field
@@ -3682,6 +3684,7 @@ mod tests {
                 "forklift-privilege-test-{}-{}", name, std::process::id()
             ));
             let _ = std::fs::remove_dir_all(&root);
+            let syncs_skipped = file_utils::skip_syncs_on_this_thread();
             let keys_dir = root.join("keys");
             std::fs::create_dir_all(&keys_dir).unwrap();
             let previous_keys_dir = std::env::var("FORKLIFT_KEYS_DIR").ok();
@@ -3722,8 +3725,8 @@ mod tests {
             crate::util::office_utils::write_trust_anchor(&anchor).unwrap();
 
             PrivilegeFixture {
-                _scope: scope, _keys_lock: keys_lock, root, anchor, admin, admin_key_id,
-                previous_keys_dir,
+                _scope: scope, _syncs_skipped: syncs_skipped, _keys_lock: keys_lock, root, anchor, admin,
+                admin_key_id, previous_keys_dir,
             }
         }
 
