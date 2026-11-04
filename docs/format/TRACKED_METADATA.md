@@ -84,9 +84,13 @@ Which parcels a pallet accepts depends on the warehouse's trust state:
    lives under its writer's directory) apply to the declared operator.
 2. **Anchor lost** — no trust anchor while an office exists. Every write and every content
    check refuses until trust is restored.
-3. **Trusted** — an anchor and an office. Every parcel must be signed, and its signature must
-   verify, inside the distrust boundary if its key is revoked. Every cell it adds or changes is
-   stamped `signer` with its own signing key, and the pallet rules hold in full.
+3. **Trusted** — an anchor and an office. Every parcel stacked after trust was established must
+   be signed, and its signature must verify, inside the distrust boundary if its key is revoked.
+   Every cell it adds or changes is stamped `signer` with its own signing key, and the pallet
+   rules hold in full. An unsigned parcel is admitted only when it is reachable from the
+   anchor's `boundary` (exact ancestry), and is then judged as in state 1: written before the
+   warehouse enrolled. One that is not reachable is refused, or, when a boundary parcel is not
+   present locally, refused as unresolvable rather than as stacked after trust.
 
 In every state a parcel's format must stay its parent's, and its changed envelopes must parse,
 in a canonical tree with no empty subtrees. `verify_meta_content` checks each parcel this way,
@@ -401,7 +405,9 @@ adopts = "<hash>"          # re-genesis only: the old office head, kept as attes
 - `adopts` is held to that same shape, parcel by parcel to its root, wherever a remote's
   anchor is taken, without checking signatures. Local re-genesis does not check it, so it
   stays usable over damaged older history.
-- `boundary` is the head of every pallet at the moment trust was established: parcels
+- `boundary` is the head of every pallet at the moment trust was established: `enroll` takes
+  every local pallet's, user and meta alike, the office excepted, and the remote's; a
+  re-genesis takes every pallet's, the old office included. Parcels
   reachable from these are the pre-trust (legacy) history and may be unsigned;
   everything else must be signed. The boundary is exact ancestry — timestamps have
   second granularity and can be forged, so they never decide a security question.

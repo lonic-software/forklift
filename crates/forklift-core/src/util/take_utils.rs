@@ -34,7 +34,7 @@ use crate::error::{CoreError, RefusalCode};
 use crate::globals;
 use crate::util::audit_utils::{self, BoundaryGap, VerifiedOffice};
 use crate::util::lock_utils::RefLock;
-use crate::util::{file_utils, merge_utils, object_utils, record_utils};
+use crate::util::{file_utils, merge_utils, meta_tree, object_utils, office_utils, record_utils};
 use crate::util::office_utils::{OfficeState, TrustAnchor};
 use crate::util::pallet_utils::{self, AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions};
 use crate::util::progress_utils::Progress;
@@ -379,30 +379,106 @@ pub async fn record_unvouched_heads(client: &RemoteClient,
         judgement.judged.push(head);
     }
 
-    if !unvouched.is_empty() {
-        let lock = RefLock::acquire()?;
-        let mut entries = read_unvouched_entries()?;
-
-        // An entry whose parcel left the store can bound nothing any more.
-        entries.retain(|(_, head)| file_utils::does_object_exist(head).unwrap_or(true));
-
-        for head in unvouched {
-            let entry = (anchor.genesis.clone(), head);
-            if !entries.contains(&entry) {
-                entries.push(entry);
-            }
-        }
-
-        write_unvouched_entries(&lock, &entries)?;
-    }
+    record_unvouched(anchor, unvouched)?;
 
     Ok(judgement)
 }
 
+/// Judge every local meta-pallet head but the office's against an anchor about to be installed
+/// from a remote, and record the ones it does not vouch for, before the install. First contact
+/// only: a re-genesis judges user pallets alone.
+///
+/// Metadata recorded here before the remote enrolled is unsigned, and the anchor admits an
+/// unsigned meta parcel only inside its boundary. A head outside it stays where it is; the
+/// record is informational — a lift of it is refused by the content check, not by the record.
+/// A refused head is judged again once the boundary has been fetched from the remote, as a user
+/// pallet's is: a store behind the remote may not hold the boundary its own heads lead to.
+///
+/// # Arguments
+/// * `client`       - The remote the anchor comes from.
+/// * `anchor`       - The anchor about to be installed.
+/// * `office_state` - The office state the anchor's office head holds.
+///
+/// # Returns
+/// * `Ok(LocalJudgement)` - Every head judged, and the meta pallets (as `@name`) the anchor does
+///                          not vouch for.
+/// * `Err(String)`        - The record could not be read or written.
+pub async fn record_unvouched_meta_heads(client: &RemoteClient,
+                                         anchor: &TrustAnchor,
+                                         office_state: &OfficeState) -> Result<LocalJudgement, String> {
+    let mut judgement = LocalJudgement { judged: Vec::new(), unvouched: Vec::new() };
+    let mut unvouched = Vec::new();
+    let mut fetched = false;
+    let mut has_gap: Option<bool> = None;
+
+    // Every meta ref on disk, as the install's precondition lists them.
+    for name in pallet_utils::list_meta_pallets()?.iter().filter(|name| *name != office_utils::OFFICE_PALLET_NAME) {
+        let Some(head) = pallet_utils::get_meta_pallet_head(name)? else { continue };
+
+        // Audit: the parcels are history this warehouse already holds, judged for their standing
+        // under the new anchor, not admitted as new writes. A pallet with no rules has no content
+        // check to judge it by.
+        let refused = || meta_tree::meta_rules(name).is_some_and(|rules| meta_tree::verify_meta_content(
+            name, rules, Some(office_state), &anchor.boundary, meta_tree::Admission::Audit, None, &head
+        ).is_err());
+
+        // Only when the boundary has a gap, since a refusal past a complete boundary is final;
+        // once for every pallet, and each head on its own: one the remote cannot serve stays
+        // missing, and the verdict past it stays a refusal. A boundary that cannot be read is
+        // not refetched either: the head stays unvouched, as a refused one does.
+        let mut refused_now = refused();
+        let gapped = refused_now && !fetched && *has_gap.get_or_insert_with(|| {
+            audit_utils::collect_reachable_present_noting_gaps(&anchor.boundary)
+                .map(|(_, gaps)| !gaps.is_empty())
+                .unwrap_or(false)
+        });
+        if gapped {
+            fetched = true;
+            for boundary_head in &anchor.boundary {
+                let _ = remote_utils::fetch_history_scoped(client, boundary_head, &format!("{}{}", pallet_utils::META_QUALIFIER, name), &Progress::NONE).await;
+            }
+            refused_now = refused();
+        }
+
+        if refused_now {
+            unvouched.push(head.clone());
+            judgement.unvouched.push(format!("{}{}", pallet_utils::META_QUALIFIER, name));
+        }
+
+        judgement.judged.push(head);
+    }
+
+    record_unvouched(anchor, unvouched)?;
+
+    Ok(judgement)
+}
+
+/// Record `heads` as not vouched for by `anchor`.
+fn record_unvouched(anchor: &TrustAnchor, heads: Vec<String>) -> Result<(), String> {
+    if heads.is_empty() {
+        return Ok(());
+    }
+
+    let lock = RefLock::acquire()?;
+    let mut entries = read_unvouched_entries()?;
+
+    // An entry whose parcel left the store can bound nothing any more.
+    entries.retain(|(_, head)| file_utils::does_object_exist(head).unwrap_or(true));
+
+    for head in heads {
+        let entry = (anchor.genesis.clone(), head);
+        if !entries.contains(&entry) {
+            entries.push(entry);
+        }
+    }
+
+    write_unvouched_entries(&lock, &entries)
+}
+
 /// What [`record_unvouched_heads`] found.
 pub struct LocalJudgement {
-    /// Every head judged: the install must be conditioned on the user pallets still holding only
-    /// these, or a head moved meanwhile goes unjudged.
+    /// Every head judged: the install must be conditioned on the judged pallets still holding
+    /// only these, or a head moved meanwhile goes unjudged.
     pub judged: Vec<String>,
 
     /// The pallets whose heads the anchor does not vouch for, for the command to name.

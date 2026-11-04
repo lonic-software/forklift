@@ -68,6 +68,9 @@ trust; if that remote has reset its trust, clone it again instead. With neither,
 cannot be re-established there: `forklift prepare` in another folder starts a warehouse
 without that history.
 
+- The boundary covers metadata too: tags, manifest entries, keyed values and
+  hauls recorded unsigned before enrolling stay valid as they are. Anything
+  written to them after enrolling must be signed.
 - If a remote is configured, its pallet heads are folded into the trust boundary
   (history the remote already has stays valid unsigned), so the remote must be
   reachable — or pass `--offline` if it's gone for good.
@@ -171,7 +174,10 @@ in the store, unreferenced. Run `audit` where the history came from.
   here before the remote enrolled), or whose history cannot be read to judge it,
   stays as it is, and `audit` reports it, but no
   later take counts its history, or anything built on it, as already verified.
-  The command names each such pallet in a `pallets_unvouched` warning.
+  The command names each such pallet in a `pallets_unvouched` warning. Metadata
+  recorded here unsigned before the remote enrolled is judged the same way at
+  first contact and named in a `meta_unvouched` warning; it stays, but a lift of
+  it to the trusted remote is refused.
 - A merge signed here makes the merged history this warehouse's, so the `stack`
   that completes a conflicted merge judges the merged head again under the
   office it signs under: a key revoked since the merge began refuses it.

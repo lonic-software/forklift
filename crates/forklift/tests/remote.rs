@@ -11305,11 +11305,62 @@ fn unsigned_metadata_lifts_and_lowers_through_a_server_that_never_enrolled() {
     assert_success(&area.forklift("a", &["lower"]));
     assert_eq!(stdout(&area.forklift("a", &["manifest", "get", "main", "ci"])).trim(), "red");
 
-    // A warehouse holding no metadata of its own still may not enroll over the remote's.
-    prepare_warehouse(&area, "c", &server.url);
-    let enroll = area.forklift("c", &["office", "enroll"]);
-    assert!(!enroll.status.success(), "{}", stdout(&enroll));
-    assert!(stderr(&enroll).contains("The remote holds metadata") && stderr(&enroll).contains("@tags"), "{}", stderr(&enroll));
+    // The clone records a change it does not lift before the remote enrolls, and falls behind
+    // on the tags: a store that does not hold the boundary its head leads to fetches it.
+    assert_success(&area.forklift("b", &["manifest", "set", "main", "ci", "blue"]));
+    assert_success(&area.forklift("a", &["tag", "create", "v1.1", "main"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    // Enrolling folds the remote's metadata into the boundary, so the server takes the anchor
+    // and keeps it, unsigned, under trust.
+    assert_success(&area.forklift(".", &["clone", &server.url, "c"]));
+    assert_success(&area.forklift("c", &["office", "enroll"]));
+    assert_success(&area.forklift("c", &["lift"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "d"]));
+    for pallet in ["@tags", "@kv"] {
+        let audit = area.forklift("d", &["audit", pallet]);
+        assert_eq!(audit.status.code(), Some(0), "{}: {}{}", pallet, stdout(&audit), stderr(&audit));
+    }
+    assert!(stdout(&area.forklift("d", &["tag", "show", "v1.0"])).contains("tester@forklift (unsigned)"));
+
+    // The clone's change was not part of what the anchor vouches for: taking the anchor names
+    // it, keeps it, and its lift is refused.
+    let lowered = area.forklift("b", &["--json", "lower"]);
+    assert_success(&lowered);
+    let warning = stderr(&lowered);
+    assert!(warning.contains("\"meta_unvouched\"") && warning.contains("\"@kv\"") && !warning.contains("\"@tags\""), "{}", warning);
+    assert!(!warning.contains("\"pallets_unvouched\""), "{}", warning);
+    assert_eq!(stdout(&area.forklift("b", &["manifest", "get", "main", "ci"])).trim(), "blue");
+    let refused = area.forklift("b", &["lift"]);
+    assert!(!refused.status.success(), "{}", stdout(&refused));
+    assert!(stderr(&refused).contains("after trust was established"), "{}", stderr(&refused));
+}
+
+#[test]
+fn a_server_refuses_an_anchor_once_its_metadata_moved_past_the_boundary() {
+    let area = TestArea::new("unsigned-meta-boundary");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/code.txt", "v1\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
+    assert_success(&area.forklift("a", &["tag", "create", "v1.0", "main"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    // The enroll records the remote's heads; another unsigned tag lands on the server after.
+    assert_success(&area.forklift(".", &["clone", &server.url, "c"]));
+    assert_success(&area.forklift("c", &["office", "enroll"]));
+    assert_success(&area.forklift("a", &["tag", "create", "v1.1", "main"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    let tags = remote_pallet_head(&server, "@tags");
+
+    // The anchor would leave that tag standing unvouched, so the server does not take it.
+    let refused = area.forklift("c", &["lift"]);
+    assert!(!refused.status.success(), "{}", stdout(&refused));
+    assert!(stderr(&refused).contains("@tags"), "{}", stderr(&refused));
+    assert_eq!(remote_pallet_head(&server, "@tags"), tags);
+    assert!(!area.path("server-root/.forklift/trust").exists(), "the server must hold no anchor");
 }
 
 #[test]

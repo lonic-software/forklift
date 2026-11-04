@@ -1019,8 +1019,14 @@ pub const LOST_ANCHOR: &str = "This warehouse holds an office but no trust ancho
 /// an unborn office). An office whose anchor is gone refuses: it can neither be verified nor
 /// treated as never enrolled.
 pub fn local_meta_office() -> Result<Option<VerifiedOffice>, String> {
-    if let Some((_, office)) = verified_local_trust()? {
-        return Ok(Some(office));
+    Ok(local_meta_trust()?.map(|(_, office)| office))
+}
+
+/// [`local_meta_office`] with the anchor it was verified against, whose boundary admits the
+/// unsigned meta history from before trust.
+pub fn local_meta_trust() -> Result<Option<(TrustAnchor, VerifiedOffice)>, String> {
+    if let Some(trust) = verified_local_trust()? {
+        return Ok(Some(trust));
     }
 
     match pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME)? {

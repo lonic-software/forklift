@@ -128,7 +128,10 @@ pub async fn handle_command(pallet: Option<String>, expect: Option<String>, keep
     // later refusal (a dirty warehouse, a missing pallet) would otherwise leave it unsaid.
     if let Some(genesis) = &trust.adopted_genesis {
         output::warn_trust_adopted(&trust_utils::first_contact(client.url(), genesis));
-        output::warn_pallets_unvouched(&unvouched);
+        let (meta, user): (Vec<String>, Vec<String>) = unvouched.into_iter()
+            .partition(|pallet| pallet.starts_with(pallet_utils::META_QUALIFIER));
+        output::warn_pallets_unvouched(&user);
+        output::warn_meta_unvouched(&meta);
     }
 
     // Meta pallets (the manifest, …) sync alongside trust — fast-forwarded, never

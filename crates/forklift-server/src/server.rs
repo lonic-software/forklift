@@ -2693,6 +2693,8 @@ async fn put_trust(State(state): State<Arc<AppState>>,
 
                 ref_write_test_checkpoint(TRUST_WRITE_SEAM);
 
+                // Every pallet head but the office's must be inside the boundary: unsigned history
+                // outside it — a meta pallet's included — would stand under the anchor unvouched.
                 let installed = office_utils::install_trust(&office_utils::TrustInstall {
                     anchor: &anchor.to_anchor(),
                     replaces: None,
@@ -2700,7 +2702,7 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                     new_office: None,
                     pallets: PalletsPrecondition::WithinBoundary {
                         boundary: anchor.boundary.clone(),
-                        scope: BoundaryScope::UserPallets,
+                        scope: BoundaryScope::AllButOffice,
                     },
                 });
 

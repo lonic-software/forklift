@@ -6,7 +6,7 @@ use forklift_core::util::office_utils::{IdentityClass, OfficeState, RevocationRe
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::pallet_utils::{AnchorPrecondition, BoundaryScope, PalletsPrecondition, RefPreconditions};
 use forklift_core::util::remote_utils::{self, RemoteClient};
-use forklift_core::util::{audit_utils, config_utils, meta_tree, office_utils, pallet_utils, sign_utils, trust_utils};
+use forklift_core::util::{audit_utils, config_utils, office_utils, pallet_utils, sign_utils, trust_utils};
 use crate::output::{self, CommandOutput};
 
 // The office command — the warehouse office manages the personnel records: users and
@@ -19,7 +19,9 @@ use crate::output::{self, CommandOutput};
 /// When a remote is configured, its pallet heads join the trust boundary: the remote
 /// may be ahead of this warehouse, and unsigned history it already has must stay
 /// tolerated once the anchor reaches it — otherwise the pallet could never be lifted
-/// again (trust is a one-way door and history is immutable).
+/// again (trust is a one-way door and history is immutable). That holds for the meta
+/// pallets but the office, local and remote alike: metadata recorded before enrolling is
+/// vouched for by the enrolling operator.
 pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
     let operator = config_utils::get_operator()?;
 
@@ -37,32 +39,22 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
         return Err(audit_utils::LOST_ANCHOR.to_string());
     }
 
-    // Metadata recorded before enrollment is unsigned, and an office admits only signed meta
-    // parcels: enrolling over it would leave every such pallet unverifiable, failing later and
-    // far from here. Refuse until enroll can admit it.
-    let mut unsigned = Vec::new();
-
-    for name in meta_tree::META_PALLET_NAMES.iter().filter(|name| **name != OFFICE_PALLET_NAME) {
-        if pallet_utils::get_meta_pallet_head(name)?.is_some() {
-            unsigned.push(format!("@{}", name));
-        }
-    }
-
-    if !unsigned.is_empty() {
-        return Err(format!(
-            "This warehouse holds metadata recorded without enrollment ({}). Enrolling over \
-            unsigned metadata is not supported yet: the office would refuse it from then on.",
-            unsigned.join(", ")
-        ));
-    }
-
     // Everything reachable from the current pallet heads is the pre-trust history:
-    // audit will allow it to be unsigned, and require signatures on everything else.
+    // audit will allow it to be unsigned, and require signatures on everything else. The meta
+    // pallets' heads join it too, so metadata recorded before enrolling stays admissible.
     let mut boundary: Vec<String> = Vec::new();
 
     for pallet in pallet_utils::list_pallets()? {
         if let Some(head) = pallet_utils::get_pallet_head(&pallet)? {
             boundary.push(head);
+        }
+    }
+
+    for name in pallet_utils::list_meta_pallets()?.iter().filter(|name| *name != OFFICE_PALLET_NAME) {
+        if let Some(head) = pallet_utils::get_meta_pallet_head(name)? {
+            if !boundary.contains(&head) {
+                boundary.push(head);
+            }
         }
     }
 
@@ -87,20 +79,6 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
                 "The remote already has trust established. \"forklift lower\" to adopt its \
                 office, then ask an enrolled operator to admit you.".to_string()
             );
-        }
-
-        // Unsigned metadata another client lifted would be adopted under the new office, which
-        // refuses it, just as the local check above.
-        let remote_meta: Vec<&String> = info.pallets.keys()
-            .filter(|name| name.starts_with('@') && name.as_str() != format!("@{}", OFFICE_PALLET_NAME))
-            .collect();
-
-        if !remote_meta.is_empty() {
-            return Err(format!(
-                "The remote holds metadata recorded without enrollment ({}). Enrolling over \
-                unsigned metadata is not supported yet: the office would refuse it from then on.",
-                remote_meta.iter().map(|name| name.as_str()).collect::<Vec<_>>().join(", ")
-            ));
         }
 
         // Live heads only: a pallet the remote deleted (its tombstone's head) stays outside, since
@@ -143,8 +121,9 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
         &state, &operator, description, &key_id, Vec::new(),
     )?;
 
-    // The anchor and the genesis land together, and only while no other bay moved a pallet since
-    // the boundary was read: a parcel stacked meanwhile would stand outside it, unsigned.
+    // The anchor and the genesis land together, and only while no other bay moved a pallet — a
+    // meta pallet included — since the boundary was read: a parcel stacked meanwhile would stand
+    // outside it, unsigned.
     office_utils::install_trust(&office_utils::TrustInstall {
         anchor: &TrustAnchor {
             genesis: genesis.clone(),
@@ -156,7 +135,7 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
         replaces: None,
         office: None,
         new_office: Some(&genesis),
-        pallets: PalletsPrecondition::WithinBoundary { boundary, scope: BoundaryScope::UserPallets },
+        pallets: PalletsPrecondition::WithinBoundary { boundary, scope: BoundaryScope::AllButOffice },
     })?;
 
     output::message(format!(
@@ -1150,6 +1129,22 @@ pub(crate) mod tests {
         office.enroll().expect("a re-run reads the moved head into its boundary");
         let anchor = office_utils::read_trust_anchor().unwrap().expect("the re-run establishes trust");
         assert_eq!(anchor.boundary, vec![elsewhere]);
+    }
+
+    // Revert: enroll installs under `BoundaryScope::UserPallets` → the anchor is written while
+    // "@tags" holds a head it does not vouch for.
+    #[test]
+    fn an_enroll_whose_metadata_moved_writes_nothing() {
+        let office = Office::new("office-enroll-meta-moved");
+        let tags = test_support::store_parcel(&test_support::store_tree("t", b"t\n"), &[]);
+        AFTER_BOUNDARY_READ.with(|seam| seam.set(Some(Box::new(move || {
+            pallet_utils::update_meta_pallet_head("tags", None, &tags, &RefPreconditions::NONE).unwrap();
+        }))));
+
+        let error = office.enroll().expect_err("a meta pallet moved after the boundary read must refuse the enroll");
+
+        assert_eq!(office_utils::read_trust_anchor().unwrap(), None, "no anchor may be written");
+        assert!(error.contains("moved pallet \"@tags\""), "{}", error);
     }
 
     // Revert: rotate passes `PalletsPrecondition::NotConsumed` → the office moves past a boundary

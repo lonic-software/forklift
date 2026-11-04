@@ -19,6 +19,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   mark these entries `(unsigned)`, and in `--json` the `signer` field is absent (hauls carry
   `"unsigned": true`). Once a warehouse has an office, every entry is signed as before. `git
   export` skips unsigned tags.
+- **`office enroll` keeps metadata recorded before it.** Unsigned tags, manifest entries, keyed
+  values and hauls are folded into the trust boundary and stay valid; everything written after
+  enrolling is signed. A server's first enroll does the same. A `lower` that adopts a remote's
+  anchor names any local metadata the anchor does not vouch for in a `meta_unvouched` warning.
 - **The command surface was redesigned, with no aliases for the old names.** Families get subcommands:
   `pallet create/list/delete/restore`, `store status/compact/peek/evict`,
   `git import/export/mirror`, `scope fetch/narrow/prune/status`, `self alias/schema/update`,

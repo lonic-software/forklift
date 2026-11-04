@@ -10011,12 +10011,19 @@ fn metadata_works_unsigned_in_a_warehouse_that_never_enrolled() {
     let log = stdout(&warehouse.run(&["manifest", "log", "main", "ci"]));
     assert!(log.contains("test@forklift (unsigned)"), "{}", log);
 
-    // Enrolling over unsigned metadata would leave it unverifiable, so it refuses up front and
-    // establishes no trust: unsigned writes still work afterwards.
-    let enroll = warehouse.run(&["office", "enroll"]);
-    assert!(!enroll.status.success(), "{}", stdout(&enroll));
-    assert!(stderr(&enroll).contains("(@manifest, @haul, @tags, @kv)"), "{}", stderr(&enroll));
+    // Enrolling folds the metadata into the trust boundary: it stays valid unsigned, and what
+    // is written after it is signed.
+    assert_success(&warehouse.run(&["office", "enroll"]));
+    for pallet in ["@tags", "@manifest", "@kv", "@haul"] {
+        let audit = warehouse.run(&["audit", pallet]);
+        assert_eq!(audit.status.code(), Some(0), "{}: {}{}", pallet, stdout(&audit), stderr(&audit));
+    }
+    assert!(stdout(&warehouse.run(&["tag", "show", "v1.0"])).contains("test@forklift (unsigned)"));
+
     assert_success(&warehouse.run(&["tag", "create", "v2.0", "main"]));
+    let signed = json(&warehouse.run(&["tag", "show", "v2.0", "--json"]));
+    assert!(signed["data"]["signer"].is_string(), "{}", signed);
+    assert_success(&warehouse.run(&["audit", "@tags"]));
 }
 
 #[test]
