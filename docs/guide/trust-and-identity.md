@@ -3,8 +3,8 @@
 Forklift can make a warehouse's entire history **tamper-evident**: once you
 establish trust, every parcel written from then on is signed, and any clone can
 verify the whole history — the signed part by its signatures, the earlier part as
-exactly what enrolling vouched for, and who was added and when — offline, with no
-server to trust.
+exactly what the trust anchor vouched for, and who was added and when — offline,
+with no server to trust.
 This guide covers the `office` command (users, keys, roles, agents, recovery),
 passphrase-protected keys, and `audit`.
 

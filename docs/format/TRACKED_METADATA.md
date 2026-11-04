@@ -429,9 +429,10 @@ What local trust does and does not defend against, by attacker capability. This 
 for parcels written under trust. A warehouse that never enrolled detects only damage: a hash
 exposes a byte changed inside an object, but anyone with write access can replace history with
 a self-consistent rewrite, and anyone who can lift can write parcels and cells under any
-operator's name. In a trusted
-warehouse the unsigned history from before the boundary is fixed by the anchor's `boundary`, so
-it cannot be rewritten or added to, but the operator names in it were never checked.
+operator's name. In a trusted warehouse the unsigned history from before the boundary is fixed
+by the anchor's `boundary` while that anchor stands, so it cannot be rewritten or added to, but
+the operator names in it were never checked. A re-genesis replaces the anchor and its boundary;
+class 2 below covers one made by an attacker.
 
 1. **No private keys, no warehouse write access** — cannot forge anything. Every object
    is content-addressed and every parcel is signed: modifying a byte changes the hash,
