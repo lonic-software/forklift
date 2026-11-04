@@ -1396,6 +1396,8 @@ mod tests {
     /// of the staging is left, and the notes name the pieces where they now stand.
     #[test]
     fn prepare_marks_a_new_warehouse_and_leaves_no_staging_folder() {
+        // Runs the staging tree's sync and the replaced files' syncs for real: the unit tests skip syncs otherwise.
+        let _syncs = crate::util::file_utils::real_syncs();
         let root = fresh_dir("marks");
         let forklift = root.join(FOLDER_NAME_FORKLIFT_ROOT);
 

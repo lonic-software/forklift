@@ -300,44 +300,58 @@ pub fn hash_from_object_path(path: &Path) -> Option<String> {
 /// operation. Read once and cached, because durability is a *process-wide* policy: the server head
 /// serves many warehouses in one process, so it must not hang off a per-warehouse config lookup on
 /// the write hot path.
+///
+/// This crate's own unit tests are the exception: they skip every sync unless a test holds
+/// [`real_syncs`].
 pub fn fsync_enabled() -> bool {
     #[cfg(test)]
-    if SYNCS_SKIPPED.with(std::cell::Cell::get) {
+    if REAL_SYNCS.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         return false;
     }
 
+    fsync_setting()
+}
+
+/// The `FORKLIFT_FSYNC` setting, read once.
+fn fsync_setting() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| parse_fsync_setting(std::env::var("FORKLIFT_FSYNC").ok().as_deref()))
 }
 
+/// How many [`RealSyncs`] guards are alive in this process.
 #[cfg(test)]
-thread_local! {
-    static SYNCS_SKIPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+static REAL_SYNCS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Runs real syncs while the returned guard lives. This crate's unit tests skip every sync
+/// otherwise: under a parallel run every sync waits on all the others, so a test that took 0.1 s
+/// alone took 14 s in the full suite. A test that checks a sync call site's behaviour (that it
+/// syncs, what a failed sync does, a barrier count) holds one. The sync fault rigs hold one for
+/// as long as they are armed, so a test that arms a sync fault always runs real syncs.
+///
+/// The switch is process-wide, so syncs run on every thread while any guard lives, including
+/// threads the code under test spawns. Under nextest each test is its own process; under
+/// `cargo test` other tests running at the same time sync too, which costs time and changes
+/// nothing else.
+///
+/// Panics when `FORKLIFT_FSYNC` turns fsync off, since the test holding the guard would then
+/// pass without running the syncs it exists for.
+#[cfg(test)]
+pub(crate) fn real_syncs() -> RealSyncs {
+    assert!(fsync_setting(), "FORKLIFT_FSYNC turns fsync off, and this test needs real syncs; unset it");
+    REAL_SYNCS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    RealSyncs { _private: () }
 }
 
-/// Skips this thread's syncs while the returned guard lives, as `FORKLIFT_FSYNC=0` does for a
-/// process; threads it spawns still sync. Test-only, for a fixture whose tests check nothing about
-/// durability: the in-process tests run with fsync on because they are what runs the sync calls,
-/// and under a parallel run every sync waits on the others, so a fixture that writes a whole
-/// warehouse took seconds per test, most of them in syncs. It also turns off the injected sync
-/// faults, which only fire on a sync that runs, so a test that arms one must not hold the guard.
-/// The guard is not `Send`: dropped on another thread it would restore that thread's setting.
+/// The guard [`real_syncs`] returns; dropping it ends its hold on real syncs.
 #[cfg(test)]
-pub(crate) fn skip_syncs_on_this_thread() -> SyncsSkipped {
-    SyncsSkipped { previous: SYNCS_SKIPPED.replace(true), _this_thread: std::marker::PhantomData }
-}
-
-/// The guard [`skip_syncs_on_this_thread`] returns; dropping it restores the thread's setting.
-#[cfg(test)]
-pub(crate) struct SyncsSkipped {
-    previous: bool,
-    _this_thread: std::marker::PhantomData<*const ()>,
+pub(crate) struct RealSyncs {
+    _private: (),
 }
 
 #[cfg(test)]
-impl Drop for SyncsSkipped {
+impl Drop for RealSyncs {
     fn drop(&mut self) {
-        SYNCS_SKIPPED.set(self.previous);
+        REAL_SYNCS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -640,25 +654,31 @@ thread_local! {
 /// once the test that created it is done, can bleed into another test. `pub(crate)` for the same
 /// cross-module reason as [`SYNC_DIR_FAULT`] itself.
 #[cfg(test)]
-pub(crate) struct SyncDirFaultGuard;
+pub(crate) struct SyncDirFaultGuard {
+    _syncs: RealSyncs,
+}
 
 #[cfg(test)]
 impl SyncDirFaultGuard {
     /// Record every directory [`sync_dir`] is asked to sync; fail none of them.
     pub(crate) fn recording() -> Self {
+        // Before arming: a panic here must leave nothing armed.
+        let syncs = real_syncs();
         SYNC_DIR_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState { attempted: Vec::new(), fail_needle: None, fail_exact: false });
-        SyncDirFaultGuard
+        SyncDirFaultGuard { _syncs: syncs }
     }
 
     /// Record every directory, and fail (with a distinctive error, no filesystem access) any
     /// whose path contains `needle`.
     pub(crate) fn failing(needle: &str) -> Self {
+        // Before arming: a panic here must leave nothing armed.
+        let syncs = real_syncs();
         SYNC_DIR_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState {
             attempted: Vec::new(),
             fail_needle: Some(needle.to_string()),
             fail_exact: false,
         });
-        SyncDirFaultGuard
+        SyncDirFaultGuard { _syncs: syncs }
     }
 }
 
@@ -1596,37 +1616,45 @@ impl DirSyncFaultState {
 /// neither a stale guard from a previous test on a reused thread, nor this guard's own arming
 /// once the test that created it is done, can bleed into another test.
 #[cfg(test)]
-pub(crate) struct DirSyncFaultGuard;
+pub(crate) struct DirSyncFaultGuard {
+    _syncs: RealSyncs,
+}
 
 #[cfg(test)]
 impl DirSyncFaultGuard {
     /// Record every directory `fsync_dir_data` is asked to sync; fail none of them.
     pub(crate) fn recording() -> Self {
+        // Before arming: a panic here must leave nothing armed.
+        let syncs = real_syncs();
         DIR_SYNC_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState { attempted: Vec::new(), fail_needle: None, fail_exact: false });
-        DirSyncFaultGuard
+        DirSyncFaultGuard { _syncs: syncs }
     }
 
     /// Record every directory, and fail (with a distinctive error, no filesystem access) any
     /// whose path contains `needle`.
     pub(crate) fn failing(needle: &str) -> Self {
+        // Before arming: a panic here must leave nothing armed.
+        let syncs = real_syncs();
         DIR_SYNC_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState {
             attempted: Vec::new(),
             fail_needle: Some(needle.to_string()),
             fail_exact: false,
         });
-        DirSyncFaultGuard
+        DirSyncFaultGuard { _syncs: syncs }
     }
 
     /// Record every directory, and fail only `dir` itself. A folder's path is contained in every
     /// path below it, so [`failing`](Self::failing) cannot fail a folder without failing its
     /// descendants too.
     pub(crate) fn failing_exactly(dir: &Path) -> Self {
+        // Before arming: a panic here must leave nothing armed.
+        let syncs = real_syncs();
         DIR_SYNC_FAULT.with(|f| *f.borrow_mut() = DirSyncFaultState {
             attempted: Vec::new(),
             fail_needle: Some(dir.to_string_lossy().into_owned()),
             fail_exact: true,
         });
-        DirSyncFaultGuard
+        DirSyncFaultGuard { _syncs: syncs }
     }
 }
 
@@ -5569,25 +5597,36 @@ mod tests {
         }
     }
 
-    /// The in-process tests are what run the sync calls: the integration suites launch their
-    /// binaries with fsync off. An environment that turns it off for this process too would
-    /// skip every sync call while those tests stay green, so it fails here instead.
+    /// This crate's unit tests skip syncs unless one holds `real_syncs`, and the guard turns
+    /// them on for every thread, including one the code under test spawns, until the last guard
+    /// is dropped. The first check runs only where this test has its process to itself, as under
+    /// nextest: under `cargo test` another test may hold a guard, or take and drop one, at any
+    /// moment.
     #[test]
-    fn in_process_tests_run_with_fsync_on() {
-        assert!(fsync_enabled(), "FORKLIFT_FSYNC turns fsync off for the in-process tests; unset it");
+    fn syncs_run_only_while_a_real_syncs_guard_lives() {
+        if std::env::var("NEXTEST_EXECUTION_MODE").as_deref() == Ok("process-per-test") {
+            assert!(!fsync_enabled(), "with no guard alive, a unit test skips its syncs");
+        }
+
+        let outer = real_syncs();
+        assert!(fsync_enabled(), "a guard turns syncs on");
+        assert!(std::thread::spawn(fsync_enabled).join().unwrap(), "on a thread the test spawns too");
+        drop(real_syncs());
+        assert!(fsync_enabled(), "dropping a nested guard leaves the outer one's syncs on");
+        drop(outer);
     }
 
-    /// The guard skips the syncs of its own thread only, and only while it lives; a nested one
-    /// restores the outer one's setting, not fsync on.
+    /// A sync fault rig holds real syncs while it is armed, so a test that arms one cannot pass
+    /// with the sync it injects into skipped.
     #[test]
-    fn skipped_syncs_are_scoped_to_the_guard_and_its_thread() {
-        let outer = skip_syncs_on_this_thread();
-        assert!(!fsync_enabled(), "the guard's thread skips its syncs");
-        assert!(std::thread::spawn(fsync_enabled).join().unwrap(), "a thread it spawns still syncs");
-        drop(skip_syncs_on_this_thread());
-        assert!(!fsync_enabled(), "dropping a nested guard keeps the outer one's setting");
-        drop(outer);
-        assert!(fsync_enabled(), "dropping the guard turns syncs back on");
+    fn an_armed_sync_fault_rig_runs_real_syncs() {
+        let rig = SyncDirFaultGuard::recording();
+        assert!(fsync_enabled(), "SyncDirFaultGuard turns syncs on while armed");
+        drop(rig);
+
+        let rig = DirSyncFaultGuard::recording();
+        assert!(fsync_enabled(), "DirSyncFaultGuard turns syncs on while armed");
+        drop(rig);
     }
 
     #[test]
@@ -6195,11 +6234,9 @@ mod tests {
     // through `fsync_dir_data`'s test-only fault injection (`DirSyncFaultGuard`,
     // `dir_sync_attempts`, `dir_sync_count`) — see their doc comments. All Unix-only: that
     // injection point does not exist on non-Unix targets (`fsync_dir_data` doesn't either).
-    // Nothing in this binary ever sets `FORKLIFT_FSYNC` (unlike the separate
-    // `write_batch_fsync_off` integration test binary, a different process), and `fsync_enabled`
-    // defaults to on when the variable is absent — so every `fsync_dir_data` call below is live
-    // rather than vacuously skipped, unless the process was launched with `FORKLIFT_FSYNC` already
-    // set to an off value in its inherited environment (a caller's problem, not this binary's).
+    // An armed `DirSyncFaultGuard` holds `real_syncs`, so every `fsync_dir_data` call below is
+    // live rather than vacuously skipped; with `FORKLIFT_FSYNC` set to an off value, arming it
+    // panics instead.
 
     #[test]
     #[cfg(unix)]
@@ -6577,6 +6614,7 @@ mod tests {
         // `sync_result_or_taint` (i.e. returning `Ok(())` unconditionally on sync success) kills
         // this test.
         let _serial = lock_taint_activation();
+        let _syncs = real_syncs();
         taint_utils::activate();
 
         let temp = std::env::temp_dir().join(format!("forklift-taint-recheck-batch-{}", std::process::id()));

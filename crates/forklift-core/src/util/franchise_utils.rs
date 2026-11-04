@@ -1397,6 +1397,8 @@ mod tests {
     /// Revert: keep the bundles folder whole → the stray survives → red.
     #[test]
     fn a_resume_keeps_only_the_bundle_file_its_record_names() {
+        // Runs the cut download's syncs for real: the unit tests skip syncs otherwise.
+        let _syncs = crate::util::file_utils::real_syncs();
         let dir = temp_dir("resume-bundle");
         let forklift = dir.join(".forklift");
         let bundles = forklift.join("bundles");

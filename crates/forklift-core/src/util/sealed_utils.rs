@@ -1547,6 +1547,8 @@ mod tests {
 
     #[test]
     fn the_first_append_creates_the_record_and_later_ones_append_in_order() {
+        // Runs the sealed record's append syncs for real: the unit tests skip syncs otherwise.
+        let _syncs = crate::util::file_utils::real_syncs();
         let (root, _scope) = scratch("append");
 
         assert!(append(&[]).unwrap().is_empty());

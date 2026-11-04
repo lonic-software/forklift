@@ -383,24 +383,30 @@ struct TaintFaultState {
 /// so neither a stale guard from a previous test on a reused thread, nor this guard's own
 /// arming once the test that created it is done, can bleed into another test.
 #[cfg(test)]
-struct TaintFaultGuard;
+struct TaintFaultGuard {
+    _syncs: file_utils::RealSyncs,
+}
 
 #[cfg(test)]
 impl TaintFaultGuard {
     /// Record every taint file [`sync_taint_file`] is asked to sync; fail none of them.
     fn recording() -> Self {
+        // Before arming: a panic here must leave nothing armed.
+        let syncs = file_utils::real_syncs();
         TAINT_WRITE_FAULT.with(|f| *f.borrow_mut() = TaintFaultState { attempted: Vec::new(), fail_needle: None });
-        TaintFaultGuard
+        TaintFaultGuard { _syncs: syncs }
     }
 
     /// Record every taint file, and fail (with a distinctive error, no filesystem access) any
     /// whose path contains `needle`.
     fn failing(needle: &str) -> Self {
+        // Before arming: a panic here must leave nothing armed.
+        let syncs = file_utils::real_syncs();
         TAINT_WRITE_FAULT.with(|f| *f.borrow_mut() = TaintFaultState {
             attempted: Vec::new(),
             fail_needle: Some(needle.to_string()),
         });
-        TaintFaultGuard
+        TaintFaultGuard { _syncs: syncs }
     }
 }
 
@@ -1397,6 +1403,7 @@ mod tests {
         let object_path = forklift.join("objects").join("99").join("00112233");
 
         let _fault = TaintFaultGuard::recording();
+        assert!(file_utils::fsync_enabled(), "the armed rig runs real syncs");
         record_taint(&[object_path.as_path()]).unwrap();
         assert_eq!(taint_write_attempts().len(), 1, "a successful write must still be observed");
     }

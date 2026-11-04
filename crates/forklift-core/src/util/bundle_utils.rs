@@ -2020,6 +2020,8 @@ mod tests {
     /// aggregate pack and does not explode its objects into individually-fsynced loose files.
     #[test]
     fn build_bundle_then_import_bundle_round_trips_directly_into_a_native_pack() {
+        // Runs the bundle envelope's syncs for real: the unit tests skip syncs otherwise.
+        let _syncs = crate::util::file_utils::real_syncs();
         let (bundle_bytes, _, _) = build_tiny_native_bundle("bundle-roundtrip-src");
         assert!(bundle_bytes.starts_with(format!("{}\n", BUNDLE_HEADER).as_bytes()));
 
@@ -2285,8 +2287,6 @@ mod tests {
     /// The bundle imports, every version reading back.
     #[test]
     fn a_bundle_deltas_each_version_against_the_last_at_its_path_and_caps_the_chain() {
-        // Nothing here is about durability, and the 55-parcel history paid a sync per write.
-        let _syncs = file_utils::skip_syncs_on_this_thread();
         let source = Scratch::new("bundle-delta-chain");
 
         let shared: Vec<u8> = (0..4096u32).map(|i| b'a' + (i.wrapping_mul(2654435761) >> 27) as u8).collect();

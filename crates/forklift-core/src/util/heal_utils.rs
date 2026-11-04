@@ -960,6 +960,8 @@ mod tests {
     fn a_hand_written_complete_taint_naming_a_verified_loose_object_is_healed() {
         // The content-verified branch: a real loose object, correctly addressed by its own path.
         let _serial = lock_activation();
+        // Runs the restaged temp file's syncs for real: the unit tests skip syncs otherwise.
+        let _syncs = crate::util::file_utils::real_syncs();
         taint_utils::activate();
 
         let root = scratch("loose-object-restage");

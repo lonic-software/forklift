@@ -4585,7 +4585,7 @@ mod tests {
         let attempts = file_utils::dir_sync_attempts();
         drop(syncs);
 
-        if cfg!(unix) && file_utils::fsync_enabled() {
+        if cfg!(unix) {
             assert!(attempts.contains(&folder.parent().unwrap().to_path_buf()),
                 "the fan-out folder holding a's new shard folder is synced: {attempts:?}");
         }
@@ -4905,7 +4905,6 @@ mod tests {
     /// metadata names `key`.
     #[cfg(unix)]
     fn assert_registration_waits_for_the_sync_of(key: &str, folder: &Path) {
-        assert!(file_utils::fsync_enabled(), "FORKLIFT_FSYNC turns fsync off for the in-process tests; unset it");
         assert!(folder.is_dir(), "{} exists", folder.display());
 
         let fault = file_utils::DirSyncFaultGuard::failing_exactly(folder);

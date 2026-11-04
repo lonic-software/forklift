@@ -4152,11 +4152,9 @@ mod tests {
     /// thread-local.
     ///
     /// Tree objects are written directly to their final on-disk path (`write_tree_object_fast`)
-    /// rather than through `LooseObject::store` (which fsyncs, and renames through a barrier,
-    /// per object): at `DEPTH` writes that per-object durability cost dominates real wall time
-    /// for no benefit this test needs — it is exercising `walk_tree`'s traversal, not any
-    /// write path's own durability, and toggling `FORKLIFT_FSYNC` would be a process-wide,
-    /// cross-test change this shared unit-test binary cannot risk. Mirrors the same fast,
+    /// rather than through `LooseObject::store` (which renames through a barrier per object):
+    /// at `DEPTH` writes that per-object cost buys nothing this test needs — it is exercising
+    /// `walk_tree`'s traversal, not any write path. Mirrors the same fast,
     /// direct-write shape `heal_utils::tests::write_loose_object` already uses for the same
     /// reason.
     #[test]
