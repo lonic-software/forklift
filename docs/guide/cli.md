@@ -176,8 +176,8 @@ key that signed it. A tag is left out, and named in a warning with the reason, w
 on no exported branch (a deleted pallet's), when this warehouse's office does not hold its key,
 when git does not accept its name (`a..b`, `v1.lock`), when the name of another tag that would be
 exported differs from it only in case (`v1` and `V1` would share one file on macOS and Windows),
-or when this build cannot read it. If the tags, or the office that names their taggers, cannot be read at all, the
-branches are still exported, with one warning.
+or when this build cannot read it. If the tags, or the office that names their taggers, cannot be
+read at all, the branches are still exported, with one warning.
 
 The export is deterministic: the same history exports to the same commit hashes on any
 machine, whatever your own git configuration says (it is shut out of every object write).
