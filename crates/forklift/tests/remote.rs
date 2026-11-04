@@ -11305,8 +11305,11 @@ fn unsigned_metadata_lifts_and_lowers_through_a_server_that_never_enrolled() {
     assert_success(&area.forklift("a", &["lower"]));
     assert_eq!(stdout(&area.forklift("a", &["manifest", "get", "main", "ci"])).trim(), "red");
 
-    // The clone records a change it does not lift before the remote enrolls.
+    // The clone records a change it does not lift before the remote enrolls, and falls behind
+    // on the tags: a store that does not hold the boundary its head leads to fetches it.
     assert_success(&area.forklift("b", &["manifest", "set", "main", "ci", "blue"]));
+    assert_success(&area.forklift("a", &["tag", "create", "v1.1", "main"]));
+    assert_success(&area.forklift("a", &["lift"]));
 
     // Enrolling folds the remote's metadata into the boundary, so the server takes the anchor
     // and keeps it, unsigned, under trust.

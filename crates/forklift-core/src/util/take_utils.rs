@@ -391,16 +391,24 @@ pub async fn record_unvouched_heads(client: &RemoteClient,
 /// Metadata recorded here before the remote enrolled is unsigned, and the anchor admits an
 /// unsigned meta parcel only inside its boundary. A head outside it stays where it is; the
 /// record is informational — a lift of it is refused by the content check, not by the record.
-/// The judgement needs only the local history and the boundary's present ancestry, so nothing
-/// is fetched.
+/// A refused head is judged again once the boundary has been fetched from the remote, as a user
+/// pallet's is: a store behind the remote may not hold the boundary its own heads lead to.
+///
+/// # Arguments
+/// * `client`       - The remote the anchor comes from.
+/// * `anchor`       - The anchor about to be installed.
+/// * `office_state` - The office state the anchor's office head holds.
 ///
 /// # Returns
 /// * `Ok(LocalJudgement)` - Every head judged, and the meta pallets (as `@name`) the anchor does
 ///                          not vouch for.
 /// * `Err(String)`        - The record could not be read or written.
-pub fn record_unvouched_meta_heads(anchor: &TrustAnchor, office_state: &OfficeState) -> Result<LocalJudgement, String> {
+pub async fn record_unvouched_meta_heads(client: &RemoteClient,
+                                         anchor: &TrustAnchor,
+                                         office_state: &OfficeState) -> Result<LocalJudgement, String> {
     let mut judgement = LocalJudgement { judged: Vec::new(), unvouched: Vec::new() };
     let mut unvouched = Vec::new();
+    let mut fetched = false;
 
     // Every meta ref on disk, as the install's precondition lists them.
     for name in pallet_utils::list_meta_pallets()?.iter().filter(|name| *name != office_utils::OFFICE_PALLET_NAME) {
@@ -409,11 +417,22 @@ pub fn record_unvouched_meta_heads(anchor: &TrustAnchor, office_state: &OfficeSt
         // Audit: the parcels are history this warehouse already holds, judged for their standing
         // under the new anchor, not admitted as new writes. A pallet with no rules has no content
         // check to judge it by.
-        let refused = meta_tree::meta_rules(name).is_some_and(|rules| meta_tree::verify_meta_content(
+        let refused = || meta_tree::meta_rules(name).is_some_and(|rules| meta_tree::verify_meta_content(
             name, rules, Some(office_state), &anchor.boundary, meta_tree::Admission::Audit, None, &head
         ).is_err());
 
-        if refused {
+        // Once for every pallet, and each head on its own: one the remote cannot serve stays
+        // missing, and the verdict past it stays a refusal.
+        let mut refused_now = refused();
+        if refused_now && !fetched {
+            fetched = true;
+            for boundary_head in &anchor.boundary {
+                let _ = remote_utils::fetch_history_scoped(client, boundary_head, &format!("{}{}", pallet_utils::META_QUALIFIER, name), &Progress::NONE).await;
+            }
+            refused_now = refused();
+        }
+
+        if refused_now {
             unvouched.push(head.clone());
             judgement.unvouched.push(format!("{}{}", pallet_utils::META_QUALIFIER, name));
         }

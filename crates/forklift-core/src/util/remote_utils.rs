@@ -7655,7 +7655,7 @@ impl PreparedTrust {
         let office_state = self.office_state.as_ref().expect("first contact verified an office");
 
         let mut judgement = take_utils::record_unvouched_heads(client, anchor, office_head, office_state, verified).await?;
-        let meta = take_utils::record_unvouched_meta_heads(anchor, office_state)?;
+        let meta = take_utils::record_unvouched_meta_heads(client, anchor, office_state).await?;
         judgement.judged.extend(meta.judged);
         judgement.unvouched.extend(meta.unvouched);
         self.judged_heads = Some(judgement.judged);

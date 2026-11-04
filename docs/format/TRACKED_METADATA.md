@@ -405,8 +405,9 @@ adopts = "<hash>"          # re-genesis only: the old office head, kept as attes
 - `adopts` is held to that same shape, parcel by parcel to its root, wherever a remote's
   anchor is taken, without checking signatures. Local re-genesis does not check it, so it
   stays usable over damaged older history.
-- `boundary` is the head of every pallet, user and meta alike (the office excepted), at the
-  moment trust was established: parcels
+- `boundary` is the head of every pallet at the moment trust was established: `enroll` takes
+  every local pallet's, user and meta alike, the office excepted, and the remote's; a
+  re-genesis takes every pallet's, the old office included. Parcels
   reachable from these are the pre-trust (legacy) history and may be unsigned;
   everything else must be signed. The boundary is exact ancestry — timestamps have
   second granularity and can be forged, so they never decide a security question.
