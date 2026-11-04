@@ -450,7 +450,7 @@ pub(crate) async fn stack_completion(description: Option<String>,
 /// precondition for a merge that materializes into the working directory. Public within
 /// the crate so `lift`'s optimistic path can check before auto-merging.
 pub(crate) async fn is_warehouse_clean(our_tree_hash: &str) -> Result<bool, String> {
-    ensure_warehouse_is_clean(our_tree_hash, "merging", "").await.map(|_| true).or_else(|_| Ok(false))
+    ensure_warehouse_is_clean(our_tree_hash, "merging", "").await.map(|_| true).or(Ok(false))
 }
 
 /// Fast-forward the current pallet to their head: materialize the tree difference and
