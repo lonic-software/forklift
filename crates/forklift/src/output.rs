@@ -62,7 +62,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 20;
+pub const SCHEMA_VERSION: u32 = 21;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -559,6 +559,10 @@ error_codes! {
     /// The remote's head of a pallet holds an entry named like the metadata folder, so it cannot
     /// be checked out.
     HeadNotMaterializable,
+
+    /// `lower` merged the remote's diverged head in and the merge conflicts; the consolidation is
+    /// left in progress.
+    MergeConflicts,
 }
 
 impl ErrorCode {
@@ -569,7 +573,7 @@ impl ErrorCode {
             ErrorCode::Usage                => "usage",
             ErrorCode::NotAWarehouse        => "not_a_warehouse",
             ErrorCode::WarehouseLocked      => "warehouse_locked",
-            ErrorCode::Conflict             => "conflict",
+            ErrorCode::Conflict             => RefusalCode::Conflict.as_str(),
             ErrorCode::Diverged             => RefusalCode::Diverged.as_str(),
             ErrorCode::OutOfScope           => scope_utils::CODE_OUT_OF_SCOPE,
             ErrorCode::OutOfScopeConflict   => scope_utils::CODE_OUT_OF_SCOPE_CONFLICT,
@@ -610,6 +614,7 @@ impl ErrorCode {
             ErrorCode::WarehouseLeaseMissing => RefusalCode::WarehouseLeaseMissing.as_str(),
             ErrorCode::WarehouseInUse => RefusalCode::WarehouseInUse.as_str(),
             ErrorCode::HeadNotMaterializable => RefusalCode::HeadNotMaterializable.as_str(),
+            ErrorCode::MergeConflicts => RefusalCode::MergeConflicts.as_str(),
         }
     }
 
@@ -664,6 +669,7 @@ impl ErrorCode {
             ErrorCode::WarehouseLeaseMissing => 44,
             ErrorCode::WarehouseInUse => 45,
             ErrorCode::HeadNotMaterializable => 46,
+            ErrorCode::MergeConflicts => 47,
         }
     }
 
@@ -677,7 +683,8 @@ impl ErrorCode {
                 "The command line could not be parsed (an unknown command, a missing or invalid \
                  argument)",
             ErrorCode::NotAWarehouse => "The command needs a warehouse; this directory is none",
-            ErrorCode::Conflict => "Working state blocks the operation (unresolved / dirty)",
+            ErrorCode::Conflict =>
+                "Changes to tracked files block the operation, which would write over them; nothing was changed",
             ErrorCode::Diverged =>
                 "The local pallet and the remote's both hold parcels the other lacks; nothing was \
                  lifted or lowered",
@@ -786,6 +793,8 @@ impl ErrorCode {
                 "An upgrade found the warehouse open in another process; let it finish, then run the upgrade again",
             ErrorCode::HeadNotMaterializable =>
                 "The remote's head of the pallet holds an entry named like the warehouse's metadata folder, so it cannot be checked out; nothing was changed",
+            ErrorCode::MergeConflicts =>
+                "Lowering merged the remote's diverged head in, and the merge conflicts; the consolidation is left in progress",
         }
     }
 
@@ -837,6 +846,8 @@ impl ErrorCode {
             RefusalCode::WarehouseLeaseMissing => ErrorCode::WarehouseLeaseMissing,
             RefusalCode::WarehouseInUse => ErrorCode::WarehouseInUse,
             RefusalCode::HeadNotMaterializable => ErrorCode::HeadNotMaterializable,
+            RefusalCode::Conflict => ErrorCode::Conflict,
+            RefusalCode::MergeConflicts => ErrorCode::MergeConflicts,
         }
     }
 }
@@ -1377,6 +1388,8 @@ mod tests {
             (RefusalCode::WarehouseLeaseMissing, "warehouse_lease_missing", 44),
             (RefusalCode::WarehouseInUse, "warehouse_in_use", 45),
             (RefusalCode::HeadNotMaterializable, "head_not_materializable", 46),
+            (RefusalCode::Conflict, "conflict", 4),
+            (RefusalCode::MergeConflicts, "merge_conflicts", 47),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

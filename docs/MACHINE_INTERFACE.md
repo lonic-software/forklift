@@ -85,7 +85,17 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 20** (current): `git import` reports no `ignored_git` or `git_already_ignored`, since
+**Schema 21** (current): the `merge_conflicts` error code exists (exit 47), and `conflict` (exit 4)
+gains producers: `consolidate`, `pick`, `haul consolidate`, `shift`, an `undo` of a shift,
+`pallet create` at a revision and a merging `lower` refuse with it over changes to tracked files,
+naming `forklift park` and the command again.
+A `lower` of the current pallet that has diverged from the remote merges the remote's head in,
+reporting the outcome `merged` and the merge parcel as `merged`; a conflicting merge refuses with
+`merge_conflicts`, its paths in `details.paths`, and leaves the consolidation in progress. A
+`lower --repair` over a diverged current pallet merges the repair the same way. A `diverged`
+working pallet's `next_step` is now `forklift lower; then forklift lift`.
+
+**Schema 20**: `git import` reports no `ignored_git` or `git_already_ignored`, since
 it no longer writes an ignore rule for the `.git` folder: every `.git` folder is always ignored.
 
 **Schema 19**: `lower --repair` and `clone --repair` exist. `lower` reports the outcome
@@ -511,8 +521,8 @@ and follows the step.
 | code | exit | condition | `next_step` |
 |---|---|---|---|
 | `behind` | 26 | this bay's base is behind its pallet's head: another bay or process moved the pallet. Raised by every command that moves the bay's pallet (`stack`, `deliver`, `consolidate`, `pick`, `haul consolidate`, `lower`, `lift`'s auto-merge, a consolidation's completion) | `forklift shift <pallet>`; a refusal mid-merge names aborting the merge first |
-| `remote_ahead` | 28 | the remote's pallet holds parcels this warehouse has not lowered: its head is unknown here, descends from the local head, or moved since this client read it (the `409` of a ref update). It does not promise this side holds nothing new; `lower` then fast-forwards or reports `diverged` | `forklift lower` |
-| `diverged` | 5 | the local pallet and the remote's each hold parcels the other lacks. `lower` never merges them; `lift` reports it when it did not auto-merge (an overlap, an unclean warehouse, or its retry bound) | for a working pallet: create a pallet at the remote head (as `<pallet>-remote-<short hash>`, unique per remote head), shift back, consolidate it, lift; for a meta pallet with replay rules: `forklift lower`. The office and other meta pallets diverge as an unclassified error, reconciled by hand |
+| `remote_ahead` | 28 | the remote's pallet holds parcels this warehouse has not lowered: its head is unknown here, descends from the local head, or moved since this client read it (the `409` of a ref update). It does not promise this side holds nothing new; `lower` then fast-forwards or merges | `forklift lower` |
+| `diverged` | 5 | the local pallet and the remote's each hold parcels the other lacks. `lift` reports it when it did not auto-merge (an overlap, an unclean warehouse, or its retry bound); `lower <pallet>` reports it for a pallet the bay is not on, and a bare `lower` merges instead | for a working pallet: `forklift lower; then forklift lift`, or for a named lower `forklift shift <pallet>; then forklift lower`; for a meta pallet with replay rules: `forklift lower`. The office and other meta pallets diverge as an unclassified error, reconciled by hand |
 | `target_not_covered` | 27 | `deliver` would undo changes on the target that the draft never consolidated | `forklift consolidate <target>` |
 
 `diverged` used to be described as a remote ref moving under a lift. That case is now

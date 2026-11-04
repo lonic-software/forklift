@@ -6247,6 +6247,60 @@ fn haul_merge_by_a_writer_not_granted_the_target_is_refused_before_merging() {
     assert_eq!(json(&warehouse.run(&["haul", "show", &id, "--json"]))["data"]["status"], "merged");
 }
 
+/// Changes to tracked files block every command that writes the files of another tree with the
+/// `conflict` code, and each names itself again after `forklift park`, so the step finishes what
+/// was asked: an undo of a shift, not a new shift, and a pallet create that wrote no ref yet.
+// Revert: pass "forklift shift <target>" from undo, or check pallet create only inside the shift
+// → the undo's next step or the absent ref fails.
+#[test]
+fn a_dirty_warehouse_refusal_names_the_command_that_was_refused() {
+    let warehouse = TestWarehouse::new("dirty-refusals");
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["prepare"]));
+    warehouse.write_file("base.txt", "base\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "base"]));
+    assert_success(&warehouse.run(&["office", "enroll"]));
+
+    assert_success(&warehouse.run(&["pallet", "create", "feature"]));
+    warehouse.write_file("feature.txt", "feat\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "feature work"]));
+    let feature = pallet_head_hash(&warehouse, "feature");
+    assert_success(&warehouse.run(&["haul", "open", "--target", "main", "--source", "feature", "--title", "Add feature"]));
+    let id = json(&warehouse.run(&["haul", "list", "--json"]))["data"]["hauls"][0]["id"].as_str().unwrap().to_string();
+    assert_success(&warehouse.run(&["shift", "main"]));
+    let main = pallet_head_hash(&warehouse, "main");
+
+    warehouse.write_file("base.txt", "edited\n");
+    let cases: [(Vec<&str>, String); 4] = [
+        (vec!["undo"], "forklift undo".to_string()),
+        (vec!["pick", &feature], format!("forklift pick {}", feature)),
+        (vec!["haul", "consolidate", &id], format!("forklift haul consolidate {}", id)),
+        (vec!["pallet", "create", "other", &feature], format!("forklift pallet create other {}", feature)),
+    ];
+    for (args, command) in &cases {
+        let mut args = args.clone();
+        args.push("--json");
+        let refused = warehouse.run(&args);
+        assert_eq!(refused.status.code(), Some(4), "{:?}: {}{}", args, stdout(&refused), stderr(&refused));
+        let value = json(&refused);
+        assert_eq!(value["error"]["code"], "conflict", "{:?}: {}", args, value);
+        assert_eq!(value["error"]["next_step"], format!("forklift park; then {}", command).as_str(), "{:?}", args);
+    }
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("base.txt")).unwrap(), "edited\n");
+    assert_eq!(pallet_head_hash(&warehouse, "main"), main);
+    assert!(!warehouse.root.join(".forklift/pallets/other").exists(), "the refused create wrote no ref");
+    assert!(stdout(&warehouse.run(&["pallet", "list"])).contains("* main"));
+
+    // Parked, the undo reverses the shift itself.
+    assert_success(&warehouse.run(&["park"]));
+    let undone = warehouse.run(&["undo", "--json"]);
+    assert_success(&undone);
+    assert_eq!(json(&undone)["data"]["op"], "shift");
+    assert!(stdout(&warehouse.run(&["pallet", "list"])).contains("* feature"));
+}
+
 /// Record text is authored by whoever wrote the record — a remote operator, once it syncs — so a
 /// human render must not let it drive the terminal: escapes and bidi overrides print as inert
 /// spaces, and a multi-line text keeps its lines. `--json` is the record, so it stays verbatim.
@@ -7916,7 +7970,7 @@ fn json_mode_wraps_every_result_in_a_versioned_envelope() {
     let value = json(&prepared);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 20);
+    assert_eq!(value["schema"], 21);
     assert_eq!(value["command"], "prepare");
     assert_eq!(value["ok"], true);
     assert!(value["data"]["created"].is_array());
@@ -7958,7 +8012,7 @@ fn json_errors_carry_a_stable_code_and_a_deterministic_exit_code() {
     // failed, so a consumer classifies by the same header on either outcome.
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 20);
+    assert_eq!(value["schema"], 21);
     assert_eq!(value["command"], "stocktake");
     assert!(value.get("data").is_none(), "a failure carries no data: {}", value);
 }
@@ -8002,7 +8056,7 @@ fn a_usage_error_under_json_is_one_failure_document_with_exit_2() {
     let value = json(&unknown);
     assert_eq!(value["lonic_json"], 1);
     assert_eq!(value["tool"], "forklift");
-    assert_eq!(value["schema"], 20);
+    assert_eq!(value["schema"], 21);
     assert_eq!(value["ok"], false);
     assert!(value["command"].is_null(), "no known command was named: {}", value);
     assert_eq!(value["error"]["code"], "usage");
@@ -8210,7 +8264,7 @@ fn every_json_document_starts_with_the_header_in_its_documented_order() {
     let warehouse = TestWarehouse::new("json-key-order");
 
     // The order is checked on the raw text: a parsed `Value` would hide it.
-    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 20,\n  \"command\": ";
+    let header = "{\n  \"lonic_json\": 1,\n  \"tool\": \"forklift\",\n  \"schema\": 21,\n  \"command\": ";
 
     for args in [&["--json", "version"][..], &["--json", "bogus"], &["--json", "stocktake"]] {
         let output = warehouse.run(args);

@@ -1,5 +1,5 @@
 use serde::Serialize;
-use crate::commands::shift;
+use crate::commands::{consolidate, shift};
 use crate::output::{self, CommandOutput};
 use forklift_core::error;
 use forklift_core::util::{bay_utils, file_utils, haul_utils, journal_utils, merge_utils, object_utils, take_utils, tombstone_utils};
@@ -49,9 +49,19 @@ pub async fn create_pallet(name: &str, revision: Option<&str>) -> Result<(), Str
             // pallet name resolves to a head that already is.
             let preconditions = take_utils::verify_take(None, &TakeTrust::local()?, &parcel_hash, name, FetchAt::Warehouse).await?;
 
+            // Checked before the ref is created too, so the common refusal leaves no pallet
+            // behind. The shift checks again after its own anchor; a refusal there comes after
+            // the ref exists, so it names the shift that is left to do.
+            let command = format!("forklift pallet create {} {}", name, revision);
+            let current_tree = match &position.base {
+                Some(hash) => Some(object_utils::load_parcel(hash)?.tree_hash),
+                None => None,
+            };
+            consolidate::ensure_warehouse_is_clean(current_tree.as_deref(), "shifting", &command).await?;
+
             pallet_utils::update_pallet_head(name, None, &parcel_hash, &preconditions)?;
 
-            let head = shift::shift_to(name).await?;
+            let head = shift::shift_to(name, &format!("forklift shift {}", name)).await?;
 
             output::emit(&Palletized {
                 pallet: name.to_string(),

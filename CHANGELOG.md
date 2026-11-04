@@ -25,9 +25,17 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   would write, remove or replace a path holding a local change, or a folder above or below one,
   refuses, names those paths and changes nothing. During a consolidation or pick in progress, a
   lower is refused unless the bay is already up to date.
+- **`lower` merges a diverged remote.** When your pallet and the remote's both hold new parcels,
+  `lower` merges the remote's head in and stacks the merge, and `lift` publishes it: two commands
+  where there used to be five and a leftover pallet. A merge that conflicts stops with
+  `merge_conflicts` (exit 47) and the consolidation in progress; `stack` completes it and `abort`
+  abandons it. Changes to tracked files refuse the merge with `conflict` (exit 4), as they
+  now refuse `consolidate`, `pick`, `haul consolidate`, `shift`, an `undo` of a shift and
+  `pallet create` at a revision. `lower --repair` merges its repair the same way instead of
+  stacking it on a pallet of its own.
 - `restore --staged` is gone; use `unload`.
 - MCP tools are generated from the command tree.
-- `--json` documents are now at schema 20.
+- `--json` documents are now at schema 21.
 - **Ignore files speak gitignore.** Every line of `.forkliftignore` is a gitignore line, and every
   `.gitignore` in the tree is honoured where it stands; `.forkliftignore` is read last and wins over
   them. A regex is written as a `re:` or `!re:` line, matched against the whole path. Matching is

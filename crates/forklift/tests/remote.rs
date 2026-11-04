@@ -1506,8 +1506,13 @@ fn the_holds_endpoint_answers_held_for_lifted_history_and_not_held_for_the_rest(
     assert!(status.starts_with("HTTP/1.1 422"), "{} / {}", status, body);
 }
 
+/// A pallet that diverged from the remote is never overwritten: the lift refuses and names the
+/// lower, which merges the remote's head in. A merge that conflicts stops with the consolidation
+/// in progress and exits with its own code; abort abandons it, and resolving and stacking completes
+/// it, after which the lift goes through.
+// Revert: send the diverged lower back to the refusal → exit 5, no consolidation in progress.
 #[test]
-fn diverged_pallets_are_refused_not_merged() {
+fn a_diverged_lower_merges_and_stops_on_a_conflict() {
     let area = TestArea::new("diverged");
     let server = Server::start(&area, None);
 
@@ -1524,6 +1529,7 @@ fn diverged_pallets_are_refused_not_merged() {
     assert_success(&area.forklift("a", &["load", "base.txt"]));
     assert_success(&area.forklift("a", &["stack", "-m", "a work"]));
     assert_success(&area.forklift("a", &["lift"]));
+    let theirs = area.read_file("a/.forklift/pallets/main").trim().to_string();
 
     // B has nothing of its own yet: the remote is strictly ahead, which is not a divergence.
     let behind = area.forklift("b", &["--json", "lift"]);
@@ -1535,27 +1541,137 @@ fn diverged_pallets_are_refused_not_merged() {
     area.write_file("b/base.txt", "b's version\n");
     assert_success(&area.forklift("b", &["load", "base.txt"]));
     assert_success(&area.forklift("b", &["stack", "-m", "b work"]));
+    let ours = user_head(&area, "b", "main");
 
     // B's lift must be refused: the remote moved. Nothing may be overwritten.
-    let refused = area.forklift("b", &["lift"]);
-    assert!(!refused.status.success());
-    assert!(stderr(&refused).contains("diverged") && stderr(&refused).contains("pallet create"), "{}", stderr(&refused));
-
     let refused = area.forklift("b", &["--json", "lift"]);
     assert_eq!(refused.status.code(), Some(5), "{}{}", stdout(&refused), stderr(&refused));
-    let value: serde_json::Value = serde_json::from_str(&stdout(&refused)).unwrap();
+    let value = json_of(&refused);
     assert_eq!(value["error"]["code"], "diverged", "{}", value);
-    assert!(value["error"]["next_step"].as_str().unwrap().starts_with("forklift pallet create "), "{}", value);
+    assert_eq!(value["error"]["next_step"], "forklift lower; then forklift lift", "{}", value);
 
-    // B's lower reports the divergence (with the parcels fetched for a consolidate).
-    let diverged = area.forklift("b", &["lower"]);
-    assert!(!diverged.status.success());
-    assert!(stderr(&diverged).contains("diverged"), "{}", stderr(&diverged));
+    // B's lower merges the remote's head in, and both sides changed base.txt.
+    let conflicted = area.forklift("b", &["--json", "lower"]);
+    assert_eq!(conflicted.status.code(), Some(47), "{}{}", stdout(&conflicted), stderr(&conflicted));
+    let value = json_of(&conflicted);
+    assert_eq!(value["error"]["code"], "merge_conflicts", "{}", value);
+    assert!(value["error"]["message"].as_str().unwrap().contains("conflict markers: base.txt."), "{}", value);
+    assert_eq!(value["error"]["details"]["paths"], serde_json::json!(["base.txt"]), "{}", value);
+    assert_eq!(user_head(&area, "b", "main"), ours, "a conflict stacks nothing");
+    let stocktake = json_of(&area.forklift("b", &["--json", "stocktake"]));
+    assert_eq!(stocktake["data"]["consolidation_in_progress"], "remote", "{}", stocktake);
 
-    let diverged = area.forklift("b", &["--json", "lower"]);
-    assert_eq!(diverged.status.code(), Some(5), "{}{}", stdout(&diverged), stderr(&diverged));
-    let value: serde_json::Value = serde_json::from_str(&stdout(&diverged)).unwrap();
-    assert_eq!(value["error"]["code"], "diverged", "{}", value);
+    // Abort puts the pallet back as it was; a second lower stops on the same conflict.
+    assert_success(&area.forklift("b", &["abort"]));
+    assert_eq!(area.read_file("b/base.txt"), "b's version\n");
+    let again = area.forklift("b", &["lower"]);
+    assert_eq!(again.status.code(), Some(47), "{}{}", stdout(&again), stderr(&again));
+    assert!(stderr(&again).contains("forklift abort"), "{}", stderr(&again));
+
+    // Resolving and stacking completes the merge, which the lift publishes.
+    area.write_file("b/base.txt", "both\n");
+    assert_success(&area.forklift("b", &["load", "base.txt"]));
+    assert_success(&area.forklift("b", &["stack", "-m", "both"]));
+    let merged = user_head(&area, "b", "main");
+    assert_eq!(parents_of(&area, "b", &merged), vec![ours, theirs]);
+    assert_success(&area.forklift("b", &["lift"]));
+
+    assert_success(&area.forklift("a", &["lower"]));
+    assert_eq!(area.read_file("a/base.txt"), "both\n");
+}
+
+/// A diverged lower whose merge is clean stacks it at once, as a parcel with both heads for
+/// parents, and reports `merged`; the lift that follows fast-forwards the remote onto it.
+// Revert: drop the served-head record after the merge → nothing observable here; report.merged
+// unset → `merged` missing from the report.
+#[test]
+fn a_clean_diverged_lower_stacks_the_merge() {
+    let area = TestArea::new("diverged-clean");
+    let server = Server::start(&area, None);
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/base.txt", "base\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
+
+    area.write_file("a/theirs.txt", "a\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "a work"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    let theirs = area.read_file("a/.forklift/pallets/main").trim().to_string();
+
+    area.write_file("b/ours.txt", "b\n");
+    assert_success(&area.forklift("b", &["load", "."]));
+    assert_success(&area.forklift("b", &["stack", "-m", "b work"]));
+    let ours = user_head(&area, "b", "main");
+
+    let lowered = area.forklift("b", &["--json", "lower"]);
+    assert_success(&lowered);
+    let value = json_of(&lowered)["data"].clone();
+    assert_eq!(value["outcome"], "merged", "{}", value);
+    let merged = value["merged"].as_str().unwrap().to_string();
+    assert_eq!(user_head(&area, "b", "main"), merged);
+    assert_eq!(parents_of(&area, "b", &merged), vec![ours, theirs]);
+    assert_eq!(area.read_file("b/theirs.txt"), "a\n");
+    assert_eq!(area.read_file("b/ours.txt"), "b\n");
+    let stocktake = json_of(&area.forklift("b", &["--json", "stocktake"]));
+    assert!(stocktake["data"]["consolidation_in_progress"].is_null(), "{}", stocktake);
+
+    assert_success(&area.forklift("b", &["lift"]));
+    assert_eq!(area.read_file("server-root/.forklift/pallets/main").trim(), merged);
+}
+
+/// Local changes to tracked files block a diverged lower before anything is merged: it refuses
+/// with the `conflict` code consolidate's own check shares, and writes nothing.
+// Revert: skip the clean check in `merge_diverged` → the merge runs over the edit.
+#[test]
+fn a_dirty_diverged_lower_refuses_and_writes_nothing() {
+    let area = TestArea::new("diverged-dirty");
+    let server = Server::start(&area, None);
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/base.txt", "base\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
+    assert_success(&area.forklift("a", &["lift"]));
+    assert_success(&area.forklift(".", &["clone", &server.url, "b"]));
+
+    area.write_file("a/theirs.txt", "a\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "a work"]));
+    assert_success(&area.forklift("a", &["lift"]));
+
+    area.write_file("b/ours.txt", "b\n");
+    assert_success(&area.forklift("b", &["load", "."]));
+    assert_success(&area.forklift("b", &["stack", "-m", "b work"]));
+    let ours = user_head(&area, "b", "main");
+    assert_success(&area.forklift("b", &["pallet", "create", "side", &ours]));
+    assert_success(&area.forklift("b", &["shift", "main"]));
+    area.write_file("b/base.txt", "edited\n");
+
+    let refused = area.forklift("b", &["--json", "lower"]);
+    assert_eq!(refused.status.code(), Some(4), "{}{}", stdout(&refused), stderr(&refused));
+    let value = json_of(&refused);
+    assert_eq!(value["error"]["code"], "conflict", "{}", value);
+    assert_eq!(value["error"]["next_step"], "forklift park; then forklift lower", "{}", value);
+    assert_eq!(user_head(&area, "b", "main"), ours);
+    assert_eq!(area.read_file("b/base.txt"), "edited\n");
+    assert!(!area.path("b/theirs.txt").exists());
+    let stocktake = json_of(&area.forklift("b", &["--json", "stocktake"]));
+    assert!(stocktake["data"]["consolidation_in_progress"].is_null(), "{}", stocktake);
+
+    // Consolidate's and shift's own checks refuse with the same code, each naming itself again.
+    for command in ["consolidate", "shift"] {
+        let refused = area.forklift("b", &["--json", command, "side"]);
+        assert_eq!(refused.status.code(), Some(4), "{}{}", stdout(&refused), stderr(&refused));
+        let value = json_of(&refused);
+        assert_eq!(value["error"]["code"], "conflict", "{}", value);
+        assert_eq!(value["error"]["next_step"], format!("forklift park; then forklift {} side", command).as_str());
+    }
+
+    // Its next step clears it.
+    run_next_steps(&area, "b", "forklift park; then forklift lower");
+    assert_eq!(parents_of(&area, "b", &user_head(&area, "b", "main")).len(), 2);
 }
 
 // Revert: pallet_moved back to an unclassified 409 → the body carries no code.
@@ -1592,7 +1708,7 @@ fn a_stale_ref_update_is_a_remote_ahead_refusal_on_the_wire() {
 
 #[test]
 fn a_scoped_merge_lifts_without_reading_the_out_of_scope_object() {
-    // A scoped bay's merge-then-lift, end to end: a scoped bay consolidates a diverged remote "work"
+    // A scoped bay's merge-then-lift, end to end: a scoped bay's lower merges a diverged remote "work"
     // head that changed an out-of-scope subtree (adopting it by hash into the merge), then lifts.
     // The lift's negotiation walk must prune that subtree against the merge's second parent — the
     // remote head it is lifting against — and never load it. To prove that, the out-of-scope
@@ -1628,15 +1744,10 @@ fn a_scoped_merge_lifts_without_reading_the_out_of_scope_object() {
     assert_success(&area.forklift("dev-work", &["load", "."]));
     assert_success(&area.forklift("dev-work", &["stack", "-m", "dev edits api"]));
 
-    // Lower fetches the diverged remote head (with its out-of-scope object) and reports the
-    // divergence; make that head a pallet and consolidate it into work — the scoped bay adopts the
-    // out-of-scope subtree by hash into the stacked merge parcel.
-    let lowered = area.forklift("dev-work", &["lower"]);
-    assert!(!lowered.status.success(), "the divergence must be reported: {}", stdout(&lowered));
-
-    assert_success(&area.forklift("dev-work", &["pallet", "create", "incoming", &remote_web_head]));
-    assert_success(&area.forklift("dev-work", &["shift", "work"]));
-    assert_success(&area.forklift("dev-work", &["consolidate", "incoming"]));
+    // Lower fetches the diverged remote head (with its out-of-scope object) and merges it into
+    // work — the scoped bay adopts the out-of-scope subtree by hash into the stacked merge parcel.
+    let lowered = area.forklift("dev-work", &["--json", "lower"]);
+    assert_eq!(json_of(&lowered)["data"]["outcome"], "merged", "{}", stdout(&lowered));
 
     // Make the out-of-scope object impossible to read (a sparse store would never have fetched it):
     // the merge already committed its hash, so the lift must not need its bytes.
@@ -1803,7 +1914,8 @@ fn optimistic_lift_auto_merges_a_disjoint_divergence_but_stops_on_overlap() {
     assert_success(&area.forklift("b", &["stack", "-m", "b edits shared"]));
     let refused = area.forklift("b", &["lift"]);
     assert!(!refused.status.success(), "an overlapping divergence must not auto-merge");
-    assert!(stderr(&refused).contains("diverged") && stderr(&refused).contains("pallet create"), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("diverged") && stderr(&refused).contains("forklift lower; then forklift lift"),
+        "{}", stderr(&refused));
     assert_eq!(area.read_file("b/shared.txt"), "from b\n"); // untouched — no half-merge
 }
 
@@ -3640,10 +3752,10 @@ fn a_lower_and_a_clone_refuse_a_wedged_head_before_changing_anything() {
     assert!(!area.path("fresh/docs").exists());
 }
 
-/// A diverged bay over a wedged remote is refused as not materializable, never as diverged: the
-/// diverged refusal's next step would check the remote head out on a pallet of its own.
-// Revert: drop the check before lower's diverged return → the refusal is `diverged`, naming
-// `forklift pallet create`.
+/// A diverged bay over a wedged remote is refused as not materializable, never merged: the merge
+/// would check the remote head's files out into the bay.
+// Revert: drop the check before lower's diverged merge → the refusal no longer carries
+// `head_not_materializable`.
 #[test]
 fn a_diverged_bay_over_a_wedged_remote_is_refused_as_not_materializable() {
     let area = TestArea::new("wedged-head-diverged");
@@ -3844,13 +3956,13 @@ fn a_lower_repair_moves_a_bay_behind_its_ref() {
     assert_eq!(area.read_file("c/src/code.txt"), "v2\n");
 }
 
-/// A pallet whose ref holds parcels the wedged head lacks keeps them: the repair goes on a pallet of
-/// its own, the lower refuses as diverged, and running its next steps, from a bay on the pallet at
-/// its ref or one another bay stacked past, lifts a head descending from both.
-// Revert: move the ref onto the repair when it has diverged → the ref's own parcel is dropped, and
-// the refusal never comes.
+/// A pallet whose ref holds parcels the wedged head lacks keeps them: the lower merges the repair
+/// into the ref, as a diverged lower merges the remote's head, and makes no pallet for it. A bay
+/// another bay stacked past is refused as behind until it catches up. The merge lifts, and a clone
+/// checks it out.
+// Revert: move the ref onto the repair when it has diverged → the ref's own parcel is dropped.
 #[test]
-fn a_lower_repair_over_a_diverged_ref_keeps_its_parcels() {
+fn a_lower_repair_over_a_diverged_ref_merges_the_repair() {
     for stacked_past in [false, true] {
         let area = TestArea::new(if stacked_past { "repair-stacked-past" } else { "repair-diverged" });
         let server = lifted_with_two_directories(&area);
@@ -3870,39 +3982,32 @@ fn a_lower_repair_over_a_diverged_ref_keeps_its_parcels() {
         assert_success(&area.forklift(stacker, &["stack", "-m", "own"]));
         let own = user_head(&area, "b", "main");
         let wedged = plant_wedged_head(&area, "main", "docs/deep");
+        let pallets = std::fs::read_dir(area.path("b/.forklift/pallets")).unwrap().count();
+
+        if stacked_past {
+            let behind = json_of(&area.forklift("b", &["--json", "lower", "--repair"]));
+            assert_eq!(behind["error"]["code"], "behind", "{}", behind);
+            assert_eq!(user_head(&area, "b", "main"), own);
+            run_next_steps(&area, "b", behind["error"]["next_step"].as_str().unwrap());
+        }
 
         let lowered = area.forklift("b", &["--json", "lower", "--repair"]);
-        assert!(!lowered.status.success(), "{}{}", stdout(&lowered), stderr(&lowered));
-        let value = json_of(&lowered);
-        assert_eq!(value["error"]["code"], "diverged", "{}", value);
-        assert_eq!(user_head(&area, "b", "main"), own, "the ref keeps its own parcel");
-        let next_step = value["error"]["next_step"].as_str().unwrap().to_string();
-        assert_eq!(next_step.starts_with("forklift shift main; then "), stacked_past, "{}", next_step);
-        let side = next_step.split("forklift consolidate ").nth(1).unwrap().split(';').next().unwrap().to_string();
-        assert!(side.starts_with("main-repair-"), "{}", next_step);
-        let repair = user_head(&area, "b", &side);
+        assert_success(&lowered);
+        let value = json_of(&lowered)["data"].clone();
+        assert_eq!(value["outcome"], "merged", "{}", value);
+        let repair = value["repair"]["parcel"].as_str().unwrap().to_string();
         assert_eq!(parents_of(&area, "b", &repair), vec![wedged.clone()]);
+        let merged = value["merged"].as_str().unwrap().to_string();
+        assert_eq!(user_head(&area, "b", "main"), merged);
+        assert_eq!(parents_of(&area, "b", &merged), vec![own.clone(), repair.clone()]);
+        assert_eq!(std::fs::read_dir(area.path("b/.forklift/pallets")).unwrap().count(), pallets, "no pallet is made");
+        assert!(!area.path("b/docs/deep").exists());
 
-        // A rerun finds the repair it stacked rather than stacking another.
-        let pallets = std::fs::read_dir(area.path("b/.forklift/pallets")).unwrap().count();
-        let again = json_of(&area.forklift("b", &["--json", "lower", "--repair"]));
-        assert_eq!(again["error"]["next_step"], next_step.as_str(), "{}", again);
-        assert_eq!(user_head(&area, "b", &side), repair);
-        assert_eq!(std::fs::read_dir(area.path("b/.forklift/pallets")).unwrap().count(), pallets);
+        // A rerun finds the pallet ahead of the remote and stacks nothing more.
+        assert_success(&area.forklift("b", &["lower", "--repair"]));
+        assert_eq!(user_head(&area, "b", "main"), merged);
 
-        // One holding something else, the wedged head itself included, is never overwritten.
-        for other in [&own, &wedged] {
-            area.write_file(&format!("b/.forklift/pallets/{}", side), &format!("{}\n", other));
-            let taken = json_of(&area.forklift("b", &["--json", "lower", "--repair"]));
-            assert_eq!(taken["error"]["code"], "head_not_materializable", "{}", taken);
-            assert_eq!(taken["error"]["next_step"], format!("forklift pallet delete {}", side).as_str(), "{}", taken);
-            assert_eq!(&user_head(&area, "b", &side), other);
-        }
-        area.write_file(&format!("b/.forklift/pallets/{}", side), &format!("{}\n", repair));
-
-        run_next_steps(&area, "b", &next_step);
-        let head = area.read_file("server-root/.forklift/pallets/main").trim().to_string();
-        assert!(descends_from(&area, "b", &head, &repair) && descends_from(&area, "b", &head, &own));
+        assert_success(&area.forklift("b", &["lift"]));
         assert_success(&area.forklift(".", &["clone", &server.url, "c"]));
         assert_eq!(area.read_file("c/src/code.txt"), "own\n");
         assert!(!area.path("c/docs/deep").exists());
@@ -3910,7 +4015,7 @@ fn a_lower_repair_over_a_diverged_ref_keeps_its_parcels() {
 }
 
 /// A named lower --repair moves another pallet's ref onto the repair, or, when that ref has diverged,
-/// stacks the repair beside it and names the shift that the consolidation needs first. Before the
+/// refuses, naming the shift onto it and the lower that merges the repair from there. Before the
 /// repair, a shift or a consolidate of a pallet holding the name refuses with the code, naming it.
 // Revert: drop the check before shift's `move_files` → the shift trips in the materialize, with
 // no code; drop it before consolidate's metadata-tree check → that check refuses with no code.
@@ -3954,13 +4059,16 @@ fn a_named_lower_repair_reaches_a_pallet_the_bay_is_not_on() {
     assert_success(&area.forklift("b", &["shift", "other"]));
     plant_wedged_head(&area, "main", "src");
 
+    let pallets = std::fs::read_dir(area.path("b/.forklift/pallets")).unwrap().count();
     let lowered = area.forklift("b", &["--json", "lower", "main", "--repair"]);
     let value = json_of(&lowered);
     assert_eq!(value["error"]["code"], "diverged", "{}", value);
     assert_eq!(user_head(&area, "b", "main"), own);
+    assert_eq!(std::fs::read_dir(area.path("b/.forklift/pallets")).unwrap().count(), pallets, "no pallet is made");
     let next_step = value["error"]["next_step"].as_str().unwrap().to_string();
-    assert!(next_step.starts_with("forklift shift main; then forklift consolidate main-repair-"), "{}", next_step);
+    assert_eq!(next_step, "forklift shift main; then forklift lower --repair");
     run_next_steps(&area, "b", &next_step);
+    assert_success(&area.forklift("b", &["lift"]));
     let head = area.read_file("server-root/.forklift/pallets/main").trim().to_string();
     assert!(descends_from(&area, "b", &head, &own));
     assert_success(&area.forklift(".", &["clone", &server.url, "d"]));
@@ -5990,9 +6098,10 @@ fn expand_fetches_the_widened_subtree_and_a_bay_can_scope_to_it() {
     assert_eq!(std::fs::read_to_string(bay_dir.join("src/web/w.txt")).unwrap(), "web v1\n");
 }
 
-/// A sparse warehouse "sparse", scoped to `src/api`, whose `lower` was refused as diverged: the
-/// remote head, lifted from a full clone "up", changes `src/web` too, so the refused lower fetched
-/// it with `src/web` sealed. Returns that head and its `src/web/w.txt` blob.
+/// A sparse warehouse "sparse", scoped to `src/api`, whose diverged `lower` was refused over an
+/// unloaded edit: the remote head, lifted from a full clone "up", changes `src/web` too, so the
+/// refused lower fetched it with `src/web` sealed before the edit stopped its merge. Returns that
+/// head and its `src/web/w.txt` blob.
 fn sparse_after_a_diverged_lower(area: &TestArea, server: &Server) -> (String, String) {
     prepare_warehouse(area, "dev", &server.url);
     area.write_file("dev/src/api/a.txt", "api v1\n");
@@ -6016,11 +6125,13 @@ fn sparse_after_a_diverged_lower(area: &TestArea, server: &Server) -> (String, S
     area.write_file("sparse/src/api/a.txt", "api v2 from sparse\n");
     assert_success(&area.forklift("sparse", &["load", "."]));
     assert_success(&area.forklift("sparse", &["stack", "-m", "sparse edits api"]));
+    area.write_file("sparse/src/api/a.txt", "api v3, not loaded\n");
 
-    let lowered = area.forklift("sparse", &["lower"]);
-    assert!(!lowered.status.success() && stderr(&lowered).contains("diverged"), "{}", stderr(&lowered));
+    let lowered = area.forklift("sparse", &["--json", "lower"]);
+    assert_eq!(json_of(&lowered)["error"]["code"], "conflict", "{}", stdout(&lowered));
     assert!(object_present(area, "sparse", &up_head), "the refused lower fetched the remote head");
     assert!(!object_present(area, "sparse", &web_blob), "with src/web sealed");
+    area.write_file("sparse/src/api/a.txt", "api v2 from sparse\n");
 
     (up_head, web_blob)
 }
@@ -7333,14 +7444,13 @@ fn a_cache_auto_merge_fetches_a_held_parcels_content() {
     assert!(closure_present(&area, "cached", &their_root), "the merged-in head's closure is held");
 }
 
-/// A `lower` that finds the remote diverged is refused with a next step that checks the remote
-/// head out on a pallet of its own, so a cache fetches that head's content before refusing, and
-/// the next step works through to a lift.
+/// A `lower` that finds the remote diverged merges the remote head in, so a cache fetches that
+/// head's content first, and the merge it stacks lifts and audits clean.
 ///
-/// Revert: fetch the head's content only past the divergence check → `pallet create` cannot check the
-/// remote head out.
+/// Revert: skip the head's content fetch on the diverged path → the merge cannot read the remote
+/// head's files.
 #[test]
-fn a_diverged_cache_lower_leaves_its_next_step_workable() {
+fn a_diverged_cache_lower_merges_the_remote_head() {
     let area = TestArea::new("cache-lower-diverged");
     let (server, _) = three_signed_parcels(&area);
     assert_success(&area.forklift(".", &["clone", &server.url, "cached", "--cache"]));
@@ -7349,26 +7459,20 @@ fn a_diverged_cache_lower_leaves_its_next_step_workable() {
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "-m", "a's file"]));
     assert_success(&area.forklift("a", &["lift"]));
-    let theirs = pallet_head(&area, "server-root", "main");
 
     area.write_file("cached/from_cache.txt", "cache\n");
     assert_success(&area.forklift("cached", &["load", "."]));
     assert_success(&area.forklift("cached", &["stack", "-m", "the cache's file"]));
-    let lowered = area.forklift("cached", &["lower"]);
-    assert!(!lowered.status.success(), "a diverged lower is refused: {}", stdout(&lowered));
-
-    let short = &theirs[..12];
-    let side = format!("main-remote-{}", short);
-    assert_success(&area.forklift("cached", &["pallet", "create", &side, short]));
+    let lowered = area.forklift("cached", &["--json", "lower"]);
+    assert_success(&lowered);
+    assert_eq!(json_of(&lowered)["data"]["outcome"], "merged", "{}", stdout(&lowered));
     assert_eq!(area.read_file("cached/from_a.txt"), "a\n");
-    assert_success(&area.forklift("cached", &["shift", "main"]));
-    assert_success(&area.forklift("cached", &["consolidate", &side]));
     assert_success(&area.forklift("cached", &["lift"]));
     assert_success(&area.forklift("cached", &["audit"]));
 }
 
-/// A lift onto a diverged remote from a dirty cache does not auto-merge, and is refused with the
-/// same next step as a diverged lower; the remote head's content is fetched for it all the same.
+/// A lift onto a diverged remote from a dirty cache does not auto-merge, and is refused, naming the
+/// lower that merges; the remote head's content is fetched for it all the same.
 ///
 /// Revert: fetch the head's content only once the warehouse is found clean → the remote head's
 /// root stays absent after the refusal.
@@ -8389,11 +8493,9 @@ fn a_merge_second_parent_below_the_remote_head_lifts_from_a_sparse_store() {
     assert_success(&area.forklift("sparse", &["load", "."]));
     assert_success(&area.forklift("sparse", &["stack", "-m", "sparse edits api (1)"]));
 
-    let lowered = area.forklift("sparse", &["lower"]);
-    assert!(!lowered.status.success(), "the first divergence must be reported");
-    assert_success(&area.forklift("sparse", &["pallet", "create", "incoming1", &p2]));
-    assert_success(&area.forklift("sparse", &["shift", "main"]));
-    assert_success(&area.forklift("sparse", &["consolidate", "incoming1"]));
+    let lowered = area.forklift("sparse", &["--json", "lower"]);
+    assert_eq!(json_of(&lowered)["data"]["outcome"], "merged", "the first divergence merges: {}", stdout(&lowered));
+    assert_eq!(parents_of(&area, "sparse", &pallet_head(&area, "sparse", "main"))[1], p2);
 
     // The remote moves forward again, on top of p2 — so p2 becomes an interior ancestor of the
     // new remote head, reachable in the sparse workspace only through the first merge's parent.
@@ -8405,11 +8507,9 @@ fn a_merge_second_parent_below_the_remote_head_lifts_from_a_sparse_store() {
     let p3 = pallet_head(&area, "up", "main");
 
     // The sparse workspace merges p3 too — building the second merge whose ancestry re-reaches p2.
-    let lowered = area.forklift("sparse", &["lower"]);
-    assert!(!lowered.status.success(), "the second divergence must be reported");
-    assert_success(&area.forklift("sparse", &["pallet", "create", "incoming2", &p3]));
-    assert_success(&area.forklift("sparse", &["shift", "main"]));
-    assert_success(&area.forklift("sparse", &["consolidate", "incoming2"]));
+    let lowered = area.forklift("sparse", &["--json", "lower"]);
+    assert_eq!(json_of(&lowered)["data"]["outcome"], "merged", "the second divergence merges: {}", stdout(&lowered));
+    assert_eq!(parents_of(&area, "sparse", &pallet_head(&area, "sparse", "main"))[1], p3);
 
     // p2's out-of-scope subtree was never fetched into the sparse store.
     assert!(!object_present(&area, "sparse", &sealed_web),

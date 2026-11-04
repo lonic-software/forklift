@@ -2232,6 +2232,11 @@ A command not listed here either reports only the generic human-message shape `{
           "const": "repaired",
           "description": "The remote head held a name no client can check out, and the pallet now points at a repair\nparcel stacked on it (`repair`); `forklift lift` publishes it.",
           "type": "string"
+        },
+        {
+          "const": "merged",
+          "description": "The local pallet and the remote had diverged, and the remote's head (or, with `repair`, a\nrepair stacked on it) was merged in cleanly: the merge parcel (`merged`) is stacked, and\n`forklift lift` publishes it.",
+          "type": "string"
         }
       ]
     },
@@ -2369,6 +2374,13 @@ A command not listed here either reports only the generic human-message shape `{
     "head": {
       "type": "string"
     },
+    "merged": {
+      "description": "The merge parcel stacked, when the outcome is `merged`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "meta_adopted": {
       "description": "Meta pallets (e.g. `@manifest`) fast-forwarded or adopted from the remote.",
       "items": {
@@ -2431,7 +2443,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "null"
         }
       ],
-      "description": "The repair parcel the pallet now points at, when the outcome is `repaired`. A diverged pallet's\nrepair is refused as `diverged`, which names the pallet it was stacked on."
+      "description": "The repair parcel the pallet now points at, when the outcome is `repaired`, or the one merged\nin, when it is `merged` from a diverged pallet's repair."
     }
   },
   "required": [

@@ -277,9 +277,7 @@ async fn consolidate(id: &str) -> Result<(), String> {
     // Anchored before the cleanliness check, so a file edited after it is never trusted.
     let anchor = file_utils::take_stat_anchor()?;
 
-    if !consolidate::is_warehouse_clean(&target_tree).await? {
-        return Err("The working directory has uncommitted changes; commit or restore them before merging.".to_string());
-    }
+    consolidate::ensure_warehouse_is_clean(Some(&target_tree), "merging", &format!("forklift haul consolidate {}", id)).await?;
 
     // The "already merged" shortcut above only ever touches the `@haul` meta-pallet, never the
     // working inventory, so it needs no exemption. Past this point the incomplete-load guard

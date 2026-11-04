@@ -212,7 +212,7 @@ refusal_codes! {
 
     /// The remote's pallet holds parcels this warehouse has not lowered yet: found before a lift,
     /// or the remote's compare-and-set refused one because the pallet moved while it ran. The next
-    /// step is `lower`, which fast-forwards, or reports `Diverged` when both sides moved.
+    /// step is `lower`, which fast-forwards, or merges the remote's head in when both sides moved.
     RemoteAhead => "remote_ahead",
 
     /// The local pallet and the remote's both hold parcels the other lacks. Nothing was lifted or
@@ -316,6 +316,16 @@ refusal_codes! {
     /// no client can check it out. Nothing was changed; the next step repairs the head into one
     /// without it.
     HeadNotMaterializable => "head_not_materializable",
+
+    /// The working state blocks the command: staged or unstaged changes to tracked files that a
+    /// merge, a pick or a shift (an undo of one, or a pallet created at a revision) would have to
+    /// write over. Nothing was changed; the next step sets the changes aside.
+    Conflict => "conflict",
+
+    /// `lower` merged the remote's diverged head into the pallet and the merge conflicts: the
+    /// markers are written and the consolidation is left in progress. The refusal's details name
+    /// the conflicted paths; the next step completes the merge or abandons it.
+    MergeConflicts => "merge_conflicts",
 }
 
 impl RefusalCode {

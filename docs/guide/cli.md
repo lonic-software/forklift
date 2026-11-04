@@ -1796,10 +1796,9 @@ stacking to one pallet stops serializing through a human. It reports how many ti
 auto-merged. Only a clean warehouse qualifies (the merge materializes), and a
 **conflicting overlap** (changes the three-way merge cannot combine) still stops with
 the diverged error (`diverged`, exit 5), leaving
-the warehouse untouched: create a pallet at the fetched remote head, shift back to your pallet,
-consolidate the new one, and lift the result. A remote holding parcels you have not lowered yet — its head unknown here, or moved
+the warehouse untouched: `lower` merges the remote head in, and a `lift` publishes the merge. A remote holding parcels you have not lowered yet — its head unknown here, or moved
 since you read it — is a different refusal, `remote_ahead` (exit 28): `lower` first, which
-fast-forwards, or reports `diverged` if you moved too. A bay another bay left behind
+fast-forwards, or merges if you moved too. A bay another bay left behind
 its pallet is refused with `behind` (exit 26) by `stack`, `deliver` and this auto-merge alike:
 `shift` to the pallet to catch up.
 
@@ -1866,10 +1865,12 @@ warning naming its genesis. `--expect <genesis>` pins the anchor before anything
 for `clone`. A remote whose anchor changed from the one held is refused with `trust_changed`
 (exit 22) — after a legitimate re-genesis, accept it with
 `office accept-regenesis --confirm <genesis>`. A remote that holds an office but declares no
-anchor had it stripped, and is refused the same way, by `clone` and `lift` too. A diverged
-pallet is never merged implicitly: `lower` fetches the parcels and reports the
-divergence, and you consolidate deliberately (`pallet create` the remote head into
-its own pallet, `consolidate` it, then `lift` the merge). Local changes, staged or not,
+anchor had it stripped, and is refused the same way, by `clone` and `lift` too. When the
+pallet has diverged from the remote, `lower` merges the remote's head in, as `consolidate` would,
+and stacks the merge (outcome `merged`); `lift` then publishes it. A merge that conflicts stops
+with `merge_conflicts` (exit 47), its paths in `details.paths`, and leaves the consolidation in
+progress: resolve, `load` and `stack` to complete it, or `abort` to put the pallet back. Changes to
+tracked files refuse the merge before it starts, with `conflict` (exit 4). Local changes, staged or not,
 come through the lower as they were, as long as the remote's new parcels leave them alone; a
 lower that would write, remove or replace a path holding one (or a folder above or below it)
 refuses, names those paths and changes nothing. During a consolidation or pick in progress, a
@@ -1935,10 +1936,10 @@ happens depends on the pallet here:
 - **At the remote's head, behind it, or not here yet:** the pallet moves onto the repair (outcome
   `repaired`), and for the current pallet so does the bay. A bay behind its own pallet is moved
   from where it stands, so its files are right; one beside it is refused as `behind`.
-- **Holding parcels the remote's head lacks:** they are kept. The repair goes on a new pallet,
-  `<pallet>-repair-<hash>`, named for the remote's head so a rerun finds it, and the lower refuses
-  as `diverged`, naming the steps: shift onto the pallet if this bay is not on it at its head,
-  `forklift consolidate <pallet>-repair-<hash>`, then `forklift lift`.
+- **Holding parcels the remote's head lacks:** they are kept. For the current pallet, from a bay at
+  its head, the repair is merged in as a diverged lower merges the remote's head (outcome
+  `merged`, with `repair` and `merged` both reported). A named pallet is refused as `diverged`,
+  naming the shift onto it and `forklift lower --repair`.
 - **Ahead of the remote, or the head holds nothing to repair:** it lowers as usual.
 
 A sparse warehouse cannot build the repair, which reads the whole tree, so its `lower --repair` is

@@ -92,7 +92,7 @@ pub async fn handle_command(as_name: Option<&str>) -> Result<(), String> {
         // `shift_to` refuses up front (a dirty workdir, a missing target pallet, …) without
         // touching anything, so the entry is only popped once it has actually succeeded.
         let left = entry.after.current_pallet.clone();
-        let head = shift::shift_to(&entry.before.current_pallet).await?;
+        let head = shift::shift_to(&entry.before.current_pallet, "forklift undo").await?;
         journal_utils::pop()?;
 
         output::emit(&Undone {
