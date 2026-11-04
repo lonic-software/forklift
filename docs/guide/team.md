@@ -5,8 +5,8 @@ This page takes a team the rest of the way: a server that knows each person by a
 that knows each person by a signing key, and a second person joining. It follows two people: Ada,
 who starts the project and runs the server, and Bob, who joins it.
 
-Each person works on their own machine, with their own keys and global settings, and each block
-below says whose machine it runs on. The commands assume Ada's server listens on
+Each person works on their own machine, with their own keys and global settings, and each section
+below says whose machine its commands run on. The commands assume Ada's server listens on
 `127.0.0.1:7171`, which is right if you try this alone with two user accounts on one computer.
 Across machines, serve on an address the others can reach (see [Running a server](../SERVER.md))
 and use it in place of `127.0.0.1:7171`.
@@ -219,7 +219,7 @@ their role, and rely on the signatures, not the tokens, for who did what.
 
 - [Running a server](../SERVER.md): the token file, roles and per-pallet grants, and serving many
   warehouses.
-- [Trust and identity](trust-and-identity.md): roles, more devices for one person, agents, revoking a
-  key, and recovering from a lost one.
+- [Trust and identity](trust-and-identity.md): roles, more devices for one person, agents,
+  revoking a key, and recovering from a lost one.
 - [`office`](cli.md#7-identity-signing-and-agents) and
   [remotes](cli.md#6-working-with-remotes) in the command reference.
