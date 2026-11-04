@@ -205,7 +205,7 @@ machine does not tell you what Windows will take.
   last, undoing each damage before the next so that every failure has one cause.
   `a_sparse_audit_states_its_boundary_and_re_verifies_in_scope_content` in `remote.rs`
   replaced five tests that each built the same signed warehouse and sparse clone. Keep
-  tests apart when a check changes the state a later one needs to see fresh: a refused
+  tests apart when a check changes the state in a way the test cannot undo: a refused
   command that has already fetched from the remote, for instance, leaves the next command
   a different starting point than a first contact would.
 - **Crash at each step, not at a random time.** To test what a crash leaves behind, stop

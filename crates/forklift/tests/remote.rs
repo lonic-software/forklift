@@ -1661,8 +1661,8 @@ fn optimistic_lift_auto_merges_a_disjoint_divergence_but_stops_on_overlap() {
 /// `merge_head_into_current` `consolidate` and `cherry-pick` do: it writes real merge output
 /// into the working inventory and only afterwards records consolidation state
 /// (`.forklift/consolidation`), before ever reaching `stack_utils::stack_parcel`'s own late
-/// guard. The up-front guard added at the call site in `lift::try_auto_merge` must refuse
-/// before any of that runs: reverting it makes the state-file assertion below go red, exactly
+/// guard. The up-front incomplete-load guard at the top of `merge_head_into_current` must refuse
+/// before any of that runs: removing it makes the state-file assertion below go red, exactly
 /// like the `consolidate`/`cherry-pick`/`haul merge` cases in `cli.rs`.
 #[test]
 fn optimistic_lift_refuses_on_an_incomplete_load_before_writing_consolidation_state() {
