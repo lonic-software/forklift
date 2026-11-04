@@ -231,11 +231,26 @@ pub enum Command {
         long_about = "Consolidate (merge) another pallet into the current one. Fast-forwards when \
                       possible; otherwise runs a three-way merge and stacks a merge parcel. \
                       Conflicts are marked in the affected files and must be resolved, loaded and \
-                      stacked to complete the consolidation."
+                      stacked to complete the consolidation. \"forklift consolidate --abort\" \
+                      abandons a consolidation in progress, however it was started (a haul's \
+                      consolidate too): every file the merge touched goes back to the pallet head, \
+                      and changes staged since to files it left alone stay staged. A file changed \
+                      since the merge (a resolution, loaded or not) holds work the merge cannot \
+                      reproduce, so the abort lists such files and changes nothing unless \
+                      --confirm is given."
     )]
     Consolidate {
         /// The pallet whose head to merge into the current pallet
-        pallet: String,
+        #[arg(required_unless_present = "abort")]
+        pallet: Option<String>,
+
+        /// Abort the consolidation in progress, putting back what the merge changed
+        #[arg(long, conflicts_with = "pallet")]
+        abort: bool,
+
+        /// With --abort: also discard the changes made to the merged files since the merge
+        #[arg(long, requires = "abort")]
+        confirm: bool,
     },
 
     /// Squash the current draft pallet onto a target as one clean parcel, keeping the trail
@@ -550,15 +565,26 @@ pub enum Command {
                       rebase, pick only *adds* — no rewrite, no force-push: the picked \
                       parcel's authors are preserved and this operator is recorded as the stacker. \
                       A clean pick is stacked immediately; a conflicting one leaves markers to \
-                      resolve, \"forklift load\" and \"forklift stack\" (which completes the pick single-parent)."
+                      resolve, \"forklift load\" and \"forklift stack\" (which completes the pick single-parent). \
+                      \"forklift pick --abort\" abandons a pick in progress the way \"forklift \
+                      consolidate --abort\" abandons a consolidation, with the same --confirm rule."
     )]
     Pick {
         /// The parcel to pick: a pallet name, or a parcel hash / unique prefix
-        revision: String,
+        #[arg(required_unless_present = "abort")]
+        revision: Option<String>,
 
         /// The new parcel's message (default: the source parcel's message)
-        #[arg(short = 'm', long)]
+        #[arg(short = 'm', long, conflicts_with = "abort")]
         message: Option<String>,
+
+        /// Abort the pick in progress, putting back what it changed
+        #[arg(long, conflicts_with = "revision")]
+        abort: bool,
+
+        /// With --abort: also discard the changes made to the picked files since the pick
+        #[arg(long, requires = "abort")]
+        confirm: bool,
     },
 
     /// Prepare a new warehouse in the current directory
@@ -2226,8 +2252,9 @@ impl Command {
     pub fn journal_op(&self) -> Option<&'static str> {
         match self {
             Command::Stack { .. } => Some("stack"),
-            Command::Consolidate { .. } => Some("consolidate"),
-            Command::Pick { .. } => Some("pick"),
+            // An abort is not journaled: it pops the entry of the operation it abandons instead.
+            Command::Consolidate { abort: false, .. } => Some("consolidate"),
+            Command::Pick { abort: false, .. } => Some("pick"),
             Command::Shift { .. } => Some("shift"),
             _ => None,
         }

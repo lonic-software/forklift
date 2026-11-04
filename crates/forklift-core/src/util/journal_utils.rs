@@ -721,6 +721,38 @@ pub fn pop() -> Result<Option<JournalEntry>, String> {
     Ok(popped)
 }
 
+/// Pop the most recent entry when it is the operation that left the bay's consolidation or pick in
+/// progress (a consolidate or pick that stopped at conflicts), and the bay is still exactly where
+/// it left it — for an abort, which abandons that operation outside `undo`. Kept, the entry would
+/// refuse every later undo: the bay no longer holds the consolidation its after records. Any other
+/// top entry is left alone, so a rerun of an interrupted abort, whose entry is already gone, pops
+/// nothing more.
+///
+/// # Returns
+/// * `Ok(true)`    - The entry was popped.
+/// * `Ok(false)`   - The top entry is not that operation's, or the journal is empty.
+/// * `Err(String)` - If the journal or the bay's state could not be read, or the journal rewritten.
+pub fn pop_if_it_left_in_progress() -> Result<bool, String> {
+    let Some(entry) = peek()? else {
+        return Ok(false);
+    };
+
+    if !left_in_progress(&entry) || BayState::read()? != entry.after.bay_state() {
+        return Ok(false);
+    }
+
+    pop()?;
+    Ok(true)
+}
+
+/// Whether `entry`'s operation started the consolidation or pick its after snapshot holds: one it
+/// stopped at conflicts, leaving the in-progress state as its only change to the bay.
+pub fn left_in_progress(entry: &JournalEntry) -> bool {
+    entry.op != DELETE_OP
+        && ((entry.after.consolidation.is_some() && entry.before.consolidation.is_none())
+            || (entry.after.cherry_pick.is_some() && entry.before.cherry_pick.is_none()))
+}
+
 /// Whether the bay is still exactly where `entry`'s operation left it: the same current pallet,
 /// standing on the same base, and the same consolidation and cherry-pick in progress (a
 /// conflicted cherry-pick moves no ref). Or whether an undo of `entry` stopped halfway, after
