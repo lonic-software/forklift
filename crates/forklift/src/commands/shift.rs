@@ -189,8 +189,7 @@ pub(crate) fn refuse_mid_merge(doing: &str) -> Result<(), String> {
 ///
 /// # Arguments
 /// * `target` - The name of the pallet to shift to. Must exist (have a ref file).
-/// * `command` - The caller's own command, which a dirty-warehouse refusal names as the step
-///               to run again once the changes are parked.
+/// * `command` - The caller's own command, which a dirty refusal names to run after parking.
 ///
 /// # Returns
 /// * `Ok(String)`  - The head parcel of the pallet shifted to (so callers can report
