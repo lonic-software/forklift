@@ -14291,9 +14291,10 @@ fn abort_puts_back_what_the_merge_touched_and_keeps_every_other_change() {
     assert!(stderr(&again).contains("No consolidation or pick is in progress"), "{}", stderr(&again));
 
     // Nothing of the abandoned merge is recorded: consolidating again meets the same conflict.
-    assert_success(&warehouse.run(&["restore", "--confirm", "."]));
+    assert_success(&warehouse.run(&["load", "k.txt"]));
+    assert_success(&warehouse.run(&["stack", "-m", "kept"]));
     let merge = warehouse.run(&["consolidate", "other"]);
-    assert!(stdout(&merge).contains("conflict: f.txt"), "{}", stdout(&merge));
+    assert!(stdout(&merge).contains("conflict: f.txt"), "{}{}", stdout(&merge), stderr(&merge));
 }
 
 #[test]
@@ -14358,17 +14359,22 @@ fn an_abort_under_a_pallet_delete_leaves_both_undoable() {
         "the consolidate's entry went with the abort: {}", stdout(&unstack));
 }
 
+/// `undo` reads the skeleton with the consolidation, and its refusal names the abort: the abort
+/// must not need it, or that way out would loop.
 #[test]
 fn abort_works_with_the_skeleton_missing() {
     let warehouse = a_conflicted_consolidation("abort-no-skeleton");
     std::fs::remove_file(warehouse.root.join(".forklift/consolidation-skeleton")).unwrap();
 
-    let stack = warehouse.run(&["stack", "-m", "x"]);
-    assert!(stderr(&stack).contains("forklift abort"), "the skeleton refusal names the abort: {}", stderr(&stack));
+    let undo = warehouse.run(&["undo"]);
+    assert!(!undo.status.success() && stderr(&undo).contains("\"forklift abort\""),
+        "the skeleton refusal names the abort: {}", stderr(&undo));
 
     assert_success(&warehouse.run(&["abort"]));
     assert_eq!(read(&warehouse, "f.txt"), "ours\n");
-    assert_success(&warehouse.run(&["undo"]));
+
+    let unstack = warehouse.run(&["undo"]);
+    assert!(stdout(&unstack).contains("Undid stack") && stdout(&unstack).contains("(ours)"), "{}", stderr(&unstack));
 }
 
 #[test]
