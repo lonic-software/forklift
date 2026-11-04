@@ -50,7 +50,8 @@ pub async fn create_pallet(name: &str, revision: Option<&str>) -> Result<(), Str
             let preconditions = take_utils::verify_take(None, &TakeTrust::local()?, &parcel_hash, name, FetchAt::Warehouse).await?;
 
             // Checked before the ref is created too, so the common refusal leaves no pallet
-            // behind; the shift checks again after its own anchor.
+            // behind. The shift checks again after its own anchor; a refusal there comes after
+            // the ref exists, so it names the shift that is left to do.
             let command = format!("forklift pallet create {} {}", name, revision);
             let current_tree = match &position.base {
                 Some(hash) => Some(object_utils::load_parcel(hash)?.tree_hash),
@@ -60,7 +61,7 @@ pub async fn create_pallet(name: &str, revision: Option<&str>) -> Result<(), Str
 
             pallet_utils::update_pallet_head(name, None, &parcel_hash, &preconditions)?;
 
-            let head = shift::shift_to(name, &command).await?;
+            let head = shift::shift_to(name, &format!("forklift shift {}", name)).await?;
 
             output::emit(&Palletized {
                 pallet: name.to_string(),
