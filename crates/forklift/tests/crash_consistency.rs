@@ -14,10 +14,10 @@
 //! `file_utils::crash_point`), and after each stop assert the store is still internally consistent
 //! and usable. A rename is where a written file becomes visible, so this stops a command once at
 //! each of its publishes, in the same order on every machine wherever it publishes from one
-//! thread; where threads rename concurrently, the scheduler picks which rename is the Nth. Killing the process at guessed delays,
-//! which these tests did before, reached a given state only when the timing happened to land
-//! there: with the blob barrier of `load` moved after its shard publish, 20 kills caught the bug in
-//! 4 runs out of 14.
+//! thread; where threads rename concurrently, the scheduler picks which rename is the Nth.
+//! Killing the process at guessed delays, which these tests did before, reached a given state only
+//! when the timing happened to land there: with the blob barrier of `load` moved after its shard
+//! publish, 20 kills caught the bug in 4 runs out of 14.
 //!
 //! What the stops do not reach: a step that is not a rename (a file written or removed in place),
 //! and a power loss. A stopped process leaves everything it wrote to the kernel in place, synced
