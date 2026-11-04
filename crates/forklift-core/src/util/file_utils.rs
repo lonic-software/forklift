@@ -319,16 +319,19 @@ thread_local! {
 /// process; threads it spawns still sync. Test-only, for a fixture whose tests check nothing about
 /// durability: the in-process tests run with fsync on because they are what runs the sync calls,
 /// and under a parallel run every sync waits on the others, so a fixture that writes a whole
-/// warehouse took seconds per test, most of them in syncs.
+/// warehouse took seconds per test, most of them in syncs. It also turns off the injected sync
+/// faults, which only fire on a sync that runs, so a test that arms one must not hold the guard.
+/// The guard is not `Send`: dropped on another thread it would restore that thread's setting.
 #[cfg(test)]
 pub(crate) fn skip_syncs_on_this_thread() -> SyncsSkipped {
-    SyncsSkipped { previous: SYNCS_SKIPPED.replace(true) }
+    SyncsSkipped { previous: SYNCS_SKIPPED.replace(true), _this_thread: std::marker::PhantomData }
 }
 
 /// The guard [`skip_syncs_on_this_thread`] returns; dropping it restores the thread's setting.
 #[cfg(test)]
 pub(crate) struct SyncsSkipped {
     previous: bool,
+    _this_thread: std::marker::PhantomData<*const ()>,
 }
 
 #[cfg(test)]

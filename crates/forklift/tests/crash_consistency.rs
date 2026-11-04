@@ -87,8 +87,7 @@ impl Area {
 
     /// Assert the store is internally consistent right now: any pallet head is a whole 64-hex hash
     /// (an atomic ref write never leaves a partial one), and the commands that read the committed
-    /// tree and history succeed (a torn object would fail the read-side hash check). `history`
-    /// reads the head parcel first, through the same hash-checked read `store peek` uses.
+    /// tree and history succeed (a torn object would fail the read-side hash check).
     fn assert_consistent(&self, context: &str) {
         let head_path = self.warehouse().join(".forklift").join("pallets").join("main");
         if let Ok(head) = std::fs::read_to_string(&head_path) {
@@ -102,6 +101,12 @@ impl Area {
             assert!(history.status.success(),
                 "{context}: history must read the parcel chain, stderr: {}",
                 String::from_utf8_lossy(&history.stderr));
+
+            // `history` follows the position, which need not be `main`.
+            let peek = self.run(&["store", "peek", head]);
+            assert!(peek.status.success(),
+                "{context}: peek of the head parcel must succeed, stderr: {}",
+                String::from_utf8_lossy(&peek.stderr));
         }
 
         let stocktake = self.run(&["stocktake"]);
@@ -461,7 +466,11 @@ fn barrier_counts_for_1_and_10(count_for: impl Fn(usize) -> u64 + Sync) -> (u64,
     std::thread::scope(|scope| {
         let one = scope.spawn(|| count_for(1));
         let ten = scope.spawn(|| count_for(10));
-        (one.join().expect("the 1-file fixture panicked"), ten.join().expect("the 10-file fixture panicked"))
+        let counts = (one.join(), ten.join());
+        match counts {
+            (Ok(one), Ok(ten)) => (one, ten),
+            (Err(panic), _) | (_, Err(panic)) => std::panic::resume_unwind(panic),
+        }
     })
 }
 
