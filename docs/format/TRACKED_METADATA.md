@@ -426,9 +426,12 @@ adopts = "<hash>"          # re-genesis only: the old office head, kept as attes
 
 ## Threat model
 What local trust does and does not defend against, by attacker capability. This is the model
-for parcels written under trust. A warehouse that never enrolled, and the unsigned history
-from before a trusted one's boundary, defend only content: hashes still expose a changed byte,
-but anyone who can lift can write parcels and cells under any operator's name.
+for parcels written under trust. A warehouse that never enrolled detects only damage: a hash
+exposes a byte changed inside an object, but anyone with write access can replace history with
+a self-consistent rewrite, and anyone who can lift can write parcels and cells under any
+operator's name. In a trusted
+warehouse the unsigned history from before the boundary is fixed by the anchor's `boundary`, so
+it cannot be rewritten or added to, but the operator names in it were never checked.
 
 1. **No private keys, no warehouse write access** — cannot forge anything. Every object
    is content-addressed and every parcel is signed: modifying a byte changes the hash,

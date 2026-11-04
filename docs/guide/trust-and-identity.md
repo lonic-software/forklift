@@ -1,8 +1,10 @@
 # Trust and identity — user guide
 
 Forklift can make a warehouse's entire history **tamper-evident**: once you
-establish trust, every parcel is signed, and any clone can verify the whole
-history — including who was added and when — offline, with no server to trust.
+establish trust, every parcel written from then on is signed, and any clone can
+verify the whole history — the signed part by its signatures, the earlier part as
+exactly what enrolling vouched for, and who was added and when — offline, with no
+server to trust.
 This guide covers the `office` command (users, keys, roles, agents, recovery),
 passphrase-protected keys, and `audit`.
 
@@ -48,8 +50,8 @@ Contents:
 The operator an unsigned parcel or metadata cell names is who *claims* to have
 written it, like a git author line, and nothing checks that the claim is true. A
 server does not match it to the token that lifted it, because lifting other
-people's history is ordinary: lifting work you lowered from a colleague carries
-their parcels, and a relay or mirror carries everyone's parcels and metadata. The
+people's history is ordinary: lifting to a second remote, a relay, a mirror or a
+git import all carry everyone's parcels, and the first three their metadata. The
 rules that keep a review or manifest entry under its writer's directory check only
 that a parcel agrees with the name it declares. This stays true after enrolling for
 everything unsigned from before the anchor: enrolling makes every parcel written
