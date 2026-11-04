@@ -32,7 +32,7 @@ pub async fn handle_command(target: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    let head = shift_to(target).await?;
+    let head = shift_to(target, &format!("forklift shift {}", target)).await?;
 
     output::emit(&Shifted { pallet: target.to_string(), head });
 
@@ -185,17 +185,19 @@ pub(crate) fn refuse_mid_merge(doing: &str) -> Result<(), String> {
 
 /// Shift to the given pallet: clean-check, materialize its head tree, repopulate the
 /// inventory, and make it the current pallet. Also used by `pallet create` when a new pallet
-/// is created at a parcel other than the current head.
+/// is created at a parcel other than the current head, and by `undo` to reverse a shift.
 ///
 /// # Arguments
 /// * `target` - The name of the pallet to shift to. Must exist (have a ref file).
+/// * `command` - The caller's own command, which a dirty-warehouse refusal names as the step
+///               to run again once the changes are parked.
 ///
 /// # Returns
 /// * `Ok(String)`  - The head parcel of the pallet shifted to (so callers can report
 ///                   it; this function never prints — the caller owns presentation).
 /// * `Err(String)` - If the pallet does not exist, the warehouse is dirty, or an
 ///                   operation failed.
-pub async fn shift_to(target: &str) -> Result<String, String> {
+pub async fn shift_to(target: &str, command: &str) -> Result<String, String> {
     pallet_utils::validate_pallet_name(target)?;
 
     refuse_mid_merge("shifting")?;
@@ -216,7 +218,7 @@ pub async fn shift_to(target: &str) -> Result<String, String> {
     // Anchored before the cleanliness check, so a file edited after it is never trusted.
     let anchor = file_utils::take_stat_anchor()?;
 
-    consolidate::ensure_warehouse_is_clean(current_tree_hash.as_deref(), "shifting", &format!("forklift shift {}", target)).await?;
+    consolidate::ensure_warehouse_is_clean(current_tree_hash.as_deref(), "shifting", command).await?;
 
     shift_utils::refuse_unmaterializable_pallet(target, current_tree_hash.as_deref(), &target_tree_hash)?;
 

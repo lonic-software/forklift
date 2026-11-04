@@ -540,6 +540,18 @@ async fn merge_diverged(client: &RemoteClient,
 /// and the merge parcel's description: this lower's and the lift's auto-merge alike.
 pub(crate) const REMOTE_LABEL: &str = "remote";
 
+/// How many conflicted paths the refusal's message names; `details.paths` carries them all.
+const LISTED_PATHS: usize = 10;
+
+/// `paths` for the refusal's message: the first [`LISTED_PATHS`], then how many more there are.
+fn listed_paths(paths: &[String]) -> String {
+    let listed = paths[..paths.len().min(LISTED_PATHS)].join(", ");
+    match paths.len().saturating_sub(LISTED_PATHS) {
+        0 => listed,
+        more => format!("{}, and {} more", listed, more),
+    }
+}
+
 /// The [`RefusalCode::MergeConflicts`] refusal for a merge of the remote's head into `pallet` that
 /// conflicts on `paths`, now left in progress.
 fn merge_conflicts_refusal(pallet: &str, paths: &[String]) -> String {
@@ -550,7 +562,7 @@ fn merge_conflicts_refusal(pallet: &str, paths: &[String]) -> String {
             conflicts on these paths, now holding conflict markers: {}. Resolve them, load and stack \
             them, then lift; or abandon the merge with \"{}\".",
             pallet,
-            paths.join(", "),
+            listed_paths(paths),
             merge_abort::ABORT_COMMAND
         ),
         "forklift load <path>; then forklift stack; then forklift lift",
@@ -1468,7 +1480,18 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_keeps;
+    use super::{listed_paths, parse_keeps, LISTED_PATHS};
+
+    #[test]
+    fn a_conflict_message_names_the_first_paths_and_counts_the_rest() {
+        let paths = |n: usize| (0..n).map(|i| format!("p{}", i)).collect::<Vec<_>>();
+        assert_eq!(listed_paths(&paths(2)), "p0, p1");
+        assert_eq!(listed_paths(&paths(LISTED_PATHS)), paths(LISTED_PATHS).join(", "));
+        assert_eq!(
+            listed_paths(&paths(LISTED_PATHS + 3)),
+            format!("{}, and 3 more", paths(LISTED_PATHS).join(", "))
+        );
+    }
 
     fn refusal(spec: &str) -> String {
         parse_keeps(&[spec.to_string()]).expect_err("the keep must be refused")

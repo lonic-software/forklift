@@ -318,7 +318,8 @@ refusal_codes! {
     HeadNotMaterializable => "head_not_materializable",
 
     /// The working state blocks the command: staged or unstaged changes to tracked files that a
-    /// merge, a pick or a shift would have to write over. Nothing was changed; the next step sets the changes aside.
+    /// merge, a pick or a shift (an undo of one, or a pallet created at a revision) would have to
+    /// write over. Nothing was changed; the next step sets the changes aside.
     Conflict => "conflict",
 
     /// `lower` merged the remote's diverged head into the pallet and the merge conflicts: the
