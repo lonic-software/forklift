@@ -11304,6 +11304,12 @@ fn unsigned_metadata_lifts_and_lowers_through_a_server_that_never_enrolled() {
     assert_success(&area.forklift("b", &["lift"]));
     assert_success(&area.forklift("a", &["lower"]));
     assert_eq!(stdout(&area.forklift("a", &["manifest", "get", "main", "ci"])).trim(), "red");
+
+    // A warehouse holding no metadata of its own still may not enroll over the remote's.
+    prepare_warehouse(&area, "c", &server.url);
+    let enroll = area.forklift("c", &["office", "enroll"]);
+    assert!(!enroll.status.success(), "{}", stdout(&enroll));
+    assert!(stderr(&enroll).contains("The remote holds metadata") && stderr(&enroll).contains("@tags"), "{}", stderr(&enroll));
 }
 
 #[test]

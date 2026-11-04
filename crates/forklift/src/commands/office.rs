@@ -89,6 +89,20 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
             );
         }
 
+        // Unsigned metadata another client lifted would be adopted under the new office, which
+        // refuses it, just as the local check above.
+        let remote_meta: Vec<&String> = info.pallets.keys()
+            .filter(|name| name.starts_with('@') && name.as_str() != format!("@{}", OFFICE_PALLET_NAME))
+            .collect();
+
+        if !remote_meta.is_empty() {
+            return Err(format!(
+                "The remote holds metadata recorded without enrollment ({}). Enrolling over \
+                unsigned metadata is not supported yet: the office would refuse it from then on.",
+                remote_meta.iter().map(|name| name.as_str()).collect::<Vec<_>>().join(", ")
+            ));
+        }
+
         // Live heads only: a pallet the remote deleted (its tombstone's head) stays outside, since
         // a deletion is how a compromised key's work is taken down, and a restore of it must not
         // pass the audit for having been vouched for here.
