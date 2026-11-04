@@ -77,6 +77,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 - Partial warehouses: a cache warehouse fetches what it reads from its origin, `store evict` frees what
   the origin holds, and `remote move` moves the origin.
 - `git mirror` keeps a git remote in step, never by force.
+- `git export` writes each tag as an annotated git tag over its parcel's commit, and names every tag
+  it leaves out, with why (`tags` and `skipped_tags` under `--json`). Tags used to be dropped
+  without a word.
 - Pallets can be deleted and restored, locally and on a remote, on both server heads.
 - A cut-off `clone` keeps what it fetched and resumes.
 - A tutorial, a concepts page and a glossary in `docs/guide`.

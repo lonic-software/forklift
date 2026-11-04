@@ -166,13 +166,20 @@ must be empty or new. **Lossy in this direction:** git has no home for the signe
 identity round-trips as the on-chain **identifier** — forklift records no display names
 (zero-PII by design), so the git author name is that identifier (or `forklift`, when
 the identifier holds nothing git keeps in a name). The meta pallets (`@office`, `@manifest`)
-and tags are not exported. Dates are written in UTC (`+0000`), and git has no date before 1970,
+are not exported. Dates are written in UTC (`+0000`), and git has no date before 1970,
 so a parcel stamped earlier exports as 1970-01-01.
+
+Each tag on an exported parcel becomes an **annotated git tag** over that parcel's commit, with
+the tag's message and date, and its tagger written as an author is. Git cannot check a Forklift
+signature, so the tag's last line names the key that signed it. A tag is left out, and named in
+a warning with the reason, when its parcel is on no exported branch (a deleted pallet's), when
+git does not accept its name (`a..b`, `v1.lock`), or when this build cannot read it.
 
 The export is deterministic: the same history exports to the same commit hashes on any
 machine, whatever your own git configuration says (it is shut out of every object write).
 Each commit message ends in a `Forklift-Parcel: <parcel> export/<N>` line naming the parcel
-it came from and the export format it was written in.
+it came from and the export format it was written in, and each tag message in a
+`Forklift-Tag-Signer: <key> export/<N>` line.
 
 ### `git mirror` — keep a git remote in step
 

@@ -1021,6 +1021,25 @@ A command not listed here either reports only the generic human-message shape `{
 
 ```json
 {
+  "$defs": {
+    "SkippedTag": {
+      "description": "A tag the export left out.",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why it was left out.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "reason"
+      ],
+      "type": "object"
+    }
+  },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The result of a git export.",
   "properties": {
@@ -1052,6 +1071,20 @@ A command not listed here either reports only the generic human-message shape `{
     "path": {
       "type": "string"
     },
+    "skipped_tags": {
+      "description": "The tags left out, each with why.",
+      "items": {
+        "$ref": "#/$defs/SkippedTag"
+      },
+      "type": "array"
+    },
+    "tags": {
+      "description": "The tags exported as annotated git tags.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "trees": {
       "description": "The git trees written. A tree unchanged from its parcel's first parent is reused, not\nwritten again.",
       "format": "uint",
@@ -1064,7 +1097,8 @@ A command not listed here either reports only the generic human-message shape `{
     "commits",
     "trees",
     "blobs",
-    "branches"
+    "branches",
+    "tags"
   ],
   "title": "ExportReport",
   "type": "object"
