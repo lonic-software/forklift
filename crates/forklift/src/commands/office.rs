@@ -6,20 +6,12 @@ use forklift_core::util::office_utils::{IdentityClass, OfficeState, RevocationRe
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::pallet_utils::{AnchorPrecondition, BoundaryScope, PalletsPrecondition, RefPreconditions};
 use forklift_core::util::remote_utils::{self, RemoteClient};
-use forklift_core::util::{config_utils, office_utils, pallet_utils, sign_utils, trust_utils};
+use forklift_core::util::{audit_utils, config_utils, meta_tree, office_utils, pallet_utils, sign_utils, trust_utils};
 use crate::output::{self, CommandOutput};
 
 // The office command — the warehouse office manages the personnel records: users and
 // keys as tracked metadata on the "@office" meta pallet. One public
 // function per subcommand; the CLI surface itself is defined in `cli.rs`.
-
-/// The refusal of `enroll` and `regenesis` over an office whose anchor is gone.
-const LOST_ANCHOR: &str = "This warehouse holds an office but no trust anchor: its anchor was lost. Nothing was \
-    changed. Restore the warehouse's trust file from a backup if you have one. Otherwise \"forklift lower\" \
-    takes the anchor of the configured remote, with nothing here to compare it against, so use it only with a \
-    remote you trust; if that remote has reset its trust, clone it again instead. With neither, trust cannot be \
-    re-established here: run \"forklift prepare\" in another folder, which starts without this warehouse's \
-    history, and enroll there.";
 
 /// Enroll the configured operator and establish trust: the genesis office parcel
 /// introduces the first user and key, self-signed by that key (the TOFU anchor).
@@ -42,7 +34,26 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
     // An office with no anchor lost its anchor: a new genesis would orphan every parcel that
     // office vouches for, and no head accepts an anchor over one.
     if pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?.is_some() {
-        return Err(LOST_ANCHOR.to_string());
+        return Err(audit_utils::LOST_ANCHOR.to_string());
+    }
+
+    // Metadata recorded before enrollment is unsigned, and an office admits only signed meta
+    // parcels: enrolling over it would leave every such pallet unverifiable, failing later and
+    // far from here. Refuse until enroll can admit it.
+    let mut unsigned = Vec::new();
+
+    for name in meta_tree::META_PALLET_NAMES.iter().filter(|name| **name != OFFICE_PALLET_NAME) {
+        if pallet_utils::get_meta_pallet_head(name)?.is_some() {
+            unsigned.push(format!("@{}", name));
+        }
+    }
+
+    if !unsigned.is_empty() {
+        return Err(format!(
+            "This warehouse holds metadata recorded without enrollment ({}). Enrolling over \
+            unsigned metadata is not supported yet: the office would refuse it from then on.",
+            unsigned.join(", ")
+        ));
     }
 
     // Everything reachable from the current pallet heads is the pre-trust history:
@@ -76,6 +87,20 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
                 "The remote already has trust established. \"forklift lower\" to adopt its \
                 office, then ask an enrolled operator to admit you.".to_string()
             );
+        }
+
+        // Unsigned metadata another client lifted would be adopted under the new office, which
+        // refuses it, just as the local check above.
+        let remote_meta: Vec<&String> = info.pallets.keys()
+            .filter(|name| name.starts_with('@') && name.as_str() != format!("@{}", OFFICE_PALLET_NAME))
+            .collect();
+
+        if !remote_meta.is_empty() {
+            return Err(format!(
+                "The remote holds metadata recorded without enrollment ({}). Enrolling over \
+                unsigned metadata is not supported yet: the office would refuse it from then on.",
+                remote_meta.iter().map(|name| name.as_str()).collect::<Vec<_>>().join(", ")
+            ));
         }
 
         // Live heads only: a pallet the remote deleted (its tombstone's head) stays outside, since
@@ -754,7 +779,7 @@ pub fn regenesis(confirm: bool) -> Result<(), String> {
 
     let Some((old_anchor, old_anchor_bytes)) = office_utils::read_trust_anchor_with_bytes()? else {
         if pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?.is_some() {
-            return Err(LOST_ANCHOR.to_string());
+            return Err(audit_utils::LOST_ANCHOR.to_string());
         }
 
         return Err(

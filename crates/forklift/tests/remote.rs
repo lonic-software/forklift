@@ -11275,7 +11275,45 @@ fn parcel_hash(area: &TestArea, dir: &str, revision: &str) -> String {
 }
 
 #[test]
-fn kv_needs_an_office_and_refuses_readers() {
+fn unsigned_metadata_lifts_and_lowers_through_a_server_that_never_enrolled() {
+    let area = TestArea::new("unsigned-meta-remote");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/code.txt", "v1\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+    assert_success(&area.forklift("a", &["stack", "-m", "base"]));
+    assert_success(&area.forklift("a", &["tag", "create", "v1.0", "main", "-m", "release"]));
+    assert_success(&area.forklift("a", &["manifest", "set", "main", "ci", "green"]));
+
+    // The server checks the unsigned parcels against no office, and stores them.
+    let lifted = area.forklift("a", &["lift"]);
+    assert_success(&lifted);
+    assert!(stdout(&lifted).contains("Lifted the @tags pallet"), "{}", stdout(&lifted));
+    assert!(stdout(&lifted).contains("Lifted the @kv pallet"), "{}", stdout(&lifted));
+    assert_eq!(remote_pallet_head(&server, "@tags"), Some(area.read_file("a/.forklift/meta/tags").trim().to_string()));
+
+    // A clone adopts them, still unsigned and by the declared operator.
+    let cloned = area.forklift(".", &["clone", &server.url, "b"]);
+    assert_success(&cloned);
+    assert!(stdout(&cloned).contains("Adopted the @tags pallet"), "{}", stdout(&cloned));
+    assert!(stdout(&area.forklift("b", &["tag", "show", "v1.0"])).contains("tester@forklift (unsigned)"));
+
+    // A change made on the clone travels back the same way.
+    assert_success(&area.forklift("b", &["manifest", "set", "main", "ci", "red"]));
+    assert_success(&area.forklift("b", &["lift"]));
+    assert_success(&area.forklift("a", &["lower"]));
+    assert_eq!(stdout(&area.forklift("a", &["manifest", "get", "main", "ci"])).trim(), "red");
+
+    // A warehouse holding no metadata of its own still may not enroll over the remote's.
+    prepare_warehouse(&area, "c", &server.url);
+    let enroll = area.forklift("c", &["office", "enroll"]);
+    assert!(!enroll.status.success(), "{}", stdout(&enroll));
+    assert!(stderr(&enroll).contains("The remote holds metadata") && stderr(&enroll).contains("@tags"), "{}", stderr(&enroll));
+}
+
+#[test]
+fn kv_refuses_readers_under_an_office() {
     let area = TestArea::new("kv-office");
     let server = Server::start(&area, None);
 
@@ -11284,10 +11322,6 @@ fn kv_needs_an_office_and_refuses_readers() {
     assert_success(&area.forklift("a", &["load", "."]));
     assert_success(&area.forklift("a", &["stack", "-m", "base"]));
 
-    // No office: a write is refused before anything is stacked.
-    let refused = area.forklift("a", &["manifest", "set", "main", "ci", "green"]);
-    assert!(!refused.status.success(), "a kv write without an office must be refused");
-    assert!(stderr(&refused).contains("office"), "{}", stderr(&refused));
     assert!(stdout(&area.forklift("a", &["manifest", "keys"])).contains("No custom metadata"));
 
     assert_success(&area.forklift("a", &["office", "enroll"]));

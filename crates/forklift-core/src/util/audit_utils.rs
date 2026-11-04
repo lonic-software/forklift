@@ -1005,6 +1005,30 @@ impl std::ops::Deref for VerifiedOffice {
     }
 }
 
+/// The refusal of anything that needs the trust state — `enroll`, `regenesis`, a metadata write —
+/// over an office whose anchor is gone.
+pub const LOST_ANCHOR: &str = "This warehouse holds an office but no trust anchor: its anchor was lost. Nothing was \
+    changed. Restore the warehouse's trust file from a backup if you have one. Otherwise \"forklift lower\" \
+    takes the anchor of the configured remote, with nothing here to compare it against, so use it only with a \
+    remote you trust; if that remote has reset its trust, clone it again instead. With neither, trust cannot be \
+    re-established here: run \"forklift prepare\" in another folder, which starts without this warehouse's \
+    history, and enroll there.";
+
+/// The office this warehouse's meta pallets are written and checked against, by its trust state:
+/// the verified office when trust is held, `None` when the warehouse never enrolled (no anchor,
+/// an unborn office). An office whose anchor is gone refuses: it can neither be verified nor
+/// treated as never enrolled.
+pub fn local_meta_office() -> Result<Option<VerifiedOffice>, String> {
+    if let Some((_, office)) = verified_local_trust()? {
+        return Ok(Some(office));
+    }
+
+    match pallet_utils::get_meta_pallet_head(office_utils::OFFICE_PALLET_NAME)? {
+        Some(_) => Err(LOST_ANCHOR.to_string()),
+        None => Ok(None),
+    }
+}
+
 /// This warehouse's office, verified against its trust anchor. A meta pallet's writes
 /// are judged against the verified office, never the unverified local read.
 pub fn verified_local_office() -> Result<VerifiedOffice, String> {
@@ -3892,12 +3916,14 @@ mod tests {
         let moved = office_head();
 
         let edit = meta_tree::set_cell(
-            &kv_utils::cell_path(&"c".repeat(64), "ci"), &fixture.admin_key_id, kv_utils::KV_TEXT_SCHEMA,
+            &kv_utils::cell_path(&"c".repeat(64), "ci"), &meta_tree::Stamp::Signer(fixture.admin_key_id.clone()),
+            kv_utils::KV_TEXT_SCHEMA,
             &kv_utils::text_value("green"),
         ).unwrap();
         let refused = meta_tree::stack_meta_edits(
-            kv_utils::KV_PALLET_NAME, &kv_utils::KvRules, &office, &[edit], &fixture.admin, "ci",
-            &meta_tree::MetaSigner::local(&fixture.admin_key_id),
+            kv_utils::KV_PALLET_NAME, &kv_utils::KvRules,
+            &meta_tree::MetaWriter::Signed { office, signer: meta_tree::MetaSigner::local(&fixture.admin_key_id) },
+            &[edit], &fixture.admin, "ci",
         );
 
         assert_eq!(crate::util::pallet_utils::get_meta_pallet_head(kv_utils::KV_PALLET_NAME).unwrap(), None,

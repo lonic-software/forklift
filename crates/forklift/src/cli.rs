@@ -314,11 +314,13 @@ pub enum Command {
     /// Reviewable merge proposals (pull requests) on the @haul meta pallet
     #[command(
         long_about = "Propose merging one pallet into another, with discussion and signed reviews — \
-                      pull requests, in Forklift's vocabulary. A haul is a set of signed cells on the @haul \
+                      pull requests, in Forklift's vocabulary. A haul is a set of cells on the @haul \
                       meta pallet — its proposal, its proposed head, its status, one review per \
-                      reviewer and its comments — so authorship, and who approved, is forge-proof \
-                      and carries the operator's identity class (a human's approval is \
-                      distinguishable from an agent's). A review names the head it reviewed, and a \
+                      reviewer and its comments. In a warehouse with an office the cells are \
+                      signed, so authorship, and who approved, is forge-proof and carries the \
+                      operator's identity class (a human's approval is distinguishable from an \
+                      agent's); in one that never enrolled they are unsigned and name their \
+                      writer's declared operator. A review names the head it reviewed, and a \
                       merged haul stays merged. Reviews are recorded; merging is not gated on them \
                       in this release. Intra-warehouse (pallet → pallet)."
     )]
@@ -501,10 +503,12 @@ pub enum Command {
                       \"@kv\" meta pallet (subcommands set, get, unset, keys and log): a key \
                       holds one text value per parcel, and lower combines changes to different \
                       keys, while a key changed differently on both sides is a conflict that \
-                      \"forklift lower --keep\" resolves. Every change is signed by its writer, \
-                      verifiable offline against the office chain, and references the parcel \
-                      without ever changing it. Recording needs an enrolled signing key; a keyed \
-                      value also needs a writer or admin role. Without a subcommand, every \
+                      \"forklift lower --keep\" resolves. Every change references the parcel \
+                      without ever changing it. In a warehouse with an office every change is \
+                      signed by its writer, verifiable offline against the office chain: recording \
+                      needs an enrolled signing key, and a keyed value also needs a writer or \
+                      admin role. In one that never enrolled, changes are unsigned and name their \
+                      writer's declared operator. Without a subcommand, every \
                       \"@manifest\" entry is listed."
     )]
     Manifest {
@@ -894,7 +898,8 @@ pub enum Command {
                       milestones. A tag is a signed record on the \"@tags\" meta pallet, so who \
                       cut it is the parcel's signature (forge-proof), verifiable offline against \
                       the office chain. The release convention: a tag is signed by an admin key, \
-                      so creating one requires an admin. Tag names are immutable. Without a \
+                      so creating one requires an admin. In a warehouse that never enrolled, a \
+                      tag is unsigned and names its tagger's declared operator. Tag names are immutable. Without a \
                       subcommand, the tags are listed."
     )]
     Tag {
@@ -1395,7 +1400,8 @@ pub enum TagAction {
         long_about = "Create a signed tag pointing at a revision — a release marker. The tag is \
                       signed and recorded on the \"@tags\" meta pallet, verifiable offline against \
                       the office chain. As the release convention, only an admin may cut a \
-                      tag. Tag names are immutable; an existing name is refused."
+                      tag. In a warehouse that never enrolled the tag is unsigned, names your \
+                      declared operator, and needs no role. Tag names are immutable; an existing name is refused."
     )]
     Create {
         /// The tag name (a release label, e.g. "v1.2.0")
@@ -1425,7 +1431,8 @@ pub enum ManifestAction {
     #[command(
         long_about = "Record a signed note about a parcel — a review comment, a caveat, any \
                       free-form annotation. The note references the parcel and never changes it. \
-                      Requires an enrolled signing key."
+                      Requires an enrolled signing key in a warehouse with an office; in one \
+                      without, the note is unsigned and names your declared operator."
     )]
     Note {
         /// The parcel the note is about (a pallet name, or a parcel hash / unique prefix)
@@ -1440,7 +1447,8 @@ pub enum ManifestAction {
     #[command(
         long_about = "Record a signed approval of a parcel — a cryptographic sign-off, forge-proof \
                       and offline-verifiable. Optionally attach a message. Requires an enrolled \
-                      signing key."
+                      signing key in a warehouse with an office; in one without, the approval is \
+                      unsigned and names your declared operator."
     )]
     Approve {
         /// The parcel to approve (a pallet name, or a parcel hash / unique prefix)
@@ -1459,7 +1467,8 @@ pub enum ManifestAction {
                       with an agent-class identity (\"forklift office admit --agent --supervisor\"), it \
                       answers \"which model produced this, under whose supervision\" forge-proof \
                       and offline — the AI-traceability question git cannot answer. Requires an \
-                      enrolled signing key."
+                      enrolled signing key in a warehouse with an office; in one without, the \
+                      entry is unsigned — a declaration, not evidence."
     )]
     Provenance {
         /// The parcel the provenance is about (a pallet name, or a parcel hash / prefix)
@@ -1501,7 +1510,8 @@ pub enum ManifestAction {
         long_about = "Set a key on a parcel to a text value, replacing any value it held. A key \
                       is ASCII letters, digits, \".\", \"_\" and \"-\", at most 128 bytes, and \
                       never begins with \".\" or \"-\"; a value is at most 64 KiB of text. \
-                      Requires an enrolled signing key and a writer or admin role."
+                      In a warehouse with an office, requires an enrolled signing key and a \
+                      writer or admin role."
     )]
     Set {
         /// The parcel the value is about (a pallet name, or a parcel hash / unique prefix)
@@ -1525,8 +1535,9 @@ pub enum ManifestAction {
 
     /// Remove a keyed value from a parcel
     #[command(
-        long_about = "Remove a key from a parcel. A key that holds no value is refused. Requires \
-                      an enrolled signing key and a writer or admin role."
+        long_about = "Remove a key from a parcel. A key that holds no value is refused. In a \
+                      warehouse with an office, requires an enrolled signing key and a writer or \
+                      admin role."
     )]
     Unset {
         /// The parcel (a pallet name, or a parcel hash / unique prefix)
@@ -1620,7 +1631,9 @@ pub enum HaulAction {
                       stated: exactly one of --approve, --request-changes or --comment, so a review \
                       never records an approval its reviewer did not give. Because the review is \
                       signed, the approval carries your identity class — an agent's approval is \
-                      distinguishable from a human's. Requires an enrolled signing key."
+                      distinguishable from a human's. Requires an enrolled signing key in a \
+                      warehouse with an office; in one without, the review is unsigned and names \
+                      your declared operator."
     )]
     Review {
         /// The haul id (or a unique prefix)

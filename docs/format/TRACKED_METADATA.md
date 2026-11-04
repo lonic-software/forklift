@@ -63,33 +63,50 @@ schema = "kv.text 1"
 text = "..."
 ```
 
-The envelope has exactly these three fields and no timestamp, so a signer writing a value
-always produces the same bytes. Two writers of the same value produce different cells.
+The envelope has exactly one stamp — `signer`, a 64-hex key id, or `operator`, a non-empty
+operator identifier — plus `schema` and `[value]`, and no timestamp. A writer writing a value
+therefore always produces the same bytes, and two writers of the same value produce different
+cells. A cell with both stamps, or neither, is malformed.
 
 Reads are tolerant per cell. A cell with an unknown schema, or one that does not parse, is
 reported as that cell's row, and the other cells still read. A missing or unknown `format`
 refuses the whole pallet, naming it as written by an older or newer forklift. Writes leave
 every path they do not name byte-for-byte unchanged.
 
-Every parcel must pass `verify_meta_content` against the office. Its signature must verify,
-and inside the distrust boundary if its key is revoked. Every cell it adds or changes relative
-to its parent must be stamped with its own signing key. Its format must stay the parent's.
-Changed envelopes must parse, in a canonical tree with no empty subtrees. The pallet's own
-rules must hold. By induction over the linear chain, every cell at a verified head names the
-key that wrote it.
+Which parcels a pallet accepts depends on the warehouse's trust state:
+
+1. **Never enrolled** — no trust anchor and no office. Every parcel is unsigned. Its `Author`
+   and `Stack` actions name one operator, and every cell it adds or changes is stamped
+   `operator` with that identifier. A parcel carrying a signature, or a cell stamped with a
+   key, is refused: with no office there is nothing to verify it against. The pallet rules
+   that judge roles (who may cut a tag, who may record a merge) do not apply, because there
+   are no roles; the rules that judge authorship (only the opener writes `opened`, a review
+   lives under its writer's directory) apply to the declared operator.
+2. **Anchor lost** — no trust anchor while an office exists. Every write and every content
+   check refuses until trust is restored.
+3. **Trusted** — an anchor and an office. Every parcel must be signed, and its signature must
+   verify, inside the distrust boundary if its key is revoked. Every cell it adds or changes is
+   stamped `signer` with its own signing key, and the pallet rules hold in full.
+
+In every state a parcel's format must stay its parent's, and its changed envelopes must parse,
+in a canonical tree with no empty subtrees. `verify_meta_content` checks each parcel this way,
+so by induction over the linear chain every cell at an accepted head names the writer that put
+it there: verifiably under trust, as declared when the warehouse never enrolled. A client
+writes in the state it reads, and its write refuses if an office or anchor appears before the
+head moves.
 
 Diverged heads are not merged. The local net change since the common ancestor is replayed onto
-the remote head as one new parcel, and each replayed cell is re-stamped with the current key.
-That re-stamp is allowed only when the old stamp resolves to the same operator under a key that
-is active or was retired, never one revoked as compromised. Paths that both sides changed
-differently refuse until each is resolved, keeping ours or theirs; keeping theirs at a subject
-resolves every conflict beneath it.
+the remote head as one new parcel, and each replayed cell is re-stamped by the current writer.
+A cell already carrying the writer's own stamp is kept as is. Under trust a key stamp may be
+re-signed only when it resolves to the same operator under a key that is active or was
+retired, never one revoked as compromised; any other re-stamp refuses. Paths that both sides
+changed differently refuse until each is resolved, keeping ours or theirs; keeping theirs at a
+subject resolves every conflict beneath it.
 
-A pallet on this format exists only under an office: a server, the serverless head and a client
-adopting or lowering it all refuse it when trust is not established or the office is not
-lifted, and run `verify_meta_content` from the head they hold. The meta pallet names are a
-fixed list — `office`, `manifest`, `haul`, `tags`, `kv` — and any other `@name` is refused, so a
-newer forklift's pallet is never stored unchecked by one that cannot read it.
+A server, the serverless head and a client adopting or lowering a pallet on this format run
+`verify_meta_content` in the trust state they hold, from the head they hold. The meta pallet
+names are a fixed list — `office`, `manifest`, `haul`, `tags`, `kv` — and any other `@name` is
+refused, so a newer forklift's pallet is never stored unchecked by one that cannot read it.
 
 ### `@kv`
 
@@ -102,7 +119,8 @@ cells/<s[0..2]>/<s>/<key>         schema "kv.text 1", value { text = "..." }
 `s` is the full hash of the parcel the value is about (it need not be held). A key is one path
 component of at most 128 bytes; `text` is the only field of the value, UTF-8 of at most 64 KiB.
 Any operator in the office except a reader may set or unset any cell (the reader rule is
-enforced at transport and by the CLI, not in the content check). Conflicts are resolved per
+enforced at transport and by the CLI, not in the content check); in a warehouse that never
+enrolled, anyone may. Conflicts are resolved per
 `<s>/<key>`, or per `<s>` for `theirs`.
 
 ### `@manifest`
@@ -141,9 +159,10 @@ trail_head = "e6ee0a58…"            # the trail tip — `history` on it walks 
 checkpoints = 3                     # how many checkpoints were squashed
 ```
 
-There is no author field: the author is the operator whose key the cell is stamped with, so it
-cannot be forged. The pallet rule, checked wherever the content check runs: a parcel may add,
-change or remove cells only under its own signer's `op`, whatever schema they carry, and an
+There is no author field: the author is the operator the cell's stamp resolves to — the owner of
+its key under trust, so it cannot be forged, or the declared operator when the warehouse never
+enrolled. The pallet rule, checked wherever the content check runs: a parcel may add, change or
+remove cells only under its own writer's `op`, whatever schema they carry, and an
 entry of a known schema only at the path its kind and content derive. A cell of a kind or
 schema this build does not know is listed as unreadable, and a query treats it as possibly
 matching (an unknown, never an absence); its ownership is still enforced. Conflicts are
@@ -151,7 +170,7 @@ resolved at any path from `<s>` down to a cell.
 
 ### `@tags`
 
-Signed release labels, one cell per name:
+Release labels, one cell per name, signed under trust:
 
 ```
 cells/<name>                        schema "tags.tag 1"
@@ -163,8 +182,9 @@ message = "first release"           # may be empty
 tagged_at = 1782205234              # display only
 ```
 
-A name is one path component of at most 128 bytes. Two rules hold. A parcel that adds a tag
-must be signed by an operator who is an admin in the office it is admitted against: when a
+A name is one path component of at most 128 bytes. Two rules hold. Under trust, a parcel that
+adds a tag must be signed by an operator who is an admin in the office it is admitted against
+(a warehouse that never enrolled has no roles, so anyone may tag): when a
 client writes or replays it, and when a server or the serverless head moves its head. A client
 adopting history a server already admitted does not re-check the role, so a later demotion
 never wedges the history it admitted. And no parcel may change or remove an existing tag, so a
@@ -194,7 +214,7 @@ source = "feature"                  # the pallet proposed for merging
 target = "main"                     # the pallet it merges into
 title = "Add X"
 description = "why"                 # may be empty
-opener = "alice@example.com"        # the operator who opened it — must be the signer's
+opener = "alice@example.com"        # the operator who opened it — must be the writer's
 opened_at = 1782205234              # part of the id; never a security input
 
 # state — the status and the head it is of, in one cell
@@ -220,8 +240,8 @@ The pallet rules, checked wherever the content check runs:
 - No other cell may exist in a haul directory without its `opened`.
 - `state` is never removed, and never changed once it reads merged. Anyone may close or reopen
   at the current head; only the opener moves the head, to any parcel (a review of an earlier
-  head stops counting). A state that reads merged is admitted only from an operator whose user
-  record may write the haul's target — an admin, a writer of every pallet, or a writer granted
+  head stops counting). Under trust, a state that reads merged is admitted only from an
+  operator whose user record may write the haul's target — an admin, a writer of every pallet, or a writer granted
   the target — since the record says the target took the haul. The rule binds where a parcel is
   first admitted (stacking it, a remote accepting its lift); a warehouse adopting a remote's
   already-admitted @haul audits only the signatures and the other rules, so a merge whose signer

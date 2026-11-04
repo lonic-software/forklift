@@ -1,7 +1,7 @@
 use serde::Serialize;
 use forklift_core::error::sanitize;
 use forklift_core::util::haul_utils::{self, Haul, HaulStatus, ReviewVerdict, UnreadableCell};
-use forklift_core::util::meta_tree::MetaSigner;
+use forklift_core::util::meta_tree::MetaWriter;
 use forklift_core::util::office_utils::{self, OfficeState};
 use forklift_core::util::{config_utils, file_utils, merge_utils, object_utils, pallet_utils, take_utils};
 use forklift_core::util::take_utils::{FetchAt, TakeTrust};
@@ -12,8 +12,9 @@ use crate::commands::lower;
 use crate::output::{self, CommandOutput};
 
 /// Handle the haul command: reviewable merge proposals (pull requests) on the `@haul`
-/// meta pallet. Every mutating action writes signed cells, so authorship — and in particular
-/// *who approved* — is forge-proof and carries the operator's identity class.
+/// meta pallet. Under trust every mutating action writes signed cells, so authorship — and in
+/// particular *who approved* — is forge-proof and carries the operator's identity class; in a
+/// warehouse that never enrolled the cells are unsigned and authorship is declared.
 ///
 /// * `haul open --target … [--source …] --title …` - open a proposal.
 /// * `haul list [--state …]`                        - list proposals.
@@ -42,12 +43,11 @@ pub async fn handle_command(action: Option<HaulAction>) -> Result<(), String> {
     }
 }
 
-/// The verified office and a signer for the configured operator.
-fn signing() -> Result<(forklift_core::util::audit_utils::VerifiedOffice, forklift_core::model::operator::Operator, MetaSigner<'static>), String> {
+/// The writer of `@haul` for the configured operator, and the operator.
+fn writing() -> Result<(MetaWriter<'static>, forklift_core::model::operator::Operator), String> {
     let actor = config_utils::get_operator()?;
-    let (office, signing_key_id) = lower::verified_signing_office(&actor)?;
 
-    Ok((office, actor, MetaSigner::local(&signing_key_id)))
+    Ok((lower::meta_writer(&actor)?, actor))
 }
 
 /// Open a haul proposing `source` (default: the current pallet) be merged into `target`.
@@ -76,8 +76,8 @@ fn open(target: &str, source: Option<String>, title: &str, description: String) 
         return Err(pallet_utils::pallet_not_found_refusal(&pallet_utils::PalletRef::user(target)).into());
     }
 
-    let (office, actor, signer) = signing()?;
-    let id = haul_utils::open_haul(&source, target, &head, title, &description, &office, &actor, &signer)?;
+    let (writer, actor) = writing()?;
+    let id = haul_utils::open_haul(&source, target, &head, title, &description, &writer, &actor)?;
 
     output::emit(&Opened { id, source, target: target.to_string(), title: title.to_string() });
 
@@ -137,16 +137,16 @@ fn update(id: &str) -> Result<(), String> {
     let head = pallet_utils::get_pallet_head(&haul.opened.source)?
         .ok_or(format!("Pallet \"{}\" has nothing stacked.", haul.opened.source))?;
 
-    let (office, actor, signer) = signing()?;
+    let (writer, actor) = writing()?;
 
-    if haul.opened.opener != haul_utils::signing_operator(&office, &signer)? {
+    if haul.opened.opener != writer.operator(&actor)? {
         return Err(format!(
             "Haul {} was opened by {}; only its opener updates its head.",
             short(&haul.id), haul.opened.opener
         ));
     }
 
-    let changed = haul_utils::record_state(&haul.id, &HaulStatus::Open, &head, "Updated", &office, &actor, &signer)?
+    let changed = haul_utils::record_state(&haul.id, &HaulStatus::Open, &head, "Updated", &writer, &actor)?
         .is_some();
 
     output::emit(&Updated { id: haul.id, head, changed });
@@ -157,9 +157,9 @@ fn update(id: &str) -> Result<(), String> {
 /// Record a comment.
 fn comment(id: &str, message: &str) -> Result<(), String> {
     let haul = haul_utils::find_haul(id)?;
-    let (office, actor, signer) = signing()?;
+    let (writer, actor) = writing()?;
 
-    haul_utils::record_comment(&haul.id, message, &office, &actor, &signer)?;
+    haul_utils::record_comment(&haul.id, message, &writer, &actor)?;
 
     output::emit(&Acted { id: haul.id, action: "commented".to_string() });
 
@@ -179,9 +179,9 @@ fn verdict(approve: bool, request_changes: bool, comment: bool) -> ReviewVerdict
 /// Record a review of the haul's current head.
 fn review(id: &str, verdict: ReviewVerdict, message: String) -> Result<(), String> {
     let haul = haul_utils::find_haul(id)?;
-    let (office, actor, signer) = signing()?;
+    let (writer, actor) = writing()?;
 
-    haul_utils::record_review(&haul.id, verdict, &message, &haul.head, &office, &actor, &signer)?;
+    haul_utils::record_review(&haul.id, verdict, &message, &haul.head, &writer, &actor)?;
 
     output::emit(&Acted { id: haul.id, action: format!("reviewed ({})", verdict.as_str()) });
 
@@ -199,9 +199,9 @@ fn set_status(id: &str, status: HaulStatus) -> Result<(), String> {
         _ => {}
     }
 
-    let (office, actor, signer) = signing()?;
+    let (writer, actor) = writing()?;
     let action = if status == HaulStatus::Closed { "Closed" } else { "Reopened" };
-    haul_utils::record_state(&haul.id, &status, &haul.head, action, &office, &actor, &signer)?;
+    haul_utils::record_state(&haul.id, &status, &haul.head, action, &writer, &actor)?;
 
     output::emit(&Acted {
         id: haul.id,
@@ -214,21 +214,24 @@ fn set_status(id: &str, status: HaulStatus) -> Result<(), String> {
 /// Merge a haul: consolidate its proposed head into the target, then record the merge.
 async fn consolidate(id: &str) -> Result<(), String> {
     let haul = find_open(id, "merged")?;
-    let (office, actor, signer) = signing()?;
+    let (writer, actor) = writing()?;
 
     // Refused before anything lands: every head that admits the record would refuse it anyway,
-    // after the target already took the merge.
-    let operator = haul_utils::signing_operator(&office, &signer)?;
-    if let Err(refusal) = haul_utils::may_record_merge(&office, &operator, &haul.opened.target) {
-        return Err(format!(
-            "Operator {} {} \"{}\", and only its writers record a merge into it. Nothing was merged.",
-            operator, refusal.why(), haul.opened.target
-        ));
+    // after the target already took the merge. Without trust there are no roles to check.
+    if let Some(office) = writer.office() {
+        let operator = writer.operator(&actor)?;
+
+        if let Err(refusal) = haul_utils::may_record_merge(office, &operator, &haul.opened.target) {
+            return Err(format!(
+                "Operator {} {} \"{}\", and only its writers record a merge into it. Nothing was merged.",
+                operator, refusal.why(), haul.opened.target
+            ));
+        }
     }
 
     // The merge is recorded at the head it merged, in the one cell a concurrent update writes.
     let record = |parcel: &str| haul_utils::record_state(
-        &haul.id, &HaulStatus::Merged(parcel.to_string()), &haul.head, "Merged", &office, &actor, &signer,
+        &haul.id, &HaulStatus::Merged(parcel.to_string()), &haul.head, "Merged", &writer, &actor,
     );
 
     // The merge lands on the target pallet, so it must be the current one.
@@ -500,6 +503,11 @@ impl CommandOutput for HaulList {
 pub(crate) struct ReviewLine {
     author: String,
 
+    /// Present and `true` when the review was written without a key, so its author is only
+    /// declared.
+    #[serde(skip_serializing_if = "crate::output::is_false")]
+    unsigned: bool,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     class: Option<String>,
 
@@ -519,6 +527,10 @@ pub(crate) struct ReviewLine {
 #[derive(Serialize)]
 pub(crate) struct CommentLine {
     author: String,
+
+    /// As [`ReviewLine::unsigned`].
+    #[serde(skip_serializing_if = "crate::output::is_false")]
+    unsigned: bool,
     body: String,
     commented_at: i64,
 }
@@ -561,6 +573,7 @@ impl HaulDetail {
                 .filter(|class| class.is_automated())
                 .map(|class| class.as_str().to_string()),
             author: review.author.clone(),
+            unsigned: !review.signed,
             verdict: review.verdict.as_str().to_string(),
             body: review.body.clone(),
             current: review.head == haul.head,
@@ -570,6 +583,7 @@ impl HaulDetail {
 
         let comments = haul.comments.iter().map(|comment| CommentLine {
             author: comment.author.clone(),
+            unsigned: !comment.signed,
             body: comment.body.clone(),
             commented_at: comment.commented_at,
         }).collect();
@@ -626,7 +640,8 @@ impl CommandOutput for HaulDetail {
                 let class = review.class.as_ref().map(|c| format!(" [{}]", sanitize(c))).unwrap_or_default();
                 let stale = if review.current { String::new() } else { format!(" (of {})", short(&review.head)) };
                 let body = first_line(&review.body);
-                println!("  {}{}: {}{}{}", sanitize(&review.author), class, sanitize(&review.verdict), stale, body);
+                let unsigned = if review.unsigned { " (unsigned)" } else { "" };
+                println!("  {}{}{}: {}{}{}", sanitize(&review.author), unsigned, class, sanitize(&review.verdict), stale, body);
             }
         }
 
@@ -636,7 +651,8 @@ impl CommandOutput for HaulDetail {
             // indented under it.
             for comment in &self.comments {
                 let mut lines = comment.body.lines();
-                println!("  {}: {}", sanitize(&comment.author), sanitize(lines.next().unwrap_or("")));
+                let unsigned = if comment.unsigned { " (unsigned)" } else { "" };
+                println!("  {}{}: {}", sanitize(&comment.author), unsigned, sanitize(lines.next().unwrap_or("")));
                 for line in lines {
                     println!("      {}", sanitize(line));
                 }

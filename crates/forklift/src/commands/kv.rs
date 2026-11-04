@@ -2,8 +2,7 @@ use chrono::DateTime;
 use serde::Serialize;
 use forklift_core::error::{sanitize, sanitize_lines};
 use forklift_core::util::kv_utils::{self, KvChange, KvEntry, KvValue};
-use forklift_core::util::meta_tree::MetaSigner;
-use forklift_core::util::office_utils::Role;
+use forklift_core::util::meta_tree::{MetaWriter, Stamp};
 use forklift_core::util::{config_utils, object_utils, pallet_utils};
 use crate::commands::lower;
 use crate::output::{self, CommandOutput};
@@ -18,33 +17,20 @@ fn subject_of(revision: &str) -> Result<String, String> {
     }
 }
 
-/// The verified office, the signing key and the operator id of a writer, refusing a reader.
-fn require_writer() -> Result<(forklift_core::util::audit_utils::VerifiedOffice, String, String,
-                               forklift_core::model::operator::Operator), String> {
+/// The writer, the operator id and the operator of a custom metadata change, refusing a reader.
+fn require_writer() -> Result<(MetaWriter<'static>, String, forklift_core::model::operator::Operator), String> {
     let actor = config_utils::get_operator()?;
-    let (office, signing_key_id) = lower::verified_signing_office(&actor)?;
+    let writer = lower::writing_meta_writer(&actor, "change custom metadata")?;
 
-    let user = office.find_user(&actor.identifier).ok_or(format!(
-        "\"{}\" is not enrolled; ask an enrolled operator to admit you.", actor.identifier
-    ))?;
-
-    if user.role == Role::Reader {
-        return Err(format!(
-            "\"{}\" is a reader; only writers and admins may change custom metadata.", user.identifier
-        ));
-    }
-
-    let actor_id = user.identifier.clone();
-
-    Ok((office, signing_key_id, actor_id, actor))
+    Ok((writer, actor.identifier.clone(), actor))
 }
 
 pub(crate) fn set(revision: &str, key: &str, value: &str) -> Result<(), String> {
     // A new value is about a parcel that exists: it must resolve here.
     let subject = pallet_utils::resolve_revision(revision)?;
-    let (office, signing_key_id, actor_id, actor) = require_writer()?;
+    let (writer, actor_id, actor) = require_writer()?;
 
-    let head = kv_utils::set(&subject, key, value, &office, &actor, &MetaSigner::local(&signing_key_id))?;
+    let head = kv_utils::set(&subject, key, value, &writer, &actor)?;
 
     output::emit(&Changed {
         action: "set",
@@ -61,9 +47,9 @@ pub(crate) fn set(revision: &str, key: &str, value: &str) -> Result<(), String> 
 
 pub(crate) fn unset(revision: &str, key: &str) -> Result<(), String> {
     let subject = subject_of(revision)?;
-    let (office, signing_key_id, actor_id, actor) = require_writer()?;
+    let (writer, actor_id, actor) = require_writer()?;
 
-    let head = kv_utils::unset(&subject, key, &office, &actor, &MetaSigner::local(&signing_key_id))?;
+    let head = kv_utils::unset(&subject, key, &writer, &actor)?;
 
     output::emit(&Changed {
         action: "unset",
@@ -171,9 +157,13 @@ pub(crate) struct EntryView {
     #[serde(skip_serializing_if = "Option::is_none")]
     unreadable: Option<String>,
 
-    /// The key id the value is stamped with.
+    /// The key id the value is stamped with; absent for a value written without a key.
     #[serde(skip_serializing_if = "Option::is_none")]
     signer: Option<String>,
+
+    /// The operator a value written without a key declares (in a warehouse that never enrolled).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operator: Option<String>,
 }
 
 impl From<&KvEntry> for EntryView {
@@ -185,7 +175,11 @@ impl From<&KvEntry> for EntryView {
             key: entry.key.clone(),
             value,
             unreadable,
-            signer: entry.signer.clone(),
+            signer: entry.stamp.as_ref().and_then(Stamp::key_id).map(str::to_string),
+            operator: match &entry.stamp {
+                Some(Stamp::Operator(identifier)) => Some(identifier.clone()),
+                _ => None,
+            },
         }
     }
 }
@@ -309,7 +303,9 @@ impl CommandOutput for KvLog {
                 (None, None, _) => String::new(),
             };
 
-            println!("{} {} {} {}", kv_utils::short(&change.parcel), when, sanitize(&change.operator), what);
+            let unsigned = if change.signer.is_none() { " (unsigned)" } else { "" };
+
+            println!("{} {} {}{} {}", kv_utils::short(&change.parcel), when, sanitize(&change.operator), unsigned, what);
         }
     }
 }

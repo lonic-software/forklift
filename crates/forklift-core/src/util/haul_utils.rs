@@ -15,9 +15,9 @@
 //!   it reviewed, so a review never silently carries over to a later head.
 //! - `comment/<op>/<id>` — a comment, under its writer's directory, at an id derived from it.
 //!
-//! A haul directory holds no cell unless its `opened` cell is present. Who wrote a cell is its
-//! signer stamp; the pallet rule lets a parcel write or remove `review/` and `comment/` cells only
-//! under its own signer's `<op>`, and lets only the opener write `opened`.
+//! A haul directory holds no cell unless its `opened` cell is present. Who wrote a cell is the
+//! operator its stamp resolves to; the pallet rule lets a parcel write or remove `review/` and
+//! `comment/` cells only under its own writer's `<op>`, and lets only the opener write `opened`.
 //!
 //! Scope: intra-warehouse (pallet → pallet); reviews are recorded but merging is not gated on
 //! them.
@@ -28,10 +28,9 @@ use toml_edit::{value, Table};
 use crate::model::operator::Operator;
 use crate::util::manifest_utils::operator_leaf;
 use crate::util::meta_tree::{
-    self, Admission, CellChange, CellEdit, CellEnvelope, CellRead, MetaKind, MetaSigner, MetaState, PalletRules,
-    ParcelChange,
+    self, CellChange, CellEdit, CellEnvelope, CellRead, MetaKind, MetaState, MetaWriter, PalletRules,
+    ParcelChange, Stamp,
 };
-use crate::util::audit_utils::VerifiedOffice;
 use crate::util::office_utils::{self, OfficeState};
 use crate::util::{file_utils, merge_utils, object_utils, pallet_utils};
 
@@ -143,9 +142,12 @@ impl Opened {
 /// A review, as its writer last recorded it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Review {
-    /// The operator whose key the cell is stamped with, or the key id when the office does not
-    /// know that key.
+    /// The operator whose key the cell is stamped with (the key id when the office does not know
+    /// that key), or the operator an unsigned cell declares.
     pub author: String,
+
+    /// Whether the cell is stamped with a key, rather than written without one.
+    pub signed: bool,
 
     pub verdict: ReviewVerdict,
     pub body: String,
@@ -162,6 +164,9 @@ pub struct Review {
 pub struct Comment {
     /// As [`Review::author`].
     pub author: String,
+
+    /// As [`Review::signed`].
+    pub signed: bool,
 
     pub body: String,
 
@@ -393,12 +398,13 @@ pub(crate) fn review_value(verdict: ReviewVerdict, body: &str, head: &str, revie
     table
 }
 
-/// Parse a review, with `author` filled in by the caller.
+/// Parse a review, with `author` and `signed` filled in by the caller.
 fn parse_review(table: &Table) -> Result<Review, String> {
     meta_tree::value_fields_only(table, &[FIELD_VERDICT, FIELD_BODY, FIELD_HEAD, FIELD_REVIEWED_AT])?;
 
     Ok(Review {
         author: String::new(),
+        signed: false,
         verdict: ReviewVerdict::parse(&meta_tree::value_string(table, FIELD_VERDICT)?)
             .map_err(|why| format!("has a verdict field that does not parse: {}", why))?,
         body: meta_tree::value_string(table, FIELD_BODY)?,
@@ -415,12 +421,13 @@ pub(crate) fn comment_value(body: &str, commented_at: i64) -> Table {
     table
 }
 
-/// Parse a comment, with `author` filled in by the caller.
+/// Parse a comment, with `author` and `signed` filled in by the caller.
 fn parse_comment(table: &Table) -> Result<Comment, String> {
     meta_tree::value_fields_only(table, &[FIELD_BODY, FIELD_COMMENTED_AT])?;
 
     Ok(Comment {
         author: String::new(),
+        signed: false,
         body: meta_tree::value_string(table, FIELD_BODY)?,
         commented_at: meta_tree::value_integer(table, FIELD_COMMENTED_AT)?,
     })
@@ -474,10 +481,10 @@ fn opened_in(cells: Option<&str>, dir: &str, rules: &HaulRules) -> Result<Option
 /// - `state` is never removed, never changed once it reads merged, and its head is moved only by
 ///   the opener — so a merge records the head it merged, and a head move racing a merge is a
 ///   conflict on the one cell;
-/// - a state that reads merged is admitted only when its signer may write the haul's target
-///   ([`may_record_merge`]), judged against the office as it stands — under
-///   [`Admission::Admit`] only, so adopting history a remote already admitted never wedges on a
-///   merger demoted since;
+/// - a signed state that reads merged is admitted only when its signer may write the haul's
+///   target ([`may_record_merge`]), judged against the office as it stands — under
+///   [`Admission::Admit`](meta_tree::Admission::Admit) only, so adopting history a remote already admitted never wedges on a
+///   merger demoted since (see [`ParcelChange::role_check`]);
 /// - `review/<op>` and `comment/<op>/…` are written or removed only by the operator `op` names;
 /// - `opened` and `state` hold exactly their own schema, since the rules read them; a review or
 ///   comment of a newer schema is carried; and no cell name this build does not know is written.
@@ -493,7 +500,7 @@ impl PalletRules for HaulRules {
     }
 
     fn check(&self, change: &ParcelChange<'_>) -> Result<(), String> {
-        let operator = &change.signer.operator;
+        let operator = change.attribution.operator();
         let owner = operator_leaf(operator);
 
         // Each haul's proposal after the parcel, read once per haul.
@@ -597,9 +604,9 @@ impl PalletRules for HaulRules {
 
                     // A state written with its proposal is the opener's by the proposal's own rule.
                     if let Some((_, head)) = &before {
-                        if &moved != head && &opened.opener != operator {
+                        if &moved != head && opened.opener != operator {
                             return Err(format!(
-                                "the state at {} moves the head, but is signed by {}; only the haul's \
+                                "the state at {} moves the head, but is written by {}; only the haul's \
                                 opener, {}, moves it. A merge or close that raced the opener's update \
                                 keeps theirs at {} and runs again",
                                 cell.path, operator, opened.opener, self.display_path(&cell.path)
@@ -607,9 +614,9 @@ impl PalletRules for HaulRules {
                         }
                     }
 
-                    let refusal = match status {
-                        HaulStatus::Merged(_) if change.admission == Admission::Admit => {
-                            may_record_merge(change.office, operator, &opened.target).err()
+                    let refusal = match (status, change.role_check()) {
+                        (HaulStatus::Merged(_), Some((office, operator))) => {
+                            may_record_merge(office, operator, &opened.target).err()
                         }
                         _ => None,
                     };
@@ -895,51 +902,43 @@ pub fn drop_held(held: &[HeldMerge]) -> String {
     drops.join(" and ")
 }
 
-/// Stack edits to the local `@haul` head as one signed parcel. `None` when they changed nothing.
+/// Stack edits to the local `@haul` head as one parcel by `writer`. `None` when they changed
+/// nothing.
 fn stack(edits: &[CellEdit],
-         office: &VerifiedOffice,
+         writer: &MetaWriter,
          actor: &Operator,
-         description: &str,
-         signer: &MetaSigner) -> Result<Option<String>, String> {
-    meta_tree::stack_meta_edits(HAUL_PALLET_NAME, &HaulRules, office, edits, actor, description, signer)
+         description: &str) -> Result<Option<String>, String> {
+    meta_tree::stack_meta_edits(HAUL_PALLET_NAME, &HaulRules, writer, edits, actor, description)
 }
 
-/// The operator a signing key belongs to.
-pub fn signing_operator(office: &OfficeState, signer: &MetaSigner) -> Result<String, String> {
-    Ok(office.find_key(&signer.key_id)
-        .ok_or(format!("The signing key {} is not in the office.", signer.key_id))?
-        .operator
-        .clone())
-}
-
-/// Open a haul: its proposal and its state — open, at `head` — as one signed parcel. The caller holds the warehouse
-/// lock and passes the verified office. Returns the new haul id.
+/// Open a haul: its proposal and its state — open, at `head` — as one parcel by `writer`. The
+/// caller holds the warehouse lock. Returns the new haul id.
 pub fn open_haul(source: &str,
                  target: &str,
                  head: &str,
                  title: &str,
                  description: &str,
-                 office: &VerifiedOffice,
-                 actor: &Operator,
-                 signer: &MetaSigner) -> Result<String, String> {
+                 writer: &MetaWriter,
+                 actor: &Operator) -> Result<String, String> {
     let opened = Opened {
         source: source.to_string(),
         target: target.to_string(),
         title: title.to_string(),
         description: description.to_string(),
-        opener: signing_operator(office, signer)?,
+        opener: writer.operator(actor)?,
         opened_at: Utc::now().timestamp(),
     };
 
     let id = opened.id();
     let dir = haul_dir(&id);
 
+    let stamp = writer.stamp(actor);
     let edits = [
-        meta_tree::set_cell(&format!("{}/{}", dir, CELL_OPENED), &signer.key_id, SCHEMA_OPENED, &opened_value(&opened))?,
-        meta_tree::set_cell(&format!("{}/{}", dir, CELL_STATE), &signer.key_id, SCHEMA_STATE, &state_value(&HaulStatus::Open, head))?,
+        meta_tree::set_cell(&format!("{}/{}", dir, CELL_OPENED), &stamp, SCHEMA_OPENED, &opened_value(&opened))?,
+        meta_tree::set_cell(&format!("{}/{}", dir, CELL_STATE), &stamp, SCHEMA_STATE, &state_value(&HaulStatus::Open, head))?,
     ];
 
-    stack(&edits, office, actor, &format!("Opened haul \"{}\".", title), signer)?
+    stack(&edits, writer, actor, &format!("Opened haul \"{}\".", title))?
         .ok_or(format!("Haul {} is already open.", short(&id)))?;
 
     Ok(id)
@@ -948,29 +947,27 @@ pub fn open_haul(source: &str,
 /// Record a comment on a haul.
 pub fn record_comment(haul_id: &str,
                       body: &str,
-                      office: &VerifiedOffice,
-                      actor: &Operator,
-                      signer: &MetaSigner) -> Result<Option<String>, String> {
+                      writer: &MetaWriter,
+                      actor: &Operator) -> Result<Option<String>, String> {
     let comment = comment_value(body, Utc::now().timestamp());
-    let path = comment_path(haul_id, &signing_operator(office, signer)?, &comment);
-    let edit = meta_tree::set_cell(&path, &signer.key_id, SCHEMA_COMMENT, &comment)?;
+    let path = comment_path(haul_id, &writer.operator(actor)?, &comment);
+    let edit = meta_tree::set_cell(&path, &writer.stamp(actor), SCHEMA_COMMENT, &comment)?;
 
-    stack(&[edit], office, actor, &format!("Commented on haul {}.", short(haul_id)), signer)
+    stack(&[edit], writer, actor, &format!("Commented on haul {}.", short(haul_id)))
 }
 
-/// Record the signer's review of a haul's `head`, replacing any earlier review of theirs.
+/// Record the writer's review of a haul's `head`, replacing any earlier review of theirs.
 pub fn record_review(haul_id: &str,
                      verdict: ReviewVerdict,
                      body: &str,
                      head: &str,
-                     office: &VerifiedOffice,
-                     actor: &Operator,
-                     signer: &MetaSigner) -> Result<Option<String>, String> {
-    let path = format!("{}/{}/{}", haul_dir(haul_id), DIR_REVIEW, operator_leaf(&signing_operator(office, signer)?));
+                     writer: &MetaWriter,
+                     actor: &Operator) -> Result<Option<String>, String> {
+    let path = format!("{}/{}/{}", haul_dir(haul_id), DIR_REVIEW, operator_leaf(&writer.operator(actor)?));
     let review = review_value(verdict, body, head, Utc::now().timestamp());
-    let edit = meta_tree::set_cell(&path, &signer.key_id, SCHEMA_REVIEW, &review)?;
+    let edit = meta_tree::set_cell(&path, &writer.stamp(actor), SCHEMA_REVIEW, &review)?;
 
-    stack(&[edit], office, actor, &format!("Reviewed haul {} ({}).", short(haul_id), verdict.as_str()), signer)
+    stack(&[edit], writer, actor, &format!("Reviewed haul {} ({}).", short(haul_id), verdict.as_str()))
 }
 
 /// Record a haul's state: `status` at `head`, so a move of the head and a change of status are
@@ -980,13 +977,12 @@ pub fn record_state(haul_id: &str,
                     status: &HaulStatus,
                     head: &str,
                     action: &str,
-                    office: &VerifiedOffice,
-                    actor: &Operator,
-                    signer: &MetaSigner) -> Result<Option<String>, String> {
+                    writer: &MetaWriter,
+                    actor: &Operator) -> Result<Option<String>, String> {
     let path = format!("{}/{}", haul_dir(haul_id), CELL_STATE);
-    let edit = meta_tree::set_cell(&path, &signer.key_id, SCHEMA_STATE, &state_value(status, head))?;
+    let edit = meta_tree::set_cell(&path, &writer.stamp(actor), SCHEMA_STATE, &state_value(status, head))?;
 
-    stack(&[edit], office, actor, &format!("{} haul {}.", action, short(haul_id)), signer)
+    stack(&[edit], writer, actor, &format!("{} haul {}.", action, short(haul_id)))
 }
 
 /// The heads every haul not yet merged proposes, at the local `@haul` head: the gc roots a haul
@@ -1043,8 +1039,8 @@ struct HaulCells {
 }
 
 /// Read every haul at the local head, attributed through the office (read best-effort, so a
-/// cell whose key the local office does not know is attributed by key id). An unborn pallet
-/// reads as empty.
+/// cell whose key the local office does not know is attributed by key id) or by the operator an
+/// unsigned cell declares. An unborn pallet reads as empty.
 pub fn read_hauls() -> Result<HaulsRead, String> {
     let Some(state) = meta_tree::read_meta_head(HAUL_PALLET_NAME, &HaulRules)? else {
         return Ok(HaulsRead::default());
@@ -1053,20 +1049,20 @@ pub fn read_hauls() -> Result<HaulsRead, String> {
     let office = office_utils::read_office_state()
         .unwrap_or(OfficeState { users: Vec::new(), keys: Vec::new() });
 
-    let author = |signer: &str| office.find_key(signer).map(|key| key.operator.clone()).unwrap_or(signer.to_string());
+    let author = |stamp: &Stamp| stamp.operator_in(&office);
 
     Ok(hauls_in(state, &author))
 }
 
-/// Read every haul at `@haul` head `head`, each cell's signer named by `author`. For a reader with
+/// Read every haul at `@haul` head `head`, each cell's writer named by `author`. For a reader with
 /// no local pallet head to read from — a remote head judging a delete, whose objects sit in a
 /// scratch mirror and which needs a haul's status, not who wrote it.
-pub fn read_hauls_at(head: &str, author: &dyn Fn(&str) -> String) -> Result<HaulsRead, String> {
+pub fn read_hauls_at(head: &str, author: &dyn Fn(&Stamp) -> String) -> Result<HaulsRead, String> {
     Ok(hauls_in(meta_tree::read_meta_state(HAUL_PALLET_NAME, head, &HaulRules)?, author))
 }
 
-/// The hauls in `@haul` state `state`, each cell's signer named by `author`.
-fn hauls_in(state: MetaState, author: &dyn Fn(&str) -> String) -> HaulsRead {
+/// The hauls in `@haul` state `state`, each cell's writer named by `author`.
+fn hauls_in(state: MetaState, author: &dyn Fn(&Stamp) -> String) -> HaulsRead {
     let mut read = HaulsRead::default();
     let mut dirs: BTreeMap<String, HaulCells> = BTreeMap::new();
 
@@ -1145,7 +1141,7 @@ fn readable<'c>(path: &str, cell: &'c CellRead, schema: &str) -> Result<&'c Cell
 
 /// Read one haul directory. Its proposal and state must both read, or nothing about the
 /// haul does; a review or comment that cannot read is listed beside the rest.
-fn read_haul(id: &str, cells: HaulCells, author: &dyn Fn(&str) -> String) -> Result<Haul, String> {
+fn read_haul(id: &str, cells: HaulCells, author: &dyn Fn(&Stamp) -> String) -> Result<Haul, String> {
     let dir = haul_dir(id);
     let named = |name: &str| format!("{}/{}", id, name);
 
@@ -1172,7 +1168,7 @@ fn read_haul(id: &str, cells: HaulCells, author: &dyn Fn(&str) -> String) -> Res
     for (path, cell) in &cells.reviews {
         let parsed = readable(&display(path), cell, SCHEMA_REVIEW).and_then(|envelope| {
             parse_review(&envelope.value)
-                .map(|review| Review { author: author(&envelope.signer), ..review })
+                .map(|review| Review { author: author(&envelope.stamp), signed: envelope.stamp.key_id().is_some(), ..review })
                 .map_err(|why| format!("the review at {} {}", display(path), why))
         });
 
@@ -1185,7 +1181,7 @@ fn read_haul(id: &str, cells: HaulCells, author: &dyn Fn(&str) -> String) -> Res
     for (path, cell) in &cells.comments {
         let parsed = readable(&display(path), cell, SCHEMA_COMMENT).and_then(|envelope| {
             parse_comment(&envelope.value)
-                .map(|comment| Comment { author: author(&envelope.signer), ..comment })
+                .map(|comment| Comment { author: author(&envelope.stamp), signed: envelope.stamp.key_id().is_some(), ..comment })
                 .map_err(|why| format!("the comment at {} {}", display(path), why))
         });
 
