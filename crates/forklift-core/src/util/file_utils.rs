@@ -5609,16 +5609,13 @@ mod tests {
     /// with the sync it injects into skipped.
     #[test]
     fn an_armed_sync_fault_rig_runs_real_syncs() {
-        let rigs: [(&str, Box<dyn Fn() -> Box<dyn std::any::Any>>); 2] = [
-            ("SyncDirFaultGuard", Box::new(|| Box::new(SyncDirFaultGuard::recording()))),
-            ("DirSyncFaultGuard", Box::new(|| Box::new(DirSyncFaultGuard::recording()))),
-        ];
+        let rig = SyncDirFaultGuard::recording();
+        assert!(fsync_enabled(), "SyncDirFaultGuard turns syncs on while armed");
+        drop(rig);
 
-        for (name, arm) in rigs {
-            let rig = arm();
-            assert!(fsync_enabled(), "{name} turns syncs on while armed");
-            drop(rig);
-        }
+        let rig = DirSyncFaultGuard::recording();
+        assert!(fsync_enabled(), "DirSyncFaultGuard turns syncs on while armed");
+        drop(rig);
     }
 
     #[test]
