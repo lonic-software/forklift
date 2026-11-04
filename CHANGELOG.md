@@ -69,6 +69,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Fixed
 
+- `stack` without `-m` refuses instead of recording a parcel with no description, unless it completes
+  a consolidation or pick, whose description it then records. A blank `-m` on `stack`, `pick` or
+  `deliver` is a usage error.
 - `forklift-server` authenticates from a request's headers before reading its body, so an
   unauthenticated peer can no longer hold server memory by opening large uploads.
 - A served root's meta pallets never move back to an ancestor.

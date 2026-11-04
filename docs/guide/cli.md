@@ -555,13 +555,17 @@ re-read once.
 
 ```sh
 forklift stack -m "a clear description"
-forklift stack                           # opens nothing; a description is optional but recommended
+forklift stack                           # only to complete a consolidation or pick in progress
 ```
 
 Builds tree objects from the inventory (bottom-up, staged removals excluded,
 empty directories pruned), creates a parcel (recording you as the author with a
 timestamp), advances the current pallet's head, and cleans up consumed staged
-state. If a consolidation is in progress, `stack` completes it. On a warehouse
+state. Every parcel records a description: `stack` without `-m` refuses and changes nothing, and a
+blank `-m` is a usage error (exit 2), as it is for `pick` and `deliver`. If a consolidation is in
+progress, `stack` completes it; given no `-m`, the parcel records the description a clean
+consolidation would have recorded (`Consolidated "feature" into "main".`). A pick in progress is
+completed the same way, with the description the pick stored when it has one. On a warehouse
 where trust is established, `stack` also signs the parcel (see
 [Identity, signing, and agents](#7-identity-signing-and-agents)).
 
