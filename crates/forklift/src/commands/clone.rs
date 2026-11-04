@@ -712,7 +712,7 @@ async fn franchise_into_prepared_target(
     // the error points at `--only`, which a resume may change without refetching.
     attempt.phase = Phase::Materialize;
 
-    shift_utils::materialize_tree(None, &tree_hash, "Cloning", file_utils::take_stat_anchor()?, &Progress::NONE).map_err(|e| error::append_to_message(
+    shift_utils::materialize_tree(None, &tree_hash, "Cloning", file_utils::take_stat_anchor()?, &Progress::NONE, &[]).map_err(|e| error::append_to_message(
         e,
         "(the signed history was already fetched and verified; only checking out the working \
         tree failed. If the same path keeps failing, resume with --only to route around it)",

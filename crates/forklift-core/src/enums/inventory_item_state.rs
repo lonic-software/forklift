@@ -7,7 +7,7 @@ const CODE_THIRD_PARENT_CONFLICT: u64 = 4;
 const CODE_DELETED: u64 = 5;
 
 /// The state of an inventory item.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum InventoryItemState {
     /// Normal state. The item has been loaded (taken into inventory).
     Normal,

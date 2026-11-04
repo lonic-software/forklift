@@ -1836,8 +1836,11 @@ for `clone`. A remote whose anchor changed from the one held is refused with `tr
 anchor had it stripped, and is refused the same way, by `clone` and `lift` too. A diverged
 pallet is never merged implicitly: `lower` fetches the parcels and reports the
 divergence, and you consolidate deliberately (`pallet create` the remote head into
-its own pallet, `consolidate` it, then `lift` the merge). Requires a clean
-warehouse. In a sparse warehouse, `lower` stays pruned — it fetches new in-scope
+its own pallet, `consolidate` it, then `lift` the merge). Local changes, staged or not,
+come through the lower as they were, as long as the remote's new parcels leave them alone; a
+lower that would write, remove or replace a path holding one (or a folder above or below it)
+refuses, names those paths and changes nothing. During a consolidation or pick in progress, a
+lower is refused unless the bay is already up to date. In a sparse warehouse, `lower` stays pruned — it fetches new in-scope
 content and leaves out-of-scope changes sealed by hash, exactly as the clone did.
 
 **A slow or busy remote.** Objects normally arrive in a few large batches. A remote that takes

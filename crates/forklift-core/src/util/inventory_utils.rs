@@ -28,7 +28,7 @@ const METADATA_ENTRY_ROOT: &str = "./";
 
 /// The warehouse path keys of every strict ancestor of `key`, from the root (`""`) down to
 /// (but not including) `key` itself.
-fn ancestor_keys_root_first(key: &str) -> Vec<String> {
+pub(crate) fn ancestor_keys_root_first(key: &str) -> Vec<String> {
     let mut chain: Vec<String> = Vec::new();
     let mut current = key;
 

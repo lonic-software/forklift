@@ -5,14 +5,13 @@ use forklift_core::model::operator::Operator;
 use forklift_core::util::meta_tree::{self, CellRead, Entry, KeepSide, MetaConflict, MetaSigner, PalletRules, ReplayError};
 use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{BatchLaneClosure, RemoteClient};
-use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
     alias_utils, audit_utils, bay_utils, config_utils, file_utils, haul_utils, held_heads, kv_utils, merge_utils, object_utils,
-    operation_utils, pallet_utils, remote_utils, repair_utils, scope_utils, shift_utils, stocktake_utils, take_utils, trust_utils,
+    operation_utils, pallet_utils, remote_utils, repair_utils, scope_utils, shift_utils, take_utils, trust_utils,
 };
 use forklift_core::util::take_utils::{FetchAt, TakeTrust};
 use forklift_core::util::operation_utils::{Operation, OperationKind};
-use crate::commands::office;
+use crate::commands::{office, shift};
 use crate::events;
 use crate::output::{self, CommandOutput};
 
@@ -220,17 +219,13 @@ async fn lower_working_pallet(client: &RemoteClient,
 
     let local_head = position.base.clone();
 
-    // Refuse before fetching anything: a dirty warehouse would be overwritten by the
-    // fast-forward, and the operator should resolve that first.
     let local_tree = match &local_head {
         Some(hash) => Some(object_utils::load_parcel(hash)?.tree_hash),
         None => None,
     };
 
-    // Anchored before the cleanliness check, so a file edited after it is never trusted.
-    let anchor = file_utils::take_stat_anchor()?;
-
-    ensure_warehouse_is_clean(local_tree.as_deref()).await?;
+    // A merge in progress is completed on the head it started from.
+    shift::refuse_mid_merge("lowering")?;
 
     // Path-pruned in a sparse warehouse (out-of-scope content stays sealed), whole in a full one
     // — a full fetch scope makes this byte-identical to the unscoped fetch — and in a cache only
@@ -274,7 +269,13 @@ async fn lower_working_pallet(client: &RemoteClient,
     // again, finding the same). A name that opens the metadata folder is refused as the head's,
     // before the planning below trips over it.
     refuse_unmaterializable(client, &pallet, local_tree.as_deref(), &remote_tree)?;
+
+    // Collected once the remote's tree is known, so an edit made during the fetch is judged too.
+    // Anchored before that, so a file edited after it is never trusted.
+    let anchor = file_utils::take_stat_anchor()?;
+    let carried = shift_utils::collect_carried(local_tree.as_deref()).await?;
     let (ops, removed_dirs) = shift_utils::diff_trees(local_tree.as_deref(), &remote_tree)?;
+    refuse_carried_overlaps(&carried, &ops, &removed_dirs)?;
     alias_utils::refuse_collisions("Lowering", &shift_utils::collect_collisions(&ops, &removed_dirs)?)?;
     shift_utils::ensure_writes_present(&ops)?;
 
@@ -289,13 +290,14 @@ async fn lower_working_pallet(client: &RemoteClient,
     operation.expected = local_head.clone();
     operation.office = preconditions.office.clone();
     operation.anchor = preconditions.anchor.clone();
+    operation.carried = carried.clone();
     operation_utils::raise(&operation)?;
 
-    shift_utils::materialize_tree(local_tree.as_deref(), &remote_tree, "Lowering", anchor, progress)?;
+    shift_utils::materialize_tree(local_tree.as_deref(), &remote_tree, "Lowering", anchor, progress, &carried)?;
 
     // A compare-and-set against the head this lower started from; the working tree goes back to
     // where it was if the pallet did not move (another bay moved it first, or the write failed).
-    let written = shift_utils::write_head_or_roll_back(&pallet, local_head.as_deref(), remote_head, &preconditions, &remote_tree, local_tree.as_deref(), anchor);
+    let written = shift_utils::write_head_or_roll_back(&pallet, local_head.as_deref(), remote_head, &preconditions, &remote_tree, local_tree.as_deref(), anchor, &carried);
     // A write that reported an error can still have landed; the ref read back decides.
     if written.is_ok() || pallet_utils::get_pallet_head(&pallet).ok().flatten().as_deref() == Some(remote_head.as_str()) {
         record_served_head(&pallet, remote_head);
@@ -431,10 +433,12 @@ async fn repair_pallet(client: &RemoteClient,
     };
     let anchor = file_utils::take_stat_anchor()?;
 
-    ensure_warehouse_is_clean(local_tree.as_deref()).await?;
+    shift::refuse_mid_merge("lowering")?;
+    let carried = shift_utils::collect_carried(local_tree.as_deref()).await?;
 
     refuse_unmaterializable(client, &pallet, local_tree.as_deref(), &repair.tree)?;
     let (ops, removed_dirs) = shift_utils::diff_trees(local_tree.as_deref(), &repair.tree)?;
+    refuse_carried_overlaps(&carried, &ops, &removed_dirs)?;
     alias_utils::refuse_collisions("Lowering", &shift_utils::collect_collisions(&ops, &removed_dirs)?)?;
     shift_utils::ensure_writes_present(&ops)?;
 
@@ -449,11 +453,12 @@ async fn repair_pallet(client: &RemoteClient,
     operation.expected = ref_head.clone();
     operation.office = preconditions.office.clone();
     operation.anchor = preconditions.anchor.clone();
+    operation.carried = carried.clone();
     operation_utils::raise(&operation)?;
 
-    shift_utils::materialize_tree(local_tree.as_deref(), &repair.tree, "Lowering", anchor, progress)?;
+    shift_utils::materialize_tree(local_tree.as_deref(), &repair.tree, "Lowering", anchor, progress, &carried)?;
 
-    let written = shift_utils::write_head_or_roll_back(&pallet, ref_head.as_deref(), &repair.parcel, &preconditions, &repair.tree, local_tree.as_deref(), anchor);
+    let written = shift_utils::write_head_or_roll_back(&pallet, ref_head.as_deref(), &repair.parcel, &preconditions, &repair.tree, local_tree.as_deref(), anchor, &carried);
     // The held-heads record keeps H, the head the remote served, which the repair descends from.
     if written.is_ok() || pallet_utils::get_pallet_head(&pallet).ok().flatten().as_deref() == Some(repair.parcel.as_str()) {
         record_served_head(&pallet, &remote_head);
@@ -985,30 +990,28 @@ impl CommandOutput for LowerReport {
     }
 }
 
-/// Ensure there are no staged or unstaged changes (untracked files are allowed) — the
-/// same rule shift and consolidate apply before they move the working directory.
-///
-/// # Arguments
-/// * `current_tree_hash` - The tree hash of the current pallet's head (or `None`).
-///
-/// # Returns
-/// * `Ok(())`      - If the warehouse is clean.
-/// * `Err(String)` - If there are changes that lowering would overwrite.
-async fn ensure_warehouse_is_clean(current_tree_hash: Option<&str>) -> Result<(), String> {
-    let staged = stocktake_utils::collect_staged_changes(current_tree_hash).await?;
-    let unstaged: Vec<_> = stocktake_utils::collect_unstaged_changes().await?
-        .into_iter()
-        .filter(|change| change.kind != ChangeKind::Untracked)
-        .collect();
+/// Refuse a lower whose diff (`ops` and `removed_dirs`) reaches a path with a local change: it
+/// cannot write or remove that path, or the directory around it, and keep the change. Changes
+/// the diff leaves alone are carried across it. Untracked files are judged by the collision check.
+fn refuse_carried_overlaps(carried: &[shift_utils::CarriedEntry], ops: &[shift_utils::FileOp], removed_dirs: &[String]) -> Result<(), String> {
+    let overlaps = shift_utils::carried_overlaps(carried, ops, removed_dirs);
 
-    if staged.is_empty() && unstaged.is_empty() {
+    if overlaps.is_empty() {
         return Ok(());
     }
 
-    Err(
-        "There are local changes that lowering would overwrite. Stack them, restore \
-        them, or park them first (see \"forklift stocktake\" for the details).".to_string()
-    )
+    const SHOWN: usize = 10;
+    let mut named = overlaps.iter().take(SHOWN).map(|path| format!("\"{}\"", path.escape_debug())).collect::<Vec<_>>().join(", ");
+    if overlaps.len() > SHOWN {
+        named.push_str(&format!(" and {} more", overlaps.len() - SHOWN));
+    }
+
+    Err(format!(
+        "Lowering would change {}, which {} local changes. Stack them, restore them, or park them \
+        first (see \"forklift stocktake\" for the details).",
+        named,
+        if overlaps.len() == 1 { "has" } else { "have" }
+    ))
 }
 
 /// Conflict resolutions, by bare pallet name, then cell path.
@@ -1451,6 +1454,124 @@ mod tests {
             let message = refusal(spec);
             assert!(message.contains("is not of the form") && !message.contains("--keep @"),
                     "{}: {}", spec, message);
+        }
+    }
+}
+
+/// A lower's local changes outlive every way its head write can end other than landing: the
+/// rollback a moved pallet forces, and heal's roll-forward or roll-back of an interrupted lower,
+/// each rebuild staging from the marker's carried entries.
+#[cfg(test)]
+mod carry_tests {
+    use forklift_core::util::operation_utils::{self, Operation, OperationKind, RecoveryOutcome};
+    use forklift_core::util::pallet_utils::{self, BayPosition, RefPreconditions};
+    use forklift_core::util::{file_utils, progress_utils::Progress, shift_utils, stocktake_utils};
+    use crate::test_support::{self, Warehouse};
+
+    /// The trees and heads of a bay on main at `start`, one parcel behind `remote`, which changes
+    /// only `app.txt`.
+    struct Behind { start_tree: String, start: String, remote_tree: String, remote: String }
+
+    /// Check `start` out on main, then stage an edit and a removal and leave an edit unstaged,
+    /// none of them to `app.txt`.
+    fn a_bay_behind_with_local_changes() -> Behind {
+        test_support::configure_operator();
+        let files = |app: &'static [u8]| [("app.txt", app), ("bob.txt", b"bob v1\n" as &[u8]), ("staged.txt", b"staged v1\n"), ("gone.txt", b"gone\n")];
+        let start_tree = test_support::store_files(&files(b"app v1\n"));
+        let start = test_support::store_parcel(&start_tree, &[]);
+        let remote_tree = test_support::store_files(&files(b"app v2\n"));
+        let remote = test_support::store_parcel(&remote_tree, &[&start]);
+
+        pallet_utils::update_pallet_head("main", None, &start, &RefPreconditions::NONE).unwrap();
+        pallet_utils::write_position(&BayPosition::new("main", Some(start.clone()))).unwrap();
+        test_support::check_out(&start_tree);
+
+        std::fs::write("staged.txt", "staged mine\n").unwrap();
+        std::fs::remove_file("gone.txt").unwrap();
+        test_support::block_on(crate::commands::load::handle_command(".")).unwrap();
+        std::fs::write("bob.txt", "bob mine\n").unwrap();
+        // Old enough that a stat taken now proves whatever hash it is recorded with.
+        std::fs::OpenOptions::new().write(true).open("bob.txt").unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60)).unwrap();
+
+        Behind { start_tree, start, remote_tree, remote }
+    }
+
+    /// The bay's staged and unstaged changes against `tree`, as their JSON.
+    fn changes(tree: &str) -> (serde_json::Value, serde_json::Value) {
+        let staged = test_support::block_on(stocktake_utils::collect_staged_changes(Some(tree))).unwrap();
+        let unstaged = test_support::block_on(stocktake_utils::collect_unstaged_changes()).unwrap();
+        (serde_json::to_value(staged).unwrap(), serde_json::to_value(unstaged).unwrap())
+    }
+
+    /// Raise the lower's marker and write the remote's files, as a lower does before its head
+    /// write; returns the anchor and the carried entries.
+    fn lower_files(behind: &Behind) -> (file_utils::StatAnchor, Vec<shift_utils::CarriedEntry>) {
+        let anchor = file_utils::take_stat_anchor().unwrap();
+        let carried = test_support::block_on(shift_utils::collect_carried(Some(&behind.start_tree))).unwrap();
+        assert_eq!(carried.len(), 3, "{:?}", carried);
+
+        let mut operation = Operation::new(OperationKind::Lower, BayPosition::new("main", Some(behind.start.clone())),
+                                           Some(behind.start_tree.clone()), BayPosition::new("main", Some(behind.remote.clone())));
+        operation.target_tree = Some(behind.remote_tree.clone());
+        operation.expected = Some(behind.start.clone());
+        operation.carried = carried.clone();
+        operation_utils::raise(&operation).unwrap();
+
+        shift_utils::materialize_tree(Some(&behind.start_tree), &behind.remote_tree, "Lowering", anchor, &Progress::NONE, &carried).unwrap();
+        (anchor, carried)
+    }
+
+    /// Another bay moves main past the lower's start before its head write.
+    fn move_main_elsewhere(behind: &Behind) {
+        let elsewhere = test_support::store_parcel(&test_support::store_tree("other.txt", b"other\n"), &[&behind.start]);
+        pallet_utils::update_pallet_head("main", Some(&behind.start), &elsewhere, &RefPreconditions::NONE).unwrap();
+    }
+
+    // Revert: the rollback rebuilds without the carried entries → the staged changes are dropped.
+    #[test]
+    fn a_lower_rolled_back_by_a_moved_pallet_keeps_the_local_changes() {
+        let warehouse = Warehouse::with_working_tree("lower-carry-rollback");
+        let behind = a_bay_behind_with_local_changes();
+        let before = changes(&behind.start_tree);
+
+        let (anchor, carried) = lower_files(&behind);
+        assert_eq!(changes(&behind.remote_tree), before, "the lower itself carries them");
+        move_main_elsewhere(&behind);
+        shift_utils::write_head_or_roll_back("main", Some(&behind.start), &behind.remote, &RefPreconditions::NONE,
+                                             &behind.remote_tree, Some(&behind.start_tree), anchor, &carried)
+            .expect_err("a pallet another bay moved must roll the lower back");
+
+        assert!(test_support::file_holds(&warehouse.root, "app.txt", b"app v1\n"));
+        assert_eq!(changes(&behind.start_tree), before);
+    }
+
+    // Reverts: heal's roll-forward, or its roll-back, rebuilds without the marker's carried
+    // entries → it reports the carried files as not holding their content, and drops the staged
+    // changes.
+    #[test]
+    fn heal_keeps_the_local_changes_of_an_interrupted_lower_rolled_either_way() {
+        for (name, moved) in [("lower-carry-heal-forward", false), ("lower-carry-heal-back", true)] {
+            let warehouse = Warehouse::with_working_tree(name);
+            let behind = a_bay_behind_with_local_changes();
+            let before = changes(&behind.start_tree);
+
+            lower_files(&behind);
+            operation_utils::forget_raised_for_tests();
+            if moved {
+                move_main_elsewhere(&behind);
+            }
+            let recovery = operation_utils::recover().unwrap().expect("the lower's marker stands");
+
+            let (outcome, tree, app) = match moved {
+                false => (RecoveryOutcome::RolledForward, &behind.remote_tree, b"app v2\n"),
+                true => (RecoveryOutcome::RolledBack, &behind.start_tree, b"app v1\n"),
+            };
+            assert_eq!(recovery.outcome, outcome, "{}", name);
+            assert!(recovery.unheld.is_empty(), "{}: {:?}", name, recovery.unheld);
+            assert!(test_support::file_holds(&warehouse.root, "app.txt", app), "{}", name);
+            assert_eq!(changes(tree), before, "{}", name);
+            drop(warehouse);
         }
     }
 }
