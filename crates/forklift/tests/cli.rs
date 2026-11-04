@@ -3719,6 +3719,9 @@ fn consolidate_conflicts_are_marked_and_resolved_by_stacking() {
     let resolved = warehouse.run(&["stack", "-m", "Consolidated feature (resolved by hand)"]);
     assert_success(&resolved);
     let merge_hash = extract_parcel_hash(&resolved);
+    // The -m given wins over the description a consolidation supplies.
+    let history = json(&warehouse.run(&["--json", "history"]));
+    assert_eq!(history["data"]["entries"][0]["description"], "Consolidated feature (resolved by hand)", "{}", history);
 
     let peek = stdout(&warehouse.run(&["store", "peek", &merge_hash]));
     assert!(peek.contains(&format!("parent {}", feature_head)));
@@ -9961,6 +9964,44 @@ fn undo_reverses_a_conflicted_cherry_pick_and_its_completion() {
 
     assert_success(&warehouse.run(&["stack", "-m", "resolved pick again"]));
     assert!(!pick_state.exists(), "the re-stack completes the pick");
+
+    // The -m given to the completing stack wins over the description the pick stored.
+    let history = json(&warehouse.run(&["--json", "history"]));
+    assert_eq!(history["data"]["entries"][0]["description"], "resolved pick again", "{}", history);
+}
+
+// A parcel with no description (a git commit imported with an empty message) is picked only with
+// -m: without one the pick refuses before it applies anything, since the parcel would record none.
+#[test]
+fn picking_a_parcel_with_no_description_needs_a_message() {
+    let warehouse = TestWarehouse::new("pick-no-description");
+    let root = warehouse.root.clone();
+    git_in(&root, &["init", "-q", "-b", "main"]);
+    warehouse.write_file("a.txt", "base\n");
+    git_in(&root, &["add", "-A"]);
+    git_in(&root, &["commit", "-qm", "base"]);
+    git_in(&root, &["checkout", "-qb", "feature"]);
+    warehouse.write_file("b.txt", "feature\n");
+    git_in(&root, &["add", "-A"]);
+    git_in(&root, &["commit", "-q", "--allow-empty-message", "-m", ""]);
+    git_in(&root, &["checkout", "-q", "main"]);
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["git", "import", "."]));
+    let feature = json(&warehouse.run(&["--json", "history", "feature"]));
+    assert!(feature["data"]["entries"][0]["description"].is_null(), "the fixture needs a parcel with no description: {}", feature);
+
+    let main_head = || std::fs::read_to_string(root.join(".forklift/pallets/main")).unwrap();
+    let before = main_head();
+    let refused = warehouse.run(&["pick", "feature"]);
+    assert!(stderr(&refused).contains("has no description to carry over"), "{}", stderr(&refused));
+    assert_eq!(main_head(), before);
+    assert!(!root.join("b.txt").exists() && !root.join(".forklift/cherry-pick").exists(), "a refused pick must apply nothing");
+
+    assert_success(&warehouse.run(&["pick", "feature", "-m", "feature's file"]));
+    let history = json(&warehouse.run(&["--json", "history"]));
+    assert_eq!(history["data"]["entries"][0]["description"], "feature's file", "{}", history);
 }
 
 // -------------------------------------------------------------------------------------------

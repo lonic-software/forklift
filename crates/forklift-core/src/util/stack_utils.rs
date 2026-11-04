@@ -155,12 +155,10 @@ pub fn resolve_signing_key(operator: &Operator) -> Result<Signing, String> {
     Ok(Signing::Signed { key_id, anchor, office })
 }
 
-/// The description a completing `stack` records when the user gives none: a consolidation's is
-/// the one a clean consolidation records ([`merge_utils::consolidation_description`]), and a
-/// pick's is the one it stored (the source parcel's, unless the pick was given one). `None` when
-/// neither is in progress, or the pick's source had no description.
-pub fn default_description() -> Result<Option<String>, String> {
-    Ok(default_description_of(merge_utils::read_consolidation_state()?.as_ref(), cherry_pick_utils::read_state()?.as_ref()))
+/// Whether `description` would record a parcel with no description: absent, or nothing but
+/// whitespace. [`stack_parcel`] refuses such a parcel.
+pub fn is_blank(description: Option<&str>) -> bool {
+    description.map_or(true, |description| description.trim().is_empty())
 }
 
 /// Refuse a blank `-m` given to a command whose message becomes a parcel's description (`stack`,
@@ -168,7 +166,7 @@ pub fn default_description() -> Result<Option<String>, String> {
 /// `history` shows with no description at all.
 pub fn refuse_blank_description(description: Option<&str>) -> Result<(), String> {
     match description {
-        Some(description) if description.trim().is_empty() => Err(
+        Some(_) if is_blank(description) => Err(
             "Nothing was changed: a parcel's description cannot be blank. Give one with \
             \"-m <description>\".".to_string()
         ),
@@ -176,7 +174,10 @@ pub fn refuse_blank_description(description: Option<&str>) -> Result<(), String>
     }
 }
 
-/// [`default_description`] over states already read.
+/// The description a completing `stack` records when the user gives none: a consolidation's is
+/// the one a clean consolidation records ([`merge_utils::consolidation_description`]), and a
+/// pick's is the one it stored (the source parcel's, unless the pick was given one). `None` when
+/// neither is in progress, or the pick's source had no description.
 fn default_description_of(consolidation: Option<&ConsolidationState>,
                           cherry_pick: Option<&CherryPickState>) -> Option<String> {
     match (consolidation, cherry_pick) {
@@ -207,7 +208,8 @@ fn default_description_of(consolidation: Option<&ConsolidationState>,
 ///
 /// # Returns
 /// * `Ok((String, String))` - The new parcel's hash and the pallet it was stacked on.
-/// * `Err(StackError)`      - If there is nothing to stack, the operator identity is not
+/// * `Err(StackError)`      - If there is nothing to stack, no description was given or supplied by
+///                            a merge or pick in progress, the operator identity is not
 ///                            configured, conflicts are unresolved, an operation failed, or the
 ///                            head write did not go through (`StackError::HeadWrite`).
 pub async fn stack_parcel(description: Option<String>,
@@ -479,7 +481,15 @@ pub async fn stack_parcel(description: Option<String>,
         parents.push(state.their_head.clone());
     }
 
+    // A parcel without a description shows as a blank line in `history`, and a pallet's first
+    // parcel cannot be undone.
     let description = description.or_else(|| default_description_of(consolidation.as_ref(), cherry_pick.as_ref()));
+    if is_blank(description.as_deref()) {
+        return Err(StackError::Other(
+            "Nothing was stacked: a parcel needs a description, and none was given. Stack again with \
+            one: \"forklift stack -m <description>\".".to_string()
+        ));
+    }
 
     // Authorship convention: every parcel records its author(s) as explicit Author
     // actions, even when the author and the stacker are the same operator (like git,
