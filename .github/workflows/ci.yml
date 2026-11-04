@@ -104,7 +104,7 @@ jobs:
   # slow per test (on 2026-11-03 Windows summed 3,540 s of tests into 469 s on 4 cores), so each
   # extra runner divides it almost evenly. Each OS's entries list its share as partition/partitions;
   # nextest's `count` scheme deals every test binary's tests round-robin across them, which spreads
-  # a binary's slow tests (the crash suite's kill tests) over all of them. Replaying that run's
+  # a binary's slow tests over all of them. Replaying that run's
   # per-test times over the three schemes put the slowest Windows share at 142–144 s for every one,
   # against a single longest test of 123 s, so more Windows shares buy little until that test is
   # faster. Every entry runs on GitHub's runners. An entry may set `blacksmith` to a runner label
@@ -168,8 +168,7 @@ jobs:
       - name: Test
         # Twice as many test threads as cores: many tests spend their time waiting (on a timeout,
         # a server, a child process), not computing, so the default of one per core leaves cores
-        # idle. The ci profile gives the crash suite's kill tests two slots each
-        # (see .config/nextest.toml).
+        # idle.
         shell: bash
         run: |
           cores=${NUMBER_OF_PROCESSORS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || true)}

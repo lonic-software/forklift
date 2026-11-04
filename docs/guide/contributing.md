@@ -80,18 +80,17 @@ Notes:
 - The hardening test spine is worth knowing when touching the object store,
   the parsers, or the parallel walks: `crates/forklift-core/tests/fuzz_formats.rs`
   fuzzes every parse entry point (must never panic) and checks round-trip
-  fidelity; `crash_consistency.rs` SIGKILLs `stack` mid-write to prove the store
-  stays consistent across power loss; `determinism.rs` pins deterministic tree hashes,
+  fidelity; `crash_consistency.rs` stops `stack`, `load` and `park` before each of
+  their renames in turn to prove every state a crash leaves is consistent; `determinism.rs` pins deterministic tree hashes,
   byte-reproducible repacks, and the warehouse-lock refusal. A parser or
   format change should keep the fuzzer green; if you add a length-prefixed field,
   bound it with a `checked_add` (never `start + length` before the bounds check).
 - Keep tests fast; see [Keeping tests fast](#keeping-tests-fast) below. Under
   `cargo nextest run`, which CI uses, `.config/nextest.toml` reports a test as SLOW at
-  30 s and fails it at two minutes; the crash suite's kill tests get ten. CI runs twice
+  30 s and fails it at two minutes. CI runs twice
   as many tests as cores, so a test with a wall-clock bound needs margin for a shared
   core; `cargo nextest run --profile ci --test-threads $((2 * $(nproc 2>/dev/null || sysctl -n hw.ncpu)))`
-  reproduces that load locally (the `ci` profile gives the crash suite's kill tests two
-  slots each, which only pays at that thread count).
+  reproduces that load locally.
 - CI (`.github/workflows/ci.yml`) splits the Windows tests across four runners,
   each running its share with nextest's `--partition count:K/N`; Linux and macOS
   run theirs in one job each. The last share of each OS also runs the doc-tests
@@ -189,9 +188,14 @@ machine does not tell you what Windows will take.
   integration test per path that proves the command reaches the rule and reports it.
   Before adding an integration test, check whether an existing one already crosses the
   same wiring; if so, add an assertion to it instead of a new test.
-- **Repetition is the cost.** A test that repeats a run to catch a race or a crash at a
-  random point uses the fewest rounds that still catch the failure, and says in a comment
-  how the count was chosen.
+- **Crash at each step, not at a random time.** To test what a crash leaves behind, stop
+  the command before each of its renames in turn with `FORKLIFT_DEBUG_CRASH_AT_RENAME`
+  (see `crash_at_every_rename` in `crash_consistency.rs`). Killing it after a guessed
+  delay costs a long corpus and many rounds, and still lands on the one state that matters
+  only by luck: the crash suite's kills caught a reordered `load` publish in 4 runs out of
+  14, and stopping at every rename catches it on every run, in half a second.
+- **Repetition is the cost.** A test that repeats a run to catch a race uses the fewest
+  rounds that still catch the failure, and says in a comment how the count was chosen.
 
 ### Formatting
 
