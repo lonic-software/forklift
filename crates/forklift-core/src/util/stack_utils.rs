@@ -295,8 +295,8 @@ pub async fn stack_parcel(description: Option<String>,
         }
     }
 
-    // A parcel without a description shows as a blank line in `history`. Refused before the tree
-    // build, which is the costly part and writes objects a refused stack would leave behind.
+    // A parcel without a description shows as a blank line in `history`. Refused here, before the
+    // tree build, so a forgotten -m costs no time on a large inventory.
     let description = description.or_else(|| default_description_of(consolidation.as_ref(), cherry_pick.as_ref()));
     if is_blank(description.as_deref()) {
         return Err(StackError::Other(
