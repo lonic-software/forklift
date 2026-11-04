@@ -721,27 +721,48 @@ pub fn pop() -> Result<Option<JournalEntry>, String> {
     Ok(popped)
 }
 
-/// Pop the most recent entry when it is the operation that left the bay's consolidation or pick in
-/// progress (a consolidate or pick that stopped at conflicts), and the bay is still exactly where
-/// it left it — for an abort, which abandons that operation outside `undo`. Kept, the entry would
-/// refuse every later undo: the bay no longer holds the consolidation its after records. Any other
-/// top entry is left alone, so a rerun of an interrupted abort, whose entry is already gone, pops
-/// nothing more.
+/// Remove the most recent entry other than a pallet delete when it is the operation that left the
+/// bay's consolidation or pick in progress (a consolidate or pick that stopped at conflicts), and
+/// the bay is still exactly where it left it — for an abort, which abandons that operation outside
+/// `undo`. Kept, the entry would refuse every later undo: the bay no longer holds the consolidation
+/// its after records. Deletes above it stay, in order: a pallet can be deleted while a merge waits,
+/// and its undo depends on no bay state. Any other entry is left alone, so a rerun of an
+/// interrupted abort, whose entry is already gone, removes nothing more.
 ///
 /// # Returns
-/// * `Ok(true)`    - The entry was popped.
-/// * `Ok(false)`   - The top entry is not that operation's, or the journal is empty.
+/// * `Ok(true)`    - The entry was removed.
+/// * `Ok(false)`   - No such entry is the latest, or the journal is empty.
 /// * `Err(String)` - If the journal or the bay's state could not be read, or the journal rewritten.
 pub fn pop_if_it_left_in_progress() -> Result<bool, String> {
-    let Some(entry) = peek()? else {
+    let mut entries = read()?;
+    let Some(index) = entries.iter().rposition(|entry| entry.op != DELETE_OP) else {
         return Ok(false);
     };
+    let entry = &entries[index];
 
-    if !left_in_progress(&entry) || BayState::read()? != entry.after.bay_state() {
+    if !left_in_progress(entry) {
         return Ok(false);
     }
 
-    pop()?;
+    // As `BayState::read`, without the skeleton: an abort clears whatever it holds, and is the way
+    // out of one that is missing or unreadable.
+    let position = pallet_utils::read_position()?;
+    let consolidation = merge_utils::read_consolidation_state()?;
+    let after = entry.after.bay_state();
+    let same_consolidation = match (&consolidation, &after.consolidation) {
+        (None, None) => true,
+        (Some(now), Some(then)) => now.their_head == then.their_head && now.their_pallet == then.their_pallet
+            && now.our_head == then.our_head && now.our_pallet == then.our_pallet,
+        _ => false,
+    };
+
+    if position.pallet != after.current_pallet || position.base != after.current_head || !same_consolidation
+        || read_cherry_pick()? != after.cherry_pick {
+        return Ok(false);
+    }
+
+    entries.remove(index);
+    write(&entries)?;
     Ok(true)
 }
 

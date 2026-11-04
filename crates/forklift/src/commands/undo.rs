@@ -2,6 +2,7 @@ use serde::Serialize;
 use forklift_core::error::sanitize;
 use forklift_core::util::journal_utils;
 use forklift_core::util::{object_utils, pallet_utils};
+use crate::commands::merge_abort::{self, MergeKind};
 use crate::commands::shift;
 use crate::output::{self, CommandOutput};
 
@@ -12,6 +13,9 @@ use crate::output::{self, CommandOutput};
 /// * Reversing a `stack`, `consolidate` or `cherry-pick` is a **soft reset**: the pallet head
 ///   moves back while the working directory and inventory are kept, so the undone changes end
 ///   up staged again (this is how a merge is reversed too).
+/// * Reversing a `consolidate` or `pick` that stopped at conflicts aborts it, as
+///   `consolidate --abort` and `pick --abort` do: the files it touched go back to the head, and it
+///   refuses rather than discard changes made to them since.
 /// * Reversing a `shift` moves back to the previous pallet, re-materializing its tree
 ///   (it refuses if the working directory is dirty, exactly like a forward `shift`).
 /// * Reversing a pallet delete brings the pallet back at the head it was deleted at, without
@@ -74,6 +78,7 @@ pub async fn handle_command(as_name: Option<&str>) -> Result<(), String> {
             undone: String::new(),
             head: position.base.unwrap_or_default(),
             description: String::new(),
+            put_back: None,
             restored: restored.deleted,
             restored_as: restored.name,
             restored_head: restored.head,
@@ -97,6 +102,31 @@ pub async fn handle_command(as_name: Option<&str>) -> Result<(), String> {
             undone: String::new(),
             head,
             description: String::new(),
+            put_back: None,
+            restored: String::new(),
+            restored_as: String::new(),
+            restored_head: String::new(),
+        });
+
+        return Ok(());
+    }
+
+    if journal_utils::left_in_progress(&entry) {
+        // The abort pops the entry itself, before its first change.
+        let kind = match entry.after.consolidation.is_some() && entry.before.consolidation.is_none() {
+            true => MergeKind::Consolidation,
+            false => MergeKind::Pick,
+        };
+        let aborted = merge_abort::abort(kind, false, kind.abort_command()).await?;
+
+        output::emit(&Undone {
+            op: entry.op,
+            pallet: aborted.pallet,
+            left: String::new(),
+            undone: String::new(),
+            head: aborted.head,
+            description: String::new(),
+            put_back: Some(aborted.restored),
             restored: String::new(),
             restored_as: String::new(),
             restored_head: String::new(),
@@ -107,8 +137,8 @@ pub async fn handle_command(as_name: Option<&str>) -> Result<(), String> {
 
     // A soft reset: restore the refs (and any consolidation or cherry-pick), keep the working
     // directory. The gate established that the current pallet is the entry's, at the head the
-    // entry left. An operation that moved no head (a consolidate or cherry-pick that stopped at
-    // conflicts) takes no parcel off the pallet; undoing it only abandons what it left in progress.
+    // entry left. An operation that moved no head takes no parcel off the pallet (one that stopped
+    // at conflicts was aborted above).
     let undone = match entry.after.current_head() {
         Some(after) if entry.before.head(&entry.after.current_pallet) != Some(after) => after.clone(),
         _ => String::new(),
@@ -129,6 +159,7 @@ pub async fn handle_command(as_name: Option<&str>) -> Result<(), String> {
         undone,
         head,
         description,
+        put_back: None,
         restored: String::new(),
         restored_as: String::new(),
         restored_head: String::new(),
@@ -161,6 +192,11 @@ pub(crate) struct Undone {
     /// The undone parcel's description (for orientation), when there is one.
     #[serde(skip_serializing_if = "String::is_empty")]
     description: String,
+
+    /// For a reversed `consolidate` or `pick` that stopped at conflicts: how many files it touched,
+    /// each now back at the head.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    put_back: Option<usize>,
 
     /// For a reversed `delete`, the pallet that was deleted.
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -200,6 +236,11 @@ impl CommandOutput for Undone {
         }
 
         println!("Undid {} on pallet \"{}\".", self.op, self.pallet);
+
+        if let Some(put_back) = self.put_back {
+            println!("The {} it left in progress is aborted: the {} file(s) it touched are back at the head ({}).", self.op, put_back, self.head);
+            return;
+        }
 
         if self.undone.is_empty() {
             println!("The pallet head is unchanged ({}); the {} is no longer in progress.", self.head, self.op);

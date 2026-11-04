@@ -130,16 +130,17 @@ pub(crate) async fn abort(kind: MergeKind, confirm: bool, command: &str) -> Resu
     let mut ops = Vec::new();
     let mut removed = Vec::new();
     let mut discards = Vec::new();
+    let mut folders = Vec::new();
 
     for path in &touched {
         let ours = object_utils::resolve_tree_file(&our_tree, path)?;
         let output = written.get(path);
 
-        if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
-            return Err(format!(
-                "Cannot abort the {}: \"{}\" is a folder now, where the {} left a file. Move or delete the folder first.",
-                kind.noun(), path, kind.noun()
-            ));
+        // A folder where the head has a file: the other side's files in it are removed below, and
+        // anything else in it is checked once they are known.
+        let is_folder = std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir());
+        if is_folder {
+            folders.push(path.clone());
         }
 
         let (dir, name) = path.rsplit_once('/').unwrap_or(("", path.as_str()));
@@ -150,7 +151,8 @@ pub(crate) async fn abort(kind: MergeKind, confirm: bool, command: &str) -> Resu
             .filter(|item| item.state != InventoryItemState::Deleted)
             .map(|item| (item.hash.clone(), item.item_type));
 
-        let working_kept = holds(path, ours.as_ref(), anchor)
+        let working_kept = is_folder
+            || holds(path, ours.as_ref(), anchor)
             || output.is_some_and(|output| holds(path, output.working.as_ref(), anchor));
         let entry_kept = entry == ours || output.is_some_and(|output| entry == output.entry);
 
@@ -160,7 +162,7 @@ pub(crate) async fn abort(kind: MergeKind, confirm: bool, command: &str) -> Resu
 
         match ours {
             Some((hash, item_type)) => ops.push(FileOp::Write { path: path.clone(), hash, item_type, is_new: false }),
-            None if std::fs::symlink_metadata(path).is_ok() => {
+            None if !is_folder && std::fs::symlink_metadata(path).is_ok() => {
                 ops.push(FileOp::Remove { path: path.clone() });
                 removed.push(path.clone());
             },
@@ -175,6 +177,18 @@ pub(crate) async fn abort(kind: MergeKind, confirm: bool, command: &str) -> Resu
         .filter(|carried| !touched.contains(&carried.path))
         .collect();
     let removed_dirs = emptied_directories(&removed, &our_tree)?;
+
+    // Checked before the first write: a file the abort does not remove would keep the folder in
+    // place, and the head's file could not be written there.
+    for folder in &folders {
+        if let Some(path) = first_file_not_in(folder, &removed)? {
+            return Err(format!(
+                "Cannot abort the {}: \"{}\" lies in the folder \"{}\", where the head has a file, and \
+                the abort would have to delete it. Move it aside first.",
+                kind.noun(), path, folder
+            ));
+        }
+    }
 
     if let Some(path) = shift_utils::carried_overlaps(&carried, &ops, &removed_dirs).first() {
         return Err(format!(
@@ -336,6 +350,27 @@ fn holds(path: &str, expected: Option<&(String, DirEntryType)>, anchor: file_uti
     }
 }
 
+/// The first file or link under `folder` (never followed) that is not in `removed`, if any.
+fn first_file_not_in(folder: &str, removed: &[String]) -> Result<Option<String>, String> {
+    let entries = std::fs::read_dir(folder).map_err(|e| format!("Error while reading \"{}\": {}", folder, e))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Error while reading \"{}\": {}", folder, e))?;
+        let path = format!("{}/{}", folder, entry.file_name().to_string_lossy());
+        let is_dir = std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir());
+
+        let found = match is_dir {
+            true => first_file_not_in(&path, removed)?,
+            false => (!removed.contains(&path)).then_some(path),
+        };
+        if found.is_some() {
+            return Ok(found);
+        }
+    }
+
+    Ok(None)
+}
+
 /// The folders that removing `removed` may leave empty and `our_tree` does not hold, deepest
 /// first, for [`shift_utils::apply_ops`] to remove where they are empty.
 fn emptied_directories(removed: &[String], our_tree: &str) -> Result<Vec<String>, String> {
@@ -381,7 +416,7 @@ fn discard_refusal(kind: MergeKind, files: &[String], command: &str) -> String {
         false => String::new(),
     };
 
-    crate::human!("Aborting the {} would discard the changes made since to:\n{}{}", kind.noun(), shown.join("\n"), more);
+    crate::human!("Aborting the {} would discard the changes made since it started to:\n{}{}", kind.noun(), shown.join("\n"), more);
 
     CoreError::refusal_with_details(
         RefusalCode::ConfirmationRequired,
@@ -411,7 +446,7 @@ pub(crate) struct Aborted {
     pub(crate) head: String,
 
     /// How many paths the merge touched, each now back at the head.
-    restored: usize,
+    pub(crate) restored: usize,
 
     /// With --confirm: the files whose changes since the merge were discarded.
     discarded: Vec<String>,
@@ -428,7 +463,7 @@ impl CommandOutput for Aborted {
         println!("The {} file(s) it touched are back at the head ({}).", self.restored, self.head);
 
         if !self.discarded.is_empty() {
-            println!("Discarded the changes made since to {} file(s).", self.discarded.len());
+            println!("Discarded the changes made since it started to {} file(s).", self.discarded.len());
         }
     }
 }
