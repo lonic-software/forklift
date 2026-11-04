@@ -3465,12 +3465,16 @@ fn graph_shard_is_sealed_with_records(shard: &std::path::Path) -> bool {
     if blake3::hash(body).as_bytes() != checksum {
         return false;
     }
-    let prefix = u8::from_str_radix(shard.file_name().unwrap().to_str().unwrap(), 16).unwrap();
+    // The name is the hex prefix of every record in it: a whole first byte, or its high nibble
+    // for a graph cut to one-hex shards.
+    let name = shard.file_name().unwrap().to_str().unwrap();
+    let prefix = u8::from_str_radix(name, 16).unwrap();
+    let in_shard = |first: u8| if name.len() == 1 { first >> 4 == prefix } else { first == prefix };
     let u32_at = |at: usize| u32::from_le_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]);
     let (mut offset, mut records) = (12, 0);
     while offset < body.len() {
         // hash(32) + generation(4) + parent count(1), the parents, then a filter length (4).
-        if offset + 37 > body.len() || body[offset] != prefix {
+        if offset + 37 > body.len() || !in_shard(body[offset]) {
             return false;
         }
         let parents = body[offset + 36] as usize;
@@ -3593,13 +3597,16 @@ fn an_unwritable_commit_graph_never_fails_a_query() {
 /// A cold `blame` fills the changed-path filter of every parcel in its chain. Filling them one
 /// query at a time rewrote each shard once per parcel in it; the batched pass writes each shard
 /// once for the generation records and once per filter batch. A history long enough to put
-/// several parcels in every shard tells the two apart.
+/// several parcels in every shard tells the two apart. The graph is cut to its 16 one-hex shards
+/// so that 64 parcels do it: at the real 256 it took 600, whose import alone was most of the
+/// test's 20 s on the Windows runner.
 #[test]
 fn a_cold_blame_writes_each_commit_graph_shard_a_bounded_number_of_times() {
     use std::io::Write;
     use std::process::Stdio;
 
-    const COMMITS: usize = 600;
+    const COMMITS: usize = 64;
+    const NARROW_GRAPH: (&str, &str) = ("FORKLIFT_DEBUG_GRAPH_SHARD_PREFIX_LEN", "1");
     let warehouse = TestWarehouse::new("commit-graph-write-once");
 
     // One file rewritten by every commit, so every parcel's filter is a real (small) diff.
@@ -3637,7 +3644,7 @@ fn a_cold_blame_writes_each_commit_graph_shard_a_bounded_number_of_times() {
 
     let graph_root = warehouse.root.join(".forklift/graph");
     let _ = std::fs::remove_dir_all(&graph_root);
-    let blame = warehouse.run_with_env(&["blame", "a.txt"], &[("FORKLIFT_DEBUG_GRAPH_WRITES", "1")]);
+    let blame = warehouse.run_with_env(&["blame", "a.txt"], &[("FORKLIFT_DEBUG_GRAPH_WRITES", "1"), NARROW_GRAPH]);
     assert_success(&blame);
     assert!(stdout(&blame).contains(&format!("line {}", COMMITS - 1)), "blame output: {}", stdout(&blame));
 
@@ -3650,6 +3657,7 @@ fn a_cold_blame_writes_each_commit_graph_shard_a_bounded_number_of_times() {
         .collect();
     for shard in &shards {
         assert!(graph_shard_is_sealed_with_records(shard), "a written shard must be whole: {}", shard.display());
+        assert_eq!(shard.file_name().unwrap().len(), 1, "the graph must be at its narrow width: {}", shard.display());
     }
     assert!(COMMITS > 2 * shards.len(),
         "sanity: the history must put several parcels in a shard to tell batched writes from per-parcel ones");
