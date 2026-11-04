@@ -2,9 +2,10 @@ use serde::Serialize;
 use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{BatchLaneClosure, LiftResult, RemoteClient};
 use forklift_core::util::{
-    file_utils, merge_utils, object_utils, pallet_utils,
+    audit_utils, file_utils, haul_utils, merge_utils, meta_tree, object_utils, pallet_utils,
     remote_utils, take_utils,
 };
+use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::take_utils::{FetchAt, TakeTrust};
 use crate::commands::consolidate::{self, MergeStatus};
 use crate::commands::lower::{self, MetaPalletFailure};
@@ -69,22 +70,17 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
         // on its own: one that fails is reported after the rest, and the working pallet,
         // have gone through. @haul lifts last, after the working pallet's attempt, since a
         // merge it records may wait for that pallet's parcel.
-        let mut meta_pallets = Vec::new();
-        let mut meta_failed = Vec::new();
+        let mut meta = MetaLifts::default();
 
-        for lift in remote_utils::lift_meta_pallets(&client, &info).await? {
-            match lift.result {
-                Ok(LiftResult::Lifted(_)) => meta_pallets.push(lift.pallet),
-                Ok(LiftResult::UpToDate) => {}
-                Err(why) => {
-                    let error = with_drop_hint(why, &info, &lift.pallet);
-                    meta_failed.push(MetaPalletFailure::new(lift.pallet, error));
-                }
+        for name in pallet_utils::list_meta_pallets()? {
+            if name != OFFICE_PALLET_NAME && name != haul_utils::HAUL_PALLET_NAME {
+                lift_meta(&client, &info, &name, None, &mut meta).await;
             }
         }
 
         let Some(head) = local_head else {
-            lift_haul(&client, &info, None, &mut meta_pallets, &mut meta_failed).await;
+            lift_meta(&client, &info, haul_utils::HAUL_PALLET_NAME, None, &mut meta).await;
+            let MetaLifts { failed: meta_failed, .. } = meta;
 
             return Err(lower::with_meta_failures(format!(
                 "Pallet \"{}\" has nothing stacked yet; there is nothing to lift.",
@@ -106,8 +102,8 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
                     }
                     Ok(false) => {}
                     Err(why) => {
-                        lift_haul(&client, &info, None, &mut meta_pallets, &mut meta_failed).await;
-                        return Err(lower::with_meta_failures(why, &meta_failed));
+                        lift_meta(&client, &info, haul_utils::HAUL_PALLET_NAME, None, &mut meta).await;
+                        return Err(lower::with_meta_failures(why, &meta.failed));
                     }
                 }
             }
@@ -115,8 +111,9 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
 
         let mut report = LiftReport {
             office_new_parcels,
-            meta_pallets,
-            meta_failed,
+            meta_pallets: Vec::new(),
+            meta_resigned: Vec::new(),
+            meta_failed: Vec::new(),
             auto_merged,
             pallet: pallet.clone(),
             up_to_date: false,
@@ -133,7 +130,8 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
         ).await;
 
         let landed = lifted.is_ok().then_some((pallet.as_str(), head.as_str()));
-        lift_haul(&client, &info, landed, &mut report.meta_pallets, &mut report.meta_failed).await;
+        lift_meta(&client, &info, haul_utils::HAUL_PALLET_NAME, landed, &mut meta).await;
+        (report.meta_pallets, report.meta_resigned, report.meta_failed) = (meta.lifted, meta.resigned, meta.failed);
         report.batch_lane = batch_lane.or(client.batch_lane_closure());
 
         match lifted {
@@ -173,22 +171,97 @@ pub async fn handle_command(recreate: bool) -> Result<(), String> {
     }
 }
 
-/// Lift `@haul` after the working pallet's lift attempt (`landed` when that lift went through),
-/// recording the outcome with the other meta pallets'.
-async fn lift_haul(client: &RemoteClient,
-                   info: &forklift_core::model::remote::WarehouseInfo,
-                   landed: Option<(&str, &str)>,
-                   meta_pallets: &mut Vec<String>,
-                   meta_failed: &mut Vec<MetaPalletFailure>) {
-    let Some(lift) = remote_utils::lift_haul_pallet(client, info, landed).await else { return };
+/// What lifting the meta pallets did.
+#[derive(Default)]
+struct MetaLifts {
+    lifted: Vec<String>,
+    resigned: Vec<String>,
+    failed: Vec<MetaPalletFailure>,
+}
 
-    match lift.result {
-        Ok(LiftResult::Lifted(_)) => meta_pallets.push(lift.pallet),
-        Ok(LiftResult::UpToDate) => {}
-        Err(why) => {
-            let error = with_drop_hint(why, info, &lift.pallet);
-            meta_failed.push(MetaPalletFailure::new(lift.pallet, error));
+/// Lift one meta pallet other than the office, recording the outcome. `@haul` lifts after the
+/// working pallet's attempt, `landed` when that lift went through.
+///
+/// Under trust, a pallet whose new parcels include unvouched ones — written before trust, outside
+/// the anchor's boundary — would be refused as it is, so its local net change is replayed under
+/// the current key instead and lifted ([`lower::replay`]): as a root parcel when the remote holds
+/// no head, re-signing the operator's own cells.
+async fn lift_meta(client: &RemoteClient,
+                   info: &forklift_core::model::remote::WarehouseInfo,
+                   name: &str,
+                   landed: Option<(&str, &str)>,
+                   meta: &mut MetaLifts) {
+    let wire = pallet_utils::PalletRef::meta(name).to_wire();
+    let remote_head = info.pallets.get(&wire).map(String::as_str);
+
+    // A replay's refusals name their own ways out, which the drop hint would contradict: with no
+    // remote head, even dropping every local change needs a key to sign the empty root.
+    let mut replaying = false;
+
+    let lifted = match needs_re_signing(name, remote_head) {
+        Err(why) => Err(why),
+        Ok(Some(rules)) => {
+            replaying = true;
+            let replayed = lower::replay(
+                client, info, name, rules, remote_head, landed, "lift", &Default::default(), &mut meta.resigned,
+            ).await;
+
+            match replayed {
+                Ok(lower::Reconciled::Replayed) => Ok(true),
+                Ok(lower::Reconciled::Adopted) => Ok(false),
+                // The remote head is an ancestor of the local one, so no path changed on both sides.
+                Ok(lower::Reconciled::Conflicts(_)) => Err(format!(
+                    "{} changed differently here and on the remote; run \"forklift lower\" first.", wire
+                )),
+                Err(why) => Err(why),
+            }
         }
+        Ok(None) if name == haul_utils::HAUL_PALLET_NAME => {
+            match remote_utils::lift_haul_pallet(client, info, landed).await {
+                None => return,
+                Some(lift) => lift.result.map(|result| matches!(result, LiftResult::Lifted(_))),
+            }
+        }
+        Ok(None) => match pallet_utils::get_meta_pallet_head(name) {
+            Err(why) => Err(why),
+            Ok(None) => return,
+            // The handshake also says whether chunked files are taken, which never gates a meta pallet.
+            Ok(Some(local_head)) => remote_utils::lift_pallet(client, &wire, &local_head, remote_head, None, info, &Progress::NONE)
+                .await
+                .map(|result| matches!(result, LiftResult::Lifted(_))),
+        },
+    };
+
+    match lifted {
+        Ok(true) => meta.lifted.push(wire),
+        Ok(false) => {}
+        Err(why) => {
+            let error = if replaying { why } else { with_drop_hint(why, info, &wire) };
+            meta.failed.push(MetaPalletFailure::new(wire, error));
+        }
+    }
+}
+
+/// The rules to replay a meta pallet's lift by, when it must be re-signed to lift: trust is held
+/// here, the local head is ahead of the remote's (or the remote holds none), and a new parcel is
+/// unvouched. `None` when it lifts as it is — including when it has diverged, which the lift
+/// itself refuses with the way out.
+fn needs_re_signing(name: &str, remote_head: Option<&str>) -> Result<Option<&'static dyn meta_tree::PalletRules>, String> {
+    let (Some(local), Some(rules)) = (pallet_utils::get_meta_pallet_head(name)?, meta_tree::meta_rules(name)) else {
+        return Ok(None);
+    };
+
+    let Some((anchor, _)) = audit_utils::local_meta_trust()? else { return Ok(None) };
+
+    if let Some(remote_head) = remote_head {
+        if !remote_utils::is_local_ahead(remote_head, &local)? {
+            return Ok(None);
+        }
+    }
+
+    match meta_tree::holds_unvouched_parcels(name, &anchor.boundary, remote_head, &local)? {
+        true => Ok(Some(rules)),
+        false => Ok(None),
     }
 }
 
@@ -285,6 +358,11 @@ pub(crate) struct LiftReport {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     meta_pallets: Vec<String>,
 
+    /// The cells (`<pallet> <path>`) a meta pallet's lift re-signed under the current key: written
+    /// here before trust was established, and replayed under it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    meta_resigned: Vec<String>,
+
     /// The meta pallets that failed to lift. Never in a successful report: a failure makes the
     /// command fail, after the rest have gone through.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -330,6 +408,10 @@ impl LiftReport {
 
         for pallet in &self.meta_pallets {
             println!("Lifted the {} pallet.", pallet);
+        }
+
+        for cell in &self.meta_resigned {
+            println!("Re-signed {} under your current key.", cell);
         }
     }
 }

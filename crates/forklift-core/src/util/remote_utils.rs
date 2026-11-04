@@ -7976,57 +7976,6 @@ pub struct MetaPalletLift {
     pub result: Result<LiftResult, String>,
 }
 
-/// Lift every meta pallet but the office and `@haul` (the manifest, tags, and future ones) to
-/// the remote, after the office and trust are already established there. Meta pallets are ordinary
-/// signed pallets from the server's point of view — object upload plus a fast-forward
-/// CAS — so this reuses `lift_pallet`; a diverged one fails (lower first), exactly like
-/// a working pallet. The office is excluded: it is lifted with the trust state
-/// (`push_local_trust`) so the remote holds the keys before any pallet that relies on
-/// them arrives.
-///
-/// `@haul` is lifted after the working pallet ([`lift_haul_pallet`]), since a merge it records
-/// may wait for that pallet's parcel.
-///
-/// Each pallet is lifted on its own: one that fails is reported in its outcome, and the
-/// rest are still lifted.
-///
-/// # Arguments
-/// * `client` - The remote.
-/// * `info`   - The remote's handshake.
-///
-/// # Returns
-/// * `Ok(Vec<MetaPalletLift>)` - Per-pallet outcomes (empty when none exist).
-/// * `Err(String)`             - If the local meta pallets cannot be listed.
-pub async fn lift_meta_pallets(client: &RemoteClient,
-                               info: &WarehouseInfo) -> Result<Vec<MetaPalletLift>, String> {
-    let mut lifts = Vec::new();
-
-    for name in pallet_utils::list_meta_pallets()? {
-        if name == OFFICE_PALLET_NAME || name == haul_utils::HAUL_PALLET_NAME {
-            continue;
-        }
-
-        let wire = pallet_utils::PalletRef::meta(&name).to_wire();
-
-        let local_head = match pallet_utils::get_meta_pallet_head(&name) {
-            Ok(Some(local_head)) => local_head,
-            Ok(None) => continue,
-            Err(why) => {
-                lifts.push(MetaPalletLift { pallet: wire, result: Err(why) });
-                continue;
-            }
-        };
-
-        let remote_head = info.pallets.get(&wire).map(String::as_str);
-
-        // The handshake also says whether chunked files are taken, which never gates a meta pallet.
-        let result = lift_pallet(client, &wire, &local_head, remote_head, None, info, &Progress::NONE).await;
-        lifts.push(MetaPalletLift { pallet: wire, result });
-    }
-
-    Ok(lifts)
-}
-
 /// Lift the local `@haul` head, unless it would publish a merge record whose parcel the remote's
 /// target is not known to hold ([`haul_utils::held_by_lift`]): then nothing is lifted and the
 /// outcome fails naming each held record and its way out. Runs after the working pallet's lift
@@ -8056,18 +8005,11 @@ pub async fn lift_haul_pallet(client: &RemoteClient,
 
     let result = match haul_utils::held_by_lift(&local_head, remote_head, &remote_target_head) {
         Err(why) => Err(why),
-        Ok(held) if !held.is_empty() => {
-            // A remote with no @haul gives "lower --keep" no remote side to keep.
-            let drop = match remote_head {
-                Some(_) => format!("; or drop the record with {}", haul_utils::drop_held(&held)),
-                None => String::new(),
-            };
-
-            Err(format!(
-                "{}. It goes once the remote's target holds the parcel: an operator who may write the target \
-                 lifts it (lowering it first when the remote's head is not held here), then lift again{}.",
-                haul_utils::describe_held(&held), drop))
-        }
+        Ok(held) if !held.is_empty() => Err(format!(
+            "{}. It goes once the remote's target holds the parcel: an operator who may write the target \
+             lifts it (lowering it first when the remote's head is not held here), then lift again; or \
+             drop the record with {}.",
+            haul_utils::describe_held(&held), haul_utils::drop_held(&held))),
         Ok(_) => lift_pallet(client, &wire, &local_head, remote_head, None, info, &Progress::NONE).await,
     };
 
@@ -8081,20 +8023,21 @@ pub fn is_local_ahead(remote_head: &str, local_head: &str) -> Result<bool, Strin
 }
 
 /// Whether the content check this store can run itself refuses a meta pallet's lift: its local
-/// head is ahead of `remote_head` and a new parcel breaks the pallet's rules against the local
-/// trust state (an admission the office no longer grants, say). `false` when the check
-/// passes, when the pallet is not ahead, or when it cannot be run here, so a failed lift for
-/// any other reason (a transfer, a remote that moved) is never taken for a refusal.
+/// head is ahead of `remote_head` (or the remote holds none) and a new parcel breaks the
+/// pallet's rules against the local trust state (an admission the office no longer grants,
+/// say). `false` when the check passes, when the pallet is not ahead, or when it cannot be run
+/// here, so a failed lift for any other reason (a transfer, a remote that moved) is never taken
+/// for a refusal.
 pub fn lift_refused_by_content(name: &str, remote_head: Option<&str>) -> bool {
-    let (Some(remote_head), Some(rules)) = (remote_head, meta_tree::meta_rules(name)) else {
-        return false;
-    };
+    let Some(rules) = meta_tree::meta_rules(name) else { return false };
 
     let refused = || -> Result<bool, String> {
         let Some(local) = pallet_utils::get_meta_pallet_head(name)? else { return Ok(false) };
 
-        if !is_local_ahead(remote_head, &local)? {
-            return Ok(false);
+        if let Some(remote_head) = remote_head {
+            if !is_local_ahead(remote_head, &local)? {
+                return Ok(false);
+            }
         }
 
         let trust = crate::util::audit_utils::local_meta_trust()?;
@@ -8102,7 +8045,7 @@ pub fn lift_refused_by_content(name: &str, remote_head: Option<&str>) -> bool {
         let boundary = trust.as_ref().map(|(anchor, _)| anchor.boundary.as_slice()).unwrap_or(&[]);
 
         Ok(meta_tree::verify_meta_content(
-            name, rules, office, boundary, meta_tree::Admission::Admit, Some(remote_head), &local
+            name, rules, office, boundary, meta_tree::Admission::Admit, remote_head, &local
         ).is_err())
     };
 
