@@ -3730,8 +3730,9 @@ fn consolidate_conflicts_are_marked_and_resolved_by_stacking() {
 }
 
 // A parcel always records a description: a bare `stack` refuses and changes nothing, a blank -m
-// is a usage error, and the stack that completes a conflicted consolidation, given no -m,
-// records the description a clean consolidation records.
+// on any command whose -m becomes one refuses before it changes anything, and the stack that
+// completes a conflicted consolidation, given no -m, records the description a clean
+// consolidation records.
 #[test]
 fn stack_needs_a_description_unless_a_consolidation_supplies_one() {
     let warehouse = TestWarehouse::new("stack-description");
@@ -3743,10 +3744,10 @@ fn stack_needs_a_description_unless_a_consolidation_supplies_one() {
     let bare = warehouse.run(&["stack"]);
     assert!(!bare.status.success());
     assert!(stderr(&bare).contains("a parcel needs a description, and none was given"), "{}", stderr(&bare));
-    for blank in ["", "  "] {
+    for blank in ["", " \t"] {
         let refused = warehouse.run(&["stack", "-m", blank]);
-        assert_eq!(refused.status.code(), Some(2), "{:?}: {}", blank, stderr(&refused));
-        assert!(stderr(&refused).contains("a parcel's description cannot be blank"), "{}", stderr(&refused));
+        assert!(!refused.status.success());
+        assert!(stderr(&refused).contains("a parcel's description cannot be blank"), "{:?}: {}", blank, stderr(&refused));
     }
     assert!(!warehouse.root.join(".forklift/pallets/main").exists(), "a refused stack must record no parcel");
 
@@ -3760,7 +3761,18 @@ fn stack_needs_a_description_unless_a_consolidation_supplies_one() {
     assert_success(&warehouse.run(&["shift", "main"]));
     warehouse.write_file("file.txt", "one\nOURS\nthree\n");
     assert_success(&warehouse.run(&["load", "file.txt"]));
-    assert_success(&warehouse.run(&["stack", "-m", "ours"]));
+    let ours = extract_parcel_hash(&warehouse.run(&["stack", "-m", "ours"]));
+
+    // The blank message is refused before the pick applies anything, and before the delivery's
+    // own checks (it would refuse for want of a key).
+    let main_head = || std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap().trim().to_string();
+    for command in [&["pick", "feature"][..], &["deliver", "feature"]] {
+        let refused = warehouse.run(&[command, &["-m", " "]].concat());
+        assert!(stderr(&refused).contains("a parcel's description cannot be blank"), "{:?}: {}", command, stderr(&refused));
+        assert_eq!(main_head(), ours, "{:?}", command);
+    }
+    assert!(!warehouse.root.join(".forklift/cherry-pick").exists(), "a refused pick must leave no pick in progress");
+
     assert!(stdout(&warehouse.run(&["consolidate", "feature"])).contains("conflict: file.txt"));
 
     warehouse.write_file("file.txt", "one\nresolved\nthree\n");

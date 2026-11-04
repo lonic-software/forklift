@@ -20,13 +20,14 @@ use crate::output::{self, CommandOutput};
 ///
 /// # Arguments
 /// * `message` - The parcel description, from `-m/--message`: required unless a consolidation or
-///               pick in progress supplies one.
+///   pick in progress supplies one, and never blank.
 ///
 /// # Returns
 /// * `Ok(())`      - If the parcel was stacked successfully.
 /// * `Err(String)` - If there was an error while handling the command.
 pub async fn handle_command(message: Option<String>) -> Result<(), String> {
     // A parcel stacked with no description shows as a blank line in `history`.
+    stack_utils::refuse_blank_description(message.as_deref())?;
     if message.is_none() && stack_utils::default_description()?.is_none() {
         return Err("Nothing was stacked: a parcel needs a description, and none was given. Stack \
                     again with one: \"forklift stack -m <description>\".".to_string());

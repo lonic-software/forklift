@@ -2,6 +2,7 @@ use serde::Serialize;
 use forklift_core::util::cherry_pick_utils::{self, CherryPickState};
 use forklift_core::util::{
     file_utils, load_guard_utils, merge_utils, object_utils, office_utils, operation_utils, pallet_utils,
+    stack_utils,
 };
 use forklift_core::util::operation_utils::OperationKind;
 use crate::commands::consolidate;
@@ -32,6 +33,7 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
     // while a load that started but never finished cleanly is still recorded
     // (`load_guard_utils`).
     load_guard_utils::check_no_incomplete_load()?;
+    stack_utils::refuse_blank_description(message.as_deref())?;
 
     // A pick applies a diff (the merge machinery) into the working directory, which could
     // touch out-of-scope paths a scoped bay never materialized, so it refuses here.

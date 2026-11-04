@@ -163,6 +163,19 @@ pub fn default_description() -> Result<Option<String>, String> {
     Ok(default_description_of(merge_utils::read_consolidation_state()?.as_ref(), cherry_pick_utils::read_state()?.as_ref()))
 }
 
+/// Refuse a blank `-m` given to a command whose message becomes a parcel's description (`stack`,
+/// `pick`, `deliver`), before the command changes anything: it would record a parcel that
+/// `history` shows with no description at all.
+pub fn refuse_blank_description(description: Option<&str>) -> Result<(), String> {
+    match description {
+        Some(description) if description.trim().is_empty() => Err(
+            "Nothing was changed: a parcel's description cannot be blank. Give one with \
+            \"-m <description>\".".to_string()
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// [`default_description`] over states already read.
 fn default_description_of(consolidation: Option<&ConsolidationState>,
                           cherry_pick: Option<&CherryPickState>) -> Option<String> {
