@@ -186,6 +186,13 @@ pub fn remove_covered_by(path: &Path, by: &str) -> BTreeSet<String> {
     removed
 }
 
+/// Put the set recorded at `path` back to `set`, read from it earlier, best-effort as
+/// [`remove_covered_by`] is: for a caller that recorded a key and then established that nothing
+/// it covers was touched.
+pub fn restore(path: &Path, set: &BTreeSet<String>) {
+    let _ = write_bytes_or_clear(path, set);
+}
+
 /// Unconditionally clear the marker, best-effort — see [`remove_covered_by`]'s doc comment on
 /// why failures are swallowed here too.
 pub fn clear(path: &Path) {

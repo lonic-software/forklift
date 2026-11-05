@@ -2,13 +2,14 @@ use std::collections::HashSet;
 use serde::Serialize;
 use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+use forklift_core::enums::dir_entry_type::DirEntryType;
 use forklift_core::enums::inventory_item_state::InventoryItemState;
 use forklift_core::model::blob::Blob;
 use forklift_core::util::merge_utils::{ConsolidationState, MergeAction};
 use forklift_core::util::operation_utils::{Operation, OperationKind};
 use forklift_core::util::{
     alias_utils, cache_miss, cherry_pick_utils, file_utils, inventory_utils, load_guard_utils, merge_utils, object_utils,
-    office_utils, operation_utils, pallet_utils, scope_utils, shift_utils, stack_utils,
+    office_utils, operation_utils, pallet_utils, redaction_utils, scope_utils, shift_utils, stack_utils,
 };
 use forklift_core::util::shift_utils::HeadWrite;
 use forklift_core::util::stack_utils::StackError;
@@ -326,6 +327,14 @@ pub(crate) async fn merge_head_into_current(current: &str,
     keep_aliased_files(&mut actions, &our_tree_hash, &scope)?;
     let ledger = ensure_no_untracked_collisions(&actions, their_label)?;
     ensure_actions_present(&actions)?;
+    let their_side = match their_label {
+        crate::commands::lower::REMOTE_LABEL => "the remote".to_string(),
+        label => format!("\"{}\"", label),
+    };
+    refuse_redacted_actions(&actions, &format!("merge {} into \"{}\"", their_side, current), |path| format!(
+        "change or delete \"{}\" on {} so it no longer holds that content, then run this again",
+        path, their_side
+    ))?;
 
     // Raised here, before the merge's first change to the bay, so every caller (consolidate,
     // haul's merge, lift's auto-merge) inherits it: a crash part-way through applying leaves a
@@ -659,6 +668,49 @@ pub(crate) fn ensure_actions_present(actions: &[MergeAction]) -> Result<(), Stri
         }
         _ => None,
     }))
+}
+
+/// Refuse `actions` when one of them would bring back content a redaction removed, before the
+/// merge marker is raised, so none of it reaches the working tree. Judged after the presence
+/// phase, which makes every recipe they write readable. `doing` names the operation; `next_step`
+/// is given the path that holds the content.
+pub(crate) fn refuse_redacted_actions(actions: &[MergeAction],
+                                      doing: &str,
+                                      next_step: impl Fn(&str) -> String) -> Result<(), String> {
+    let Some(guard) = redaction_utils::staging_guard()? else {
+        return Ok(());
+    };
+
+    for action in actions {
+        let named = match action {
+            MergeAction::TakeTheirs { path, hash, item_type, .. } => {
+                guard.names_file(hash, *item_type)?.map(|hash| (path.clone(), hash))
+            }
+            MergeAction::Merged { path, content, item_type }
+            | MergeAction::Conflict { path, content: Some(content), item_type, .. } => {
+                let blob = LooseObjectBuilder::build_blob(&Blob { content: content.clone() });
+
+                guard.names_file(&blob.hash, *item_type)?.map(|hash| (path.clone(), hash))
+            }
+            MergeAction::Conflict { path, content: None, entry_hash, item_type } if item_type.is_chunked() => {
+                guard.names_file(entry_hash, *item_type)?.map(|hash| (path.clone(), hash))
+            }
+            MergeAction::ResolveOutOfScope { path, resolution: Some((hash, item_type)) } => {
+                if *item_type == DirEntryType::Tree {
+                    guard.names_tree(hash)?.map(|(inner, hash)| (format!("{}/{}", path, inner), hash))
+                } else {
+                    guard.names_file(hash, *item_type)?.map(|hash| (path.clone(), hash))
+                }
+            }
+            _ => None,
+        };
+
+        if let Some((path, hash)) = named {
+            return Err(redaction_utils::staging_refusal(doing, &path, &hash, "Nothing was changed.", next_step(&path)));
+        }
+    }
+
+    Ok(())
 }
 
 /// Whether applying a conflict writes its file: inline content, or a chunked file materialized

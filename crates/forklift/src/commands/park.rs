@@ -8,7 +8,8 @@ use forklift_core::util::shift_utils::FileOp;
 use serde::Serialize;
 use forklift_core::util::{
     alias_utils, cherry_pick_utils, config_utils, file_utils, inventory_utils, load_guard_utils, merge_utils, object_utils,
-    operation_utils, pallet_utils, park_utils, scope_utils, shift_utils, sign_utils, stack_utils, tree_utils,
+    operation_utils, pallet_utils, park_utils, redaction_utils, scope_utils, shift_utils, sign_utils, stack_utils,
+    tree_utils,
 };
 use forklift_core::util::operation_utils::{Operation, OperationKind};
 use crate::commands::merge_abort;
@@ -179,6 +180,21 @@ pub async fn park_changes() -> Result<(), String> {
     // sidecar and the parked-list record are both written only from this point on, deliberately
     // kept out of this same batch (see `stack_utils::stack_parcel`'s identical ordering note).
     batch.finish()?;
+
+    // A parked parcel is no pallet head, but popping it would bring the content back, so the
+    // parked tree is judged whole, as a head's is. Judged once the batch is readable; a refusal
+    // leaves the bay as it was, and the parcel object unreferenced.
+    if let Some(guard) = redaction_utils::staging_guard()? {
+        if let Some((path, hash)) = guard.names_tree(&root_tree.hash)? {
+            return Err(redaction_utils::staging_refusal(
+                "park",
+                &path,
+                &hash,
+                "Nothing was parked.",
+                format!("change or delete \"{}\" so it no longer holds that content, then park again", path),
+            ));
+        }
+    }
 
     // The reset back to the pallet head is checked before anything references the parked
     // parcel: a staged removal leaves a path the head writes back, and untracked content (or,
