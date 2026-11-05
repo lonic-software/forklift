@@ -1473,6 +1473,9 @@ fn an_export_from_a_fresh_clone_names_each_remote_pallet_whose_work_it_lacks() {
 fn an_export_names_the_remote_tags_and_meta_pallets_it_lacks() {
     let fixture = Fixture::new("export-left-meta");
     let area = &fixture.area;
+    // "b" clones an @tags the remote then moves past, so the two differ rather than one lacking it.
+    area.forklift_ok("a", &["tag", "create", "v0", "main"]);
+    area.lift("a");
     fixture.franchise("b");
 
     // After the clone, the remote gains a tag and a haul that "b" does not hold.
@@ -1489,7 +1492,7 @@ fn an_export_names_the_remote_tags_and_meta_pallets_it_lacks() {
     let names: Vec<String> = left_behind(&export).into_iter().map(|(name, _)| name).collect();
     assert_eq!(names, ["@tags", "feature"], "{}", export);
     assert_eq!(export["not_exported"], serde_json::json!(["@haul"]), "{}", export);
-    assert_eq!(export["tags"], serde_json::json!([]), "{}", export);
+    assert_eq!(export["tags"], serde_json::json!(["v0"]), "{}", export);
 
     let human = stdout(&area.forklift_ok("b", &["git", "export", area.path("out-human").to_str().unwrap()]));
     assert!(human.contains("warning: the remote's tags include some this export does not."), "{}", human);
@@ -1499,7 +1502,7 @@ fn an_export_names_the_remote_tags_and_meta_pallets_it_lacks() {
     area.forklift_ok("b", &["lower", "feature"]);
     let export = area.json("b", &["git", "export", area.path("out-lowered").to_str().unwrap()]);
     assert!(export.get("remote_left_behind").is_none(), "{}", export);
-    assert_eq!(export["tags"], serde_json::json!(["v1"]), "{}", export);
+    assert_eq!(export["tags"], serde_json::json!(["v0", "v1"]), "{}", export);
     assert_eq!(export["not_exported"], serde_json::json!(["@haul"]), "{}", export);
 }
 
