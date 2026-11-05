@@ -1551,7 +1551,7 @@ pub(crate) fn update_pallet_head_locked(
 ) -> Result<(), RefUpdateError> {
     validate_head_write(name, new)?;
 
-    if !redaction.is_for(namespace, expected, new) || !redaction.holds(lock)? {
+    if !redaction.is_for(namespace, name, expected, new) || !redaction.holds(lock)? {
         return Err(RefUpdateError::Failed(format!(
             "Refusing to set pallet \"{}\" to {}: its check against the redactions is for another \
             write, or a redaction was recorded since. Nothing was written. Run the command again.",
@@ -2606,8 +2606,8 @@ pub(crate) mod tests {
             assert_eq!(get_meta_pallet_head("notes").unwrap().as_deref(), Some(inherits.as_str()));
         }
 
-        // Revert: accept a locked write whatever check it is handed → the write lands under a
-        // check made for another head.
+        // Revert: accept a locked write whatever check it is handed, or ignore the pallet's name
+        // → the write lands under a check made for another head, or another pallet.
         #[test]
         fn a_locked_write_refuses_a_check_made_for_another_write() {
             let (_root, _scope) = scratch("redacted-token");
@@ -2620,6 +2620,12 @@ pub(crate) mod tests {
 
             let lock = crate::util::lock_utils::RefLock::acquire().unwrap();
             let refused = update_pallet_head_locked(&lock, PalletNamespace::User, "main", Some(&base), &head, None, &check);
+            assert!(matches!(refused, Err(RefUpdateError::Failed(_))), "{:?}", refused);
+
+            // Made for the same move of another pallet.
+            let side = crate::util::redaction_utils::check_head_write(PalletNamespace::User, "side", Some(&base), &head)
+                .unwrap();
+            let refused = update_pallet_head_locked(&lock, PalletNamespace::User, "main", Some(&base), &head, None, &side);
             assert!(matches!(refused, Err(RefUpdateError::Failed(_))), "{:?}", refused);
             drop(lock);
             assert_eq!(get_pallet_head("main").unwrap().as_deref(), Some(base.as_str()));

@@ -745,7 +745,7 @@ fn write_named_head(pallet: &str,
                 pallet, error, read, new
             )),
         },
-        refused => Err(refused.to_string()),
+        refused => Err(refused.into()),
     }
 }
 

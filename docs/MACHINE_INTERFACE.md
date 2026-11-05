@@ -87,8 +87,8 @@ exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a deat
 
 **Schema 23** (current): the `content_redacted` error code exists (exit 49), with the pallet, the
 head that was refused, and the path and hash of the redacted content it named in `details.pallet`,
-`details.head`, `details.path` and `details.hash`. A remote refuses a pushed head naming redacted
-content with `422`.
+`details.head`, `details.path` and `details.hash`. A `forklift-server` remote refuses a pushed head
+naming redacted content with `422`; the AWS head does not check yet.
 
 **Schema 22**: the `redaction_blocked` error code exists (exit 48), with the meta
 pallets whose history names the object in `details.meta_pallets`.

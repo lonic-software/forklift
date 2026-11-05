@@ -7706,11 +7706,11 @@ impl PreparedTrust {
                         .is_some_and(|anchor| anchor.genesis == remote_trust.genesis);
 
                     return Err(match held {
-                        true => format!(
-                            "{} This warehouse now holds the remote's trust anchor (genesis {}).",
-                            error, remote_trust.genesis
-                        ),
-                        false => error.to_string(),
+                        true => crate::error::append_to_message(error.into(), &format!(
+                            "This warehouse now holds the remote's trust anchor (genesis {}).",
+                            remote_trust.genesis
+                        )),
+                        false => error.into(),
                     });
                 }
 

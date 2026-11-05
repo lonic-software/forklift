@@ -1090,7 +1090,7 @@ fn put_back_refs(entry: &JournalEntry) -> Result<(), String> {
             // complete (no precondition is consumed, so nothing else refuses it): put the current
             // pallet back where the operation left it, so the bay still matches the entry and a
             // retried undo passes the gate again.
-            Err(e) => return Err(un_restore_current(entry, e.to_string())),
+            Err(e) => return Err(un_restore_current(entry, e.into())),
         }
     }
 
@@ -1129,11 +1129,11 @@ fn un_restore_current(entry: &JournalEntry, error: String) -> String {
         Err(read) => format!("it could not be read back either ({})", read),
     };
 
-    format!(
-        "{} Pallet \"{}\" could not be put back where the operation left it ({}): {}, so a \
-        retried undo will not pass its check.",
-        error, current, e, at
-    )
+    crate::error::append_to_message(error, &format!(
+        "Pallet \"{}\" could not be put back where the operation left it ({}): {}, so a retried \
+        undo will not pass its check.",
+        current, e, at
+    ))
 }
 
 /// The journal file path (bay-local).

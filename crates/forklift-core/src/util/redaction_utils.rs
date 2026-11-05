@@ -506,18 +506,22 @@ fn tree_names(tree: &str, set: &RedactedSet, partial: bool) -> Result<Option<Nam
 #[derive(Debug)]
 pub struct RedactionCheck {
     namespace: pallet_utils::PalletNamespace,
+    name: String,
     expected: Option<String>,
     new: String,
     redactions: Option<String>,
 }
 
 impl RedactionCheck {
-    /// Whether this check is for the write of `new` over `expected` in `namespace`.
+    /// Whether this check is for the write of `new` over `expected` to pallet `name` in
+    /// `namespace`.
     pub(crate) fn is_for(&self,
                          namespace: pallet_utils::PalletNamespace,
+                         name: &str,
                          expected: Option<&str>,
                          new: &str) -> bool {
-        self.namespace == namespace && self.expected.as_deref() == expected && self.new == new
+        self.namespace == namespace && self.name == name && self.expected.as_deref() == expected
+            && self.new == new
     }
 
     /// Whether the check still holds: `@redactions` is at the head it was checked against. Read
@@ -554,6 +558,7 @@ pub fn check_head_write(namespace: pallet_utils::PalletNamespace,
     let redactions = pallet_utils::get_meta_pallet_head(REDACTIONS_PALLET_NAME)?;
     let check = RedactionCheck {
         namespace,
+        name: name.to_string(),
         expected: expected.map(str::to_string),
         new: new.to_string(),
         redactions: redactions.clone(),
