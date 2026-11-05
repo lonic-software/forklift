@@ -508,7 +508,7 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
             }).await,
         Command::Git { action } => match action {
             GitAction::Import { path, no_compact } => commands::import_git::handle_command(&path, no_compact),
-            GitAction::Export { path } => commands::export_git::handle_command(&path),
+            GitAction::Export { path } => commands::export_git::handle_command(&path).await,
             GitAction::Mirror => commands::mirror::handle_command().await,
         },
         Command::Lift { recreate } => commands::lift::handle_command(recreate).await,

@@ -840,7 +840,7 @@ pub async fn list_remote_pallets(all: bool) -> Result<(), String> {
 /// whose parcel is not here cannot be a local ancestor — a parcel is fetched whole, and a ref
 /// moves only once its closure is present — so it differs, without a walk; behind and diverged
 /// cannot be told apart without fetching, which `lower` does.
-fn relation_to_remote(remote_head: &str, local_head: Option<&str>) -> Result<RemoteRelation, String> {
+pub(crate) fn relation_to_remote(remote_head: &str, local_head: Option<&str>) -> Result<RemoteRelation, String> {
     let Some(local_head) = local_head else {
         return Ok(RemoteRelation::Absent);
     };
