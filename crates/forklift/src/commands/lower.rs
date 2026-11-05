@@ -1377,11 +1377,17 @@ pub(crate) async fn replay(client: &RemoteClient,
             use pallet_utils::RefUpdateError::*;
 
             let why = match &refused {
+                // A write can land and still fail, so the local head is read back before saying
+                // where it is.
                 Failed(why) => {
-                    let failure = forklift_core::error::prefix_message(
-                        &format!("{} was lifted to the remote, but this warehouse could not move its local head there", wire),
-                        why.clone(),
-                    );
+                    let context = match pallet_utils::get_meta_pallet_head(name) {
+                        Ok(Some(head)) if head == parcel => format!(
+                            "{} was lifted to the remote, and its local head moved there, but the move may not be durable", wire
+                        ),
+                        Ok(_) => format!("{} was lifted to the remote, but this warehouse could not move its local head there", wire),
+                        Err(_) => format!("{} was lifted to the remote, but whether its local head moved there is not known", wire),
+                    };
+                    let failure = forklift_core::error::prefix_message(&context, why.clone());
 
                     return Err(match resigned_note.is_empty() {
                         true => failure,

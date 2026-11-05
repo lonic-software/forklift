@@ -2681,7 +2681,10 @@ pub(crate) mod tests {
 
             let next = parcel(&tree(&[("more", &blob("more"), DirEntryType::Normal)]), &[&base]);
             let written = update_meta_pallet_head("notes", Some(&base), &next, &RefPreconditions::NONE);
-            assert!(matches!(written, Err(RefUpdateError::Failed(_))), "{:?}", written);
+            match &written {
+                Err(RefUpdateError::Failed(why)) => assert!(why.contains("pallet \"redactions\""), "{}", why),
+                other => panic!("expected the @redactions read's failure, got {:?}", other),
+            }
             assert_eq!(get_meta_pallet_head("notes").unwrap().as_deref(), Some(base.as_str()), "nothing was written");
         }
 
