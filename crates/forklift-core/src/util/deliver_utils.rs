@@ -1,11 +1,12 @@
-//! Deliver a draft pallet's checkpoint trail as one clean signed parcel (§7.3).
+//! Deliver a draft pallet's checkpoint trail as one clean parcel (§7.3).
 //!
 //! Agents checkpoint constantly; humans want one reviewed parcel. `deliver` squashes the
-//! draft pallet's net change into a single signed parcel on the target — a plain
-//! single-parent parcel carrying the draft head's tree, so the checkpoints stay *out* of
-//! the target's history — and records the trail as a signed **delivery** manifest entry
-//! referencing the kept checkpoints. The clean story stays clean; the "what the agent
-//! tried, in what order" evidence stays complete and discoverable.
+//! draft pallet's net change into a single parcel on the target — a plain single-parent
+//! parcel carrying the draft head's tree, so the checkpoints stay *out* of the target's
+//! history — and records the trail as a **delivery** manifest entry referencing the kept
+//! checkpoints. Both are signed once the warehouse holds trust, and unsigned in a warehouse
+//! that never enrolled. The clean story stays clean; the "what the agent tried, in what order"
+//! evidence stays complete and discoverable.
 //!
 //! Because the delivered tree equals the draft head's tree, the working directory does not
 //! change: delivering only moves refs, never materializes.
@@ -45,8 +46,9 @@ pub struct DeliverOutcome {
     pub manifest_head: String,
 }
 
-/// Deliver the current (draft) pallet's trail onto `target` as one clean signed parcel,
-/// and record the trail as a signed delivery manifest entry.
+/// Deliver the current (draft) pallet's trail onto `target` as one clean parcel, and record
+/// the trail as a delivery manifest entry: both signed under trust, unsigned in a warehouse
+/// that never enrolled.
 ///
 /// # Arguments
 /// * `target`      - The pallet to deliver onto (a user pallet; may be unborn).
@@ -55,8 +57,8 @@ pub struct DeliverOutcome {
 /// # Returns
 /// * `Ok(DeliverOutcome)` - The delivered parcel and trail details.
 /// * `Err(String)`        - If there is nothing to deliver, the target holds changes the
-///                          draft has not seen, trust is not established, or an object could
-///                          not be built, stored or signed.
+///                          draft has not seen, the operator cannot sign under trust, the
+///                          anchor is lost, or an object could not be built, stored or signed.
 pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutcome, String> {
     pallet_utils::validate_pallet_name(target)?;
 
@@ -69,23 +71,36 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
 
     let operator = config_utils::get_operator()?;
 
-    // Delivery records the trail as signed post-metadata, so it needs an enrolled key —
-    // there is no unsigned delivery (the evidence is the point).
-    // The delivery record is judged against the verified office the key is chosen from, and the
-    // delivered head is written only while that office stands. A reader may write no pallet, so
-    // is refused before anything is written.
-    let stack_utils::Signing::Signed { key_id: signing_key_id, office, .. } = stack_utils::resolve_signing_key(&operator)? else {
-        return Err(
-            "Deliver records the checkpoint trail as signed post-metadata, so it needs an \
-            enrolled key. Establish trust with \"forklift office enroll\" first.".to_string()
-        );
-    };
+    // Under trust, the parcel and its delivery record are signed with the operator's key, the
+    // record is judged against the verified office the key is chosen from, and the delivered head
+    // is written only while that office stands. A reader may write no pallet, so is refused
+    // before anything is written. In a warehouse that never enrolled (no anchor, no office), both
+    // are unsigned and name the configured operator, and the head lands only while that still
+    // holds. An office whose anchor is gone is neither, and refuses here, as does trust
+    // established since the signing choice was read.
+    let (signing_key_id, writer) = match stack_utils::resolve_signing_key(&operator)? {
+        stack_utils::Signing::Unsigned => {
+            if audit_utils::local_meta_trust()?.is_some() {
+                return Err(
+                    "Trust was established for this warehouse while deliver ran; nothing was \
+                    changed. Run it again.".to_string()
+                );
+            }
 
-    if office.find_user(&operator.identifier).is_some_and(|user| matches!(user.role, Role::Reader)) {
-        return Err(format!(
-            "\"{}\" is a reader in this office, and a reader cannot deliver.", operator.identifier
-        ));
-    }
+            (None, MetaWriter::Unsigned)
+        }
+        stack_utils::Signing::Signed { key_id, office, .. } => {
+            if office.find_user(&operator.identifier).is_some_and(|user| matches!(user.role, Role::Reader)) {
+                return Err(format!(
+                    "\"{}\" is a reader in this office, and a reader cannot deliver.", operator.identifier
+                ));
+            }
+
+            let signer = MetaSigner::local(&key_id);
+
+            (Some(key_id), MetaWriter::Signed { office, signer })
+        }
+    };
 
     // The delivered parcel carries the tree this bay holds, and the bay ends up on it. A bay behind
     // its draft pallet would deliver a tree without the draft's latest parcels, so it catches up
@@ -164,10 +179,12 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
     let mut object = LooseObjectBuilder::build_parcel(&parcel);
     object.store()?;
 
-    let signature = sign_utils::sign_parcel_hash(&signing_key_id, &object.hash)?;
-    sign_utils::store_parcel_signature(&object.hash, &signature)?;
+    if let Some(signing_key_id) = &signing_key_id {
+        let signature = sign_utils::sign_parcel_hash(signing_key_id, &object.hash)?;
+        sign_utils::store_parcel_signature(&object.hash, &signature)?;
+    }
 
-    // Record the delivery as signed post-metadata on the clean parcel, referencing the
+    // Record the delivery as post-metadata on the clean parcel, referencing the
     // kept trail so "what the agent tried" stays discoverable. It is recorded before the target
     // moves, so a refused record leaves the target where it was. The converse — the ref write
     // failing after the record stood — leaves a record about a parcel no pallet holds, and a
@@ -190,7 +207,6 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
         "Delivered {} checkpoint(s) from \"{}\" as parcel {}.",
         checkpoints, source, object.hash
     );
-    let writer = MetaWriter::Signed { office: office.clone(), signer: MetaSigner::local(&signing_key_id) };
     let recorded = manifest_utils::record_entry(&entry, &writer, &operator, &manifest_description)?;
     let manifest_head = match recorded {
         Some(head) => head,
@@ -198,7 +214,7 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
         None => pallet_utils::get_meta_pallet_head(manifest_utils::MANIFEST_PALLET_NAME)?.unwrap_or_default(),
     };
 
-    pallet_utils::update_pallet_head(target, target_head.as_deref(), &object.hash, &office.preconditions())?;
+    pallet_utils::update_pallet_head(target, target_head.as_deref(), &object.hash, &writer.preconditions())?;
 
     // The delivered tree equals the draft's, so switching the current pallet needs no
     // materialization — the working directory already matches, and the bay stands on the

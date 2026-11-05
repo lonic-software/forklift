@@ -18,6 +18,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   refusing. There are no roles until you enroll, so anyone may tag or record a merge. Readers
   mark these entries `(unsigned)`, and in `--json` the `signer` field is absent (hauls carry
   `"unsigned": true`). Once a warehouse has an office, every entry is signed as before.
+- **`deliver` works without enrolling.** In a warehouse that never enrolled, the delivered parcel
+  and its delivery entry are recorded unsigned under your configured operator, instead of the
+  delivery being refused. Once a warehouse has an office, both are signed as before; one whose
+  trust anchor was lost refuses, saying so.
 - **`git export` writes unsigned tags.** A tag recorded without a key becomes an annotated git tag
   with its declared operator as tagger, ending in a `Forklift-Tag-Unsigned: export/1` line instead
   of a signer key, so a warehouse with no office exports its tags. An office that cannot be read

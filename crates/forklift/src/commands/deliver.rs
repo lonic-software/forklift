@@ -3,8 +3,8 @@ use forklift_core::util::deliver_utils;
 use crate::output::{self, CommandOutput};
 
 /// Handle the deliver command (§7.3): squash the current (draft) pallet's checkpoint
-/// trail into one clean signed parcel on the target pallet, and keep the trail as a
-/// signed delivery manifest entry on that parcel.
+/// trail into one clean parcel on the target pallet, and keep the trail as a delivery
+/// manifest entry on that parcel (both signed under trust, unsigned before it).
 ///
 /// The draft pallet is left intact (its checkpoints stay browsable via `history`), and
 /// the current pallet becomes the target. Because the delivered parcel carries the draft
@@ -17,7 +17,8 @@ use crate::output::{self, CommandOutput};
 /// # Returns
 /// * `Ok(())`      - If the delivery completed.
 /// * `Err(String)` - If there is nothing to deliver, the target moved after the draft
-///                   forked, trust is not established, or an operation failed.
+///                   forked, the operator cannot sign under trust, the anchor is lost, or an
+///                   operation failed.
 pub fn handle_command(target: &str, message: Option<String>) -> Result<(), String> {
     forklift_core::util::stack_utils::refuse_blank_description(message.as_deref())?;
 
