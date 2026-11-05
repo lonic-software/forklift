@@ -60,7 +60,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 24;
+pub const SCHEMA_VERSION: u32 = 25;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -566,7 +566,8 @@ error_codes! {
     /// was recorded.
     RedactionBlocked,
 
-    /// A pallet head would have named content a redaction removes; nothing was written.
+    /// A pallet head would have named content a redaction removes, or a load, park, merge or pick
+    /// would have brought it into the bay; nothing was written.
     ContentRedacted,
 
     /// `redact` found the object in a pallet head; nothing was recorded.
@@ -812,7 +813,7 @@ impl ErrorCode {
             ErrorCode::RedactionBlocked =>
                 "The object to redact is named by a meta pallet's history, which is never rewritten, so it cannot be removed; nothing was recorded",
             ErrorCode::ContentRedacted =>
-                "A pallet head would have named a file whose content is redacted; nothing was written",
+                "A pallet head would have named a file whose content is redacted, or a load, park, merge or pick would have brought it into the bay; nothing was written",
             ErrorCode::HeadNamesContent =>
                 "The object to redact is in a pallet head; take the file out of that head first. Nothing was recorded",
         }

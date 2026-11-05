@@ -7,7 +7,7 @@ use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{BatchLaneClosure, RemoteClient};
 use forklift_core::util::{
     alias_utils, audit_utils, bay_utils, config_utils, file_utils, haul_utils, held_heads, kv_utils, merge_utils, object_utils,
-    operation_utils, pallet_utils, remote_utils, repair_utils, scope_utils, shift_utils, take_utils, trust_utils,
+    operation_utils, pallet_utils, redaction_utils, remote_utils, repair_utils, scope_utils, shift_utils, take_utils, trust_utils,
 };
 use forklift_core::util::take_utils::{FetchAt, TakeTrust};
 use forklift_core::util::operation_utils::{Operation, OperationKind};
@@ -286,6 +286,10 @@ async fn lower_working_pallet(client: &RemoteClient,
     refuse_carried_overlaps(&carried, &ops, &removed_dirs)?;
     alias_utils::refuse_collisions("Lowering", &shift_utils::collect_collisions(&ops, &removed_dirs)?)?;
     shift_utils::ensure_writes_present(&ops)?;
+    redaction_utils::refuse_redacted_writes(&ops, &format!("lower pallet \"{}\"", pallet), |path| format!(
+        "change or delete \"{}\" on the remote so it no longer holds that content, then lower again",
+        path
+    ))?;
 
     // Finished by `write_head_or_roll_back` once the bay is settled at one head or the other.
     let mut operation = Operation::new(
@@ -473,6 +477,10 @@ async fn repair_pallet(client: &RemoteClient,
     refuse_carried_overlaps(&carried, &ops, &removed_dirs)?;
     alias_utils::refuse_collisions("Lowering", &shift_utils::collect_collisions(&ops, &removed_dirs)?)?;
     shift_utils::ensure_writes_present(&ops)?;
+    redaction_utils::refuse_redacted_writes(&ops, &format!("lower pallet \"{}\"", pallet), |path| format!(
+        "change or delete \"{}\" on the remote so it no longer holds that content, then lower again",
+        path
+    ))?;
 
     // The bay moves from its base, but the ref from V: the marker and the compare-and-set take V.
     let mut operation = Operation::new(

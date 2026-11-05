@@ -541,26 +541,34 @@ impl RedactedSet {
     fn named_by(&self,
                 entry: &crate::model::tree_item::TreeItem,
                 partial: Option<&mut HashSet<String>>) -> Result<Option<String>, String> {
-        if self.hashes.contains(&entry.hash) {
-            return Ok(Some(entry.hash.clone()));
+        self.names_file(&entry.hash, entry.item_type, partial)
+    }
+
+    /// [`RedactedSet::named_by`] for a file of content `hash` stored as `item_type`.
+    fn names_file(&self,
+                  hash: &str,
+                  item_type: DirEntryType,
+                  partial: Option<&mut HashSet<String>>) -> Result<Option<String>, String> {
+        if self.hashes.contains(hash) {
+            return Ok(Some(hash.to_string()));
         }
 
-        if self.chunk_lists.is_empty() || !entry.item_type.is_chunked() {
+        if self.chunk_lists.is_empty() || !item_type.is_chunked() {
             return Ok(None);
         }
 
-        let chunks = match object_utils::recipe_chunk_hashes(&entry.hash) {
+        let chunks = match object_utils::recipe_chunk_hashes(hash) {
             Ok(chunks) => chunks,
             Err(error) => match partial {
-                Some(skipped) if !file_utils::does_object_exist(&entry.hash)? => {
-                    skipped.insert(entry.hash.clone());
+                Some(skipped) if !file_utils::does_object_exist(hash)? => {
+                    skipped.insert(hash.to_string());
                     return Ok(None);
                 }
                 _ => return Err(error),
             },
         };
 
-        Ok(self.chunk_lists.contains(&chunk_list_digest(&chunks)).then(|| entry.hash.clone()))
+        Ok(self.chunk_lists.contains(&chunk_list_digest(&chunks)).then(|| hash.to_string()))
     }
 }
 
@@ -605,6 +613,92 @@ fn tree_names(tree: &str, set: &RedactedSet, mut partial: Option<&mut HashSet<St
     }
 
     Ok(None)
+}
+
+/// The redactions a bay-local write judges what it stages against: `load`, `park`, and a merge or
+/// pick before it touches the working directory. Bay-local state is no pallet head, so nothing
+/// requires this; it refuses early what the next head write would refuse, before the content is
+/// staged again or written back into the bay. Judged by the head-write rule: the redacted hash, or
+/// for a recipe, a chunked file with the same chunk list. A partial warehouse tolerates a subtree
+/// or recipe it does not hold, as the head write does.
+pub struct StagingGuard {
+    set: RedactedSet,
+    partial: bool,
+}
+
+/// The guard for the redactions at the current `@redactions` head, or `None` while there are
+/// none, so a warehouse without redactions reads nothing more.
+pub fn staging_guard() -> Result<Option<StagingGuard>, String> {
+    let Some(head) = pallet_utils::get_meta_pallet_head(REDACTIONS_PALLET_NAME)? else {
+        return Ok(None);
+    };
+
+    let set = RedactedSet::at(&head)?;
+
+    if set.hashes.is_empty() {
+        return Ok(None);
+    }
+
+    let partial = crate::util::scope_utils::content_may_be_absent()?;
+
+    Ok(Some(StagingGuard { set, partial }))
+}
+
+impl StagingGuard {
+    /// The redacted hash a file of content `hash`, stored as `item_type`, names, if any.
+    pub fn names_file(&self, hash: &str, item_type: DirEntryType) -> Result<Option<String>, String> {
+        let mut skipped = HashSet::new();
+
+        self.set.names_file(hash, item_type, self.partial.then_some(&mut skipped))
+    }
+
+    /// The first file under `tree` naming redacted content, as its path from the tree's root and
+    /// the redacted hash.
+    pub fn names_tree(&self, tree: &str) -> Result<Option<(String, String)>, String> {
+        let mut skipped = HashSet::new();
+
+        tree_names(tree, &self.set, self.partial.then_some(&mut skipped))
+    }
+}
+
+/// Refuse checking out a tree whose `ops`, what it writes into the bay, would bring back content a
+/// redaction removed, before the bay is touched: the head write it leads to would be refused too,
+/// but only once the content had reached the bay. Judged after the presence phase, which makes
+/// every recipe they write readable. `doing` names the operation; `next_step` is given the path.
+pub fn refuse_redacted_writes(ops: &[crate::util::shift_utils::FileOp],
+                              doing: &str,
+                              next_step: impl Fn(&str) -> String) -> Result<(), String> {
+    let Some(guard) = staging_guard()? else {
+        return Ok(());
+    };
+
+    for op in ops {
+        let crate::util::shift_utils::FileOp::Write { path, hash, item_type, .. } = op else {
+            continue;
+        };
+
+        if let Some(hash) = guard.names_file(hash, *item_type)? {
+            return Err(staging_refusal(doing, path, &hash, "Nothing was changed.", next_step(path)));
+        }
+    }
+
+    Ok(())
+}
+
+/// The `content_redacted` refusal of a bay-local write that would stage the file at `path`, whose
+/// content `hash` is redacted: "Refusing to `doing`", then `outcome`, which says what was left as it
+/// was. `details` carries the path and the hash; no pallet head was refused, so it names none.
+pub fn staging_refusal(doing: &str, path: &str, hash: &str, outcome: &str, next_step: String) -> String {
+    crate::error::CoreError::refusal_with_details(
+        crate::error::RefusalCode::ContentRedacted,
+        format!(
+            "Refusing to {}: \"{}\" holds content ({}) that is redacted in this warehouse, and \
+            nothing may bring it back. {}",
+            doing, path, hash, outcome
+        ),
+        next_step,
+        serde_json::json!({ "path": path, "hash": hash }),
+    ).into()
 }
 
 /// The proof a ref write's new head was checked against the redactions: which write, the

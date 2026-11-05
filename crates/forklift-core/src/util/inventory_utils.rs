@@ -12,7 +12,7 @@ use crate::model::task::inventory_builder::inventory_builder_task::InventoryBuil
 use crate::model::task::TaskExecutor;
 use crate::parser;
 use crate::traits::task_context::TaskContext;
-use crate::util::{alias_utils, chunk_utils, fanout_utils, file_utils, load_guard_utils, object_utils, office_utils, path_utils, record_utils, tree_utils, warehouse_utils};
+use crate::util::{alias_utils, chunk_utils, fanout_utils, file_utils, load_guard_utils, object_utils, office_utils, path_utils, record_utils, redaction_utils, tree_utils, warehouse_utils};
 use crate::util::object_utils::IngestMode;
 use crate::util::path_utils::WarehousePath;
 use crate::util::scope_utils::{PathScope, ScopeClass};
@@ -491,6 +491,7 @@ fn registered_keys() -> Result<BTreeSet<String>, String> {
 pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), String> {
     let context = Arc::new(InventoryBuilderContext::new());
 
+    let recorded = load_guard_utils::recorded();
     load_guard_utils::stage_start_marker(&context.blob_batch, path.as_key())?;
 
     let executor = TaskExecutor::new(Arc::clone(&context));
@@ -634,6 +635,17 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
     // registered some of the keys, which then read as empty directories until a later load
     // publishes them, never as a shard nobody registered; a key registered whose shard did not land
     // reads as empty too.
+    // Content a redaction removes is refused before any shard lands, so the load stages nothing
+    // and withdraws its start marker. Judged after phase 0, which makes every recipe the walk
+    // stored readable; the blobs it made durable stay unnamed.
+    if blob_batch_published {
+        if let Some((path, hash)) = staged_redacted(&writes)? {
+            load_guard_utils::withdraw_start(recorded.as_ref());
+
+            return Err(load_refusal(&path, &hash));
+        }
+    }
+
     if blob_batch_published {
         let new_inventory_paths = context.new_inventory_paths.lock().await.clone();
 
@@ -1351,6 +1363,9 @@ fn directory_has_no_untracked_content(key: &str,
 /// strictly before `shard_write::publish_shards` stages any shard content (DESIGN.html §5.0 D
 /// item 10, finding #7; see its doc comment for why the two must not share one batch).
 ///
+/// A file whose content a redaction removes, in a shard this pass would publish, refuses the whole
+/// pass before any shard lands, with `refuse_redacted(path, hash)`; nothing is staged.
+///
 /// Shards are decided in parallel, and taken up in metadata order. If deciding one fails (an
 /// unreadable file, a corrupt shard), the first such shard in that order ends the pass there:
 /// neither it nor any shard after it is published, though those were decided too, and any blob they
@@ -1372,7 +1387,7 @@ fn directory_has_no_untracked_content(key: &str,
 ///                   publish. Every shard before the first failure in metadata order is handed
 ///                   to the publish step when the blob batch finishes; a blob-batch failure
 ///                   publishes nothing from this pass — see the doc comment above.
-pub fn refresh_tracked_entries() -> Result<(), String> {
+pub fn refresh_tracked_entries(refuse_redacted: impl Fn(&str, &str) -> String) -> Result<(), String> {
     let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
 
     let Some(metadata) = metadata_opt else {
@@ -1436,6 +1451,10 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
     // comment for the exact ordering (and how it closes finding #1, per this function's own doc
     // comment above).
     if blob_batch_published {
+        if let Some((path, hash)) = staged_redacted(&writes)? {
+            return Err(refuse_redacted(&path, &hash));
+        }
+
         if let Err(e) = publish_shards(&mut ledger, ShardPublish::of(writes)) {
             if result.is_ok() { result = Err(e); }
         }
@@ -2898,6 +2917,12 @@ fn add_file_to_inventory(path: &WarehousePath) -> Result<(), String> {
         None => build_inventory_item_from_file(&fs_path, &file_name, item_type, anchor)?,
     };
 
+    if let Some(guard) = redaction_utils::staging_guard()? {
+        if let Some(hash) = guard.names_file(&item.hash, item.item_type)? {
+            return Err(load_refusal(path.as_key(), &hash));
+        }
+    }
+
     inventory.add_item(item);
 
     // The incomplete-load marker for `path` rides this shard's own content-write barrier
@@ -2916,6 +2941,45 @@ fn add_file_to_inventory(path: &WarehousePath) -> Result<(), String> {
         extra,
         ..ShardPublish::one(parent.as_key(), inventory)
     })
+}
+
+/// The first live entry of `writes`, shards a load is about to publish keyed by directory, whose
+/// content a redaction removes: its path and the redacted hash. A staged removal names content
+/// only to remove it, so it passes.
+fn staged_redacted(writes: &BTreeMap<String, Inventory>) -> Result<Option<(String, String)>, String> {
+    let Some(guard) = redaction_utils::staging_guard()? else {
+        return Ok(None);
+    };
+
+    for (key, inventory) in writes {
+        for (name, item) in inventory.get_items() {
+            if item.state == InventoryItemState::Deleted {
+                continue;
+            }
+
+            if let Some(hash) = guard.names_file(&item.hash, item.item_type)? {
+                let path = if key.is_empty() { name.to_string() } else { format!("{}/{}", key, name) };
+
+                return Ok(Some((path, hash)));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// The refusal of a load that would stage the file at `path`, whose content `hash` is redacted.
+fn load_refusal(path: &str, hash: &str) -> String {
+    redaction_utils::staging_refusal(
+        "load",
+        path,
+        hash,
+        "Nothing was staged.",
+        format!(
+            "change or delete \"{}\" so it no longer holds that content, then load again",
+            path
+        ),
+    )
 }
 
 /// Stage the removal of a single file: mark its entry in its parent's inventory as `Deleted`.
@@ -3220,7 +3284,7 @@ mod tests {
         let (metadata_path, _) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
         write_metadata_to_file(&metadata_path, &metadata).unwrap();
 
-        let error = refresh_tracked_entries().expect_err("the corrupt shard must fail the refresh");
+        let error = refresh_tracked_entries(|_, _| String::new()).expect_err("the corrupt shard must fail the refresh");
         assert!(error.contains("bbb"), "the error should name \"bbb\", got: {error}");
 
         let state_of = |key: &str| {

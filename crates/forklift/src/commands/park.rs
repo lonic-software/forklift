@@ -8,7 +8,8 @@ use forklift_core::util::shift_utils::FileOp;
 use serde::Serialize;
 use forklift_core::util::{
     alias_utils, cherry_pick_utils, config_utils, file_utils, inventory_utils, load_guard_utils, merge_utils, object_utils,
-    operation_utils, pallet_utils, park_utils, scope_utils, shift_utils, sign_utils, stack_utils, tree_utils,
+    operation_utils, pallet_utils, park_utils, redaction_utils, scope_utils, shift_utils, sign_utils, stack_utils,
+    tree_utils,
 };
 use forklift_core::util::operation_utils::{Operation, OperationKind};
 use crate::commands::merge_abort;
@@ -72,7 +73,7 @@ pub async fn park_changes() -> Result<(), String> {
     // rebuild below anchors before it, so a file edited after the refresh is never trusted.
     let anchor = file_utils::take_stat_anchor()?;
 
-    inventory_utils::refresh_tracked_entries()?;
+    inventory_utils::refresh_tracked_entries(|path, hash| park_refusal(path, hash))?;
 
     // In a scoped (sparse) bay the inventory holds only the in-scope subtree(s); splice it
     // onto the head's spine exactly like `stack` does (§3.2), so the parked parcel commits the
@@ -180,6 +181,16 @@ pub async fn park_changes() -> Result<(), String> {
     // kept out of this same batch (see `stack_utils::stack_parcel`'s identical ordering note).
     batch.finish()?;
 
+    // A parked parcel is no pallet head, but popping it would bring the content back, so the
+    // parked tree is judged whole, as a head's is: the refresh above judged only what it restaged.
+    // Judged once the batch is readable; a refusal leaves the bay as it was, and the parcel object
+    // unreferenced.
+    if let Some(guard) = redaction_utils::staging_guard()? {
+        if let Some((path, hash)) = guard.names_tree(&root_tree.hash)? {
+            return Err(park_refusal(&path, &hash));
+        }
+    }
+
     // The reset back to the pallet head is checked before anything references the parked
     // parcel: a staged removal leaves a path the head writes back, and untracked content (or,
     // on a case-insensitive volume, another spelling) may sit there now. A refusal here leaves
@@ -226,6 +237,17 @@ pub async fn park_changes() -> Result<(), String> {
     ));
 
     Ok(())
+}
+
+/// The refusal of a park that would park the file at `path`, whose content `hash` is redacted.
+fn park_refusal(path: &str, hash: &str) -> String {
+    redaction_utils::staging_refusal(
+        "park",
+        path,
+        hash,
+        "Nothing was parked.",
+        format!("change or delete \"{}\" so it no longer holds that content, then park again", path),
+    )
 }
 
 /// Re-apply the most recently parked parcel (staging its changes) and drop it from the

@@ -129,6 +129,10 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
     consolidate::keep_aliased_files(&mut actions, &our_tree, &scope)?;
     let ledger = consolidate::ensure_no_untracked_collisions(&actions, &source_label)?;
     consolidate::ensure_actions_present(&actions)?;
+    consolidate::refuse_redacted_actions(&actions, &theirs_tree, &format!("pick {}", short), |path| format!(
+        "make the change by hand without \"{}\" instead of picking {}",
+        path, short
+    ))?;
 
     // The completing parcel's message: the -m override, else the source's own message. A source
     // with none (a git commit imported with an empty message, say) needs -m, asked for before the

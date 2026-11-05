@@ -168,6 +168,22 @@ pub fn stage_start_marker(batch: &file_utils::WriteBatch, root_key: &str) -> Res
     marker_utils::add_deferred(batch, &marker_path(), root_key)
 }
 
+/// What the marker records now, read before a load stages its start so a load that publishes no
+/// shard can withdraw it with [`withdraw_start`]; `None` when the marker cannot be read.
+pub fn recorded() -> Option<BTreeSet<String>> {
+    marker_utils::read(&marker_path()).ok()
+}
+
+/// Withdraw the start a load staged, for a load refused before it published any shard: put the
+/// marker back to `before`, what [`recorded`] read then. Recording the start may have absorbed
+/// narrower roots into the load's own, so this restores the set rather than removing one key.
+/// Best-effort; a `before` that could not be read leaves the marker as it is.
+pub fn withdraw_start(before: Option<&BTreeSet<String>>) {
+    if let Some(before) = before {
+        marker_utils::restore(&marker_path(), before);
+    }
+}
+
 /// Record that the load rooted at `root_key` completed cleanly: clears every recorded root
 /// `root_key` covers — see the module doc comment's clearing-scope section. Best-effort
 /// throughout (including a marker this cannot make sense of, which is left in place rather than

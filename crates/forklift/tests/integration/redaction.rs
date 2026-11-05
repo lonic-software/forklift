@@ -367,9 +367,9 @@ fn a_stack_naming_redacted_content_is_refused_until_the_file_is_gone() {
     recorded_hash(&warehouse, &hash, "leaked token");
     let head = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap();
 
-    // The file still there, beside a new one: the new head would name it.
+    // The file still staged, beside a new one: the new head would name it.
     std::fs::write(warehouse.root.join("more.txt"), b"more\n").unwrap();
-    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["load", "more.txt"]);
     let error = content_redacted(&warehouse, &["stack", "-m", "notes"]);
     assert_eq!(error["details"]["path"], "secret.env", "{}", error);
     assert_eq!(error["details"]["hash"], hash.as_str(), "{}", error);
@@ -378,16 +378,121 @@ fn a_stack_naming_redacted_content_is_refused_until_the_file_is_gone() {
         "nothing was written"
     );
 
-    // The same bytes under another name are the same content.
     std::fs::remove_file(warehouse.root.join("secret.env")).unwrap();
-    std::fs::write(warehouse.root.join("copy.env"), b"TOKEN=hunter2\n").unwrap();
-    warehouse.run_ok(&["load", "."]);
-    let error = content_redacted(&warehouse, &["stack", "-m", "copy"]);
-    assert_eq!(error["details"]["path"], "copy.env", "{}", error);
-
-    std::fs::remove_file(warehouse.root.join("copy.env")).unwrap();
     warehouse.run_ok(&["load", "."]);
     warehouse.run_ok(&["stack", "-m", "without the secret"]);
+}
+
+#[test]
+fn a_load_staging_redacted_content_is_refused_and_stages_nothing() {
+    let warehouse = Warehouse::new("load");
+    warehouse.stack("notes.txt", b"notes\n", "notes");
+    let hash = warehouse.redact_loaded("secret.env", b"TOKEN=hunter2\n", "leaked token");
+
+    // The same bytes under another name are the same content, by a directory load beside a file
+    // that is fine and by the file alone.
+    std::fs::create_dir_all(warehouse.root.join("dir")).unwrap();
+    std::fs::write(warehouse.root.join("dir/copy.env"), b"TOKEN=hunter2\n").unwrap();
+    std::fs::write(warehouse.root.join("more.txt"), b"more\n").unwrap();
+
+    for target in [".", "dir", "dir/copy.env"] {
+        let error = content_redacted(&warehouse, &["load", target]);
+        assert_eq!(error["details"], serde_json::json!({ "path": "dir/copy.env", "hash": hash }), "{}", error);
+        let message = error["message"].as_str().unwrap();
+        assert!(message.starts_with("Refusing to load: \"dir/copy.env\" holds content"), "{}", error);
+        assert!(message.ends_with("Nothing was staged."), "{}", error);
+        assert_eq!(
+            error["next_step"],
+            "change or delete \"dir/copy.env\" so it no longer holds that content, then load again",
+            "{}", error
+        );
+        assert_eq!(warehouse.json(&["status"])["data"]["staged_count"], 0, "{}: nothing was staged", target);
+    }
+
+    // Nothing is left marked as an incomplete load, so a stack of other work goes ahead.
+    warehouse.run_ok(&["load", "more.txt"]);
+    warehouse.run_ok(&["stack", "-m", "more"]);
+
+    // The next step, as it says.
+    std::fs::write(warehouse.root.join("dir/copy.env"), b"TOKEN=rotated\n").unwrap();
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "-m", "rotated"]);
+}
+
+#[test]
+fn a_park_naming_redacted_content_is_refused_and_parks_nothing() {
+    let warehouse = Warehouse::new("park");
+    warehouse.stack("notes.txt", b"notes\n", "notes");
+
+    // Redacted while it is only loaded, so no head names it; a parked parcel would.
+    std::fs::write(warehouse.root.join("secret.env"), b"TOKEN=hunter2\n").unwrap();
+    warehouse.run_ok(&["load", "secret.env"]);
+    let hash = hash_of(b"TOKEN=hunter2\n");
+    recorded_hash(&warehouse, &hash, "leaked token");
+
+    let error = content_redacted(&warehouse, &["park"]);
+    assert_eq!(error["details"], serde_json::json!({ "path": "secret.env", "hash": hash }), "{}", error);
+    let message = error["message"].as_str().unwrap();
+    assert!(message.starts_with("Refusing to park: \"secret.env\" holds content"), "{}", error);
+    assert!(message.ends_with("Nothing was parked."), "{}", error);
+    assert_eq!(
+        error["next_step"],
+        "change or delete \"secret.env\" so it no longer holds that content, then park again",
+        "{}", error
+    );
+    assert_eq!(warehouse.json(&["park", "list"])["data"]["parked"], serde_json::json!([]), "nothing was parked");
+    assert_eq!(std::fs::read(warehouse.root.join("secret.env")).unwrap(), b"TOKEN=hunter2\n", "the bay is as it was");
+
+    // The next step, as it says.
+    std::fs::write(warehouse.root.join("secret.env"), b"TOKEN=rotated\n").unwrap();
+    warehouse.run_ok(&["park"]);
+    assert_eq!(warehouse.json(&["park", "list"])["data"]["parked"].as_array().unwrap().len(), 1);
+
+    // A tracked file edited to hold the content is refused before park restages it.
+    std::fs::write(warehouse.root.join("notes.txt"), b"TOKEN=hunter2\n").unwrap();
+    let error = content_redacted(&warehouse, &["park"]);
+    assert_eq!(error["details"]["path"], "notes.txt", "{}", error);
+    let status = warehouse.json(&["status"]);
+    assert_eq!(status["data"]["staged_count"], 0, "nothing was staged: {}", status);
+    assert_eq!(status["data"]["unstaged_count"], 1, "{}", status);
+    assert_eq!(warehouse.json(&["park", "list"])["data"]["parked"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn a_pick_bringing_back_redacted_content_is_refused_before_it_touches_the_bay() {
+    let warehouse = Warehouse::new("pick");
+    warehouse.stack("notes.txt", b"notes\n", "notes");
+    warehouse.run_ok(&["pallet", "create", "side"]);
+    warehouse.run_ok(&["shift", "main"]);
+    let leak = warehouse.leaked("secret.env", b"TOKEN=hunter2\n");
+    let short = &leak[..12];
+    let recorded = recorded_hash(&warehouse, &format!("{}:secret.env", leak), "leaked token");
+    std::fs::remove_file(warehouse.root.join("secret.env")).unwrap();
+    warehouse.stack("fine.txt", b"fine\n", "fine");
+    let fine = warehouse.head("main");
+
+    // Picked onto a pallet whose history never held it.
+    warehouse.run_ok(&["shift", "side"]);
+    let head = warehouse.head("side");
+
+    let error = content_redacted(&warehouse, &["pick", &leak]);
+    assert_eq!(error["details"]["path"], "secret.env", "{}", error);
+    assert_eq!(error["details"]["hash"], recorded["data"]["hash"], "{}", error);
+    let message = error["message"].as_str().unwrap();
+    assert!(message.starts_with(&format!("Refusing to pick {}: \"secret.env\"", short)), "{}", error);
+    assert!(message.ends_with("Nothing was changed."), "{}", error);
+    assert_eq!(
+        error["next_step"].as_str().unwrap(),
+        format!("make the change by hand without \"secret.env\" instead of picking {}", short),
+        "{}", error
+    );
+    assert!(!warehouse.root.join("secret.env").exists(), "the content never reached the bay");
+    assert_eq!(warehouse.head("side"), head);
+    assert_eq!(warehouse.json(&["status"])["data"]["staged_count"], 0, "nothing was staged");
+
+    // No pick was left standing: another one goes ahead.
+    warehouse.run_ok(&["pick", &fine]);
+    assert!(warehouse.root.join("fine.txt").exists());
 }
 
 #[test]
@@ -517,6 +622,127 @@ fn a_lift_is_refused_for_a_head_stacked_before_a_redaction_came_down() {
     warehouse.run_ok(&["stack", "-m", "without the secret"]);
     warehouse.run_ok(&["lift"]);
     assert_eq!(served_main(&server.url, "lift-after"), warehouse.head("main"));
+}
+
+#[test]
+fn a_pick_conflicting_with_their_redacted_version_is_refused() {
+    let warehouse = Warehouse::new("pick-conflict");
+    warehouse.stack("shared.txt", b"base\n", "base");
+    warehouse.run_ok(&["pallet", "create", "side"]);
+    warehouse.stack("shared.txt", b"ours\n", "ours");
+    warehouse.run_ok(&["shift", "main"]);
+
+    // Main's leak changes the file both sides changed, then a later parcel changes it again, so
+    // no head names the content and the redaction is recorded.
+    warehouse.stack("shared.txt", b"TOKEN=hunter2\n", "leak");
+    let leak = warehouse.head("main");
+    warehouse.stack("shared.txt", b"rotated\n", "rotate");
+    let hash = recorded_hash(&warehouse, &format!("{}:shared.txt", leak), "leaked token")["data"]["hash"].clone();
+
+    // Picked onto side, the file conflicts, and the markers would carry their version whole.
+    warehouse.run_ok(&["shift", "side"]);
+    let error = content_redacted(&warehouse, &["pick", &leak]);
+    assert_eq!(error["details"], serde_json::json!({ "path": "shared.txt", "hash": hash }), "{}", error);
+    assert_eq!(std::fs::read(warehouse.root.join("shared.txt")).unwrap(), b"ours\n", "the bay is as it was");
+}
+
+#[test]
+fn a_lower_merging_redacted_content_in_is_refused_before_it_touches_the_bay() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-lower-server-{}", std::process::id())));
+
+    let first = Warehouse::cloned("lower-first", &server.url);
+    first.stack("notes.txt", b"notes\n", "notes");
+    first.run_ok(&["lift"]);
+
+    // This warehouse redacts content the remote does not know is redacted, and stacks work of its
+    // own; another warehouse lifts a head naming that content, so a lower here merges it in.
+    let warehouse = Warehouse::cloned("lower", &server.url);
+    let hash = warehouse.redact_loaded("secret.env", b"TOKEN=hunter2\n", "leaked token");
+    let head = warehouse.head("main");
+
+    let other = Warehouse::cloned("lower-other", &server.url);
+    other.stack("secret.env", b"TOKEN=hunter2\n", "leak");
+    other.run_ok(&["lift"]);
+
+    // With nothing of its own, the lower would fast-forward the bay to the remote's head.
+    let error = content_redacted(&warehouse, &["lower", "main"]);
+    assert_eq!(error["details"], serde_json::json!({ "path": "secret.env", "hash": hash }), "{}", error);
+    let message = error["message"].as_str().unwrap();
+    assert!(message.starts_with("Refusing to lower pallet \"main\": \"secret.env\""), "{}", error);
+    assert_eq!(
+        error["next_step"],
+        "change or delete \"secret.env\" on the remote so it no longer holds that content, then lower again",
+        "{}", error
+    );
+    assert!(!warehouse.root.join("secret.env").exists(), "the content never reached the bay");
+    assert_eq!(warehouse.head("main"), head, "nothing was lowered");
+
+    warehouse.stack("mine.txt", b"mine\n", "mine");
+    let head = warehouse.head("main");
+
+    let error = content_redacted(&warehouse, &["lower", "main"]);
+    assert_eq!(error["details"], serde_json::json!({ "path": "secret.env", "hash": hash }), "{}", error);
+    let message = error["message"].as_str().unwrap();
+    assert!(message.starts_with("Refusing to merge the remote into \"main\": \"secret.env\""), "{}", error);
+    assert_eq!(
+        error["next_step"],
+        "change or delete \"secret.env\" on the remote so it no longer holds that content, then run this again",
+        "{}", error
+    );
+    assert!(!warehouse.root.join("secret.env").exists(), "the content never reached the bay");
+    assert_eq!(warehouse.head("main"), head, "no merge was written");
+
+    // The next step, as it says.
+    other.run_ok(&["remove", "secret.env"]);
+    other.run_ok(&["stack", "-m", "take the leak out"]);
+    other.run_ok(&["lift"]);
+    warehouse.run_ok(&["lower", "main"]);
+    assert!(!warehouse.root.join("secret.env").exists());
+    assert!(warehouse.root.join("mine.txt").exists());
+}
+
+#[test]
+fn a_fast_forward_to_a_head_stacked_before_a_redaction_came_down_is_refused() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-ff-server-{}", std::process::id())));
+
+    let first = Warehouse::cloned("ff-first", &server.url);
+    first.stack("notes.txt", b"notes\n", "notes");
+    first.run_ok(&["lift"]);
+
+    // Side is stacked ahead of main before any redaction exists; another warehouse's redaction
+    // then comes down by lower.
+    let warehouse = Warehouse::cloned("ff", &server.url);
+    warehouse.run_ok(&["pallet", "create", "side"]);
+    warehouse.stack("secret.env", b"TOKEN=hunter2\n", "leak");
+    warehouse.run_ok(&["shift", "main"]);
+
+    let other = Warehouse::cloned("ff-other", &server.url);
+    let hash = other.redact_loaded("secret.env", b"TOKEN=hunter2\n", "leaked token");
+    other.run_ok(&["lift"]);
+    warehouse.run_ok(&["lower", "main"]);
+    let head = warehouse.head("main");
+
+    let error = content_redacted(&warehouse, &["consolidate", "side"]);
+    assert_eq!(error["details"], serde_json::json!({ "path": "secret.env", "hash": hash }), "{}", error);
+    let message = error["message"].as_str().unwrap();
+    assert!(message.starts_with("Refusing to consolidate \"side\" into \"main\": \"secret.env\""), "{}", error);
+    assert_eq!(
+        error["next_step"],
+        "shift to \"side\", take \"secret.env\" out of it and stack, then shift back to \"main\" and consolidate again",
+        "{}", error
+    );
+    assert!(!warehouse.root.join("secret.env").exists(), "the content never reached the bay");
+    assert_eq!(warehouse.head("main"), head);
+
+    // The next step, as it says.
+    warehouse.run_ok(&["shift", "side"]);
+    warehouse.run_ok(&["remove", "secret.env"]);
+    std::fs::remove_file(warehouse.root.join("secret.env")).unwrap();
+    warehouse.run_ok(&["stack", "-m", "take the leak out"]);
+    warehouse.run_ok(&["shift", "main"]);
+    warehouse.run_ok(&["consolidate", "side"]);
 }
 
 #[test]
