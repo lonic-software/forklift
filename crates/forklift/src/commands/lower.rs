@@ -1376,15 +1376,26 @@ pub(crate) async fn replay(client: &RemoteClient,
 
             let why = match &refused {
                 Failed(why) => return Err(why.clone()),
+                // Refused however often it runs; framed, so it keeps its code.
+                Redacted { .. } => {
+                    let refusal = forklift_core::error::prefix_message(
+                        &format!("{} was lifted to the remote, but this warehouse refused to move its local head there", wire),
+                        refused.clone().into(),
+                    );
+
+                    return Err(match resigned_note.is_empty() {
+                        true => refusal,
+                        false => forklift_core::error::append_to_message(refusal, resigned_note.trim_start()),
+                    });
+                }
                 Moved(_) => "another bay or process moved it here meanwhile",
                 OfficeMoved { .. } | AnchorMoved | PalletsMoved { .. } | WitnessMoved { .. } => {
                     "the office or the trust anchor it was signed under changed here meanwhile"
                 }
                 // A replay lifts a fresh parcel onto the remote head, so it never takes the
                 // pallet back, and only a user pallet has a tombstone or a completeness check:
-                // none of these is expected. A replay naming redacted content is refused however
-                // often it runs. Running lower again would clear none of them.
-                Backward { .. } | Deleted { .. } | Incomplete { .. } | Redacted { .. } => {
+                // none of these is expected. Running lower again would clear none of them.
+                Backward { .. } | Deleted { .. } | Incomplete { .. } => {
                     return Err(format!(
                         "{} was lifted to the remote, but this warehouse refused to move its local \
                         head there.{} {}",
