@@ -119,6 +119,16 @@ and its directory, rather than being imported under a different path; so does an
 depth that some file system opens as `.forklift` (`.Forklift`, `.forklift.`). For agents, this means a project can be moved onto
 forklift with one command.
 
+Git's tags come along, unsigned like the history. An annotated tag keeps its tagger's email, its
+date and its message, and a tag of a tag is followed to its commit. Git keeps a tag's signature
+at the end of its message, and that signature signs git's object, so the import drops it and
+says how many tags carried one. A lightweight tag has no tagger, date or message, so it is
+recorded by your configured operator, dated by the import. The import leaves out, naming each
+with why (`skipped_tags` under `--json`; the recorded names are `tags`): a tag Forklift cannot
+name (a name with `/`, say), a tag over a tree or a blob, a tag over a commit on no local branch
+(a tag never brings history of its own), and a name a tag already here holds, since tag names are
+immutable. `office enroll` keeps the imported tags, as it keeps the history.
+
 Forklift stores a file's bytes as they are and converts nothing on checkout, so the history
 keeps the bytes git stored. Git rewrites some files as it checks them out: LF to CRLF under
 `eol=crlf`, under `core.autocrlf=true` (Git for Windows' default, which converts every text
