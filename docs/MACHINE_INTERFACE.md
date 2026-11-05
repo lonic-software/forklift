@@ -94,6 +94,8 @@ reporting the outcome `merged` and the merge parcel as `merged`; a conflicting m
 `merge_conflicts`, its paths in `details.paths`, and leaves the consolidation in progress. A
 `lower --repair` over a diverged current pallet merges the repair the same way. A `diverged`
 working pallet's `next_step` is now `forklift lower; then forklift lift`.
+`git import` reports `tags`, the git tags it recorded, and `skipped_tags`, each one it left out
+with why.
 `lift` carries `meta_resigned`, the cells (`<pallet> <path>`) it re-signed under the operator's
 key when it replayed metadata recorded before trust.
 
@@ -740,7 +742,7 @@ These commands report today, with these phases:
 | `compact` | `Collecting objects`, `Packing objects`, `Removing packed originals` |
 | `lift` | `Fetching history` (only when it merges first), `Finding objects to lift`, `Uploading objects`, `Committing staged objects` (only against a staging remote), `Updating the remote` |
 | `lower` | `Fetching history`, `Writing files`, `Rebuilding the inventory` |
-| `git import` | `Converting commits`, `Publishing objects`, `Building the inventory` |
+| `git import` | `Converting commits`, `Publishing objects`, `Building the inventory`, `Recording tags` (only when there are tags to record) |
 
 Phase names are for display. Treat them as text, not as an API to branch on.
 

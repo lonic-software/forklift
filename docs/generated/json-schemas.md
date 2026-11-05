@@ -946,6 +946,24 @@ A command not listed here either reports only the generic human-message shape `{
         "deltas"
       ],
       "type": "object"
+    },
+    "SkippedTag": {
+      "description": "A tag an export or a mirror left out.",
+      "properties": {
+        "name": {
+          "description": "The tag's name.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why it was left out.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "reason"
+      ],
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -986,6 +1004,20 @@ A command not listed here either reports only the generic human-message shape `{
       },
       "type": "array"
     },
+    "skipped_tags": {
+      "description": "The git tags left out, each with why.",
+      "items": {
+        "$ref": "#/$defs/SkippedTag"
+      },
+      "type": "array"
+    },
+    "tags": {
+      "description": "The git tags recorded on `@tags`, unsigned.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "trees": {
       "format": "uint",
       "minimum": 0,
@@ -1010,7 +1042,8 @@ A command not listed here either reports only the generic human-message shape `{
     "commits",
     "trees",
     "blobs",
-    "pallets"
+    "pallets",
+    "tags"
   ],
   "title": "ImportReport",
   "type": "object"

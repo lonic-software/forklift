@@ -99,6 +99,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 - `git export` writes each tag as an annotated git tag over its parcel's commit, and names every tag
   it leaves out, with why (`tags` and `skipped_tags` under `--json`). Tags used to be dropped
   without a word.
+- `git import` records git's tags on `@tags`, unsigned: an annotated tag with its tagger, date and
+  message, without its git signature, and a lightweight tag by your configured operator. Each tag it
+  leaves out is named with why (`tags` and `skipped_tags` under `--json`). Tags used to be dropped
+  without a word.
 - `git mirror` and a lift's mirror push the remote's tags too, as the annotated tags `git export`
   writes, once the branch holding a tag's parcel is in step. A tag git already holds as another
   object is refused and never forced, and fails `git mirror` with `mirror_incomplete`; a lift only

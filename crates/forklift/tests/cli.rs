@@ -4934,6 +4934,228 @@ fn import_git_migrates_a_repo_into_the_warehouse() {
     assert!(!warehouse.run(&["git", "import", "."]).status.success());
 }
 
+/// Run git in `root` with a fixed identity, `stdin` as its input, returning its trimmed stdout.
+fn git_with_input(root: &std::path::Path, args: &[&str], stdin: &str) -> String {
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("git must be installed to run this test");
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), stdin.as_bytes()).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// The parcel of the entry `history <revision>` describes as `description`.
+fn parcel_described(warehouse: &TestWarehouse, revision: &str, description: &str) -> String {
+    let history = json(&warehouse.run(&["--json", "history", revision]));
+    history["data"]["entries"].as_array().unwrap().iter()
+        .find(|entry| entry["description"] == description)
+        .unwrap_or_else(|| panic!("no parcel described {:?}: {}", description, history))["parcel"]
+        .as_str().unwrap().to_string()
+}
+
+/// Git import records every git tag over an imported commit on `@tags`, unsigned: an annotated
+/// tag with its tagger, date and message, peeled through a tag of a tag, without the git signature
+/// it carried; a lightweight tag by the importing operator. A tag Forklift cannot name, one over a
+/// tree and one over a commit on no branch are each named with why, and enrolling keeps the tags.
+// Revert: record every tag by the importing operator → v1.0's tagger is "test@forklift"; drop the
+// signature cut in `parse_tag` → "signed" keeps the PGP block; stop peeling at the first tag
+// object → "outer" is left out; record a lightweight tag by its commit's committer → "light"'s
+// tagger is "ada@example.com", which the importer ("test@forklift") is not; date it at 0 → "light"
+// is dated outside the import; count only the outermost tag's signature → 2 tags carried one;
+// ignore the gpgsig header → 2 tags carried one; keep an empty tagger → the import fails.
+#[test]
+fn import_git_records_the_git_tags_unsigned() {
+    let warehouse = TestWarehouse::new("import-git-tags");
+    let root = warehouse.root.clone();
+
+    git_in(&root, &["init", "-q", "-b", "main"]);
+    warehouse.write_file("a.txt", "one\n");
+    git_in(&root, &["add", "-A"]);
+    git_in(&root, &["commit", "-qm", "first commit"]);
+    warehouse.write_file("a.txt", "two\n");
+    git_in(&root, &["commit", "-qam", "second commit"]);
+    git_in(&root, &["checkout", "-q", "-b", "feature", "HEAD~1"]);
+    warehouse.write_file("b.txt", "feature\n");
+    git_in(&root, &["add", "-A"]);
+    git_in(&root, &["commit", "-qm", "feature work"]);
+    git_in(&root, &["checkout", "-q", "-b", "gone"]);
+    warehouse.write_file("c.txt", "gone\n");
+    git_in(&root, &["add", "-A"]);
+    git_in(&root, &["commit", "-qm", "gone work"]);
+    git_in(&root, &["tag", "orphan"]);
+    git_in(&root, &["checkout", "-q", "main"]);
+    git_in(&root, &["branch", "-qD", "gone"]);
+
+    // An annotated tag by another tagger at a fixed date, a tag of that tag, a lightweight tag,
+    // and the three a Forklift tag cannot be.
+    let bob = Command::new("git")
+        .args(["tag", "-a", "v1.0", "-m", "First release", "main~1"])
+        .current_dir(&root)
+        .env("GIT_COMMITTER_NAME", "Bob").env("GIT_COMMITTER_EMAIL", "bob@example.com")
+        .env("GIT_COMMITTER_DATE", "1700000000 +0000")
+        .output().unwrap();
+    assert!(bob.status.success(), "{}", String::from_utf8_lossy(&bob.stderr));
+    git_in(&root, &["tag", "-a", "outer", "-m", "Outer", "v1.0"]);
+    git_in(&root, &["tag", "light", "feature"]);
+    git_in(&root, &["tag", "release/2", "main"]);
+    git_in(&root, &["tag", "treetag", "main^{tree}"]);
+
+    // A signed tag: git keeps the signature at the end of the message, after the last line that
+    // opens one; a line that only mentions one stays in the message.
+    let main = git_with_input(&root, &["rev-parse", "main"], "");
+    let object = format!(
+        "object {}\ntype commit\ntag signed\ntagger Carol <carol@example.com> 1700000100 +0000\n\n\
+        Signed release\n -----BEGIN PGP SIGNATURE----- is quoted here\n\
+        -----BEGIN PGP SIGNATURE-----\n\nabc\n-----END PGP SIGNATURE-----\n",
+        main
+    );
+    let signed = git_with_input(&root, &["mktag"], &object);
+    git_in(&root, &["update-ref", "refs/tags/signed", &signed]);
+
+    // An unsigned tag over the signed one, a tag signed in a header (the other hash algorithm's
+    // signature), and a tagger with no email, which the importing operator records at git's time.
+    git_in(&root, &["tag", "-a", "wrapped", "-m", "Wrapped", "signed"]);
+    let object = format!(
+        "object {}\ntype commit\ntag headsig\ntagger Dan <dan@example.com> 1700000300 +0000\n\
+        gpgsig-sha256 -----BEGIN PGP SIGNATURE-----\n \n abc\n -----END PGP SIGNATURE-----\n\n\
+        Header signed\n",
+        main
+    );
+    let headsig = git_with_input(&root, &["mktag"], &object);
+    git_in(&root, &["update-ref", "refs/tags/headsig", &headsig]);
+    let object = format!("object {}\ntype commit\ntag nameless\ntagger Nobody <> 1700000200 +0000\n\nNo email\n", main);
+    let nameless = git_with_input(&root, &["mktag"], &object);
+    git_in(&root, &["update-ref", "refs/tags/nameless", &nameless]);
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    let before = chrono::Utc::now().timestamp();
+    let imported = warehouse.run(&["--json", "git", "import", "."]);
+    assert_success(&imported);
+    let after = chrono::Utc::now().timestamp();
+    let report = json(&imported);
+    assert_eq!(report["data"]["tags"], serde_json::json!(["headsig", "light", "nameless", "outer", "signed", "v1.0", "wrapped"]), "{}", report);
+
+    let skipped: Vec<(String, String)> = report["data"]["skipped_tags"].as_array().unwrap().iter()
+        .map(|tag| (tag["name"].as_str().unwrap().to_string(), tag["reason"].as_str().unwrap().to_string()))
+        .collect();
+    assert_eq!(skipped.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["orphan", "release/2", "treetag"], "{}", report);
+    assert!(skipped[0].1.contains("is on no imported branch"), "{}", report);
+    assert!(skipped[1].1.contains("Forklift does not accept it as a tag name"), "{}", report);
+    assert!(skipped[2].1.contains("it points at a git tree, not a commit"), "{}", report);
+    assert!(report["data"]["warnings"].as_array().unwrap().iter()
+        .any(|warning| warning.as_str().unwrap().starts_with("3 imported tag(s) carried a git signature")), "{}", report);
+
+    let first = parcel_described(&warehouse, "main", "first commit");
+    let second = parcel_described(&warehouse, "main", "second commit");
+    let feature = parcel_described(&warehouse, "feature", "feature work");
+
+    let show = |name: &str| json(&warehouse.run(&["--json", "tag", "show", name]))["data"].clone();
+
+    let release = show("v1.0");
+    assert_eq!(release["subject"], first.as_str(), "{}", release);
+    assert_eq!(release["tagger"], "bob@example.com", "{}", release);
+    assert_eq!(release["message"], "First release", "{}", release);
+    assert_eq!(release["tagged_at"], "2023-11-14T22:13:20+00:00", "{}", release);
+    assert!(release.get("signer").is_none(), "{}", release);
+
+    let outer = show("outer");
+    assert_eq!(outer["subject"], first.as_str(), "{}", outer);
+    assert_eq!(outer["tagger"], "ada@example.com", "{}", outer);
+    assert_eq!(outer["message"], "Outer", "{}", outer);
+
+    let light = show("light");
+    assert_eq!(light["subject"], feature.as_str(), "{}", light);
+    assert_eq!(light["tagger"], "test@forklift", "{}", light);
+    assert!(light.get("message").is_none(), "{}", light);
+    let light_at = chrono::DateTime::parse_from_rfc3339(light["tagged_at"].as_str().unwrap()).unwrap().timestamp();
+    assert!((before..=after).contains(&light_at), "a lightweight tag is dated by the import: {}", light);
+
+    let signed = show("signed");
+    assert_eq!(signed["subject"], second.as_str(), "{}", signed);
+    assert_eq!(signed["tagger"], "carol@example.com", "{}", signed);
+    assert_eq!(signed["message"], "Signed release\n -----BEGIN PGP SIGNATURE----- is quoted here", "{}", signed);
+
+    let headsig = show("headsig");
+    assert_eq!(headsig["message"], "Header signed", "{}", headsig);
+
+    let nameless = show("nameless");
+    assert_eq!(nameless["tagger"], "test@forklift", "{}", nameless);
+    assert_eq!(nameless["tagged_at"], "2023-11-14T22:16:40+00:00", "{}", nameless);
+
+    // Enrolling keeps the imported tags, unsigned, inside the trust boundary.
+    assert_success(&warehouse.run(&["office", "enroll"]));
+    let audit = warehouse.run(&["audit", "@tags"]);
+    assert_eq!(audit.status.code(), Some(0), "{}{}", stdout(&audit), stderr(&audit));
+    let listed = json(&warehouse.run(&["--json", "tag", "list"]));
+    assert_eq!(listed["data"]["tags"].as_array().unwrap().len(), 7, "{}", listed);
+    assert!(stdout(&warehouse.run(&["tag", "show", "v1.0"])).contains("bob@example.com (unsigned)"));
+}
+
+/// An office standing without its anchor refuses every unsigned write, so git import refuses it
+/// up front, saying the anchor was lost, and no branch lands.
+// Revert: drop the up-front `local_meta_trust` check → the head precondition still refuses after
+// the conversion, but as a changed office, without the lost-anchor message.
+#[test]
+fn import_git_refuses_an_office_without_its_anchor_before_any_branch_lands() {
+    let warehouse = TestWarehouse::new("import-git-lost-anchor");
+    let root = warehouse.root.clone();
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["office", "enroll"]));
+    std::fs::remove_file(root.join(".forklift/trust")).unwrap();
+
+    git_in(&root, &["init", "-q", "-b", "trunk"]);
+    warehouse.write_file("x.txt", "here\n");
+    git_in(&root, &["add", "-A"]);
+    git_in(&root, &["commit", "-qm", "git work"]);
+    git_in(&root, &["tag", "v1.0"]);
+
+    let refused = warehouse.run(&["git", "import", "."]);
+    assert!(!refused.status.success(), "{}{}", stdout(&refused), stderr(&refused));
+    assert!(stderr(&refused).contains("holds an office but no trust anchor"), "{}", stderr(&refused));
+    let pallets = stdout(&warehouse.run(&["pallet", "list"]));
+    assert!(!pallets.contains("trunk"), "no branch lands: {}", pallets);
+}
+
+/// Git import leaves out a git tag whose name a tag already here holds, since a tag name is
+/// immutable, and records the rest.
+// Revert: drop the `taken` check in `plan_tags` → the import fails on the immutable name.
+#[test]
+fn import_git_leaves_out_a_tag_name_already_here() {
+    let warehouse = TestWarehouse::new("import-git-taken-tag");
+    let root = warehouse.root.clone();
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    warehouse.write_file("x.txt", "here\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "here"]));
+    assert_success(&warehouse.run(&["tag", "create", "v1.0", "main", "-m", "ours"]));
+
+    git_in(&root, &["init", "-q", "-b", "trunk"]);
+    git_in(&root, &["add", "-A"]);
+    git_in(&root, &["commit", "-qm", "theirs"]);
+    git_in(&root, &["tag", "-a", "v1.0", "-m", "theirs"]);
+    git_in(&root, &["tag", "v2.0"]);
+
+    let imported = warehouse.run(&["--json", "git", "import", "."]);
+    assert_success(&imported);
+    let report = json(&imported);
+    assert_eq!(report["data"]["tags"], serde_json::json!(["v2.0"]), "{}", report);
+    assert_eq!(report["data"]["skipped_tags"][0]["name"], "v1.0", "{}", report);
+    assert!(report["data"]["skipped_tags"][0]["reason"].as_str().unwrap().contains("already exists here"), "{}", report);
+
+    assert_eq!(json(&warehouse.run(&["--json", "tag", "show", "v1.0"]))["data"]["message"], "ours");
+}
+
 /// The paths `git add -A` would stage in the git working tree `root`.
 fn git_would_add(root: &std::path::Path) -> Vec<String> {
     let output = Command::new("git").args(["add", "-A", "-n"]).current_dir(root).output()

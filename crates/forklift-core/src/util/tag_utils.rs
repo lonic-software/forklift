@@ -197,17 +197,38 @@ impl PalletRules for TagsRules {
 pub fn record_tag(tag: &Tag,
                   writer: &MetaWriter,
                   actor: &Operator) -> Result<String, String> {
-    validate_tag_name(&tag.name)?;
-
-    if !object_utils::is_object_hash(&tag.subject) {
-        return Err(format!("\"{}\" is not a full parcel hash.", tag.subject));
-    }
-
-    let edit = meta_tree::set_cell(&tag.name, &writer.stamp(actor), TAG_SCHEMA, &tag_value(tag))?;
     let description = format!("tag {} {}", tag.name, tag.subject);
 
-    meta_tree::stack_meta_edits(TAGS_PALLET_NAME, &TagsRules, writer, &[edit], actor, &description)?
+    record_tags(std::slice::from_ref(tag), writer, actor, &description)?
         .ok_or(format!("Tag \"{}\" already exists.", tag.name))
+}
+
+/// Create several tags, as one parcel on the local `@tags` head stamped by `writer` for `actor`
+/// and described by `description`. The caller holds the warehouse lock; the content check refuses
+/// as [`record_tag`]'s does, so one refused tag records none of them.
+///
+/// # Returns
+/// * `Ok(Some(hash))` - The new `@tags` head.
+/// * `Ok(None)`       - Every tag already stood exactly as given, so nothing was stacked.
+/// * `Err(String)`    - If a tag is refused, or the head or the trust state moved meanwhile.
+pub fn record_tags(tags: &[Tag],
+                   writer: &MetaWriter,
+                   actor: &Operator,
+                   description: &str) -> Result<Option<String>, String> {
+    let stamp = writer.stamp(actor);
+    let mut edits = Vec::with_capacity(tags.len());
+
+    for tag in tags {
+        validate_tag_name(&tag.name)?;
+
+        if !object_utils::is_object_hash(&tag.subject) {
+            return Err(format!("\"{}\" is not a full parcel hash.", tag.subject));
+        }
+
+        edits.push(meta_tree::set_cell(&tag.name, &stamp, TAG_SCHEMA, &tag_value(tag))?);
+    }
+
+    meta_tree::stack_meta_edits(TAGS_PALLET_NAME, &TagsRules, writer, &edits, actor, description)
 }
 
 /// Read every tag at the local head, attributed through the office (read best-effort, so a
