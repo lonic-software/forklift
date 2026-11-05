@@ -1380,13 +1380,7 @@ pub(crate) async fn replay(client: &RemoteClient,
                 // A write can land and still fail, so the local head is read back before saying
                 // where it is.
                 Failed(why) => {
-                    let context = match pallet_utils::get_meta_pallet_head(name) {
-                        Ok(Some(head)) if head == parcel => format!(
-                            "{} was lifted to the remote, and its local head moved there, but the move may not be durable", wire
-                        ),
-                        Ok(_) => format!("{} was lifted to the remote, but this warehouse could not move its local head there", wire),
-                        Err(_) => format!("{} was lifted to the remote, but whether its local head moved there is not known", wire),
-                    };
+                    let context = replay_failure_context(&wire, &parcel, pallet_utils::get_meta_pallet_head(name));
                     let failure = forklift_core::error::prefix_message(&context, why.clone());
 
                     return Err(match resigned_note.is_empty() {
@@ -1528,6 +1522,18 @@ fn describe_conflicts(wire: &str,
 
 /// The `meta_conflict` refusal for the pallets that conflicted, naming the working pallet that
 /// did lower and its head.
+/// Where a replay lifted to the remote left the local head, after the local write failed:
+/// `read_back` is the local head read after the failure, since a write can land and still fail.
+fn replay_failure_context(wire: &str, parcel: &str, read_back: Result<Option<String>, String>) -> String {
+    match read_back {
+        Ok(Some(head)) if head == parcel => format!(
+            "{} was lifted to the remote, and its local head moved there, but the move may not be durable", wire
+        ),
+        Ok(_) => format!("{} was lifted to the remote, but this warehouse could not move its local head there", wire),
+        Err(_) => format!("{} was lifted to the remote, but whether its local head moved there is not known", wire),
+    }
+}
+
 fn meta_conflict_refusal(conflicts: &[MetaPalletConflicts], pallet: &str, head: &str) -> String {
     let count: usize = conflicts.iter().map(|pallet| pallet.conflicts.len()).sum();
     let pallets: Vec<&str> = conflicts.iter().map(|pallet| pallet.pallet.as_str()).collect();
@@ -1624,7 +1630,27 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
 
 #[cfg(test)]
 mod tests {
-    use super::{listed_paths, parse_keeps, LISTED_PATHS};
+    use super::{listed_paths, parse_keeps, replay_failure_context, LISTED_PATHS};
+
+    // Revert: swap the landed and unmoved wording, or compare the read-back with anything but the
+    // replayed parcel → a failed write that landed reads as unmoved, or the reverse.
+    #[test]
+    fn a_failed_replay_says_where_the_read_back_found_the_local_head() {
+        let landed = replay_failure_context("@notes", "replayed", Ok(Some("replayed".to_string())));
+        assert_eq!(landed, "@notes was lifted to the remote, and its local head moved there, but the move may not be durable");
+
+        for unmoved in [Ok(Some("local".to_string())), Ok(None)] {
+            assert_eq!(
+                replay_failure_context("@notes", "replayed", unmoved),
+                "@notes was lifted to the remote, but this warehouse could not move its local head there"
+            );
+        }
+
+        assert_eq!(
+            replay_failure_context("@notes", "replayed", Err("unreadable".to_string())),
+            "@notes was lifted to the remote, but whether its local head moved there is not known"
+        );
+    }
 
     #[test]
     fn a_conflict_message_names_the_first_paths_and_counts_the_rest() {
