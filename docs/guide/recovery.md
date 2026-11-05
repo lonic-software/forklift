@@ -159,6 +159,14 @@ If the merge conflicts, `lower` stops with `merge_conflicts` (exit 47). **Do not
 option: the wire is fast-forward only. A `lower <pallet>` of a pallet this bay is not on refuses as
 `diverged` instead, naming `forklift shift <pallet>` first.
 
+### `content_redacted` (exit 49)
+
+The command would have written a pallet head that names content redacted in this warehouse, and a
+redaction means no new head may name it again. Nothing was written. The error's `details.path` and
+`details.hash` say which file and which content. Remove that file from what the command writes —
+delete it from the bay and `load` again before `stack`, for instance — and run the command again.
+The same bytes under another name are the same content, so renaming the file does not help.
+
 ### `redaction_blocked` (exit 48)
 
 The content you tried to redact is also part of a meta pallet's history: the office, the

@@ -85,7 +85,12 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 22** (current): the `redaction_blocked` error code exists (exit 48), with the meta
+**Schema 23** (current): the `content_redacted` error code exists (exit 49), with the pallet, the
+head that was refused, and the path and hash of the redacted content it named in `details.pallet`,
+`details.head`, `details.path` and `details.hash`. A remote refuses a pushed head naming redacted
+content with `422`.
+
+**Schema 22**: the `redaction_blocked` error code exists (exit 48), with the meta
 pallets whose history names the object in `details.meta_pallets`.
 
 **Schema 21**: the `merge_conflicts` error code exists (exit 47), and `conflict` (exit 4)

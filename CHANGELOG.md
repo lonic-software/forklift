@@ -98,6 +98,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Added
 
+- **The `--json` schema is now 23, with the `content_redacted` error code (exit 49).** Also part of
+  content redaction: once a file's content is redacted, a command that would write a pallet head
+  naming that content again (a `stack` of the file still in the bay, the same bytes under another
+  name, a tag or other metadata carrying them) refuses with it and writes nothing.
 - **The `--json` schema is now 22, with the `redaction_blocked` error code (exit 48).** It belongs
   to content redaction, which is being built and whose command is not yet offered: it refuses to
   redact content that the history of a meta pallet (`@office`, `@tags` and the rest) holds, since
