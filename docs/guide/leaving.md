@@ -78,8 +78,9 @@ Not exported, as git has no equivalent: @haul (hauls and their reviews).
 ```
 
 An export carries only what this warehouse holds, so it asks the configured remote what it has
-besides, and names each pallet it has no branch for as it stands there. If the remote cannot be reached, the
-export still finishes and says it could not check; `forklift pallet list --remote` asks again later.
+besides, and names each pallet it has no branch for as it stands there. If the remote cannot be
+reached, the export still finishes and says it could not check; `forklift pallet list --remote`
+asks again later.
 
 ## 3. Bring everything here, then export again
 
@@ -116,8 +117,8 @@ $ forklift haul list --state all --json > hauls.json
 $ forklift haul show <haul> --json > haul-<haul>.json
 ```
 
-The signatures can only be checked by Forklift. If you may need to prove later who stacked what, keep
-the warehouse folder: `forklift audit` checks it offline, with no server.
+The signatures can only be checked by Forklift. If you may need to prove later who stacked what,
+keep the warehouse folder: `forklift audit` checks it offline, with no server.
 
-Everything else is in git. Each commit message ends in a `Forklift-Parcel:` line naming the parcel it
-came from, so a commit can always be traced back to the warehouse you kept.
+Everything else is in git. Each commit message ends in a `Forklift-Parcel:` line naming the parcel
+it came from, so a commit can always be traced back to the warehouse you kept.

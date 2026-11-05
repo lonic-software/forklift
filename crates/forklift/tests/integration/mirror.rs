@@ -1475,6 +1475,28 @@ fn an_export_from_a_fresh_clone_names_each_remote_pallet_it_has_no_branch_for() 
 }
 
 #[test]
+fn an_export_names_a_pallet_behind_the_remote_even_when_another_holds_its_head() {
+    let fixture = Fixture::new("export-left-behind-reached");
+    let area = &fixture.area;
+    area.forklift_ok("a", &["pallet", "create", "feature"]);
+    area.stack("a", "feature.txt", "a\n", "feature work");
+    area.lift("a");
+    fixture.franchise("b");
+    area.forklift_ok("b", &["lower", "feature"]);
+
+    // The remote's "feature" moves on, and "carry" brings its new head here; "feature" here stays.
+    area.stack("a", "feature.txt", "b\n", "more feature work");
+    let feature = area.lift("a")["head"].as_str().unwrap().to_string();
+    area.forklift_ok("a", &["pallet", "create", "carry"]);
+    area.lift("a");
+    area.forklift_ok("b", &["lower", "carry"]);
+
+    let export = area.json("b", &["git", "export", area.path("out").to_str().unwrap()]);
+    assert_eq!(export["branches"], serde_json::json!(["carry", "feature", "main"]), "{}", export);
+    assert_eq!(left_behind(&export), [("feature".to_string(), feature)], "{}", export);
+}
+
+#[test]
 fn an_export_names_the_remote_tags_and_meta_pallets_it_lacks() {
     let fixture = Fixture::new("export-left-meta");
     let area = &fixture.area;
