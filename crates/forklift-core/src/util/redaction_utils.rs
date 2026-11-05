@@ -472,8 +472,10 @@ type Named = (String, String);
 
 /// The first file under `tree` that names content in `set`, walking every subtree once. `partial`
 /// (a sparse or cache warehouse) skips a subtree or recipe the store does not hold: its bytes are
-/// not here, so this warehouse cannot hand them on, and every head that receives it checks what it
-/// accepts. In a full warehouse a missing object is an error, never a pass.
+/// not here, so this warehouse cannot hand them on. A head that receives the parcel judges it
+/// against its own redactions, if it checks at all (the AWS head does not yet), so a redaction
+/// recorded only here does not follow a skipped subtree. In a full warehouse a missing object is
+/// an error, never a pass.
 fn tree_names(tree: &str, set: &RedactedSet, partial: bool) -> Result<Option<Named>, String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut pending = vec![(String::new(), tree.to_string())];
