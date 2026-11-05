@@ -751,10 +751,11 @@ fn write_named_head(pallet: &str,
                 ))
             }
             Ok(_) => Err(forklift_core::error::prefix_message(&format!("Pallet \"{}\" was not moved", pallet), error)),
-            Err(read) => Err(forklift_core::error::append_to_message(
-                forklift_core::error::prefix_message(&format!("Writing pallet \"{}\" failed", pallet), error),
-                &format!("Reading it back failed too ({}); it may or may not hold parcel {}.", read, new),
-            )),
+            Err(read) => Err(forklift_core::error::prefix_message(&format!(
+                "Writing pallet \"{}\" failed, and reading it back failed too ({}), so it may or may not \
+                hold parcel {}. The write's error",
+                pallet, read, new
+            ), error)),
         },
         refused => Err(refused.into()),
     }
