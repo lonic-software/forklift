@@ -787,7 +787,7 @@ impl RefUpdateError {
         Some(crate::error::CoreError::refusal_with_details(
             crate::error::RefusalCode::ContentRedacted,
             self.to_string(),
-            format!("remove \"{}\" from what this command writes", path),
+            format!("leave \"{}\" out of what this command writes", path),
             serde_json::json!({ "pallet": pallet.to_wire(), "head": head, "path": path, "hash": hash }),
         ))
     }
@@ -1242,7 +1242,9 @@ fn update_pallet_head_checked(
 
     let mut tombstone = recreated_tombstone(namespace, name, expected, new, acknowledged)?;
     let mut backward = served_backward(namespace, expected, new)?;
-    let mut redaction = crate::util::redaction_utils::check_head_write(namespace, name, expected, new)?;
+    // Its refusal, or a walk that failed, is reported only inside the hold and after the compares,
+    // so a ref or precondition that moved meanwhile is what the caller hears.
+    let mut redaction = crate::util::redaction_utils::check_head_write(namespace, name, expected, new);
 
     loop {
         #[cfg(test)]
@@ -1305,13 +1307,23 @@ fn update_pallet_head_checked(
 
         // `@redactions` is written under this lock too, so a redaction either lands before this
         // hold, and the head is checked against it, or after the write.
-        if !redaction.holds(&lock)? {
+        let holds = match &redaction {
+            Ok(check) => check.holds(&lock)?,
+            Err(_) => true,
+        };
+
+        if !holds {
             drop(lock);
-            redaction = crate::util::redaction_utils::check_head_write(namespace, name, expected, new)?;
+            redaction = crate::util::redaction_utils::check_head_write(namespace, name, expected, new);
             continue;
         }
 
-        let written = update_pallet_head_locked(&lock, namespace, name, expected, new, left, &redaction);
+        let check = match &redaction {
+            Ok(check) => check,
+            Err(refused) => return Err(refused.clone()),
+        };
+
+        let written = update_pallet_head_locked(&lock, namespace, name, expected, new, left, check);
 
         // A write can land and still report a failure, so the ref is read back before the
         // tombstone is kept. Once it has landed, a tombstone that cannot be cleared fails nothing:
@@ -2526,6 +2538,24 @@ pub(crate) mod tests {
 
             assert_redacted(write("main", Some(&base), &head), "web/b", &blob("secret"));
             assert_eq!(get_pallet_head("main").unwrap().as_deref(), Some(base.as_str()), "nothing was written");
+        }
+
+        // Revert: report the check's refusal before the ref's compare → a write another writer
+        // already landed reads as refused, not as landed.
+        #[test]
+        fn a_ref_already_moved_reports_the_move_before_the_redaction() {
+            let (_root, _scope) = scratch("redacted-moved");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let secret = blob("secret");
+            let head = parcel(&two_dirs("a1", "secret"), &[&base]);
+            write("main", Some(&base), &head).unwrap();
+            redact(&secret);
+
+            match write("main", Some(&base), &head) {
+                Err(RefUpdateError::Moved(moved)) => assert_eq!(moved.found.as_deref(), Some(head.as_str())),
+                other => panic!("expected the move, got {:?}", other),
+            }
         }
 
         // Revert: walk a partial warehouse's tree as a full one's → the write fails over the

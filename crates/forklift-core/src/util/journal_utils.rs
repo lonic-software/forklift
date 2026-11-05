@@ -608,7 +608,7 @@ fn create_deleted(wire: &str,
             _ => Err(CreateRefused::Other(format!("{} The undo entry is kept; run \"forklift undo\" again.", error))),
         },
         Err(RefUpdateError::Incomplete { missing, .. }) => Err(CreateRefused::Incomplete(missing)),
-        Err(error) => Err(CreateRefused::Other(error.to_string())),
+        Err(error) => Err(CreateRefused::Other(error.into())),
     }
 }
 

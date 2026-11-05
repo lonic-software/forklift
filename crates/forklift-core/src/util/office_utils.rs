@@ -1181,13 +1181,12 @@ pub fn install_trust(install: &TrustInstall) -> Result<TrustInstalled, RefUpdate
         let redaction = office_write
             .map(|new| crate::util::redaction_utils::check_head_write(
                 pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME, install.office, new,
-            ))
-            .transpose()?;
+            ));
 
         let lock = crate::util::lock_utils::RefLock::acquire()?;
 
         match &redaction {
-            Some(check) if !check.holds(&lock)? => drop(lock),
+            Some(Ok(check)) if !check.holds(&lock)? => drop(lock),
             _ => break (lock, redaction),
         }
     };
@@ -1205,6 +1204,10 @@ pub fn install_trust(install: &TrustInstall) -> Result<TrustInstalled, RefUpdate
         },
         pallets: install.pallets.clone(),
     })?;
+
+    // The check's refusal, or a walk that failed, counts only once the trust install is known to be
+    // still wanted and the office and anchor not to have moved.
+    let redaction = redaction.transpose()?;
 
     let error = match write_trust_install(&lock, install, &bytes, redaction.as_ref()) {
         Ok(()) => return Ok(TrustInstalled::Written),

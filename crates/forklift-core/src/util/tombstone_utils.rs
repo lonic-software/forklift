@@ -222,7 +222,7 @@ pub fn restore_pallet(wire: &str) -> Result<String, String> {
             Ok(Some(found)) if found == head => Ok(head),
             _ => Err(error),
         },
-        Err(error) => Err(error.to_string()),
+        Err(error) => Err(error.into()),
     }
 }
 

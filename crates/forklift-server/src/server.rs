@@ -1249,10 +1249,11 @@ fn trust_install_refusal(error: RefUpdateError) -> HandlerError {
             | RefUpdateError::Incomplete { .. }
             | RefUpdateError::WitnessMoved { .. }
             | RefUpdateError::Deleted { .. }
-            | RefUpdateError::Backward { .. }
-            | RefUpdateError::Redacted { .. }) => {
+            | RefUpdateError::Backward { .. }) => {
             (StatusCode::CONFLICT, moved.to_string())
         }
+        // Refused however often it is sent, as a ref update naming redacted content is.
+        refused @ RefUpdateError::Redacted { .. } => unprocessable(refused.to_string()),
         RefUpdateError::Failed(message) => internal(message),
     }
 }
