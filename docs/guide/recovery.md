@@ -167,6 +167,13 @@ redaction means no new head may name it again. Nothing was written. The error's 
 delete it from the bay and `load` again before `stack`, for instance — and run the command again.
 The same bytes under another name are the same content, so renaming the file does not help.
 
+`lift` refuses with this code too, before it sends the pallet, when a head you stacked earlier names
+the content; the remote may not hold the redaction yet, so its own check cannot be relied on. From
+a bay standing on that head with the file in its scope, `forklift remove` the file, `stack`, and
+lift again: the new head no longer names it. The parcels before it still do, and they lift with
+it as history, so the remote receives the content. If the lift then fails over
+`@redactions`, `lower` reconciles it with the remote's, and the next lift sends the redaction.
+
 ### `redaction_blocked` (exit 48)
 
 The content you tried to redact is also part of a meta pallet's history: the office, the

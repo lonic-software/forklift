@@ -29,7 +29,8 @@ use crate::util::body_utils::{self, BodyReadError, JsonReadError};
 use crate::util::object_utils::MAX_OBJECT_BYTES;
 use crate::util::{
     audit_utils, bundle_utils, config_utils, fetch_ledger, file_utils, haul_utils, held_heads, merge_utils, meta_tree, object_utils,
-    office_utils, origin_utils, pack_utils, pallet_utils, sealed_utils, sign_utils, take_utils, trust_utils,
+    office_utils, origin_utils, pack_utils, pallet_utils, redaction_utils, sealed_utils, sign_utils, take_utils,
+    tree_utils, trust_utils,
 };
 
 /// How many object transfers run concurrently.
@@ -6326,6 +6327,8 @@ async fn lift_pallet_inner(client: &RemoteClient,
         }
     }
 
+    refuse_redacted_head(pallet, local_head, remote_head)?;
+
     let (new_parcels, uploaded_objects, uploaded_signatures) =
         // An acknowledged tombstone's head is held on the remote (a gc root), so a re-creation
         // uploads only the work past it.
@@ -6345,6 +6348,73 @@ async fn lift_pallet_inner(client: &RemoteClient,
         old_head: remote_head.map(|hash| hash.to_string()),
         unrecorded,
     }))
+}
+
+/// Refuse to lift `local_head` over `remote_head` to `pallet` (its wire name) when this warehouse's
+/// own redactions forbid it, by the check a local ref write takes
+/// ([`redaction_utils::check_head_write`]). The remote's check is not enough: `@redactions` lifts as
+/// a meta pallet of its own, and the working pallet lifts even when that lift failed, so the remote
+/// may not hold the redaction at all. The office and other meta pallets may already have lifted
+/// when this refuses, so the refusal speaks for `pallet` alone.
+///
+/// A user pallet's refusal names the commands that stack a head without the file only where they
+/// work: from this bay, standing on the pallet at exactly `local_head`, with the file in its scope.
+/// Elsewhere (another bay stacked past this one's base, or the file is outside this bay's scope)
+/// it says what has to change. A meta pallet's refusal keeps the ref write's own next step.
+pub fn refuse_redacted_head(pallet: &str, local_head: &str, remote_head: Option<&str>) -> Result<(), String> {
+    let target = pallet_utils::PalletRef::parse(pallet)?;
+    let check = redaction_utils::check_head_write(target.namespace, &target.name, remote_head, local_head);
+
+    let Err(refused) = check.outcome() else { return Ok(()) };
+
+    let pallet_utils::RefUpdateError::Redacted { path, hash, .. } = &refused else {
+        return Err(refused.reported_with("This pallet was not lifted."));
+    };
+
+    let message = format!(
+        "Refusing to lift pallet \"{}\" at {}: it names \"{}\", whose content ({}) is redacted in this \
+        warehouse and may never be named by a new head. {}",
+        pallet, local_head.get(..12).unwrap_or(local_head), path, hash,
+        match remote_head {
+            Some(_) => format!("The remote's pallet \"{}\" was not moved.", pallet),
+            None => format!("Pallet \"{}\" was not created on the remote.", pallet),
+        }
+    );
+
+    let next_step = if target.namespace == pallet_utils::PalletNamespace::User {
+        let here = stacks_here(pallet, local_head, path, pallet_utils::read_position().ok(), || scope_utils::current_scope().ok());
+
+        let remedy = tree_utils::remedy_path(path);
+
+        Some(if here {
+            format!(
+                "from the working tree's root, forklift remove {}{}, then forklift stack -m <description>, then forklift lift",
+                remedy.as_deref().unwrap_or("-- <path>"),
+                if remedy.is_some() { "" } else { " with that path quoted for your shell" }
+            )
+        } else {
+            format!(
+                "stack a head of pallet \"{}\" without \"{}\", from a bay standing on its head with that path in scope, then lift",
+                pallet, path
+            )
+        })
+    } else {
+        None
+    };
+
+    Err(refused.redacted_refusal(message, next_step).map_or_else(|| refused.to_string(), Into::into))
+}
+
+/// Whether this checkout can take `path` out of `pallet`'s `local_head` by `remove` and `stack`:
+/// it stands on that pallet at exactly that head (`position`), and `path` is in its `scope`. A
+/// position or scope that cannot be read counts as not.
+fn stacks_here(pallet: &str,
+               local_head: &str,
+               path: &str,
+               position: Option<pallet_utils::BayPosition>,
+               scope: impl FnOnce() -> Option<PathScope>) -> bool {
+    position.is_some_and(|position| position.pallet == pallet && position.base.as_deref() == Some(local_head))
+        && scope().is_some_and(|scope| scope.classify(path) != ScopeClass::OutOfScope)
 }
 
 /// The [`RefusalCode::Diverged`] refusal for `pallet` (its wire name), whose local head and the
@@ -17481,5 +17551,23 @@ mod tests {
             expansion.walk_new_ref_heads_locally().unwrap();
             assert!(matches!(expansion.commit().unwrap(), ExpandCommit::Written(_)));
         }
+    }
+
+    #[test]
+    fn a_lift_refusal_names_remove_and_stack_only_from_a_bay_that_can_run_them() {
+        let at = |pallet: &str, base: Option<&str>| Some(pallet_utils::BayPosition::new(pallet, base.map(str::to_string)));
+        let full = || Some(PathScope::full());
+
+        assert!(stacks_here("main", "h1", "secret.env", at("main", Some("h1")), full), "this bay, at the head, in scope");
+
+        assert!(!stacks_here("main", "h1", "secret.env", at("main", Some("h0")), full), "another bay stacked past this base");
+        assert!(!stacks_here("main", "h1", "secret.env", at("side", Some("h1")), full), "a bay on another pallet");
+        assert!(!stacks_here("main", "h1", "secret.env", at("main", None), full), "an unborn base");
+        assert!(!stacks_here("main", "h1", "secret.env", None, full), "no position read");
+
+        let docs = || Some(PathScope::from_prefixes(["docs"]));
+        assert!(!stacks_here("main", "h1", "secret.env", at("main", Some("h1")), docs), "outside this bay's scope");
+        assert!(stacks_here("main", "h1", "docs/secret.env", at("main", Some("h1")), docs), "inside it");
+        assert!(!stacks_here("main", "h1", "docs/secret.env", at("main", Some("h1")), || None), "no scope read");
     }
 }

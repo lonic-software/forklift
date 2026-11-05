@@ -325,6 +325,10 @@ async fn try_auto_merge(client: &RemoteClient,
         return Ok(false);
     }
 
+    // The merge's own ref write would refuse a head naming redacted content too, but in the
+    // merge's words, so lift's check comes first.
+    remote_utils::refuse_redacted_head(pallet, head, Some(remote_head))?;
+
     // The merge materializes into this bay and moves the pallet from the tree it holds, so a bay
     // another bay or process left behind its pallet is told so instead of attempting it.
     if base != Some(head) {
