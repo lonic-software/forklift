@@ -60,7 +60,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 22;
+pub const SCHEMA_VERSION: u32 = 23;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -565,6 +565,9 @@ error_codes! {
     /// `redact` found the object in some meta pallet's history, which is never rewritten; nothing
     /// was recorded.
     RedactionBlocked,
+
+    /// A pallet head would have named content a redaction removes; nothing was written.
+    ContentRedacted,
 }
 
 impl ErrorCode {
@@ -618,6 +621,7 @@ impl ErrorCode {
             ErrorCode::HeadNotMaterializable => RefusalCode::HeadNotMaterializable.as_str(),
             ErrorCode::MergeConflicts => RefusalCode::MergeConflicts.as_str(),
             ErrorCode::RedactionBlocked => RefusalCode::RedactionBlocked.as_str(),
+            ErrorCode::ContentRedacted => RefusalCode::ContentRedacted.as_str(),
         }
     }
 
@@ -674,6 +678,7 @@ impl ErrorCode {
             ErrorCode::HeadNotMaterializable => 46,
             ErrorCode::MergeConflicts => 47,
             ErrorCode::RedactionBlocked => 48,
+            ErrorCode::ContentRedacted => 49,
         }
     }
 
@@ -801,6 +806,8 @@ impl ErrorCode {
                 "Lowering merged the remote's diverged head in, and the merge conflicts; the consolidation is left in progress",
             ErrorCode::RedactionBlocked =>
                 "The object to redact is named by a meta pallet's history, which is never rewritten, so it cannot be removed; nothing was recorded",
+            ErrorCode::ContentRedacted =>
+                "A pallet head would have named a file whose content is redacted; nothing was written",
         }
     }
 
@@ -855,6 +862,7 @@ impl ErrorCode {
             RefusalCode::Conflict => ErrorCode::Conflict,
             RefusalCode::MergeConflicts => ErrorCode::MergeConflicts,
             RefusalCode::RedactionBlocked => ErrorCode::RedactionBlocked,
+            RefusalCode::ContentRedacted => ErrorCode::ContentRedacted,
         }
     }
 }
@@ -1429,6 +1437,7 @@ mod tests {
             (RefusalCode::Conflict, "conflict", 4),
             (RefusalCode::MergeConflicts, "merge_conflicts", 47),
             (RefusalCode::RedactionBlocked, "redaction_blocked", 48),
+            (RefusalCode::ContentRedacted, "content_redacted", 49),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

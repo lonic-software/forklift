@@ -755,8 +755,42 @@ pub enum RefUpdateError {
         head: String,
     },
 
+    /// The new head would name content a redaction removes (see
+    /// [`redaction_utils::check_head_write`](crate::util::redaction_utils::check_head_write)): a
+    /// user pallet's head tree holds the file, or a meta pallet's new parcel adds a cell holding
+    /// it; nothing was written.
+    Redacted {
+        /// The pallet whose ref was to move.
+        pallet: PalletRef,
+
+        /// The refused head.
+        head: String,
+
+        /// Where the head's tree holds the redacted content.
+        path: String,
+
+        /// The redacted hash.
+        hash: String,
+    },
+
     /// Anything else: an invalid name or value, or the ref could not be read or written.
     Failed(String),
+}
+
+impl RefUpdateError {
+    /// The [`RefusalCode::ContentRedacted`](crate::error::RefusalCode::ContentRedacted) refusal a
+    /// [`RefUpdateError::Redacted`] crosses a String-typed caller as, so the code reaches the
+    /// command boundary. `None` for every other variant.
+    fn redacted_refusal(&self) -> Option<crate::error::CoreError> {
+        let RefUpdateError::Redacted { pallet, head, path, hash } = self else { return None };
+
+        Some(crate::error::CoreError::refusal_with_details(
+            crate::error::RefusalCode::ContentRedacted,
+            self.to_string(),
+            format!("remove \"{}\" from what this command writes", path),
+            serde_json::json!({ "pallet": pallet.to_wire(), "head": head, "path": path, "hash": hash }),
+        ))
+    }
 }
 
 impl std::fmt::Display for RefUpdateError {
@@ -825,6 +859,12 @@ impl std::fmt::Display for RefUpdateError {
                 pallet.to_wire(), head,
                 if pallet.namespace == PalletNamespace::Meta { "the move takes the pallet back to an older head" } else { "the new head does not descend from it" },
                 if pallet.namespace == PalletNamespace::Meta { "make a new change" } else { "stack a parcel" }
+            ),
+            RefUpdateError::Redacted { pallet, head, path, hash } => write!(
+                f,
+                "Refusing to set pallet \"{}\" to {}: it names \"{}\", whose content ({}) is \
+                redacted in this warehouse and may never be named by a new head. Nothing was written.",
+                pallet.to_wire(), &head[..head.len().min(12)], path, hash
             ),
             RefUpdateError::Failed(message) => f.write_str(message),
         }
@@ -989,7 +1029,10 @@ impl From<String> for RefUpdateError {
 
 impl From<RefUpdateError> for String {
     fn from(error: RefUpdateError) -> Self {
-        error.to_string()
+        match error.redacted_refusal() {
+            Some(refusal) => refusal.into(),
+            None => error.to_string(),
+        }
     }
 }
 
@@ -1150,6 +1193,12 @@ impl VerifiedClosure {
 /// sealed-by-hash record has the hold re-read the record the same way, since its writers commit
 /// under the lock too.
 ///
+/// The redaction check ([`redaction_utils::check_head_write`]) walks before the lock as well, and
+/// the hold re-reads the `@redactions` head it was checked against, starting over when a
+/// redaction landed meanwhile.
+///
+/// [`redaction_utils::check_head_write`]: crate::util::redaction_utils::check_head_write
+///
 /// A creation's tombstone check works the same way: whether `new` descends from the tombstone's
 /// head is walked before the lock, and the hold re-reads the tombstone, starting over when it
 /// changed meanwhile. So does a served warehouse's refusal of a move off a head `new` does not
@@ -1193,6 +1242,7 @@ fn update_pallet_head_checked(
 
     let mut tombstone = recreated_tombstone(namespace, name, expected, new, acknowledged)?;
     let mut backward = served_backward(namespace, expected, new)?;
+    let mut redaction = crate::util::redaction_utils::check_head_write(namespace, name, expected, new)?;
 
     loop {
         #[cfg(test)]
@@ -1253,7 +1303,15 @@ fn update_pallet_head_checked(
             }
         }
 
-        let written = update_pallet_head_locked(&lock, namespace, name, expected, new, left);
+        // `@redactions` is written under this lock too, so a redaction either lands before this
+        // hold, and the head is checked against it, or after the write.
+        if !redaction.holds(&lock)? {
+            drop(lock);
+            redaction = crate::util::redaction_utils::check_head_write(namespace, name, expected, new)?;
+            continue;
+        }
+
+        let written = update_pallet_head_locked(&lock, namespace, name, expected, new, left, &redaction);
 
         // A write can land and still report a failure, so the ref is read back before the
         // tombstone is kept. Once it has landed, a tombstone that cannot be cleared fails nothing:
@@ -1463,8 +1521,10 @@ fn validate_head_write(name: &str, new: &str) -> Result<(), RefUpdateError> {
 /// the readback and the write log.
 ///
 /// It is where `left`, the head the write leaves unreached ([`left_unreached`], worked out before
-/// the hold), is recorded in the fetched-heads ledger, in the same hold as the write. It verifies
-/// no closure, so a user-pallet head write must reach it through [`update_pallet_head_checked`],
+/// the hold), is recorded in the fetched-heads ledger, in the same hold as the write. It takes the
+/// write's [`RedactionCheck`](crate::util::redaction_utils::RedactionCheck), which only the
+/// redaction walk builds, and refuses one for another write or one `@redactions` has moved past,
+/// so no head reaches the ref unchecked. It verifies no closure, so a user-pallet head write must reach it through [`update_pallet_head_checked`],
 /// which verifies the new head or takes a [`VerifiedClosure`] for exactly that head, scope and
 /// namespace. Its one other caller, the trust install, writes the meta office ref, whose writer
 /// verifies its own history.
@@ -1475,8 +1535,17 @@ pub(crate) fn update_pallet_head_locked(
     expected: Option<&str>,
     new: &str,
     left: Option<&str>,
+    redaction: &crate::util::redaction_utils::RedactionCheck,
 ) -> Result<(), RefUpdateError> {
     validate_head_write(name, new)?;
+
+    if !redaction.is_for(namespace, expected, new) || !redaction.holds(lock)? {
+        return Err(RefUpdateError::Failed(format!(
+            "Refusing to set pallet \"{}\" to {}: its check against the redactions is for another \
+            write, or a redaction was recorded since. Nothing was written. Run the command again.",
+            PalletRef { namespace, name: name.to_string() }.to_wire(), &new[..new.len().min(12)]
+        )));
+    }
 
     let found = require_head(namespace, name, expected)?;
 

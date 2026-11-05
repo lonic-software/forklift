@@ -1173,8 +1173,24 @@ pub fn install_trust(install: &TrustInstall) -> Result<TrustInstalled, RefUpdate
 
     let bytes = encode_trust_anchor(install.anchor).into_bytes();
     let office_target = install.new_office.or(install.office);
+    let office_write = install.new_office.filter(|new| Some(*new) != install.office);
 
-    let lock = crate::util::lock_utils::RefLock::acquire()?;
+    // The office's move is checked against the redactions before the hold, and again (by the
+    // `@redactions` head it was checked against) inside it.
+    let (lock, redaction) = loop {
+        let redaction = office_write
+            .map(|new| crate::util::redaction_utils::check_head_write(
+                pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME, install.office, new,
+            ))
+            .transpose()?;
+
+        let lock = crate::util::lock_utils::RefLock::acquire()?;
+
+        match &redaction {
+            Some(check) if !check.holds(&lock)? => drop(lock),
+            _ => break (lock, redaction),
+        }
+    };
 
     if read_trust_anchor_bytes()?.as_deref() == Some(bytes.as_slice())
         && pallet_utils::get_meta_pallet_head(OFFICE_PALLET_NAME)?.as_deref() == office_target {
@@ -1190,7 +1206,7 @@ pub fn install_trust(install: &TrustInstall) -> Result<TrustInstalled, RefUpdate
         pallets: install.pallets.clone(),
     })?;
 
-    let error = match write_trust_install(&lock, install, &bytes) {
+    let error = match write_trust_install(&lock, install, &bytes, redaction.as_ref()) {
         Ok(()) => return Ok(TrustInstalled::Written),
         Err(error) => error,
     };
@@ -1247,7 +1263,8 @@ pub fn install_trust(install: &TrustInstall) -> Result<TrustInstalled, RefUpdate
 /// The writes of [`install_trust`], under its hold: the anchor, then the office.
 fn write_trust_install(lock: &crate::util::lock_utils::RefLock,
                        install: &TrustInstall,
-                       bytes: &[u8]) -> Result<(), RefUpdateError> {
+                       bytes: &[u8],
+                       redaction: Option<&crate::util::redaction_utils::RedactionCheck>) -> Result<(), RefUpdateError> {
     file_utils::write_file_atomically(&forklift_root().join(FILE_NAME_TRUST), bytes)?;
 
     #[cfg(test)]
@@ -1265,8 +1282,12 @@ fn write_trust_install(lock: &crate::util::lock_utils::RefLock,
         return Err(RefUpdateError::Failed("injected office write refusal".to_string()));
     }
 
+    let redaction = redaction.ok_or_else(|| RefUpdateError::Failed(
+        "The office's move was not checked against the redactions; nothing was written.".to_string()
+    ))?;
+
     let written = pallet_utils::update_pallet_head_locked(
-        lock, pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME, install.office, new_office, None,
+        lock, pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME, install.office, new_office, None, redaction,
     );
 
     #[cfg(test)]

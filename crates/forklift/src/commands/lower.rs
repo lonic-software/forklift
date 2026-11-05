@@ -1382,8 +1382,9 @@ pub(crate) async fn replay(client: &RemoteClient,
                 }
                 // A replay lifts a fresh parcel onto the remote head, so it never takes the
                 // pallet back, and only a user pallet has a tombstone or a completeness check:
-                // none of these is expected, and running lower again would not clear one.
-                Backward { .. } | Deleted { .. } | Incomplete { .. } => {
+                // none of these is expected. A replay naming redacted content is refused however
+                // often it runs. Running lower again would clear none of them.
+                Backward { .. } | Deleted { .. } | Incomplete { .. } | Redacted { .. } => {
                     return Err(format!(
                         "{} was lifted to the remote, but this warehouse refused to move its local \
                         head there.{} {}",

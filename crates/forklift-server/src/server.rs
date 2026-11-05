@@ -1249,7 +1249,8 @@ fn trust_install_refusal(error: RefUpdateError) -> HandlerError {
             | RefUpdateError::Incomplete { .. }
             | RefUpdateError::WitnessMoved { .. }
             | RefUpdateError::Deleted { .. }
-            | RefUpdateError::Backward { .. }) => {
+            | RefUpdateError::Backward { .. }
+            | RefUpdateError::Redacted { .. }) => {
             (StatusCode::CONFLICT, moved.to_string())
         }
         RefUpdateError::Failed(message) => internal(message),
@@ -3028,7 +3029,9 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                 }
                 // The fast-forward check above refuses such a move first; a conflict all the same.
                 Err(backward @ RefUpdateError::Backward { .. }) => return Err((StatusCode::CONFLICT, backward.to_string())),
-                Err(refused @ RefUpdateError::Incomplete { .. }) => {
+                // A head naming redacted content is refused however often it is sent: the client
+                // must write a head without it.
+                Err(refused @ (RefUpdateError::Incomplete { .. } | RefUpdateError::Redacted { .. })) => {
                     return Err(unprocessable(refused.to_string()));
                 }
                 Err(RefUpdateError::Deleted { pallet, head, acknowledged }) => {
