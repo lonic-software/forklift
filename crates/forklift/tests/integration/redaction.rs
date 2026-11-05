@@ -175,21 +175,6 @@ fn content_a_meta_pallet_history_names_is_refused_with_its_code() {
 }
 
 #[test]
-fn content_only_an_older_meta_parcel_names_is_refused_too() {
-    let warehouse = Warehouse::new("meta-history");
-    warehouse.stack("notes.txt", b"first\n", "first");
-    warehouse.run_ok(&["tag", "create", "v1", "main"]);
-    warehouse.stack("marker.txt", b"forklift-meta 1 tags", "marker");
-
-    // Every later @tags parcel still carries the marker, so the walk must reach it through the
-    // chain's head as well as its root; a second tag makes the chain longer than one parcel.
-    warehouse.run_ok(&["tag", "create", "v2", "main"]);
-
-    let refused = warehouse.run(&["redact", "record", "main:marker.txt", "--reason", "r"]);
-    assert_eq!(refused.status.code(), Some(48), "{}", String::from_utf8_lossy(&refused.stderr));
-}
-
-#[test]
 fn an_enrolled_admin_records_a_signed_redaction() {
     let warehouse = Warehouse::new("signed");
     warehouse.run_ok(&["office", "enroll"]);

@@ -3831,6 +3831,22 @@ mod tests {
     }
 
     #[test]
+    fn a_meta_chain_names_a_hash_only_an_older_parcel_holds() {
+        let _scratch = Scratch::new("redactions-chain");
+        let alice = Key::new("alice", 1);
+        let held = store_blob(b"held").unwrap();
+        let other = store_blob(b"other").unwrap();
+
+        // The root's cells hold the blob; the head removed it, so only history names it.
+        let root = forge(&[], &kv(), cells(&[("k", &held)]).as_deref(), &alice.signer());
+        let head = forge(&[&root], &kv(), None, &alice.signer());
+
+        assert!(redaction_utils::chain_names(&head, &held, false).unwrap());
+        assert!(redaction_utils::chain_names(&root, &held, false).unwrap());
+        assert!(!redaction_utils::chain_names(&head, &other, false).unwrap());
+    }
+
+    #[test]
     fn a_tag_from_before_trust_is_admitted_without_its_role_and_a_signed_one_is_not() {
         let _scratch = Scratch::new("tags-legacy");
         let (alice, bob) = (Key::new("alice", 1), Key::new("bob", 2));

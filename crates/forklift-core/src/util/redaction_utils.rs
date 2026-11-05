@@ -295,7 +295,7 @@ pub fn meta_holders(hash: &str) -> Result<Vec<String>, String> {
 }
 
 /// Whether any parcel reachable from `head` has a tree naming `hash` at any depth.
-fn chain_names(head: &str, hash: &str, may_be_absent: bool) -> Result<bool, String> {
+pub(crate) fn chain_names(head: &str, hash: &str, may_be_absent: bool) -> Result<bool, String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut pending = vec![(head.to_string(), true)];
 
