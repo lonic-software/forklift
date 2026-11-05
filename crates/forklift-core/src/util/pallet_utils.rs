@@ -2781,6 +2781,51 @@ pub(crate) mod tests {
             assert_eq!(get_meta_pallet_head("notes").unwrap().as_deref(), Some(inherits.as_str()));
         }
 
+        // Revert: drop `served` from the walk's reached set → the served chain adding the redacted
+        // blob is refused; or exempt the whole new chain → the replay adding one lands.
+        #[test]
+        fn a_served_meta_chain_is_taken_and_only_what_it_reaches() {
+            let (_root, _scope) = scratch("redacted-served");
+            let held = blob("held");
+            let base = parcel(&tree(&[("held", &held, DirEntryType::Normal)]), &[]);
+            update_meta_pallet_head("notes", None, &base, &RefPreconditions::NONE).unwrap();
+            let local = parcel(&tree(&[
+                ("held", &held, DirEntryType::Normal),
+                ("mine", &blob("mine"), DirEntryType::Normal),
+            ]), &[&base]);
+            update_meta_pallet_head("notes", Some(&base), &local, &RefPreconditions::NONE).unwrap();
+
+            let secret = blob("secret");
+            redact(&secret);
+            let remote = parcel(&tree(&[
+                ("held", &held, DirEntryType::Normal),
+                ("secret", &secret, DirEntryType::Normal),
+            ]), &[&base]);
+
+            // A replay of the local parcel onto the served head, adding a redacted blob of its own.
+            let later = blob("later");
+            redact(&later);
+            let mine = blob("mine");
+            let replay = |extra: &[(&str, &str, DirEntryType)]| {
+                let mut entries = vec![
+                    ("held", held.as_str(), DirEntryType::Normal),
+                    ("mine", mine.as_str(), DirEntryType::Normal),
+                    ("secret", secret.as_str(), DirEntryType::Normal),
+                ];
+                entries.extend_from_slice(extra);
+                parcel(&tree(&entries), &[&remote])
+            };
+            let refused = replay(&[("later", &later, DirEntryType::Normal)]);
+            assert_redacted(
+                update_meta_pallet_head_served("notes", Some(&local), &refused, &remote, &RefPreconditions::NONE), "later", &later
+            );
+            assert_eq!(get_meta_pallet_head("notes").unwrap().as_deref(), Some(local.as_str()));
+
+            let taken = replay(&[]);
+            update_meta_pallet_head_served("notes", Some(&local), &taken, &remote, &RefPreconditions::NONE).unwrap();
+            assert_eq!(get_meta_pallet_head("notes").unwrap().as_deref(), Some(taken.as_str()));
+        }
+
         // Revert: accept a locked write whatever check it is handed, or ignore the pallet's name
         // → the write lands under a check made for another head, or another pallet.
         #[test]
