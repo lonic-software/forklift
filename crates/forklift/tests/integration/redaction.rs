@@ -390,6 +390,18 @@ fn a_lift_is_refused_by_this_warehouses_own_redactions_until_the_file_is_taken_o
     );
     assert_eq!(served_main(&server.url, "lift-refused"), served, "nothing was lifted");
 
+    // Another warehouse lifts a change of its own to main, so this lift would merge it in first.
+    // It is refused in lift's own words, before any merge is written.
+    let ahead = Warehouse::cloned("lift-ahead", &server.url);
+    ahead.stack("more.txt", b"more\n", "more");
+    ahead.run_ok(&["lift"]);
+    let local = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap();
+
+    let error = content_redacted(&warehouse, &["lift"]);
+    assert!(error["message"].as_str().unwrap().starts_with("Refusing to lift pallet \"main\""), "{}", error);
+    assert_eq!(error["details"]["path"], "secret.env", "{}", error);
+    assert_eq!(std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap(), local, "no merge was written");
+
     // The next step, as it says. The working pallet lifts; the lift still fails over @redactions,
     // which only a lower reconciles with the remote's.
     warehouse.run_ok(&["remove", "secret.env"]);
@@ -403,4 +415,20 @@ fn a_lift_is_refused_by_this_warehouses_own_redactions_until_the_file_is_taken_o
 
     warehouse.run_ok(&["lower"]);
     warehouse.run_ok(&["lift"]);
+}
+
+#[test]
+fn a_lift_refused_for_a_pallet_the_remote_lacks_says_it_was_not_created() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-lift-new-server-{}", std::process::id())));
+
+    let warehouse = Warehouse::cloned("lift-new", &server.url);
+    warehouse.run_ok(&["pallet", "create", "fresh"]);
+    warehouse.stack("secret.env", b"TOKEN=hunter2\n", "leak");
+    recorded_hash(&warehouse, "fresh:secret.env", "leaked token");
+
+    let error = content_redacted(&warehouse, &["lift"]);
+    assert_eq!(error["details"]["pallet"], "fresh", "{}", error);
+    let message = error["message"].as_str().unwrap();
+    assert!(message.ends_with("Pallet \"fresh\" was not created on the remote."), "{}", error);
 }

@@ -6359,9 +6359,9 @@ async fn lift_pallet_inner(client: &RemoteClient,
 ///
 /// A user pallet's refusal names the commands that stack a head without the file only where they
 /// work: from this bay, standing on the pallet at exactly `local_head`, with the file in its scope.
-/// Elsewhere (another bay stacked past this one's base, or the file is outside this bay's scope),
-/// and for a meta pallet, whose history is not taken back, it says what has to change.
-fn refuse_redacted_head(pallet: &str, local_head: &str, remote_head: Option<&str>) -> Result<(), String> {
+/// Elsewhere (another bay stacked past this one's base, or the file is outside this bay's scope)
+/// it says what has to change. A meta pallet's refusal keeps the ref write's own next step.
+pub fn refuse_redacted_head(pallet: &str, local_head: &str, remote_head: Option<&str>) -> Result<(), String> {
     let target = pallet_utils::PalletRef::parse(pallet)?;
     let check = redaction_utils::check_head_write(target.namespace, &target.name, remote_head, local_head);
 
@@ -6373,8 +6373,12 @@ fn refuse_redacted_head(pallet: &str, local_head: &str, remote_head: Option<&str
 
     let message = format!(
         "Refusing to lift pallet \"{}\" at {}: it names \"{}\", whose content ({}) is redacted in this \
-        warehouse and may never be named by a new head. The remote's pallet \"{}\" was not moved.",
-        pallet, &local_head[..local_head.len().min(12)], path, hash, pallet
+        warehouse and may never be named by a new head. {}",
+        pallet, local_head.get(..12).unwrap_or(local_head), path, hash,
+        match remote_head {
+            Some(_) => format!("The remote's pallet \"{}\" was not moved.", pallet),
+            None => format!("Pallet \"{}\" was not created on the remote.", pallet),
+        }
     );
 
     let next_step = if target.namespace == pallet_utils::PalletNamespace::User {
