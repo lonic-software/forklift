@@ -168,7 +168,7 @@ async fn check_remote(exporter: &Exporter<'_>) -> RemoteCheck {
     let mut check = RemoteCheck { left_behind: Vec::new(), meta: Vec::new(), unchecked: None };
 
     let info = match RemoteClient::for_warehouse() {
-        Ok(client) => client.fetch_info().await.map_err(String::from),
+        Ok(client) => client.fetch_info().await,
         Err(e) => Err(String::from(e)),
     };
     let info = match info {

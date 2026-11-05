@@ -187,9 +187,9 @@ it (`parked`).
 Only what this warehouse holds is exported, so with a remote configured, the export also asks the
 remote for its pallets. Each one whose head is not among the exported parcels gets a warning naming
 the `lower` that brings it here (`remote_left_behind` in `--json`), and so does the remote's `@tags`
-when it has tags this warehouse lacks. A fresh clone holds only the pallet it checked out, so leaving
-from one without this would silently lose the others. A remote that cannot be reached does not fail
-the export: one warning says the check could not be made (`remote_unchecked`).
+when it has tags this warehouse lacks. A fresh clone holds only the pallet it checked out, so
+leaving from one without this would silently lose the others. A remote that cannot be reached does
+not fail the export: one warning says the check could not be made (`remote_unchecked`).
 
 Each tag on an exported parcel becomes an **annotated git tag** over that parcel's commit, with
 the tag's message and date, and as tagger the operator the office binds its signing key to,
