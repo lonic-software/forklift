@@ -1386,3 +1386,50 @@ fn a_tag_on_a_pallet_not_mirrored_is_left_out() {
     assert_eq!(lifted["mirror"]["status"], "pushed", "{}", lifted);
     assert!(lifted["mirror"].get("skipped_tags").is_none(), "{}", lifted);
 }
+
+/// A mirror repository found damaged while finding a tag's commit fails the run with the delete
+/// step; it is not a tag left out. The damage sits below the tip's own parent check: the commit of
+/// main's first parcel names another parcel, and git holds the same rewritten history, so main is
+/// in step and only the tag's descent reaches it.
+///
+/// Revert: let a problem finding a tag's commit be an ordinary skip → the run exits 0.
+#[test]
+fn a_damaged_mirror_under_a_tag_fails_the_tags() {
+    let fixture = Fixture::new("tag-damaged");
+    let area = &fixture.area;
+
+    area.forklift_ok("a", &["config", "set", "mirror.auto", "off"]);
+    area.stack("a", "code.txt", "v2\n", "second");
+    let second = area.lift("a")["head"].as_str().unwrap().to_string();
+    area.stack("a", "code.txt", "v3\n", "third");
+    area.lift("a");
+    area.forklift_ok("a", &["git", "mirror"]);
+
+    let mirror = fixture.mirror_dir("a");
+    let commits: Vec<String> = git_ok(&mirror, &["rev-list", "--reverse", "refs/forklift/exported/main"])
+        .lines().map(str::to_string).collect();
+    assert_eq!(commits.len(), 3);
+    let mut parent: Option<String> = None;
+    for (index, commit) in commits.iter().enumerate() {
+        let tree = git_ok(&mirror, &["rev-parse", &format!("{}^{{tree}}", commit)]);
+        let message = match index {
+            0 => format!("first\n\n{}\n", parcel_line(&second)),
+            _ => git_ok(&mirror, &["log", "-1", "--format=%B", commit]) + "\n",
+        };
+        let parents: Vec<&str> = parent.iter().map(String::as_str).collect();
+        parent = Some(write_commit(&mirror, &tree, &parents, &message));
+    }
+    let rewritten = parent.unwrap();
+    git_ok(&mirror, &["update-ref", "refs/forklift/exported/main", &rewritten]);
+    git_ok(&mirror, &["push", "-q", fixture.git.to_str().unwrap(), &format!("+{}:refs/heads/main", rewritten)]);
+
+    area.forklift_ok("a", &["tag", "create", "v0", &fixture.first]);
+    area.lift("a");
+    let run = area.forklift("a", &["--json", "git", "mirror"]);
+    assert_eq!(run.status.code(), Some(33), "{}", stdout(&run));
+    let document: serde_json::Value = serde_json::from_str(&stdout(&run)).unwrap();
+    let details = &document["error"]["details"];
+    assert_eq!(outcome(details, "main")["status"], "up_to_date", "{}", document);
+    assert!(details["tags_error"].as_str().unwrap().contains("Delete .forklift/mirror.git"), "{}", document);
+    assert!(!git(&fixture.git, &["rev-parse", "--verify", "-q", "refs/tags/v0"]).status.success());
+}

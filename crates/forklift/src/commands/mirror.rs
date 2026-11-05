@@ -186,18 +186,10 @@ pub(crate) async fn after_lift(client: &RemoteClient, pallet: &str, head: &str) 
             return Ok::<LiftMirror, Problem>(LiftMirror::pallet(outcome));
         }
 
-        // Tags on other pallets are left to their own lifts, so they are not named here.
-        let mut tags = match client.fetch_info().await {
+        let tags = match client.fetch_info().await {
             Ok(info) => run.mirror_tags(info.pallets.get(&tags_pallet_key()).map(String::as_str), &[head.to_string()], true).await,
             Err(why) => TagsMirror { tags_error: Some(why), ..TagsMirror::default() },
         };
-        if let Some(why) = tags.tags_error.take() {
-            tags.tags_error = Some(format!(
-                "{} Run \"forklift git mirror\", which first brings this warehouse's office up to the \
-                remote's.",
-                why
-            ));
-        }
 
         Ok(LiftMirror { pallet: outcome, tags })
     }.await;
@@ -837,18 +829,21 @@ impl<'a> Run<'a> {
 
     /// Push every tag at `tags_head` (the remote's `@tags` head; none when it has no tags) whose
     /// parcel is on one of the `in_step` heads, as the annotated tag `git export` writes over that
-    /// parcel's commit. A tag git already holds as another object is refused, never forced. With
-    /// `quiet_off_branch`, a tag on no `in_step` head is passed over without being named.
-    async fn mirror_tags(&mut self, tags_head: Option<&str>, in_step: &[String], quiet_off_branch: bool) -> TagsMirror {
+    /// parcel's commit. A tag git already holds as another object is refused, never forced.
+    ///
+    /// For a `lift`, which mirrors one pallet, a tag on no `in_step` head and a tag cell that
+    /// cannot be read are passed over without being named (they may belong to any pallet), and
+    /// tags the local office cannot verify name `forklift git mirror`, which brings it up first.
+    async fn mirror_tags(&mut self, tags_head: Option<&str>, in_step: &[String], lift: bool) -> TagsMirror {
         let Some(head) = tags_head else { return TagsMirror::default() };
 
-        match self.try_mirror_tags(head, in_step, quiet_off_branch).await {
+        match self.try_mirror_tags(head, in_step, lift).await {
             Ok(tags) => tags,
             Err(problem) => TagsMirror { tags_error: Some(problem.into_message()), ..TagsMirror::default() },
         }
     }
 
-    async fn try_mirror_tags(&mut self, head: &str, in_step: &[String], quiet_off_branch: bool) -> Result<TagsMirror, Problem> {
+    async fn try_mirror_tags(&mut self, head: &str, in_step: &[String], lift: bool) -> Result<TagsMirror, Problem> {
         let mut mirrored = TagsMirror::default();
 
         // Verified as a take of @tags is: git receives only tags the anchor vouches for, each
@@ -861,12 +856,21 @@ impl<'a> Run<'a> {
         };
         let office = meta_tree::verify_meta_update(
             tag_utils::TAGS_PALLET_NAME, &tag_utils::TagsRules, meta_tree::Admission::Audit, anchor, office_head, None, head,
-        ).map_err(|why| Problem::Failed(format!("The Forklift remote's tags were refused: {}", why)))?;
+        ).map_err(|why| Problem::Failed(match lift {
+            false => format!("The Forklift remote's tags were refused: {}", why),
+            true => format!(
+                "The Forklift remote's tags were refused: {} Run \"forklift git mirror\", which first \
+                brings this warehouse's office up to the remote's.",
+                why
+            ),
+        }))?;
 
         let read = tag_utils::read_tags_at(head, office.as_ref())?;
-        mirrored.skipped_tags = read.unreadable.iter()
-            .map(|tag| SkippedTag { name: tag.name.clone(), reason: format!("it cannot be read: {}", tag.reason) })
-            .collect();
+        if !lift {
+            mirrored.skipped_tags = read.unreadable.iter()
+                .map(|tag| SkippedTag { name: tag.name.clone(), reason: format!("it cannot be read: {}", tag.reason) })
+                .collect();
+        }
         if read.tags.is_empty() {
             return Ok(mirrored);
         }
@@ -880,23 +884,26 @@ impl<'a> Run<'a> {
         let mut failure: Option<Problem> = None;
         let (writable, skipped) = export_git::plan_tags(
             repo, &read.tags, office.as_ref().ok_or("this warehouse holds no trust anchor"), &held_names,
-            |attributed| match self.tag_commit(&attributed.tag.subject, in_step) {
-                Ok(Some(commit)) => Ok(commit),
-                Ok(None) => {
-                    off_branch.insert(attributed.tag.name.clone());
-                    Err(format!("its parcel {} is on no branch the mirror holds in step with git", attributed.tag.subject))
-                }
-                Err(problem) => {
-                    failure.get_or_insert(problem);
-                    Err(String::new())
-                }
+            |attributed| match failure.is_some() {
+                true => Err(String::new()),
+                false => match self.tag_commit(&attributed.tag.subject, in_step) {
+                    Ok(Some(commit)) => Ok(commit),
+                    Ok(None) => {
+                        off_branch.insert(attributed.tag.name.clone());
+                        Err(format!("its parcel {} is on no branch the mirror holds in step with git", attributed.tag.subject))
+                    }
+                    Err(problem) => {
+                        failure = Some(problem);
+                        Err(String::new())
+                    }
+                },
             },
         )?;
         if let Some(problem) = failure {
             return Err(problem);
         }
         mirrored.skipped_tags.extend(skipped.into_iter()
-            .filter(|tag| !(quiet_off_branch && off_branch.contains(&tag.name))));
+            .filter(|tag| !(lift && off_branch.contains(&tag.name))));
 
         let mut pushes: Vec<(String, String)> = Vec::new();
         for WritableTag { attributed, commit, tagger, signer, refname } in writable {
