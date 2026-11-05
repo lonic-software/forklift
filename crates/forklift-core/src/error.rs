@@ -337,6 +337,12 @@ refusal_codes! {
     /// meta pallet's new parcel adds. Nothing was written; the details name the pallet, the file's
     /// path and the redacted hash, and the next step names the file to leave out.
     ContentRedacted => "content_redacted",
+
+    /// `redact` refused to record a redaction: a user pallet head names the object, and a
+    /// redaction removes content from history only. Nothing was recorded; the details name the
+    /// heads that hold it, and the next step takes the file out of one so the redaction can be
+    /// recorded.
+    HeadNamesContent => "head_names_content",
 }
 
 impl RefusalCode {

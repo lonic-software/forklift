@@ -98,6 +98,11 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Added
 
+- **The `--json` schema is now 24, with the `head_names_content` error code (exit 50).** Content
+  redaction removes content from history only, so recording a redaction of content a pallet head
+  still holds is refused with it, naming every head that holds the file; take the file out of each,
+  then record the redaction as its next step names, usually at the parcel that held the file, as
+  `<parcel>:<path>`.
 - **The `--json` schema is now 23, with the `content_redacted` error code (exit 49).** Also part of
   content redaction: once a file's content is redacted, a command that would write a pallet head
   naming that content again (a `stack` of the file still in the bay, the same bytes under another

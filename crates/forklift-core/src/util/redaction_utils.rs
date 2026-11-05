@@ -13,7 +13,9 @@
 //! that adds one must be signed by an Admin of the office as it stands when the parcel is admitted
 //! — the convention `@tags` follows, for the same reasons. A hash some meta pallet's history names
 //! is refused when the redaction is recorded: a meta pallet's history is never rewritten, so its
-//! content could never be removed.
+//! content could never be removed. So is one a pallet head names, until the file is taken out of
+//! it; that refusal only comes early, since no head written after the redaction may name the
+//! content either way.
 
 use std::collections::HashSet;
 use toml_edit::{value, Table};
@@ -352,10 +354,97 @@ pub(crate) fn chain_names(pallet: &str, head: &str, hash: &str) -> Result<bool, 
     Ok(false)
 }
 
+/// A user pallet head that names the content a redaction would remove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadHolder {
+    /// The pallet.
+    pub pallet: String,
+
+    /// Its head.
+    pub head: String,
+
+    /// Where the head's tree holds the content.
+    pub path: String,
+
+    /// The hash at that path: the redacted hash, or for a recipe, another with the same chunk
+    /// list.
+    pub hash: String,
+}
+
+/// Every user pallet whose head names what `redaction` removes, by the rule a head write is
+/// judged by: the redacted hash anywhere in the head's tree, or for a recipe, a chunked file with
+/// the same chunk list. A partial warehouse skips a head, subtree or recipe it does not hold, as
+/// the write check does, so a head can name the content in a part this warehouse never fetched.
+/// Elsewhere an object the walk needs and the store lacks is an error, never a pass; a pallet that
+/// does name the content is reported ahead of that error.
+pub fn head_holders(redaction: &Redaction) -> Result<Vec<HeadHolder>, String> {
+    let set = RedactedSet {
+        hashes: HashSet::from([redaction.hash.clone()]),
+        chunk_lists: redaction.chunks.iter().cloned().collect(),
+    };
+
+    let partial = crate::util::scope_utils::content_may_be_absent()?;
+    let mut holders = Vec::new();
+    let mut undecided = None;
+
+    for pallet in pallet_utils::list_pallets()? {
+        let Some(head) = pallet_utils::get_pallet_head(&pallet)? else { continue };
+
+        if partial && !file_utils::does_object_exist(&head)? {
+            continue;
+        }
+
+        let mut skipped = HashSet::new();
+        let named = object_utils::load_parcel(&head)
+            .and_then(|parcel| tree_names(&parcel.tree_hash, &set, partial.then_some(&mut skipped)));
+
+        match named {
+            Ok(Some((path, hash))) => holders.push(HeadHolder { pallet, head, path, hash }),
+            Ok(None) => {}
+            Err(error) => {
+                undecided.get_or_insert(format!(
+                    "The head of pallet \"{}\" ({}) cannot be read ({}), so whether it names {} cannot \
+                    be told, and nothing was recorded.",
+                    pallet, head, error.trim_end_matches('.'), redaction.hash
+                ));
+            }
+        }
+    }
+
+    match undecided {
+        Some(error) if holders.is_empty() => Err(error),
+        _ => Ok(holders),
+    }
+}
+
+/// The command that records the redaction of the file at `path` in parcel `head`, for a next step
+/// given once that head is no longer a pallet's: `<revision>:<path>` resolves whether or not the
+/// store holds the content, where a bare hash needs it held.
+pub fn record_command(head: &str, path: &str) -> String {
+    record_command_when(head, path, cfg!(windows))
+}
+
+/// [`record_command`], quoting for Windows when `windows`.
+fn record_command_when(head: &str, path: &str, windows: bool) -> String {
+    // The path is quoted on its own; behind the head it never starts the argument, so it needs no
+    // `--` either.
+    match crate::util::tree_utils::remedy_path_when(path, windows) {
+        Some(quoted) => format!(
+            "forklift redact record {}:{} -m <reason>",
+            head, quoted.strip_prefix("-- ").unwrap_or(&quoted)
+        ),
+        None => format!(
+            "forklift redact record {}:<path> -m <reason>, with that path quoted for your shell",
+            head
+        ),
+    }
+}
+
 /// Record a redaction, as one cell on the local `@redactions` head stamped by `writer`. The
 /// caller holds the warehouse lock, and has resolved the hash and checked it against the meta
-/// pallets; the content check refuses a signer who is not an admin, and a hash already redacted
-/// (a fresh `redacted_at` always changes the cells, so a repeat reaches that check).
+/// pallets and the pallet heads; the content check refuses a signer who is not an admin, and a
+/// hash already redacted (a fresh `redacted_at` always changes the cells, so a repeat reaches that
+/// check).
 pub fn record_redaction(redaction: &Redaction,
                         writer: &MetaWriter,
                         actor: &Operator) -> Result<String, String> {
@@ -843,6 +932,22 @@ mod tests {
         assert_ne!(digest(&[&b, &c]), digest(&[&c, &b]));
         assert_ne!(digest(&[&b]), digest(&[&b, &b]));
         assert!(object_utils::is_object_hash(&digest(&[&b])));
+    }
+
+    #[test]
+    fn the_record_command_quotes_the_path_behind_the_head() {
+        let command = |path: &str, windows: bool| record_command_when("abc123", path, windows);
+
+        for windows in [false, true] {
+            assert_eq!(command("dir/secret.env", windows), "forklift redact record abc123:dir/secret.env -m <reason>");
+            assert_eq!(command("-x.env", windows), "forklift redact record abc123:-x.env -m <reason>");
+        }
+
+        assert_eq!(command("a b.env", false), "forklift redact record abc123:'a b.env' -m <reason>");
+        assert_eq!(
+            command("a b.env", true),
+            "forklift redact record abc123:<path> -m <reason>, with that path quoted for your shell"
+        );
     }
 
     #[test]

@@ -182,6 +182,18 @@ never rewritten, so the content can never be removed from this warehouse or any 
 nothing was recorded. The error's `details.meta_pallets` names where it is. Treat the content as
 exposed: rotate or revoke the secret it holds.
 
+### `head_names_content` (exit 50)
+
+The content you tried to redact is still in the head of a pallet: a redaction removes content from
+history only, so nothing was recorded. The error's `details.heads` names each pallet, its head and
+the path the file has there. Take the file out of each head: `forklift remove` it and `stack`, from
+a bay standing on that pallet's head with the path in its scope. Then record the redaction at a
+head you left whose file is the object itself, as `forklift redact record <head>:<path>`. The
+pallet's new head no longer has the file, and that form works even where this warehouse does not
+hold the content. A chunked file can be in a head under another recipe with the same chunks; that
+head's path names the other recipe, so where no head holds the object itself, record it by its
+hash. The error's `next_step` names the commands for one of the heads and the record that fits.
+
 ### `merge_conflicts` (exit 47)
 
 `lower` merged the remote's diverged head into your pallet, and both sides changed the same paths.

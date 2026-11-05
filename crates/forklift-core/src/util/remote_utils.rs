@@ -6357,10 +6357,8 @@ async fn lift_pallet_inner(client: &RemoteClient,
 /// may not hold the redaction at all. The office and other meta pallets may already have lifted
 /// when this refuses, so the refusal speaks for `pallet` alone.
 ///
-/// A user pallet's refusal names the commands that stack a head without the file only where they
-/// work: from this bay, standing on the pallet at exactly `local_head`, with the file in its scope.
-/// Elsewhere (another bay stacked past this one's base, or the file is outside this bay's scope)
-/// it says what has to change. A meta pallet's refusal keeps the ref write's own next step.
+/// A user pallet's refusal names the commands that stack a head without the file where they work
+/// ([`take_out_next_step`]). A meta pallet's refusal keeps the ref write's own next step.
 pub fn refuse_redacted_head(pallet: &str, local_head: &str, remote_head: Option<&str>) -> Result<(), String> {
     let target = pallet_utils::PalletRef::parse(pallet)?;
     let check = redaction_utils::check_head_write(target.namespace, &target.name, remote_head, local_head, None);
@@ -6381,28 +6379,34 @@ pub fn refuse_redacted_head(pallet: &str, local_head: &str, remote_head: Option<
         }
     );
 
-    let next_step = if target.namespace == pallet_utils::PalletNamespace::User {
-        let here = stacks_here(pallet, local_head, path, pallet_utils::read_position().ok(), || scope_utils::current_scope().ok());
-
-        let remedy = tree_utils::remedy_path(path);
-
-        Some(if here {
-            format!(
-                "from the working tree's root, forklift remove {}{}, then forklift stack -m <description>, then forklift lift",
-                remedy.as_deref().unwrap_or("-- <path>"),
-                if remedy.is_some() { "" } else { " with that path quoted for your shell" }
-            )
-        } else {
-            format!(
-                "stack a head of pallet \"{}\" without \"{}\", from a bay standing on its head with that path in scope, then lift",
-                pallet, path
-            )
-        })
-    } else {
-        None
-    };
+    let next_step = (target.namespace == pallet_utils::PalletNamespace::User)
+        .then(|| take_out_next_step(pallet, local_head, path, "forklift lift"));
 
     Err(refused.redacted_refusal(message, next_step).map_or_else(|| refused.to_string(), Into::into))
+}
+
+/// The next step that takes `path` out of user pallet `pallet`, whose head is `head`, followed by
+/// `then`. It names `remove` and `stack` only where they work: from this bay, standing on the
+/// pallet at exactly `head`, with the file in its scope. Elsewhere (another bay stacked past this
+/// one's base, or the file is outside this bay's scope) it says what has to change.
+pub fn take_out_next_step(pallet: &str, head: &str, path: &str, then: &str) -> String {
+    let here = stacks_here(pallet, head, path, pallet_utils::read_position().ok(), || scope_utils::current_scope().ok());
+
+    if !here {
+        return format!(
+            "stack a head of pallet \"{}\" without \"{}\", from a bay standing on its head with that path in scope, then {}",
+            pallet, path, then
+        );
+    }
+
+    let remedy = tree_utils::remedy_path(path);
+
+    format!(
+        "from the working tree's root, forklift remove {}{}, then forklift stack -m <description>, then {}",
+        remedy.as_deref().unwrap_or("-- <path>"),
+        if remedy.is_some() { "" } else { " with that path quoted for your shell" },
+        then
+    )
 }
 
 /// Whether this checkout can take `path` out of `pallet`'s `local_head` by `remove` and `stack`:

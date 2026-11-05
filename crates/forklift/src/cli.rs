@@ -920,8 +920,9 @@ pub enum Command {
                       warehouse and never stored in it again. It is a record on the \
                       \"@redactions\" meta pallet, never changed or removed; under trust only an \
                       admin may record one. Content a meta pallet's history names cannot be \
-                      redacted, because that history is never rewritten. Without a subcommand, \
-                      the redactions are listed."
+                      redacted, because that history is never rewritten; content a pallet head \
+                      names can be redacted once the file is taken out of that head. Without a \
+                      subcommand, the redactions are listed."
     )]
     Redact {
         #[command(subcommand)]
@@ -1422,7 +1423,9 @@ pub enum RedactAction {
         long_about = "Record a permanent redaction of one file's content: a full object hash held \
                       in this store, or <revision>:<path>. For a chunked file the recipe is \
                       redacted together with its chunk list. A redaction cannot be undone; a hash \
-                      some meta pallet's history names is refused."
+                      some meta pallet's history names is refused, and so is one a pallet head \
+                      names, until the file is taken out of that head; the refusal's next step \
+                      names how to record it then."
     )]
     Record {
         /// The content to redact: a full object hash, or <revision>:<path>
