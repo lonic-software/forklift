@@ -1377,7 +1377,17 @@ pub(crate) async fn replay(client: &RemoteClient,
             use pallet_utils::RefUpdateError::*;
 
             let why = match &refused {
-                Failed(why) => return Err(why.clone()),
+                Failed(why) => {
+                    let failure = forklift_core::error::prefix_message(
+                        &format!("{} was lifted to the remote, but this warehouse could not move its local head there", wire),
+                        why.clone(),
+                    );
+
+                    return Err(match resigned_note.is_empty() {
+                        true => failure,
+                        false => forklift_core::error::append_to_message(failure, resigned_note.trim_start()),
+                    });
+                }
                 // Refused however often it runs; framed, so it keeps its code.
                 Redacted { .. } => {
                     let refusal = forklift_core::error::prefix_message(

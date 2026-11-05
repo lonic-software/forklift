@@ -451,7 +451,7 @@ impl RedactedSet {
     /// as skipped.
     fn named_by(&self,
                 entry: &crate::model::tree_item::TreeItem,
-                partial: Option<&mut Vec<String>>) -> Result<Option<String>, String> {
+                partial: Option<&mut HashSet<String>>) -> Result<Option<String>, String> {
         if self.hashes.contains(&entry.hash) {
             return Ok(Some(entry.hash.clone()));
         }
@@ -464,7 +464,7 @@ impl RedactedSet {
             Ok(chunks) => chunks,
             Err(error) => match partial {
                 Some(skipped) if !file_utils::does_object_exist(&entry.hash)? => {
-                    skipped.push(entry.hash.clone());
+                    skipped.insert(entry.hash.clone());
                     return Ok(None);
                 }
                 _ => return Err(error),
@@ -485,7 +485,7 @@ type Named = (String, String);
 /// recorded only here does not follow a skipped subtree. Each skipped object is recorded in
 /// `partial`, so the write's hold can see one stored meanwhile. In a full warehouse a missing
 /// object is an error, never a pass.
-fn tree_names(tree: &str, set: &RedactedSet, mut partial: Option<&mut Vec<String>>) -> Result<Option<Named>, String> {
+fn tree_names(tree: &str, set: &RedactedSet, mut partial: Option<&mut HashSet<String>>) -> Result<Option<Named>, String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut pending = vec![(String::new(), tree.to_string())];
 
@@ -498,7 +498,7 @@ fn tree_names(tree: &str, set: &RedactedSet, mut partial: Option<&mut Vec<String
             Ok(loaded) => loaded,
             Err(error) => match partial.as_deref_mut() {
                 Some(skipped) if !file_utils::does_object_exist(&hash)? => {
-                    skipped.push(hash);
+                    skipped.insert(hash);
                     continue;
                 }
                 _ => return Err(error),
@@ -518,10 +518,12 @@ fn tree_names(tree: &str, set: &RedactedSet, mut partial: Option<&mut Vec<String
     Ok(None)
 }
 
-/// The proof a ref write's new head was checked against the redactions: which write, and the
-/// `@redactions` head it was checked against. Built only by [`check_head_write`], so a write that
-/// holds one ran the check; the compare-and-set takes it and, under the ref lock, refuses it when
-/// it is for another write or `@redactions` has moved since (see [`RedactionCheck::holds`]).
+/// The proof a ref write's new head was checked against the redactions: which write, the
+/// `@redactions` head it was checked against, and what a partial warehouse's walk skipped as
+/// absent. Built only by [`check_head_write`], so a write that holds one ran the check; the
+/// compare-and-set takes it and, under the ref lock, refuses it when it is for another write, or
+/// `@redactions` has moved or a skipped object has been stored since (see
+/// [`RedactionCheck::holds`]).
 #[derive(Debug)]
 pub struct RedactionCheck {
     namespace: pallet_utils::PalletNamespace,
@@ -531,7 +533,7 @@ pub struct RedactionCheck {
     redactions: Option<String>,
 
     /// What a partial warehouse's walk skipped as absent.
-    skipped: Vec<String>,
+    skipped: HashSet<String>,
 }
 
 impl RedactionCheck {
@@ -547,9 +549,11 @@ impl RedactionCheck {
     }
 
     /// Whether the check still holds: `@redactions` is at the head it was checked against, and
-    /// nothing the walk skipped as absent has been stored since. Read under the held ref lock,
-    /// which every `@redactions` write takes too, so a redaction either lands before the write's
-    /// hold or after the write.
+    /// nothing the walk skipped as absent is stored now. Read under the held ref lock, which every
+    /// `@redactions` write takes too, so a redaction either lands before the write's hold or after
+    /// the write. Storing an object takes no ref lock, so a skipped object stored after this read
+    /// can still land beside the written head, as one fetched after the write can; the receiving
+    /// side of a lift, not this check, is what judges bytes handed on.
     pub(crate) fn holds(&self, _lock: &crate::util::lock_utils::RefLock) -> Result<bool, String> {
         if pallet_utils::get_meta_pallet_head(REDACTIONS_PALLET_NAME)? != self.redactions {
             return Ok(false);
@@ -579,13 +583,16 @@ impl HeadWriteCheck {
     /// checks again. A pass stands while [`RedactionCheck`]'s inputs are unchanged. A refusal
     /// always stands: redactions are only ever added, and the head's tree does not change. A
     /// check that failed stands until `@redactions` moves, so it is retried once a redaction
-    /// lands rather than reporting a failure about a head that no longer holds.
+    /// lands rather than reporting a failure about a head that no longer holds; one that could
+    /// not read `@redactions` at all stands, and its failure is reported.
     pub(crate) fn stands(&self, lock: &crate::util::lock_utils::RefLock) -> Result<bool, String> {
         match &self.outcome {
             Ok(check) => check.holds(lock),
             Err(pallet_utils::RefUpdateError::Redacted { .. }) => Ok(true),
-            Err(_) => Ok(self.redactions.as_ref()
-                == Some(&pallet_utils::get_meta_pallet_head(REDACTIONS_PALLET_NAME)?)),
+            Err(_) => match &self.redactions {
+                Some(read) => Ok(*read == pallet_utils::get_meta_pallet_head(REDACTIONS_PALLET_NAME)?),
+                None => Ok(true),
+            },
         }
     }
 
@@ -641,7 +648,7 @@ fn check_head_write_at(namespace: pallet_utils::PalletNamespace,
         expected: expected.map(str::to_string),
         new: new.to_string(),
         redactions: redactions.clone(),
-        skipped: Vec::new(),
+        skipped: HashSet::new(),
     };
 
     let Some(redactions) = redactions.filter(|_| expected != Some(new)) else {

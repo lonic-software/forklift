@@ -792,9 +792,11 @@ impl RefUpdateError {
         ))
     }
 
-    /// This refusal as a caller reports it after writing elsewhere first, such as a remote: the
-    /// message says `outcome` where it would say "Nothing was written.", and a redaction refusal
-    /// keeps its code, as the `String` conversion does.
+    /// This refusal as a caller reports it after writing elsewhere first, such as a remote: a
+    /// refusal whose message says "Nothing was written." (`Incomplete`, `Deleted`, `Backward` and
+    /// `Redacted`) says `outcome` there instead, and a redaction refusal keeps its code, as the
+    /// `String` conversion does. Every other variant's message is unchanged, so a caller that has
+    /// written elsewhere words those itself.
     pub fn reported_with(&self, outcome: &str) -> String {
         let message = WithOutcome(self, outcome).to_string();
 
@@ -1574,7 +1576,8 @@ pub(crate) fn update_pallet_head_locked(
     if !redaction.is_for(namespace, name, expected, new) || !redaction.holds(lock)? {
         return Err(RefUpdateError::Failed(format!(
             "Refusing to set pallet \"{}\" to {}: its check against the redactions is for another \
-            write, or a redaction was recorded since. Nothing was written. Run the command again.",
+            write, or what it was checked against changed since. The pallet was not moved. Run the \
+            command again.",
             PalletRef { namespace, name: name.to_string() }.to_wire(), &new[..new.len().min(12)]
         )));
     }
@@ -2606,9 +2609,9 @@ pub(crate) mod tests {
         }
 
         // Revert: leave what the walk skipped as absent out of the hold's re-check → the subtree a
-        // fill stored meanwhile, within the same scope, lands unchecked.
+        // fill stored between the walk and the hold, within the same scope, lands unchecked.
         #[test]
-        fn a_skipped_subtree_stored_before_the_hold_walks_the_redactions_again() {
+        fn a_skipped_subtree_stored_between_the_walk_and_the_hold_walks_the_redactions_again() {
             let (_root, _scope) = scratch("redacted-filled");
             crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
             crate::util::scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src"])).unwrap();
@@ -2659,6 +2662,27 @@ pub(crate) mod tests {
 
             assert_redacted(write("main", Some(&base), &head), "web/b", &blob("secret"));
             assert_eq!(get_pallet_head("main").unwrap().as_deref(), Some(base.as_str()), "nothing was written");
+        }
+
+        // Revert: retry a check whose @redactions read failed whenever the hold reads it → the
+        // write lands on a check that never ran, rather than reporting the failure.
+        #[test]
+        fn a_check_that_could_not_read_the_redactions_reports_the_failure() {
+            let (_root, _scope) = scratch("redacted-unread");
+            let held = blob("held");
+            let base = parcel(&tree(&[("held", &held, DirEntryType::Normal)]), &[]);
+            update_meta_pallet_head("notes", None, &base, &RefPreconditions::NONE).unwrap();
+            redact(&blob("unrelated"));
+
+            let path = get_pallet_ref_path(PalletNamespace::Meta, crate::util::redaction_utils::REDACTIONS_PALLET_NAME);
+            let bytes = std::fs::read(&path).unwrap();
+            std::fs::write(&path, "not a hash\n").unwrap();
+            BEFORE_HOLD.with(|slot| *slot.borrow_mut() = Some(Box::new(move || std::fs::write(&path, &bytes).unwrap())));
+
+            let next = parcel(&tree(&[("more", &blob("more"), DirEntryType::Normal)]), &[&base]);
+            let written = update_meta_pallet_head("notes", Some(&base), &next, &RefPreconditions::NONE);
+            assert!(matches!(written, Err(RefUpdateError::Failed(_))), "{:?}", written);
+            assert_eq!(get_meta_pallet_head("notes").unwrap().as_deref(), Some(base.as_str()), "nothing was written");
         }
 
         // Revert: report the refusal's own message → it says "Nothing was written" after a
