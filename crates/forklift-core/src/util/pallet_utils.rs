@@ -1217,8 +1217,11 @@ impl VerifiedClosure {
 /// under the lock too.
 ///
 /// The redaction check ([`redaction_utils::check_head_write`]) walks before the lock as well, and
-/// the hold re-reads the `@redactions` head it was checked against, starting over when a
-/// redaction landed meanwhile.
+/// the hold re-reads the `@redactions` head it was checked against, and in a partial warehouse
+/// whether what the walk skipped as absent is still absent, starting over when either moved
+/// (see [`HeadWriteCheck::stands`]).
+///
+/// [`HeadWriteCheck::stands`]: crate::util::redaction_utils::HeadWriteCheck::stands
 ///
 /// [`redaction_utils::check_head_write`]: crate::util::redaction_utils::check_head_write
 ///
