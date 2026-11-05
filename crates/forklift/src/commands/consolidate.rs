@@ -477,6 +477,11 @@ fn fast_forward(current: &str,
         &shift_utils::collect_collisions(&ops, &removed_dirs)?,
     )?;
     shift_utils::ensure_writes_present(&ops)?;
+    // A head stacked before a redaction came down by `lower` can still name the content.
+    redaction_utils::refuse_redacted_writes(&ops, &format!("consolidate \"{}\" into \"{}\"", target, current), |path| format!(
+        "shift to \"{}\", take \"{}\" out of it and stack, then consolidate again",
+        target, path
+    ))?;
 
     // Finished by `write_head_or_roll_back` once the bay is settled at one head or the other.
     let mut operation = Operation::new(
@@ -672,7 +677,7 @@ pub(crate) fn ensure_actions_present(actions: &[MergeAction]) -> Result<(), Stri
 
 /// Refuse `actions`, merging `their_tree` in, when one of them would bring back content a
 /// redaction removed, before the merge marker is raised, so none of it reaches the working tree. A
-/// file both sides changed is judged by their version too: conflict markers carry it whole. Judged
+/// conflict written with markers is judged by their version too, which the markers carry whole. Judged
 /// after the presence phase, which makes every recipe they write readable. `doing` names the
 /// operation; `next_step` is given the path that holds the content.
 pub(crate) fn refuse_redacted_actions(actions: &[MergeAction],
@@ -688,8 +693,12 @@ pub(crate) fn refuse_redacted_actions(actions: &[MergeAction],
             MergeAction::TakeTheirs { path, hash, item_type, .. } => {
                 guard.names_file(hash, *item_type)?.map(|hash| (path.clone(), hash))
             }
-            MergeAction::Merged { path, content, item_type }
-            | MergeAction::Conflict { path, content: Some(content), item_type, .. } => {
+            MergeAction::Merged { path, content, item_type } => {
+                let blob = LooseObjectBuilder::build_blob(&Blob { content: content.clone() });
+
+                guard.names_file(&blob.hash, *item_type)?.map(|hash| (path.clone(), hash))
+            }
+            MergeAction::Conflict { path, content: Some(content), item_type, .. } => {
                 let blob = LooseObjectBuilder::build_blob(&Blob { content: content.clone() });
 
                 match guard.names_file(&blob.hash, *item_type)? {
@@ -697,13 +706,8 @@ pub(crate) fn refuse_redacted_actions(actions: &[MergeAction],
                     None => theirs_named(&guard, their_tree, path)?,
                 }
             }
-            MergeAction::Conflict { path, content: None, entry_hash, item_type } => {
-                let ours = if item_type.is_chunked() { guard.names_file(entry_hash, *item_type)? } else { None };
-
-                match ours {
-                    Some(hash) => Some((path.clone(), hash)),
-                    None => theirs_named(&guard, their_tree, path)?,
-                }
+            MergeAction::Conflict { path, content: None, entry_hash, item_type } if item_type.is_chunked() => {
+                guard.names_file(entry_hash, *item_type)?.map(|hash| (path.clone(), hash))
             }
             MergeAction::ResolveOutOfScope { path, resolution: Some((hash, item_type)) } => {
                 if *item_type == DirEntryType::Tree {

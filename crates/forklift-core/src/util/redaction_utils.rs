@@ -661,6 +661,30 @@ impl StagingGuard {
     }
 }
 
+/// Refuse checking out a tree whose `ops`, what it writes into the bay, would bring back content a
+/// redaction removed, before the bay is touched: the head write it leads to would be refused too,
+/// but only once the content had reached the bay. Judged after the presence phase, which makes
+/// every recipe they write readable. `doing` names the operation; `next_step` is given the path.
+pub fn refuse_redacted_writes(ops: &[crate::util::shift_utils::FileOp],
+                              doing: &str,
+                              next_step: impl Fn(&str) -> String) -> Result<(), String> {
+    let Some(guard) = staging_guard()? else {
+        return Ok(());
+    };
+
+    for op in ops {
+        let crate::util::shift_utils::FileOp::Write { path, hash, item_type, .. } = op else {
+            continue;
+        };
+
+        if let Some(hash) = guard.names_file(hash, *item_type)? {
+            return Err(staging_refusal(doing, path, &hash, "Nothing was changed.", next_step(path)));
+        }
+    }
+
+    Ok(())
+}
+
 /// The `content_redacted` refusal of a bay-local write that would stage the file at `path`, whose
 /// content `hash` is redacted: "Refusing to `doing`", then `outcome`, which says what was left as it
 /// was. `details` carries the path and the hash; no pallet head was refused, so it names none.

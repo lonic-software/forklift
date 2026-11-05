@@ -703,6 +703,49 @@ fn a_lower_merging_redacted_content_in_is_refused_before_it_touches_the_bay() {
 }
 
 #[test]
+fn a_fast_forward_to_a_head_stacked_before_a_redaction_came_down_is_refused() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-ff-server-{}", std::process::id())));
+
+    let first = Warehouse::cloned("ff-first", &server.url);
+    first.stack("notes.txt", b"notes\n", "notes");
+    first.run_ok(&["lift"]);
+
+    // Side is stacked ahead of main before any redaction exists; another warehouse's redaction
+    // then comes down by lower.
+    let warehouse = Warehouse::cloned("ff", &server.url);
+    warehouse.run_ok(&["pallet", "create", "side"]);
+    warehouse.stack("secret.env", b"TOKEN=hunter2\n", "leak");
+    warehouse.run_ok(&["shift", "main"]);
+
+    let other = Warehouse::cloned("ff-other", &server.url);
+    let hash = other.redact_loaded("secret.env", b"TOKEN=hunter2\n", "leaked token");
+    other.run_ok(&["lift"]);
+    warehouse.run_ok(&["lower", "main"]);
+    let head = warehouse.head("main");
+
+    let error = content_redacted(&warehouse, &["consolidate", "side"]);
+    assert_eq!(error["details"], serde_json::json!({ "path": "secret.env", "hash": hash }), "{}", error);
+    let message = error["message"].as_str().unwrap();
+    assert!(message.starts_with("Refusing to consolidate \"side\" into \"main\": \"secret.env\""), "{}", error);
+    assert_eq!(
+        error["next_step"],
+        "shift to \"side\", take \"secret.env\" out of it and stack, then consolidate again",
+        "{}", error
+    );
+    assert!(!warehouse.root.join("secret.env").exists(), "the content never reached the bay");
+    assert_eq!(warehouse.head("main"), head);
+
+    // The next step, as it says.
+    warehouse.run_ok(&["shift", "side"]);
+    warehouse.run_ok(&["remove", "secret.env"]);
+    std::fs::remove_file(warehouse.root.join("secret.env")).unwrap();
+    warehouse.run_ok(&["stack", "-m", "take the leak out"]);
+    warehouse.run_ok(&["shift", "main"]);
+    warehouse.run_ok(&["consolidate", "side"]);
+}
+
+#[test]
 fn a_lift_refused_for_a_pallet_the_remote_lacks_says_it_was_not_created() {
     let server = Server::start(&std::env::temp_dir()
         .join(format!("forklift-redaction-lift-new-server-{}", std::process::id())));
