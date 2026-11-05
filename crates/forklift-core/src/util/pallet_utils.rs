@@ -2014,13 +2014,13 @@ pub(crate) mod tests {
         use crate::model::blob::Blob;
         use crate::model::tree_item::TreeItem;
 
-        fn blob(content: &str) -> String {
+        pub(super) fn blob(content: &str) -> String {
             let mut object = LooseObjectBuilder::build_blob(&Blob { content: content.as_bytes().to_vec() });
             object.store().unwrap();
             object.hash
         }
 
-        fn tree(entries: &[(&str, &str, DirEntryType)]) -> String {
+        pub(super) fn tree(entries: &[(&str, &str, DirEntryType)]) -> String {
             let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
             for (name, hash, item_type) in entries {
                 tree.add_child(TreeItem::new(name.to_string(), hash.to_string(), *item_type));
@@ -2031,13 +2031,13 @@ pub(crate) mod tests {
         }
 
         /// A tree with `src/a` and `web/b`, holding `src` and `web` as their contents.
-        fn two_dirs(src: &str, web: &str) -> String {
+        pub(super) fn two_dirs(src: &str, web: &str) -> String {
             let src = tree(&[("a", &blob(src), DirEntryType::Normal)]);
             let web = tree(&[("b", &blob(web), DirEntryType::Normal)]);
             tree(&[("src", &src, DirEntryType::Tree), ("web", &web, DirEntryType::Tree)])
         }
 
-        fn parcel(tree_hash: &str, parents: &[&str]) -> String {
+        pub(super) fn parcel(tree_hash: &str, parents: &[&str]) -> String {
             let mut object = LooseObjectBuilder::build_parcel(&crate::model::parcel::Parcel {
                 tree_hash: tree_hash.to_string(),
                 parents: parents.iter().map(|parent| parent.to_string()).collect(),
@@ -2048,12 +2048,12 @@ pub(crate) mod tests {
             object.hash
         }
 
-        fn remove(hash: &str) {
+        pub(super) fn remove(hash: &str) {
             let (folder, file) = file_utils::get_path_for_object(hash).unwrap();
             std::fs::remove_file(std::path::Path::new(&folder).join(file)).unwrap();
         }
 
-        fn write(name: &str, expected: Option<&str>, new: &str) -> Result<(), RefUpdateError> {
+        pub(super) fn write(name: &str, expected: Option<&str>, new: &str) -> Result<(), RefUpdateError> {
             update_pallet_head(name, expected, new, &RefPreconditions::NONE)
         }
 
@@ -2457,6 +2457,142 @@ pub(crate) mod tests {
 
             write("main", Some(&base), &head).unwrap();
             assert_eq!(get_pallet_head("main").unwrap(), Some(head));
+        }
+    }
+
+    /// The redaction check at a head write: no new head may name a redacted hash.
+    mod redaction_at_write {
+        use super::*;
+        use super::closure_at_write::{blob, parcel, remove, tree, two_dirs, write};
+        use crate::enums::dir_entry_type::DirEntryType;
+        use crate::util::redaction_utils::{record_redaction, Redaction};
+
+        /// Record an unsigned redaction of `hash`.
+        fn redact(hash: &str) {
+            let redaction = Redaction {
+                hash: hash.to_string(),
+                reason: "leaked".to_string(),
+                redacted_at: 0,
+                chunks: None,
+            };
+            let operator = crate::model::operator::Operator { identifier: "test".to_string() };
+            record_redaction(&redaction, &crate::util::meta_tree::MetaWriter::Unsigned, &operator).unwrap();
+        }
+
+        fn assert_redacted(result: Result<(), RefUpdateError>, path: &str, hash: &str) {
+            match result {
+                Err(RefUpdateError::Redacted { path: named, hash: found, .. }) => {
+                    assert_eq!((named.as_str(), found.as_str()), (path, hash));
+                }
+                other => panic!("expected a redacted refusal, got {:?}", other),
+            }
+        }
+
+        // Revert: skip the check → the head naming the redacted blob lands; or refuse every head
+        // once anything is redacted → the head without it is refused too.
+        #[test]
+        fn a_user_head_naming_a_redacted_blob_is_refused_and_one_without_it_lands() {
+            let (_root, _scope) = scratch("redacted-user");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let secret = blob("secret");
+            redact(&secret);
+
+            let head = parcel(&two_dirs("a1", "secret"), &[&base]);
+            assert_redacted(write("main", Some(&base), &head), "web/b", &secret);
+            assert_eq!(get_pallet_head("main").unwrap().as_deref(), Some(base.as_str()), "nothing was written");
+
+            // The same content under another name is the same hash.
+            let renamed = parcel(&tree(&[("copy.env", &secret, DirEntryType::Normal)]), &[&base]);
+            assert_redacted(write("main", Some(&base), &renamed), "copy.env", &secret);
+
+            let clean = parcel(&two_dirs("a1", "b1"), &[&base]);
+            write("main", Some(&base), &clean).unwrap();
+            assert_eq!(get_pallet_head("main").unwrap(), Some(clean));
+        }
+
+        // Revert: never re-read the @redactions head inside the hold (in the loop and in the
+        // locked write both) → the write lands over a redaction recorded after its walk.
+        #[test]
+        fn a_redaction_recorded_between_the_check_and_the_hold_is_checked_again() {
+            let (_root, _scope) = scratch("redacted-meanwhile");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            redact(&blob("unrelated"));
+            let secret = blob("secret");
+            let head = parcel(&two_dirs("a1", "secret"), &[&base]);
+
+            BEFORE_HOLD.with(|slot| *slot.borrow_mut() = Some(Box::new(move || redact(&secret))));
+
+            assert_redacted(write("main", Some(&base), &head), "web/b", &blob("secret"));
+            assert_eq!(get_pallet_head("main").unwrap().as_deref(), Some(base.as_str()), "nothing was written");
+        }
+
+        // Revert: walk a partial warehouse's tree as a full one's → the write fails over the
+        // subtree outside the scope.
+        #[test]
+        fn a_sparse_warehouse_skips_what_it_does_not_hold() {
+            let (_root, _scope) = scratch("redacted-sparse");
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
+            crate::util::scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src"])).unwrap();
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            redact(&blob("secret"));
+
+            let web = tree(&[("b", &blob("b1"), DirEntryType::Normal)]);
+            let src = tree(&[("a", &blob("a1"), DirEntryType::Normal)]);
+            let head = parcel(&tree(&[("src", &src, DirEntryType::Tree), ("web", &web, DirEntryType::Tree)]), &[&base]);
+            remove(&web);
+
+            write("main", Some(&base), &head).unwrap();
+            assert_eq!(get_pallet_head("main").unwrap(), Some(head));
+        }
+
+        // Revert: judge a meta parcel by its whole tree → the parcel inheriting the redacted blob
+        // is refused; or skip meta parcels → the one adding a redacted blob lands.
+        #[test]
+        fn a_meta_parcel_is_judged_by_what_it_adds_to_its_parents() {
+            let (_root, _scope) = scratch("redacted-meta");
+            let held = blob("held");
+            let base = parcel(&tree(&[("held", &held, DirEntryType::Normal)]), &[]);
+            update_meta_pallet_head("notes", None, &base, &RefPreconditions::NONE).unwrap();
+            redact(&held);
+
+            let inherits = parcel(&tree(&[
+                ("held", &held, DirEntryType::Normal),
+                ("more", &blob("more"), DirEntryType::Normal),
+            ]), &[&base]);
+            update_meta_pallet_head("notes", Some(&base), &inherits, &RefPreconditions::NONE).unwrap();
+
+            let later = blob("later");
+            redact(&later);
+            let adds = parcel(&tree(&[
+                ("held", &held, DirEntryType::Normal),
+                ("later", &later, DirEntryType::Normal),
+            ]), &[&inherits]);
+            assert_redacted(
+                update_meta_pallet_head("notes", Some(&inherits), &adds, &RefPreconditions::NONE), "later", &later
+            );
+            assert_eq!(get_meta_pallet_head("notes").unwrap().as_deref(), Some(inherits.as_str()));
+        }
+
+        // Revert: accept a locked write whatever check it is handed → the write lands under a
+        // check made for another head.
+        #[test]
+        fn a_locked_write_refuses_a_check_made_for_another_write() {
+            let (_root, _scope) = scratch("redacted-token");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let other = parcel(&two_dirs("a1", "b1"), &[&base]);
+            let head = parcel(&two_dirs("a2", "b2"), &[&base]);
+            let check = crate::util::redaction_utils::check_head_write(PalletNamespace::User, "main", Some(&base), &other)
+                .unwrap();
+
+            let lock = crate::util::lock_utils::RefLock::acquire().unwrap();
+            let refused = update_pallet_head_locked(&lock, PalletNamespace::User, "main", Some(&base), &head, None, &check);
+            assert!(matches!(refused, Err(RefUpdateError::Failed(_))), "{:?}", refused);
+            drop(lock);
+            assert_eq!(get_pallet_head("main").unwrap().as_deref(), Some(base.as_str()));
         }
     }
 
