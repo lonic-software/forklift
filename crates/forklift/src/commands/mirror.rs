@@ -45,7 +45,8 @@ const GIT_STEP: &str = "Fix the cause git reports, then run \"forklift git mirro
 /// lift again.
 ///
 /// # Returns
-/// * `Ok(())`      - If every mirrored pallet is in step (or was skipped as not mirrorable).
+/// * `Ok(())`      - If every mirrored pallet is in step (or was skipped as not mirrorable) and
+///                   no tag was refused.
 /// * `Err(String)` - If the mirror is not configured, busy or damaged, or a pallet was refused or
 ///                   its push failed, or a tag was refused or the tags could not be mirrored
 ///                   (after the rest went through: `mirror_incomplete`, with the run's report as
