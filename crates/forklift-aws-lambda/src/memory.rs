@@ -184,7 +184,8 @@ impl ObjectStore for MemoryObjectStore {
     fn put_target(&self, session: Option<&str>, hash: &str) -> Result<PutTarget, String> {
         match (&self.redirect_base, session) {
             // A staging key under the session — never the canonical key `get`/`exists` read.
-            // The fake serves one warehouse, so its keys leave the warehouse out.
+            // The fake keys nothing per warehouse: a test that hands one fake to several
+            // warehouses shares their objects, as the S3 store no longer does.
             (Some(base), Some(session)) => {
                 Ok(PutTarget::Staged(format!("{}/staging/{}/{}", base, session, hash)))
             }

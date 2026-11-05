@@ -226,9 +226,10 @@ impl AwsUpgradeChain<'_> {
     /// How far back the chain reaches, for a refusal of a format below it.
     fn reach(&self) -> String {
         if self.migrations.is_empty() {
-            "no upgrade reaches it: this version upgrades no older format".to_string()
+            "no upgrade reaches it, since no older format is upgraded".to_string()
         } else {
-            format!("no upgrade reaches it: format {} is the oldest this version upgrades", self.floor())
+            let floor = self.floor();
+            format!("no upgrade reaches it, since format {} is the oldest one upgraded", floor)
         }
     }
 
@@ -587,7 +588,7 @@ mod tests {
 
         assert_eq!(refusal.status.as_u16(), 503);
         assert!(refusal.message.contains("Make it again under a new id"), "{}", refusal.message);
-        assert!(refusal.message.contains("upgrades no older format"), "{}", refusal.message);
+        assert!(refusal.message.contains("no older format is upgraded"), "{}", refusal.message);
         assert!(!refusal.message.contains("operator has to upgrade"), "{}", refusal.message);
         assert_eq!(CHAIN.floor(), AWS_FORMAT);
     }
@@ -599,7 +600,7 @@ mod tests {
         let migrations = [AwsMigration { steps: &steps }];
         let chain = AwsUpgradeChain { reads: 3, migrations: &migrations };
 
-        for (state, says) in [("2", "operator has to upgrade"), ("1", "format 2 is the oldest this version upgrades")] {
+        for (state, says) in [("2", "operator has to upgrade"), ("1", "format 2 is the oldest one upgraded")] {
             let refusal = gate_for(&store_at(Some(state)), &chain).unwrap_err();
             assert!(refusal.message.contains(says), "{}: {}", state, refusal.message);
         }
@@ -786,7 +787,7 @@ mod tests {
         let chain = AwsUpgradeChain { reads: 1, migrations: &migrations };
 
         for (state, says) in [
-            (Some("0"), "this version upgrades no older format"),
+            (Some("0"), "no older format is upgraded"),
             (Some("2"), "newer than format 1"),
             (Some("x"), "cannot read"),
             (Some("0>1 dead 0"), "which this version does not do"),

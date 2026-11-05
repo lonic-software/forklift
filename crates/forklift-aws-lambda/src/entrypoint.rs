@@ -29,6 +29,7 @@
 //! object bytes it can hand off, which is what keeps a Lambda inside its few-megabyte response
 //! limit. The self-host equivalent (the fakes) serves those bytes inline, and [`handle`] answers
 //! both shapes so one router serves both stores.
+//!
 //! # Multi-warehouse routing
 //!
 //! Like `forklift-server`'s `--root`/`--warehouses`, a deployment either pins one warehouse

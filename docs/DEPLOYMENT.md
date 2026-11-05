@@ -281,9 +281,11 @@ whether another holds an object.
 A warehouse in AWS format 1 kept one `objects/{hash}` and `signatures/{hash}` key for every
 warehouse in the bucket. Nothing reads those keys, and the format gate refuses such a warehouse with
 a `503` that says to make it again under a new id (`docs/format/WAREHOUSE_FORMAT.md`). Its keys stay
-in the bucket until the operator deletes them: they are the `objects/` and `signatures/` keys with
-no warehouse segment, a 64-character hash straight after the prefix. Its DynamoDB partition stays
-too, and keeps its id taken until its items are deleted.
+in the bucket until the operator deletes them: they are the keys that are exactly `objects/{hash}`
+or `signatures/{hash}`, with no further `/`. Select them one by one by that whole shape, never with
+a prefix or recursive delete: a format 2 warehouse id may itself be 64 hex characters, and then
+`objects/{id}/` is that live warehouse's objects. Its DynamoDB partition stays too, and keeps its id
+taken until its items are deleted.
 
 No presigned `PUT` is ever issued to `objects/` — `presign_staging_put` hardcodes the
 `staging/` prefix and is the only code path that mints a presigned `PUT` at all.
