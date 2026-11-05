@@ -171,13 +171,25 @@ The reverse of `git import`, and the **escape hatch**: parcels become commits, t
 trees, blobs become blobs, and each **user pallet becomes a branch** (git's HEAD is set to
 the current pallet, and its working tree is checked out). The point is that trying forklift is
 reversible — your code history is never trapped. Requires `git` on your PATH; the target path
-must be empty or new. **Lossy in this direction:** git has no home for the signed office, the
-`@manifest` (approvals/provenance) or per-parcel signatures, so those are dropped. Author
+must be empty or new. [Leaving Forklift](leaving.md) walks through it end to end. Author
 identity round-trips as the on-chain **identifier** — forklift records no display names
 (zero-PII by design), so the git author name is that identifier (or `forklift`, when
-the identifier holds nothing git keeps in a name). The meta pallets (`@office`, `@manifest`)
-are not exported. Dates are written in UTC (`+0000`), and git has no date before 1970,
-so a parcel stamped earlier exports as 1970-01-01.
+the identifier holds nothing git keeps in a name). Dates are written in UTC (`+0000`), and git has
+no date before 1970, so a parcel stamped earlier exports as 1970-01-01.
+
+**Lossy in this direction**, and it says what it drops. Git has no home for the meta pallets other
+than `@tags`: the signed office (`@office`), approvals and provenance (`@manifest`), hauls and their
+reviews (`@haul`) and custom metadata (`@kv`), nor for the signatures on parcels and tags. The
+export's last line names each one the warehouse (or its remote) holds; `--json` lists them as
+`not_exported`. Parked work (`park`) is on no pallet, so it is not exported either; a warning counts
+it (`parked`).
+
+Only what this warehouse holds is exported, so with a remote configured, the export also asks the
+remote for its pallets. Each one whose head is not among the exported parcels gets a warning naming
+the `lower` that brings it here (`remote_left_behind` in `--json`), and so does the remote's `@tags`
+when it has tags this warehouse lacks. A fresh clone holds only the pallet it checked out, so leaving
+from one without this would silently lose the others. A remote that cannot be reached does not fail
+the export: one warning says the check could not be made (`remote_unchecked`).
 
 Each tag on an exported parcel becomes an **annotated git tag** over that parcel's commit, with
 the tag's message and date, and as tagger the operator the office binds its signing key to,
