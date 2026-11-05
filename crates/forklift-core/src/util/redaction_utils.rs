@@ -429,6 +429,9 @@ impl RedactedSet {
         let state = meta_tree::read_meta_state(REDACTIONS_PALLET_NAME, head, &RedactionsRules)?;
         let mut set = RedactedSet::default();
 
+        // A cell this build cannot read, or whose value does not parse, still redacts its hash; what
+        // it says about a chunk list is lost with it, so the same chunks under another recipe are
+        // not caught until the cell is read by a forklift that understands it.
         for (hash, cell) in state.cells {
             if let CellRead::Readable(envelope) = &cell {
                 if let Ok(Redaction { chunks: Some(chunks), .. }) = parse_value(&hash, &envelope.value) {

@@ -1301,6 +1301,8 @@ fn update_pallet_head_checked(
                 drop(lock);
                 let leaned_on = verify_new_head(name, expected, new, &current)?;
                 verified_at = Some((current, leaned_on));
+                // What a partial warehouse holds decided what the redaction walk skipped.
+                redaction = crate::util::redaction_utils::check_head_write(namespace, name, expected, new);
                 continue;
             }
         }
@@ -2556,6 +2558,33 @@ pub(crate) mod tests {
                 Err(RefUpdateError::Moved(moved)) => assert_eq!(moved.found.as_deref(), Some(head.as_str())),
                 other => panic!("expected the move, got {:?}", other),
             }
+        }
+
+        // Revert: keep the redaction check when the scope moves inside the hold → the subtree
+        // the first walk skipped as absent lands unchecked once the scope holds it.
+        #[test]
+        fn a_scope_widened_before_the_hold_walks_the_redactions_again() {
+            let (_root, _scope) = scratch("redacted-widened");
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
+            crate::util::scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src"])).unwrap();
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let secret = blob("secret");
+            redact(&secret);
+
+            let web = tree(&[("b", &secret, DirEntryType::Normal)]);
+            let src = tree(&[("a", &blob("a1"), DirEntryType::Normal)]);
+            let head = parcel(&tree(&[("src", &src, DirEntryType::Tree), ("web", &web, DirEntryType::Tree)]), &[&base]);
+            remove(&web);
+
+            BEFORE_HOLD.with(|slot| *slot.borrow_mut() = Some(Box::new(|| {
+                tree(&[("b", &blob("secret"), DirEntryType::Normal)]);
+                crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
+                crate::util::scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src", "web"])).unwrap();
+            })));
+
+            assert_redacted(write("main", Some(&base), &head), "web/b", &secret);
+            assert_eq!(get_pallet_head("main").unwrap().as_deref(), Some(base.as_str()), "nothing was written");
         }
 
         // Revert: walk a partial warehouse's tree as a full one's → the write fails over the

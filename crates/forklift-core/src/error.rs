@@ -335,7 +335,7 @@ refusal_codes! {
     /// The command would have written a pallet head that names redacted content: a file whose
     /// content a `@redactions` cell removes is in the tree the new head points at, or in a cell a
     /// meta pallet's new parcel adds. Nothing was written; the details name the pallet, the file's
-    /// path and the redacted hash, and the next step removes the file.
+    /// path and the redacted hash, and the next step names the file to leave out.
     ContentRedacted => "content_redacted",
 }
 
