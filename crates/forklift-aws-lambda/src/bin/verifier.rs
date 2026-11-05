@@ -78,13 +78,19 @@ async fn handler(event: LambdaEvent<S3Event>) -> Result<(), Error> {
         };
 
         let (session, hash) = (staged.session.to_string(), staged.hash.to_string());
-        let objects = S3ObjectStore::new(
+        // A warehouse the store refuses is skipped for the same reason: no retry can change it.
+        let objects = match S3ObjectStore::new(
             context.s3.clone(),
             context.bucket.clone(),
             staged.warehouse.to_string(),
             context.bridge.clone(),
-        )
-        .map_err(Error::from)?;
+        ) {
+            Ok(objects) => objects,
+            Err(e) => {
+                eprintln!("verifier: ignoring a staging object of no warehouse: {}: {}", key, e);
+                continue;
+            }
+        };
 
         // A storage error propagates (the event retries); a semantic outcome is logged and the
         // event is consumed — a corrupt object was discarded, not promoted, and retrying it

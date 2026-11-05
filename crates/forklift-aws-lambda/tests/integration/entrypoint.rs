@@ -1870,7 +1870,7 @@ fn every_request_is_gated_on_the_warehouse_format() {
     for (state, says) in [
         (Some("2>3 operator 0"), "being upgraded from format 2 to format 3"),
         (Some("3"), "newer than format 2"),
-        (Some("1"), "make it again under a new id"),
+        (Some("1"), "Make it again under a new id"),
         (None, "records no format"),
     ] {
         fixture.refs.set_format(state);

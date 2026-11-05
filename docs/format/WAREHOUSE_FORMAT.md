@@ -137,7 +137,8 @@ A state left by another run is refused unless the operator passes `--takeover` w
 after making sure that run has stopped. Takeover puts a new owner in the state, waits again (the run it
 takes over may have stopped before its wait was out), and resumes at the first step not done, so steps
 must be idempotent. A warehouse that fails is reported and the others are still upgraded. Steps change
-the warehouse's own DynamoDB partition and its own keys in the bucket.
+only the warehouse's own DynamoDB partition: a step is given no object store, and nothing fences the
+bucket's keys, so an S3 layout change has no in-place path.
 
 Since AWS format 2 every warehouse has its own keys in the bucket: `objects/{warehouse}/{hash}`,
 `signatures/{warehouse}/{parcel_hash}` and `staging/{warehouse}/{session}/{hash}`. Only `responses/`,

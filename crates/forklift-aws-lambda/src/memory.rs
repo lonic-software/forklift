@@ -183,8 +183,8 @@ impl ObjectStore for MemoryObjectStore {
 
     fn put_target(&self, session: Option<&str>, hash: &str) -> Result<PutTarget, String> {
         match (&self.redirect_base, session) {
-            // A staging key under the session — never `objects/{hash}`, which is the
-            // canonical key `get`/`exists` read.
+            // A staging key under the session — never the canonical key `get`/`exists` read.
+            // The fake serves one warehouse, so its keys leave the warehouse out.
             (Some(base), Some(session)) => {
                 Ok(PutTarget::Staged(format!("{}/staging/{}/{}", base, session, hash)))
             }

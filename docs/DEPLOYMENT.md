@@ -63,12 +63,12 @@ endpoints, which do return raw bytes through the control-plane Lambda — see "B
 below.
 
 A client `PUT`s straight to `staging/{warehouse}/{session}/{hash}`, never to the canonical
-`objects/{warehouse}/{hash}` key — nothing lands at a hash key until it is hash-verified. Small control-plane objects
-(parcels, trees, signatures) are verified and promoted **synchronously** by the control plane
-when the client calls `POST /lift/{session}/commit`; large blobs and chunks are verified and
-promoted **asynchronously** by the verifier Lambda, triggered by the S3 event the staging `PUT`
-itself fires. Both call the identical `ObjectStore::verify_and_promote`, and it is idempotent,
-so the two racing on one hash is safe — whichever gets there first wins, the other reads
+`objects/{warehouse}/{hash}` key — nothing lands at a hash key until it is hash-verified. Small
+control-plane objects (parcels, trees, signatures) are verified and promoted **synchronously** by
+the control plane when the client calls `POST /lift/{session}/commit`; large blobs and chunks are
+verified and promoted **asynchronously** by the verifier Lambda, triggered by the S3 event the
+staging `PUT` itself fires. Both call the identical `ObjectStore::verify_and_promote`, and it is
+idempotent, so the two racing on one hash is safe — whichever gets there first wins, the other reads
 `AlreadyPresent`.
 
 ## The two Lambda functions
@@ -279,8 +279,11 @@ whether another holds an object.
 | `responses/{content_hash}` | Ephemeral, content-addressed `batch`-bundle bodies offloaded from the control plane, shared by every warehouse and reached only through a presigned URL. Never `objects/`. | `offload_response` |
 
 A warehouse in AWS format 1 kept one `objects/{hash}` and `signatures/{hash}` key for every
-warehouse in the bucket. Nothing reads those keys, and the format gate refuses such a warehouse with a
-`503` that says to make it again under a new id (`docs/format/WAREHOUSE_FORMAT.md`).
+warehouse in the bucket. Nothing reads those keys, and the format gate refuses such a warehouse with
+a `503` that says to make it again under a new id (`docs/format/WAREHOUSE_FORMAT.md`). Its keys stay
+in the bucket until the operator deletes them: they are the `objects/` and `signatures/` keys with
+no warehouse segment, a 64-character hash straight after the prefix. Its DynamoDB partition stays
+too, and keeps its id taken until its items are deleted.
 
 No presigned `PUT` is ever issued to `objects/` — `presign_staging_put` hardcodes the
 `staging/` prefix and is the only code path that mints a presigned `PUT` at all.
@@ -311,11 +314,11 @@ longer, since clients hash-verify every bundle record on import regardless.
 
 Configure S3 Event Notifications (bucket-level, or EventBridge if you prefer) for
 **`s3:ObjectCreated:*` on the `staging/` prefix**, targeting the verifier Lambda. The verifier
-parses `record.s3.object.key`, decodes it, and calls `parse_staging_key` — anything that does
-not split cleanly into `staging/{warehouse}/{session}/{hash}`, with a valid warehouse id, is logged and skipped rather than retried, so
-a notification scoped to any other prefix is simply wasted invocations, not a correctness bug.
-Do not wire `ObjectRemoved` or other event types — the verifier has no use for them, and a
-`staging/`-shaped key from a delete event would just read back `Missing`.
+parses `record.s3.object.key`, decodes it, and calls `parse_staging_key` — anything that does not
+split cleanly into `staging/{warehouse}/{session}/{hash}`, with a valid warehouse id, is logged and
+skipped rather than retried, so a notification scoped to any other prefix is simply wasted
+invocations, not a correctness bug. Do not wire `ObjectRemoved` or other event types — the verifier
+has no use for them, and a `staging/`-shaped key from a delete event would just read back `Missing`.
 
 ### Versioning, encryption, CORS
 

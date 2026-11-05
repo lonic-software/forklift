@@ -274,10 +274,10 @@ async fn s3_object_store_upholds_the_object_contract() {
     .expect("the blocking assertions");
 }
 
-/// Two warehouses on one bucket keep apart over real S3 (memo F14, the presence oracle): an
-/// object, a signature or a staged upload one holds is not fetchable through the other, and the
-/// other's presence probes answer absent for it. Separates the per-warehouse layout from the
-/// shared one, where every warehouse read `objects/{hash}`; the positive half shows the probes
+/// Two warehouses on one bucket keep apart over real S3, so neither is a presence oracle for the
+/// other: an object, a signature or a staged upload one holds is not fetchable through the other,
+/// and the other's presence probes answer absent for it. Separates the per-warehouse layout from
+/// the shared one, where every warehouse read `objects/{hash}`; the positive half shows the probes
 /// engaged on the warehouse that holds them.
 ///
 /// Revert: key objects, signatures or staging without the warehouse → `b` sees `a`'s copy.
@@ -2168,8 +2168,8 @@ async fn chunk_object_get(objects: S3ObjectStore, hash: &str) -> (S3ObjectStore,
 }
 
 /// Stage bytes straight to `staging/{warehouse}/{session}/{hash}` via the real client — the same
-/// shortcut `s3_verify_and_promote_gates_the_canonical_namespace` takes above, standing in for a client's
-/// presigned staging `PUT` (proven end to end, for a chunk specifically, by
+/// shortcut `s3_verify_and_promote_gates_the_canonical_namespace` takes above, standing in for a
+/// client's presigned staging `PUT` (proven end to end, for a chunk specifically, by
 /// `a_chunked_files_chunks_stage_and_promote_over_real_s3` below).
 async fn chunk_stage_raw(
     s3: &aws_sdk_s3::Client,
@@ -2232,8 +2232,8 @@ async fn chunk_commit_lift(
 
 /// PROOF 1 — a chunked file's lift, chunk by chunk, over real S3: each chunk stages via its own
 /// presigned `PUT` (the same `put_target`/`staging/{warehouse}/{session}/{hash}` scheme as any
-/// other object — a chunk is not a special case anywhere on the wire, see `head.rs::commit_lift`'s doc comment),
-/// and lands canonical only once `verify_and_promote` runs on the staged key.
+/// other object — a chunk is not a special case anywhere on the wire, see `head.rs::commit_lift`'s
+/// doc comment), and lands canonical only once `verify_and_promote` runs on the staged key.
 ///
 /// LocalStack's community edition does not deliver S3 bucket-notification events to a Lambda the
 /// way production does (that is what `verifier.rs`'s `S3Event` handler reacts to), so — exactly

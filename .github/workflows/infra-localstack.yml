@@ -118,10 +118,10 @@ jobs:
             -var auth_token="$(openssl rand -hex 32)" \
             -var name_prefix="forklift-l2-${{ github.run_id }}"
 
-      # The point of Layer 2: stage an object under staging/ exactly as a client's presigned
-      # PUT would, in warehouse "ci", then poll objects/ci/ until the S3 event has fired the verifier and it has
-      # cold-started and promoted the object. A plan-only Layer 1 assert cannot reach either
-      # half of this claim.
+      # The point of Layer 2: stage an object under staging/ exactly as a client's presigned PUT
+      # would, in warehouse "ci", then poll objects/ci/ until the S3 event has fired the verifier
+      # and it has cold-started and promoted the object. A plan-only Layer 1 assert cannot reach
+      # either half of this claim.
       - name: Exercise — stage an object, poll for promotion
         working-directory: infra/aws-serverless/tests/localstack
         run: |

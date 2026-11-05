@@ -10,11 +10,10 @@
 //! so no warehouse's keys sit under another's.
 //!
 //! * `objects/{warehouse}/{hash}` — the **canonical** namespace. Everything here is hash-verified,
-//!   and
-//!   the only two write paths into it are [`put_verified`](S3ObjectStore::put_verified)
-//!   (which hashes the bytes first) and [`verify_and_promote`](S3ObjectStore::verify_and_promote)
-//!   (which hashes the staged bytes first). Nothing else can put a key here — in particular,
-//!   no presigned `PUT` ever addresses this prefix.
+//!   and the only two write paths into it are [`put_verified`](S3ObjectStore::put_verified) (which
+//!   hashes the bytes first) and [`verify_and_promote`](S3ObjectStore::verify_and_promote) (which
+//!   hashes the staged bytes first). Nothing else can put a key here — in particular, no presigned
+//!   `PUT` ever addresses this prefix.
 //! * `staging/{warehouse}/{session}/{hash}` — where a client's presigned `PUT` lands. Bytes here
 //!   are invisible to [`exists`](S3ObjectStore::exists)/[`get`](S3ObjectStore::get); they become
 //!   fetchable only when `verify_and_promote` copies them to `objects/{warehouse}/{hash}` after

@@ -96,7 +96,7 @@ fn older_aws_fixtures_upgrade_and_are_served() {
         let refs = MemoryRefStore::from_items(&read_items(&path)).unwrap();
         if format < CHAIN.floor() {
             let refusal = gate(&refs).unwrap_err();
-            assert!(refusal.message.contains("make it again under a new id"), "AWS format {}: {}", format, refusal.message);
+            assert!(refusal.message.contains("Make it again under a new id"), "AWS format {}: {}", format, refusal.message);
             let error = upgrade(&refs, &CHAIN, "fixture", &options).unwrap_err();
             assert!(error.contains("Make it again under a new id"), "AWS format {}: {}", format, error);
             assert_eq!(refs.read_format().unwrap(), Some(format.to_string()), "AWS format {}", format);

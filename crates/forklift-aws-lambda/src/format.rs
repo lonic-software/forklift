@@ -18,9 +18,9 @@
 //! advancing the mark's step after each, and swaps the mark for the new format. Every write a step
 //! makes is fenced on the exact mark, so an operator that stalls and is taken over can no longer
 //! write. A mark on record is taken over only when the operator says the run that left it is dead
-//! (`--takeover`). A step may also rewrite the warehouse's own keys in the bucket, which are under
-//! `objects/{warehouse}/`, `signatures/{warehouse}/` and `staging/{warehouse}/`; `responses/` holds
-//! nothing a step migrates.
+//! (`--takeover`). Steps are confined to the warehouse's own DynamoDB partition: a step is given
+//! no object store, and nothing fences the bucket's keys, which the verifier writes without a
+//! gate. An S3 layout change therefore has no in-place path.
 //!
 //! The chain is a parameter, so tests run the upgrade over chains of their own; [`CHAIN`] is this
 //! build's, and empty. Format 2 keys the bucket per warehouse, and format 1 shared one key per
@@ -112,9 +112,9 @@ pub fn gate_for<R: RefStore + ?Sized>(refs: &R, chain: &AwsUpgradeChain<'_>) -> 
     match FormatState::parse(&state) {
         Some(FormatState::At(format)) if format == reads => Ok(FormatFence::At(state)),
         Some(FormatState::At(format)) if format < chain.floor() => Err(HeadError::service_unavailable(format!(
-            "This warehouse is in format {}, older than format {}, the oldest this deployment \
-            upgrades. No upgrade reaches it: make it again under a new id; nothing in it was changed.",
-            format, chain.floor()
+            "This warehouse is in format {}, older than format {}, the one this deployment reads, \
+            and {}. Make it again under a new id; nothing in it was changed.",
+            format, reads, chain.reach()
         ))),
         Some(FormatState::At(format)) if format < reads => Err(HeadError::service_unavailable(format!(
             "This warehouse is in format {}, older than format {}, the one this deployment reads. \
@@ -221,6 +221,15 @@ impl AwsUpgradeChain<'_> {
             .ok()
             .and_then(|count| self.reads.checked_sub(count))
             .expect("a chain has no more migrations than there are formats before the one it reads")
+    }
+
+    /// How far back the chain reaches, for a refusal of a format below it.
+    fn reach(&self) -> String {
+        if self.migrations.is_empty() {
+            "no upgrade reaches it: this version upgrades no older format".to_string()
+        } else {
+            format!("no upgrade reaches it: format {} is the oldest this version upgrades", self.floor())
+        }
     }
 
     fn migration_from(&self, format: u32) -> Option<&AwsMigration<'_>> {
@@ -354,11 +363,12 @@ pub fn upgrade<S: RefStore + FormatStore>(
             FormatState::At(format) => {
                 let migration = chain.migration_from(format).ok_or_else(|| {
                     format!(
-                        "Warehouse {} is in format {}, older than format {}, the oldest this version \
-                        upgrades. Make it again under a new id.",
+                        "Warehouse {} is in format {}, older than format {}, the one this version \
+                        reads, and {}. Make it again under a new id.",
                         warehouse,
                         format,
-                        chain.floor()
+                        chain.reads,
+                        chain.reach()
                     )
                 })?;
                 let mark = FormatState::Upgrading { from: format, to: format + 1, owner: options.owner.clone(), step: 0 };
@@ -576,7 +586,8 @@ mod tests {
         let refusal = gate(&store_at(Some("1"))).unwrap_err();
 
         assert_eq!(refusal.status.as_u16(), 503);
-        assert!(refusal.message.contains("make it again under a new id"), "{}", refusal.message);
+        assert!(refusal.message.contains("Make it again under a new id"), "{}", refusal.message);
+        assert!(refusal.message.contains("upgrades no older format"), "{}", refusal.message);
         assert!(!refusal.message.contains("operator has to upgrade"), "{}", refusal.message);
         assert_eq!(CHAIN.floor(), AWS_FORMAT);
     }
@@ -588,7 +599,7 @@ mod tests {
         let migrations = [AwsMigration { steps: &steps }];
         let chain = AwsUpgradeChain { reads: 3, migrations: &migrations };
 
-        for (state, says) in [("2", "operator has to upgrade"), ("1", "make it again under a new id")] {
+        for (state, says) in [("2", "operator has to upgrade"), ("1", "format 2 is the oldest this version upgrades")] {
             let refusal = gate_for(&store_at(Some(state)), &chain).unwrap_err();
             assert!(refusal.message.contains(says), "{}: {}", state, refusal.message);
         }
@@ -775,7 +786,7 @@ mod tests {
         let chain = AwsUpgradeChain { reads: 1, migrations: &migrations };
 
         for (state, says) in [
-            (Some("0"), "oldest this version upgrades"),
+            (Some("0"), "this version upgrades no older format"),
             (Some("2"), "newer than format 1"),
             (Some("x"), "cannot read"),
             (Some("0>1 dead 0"), "which this version does not do"),
