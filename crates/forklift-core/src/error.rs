@@ -335,7 +335,9 @@ refusal_codes! {
     /// The command would have written a pallet head that names redacted content: a file whose
     /// content a `@redactions` cell removes is in the tree the new head points at, or in a cell a
     /// meta pallet's new parcel adds. Nothing was written; the details name the pallet, the file's
-    /// path and the redacted hash, and the next step names the file to leave out.
+    /// path and the redacted hash, and the next step names the file to leave out. A load, park,
+    /// merge or pick refuses with it too, before the content reaches the bay; no head was refused,
+    /// so its details carry only the path and the hash.
     ContentRedacted => "content_redacted",
 
     /// `redact` refused to record a redaction: a user pallet head names the object, and a

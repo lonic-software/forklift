@@ -85,7 +85,12 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 24** (current): the `head_names_content` error code exists (exit 50): `redact record`
+**Schema 25** (current): `content_redacted` (exit 49) is also returned before anything lands in
+the bay: by `load` for a file it would stage, by `park` for a file it would park, and by a merge
+(`consolidate`, `haul`, `lower`, `lift`'s merge) or `pick` for a file it would write. These carry
+only `details.path` and `details.hash`, since no pallet head was refused.
+
+**Schema 24**: the `head_names_content` error code exists (exit 50): `redact record`
 refuses content a user pallet head still holds, with the hash in `details.hash` and every head that
 holds it in `details.heads`, each with its `pallet`, `head` and `path`.
 
