@@ -1459,8 +1459,8 @@ fn an_export_from_a_fresh_clone_names_each_remote_pallet_whose_work_it_lacks() {
     assert_eq!(left_behind(&export), [("feature".to_string(), feature.clone())], "{}", export);
 
     let human = stdout(&area.forklift_ok("b", &["git", "export", area.path("out-human").to_str().unwrap()]));
-    assert!(human.contains("warning: the remote's pallet \"feature\" holds work this export does not."), "{}", human);
-    assert!(human.contains("\"forklift lower <pallet>\" brings a pallet here"), "{}", human);
+    assert!(human.contains("warning: the remote's pallet \"feature\" holds work this export does not; \
+        \"forklift lower feature\" brings it here.\n  Then export again, into a new path.\n"), "{}", human);
 
     // The way out the warning names: lowered, the pallet is exported and nothing is left behind.
     area.forklift_ok("b", &["lower", "feature"]);
@@ -1495,7 +1495,8 @@ fn an_export_names_the_remote_tags_and_meta_pallets_it_lacks() {
     assert_eq!(export["tags"], serde_json::json!(["v0"]), "{}", export);
 
     let human = stdout(&area.forklift_ok("b", &["git", "export", area.path("out-human").to_str().unwrap()]));
-    assert!(human.contains("warning: the remote's tags include some this export does not."), "{}", human);
+    assert!(human.contains("warning: the remote's tags include some this export does not; a \
+        \"forklift lower\" of any pallet brings them here."), "{}", human);
     assert!(human.contains("Not exported, as git has no equivalent: @haul (hauls and their reviews)."), "{}", human);
 
     // Lowering brings the remote's tags (and its hauls) along with the pallet.

@@ -1057,17 +1057,19 @@ impl CommandOutput for ExportReport {
         // A remote's pallet names are its own text.
         for left in &self.remote_left_behind {
             match PalletRef::parse(&left.name) {
-                Ok(reference) if reference == PalletRef::meta(tag_utils::TAGS_PALLET_NAME) => println!("  warning: the remote's tags include some this export does not."),
+                Ok(reference) if reference == PalletRef::meta(tag_utils::TAGS_PALLET_NAME) => println!(
+                    "  warning: the remote's tags include some this export does not; a \"forklift lower\" \
+                    of any pallet brings them here."
+                ),
                 _ => println!(
-                    "  warning: the remote's pallet \"{}\" holds work this export does not.", sanitize(&left.name)
+                    "  warning: the remote's pallet \"{0}\" holds work this export does not; \
+                    \"forklift lower {0}\" brings it here.",
+                    sanitize(&left.name)
                 ),
             }
         }
         if !self.remote_left_behind.is_empty() {
-            println!(
-                "  \"forklift lower <pallet>\" brings a pallet here, and the remote's tags with it; \
-                then export again, into a new path."
-            );
+            println!("  Then export again, into a new path.");
         }
         if let Some(why) = &self.remote_unchecked {
             println!(

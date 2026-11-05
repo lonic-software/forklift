@@ -24,7 +24,7 @@ use crate::common;
 use common::{fence, forklift_command, repository_root, server_binary, tracked_pages};
 
 /// The pages under `docs/guide/` this test runs, each from an empty folder.
-const RUN_PAGES: &[&str] = &["tutorial.md", "concepts.md", "team.md", "cache.md"];
+const RUN_PAGES: &[&str] = &["tutorial.md", "concepts.md", "team.md", "cache.md", "leaving.md"];
 
 /// The address the pages tell the reader to serve on. The test serves on a port the server picks
 /// itself, so a busy 7171 on a CI machine cannot fail it, and rewrites this address wherever a
@@ -586,7 +586,7 @@ impl Reader {
 
         let unsupported = || -> ! {
             fail(&"this test cannot run it; use a command it knows (forklift, forklift-server, \
-                cd, mkdir, cat, echo > file) or teach it")
+                cd, mkdir, cat, echo > file, forklift > file) or teach it")
         };
 
         match (words[0].as_str(), redirect) {
@@ -599,6 +599,18 @@ impl Reader {
                 std::io::Write::write_all(&mut file, format!("{}\n", text).as_bytes())
                     .unwrap_or_else(|e| fail(&e));
                 (Some(0), Vec::new())
+            }
+            ("forklift", Some((path, append))) => {
+                // As a shell runs it: stdout into the file, stderr still on the terminal.
+                let file = std::fs::OpenOptions::new()
+                    .create(true).write(true).append(append).truncate(!append)
+                    .open(self.cwd.join(path))
+                    .unwrap_or_else(|e| fail(&e));
+                let mut command = forklift_command();
+                command.args(&words[1..]);
+                self.environment(&mut command);
+                let output = command.stdout(file).stderr(Stdio::piped()).output().unwrap_or_else(|e| fail(&e));
+                (output.status.code(), output.stderr)
             }
             (_, Some(_)) => unsupported(),
             ("cd", None) if words.len() == 2 => {
@@ -771,6 +783,11 @@ fn team_runs_as_written() {
 #[test]
 fn cache_runs_as_written() {
     run_page("cache.md");
+}
+
+#[test]
+fn leaving_runs_as_written() {
+    run_page("leaving.md");
 }
 
 /// A page that shows commands in a `console` block promises they run as shown, so a page with one
