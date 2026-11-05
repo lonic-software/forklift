@@ -312,23 +312,27 @@ pub(crate) fn chain_names(pallet: &str, head: &str, hash: &str) -> Result<bool, 
             continue;
         }
 
-        if !file_utils::does_object_exist(&object)? {
-            return Err(format!(
+        // A meta chain is checked from its root wherever it is adopted, so an object missing
+        // here is damage, not a partial fetch; the walk fails rather than pass a hash it could
+        // not judge.
+        let missing = |error: String| match file_utils::does_object_exist(&object) {
+            Ok(false) => format!(
                 "Object {} of @{}'s history is not in this store, so whether that history names \
-                {} cannot be told; nothing was recorded. Fetch the meta pallet's history, or \
-                record the redaction in a warehouse that holds it.",
+                {} cannot be told, and nothing was recorded. Record the redaction in a fresh \
+                clone of this warehouse.",
                 object, pallet, hash
-            ));
-        }
+            ),
+            _ => error,
+        };
 
         if is_parcel {
-            let parcel = object_utils::load_parcel(&object)?;
+            let parcel = object_utils::load_parcel(&object).map_err(missing)?;
             pending.extend(parcel.parents.into_iter().map(|parent| (parent, true)));
             pending.push((parcel.tree_hash, false));
             continue;
         }
 
-        let tree = object_utils::load_tree_shared(&object)?;
+        let tree = object_utils::load_tree_shared(&object).map_err(missing)?;
 
         if tree.get_files().any(|(_, file)| file.hash == hash) {
             return Ok(true);

@@ -3844,6 +3844,12 @@ mod tests {
         assert!(redaction_utils::chain_names("kv", &head, &held).unwrap());
         assert!(redaction_utils::chain_names("kv", &root, &held).unwrap());
         assert!(!redaction_utils::chain_names("kv", &head, &other).unwrap());
+
+        // With the root gone the walk cannot tell, and says so rather than answer "no".
+        let (folder, file_name) = crate::util::file_utils::get_path_for_object(&root).unwrap();
+        std::fs::remove_file(std::path::Path::new(&folder).join(file_name)).unwrap();
+        let error = redaction_utils::chain_names("kv", &head, &other).unwrap_err();
+        assert!(error.contains(&root) && error.contains("cannot be told"), "{}", error);
     }
 
     #[test]
