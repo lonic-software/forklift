@@ -6354,29 +6354,61 @@ async fn lift_pallet_inner(client: &RemoteClient,
 /// own redactions forbid it, by the check a local ref write takes
 /// ([`redaction_utils::check_head_write`]). The remote's check is not enough: `@redactions` lifts as
 /// a meta pallet of its own, and the working pallet lifts even when that lift failed, so the remote
-/// may not hold the redaction at all. A user pallet's refusal names the file and how a bay standing
-/// on the pallet stacks a head without it; a meta pallet's history is not taken back, so its refusal
-/// keeps the generic next step.
+/// may not hold the redaction at all. The office and other meta pallets may already have lifted
+/// when this refuses, so the refusal speaks for `pallet` alone.
+///
+/// A user pallet's refusal names the commands that stack a head without the file only where they
+/// work: from this bay, standing on the pallet at exactly `local_head`, with the file in its scope.
+/// Elsewhere (another bay stacked past this one's base, or the file is outside this bay's scope),
+/// and for a meta pallet, whose history is not taken back, it says what has to change.
 fn refuse_redacted_head(pallet: &str, local_head: &str, remote_head: Option<&str>) -> Result<(), String> {
     let target = pallet_utils::PalletRef::parse(pallet)?;
     let check = redaction_utils::check_head_write(target.namespace, &target.name, remote_head, local_head);
 
     let Err(refused) = check.outcome() else { return Ok(()) };
 
-    let next_step = match &refused {
-        pallet_utils::RefUpdateError::Redacted { path, .. } if target.namespace == pallet_utils::PalletNamespace::User => {
-            let remedy = tree_utils::remedy_path(path);
-
-            Some(format!(
-                "from the working tree's root, forklift remove {}{}, then forklift stack -m <description>, then forklift lift",
-                remedy.as_deref().unwrap_or("-- <path>"),
-                if remedy.is_some() { "" } else { " with that path quoted for your shell" }
-            ))
-        }
-        _ => None,
+    let pallet_utils::RefUpdateError::Redacted { path, hash, .. } = &refused else {
+        return Err(refused.reported_with("This pallet was not lifted."));
     };
 
-    Err(refused.reported_with_next_step("Nothing was lifted.", next_step))
+    let message = format!(
+        "Refusing to lift pallet \"{}\" at {}: it names \"{}\", whose content ({}) is redacted in this \
+        warehouse and may never be named by a new head. The remote's pallet \"{}\" was not moved.",
+        pallet, &local_head[..local_head.len().min(12)], path, hash, pallet
+    );
+
+    let next_step = if target.namespace == pallet_utils::PalletNamespace::User {
+        let here = stacks_here(pallet, local_head, path, pallet_utils::read_position().ok(), || scope_utils::current_scope().ok());
+
+        Some(match (here, tree_utils::remedy_path(path)) {
+            (true, Some(remedy)) => format!(
+                "from the working tree's root, forklift remove {}, then forklift stack -m <description>, then forklift lift",
+                remedy
+            ),
+            (true, None) => "from the working tree's root, forklift remove -- <path> with that path quoted for your shell, \
+                then forklift stack -m <description>, then forklift lift".to_string(),
+            (false, _) => format!(
+                "stack a head of pallet \"{}\" without \"{}\", from a bay standing on its head with that path in scope, then lift",
+                pallet, path
+            ),
+        })
+    } else {
+        None
+    };
+
+    Err(refused.redacted_refusal(message, next_step).map_or_else(|| refused.to_string(), Into::into))
+}
+
+/// Whether this checkout can take `path` out of `pallet`'s `local_head` by `remove` and `stack`:
+/// it stands on that pallet at exactly that head (`position`), and `path` is in its `scope`. A
+/// position or scope that cannot be read counts as not.
+fn stacks_here(pallet: &str,
+               local_head: &str,
+               path: &str,
+               position: Option<pallet_utils::BayPosition>,
+               scope: impl FnOnce() -> Option<PathScope>) -> bool {
+    position.is_some_and(|position| position.pallet == pallet && position.base.as_deref() == Some(local_head))
+        && scope().is_some_and(|scope| scope.classify(path) != ScopeClass::OutOfScope)
 }
 
 /// The [`RefusalCode::Diverged`] refusal for `pallet` (its wire name), whose local head and the
@@ -17513,5 +17545,23 @@ mod tests {
             expansion.walk_new_ref_heads_locally().unwrap();
             assert!(matches!(expansion.commit().unwrap(), ExpandCommit::Written(_)));
         }
+    }
+
+    #[test]
+    fn a_lift_refusal_names_remove_and_stack_only_from_a_bay_that_can_run_them() {
+        let at = |pallet: &str, base: Option<&str>| Some(pallet_utils::BayPosition::new(pallet, base.map(str::to_string)));
+        let full = || Some(PathScope::full());
+
+        assert!(stacks_here("main", "h1", "secret.env", at("main", Some("h1")), full), "this bay, at the head, in scope");
+
+        assert!(!stacks_here("main", "h1", "secret.env", at("main", Some("h0")), full), "another bay stacked past this base");
+        assert!(!stacks_here("main", "h1", "secret.env", at("side", Some("h1")), full), "a bay on another pallet");
+        assert!(!stacks_here("main", "h1", "secret.env", at("main", None), full), "an unborn base");
+        assert!(!stacks_here("main", "h1", "secret.env", None, full), "no position read");
+
+        let docs = || Some(PathScope::from_prefixes(["docs"]));
+        assert!(!stacks_here("main", "h1", "secret.env", at("main", Some("h1")), docs), "outside this bay's scope");
+        assert!(stacks_here("main", "h1", "docs/secret.env", at("main", Some("h1")), docs), "inside it");
+        assert!(!stacks_here("main", "h1", "docs/secret.env", at("main", Some("h1")), || None), "no scope read");
     }
 }

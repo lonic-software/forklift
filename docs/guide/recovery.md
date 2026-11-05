@@ -169,8 +169,10 @@ The same bytes under another name are the same content, so renaming the file doe
 
 `lift` refuses with this code too, before it sends the pallet, when a head you stacked earlier names
 the content; the remote may not hold the redaction yet, so its own check cannot be relied on. From
-the working tree's root, `forklift remove` the file, `stack`, and lift again: the new head no
-longer names it.
+a bay standing on that head with the file in its scope, `forklift remove` the file, `stack`, and
+lift again: the new head no longer names it. The parcels before it still do, and they lift with
+it, as history. If the lift then fails over
+`@redactions`, `lower` reconciles it with the remote's, and the next lift sends the redaction.
 
 ### `redaction_blocked` (exit 48)
 

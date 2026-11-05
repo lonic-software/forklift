@@ -782,7 +782,7 @@ impl RefUpdateError {
     /// [`RefUpdateError::Redacted`] crosses a String-typed caller as, with `message`, so the code
     /// reaches the command boundary, with `next_step` when the caller knows how its user takes the
     /// content out. `None` for every other variant.
-    fn redacted_refusal(&self, message: String, next_step: Option<String>) -> Option<crate::error::CoreError> {
+    pub(crate) fn redacted_refusal(&self, message: String, next_step: Option<String>) -> Option<crate::error::CoreError> {
         let RefUpdateError::Redacted { pallet, head, path, hash } = self else { return None };
 
         Some(crate::error::CoreError::refusal_with_details(
@@ -799,15 +799,9 @@ impl RefUpdateError {
     /// `String` conversion does. Every other variant's message is unchanged, so a caller that has
     /// written elsewhere words those itself.
     pub fn reported_with(&self, outcome: &str) -> String {
-        self.reported_with_next_step(outcome, None)
-    }
-
-    /// [`reported_with`](RefUpdateError::reported_with), with `next_step` in place of a redaction
-    /// refusal's own when it is given.
-    pub fn reported_with_next_step(&self, outcome: &str, next_step: Option<String>) -> String {
         let message = WithOutcome(self, outcome).to_string();
 
-        match self.redacted_refusal(message.clone(), next_step) {
+        match self.redacted_refusal(message.clone(), None) {
             Some(refusal) => refusal.into(),
             None => message,
         }

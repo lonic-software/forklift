@@ -380,6 +380,9 @@ fn a_lift_is_refused_by_this_warehouses_own_redactions_until_the_file_is_taken_o
     assert_eq!(error["details"]["path"], "secret.env", "{}", error);
     assert_eq!(error["details"]["hash"], hash.as_str(), "{}", error);
     assert_eq!(error["details"]["pallet"], "main", "{}", error);
+    let message = error["message"].as_str().unwrap();
+    assert!(message.starts_with("Refusing to lift pallet \"main\""), "{}", error);
+    assert!(message.contains("The remote's pallet \"main\" was not moved."), "{}", error);
     assert_eq!(
         error["next_step"],
         "from the working tree's root, forklift remove secret.env, then forklift stack -m <description>, then forklift lift",
