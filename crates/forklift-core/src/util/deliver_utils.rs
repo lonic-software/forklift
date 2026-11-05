@@ -4,8 +4,8 @@
 //! draft pallet's net change into a single parcel on the target — a plain single-parent
 //! parcel carrying the draft head's tree, so the checkpoints stay *out* of the target's
 //! history — and records the trail as a **delivery** manifest entry referencing the kept
-//! checkpoints. Both are signed once the warehouse holds trust, and unsigned before it, as
-//! a stack is. The clean story stays clean; the "what the agent tried, in what order"
+//! checkpoints. Both are signed once the warehouse holds trust, and unsigned in a warehouse
+//! that never enrolled. The clean story stays clean; the "what the agent tried, in what order"
 //! evidence stays complete and discoverable.
 //!
 //! Because the delivered tree equals the draft head's tree, the working directory does not
@@ -76,10 +76,16 @@ pub fn deliver(target: &str, description: Option<String>) -> Result<DeliverOutco
     // is written only while that office stands. A reader may write no pallet, so is refused
     // before anything is written. In a warehouse that never enrolled (no anchor, no office), both
     // are unsigned and name the configured operator, and the head lands only while that still
-    // holds. An office whose anchor is gone is neither, and refuses here.
+    // holds. An office whose anchor is gone is neither, and refuses here, as does trust
+    // established since the signing choice was read.
     let (signing_key_id, writer) = match stack_utils::resolve_signing_key(&operator)? {
         stack_utils::Signing::Unsigned => {
-            audit_utils::local_meta_trust()?;
+            if audit_utils::local_meta_trust()?.is_some() {
+                return Err(
+                    "Trust was established for this warehouse while deliver ran; nothing was \
+                    changed. Run it again.".to_string()
+                );
+            }
 
             (None, MetaWriter::Unsigned)
         }

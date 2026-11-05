@@ -41,7 +41,8 @@ const PRIMITIVES: &[&str] = &[
 /// Every production writer: the file, the function holding the call, and why it is sound. A
 /// function holding several calls is listed once per call.
 const WRITERS: &[(&str, &str, Class)] = &[
-    // Signed whenever an anchor is held; unsigned only under no anchor and no office.
+    // Signed whenever an anchor is held: an unsigned head is written only under the unsigned
+    // writer's preconditions, no anchor and no office.
     ("crates/forklift-core/src/util/deliver_utils.rs", "deliver", Class::Signs),
     // An undone delete's head is verified as the anchor and office stand now.
     ("crates/forklift-core/src/util/journal_utils.rs", "create_deleted", Class::Verifies),

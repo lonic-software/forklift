@@ -263,8 +263,9 @@ pub enum Command {
                       the full trail is kept (the draft pallet is left intact) and recorded as a \
                       \"delivery\" entry on the parcel's manifest, so \"what the agent tried, in \
                       what order\" stays discoverable. Once the warehouse is enrolled, the parcel \
-                      and the entry are signed with your key; before that, both are unsigned and \
-                      name your configured operator, as a stack is. The current pallet becomes \
+                      and the entry are signed with your key; in a warehouse that never \
+                      enrolled, both are unsigned and name your configured operator. A warehouse \
+                      whose trust anchor was lost refuses. The current pallet becomes \
                       the target; the working directory is unchanged (the tree is identical)."
     )]
     Deliver {

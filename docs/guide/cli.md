@@ -1428,8 +1428,9 @@ order" stays discoverable (`manifest show <parcel>`). The delivered parcel prese
 trail's authors; the deliverer is the stacker.
 
 Once the warehouse is enrolled, the parcel and its delivery entry are signed with your key,
-and a reader cannot deliver. Before that, both are unsigned and name your configured
-operator, as a `stack` is, and enrolling later keeps them valid. The current pallet becomes
+and a reader cannot deliver. In a warehouse that never enrolled, both are unsigned and name
+your configured operator, and enrolling later keeps them valid; a warehouse whose trust
+anchor was lost refuses. The current pallet becomes
 the target, and because the delivered tree equals the draft's, the working directory does
 not change. A second delivery of an already-delivered draft is refused.
 

@@ -17,7 +17,8 @@ use crate::output::{self, CommandOutput};
 /// # Returns
 /// * `Ok(())`      - If the delivery completed.
 /// * `Err(String)` - If there is nothing to deliver, the target moved after the draft
-///                   forked, the operator cannot sign under trust, or an operation failed.
+///                   forked, the operator cannot sign under trust, the anchor is lost, or an
+///                   operation failed.
 pub fn handle_command(target: &str, message: Option<String>) -> Result<(), String> {
     forklift_core::util::stack_utils::refuse_blank_description(message.as_deref())?;
 
