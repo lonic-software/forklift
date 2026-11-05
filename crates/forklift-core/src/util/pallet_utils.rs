@@ -2638,10 +2638,9 @@ pub(crate) mod tests {
             let secret = blob("secret");
             let head = parcel(&two_dirs("a1", "secret"), &[&base]);
 
-            // The redactions' tree is unreadable, so the first walk fails.
+            // The @redactions head parcel is missing, so the first walk fails.
             let redactions = get_meta_pallet_head(crate::util::redaction_utils::REDACTIONS_PALLET_NAME).unwrap().unwrap();
-            let state = crate::util::object_utils::load_parcel(&redactions).unwrap().tree_hash;
-            let (folder, file) = file_utils::get_path_for_object(&state).unwrap();
+            let (folder, file) = file_utils::get_path_for_object(&redactions).unwrap();
             let path = std::path::Path::new(&folder).join(file);
             let bytes = std::fs::read(&path).unwrap();
             std::fs::remove_file(&path).unwrap();
