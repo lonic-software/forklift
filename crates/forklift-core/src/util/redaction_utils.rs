@@ -615,8 +615,9 @@ impl HeadWriteCheck {
 ///   that adds a redacted object to the tree is refused; refusing the carry would freeze a pallet
 ///   whose history named the object before it was redacted.
 /// - `served`, a meta head the remote served in this same command, exempts the history it reaches:
-///   the remote judged each of those parcels when it took it, so whatever they name is already
-///   held there by meta history, where a redaction stays pending. A client adopting the remote's
+///   the remote judged each of those parcels against its own redactions when it took it, which
+///   need not hold this warehouse's, but whatever they name is held there by meta history that is
+///   never rewritten, so refusing would only freeze the pallet behind it. A client adopting the remote's
 ///   chain (a lower's fast-forward, the trust install's office, a replay onto the remote's head) is
 ///   then not refused for history it merely takes. A parcel past `served` is judged as usual. It
 ///   is `None` for every write a remote sends this warehouse, and it exempts nothing for a user
@@ -697,6 +698,11 @@ fn meta_parcels_add(expected: Option<&str>,
                     served: Option<&str>,
                     new: &str,
                     set: &RedactedSet) -> Result<Option<Named>, String> {
+    // Taking the served head itself adds nothing past it.
+    if served == Some(new) {
+        return Ok(None);
+    }
+
     let mut reached: HashSet<String> = HashSet::new();
     let mut pending: Vec<String> = expected.into_iter().chain(served).map(str::to_string).collect();
 

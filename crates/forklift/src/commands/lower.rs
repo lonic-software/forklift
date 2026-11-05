@@ -1273,7 +1273,7 @@ pub(crate) async fn replay(client: &RemoteClient,
     // so an operator the office no longer lets sign can still drop what the remote refuses. With
     // no remote head there is nothing to move to: the replay stacks an empty root instead.
     if let (true, Some(remote_head)) = (plan.is_empty(), remote_head) {
-        pallet_utils::update_meta_pallet_head(name, Some(&local), remote_head, &pallet_utils::RefPreconditions::NONE)?;
+        pallet_utils::update_meta_pallet_head_served(name, Some(&local), remote_head, remote_head, &pallet_utils::RefPreconditions::NONE)?;
         return Ok(Reconciled::Adopted);
     }
 
