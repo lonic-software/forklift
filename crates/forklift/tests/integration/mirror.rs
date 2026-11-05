@@ -1433,3 +1433,109 @@ fn a_damaged_mirror_under_a_tag_fails_the_tags() {
     assert!(details["tags_error"].as_str().unwrap().contains("Delete .forklift/mirror.git"), "{}", document);
     assert!(!git(&fixture.git, &["rev-parse", "--verify", "-q", "refs/tags/v0"]).status.success());
 }
+
+/// `git export`'s `remote_left_behind`, as `(name, head)` pairs.
+fn left_behind(export: &serde_json::Value) -> Vec<(String, String)> {
+    export["remote_left_behind"].as_array().map(Vec::as_slice).unwrap_or_default().iter()
+        .map(|left| (left["name"].as_str().unwrap().to_string(), left["head"].as_str().unwrap().to_string()))
+        .collect()
+}
+
+#[test]
+fn an_export_from_a_fresh_clone_names_each_remote_pallet_whose_work_it_lacks() {
+    let fixture = Fixture::new("export-left-behind");
+    let area = &fixture.area;
+
+    // "alias" is a second name for main's head, so the export holds its work under another name.
+    area.forklift_ok("a", &["pallet", "create", "alias"]);
+    area.lift("a");
+    area.forklift_ok("a", &["pallet", "create", "feature"]);
+    area.stack("a", "feature.txt", "f\n", "feature work");
+    let feature = area.lift("a")["head"].as_str().unwrap().to_string();
+
+    fixture.franchise("b");
+    let export = area.json("b", &["git", "export", area.path("out").to_str().unwrap()]);
+    assert_eq!(export["branches"], serde_json::json!(["main"]), "{}", export);
+    assert_eq!(left_behind(&export), [("feature".to_string(), feature.clone())], "{}", export);
+
+    let human = stdout(&area.forklift_ok("b", &["git", "export", area.path("out-human").to_str().unwrap()]));
+    assert!(human.contains("warning: the remote's pallet \"feature\" holds work this export does not."), "{}", human);
+    assert!(human.contains("\"forklift lower <pallet>\" brings a pallet here"), "{}", human);
+
+    // The way out the warning names: lowered, the pallet is exported and nothing is left behind.
+    area.forklift_ok("b", &["lower", "feature"]);
+    let export = area.json("b", &["git", "export", area.path("out-lowered").to_str().unwrap()]);
+    assert_eq!(export["branches"], serde_json::json!(["feature", "main"]), "{}", export);
+    assert!(export.get("remote_left_behind").is_none(), "{}", export);
+}
+
+#[test]
+fn an_export_names_the_remote_tags_and_meta_pallets_it_lacks() {
+    let fixture = Fixture::new("export-left-meta");
+    let area = &fixture.area;
+    fixture.franchise("b");
+
+    // After the clone, the remote gains a tag and a haul that "b" does not hold.
+    area.forklift_ok("a", &["tag", "create", "v1", "main"]);
+    area.lift("a");
+    area.forklift_ok("a", &["pallet", "create", "feature"]);
+    area.stack("a", "feature.txt", "f\n", "feature work");
+    area.lift("a");
+    area.forklift_ok("a", &["haul", "open", "--target", "main", "--source", "feature", "--title", "Add f", "-m", "why"]);
+    area.lift("a");
+    assert!(!area.path("b/.forklift/meta/haul").exists());
+
+    let export = area.json("b", &["git", "export", area.path("out").to_str().unwrap()]);
+    let names: Vec<String> = left_behind(&export).into_iter().map(|(name, _)| name).collect();
+    assert_eq!(names, ["@tags", "feature"], "{}", export);
+    assert_eq!(export["not_exported"], serde_json::json!(["@haul"]), "{}", export);
+    assert_eq!(export["tags"], serde_json::json!([]), "{}", export);
+
+    let human = stdout(&area.forklift_ok("b", &["git", "export", area.path("out-human").to_str().unwrap()]));
+    assert!(human.contains("warning: the remote's tags include some this export does not."), "{}", human);
+    assert!(human.contains("Not exported, as git has no equivalent: @haul (hauls and their reviews)."), "{}", human);
+
+    // Lowering brings the remote's tags (and its hauls) along with the pallet.
+    area.forklift_ok("b", &["lower", "feature"]);
+    let export = area.json("b", &["git", "export", area.path("out-lowered").to_str().unwrap()]);
+    assert!(export.get("remote_left_behind").is_none(), "{}", export);
+    assert_eq!(export["tags"], serde_json::json!(["v1"]), "{}", export);
+    assert_eq!(export["not_exported"], serde_json::json!(["@haul"]), "{}", export);
+}
+
+#[test]
+fn an_export_still_succeeds_and_says_so_when_the_remote_cannot_be_asked() {
+    let area = TestArea::new("export-unreachable");
+    // Nothing listens on port 1.
+    prepare_warehouse(&area, "a", "http://127.0.0.1:1");
+    area.stack("a", "code.txt", "v1\n", "first");
+
+    let export = area.json("a", &["git", "export", area.path("out").to_str().unwrap()]);
+    assert_eq!(export["branches"], serde_json::json!(["main"]), "{}", export);
+    assert!(export["remote_unchecked"].as_str().is_some_and(|why| !why.is_empty()), "{}", export);
+    assert!(export.get("remote_left_behind").is_none(), "{}", export);
+
+    let human = stdout(&area.forklift_ok("a", &["git", "export", area.path("out-human").to_str().unwrap()]));
+    assert!(human.contains("warning: could not ask the remote which pallets it holds"), "{}", human);
+    assert!(human.contains("\"forklift pallet list --remote\" lists them."), "{}", human);
+}
+
+#[test]
+fn an_export_without_a_remote_asks_nothing_and_counts_parked_work() {
+    let area = TestArea::new("export-parked");
+    std::fs::create_dir_all(area.path("a")).unwrap();
+    area.forklift_ok("a", &["prepare"]);
+    area.forklift_ok("a", &["config", "set", "--global", "operator.identifier", "tester@forklift"]);
+    area.stack("a", "code.txt", "v1\n", "first");
+    area.write_file("a/code.txt", "v2\n");
+    area.forklift_ok("a", &["park"]);
+
+    let export = area.json("a", &["git", "export", area.path("out").to_str().unwrap()]);
+    assert_eq!(export["parked"], 1, "{}", export);
+    assert!(export.get("remote_unchecked").is_none(), "{}", export);
+    assert_eq!(export["not_exported"], serde_json::json!([]), "{}", export);
+
+    let human = stdout(&area.forklift_ok("a", &["git", "export", area.path("out-human").to_str().unwrap()]));
+    assert!(human.contains("warning: 1 parked parcel(s) were not exported."), "{}", human);
+    assert!(!human.contains("Not exported, as git has no equivalent"), "{}", human);
+}
