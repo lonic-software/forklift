@@ -5098,9 +5098,6 @@ fn import_git_records_the_git_tags_unsigned() {
     assert!(stdout(&warehouse.run(&["tag", "show", "v1.0"])).contains("bob@example.com (unsigned)"));
 }
 
-/// Git import leaves out a git tag whose name a tag already here holds, since a tag name is
-/// immutable, and records the rest.
-// Revert: drop the `taken` check in `plan_tags` → the import fails on the immutable name.
 /// An office standing without its anchor refuses every unsigned write, so git import refuses it
 /// before any branch lands, rather than failing on the tags afterwards.
 // Revert: drop the up-front office check → the branches land before the refusal.
@@ -5127,6 +5124,9 @@ fn import_git_refuses_an_office_without_its_anchor_before_any_branch_lands() {
     assert!(!pallets.contains("trunk"), "no branch lands: {}", pallets);
 }
 
+/// Git import leaves out a git tag whose name a tag already here holds, since a tag name is
+/// immutable, and records the rest.
+// Revert: drop the `taken` check in `plan_tags` → the import fails on the immutable name.
 #[test]
 fn import_git_leaves_out_a_tag_name_already_here() {
     let warehouse = TestWarehouse::new("import-git-taken-tag");

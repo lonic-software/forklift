@@ -65,17 +65,15 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
     )?;
 
     // Imported parcels are unsigned; a trusted warehouse rejects those, so import must
-    // come first — enrolling afterwards records the imported heads as the legacy boundary.
-    if office_utils::read_trust_anchor()?.is_some() {
+    // come first — enrolling afterwards records the imported heads as the legacy boundary. An
+    // office standing without its anchor refuses every unsigned write, the tags included, so it
+    // is refused here too, before any head moves.
+    if audit_utils::local_meta_trust()?.is_some() {
         return Err(
             "Trust is already established here; unsigned git history cannot be imported. \
             Import into a fresh warehouse, then \"forklift office enroll\".".to_string()
         );
     }
-
-    // An office standing without its anchor refuses every unsigned write, the tags included:
-    // refused here, before any head moves, rather than after the branches have landed.
-    audit_utils::local_meta_trust()?;
 
     // Validate it is a git repository up front (a clear error beats a cryptic one later).
     git(path, &["rev-parse", "--git-dir"])?;
@@ -129,11 +127,12 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
         session.finish()?;
     }
 
-    // Each local branch becomes a pallet, unsigned, so each is written only while no anchor
-    // stands: an "office enroll" in another bay during the conversion refuses the import rather
-    // than leaving heads outside the boundary it recorded.
+    // Each local branch becomes a pallet, unsigned, so each is written only while no anchor and
+    // no office stand, as the tags are: an "office enroll" in another bay during the conversion
+    // refuses the import rather than leaving heads outside the boundary it recorded.
     let mut imported: Vec<(String, String)> = Vec::new();
     let unsigned = pallet_utils::RefPreconditions {
+        office: pallet_utils::OfficePrecondition::At(None),
         anchor: pallet_utils::AnchorPrecondition::Absent,
         ..pallet_utils::RefPreconditions::NONE
     };
@@ -203,7 +202,7 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
         true => format!("The branches were imported, but the git tags could not be recorded: {}", why),
         false => format!(
             "The branches were imported, and the git tags {} were recorded, but the rest could not be: {}",
-            recorded.iter().map(|name| format!("\"{}\"", sanitize(name))).collect::<Vec<_>>().join(", "),
+            recorded.iter().map(|name| format!("\"{}\"", name)).collect::<Vec<_>>().join(", "),
             why
         ),
     })?;
