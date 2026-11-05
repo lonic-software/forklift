@@ -86,8 +86,9 @@ exit status alone. Forklift has no prompt that handles a cancellation itself, so
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
 **Schema 25** (current): `content_redacted` (exit 49) is also returned before anything lands in
-the bay: by `load` for a file it would stage, by `park` for a file it would park, and by a merge
-(`consolidate`, `haul`, `lower`, `lift`'s merge) or `pick` for a file it would write. These carry
+the bay: by `load` for a file it would stage, by `park` for a file it would park or restage, by
+`lower` for a file the remote's head would write, and by a merge (`consolidate`, `haul`, `lower`,
+`lift`'s merge) or `pick` for a file it would write or whose other side it would bring in. These carry
 only `details.path` and `details.hash`, since no pallet head was refused.
 
 **Schema 24**: the `head_names_content` error code exists (exit 50): `redact record`

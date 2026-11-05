@@ -167,10 +167,10 @@ redaction means no new head may name it again. Nothing was written. The error's 
 delete it from the bay and `load` again before `stack`, for instance — and run the command again.
 The same bytes under another name are the same content, so renaming the file does not help.
 
-`load`, `park`, a merge (`consolidate`, `haul`, `lower`, `lift`'s merge) and `pick` refuse with this
+`load`, `park`, `lower`, a merge (`consolidate`, `haul`, `lift`'s merge) and `pick` refuse with this
 code too, before anything reaches the bay, when they would stage, park or write the content. Change
-or delete the file and run `load` or `park` again. A merge or pick brings the content from the other
-side, so take the file out there first, or make the change by hand without it.
+or delete the file and run `load` or `park` again. `lower`, a merge or a pick brings the content from
+the other side, so take the file out there first, or make the change by hand without it.
 
 `lift` refuses with this code too, before it sends the pallet, when a head you stacked earlier names
 the content; the remote may not hold the redaction yet, so its own check cannot be relied on. From

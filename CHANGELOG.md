@@ -100,8 +100,8 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 - **The `--json` schema is now 25: `load`, `park`, merges and `pick` refuse redacted content.** Part
   of content redaction: a file whose content is redacted is refused with `content_redacted` (exit 49)
-  before anything reaches the bay, when `load` would stage it, `park` would park it, or a merge
-  (`consolidate`, `haul`, `lower`, `lift`'s merge) or `pick` would write it. Nothing is staged,
+  before anything reaches the bay, when `load` would stage it, `park` would park it, `lower` would
+  check it out, or a merge (`consolidate`, `haul`, `lift`'s merge) or `pick` would write it. Nothing is staged,
   parked or changed, and these refusals carry only the path and the hash.
 - **The `--json` schema is now 24, with the `head_names_content` error code (exit 50).** Content
   redaction removes content from history only, so recording a redaction of content a pallet head
