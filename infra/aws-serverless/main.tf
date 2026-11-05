@@ -31,8 +31,9 @@ locals {
   # though verify_and_promote never issues a single DynamoDB operation (the "operator quirk",
   # docs/DEPLOYMENT.md, pinned by C4) — a module that wires both functions from one config
   # cannot forget this. No credential (the verifier is never invoked by a bearer-carrying
-  # client — it is triggered by an S3 event, entrypoint.rs), no FORKLIFT_WAREHOUSE_ID (promotion
-  # is content-addressed, not warehouse-scoped), no FORKLIFT_DEFAULT_PALLET (control-plane only).
+  # client — it is triggered by an S3 event, entrypoint.rs), no FORKLIFT_WAREHOUSE_ID (each staged
+  # key names its warehouse, so one verifier serves them all), no FORKLIFT_DEFAULT_PALLET
+  # (control-plane only).
   verifier_env = merge(
     {
       FORKLIFT_S3_BUCKET      = aws_s3_bucket.this.bucket

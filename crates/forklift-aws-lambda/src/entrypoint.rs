@@ -20,15 +20,15 @@
 //!
 //! On an S3-backed head the object and bundle endpoints answer with a redirect to a presigned
 //! storage URL: an object `GET` redirects to the canonical key and a staged `PUT` redirects to
-//! `staging/{session}/{hash}` (never the hash key — invariant 1), both `307 Temporary Redirect`
-//! since the client must replay the same method at the target. A `batch` bundle redirects to an
-//! ephemeral response key with `303 See Other` instead — the target is always a presigned `GET`,
-//! and the original request was a `POST`, so the redirect must tell the client to *switch*
-//! methods rather than replay the `POST` (which a `307`/`308` would, failing signature
-//! verification against a `GET`-only presigned URL). The control plane never carries object
-//! bytes it can hand off, which is what keeps a Lambda inside its few-megabyte response limit.
-//! The self-host equivalent (the fakes) serves those bytes inline, and [`handle`] answers both
-//! shapes so one router serves both stores.
+//! `staging/{warehouse}/{session}/{hash}` (never the hash key — invariant 1), both
+//! `307 Temporary Redirect` since the client must replay the same method at the target. A `batch`
+//! bundle redirects to an ephemeral response key with `303 See Other` instead — the target is
+//! always a presigned `GET`, and the original request was a `POST`, so the redirect must tell the
+//! client to *switch* methods rather than replay the `POST` (which a `307`/`308` would, failing
+//! signature verification against a `GET`-only presigned URL). The control plane never carries
+//! object bytes it can hand off, which is what keeps a Lambda inside its few-megabyte response
+//! limit. The self-host equivalent (the fakes) serves those bytes inline, and [`handle`] answers
+//! both shapes so one router serves both stores.
 //!
 //! # Multi-warehouse routing
 //!
@@ -682,8 +682,8 @@ fn param(segment: &str) -> HeadResult<String> {
 
 /// A lift session id, wherever the request names it (the commit path, the upload query, the
 /// `upload-targets` body): one or more ASCII alphanumerics and `-`, as the client's hyphenated
-/// UUIDs are. The id becomes the staging prefix `staging/{session}/`, so a `/` in one would place
-/// its staging keys under another session's sweep prefix; anything else is a `422`.
+/// UUIDs are. The id becomes the staging prefix `staging/{warehouse}/{session}/`, so a `/` in one
+/// would place its staging keys under another session's sweep prefix; anything else is a `422`.
 fn session_id(session: &str) -> HeadResult<String> {
     let valid = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'-';
     if !session.is_empty() && session.bytes().all(valid) {

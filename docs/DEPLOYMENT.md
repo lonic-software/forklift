@@ -37,13 +37,15 @@ store code behind them, not a Terraform/CDK stack.
           ▼                ▼
  ┌───────────────────────────────────┐
  │              S3 bucket             │
- │  objects/{hash}   staging/{sess}/  │
- │  signatures/{hash} responses/{h}   │
+ │  objects/{wh}/{hash}               │
+ │  staging/{wh}/{sess}/{hash}        │
+ │  signatures/{wh}/{hash}            │
+ │  responses/{h}                     │
  └───────────────┬───────────────────┘
                   │ s3:ObjectCreated:* on staging/*
                   ▼
  ┌─────────────────────────┐
- │  forklift-aws-verifier   │  verify_and_promote → objects/{hash}
+ │  forklift-aws-verifier   │  verify_and_promote → objects/{wh}/{hash}
  │        (Lambda)          │  (the same function the control plane
  └─────────────────────────┘   calls synchronously for small objects)
 
@@ -60,13 +62,13 @@ client follows it and talks to S3 directly. The one exception is the signature s
 endpoints, which do return raw bytes through the control-plane Lambda — see "Binary responses"
 below.
 
-A client `PUT`s straight to `staging/{session}/{hash}`, never to the canonical `objects/{hash}`
-key — nothing lands at a hash key until it is hash-verified. Small control-plane objects
-(parcels, trees, signatures) are verified and promoted **synchronously** by the control plane
-when the client calls `POST /lift/{session}/commit`; large blobs and chunks are verified and
-promoted **asynchronously** by the verifier Lambda, triggered by the S3 event the staging `PUT`
-itself fires. Both call the identical `ObjectStore::verify_and_promote`, and it is idempotent,
-so the two racing on one hash is safe — whichever gets there first wins, the other reads
+A client `PUT`s straight to `staging/{warehouse}/{session}/{hash}`, never to the canonical
+`objects/{warehouse}/{hash}` key — nothing lands at a hash key until it is hash-verified. Small
+control-plane objects (parcels, trees, signatures) are verified and promoted **synchronously** by
+the control plane when the client calls `POST /lift/{session}/commit`; large blobs and chunks are
+verified and promoted **asynchronously** by the verifier Lambda, triggered by the S3 event the
+staging `PUT` itself fires. Both call the identical `ObjectStore::verify_and_promote`, and it is
+idempotent, so the two racing on one hash is safe — whichever gets there first wins, the other reads
 `AlreadyPresent`.
 
 ## The two Lambda functions
@@ -87,11 +89,13 @@ refuses to let a runtime worker block. It builds `Head` with `Head::pooled`, whi
 process-global, on-disk audit-mirror scratch across warm invocations (keyed by warehouse id),
 so the ref-update audit's mirroring cost is amortized rather than paid on every request.
 
-**Staging verifier.** Even thinner: for every S3 event record it parses the `staging/{session}
-/{hash}` key (decoding the `+`/`%XX` escaping S3 event notifications apply, preferring the
-event's own `url_decoded_key` field when present) and calls `verify_and_promote` on a blocking
-thread. It builds only an `S3ObjectStore` — no `DynamoRefStore`, no warehouse id — because
-promotion is content-addressed, not warehouse-scoped. A storage error propagates (so S3 retries
+**Staging verifier.** Even thinner: for every S3 event record it parses the
+`staging/{warehouse}/{session}/{hash}` key (decoding the `+`/`%XX` escaping S3 event notifications
+apply, preferring the event's own `url_decoded_key` field when present) and calls
+`verify_and_promote` on a blocking thread. It builds only an `S3ObjectStore`, no `DynamoRefStore`,
+bound to the warehouse the key names: objects are keyed per warehouse, and the key is all an S3
+event carries. It needs no `FORKLIFT_WAREHOUSE_ID`, so one verifier serves every warehouse in the
+bucket. A storage error propagates (so S3 retries
 the event); a semantic outcome (missing, corrupt) is logged and the event is consumed, since
 retrying a corrupt object would only rediscard it forever.
 
@@ -263,16 +267,27 @@ in its SDK retries for longer than the reserve can still carry the walk past the
 ### Key layout
 
 One bucket, four prefixes (`aws::s3`'s module docs), and the boundary between them **is** the
-protocol's "nothing unverified is fetchable" invariant:
+protocol's "nothing unverified is fetchable" invariant. Under three of them every warehouse has its
+own keys, so no warehouse's answers depend on what another one stores: one warehouse cannot learn
+whether another holds an object.
 
 | Prefix | Contents | Written by |
 |---|---|---|
-| `objects/{hash}` | Canonical, hash-verified objects. The **only** namespace a `GET` ever serves. | `put_verified` (direct write) / `verify_and_promote` (promotion) |
-| `staging/{session}/{hash}` | Unverified bytes a client `PUT` straight into, via a presigned URL. Invisible to `exists`/`get`. | The client, via a presigned `PUT` |
-| `signatures/{parcel_hash}` | Parcel signature sidecars — a distinct prefix so a sidecar never collides with its parcel's own object at `objects/{parcel_hash}`. | `put_signature` |
-| `responses/{content_hash}` | Ephemeral, content-addressed `batch`-bundle bodies offloaded from the control plane. Never `objects/`. | `offload_response` |
+| `objects/{warehouse}/{hash}` | Canonical, hash-verified objects. The **only** namespace a `GET` ever serves. | `put_verified` (direct write) / `verify_and_promote` (promotion) |
+| `staging/{warehouse}/{session}/{hash}` | Unverified bytes a client `PUT` straight into, via a presigned URL. Invisible to `exists`/`get`. | The client, via a presigned `PUT` |
+| `signatures/{warehouse}/{parcel_hash}` | Parcel signature sidecars — a distinct prefix so a sidecar never collides with its parcel's own object at `objects/{warehouse}/{parcel_hash}`. | `put_signature` |
+| `responses/{content_hash}` | Ephemeral, content-addressed `batch`-bundle bodies offloaded from the control plane, shared by every warehouse and reached only through a presigned URL. Never `objects/`. | `offload_response` |
 
-No presigned `PUT` is ever issued to `objects/{hash}` — `presign_staging_put` hardcodes the
+A warehouse in AWS format 1 kept one `objects/{hash}` and `signatures/{hash}` key for every
+warehouse in the bucket. Nothing reads those keys, and the format gate refuses such a warehouse with
+a `503` that says to make it again under a new id (`docs/format/WAREHOUSE_FORMAT.md`). Its keys stay
+in the bucket until the operator deletes them: they are the keys that are exactly `objects/{hash}`
+or `signatures/{hash}`, with no further `/`. Select them one by one by that whole shape, never with
+a prefix or recursive delete: a format 2 warehouse id may itself be 64 hex characters, and then
+`objects/{id}/` is that live warehouse's objects. Its DynamoDB partition stays too, and keeps its id
+taken until its items are deleted.
+
+No presigned `PUT` is ever issued to `objects/` — `presign_staging_put` hardcodes the
 `staging/` prefix and is the only code path that mints a presigned `PUT` at all.
 
 ### Required: expire the `staging/` prefix
@@ -301,11 +316,11 @@ longer, since clients hash-verify every bundle record on import regardless.
 
 Configure S3 Event Notifications (bucket-level, or EventBridge if you prefer) for
 **`s3:ObjectCreated:*` on the `staging/` prefix**, targeting the verifier Lambda. The verifier
-parses `record.s3.object.key`, decodes it, and calls `parse_staging_key` — anything that does
-not split cleanly into `staging/{session}/{hash}` is logged and skipped rather than retried, so
-a notification scoped to any other prefix is simply wasted invocations, not a correctness bug.
-Do not wire `ObjectRemoved` or other event types — the verifier has no use for them, and a
-`staging/`-shaped key from a delete event would just read back `Missing`.
+parses `record.s3.object.key`, decodes it, and calls `parse_staging_key` — anything that does not
+split cleanly into `staging/{warehouse}/{session}/{hash}`, with a valid warehouse id, is logged and
+skipped rather than retried, so a notification scoped to any other prefix is simply wasted
+invocations, not a correctness bug. Do not wire `ObjectRemoved` or other event types — the verifier
+has no use for them, and a `staging/`-shaped key from a delete event would just read back `Missing`.
 
 ### Versioning, encryption, CORS
 
@@ -611,8 +626,8 @@ DynamoDB client via `config_from_env`/`build_clients`, but never issues a single
 it). `iam/verifier.policy.json`'s statements: `s3:GetObject`/`s3:DeleteObject` on `staging/*` (read
 then clear the staged object once promoted), `s3:GetObject`/`s3:PutObject` on `objects/*` (write the
 promoted copy), `s3:ListBucket` on the bucket (404-vs-403 semantics, below — `verify_and_promote`'s
-`key_exists` check against the canonical `objects/{hash}` key, absent by definition for a genuinely
-new object, is a `HeadObject` on a missing key), and the same `Logs` statement as the control plane.
+`key_exists` check against the canonical `objects/{warehouse}/{hash}` key, absent by definition for a
+genuinely new object, is a `HeadObject` on a missing key), and the same `Logs` statement as the control plane.
 
 ### `forklift-aws-upgrade`
 
@@ -904,7 +919,7 @@ Run this against your **actual deployed infrastructure** (not LocalStack) once i
    `clone` it back down — confirms the presigned chunk `GET`s, the recipe descent, and
    `assemble_chunked_file`'s content-hash re-verification all work against your real bucket and
    table, not just LocalStack.
-4. After a successful `lift`, list the bucket under `staging/{session}/` for the session that
+4. After a successful `lift`, list the bucket under `staging/{warehouse}/{session}/` for the session that
    just committed — it should be **empty** (the final `commit_lift` batch swept it).
 5. If you can drive it easily: stage every object of a lift **except one chunk**, attempt the ref
    update, and confirm it is refused (`422`) rather than silently committing over a missing

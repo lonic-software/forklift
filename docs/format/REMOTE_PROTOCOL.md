@@ -283,8 +283,8 @@ already-present hash is a no-op `200` (objects are immutable, so equal hash mean
 content). Success is `201`.
 
 A head whose byte plane is object storage answers `307` instead, with a `Location` of a
-presigned PUT under the **staging prefix of the lift session** — `staging/{session}/{hash}`,
-never `objects/{hash}`. Nothing is fetchable at the hash key until
+presigned PUT under the **staging prefix of the lift session** —
+`staging/{warehouse}/{session}/{hash}`, never `objects/{warehouse}/{hash}`. Nothing is fetchable at the hash key until
 `POST /lift/{session}/commit` (small control-plane objects) or the staging verifier (large
 blobs) has verified and promoted it. Such a head therefore needs the session: `?session=`
 is **additive and head-specific** (the `forklift-server` head ignores it and verifies the

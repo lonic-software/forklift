@@ -1,46 +1,59 @@
 //! The staging verifier Lambda: an S3 object-created event → `verify_and_promote`.
 //!
 //! The large-blob half of the split-verify decision (`store.rs`). A client `PUT`s a large
-//! object straight to `staging/{session}/{hash}` via a presigned URL, which the control plane
-//! never sees; S3 fires an object-created event, and this function runs the *same*
+//! object straight to `staging/{warehouse}/{session}/{hash}` via a presigned URL, which the
+//! control plane never sees; S3 fires an object-created event, and this function runs the *same*
 //! [`ObjectStore::verify_and_promote`] the control plane runs synchronously for small objects —
 //! it stream-hashes the staged bytes and, only if `Blake3(bytes) == hash`, server-side-copies
-//! them to the canonical key. Promotion is the single moment the object becomes fetchable
-//! (invariant 1), and it is idempotent, so this racing the control plane's `commit_lift` on one
-//! hash is safe.
+//! them to that warehouse's canonical key. Promotion is the single moment the object becomes
+//! fetchable (invariant 1), and it is idempotent, so this racing the control plane's
+//! `commit_lift` on one hash is safe.
+//!
+//! The warehouse in the key is trusted because the key is: the only presigned `PUT` the control
+//! plane mints is to a staging key of the warehouse the request was authorized for, and the
+//! signature covers the key.
 //!
 //! Same blocking discipline as the control plane: `verify_and_promote` bridges S3 futures,
-//! so it runs on a blocking thread. It needs only the object store — no ref store, no warehouse
-//! id — because promotion is content-addressed, not warehouse-scoped.
+//! so it runs on a blocking thread. It needs only an object store — no ref store — bound to the
+//! warehouse the staging key names ([`parse_staging_key`]): objects are keyed per warehouse, and
+//! the key is all an S3 event carries.
 //!
 //! Build with `cargo build -p forklift-aws-lambda --features lambda --release`.
 
 use aws_lambda_events::event::s3::S3Event;
-use forklift_aws_lambda::aws::build_clients;
+use forklift_aws_lambda::aws::s3::parse_staging_key;
+use forklift_aws_lambda::aws::{build_clients, S3Ops};
 use forklift_aws_lambda::store::{ObjectStore, PromoteOutcome};
 use forklift_aws_lambda::{config_from_env, AsyncBridge, S3ObjectStore};
 use lambda_runtime::{run, service_fn, Error, LambdaEvent};
 use tokio::sync::OnceCell;
 
-/// The object store, built once per cold start (the bucket is warehouse-agnostic).
-static OBJECTS: OnceCell<S3ObjectStore> = OnceCell::const_new();
+/// What every warehouse's object store is built from: the S3 client, the bucket and the bridge,
+/// built once per cold start. The store itself is built per staged object, for its warehouse.
+struct Context {
+    s3: S3Ops,
+    bucket: String,
+    bridge: AsyncBridge,
+}
 
-/// Resolve the object store, building the S3 client and capturing the bridge on first use.
-async fn objects() -> Result<&'static S3ObjectStore, Error> {
-    OBJECTS
+static CONTEXT: OnceCell<Context> = OnceCell::const_new();
+
+/// Resolve the context, building the S3 client and capturing the bridge on first use.
+async fn context() -> Result<&'static Context, Error> {
+    CONTEXT
         .get_or_try_init(|| async {
             let (config, _routing) = config_from_env().map_err(Error::from)?;
             let (s3, _dynamodb) = build_clients(&config).await.map_err(Error::from)?;
             let bridge = AsyncBridge::current().map_err(Error::from)?;
 
-            Ok(S3ObjectStore::new(s3, config.bucket, bridge))
+            Ok(Context { s3, bucket: config.bucket, bridge })
         })
         .await
 }
 
 /// Verify-and-promote every staged object an S3 event names.
 async fn handler(event: LambdaEvent<S3Event>) -> Result<(), Error> {
-    let objects = objects().await?;
+    let context = context().await?;
 
     for record in event.payload.records {
         let Some(raw_key) = record.s3.object.key else {
@@ -49,22 +62,35 @@ async fn handler(event: LambdaEvent<S3Event>) -> Result<(), Error> {
 
         // S3 event notifications URL-encode the key the way a query string is (space → `+`,
         // everything else percent-escaped): "red flower.jpg" arrives as "red+flower.jpg". A
-        // session id or hash cannot contain either character, but the key is split on `/`
-        // first — an unrelated, encoded key (or a stray notification) must decode cleanly
+        // warehouse id, session id or hash cannot contain either character, but the key is split
+        // on `/` first — an unrelated, encoded key (or a stray notification) must decode cleanly
         // before `parse_staging_key` judges its shape, or a corrupted split could misroute it.
         // Newer event payloads carry the already-decoded form in `url_decoded_key`; prefer it
         // when present, and fall back to a small inline decoder for payloads that predate it,
         // rather than pulling in a URL-decoding dependency for one string.
         let key = record.s3.object.url_decoded_key.unwrap_or_else(|| decode_s3_key(&raw_key));
 
-        let Some((session, hash)) = parse_staging_key(&key) else {
+        let Some(staged) = parse_staging_key(&key) else {
             // The trigger should be scoped to the `staging/` prefix, but a stray event is
             // skipped rather than failed — a failure would have S3/EventBridge retry forever.
             eprintln!("verifier: ignoring an S3 event that is not a staging object: {}", key);
             continue;
         };
 
-        let (session, hash) = (session.to_string(), hash.to_string());
+        let (session, hash) = (staged.session.to_string(), staged.hash.to_string());
+        // A warehouse the store refuses is skipped for the same reason: no retry can change it.
+        let objects = match S3ObjectStore::new(
+            context.s3.clone(),
+            context.bucket.clone(),
+            staged.warehouse.to_string(),
+            context.bridge.clone(),
+        ) {
+            Ok(objects) => objects,
+            Err(e) => {
+                eprintln!("verifier: ignoring a staging object of no warehouse: {}: {}", key, e);
+                continue;
+            }
+        };
 
         // A storage error propagates (the event retries); a semantic outcome is logged and the
         // event is consumed — a corrupt object was discarded, not promoted, and retrying it
@@ -96,7 +122,7 @@ async fn handler(event: LambdaEvent<S3Event>) -> Result<(), Error> {
 /// string — used only as the fallback for event payloads that predate `url_decoded_key`.
 /// A malformed or truncated `%` escape is left as a literal `%` rather than rejected: this feeds
 /// `parse_staging_key`, which already treats anything that does not split into
-/// `staging/{session}/{hash}` as "not a staging object".
+/// `staging/{warehouse}/{session}/{hash}` as "not a staging object".
 fn decode_s3_key(key: &str) -> String {
     let bytes = key.as_bytes();
     let mut decoded: Vec<u8> = Vec::with_capacity(bytes.len());
@@ -131,19 +157,6 @@ fn decode_s3_key(key: &str) -> String {
     String::from_utf8_lossy(&decoded).into_owned()
 }
 
-/// Parse a `staging/{session}/{hash}` key into its parts. `None` for any other key shape.
-fn parse_staging_key(key: &str) -> Option<(&str, &str)> {
-    let rest = key.strip_prefix("staging/")?;
-    let (session, hash) = rest.split_once('/')?;
-
-    // A well-formed staging key is exactly two more segments; a nested slash is not one.
-    if session.is_empty() || hash.is_empty() || hash.contains('/') {
-        return None;
-    }
-
-    Some((session, hash))
-}
-
 /// Multi-thread on purpose, exactly as the control plane: [`AsyncBridge`] refuses a
 /// single-threaded runtime.
 #[tokio::main(flavor = "multi_thread")]
@@ -153,28 +166,15 @@ async fn main() -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_s3_key, parse_staging_key};
-
-    #[test]
-    fn a_staging_key_splits_into_session_and_hash() {
-        assert_eq!(parse_staging_key("staging/lift-1/abc123"), Some(("lift-1", "abc123")));
-    }
-
-    #[test]
-    fn a_non_staging_key_is_rejected() {
-        assert_eq!(parse_staging_key("objects/abc123"), None);
-        assert_eq!(parse_staging_key("staging/lift-1"), None, "no hash segment");
-        assert_eq!(parse_staging_key("staging//abc"), None, "empty session");
-        assert_eq!(parse_staging_key("staging/lift-1/"), None, "empty hash");
-        assert_eq!(parse_staging_key("staging/lift-1/a/b"), None, "extra segment");
-    }
+    use super::decode_s3_key;
+    use forklift_aws_lambda::aws::s3::{parse_staging_key, StagedKey};
 
     #[test]
     fn decode_s3_key_handles_plus_as_space_and_percent_escapes() {
         assert_eq!(decode_s3_key("a+b"), "a b");
         assert_eq!(decode_s3_key("a%2Bb"), "a+b");
         assert_eq!(decode_s3_key("Happy%20Face.jpg"), "Happy Face.jpg");
-        assert_eq!(decode_s3_key("staging/lift+session/de%2Dad"), "staging/lift session/de-ad");
+        assert_eq!(decode_s3_key("staging/wh/lift+session/de%2Dad"), "staging/wh/lift session/de-ad");
     }
 
     #[test]
@@ -192,8 +192,9 @@ mod tests {
     /// running it through the same `decode_s3_key` → `parse_staging_key` pipeline `handler` uses.
     #[test]
     fn a_url_encoded_staging_key_still_parses_after_decoding() {
-        let key = "staging/lift+session-1/deadbeef";
+        let key = "staging/tenant-a/lift+session-1/deadbeef";
         let decoded = decode_s3_key(key);
-        assert_eq!(parse_staging_key(&decoded), Some(("lift session-1", "deadbeef")));
+        let staged = StagedKey { warehouse: "tenant-a", session: "lift session-1", hash: "deadbeef" };
+        assert_eq!(parse_staging_key(&decoded), Some(staged));
     }
 }
