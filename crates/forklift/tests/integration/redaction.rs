@@ -83,7 +83,9 @@ fn hash_of(content: &[u8]) -> String {
 
 /// Record a redaction of `target`, which must succeed, and return the JSON report.
 fn recorded_hash(warehouse: &Warehouse, target: &str, reason: &str) -> serde_json::Value {
-    warehouse.json(&["redact", "record", target, "-m", reason])
+    let recorded = warehouse.json(&["redact", "record", target, "-m", reason]);
+    assert_eq!(recorded["ok"], true, "{}", recorded);
+    recorded
 }
 
 #[test]

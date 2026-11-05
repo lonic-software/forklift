@@ -3841,9 +3841,9 @@ mod tests {
         let root = forge(&[], &kv(), cells(&[("k", &held)]).as_deref(), &alice.signer());
         let head = forge(&[&root], &kv(), None, &alice.signer());
 
-        assert!(redaction_utils::chain_names(&head, &held, false).unwrap());
-        assert!(redaction_utils::chain_names(&root, &held, false).unwrap());
-        assert!(!redaction_utils::chain_names(&head, &other, false).unwrap());
+        assert!(redaction_utils::chain_names("kv", &head, &held).unwrap());
+        assert!(redaction_utils::chain_names("kv", &root, &held).unwrap());
+        assert!(!redaction_utils::chain_names("kv", &head, &other).unwrap());
     }
 
     #[test]

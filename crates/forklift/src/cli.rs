@@ -2229,7 +2229,7 @@ impl Command {
                 | Command::Shift { .. }
                 | Command::Stack { .. }
                 | Command::Tag { .. }
-                | Command::Redact { .. }
+                | Command::Redact { action: Some(RedactAction::Record { .. }) }
                 | Command::Undo { .. }
                 | Command::Unload { .. }
         )

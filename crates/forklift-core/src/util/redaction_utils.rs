@@ -24,7 +24,7 @@ use crate::util::meta_tree::{
     self, CellEnvelope, CellRead, MetaKind, MetaWriter, PalletRules, ParcelChange,
 };
 use crate::util::office_utils::{self, OfficeState, Role};
-use crate::util::{file_utils, object_utils, pallet_utils, scope_utils};
+use crate::util::{file_utils, object_utils, pallet_utils};
 
 /// The name of the redactions meta pallet. Lives in the meta namespace, so it is reached as
 /// `@redactions` and reserves no user pallet name (DESIGN.html §3.3).
@@ -281,16 +281,14 @@ pub fn entry_kind(entry_type: DirEntryType) -> Option<RedactedKind> {
 
 /// Every meta pallet whose history names `hash` anywhere in a parcel's tree, by name. Walks every
 /// meta pallet's whole chain, each parcel and tree once per pallet. An object the walk needs and
-/// the store lacks is an error in a full warehouse; in a partial one it is skipped, as content
-/// that may be absent.
+/// the store lacks is an error, never a pass: the walk could not tell whether it names `hash`.
 pub fn meta_holders(hash: &str) -> Result<Vec<String>, String> {
-    let may_be_absent = scope_utils::content_may_be_absent()?;
     let mut holders = Vec::new();
 
     for name in pallet_utils::list_meta_pallets()? {
         let Some(head) = pallet_utils::get_meta_pallet_head(&name)? else { continue };
 
-        if chain_names(&head, hash, may_be_absent)? {
+        if chain_names(&name, &head, hash)? {
             holders.push(name);
         }
     }
@@ -298,8 +296,9 @@ pub fn meta_holders(hash: &str) -> Result<Vec<String>, String> {
     Ok(holders)
 }
 
-/// Whether any parcel reachable from `head` has a tree naming `hash` at any depth.
-pub(crate) fn chain_names(head: &str, hash: &str, may_be_absent: bool) -> Result<bool, String> {
+/// Whether any parcel reachable from `head`, the head of meta pallet `pallet`, has a tree naming
+/// `hash` at any depth.
+pub(crate) fn chain_names(pallet: &str, head: &str, hash: &str) -> Result<bool, String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut pending = vec![(head.to_string(), true)];
 
@@ -313,8 +312,13 @@ pub(crate) fn chain_names(head: &str, hash: &str, may_be_absent: bool) -> Result
             continue;
         }
 
-        if may_be_absent && !file_utils::does_object_exist(&object)? {
-            continue;
+        if !file_utils::does_object_exist(&object)? {
+            return Err(format!(
+                "Object {} of @{}'s history is not in this store, so whether that history names \
+                {} cannot be told; nothing was recorded. Fetch the meta pallet's history, or \
+                record the redaction in a warehouse that holds it.",
+                object, pallet, hash
+            ));
         }
 
         if is_parcel {
@@ -338,7 +342,8 @@ pub(crate) fn chain_names(head: &str, hash: &str, may_be_absent: bool) -> Result
 
 /// Record a redaction, as one cell on the local `@redactions` head stamped by `writer`. The
 /// caller holds the warehouse lock, and has resolved the hash and checked it against the meta
-/// pallets; the content check refuses a signer who is not an admin, and a hash already redacted.
+/// pallets; the content check refuses a signer who is not an admin, and a hash already redacted
+/// (a fresh `redacted_at` always changes the cells, so a repeat reaches that check).
 pub fn record_redaction(redaction: &Redaction,
                         writer: &MetaWriter,
                         actor: &Operator) -> Result<String, String> {
@@ -352,7 +357,10 @@ pub fn record_redaction(redaction: &Redaction,
 
     let rules = &RedactionsRules;
     meta_tree::stack_meta_edits(REDACTIONS_PALLET_NAME, rules, writer, &edits, actor, &description)?
-        .ok_or(format!("Object {} is already redacted.", redaction.hash))
+        .ok_or(format!(
+            "The redaction of {} changed nothing, so nothing was recorded.",
+            redaction.hash
+        ))
 }
 
 /// Read every redaction at the local head, attributed through the office (read best-effort, so
