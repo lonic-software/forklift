@@ -171,8 +171,8 @@ struct RemoteCheck {
 
 /// Ask the configured remote for its pallets and compare them with what an export of `pallets`
 /// (name and head), reaching the parcels `exported`, writes: a user pallet is left behind unless a
-/// pallet of its name is exported and its remote head is an exported parcel (so the export has no
-/// branch for it as it stands there), and `@tags` when its remote head is not one the local `@tags`
+/// pallet of its name is exported at or ahead of its remote head (so the export has no branch for
+/// it as it stands there), and `@tags` when its remote head is not one the local `@tags`
 /// holds. Other meta pallets are never exported, so they are only named. A remote that cannot be
 /// asked is reported, not fatal.
 async fn check_remote(pallets: &[(String, String)], exported: &HashSet<String>) -> RemoteCheck {
@@ -203,7 +203,13 @@ async fn check_remote(pallets: &[(String, String)], exported: &HashSet<String>) 
                 !matches!(local.and_then(|local| relation_to_remote(head, local.as_deref())),
                     Ok(RemoteRelation::Same | RemoteRelation::LocalAhead))
             }
-            Ok(_) => !(pallets.iter().any(|(name, _)| name == wire) && exported.contains(head)),
+            // The branch of that name must stand at or ahead of the remote's head; the head being
+            // reachable through another pallet leaves this one behind or apart from it.
+            Ok(_) => {
+                let local = pallets.iter().find(|(name, _)| name == wire).map(|(_, head)| head.as_str());
+                !matches!(relation_to_remote(head, local),
+                    Ok(RemoteRelation::Same | RemoteRelation::LocalAhead))
+            }
             // A meta pallet this build cannot name is still never exported.
             Err(_) if wire.starts_with(pallet_utils::META_QUALIFIER) => {
                 check.meta.push(wire.trim_start_matches(pallet_utils::META_QUALIFIER).to_string());
