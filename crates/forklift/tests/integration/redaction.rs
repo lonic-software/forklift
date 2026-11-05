@@ -17,19 +17,39 @@ struct Warehouse {
 
 impl Warehouse {
     fn new(name: &str) -> Warehouse {
+        let warehouse = Warehouse::empty(name);
+        std::fs::create_dir_all(&warehouse.root).unwrap();
+        warehouse.run_ok(&["prepare"]);
+        warehouse.run_ok(&["config", "set", "operator.identifier", "redactor@forklift"]);
+
+        warehouse
+    }
+
+    /// A clone of the remote at `url`.
+    fn cloned(name: &str, url: &str) -> Warehouse {
+        let warehouse = Warehouse::empty(name);
+        let cloned = forklift_command()
+            .args(["clone", url, warehouse.root.to_str().unwrap()])
+            .env("FORKLIFT_GLOBAL_CONFIG", warehouse.home.join("global-config.toml"))
+            .env("FORKLIFT_KEYS_DIR", warehouse.home.join("keys"))
+            .output()
+            .unwrap();
+        assert!(cloned.status.success(), "clone failed: {}", String::from_utf8_lossy(&cloned.stderr));
+        warehouse.run_ok(&["config", "set", "operator.identifier", "redactor@forklift"]);
+
+        warehouse
+    }
+
+    /// A fresh scratch directory with nothing in the warehouse root yet.
+    fn empty(name: &str) -> Warehouse {
         let base = std::env::temp_dir()
             .join(format!("forklift-redaction-{}-{}", name, std::process::id()));
         let root = base.join("warehouse");
         let home = base.join("home");
         let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&home).unwrap();
 
-        let warehouse = Warehouse { root, home };
-        warehouse.run_ok(&["prepare"]);
-        warehouse.run_ok(&["config", "set", "operator.identifier", "redactor@forklift"]);
-
-        warehouse
+        Warehouse { root, home }
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -274,4 +294,110 @@ fn a_meta_pallet_may_not_start_naming_redacted_content() {
     assert_eq!(error["details"]["pallet"], "@tags", "{}", error);
     let listed = warehouse.run_ok(&["tag", "list"]);
     assert!(!String::from_utf8_lossy(&listed.stdout).contains("v1"), "nothing was written: {:?}", listed);
+}
+
+/// A running forklift-server over a bare warehouse at `root`.
+struct Server {
+    child: std::process::Child,
+    url: String,
+}
+
+impl Server {
+    fn start(root: &std::path::Path) -> Server {
+        use std::io::BufRead;
+
+        let _ = std::fs::remove_dir_all(root);
+        let root = root.to_str().unwrap();
+        let prepared = std::process::Command::new(common::server_binary()).env("FORKLIFT_FSYNC", "0")
+            .args(["prepare", "--root", root]).output().unwrap();
+        assert!(prepared.status.success(), "{}", String::from_utf8_lossy(&prepared.stderr));
+
+        let mut child = std::process::Command::new(common::server_binary()).env("FORKLIFT_FSYNC", "0")
+            .args(["serve", "--root", root, "--addr", "127.0.0.1:0", "--open"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .unwrap();
+
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let url = line.trim().rsplit(' ').next().unwrap().to_string();
+        assert!(url.starts_with("http://"), "unexpected startup line: {}", line);
+
+        Server { child, url }
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The head the remote at `url` serves for `main`, read through a fresh clone named `name`.
+fn served_main(url: &str, name: &str) -> String {
+    let clone = Warehouse::cloned(name, url);
+    std::fs::read_to_string(clone.root.join(".forklift/pallets/main")).unwrap().trim().to_string()
+}
+
+#[test]
+fn a_lift_is_refused_by_this_warehouses_own_redactions_until_the_file_is_taken_out() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-lift-server-{}", std::process::id())));
+
+    let first = Warehouse::cloned("lift-first", &server.url);
+    first.stack("notes.txt", b"notes\n", "notes");
+    first.run_ok(&["lift"]);
+
+    // This warehouse clones before any redaction exists, so its @redactions is its own: the one it
+    // records below diverges from the remote's, its lift fails, and the remote never learns of
+    // that redaction. Only this warehouse's own check can refuse the head.
+    let warehouse = Warehouse::cloned("lift", &server.url);
+
+    // Another warehouse moves the remote's @redactions on, from a pallet of its own.
+    let other = Warehouse::cloned("lift-other", &server.url);
+    other.run_ok(&["pallet", "create", "side"]);
+    other.stack("other.env", b"OTHER=1\n", "other");
+    other.run_ok(&["lift"]);
+
+    // The remote already serves exactly this head, so lifting it moves nothing, and the
+    // redaction reaches the remote's @redactions.
+    recorded_hash(&other, "side:other.env", "other leak");
+    other.run_ok(&["lift"]);
+
+    // Taken out again, so the remote serves no head naming it.
+    other.run_ok(&["remove", "other.env"]);
+    other.run_ok(&["stack", "-m", "without other"]);
+    other.run_ok(&["lift"]);
+
+    warehouse.stack("secret.env", b"TOKEN=hunter2\n", "leak");
+    let hash = recorded_hash(&warehouse, "main:secret.env", "leaked token")["data"]["hash"]
+        .as_str().unwrap().to_string();
+    let served = served_main(&server.url, "lift-before");
+
+    let error = content_redacted(&warehouse, &["lift"]);
+    assert_eq!(error["details"]["path"], "secret.env", "{}", error);
+    assert_eq!(error["details"]["hash"], hash.as_str(), "{}", error);
+    assert_eq!(error["details"]["pallet"], "main", "{}", error);
+    assert_eq!(
+        error["next_step"],
+        "from the working tree's root, forklift remove secret.env, then forklift stack -m <description>, then forklift lift",
+        "{}", error
+    );
+    assert_eq!(served_main(&server.url, "lift-refused"), served, "nothing was lifted");
+
+    // The next step, as it says. The working pallet lifts; the lift still fails over @redactions,
+    // which only a lower reconciles with the remote's.
+    warehouse.run_ok(&["remove", "secret.env"]);
+    warehouse.run_ok(&["stack", "-m", "without the secret"]);
+    let lifted = warehouse.run(&["lift"]);
+    assert!(!lifted.status.success(), "{:?}", lifted);
+    assert!(String::from_utf8_lossy(&lifted.stderr).contains("@redactions"), "{:?}", lifted);
+
+    let head = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap();
+    assert_eq!(served_main(&server.url, "lift-after"), head.trim());
+
+    warehouse.run_ok(&["lower"]);
+    warehouse.run_ok(&["lift"]);
 }

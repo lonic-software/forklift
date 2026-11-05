@@ -780,14 +780,15 @@ pub enum RefUpdateError {
 impl RefUpdateError {
     /// The [`RefusalCode::ContentRedacted`](crate::error::RefusalCode::ContentRedacted) refusal a
     /// [`RefUpdateError::Redacted`] crosses a String-typed caller as, with `message`, so the code
-    /// reaches the command boundary. `None` for every other variant.
-    fn redacted_refusal(&self, message: String) -> Option<crate::error::CoreError> {
+    /// reaches the command boundary, with `next_step` when the caller knows how its user takes the
+    /// content out. `None` for every other variant.
+    fn redacted_refusal(&self, message: String, next_step: Option<String>) -> Option<crate::error::CoreError> {
         let RefUpdateError::Redacted { pallet, head, path, hash } = self else { return None };
 
         Some(crate::error::CoreError::refusal_with_details(
             crate::error::RefusalCode::ContentRedacted,
             message,
-            format!("leave \"{}\" out of what this command writes", path),
+            next_step.unwrap_or_else(|| format!("leave \"{}\" out of what this command writes", path)),
             serde_json::json!({ "pallet": pallet.to_wire(), "head": head, "path": path, "hash": hash }),
         ))
     }
@@ -798,9 +799,15 @@ impl RefUpdateError {
     /// `String` conversion does. Every other variant's message is unchanged, so a caller that has
     /// written elsewhere words those itself.
     pub fn reported_with(&self, outcome: &str) -> String {
+        self.reported_with_next_step(outcome, None)
+    }
+
+    /// [`reported_with`](RefUpdateError::reported_with), with `next_step` in place of a redaction
+    /// refusal's own when it is given.
+    pub fn reported_with_next_step(&self, outcome: &str, next_step: Option<String>) -> String {
         let message = WithOutcome(self, outcome).to_string();
 
-        match self.redacted_refusal(message.clone()) {
+        match self.redacted_refusal(message.clone(), next_step) {
             Some(refusal) => refusal.into(),
             None => message,
         }
@@ -1054,7 +1061,7 @@ impl From<String> for RefUpdateError {
 
 impl From<RefUpdateError> for String {
     fn from(error: RefUpdateError) -> Self {
-        match error.redacted_refusal(error.to_string()) {
+        match error.redacted_refusal(error.to_string(), None) {
             Some(refusal) => refusal.into(),
             None => error.to_string(),
         }

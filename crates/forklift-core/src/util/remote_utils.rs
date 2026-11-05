@@ -29,7 +29,8 @@ use crate::util::body_utils::{self, BodyReadError, JsonReadError};
 use crate::util::object_utils::MAX_OBJECT_BYTES;
 use crate::util::{
     audit_utils, bundle_utils, config_utils, fetch_ledger, file_utils, haul_utils, held_heads, merge_utils, meta_tree, object_utils,
-    office_utils, origin_utils, pack_utils, pallet_utils, sealed_utils, sign_utils, take_utils, trust_utils,
+    office_utils, origin_utils, pack_utils, pallet_utils, redaction_utils, sealed_utils, sign_utils, take_utils,
+    tree_utils, trust_utils,
 };
 
 /// How many object transfers run concurrently.
@@ -6326,6 +6327,8 @@ async fn lift_pallet_inner(client: &RemoteClient,
         }
     }
 
+    refuse_redacted_head(pallet, local_head, remote_head)?;
+
     let (new_parcels, uploaded_objects, uploaded_signatures) =
         // An acknowledged tombstone's head is held on the remote (a gc root), so a re-creation
         // uploads only the work past it.
@@ -6345,6 +6348,35 @@ async fn lift_pallet_inner(client: &RemoteClient,
         old_head: remote_head.map(|hash| hash.to_string()),
         unrecorded,
     }))
+}
+
+/// Refuse to lift `local_head` over `remote_head` to `pallet` (its wire name) when this warehouse's
+/// own redactions forbid it, by the check a local ref write takes
+/// ([`redaction_utils::check_head_write`]). The remote's check is not enough: `@redactions` lifts as
+/// a meta pallet of its own, and the working pallet lifts even when that lift failed, so the remote
+/// may not hold the redaction at all. A user pallet's refusal names the file and how a bay standing
+/// on the pallet stacks a head without it; a meta pallet's history is not taken back, so its refusal
+/// keeps the generic next step.
+fn refuse_redacted_head(pallet: &str, local_head: &str, remote_head: Option<&str>) -> Result<(), String> {
+    let target = pallet_utils::PalletRef::parse(pallet)?;
+    let check = redaction_utils::check_head_write(target.namespace, &target.name, remote_head, local_head);
+
+    let Err(refused) = check.outcome() else { return Ok(()) };
+
+    let next_step = match &refused {
+        pallet_utils::RefUpdateError::Redacted { path, .. } if target.namespace == pallet_utils::PalletNamespace::User => {
+            let remedy = tree_utils::remedy_path(path);
+
+            Some(format!(
+                "from the working tree's root, forklift remove {}{}, then forklift stack -m <description>, then forklift lift",
+                remedy.as_deref().unwrap_or("-- <path>"),
+                if remedy.is_some() { "" } else { " with that path quoted for your shell" }
+            ))
+        }
+        _ => None,
+    };
+
+    Err(refused.reported_with_next_step("Nothing was lifted.", next_step))
 }
 
 /// The [`RefusalCode::Diverged`] refusal for `pallet` (its wire name), whose local head and the
