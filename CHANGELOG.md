@@ -98,6 +98,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Added
 
+- **The `--json` schema is now 22, with the `redaction_blocked` error code (exit 48).** It belongs
+  to content redaction, which is being built and whose command is not yet offered: it refuses to
+  redact content that the history of a meta pallet (`@office`, `@tags` and the rest) holds, since
+  that history is never rewritten.
 - **`forklift abort` abandons a consolidation or pick that stopped at conflicts.** The files the merge
   touched go back to the pallet head and nothing is left in progress; changes to other files are kept.
   It refuses without `--confirm` (exit 39) where it would throw away what you changed since, such as a

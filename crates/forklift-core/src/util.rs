@@ -25,6 +25,7 @@ pub mod meta_tree;
 pub mod kv_utils;
 pub mod stack_utils;
 pub mod tag_utils;
+pub mod redaction_utils;
 pub mod cherry_pick_utils;
 pub mod pallet_utils;
 pub mod park_utils;

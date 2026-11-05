@@ -44,7 +44,7 @@ materializes or merges trees.
 
 ## The meta-tree format
 `forklift-core`'s `meta_tree` module defines the format of every meta pallet but the office:
-`@kv`, `@manifest`, `@tags` and `@haul`. A meta tree is the pallet's whole state, and its chain
+`@kv`, `@manifest`, `@tags`, `@haul` and `@redactions`. A meta tree is the pallet's whole state, and its chain
 is linear (a parcel has at most one parent), as with the office:
 
 ```
@@ -206,6 +206,28 @@ never wedges the history it admitted. And no parcel may change or remove an exis
 tag name is immutable everywhere. Two tags created concurrently under one name are a conflict
 at `lower`: keeping `theirs` drops the local tag, and keeping `ours` is refused by the
 immutability rule.
+
+### `@redactions`
+
+Permanent redactions, one cell per redacted object, signed under trust:
+
+```
+cells/<hash>                        schema "redactions.redaction 1"
+```
+
+```toml
+reason = "leaked deploy token"      # never empty, at most 1024 bytes
+redacted_at = 1782205234            # display only
+chunks = "5c1e09ab…"                # a chunked file only: the digest of its chunk list
+```
+
+The path is the full hash of the redacted object: a file's blob, or a chunked file's recipe.
+For a recipe, `chunks` is the BLAKE3 hash of its chunk hashes in order, each followed by a
+newline, so the same file chunked the same way is still recognised once the recipe is gone. The
+value is strict: any other field is refused. As with `@tags`, a parcel that adds a redaction under
+trust must be signed by an admin of the office it is admitted against, and no parcel may change
+or remove one. `forklift redact` also refuses to record a hash that the history of any meta
+pallet names, since that history is never rewritten.
 
 ### `@haul`
 

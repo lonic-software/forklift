@@ -326,6 +326,11 @@ refusal_codes! {
     /// markers are written and the consolidation is left in progress. The refusal's details name
     /// the conflicted paths; the next step completes the merge or abandons it.
     MergeConflicts => "merge_conflicts",
+
+    /// `redact` refused to record a redaction: some meta pallet's history names the object, and a
+    /// meta pallet's history is never rewritten, so its content could never be removed. Nothing
+    /// was recorded; the details name the meta pallets that hold it.
+    RedactionBlocked => "redaction_blocked",
 }
 
 impl RefusalCode {

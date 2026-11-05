@@ -2789,6 +2789,7 @@ pub(crate) mod tests {
             crate::util::kv_utils::KV_PALLET_NAME,
             crate::util::manifest_utils::MANIFEST_PALLET_NAME,
             crate::util::tag_utils::TAGS_PALLET_NAME,
+            crate::util::redaction_utils::REDACTIONS_PALLET_NAME,
         ];
 
         for name in built_in {
@@ -2899,6 +2900,8 @@ pub(crate) mod tests {
     /// to its sibling: the write's temp can no longer be that pallet's ref file. Other tests in this
     /// process draw from the same counter, so the victims cover a window of values, and an attempt
     /// counts only if the counter read after the write shows the write drew inside that window.
+    /// Under a loaded full run concurrent tests can draw past the window on many attempts in a
+    /// row, so there are enough attempts for one to land.
     #[test]
     fn a_ref_write_never_consumes_a_neighbouring_pallet() {
         let (root, _scope) = scratch("temp-clobber");
@@ -2909,7 +2912,7 @@ pub(crate) mod tests {
         };
 
         let mut certified = false;
-        for attempt in 0..8u64 {
+        for attempt in 0..64u64 {
             let next = next_write_id();
             let victims: Vec<String> = (next..next + 64)
                 .map(|n| format!("x.tmp{}-{}", std::process::id(), n)).collect();

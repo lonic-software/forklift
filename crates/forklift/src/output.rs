@@ -35,9 +35,7 @@ pub const TOOL: &str = "forklift";
 /// `data` shape or the error-code registry changes incompatibly, so an agent can pin it and
 /// detect drift.
 ///
-/// Version 15 (this one): the `confirmation_required` error code exists, and `scope prune`'s
-/// report drops `dry_run`.
-/// Versions 10–14 are recorded in docs/MACHINE_INTERFACE.md.
+/// Versions 2 onward are recorded in docs/MACHINE_INTERFACE.md; versions 2–9 are noted here too.
 /// Version 9: `batch_lane` may be `out_of_time`, when the remote ran out of time for a
 /// batch download and the rest of the command fetched one object at a time.
 /// Version 8: the `pallet_deleted_on_remote` error code exists; `palletize --remote`
@@ -62,7 +60,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 21;
+pub const SCHEMA_VERSION: u32 = 22;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -563,6 +561,10 @@ error_codes! {
     /// `lower` merged the remote's diverged head in and the merge conflicts; the consolidation is
     /// left in progress.
     MergeConflicts,
+
+    /// `redact` found the object in some meta pallet's history, which is never rewritten; nothing
+    /// was recorded.
+    RedactionBlocked,
 }
 
 impl ErrorCode {
@@ -615,6 +617,7 @@ impl ErrorCode {
             ErrorCode::WarehouseInUse => RefusalCode::WarehouseInUse.as_str(),
             ErrorCode::HeadNotMaterializable => RefusalCode::HeadNotMaterializable.as_str(),
             ErrorCode::MergeConflicts => RefusalCode::MergeConflicts.as_str(),
+            ErrorCode::RedactionBlocked => RefusalCode::RedactionBlocked.as_str(),
         }
     }
 
@@ -670,6 +673,7 @@ impl ErrorCode {
             ErrorCode::WarehouseInUse => 45,
             ErrorCode::HeadNotMaterializable => 46,
             ErrorCode::MergeConflicts => 47,
+            ErrorCode::RedactionBlocked => 48,
         }
     }
 
@@ -795,6 +799,8 @@ impl ErrorCode {
                 "The remote's head of the pallet holds an entry named like the warehouse's metadata folder, so it cannot be checked out; nothing was changed",
             ErrorCode::MergeConflicts =>
                 "Lowering merged the remote's diverged head in, and the merge conflicts; the consolidation is left in progress",
+            ErrorCode::RedactionBlocked =>
+                "The object to redact is named by a meta pallet's history, which is never rewritten, so it cannot be removed; nothing was recorded",
         }
     }
 
@@ -848,6 +854,7 @@ impl ErrorCode {
             RefusalCode::HeadNotMaterializable => ErrorCode::HeadNotMaterializable,
             RefusalCode::Conflict => ErrorCode::Conflict,
             RefusalCode::MergeConflicts => ErrorCode::MergeConflicts,
+            RefusalCode::RedactionBlocked => ErrorCode::RedactionBlocked,
         }
     }
 }
@@ -1421,6 +1428,7 @@ mod tests {
             (RefusalCode::HeadNotMaterializable, "head_not_materializable", 46),
             (RefusalCode::Conflict, "conflict", 4),
             (RefusalCode::MergeConflicts, "merge_conflicts", 47),
+            (RefusalCode::RedactionBlocked, "redaction_blocked", 48),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

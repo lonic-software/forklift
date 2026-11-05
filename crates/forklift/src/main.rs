@@ -589,6 +589,7 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
         Command::Show { target } => commands::show::handle_command(&target),
         Command::Stack { message } => commands::stack::handle_command(message).await,
         Command::Tag { action } => commands::tag::handle_command(action).await,
+        Command::Redact { action } => commands::redact::handle_command(action).await,
         Command::Stocktake { summary } => commands::stocktake::handle_command(summary).await,
         Command::Undo { as_name } => commands::undo::handle_command(as_name.as_deref()).await,
         Command::Unload { path } => commands::unload::handle_command(&path),

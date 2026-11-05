@@ -48,7 +48,10 @@ use crate::util::audit_utils::{self, DistrustBoundaryMemo, SignatureTrust, Verif
 use crate::util::office_utils::{KeyRecord, OfficeState, RevocationReason, TrustAnchor};
 use crate::util::pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions};
 use crate::util::sign_utils::ParcelSignature;
-use crate::util::{haul_utils, kv_utils, manifest_utils, object_utils, office_utils, pallet_utils, sign_utils, tag_utils};
+use crate::util::{
+    haul_utils, kv_utils, manifest_utils, object_utils, office_utils, pallet_utils, redaction_utils,
+    sign_utils, tag_utils,
+};
 
 /// The spine every meta tree keeps: `.forklift/tracked/`.
 const TREE_NAME_FORKLIFT: &str = ".forklift";
@@ -70,15 +73,16 @@ const FIELD_OPERATOR: &str = "operator";
 const FIELD_SCHEMA: &str = "schema";
 const FIELD_VALUE: &str = "value";
 
-/// Every meta pallet name a remote stores: the office, and the four kinds below. A meta ref
+/// Every meta pallet name a remote stores: the office, and the five kinds below. A meta ref
 /// update for any other name is refused, so a newer client's new pallet fails loudly against
 /// an older remote instead of being stored unchecked.
-pub const META_PALLET_NAMES: [&str; 5] = [
+pub const META_PALLET_NAMES: [&str; 6] = [
     office_utils::OFFICE_PALLET_NAME,
     manifest_utils::MANIFEST_PALLET_NAME,
     haul_utils::HAUL_PALLET_NAME,
     tag_utils::TAGS_PALLET_NAME,
     kv_utils::KV_PALLET_NAME,
+    redaction_utils::REDACTIONS_PALLET_NAME,
 ];
 
 /// The rules of a meta pallet on this substrate, or `None` for the office, which is on its own
@@ -89,6 +93,7 @@ pub fn meta_rules(name: &str) -> Option<&'static dyn PalletRules> {
         manifest_utils::MANIFEST_PALLET_NAME => Some(&manifest_utils::ManifestRules),
         tag_utils::TAGS_PALLET_NAME => Some(&tag_utils::TagsRules),
         haul_utils::HAUL_PALLET_NAME => Some(&haul_utils::HaulRules),
+        redaction_utils::REDACTIONS_PALLET_NAME => Some(&redaction_utils::RedactionsRules),
         _ => None,
     }
 }
@@ -113,10 +118,12 @@ pub enum MetaKind {
     Manifest,
     Haul,
     Tags,
+    Redactions,
 }
 
 impl MetaKind {
-    const ALL: [MetaKind; 4] = [MetaKind::Kv, MetaKind::Manifest, MetaKind::Haul, MetaKind::Tags];
+    const ALL: [MetaKind; 5] =
+        [MetaKind::Kv, MetaKind::Manifest, MetaKind::Haul, MetaKind::Tags, MetaKind::Redactions];
 
     /// The kind's name, as the format marker spells it.
     pub fn as_str(&self) -> &'static str {
@@ -125,6 +132,7 @@ impl MetaKind {
             MetaKind::Manifest => "manifest",
             MetaKind::Haul => "haul",
             MetaKind::Tags => "tags",
+            MetaKind::Redactions => "redactions",
         }
     }
 
@@ -3763,6 +3771,92 @@ mod tests {
         // Admitted history is audited without the role rule: a tagger demoted since is no
         // reason to refuse what an admit already took.
         verify_tags(&office, Admission::Audit, Some(&by_admin), &by_writer).unwrap();
+    }
+
+    /// Store a `redactions.redaction 1` cell stamped with `key_id`, with `reason`.
+    fn redaction_cell(key_id: &str, reason: &str) -> String {
+        let mut table = Table::new();
+        table.insert("reason", toml_edit::value(reason));
+        table.insert("redacted_at", toml_edit::value(7));
+
+        store_blob(&encode_cell(&key_stamp(key_id), redaction_utils::REDACTION_SCHEMA, &table)).unwrap()
+    }
+
+    /// A signed `@redactions` parcel on `parent` whose cells are the parent's with `edits` applied.
+    fn redactions_parcel(parent: Option<&str>, key: &Key, edits: &[CellEdit]) -> String {
+        let base = parent
+            .and_then(|parent| read_pallet_spine("redactions", parent, MetaKind::Redactions).unwrap().cells);
+        let cells = apply_edits(base.as_deref(), edits).unwrap();
+        let parents: Vec<&str> = parent.into_iter().collect();
+
+        forge(&parents, &MetaKind::Redactions.format_marker(), cells.as_deref(), &key.signer())
+    }
+
+    #[test]
+    fn a_redaction_is_admitted_once_from_an_admin_and_never_changed_or_removed() {
+        let _scratch = Scratch::new("redactions");
+        let (alice, bob) = (Key::new("alice", 1), Key::new("bob", 2));
+        let office = office_with_roles(&[(&alice, office_utils::Role::Admin), (&bob, office_utils::Role::Writer)]);
+        let verify = |admission, old: Option<&str>, new: &str| verify_meta_content(
+            "redactions", &redaction_utils::RedactionsRules, Some(&office), &[], admission, old, new,
+        );
+        let (first, second) = ("ab".repeat(32), "cd".repeat(32));
+
+        let head = redactions_parcel(None, &alice, &[set(&first, &redaction_cell(alice.id(), "leaked"))]);
+        verify(Admission::Admit, None, &head).unwrap();
+
+        // A writer may not add one, though admitted history is audited without the role rule.
+        let by_writer = redactions_parcel(Some(&head), &bob, &[set(&second, &redaction_cell(bob.id(), "leaked"))]);
+        let error = verify(Admission::Admit, Some(&head), &by_writer).unwrap_err();
+        assert!(error.contains(&second) && error.contains("not an admin"), "{}", error);
+        verify(Admission::Audit, Some(&head), &by_writer).unwrap();
+
+        // Once recorded, a redaction is never changed or removed, by anyone.
+        let changed = redactions_parcel(Some(&head), &alice, &[set(&first, &redaction_cell(alice.id(), "other"))]);
+        let removed = redactions_parcel(Some(&head), &alice, &[unset(&first)]);
+
+        for rewrite in [changed, removed] {
+            for admission in [Admission::Admit, Admission::Audit] {
+                let error = verify(admission, Some(&head), &rewrite).unwrap_err();
+                assert!(error.contains("never changed or removed"), "{}", error);
+            }
+        }
+
+        // The cell path is a full object hash, and the value is strict.
+        let misplaced = redactions_parcel(Some(&head), &alice, &[set("secret", &redaction_cell(alice.id(), "leaked"))]);
+        assert!(verify(Admission::Admit, Some(&head), &misplaced).unwrap_err().contains("not a full object hash"));
+
+        let unreasoned = redactions_parcel(Some(&head), &alice, &[set(&second, &redaction_cell(alice.id(), ""))]);
+        assert!(verify(Admission::Admit, Some(&head), &unreasoned).unwrap_err().contains("empty reason"));
+    }
+
+    #[test]
+    fn a_meta_chain_names_a_hash_only_an_older_parcel_holds() {
+        let _scratch = Scratch::new("redactions-chain");
+        let alice = Key::new("alice", 1);
+        let held = store_blob(b"held").unwrap();
+        let other = store_blob(b"other").unwrap();
+
+        // The root's cells hold the blob; the head removed it, so only history names it.
+        let root = forge(&[], &kv(), cells(&[("k", &held)]).as_deref(), &alice.signer());
+        let head = forge(&[&root], &kv(), None, &alice.signer());
+
+        assert!(redaction_utils::chain_names("kv", &head, &held).unwrap());
+        assert!(redaction_utils::chain_names("kv", &root, &held).unwrap());
+        assert!(!redaction_utils::chain_names("kv", &head, &other).unwrap());
+
+        // With a root's tree, then the root itself, gone the walk cannot tell, and says so
+        // rather than answer "no". A chain no walk has read yet, so no cache holds its trees.
+        let root = forge(&[], &kv(), cells(&[("j", &held)]).as_deref(), &alice.signer());
+        let head = forge(&[&root], &kv(), None, &alice.signer());
+        let root_tree = object_utils::load_parcel(&root).unwrap().tree_hash;
+
+        for missing in [&root_tree, &root] {
+            let (folder, file_name) = crate::util::file_utils::get_path_for_object(missing).unwrap();
+            std::fs::remove_file(std::path::Path::new(&folder).join(file_name)).unwrap();
+            let error = redaction_utils::chain_names("kv", &head, &other).unwrap_err();
+            assert!(error.contains(missing.as_str()) && error.contains("cannot be told"), "{}", error);
+        }
     }
 
     #[test]
