@@ -1520,8 +1520,6 @@ fn describe_conflicts(wire: &str,
     Ok(MetaPalletConflicts { pallet: wire.to_string(), conflicts })
 }
 
-/// The `meta_conflict` refusal for the pallets that conflicted, naming the working pallet that
-/// did lower and its head.
 /// Where a replay lifted to the remote left the local head, after the local write failed:
 /// `read_back` is the local head read after the failure, since a write can land and still fail.
 fn replay_failure_context(wire: &str, parcel: &str, read_back: Result<Option<String>, String>) -> String {
@@ -1534,6 +1532,8 @@ fn replay_failure_context(wire: &str, parcel: &str, read_back: Result<Option<Str
     }
 }
 
+/// The `meta_conflict` refusal for the pallets that conflicted, naming the working pallet that
+/// did lower and its head.
 fn meta_conflict_refusal(conflicts: &[MetaPalletConflicts], pallet: &str, head: &str) -> String {
     let count: usize = conflicts.iter().map(|pallet| pallet.conflicts.len()).sum();
     let pallets: Vec<&str> = conflicts.iter().map(|pallet| pallet.pallet.as_str()).collect();
