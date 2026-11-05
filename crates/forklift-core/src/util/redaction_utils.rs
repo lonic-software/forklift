@@ -614,6 +614,14 @@ impl HeadWriteCheck {
 ///   whole state, so a parcel that carries a cell its parent already names passes, and only one
 ///   that adds a redacted object to the tree is refused; refusing the carry would freeze a pallet
 ///   whose history named the object before it was redacted.
+/// - `served`, a meta head the remote served in this same command, exempts the history it reaches:
+///   the remote judged each of those parcels against its own redactions when it took it, which
+///   need not hold this warehouse's, but whatever they name is held there by meta history that is
+///   never rewritten, so refusing would only freeze the pallet behind it. A client adopting the remote's
+///   chain (a lower's fast-forward, the trust install's office, a replay onto the remote's head) is
+///   then not refused for history it merely takes. A parcel past `served` is judged as usual. It
+///   is `None` for every write a remote sends this warehouse, and it exempts nothing for a user
+///   pallet.
 /// - A write that leaves the ref where it is, or one made while no redaction exists, walks
 ///   nothing.
 ///
@@ -626,10 +634,11 @@ impl HeadWriteCheck {
 pub fn check_head_write(namespace: pallet_utils::PalletNamespace,
                         name: &str,
                         expected: Option<&str>,
-                        new: &str) -> HeadWriteCheck {
+                        new: &str,
+                        served: Option<&str>) -> HeadWriteCheck {
     let redactions = pallet_utils::get_meta_pallet_head(REDACTIONS_PALLET_NAME);
     let outcome = match &redactions {
-        Ok(redactions) => check_head_write_at(namespace, name, expected, new, redactions.clone()),
+        Ok(redactions) => check_head_write_at(namespace, name, expected, new, served, redactions.clone()),
         Err(error) => Err(error.clone().into()),
     };
 
@@ -641,6 +650,7 @@ fn check_head_write_at(namespace: pallet_utils::PalletNamespace,
                        name: &str,
                        expected: Option<&str>,
                        new: &str,
+                       served: Option<&str>,
                        redactions: Option<String>) -> Result<RedactionCheck, pallet_utils::RefUpdateError> {
     let mut check = RedactionCheck {
         namespace,
@@ -667,7 +677,7 @@ fn check_head_write_at(namespace: pallet_utils::PalletNamespace,
             let tree = object_utils::load_parcel(new)?.tree_hash;
             tree_names(&tree, &set, partial.then_some(&mut check.skipped))?
         }
-        pallet_utils::PalletNamespace::Meta => meta_parcels_add(expected, new, &set)?,
+        pallet_utils::PalletNamespace::Meta => meta_parcels_add(expected, served, new, &set)?,
     };
 
     match named {
@@ -682,11 +692,19 @@ fn check_head_write_at(namespace: pallet_utils::PalletNamespace,
 }
 
 /// The first redacted object a parcel of the meta chain at `new` adds over its parents, among the
-/// parcels `expected` does not reach. A meta chain is complete wherever it is adopted, so an
-/// object missing here is an error.
-fn meta_parcels_add(expected: Option<&str>, new: &str, set: &RedactedSet) -> Result<Option<Named>, String> {
+/// parcels neither `expected` nor `served` reaches. A meta chain is complete wherever it is
+/// adopted, so an object missing here is an error.
+fn meta_parcels_add(expected: Option<&str>,
+                    served: Option<&str>,
+                    new: &str,
+                    set: &RedactedSet) -> Result<Option<Named>, String> {
+    // Taking the served head itself adds nothing past it.
+    if served == Some(new) {
+        return Ok(None);
+    }
+
     let mut reached: HashSet<String> = HashSet::new();
-    let mut pending: Vec<String> = expected.into_iter().map(str::to_string).collect();
+    let mut pending: Vec<String> = expected.into_iter().chain(served).map(str::to_string).collect();
 
     while let Some(parcel) = pending.pop() {
         if reached.insert(parcel.clone()) {

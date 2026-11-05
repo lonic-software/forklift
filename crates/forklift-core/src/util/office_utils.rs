@@ -1110,6 +1110,13 @@ pub struct TrustInstall<'a> {
     /// The office head the anchor governs (`None`: the office stays at `office`).
     pub new_office: Option<&'a str>,
 
+    /// The office head the remote served in this same command, when the install takes the
+    /// remote's office (a lower's first contact or an accepted re-genesis): the history it reaches
+    /// is not judged against this warehouse's redactions, since the remote judged it (see
+    /// [`check_head_write`](crate::util::redaction_utils::check_head_write)). `None` for every
+    /// other install, a remote's own included.
+    pub served: Option<&'a str>,
+
     /// The boundary the anchor records, as a precondition on the pallet heads
     /// ([`PalletsPrecondition::NotConsumed`] for an anchor adopted from a remote, whose boundary
     /// is the remote's).
@@ -1180,7 +1187,7 @@ pub fn install_trust(install: &TrustInstall) -> Result<TrustInstalled, RefUpdate
     let (lock, redaction) = loop {
         let redaction = office_write
             .map(|new| crate::util::redaction_utils::check_head_write(
-                pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME, install.office, new,
+                pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME, install.office, new, install.served,
             ));
 
         let lock = crate::util::lock_utils::RefLock::acquire()?;

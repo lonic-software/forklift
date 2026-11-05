@@ -1273,7 +1273,7 @@ pub(crate) async fn replay(client: &RemoteClient,
     // so an operator the office no longer lets sign can still drop what the remote refuses. With
     // no remote head there is nothing to move to: the replay stacks an empty root instead.
     if let (true, Some(remote_head)) = (plan.is_empty(), remote_head) {
-        pallet_utils::update_meta_pallet_head(name, Some(&local), remote_head, &pallet_utils::RefPreconditions::NONE)?;
+        pallet_utils::update_meta_pallet_head_served(name, Some(&local), remote_head, remote_head, &pallet_utils::RefPreconditions::NONE)?;
         return Ok(Reconciled::Adopted);
     }
 
@@ -1323,7 +1323,7 @@ pub(crate) async fn replay(client: &RemoteClient,
         Ok(Some(parcel)) => parcel,
         Ok(None) => {
             let remote_head = remote_head.ok_or(format!("The replay of {} onto no remote head stacked nothing.", wire))?;
-            pallet_utils::update_meta_pallet_head(name, Some(&local), remote_head, &pallet_utils::RefPreconditions::NONE)?;
+            pallet_utils::update_meta_pallet_head_served(name, Some(&local), remote_head, remote_head, &pallet_utils::RefPreconditions::NONE)?;
             return Ok(Reconciled::Adopted);
         }
         Err(ReplayError::Conflicts(conflicts)) => {
@@ -1371,7 +1371,14 @@ pub(crate) async fn replay(client: &RemoteClient,
     // written".
     const REMOTE_ONLY: &str = "Only the remote was written.";
 
-    match pallet_utils::update_meta_pallet_head(name, Some(&local), &parcel, &writer.preconditions()) {
+    // The replay is judged against the remote head it was stacked onto, not the remote's history
+    // the local head lacks.
+    let written = match remote_head {
+        Some(remote_head) => pallet_utils::update_meta_pallet_head_served(name, Some(&local), &parcel, remote_head, &writer.preconditions()),
+        None => pallet_utils::update_meta_pallet_head(name, Some(&local), &parcel, &writer.preconditions()),
+    };
+
+    match written {
         Ok(()) => {}
         Err(refused) => {
             use pallet_utils::RefUpdateError::*;

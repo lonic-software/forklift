@@ -432,3 +432,44 @@ fn a_lift_refused_for_a_pallet_the_remote_lacks_says_it_was_not_created() {
     let message = error["message"].as_str().unwrap();
     assert!(message.ends_with("Pallet \"fresh\" was not created on the remote."), "{}", error);
 }
+
+#[test]
+fn a_meta_history_the_remote_serves_is_taken_though_it_names_a_redacted_hash() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-served-meta-server-{}", std::process::id())));
+
+    let other = Warehouse::cloned("served-meta-other", &server.url);
+    other.stack("notes.txt", b"notes\n", "notes");
+    other.run_ok(&["lift"]);
+
+    // Cloned before the remote has any @tags, so no meta history here names the marker and the
+    // redaction is recorded. The marker is only loaded, so no pallet head names it either.
+    let warehouse = Warehouse::cloned("served-meta", &server.url);
+
+    // Every @tags parcel's tree names the marker blob, so the remote's @tags names it from here on.
+    other.run_ok(&["tag", "create", "v1", "main"]);
+    other.run_ok(&["lift"]);
+
+    let marker = b"forklift-meta 1 tags";
+    std::fs::write(warehouse.root.join("marker.txt"), marker).unwrap();
+    warehouse.run_ok(&["load", "marker.txt"]);
+    recorded_hash(&warehouse, &hash_of(marker), "r");
+    warehouse.run_ok(&["unload", "marker.txt"]);
+    std::fs::remove_file(warehouse.root.join("marker.txt")).unwrap();
+    warehouse.run_ok(&["lift"]);
+
+    // A fresh clone takes @redactions and then the remote's @tags, which the remote judged when it
+    // took each parcel: the redaction is pending there, held by that history.
+    let fresh = Warehouse::cloned("served-meta-fresh", &server.url);
+    assert_eq!(fresh.redactions().len(), 1);
+    let tags = fresh.run_ok(&["tag", "list"]);
+    assert!(String::from_utf8_lossy(&tags.stdout).contains("v1"), "{:?}", tags);
+
+    // So does a lower's fast-forward from an unborn @tags.
+    warehouse.run_ok(&["lower"]);
+    let tags = warehouse.run_ok(&["tag", "list"]);
+    assert!(String::from_utf8_lossy(&tags.stdout).contains("v1"), "{:?}", tags);
+
+    // A parcel past the served head only carries the marker its parent names, so it is written.
+    warehouse.run_ok(&["tag", "create", "v2", "main"]);
+}

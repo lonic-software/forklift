@@ -2647,6 +2647,7 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                     replaces: Some(&existing_bytes),
                     office: office_head.as_deref(),
                     new_office: None,
+                    served: None,
                     pallets: PalletsPrecondition::WithinBoundary {
                         boundary: anchor.boundary.clone(),
                         scope: BoundaryScope::AllButOffice,
@@ -2702,6 +2703,7 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                     replaces: None,
                     office: None,
                     new_office: None,
+                    served: None,
                     pallets: PalletsPrecondition::WithinBoundary {
                         boundary: anchor.boundary.clone(),
                         scope: BoundaryScope::AllButOffice,
@@ -3608,6 +3610,7 @@ mod tests {
             replaces: None,
             office: office.as_deref(),
             new_office: None,
+            served: None,
             pallets: PalletsPrecondition::NotConsumed,
         }).map(|_| ())
     }

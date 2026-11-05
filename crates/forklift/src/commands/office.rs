@@ -135,6 +135,7 @@ pub async fn enroll(offline: bool, passphrase: bool) -> Result<(), String> {
         replaces: None,
         office: None,
         new_office: Some(&genesis),
+        served: None,
         pallets: PalletsPrecondition::WithinBoundary { boundary, scope: BoundaryScope::AllButOffice },
     })?;
 
@@ -862,6 +863,7 @@ pub fn regenesis(confirm: bool) -> Result<(), String> {
         replaces: Some(&old_anchor_bytes),
         office: Some(&old_office_head),
         new_office: Some(&genesis),
+        served: None,
         pallets: PalletsPrecondition::WithinBoundary { boundary, scope: BoundaryScope::AllButOffice },
     })?;
 
