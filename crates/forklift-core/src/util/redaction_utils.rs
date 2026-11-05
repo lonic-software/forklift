@@ -13,7 +13,9 @@
 //! that adds one must be signed by an Admin of the office as it stands when the parcel is admitted
 //! — the convention `@tags` follows, for the same reasons. A hash some meta pallet's history names
 //! is refused when the redaction is recorded: a meta pallet's history is never rewritten, so its
-//! content could never be removed.
+//! content could never be removed. So is one a pallet head names, until the file is taken out of
+//! it; that refusal only comes early, since no head written after the redaction may name the
+//! content either way.
 
 use std::collections::HashSet;
 use toml_edit::{value, Table};
@@ -352,9 +354,57 @@ pub(crate) fn chain_names(pallet: &str, head: &str, hash: &str) -> Result<bool, 
     Ok(false)
 }
 
+/// A user pallet head that names the content a redaction would remove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadHolder {
+    /// The pallet.
+    pub pallet: String,
+
+    /// Its head.
+    pub head: String,
+
+    /// Where the head's tree holds the content.
+    pub path: String,
+}
+
+/// Every user pallet whose head names what `redaction` removes, by the rule a head write is
+/// judged by: the redacted hash anywhere in the head's tree, or for a recipe, a chunked file with
+/// the same chunk list. A partial warehouse skips a subtree or recipe it does not hold, as the
+/// write check does. Elsewhere an object the walk needs and the store lacks is an error, never a
+/// pass; a pallet that does name the content is reported ahead of that error.
+pub fn head_holders(redaction: &Redaction) -> Result<Vec<HeadHolder>, String> {
+    let set = RedactedSet {
+        hashes: HashSet::from([redaction.hash.clone()]),
+        chunk_lists: redaction.chunks.iter().cloned().collect(),
+    };
+
+    let partial = crate::util::scope_utils::content_may_be_absent()?;
+    let mut holders = Vec::new();
+    let mut undecided = None;
+
+    for pallet in pallet_utils::list_pallets()? {
+        let Some(head) = pallet_utils::get_pallet_head(&pallet)? else { continue };
+
+        let mut skipped = HashSet::new();
+        let named = object_utils::load_parcel(&head)
+            .and_then(|parcel| tree_names(&parcel.tree_hash, &set, partial.then_some(&mut skipped)));
+
+        match named {
+            Ok(Some((path, _))) => holders.push(HeadHolder { pallet, head, path }),
+            Ok(None) => {}
+            Err(error) => { undecided.get_or_insert(error); }
+        }
+    }
+
+    match undecided {
+        Some(error) if holders.is_empty() => Err(error),
+        _ => Ok(holders),
+    }
+}
+
 /// Record a redaction, as one cell on the local `@redactions` head stamped by `writer`. The
 /// caller holds the warehouse lock, and has resolved the hash and checked it against the meta
-/// pallets; the content check refuses a signer who is not an admin, and a hash already redacted
+/// pallets and the pallet heads; the content check refuses a signer who is not an admin, and a hash already redacted
 /// (a fresh `redacted_at` always changes the cells, so a repeat reaches that check).
 pub fn record_redaction(redaction: &Redaction,
                         writer: &MetaWriter,

@@ -1,6 +1,6 @@
 //! `forklift redact` records a permanent redaction on the `@redactions` meta pallet: one cell per
 //! redacted object hash, never changed or removed, refused outright for a hash some meta pallet's
-//! history names.
+//! history names, and refused while a pallet head names it.
 
 use std::path::PathBuf;
 use std::process::Output;
@@ -92,6 +92,34 @@ impl Warehouse {
         self.run_ok(&["stack", "-m", message]);
     }
 
+    /// Stack `file` with `content`, then take it out again, and return the parcel that held it: a
+    /// leak that history keeps and no pallet head names.
+    fn leaked(&self, file: &str, content: &[u8]) -> String {
+        self.stack(file, content, "leak");
+        let parcel = self.head("main");
+        self.run_ok(&["remove", file]);
+        self.run_ok(&["stack", "-m", "take the leak out"]);
+
+        parcel
+    }
+
+    /// Record a redaction of `content` by its hash while no head names it: the file is only
+    /// loaded, so the store holds the blob, and is unloaded and deleted once the redaction is in.
+    fn redact_loaded(&self, file: &str, content: &[u8], reason: &str) -> String {
+        std::fs::write(self.root.join(file), content).unwrap();
+        self.run_ok(&["load", file]);
+        let hash = hash_of(content);
+        recorded_hash(self, &hash, reason);
+        self.run_ok(&["unload", file]);
+        std::fs::remove_file(self.root.join(file)).unwrap();
+
+        hash
+    }
+
+    fn head(&self, pallet: &str) -> String {
+        std::fs::read_to_string(self.root.join(".forklift/pallets").join(pallet)).unwrap().trim().to_string()
+    }
+
     fn redactions(&self) -> Vec<serde_json::Value> {
         self.json(&["redact", "list"])["data"]["redactions"].as_array().unwrap().clone()
     }
@@ -111,11 +139,12 @@ fn recorded_hash(warehouse: &Warehouse, target: &str, reason: &str) -> serde_jso
 #[test]
 fn a_redaction_is_recorded_listed_and_never_recorded_twice() {
     let warehouse = Warehouse::new("record");
-    warehouse.stack("secret.env", b"TOKEN=hunter2\n", "leak");
+    let leak = warehouse.leaked("secret.env", b"TOKEN=hunter2\n");
+    let target = format!("{}:secret.env", leak);
 
     assert!(warehouse.redactions().is_empty());
 
-    let recorded = recorded_hash(&warehouse, "main:secret.env", "leaked token");
+    let recorded = recorded_hash(&warehouse, &target, "leaked token");
     let hash = recorded["data"]["hash"].as_str().unwrap().to_string();
     assert_eq!(recorded["data"]["chunked"], false, "{}", recorded);
     assert!(recorded["data"]["redactions_head"].as_str().is_some(), "{}", recorded);
@@ -130,7 +159,7 @@ fn a_redaction_is_recorded_listed_and_never_recorded_twice() {
 
     // Again, by path and by hash: a redaction is permanent, and the second leaves the first as it
     // was.
-    for target in ["main:secret.env", hash.as_str()] {
+    for target in [target.as_str(), hash.as_str()] {
         let again = warehouse.run(&["redact", "record", target, "-m", "again"]);
         assert!(!again.status.success());
         assert!(String::from_utf8_lossy(&again.stderr).contains("already redacted"), "{:?}", again);
@@ -142,14 +171,11 @@ fn a_redaction_is_recorded_listed_and_never_recorded_twice() {
 #[test]
 fn a_held_hash_is_redacted_by_hash_and_only_file_content_is() {
     let warehouse = Warehouse::new("by-hash");
-    warehouse.stack("dir/secret.env", b"TOKEN=hunter2\n", "leak");
+    let leak = warehouse.leaked("dir/secret.env", b"TOKEN=hunter2\n");
 
     // Not a file: a directory path (which the tree lookup does not find), a parcel hash,
     // an absent hash, a malformed target, a missing path.
-    let parcel = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main"))
-        .unwrap()
-        .trim()
-        .to_string();
+    let parcel = warehouse.head("main");
     let absent = "0".repeat(64);
 
     for (target, expected) in [
@@ -168,7 +194,7 @@ fn a_held_hash_is_redacted_by_hash_and_only_file_content_is() {
     assert!(warehouse.redactions().is_empty());
 
     // An empty reason is refused before anything is written.
-    let empty = warehouse.run(&["redact", "record", "main:dir/secret.env", "-m", " "]);
+    let empty = warehouse.run(&["redact", "record", &format!("{}:dir/secret.env", leak), "-m", " "]);
     assert!(!empty.status.success());
     assert!(String::from_utf8_lossy(&empty.stderr).contains("empty reason"), "{:?}", empty);
 
@@ -196,18 +222,80 @@ fn content_a_meta_pallet_history_names_is_refused_with_its_code() {
     assert_eq!(error["details"]["meta_pallets"], serde_json::json!(["@tags"]), "{}", document);
     assert!(warehouse.redactions().is_empty());
 
-    // A file no meta pallet names is redacted as usual in the same warehouse.
-    recorded_hash(&warehouse, "main:notes.txt", "fine");
+    // A file no meta pallet or head names is redacted as usual in the same warehouse.
+    warehouse.redact_loaded("loaded.txt", b"loaded\n", "fine");
     assert_eq!(warehouse.redactions().len(), 1);
+}
+
+/// Run `redact record <target>` in `--json` mode, which must be refused as `head_names_content`
+/// with nothing recorded, and return the error.
+fn head_names_content(warehouse: &Warehouse, target: &str) -> serde_json::Value {
+    let refused = warehouse.run(&["--json", "redact", "record", target, "-m", "r"]);
+    let stdout = String::from_utf8_lossy(&refused.stdout);
+    assert_eq!(refused.status.code(), Some(50), "{}{}", stdout, String::from_utf8_lossy(&refused.stderr));
+    let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(document["error"]["code"], "head_names_content", "{}", document);
+    assert!(warehouse.redactions().is_empty(), "nothing was recorded");
+    document["error"].clone()
+}
+
+#[test]
+fn content_a_pallet_head_names_is_refused_until_the_file_is_taken_out() {
+    let warehouse = Warehouse::new("head-held");
+    warehouse.stack("secret.env", b"TOKEN=hunter2\n", "leak");
+    let hash = hash_of(b"TOKEN=hunter2\n");
+
+    // A second pallet at the same head, under another name too, and this bay stands on it.
+    warehouse.run_ok(&["pallet", "create", "side"]);
+    std::fs::rename(warehouse.root.join("secret.env"), warehouse.root.join("copy.env")).unwrap();
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "-m", "renamed"]);
+
+    // Every head is named; the first is main's, which this bay cannot take the file out of.
+    let error = head_names_content(&warehouse, &hash);
+    assert_eq!(error["details"]["hash"], hash.as_str(), "{}", error);
+    assert_eq!(error["details"]["heads"], serde_json::json!([
+        { "pallet": "main", "head": warehouse.head("main"), "path": "secret.env" },
+        { "pallet": "side", "head": warehouse.head("side"), "path": "copy.env" },
+    ]), "{}", error);
+    assert_eq!(
+        error["next_step"],
+        "stack a head of pallet \"main\" without \"secret.env\", from a bay standing on its head with that path in scope, then forklift redact record <hash> -m <reason>"
+            .replace("<hash>", &hash),
+        "{}", error
+    );
+
+    // By path it is the same object.
+    head_names_content(&warehouse, "side:copy.env");
+
+    // Taken out of side, main's head still names it.
+    warehouse.run_ok(&["remove", "copy.env"]);
+    warehouse.run_ok(&["stack", "-m", "take it out"]);
+    let error = head_names_content(&warehouse, &hash);
+    assert_eq!(error["details"]["heads"].as_array().unwrap().len(), 1, "{}", error);
+
+    // From a bay on main, the next step is the commands themselves; followed, the redaction lands.
+    warehouse.run_ok(&["shift", "main"]);
+    let error = head_names_content(&warehouse, &hash);
+    let next_step = error["next_step"].as_str().unwrap().to_string();
+    assert_eq!(
+        next_step,
+        format!("from the working tree's root, forklift remove secret.env, then forklift stack -m <description>, then forklift redact record {} -m <reason>", hash),
+        "{}", error
+    );
+
+    warehouse.run_ok(&["remove", "secret.env"]);
+    warehouse.run_ok(&["stack", "-m", "take it out"]);
+    recorded_hash(&warehouse, &hash, "leaked token");
 }
 
 #[test]
 fn an_enrolled_admin_records_a_signed_redaction() {
     let warehouse = Warehouse::new("signed");
     warehouse.run_ok(&["office", "enroll"]);
-    warehouse.stack("secret.env", b"TOKEN=hunter2\n", "leak");
+    let leak = warehouse.leaked("secret.env", b"TOKEN=hunter2\n");
 
-    recorded_hash(&warehouse, "main:secret.env", "leaked token");
+    recorded_hash(&warehouse, &format!("{}:secret.env", leak), "leaked token");
 
     let listed = warehouse.redactions();
     assert_eq!(listed.len(), 1, "{:?}", listed);
@@ -226,9 +314,9 @@ fn a_chunked_file_is_redacted_with_its_chunk_list() {
         state ^= state << 17;
         state as u8
     }).collect();
-    warehouse.stack("big.bin", &content, "big");
+    let leak = warehouse.leaked("big.bin", &content);
 
-    let recorded = recorded_hash(&warehouse, "main:big.bin", "leaked dump");
+    let recorded = recorded_hash(&warehouse, &format!("{}:big.bin", leak), "leaked dump");
     assert_eq!(recorded["data"]["chunked"], true, "{}", recorded);
 
     let listed = warehouse.redactions();
@@ -252,13 +340,17 @@ fn content_redacted(warehouse: &Warehouse, args: &[&str]) -> serde_json::Value {
 #[test]
 fn a_stack_naming_redacted_content_is_refused_until_the_file_is_gone() {
     let warehouse = Warehouse::new("stack");
-    warehouse.stack("secret.env", b"TOKEN=hunter2\n", "leak");
-    let hash = recorded_hash(&warehouse, "main:secret.env", "leaked token")["data"]["hash"]
-        .as_str().unwrap().to_string();
+    warehouse.stack("notes.txt", b"notes\n", "notes");
+
+    // Redacted while it is only loaded, so no head names it yet; the next stack would.
+    std::fs::write(warehouse.root.join("secret.env"), b"TOKEN=hunter2\n").unwrap();
+    warehouse.run_ok(&["load", "secret.env"]);
+    let hash = hash_of(b"TOKEN=hunter2\n");
+    recorded_hash(&warehouse, &hash, "leaked token");
     let head = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap();
 
-    // The file still there, beside a new one: the new head would name it again.
-    std::fs::write(warehouse.root.join("notes.txt"), b"notes\n").unwrap();
+    // The file still there, beside a new one: the new head would name it.
+    std::fs::write(warehouse.root.join("more.txt"), b"more\n").unwrap();
     warehouse.run_ok(&["load", "."]);
     let error = content_redacted(&warehouse, &["stack", "-m", "notes"]);
     assert_eq!(error["details"]["path"], "secret.env", "{}", error);
@@ -285,10 +377,9 @@ fn a_meta_pallet_may_not_start_naming_redacted_content() {
     let warehouse = Warehouse::new("meta-adds");
     warehouse.stack("notes.txt", b"first\n", "first");
 
-    // No @tags yet, so no meta history names the marker and the redaction is recorded; the first
-    // @tags parcel would then add it.
-    warehouse.stack("marker.txt", b"forklift-meta 1 tags", "marker");
-    recorded_hash(&warehouse, "main:marker.txt", "r");
+    // No @tags yet, so no meta history names the marker, and the marker is only loaded, so no
+    // head names it: the redaction is recorded. The first @tags parcel would then add it.
+    warehouse.redact_loaded("marker.txt", b"forklift-meta 1 tags", "r");
 
     let error = content_redacted(&warehouse, &["tag", "create", "v1", "main"]);
     assert_eq!(error["details"]["pallet"], "@tags", "{}", error);
@@ -350,30 +441,17 @@ fn a_lift_is_refused_by_this_warehouses_own_redactions_until_the_file_is_taken_o
     first.stack("notes.txt", b"notes\n", "notes");
     first.run_ok(&["lift"]);
 
-    // This warehouse clones before any redaction exists, so its @redactions is its own: the one it
-    // records below diverges from the remote's, its lift fails, and the remote never learns of
-    // that redaction. Only this warehouse's own check can refuse the head.
+    // This warehouse stacks the file before any redaction exists, and has not lifted it.
     let warehouse = Warehouse::cloned("lift", &server.url);
-
-    // Another warehouse moves the remote's @redactions on, from a pallet of its own.
-    let other = Warehouse::cloned("lift-other", &server.url);
-    other.run_ok(&["pallet", "create", "side"]);
-    other.stack("other.env", b"OTHER=1\n", "other");
-    other.run_ok(&["lift"]);
-
-    // The remote already serves exactly this head, so lifting it moves nothing, and the
-    // redaction reaches the remote's @redactions.
-    recorded_hash(&other, "side:other.env", "other leak");
-    other.run_ok(&["lift"]);
-
-    // Taken out again, so the remote serves no head naming it.
-    other.run_ok(&["remove", "other.env"]);
-    other.run_ok(&["stack", "-m", "without other"]);
-    other.run_ok(&["lift"]);
-
     warehouse.stack("secret.env", b"TOKEN=hunter2\n", "leak");
-    let hash = recorded_hash(&warehouse, "main:secret.env", "leaked token")["data"]["hash"]
-        .as_str().unwrap().to_string();
+
+    // Another warehouse redacts the same content, which no head it holds names, and lifts the
+    // redaction; this warehouse's lower takes it. The remote serves no head naming the content.
+    let other = Warehouse::cloned("lift-other", &server.url);
+    let hash = other.redact_loaded("secret.env", b"TOKEN=hunter2\n", "leaked token");
+    other.run_ok(&["lift"]);
+    warehouse.run_ok(&["lower"]);
+    assert_eq!(warehouse.redactions().len(), 1);
     let served = served_main(&server.url, "lift-before");
 
     let error = content_redacted(&warehouse, &["lift"]);
@@ -402,19 +480,11 @@ fn a_lift_is_refused_by_this_warehouses_own_redactions_until_the_file_is_taken_o
     assert_eq!(error["details"]["path"], "secret.env", "{}", error);
     assert_eq!(std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap(), local, "no merge was written");
 
-    // The next step, as it says. The working pallet lifts; the lift still fails over @redactions,
-    // which only a lower reconciles with the remote's.
+    // The next step, as it says.
     warehouse.run_ok(&["remove", "secret.env"]);
     warehouse.run_ok(&["stack", "-m", "without the secret"]);
-    let lifted = warehouse.run(&["lift"]);
-    assert!(!lifted.status.success(), "{:?}", lifted);
-    assert!(String::from_utf8_lossy(&lifted.stderr).contains("@redactions"), "{:?}", lifted);
-
-    let head = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap();
-    assert_eq!(served_main(&server.url, "lift-after"), head.trim());
-
-    warehouse.run_ok(&["lower"]);
     warehouse.run_ok(&["lift"]);
+    assert_eq!(served_main(&server.url, "lift-after"), warehouse.head("main"));
 }
 
 #[test]
@@ -425,7 +495,14 @@ fn a_lift_refused_for_a_pallet_the_remote_lacks_says_it_was_not_created() {
     let warehouse = Warehouse::cloned("lift-new", &server.url);
     warehouse.run_ok(&["pallet", "create", "fresh"]);
     warehouse.stack("secret.env", b"TOKEN=hunter2\n", "leak");
-    recorded_hash(&warehouse, "fresh:secret.env", "leaked token");
+
+    let other = Warehouse::cloned("lift-new-other", &server.url);
+    other.stack("notes.txt", b"notes\n", "notes");
+    other.redact_loaded("secret.env", b"TOKEN=hunter2\n", "leaked token");
+    other.run_ok(&["lift"]);
+
+    // The remote lacks "fresh", so the redaction comes down with main.
+    warehouse.run_ok(&["lower", "main"]);
 
     let error = content_redacted(&warehouse, &["lift"]);
     assert_eq!(error["details"]["pallet"], "fresh", "{}", error);

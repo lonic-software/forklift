@@ -2,8 +2,8 @@ use serde::Serialize;
 use forklift_core::error::{sanitize, CoreError, RefusalCode};
 use forklift_core::util::kv_utils::short;
 use forklift_core::util::office_utils::Role;
-use forklift_core::util::redaction_utils::{self, AttributedRedaction, RedactedKind, Redaction};
-use forklift_core::util::{config_utils, object_utils, pallet_utils};
+use forklift_core::util::redaction_utils::{self, AttributedRedaction, HeadHolder, RedactedKind, Redaction};
+use forklift_core::util::{config_utils, object_utils, pallet_utils, remote_utils};
 use crate::cli::RedactAction;
 use crate::commands::lower;
 use crate::output::{self, CommandOutput};
@@ -30,10 +30,12 @@ pub async fn handle_command(action: Option<RedactAction>) -> Result<(), String> 
 /// Record a redaction of the object `target` names: a full object hash, or `<revision>:<path>`
 /// for the content of one file at a revision. Under trust only an admin may record one, and the
 /// object must be a file's content (a blob, or a chunked file's recipe). A hash some meta pallet's
-/// history names is refused: that history is never rewritten, so the content could never go.
+/// history names is refused: that history is never rewritten, so the content could never go. So
+/// is one a pallet head names, until the file is taken out of that head.
 ///
 /// The admin rule and immutability are the pallet's own, checked on every write and by the
-/// remote; the checks here only refuse early, with a plainer message.
+/// remote, and no head written after the redaction may name the content; the checks here only
+/// refuse early, with a plainer message.
 fn record(target: &str, reason: &str) -> Result<(), String> {
     let (hash, kind) = resolve_target(target)?;
 
@@ -84,6 +86,12 @@ fn record(target: &str, reason: &str) -> Result<(), String> {
         redacted_at: chrono::Utc::now().timestamp(),
         chunks,
     };
+
+    let holders = redaction_utils::head_holders(&redaction)?;
+
+    if !holders.is_empty() {
+        return Err(head_held_refusal(&hash, &holders));
+    }
 
     let redactions_head = redaction_utils::record_redaction(&redaction, &writer, &operator)?;
 
@@ -148,6 +156,37 @@ fn meta_held_refusal(hash: &str, holders: &[String]) -> String {
         ),
         "rotate or revoke the exposed secret",
         serde_json::json!({ "hash": hash, "meta_pallets": names }),
+    ).into()
+}
+
+/// The [`RefusalCode::HeadNamesContent`] refusal for `hash`, which the head of every pallet in
+/// `holders` names. A redaction removes content from history only, so the file comes out of each
+/// head first; the next step takes it out of the first, then records the redaction by its hash,
+/// which a `<revision>:<path>` at the new head no longer resolves to.
+fn head_held_refusal(hash: &str, holders: &[HeadHolder]) -> String {
+    let first = &holders[0];
+    let named: Vec<String> = holders.iter()
+        .map(|holder| format!("pallet \"{}\" as \"{}\"", holder.pallet, holder.path))
+        .collect();
+    let heads: Vec<serde_json::Value> = holders.iter()
+        .map(|holder| serde_json::json!({
+            "pallet": holder.pallet, "head": holder.head, "path": holder.path,
+        }))
+        .collect();
+
+    CoreError::refusal_with_details(
+        RefusalCode::HeadNamesContent,
+        format!(
+            "Object {} is in the head of {}. A redaction removes content from history only, so no \
+            pallet head may name it when the redaction is recorded, and nothing was recorded.",
+            hash,
+            named.join(", ")
+        ),
+        remote_utils::take_out_next_step(
+            &first.pallet, &first.head, &first.path,
+            &format!("forklift redact record {} -m <reason>", hash),
+        ),
+        serde_json::json!({ "hash": hash, "heads": heads }),
     ).into()
 }
 
