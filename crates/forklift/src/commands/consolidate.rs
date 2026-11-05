@@ -479,8 +479,8 @@ fn fast_forward(current: &str,
     shift_utils::ensure_writes_present(&ops)?;
     // A head stacked before a redaction came down by `lower` can still name the content.
     redaction_utils::refuse_redacted_writes(&ops, &format!("consolidate \"{}\" into \"{}\"", target, current), |path| format!(
-        "shift to \"{}\", take \"{}\" out of it and stack, then consolidate again",
-        target, path
+        "shift to \"{}\", take \"{}\" out of it and stack, then shift back to \"{}\" and consolidate again",
+        target, path, current
     ))?;
 
     // Finished by `write_head_or_roll_back` once the bay is settled at one head or the other.

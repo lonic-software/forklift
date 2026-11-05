@@ -170,7 +170,9 @@ The same bytes under another name are the same content, so renaming the file doe
 `load`, `park`, `lower`, a merge (`consolidate`, `haul`, `lift`'s merge) and `pick` refuse with this
 code too, before anything reaches the bay, when they would stage, park or write the content. Change
 or delete the file and run `load` or `park` again. `lower`, a merge or a pick brings the content from
-the other side, so take the file out there first, or make the change by hand without it.
+the other side, so take the file out there first, or make the change by hand without it. A
+`consolidate` that would fast-forward to a head stacked before the redaction came down names that
+pallet: shift to it, take the file out and stack, then shift back and consolidate again.
 
 `lift` refuses with this code too, before it sends the pallet, when a head you stacked earlier names
 the content; the remote may not hold the redaction yet, so its own check cannot be relied on. From

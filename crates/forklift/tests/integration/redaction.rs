@@ -730,7 +730,7 @@ fn a_fast_forward_to_a_head_stacked_before_a_redaction_came_down_is_refused() {
     assert!(message.starts_with("Refusing to consolidate \"side\" into \"main\": \"secret.env\""), "{}", error);
     assert_eq!(
         error["next_step"],
-        "shift to \"side\", take \"secret.env\" out of it and stack, then consolidate again",
+        "shift to \"side\", take \"secret.env\" out of it and stack, then shift back to \"main\" and consolidate again",
         "{}", error
     );
     assert!(!warehouse.root.join("secret.env").exists(), "the content never reached the bay");
