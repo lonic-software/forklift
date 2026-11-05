@@ -19,7 +19,7 @@ use forklift_core::util::file_utils::BulkStoreSession;
 use forklift_core::util::pack_utils::{IngestBase, IngestStored, StoreIngest};
 use forklift_core::util::meta_tree::MetaWriter;
 use forklift_core::util::tag_utils::{self, Tag};
-use forklift_core::util::{config_utils, inventory_utils, object_utils, office_utils, operation_utils, pallet_utils, shift_utils};
+use forklift_core::util::{audit_utils, config_utils, inventory_utils, object_utils, office_utils, operation_utils, pallet_utils, shift_utils};
 use forklift_core::util::operation_utils::{Operation, OperationKind};
 use crate::commands::export_git::SkippedTag;
 use crate::events;
@@ -72,6 +72,10 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
             Import into a fresh warehouse, then \"forklift office enroll\".".to_string()
         );
     }
+
+    // An office standing without its anchor refuses every unsigned write, the tags included:
+    // refused here, before any head moves, rather than after the branches have landed.
+    audit_utils::local_meta_trust()?;
 
     // Validate it is a git repository up front (a clear error beats a cryptic one later).
     git(path, &["rev-parse", "--git-dir"])?;
@@ -195,9 +199,14 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
     if !planned.is_empty() {
         progress.status("Recording tags");
     }
-    let tags = record_tags(planned).map_err(|why| format!(
-        "The branches were imported, but the git tags could not be recorded: {}", why
-    ))?;
+    let tags = record_tags(planned).map_err(|(recorded, why)| match recorded.is_empty() {
+        true => format!("The branches were imported, but the git tags could not be recorded: {}", why),
+        false => format!(
+            "The branches were imported, and the git tags {} were recorded, but the rest could not be: {}",
+            recorded.iter().map(|name| format!("\"{}\"", sanitize(name))).collect::<Vec<_>>().join(", "),
+            why
+        ),
+    })?;
 
     output::emit(&ImportReport {
         commits: converter.commits.len(),
@@ -232,15 +241,20 @@ struct PlannedTag {
 /// only while no anchor and no office stand.
 ///
 /// # Returns
-/// * `Ok(Vec<String>)` - The names recorded, sorted.
-/// * `Err(String)`     - If a parcel is refused or trust was established meanwhile.
-fn record_tags(planned: Vec<PlannedTag>) -> Result<Vec<String>, String> {
+/// * `Ok(Vec<String>)`            - The names recorded, sorted.
+/// * `Err((Vec<String>, String))` - If a parcel is refused or trust was established meanwhile:
+///   the names the parcels before it recorded, and why.
+fn record_tags(planned: Vec<PlannedTag>) -> Result<Vec<String>, (Vec<String>, String)> {
     let mut by_tagger: BTreeMap<String, Vec<Tag>> = BTreeMap::new();
+    let mut importer: Option<Operator> = None;
 
     for PlannedTag { tag, tagger, .. } in planned {
         let tagger = match tagger {
             Some(tagger) => tagger,
-            None => config_utils::get_operator()?,
+            None => match &importer {
+                Some(importer) => importer.clone(),
+                None => importer.insert(config_utils::get_operator().map_err(|why| (Vec::new(), why))?).clone(),
+            },
         };
 
         by_tagger.entry(tagger.identifier).or_default().push(tag);
@@ -253,7 +267,10 @@ fn record_tags(planned: Vec<PlannedTag>) -> Result<Vec<String>, String> {
 
         let description = format!("import {} git tag(s)", tags.len());
         let actor = Operator { identifier };
-        tag_utils::record_tags(&tags, &MetaWriter::Unsigned, &actor, &description)?;
+        if let Err(why) = tag_utils::record_tags(&tags, &MetaWriter::Unsigned, &actor, &description) {
+            names.sort();
+            return Err((names, why));
+        }
 
         names.extend(tags.into_iter().map(|tag| tag.name));
     }
@@ -283,7 +300,8 @@ struct GitTag {
     /// The message, without git's signature and trailing newlines.
     message: String,
 
-    /// Whether the message carried a signature.
+    /// Whether it carried a signature: in its message, or in a `gpgsig` header (the signature
+    /// over the other hash algorithm's form of a tag).
     signed: bool,
 }
 
@@ -294,9 +312,12 @@ fn parse_tag(text: &str) -> Result<GitTag, String> {
 
     let mut object = None;
     let mut tagger = None;
+    let mut header_signed = false;
 
     for line in header.lines() {
-        if let Some(rest) = line.strip_prefix("object ") {
+        if line.starts_with("gpgsig") {
+            header_signed = true;
+        } else if let Some(rest) = line.strip_prefix("object ") {
             object = Some(rest.trim().to_string());
         } else if let Some(rest) = line.strip_prefix("tagger ") {
             tagger = Some(parse_identity(rest).map_err(|why| format!("its tagger cannot be read ({})", why))?);
@@ -318,7 +339,7 @@ fn parse_tag(text: &str) -> Result<GitTag, String> {
         object: object.ok_or("its tag object names no object".to_string())?,
         tagger,
         message: message.trim_end_matches('\n').to_string(),
-        signed: signature_at.is_some(),
+        signed: header_signed || signature_at.is_some(),
     })
 }
 
@@ -617,8 +638,11 @@ impl Converter {
             }
 
             match self.peel_tag(&object) {
-                Ok((subject, outer)) => {
+                Ok((subject, outer, signed)) => {
+                    // A tagger with no email names no operator, so the importing operator records
+                    // the tag, at git's time.
                     let (tagger, tagged_at) = match outer.as_ref().and_then(|tag| tag.tagger.clone()) {
+                        Some((tagger, time)) if tagger.identifier.is_empty() => (None, time),
                         Some((tagger, time)) => (Some(tagger), time),
                         None => (None, now),
                     };
@@ -631,7 +655,7 @@ impl Converter {
                             tagged_at,
                         },
                         tagger,
-                        signed: outer.is_some_and(|tag| tag.signed),
+                        signed,
                     });
                 }
                 Err(reason) => skipped.push(skip(reason)),
@@ -642,18 +666,21 @@ impl Converter {
     }
 
     /// Follow the git object `object` a tag ref names, through any tag objects, to an imported
-    /// commit: its parcel, and the outermost tag object (`None` for a lightweight tag).
+    /// commit: its parcel, the outermost tag object (`None` for a lightweight tag), and whether any
+    /// tag object on the way carried a signature.
     ///
     /// # Returns
-    /// * `Ok((String, Option<GitTag>))` - The parcel, and the tag object the ref names.
-    /// * `Err(String)`                  - Why the tag is left out.
-    fn peel_tag(&mut self, object: &str) -> Result<(String, Option<GitTag>), String> {
+    /// * `Ok((String, Option<GitTag>, bool))` - The parcel, the tag object the ref names, and
+    ///   whether a signature was met.
+    /// * `Err(String)`                        - Why the tag is left out.
+    fn peel_tag(&mut self, object: &str) -> Result<(String, Option<GitTag>, bool), String> {
         let mut outer: Option<GitTag> = None;
+        let mut signed = false;
         let mut cursor = object.to_string();
 
         loop {
             if let Some(parcel) = self.commits.get(&cursor) {
-                return Ok((parcel.clone(), outer));
+                return Ok((parcel.clone(), outer, signed));
             }
 
             let (kind, bytes) = self.batch.read(&cursor)
@@ -663,6 +690,7 @@ impl Converter {
                 "tag" => {
                     let tag = parse_tag(&String::from_utf8_lossy(&bytes))?;
                     cursor = tag.object.clone();
+                    signed |= tag.signed;
                     outer.get_or_insert(tag);
                 }
                 "commit" => return Err(format!("its commit {} is on no imported branch", cursor)),

@@ -4967,7 +4967,8 @@ fn parcel_described(warehouse: &TestWarehouse, revision: &str, description: &str
 // signature cut in `parse_tag` → "signed" keeps the PGP block; stop peeling at the first tag
 // object → "outer" is left out; record a lightweight tag by its commit's committer → "light"'s
 // tagger is "ada@example.com", which the importer ("test@forklift") is not; date it at 0 → "light"
-// is dated outside the import.
+// is dated outside the import; count only the outermost tag's signature → 2 tags carried one;
+// ignore the gpgsig header → 2 tags carried one; keep an empty tagger → the import fails.
 #[test]
 fn import_git_records_the_git_tags_unsigned() {
     let warehouse = TestWarehouse::new("import-git-tags");
@@ -5017,6 +5018,21 @@ fn import_git_records_the_git_tags_unsigned() {
     let signed = git_with_input(&root, &["mktag"], &object);
     git_in(&root, &["update-ref", "refs/tags/signed", &signed]);
 
+    // An unsigned tag over the signed one, a tag signed in a header (the other hash algorithm's
+    // signature), and a tagger with no email, which the importing operator records at git's time.
+    git_in(&root, &["tag", "-a", "wrapped", "-m", "Wrapped", "signed"]);
+    let object = format!(
+        "object {}\ntype commit\ntag headsig\ntagger Dan <dan@example.com> 1700000300 +0000\n\
+        gpgsig-sha256 -----BEGIN PGP SIGNATURE-----\n \n abc\n -----END PGP SIGNATURE-----\n\n\
+        Header signed\n",
+        main
+    );
+    let headsig = git_with_input(&root, &["mktag"], &object);
+    git_in(&root, &["update-ref", "refs/tags/headsig", &headsig]);
+    let object = format!("object {}\ntype commit\ntag nameless\ntagger Nobody <> 1700000200 +0000\n\nNo email\n", main);
+    let nameless = git_with_input(&root, &["mktag"], &object);
+    git_in(&root, &["update-ref", "refs/tags/nameless", &nameless]);
+
     assert_success(&warehouse.run(&["prepare"]));
     configure_operator(&warehouse);
     let before = chrono::Utc::now().timestamp();
@@ -5024,7 +5040,7 @@ fn import_git_records_the_git_tags_unsigned() {
     assert_success(&imported);
     let after = chrono::Utc::now().timestamp();
     let report = json(&imported);
-    assert_eq!(report["data"]["tags"], serde_json::json!(["light", "outer", "signed", "v1.0"]), "{}", report);
+    assert_eq!(report["data"]["tags"], serde_json::json!(["headsig", "light", "nameless", "outer", "signed", "v1.0", "wrapped"]), "{}", report);
 
     let skipped: Vec<(String, String)> = report["data"]["skipped_tags"].as_array().unwrap().iter()
         .map(|tag| (tag["name"].as_str().unwrap().to_string(), tag["reason"].as_str().unwrap().to_string()))
@@ -5034,7 +5050,7 @@ fn import_git_records_the_git_tags_unsigned() {
     assert!(skipped[1].1.contains("Forklift does not accept it as a tag name"), "{}", report);
     assert!(skipped[2].1.contains("it points at a git tree, not a commit"), "{}", report);
     assert!(report["data"]["warnings"].as_array().unwrap().iter()
-        .any(|warning| warning.as_str().unwrap().starts_with("1 imported tag(s) carried a git signature")), "{}", report);
+        .any(|warning| warning.as_str().unwrap().starts_with("3 imported tag(s) carried a git signature")), "{}", report);
 
     let first = parcel_described(&warehouse, "main", "first commit");
     let second = parcel_described(&warehouse, "main", "second commit");
@@ -5066,18 +5082,51 @@ fn import_git_records_the_git_tags_unsigned() {
     assert_eq!(signed["tagger"], "carol@example.com", "{}", signed);
     assert_eq!(signed["message"], "Signed release\n -----BEGIN PGP SIGNATURE----- is quoted here", "{}", signed);
 
+    let headsig = show("headsig");
+    assert_eq!(headsig["message"], "Header signed", "{}", headsig);
+
+    let nameless = show("nameless");
+    assert_eq!(nameless["tagger"], "test@forklift", "{}", nameless);
+    assert_eq!(nameless["tagged_at"], "2023-11-14T22:16:40+00:00", "{}", nameless);
+
     // Enrolling keeps the imported tags, unsigned, inside the trust boundary.
     assert_success(&warehouse.run(&["office", "enroll"]));
     let audit = warehouse.run(&["audit", "@tags"]);
     assert_eq!(audit.status.code(), Some(0), "{}{}", stdout(&audit), stderr(&audit));
     let listed = json(&warehouse.run(&["--json", "tag", "list"]));
-    assert_eq!(listed["data"]["tags"].as_array().unwrap().len(), 4, "{}", listed);
+    assert_eq!(listed["data"]["tags"].as_array().unwrap().len(), 7, "{}", listed);
     assert!(stdout(&warehouse.run(&["tag", "show", "v1.0"])).contains("bob@example.com (unsigned)"));
 }
 
 /// Git import leaves out a git tag whose name a tag already here holds, since a tag name is
 /// immutable, and records the rest.
 // Revert: drop the `taken` check in `plan_tags` → the import fails on the immutable name.
+/// An office standing without its anchor refuses every unsigned write, so git import refuses it
+/// before any branch lands, rather than failing on the tags afterwards.
+// Revert: drop the up-front office check → the branches land before the refusal.
+#[test]
+fn import_git_refuses_an_office_without_its_anchor_before_any_branch_lands() {
+    let warehouse = TestWarehouse::new("import-git-lost-anchor");
+    let root = warehouse.root.clone();
+
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["office", "enroll"]));
+    std::fs::remove_file(root.join(".forklift/trust")).unwrap();
+
+    git_in(&root, &["init", "-q", "-b", "trunk"]);
+    warehouse.write_file("x.txt", "here\n");
+    git_in(&root, &["add", "-A"]);
+    git_in(&root, &["commit", "-qm", "git work"]);
+    git_in(&root, &["tag", "v1.0"]);
+
+    let refused = warehouse.run(&["git", "import", "."]);
+    assert!(!refused.status.success(), "{}{}", stdout(&refused), stderr(&refused));
+    assert!(stderr(&refused).contains("holds an office but no trust anchor"), "{}", stderr(&refused));
+    let pallets = stdout(&warehouse.run(&["pallet", "list"]));
+    assert!(!pallets.contains("trunk"), "no branch lands: {}", pallets);
+}
+
 #[test]
 fn import_git_leaves_out_a_tag_name_already_here() {
     let warehouse = TestWarehouse::new("import-git-taken-tag");
