@@ -92,7 +92,7 @@ pub async fn handle_command() -> Result<(), String> {
         .filter(|outcome| outcome.status.is_in_step())
         .filter_map(|outcome| info.pallets.get(&outcome.pallet).cloned())
         .collect();
-    report.tags = run.mirror_tags(info.pallets.get(&tags_pallet_key()).map(String::as_str), &in_step).await;
+    report.tags = run.mirror_tags(info.pallets.get(&tags_pallet_key()).map(String::as_str), &in_step, false).await;
 
     // The record keeps the configured set: a pallet that went through, or was refused or failed
     // after its export, holds the entry its export wrote; one that failed before it keeps its
@@ -132,8 +132,8 @@ pub async fn handle_command() -> Result<(), String> {
 /// reported in the lift's result and never fails the lift; a pallet left behind is caught up by
 /// the next lift or `forklift git mirror`. Once the pallet is in step, the remote's tags on its
 /// history follow it. They are verified against this warehouse's own office, which a lift does not
-/// first bring up to the remote's, so a tag signed by a key admitted since is left out until
-/// `forklift git mirror` runs.
+/// first bring up to the remote's: while the remote's tags hold a key admitted since, a lift
+/// mirrors no tag and names `forklift git mirror`, which does.
 ///
 /// # Returns
 /// * `Some(LiftMirror)` - What the mirror did.
@@ -186,10 +186,18 @@ pub(crate) async fn after_lift(client: &RemoteClient, pallet: &str, head: &str) 
             return Ok::<LiftMirror, Problem>(LiftMirror::pallet(outcome));
         }
 
-        let tags = match client.fetch_info().await {
-            Ok(info) => run.mirror_tags(info.pallets.get(&tags_pallet_key()).map(String::as_str), &[head.to_string()]).await,
+        // Tags on other pallets are left to their own lifts, so they are not named here.
+        let mut tags = match client.fetch_info().await {
+            Ok(info) => run.mirror_tags(info.pallets.get(&tags_pallet_key()).map(String::as_str), &[head.to_string()], true).await,
             Err(why) => TagsMirror { tags_error: Some(why), ..TagsMirror::default() },
         };
+        if let Some(why) = tags.tags_error.take() {
+            tags.tags_error = Some(format!(
+                "{} Run \"forklift git mirror\", which first brings this warehouse's office up to the \
+                remote's.",
+                why
+            ));
+        }
 
         Ok(LiftMirror { pallet: outcome, tags })
     }.await;
@@ -829,17 +837,18 @@ impl<'a> Run<'a> {
 
     /// Push every tag at `tags_head` (the remote's `@tags` head; none when it has no tags) whose
     /// parcel is on one of the `in_step` heads, as the annotated tag `git export` writes over that
-    /// parcel's commit. A tag git already holds as another object is refused, never forced.
-    async fn mirror_tags(&mut self, tags_head: Option<&str>, in_step: &[String]) -> TagsMirror {
+    /// parcel's commit. A tag git already holds as another object is refused, never forced. With
+    /// `quiet_off_branch`, a tag on no `in_step` head is passed over without being named.
+    async fn mirror_tags(&mut self, tags_head: Option<&str>, in_step: &[String], quiet_off_branch: bool) -> TagsMirror {
         let Some(head) = tags_head else { return TagsMirror::default() };
 
-        match self.try_mirror_tags(head, in_step).await {
+        match self.try_mirror_tags(head, in_step, quiet_off_branch).await {
             Ok(tags) => tags,
             Err(problem) => TagsMirror { tags_error: Some(problem.into_message()), ..TagsMirror::default() },
         }
     }
 
-    async fn try_mirror_tags(&mut self, head: &str, in_step: &[String]) -> Result<TagsMirror, Problem> {
+    async fn try_mirror_tags(&mut self, head: &str, in_step: &[String], quiet_off_branch: bool) -> Result<TagsMirror, Problem> {
         let mut mirrored = TagsMirror::default();
 
         // Verified as a take of @tags is: git receives only tags the anchor vouches for, each
@@ -864,12 +873,30 @@ impl<'a> Run<'a> {
 
         let held = self.held_tags()?;
         let held_names: Vec<String> = held.keys().cloned().collect();
+        // A tag off every in-step branch is an ordinary skip; a failure finding a commit (a damaged
+        // mirror, a store that cannot be read) fails the tags instead.
         let repo = self.repo;
+        let mut off_branch: HashSet<String> = HashSet::new();
+        let mut failure: Option<Problem> = None;
         let (writable, skipped) = export_git::plan_tags(
             repo, &read.tags, office.as_ref().ok_or("this warehouse holds no trust anchor"), &held_names,
-            |attributed| self.tag_commit(&attributed.tag.subject, in_step),
+            |attributed| match self.tag_commit(&attributed.tag.subject, in_step) {
+                Ok(Some(commit)) => Ok(commit),
+                Ok(None) => {
+                    off_branch.insert(attributed.tag.name.clone());
+                    Err(format!("its parcel {} is on no branch the mirror holds in step with git", attributed.tag.subject))
+                }
+                Err(problem) => {
+                    failure.get_or_insert(problem);
+                    Err(String::new())
+                }
+            },
         )?;
-        mirrored.skipped_tags.extend(skipped);
+        if let Some(problem) = failure {
+            return Err(problem);
+        }
+        mirrored.skipped_tags.extend(skipped.into_iter()
+            .filter(|tag| !(quiet_off_branch && off_branch.contains(&tag.name))));
 
         let mut pushes: Vec<(String, String)> = Vec::new();
         for WritableTag { attributed, commit, tagger, signer, refname } in writable {
@@ -944,9 +971,9 @@ impl<'a> Run<'a> {
         Ok(mirrored)
     }
 
-    /// The commit a tag's parcel `subject` is exported as, when the parcel is on one of the
-    /// `in_step` heads, or why the tag is left out. A tag never brings history of its own.
-    fn tag_commit(&mut self, subject: &str, in_step: &[String]) -> Result<String, String> {
+    /// The commit a tag's parcel `subject` is exported as, or `None` when the parcel is on none of
+    /// the `in_step` heads. A tag never brings history of its own.
+    fn tag_commit(&mut self, subject: &str, in_step: &[String]) -> Result<Option<String>, Problem> {
         let mut on_branch = false;
         if file_utils::does_object_exist(subject)? {
             for head in in_step {
@@ -957,13 +984,15 @@ impl<'a> Run<'a> {
             }
         }
         if !on_branch {
-            return Err(format!("its parcel {} is on no branch the mirror holds in step with git", subject));
+            return Ok(None);
         }
 
         // An old parcel was exported by an earlier run, and is found below a boundary.
-        self.export(subject).map_err(Problem::into_message)?;
-        self.exporter.commit_of(subject).map(str::to_string)
-            .ok_or(format!("its parcel {} was not exported", subject))
+        self.export(subject)?;
+        match self.exporter.commit_of(subject) {
+            Some(commit) => Ok(Some(commit.to_string())),
+            None => Err(Problem::Failed(format!("Parcel {} of a tag was not exported.", subject))),
+        }
     }
 
     /// Every tag git holds, by name, with its object.

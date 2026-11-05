@@ -244,8 +244,9 @@ invalid ref name, or a name differing from another tag only in case), each named
 `skipped_tags` without failing anything. A tag git already holds as another object is never
 forced: it is listed in `refused_tags` and fails the run with `mirror_incomplete`, until git's tag
 is deleted or renamed. A lift pushes the tags on the pallet it mirrored, checked against the
-local office, so a tag signed by a key admitted since is left out until `git mirror` runs; a
-refused tag is only reported there.
+local office, which a lift does not bring up to the remote's: while the remote's tags hold a key
+admitted since, the lift mirrors no tag and says to run `git mirror`, which does. A refused tag
+is only reported by a lift.
 
 A head
 is exported only once its history verifies against the trust anchor: with one held, against it

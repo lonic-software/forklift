@@ -1357,9 +1357,11 @@ fn a_tag_git_holds_differently_is_refused_and_never_forced() {
 }
 
 /// A tag never brings history of its own: one on a parcel of a pallet the mirror does not carry is
-/// left out, and git receives neither the tag nor the parcel.
+/// left out, and git receives neither the tag nor the parcel. A lift of another pallet passes it
+/// over without naming it.
 ///
-/// Revert: drop the in-step check on a tag's parcel → the tag and its parcel's commit reach git.
+/// Revert: drop the in-step check on a tag's parcel → the tag and its parcel's commit reach git;
+/// name every skip in a lift → the lift lists "f1".
 #[test]
 fn a_tag_on_a_pallet_not_mirrored_is_left_out() {
     let fixture = Fixture::new("tag-unmirrored");
@@ -1378,4 +1380,9 @@ fn a_tag_on_a_pallet_not_mirrored_is_left_out() {
     assert!(report["skipped_tags"][0]["reason"].as_str().unwrap().contains("on no branch the mirror holds"), "{}", report);
     assert!(!git(&fixture.git, &["rev-parse", "--verify", "-q", "refs/tags/f1"]).status.success());
     assert_eq!(git_ok(&fixture.git, &["rev-list", "--all", "--count"]), "1");
+
+    area.stack("a", "code.txt", "v2\n", "second");
+    let lifted = area.lift("a");
+    assert_eq!(lifted["mirror"]["status"], "pushed", "{}", lifted);
+    assert!(lifted["mirror"].get("skipped_tags").is_none(), "{}", lifted);
 }
