@@ -282,18 +282,25 @@ pub fn entry_kind(entry_type: DirEntryType) -> Option<RedactedKind> {
 /// Every meta pallet whose history names `hash` anywhere in a parcel's tree, by name. Walks every
 /// meta pallet's whole chain, each parcel and tree once per pallet. An object the walk needs and
 /// the store lacks is an error, never a pass: the walk could not tell whether it names `hash`.
+/// A pallet that does name it is reported ahead of that error, as the more definite answer.
 pub fn meta_holders(hash: &str) -> Result<Vec<String>, String> {
     let mut holders = Vec::new();
+    let mut undecided = None;
 
     for name in pallet_utils::list_meta_pallets()? {
         let Some(head) = pallet_utils::get_meta_pallet_head(&name)? else { continue };
 
-        if chain_names(&name, &head, hash)? {
-            holders.push(name);
+        match chain_names(&name, &head, hash) {
+            Ok(true) => holders.push(name),
+            Ok(false) => {}
+            Err(error) => { undecided.get_or_insert(error); }
         }
     }
 
-    Ok(holders)
+    match undecided {
+        Some(error) if holders.is_empty() => Err(error),
+        _ => Ok(holders),
+    }
 }
 
 /// Whether any parcel reachable from `head`, the head of meta pallet `pallet`, has a tree naming
@@ -317,9 +324,10 @@ pub(crate) fn chain_names(pallet: &str, head: &str, hash: &str) -> Result<bool, 
         // not judge.
         let missing = |error: String| match file_utils::does_object_exist(&object) {
             Ok(false) => format!(
-                "Object {} of @{}'s history is not in this store, so whether that history names \
-                {} cannot be told, and nothing was recorded. Record the redaction in a fresh \
-                clone of this warehouse.",
+                "The store is damaged: object {} of @{}'s history is missing, so whether that \
+                history names {} cannot be told, and nothing was recorded. If this warehouse has \
+                a remote, record the redaction in a fresh clone of it; otherwise the missing \
+                history cannot be recovered here.",
                 object, pallet, hash
             ),
             _ => error,

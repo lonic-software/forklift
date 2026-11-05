@@ -3845,11 +3845,18 @@ mod tests {
         assert!(redaction_utils::chain_names("kv", &root, &held).unwrap());
         assert!(!redaction_utils::chain_names("kv", &head, &other).unwrap());
 
-        // With the root gone the walk cannot tell, and says so rather than answer "no".
-        let (folder, file_name) = crate::util::file_utils::get_path_for_object(&root).unwrap();
-        std::fs::remove_file(std::path::Path::new(&folder).join(file_name)).unwrap();
-        let error = redaction_utils::chain_names("kv", &head, &other).unwrap_err();
-        assert!(error.contains(&root) && error.contains("cannot be told"), "{}", error);
+        // With a root's tree, then the root itself, gone the walk cannot tell, and says so
+        // rather than answer "no". A chain no walk has read yet, so no cache holds its trees.
+        let root = forge(&[], &kv(), cells(&[("j", &held)]).as_deref(), &alice.signer());
+        let head = forge(&[&root], &kv(), None, &alice.signer());
+        let root_tree = object_utils::load_parcel(&root).unwrap().tree_hash;
+
+        for missing in [&root_tree, &root] {
+            let (folder, file_name) = crate::util::file_utils::get_path_for_object(missing).unwrap();
+            std::fs::remove_file(std::path::Path::new(&folder).join(file_name)).unwrap();
+            let error = redaction_utils::chain_names("kv", &head, &other).unwrap_err();
+            assert!(error.contains(missing.as_str()) && error.contains("cannot be told"), "{}", error);
+        }
     }
 
     #[test]
