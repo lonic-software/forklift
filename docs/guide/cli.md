@@ -1420,16 +1420,18 @@ forklift deliver main -m "add the feature"   # run from the draft pallet
 
 The squash agents need without losing the trail. Agents checkpoint constantly;
 humans want one reviewed parcel. `deliver` takes the current (draft) pallet's net change
-and lands it on the target as a **single clean signed parcel** — the draft head's tree
-with the target as its *only* parent, so the checkpoints stay out of the target's history.
-The full trail is **kept** (the draft pallet is left intact, browsable with `history`) and
-recorded as a signed **delivery** entry on the new parcel's manifest, so "what the agent
-tried, in what order" stays discoverable (`manifest show <parcel>`). The delivered parcel
-preserves the trail's authors; the deliverer is the stacker.
+and lands it on the target as a **single clean parcel** — the draft head's tree with the
+target as its *only* parent, so the checkpoints stay out of the target's history. The full
+trail is **kept** (the draft pallet is left intact, browsable with `history`) and recorded
+as a **delivery** entry on the new parcel's manifest, so "what the agent tried, in what
+order" stays discoverable (`manifest show <parcel>`). The delivered parcel preserves the
+trail's authors; the deliverer is the stacker.
 
-Needs an enrolled key (the trail is signed evidence). The current pallet becomes the
-target, and because the delivered tree equals the draft's, the working directory does not
-change. A second delivery of an already-delivered draft is refused.
+Once the warehouse is enrolled, the parcel and its delivery entry are signed with your key,
+and a reader cannot deliver. Before that, both are unsigned and name your configured
+operator, as a `stack` is, and enrolling later keeps them valid. The current pallet becomes
+the target, and because the delivered tree equals the draft's, the working directory does
+not change. A second delivery of an already-delivered draft is refused.
 
 The squash replaces the target's tree with the draft's, so `deliver` refuses a target that
 moved after the draft forked from it: those changes would be silently undone

@@ -7439,6 +7439,92 @@ fn deliver_squashes_a_draft_trail_and_keeps_it_as_post_metadata() {
     assert!(stderr(&again).contains("already delivered"), "{}", stderr(&again));
 }
 
+/// Before any enrollment, deliver records the parcel and its delivery entry unsigned under the
+/// configured operator; enrolling keeps both valid, and a delivery after it is signed.
+// Revert: refuse `Signing::Unsigned` in `deliver` as before → the first delivery fails.
+#[test]
+fn deliver_works_unsigned_in_a_warehouse_that_never_enrolled() {
+    let warehouse = TestWarehouse::new("deliver-unsigned");
+    warehouse.write_file("code.txt", "v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
+
+    let checkpoint = |v: &str| {
+        warehouse.write_file("code.txt", &format!("{}\n", v));
+        assert_success(&warehouse.run(&["load", "."]));
+        assert_success(&warehouse.run(&["stack", "-m", &format!("wip {}", v)]));
+    };
+    let deliver = |message: &str| {
+        let delivered = warehouse.run(&["--json", "deliver", "main", "-m", message]);
+        assert_eq!(delivered.status.code(), Some(0), "{}{}", stdout(&delivered), stderr(&delivered));
+        json(&delivered)["data"]["delivered"].as_str().unwrap().to_string()
+    };
+    let sidecar = |parcel: &str| warehouse.root.join(".forklift/objects").join(&parcel[0..2]).join(format!("{}.sig", &parcel[2..]));
+    let delivery = |n: usize| json(&warehouse.run(&["--json", "manifest", "show", "main"]))["data"]["entries"][n].clone();
+
+    assert_success(&warehouse.run(&["pallet", "create", "draft"]));
+    checkpoint("v2");
+    checkpoint("v3");
+    let first = deliver("first");
+    assert!(!sidecar(&first).exists(), "the delivered parcel is unsigned");
+    let entry = delivery(0);
+    assert_eq!(entry["kind"], "delivery", "{}", entry);
+    assert_eq!(entry["author"], "test@forklift", "{}", entry);
+    assert_eq!(entry["checkpoints"], 2, "{}", entry);
+    assert!(entry.get("signer").is_none(), "{}", entry);
+    assert!(stdout(&warehouse.run(&["manifest", "show", "main"])).contains("test@forklift (unsigned)"));
+
+    // The draft keeps working and delivers again: the unsigned record covers the target.
+    assert_success(&warehouse.run(&["shift", "draft"]));
+    checkpoint("v4");
+    deliver("second");
+
+    // Enrolling keeps the unsigned deliveries valid, and the next one is signed.
+    assert_success(&warehouse.run(&["office", "enroll"]));
+    for pallet in ["main", "@manifest"] {
+        let audit = warehouse.run(&["audit", pallet]);
+        assert_eq!(audit.status.code(), Some(0), "{}: {}{}", pallet, stdout(&audit), stderr(&audit));
+    }
+
+    assert_success(&warehouse.run(&["shift", "draft"]));
+    checkpoint("v5");
+    let third = deliver("third");
+    assert!(sidecar(&third).exists(), "the delivered parcel is signed");
+    let signed: Vec<_> = (0..3).map(delivery).filter(|entry| entry["signer"].is_string()).collect();
+    assert_eq!(signed.len(), 1, "only the delivery after enrolling is signed: {:?}", signed);
+    assert_eq!(signed[0]["body"], "third", "{:?}", signed);
+}
+
+/// An office standing without its anchor is neither trusted nor never enrolled, so deliver
+/// refuses it up front, saying the anchor was lost, and records nothing.
+// Revert: drop the `local_meta_trust` check in `deliver` → the delivery record still refuses, as
+// a changed office, without the lost-anchor message.
+#[test]
+fn deliver_refuses_an_office_without_its_anchor_before_anything_is_written() {
+    let warehouse = TestWarehouse::new("deliver-lost-anchor");
+    warehouse.write_file("code.txt", "v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "initial"]));
+    assert_success(&warehouse.run(&["office", "enroll"]));
+    assert_success(&warehouse.run(&["pallet", "create", "draft"]));
+    warehouse.write_file("code.txt", "v2\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "draft work"]));
+    let main_head = stdout(&warehouse.run(&["history", "main", "-n", "1"]));
+    std::fs::remove_file(warehouse.root.join(".forklift/trust")).unwrap();
+
+    let refused = warehouse.run(&["deliver", "main", "-m", "over a lost anchor"]);
+    assert!(!refused.status.success(), "{}{}", stdout(&refused), stderr(&refused));
+    assert!(stderr(&refused).contains("holds an office but no trust anchor"), "{}", stderr(&refused));
+    assert_eq!(stdout(&warehouse.run(&["history", "main", "-n", "1"])), main_head, "the target must not move");
+    let pallets = stdout(&warehouse.run(&["pallet", "list", "--all"]));
+    assert!(!pallets.contains("@manifest"), "nothing is recorded: {}", pallets);
+}
+
 // Revert: drop deliver's target-coverage check → the delivery lands and other.txt is back to v1.
 #[test]
 fn deliver_onto_a_target_that_moved_after_the_draft_forked_is_refused() {

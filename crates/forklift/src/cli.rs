@@ -257,14 +257,15 @@ pub enum Command {
     /// Squash the current draft pallet onto a target as one clean parcel, keeping the trail
     #[command(
         long_about = "Deliver the current (draft) pallet's checkpoint trail onto a target pallet \
-                      as a single clean signed parcel — the squash agents need, without \
-                      losing the trail. The delivered parcel carries the draft head's tree with \
-                      the target as its only parent, so the checkpoints stay out of the target's \
-                      history; the full trail is kept (the draft pallet is left intact) and \
-                      recorded as a signed \"delivery\" entry on the parcel's manifest, so \"what \
-                      the agent tried, in what order\" stays discoverable. Needs an enrolled key \
-                      (the trail is signed evidence). The current pallet becomes the target; the \
-                      working directory is unchanged (the tree is identical)."
+                      as a single clean parcel — the squash agents need, without losing the \
+                      trail. The delivered parcel carries the draft head's tree with the target \
+                      as its only parent, so the checkpoints stay out of the target's history; \
+                      the full trail is kept (the draft pallet is left intact) and recorded as a \
+                      \"delivery\" entry on the parcel's manifest, so \"what the agent tried, in \
+                      what order\" stays discoverable. Once the warehouse is enrolled, the parcel \
+                      and the entry are signed with your key; before that, both are unsigned and \
+                      name your configured operator, as a stack is. The current pallet becomes \
+                      the target; the working directory is unchanged (the tree is identical)."
     )]
     Deliver {
         /// The pallet to deliver onto
