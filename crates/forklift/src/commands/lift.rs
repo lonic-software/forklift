@@ -9,7 +9,7 @@ use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::take_utils::{FetchAt, TakeTrust};
 use crate::commands::consolidate::{self, MergeStatus};
 use crate::commands::lower::{self, MetaPalletFailure};
-use crate::commands::mirror::{self, PalletMirror};
+use crate::commands::mirror::{self, LiftMirror};
 use crate::events;
 use crate::output::{self, CommandOutput};
 
@@ -405,10 +405,11 @@ pub(crate) struct LiftReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     batch_lane: Option<BatchLaneClosure>,
 
-    /// What the git mirror did with the lifted pallet (`mirror.url`, `mirror.auto`). Absent when
-    /// no mirror applies to it. A mirror failure is reported here and never fails the lift.
+    /// What the git mirror did with the lifted pallet and the tags on its history (`mirror.url`,
+    /// `mirror.auto`). Absent when no mirror applies to it. A mirror failure is reported here and
+    /// never fails the lift.
     #[serde(skip_serializing_if = "Option::is_none")]
-    mirror: Option<PalletMirror>,
+    mirror: Option<LiftMirror>,
 }
 
 /// Whether a count is zero (for skipping it in the JSON envelope).
@@ -458,7 +459,7 @@ impl CommandOutput for LiftReport {
         output::print_batch_lane(self.batch_lane);
 
         if let Some(mirror) = &self.mirror {
-            mirror.render_line();
+            mirror.render();
         }
     }
 }

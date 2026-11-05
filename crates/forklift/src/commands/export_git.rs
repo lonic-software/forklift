@@ -129,14 +129,93 @@ struct TagExport {
     unreadable: Option<String>,
 }
 
-/// A tag the export can write, with the commit it goes over, its tagger, its signer key (`None` for
+/// A tag that can be written, with the commit it goes over, its tagger, its signer key (`None` for
 /// an unsigned tag) and its git ref.
-struct WritableTag<'a> {
-    attributed: &'a AttributedTag,
-    commit: &'a str,
-    tagger: &'a str,
-    signer: Option<&'a str>,
-    refname: String,
+pub(crate) struct WritableTag<'a> {
+    pub(crate) attributed: &'a AttributedTag,
+    pub(crate) commit: String,
+    pub(crate) tagger: &'a str,
+    pub(crate) signer: Option<&'a str>,
+    pub(crate) refname: String,
+}
+
+/// Sort `tags` into the ones that can be written as annotated git tags and the ones left out, each
+/// with why: `commit_of` names a tag's commit or why it has none; a signed tag's tagger is the
+/// operator `office` binds its signer key to; git must accept the name; and no two names may differ
+/// only in case, among these tags and the git tags `held` names (a repository already holding `V1`
+/// cannot also keep `v1` on a filesystem that folds case).
+///
+/// # Returns
+/// * `Ok((Vec<WritableTag>, Vec<SkippedTag>))` - The tags to write, and the tags left out.
+/// * `Err(String)`                             - If git could not be run.
+pub(crate) fn plan_tags<'a>(repo: &GitRepo,
+                            tags: &'a [AttributedTag],
+                            office: Result<&'a office_utils::OfficeState, &str>,
+                            held: &[String],
+                            mut commit_of: impl FnMut(&AttributedTag) -> Result<String, String>)
+    -> Result<(Vec<WritableTag<'a>>, Vec<SkippedTag>), String> {
+    let mut writable: Vec<WritableTag> = Vec::new();
+    let mut skipped: Vec<SkippedTag> = Vec::new();
+
+    for attributed in tags {
+        let name = &attributed.tag.name;
+        let skip = |reason: String| SkippedTag { name: name.clone(), reason };
+
+        let commit = match commit_of(attributed) {
+            Ok(commit) => commit,
+            Err(reason) => {
+                skipped.push(skip(reason));
+                continue;
+            }
+        };
+
+        // A signed tag's tagger is the operator the office binds the signer key to, a binding that
+        // never changes (a retired key stays in the office). Read strictly, so a machine whose
+        // office cannot be read or lacks the key leaves the tag out instead of writing a different
+        // tagger, and a different tag object, than every other machine. An unsigned tag's tagger is
+        // the operator it declares, which needs no office.
+        let (tagger, signer) = match (&attributed.signer, office) {
+            (None, _) => (attributed.tagger.as_str(), None),
+            (Some(_), Err(why)) => {
+                skipped.push(skip(format!("the office that names its tagger could not be read: {}", why)));
+                continue;
+            }
+            (Some(signer), Ok(office)) => match office.find_key(signer) {
+                Some(key) => (key.operator.as_str(), Some(key.key_id.as_str())),
+                None => {
+                    skipped.push(skip(format!("its signer key {} is not in this warehouse's office", signer)));
+                    continue;
+                }
+            },
+        };
+
+        // Forklift's tag names are a superset of git's: `a..b` and `v1.lock` are refused there.
+        let refname = format!("refs/tags/{}", name);
+        if !repo.output(&["check-ref-format", &refname])?.status.success() {
+            skipped.push(skip("git does not accept it as a tag name".to_string()));
+            continue;
+        }
+
+        writable.push(WritableTag { attributed, commit, tagger, signer, refname });
+    }
+
+    // Git keeps a loose ref as a file, so on a filesystem that folds case `V1` would overwrite
+    // `v1`. Two such names are both left out, on every filesystem, so the result does not depend
+    // on the one it is written to. A held tag of the very same name is that tag, not a collision.
+    let mut folded: HashMap<String, HashSet<&str>> = HashMap::new();
+    for name in writable.iter().map(|tag| tag.attributed.tag.name.as_str()).chain(held.iter().map(String::as_str)) {
+        folded.entry(name.to_ascii_lowercase()).or_default().insert(name);
+    }
+
+    let (kept, collided): (Vec<WritableTag>, Vec<WritableTag>) = writable.into_iter()
+        .partition(|tag| folded[&tag.attributed.tag.name.to_ascii_lowercase()].len() == 1);
+    skipped.extend(collided.into_iter().map(|tag| SkippedTag {
+        name: tag.attributed.tag.name.clone(),
+        reason: "another tag's name differs from it only in case, which git cannot keep apart on \
+            every filesystem".to_string(),
+    }));
+
+    Ok((kept, skipped))
 }
 
 /// Write every tag at the local `@tags` head whose subject this export wrote as an annotated git
@@ -167,72 +246,23 @@ fn export_tags(repo: &GitRepo, exporter: &Exporter) -> Result<TagExport, String>
         return Ok(export);
     }
 
-    // A signed tag's tagger is the operator the office binds the signer key to, a binding that
-    // never changes (a retired key stays in the office). Read strictly, so a machine whose office
-    // cannot be read or lacks the key leaves the tag out instead of writing a different tagger, and
-    // a different tag object, than every other machine. An unsigned tag's tagger is the operator it
-    // declares, which needs no office.
-    let office = office_utils::read_office_state();
-
     // The tags that could be written: on an exported parcel, unsigned or by a key the office holds,
     // under a name git accepts.
-    let mut writable: Vec<WritableTag> = Vec::new();
-    for attributed in &read.tags {
-        let name = &attributed.tag.name;
-        let skip = |reason: String| SkippedTag { name: name.clone(), reason };
-
-        let Some(commit) = exporter.commit_of(&attributed.tag.subject) else {
-            export.skipped.push(skip(format!("its parcel {} is on no exported branch", attributed.tag.subject)));
-            continue;
-        };
-
-        let (tagger, signer) = match (&attributed.signer, &office) {
-            (None, _) => (attributed.tagger.as_str(), None),
-            (Some(_), Err(why)) => {
-                export.skipped.push(skip(format!("the office that names its tagger could not be read: {}", why)));
-                continue;
-            }
-            (Some(signer), Ok(office)) => match office.find_key(signer) {
-                Some(key) => (key.operator.as_str(), Some(key.key_id.as_str())),
-                None => {
-                    export.skipped.push(skip(format!("its signer key {} is not in this warehouse's office", signer)));
-                    continue;
-                }
-            },
-        };
-
-        // Forklift's tag names are a superset of git's: `a..b` and `v1.lock` are refused there.
-        let refname = format!("refs/tags/{}", name);
-        if !repo.output(&["check-ref-format", &refname])?.status.success() {
-            export.skipped.push(skip("git does not accept it as a tag name".to_string()));
-            continue;
-        }
-
-        writable.push(WritableTag { attributed, commit, tagger, signer, refname });
-    }
-
-    // Git keeps a loose ref as a file, so on a filesystem that folds case `V1` would overwrite
-    // `v1`. Two such tags are both left out, on every filesystem, so the export does not depend
-    // on the one it is written to.
-    let mut folded: HashMap<String, usize> = HashMap::new();
-    for WritableTag { attributed, .. } in &writable {
-        *folded.entry(attributed.tag.name.to_ascii_lowercase()).or_default() += 1;
-    }
+    let office = office_utils::read_office_state();
+    let (writable, skipped) = plan_tags(repo, &read.tags, office.as_ref().map_err(String::as_str), &[], |attributed| {
+        exporter.commit_of(&attributed.tag.subject).map(str::to_string)
+            .ok_or(format!("its parcel {} is on no exported branch", attributed.tag.subject))
+    })?;
+    export.skipped.extend(skipped);
 
     for WritableTag { attributed, commit, tagger, signer, refname } in writable {
         let name = &attributed.tag.name;
         let skip = |reason: String| SkippedTag { name: name.clone(), reason };
 
-        if folded[&name.to_ascii_lowercase()] > 1 {
-            export.skipped.push(skip("another tag's name differs from it only in case, which git cannot \
-                keep apart on every filesystem".to_string()));
-            continue;
-        }
-
         // Git checks a tag object's text (a message holding a NUL, say), and a ref name can still
         // be one the filesystem refuses (`con` on Windows): either leaves that tag out. A ref write
         // can land and still report failure, so the ref read back decides.
-        let object = match exporter.write_tag(commit, tagger, signer, attributed) {
+        let object = match exporter.write_tag(&commit, tagger, signer, attributed) {
             Ok(object) => object,
             Err(refused) => {
                 export.skipped.push(skip(refused));
@@ -908,10 +938,10 @@ impl CommandOutput for ExportReport {
 #[derive(Serialize)]
 pub(crate) struct SkippedTag {
     /// The tag's name.
-    name: String,
+    pub(crate) name: String,
 
     /// Why it was left out.
-    reason: String,
+    pub(crate) reason: String,
 }
 
 
