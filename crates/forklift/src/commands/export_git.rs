@@ -933,7 +933,7 @@ impl CommandOutput for ExportReport {
     }
 }
 
-/// A tag the export left out.
+/// A tag an export or a mirror left out.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
 pub(crate) struct SkippedTag {

@@ -1023,7 +1023,7 @@ A command not listed here either reports only the generic human-message shape `{
 {
   "$defs": {
     "SkippedTag": {
-      "description": "A tag the export left out.",
+      "description": "A tag an export or a mirror left out.",
       "properties": {
         "name": {
           "description": "The tag's name.",
@@ -1209,6 +1209,24 @@ A command not listed here either reports only the generic human-message shape `{
         "exported"
       ],
       "type": "object"
+    },
+    "SkippedTag": {
+      "description": "A tag an export or a mirror left out.",
+      "properties": {
+        "name": {
+          "description": "The tag's name.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why it was left out.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "reason"
+      ],
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1221,6 +1239,40 @@ A command not listed here either reports only the generic human-message shape `{
       },
       "type": "array"
     },
+    "refused_tags": {
+      "description": "Tags git refused, or already holds as another object, with the step that clears each.",
+      "items": {
+        "$ref": "#/$defs/SkippedTag"
+      },
+      "type": "array"
+    },
+    "skipped_tags": {
+      "description": "Tags left out, with why: on no branch in step with git, unreadable here, or not a name git\nkeeps. A tag left out does not fail the run.",
+      "items": {
+        "$ref": "#/$defs/SkippedTag"
+      },
+      "type": "array"
+    },
+    "tags": {
+      "description": "The tags this run pushed to git, as the annotated tags `git export` writes.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "tags_error": {
+      "description": "Why no tag could be mirrored, when none could.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tags_in_step": {
+      "description": "How many tags git already held as the very tag object this run would push.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
     "url": {
       "description": "The git remote mirrored to (`mirror.url`).",
       "type": "string"
@@ -1228,7 +1280,9 @@ A command not listed here either reports only the generic human-message shape `{
   },
   "required": [
     "url",
-    "pallets"
+    "pallets",
+    "tags",
+    "tags_in_step"
   ],
   "title": "MirrorReport",
   "type": "object"
@@ -2004,6 +2058,79 @@ A command not listed here either reports only the generic human-message shape `{
         }
       ]
     },
+    "LiftMirror": {
+      "description": "What the lift trigger's mirror did: the lifted pallet, then the tags on its history.",
+      "properties": {
+        "commit": {
+          "description": "The git commit the branch is at, when it is in step with the export.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "exported": {
+          "description": "The parcels this run wrote as new git commits.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "message": {
+          "description": "Why the pallet was skipped or not mirrored, with the step that clears it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pallet": {
+          "type": "string"
+        },
+        "refused_tags": {
+          "description": "Tags git refused, or already holds as another object, with the step that clears each.",
+          "items": {
+            "$ref": "#/$defs/SkippedTag"
+          },
+          "type": "array"
+        },
+        "skipped_tags": {
+          "description": "Tags left out, with why: on no branch in step with git, unreadable here, or not a name git\nkeeps. A tag left out does not fail the run.",
+          "items": {
+            "$ref": "#/$defs/SkippedTag"
+          },
+          "type": "array"
+        },
+        "status": {
+          "$ref": "#/$defs/MirrorStatus"
+        },
+        "tags": {
+          "description": "The tags this run pushed to git, as the annotated tags `git export` writes.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tags_error": {
+          "description": "Why no tag could be mirrored, when none could.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tags_in_step": {
+          "description": "How many tags git already held as the very tag object this run would push.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "pallet",
+        "status",
+        "exported",
+        "tags",
+        "tags_in_step"
+      ],
+      "type": "object"
+    },
     "MetaPalletFailure": {
       "description": "A meta pallet that failed to sync, and why.",
       "properties": {
@@ -2076,40 +2203,21 @@ A command not listed here either reports only the generic human-message shape `{
         }
       ]
     },
-    "PalletMirror": {
-      "description": "One pallet's mirror outcome.",
+    "SkippedTag": {
+      "description": "A tag an export or a mirror left out.",
       "properties": {
-        "commit": {
-          "description": "The git commit the branch is at, when it is in step with the export.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "exported": {
-          "description": "The parcels this run wrote as new git commits.",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "message": {
-          "description": "Why the pallet was skipped or not mirrored, with the step that clears it.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "pallet": {
+        "name": {
+          "description": "The tag's name.",
           "type": "string"
         },
-        "status": {
-          "$ref": "#/$defs/MirrorStatus"
+        "reason": {
+          "description": "Why it was left out.",
+          "type": "string"
         }
       },
       "required": [
-        "pallet",
-        "status",
-        "exported"
+        "name",
+        "reason"
       ],
       "type": "object"
     }
@@ -2161,13 +2269,13 @@ A command not listed here either reports only the generic human-message shape `{
     "mirror": {
       "anyOf": [
         {
-          "$ref": "#/$defs/PalletMirror"
+          "$ref": "#/$defs/LiftMirror"
         },
         {
           "type": "null"
         }
       ],
-      "description": "What the git mirror did with the lifted pallet (`mirror.url`, `mirror.auto`). Absent when\nno mirror applies to it. A mirror failure is reported here and never fails the lift."
+      "description": "What the git mirror did with the lifted pallet and the tags on its history (`mirror.url`,\n`mirror.auto`). Absent when no mirror applies to it. A mirror failure is reported here and\nnever fails the lift."
     },
     "new_parcels": {
       "format": "uint",

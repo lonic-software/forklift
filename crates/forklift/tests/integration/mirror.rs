@@ -1323,8 +1323,9 @@ fn a_tag_on_an_old_parcel_follows_the_lift_as_the_export_tag() {
 /// goes through, and `git mirror` fails naming the step. A name differing from one of git's own
 /// tags only in case is left out without failing anything.
 ///
-/// Revert: force the tag refspec → git's v1.0 moves; check case against the export's tags alone →
-/// "rc" is pushed.
+/// Revert: skip the check against the object git holds and force the tag refspec → git's v1.0
+/// moves; read git's "already exists" as any other refusal → the step is not named; check case
+/// against the export's tags alone → "rc" is pushed.
 #[test]
 fn a_tag_git_holds_differently_is_refused_and_never_forced() {
     let fixture = Fixture::new("tag-conflict");
