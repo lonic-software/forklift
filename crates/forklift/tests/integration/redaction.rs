@@ -252,42 +252,59 @@ fn content_a_pallet_head_names_is_refused_until_the_file_is_taken_out() {
     warehouse.run_ok(&["load", "."]);
     warehouse.run_ok(&["stack", "-m", "renamed"]);
 
-    // Every head is named; the first is main's, which this bay cannot take the file out of.
+    // Every head is named, and the next step starts from the one this bay stands on.
+    let (main, side) = (warehouse.head("main"), warehouse.head("side"));
     let error = head_names_content(&warehouse, &hash);
     assert_eq!(error["details"]["hash"], hash.as_str(), "{}", error);
     assert_eq!(error["details"]["heads"], serde_json::json!([
-        { "pallet": "main", "head": warehouse.head("main"), "path": "secret.env" },
-        { "pallet": "side", "head": warehouse.head("side"), "path": "copy.env" },
+        { "pallet": "main", "head": main, "path": "secret.env" },
+        { "pallet": "side", "head": side, "path": "copy.env" },
     ]), "{}", error);
     assert_eq!(
-        error["next_step"],
-        "stack a head of pallet \"main\" without \"secret.env\", from a bay standing on its head with that path in scope, then forklift redact record <hash> -m <reason>"
-            .replace("<hash>", &hash),
+        error["next_step"].as_str().unwrap(),
+        format!(
+            "from the working tree's root, forklift remove copy.env, then forklift stack -m <description>, \
+            then take it out of the other heads in details.heads the same way, then forklift redact record {}:copy.env -m <reason>",
+            side
+        ),
         "{}", error
     );
 
     // By path it is the same object.
     head_names_content(&warehouse, "side:copy.env");
 
-    // Taken out of side, main's head still names it.
+    // Taken out of side, main's head still names it, and this bay cannot take it out of that.
     warehouse.run_ok(&["remove", "copy.env"]);
     warehouse.run_ok(&["stack", "-m", "take it out"]);
-    let error = head_names_content(&warehouse, &hash);
+    let error = head_names_content(&warehouse, &format!("{}:copy.env", side));
     assert_eq!(error["details"]["heads"].as_array().unwrap().len(), 1, "{}", error);
+    assert_eq!(
+        error["next_step"].as_str().unwrap(),
+        format!(
+            "stack a head of pallet \"main\" without \"secret.env\", from a bay standing on its head with that path in scope, \
+            then forklift redact record {}:secret.env -m <reason>",
+            main
+        ),
+        "{}", error
+    );
 
     // From a bay on main, the next step is the commands themselves; followed, the redaction lands.
     warehouse.run_ok(&["shift", "main"]);
     let error = head_names_content(&warehouse, &hash);
-    let next_step = error["next_step"].as_str().unwrap().to_string();
     assert_eq!(
-        next_step,
-        format!("from the working tree's root, forklift remove secret.env, then forklift stack -m <description>, then forklift redact record {} -m <reason>", hash),
+        error["next_step"].as_str().unwrap(),
+        format!(
+            "from the working tree's root, forklift remove secret.env, then forklift stack -m <description>, \
+            then forklift redact record {}:secret.env -m <reason>",
+            main
+        ),
         "{}", error
     );
 
     warehouse.run_ok(&["remove", "secret.env"]);
     warehouse.run_ok(&["stack", "-m", "take it out"]);
-    recorded_hash(&warehouse, &hash, "leaked token");
+    let recorded = recorded_hash(&warehouse, &format!("{}:secret.env", main), "leaked token");
+    assert_eq!(recorded["data"]["hash"], hash.as_str(), "{}", recorded);
 }
 
 #[test]
@@ -434,7 +451,10 @@ fn served_main(url: &str, name: &str) -> String {
 }
 
 #[test]
-fn a_lift_is_refused_by_this_warehouses_own_redactions_until_the_file_is_taken_out() {
+/// A head stacked before a redaction came down by `lower` is refused by this warehouse's own check
+/// before it is sent. The remote holds the redaction here too; a recorded redaction never leaves a
+/// local head naming the content, so a redaction only this warehouse holds no longer reaches lift.
+fn a_lift_is_refused_for_a_head_stacked_before_a_redaction_came_down() {
     let server = Server::start(&std::env::temp_dir()
         .join(format!("forklift-redaction-lift-server-{}", std::process::id())));
 
@@ -454,6 +474,16 @@ fn a_lift_is_refused_by_this_warehouses_own_redactions_until_the_file_is_taken_o
     warehouse.run_ok(&["lower"]);
     assert_eq!(warehouse.redactions().len(), 1);
     let served = served_main(&server.url, "lift-before");
+
+    // A stack that only carries the file over from its parent, unchanged, is refused too.
+    let stacked = warehouse.head("main");
+    std::fs::write(warehouse.root.join("todo.txt"), b"todo\n").unwrap();
+    warehouse.run_ok(&["load", "todo.txt"]);
+    let error = content_redacted(&warehouse, &["stack", "-m", "todo"]);
+    assert_eq!(error["details"]["path"], "secret.env", "{}", error);
+    assert_eq!(warehouse.head("main"), stacked, "nothing was written");
+    warehouse.run_ok(&["unload", "todo.txt"]);
+    std::fs::remove_file(warehouse.root.join("todo.txt")).unwrap();
 
     let error = content_redacted(&warehouse, &["lift"]);
     assert_eq!(error["details"]["path"], "secret.env", "{}", error);

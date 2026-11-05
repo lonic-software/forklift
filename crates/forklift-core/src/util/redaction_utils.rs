@@ -369,8 +369,8 @@ pub struct HeadHolder {
 
 /// Every user pallet whose head names what `redaction` removes, by the rule a head write is
 /// judged by: the redacted hash anywhere in the head's tree, or for a recipe, a chunked file with
-/// the same chunk list. A partial warehouse skips a subtree or recipe it does not hold, as the
-/// write check does. Elsewhere an object the walk needs and the store lacks is an error, never a
+/// the same chunk list. A partial warehouse skips a head, subtree or recipe it does not hold, as
+/// the write check does, so a head can name the content in a part this warehouse never fetched. Elsewhere an object the walk needs and the store lacks is an error, never a
 /// pass; a pallet that does name the content is reported ahead of that error.
 pub fn head_holders(redaction: &Redaction) -> Result<Vec<HeadHolder>, String> {
     let set = RedactedSet {
@@ -385,6 +385,10 @@ pub fn head_holders(redaction: &Redaction) -> Result<Vec<HeadHolder>, String> {
     for pallet in pallet_utils::list_pallets()? {
         let Some(head) = pallet_utils::get_pallet_head(&pallet)? else { continue };
 
+        if partial && !file_utils::does_object_exist(&head)? {
+            continue;
+        }
+
         let mut skipped = HashSet::new();
         let named = object_utils::load_parcel(&head)
             .and_then(|parcel| tree_names(&parcel.tree_hash, &set, partial.then_some(&mut skipped)));
@@ -392,13 +396,42 @@ pub fn head_holders(redaction: &Redaction) -> Result<Vec<HeadHolder>, String> {
         match named {
             Ok(Some((path, _))) => holders.push(HeadHolder { pallet, head, path }),
             Ok(None) => {}
-            Err(error) => { undecided.get_or_insert(error); }
+            Err(error) => {
+                undecided.get_or_insert(format!(
+                    "The head of pallet \"{}\" ({}) cannot be read ({}), so whether it names {} cannot \
+                    be told, and nothing was recorded.",
+                    pallet, head, error.trim_end_matches('.'), redaction.hash
+                ));
+            }
         }
     }
 
     match undecided {
         Some(error) if holders.is_empty() => Err(error),
         _ => Ok(holders),
+    }
+}
+
+/// The command that records the redaction of the file at `path` in parcel `head`, for a next step
+/// given once that head is no longer a pallet's: `<revision>:<path>` resolves whether or not the
+/// store holds the content, where a bare hash needs it held.
+pub fn record_command(head: &str, path: &str) -> String {
+    record_command_when(head, path, cfg!(windows))
+}
+
+/// [`record_command`], quoting for Windows when `windows`.
+fn record_command_when(head: &str, path: &str, windows: bool) -> String {
+    // The path is quoted on its own; behind the head it never starts the argument, so it needs no
+    // `--` either.
+    match crate::util::tree_utils::remedy_path_when(path, windows) {
+        Some(quoted) => format!(
+            "forklift redact record {}:{} -m <reason>",
+            head, quoted.strip_prefix("-- ").unwrap_or(&quoted)
+        ),
+        None => format!(
+            "forklift redact record {}:<path> -m <reason>, with that path quoted for your shell",
+            head
+        ),
     }
 }
 
@@ -893,6 +926,22 @@ mod tests {
         assert_ne!(digest(&[&b, &c]), digest(&[&c, &b]));
         assert_ne!(digest(&[&b]), digest(&[&b, &b]));
         assert!(object_utils::is_object_hash(&digest(&[&b])));
+    }
+
+    #[test]
+    fn the_record_command_quotes_the_path_behind_the_head() {
+        let command = |path: &str, windows: bool| record_command_when("abc123", path, windows);
+
+        for windows in [false, true] {
+            assert_eq!(command("dir/secret.env", windows), "forklift redact record abc123:dir/secret.env -m <reason>");
+            assert_eq!(command("-x.env", windows), "forklift redact record abc123:-x.env -m <reason>");
+        }
+
+        assert_eq!(command("a b.env", false), "forklift redact record abc123:'a b.env' -m <reason>");
+        assert_eq!(
+            command("a b.env", true),
+            "forklift redact record abc123:<path> -m <reason>, with that path quoted for your shell"
+        );
     }
 
     #[test]

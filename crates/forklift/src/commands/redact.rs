@@ -161,10 +161,19 @@ fn meta_held_refusal(hash: &str, holders: &[String]) -> String {
 
 /// The [`RefusalCode::HeadNamesContent`] refusal for `hash`, which the head of every pallet in
 /// `holders` names. A redaction removes content from history only, so the file comes out of each
-/// head first; the next step takes it out of the first, then records the redaction by its hash,
-/// which a `<revision>:<path>` at the new head no longer resolves to.
+/// head first. The next step takes it out of the pallet this bay stands on when that is a holder
+/// (else the first), then records the redaction at the head it leaves, where the path still names
+/// the file and resolves whether or not the store holds it.
 fn head_held_refusal(hash: &str, holders: &[HeadHolder]) -> String {
-    let first = &holders[0];
+    let position = pallet_utils::read_position().ok();
+    let chosen = holders.iter()
+        .find(|holder| position.as_ref().is_some_and(|position| position.pallet == holder.pallet))
+        .unwrap_or(&holders[0]);
+    let record = redaction_utils::record_command(&chosen.head, &chosen.path);
+    let then = match holders.len() {
+        1 => record,
+        _ => format!("take it out of the other heads in details.heads the same way, then {}", record),
+    };
     let named: Vec<String> = holders.iter()
         .map(|holder| format!("pallet \"{}\" as \"{}\"", holder.pallet, holder.path))
         .collect();
@@ -182,10 +191,7 @@ fn head_held_refusal(hash: &str, holders: &[HeadHolder]) -> String {
             hash,
             named.join(", ")
         ),
-        remote_utils::take_out_next_step(
-            &first.pallet, &first.head, &first.path,
-            &format!("forklift redact record {} -m <reason>", hash),
-        ),
+        remote_utils::take_out_next_step(&chosen.pallet, &chosen.head, &chosen.path, &then),
         serde_json::json!({ "hash": hash, "heads": heads }),
     ).into()
 }
