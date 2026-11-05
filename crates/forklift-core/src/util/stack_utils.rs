@@ -61,7 +61,7 @@ impl From<crate::error::CoreError> for StackError {
 impl From<StackError> for String {
     fn from(error: StackError) -> Self {
         match error {
-            StackError::HeadWrite { error, .. } => error.to_string(),
+            StackError::HeadWrite { error, .. } => error.into(),
             StackError::Behind { pallet, base, head } => {
                 pallet_utils::behind_refusal(&pallet, base.as_deref(), head.as_deref(), "stacked").into()
             },
