@@ -3196,7 +3196,10 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
                     Ok(None) => true,
                     _ => return Err(internal(e)),
                 },
-                Err(error) => return Err((StatusCode::CONFLICT, error.to_string())),
+                // Refused however often it is sent, as the ref update answers it; a removal names
+                // no new head, so this is not reached today.
+                Err(refused @ RefUpdateError::Redacted { .. }) => return Err(unprocessable(refused.into())),
+                Err(error) => return Err((StatusCode::CONFLICT, error.into())),
             };
 
             if removed {

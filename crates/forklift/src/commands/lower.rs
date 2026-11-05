@@ -741,17 +741,21 @@ fn write_named_head(pallet: &str,
         pallet_utils::RefUpdateError::Moved(found) => Err(format!(
             "{} Run \"forklift lower {}\" again.", found, pallet
         )),
+        // A failure can carry a framed refusal (a move of the origin pending, say), so it is
+        // composed around, never inside, a new message.
         pallet_utils::RefUpdateError::Failed(error) => match pallet_utils::get_pallet_head(pallet) {
             Ok(head) if head.as_deref() == Some(new) => {
                 record_served_head(pallet, served);
-                Err(format!("Pallet \"{}\" now holds parcel {}, but its write reported an error: {}", pallet, new, error))
+                Err(forklift_core::error::prefix_message(
+                    &format!("Pallet \"{}\" now holds parcel {}, but its write reported an error", pallet, new), error,
+                ))
             }
-            Ok(_) => Err(format!("Pallet \"{}\" was not moved: {}", pallet, error)),
-            Err(read) => Err(format!(
-                "Writing pallet \"{}\" failed ({}), and reading it back failed too ({}); it may or may \
-                not hold parcel {}.",
-                pallet, error, read, new
-            )),
+            Ok(_) => Err(forklift_core::error::prefix_message(&format!("Pallet \"{}\" was not moved", pallet), error)),
+            Err(read) => Err(forklift_core::error::prefix_message(&format!(
+                "Writing pallet \"{}\" failed, and reading it back failed too ({}), so it may or may not \
+                hold parcel {}. The write's error",
+                pallet, read, new
+            ), error)),
         },
         refused => Err(refused.into()),
     }

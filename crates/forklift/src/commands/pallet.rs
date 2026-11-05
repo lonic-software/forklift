@@ -195,7 +195,7 @@ pub async fn delete_pallet(name: &str, force: bool) -> Result<(), String> {
             it back.",
             e
         )),
-        Err(e) => return Err(e.to_string()),
+        Err(e) => return Err(e.into()),
     }
 
     output::emit(&Deleted {
