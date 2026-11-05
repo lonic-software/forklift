@@ -162,14 +162,13 @@ fn meta_held_refusal(hash: &str, holders: &[String]) -> String {
 /// The [`RefusalCode::HeadNamesContent`] refusal for `hash`, which the head of every pallet in
 /// `holders` names. A redaction removes content from history only, so the file comes out of each
 /// head first. The next step takes it out of the pallet this bay stands on when that is a holder
-/// (else the first), then records the redaction at the head it leaves, where the path still names
-/// the file and resolves whether or not the store holds it.
+/// (else the first), then records the redaction (see [`record_step`]).
 fn head_held_refusal(hash: &str, holders: &[HeadHolder]) -> String {
     let position = pallet_utils::read_position().ok();
     let chosen = holders.iter()
         .find(|holder| position.as_ref().is_some_and(|position| position.pallet == holder.pallet))
         .unwrap_or(&holders[0]);
-    let record = redaction_utils::record_command(&chosen.head, &chosen.path);
+    let record = record_step(hash, chosen, holders);
     let then = match holders.len() {
         1 => record,
         _ => format!("take it out of the other heads in details.heads the same way, then {}", record),
@@ -194,6 +193,17 @@ fn head_held_refusal(hash: &str, holders: &[HeadHolder]) -> String {
         remote_utils::take_out_next_step(&chosen.pallet, &chosen.head, &chosen.path, &then),
         serde_json::json!({ "hash": hash, "heads": heads }),
     ).into()
+}
+
+/// The command that records the redaction of `hash` once the file is out of the heads: at a head
+/// left behind, preferring `chosen`'s, where the path still names the file and resolves whether or
+/// not the store holds it. A holder that matched by chunk list holds another recipe, which its
+/// path would name instead, so with no holder of `hash` itself the hash is named bare.
+fn record_step(hash: &str, chosen: &HeadHolder, holders: &[HeadHolder]) -> String {
+    match std::iter::once(chosen).chain(holders).find(|holder| holder.hash == hash) {
+        Some(exact) => redaction_utils::record_command(&exact.head, &exact.path),
+        None => format!("forklift redact record {} -m <reason>", hash),
+    }
 }
 
 /// List every redaction, attributed to its redactor, and every cell this forklift cannot read.
@@ -337,4 +347,36 @@ pub(crate) fn __docgen_schemas() -> Vec<crate::docgen::OutputSchema> {
         crate::docgen::OutputSchema::of::<Recorded>(),
         crate::docgen::OutputSchema::of::<RedactionList>(),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn holder(pallet: &str, hash: &str) -> HeadHolder {
+        HeadHolder {
+            pallet: pallet.to_string(),
+            head: format!("{}-head", pallet),
+            path: format!("{}.bin", pallet),
+            hash: hash.to_string(),
+        }
+    }
+
+    #[test]
+    fn the_record_step_names_a_head_only_where_it_holds_the_hash_itself() {
+        let main = holder("main", "x");
+        let side = holder("side", "y");
+
+        assert_eq!(record_step("x", &main, &[main.clone(), side.clone()]),
+                   "forklift redact record main-head:main.bin -m <reason>");
+        assert_eq!(record_step("x", &side, &[main.clone(), side.clone()]),
+                   "forklift redact record main-head:main.bin -m <reason>");
+        assert_eq!(record_step("x", &side, std::slice::from_ref(&side)),
+                   "forklift redact record x -m <reason>");
+
+        let other = holder("other", "x");
+
+        assert_eq!(record_step("x", &other, &[main.clone(), other.clone()]),
+                   "forklift redact record other-head:other.bin -m <reason>");
+    }
 }

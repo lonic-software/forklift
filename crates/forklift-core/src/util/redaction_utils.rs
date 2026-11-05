@@ -365,13 +365,18 @@ pub struct HeadHolder {
 
     /// Where the head's tree holds the content.
     pub path: String,
+
+    /// The hash at that path: the redacted hash, or for a recipe, another with the same chunk
+    /// list.
+    pub hash: String,
 }
 
 /// Every user pallet whose head names what `redaction` removes, by the rule a head write is
 /// judged by: the redacted hash anywhere in the head's tree, or for a recipe, a chunked file with
 /// the same chunk list. A partial warehouse skips a head, subtree or recipe it does not hold, as
-/// the write check does, so a head can name the content in a part this warehouse never fetched. Elsewhere an object the walk needs and the store lacks is an error, never a
-/// pass; a pallet that does name the content is reported ahead of that error.
+/// the write check does, so a head can name the content in a part this warehouse never fetched.
+/// Elsewhere an object the walk needs and the store lacks is an error, never a pass; a pallet that
+/// does name the content is reported ahead of that error.
 pub fn head_holders(redaction: &Redaction) -> Result<Vec<HeadHolder>, String> {
     let set = RedactedSet {
         hashes: HashSet::from([redaction.hash.clone()]),
@@ -394,7 +399,7 @@ pub fn head_holders(redaction: &Redaction) -> Result<Vec<HeadHolder>, String> {
             .and_then(|parcel| tree_names(&parcel.tree_hash, &set, partial.then_some(&mut skipped)));
 
         match named {
-            Ok(Some((path, _))) => holders.push(HeadHolder { pallet, head, path }),
+            Ok(Some((path, hash))) => holders.push(HeadHolder { pallet, head, path, hash }),
             Ok(None) => {}
             Err(error) => {
                 undecided.get_or_insert(format!(
@@ -437,8 +442,8 @@ fn record_command_when(head: &str, path: &str, windows: bool) -> String {
 
 /// Record a redaction, as one cell on the local `@redactions` head stamped by `writer`. The
 /// caller holds the warehouse lock, and has resolved the hash and checked it against the meta
-/// pallets and the pallet heads; the content check refuses a signer who is not an admin, and a hash already redacted
-/// (a fresh `redacted_at` always changes the cells, so a repeat reaches that check).
+/// pallets and the pallet heads; the content check refuses a signer who is not an admin, and a
+/// hash already redacted (a fresh `redacted_at` always changes the cells, so a repeat reaches that check).
 pub fn record_redaction(redaction: &Redaction,
                         writer: &MetaWriter,
                         actor: &Operator) -> Result<String, String> {

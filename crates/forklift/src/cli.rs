@@ -921,8 +921,8 @@ pub enum Command {
                       \"@redactions\" meta pallet, never changed or removed; under trust only an \
                       admin may record one. Content a meta pallet's history names cannot be \
                       redacted, because that history is never rewritten; content a pallet head \
-                      names is redacted once the file is taken out of that head. Without a subcommand, \
-                      the redactions are listed."
+                      names can be redacted once the file is taken out of that head. Without a \
+                      subcommand, the redactions are listed."
     )]
     Redact {
         #[command(subcommand)]

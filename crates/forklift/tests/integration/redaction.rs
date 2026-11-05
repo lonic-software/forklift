@@ -450,10 +450,11 @@ fn served_main(url: &str, name: &str) -> String {
     std::fs::read_to_string(clone.root.join(".forklift/pallets/main")).unwrap().trim().to_string()
 }
 
-#[test]
 /// A head stacked before a redaction came down by `lower` is refused by this warehouse's own check
-/// before it is sent. The remote holds the redaction here too; a recorded redaction never leaves a
-/// local head naming the content, so a redaction only this warehouse holds no longer reaches lift.
+/// before it is sent. The remote holds the redaction here too; in a full warehouse a recorded
+/// redaction never leaves a local head naming the content, so a redaction only this warehouse holds
+/// no longer reaches lift.
+#[test]
 fn a_lift_is_refused_for_a_head_stacked_before_a_redaction_came_down() {
     let server = Server::start(&std::env::temp_dir()
         .join(format!("forklift-redaction-lift-server-{}", std::process::id())));
