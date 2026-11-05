@@ -6232,6 +6232,129 @@ A command not listed here either reports only the generic human-message shape `{
 }
 ```
 
+## `redact`
+
+### `Recorded`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The result of recording a redaction.",
+  "properties": {
+    "chunked": {
+      "description": "Whether the object is a chunked file's recipe, whose chunk list is redacted with it.",
+      "type": "boolean"
+    },
+    "hash": {
+      "description": "The redacted object.",
+      "type": "string"
+    },
+    "redactions_head": {
+      "description": "The new head of the @redactions meta pallet.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "hash",
+    "chunked",
+    "redactions_head"
+  ],
+  "title": "Recorded",
+  "type": "object"
+}
+```
+
+### `RedactionList`
+
+```json
+{
+  "$defs": {
+    "RedactionView": {
+      "description": "One redaction.",
+      "properties": {
+        "chunks": {
+          "description": "For a chunked file, the digest of its ordered chunk list.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hash": {
+          "description": "The redacted object.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why it was redacted.",
+          "type": "string"
+        },
+        "redacted_at": {
+          "description": "When it was recorded (RFC 3339, UTC).",
+          "type": "string"
+        },
+        "redactor": {
+          "description": "The redactor: an operator id, or a key id the office does not know.",
+          "type": "string"
+        },
+        "signer": {
+          "description": "The key id the redaction is signed with; absent when it was written without a key.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "hash",
+        "reason",
+        "redacted_at",
+        "redactor"
+      ],
+      "type": "object"
+    },
+    "UnreadableView": {
+      "description": "A redaction cell this forklift cannot read.",
+      "properties": {
+        "hash": {
+          "description": "The redacted object — the cell's path.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why it cannot be read.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "hash",
+        "reason"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The list of redactions.",
+  "properties": {
+    "redactions": {
+      "items": {
+        "$ref": "#/$defs/RedactionView"
+      },
+      "type": "array"
+    },
+    "unreadable": {
+      "description": "Redactions this forklift cannot read — a newer schema, or a malformed cell. Listed, never\ndropped.",
+      "items": {
+        "$ref": "#/$defs/UnreadableView"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "redactions"
+  ],
+  "title": "RedactionList",
+  "type": "object"
+}
+```
+
 ## `undo`
 
 ### `Undone`

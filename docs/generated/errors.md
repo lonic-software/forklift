@@ -60,4 +60,5 @@ Exit code 17 is reserved for a future feature and is not yet assigned to any cod
 | `warehouse_in_use` | 45 | An upgrade found the warehouse open in another process; let it finish, then run the upgrade again |
 | `head_not_materializable` | 46 | The remote's head of the pallet holds an entry named like the warehouse's metadata folder, so it cannot be checked out; nothing was changed |
 | `merge_conflicts` | 47 | Lowering merged the remote's diverged head in, and the merge conflicts; the consolidation is left in progress |
+| `redaction_blocked` | 48 | The object to redact is named by a meta pallet's history, which is never rewritten, so it cannot be removed; nothing was recorded |
 
