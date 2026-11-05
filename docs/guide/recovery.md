@@ -182,6 +182,14 @@ never rewritten, so the content can never be removed from this warehouse or any 
 nothing was recorded. The error's `details.meta_pallets` names where it is. Treat the content as
 exposed: rotate or revoke the secret it holds.
 
+### `head_names_content` (exit 50)
+
+The content you tried to redact is still in the head of a pallet: a redaction removes content from
+history only, so nothing was recorded. The error's `details.heads` names each pallet, its head and
+the path the file has there. Take the file out of each head — from a bay on that pallet,
+`forklift remove` it and `stack` — then record the redaction again by the hash in `details.hash`,
+since the pallet's new head no longer has the file to name by path.
+
 ### `merge_conflicts` (exit 47)
 
 `lower` merged the remote's diverged head into your pallet, and both sides changed the same paths.

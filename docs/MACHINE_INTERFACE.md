@@ -85,7 +85,11 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 23** (current): the `content_redacted` error code exists (exit 49), with the pallet, the
+**Schema 24** (current): the `head_names_content` error code exists (exit 50): `redact record`
+refuses content a user pallet head still holds, with the hash in `details.hash` and every head that
+holds it in `details.heads`, each with its `pallet`, `head` and `path`.
+
+**Schema 23**: the `content_redacted` error code exists (exit 49), with the pallet, the
 head that was refused, and the path and hash of the redacted content it named in `details.pallet`,
 `details.head`, `details.path` and `details.hash`. A `forklift-server` remote refuses a pushed head
 naming redacted content with `422`; the AWS head does not check yet.
