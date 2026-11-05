@@ -1101,6 +1101,19 @@ pub fn update_meta_pallet_head(name: &str,
     update_pallet_head_in(PalletNamespace::Meta, name, expected, new, preconditions)
 }
 
+/// [`update_meta_pallet_head`] for a write that takes the chain of `served`, a head the remote
+/// served for this meta pallet in the same command: a lower's fast-forward to it, or a replay
+/// stacked onto it. The history `served` reaches is not judged against the redactions (see
+/// [`redaction_utils::check_head_write`](crate::util::redaction_utils::check_head_write)); the
+/// remote judged it when it took it. Never for a write a remote sends this warehouse.
+pub fn update_meta_pallet_head_served(name: &str,
+                                      expected: Option<&str>,
+                                      new: &str,
+                                      served: &str,
+                                      preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
+    update_pallet_head_checked(PalletNamespace::Meta, name, expected, new, preconditions, None, None, Some(served))
+}
+
 /// Move the head of a pallet from `expected` to `new`: a compare-and-set, and the only way a
 /// pallet ref is written. Under the warehouse's [`RefLock`](crate::util::lock_utils::RefLock),
 /// which every bay shares, the head is read and then the `preconditions` are checked; when either
@@ -1156,7 +1169,7 @@ pub fn update_pallet_head_in(
     new: &str,
     preconditions: &RefPreconditions,
 ) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(namespace, name, expected, new, preconditions, None, None)
+    update_pallet_head_checked(namespace, name, expected, new, preconditions, None, None, None)
 }
 
 /// Create user pallet `name` at `new`, acknowledging the tombstone a delete in this served
@@ -1167,7 +1180,7 @@ pub fn recreate_pallet_head(name: &str,
                             new: &str,
                             preconditions: &RefPreconditions,
                             tombstone: &str) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(PalletNamespace::User, name, None, new, preconditions, None, Some(tombstone))
+    update_pallet_head_checked(PalletNamespace::User, name, None, new, preconditions, None, Some(tombstone), None)
 }
 
 /// [`update_pallet_head_in`] for a caller that has just verified `new`'s closure itself (a
@@ -1184,7 +1197,7 @@ pub fn update_pallet_head_verified(
     verified: &VerifiedClosure,
     tombstone: Option<&str>,
 ) -> Result<(), RefUpdateError> {
-    update_pallet_head_checked(namespace, name, expected, new, preconditions, Some(verified), tombstone)
+    update_pallet_head_checked(namespace, name, expected, new, preconditions, Some(verified), tombstone, None)
 }
 
 /// That a head's closure was verified, at which fetch scope, and down to which bound. The bound matters
@@ -1240,6 +1253,7 @@ fn update_pallet_head_checked(
     preconditions: &RefPreconditions,
     verified: Option<&VerifiedClosure>,
     acknowledged: Option<&str>,
+    served: Option<&str>,
 ) -> Result<(), RefUpdateError> {
     // Checked before the lock too, so an invalid write never waits for it.
     validate_head_write(name, new)?;
@@ -1273,7 +1287,7 @@ fn update_pallet_head_checked(
     let mut backward = served_backward(namespace, expected, new)?;
     // Its refusal, or a walk that failed, is reported only inside the hold and after the compares,
     // so a ref or precondition that moved meanwhile is what the caller hears.
-    let mut redaction = crate::util::redaction_utils::check_head_write(namespace, name, expected, new);
+    let mut redaction = crate::util::redaction_utils::check_head_write(namespace, name, expected, new, served);
 
     loop {
         #[cfg(test)]
@@ -1331,7 +1345,7 @@ fn update_pallet_head_checked(
                 let leaned_on = verify_new_head(name, expected, new, &current)?;
                 verified_at = Some((current, leaned_on));
                 // What a partial warehouse holds decided what the redaction walk skipped.
-                redaction = crate::util::redaction_utils::check_head_write(namespace, name, expected, new);
+                redaction = crate::util::redaction_utils::check_head_write(namespace, name, expected, new, served);
                 continue;
             }
         }
@@ -1340,7 +1354,7 @@ fn update_pallet_head_checked(
         // hold, and the head is checked against it, or after the write.
         if !redaction.stands(&lock)? {
             drop(lock);
-            redaction = crate::util::redaction_utils::check_head_write(namespace, name, expected, new);
+            redaction = crate::util::redaction_utils::check_head_write(namespace, name, expected, new, served);
             continue;
         }
 
@@ -2652,7 +2666,7 @@ pub(crate) mod tests {
             let bytes = std::fs::read(&path).unwrap();
             std::fs::remove_file(&path).unwrap();
             assert!(matches!(
-                crate::util::redaction_utils::check_head_write(PalletNamespace::User, "main", Some(&base), &head).outcome(),
+                crate::util::redaction_utils::check_head_write(PalletNamespace::User, "main", Some(&base), &head, None).outcome(),
                 Err(RefUpdateError::Failed(_))
             ));
 
@@ -2776,14 +2790,14 @@ pub(crate) mod tests {
             write("main", None, &base).unwrap();
             let other = parcel(&two_dirs("a1", "b1"), &[&base]);
             let head = parcel(&two_dirs("a2", "b2"), &[&base]);
-            let check = crate::util::redaction_utils::check_head_write(PalletNamespace::User, "main", Some(&base), &other);
+            let check = crate::util::redaction_utils::check_head_write(PalletNamespace::User, "main", Some(&base), &other, None);
 
             let lock = crate::util::lock_utils::RefLock::acquire().unwrap();
             let refused = update_pallet_head_locked(&lock, PalletNamespace::User, "main", Some(&base), &head, None, check.outcome().unwrap());
             assert!(matches!(refused, Err(RefUpdateError::Failed(_))), "{:?}", refused);
 
             // Made for the same move of another pallet.
-            let side = crate::util::redaction_utils::check_head_write(PalletNamespace::User, "side", Some(&base), &head);
+            let side = crate::util::redaction_utils::check_head_write(PalletNamespace::User, "side", Some(&base), &head, None);
             let refused = update_pallet_head_locked(&lock, PalletNamespace::User, "main", Some(&base), &head, None, side.outcome().unwrap());
             assert!(matches!(refused, Err(RefUpdateError::Failed(_))), "{:?}", refused);
             drop(lock);

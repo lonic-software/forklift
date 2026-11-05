@@ -6363,7 +6363,7 @@ async fn lift_pallet_inner(client: &RemoteClient,
 /// it says what has to change. A meta pallet's refusal keeps the ref write's own next step.
 pub fn refuse_redacted_head(pallet: &str, local_head: &str, remote_head: Option<&str>) -> Result<(), String> {
     let target = pallet_utils::PalletRef::parse(pallet)?;
-    let check = redaction_utils::check_head_write(target.namespace, &target.name, remote_head, local_head);
+    let check = redaction_utils::check_head_write(target.namespace, &target.name, remote_head, local_head, None);
 
     let Err(refused) = check.outcome() else { return Ok(()) };
 
@@ -7765,6 +7765,7 @@ impl PreparedTrust {
                     replaces: None,
                     office: self.local_office_head.as_deref(),
                     new_office,
+                    served: new_office,
                     pallets: pallet_utils::PalletsPrecondition::WithinBoundary {
                         boundary: judged,
                         scope: pallet_utils::BoundaryScope::AllButOffice,
@@ -7790,8 +7791,8 @@ impl PreparedTrust {
             // The anchor is held: the office fast-forwards only while it still is.
             (None, Some(anchor_bytes)) => {
                 if let Some(new_office) = new_office {
-                    pallet_utils::update_meta_pallet_head(
-                        OFFICE_PALLET_NAME, self.local_office_head.as_deref(), new_office, &RefPreconditions {
+                    pallet_utils::update_meta_pallet_head_served(
+                        OFFICE_PALLET_NAME, self.local_office_head.as_deref(), new_office, new_office, &RefPreconditions {
                             anchor: pallet_utils::AnchorPrecondition::Bytes(anchor_bytes.clone()),
                             ..RefPreconditions::NONE
                         },
@@ -7948,6 +7949,7 @@ pub async fn accept_regenesis(client: &RemoteClient,
         replaces: Some(&local_bytes),
         office: local_office_head.as_deref(),
         new_office: Some(remote_office_head),
+        served: Some(remote_office_head),
         pallets: pallet_utils::PalletsPrecondition::WithinBoundary { boundary: judgement.judged, scope: pallet_utils::BoundaryScope::UserPallets },
     })?;
 
@@ -8259,7 +8261,7 @@ async fn adopt_meta_pallet(client: &RemoteClient, name: &str, remote_head: &str)
         return Ok(MetaAdoptStep::Diverged);
     }
 
-    pallet_utils::update_meta_pallet_head(name, local.as_deref(), remote_head, &preconditions)?;
+    pallet_utils::update_meta_pallet_head_served(name, local.as_deref(), remote_head, remote_head, &preconditions)?;
 
     Ok(MetaAdoptStep::Adopted)
 }
@@ -8360,6 +8362,7 @@ mod tests {
                 replaces: Some(&self.old_bytes),
                 office: Some(&self.local_head),
                 new_office: Some(&self.remote_head),
+                served: None,
                 pallets: pallet_utils::PalletsPrecondition::NotConsumed,
             }).map(|_| ())
         }
@@ -8416,6 +8419,7 @@ mod tests {
             replaces: Some(&fixture.old_bytes),
             office: Some(&fixture.local_head),
             new_office: None,
+            served: None,
             pallets: pallet_utils::PalletsPrecondition::NotConsumed,
         }).unwrap();
 

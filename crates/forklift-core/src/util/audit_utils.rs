@@ -3972,6 +3972,7 @@ mod tests {
             replaces: Some(&anchor_bytes()),
             office: Some(&old_office),
             new_office: None,
+            served: None,
             pallets: crate::util::pallet_utils::PalletsPrecondition::NotConsumed,
         }).unwrap();
 
@@ -4001,6 +4002,7 @@ mod tests {
             replaces: Some(&read),
             office: head.as_deref(),
             new_office: None,
+            served: None,
             pallets: crate::util::pallet_utils::PalletsPrecondition::NotConsumed,
         }).unwrap();
 
