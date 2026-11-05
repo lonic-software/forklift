@@ -1427,7 +1427,8 @@ async fn a_head_untrusted_lift_commits_over_s3_and_dynamodb() {
         assert_eq!(head.missing(&all).expect("missing").len(), all.len());
 
         // Seed the canonical namespace directly: `put_verified` hash-checks each object into
-        // `objects/{warehouse}/{hash}` on S3, and each sidecar into `signatures/{warehouse}/{hash}`.
+        // `objects/{warehouse}/{hash}` on S3, and each sidecar into
+        // `signatures/{warehouse}/{hash}`.
         for (hash, bytes) in &harvest.objects {
             head.objects.put_verified(hash, bytes).expect("seed object");
         }
@@ -2166,8 +2167,8 @@ async fn chunk_object_get(objects: S3ObjectStore, hash: &str) -> (S3ObjectStore,
     .expect("blocking get")
 }
 
-/// Stage bytes straight to `staging/{warehouse}/{session}/{hash}` via the real client — the same shortcut
-/// `s3_verify_and_promote_gates_the_canonical_namespace` takes above, standing in for a client's
+/// Stage bytes straight to `staging/{warehouse}/{session}/{hash}` via the real client — the same
+/// shortcut `s3_verify_and_promote_gates_the_canonical_namespace` takes above, standing in for a client's
 /// presigned staging `PUT` (proven end to end, for a chunk specifically, by
 /// `a_chunked_files_chunks_stage_and_promote_over_real_s3` below).
 async fn chunk_stage_raw(
@@ -2187,8 +2188,8 @@ async fn chunk_stage_raw(
         .expect("stage bytes");
 }
 
-/// List every key currently under `warehouse`'s `session`'s staging prefix in real S3 — the ground truth this
-/// suite's in-memory-fake counterpart (`protocol.rs`'s `MemoryObjectStore::staged_count`) has no
+/// List every key currently under `warehouse`'s `session`'s staging prefix in real S3 — the
+/// ground truth this suite's in-memory-fake counterpart (`protocol.rs`'s `MemoryObjectStore::staged_count`) has no
 /// equivalent for, and the direct proof a sweep did or did not run.
 async fn chunk_list_staging_keys(
     s3: &aws_sdk_s3::Client,
@@ -2230,8 +2231,8 @@ async fn chunk_commit_lift(
 }
 
 /// PROOF 1 — a chunked file's lift, chunk by chunk, over real S3: each chunk stages via its own
-/// presigned `PUT` (the same `put_target`/`staging/{warehouse}/{session}/{hash}` scheme as any other object —
-/// a chunk is not a special case anywhere on the wire, see `head.rs::commit_lift`'s doc comment),
+/// presigned `PUT` (the same `put_target`/`staging/{warehouse}/{session}/{hash}` scheme as any
+/// other object — a chunk is not a special case anywhere on the wire, see `head.rs::commit_lift`'s doc comment),
 /// and lands canonical only once `verify_and_promote` runs on the staged key.
 ///
 /// LocalStack's community edition does not deliver S3 bucket-notification events to a Lambda the

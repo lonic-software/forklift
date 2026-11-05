@@ -21,8 +21,8 @@
 //!   checking the hash. This is the whole reason a `PUT` target needs a lift session. The staging
 //!   verifier Lambda learns the warehouse to promote into from this key ([`parse_staging_key`]).
 //! * `signatures/{warehouse}/{parcel_hash}` — signature sidecars, immutable like objects. A
-//!   distinct prefix, never `objects/`, because a parcel's sidecar shares the parcel's hash and must
-//!   not collide with the parcel object.
+//!   distinct prefix, never `objects/`, because a parcel's sidecar shares the parcel's hash and
+//!   must not collide with the parcel object.
 //! * `responses/{content_hash}` — offloaded `batch` bundles, ephemeral and content-addressed,
 //!   deliberately outside `objects/` so nothing here is reachable as an object (invariant 1
 //!   is not in play; the client verifies every record on import regardless). Shared by every
@@ -464,9 +464,9 @@ impl S3ObjectStore {
     }
 
     /// Presign a `PUT` into the session's **staging** prefix, valid for [`PRESIGN_TTL`]. This
-    /// is the *only* presigned-`PUT` path in the store, and it hardcodes `staging/{warehouse}/{session}/`:
-    /// there is no way to hand a client a presigned `PUT` to a canonical hash key. That is the
-    /// structural half of invariant 1.
+    /// is the *only* presigned-`PUT` path in the store, and it hardcodes
+    /// `staging/{warehouse}/{session}/`: there is no way to hand a client a presigned `PUT` to a
+    /// canonical hash key. That is the structural half of invariant 1.
     ///
     /// Does **not** carry a size condition — see the module docs on why a presigned `PUT`
     /// cannot express one, and where [`MAX_STAGED_OBJECT_BYTES`] is actually enforced instead.
@@ -580,7 +580,8 @@ impl ObjectStore for S3ObjectStore {
     }
 
     /// The staging-key twin of [`objects_missing`](ObjectStore::objects_missing): the same bounded
-    /// batch of `HeadObject`s, against `staging/{warehouse}/{session}/{hash}`, returning the hashes present.
+    /// batch of `HeadObject`s, against `staging/{warehouse}/{session}/{hash}`, returning the
+    /// hashes present.
     fn objects_staged(&self, session: &str, hashes: &[String]) -> Result<Vec<String>, String> {
         use futures::stream::{self, StreamExt, TryStreamExt};
 

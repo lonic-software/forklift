@@ -20,8 +20,8 @@
 //!
 //! On an S3-backed head the object and bundle endpoints answer with a redirect to a presigned
 //! storage URL: an object `GET` redirects to the canonical key and a staged `PUT` redirects to
-//! `staging/{warehouse}/{session}/{hash}` (never the hash key — invariant 1), both `307 Temporary Redirect`
-//! since the client must replay the same method at the target. A `batch` bundle redirects to an
+//! `staging/{warehouse}/{session}/{hash}` (never the hash key — invariant 1), both
+//! `307 Temporary Redirect` since the client must replay the same method at the target. A `batch` bundle redirects to an
 //! ephemeral response key with `303 See Other` instead — the target is always a presigned `GET`,
 //! and the original request was a `POST`, so the redirect must tell the client to *switch*
 //! methods rather than replay the `POST` (which a `307`/`308` would, failing signature
