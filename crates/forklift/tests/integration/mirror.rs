@@ -1442,13 +1442,13 @@ fn left_behind(export: &serde_json::Value) -> Vec<(String, String)> {
 }
 
 #[test]
-fn an_export_from_a_fresh_clone_names_each_remote_pallet_whose_work_it_lacks() {
+fn an_export_from_a_fresh_clone_names_each_remote_pallet_it_has_no_branch_for() {
     let fixture = Fixture::new("export-left-behind");
     let area = &fixture.area;
 
-    // "alias" is a second name for main's head, so the export holds its work under another name.
+    // "alias" is a second name for main's head: its work is exported, but not its branch.
     area.forklift_ok("a", &["pallet", "create", "alias"]);
-    area.lift("a");
+    let alias = area.lift("a")["head"].as_str().unwrap().to_string();
     area.forklift_ok("a", &["pallet", "create", "feature"]);
     area.stack("a", "feature.txt", "f\n", "feature work");
     let feature = area.lift("a")["head"].as_str().unwrap().to_string();
@@ -1456,16 +1456,21 @@ fn an_export_from_a_fresh_clone_names_each_remote_pallet_whose_work_it_lacks() {
     fixture.franchise("b");
     let export = area.json("b", &["git", "export", area.path("out").to_str().unwrap()]);
     assert_eq!(export["branches"], serde_json::json!(["main"]), "{}", export);
-    assert_eq!(left_behind(&export), [("feature".to_string(), feature.clone())], "{}", export);
+    assert_eq!(left_behind(&export), [("alias".to_string(), alias), ("feature".to_string(), feature.clone())],
+        "{}", export);
 
     let human = stdout(&area.forklift_ok("b", &["git", "export", area.path("out-human").to_str().unwrap()]));
-    assert!(human.contains("warning: the remote's pallet \"feature\" holds work this export does not; \
-        \"forklift lower feature\" brings it here.\n  Then export again, into a new path.\n"), "{}", human);
+    assert!(human.contains("warning: the export has no branch for the remote's pallet \"feature\" as it \
+        stands there; \"forklift lower feature\" brings it here.\n  Then export again, into a new path.\n"),
+        "{}", human);
 
-    // The way out the warning names: lowered, the pallet is exported and nothing is left behind.
+    // The way out the warning names: lowered, each pallet is exported and nothing is left behind,
+    // and a pallet here ahead of the remote's is not left behind either.
     area.forklift_ok("b", &["lower", "feature"]);
+    area.forklift_ok("b", &["lower", "alias"]);
+    area.stack("b", "more.txt", "m\n", "ahead of the remote");
     let export = area.json("b", &["git", "export", area.path("out-lowered").to_str().unwrap()]);
-    assert_eq!(export["branches"], serde_json::json!(["feature", "main"]), "{}", export);
+    assert_eq!(export["branches"], serde_json::json!(["alias", "feature", "main"]), "{}", export);
     assert!(export.get("remote_left_behind").is_none(), "{}", export);
 }
 
@@ -1542,4 +1547,18 @@ fn an_export_without_a_remote_asks_nothing_and_counts_parked_work() {
     let human = stdout(&area.forklift_ok("a", &["git", "export", area.path("out-human").to_str().unwrap()]));
     assert!(human.contains("warning: 1 parked parcel(s) were not exported."), "{}", human);
     assert!(!human.contains("Not exported, as git has no equivalent"), "{}", human);
+
+    // Parked work is bay-local, and another bay's is counted too.
+    area.forklift_ok("a", &["bay", "add", "other", area.path("bay").to_str().unwrap()]);
+    area.write_file("bay/code.txt", "v3\n");
+    area.forklift_ok("bay", &["park"]);
+    let export = area.json("a", &["git", "export", area.path("out-bays").to_str().unwrap()]);
+    assert_eq!(export["parked"], 2, "{}", export);
+
+    // What can fail is read before the repository is made, so a failure leaves nothing to clear
+    // before trying again at the same path.
+    std::fs::write(area.path("a/.forklift/parked"), "not a parked list").unwrap();
+    let failed = area.forklift("a", &["git", "export", area.path("out-failed").to_str().unwrap()]);
+    assert!(!failed.status.success(), "{}", stdout(&failed));
+    assert!(!area.path("out-failed").exists());
 }

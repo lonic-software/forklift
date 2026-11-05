@@ -9,7 +9,7 @@ use forklift_core::model::parcel::Parcel;
 use forklift_core::error::sanitize;
 use forklift_core::util::tag_utils::{self, AttributedTag};
 use forklift_core::util::{file_utils, haul_utils, kv_utils, manifest_utils, object_utils, office_utils};
-use forklift_core::util::{pallet_utils, park_utils};
+use forklift_core::util::{bay_utils, pallet_utils, park_utils};
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef};
 use forklift_core::util::remote_utils::RemoteClient;
 use crate::commands::pallet::{relation_to_remote, RemoteRelation};
@@ -76,15 +76,40 @@ pub async fn handle_command(path: &str) -> Result<(), String> {
         return Err("This warehouse has nothing stacked to export.".to_string());
     }
 
+    // Every parcel reachable from the branch heads, parents before children so a commit's parents
+    // are already written when git-commit-tree needs them.
+    let order = topological_order(&pallets.iter().map(|(_, head)| head.clone()).collect::<Vec<_>>())?;
+
+    // Everything that can fail or wait on the network runs before the repository exists, so a
+    // failure leaves no half-written export that a retry at the same path would refuse.
+    //
+    // Only what this warehouse holds is exported, so ask the remote (if there is one) what it has
+    // that the export does not, rather than let someone leaving from a fresh clone lose it unseen.
+    let remote = match RemoteClient::is_configured() {
+        true => Some(check_remote(&pallets, &order.iter().cloned().collect()).await),
+        false => None,
+    };
+    let local_meta = pallet_utils::list_meta_pallets()?;
+    let signed = local_meta.iter().any(|name| name == office_utils::OFFICE_PALLET_NAME);
+    let mut not_exported: Vec<String> = local_meta.into_iter()
+        .chain(remote.iter().flat_map(|remote| remote.meta.iter().cloned()))
+        .filter(|name| name != tag_utils::TAGS_PALLET_NAME)
+        .map(|name| PalletRef::meta(&name).to_wire())
+        .collect();
+    not_exported.sort();
+    not_exported.dedup();
+    // Parked work is bay-local, and every bay's is left behind.
+    let mut parked = 0;
+    for dir in bay_utils::all_bay_state_dirs()? {
+        parked += park_utils::read_parked_in(&dir)?.len();
+    }
+    let RemoteCheck { left_behind, unchecked, .. } = remote.unwrap_or_default();
+
     std::fs::create_dir_all(target)
         .map_err(|e| format!("Error while creating \"{}\": {}", path, e))?;
     let repo = GitRepo::create(target)?;
 
     let mut exporter = Exporter::new(&repo);
-
-    // Convert every parcel reachable from the branch heads, parents before children so a
-    // commit's parents are already written when git-commit-tree needs them.
-    let order = topological_order(&pallets.iter().map(|(_, head)| head.clone()).collect::<Vec<_>>())?;
     for parcel in &order {
         exporter.export_parcel(parcel)?;
     }
@@ -100,23 +125,6 @@ pub async fn handle_command(path: &str) -> Result<(), String> {
     }
 
     let tags = export_tags(&repo, &exporter)?;
-
-    // Only what this warehouse holds is exported, so ask the remote (if there is one) what it has
-    // that the export does not, rather than let someone leaving from a fresh clone lose it unseen.
-    let remote = match RemoteClient::is_configured() {
-        true => Some(check_remote(&exporter).await),
-        false => None,
-    };
-
-    let mut not_exported: Vec<String> = pallet_utils::list_meta_pallets()?.into_iter()
-        .chain(remote.iter().flat_map(|remote| remote.meta.iter().cloned()))
-        .filter(|name| name != tag_utils::TAGS_PALLET_NAME)
-        .map(|name| PalletRef::meta(&name).to_wire())
-        .collect();
-    not_exported.sort();
-    not_exported.dedup();
-
-    let parked = park_utils::read_parked()?.len();
 
     // Check out the current pallet's branch (or the first), materializing a working tree.
     let current = pallet_utils::read_position().ok().map(|position| position.pallet)
@@ -139,17 +147,19 @@ pub async fn handle_command(path: &str) -> Result<(), String> {
         unreadable_tags: tags.unreadable,
         current,
         not_exported,
+        signed,
         parked,
-        remote_left_behind: remote.as_ref().map(|remote| remote.left_behind.clone()).unwrap_or_default(),
-        remote_unchecked: remote.and_then(|remote| remote.unchecked),
+        remote_left_behind: left_behind,
+        remote_unchecked: unchecked,
     });
 
     Ok(())
 }
 
 /// What the configured remote holds that an export does not, or why it could not be asked.
+#[derive(Default)]
 struct RemoteCheck {
-    /// The remote's pallets whose work the export lacks.
+    /// The remote's pallets the export lacks as they stand there.
     left_behind: Vec<LeftBehind>,
 
     /// The bare names of the remote's meta pallets.
@@ -159,13 +169,14 @@ struct RemoteCheck {
     unchecked: Option<String>,
 }
 
-/// Ask the configured remote for its pallets and compare them with what `exporter` exported: a
-/// user pallet is left behind when its remote head is not an exported parcel (so a pallet held
-/// here under another name is not), and `@tags` when its remote head is not one the local
-/// `@tags` holds. Other meta pallets are never exported, so they are only named. A remote that
-/// cannot be asked is reported, not fatal: the export is already written.
-async fn check_remote(exporter: &Exporter<'_>) -> RemoteCheck {
-    let mut check = RemoteCheck { left_behind: Vec::new(), meta: Vec::new(), unchecked: None };
+/// Ask the configured remote for its pallets and compare them with what an export of `pallets`
+/// (name and head), reaching the parcels `exported`, writes: a user pallet is left behind unless a
+/// pallet of its name is exported and its remote head is an exported parcel (so the export has no
+/// branch for it as it stands there), and `@tags` when its remote head is not one the local `@tags`
+/// holds. Other meta pallets are never exported, so they are only named. A remote that cannot be
+/// asked is reported, not fatal.
+async fn check_remote(pallets: &[(String, String)], exported: &HashSet<String>) -> RemoteCheck {
+    let mut check = RemoteCheck::default();
 
     let info = match RemoteClient::for_warehouse() {
         Ok(client) => client.fetch_info().await,
@@ -192,8 +203,14 @@ async fn check_remote(exporter: &Exporter<'_>) -> RemoteCheck {
                 !matches!(local.and_then(|local| relation_to_remote(head, local.as_deref())),
                     Ok(RemoteRelation::Same | RemoteRelation::LocalAhead))
             }
-            // A name this build rejects is still a pallet whose head the export may lack.
-            _ => !exporter.exported.contains_key(head),
+            Ok(_) => !(pallets.iter().any(|(name, _)| name == wire) && exported.contains(head)),
+            // A meta pallet this build cannot name is still never exported.
+            Err(_) if wire.starts_with(pallet_utils::META_QUALIFIER) => {
+                check.meta.push(wire.trim_start_matches(pallet_utils::META_QUALIFIER).to_string());
+                continue;
+            }
+            // A user pallet this build cannot name has a head the export may still lack.
+            Err(_) => !exported.contains(head),
         };
 
         if lacked {
@@ -988,14 +1005,19 @@ pub(crate) struct ExportReport {
     /// this warehouse's and, when it was asked, the remote's. `@tags` is exported, so never here.
     not_exported: Vec<String>,
 
-    /// How many parcels are parked in this bay (`park`). Parked work is on no pallet, so it is not
-    /// exported.
+    /// Whether this warehouse has an office, so its parcels and tags carry signatures the export
+    /// drops.
+    #[serde(skip)]
+    signed: bool,
+
+    /// How many parcels are parked (`park`), across every bay. Parked work is on no pallet, so it is
+    /// not exported.
     #[serde(skip_serializing_if = "is_zero")]
     parked: usize,
 
-    /// The configured remote's pallets whose work this export lacks: a user pallet whose remote
-    /// head is not an exported parcel, or `@tags` when the remote's is not one held here. Empty
-    /// when no remote is configured or it could not be asked.
+    /// The configured remote's pallets this export lacks as they stand there: a user pallet with no
+    /// branch here, or whose remote head is not an exported parcel, or `@tags` when the remote's is
+    /// not one held here. Empty when no remote is configured or it could not be asked.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     remote_left_behind: Vec<LeftBehind>,
 
@@ -1008,7 +1030,7 @@ fn is_zero(count: &usize) -> bool {
     *count == 0
 }
 
-/// A pallet of the remote whose work an export lacks.
+/// A pallet of the remote that an export lacks as it stands there.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize, Clone)]
 pub(crate) struct LeftBehind {
@@ -1061,9 +1083,14 @@ impl CommandOutput for ExportReport {
                     "  warning: the remote's tags include some this export does not; a \"forklift lower\" \
                     of any pallet brings them here."
                 ),
-                _ => println!(
-                    "  warning: the remote's pallet \"{0}\" holds work this export does not; \
-                    \"forklift lower {0}\" brings it here.",
+                Ok(_) => println!(
+                    "  warning: the export has no branch for the remote's pallet \"{0}\" as it stands \
+                    there; \"forklift lower {0}\" brings it here.",
+                    sanitize(&left.name)
+                ),
+                Err(_) => println!(
+                    "  warning: the export lacks the remote's pallet \"{}\", whose name this build \
+                    cannot read.",
                     sanitize(&left.name)
                 ),
             }
@@ -1081,15 +1108,15 @@ impl CommandOutput for ExportReport {
 
         if self.parked > 0 {
             println!(
-                "  warning: {} parked parcel(s) were not exported. \"forklift park pop\" brings back \
-                the latest, to stack before exporting again.",
+                "  warning: {} parked parcel(s) were not exported. \"forklift park pop\", in a bay \
+                that parked one, brings back its latest, to stack before exporting again.",
                 self.parked
             );
         }
 
-        // Only a warehouse with an office signs anything.
+        // Only a warehouse with an office signs anything; a remote's office signed nothing here.
         let mut dropped: Vec<String> = self.not_exported.iter().map(|name| describe_not_exported(name)).collect();
-        if self.not_exported.iter().any(|name| name == &PalletRef::meta(office_utils::OFFICE_PALLET_NAME).to_wire()) {
+        if self.signed {
             dropped.push("the signatures on parcels and tags".to_string());
         }
         if !dropped.is_empty() {

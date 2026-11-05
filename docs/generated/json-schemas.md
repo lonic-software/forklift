@@ -1056,7 +1056,7 @@ A command not listed here either reports only the generic human-message shape `{
 {
   "$defs": {
     "LeftBehind": {
-      "description": "A pallet of the remote whose work an export lacks.",
+      "description": "A pallet of the remote that an export lacks as it stands there.",
       "properties": {
         "head": {
           "description": "Its head on the remote.",
@@ -1128,7 +1128,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "array"
     },
     "parked": {
-      "description": "How many parcels are parked in this bay (`park`). Parked work is on no pallet, so it is not\nexported.",
+      "description": "How many parcels are parked (`park`), across every bay. Parked work is on no pallet, so it is\nnot exported.",
       "format": "uint",
       "minimum": 0,
       "type": "integer"
@@ -1137,7 +1137,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "string"
     },
     "remote_left_behind": {
-      "description": "The configured remote's pallets whose work this export lacks: a user pallet whose remote\nhead is not an exported parcel, or `@tags` when the remote's is not one held here. Empty\nwhen no remote is configured or it could not be asked.",
+      "description": "The configured remote's pallets this export lacks as they stand there: a user pallet with no\nbranch here, or whose remote head is not an exported parcel, or `@tags` when the remote's is\nnot one held here. Empty when no remote is configured or it could not be asked.",
       "items": {
         "$ref": "#/$defs/LeftBehind"
       },

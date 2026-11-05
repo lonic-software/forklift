@@ -72,13 +72,13 @@ $ cd copy
 $ forklift git export ../project-git
 Exported 1 commit(s) into a git repository at "../project-git" (1 branch(es), 1 tree(s), 1 blob(s)).
 Checked out "main".
-  warning: the remote's pallet "feature" holds work this export does not; "forklift lower feature" brings it here.
+  warning: the export has no branch for the remote's pallet "feature" as it stands there; "forklift lower feature" brings it here.
   Then export again, into a new path.
 Not exported, as git has no equivalent: @haul (hauls and their reviews).
 ```
 
 An export carries only what this warehouse holds, so it asks the configured remote what it has
-besides, and names each pallet whose work the export lacks. If the remote cannot be reached, the
+besides, and names each pallet it has no branch for as it stands there. If the remote cannot be reached, the
 export still finishes and says it could not check; `forklift pallet list --remote` asks again later.
 
 ## 3. Bring everything here, then export again

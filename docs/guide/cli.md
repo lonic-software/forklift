@@ -182,12 +182,13 @@ than `@tags`: the signed office (`@office`), approvals and provenance (`@manifes
 reviews (`@haul`) and custom metadata (`@kv`), nor for the signatures on parcels and tags. The
 export's last line names each one the warehouse (or its remote) holds; `--json` lists them as
 `not_exported`. Parked work (`park`) is on no pallet, so it is not exported either; a warning counts
-it (`parked`).
+it, in every bay (`parked`).
 
 Only what this warehouse holds is exported, so with a remote configured, the export also asks the
-remote for its pallets. Each one whose head is not among the exported parcels gets a warning naming
-the `lower` that brings it here (`remote_left_behind` in `--json`), and so does the remote's `@tags`
-when it has tags this warehouse lacks. A fresh clone holds only the pallet it checked out, so
+remote for its pallets. Each one the export has no branch for as it stands there (none of that name
+here, or one behind or apart from the remote's) gets a warning naming the `lower` that brings it here
+(`remote_left_behind` in `--json`), and so does the remote's `@tags` when it has tags this warehouse
+lacks. A fresh clone holds only the pallet it checked out, so
 leaving from one without this would silently lose the others. A remote that cannot be reached does
 not fail the export: one warning says the check could not be made (`remote_unchecked`).
 
