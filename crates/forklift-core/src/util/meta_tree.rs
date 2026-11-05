@@ -3773,6 +3773,63 @@ mod tests {
         verify_tags(&office, Admission::Audit, Some(&by_admin), &by_writer).unwrap();
     }
 
+    /// Store a `redactions.redaction 1` cell stamped with `key_id`, with `reason`.
+    fn redaction_cell(key_id: &str, reason: &str) -> String {
+        let mut table = Table::new();
+        table.insert("reason", toml_edit::value(reason));
+        table.insert("redacted_at", toml_edit::value(7));
+
+        store_blob(&encode_cell(&key_stamp(key_id), redaction_utils::REDACTION_SCHEMA, &table)).unwrap()
+    }
+
+    /// A signed `@redactions` parcel on `parent` whose cells are the parent's with `edits` applied.
+    fn redactions_parcel(parent: Option<&str>, key: &Key, edits: &[CellEdit]) -> String {
+        let base = parent
+            .and_then(|parent| read_pallet_spine("redactions", parent, MetaKind::Redactions).unwrap().cells);
+        let cells = apply_edits(base.as_deref(), edits).unwrap();
+        let parents: Vec<&str> = parent.into_iter().collect();
+
+        forge(&parents, &MetaKind::Redactions.format_marker(), cells.as_deref(), &key.signer())
+    }
+
+    #[test]
+    fn a_redaction_is_admitted_once_from_an_admin_and_never_changed_or_removed() {
+        let _scratch = Scratch::new("redactions");
+        let (alice, bob) = (Key::new("alice", 1), Key::new("bob", 2));
+        let office = office_with_roles(&[(&alice, office_utils::Role::Admin), (&bob, office_utils::Role::Writer)]);
+        let verify = |admission, old: Option<&str>, new: &str| verify_meta_content(
+            "redactions", &redaction_utils::RedactionsRules, Some(&office), &[], admission, old, new,
+        );
+        let (first, second) = ("ab".repeat(32), "cd".repeat(32));
+
+        let head = redactions_parcel(None, &alice, &[set(&first, &redaction_cell(alice.id(), "leaked"))]);
+        verify(Admission::Admit, None, &head).unwrap();
+
+        // A writer may not add one, though admitted history is audited without the role rule.
+        let by_writer = redactions_parcel(Some(&head), &bob, &[set(&second, &redaction_cell(bob.id(), "leaked"))]);
+        let error = verify(Admission::Admit, Some(&head), &by_writer).unwrap_err();
+        assert!(error.contains(&second) && error.contains("not an admin"), "{}", error);
+        verify(Admission::Audit, Some(&head), &by_writer).unwrap();
+
+        // Once recorded, a redaction is never changed or removed, by anyone.
+        let changed = redactions_parcel(Some(&head), &alice, &[set(&first, &redaction_cell(alice.id(), "other"))]);
+        let removed = redactions_parcel(Some(&head), &alice, &[unset(&first)]);
+
+        for rewrite in [changed, removed] {
+            for admission in [Admission::Admit, Admission::Audit] {
+                let error = verify(admission, Some(&head), &rewrite).unwrap_err();
+                assert!(error.contains("never changed or removed"), "{}", error);
+            }
+        }
+
+        // The cell path is a full object hash, and the value is strict.
+        let misplaced = redactions_parcel(Some(&head), &alice, &[set("secret", &redaction_cell(alice.id(), "leaked"))]);
+        assert!(verify(Admission::Admit, Some(&head), &misplaced).unwrap_err().contains("not a full object hash"));
+
+        let unreasoned = redactions_parcel(Some(&head), &alice, &[set(&second, &redaction_cell(alice.id(), ""))]);
+        assert!(verify(Admission::Admit, Some(&head), &unreasoned).unwrap_err().contains("empty reason"));
+    }
+
     #[test]
     fn a_tag_from_before_trust_is_admitted_without_its_role_and_a_signed_one_is_not() {
         let _scratch = Scratch::new("tags-legacy");
