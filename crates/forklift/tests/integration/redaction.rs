@@ -247,7 +247,8 @@ fn content_a_pallet_head_names_is_refused_until_the_file_is_taken_out() {
 
     // A second pallet at the same head, under another name too, and this bay stands on it.
     warehouse.run_ok(&["pallet", "create", "side"]);
-    std::fs::rename(warehouse.root.join("secret.env"), warehouse.root.join("copy.env")).unwrap();
+    std::fs::write(warehouse.root.join("copy.env"), b"TOKEN=hunter2\n").unwrap();
+    std::fs::remove_file(warehouse.root.join("secret.env")).unwrap();
     warehouse.run_ok(&["load", "."]);
     warehouse.run_ok(&["stack", "-m", "renamed"]);
 
