@@ -216,3 +216,62 @@ fn a_chunked_file_is_redacted_with_its_chunk_list() {
     assert_eq!(chunks.len(), 64, "{:?}", listed);
     assert_ne!(listed[0]["hash"], chunks, "{:?}", listed);
 }
+
+/// Run `args` in `--json` mode, which must be refused as `content_redacted`, and return the error.
+fn content_redacted(warehouse: &Warehouse, args: &[&str]) -> serde_json::Value {
+    let mut full = vec!["--json"];
+    full.extend_from_slice(args);
+    let refused = warehouse.run(&full);
+    let stdout = String::from_utf8_lossy(&refused.stdout);
+    assert_eq!(refused.status.code(), Some(49), "`{}`: {}{}", args.join(" "), stdout, String::from_utf8_lossy(&refused.stderr));
+    let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(document["error"]["code"], "content_redacted", "{}", document);
+    document["error"].clone()
+}
+
+#[test]
+fn a_stack_naming_redacted_content_is_refused_until_the_file_is_gone() {
+    let warehouse = Warehouse::new("stack");
+    warehouse.stack("secret.env", b"TOKEN=hunter2\n", "leak");
+    let hash = recorded_hash(&warehouse, "main:secret.env", "leaked token")["data"]["hash"]
+        .as_str().unwrap().to_string();
+    let head = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap();
+
+    // The file still there, beside a new one: the new head would name it again.
+    std::fs::write(warehouse.root.join("notes.txt"), b"notes\n").unwrap();
+    warehouse.run_ok(&["load", "."]);
+    let error = content_redacted(&warehouse, &["stack", "-m", "notes"]);
+    assert_eq!(error["details"]["path"], "secret.env", "{}", error);
+    assert_eq!(error["details"]["hash"], hash.as_str(), "{}", error);
+    assert_eq!(
+        std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main")).unwrap(), head,
+        "nothing was written"
+    );
+
+    // The same bytes under another name are the same content.
+    std::fs::remove_file(warehouse.root.join("secret.env")).unwrap();
+    std::fs::write(warehouse.root.join("copy.env"), b"TOKEN=hunter2\n").unwrap();
+    warehouse.run_ok(&["load", "."]);
+    let error = content_redacted(&warehouse, &["stack", "-m", "copy"]);
+    assert_eq!(error["details"]["path"], "copy.env", "{}", error);
+
+    std::fs::remove_file(warehouse.root.join("copy.env")).unwrap();
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["stack", "-m", "without the secret"]);
+}
+
+#[test]
+fn a_meta_pallet_may_not_start_naming_redacted_content() {
+    let warehouse = Warehouse::new("meta-adds");
+    warehouse.stack("notes.txt", b"first\n", "first");
+
+    // No @tags yet, so no meta history names the marker and the redaction is recorded; the first
+    // @tags parcel would then add it.
+    warehouse.stack("marker.txt", b"forklift-meta 1 tags", "marker");
+    recorded_hash(&warehouse, "main:marker.txt", "r");
+
+    let error = content_redacted(&warehouse, &["tag", "create", "v1", "main"]);
+    assert_eq!(error["details"]["pallet"], "@tags", "{}", error);
+    let listed = warehouse.run_ok(&["tag", "list"]);
+    assert!(!String::from_utf8_lossy(&listed.stdout).contains("v1"), "nothing was written: {:?}", listed);
+}

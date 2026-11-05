@@ -1252,6 +1252,8 @@ fn trust_install_refusal(error: RefUpdateError) -> HandlerError {
             | RefUpdateError::Backward { .. }) => {
             (StatusCode::CONFLICT, moved.to_string())
         }
+        // Refused however often it is sent, as a ref update naming redacted content is.
+        refused @ RefUpdateError::Redacted { .. } => unprocessable(refused.into()),
         RefUpdateError::Failed(message) => internal(message),
     }
 }
@@ -3030,6 +3032,11 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                 Err(backward @ RefUpdateError::Backward { .. }) => return Err((StatusCode::CONFLICT, backward.to_string())),
                 Err(refused @ RefUpdateError::Incomplete { .. }) => {
                     return Err(unprocessable(refused.to_string()));
+                }
+                // A head naming redacted content is refused however often it is sent: the client
+                // must write a head without it. Framed, so the client reads its code.
+                Err(refused @ RefUpdateError::Redacted { .. }) => {
+                    return Err(unprocessable(refused.into()));
                 }
                 Err(RefUpdateError::Deleted { pallet, head, acknowledged }) => {
                     return Err(pallet_deleted(&pallet, &head, acknowledged));

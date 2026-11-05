@@ -414,6 +414,357 @@ pub fn read_redactions() -> Result<RedactionsRead, String> {
     Ok(read)
 }
 
+/// What the redactions at one `@redactions` head forbid a new head to name: every redacted hash,
+/// readable or not (a cell this build cannot read still names its hash, and still refuses it),
+/// and the chunk-list digest of every redacted recipe.
+#[derive(Debug, Default)]
+struct RedactedSet {
+    hashes: HashSet<String>,
+    chunk_lists: HashSet<String>,
+}
+
+impl RedactedSet {
+    /// The set at `head`, the head of `@redactions`.
+    fn at(head: &str) -> Result<RedactedSet, String> {
+        let state = meta_tree::read_meta_state(REDACTIONS_PALLET_NAME, head, &RedactionsRules)?;
+        let mut set = RedactedSet::default();
+
+        // A cell this build cannot read, or whose value does not parse, still redacts its hash; what
+        // it says about a chunk list is lost with it, so the same chunks under another recipe are
+        // not caught until the cell is read by a forklift that understands it.
+        for (hash, cell) in state.cells {
+            if let CellRead::Readable(envelope) = &cell {
+                if let Ok(Redaction { chunks: Some(chunks), .. }) = parse_value(&hash, &envelope.value) {
+                    set.chunk_lists.insert(chunks);
+                }
+            }
+
+            set.hashes.insert(hash);
+        }
+
+        Ok(set)
+    }
+
+    /// The redacted hash a file entry names: its own hash, or for a chunked file whose recipe the
+    /// store holds, the hash of the redaction its chunk list matches. `partial` tolerates a recipe
+    /// the store lacks, which then carries no chunks this warehouse could hand on, and records it
+    /// as skipped.
+    fn named_by(&self,
+                entry: &crate::model::tree_item::TreeItem,
+                partial: Option<&mut HashSet<String>>) -> Result<Option<String>, String> {
+        if self.hashes.contains(&entry.hash) {
+            return Ok(Some(entry.hash.clone()));
+        }
+
+        if self.chunk_lists.is_empty() || !entry.item_type.is_chunked() {
+            return Ok(None);
+        }
+
+        let chunks = match object_utils::recipe_chunk_hashes(&entry.hash) {
+            Ok(chunks) => chunks,
+            Err(error) => match partial {
+                Some(skipped) if !file_utils::does_object_exist(&entry.hash)? => {
+                    skipped.insert(entry.hash.clone());
+                    return Ok(None);
+                }
+                _ => return Err(error),
+            },
+        };
+
+        Ok(self.chunk_lists.contains(&chunk_list_digest(&chunks)).then(|| entry.hash.clone()))
+    }
+}
+
+/// A redacted file a tree names: its path from the tree's root, and the redacted hash.
+type Named = (String, String);
+
+/// The first file under `tree` that names content in `set`, walking every subtree once. `partial`
+/// (a sparse or cache warehouse) skips a subtree or recipe the store does not hold: its bytes are
+/// not here, so this warehouse cannot hand them on. A head that receives the parcel judges it
+/// against its own redactions, if it checks at all (the AWS head does not yet), so a redaction
+/// recorded only here does not follow a skipped subtree. Each skipped object is recorded in
+/// `partial`, so the write's hold can see one stored meanwhile. In a full warehouse a missing
+/// object is an error, never a pass.
+fn tree_names(tree: &str, set: &RedactedSet, mut partial: Option<&mut HashSet<String>>) -> Result<Option<Named>, String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut pending = vec![(String::new(), tree.to_string())];
+
+    while let Some((prefix, hash)) = pending.pop() {
+        if !seen.insert(hash.clone()) {
+            continue;
+        }
+
+        let loaded = match object_utils::load_tree_shared(&hash) {
+            Ok(loaded) => loaded,
+            Err(error) => match partial.as_deref_mut() {
+                Some(skipped) if !file_utils::does_object_exist(&hash)? => {
+                    skipped.insert(hash);
+                    continue;
+                }
+                _ => return Err(error),
+            },
+        };
+
+        for (name, file) in loaded.get_files() {
+            if let Some(redacted) = set.named_by(file, partial.as_deref_mut())? {
+                return Ok(Some((format!("{}{}", prefix, name), redacted)));
+            }
+        }
+
+        pending.extend(loaded.get_subtrees()
+            .map(|(name, subtree)| (format!("{}{}/", prefix, name), subtree.hash.clone())));
+    }
+
+    Ok(None)
+}
+
+/// The proof a ref write's new head was checked against the redactions: which write, the
+/// `@redactions` head it was checked against, and what a partial warehouse's walk skipped as
+/// absent. Built only by [`check_head_write`], so a write that holds one ran the check; the
+/// compare-and-set takes it and, under the ref lock, refuses it when it is for another write, or
+/// `@redactions` has moved or a skipped object has been stored since (see
+/// [`RedactionCheck::holds`]).
+#[derive(Debug)]
+pub struct RedactionCheck {
+    namespace: pallet_utils::PalletNamespace,
+    name: String,
+    expected: Option<String>,
+    new: String,
+    redactions: Option<String>,
+
+    /// What a partial warehouse's walk skipped as absent.
+    skipped: HashSet<String>,
+}
+
+impl RedactionCheck {
+    /// Whether this check is for the write of `new` over `expected` to pallet `name` in
+    /// `namespace`.
+    pub(crate) fn is_for(&self,
+                         namespace: pallet_utils::PalletNamespace,
+                         name: &str,
+                         expected: Option<&str>,
+                         new: &str) -> bool {
+        self.namespace == namespace && self.name == name && self.expected.as_deref() == expected
+            && self.new == new
+    }
+
+    /// Whether the check still holds: `@redactions` is at the head it was checked against, and
+    /// nothing the walk skipped as absent is stored now. Read under the held ref lock, which every
+    /// `@redactions` write takes too, so a redaction either lands before the write's hold or after
+    /// the write. Storing an object takes no ref lock, so a skipped object stored after this read
+    /// can still land beside the written head, as one fetched after the write can; the receiving
+    /// side of a lift, not this check, is what judges bytes handed on.
+    pub(crate) fn holds(&self, _lock: &crate::util::lock_utils::RefLock) -> Result<bool, String> {
+        if pallet_utils::get_meta_pallet_head(REDACTIONS_PALLET_NAME)? != self.redactions {
+            return Ok(false);
+        }
+
+        for hash in &self.skipped {
+            if file_utils::does_object_exist(hash)? {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+}
+
+/// What [`check_head_write`] decided, and what it read deciding it, so the write's hold can tell
+/// whether the decision still stands.
+#[derive(Debug)]
+pub struct HeadWriteCheck {
+    /// The `@redactions` head read before the check, or `None` when it could not be read.
+    redactions: Option<Option<String>>,
+    outcome: Result<RedactionCheck, pallet_utils::RefUpdateError>,
+}
+
+impl HeadWriteCheck {
+    /// Whether the decision still stands under the held ref lock; when it does not, the write
+    /// checks again. A pass stands while [`RedactionCheck`]'s inputs are unchanged. A refusal
+    /// always stands: redactions are only ever added, and the head's tree does not change. A
+    /// check that failed stands until `@redactions` moves, so it is retried once a redaction
+    /// lands rather than reporting a failure about a head that no longer holds; one that could
+    /// not read `@redactions` at all stands, and its failure is reported.
+    pub(crate) fn stands(&self, lock: &crate::util::lock_utils::RefLock) -> Result<bool, String> {
+        match &self.outcome {
+            Ok(check) => check.holds(lock),
+            Err(pallet_utils::RefUpdateError::Redacted { .. }) => Ok(true),
+            Err(_) => match &self.redactions {
+                Some(read) => Ok(*read == pallet_utils::get_meta_pallet_head(REDACTIONS_PALLET_NAME)?),
+                None => Ok(true),
+            },
+        }
+    }
+
+    /// The decision: the proof the compare-and-set takes, or the refusal or failure.
+    pub(crate) fn outcome(&self) -> Result<&RedactionCheck, pallet_utils::RefUpdateError> {
+        self.outcome.as_ref().map_err(Clone::clone)
+    }
+}
+
+/// Check a ref write of `new` over `expected` against the redactions at the current `@redactions`
+/// head, and return the proof the compare-and-set takes. Run before the ref lock, since it walks;
+/// a redaction landing between this and the hold sends the write round again (see
+/// [`HeadWriteCheck::stands`]).
+///
+/// - A user pallet's new head is refused when its tree names a redacted file anywhere. The whole
+///   tree is walked, never only what differs from `expected`: a stale branch revived onto a ref
+///   must not bring the content back.
+/// - A meta pallet's write is judged by the history it adds. Each meta parcel is the pallet's
+///   whole state, so a parcel that carries a cell its parent already names passes, and only one
+///   that adds a redacted object to the tree is refused; refusing the carry would freeze a pallet
+///   whose history named the object before it was redacted.
+/// - A write that leaves the ref where it is, or one made while no redaction exists, walks
+///   nothing.
+///
+/// # Returns
+/// The decision and what it read. Its outcome is:
+/// * `Ok(check)`                       - Nothing the write adds names redacted content.
+/// * `Err(RefUpdateError::Redacted)`   - It does; nothing was written.
+/// * `Err(RefUpdateError::Failed)`     - `@redactions` or an object the check needs could not be
+///                                       read.
+pub fn check_head_write(namespace: pallet_utils::PalletNamespace,
+                        name: &str,
+                        expected: Option<&str>,
+                        new: &str) -> HeadWriteCheck {
+    let redactions = pallet_utils::get_meta_pallet_head(REDACTIONS_PALLET_NAME);
+    let outcome = match &redactions {
+        Ok(redactions) => check_head_write_at(namespace, name, expected, new, redactions.clone()),
+        Err(error) => Err(error.clone().into()),
+    };
+
+    HeadWriteCheck { redactions: redactions.ok(), outcome }
+}
+
+/// [`check_head_write`]'s decision against the redactions at `redactions`.
+fn check_head_write_at(namespace: pallet_utils::PalletNamespace,
+                       name: &str,
+                       expected: Option<&str>,
+                       new: &str,
+                       redactions: Option<String>) -> Result<RedactionCheck, pallet_utils::RefUpdateError> {
+    let mut check = RedactionCheck {
+        namespace,
+        name: name.to_string(),
+        expected: expected.map(str::to_string),
+        new: new.to_string(),
+        redactions: redactions.clone(),
+        skipped: HashSet::new(),
+    };
+
+    let Some(redactions) = redactions.filter(|_| expected != Some(new)) else {
+        return Ok(check);
+    };
+
+    let set = RedactedSet::at(&redactions)?;
+
+    if set.hashes.is_empty() {
+        return Ok(check);
+    }
+
+    let named = match namespace {
+        pallet_utils::PalletNamespace::User => {
+            let partial = crate::util::scope_utils::content_may_be_absent()?;
+            let tree = object_utils::load_parcel(new)?.tree_hash;
+            tree_names(&tree, &set, partial.then_some(&mut check.skipped))?
+        }
+        pallet_utils::PalletNamespace::Meta => meta_parcels_add(expected, new, &set)?,
+    };
+
+    match named {
+        None => Ok(check),
+        Some((path, hash)) => Err(pallet_utils::RefUpdateError::Redacted {
+            pallet: pallet_utils::PalletRef { namespace, name: name.to_string() },
+            head: new.to_string(),
+            path,
+            hash,
+        }),
+    }
+}
+
+/// The first redacted object a parcel of the meta chain at `new` adds over its parents, among the
+/// parcels `expected` does not reach. A meta chain is complete wherever it is adopted, so an
+/// object missing here is an error.
+fn meta_parcels_add(expected: Option<&str>, new: &str, set: &RedactedSet) -> Result<Option<Named>, String> {
+    let mut reached: HashSet<String> = HashSet::new();
+    let mut pending: Vec<String> = expected.into_iter().map(str::to_string).collect();
+
+    while let Some(parcel) = pending.pop() {
+        if reached.insert(parcel.clone()) {
+            pending.extend(object_utils::load_parcel(&parcel)?.parents);
+        }
+    }
+
+    let mut pending = vec![new.to_string()];
+
+    while let Some(hash) = pending.pop() {
+        if !reached.insert(hash.clone()) {
+            continue;
+        }
+
+        let parcel = object_utils::load_parcel(&hash)?;
+        let mut inherited: HashSet<String> = HashSet::new();
+
+        for parent in &parcel.parents {
+            inherited.extend(tree_objects(&object_utils::load_parcel(parent)?.tree_hash)?);
+        }
+
+        if let Some(named) = tree_adds(&parcel.tree_hash, &inherited, set)? {
+            return Ok(Some(named));
+        }
+
+        pending.extend(parcel.parents);
+    }
+
+    Ok(None)
+}
+
+/// Every object a meta parcel's tree holds: its subtrees and files, at any depth.
+fn tree_objects(tree: &str) -> Result<HashSet<String>, String> {
+    let mut objects: HashSet<String> = HashSet::new();
+    let mut pending = vec![tree.to_string()];
+
+    while let Some(hash) = pending.pop() {
+        if !objects.insert(hash.clone()) {
+            continue;
+        }
+
+        let loaded = object_utils::load_tree_shared(&hash)?;
+        objects.extend(loaded.get_files().map(|(_, file)| file.hash.clone()));
+        pending.extend(loaded.get_subtrees().map(|(_, subtree)| subtree.hash.clone()));
+    }
+
+    Ok(objects)
+}
+
+/// The first file under meta tree `tree` naming a redacted object that `inherited` (everything
+/// its parents' trees hold) does not. A subtree its parents hold is skipped whole.
+fn tree_adds(tree: &str, inherited: &HashSet<String>, set: &RedactedSet) -> Result<Option<Named>, String> {
+    let mut pending = vec![(String::new(), tree.to_string())];
+
+    while let Some((prefix, hash)) = pending.pop() {
+        if inherited.contains(&hash) {
+            continue;
+        }
+
+        let loaded = object_utils::load_tree_shared(&hash)?;
+
+        for (name, file) in loaded.get_files() {
+            if inherited.contains(&file.hash) {
+                continue;
+            }
+
+            if let Some(redacted) = set.named_by(file, None)? {
+                return Ok(Some((format!("{}{}", prefix, name), redacted)));
+            }
+        }
+
+        pending.extend(loaded.get_subtrees()
+            .map(|(name, subtree)| (format!("{}{}/", prefix, name), subtree.hash.clone())));
+    }
+
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

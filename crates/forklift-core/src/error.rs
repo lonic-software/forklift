@@ -331,6 +331,12 @@ refusal_codes! {
     /// meta pallet's history is never rewritten, so its content could never be removed. Nothing
     /// was recorded; the details name the meta pallets that hold it.
     RedactionBlocked => "redaction_blocked",
+
+    /// The command would have written a pallet head that names redacted content: a file whose
+    /// content a `@redactions` cell removes is in the tree the new head points at, or in a cell a
+    /// meta pallet's new parcel adds. Nothing was written; the details name the pallet, the file's
+    /// path and the redacted hash, and the next step names the file to leave out.
+    ContentRedacted => "content_redacted",
 }
 
 impl RefusalCode {

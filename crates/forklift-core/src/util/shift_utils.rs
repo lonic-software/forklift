@@ -1852,8 +1852,9 @@ pub fn settle_head_write(pallet: &str,
         RefUpdateError::Moved(moved) => (moved.to_string(), moved.behind_refusal().into()),
         RefUpdateError::Failed(error) => (error.clone(), error),
         // A precondition refused the write, so nothing was written; the tree goes back like any
-        // other refused write's.
-        refused => (refused.to_string(), refused.to_string()),
+        // other refused write's. The rolled-back error keeps a refusal's code; the first is only
+        // ever composed into a longer message.
+        refused => (refused.to_string(), refused.into()),
     };
 
     match pallet_utils::get_pallet_head(pallet) {
