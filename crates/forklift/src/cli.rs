@@ -1424,8 +1424,8 @@ pub enum RedactAction {
                       in this store, or <revision>:<path>. For a chunked file the recipe is \
                       redacted together with its chunk list. A redaction cannot be undone; a hash \
                       some meta pallet's history names is refused, and so is one a pallet head \
-                      names, until the file is taken out of that head and the redaction is \
-                      recorded at the parcel that held it, as <parcel>:<path>."
+                      names, until the file is taken out of that head; the refusal's next step \
+                      names how to record it then."
     )]
     Record {
         /// The content to redact: a full object hash, or <revision>:<path>

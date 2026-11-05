@@ -443,7 +443,8 @@ fn record_command_when(head: &str, path: &str, windows: bool) -> String {
 /// Record a redaction, as one cell on the local `@redactions` head stamped by `writer`. The
 /// caller holds the warehouse lock, and has resolved the hash and checked it against the meta
 /// pallets and the pallet heads; the content check refuses a signer who is not an admin, and a
-/// hash already redacted (a fresh `redacted_at` always changes the cells, so a repeat reaches that check).
+/// hash already redacted (a fresh `redacted_at` always changes the cells, so a repeat reaches that
+/// check).
 pub fn record_redaction(redaction: &Redaction,
                         writer: &MetaWriter,
                         actor: &Operator) -> Result<String, String> {
