@@ -1363,6 +1363,9 @@ fn directory_has_no_untracked_content(key: &str,
 /// strictly before `shard_write::publish_shards` stages any shard content (DESIGN.html §5.0 D
 /// item 10, finding #7; see its doc comment for why the two must not share one batch).
 ///
+/// A file whose content a redaction removes, in a shard this pass would publish, refuses the whole
+/// pass before any shard lands, with `refuse_redacted(path, hash)`; nothing is staged.
+///
 /// Shards are decided in parallel, and taken up in metadata order. If deciding one fails (an
 /// unreadable file, a corrupt shard), the first such shard in that order ends the pass there:
 /// neither it nor any shard after it is published, though those were decided too, and any blob they
@@ -1384,7 +1387,7 @@ fn directory_has_no_untracked_content(key: &str,
 ///                   publish. Every shard before the first failure in metadata order is handed
 ///                   to the publish step when the blob batch finishes; a blob-batch failure
 ///                   publishes nothing from this pass — see the doc comment above.
-pub fn refresh_tracked_entries() -> Result<(), String> {
+pub fn refresh_tracked_entries(refuse_redacted: impl Fn(&str, &str) -> String) -> Result<(), String> {
     let (_, metadata_opt) = file_utils::retrieve_inventory_metadata_or_none()?;
 
     let Some(metadata) = metadata_opt else {
@@ -1448,6 +1451,10 @@ pub fn refresh_tracked_entries() -> Result<(), String> {
     // comment for the exact ordering (and how it closes finding #1, per this function's own doc
     // comment above).
     if blob_batch_published {
+        if let Some((path, hash)) = staged_redacted(&writes)? {
+            return Err(refuse_redacted(&path, &hash));
+        }
+
         if let Err(e) = publish_shards(&mut ledger, ShardPublish::of(writes)) {
             if result.is_ok() { result = Err(e); }
         }
@@ -3277,7 +3284,7 @@ mod tests {
         let (metadata_path, _) = file_utils::retrieve_inventory_metadata_or_none().unwrap();
         write_metadata_to_file(&metadata_path, &metadata).unwrap();
 
-        let error = refresh_tracked_entries().expect_err("the corrupt shard must fail the refresh");
+        let error = refresh_tracked_entries(|_, _| String::new()).expect_err("the corrupt shard must fail the refresh");
         assert!(error.contains("bbb"), "the error should name \"bbb\", got: {error}");
 
         let state_of = |key: &str| {

@@ -447,6 +447,15 @@ fn a_park_naming_redacted_content_is_refused_and_parks_nothing() {
     std::fs::write(warehouse.root.join("secret.env"), b"TOKEN=rotated\n").unwrap();
     warehouse.run_ok(&["park"]);
     assert_eq!(warehouse.json(&["park", "list"])["data"]["parked"].as_array().unwrap().len(), 1);
+
+    // A tracked file edited to hold the content is refused before park restages it.
+    std::fs::write(warehouse.root.join("notes.txt"), b"TOKEN=hunter2\n").unwrap();
+    let error = content_redacted(&warehouse, &["park"]);
+    assert_eq!(error["details"]["path"], "notes.txt", "{}", error);
+    let status = warehouse.json(&["status"]);
+    assert_eq!(status["data"]["staged_count"], 0, "nothing was staged: {}", status);
+    assert_eq!(status["data"]["unstaged_count"], 1, "{}", status);
+    assert_eq!(warehouse.json(&["park", "list"])["data"]["parked"].as_array().unwrap().len(), 1);
 }
 
 #[test]
@@ -616,6 +625,28 @@ fn a_lift_is_refused_for_a_head_stacked_before_a_redaction_came_down() {
 }
 
 #[test]
+fn a_pick_conflicting_with_their_redacted_version_is_refused() {
+    let warehouse = Warehouse::new("pick-conflict");
+    warehouse.stack("shared.txt", b"base\n", "base");
+    warehouse.run_ok(&["pallet", "create", "side"]);
+    warehouse.stack("shared.txt", b"ours\n", "ours");
+    warehouse.run_ok(&["shift", "main"]);
+
+    // Main's leak changes the file both sides changed, then a later parcel changes it again, so
+    // no head names the content and the redaction is recorded.
+    warehouse.stack("shared.txt", b"TOKEN=hunter2\n", "leak");
+    let leak = warehouse.head("main");
+    warehouse.stack("shared.txt", b"rotated\n", "rotate");
+    let hash = recorded_hash(&warehouse, &format!("{}:shared.txt", leak), "leaked token")["data"]["hash"].clone();
+
+    // Picked onto side, the file conflicts, and the markers would carry their version whole.
+    warehouse.run_ok(&["shift", "side"]);
+    let error = content_redacted(&warehouse, &["pick", &leak]);
+    assert_eq!(error["details"], serde_json::json!({ "path": "shared.txt", "hash": hash }), "{}", error);
+    assert_eq!(std::fs::read(warehouse.root.join("shared.txt")).unwrap(), b"ours\n", "the bay is as it was");
+}
+
+#[test]
 fn a_lower_merging_redacted_content_in_is_refused_before_it_touches_the_bay() {
     let server = Server::start(&std::env::temp_dir()
         .join(format!("forklift-redaction-lower-server-{}", std::process::id())));
@@ -628,12 +659,27 @@ fn a_lower_merging_redacted_content_in_is_refused_before_it_touches_the_bay() {
     // own; another warehouse lifts a head naming that content, so a lower here merges it in.
     let warehouse = Warehouse::cloned("lower", &server.url);
     let hash = warehouse.redact_loaded("secret.env", b"TOKEN=hunter2\n", "leaked token");
-    warehouse.stack("mine.txt", b"mine\n", "mine");
     let head = warehouse.head("main");
 
     let other = Warehouse::cloned("lower-other", &server.url);
     other.stack("secret.env", b"TOKEN=hunter2\n", "leak");
     other.run_ok(&["lift"]);
+
+    // With nothing of its own, the lower would fast-forward the bay to the remote's head.
+    let error = content_redacted(&warehouse, &["lower", "main"]);
+    assert_eq!(error["details"], serde_json::json!({ "path": "secret.env", "hash": hash }), "{}", error);
+    let message = error["message"].as_str().unwrap();
+    assert!(message.starts_with("Refusing to lower pallet \"main\": \"secret.env\""), "{}", error);
+    assert_eq!(
+        error["next_step"],
+        "change or delete \"secret.env\" on the remote so it no longer holds that content, then lower again",
+        "{}", error
+    );
+    assert!(!warehouse.root.join("secret.env").exists(), "the content never reached the bay");
+    assert_eq!(warehouse.head("main"), head, "nothing was lowered");
+
+    warehouse.stack("mine.txt", b"mine\n", "mine");
+    let head = warehouse.head("main");
 
     let error = content_redacted(&warehouse, &["lower", "main"]);
     assert_eq!(error["details"], serde_json::json!({ "path": "secret.env", "hash": hash }), "{}", error);

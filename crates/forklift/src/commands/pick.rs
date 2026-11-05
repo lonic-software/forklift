@@ -129,7 +129,7 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
     consolidate::keep_aliased_files(&mut actions, &our_tree, &scope)?;
     let ledger = consolidate::ensure_no_untracked_collisions(&actions, &source_label)?;
     consolidate::ensure_actions_present(&actions)?;
-    consolidate::refuse_redacted_actions(&actions, &format!("pick {}", short), |path| format!(
+    consolidate::refuse_redacted_actions(&actions, &theirs_tree, &format!("pick {}", short), |path| format!(
         "make the change by hand without \"{}\" instead of picking {}",
         path, short
     ))?;

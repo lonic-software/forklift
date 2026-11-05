@@ -331,7 +331,7 @@ pub(crate) async fn merge_head_into_current(current: &str,
         crate::commands::lower::REMOTE_LABEL => "the remote".to_string(),
         label => format!("\"{}\"", label),
     };
-    refuse_redacted_actions(&actions, &format!("merge {} into \"{}\"", their_side, current), |path| format!(
+    refuse_redacted_actions(&actions, &their_tree_hash, &format!("merge {} into \"{}\"", their_side, current), |path| format!(
         "change or delete \"{}\" on {} so it no longer holds that content, then run this again",
         path, their_side
     ))?;
@@ -670,11 +670,13 @@ pub(crate) fn ensure_actions_present(actions: &[MergeAction]) -> Result<(), Stri
     }))
 }
 
-/// Refuse `actions` when one of them would bring back content a redaction removed, before the
-/// merge marker is raised, so none of it reaches the working tree. Judged after the presence
-/// phase, which makes every recipe they write readable. `doing` names the operation; `next_step`
-/// is given the path that holds the content.
+/// Refuse `actions`, merging `their_tree` in, when one of them would bring back content a
+/// redaction removed, before the merge marker is raised, so none of it reaches the working tree. A
+/// file both sides changed is judged by their version too: conflict markers carry it whole. Judged
+/// after the presence phase, which makes every recipe they write readable. `doing` names the
+/// operation; `next_step` is given the path that holds the content.
 pub(crate) fn refuse_redacted_actions(actions: &[MergeAction],
+                                      their_tree: &str,
                                       doing: &str,
                                       next_step: impl Fn(&str) -> String) -> Result<(), String> {
     let Some(guard) = redaction_utils::staging_guard()? else {
@@ -690,10 +692,18 @@ pub(crate) fn refuse_redacted_actions(actions: &[MergeAction],
             | MergeAction::Conflict { path, content: Some(content), item_type, .. } => {
                 let blob = LooseObjectBuilder::build_blob(&Blob { content: content.clone() });
 
-                guard.names_file(&blob.hash, *item_type)?.map(|hash| (path.clone(), hash))
+                match guard.names_file(&blob.hash, *item_type)? {
+                    Some(hash) => Some((path.clone(), hash)),
+                    None => theirs_named(&guard, their_tree, path)?,
+                }
             }
-            MergeAction::Conflict { path, content: None, entry_hash, item_type } if item_type.is_chunked() => {
-                guard.names_file(entry_hash, *item_type)?.map(|hash| (path.clone(), hash))
+            MergeAction::Conflict { path, content: None, entry_hash, item_type } => {
+                let ours = if item_type.is_chunked() { guard.names_file(entry_hash, *item_type)? } else { None };
+
+                match ours {
+                    Some(hash) => Some((path.clone(), hash)),
+                    None => theirs_named(&guard, their_tree, path)?,
+                }
             }
             MergeAction::ResolveOutOfScope { path, resolution: Some((hash, item_type)) } => {
                 if *item_type == DirEntryType::Tree {
@@ -711,6 +721,17 @@ pub(crate) fn refuse_redacted_actions(actions: &[MergeAction],
     }
 
     Ok(())
+}
+
+/// Their version of the file at `path` in `their_tree`, when its content is redacted.
+fn theirs_named(guard: &redaction_utils::StagingGuard,
+                their_tree: &str,
+                path: &str) -> Result<Option<(String, String)>, String> {
+    let Some((hash, item_type)) = object_utils::resolve_tree_file(their_tree, path)? else {
+        return Ok(None);
+    };
+
+    Ok(guard.names_file(&hash, item_type)?.map(|hash| (path.to_string(), hash)))
 }
 
 /// Whether applying a conflict writes its file: inline content, or a chunked file materialized

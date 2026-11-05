@@ -7,7 +7,7 @@ use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{BatchLaneClosure, RemoteClient};
 use forklift_core::util::{
     alias_utils, audit_utils, bay_utils, config_utils, file_utils, haul_utils, held_heads, kv_utils, merge_utils, object_utils,
-    operation_utils, pallet_utils, remote_utils, repair_utils, scope_utils, shift_utils, take_utils, trust_utils,
+    operation_utils, pallet_utils, redaction_utils, remote_utils, repair_utils, scope_utils, shift_utils, take_utils, trust_utils,
 };
 use forklift_core::util::take_utils::{FetchAt, TakeTrust};
 use forklift_core::util::operation_utils::{Operation, OperationKind};
@@ -286,6 +286,7 @@ async fn lower_working_pallet(client: &RemoteClient,
     refuse_carried_overlaps(&carried, &ops, &removed_dirs)?;
     alias_utils::refuse_collisions("Lowering", &shift_utils::collect_collisions(&ops, &removed_dirs)?)?;
     shift_utils::ensure_writes_present(&ops)?;
+    refuse_redacted_writes(&pallet, &ops)?;
 
     // Finished by `write_head_or_roll_back` once the bay is settled at one head or the other.
     let mut operation = Operation::new(
@@ -313,6 +314,34 @@ async fn lower_working_pallet(client: &RemoteClient,
     written?;
 
     report.outcome = Some(LowerOutcome::Lowered);
+
+    Ok(())
+}
+
+/// Refuse checking out the remote's head of `pallet` when `ops`, what it writes into this bay, would
+/// bring back content a redaction here removed. Its head write would be refused too, but only once
+/// the content had reached the bay. Judged after the presence phase, which makes every recipe they
+/// write readable.
+fn refuse_redacted_writes(pallet: &str, ops: &[shift_utils::FileOp]) -> Result<(), String> {
+    let Some(guard) = redaction_utils::staging_guard()? else {
+        return Ok(());
+    };
+
+    for op in ops {
+        let shift_utils::FileOp::Write { path, hash, item_type, .. } = op else {
+            continue;
+        };
+
+        if let Some(hash) = guard.names_file(hash, *item_type)? {
+            return Err(redaction_utils::staging_refusal(
+                &format!("lower pallet \"{}\"", pallet),
+                path,
+                &hash,
+                "Nothing was changed.",
+                format!("change or delete \"{}\" on the remote so it no longer holds that content, then lower again", path),
+            ));
+        }
+    }
 
     Ok(())
 }
@@ -473,6 +502,7 @@ async fn repair_pallet(client: &RemoteClient,
     refuse_carried_overlaps(&carried, &ops, &removed_dirs)?;
     alias_utils::refuse_collisions("Lowering", &shift_utils::collect_collisions(&ops, &removed_dirs)?)?;
     shift_utils::ensure_writes_present(&ops)?;
+    refuse_redacted_writes(&pallet, &ops)?;
 
     // The bay moves from its base, but the ref from V: the marker and the compare-and-set take V.
     let mut operation = Operation::new(
