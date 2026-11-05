@@ -65,15 +65,17 @@ pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
     )?;
 
     // Imported parcels are unsigned; a trusted warehouse rejects those, so import must
-    // come first — enrolling afterwards records the imported heads as the legacy boundary. An
-    // office standing without its anchor refuses every unsigned write, the tags included, so it
-    // is refused here too, before any head moves.
-    if audit_utils::local_meta_trust()?.is_some() {
+    // come first — enrolling afterwards records the imported heads as the legacy boundary.
+    if office_utils::read_trust_anchor()?.is_some() {
         return Err(
             "Trust is already established here; unsigned git history cannot be imported. \
             Import into a fresh warehouse, then \"forklift office enroll\".".to_string()
         );
     }
+
+    // With no anchor, an office standing refuses every unsigned write: refused here, with what
+    // happened to the anchor, rather than after the conversion as a changed office.
+    audit_utils::local_meta_trust()?;
 
     // Validate it is a git repository up front (a clear error beats a cryptic one later).
     git(path, &["rev-parse", "--git-dir"])?;

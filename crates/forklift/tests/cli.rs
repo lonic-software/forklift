@@ -5099,8 +5099,9 @@ fn import_git_records_the_git_tags_unsigned() {
 }
 
 /// An office standing without its anchor refuses every unsigned write, so git import refuses it
-/// before any branch lands, rather than failing on the tags afterwards.
-// Revert: drop the up-front office check → the branches land before the refusal.
+/// up front, saying the anchor was lost, and no branch lands.
+// Revert: drop the up-front `local_meta_trust` check → the head precondition still refuses after
+// the conversion, but as a changed office, without the lost-anchor message.
 #[test]
 fn import_git_refuses_an_office_without_its_anchor_before_any_branch_lands() {
     let warehouse = TestWarehouse::new("import-git-lost-anchor");
