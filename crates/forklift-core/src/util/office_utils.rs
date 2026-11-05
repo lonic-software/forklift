@@ -1186,7 +1186,7 @@ pub fn install_trust(install: &TrustInstall) -> Result<TrustInstalled, RefUpdate
         let lock = crate::util::lock_utils::RefLock::acquire()?;
 
         match &redaction {
-            Some(Ok(check)) if !check.holds(&lock)? => drop(lock),
+            Some(redaction) if !redaction.stands(&lock)? => drop(lock),
             _ => break (lock, redaction),
         }
     };
@@ -1207,9 +1207,9 @@ pub fn install_trust(install: &TrustInstall) -> Result<TrustInstalled, RefUpdate
 
     // The check's refusal, or a walk that failed, counts only once the trust install is known to be
     // still wanted and the office and anchor not to have moved.
-    let redaction = redaction.transpose()?;
+    let redaction = redaction.as_ref().map(crate::util::redaction_utils::HeadWriteCheck::outcome).transpose()?;
 
-    let error = match write_trust_install(&lock, install, &bytes, redaction.as_ref()) {
+    let error = match write_trust_install(&lock, install, &bytes, redaction) {
         Ok(()) => return Ok(TrustInstalled::Written),
         Err(error) => error,
     };

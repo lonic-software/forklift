@@ -779,23 +779,46 @@ pub enum RefUpdateError {
 
 impl RefUpdateError {
     /// The [`RefusalCode::ContentRedacted`](crate::error::RefusalCode::ContentRedacted) refusal a
-    /// [`RefUpdateError::Redacted`] crosses a String-typed caller as, so the code reaches the
-    /// command boundary. `None` for every other variant.
-    fn redacted_refusal(&self) -> Option<crate::error::CoreError> {
+    /// [`RefUpdateError::Redacted`] crosses a String-typed caller as, with `message`, so the code
+    /// reaches the command boundary. `None` for every other variant.
+    fn redacted_refusal(&self, message: String) -> Option<crate::error::CoreError> {
         let RefUpdateError::Redacted { pallet, head, path, hash } = self else { return None };
 
         Some(crate::error::CoreError::refusal_with_details(
             crate::error::RefusalCode::ContentRedacted,
-            self.to_string(),
+            message,
             format!("leave \"{}\" out of what this command writes", path),
             serde_json::json!({ "pallet": pallet.to_wire(), "head": head, "path": path, "hash": hash }),
         ))
     }
+
+    /// This refusal as a caller reports it after writing elsewhere first, such as a remote: the
+    /// message says `outcome` where it would say "Nothing was written.", and a redaction refusal
+    /// keeps its code, as the `String` conversion does.
+    pub fn reported_with(&self, outcome: &str) -> String {
+        let message = WithOutcome(self, outcome).to_string();
+
+        match self.redacted_refusal(message.clone()) {
+            Some(refusal) => refusal.into(),
+            None => message,
+        }
+    }
 }
+
+/// A [`RefUpdateError`]'s message with its outcome sentence given.
+struct WithOutcome<'a>(&'a RefUpdateError, &'a str);
 
 impl std::fmt::Display for RefUpdateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
+        WithOutcome(self, "Nothing was written.").fmt(f)
+    }
+}
+
+impl std::fmt::Display for WithOutcome<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let WithOutcome(error, outcome) = *self;
+
+        match error {
             RefUpdateError::Moved(moved) => moved.fmt(f),
             RefUpdateError::OfficeMoved { found } => write!(
                 f,
@@ -806,9 +829,9 @@ impl std::fmt::Display for RefUpdateError {
             RefUpdateError::Incomplete { pallet, head, missing } => write!(
                 f,
                 "Refusing to set pallet \"{}\" to {}: its history is not completely present in this \
-                warehouse ({}). Nothing was written. If a fetch of it stopped part-way, run that \
-                fetch again before this command.",
-                pallet, &head[..head.len().min(12)], missing
+                warehouse ({}). {} If a fetch of it stopped part-way, run that fetch again before \
+                this command.",
+                pallet, &head[..head.len().min(12)], missing, outcome
             ),
             RefUpdateError::AnchorMoved => f.write_str(
                 "Another bay or process changed this warehouse's trust anchor while this command \
@@ -831,15 +854,15 @@ impl std::fmt::Display for RefUpdateError {
                     false => write!(
                         f,
                         "Pallet \"{}\" was deleted at {}, and this warehouse has been served, so the \
-                        name stays reserved for that history. Nothing was written.",
-                        pallet, head
+                        name stays reserved for that history. {}",
+                        pallet, head, outcome
                     )?,
                     true => write!(
                         f,
                         "Refusing to re-create deleted pallet \"{}\": the new head does not descend \
                         from {}, the head it was deleted at, and this warehouse has been served, so \
-                        the name stays reserved for that history. Nothing was written.",
-                        pallet, head
+                        the name stays reserved for that history. {}",
+                        pallet, head, outcome
                     )?,
                 }
 
@@ -854,17 +877,17 @@ impl std::fmt::Display for RefUpdateError {
             RefUpdateError::Backward { pallet, head } => write!(
                 f,
                 "Refusing to move pallet \"{}\" off {}: this warehouse has been served, so its clones \
-                may rely on that head, and {}. Nothing was written. To take a change out, {} \
-                that reverts it.",
+                may rely on that head, and {}. {} To take a change out, {} that reverts it.",
                 pallet.to_wire(), head,
                 if pallet.namespace == PalletNamespace::Meta { "the move takes the pallet back to an older head" } else { "the new head does not descend from it" },
+                outcome,
                 if pallet.namespace == PalletNamespace::Meta { "make a new change" } else { "stack a parcel" }
             ),
             RefUpdateError::Redacted { pallet, head, path, hash } => write!(
                 f,
                 "Refusing to set pallet \"{}\" to {}: it names \"{}\", whose content ({}) is \
-                redacted in this warehouse and may never be named by a new head. Nothing was written.",
-                pallet.to_wire(), &head[..head.len().min(12)], path, hash
+                redacted in this warehouse and may never be named by a new head. {}",
+                pallet.to_wire(), &head[..head.len().min(12)], path, hash, outcome
             ),
             RefUpdateError::Failed(message) => f.write_str(message),
         }
@@ -1029,7 +1052,7 @@ impl From<String> for RefUpdateError {
 
 impl From<RefUpdateError> for String {
     fn from(error: RefUpdateError) -> Self {
-        match error.redacted_refusal() {
+        match error.redacted_refusal(error.to_string()) {
             Some(refusal) => refusal.into(),
             None => error.to_string(),
         }
@@ -1309,21 +1332,13 @@ fn update_pallet_head_checked(
 
         // `@redactions` is written under this lock too, so a redaction either lands before this
         // hold, and the head is checked against it, or after the write.
-        let holds = match &redaction {
-            Ok(check) => check.holds(&lock)?,
-            Err(_) => true,
-        };
-
-        if !holds {
+        if !redaction.stands(&lock)? {
             drop(lock);
             redaction = crate::util::redaction_utils::check_head_write(namespace, name, expected, new);
             continue;
         }
 
-        let check = match &redaction {
-            Ok(check) => check,
-            Err(refused) => return Err(refused.clone()),
-        };
+        let check = redaction.outcome()?;
 
         let written = update_pallet_head_locked(&lock, namespace, name, expected, new, left, check);
 
@@ -2587,6 +2602,93 @@ pub(crate) mod tests {
             assert_eq!(get_pallet_head("main").unwrap().as_deref(), Some(base.as_str()), "nothing was written");
         }
 
+        // Revert: leave what the walk skipped as absent out of the hold's re-check → the subtree a
+        // fill stored meanwhile, within the same scope, lands unchecked.
+        #[test]
+        fn a_skipped_subtree_stored_before_the_hold_walks_the_redactions_again() {
+            let (_root, _scope) = scratch("redacted-filled");
+            crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Sparse);
+            crate::util::scope_utils::set_fetch_scope(&PathScope::from_prefixes(["src"])).unwrap();
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let secret = blob("secret");
+            redact(&secret);
+
+            let web = tree(&[("b", &secret, DirEntryType::Normal)]);
+            let src = tree(&[("a", &blob("a1"), DirEntryType::Normal)]);
+            let head = parcel(&tree(&[("src", &src, DirEntryType::Tree), ("web", &web, DirEntryType::Tree)]), &[&base]);
+            remove(&web);
+
+            BEFORE_HOLD.with(|slot| *slot.borrow_mut() = Some(Box::new(|| {
+                tree(&[("b", &blob("secret"), DirEntryType::Normal)]);
+            })));
+
+            assert_redacted(write("main", Some(&base), &head), "web/b", &secret);
+            assert_eq!(get_pallet_head("main").unwrap().as_deref(), Some(base.as_str()), "nothing was written");
+        }
+
+        // Revert: keep a failed walk as final inside the hold → the write reports the failure,
+        // not the redaction recorded after it, once the object it lacked is back.
+        #[test]
+        fn a_failed_walk_is_retried_once_a_redaction_lands() {
+            let (_root, _scope) = scratch("redacted-failed");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            redact(&blob("unrelated"));
+            let secret = blob("secret");
+            let head = parcel(&two_dirs("a1", "secret"), &[&base]);
+
+            // The redactions' tree is unreadable, so the first walk fails.
+            let redactions = get_meta_pallet_head(crate::util::redaction_utils::REDACTIONS_PALLET_NAME).unwrap().unwrap();
+            let state = crate::util::object_utils::load_parcel(&redactions).unwrap().tree_hash;
+            let (folder, file) = file_utils::get_path_for_object(&state).unwrap();
+            let path = std::path::Path::new(&folder).join(file);
+            let bytes = std::fs::read(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            assert!(matches!(
+                crate::util::redaction_utils::check_head_write(PalletNamespace::User, "main", Some(&base), &head).outcome(),
+                Err(RefUpdateError::Failed(_))
+            ));
+
+            BEFORE_HOLD.with(|slot| *slot.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(&path, &bytes).unwrap();
+                redact(&secret);
+            })));
+
+            assert_redacted(write("main", Some(&base), &head), "web/b", &blob("secret"));
+            assert_eq!(get_pallet_head("main").unwrap().as_deref(), Some(base.as_str()), "nothing was written");
+        }
+
+        // Revert: report the refusal's own message → it says "Nothing was written" after a
+        // remote was written; or drop the frame → the code is lost.
+        #[test]
+        fn a_refusal_reported_after_another_write_says_what_was_written() {
+            let refused = RefUpdateError::Redacted {
+                pallet: PalletRef { namespace: PalletNamespace::Meta, name: "notes".to_string() },
+                head: "a".repeat(64),
+                path: "secret.env".to_string(),
+                hash: "b".repeat(64),
+            };
+
+            let reported = crate::error::CoreError::from(refused.reported_with("Only the remote was written."));
+            match reported {
+                crate::error::CoreError::Refusal { code, message, .. } => {
+                    assert_eq!(code, crate::error::RefusalCode::ContentRedacted);
+                    assert!(message.ends_with("may never be named by a new head. Only the remote was written."), "{}", message);
+                    assert!(!message.contains("Nothing was written"), "{}", message);
+                }
+                other => panic!("expected a framed refusal, got {:?}", other),
+            }
+
+            let backward = RefUpdateError::Backward {
+                pallet: PalletRef { namespace: PalletNamespace::Meta, name: "notes".to_string() },
+                head: "c".repeat(64),
+            };
+            let reported = backward.reported_with("Only the remote was written.");
+            assert!(reported.contains("older head. Only the remote was written. To take a change out"), "{}", reported);
+            assert!(backward.to_string().contains("older head. Nothing was written. To take a change out"), "{}", backward);
+        }
+
         // Revert: walk a partial warehouse's tree as a full one's → the write fails over the
         // subtree outside the scope.
         #[test]
@@ -2644,17 +2746,15 @@ pub(crate) mod tests {
             write("main", None, &base).unwrap();
             let other = parcel(&two_dirs("a1", "b1"), &[&base]);
             let head = parcel(&two_dirs("a2", "b2"), &[&base]);
-            let check = crate::util::redaction_utils::check_head_write(PalletNamespace::User, "main", Some(&base), &other)
-                .unwrap();
+            let check = crate::util::redaction_utils::check_head_write(PalletNamespace::User, "main", Some(&base), &other);
 
             let lock = crate::util::lock_utils::RefLock::acquire().unwrap();
-            let refused = update_pallet_head_locked(&lock, PalletNamespace::User, "main", Some(&base), &head, None, &check);
+            let refused = update_pallet_head_locked(&lock, PalletNamespace::User, "main", Some(&base), &head, None, check.outcome().unwrap());
             assert!(matches!(refused, Err(RefUpdateError::Failed(_))), "{:?}", refused);
 
             // Made for the same move of another pallet.
-            let side = crate::util::redaction_utils::check_head_write(PalletNamespace::User, "side", Some(&base), &head)
-                .unwrap();
-            let refused = update_pallet_head_locked(&lock, PalletNamespace::User, "main", Some(&base), &head, None, &side);
+            let side = crate::util::redaction_utils::check_head_write(PalletNamespace::User, "side", Some(&base), &head);
+            let refused = update_pallet_head_locked(&lock, PalletNamespace::User, "main", Some(&base), &head, None, side.outcome().unwrap());
             assert!(matches!(refused, Err(RefUpdateError::Failed(_))), "{:?}", refused);
             drop(lock);
             assert_eq!(get_pallet_head("main").unwrap().as_deref(), Some(base.as_str()));

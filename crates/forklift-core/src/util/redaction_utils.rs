@@ -447,8 +447,11 @@ impl RedactedSet {
 
     /// The redacted hash a file entry names: its own hash, or for a chunked file whose recipe the
     /// store holds, the hash of the redaction its chunk list matches. `partial` tolerates a recipe
-    /// the store lacks, which then carries no chunks this warehouse could hand on.
-    fn named_by(&self, entry: &crate::model::tree_item::TreeItem, partial: bool) -> Result<Option<String>, String> {
+    /// the store lacks, which then carries no chunks this warehouse could hand on, and records it
+    /// as skipped.
+    fn named_by(&self,
+                entry: &crate::model::tree_item::TreeItem,
+                partial: Option<&mut Vec<String>>) -> Result<Option<String>, String> {
         if self.hashes.contains(&entry.hash) {
             return Ok(Some(entry.hash.clone()));
         }
@@ -459,8 +462,13 @@ impl RedactedSet {
 
         let chunks = match object_utils::recipe_chunk_hashes(&entry.hash) {
             Ok(chunks) => chunks,
-            Err(_) if partial && !file_utils::does_object_exist(&entry.hash)? => return Ok(None),
-            Err(error) => return Err(error),
+            Err(error) => match partial {
+                Some(skipped) if !file_utils::does_object_exist(&entry.hash)? => {
+                    skipped.push(entry.hash.clone());
+                    return Ok(None);
+                }
+                _ => return Err(error),
+            },
         };
 
         Ok(self.chunk_lists.contains(&chunk_list_digest(&chunks)).then(|| entry.hash.clone()))
@@ -474,9 +482,10 @@ type Named = (String, String);
 /// (a sparse or cache warehouse) skips a subtree or recipe the store does not hold: its bytes are
 /// not here, so this warehouse cannot hand them on. A head that receives the parcel judges it
 /// against its own redactions, if it checks at all (the AWS head does not yet), so a redaction
-/// recorded only here does not follow a skipped subtree. In a full warehouse a missing object is
-/// an error, never a pass.
-fn tree_names(tree: &str, set: &RedactedSet, partial: bool) -> Result<Option<Named>, String> {
+/// recorded only here does not follow a skipped subtree. Each skipped object is recorded in
+/// `partial`, so the write's hold can see one stored meanwhile. In a full warehouse a missing
+/// object is an error, never a pass.
+fn tree_names(tree: &str, set: &RedactedSet, mut partial: Option<&mut Vec<String>>) -> Result<Option<Named>, String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut pending = vec![(String::new(), tree.to_string())];
 
@@ -487,12 +496,17 @@ fn tree_names(tree: &str, set: &RedactedSet, partial: bool) -> Result<Option<Nam
 
         let loaded = match object_utils::load_tree_shared(&hash) {
             Ok(loaded) => loaded,
-            Err(_) if partial && !file_utils::does_object_exist(&hash)? => continue,
-            Err(error) => return Err(error),
+            Err(error) => match partial.as_deref_mut() {
+                Some(skipped) if !file_utils::does_object_exist(&hash)? => {
+                    skipped.push(hash);
+                    continue;
+                }
+                _ => return Err(error),
+            },
         };
 
         for (name, file) in loaded.get_files() {
-            if let Some(redacted) = set.named_by(file, partial)? {
+            if let Some(redacted) = set.named_by(file, partial.as_deref_mut())? {
                 return Ok(Some((format!("{}{}", prefix, name), redacted)));
             }
         }
@@ -515,6 +529,9 @@ pub struct RedactionCheck {
     expected: Option<String>,
     new: String,
     redactions: Option<String>,
+
+    /// What a partial warehouse's walk skipped as absent.
+    skipped: Vec<String>,
 }
 
 impl RedactionCheck {
@@ -529,17 +546,59 @@ impl RedactionCheck {
             && self.new == new
     }
 
-    /// Whether the check still holds: `@redactions` is at the head it was checked against. Read
-    /// under the held ref lock, which every `@redactions` write takes too, so a redaction either
-    /// lands before the write's hold or after the write.
+    /// Whether the check still holds: `@redactions` is at the head it was checked against, and
+    /// nothing the walk skipped as absent has been stored since. Read under the held ref lock,
+    /// which every `@redactions` write takes too, so a redaction either lands before the write's
+    /// hold or after the write.
     pub(crate) fn holds(&self, _lock: &crate::util::lock_utils::RefLock) -> Result<bool, String> {
-        Ok(pallet_utils::get_meta_pallet_head(REDACTIONS_PALLET_NAME)? == self.redactions)
+        if pallet_utils::get_meta_pallet_head(REDACTIONS_PALLET_NAME)? != self.redactions {
+            return Ok(false);
+        }
+
+        for hash in &self.skipped {
+            if file_utils::does_object_exist(hash)? {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+}
+
+/// What [`check_head_write`] decided, and what it read deciding it, so the write's hold can tell
+/// whether the decision still stands.
+#[derive(Debug)]
+pub struct HeadWriteCheck {
+    /// The `@redactions` head read before the check, or `None` when it could not be read.
+    redactions: Option<Option<String>>,
+    outcome: Result<RedactionCheck, pallet_utils::RefUpdateError>,
+}
+
+impl HeadWriteCheck {
+    /// Whether the decision still stands under the held ref lock; when it does not, the write
+    /// checks again. A pass stands while [`RedactionCheck`]'s inputs are unchanged. A refusal
+    /// always stands: redactions are only ever added, and the head's tree does not change. A
+    /// check that failed stands until `@redactions` moves, so it is retried once a redaction
+    /// lands rather than reporting a failure about a head that no longer holds.
+    pub(crate) fn stands(&self, lock: &crate::util::lock_utils::RefLock) -> Result<bool, String> {
+        match &self.outcome {
+            Ok(check) => check.holds(lock),
+            Err(pallet_utils::RefUpdateError::Redacted { .. }) => Ok(true),
+            Err(_) => Ok(self.redactions.as_ref()
+                == Some(&pallet_utils::get_meta_pallet_head(REDACTIONS_PALLET_NAME)?)),
+        }
+    }
+
+    /// The decision: the proof the compare-and-set takes, or the refusal or failure.
+    pub(crate) fn outcome(&self) -> Result<&RedactionCheck, pallet_utils::RefUpdateError> {
+        self.outcome.as_ref().map_err(Clone::clone)
     }
 }
 
 /// Check a ref write of `new` over `expected` against the redactions at the current `@redactions`
 /// head, and return the proof the compare-and-set takes. Run before the ref lock, since it walks;
-/// a redaction landing between this and the hold sends the write round again.
+/// a redaction landing between this and the hold sends the write round again (see
+/// [`HeadWriteCheck::stands`]).
 ///
 /// - A user pallet's new head is refused when its tree names a redacted file anywhere. The whole
 ///   tree is walked, never only what differs from `expected`: a stale branch revived onto a ref
@@ -552,6 +611,7 @@ impl RedactionCheck {
 ///   nothing.
 ///
 /// # Returns
+/// The decision and what it read. Its outcome is:
 /// * `Ok(check)`                       - Nothing the write adds names redacted content.
 /// * `Err(RefUpdateError::Redacted)`   - It does; nothing was written.
 /// * `Err(RefUpdateError::Failed)`     - `@redactions` or an object the check needs could not be
@@ -559,14 +619,29 @@ impl RedactionCheck {
 pub fn check_head_write(namespace: pallet_utils::PalletNamespace,
                         name: &str,
                         expected: Option<&str>,
-                        new: &str) -> Result<RedactionCheck, pallet_utils::RefUpdateError> {
-    let redactions = pallet_utils::get_meta_pallet_head(REDACTIONS_PALLET_NAME)?;
-    let check = RedactionCheck {
+                        new: &str) -> HeadWriteCheck {
+    let redactions = pallet_utils::get_meta_pallet_head(REDACTIONS_PALLET_NAME);
+    let outcome = match &redactions {
+        Ok(redactions) => check_head_write_at(namespace, name, expected, new, redactions.clone()),
+        Err(error) => Err(error.clone().into()),
+    };
+
+    HeadWriteCheck { redactions: redactions.ok(), outcome }
+}
+
+/// [`check_head_write`]'s decision against the redactions at `redactions`.
+fn check_head_write_at(namespace: pallet_utils::PalletNamespace,
+                       name: &str,
+                       expected: Option<&str>,
+                       new: &str,
+                       redactions: Option<String>) -> Result<RedactionCheck, pallet_utils::RefUpdateError> {
+    let mut check = RedactionCheck {
         namespace,
         name: name.to_string(),
         expected: expected.map(str::to_string),
         new: new.to_string(),
         redactions: redactions.clone(),
+        skipped: Vec::new(),
     };
 
     let Some(redactions) = redactions.filter(|_| expected != Some(new)) else {
@@ -582,7 +657,8 @@ pub fn check_head_write(namespace: pallet_utils::PalletNamespace,
     let named = match namespace {
         pallet_utils::PalletNamespace::User => {
             let partial = crate::util::scope_utils::content_may_be_absent()?;
-            tree_names(&object_utils::load_parcel(new)?.tree_hash, &set, partial)?
+            let tree = object_utils::load_parcel(new)?.tree_hash;
+            tree_names(&tree, &set, partial.then_some(&mut check.skipped))?
         }
         pallet_utils::PalletNamespace::Meta => meta_parcels_add(expected, new, &set)?,
     };
@@ -670,7 +746,7 @@ fn tree_adds(tree: &str, inherited: &HashSet<String>, set: &RedactedSet) -> Resu
                 continue;
             }
 
-            if let Some(redacted) = set.named_by(file, false)? {
+            if let Some(redacted) = set.named_by(file, None)? {
                 return Ok(Some((format!("{}{}", prefix, name), redacted)));
             }
         }

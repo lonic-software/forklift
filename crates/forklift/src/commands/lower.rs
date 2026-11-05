@@ -1369,6 +1369,8 @@ pub(crate) async fn replay(client: &RemoteClient,
     // Conditioned on the trust state the replay was written and checked under, as every meta
     // write is. The remote already holds the replay, so a refusal says so rather than "nothing was
     // written".
+    const REMOTE_ONLY: &str = "Only the remote was written.";
+
     match pallet_utils::update_meta_pallet_head(name, Some(&local), &parcel, &writer.preconditions()) {
         Ok(()) => {}
         Err(refused) => {
@@ -1380,7 +1382,7 @@ pub(crate) async fn replay(client: &RemoteClient,
                 Redacted { .. } => {
                     let refusal = forklift_core::error::prefix_message(
                         &format!("{} was lifted to the remote, but this warehouse refused to move its local head there", wire),
-                        refused.clone().into(),
+                        refused.reported_with(REMOTE_ONLY),
                     );
 
                     return Err(match resigned_note.is_empty() {
@@ -1399,7 +1401,7 @@ pub(crate) async fn replay(client: &RemoteClient,
                     return Err(format!(
                         "{} was lifted to the remote, but this warehouse refused to move its local \
                         head there.{} {}",
-                        wire, resigned_note, refused
+                        wire, resigned_note, refused.reported_with(REMOTE_ONLY)
                     ));
                 }
             };
