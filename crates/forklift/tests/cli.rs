@@ -5821,9 +5821,9 @@ fn export_git_writes_tags_as_annotated_git_tags() {
     assert!(human.contains("warning: tag \"side-1\" was not exported"), "{}", human);
 }
 
-/// A tag's tagger is the operator the office binds its key to, read strictly: an office that cannot
-/// be read leaves every tag out with one warning, and one that lacks the key leaves that tag out,
-/// while the branches are exported either way.
+/// A signed tag's tagger is the operator the office binds its key to, read strictly: an office that
+/// cannot be read, or one that lacks the key, leaves that tag out with the reason, while the
+/// branches and the unsigned tags, whose tagger needs no office, are exported either way.
 #[test]
 fn export_git_leaves_tags_out_when_the_office_cannot_name_their_tagger() {
     let warehouse = TestWarehouse::new("export-git-tags-office");
@@ -5832,6 +5832,8 @@ fn export_git_leaves_tags_out_when_the_office_cannot_name_their_tagger() {
     warehouse.write_file("a.txt", "one\n");
     assert_success(&warehouse.run(&["load", "."]));
     assert_success(&warehouse.run(&["stack", "-m", "first"]));
+    // Recorded before trust, so it stays unsigned after the enroll.
+    assert_success(&warehouse.run(&["tag", "create", "pre", "main"]));
     assert_success(&warehouse.run(&["office", "enroll"]));
     assert_success(&warehouse.run(&["tag", "create", "v1", "main"]));
 
@@ -5845,17 +5847,66 @@ fn export_git_leaves_tags_out_when_the_office_cannot_name_their_tagger() {
     std::fs::write(&office_head, "not a parcel hash\n").unwrap();
     let damaged = export("damaged");
     assert_eq!(damaged["branches"], serde_json::json!(["main"]));
-    assert_eq!(damaged["tags"], serde_json::json!([]));
-    assert!(damaged["unreadable_tags"].as_str().unwrap().contains("the office that names their taggers"), "{}", damaged);
+    assert_eq!(damaged["tags"], serde_json::json!(["pre"]));
+    assert_eq!(damaged["skipped_tags"].as_array().unwrap().len(), 1, "{}", damaged);
+    let skipped = &damaged["skipped_tags"][0];
+    assert_eq!(skipped["name"], "v1");
+    assert!(skipped["reason"].as_str().unwrap().contains("the office that names its tagger could not be read"),
+        "{}", damaged);
+    assert!(damaged.get("unreadable_tags").is_none(), "{}", damaged);
     let human = stdout(&warehouse.run(&["git", "export", warehouse.root.join("damaged-human").to_str().unwrap()]));
-    assert!(human.contains("warning: no tag was exported: the office"), "{}", human);
+    assert!(human.contains("warning: tag \"v1\" was not exported: the office"), "{}", human);
 
     std::fs::remove_file(&office_head).unwrap();
     let unborn = export("unborn");
-    assert_eq!(unborn["tags"], serde_json::json!([]));
+    assert_eq!(unborn["tags"], serde_json::json!(["pre"]));
+    assert_eq!(unborn["skipped_tags"].as_array().unwrap().len(), 1, "{}", unborn);
     let skipped = &unborn["skipped_tags"][0];
     assert_eq!(skipped["name"], "v1");
     assert!(skipped["reason"].as_str().unwrap().contains("is not in this warehouse's office"), "{}", unborn);
+}
+
+/// An unsigned tag is exported, not skipped: its tagger is the operator it declares, and its last
+/// line marks it unsigned instead of naming a key, so git never shows a declared tagger as signed.
+/// A warehouse that never enrolled has no office, and needs none to export its tags.
+#[test]
+fn export_git_writes_an_unsigned_tag_with_its_declared_tagger() {
+    let warehouse = TestWarehouse::new("export-git-tags-unsigned");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    warehouse.write_file("a.txt", "one\n");
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "-m", "first"]));
+    assert_success(&warehouse.run(&["tag", "create", "v1", "main", "-m", "the first release"]));
+    assert_success(&warehouse.run(&["tag", "create", "v1-bare", "main"]));
+    let shown = json(&warehouse.run(&["--json", "tag", "show", "v1"]));
+    assert!(shown["data"].get("signer").is_none(), "{}", shown);
+    assert_eq!(shown["data"]["tagger"], "test@forklift");
+
+    let out = warehouse.root.join("exported");
+    let exported = warehouse.run(&["--json", "git", "export", out.to_str().unwrap()]);
+    assert_success(&exported);
+    let data = &json(&exported)["data"];
+    assert_eq!(data["tags"], serde_json::json!(["v1", "v1-bare"]));
+    assert!(data.get("skipped_tags").is_none() && data.get("unreadable_tags").is_none(), "{}", data);
+
+    let git = |args: &[&str]| -> String {
+        let output = Command::new("git").args(args).current_dir(&out).output()
+            .expect("git must be installed to run this test");
+        assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    assert_eq!(git(&["for-each-ref", "--format=%(objecttype) %(refname)", "refs/tags"]),
+        "tag refs/tags/v1\ntag refs/tags/v1-bare\n");
+    assert_eq!(git(&["rev-parse", "v1^{commit}"]), git(&["rev-parse", "main"]));
+    assert_eq!(git(&["for-each-ref", "--format=%(taggername) %(taggeremail)", "refs/tags/v1"]),
+        "test@forklift <test@forklift>\n");
+    let body = git(&["cat-file", "tag", "v1"]);
+    assert!(body.ends_with("\n\nthe first release\n\nForklift-Tag-Unsigned: export/1\n"), "{}", body);
+    assert!(!body.contains("Forklift-Tag-Signer"), "{}", body);
+    assert_eq!(git(&["cat-file", "tag", "v1-bare"]).split_once("\n\n").unwrap().1, "Forklift-Tag-Unsigned: export/1\n");
+    git(&["fsck", "--strict"]);
 }
 
 #[test]

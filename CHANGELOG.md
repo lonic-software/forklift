@@ -17,8 +17,11 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   `haul` command now record unsigned entries naming your configured operator, instead of
   refusing. There are no roles until you enroll, so anyone may tag or record a merge. Readers
   mark these entries `(unsigned)`, and in `--json` the `signer` field is absent (hauls carry
-  `"unsigned": true`). Once a warehouse has an office, every entry is signed as before. `git
-  export` skips unsigned tags.
+  `"unsigned": true`). Once a warehouse has an office, every entry is signed as before.
+- **`git export` writes unsigned tags.** A tag recorded without a key becomes an annotated git tag
+  with its declared operator as tagger, ending in a `Forklift-Tag-Unsigned: export/1` line instead
+  of a signer key, so a warehouse with no office exports its tags. An office that cannot be read
+  now leaves out only the signed tags, each named in a warning.
 - **`office enroll` keeps metadata recorded before it.** Unsigned tags, manifest entries, keyed
   values and hauls are folded into the trust boundary and stay valid; everything written after
   enrolling is signed. A server's first enroll does the same. A `lower` that adopts a remote's
