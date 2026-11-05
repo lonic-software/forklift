@@ -2789,6 +2789,7 @@ pub(crate) mod tests {
             crate::util::kv_utils::KV_PALLET_NAME,
             crate::util::manifest_utils::MANIFEST_PALLET_NAME,
             crate::util::tag_utils::TAGS_PALLET_NAME,
+            crate::util::redaction_utils::REDACTIONS_PALLET_NAME,
         ];
 
         for name in built_in {

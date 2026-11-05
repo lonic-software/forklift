@@ -909,6 +909,25 @@ pub enum Command {
         action: Option<TagAction>,
     },
 
+    /// Redact stored content permanently: record an object that must be removed and never stored
+    /// again
+    // Hidden until this build also refuses and deletes what it records: a redaction that only
+    // records would promise a removal nothing performs.
+    #[command(
+        hide = true,
+        long_about = "Redact stored content permanently. A redaction names one file's content \
+                      (by object hash, or as <revision>:<path>) that must be removed from the \
+                      warehouse and never stored in it again. It is a record on the \
+                      \"@redactions\" meta pallet, never changed or removed; under trust only an \
+                      admin may record one. Content a meta pallet's history names cannot be \
+                      redacted, because that history is never rewritten. Without a subcommand, \
+                      the redactions are listed."
+    )]
+    Redact {
+        #[command(subcommand)]
+        action: Option<RedactAction>,
+    },
+
     /// Undo the last stack, consolidate, pick, shift or pallet delete
     #[command(
         long_about = "Undo the last journaled operation: a \"forklift stack\", \"forklift consolidate\", \
@@ -1394,6 +1413,28 @@ pub enum GitAction {
                       Requires git on PATH."
     )]
     Mirror,
+}
+
+#[derive(Subcommand)]
+pub enum RedactAction {
+    /// Record a permanent redaction of one file's content (admin only)
+    #[command(
+        long_about = "Record a permanent redaction of one file's content: a full object hash held \
+                      in this store, or <revision>:<path>. For a chunked file the recipe is \
+                      redacted together with its chunk list. A redaction cannot be undone; a hash \
+                      some meta pallet's history names is refused."
+    )]
+    Record {
+        /// The content to redact: a full object hash, or <revision>:<path>
+        target: String,
+
+        /// Why the content is redacted
+        #[arg(long)]
+        reason: String,
+    },
+
+    /// List every redaction (the default)
+    List,
 }
 
 #[derive(Subcommand)]
@@ -2085,6 +2126,7 @@ impl Command {
                 | Command::Stocktake { .. }
                 | Command::Store { .. }
                 | Command::Tag { .. }
+                | Command::Redact { .. }
                 | Command::Undo { .. }
                 | Command::Unload { .. }
         )
@@ -2187,6 +2229,7 @@ impl Command {
                 | Command::Shift { .. }
                 | Command::Stack { .. }
                 | Command::Tag { .. }
+                | Command::Redact { .. }
                 | Command::Undo { .. }
                 | Command::Unload { .. }
         )

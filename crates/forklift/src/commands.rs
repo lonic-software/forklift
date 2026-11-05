@@ -26,6 +26,7 @@ pub mod shift;
 pub mod stocktake;
 pub mod stack;
 pub mod tag;
+pub mod redact;
 pub mod pallet;
 pub mod config;
 pub mod version;

@@ -563,6 +563,10 @@ error_codes! {
     /// `lower` merged the remote's diverged head in and the merge conflicts; the consolidation is
     /// left in progress.
     MergeConflicts,
+
+    /// `redact` found the object in some meta pallet's history, which is never rewritten; nothing
+    /// was recorded.
+    RedactionBlocked,
 }
 
 impl ErrorCode {
@@ -615,6 +619,7 @@ impl ErrorCode {
             ErrorCode::WarehouseInUse => RefusalCode::WarehouseInUse.as_str(),
             ErrorCode::HeadNotMaterializable => RefusalCode::HeadNotMaterializable.as_str(),
             ErrorCode::MergeConflicts => RefusalCode::MergeConflicts.as_str(),
+            ErrorCode::RedactionBlocked => RefusalCode::RedactionBlocked.as_str(),
         }
     }
 
@@ -670,6 +675,7 @@ impl ErrorCode {
             ErrorCode::WarehouseInUse => 45,
             ErrorCode::HeadNotMaterializable => 46,
             ErrorCode::MergeConflicts => 47,
+            ErrorCode::RedactionBlocked => 48,
         }
     }
 
@@ -795,6 +801,8 @@ impl ErrorCode {
                 "The remote's head of the pallet holds an entry named like the warehouse's metadata folder, so it cannot be checked out; nothing was changed",
             ErrorCode::MergeConflicts =>
                 "Lowering merged the remote's diverged head in, and the merge conflicts; the consolidation is left in progress",
+            ErrorCode::RedactionBlocked =>
+                "The object to redact is named by a meta pallet's history, which is never rewritten, so it cannot be removed; nothing was recorded",
         }
     }
 
@@ -848,6 +856,7 @@ impl ErrorCode {
             RefusalCode::HeadNotMaterializable => ErrorCode::HeadNotMaterializable,
             RefusalCode::Conflict => ErrorCode::Conflict,
             RefusalCode::MergeConflicts => ErrorCode::MergeConflicts,
+            RefusalCode::RedactionBlocked => ErrorCode::RedactionBlocked,
         }
     }
 }
@@ -1421,6 +1430,7 @@ mod tests {
             (RefusalCode::HeadNotMaterializable, "head_not_materializable", 46),
             (RefusalCode::Conflict, "conflict", 4),
             (RefusalCode::MergeConflicts, "merge_conflicts", 47),
+            (RefusalCode::RedactionBlocked, "redaction_blocked", 48),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

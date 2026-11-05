@@ -29,6 +29,7 @@ mod mirror;
 mod nested_working_trees;
 mod query;
 mod recovery_page;
+mod redaction;
 mod rollup_hash;
 mod rollup_hash_skip;
 mod shard_store;

@@ -48,7 +48,10 @@ use crate::util::audit_utils::{self, DistrustBoundaryMemo, SignatureTrust, Verif
 use crate::util::office_utils::{KeyRecord, OfficeState, RevocationReason, TrustAnchor};
 use crate::util::pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions};
 use crate::util::sign_utils::ParcelSignature;
-use crate::util::{haul_utils, kv_utils, manifest_utils, object_utils, office_utils, pallet_utils, sign_utils, tag_utils};
+use crate::util::{
+    haul_utils, kv_utils, manifest_utils, object_utils, office_utils, pallet_utils, redaction_utils, sign_utils,
+    tag_utils,
+};
 
 /// The spine every meta tree keeps: `.forklift/tracked/`.
 const TREE_NAME_FORKLIFT: &str = ".forklift";
@@ -70,15 +73,16 @@ const FIELD_OPERATOR: &str = "operator";
 const FIELD_SCHEMA: &str = "schema";
 const FIELD_VALUE: &str = "value";
 
-/// Every meta pallet name a remote stores: the office, and the four kinds below. A meta ref
+/// Every meta pallet name a remote stores: the office, and the five kinds below. A meta ref
 /// update for any other name is refused, so a newer client's new pallet fails loudly against
 /// an older remote instead of being stored unchecked.
-pub const META_PALLET_NAMES: [&str; 5] = [
+pub const META_PALLET_NAMES: [&str; 6] = [
     office_utils::OFFICE_PALLET_NAME,
     manifest_utils::MANIFEST_PALLET_NAME,
     haul_utils::HAUL_PALLET_NAME,
     tag_utils::TAGS_PALLET_NAME,
     kv_utils::KV_PALLET_NAME,
+    redaction_utils::REDACTIONS_PALLET_NAME,
 ];
 
 /// The rules of a meta pallet on this substrate, or `None` for the office, which is on its own
@@ -89,6 +93,7 @@ pub fn meta_rules(name: &str) -> Option<&'static dyn PalletRules> {
         manifest_utils::MANIFEST_PALLET_NAME => Some(&manifest_utils::ManifestRules),
         tag_utils::TAGS_PALLET_NAME => Some(&tag_utils::TagsRules),
         haul_utils::HAUL_PALLET_NAME => Some(&haul_utils::HaulRules),
+        redaction_utils::REDACTIONS_PALLET_NAME => Some(&redaction_utils::RedactionsRules),
         _ => None,
     }
 }
@@ -113,10 +118,12 @@ pub enum MetaKind {
     Manifest,
     Haul,
     Tags,
+    Redactions,
 }
 
 impl MetaKind {
-    const ALL: [MetaKind; 4] = [MetaKind::Kv, MetaKind::Manifest, MetaKind::Haul, MetaKind::Tags];
+    const ALL: [MetaKind; 5] =
+        [MetaKind::Kv, MetaKind::Manifest, MetaKind::Haul, MetaKind::Tags, MetaKind::Redactions];
 
     /// The kind's name, as the format marker spells it.
     pub fn as_str(&self) -> &'static str {
@@ -125,6 +132,7 @@ impl MetaKind {
             MetaKind::Manifest => "manifest",
             MetaKind::Haul => "haul",
             MetaKind::Tags => "tags",
+            MetaKind::Redactions => "redactions",
         }
     }
 
