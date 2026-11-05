@@ -3196,7 +3196,7 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
                     Ok(None) => true,
                     _ => return Err(internal(e)),
                 },
-                Err(error) => return Err((StatusCode::CONFLICT, error.to_string())),
+                Err(error) => return Err((StatusCode::CONFLICT, error.into())),
             };
 
             if removed {
