@@ -2,23 +2,35 @@
 //!
 //! # Key layout
 //!
-//! One bucket, four prefixes, and the boundary between them *is* invariant 1:
+//! One bucket, four prefixes, and the boundary between them *is* invariant 1. Every key but a
+//! response's names the warehouse it belongs to, right after its prefix: a store is built for one
+//! warehouse ([`S3ObjectStore::new`]) and reads and writes only under that warehouse's keys, so
+//! one warehouse on a shared bucket can neither fetch another's objects nor learn which hashes
+//! another holds. A warehouse id never contains `/` (`warehouse_utils::validate_warehouse_id`),
+//! so no warehouse's keys sit under another's.
 //!
-//! * `objects/{hash}` — the **canonical** namespace. Everything here is hash-verified, and
+//! * `objects/{warehouse}/{hash}` — the **canonical** namespace. Everything here is hash-verified,
+//!   and
 //!   the only two write paths into it are [`put_verified`](S3ObjectStore::put_verified)
 //!   (which hashes the bytes first) and [`verify_and_promote`](S3ObjectStore::verify_and_promote)
 //!   (which hashes the staged bytes first). Nothing else can put a key here — in particular,
 //!   no presigned `PUT` ever addresses this prefix.
-//! * `staging/{session}/{hash}` — where a client's presigned `PUT` lands. Bytes here are
-//!   invisible to [`exists`](S3ObjectStore::exists)/[`get`](S3ObjectStore::get); they become
-//!   fetchable only when `verify_and_promote` copies them to `objects/{hash}` after checking
-//!   the hash. This is the whole reason a `PUT` target needs a lift session.
-//! * `signatures/{parcel_hash}` — signature sidecars, immutable like objects. A distinct
-//!   prefix, never `objects/`, because a parcel's sidecar shares the parcel's hash and must
+//! * `staging/{warehouse}/{session}/{hash}` — where a client's presigned `PUT` lands. Bytes here
+//!   are invisible to [`exists`](S3ObjectStore::exists)/[`get`](S3ObjectStore::get); they become
+//!   fetchable only when `verify_and_promote` copies them to `objects/{warehouse}/{hash}` after
+//!   checking the hash. This is the whole reason a `PUT` target needs a lift session. The staging
+//!   verifier Lambda learns the warehouse to promote into from this key ([`parse_staging_key`]).
+//! * `signatures/{warehouse}/{parcel_hash}` — signature sidecars, immutable like objects. A
+//!   distinct prefix, never `objects/`, because a parcel's sidecar shares the parcel's hash and must
 //!   not collide with the parcel object.
 //! * `responses/{content_hash}` — offloaded `batch` bundles, ephemeral and content-addressed,
 //!   deliberately outside `objects/` so nothing here is reachable as an object (invariant 1
-//!   is not in play; the client verifies every record on import regardless).
+//!   is not in play; the client verifies every record on import regardless). Shared by every
+//!   warehouse: a response is reached only through the presigned URL the head hands back.
+//!
+//! Warehouses in AWS format 1 kept objects and signatures at `objects/{hash}` and
+//! `signatures/{hash}`, shared by every warehouse. Nothing here reads those keys, and the format
+//! gate refuses such a warehouse before any of them could be looked for (`format::gate`).
 //!
 //! # The conditional-write CAS
 //!
@@ -77,8 +89,9 @@
 //!
 //! # Operational requirement: expire abandoned staging objects (§9.4b Stage 3, W2)
 //!
-//! [`discard_session`](S3ObjectStore::discard_session) sweeps a lift session's `staging/{session}/`
-//! prefix, but only ever runs when a client actually calls `commit_lift` with the session's *final*
+//! [`discard_session`](S3ObjectStore::discard_session) sweeps a lift session's
+//! `staging/{warehouse}/{session}/` prefix, but only ever runs when a client actually calls
+//! `commit_lift` with the session's *final*
 //! batch (`more: false`) — see `Head::commit_lift`. A client that dies mid-lift (crash, killed
 //! process, a bay that is simply abandoned) never issues that final call, so its staged objects are
 //! never swept by any code path here: nothing in this store, or in the head, ever revisits a
@@ -106,7 +119,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_runtime_api::client::result::SdkError;
 
-use forklift_core::util::object_utils;
+use forklift_core::util::{object_utils, warehouse_utils};
 
 use crate::aws::s3_ops::S3Ops;
 use crate::aws::sdk::{
@@ -169,27 +182,53 @@ const MAX_PROMOTE_ATTEMPTS: u32 = 3;
 /// blocking thread the head already runs on, which is why each probe may borrow `&self`.
 const MISSING_PROBE_CONCURRENCY: usize = 64;
 
-/// The canonical key of an object — the only prefix `exists`/`get`/`access` read, and the
-/// only prefix hash-verified writes target.
-fn object_key(hash: &str) -> String {
-    format!("objects/{}", hash)
+/// The canonical key of `warehouse`'s object — the only prefix `exists`/`get`/`access` read,
+/// and the only prefix hash-verified writes target.
+fn object_key(warehouse: &str, hash: &str) -> String {
+    format!("objects/{}/{}", warehouse, hash)
 }
 
-/// The staging key an upload for `hash` lands at under lift `session`. Never `objects/{hash}`:
-/// bytes here are unverified and unfetchable until promotion (invariant 1).
-fn staging_key(session: &str, hash: &str) -> String {
-    format!("staging/{}/{}", session, hash)
+/// The staging key an upload for `hash` lands at under `warehouse`'s lift `session`. Never an
+/// `objects/` key: bytes here are unverified and unfetchable until promotion (invariant 1).
+fn staging_key(warehouse: &str, session: &str, hash: &str) -> String {
+    format!("staging/{}/{}/{}", warehouse, session, hash)
 }
 
 /// The prefix sweeping a whole session's staged uploads.
-fn staging_prefix(session: &str) -> String {
-    format!("staging/{}/", session)
+fn staging_prefix(warehouse: &str, session: &str) -> String {
+    format!("staging/{}/{}/", warehouse, session)
 }
 
-/// A parcel's signature-sidecar key. A distinct prefix so it never collides with the parcel
-/// object at `objects/{parcel_hash}`.
-fn signature_key(parcel_hash: &str) -> String {
-    format!("signatures/{}", parcel_hash)
+/// A staged upload's place, parsed back out of its key ([`parse_staging_key`]).
+#[derive(Debug, PartialEq, Eq)]
+pub struct StagedKey<'a> {
+    pub warehouse: &'a str,
+    pub session: &'a str,
+    pub hash: &'a str,
+}
+
+/// Parse a `staging/{warehouse}/{session}/{hash}` key into its parts: how the staging verifier
+/// Lambda, which is given only the key, learns which warehouse to promote into. `None` for any
+/// other shape, an AWS format 1 key `staging/{session}/{hash}` included, and for a warehouse
+/// segment that is not a valid warehouse id. The hash is not judged here; promotion hashes the
+/// bytes and refuses a mismatch.
+pub fn parse_staging_key(key: &str) -> Option<StagedKey<'_>> {
+    let mut segments = key.strip_prefix("staging/")?.split('/');
+    let (warehouse, session, hash) = (segments.next()?, segments.next()?, segments.next()?);
+
+    if segments.next().is_some() || session.is_empty() || hash.is_empty() {
+        return None;
+    }
+
+    warehouse_utils::validate_warehouse_id(warehouse).ok()?;
+
+    Some(StagedKey { warehouse, session, hash })
+}
+
+/// `warehouse`'s signature-sidecar key for a parcel. A distinct prefix so it never collides with
+/// the parcel object at the same hash.
+fn signature_key(warehouse: &str, parcel_hash: &str) -> String {
+    format!("signatures/{}/{}", warehouse, parcel_hash)
 }
 
 /// The ephemeral, content-addressed key of an offloaded response body. Outside `objects/`, so
@@ -216,7 +255,7 @@ fn percent_encode_copy_source_key(key: &str) -> String {
     out
 }
 
-/// The S3-backed [`ObjectStore`]: the byte plane of an AWS serverless head.
+/// The S3-backed [`ObjectStore`]: the byte plane of an AWS serverless head, for one warehouse.
 ///
 /// Every method is synchronous (the settled sync/async seam) and drives the async SDK through the
 /// [`AsyncBridge`]. It must be built inside a multi-thread runtime and its methods called
@@ -224,6 +263,7 @@ fn percent_encode_copy_source_key(key: &str) -> String {
 pub struct S3ObjectStore {
     client: S3Ops,
     bucket: String,
+    warehouse: String,
     bridge: AsyncBridge,
 }
 
@@ -322,10 +362,22 @@ fn head_object_outcome<T>(
 }
 
 impl S3ObjectStore {
-    /// Build the store over an S3 `client` addressing `bucket`, driving its async calls
-    /// through `bridge`. Capture the bridge on the runtime thread (see `aws::config`).
-    pub fn new(client: S3Ops, bucket: String, bridge: AsyncBridge) -> S3ObjectStore {
-        S3ObjectStore { client, bucket, bridge }
+    /// Build `warehouse`'s store over an S3 `client` addressing `bucket`, driving its async calls
+    /// through `bridge`. Capture the bridge on the runtime thread (see `aws::config`). Every key
+    /// it reads or writes but a response's names `warehouse`.
+    ///
+    /// # Errors
+    /// * `Err(String)` - `warehouse` is not a valid warehouse id, which could put its keys under
+    ///                   another warehouse's.
+    pub fn new(
+        client: S3Ops,
+        bucket: String,
+        warehouse: String,
+        bridge: AsyncBridge,
+    ) -> Result<S3ObjectStore, String> {
+        warehouse_utils::validate_warehouse_id(&warehouse)?;
+
+        Ok(S3ObjectStore { client, bucket, warehouse, bridge })
     }
 
     /// Whether a key exists (an S3 `HEAD`). A `404` is `Ok(false)`, not an error. See
@@ -412,7 +464,7 @@ impl S3ObjectStore {
     }
 
     /// Presign a `PUT` into the session's **staging** prefix, valid for [`PRESIGN_TTL`]. This
-    /// is the *only* presigned-`PUT` path in the store, and it hardcodes `staging/{session}/`:
+    /// is the *only* presigned-`PUT` path in the store, and it hardcodes `staging/{warehouse}/{session}/`:
     /// there is no way to hand a client a presigned `PUT` to a canonical hash key. That is the
     /// structural half of invariant 1.
     ///
@@ -426,7 +478,7 @@ impl S3ObjectStore {
             .client
             .put_object()
             .bucket(&self.bucket)
-            .key(staging_key(session, hash))
+            .key(staging_key(&self.warehouse, session, hash))
             .presigned(config)
             .await
             .map_err(|err| describe("S3 presign put_object", err))?;
@@ -501,7 +553,7 @@ impl S3ObjectStore {
 
 impl ObjectStore for S3ObjectStore {
     fn exists(&self, hash: &str) -> Result<bool, String> {
-        self.bridge.block_on(self.key_exists(&object_key(hash)))
+        self.bridge.block_on(self.key_exists(&object_key(&self.warehouse, hash)))
     }
 
     /// The bulk presence probe, run as a bounded-concurrency batch of `HeadObject`s rather than the
@@ -516,7 +568,7 @@ impl ObjectStore for S3ObjectStore {
         self.bridge.block_on(async {
             stream::iter(hashes.iter())
                 .map(|hash| async move {
-                    let present = self.key_exists(&object_key(hash)).await?;
+                    let present = self.key_exists(&object_key(&self.warehouse, hash)).await?;
 
                     Ok::<Option<String>, String>((!present).then(|| hash.clone()))
                 })
@@ -528,14 +580,14 @@ impl ObjectStore for S3ObjectStore {
     }
 
     /// The staging-key twin of [`objects_missing`](ObjectStore::objects_missing): the same bounded
-    /// batch of `HeadObject`s, against `staging/{session}/{hash}`, returning the hashes present.
+    /// batch of `HeadObject`s, against `staging/{warehouse}/{session}/{hash}`, returning the hashes present.
     fn objects_staged(&self, session: &str, hashes: &[String]) -> Result<Vec<String>, String> {
         use futures::stream::{self, StreamExt, TryStreamExt};
 
         self.bridge.block_on(async {
             stream::iter(hashes.iter())
                 .map(|hash| async move {
-                    let present = self.key_exists(&staging_key(session, hash)).await?;
+                    let present = self.key_exists(&staging_key(&self.warehouse, session, hash)).await?;
 
                     Ok::<Option<String>, String>(present.then(|| hash.clone()))
                 })
@@ -547,7 +599,7 @@ impl ObjectStore for S3ObjectStore {
     }
 
     fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, String> {
-        self.bridge.block_on(self.key_bytes(&object_key(hash)))
+        self.bridge.block_on(self.key_bytes(&object_key(&self.warehouse, hash)))
     }
 
     /// A bounded-concurrency batch of `GetObject`s, [`objects_missing`](ObjectStore::objects_missing)'s
@@ -558,7 +610,7 @@ impl ObjectStore for S3ObjectStore {
 
         self.bridge.block_on(async {
             stream::iter(hashes.iter())
-                .map(|hash| async move { self.key_bytes(&object_key(hash)).await })
+                .map(|hash| async move { self.key_bytes(&object_key(&self.warehouse, hash)).await })
                 .buffered(MISSING_PROBE_CONCURRENCY)
                 .collect()
                 .await
@@ -578,7 +630,7 @@ impl ObjectStore for S3ObjectStore {
         }
 
         self.bridge.block_on(async {
-            match self.put_if_absent(&object_key(hash), bytes.to_vec()).await? {
+            match self.put_if_absent(&object_key(&self.warehouse, hash), bytes.to_vec()).await? {
                 Conditional::Written => Ok(PutOutcome::Created),
                 Conditional::AlreadyExists => Ok(PutOutcome::AlreadyPresent),
             }
@@ -586,11 +638,11 @@ impl ObjectStore for S3ObjectStore {
     }
 
     fn get_signature(&self, parcel_hash: &str) -> Result<Option<Vec<u8>>, String> {
-        self.bridge.block_on(self.key_bytes(&signature_key(parcel_hash)))
+        self.bridge.block_on(self.key_bytes(&signature_key(&self.warehouse, parcel_hash)))
     }
 
     fn put_signature(&self, parcel_hash: &str, bytes: &[u8]) -> Result<SignatureOutcome, String> {
-        let key = signature_key(parcel_hash);
+        let key = signature_key(&self.warehouse, parcel_hash);
 
         self.bridge.block_on(async {
             match self.put_if_absent(&key, bytes.to_vec()).await? {
@@ -609,7 +661,7 @@ impl ObjectStore for S3ObjectStore {
     }
 
     fn access(&self, hash: &str) -> Result<Option<ObjectAccess>, String> {
-        let key = object_key(hash);
+        let key = object_key(&self.warehouse, hash);
 
         self.bridge.block_on(async {
             // Mirror the fake: absent is `None` (the head's `404`), present is a presigned GET.
@@ -639,8 +691,8 @@ impl ObjectStore for S3ObjectStore {
     }
 
     fn verify_and_promote(&self, session: &str, hash: &str) -> Result<PromoteOutcome, String> {
-        let canonical = object_key(hash);
-        let staged = staging_key(session, hash);
+        let canonical = object_key(&self.warehouse, hash);
+        let staged = staging_key(&self.warehouse, session, hash);
 
         self.bridge.block_on(async {
             for _ in 0..MAX_PROMOTE_ATTEMPTS {
@@ -762,7 +814,7 @@ impl ObjectStore for S3ObjectStore {
     }
 
     fn discard_session(&self, session: &str) -> Result<(), String> {
-        let prefix = staging_prefix(session);
+        let prefix = staging_prefix(&self.warehouse, session);
 
         self.bridge.block_on(async {
             let mut continuation: Option<String> = None;
@@ -825,13 +877,37 @@ mod tests {
     fn the_canonical_and_staging_prefixes_never_collide() {
         let hash = "a".repeat(64);
 
-        assert_eq!(object_key(&hash), format!("objects/{}", hash));
-        assert_eq!(staging_key("lift-1", &hash), format!("staging/lift-1/{}", hash));
+        assert_eq!(object_key("wh-a", &hash), format!("objects/wh-a/{}", hash));
+        assert_eq!(staging_key("wh-a", "lift-1", &hash), format!("staging/wh-a/lift-1/{}", hash));
 
         // The one property invariant 1 rests on at the key layout: a staged key is never the
         // canonical key, so bytes uploaded to it are not fetchable at the hash.
-        assert_ne!(object_key(&hash), staging_key("lift-1", &hash));
-        assert!(!staging_key("lift-1", &hash).starts_with("objects/"));
+        assert_ne!(object_key("wh-a", &hash), staging_key("wh-a", "lift-1", &hash));
+        assert!(!staging_key("wh-a", "lift-1", &hash).starts_with("objects/"));
+    }
+
+    /// Two warehouses on one bucket never share a key, and none of a warehouse's keys sits under
+    /// another's prefix: so one cannot read another's object or signature, or probe whether it
+    /// holds a hash. Separates from the AWS format 1 layout, where both warehouses read
+    /// `objects/{hash}`.
+    ///
+    /// Revert: drop the warehouse from any key → that key's assertion.
+    #[test]
+    fn two_warehouses_never_share_a_key() {
+        let hash = "f".repeat(64);
+        let (a, b) = ("wh", "wh-b");
+
+        assert_ne!(object_key(a, &hash), object_key(b, &hash), "objects");
+        assert_ne!(signature_key(a, &hash), signature_key(b, &hash), "signatures");
+        assert_ne!(staging_key(a, "s", &hash), staging_key(b, "s", &hash), "staging");
+
+        // "wh" is a prefix of "wh-b", which the separator after the warehouse keeps apart.
+        let a_objects = object_key(a, "");
+        assert!(!object_key(b, &hash).starts_with(&a_objects), "{}", a_objects);
+        assert!(!signature_key(b, &hash).starts_with(&signature_key(a, "")));
+        assert!(!staging_key(b, "s", &hash).starts_with(&staging_prefix(a, "s")));
+
+        assert_ne!(object_key(a, &hash), format!("objects/{}", hash), "the format 1 key");
     }
 
     #[test]
@@ -839,8 +915,8 @@ mod tests {
         let hash = "b".repeat(64);
 
         // A sidecar shares the parcel's hash but must not collide with the parcel object.
-        assert_eq!(signature_key(&hash), format!("signatures/{}", hash));
-        assert_ne!(signature_key(&hash), object_key(&hash));
+        assert_eq!(signature_key("wh-a", &hash), format!("signatures/wh-a/{}", hash));
+        assert_ne!(signature_key("wh-a", &hash), object_key("wh-a", &hash));
 
         // A response body is never reachable as an object at a hash key.
         assert_eq!(response_key(&hash), format!("responses/{}", hash));
@@ -849,12 +925,48 @@ mod tests {
 
     #[test]
     fn a_session_prefix_bounds_exactly_its_staged_keys() {
-        let prefix = staging_prefix("lift-7");
+        let prefix = staging_prefix("wh-a", "lift-7");
 
-        assert_eq!(prefix, "staging/lift-7/");
-        assert!(staging_key("lift-7", &"c".repeat(64)).starts_with(&prefix));
+        assert_eq!(prefix, "staging/wh-a/lift-7/");
+        assert!(staging_key("wh-a", "lift-7", &"c".repeat(64)).starts_with(&prefix));
         // The prefix of one session never captures another's keys.
-        assert!(!staging_key("lift-8", &"c".repeat(64)).starts_with(&prefix));
+        assert!(!staging_key("wh-a", "lift-8", &"c".repeat(64)).starts_with(&prefix));
+    }
+
+    /// The staging verifier reads back the warehouse, session and hash the head staged under,
+    /// so it promotes into the warehouse the upload belongs to.
+    ///
+    /// Revert: parse the segments in another order, or drop the warehouse segment → the
+    /// round trip.
+    #[test]
+    fn a_staging_key_parses_back_into_its_warehouse_session_and_hash() {
+        let hash = "9".repeat(64);
+        let key = staging_key("tenant-b", "lift-3", &hash);
+
+        let parsed = parse_staging_key(&key).expect("a staging key parses");
+        assert_eq!(parsed, StagedKey { warehouse: "tenant-b", session: "lift-3", hash: &hash });
+    }
+
+    /// Every key that is not a well-formed staging key is refused, the AWS format 1 shape
+    /// `staging/{session}/{hash}` first among them: read as the new shape it would name the
+    /// session as a warehouse.
+    #[test]
+    fn a_key_that_is_not_a_staging_key_is_refused() {
+        let hash = "9".repeat(64);
+
+        for key in [
+            format!("staging/lift-1/{}", hash),
+            format!("objects/wh/{}", hash),
+            "staging/wh/lift-1".to_string(),
+            format!("staging//lift-1/{}", hash),
+            format!("staging/wh//{}", hash),
+            "staging/wh/lift-1/".to_string(),
+            format!("staging/wh/lift-1/{}/x", hash),
+            format!("staging/-wh/lift-1/{}", hash),
+            format!("staging/Wh/lift-1/{}", hash),
+        ] {
+            assert_eq!(parse_staging_key(&key), None, "{}", key);
+        }
     }
 
     #[test]
@@ -891,7 +1003,7 @@ mod tests {
 
     #[test]
     fn copy_source_keys_are_percent_encoded_but_keep_literal_slashes() {
-        let key = staging_key("lift 1", &"d".repeat(64)); // a space: needs encoding
+        let key = staging_key("wh", "lift 1", &"d".repeat(64)); // a space: needs encoding
         let encoded = percent_encode_copy_source_key(&key);
 
         assert!(encoded.contains("%20"), "{}", encoded);
@@ -899,7 +1011,7 @@ mod tests {
 
         // Already-safe characters (hex hashes, the fixed prefixes) round-trip unchanged.
         let hash = "e".repeat(64);
-        assert_eq!(percent_encode_copy_source_key(&object_key(&hash)), object_key(&hash));
+        assert_eq!(percent_encode_copy_source_key(&object_key("wh", &hash)), object_key("wh", &hash));
     }
 
     /// The soundness property the whole streaming fix rests on: hashing a body in chunks

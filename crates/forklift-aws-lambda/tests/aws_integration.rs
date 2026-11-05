@@ -36,6 +36,7 @@ use http::{Request, Response};
 use forklift_aws_lambda::aws::dynamo::list_warehouses;
 use forklift_aws_lambda::format::{self, UpgradeOptions, AWS_FORMAT};
 use forklift_aws_lambda::reissue::request_token;
+use forklift_aws_lambda::aws::s3::parse_staging_key;
 use forklift_aws_lambda::aws::{build_clients, build_stores, AwsConfig, DynamoOps, S3Ops};
 use forklift_aws_lambda::store::{
     ExpectedHead, RefHead,
@@ -212,6 +213,7 @@ async fn s3_object_store_upholds_the_object_contract() {
 
     let bridge = AsyncBridge::current().expect("a multi-thread runtime");
     let (objects, _refs) = build_stores(&config, bridge).await.expect("build stores");
+    let warehouse = config.warehouse_id.clone();
 
     tokio::task::spawn_blocking(move || {
         let bytes = b"a real object".to_vec();
@@ -238,7 +240,7 @@ async fn s3_object_store_upholds_the_object_contract() {
         // A present object reads back as a presigned GET redirect.
         match objects.access(&hash).expect("access") {
             Some(ObjectAccess::Redirect(url)) => {
-                assert!(url.contains(&format!("objects/{}", hash)), "{}", url)
+                assert!(url.contains(&format!("objects/{}/{}", warehouse, hash)), "{}", url)
             }
             other => panic!("expected a redirect, got {:?}", other.is_some()),
         }
@@ -250,7 +252,7 @@ async fn s3_object_store_upholds_the_object_contract() {
         let staged_hash = object_utils::hash_object_bytes(b"staged object");
         match objects.put_target(Some("lift-1"), &staged_hash).expect("target") {
             PutTarget::Staged(url) => {
-                assert!(url.contains(&format!("staging/lift-1/{}", staged_hash)), "{}", url);
+                assert!(url.contains(&format!("staging/{}/lift-1/{}", warehouse, staged_hash)), "{}", url);
                 assert!(!url.contains("/objects/"), "an upload must never target the hash key");
             }
             _ => panic!("expected a staged target"),
@@ -267,6 +269,71 @@ async fn s3_object_store_upholds_the_object_contract() {
         );
 
         objects
+    })
+    .await
+    .expect("the blocking assertions");
+}
+
+/// Two warehouses on one bucket keep apart over real S3 (memo F14, the presence oracle): an
+/// object, a signature or a staged upload one holds is not fetchable through the other, and the
+/// other's presence probes answer absent for it. Separates the per-warehouse layout from the
+/// shared one, where every warehouse read `objects/{hash}`; the positive half shows the probes
+/// engaged on the warehouse that holds them.
+///
+/// Revert: key objects, signatures or staging without the warehouse → `b` sees `a`'s copy.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_warehouses_on_one_bucket_never_see_each_others_objects() {
+    let Some(endpoint) = endpoint() else {
+        eprintln!("skipping: FORKLIFT_AWS_TEST_ENDPOINT is unset");
+        return;
+    };
+
+    let config = test_config(&endpoint);
+    provision(&config).await;
+
+    let (raw_s3, _dynamodb) = raw_clients(&config).await;
+    let (s3, _dynamodb) = build_clients(&config).await.expect("clients");
+    let bridge = AsyncBridge::current().expect("a multi-thread runtime");
+    let store = |warehouse: &str| {
+        S3ObjectStore::new(s3.clone(), config.bucket.clone(), warehouse.to_string(), bridge.clone())
+            .expect("a store")
+    };
+    let (a, b) = (store(&config.warehouse_id), store(&unique("other")));
+
+    let bytes = b"only warehouse a holds this".to_vec();
+    let hash = object_utils::hash_object_bytes(&bytes);
+    let staged = b"warehouse a staged this".to_vec();
+    let staged_hash = object_utils::hash_object_bytes(&staged);
+
+    // Staged under `a`'s session, as `a`'s presigned PUT would.
+    let key = format!("staging/{}/lift-1/{}", config.warehouse_id, staged_hash);
+    raw_s3.put_object().bucket(&config.bucket).key(key).body(staged.into()).send().await.expect("stage");
+
+    tokio::task::spawn_blocking(move || {
+        assert_eq!(a.put_verified(&hash, &bytes).expect("put"), PutOutcome::Created);
+        assert_eq!(a.put_signature(&hash, b"a sidecar").expect("sign"), SignatureOutcome::Created);
+
+        // `b` cannot fetch it, and its probes answer absent.
+        assert!(!b.exists(&hash).expect("b exists"));
+        assert!(b.get(&hash).expect("b get").is_none());
+        assert!(b.access(&hash).expect("b access").is_none());
+        assert_eq!(b.objects_missing(std::slice::from_ref(&hash)).expect("b missing"), vec![hash.clone()]);
+        assert!(b.get_signature(&hash).expect("b signature").is_none());
+        assert!(b.objects_staged("lift-1", std::slice::from_ref(&staged_hash)).expect("b staged").is_empty());
+        assert_eq!(b.verify_and_promote("lift-1", &staged_hash).expect("b promote"), PromoteOutcome::Missing);
+        assert!(!b.exists(&staged_hash).expect("b never promoted it"));
+
+        // `b` writing the same bytes makes its own copy, and is not told `a` had them.
+        assert_eq!(b.put_verified(&hash, &bytes).expect("b put"), PutOutcome::Created);
+
+        // `a` sees all of its own.
+        assert!(a.exists(&hash).expect("a exists"));
+        assert!(a.objects_missing(std::slice::from_ref(&hash)).expect("a missing").is_empty());
+        assert_eq!(a.get_signature(&hash).expect("a signature").as_deref(), Some(&b"a sidecar"[..]));
+        assert_eq!(a.objects_staged("lift-1", std::slice::from_ref(&staged_hash)).expect("a staged"),
+            vec![staged_hash.clone()]);
+        assert_eq!(a.verify_and_promote("lift-1", &staged_hash).expect("a promote"), PromoteOutcome::Promoted);
+        assert!(a.exists(&staged_hash).expect("a promoted it"));
     })
     .await
     .expect("the blocking assertions");
@@ -307,8 +374,9 @@ async fn s3_verify_and_promote_gates_the_canonical_namespace() {
                 .expect("stage bytes");
         }
     };
-    stage(format!("staging/lift-1/{}", good_hash), good.clone()).await;
-    stage(format!("staging/lift-1/{}", corrupt_hash), b"tampered".to_vec()).await;
+    let staging = format!("staging/{}/lift-1", config.warehouse_id);
+    stage(format!("{}/{}", staging, good_hash), good.clone()).await;
+    stage(format!("{}/{}", staging, corrupt_hash), b"tampered".to_vec()).await;
 
     tokio::task::spawn_blocking(move || {
         // Neither is fetchable while merely staged.
@@ -427,8 +495,9 @@ async fn s3_verify_and_promote_streams_large_staged_objects() {
                 .expect("stage bytes");
         }
     };
-    stage(format!("staging/lift-big/{}", good_hash), good.clone()).await;
-    stage(format!("staging/lift-big/{}", declared_hash), wrong_content).await;
+    let staging = format!("staging/{}/lift-big", config.warehouse_id);
+    stage(format!("{}/{}", staging, good_hash), good.clone()).await;
+    stage(format!("{}/{}", staging, declared_hash), wrong_content).await;
 
     tokio::task::spawn_blocking(move || {
         // The corrupt large object is discarded, never promoted, over the streaming path.
@@ -1358,7 +1427,7 @@ async fn a_head_untrusted_lift_commits_over_s3_and_dynamodb() {
         assert_eq!(head.missing(&all).expect("missing").len(), all.len());
 
         // Seed the canonical namespace directly: `put_verified` hash-checks each object into
-        // `objects/{hash}` on S3, and each sidecar into `signatures/{hash}`.
+        // `objects/{warehouse}/{hash}` on S3, and each sidecar into `signatures/{warehouse}/{hash}`.
         for (hash, bytes) in &harvest.objects {
             head.objects.put_verified(hash, bytes).expect("seed object");
         }
@@ -1417,7 +1486,8 @@ async fn edge(
             // default.
             &AuthConfig::Open,
             move |warehouse_id| {
-                let objects = S3ObjectStore::new(s3, config.bucket.clone(), bridge.clone());
+                let objects =
+                    S3ObjectStore::new(s3, config.bucket.clone(), warehouse_id.to_string(), bridge.clone())?;
                 let refs = DynamoRefStore::new(
                     dynamodb,
                     config.table.clone(),
@@ -1486,7 +1556,8 @@ async fn the_http_edge_drives_a_staged_lift_over_s3_and_dynamodb_following_307s(
     .await;
     assert_eq!(response.status().as_u16(), 307, "a staging head redirects the upload");
     let staging_url = location(&response);
-    assert!(staging_url.contains(&format!("staging/lift-edge/{}", staged_hash)), "{}", staging_url);
+    let staging = format!("staging/{}/lift-edge/{}", config.warehouse_id, staged_hash);
+    assert!(staging_url.contains(&staging), "{}", staging_url);
     assert!(!staging_url.contains("/objects/"), "an upload never targets the hash key");
 
     // 2. Follow the redirect by hand: `PUT` the real bytes straight to storage.
@@ -1520,7 +1591,9 @@ async fn the_http_edge_drives_a_staged_lift_over_s3_and_dynamodb_following_307s(
 
     // Seed the rest of the closure straight into the canonical namespace.
     {
-        let objects = S3ObjectStore::new(s3.clone(), config.bucket.clone(), bridge.clone());
+        let objects =
+            S3ObjectStore::new(s3.clone(), config.bucket.clone(), config.warehouse_id.clone(), bridge.clone())
+                .unwrap();
         let harvest_objects = harvest.objects.clone();
         let harvest_signatures = harvest.signatures.clone();
         let staged = staged_hash.clone();
@@ -1570,7 +1643,8 @@ async fn the_http_edge_drives_a_staged_lift_over_s3_and_dynamodb_following_307s(
     .await;
     assert_eq!(response.status().as_u16(), 307, "a present object reads back as a redirect");
     let canonical_url = location(&response);
-    assert!(canonical_url.contains(&format!("objects/{}", staged_hash)), "{}", canonical_url);
+    let canonical = format!("objects/{}/{}", config.warehouse_id, staged_hash);
+    assert!(canonical_url.contains(&canonical), "{}", canonical_url);
     let fetched = client.get(&canonical_url).send().await.expect("presigned GET");
     assert!(fetched.status().is_success(), "the presigned GET failed: {}", fetched.status());
     #[allow(clippy::disallowed_methods)] // a test reading its own fixture object back
@@ -1842,7 +1916,8 @@ async fn shim_handler(
             &routing,
             &AuthConfig::Open,
             move |warehouse_id| {
-                let objects = S3ObjectStore::new(s3, config.bucket.clone(), bridge.clone());
+                let objects =
+                    S3ObjectStore::new(s3, config.bucket.clone(), warehouse_id.to_string(), bridge.clone())?;
                 let refs = DynamoRefStore::new(
                     dynamodb,
                     config.table.clone(),
@@ -1878,20 +1953,18 @@ async fn run_staging_verifier(raw_s3: aws_sdk_s3::Client, s3_ops: S3Ops, config:
             for object in listed.contents() {
                 let Some(key) = object.key() else { continue };
 
-                // key == "staging/{session}/{hash}"
-                let parts: Vec<&str> = key.splitn(3, '/').collect();
-                if parts.len() != 3 || parts[0] != "staging" {
-                    continue;
-                }
+                // The same parse the verifier Lambda runs, so it promotes into the key's warehouse.
+                let Some(staged) = parse_staging_key(key) else { continue };
 
-                let session = parts[1].to_string();
-                let hash = parts[2].to_string();
+                let warehouse = staged.warehouse.to_string();
+                let session = staged.session.to_string();
+                let hash = staged.hash.to_string();
                 let s3_ops = s3_ops.clone();
                 let bucket = config.bucket.clone();
                 let bridge = bridge.clone();
 
                 let _ = tokio::task::spawn_blocking(move || {
-                    let objects = S3ObjectStore::new(s3_ops, bucket, bridge);
+                    let objects = S3ObjectStore::new(s3_ops, bucket, warehouse, bridge).unwrap();
                     let _ = objects.verify_and_promote(&session, &hash);
                 })
                 .await;
@@ -2093,28 +2166,40 @@ async fn chunk_object_get(objects: S3ObjectStore, hash: &str) -> (S3ObjectStore,
     .expect("blocking get")
 }
 
-/// Stage bytes straight to `staging/{session}/{hash}` via the real client — the same shortcut
+/// Stage bytes straight to `staging/{warehouse}/{session}/{hash}` via the real client — the same shortcut
 /// `s3_verify_and_promote_gates_the_canonical_namespace` takes above, standing in for a client's
 /// presigned staging `PUT` (proven end to end, for a chunk specifically, by
 /// `a_chunked_files_chunks_stage_and_promote_over_real_s3` below).
-async fn chunk_stage_raw(s3: &aws_sdk_s3::Client, bucket: &str, session: &str, hash: &str, bytes: Vec<u8>) {
+async fn chunk_stage_raw(
+    s3: &aws_sdk_s3::Client,
+    bucket: &str,
+    warehouse: &str,
+    session: &str,
+    hash: &str,
+    bytes: Vec<u8>,
+) {
     s3.put_object()
         .bucket(bucket)
-        .key(format!("staging/{}/{}", session, hash))
+        .key(format!("staging/{}/{}/{}", warehouse, session, hash))
         .body(bytes.into())
         .send()
         .await
         .expect("stage bytes");
 }
 
-/// List every key currently under `session`'s staging prefix in real S3 — the ground truth this
+/// List every key currently under `warehouse`'s `session`'s staging prefix in real S3 — the ground truth this
 /// suite's in-memory-fake counterpart (`protocol.rs`'s `MemoryObjectStore::staged_count`) has no
 /// equivalent for, and the direct proof a sweep did or did not run.
-async fn chunk_list_staging_keys(s3: &aws_sdk_s3::Client, bucket: &str, session: &str) -> Vec<String> {
+async fn chunk_list_staging_keys(
+    s3: &aws_sdk_s3::Client,
+    bucket: &str,
+    warehouse: &str,
+    session: &str,
+) -> Vec<String> {
     let listed = s3
         .list_objects_v2()
         .bucket(bucket)
-        .prefix(format!("staging/{}/", session))
+        .prefix(format!("staging/{}/{}/", warehouse, session))
         .send()
         .await
         .expect("list staging keys");
@@ -2145,7 +2230,7 @@ async fn chunk_commit_lift(
 }
 
 /// PROOF 1 — a chunked file's lift, chunk by chunk, over real S3: each chunk stages via its own
-/// presigned `PUT` (the same `put_target`/`staging/{session}/{hash}` scheme as any other object —
+/// presigned `PUT` (the same `put_target`/`staging/{warehouse}/{session}/{hash}` scheme as any other object —
 /// a chunk is not a special case anywhere on the wire, see `head.rs::commit_lift`'s doc comment),
 /// and lands canonical only once `verify_and_promote` runs on the staged key.
 ///
@@ -2267,7 +2352,7 @@ async fn a_multi_batch_commit_lift_does_not_sweep_staging_until_the_final_batch_
     // itself is proven end to end above; this test is about the sweep, not the upload).
     for hash in [&first_chunk, &second_chunk, &straggler] {
         let bytes = harvest.objects[hash].clone();
-        chunk_stage_raw(&s3, &bucket, session, hash, bytes).await;
+        chunk_stage_raw(&s3, &bucket, &config.warehouse_id, session, hash, bytes).await;
     }
 
     // The background staging verifier has caught up on batch 1's chunk only.
@@ -2279,7 +2364,7 @@ async fn a_multi_batch_commit_lift_does_not_sweep_staging_until_the_final_batch_
         chunk_commit_lift(objects, refs, session, vec![], vec![first_chunk.clone()], true).await;
     result.expect("the intermediate batch commits");
 
-    let staged = chunk_list_staging_keys(&s3, &bucket, session).await;
+    let staged = chunk_list_staging_keys(&s3, &bucket, &config.warehouse_id, session).await;
     assert!(
         staged.iter().any(|key| key.ends_with(&second_chunk)),
         "batch 2's staged chunk must survive an intermediate (more) batch: {:?}",
@@ -2301,7 +2386,7 @@ async fn a_multi_batch_commit_lift_does_not_sweep_staging_until_the_final_batch_
         chunk_commit_lift(objects, refs, session, vec![], vec![second_chunk.clone()], false).await;
     result.expect("the final batch commits");
 
-    let staged_after = chunk_list_staging_keys(&s3, &bucket, session).await;
+    let staged_after = chunk_list_staging_keys(&s3, &bucket, &config.warehouse_id, session).await;
     assert!(
         staged_after.is_empty(),
         "the final (more: false) batch sweeps the whole session, straggler included: {:?}",

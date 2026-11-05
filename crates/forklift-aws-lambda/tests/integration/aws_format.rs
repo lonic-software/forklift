@@ -78,10 +78,15 @@ fn this_build_serves_the_frozen_items() {
     assert_eq!(TrustAnchorDto::from(&anchor).genesis, hash('4'));
 }
 
-/// Every older AWS format's fixture upgrades through this build's chain and is then served. Format
-/// 1 is the first, so there is none yet.
+/// Every older AWS format's fixture the chain reaches upgrades through it and is then served; one
+/// below the chain's floor is refused by both, loudly, and left as it was. Format 1 shared its
+/// object keys between warehouses, so nothing reaches it.
+///
+/// Revert: let the gate serve format 1, or the upgrade stamp it → red.
 #[test]
 fn older_aws_fixtures_upgrade_and_are_served() {
+    let options = UpgradeOptions { owner: "fixture".to_string(), takeover: false, wait: Duration::ZERO };
+
     for (format, path) in fixture_formats() {
         assert!(format <= AWS_FORMAT, "a fixture of AWS format {} is newer than this build's {}", format, AWS_FORMAT);
         if format == AWS_FORMAT {
@@ -89,14 +94,24 @@ fn older_aws_fixtures_upgrade_and_are_served() {
         }
 
         let refs = MemoryRefStore::from_items(&read_items(&path)).unwrap();
-        let options = UpgradeOptions { owner: "fixture".to_string(), takeover: false, wait: Duration::ZERO };
+        if format < CHAIN.floor() {
+            let refusal = gate(&refs).unwrap_err();
+            assert!(refusal.message.contains("make it again under a new id"), "AWS format {}: {}", format, refusal.message);
+            let error = upgrade(&refs, &CHAIN, "fixture", &options).unwrap_err();
+            assert!(error.contains("Make it again under a new id"), "AWS format {}: {}", format, error);
+            assert_eq!(refs.read_format().unwrap(), Some(format.to_string()), "AWS format {}", format);
+            continue;
+        }
+
         upgrade(&refs, &CHAIN, "fixture", &options).unwrap_or_else(|e| panic!("AWS format {}: {}", format, e));
         assert_eq!(gate(&refs).unwrap(), FormatFence::At(AWS_FORMAT.to_string()), "AWS format {}", format);
     }
+
+    assert!(fixture_formats().contains_key(&1), "the format 1 fixture is what proves it is refused");
 }
 
 /// Make the current AWS format's fixture. Run it once per format, after a bump:
-/// `cargo test -p forklift-aws-lambda --test aws_format -- --ignored freeze`. It refuses a format
+/// `cargo test -p forklift-aws-lambda --test integration -- --ignored freeze`. It refuses a format
 /// that already has one, since it never changes.
 #[test]
 #[ignore]

@@ -171,7 +171,7 @@ async fn load_shared_config(config: &AwsConfig) -> aws_config::SdkConfig {
 ///
 /// # Returns
 /// * `Ok((objects, refs))` - The byte plane and the consistency point, ready for a [`Head`].
-/// * `Err(String)`         - If the clients could not be built.
+/// * `Err(String)`         - If the clients could not be built, or the warehouse id is not one.
 ///
 /// [`Head`]: crate::Head
 pub async fn build_stores(
@@ -180,7 +180,8 @@ pub async fn build_stores(
 ) -> Result<(S3ObjectStore, DynamoRefStore), String> {
     let (s3, dynamodb) = build_clients(config).await?;
 
-    let objects = S3ObjectStore::new(s3, config.bucket.clone(), bridge.clone());
+    let objects =
+        S3ObjectStore::new(s3, config.bucket.clone(), config.warehouse_id.clone(), bridge.clone())?;
     let refs = DynamoRefStore::new(
         dynamodb,
         config.table.clone(),

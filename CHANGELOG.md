@@ -12,6 +12,11 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Changed
 
+- **The AWS head keeps each warehouse's objects apart.** Objects, signatures and staged uploads are
+  stored under the warehouse's own keys in the bucket, so one warehouse can no longer learn whether
+  another holds an object. This is AWS format 2: a warehouse made by an earlier build is refused
+  with a message saying to make it again under a new id, and `forklift-aws-upgrade` refuses it the
+  same way.
 - **`git export` says what it leaves behind.** With a remote configured, it asks the remote for its
   pallets and warns about each one it has no branch for as it stands there, naming the `lower` that
   brings it here, and about tags the remote has and this warehouse does not; leaving from a fresh

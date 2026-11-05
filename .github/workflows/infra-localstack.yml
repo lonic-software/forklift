@@ -119,7 +119,7 @@ jobs:
             -var name_prefix="forklift-l2-${{ github.run_id }}"
 
       # The point of Layer 2: stage an object under staging/ exactly as a client's presigned
-      # PUT would, then poll objects/ until the S3 event has fired the verifier and it has
+      # PUT would, in warehouse "ci", then poll objects/ci/ until the S3 event has fired the verifier and it has
       # cold-started and promoted the object. A plan-only Layer 1 assert cannot reach either
       # half of this claim.
       - name: Exercise — stage an object, poll for promotion
@@ -139,12 +139,12 @@ jobs:
           echo "staging object $hash"
 
           aws --endpoint-url "$LOCALSTACK_ENDPOINT" s3api put-object \
-            --bucket "$BUCKET" --key "staging/ci-session/$hash" --body /tmp/l2_object.txt
+            --bucket "$BUCKET" --key "staging/ci/ci-session/$hash" --body /tmp/l2_object.txt
 
           promoted=0
           for _ in $(seq 1 30); do
             if aws --endpoint-url "$LOCALSTACK_ENDPOINT" s3api head-object \
-              --bucket "$BUCKET" --key "objects/$hash" > /dev/null 2>&1; then
+              --bucket "$BUCKET" --key "objects/ci/$hash" > /dev/null 2>&1; then
               promoted=1
               break
             fi
@@ -152,12 +152,12 @@ jobs:
           done
 
           if [ "$promoted" != "1" ]; then
-            echo "the staged object was never promoted to objects/$hash" >&2
+            echo "the staged object was never promoted to objects/ci/$hash" >&2
             exit 1
           fi
 
           aws --endpoint-url "$LOCALSTACK_ENDPOINT" s3api get-object \
-            --bucket "$BUCKET" --key "objects/$hash" /tmp/l2_object_fetched.txt > /dev/null
+            --bucket "$BUCKET" --key "objects/ci/$hash" /tmp/l2_object_fetched.txt > /dev/null
           diff /tmp/l2_object.txt /tmp/l2_object_fetched.txt
 
       - name: tofu destroy

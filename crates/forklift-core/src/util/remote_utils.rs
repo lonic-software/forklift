@@ -305,7 +305,7 @@ fn endpoint_absent(status: reqwest::StatusCode) -> bool {
 
 /// A fresh client-side lift session id — a random v4 UUID (the same in-tree generator that
 /// mints pseudonymous operator ids, so no new dependency). It scopes one pallet lift's staging
-/// keys (`staging/{session}/{hash}`) on a storage-backed head and is a safe single path
+/// keys (`staging/{warehouse}/{session}/{hash}`) on a storage-backed head and is a safe single path
 /// component; a direct head ignores it.
 fn new_lift_session() -> String {
     config_utils::mint_uuid_v4()
@@ -8933,7 +8933,7 @@ mod tests {
     }
 
     /// A lift session id is a distinct, hyphenated uuid-shaped string — a safe single path
-    /// component for a `staging/{session}/{hash}` key.
+    /// component for a `staging/{warehouse}/{session}/{hash}` key.
     #[test]
     fn lift_session_ids_are_unique_and_path_safe() {
         let one = new_lift_session();

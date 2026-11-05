@@ -45,8 +45,12 @@ impl Context {
         warehouse_id: &str,
         deadline: SystemTime,
     ) -> Result<Head<S3ObjectStore, DynamoRefStore>, String> {
-        let objects =
-            S3ObjectStore::new(self.s3.clone(), self.config.bucket.clone(), self.bridge.clone());
+        let objects = S3ObjectStore::new(
+            self.s3.clone(),
+            self.config.bucket.clone(),
+            warehouse_id.to_string(),
+            self.bridge.clone(),
+        )?;
         let refs = DynamoRefStore::new(
             self.dynamodb.clone(),
             self.config.table.clone(),

@@ -1800,7 +1800,7 @@ impl RefStore for MarkedMidRequest {
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.0.set_format(Some("1>2 operator 0"));
+        self.0.set_format(Some("2>3 operator 0"));
         self.0.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
     }
     fn delete_head(
@@ -1865,12 +1865,12 @@ fn every_request_is_gated_on_the_warehouse_format() {
     }
     let lift = RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None };
     assert_eq!(status(&fixture.call(post_json("/v1/pallets/main", &lift))), 200);
-    assert_eq!(fixture.refs.read_format().unwrap().as_deref(), Some("1"), "the first write stamps the format");
+    assert_eq!(fixture.refs.read_format().unwrap().as_deref(), Some("2"), "the first write stamps the format");
 
     for (state, says) in [
-        (Some("1>2 operator 0"), "being upgraded from format 1 to format 2"),
-        (Some("2"), "newer than format 1"),
-        (Some("0"), "older than format 1"),
+        (Some("2>3 operator 0"), "being upgraded from format 2 to format 3"),
+        (Some("3"), "newer than format 2"),
+        (Some("1"), "make it again under a new id"),
         (None, "records no format"),
     ] {
         fixture.refs.set_format(state);
@@ -1883,7 +1883,7 @@ fn every_request_is_gated_on_the_warehouse_format() {
         }
     }
 
-    fixture.refs.set_format(Some("1"));
+    fixture.refs.set_format(Some("2"));
     assert_eq!(fixture.refs.get_head(PalletNamespace::User, "feature").unwrap(), RefHead::Absent);
 
     let refs = fixture.refs.clone();
@@ -1899,5 +1899,5 @@ fn every_request_is_gated_on_the_warehouse_format() {
     let body: serde_json::Value = body_json(&response);
     assert!(body["error"].as_str().unwrap().contains("being upgraded"), "{}", body);
     assert_eq!(fixture.refs.get_head(PalletNamespace::User, "feature").unwrap(), RefHead::Absent);
-    assert_eq!(fixture.refs.read_format().unwrap().as_deref(), Some("1>2 operator 0"), "the mark stands");
+    assert_eq!(fixture.refs.read_format().unwrap().as_deref(), Some("2>3 operator 0"), "the mark stands");
 }

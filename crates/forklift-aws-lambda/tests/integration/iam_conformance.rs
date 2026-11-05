@@ -1236,7 +1236,7 @@ fn each_policy_grants_unconditional_list_bucket_on_the_bucket_per_file() {
     assert!(
         has_unconditional_list_bucket_on_bucket(VERIFIER_POLICY),
         "verifier.policy.json must grant an unconditional s3:ListBucket on ${{bucket_arn}} — \
-         verify_and_promote's key_exists HeadObject on the canonical objects/{{hash}} key needs \
+         verify_and_promote's key_exists HeadObject on the canonical objects/{{warehouse}}/{{hash}} key needs \
          it too (that key is absent by definition for a genuinely new object). This exact grant \
          was silently absent before this PR, and the union-based test alone never caught it."
     );

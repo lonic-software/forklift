@@ -111,7 +111,8 @@ unless the state is exactly the format the deployment reads:
 | The deployment's format | is served | Nothing to do. |
 | Absent, and nothing stored in the warehouse | is served; its first write records the format | Nothing to do. |
 | Absent, with data stored | is refused | Make the warehouse again under a new id. |
-| Older | is refused | The operator runs `forklift-aws-upgrade`. |
+| Older, and the chain reaches it | is refused | The operator runs `forklift-aws-upgrade`. |
+| Older than the chain reaches | is refused | Make the warehouse again under a new id. |
 | Newer | is refused | Update the deployment. |
 | An upgrade | is refused | Wait for the upgrade, or have the operator run it again. |
 | Anything else | is refused | Nothing to guess at: the state was not written by Forklift. |
@@ -135,12 +136,19 @@ Lambda, and takes warehouse ids or `--all`:
 A state left by another run is refused unless the operator passes `--takeover` with that warehouse's id,
 after making sure that run has stopped. Takeover puts a new owner in the state, waits again (the run it
 takes over may have stopped before its wait was out), and resumes at the first step not done, so steps
-must be idempotent. A warehouse that fails is reported and the others are still upgraded. Steps change only the warehouse's own DynamoDB partition: the bucket's
-`objects/` and `signatures/` keys are shared by every warehouse and named by their content, and
-`staging/` and `responses/` are transient. An S3 layout change has no in-place path.
+must be idempotent. A warehouse that fails is reported and the others are still upgraded. Steps change
+the warehouse's own DynamoDB partition and its own keys in the bucket.
+
+Since AWS format 2 every warehouse has its own keys in the bucket: `objects/{warehouse}/{hash}`,
+`signatures/{warehouse}/{parcel_hash}` and `staging/{warehouse}/{session}/{hash}`. Only `responses/`,
+which holds transient bundle bodies reached through a presigned URL, is shared. AWS format 1 kept one
+`objects/{hash}` and one `signatures/{hash}` key per object for every warehouse in the bucket, so a
+warehouse could learn from the answers whether another one held an object. No step can tell whose a
+shared key was, so the chain does not reach format 1: a format 1 warehouse is refused, never read
+against the new keys, and is made again under a new id.
 
 A format break on a deployment refuses every warehouse until each is upgraded. The AWS head's chain is
-empty as well: format 1 is its first format.
+empty: it reads format 2 and upgrades no older format.
 
 ## What a format break ships
 
@@ -276,5 +284,6 @@ The AWS head's items are frozen the same way, against `AWS_FORMAT`:
 holding a live pallet, a deleted one, the office pallet and a trust anchor is written as, on the
 memory store. The current build must write exactly those items and serve them back, and the LocalStack
 suite writes the same warehouse through DynamoDB and requires the very same items there, so the fixture
-holds what DynamoDB stores rather than only the memory store's mapping. Every older AWS format's items
-must upgrade through the chain and then be served.
+holds what DynamoDB stores rather than only the memory store's mapping. An older AWS format's items must
+upgrade through the chain and then be served when the chain reaches that format, and must be refused
+by both the gate and the upgrade, and left as they were, when it does not.
