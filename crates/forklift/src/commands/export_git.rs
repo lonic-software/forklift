@@ -12,12 +12,13 @@ use forklift_core::util::{file_utils, object_utils, office_utils, pallet_utils};
 use crate::output::{self, CommandOutput};
 
 /// The export layout version: the `export/<N>` every exported commit's parcel line and every
-/// exported tag's signer line names. It covers every rule that fixes an exported object's bytes:
-/// the message shape and its parcel line, the identity mapping, the date form (pre-1970 written as
-/// the epoch), the parent rule, the type-to-mode map, chunked-blob assembly, filter-free hashing
-/// and the tag object's shape. Two builds on one layout write identical objects for the same
-/// parcel, so a change to any of those rules bumps it (the golden tip-hash and tag-object tests
-/// fail until it does).
+/// exported tag's last line (signer or unsigned) names. It covers every rule that fixes an exported
+/// object's bytes: the message shape and its parcel line, the identity mapping, the date form
+/// (pre-1970 written as the epoch), the parent rule, the type-to-mode map, chunked-blob assembly,
+/// filter-free hashing and the tag object's shape. Two builds on one layout write identical objects
+/// for the same parcel or tag, so a change to any of those rules bumps it (the golden tip-hash and
+/// tag-object tests fail until it does). Layout 1 holds both tag-line forms: the unsigned one was
+/// added before any build exported an unsigned tag, so no object written earlier changed.
 pub(crate) const EXPORT_LAYOUT: u32 = 1;
 
 /// Handle the git export command (§7.8): one-way export of this warehouse's history into a
@@ -128,6 +129,16 @@ struct TagExport {
     unreadable: Option<String>,
 }
 
+/// A tag the export can write, with the commit it goes over, its tagger, its signer key (`None` for
+/// an unsigned tag) and its git ref.
+struct WritableTag<'a> {
+    attributed: &'a AttributedTag,
+    commit: &'a str,
+    tagger: &'a str,
+    signer: Option<&'a str>,
+    refname: String,
+}
+
 /// Write every tag at the local `@tags` head whose subject this export wrote as an annotated git
 /// tag, and name every other one with the reason it was left out. A tag never brings history of
 /// its own: one on a parcel no exported branch holds is left out, not exported with that parcel.
@@ -142,11 +153,6 @@ struct TagExport {
 fn export_tags(repo: &GitRepo, exporter: &Exporter) -> Result<TagExport, String> {
     let mut export = TagExport { exported: Vec::new(), skipped: Vec::new(), unreadable: None };
 
-    // A signed tag's tagger is the operator the office binds the signer key to, a binding that
-    // never changes (a retired key stays in the office). Read strictly, so a machine whose office
-    // cannot be read or lacks the key leaves the tag out instead of writing a different tagger, and
-    // a different tag object, than every other machine. An unsigned tag's tagger is the operator it
-    // declares, which needs no office.
     let read = match tag_utils::read_tags() {
         Ok(read) => read,
         Err(why) => {
@@ -161,12 +167,16 @@ fn export_tags(repo: &GitRepo, exporter: &Exporter) -> Result<TagExport, String>
         return Ok(export);
     }
 
-    // An office that cannot be read leaves out only the signed tags.
+    // A signed tag's tagger is the operator the office binds the signer key to, a binding that
+    // never changes (a retired key stays in the office). Read strictly, so a machine whose office
+    // cannot be read or lacks the key leaves the tag out instead of writing a different tagger, and
+    // a different tag object, than every other machine. An unsigned tag's tagger is the operator it
+    // declares, which needs no office.
     let office = office_utils::read_office_state();
 
     // The tags that could be written: on an exported parcel, unsigned or by a key the office holds,
-    // under a name git accepts. Each is paired with its tagger and signer key.
-    let mut writable: Vec<(&AttributedTag, &str, &str, Option<&str>, String)> = Vec::new();
+    // under a name git accepts.
+    let mut writable: Vec<WritableTag> = Vec::new();
     for attributed in &read.tags {
         let name = &attributed.tag.name;
         let skip = |reason: String| SkippedTag { name: name.clone(), reason };
@@ -198,18 +208,18 @@ fn export_tags(repo: &GitRepo, exporter: &Exporter) -> Result<TagExport, String>
             continue;
         }
 
-        writable.push((attributed, commit, tagger, signer, refname));
+        writable.push(WritableTag { attributed, commit, tagger, signer, refname });
     }
 
     // Git keeps a loose ref as a file, so on a filesystem that folds case `V1` would overwrite
     // `v1`. Two such tags are both left out, on every filesystem, so the export does not depend
     // on the one it is written to.
     let mut folded: HashMap<String, usize> = HashMap::new();
-    for (attributed, ..) in &writable {
+    for WritableTag { attributed, .. } in &writable {
         *folded.entry(attributed.tag.name.to_ascii_lowercase()).or_default() += 1;
     }
 
-    for (attributed, commit, tagger, signer, refname) in writable {
+    for WritableTag { attributed, commit, tagger, signer, refname } in writable {
         let name = &attributed.tag.name;
         let skip = |reason: String| SkippedTag { name: name.clone(), reason };
 
