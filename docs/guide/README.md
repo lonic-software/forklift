@@ -18,6 +18,7 @@ machine/agent interface).
 | Setting up a team on a server | [`team.md`](team.md) — tokens, an office, and a second person joining, from zero |
 | Working on a large project without its whole history on disk | [`cache.md`](cache.md) — a cache warehouse: every parcel, only the files you use |
 | Deciding whether forklift fits | [`concepts.md`](concepts.md) — what it does that git cannot, with runnable examples |
+| Moving a project back to git | [`leaving.md`](leaving.md) — export everything, including what is only on the server, and keep the hauls |
 | A user learning the CLI | [`cli.md`](cli.md) — every command, by workflow, with examples |
 | Looking up what a term means | [`glossary.md`](glossary.md) — Forklift's terms, with their git equivalents |
 | Stuck on a refusal, a lock, damage, or lost keys | [`recovery.md`](recovery.md) — what to do about each one |

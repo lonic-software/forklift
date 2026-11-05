@@ -12,6 +12,13 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Changed
 
+- **`git export` says what it leaves behind.** With a remote configured, it asks the remote for its
+  pallets and warns about each one it has no branch for as it stands there, naming the `lower` that
+  brings it here, and about tags the remote has and this warehouse does not; leaving from a fresh
+  clone no longer silently drops every other pallet. Its last line now names each Forklift-only
+  record it drops, `@haul` and `@kv` included, and a warning counts parked work. In `--json`:
+  `not_exported`, `parked`, `remote_left_behind` and `remote_unchecked`. A new guide page,
+  `leaving.md`, walks through moving a project back to git.
 - **Tags, the manifest, keyed values and hauls work without enrolling.** In a warehouse that
   never ran `office enroll`, `tag create`, `manifest note/approve/provenance/set/unset` and every
   `haul` command now record unsigned entries naming your configured operator, instead of

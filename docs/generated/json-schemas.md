@@ -1055,6 +1055,24 @@ A command not listed here either reports only the generic human-message shape `{
 ```json
 {
   "$defs": {
+    "LeftBehind": {
+      "description": "A pallet of the remote that an export lacks as it stands there.",
+      "properties": {
+        "head": {
+          "description": "Its head on the remote.",
+          "type": "string"
+        },
+        "name": {
+          "description": "The pallet's name, qualified for a meta pallet (`@tags`).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "head"
+      ],
+      "type": "object"
+    },
     "SkippedTag": {
       "description": "A tag an export or a mirror left out.",
       "properties": {
@@ -1102,8 +1120,35 @@ A command not listed here either reports only the generic human-message shape `{
         "null"
       ]
     },
+    "not_exported": {
+      "description": "The meta pallets git has no home for, so not exported, in their qualified form (`@haul`):\nthis warehouse's and, when it was asked, the remote's. `@tags` is exported, so never here.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "parked": {
+      "description": "How many parcels are parked (`park`), across every bay. Parked work is on no pallet, so it is\nnot exported.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
     "path": {
       "type": "string"
+    },
+    "remote_left_behind": {
+      "description": "The configured remote's pallets this export lacks as they stand there: a user pallet with no\nbranch here, or whose remote head is not an exported parcel, or `@tags` when the remote's is\nnot one held here. Empty when no remote is configured or it could not be asked.",
+      "items": {
+        "$ref": "#/$defs/LeftBehind"
+      },
+      "type": "array"
+    },
+    "remote_unchecked": {
+      "description": "Why the configured remote could not be asked which pallets it holds.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "skipped_tags": {
       "description": "The tags left out, each with why.",
@@ -1139,7 +1184,8 @@ A command not listed here either reports only the generic human-message shape `{
     "trees",
     "blobs",
     "branches",
-    "tags"
+    "tags",
+    "not_exported"
   ],
   "title": "ExportReport",
   "type": "object"

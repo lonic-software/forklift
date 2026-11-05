@@ -6041,6 +6041,10 @@ fn export_git_writes_tags_as_annotated_git_tags() {
     let human = stdout(&warehouse.run(&["git", "export", warehouse.root.join("again").to_str().unwrap()]));
     assert!(human.contains("Exported 3 tag(s)"), "{}", human);
     assert!(human.contains("warning: tag \"side-1\" was not exported"), "{}", human);
+    // A signed warehouse names its office, and the signatures it cannot carry over, as dropped.
+    let dropped = human.lines().find(|line| line.starts_with("Not exported, as git has no equivalent: ")).unwrap();
+    assert!(dropped.contains("the signed office (@office)"), "{}", human);
+    assert!(dropped.ends_with(", the signatures on parcels and tags."), "{}", human);
 }
 
 /// A signed tag's tagger is the operator the office binds its key to, read strictly: an office that
