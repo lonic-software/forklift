@@ -6380,17 +6380,19 @@ fn refuse_redacted_head(pallet: &str, local_head: &str, remote_head: Option<&str
     let next_step = if target.namespace == pallet_utils::PalletNamespace::User {
         let here = stacks_here(pallet, local_head, path, pallet_utils::read_position().ok(), || scope_utils::current_scope().ok());
 
-        Some(match (here, tree_utils::remedy_path(path)) {
-            (true, Some(remedy)) => format!(
-                "from the working tree's root, forklift remove {}, then forklift stack -m <description>, then forklift lift",
-                remedy
-            ),
-            (true, None) => "from the working tree's root, forklift remove -- <path> with that path quoted for your shell, \
-                then forklift stack -m <description>, then forklift lift".to_string(),
-            (false, _) => format!(
+        let remedy = tree_utils::remedy_path(path);
+
+        Some(if here {
+            format!(
+                "from the working tree's root, forklift remove {}{}, then forklift stack -m <description>, then forklift lift",
+                remedy.as_deref().unwrap_or("-- <path>"),
+                if remedy.is_some() { "" } else { " with that path quoted for your shell" }
+            )
+        } else {
+            format!(
                 "stack a head of pallet \"{}\" without \"{}\", from a bay standing on its head with that path in scope, then lift",
                 pallet, path
-            ),
+            )
         })
     } else {
         None
