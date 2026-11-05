@@ -221,6 +221,20 @@ pub fn read_tags() -> Result<TagsRead, String> {
     let office = office_utils::read_office_state()
         .unwrap_or(OfficeState { users: Vec::new(), keys: Vec::new() });
 
+    Ok(attribute(state, &office))
+}
+
+/// Read every tag at `head`, a head of `@tags` whose parcels are in the local store, attributed
+/// through `office` (`None` reads every signed tag by key id) or by the operator an unsigned cell
+/// declares, with every cell this build cannot read.
+pub fn read_tags_at(head: &str, office: Option<&OfficeState>) -> Result<TagsRead, String> {
+    let state = meta_tree::read_meta_state(TAGS_PALLET_NAME, head, &TagsRules)?;
+    let empty = OfficeState { users: Vec::new(), keys: Vec::new() };
+
+    Ok(attribute(state, office.unwrap_or(&empty)))
+}
+
+fn attribute(state: meta_tree::MetaState, office: &OfficeState) -> TagsRead {
     let mut read = TagsRead::default();
 
     for (name, cell) in state.cells {
@@ -236,14 +250,14 @@ pub fn read_tags() -> Result<TagsRead, String> {
         match parsed {
             Ok((tag, stamp)) => read.tags.push(AttributedTag {
                 tag,
-                tagger: stamp.operator_in(&office),
+                tagger: stamp.operator_in(office),
                 signer: stamp.key_id().map(str::to_string),
             }),
             Err(reason) => read.unreadable.push(UnreadableTag { name, reason }),
         }
     }
 
-    Ok(read)
+    read
 }
 
 /// The tag of a name at the local head, or `None` when there is none. A tag cell this build

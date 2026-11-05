@@ -233,8 +233,22 @@ prompt for credentials; one that would fails at once and is reported.
 A pallet whose name git does not accept as a branch name (`feature.lock`, `a..b`) is skipped,
 as is one in `mirror.pallets` the remote does not have; neither is a failure. `git mirror` fails
 with `mirror_incomplete` (exit 33) when any pallet is refused or its push fails, after the
-others went through; under `--json` the error's `details` carry the whole run's report. Tags, the
-signed office, the `@manifest` and signatures are not mirrored: git has no equivalent. A head
+others went through; under `--json` the error's `details` carry the whole run's report. The
+signed office, the `@manifest` and signatures are not mirrored: git has no equivalent.
+
+Tags follow the pallets. Each tag the remote holds, verified like its heads, whose parcel is on a
+branch now in step with git is pushed as the annotated tag `git export` writes for it (`tags`
+under `--json`; one git already holds is counted in `tags_in_step`). A tag never brings history
+of its own: one on a parcel no in-step branch holds is left out, as is one git cannot keep (an
+invalid ref name, or a name differing from another tag only in case), each named in
+`skipped_tags` without failing anything. A tag git already holds as another object is never
+forced: it is listed in `refused_tags` and fails the run with `mirror_incomplete`, until git's tag
+is deleted or renamed. A lift pushes the tags on the pallet it mirrored, checked against the
+local office, which a lift does not bring up to the remote's: while the remote's tags hold a key
+admitted since, the lift mirrors no tag and says to run `git mirror`, which does. A refused tag
+is only reported by a lift.
+
+A head
 is exported only once its history verifies against the trust anchor: with one held, against it
 and the office, which first catches up with the remote's as a `lower` takes it; with none held,
 against the anchor the remote serves, which a mirror never installs. A head that does not

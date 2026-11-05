@@ -1,16 +1,16 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use serde::Serialize;
-use forklift_core::error::{CoreError, RefusalCode};
+use forklift_core::error::{sanitize, CoreError, RefusalCode};
 use forklift_core::util::lock_utils::MirrorLock;
 use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{self, RemoteClient};
 use forklift_core::util::{
-    config_utils, file_utils, graph_utils, merge_utils, mirror_utils, object_utils, pallet_utils,
-    scope_utils, take_utils,
+    config_utils, file_utils, graph_utils, merge_utils, meta_tree, mirror_utils, object_utils,
+    pallet_utils, scope_utils, tag_utils, take_utils,
 };
 use forklift_core::util::take_utils::{FetchAt, TakeTrust};
-use crate::commands::export_git::{self, Exporter, GitRepo, EXPORT_LAYOUT};
+use crate::commands::export_git::{self, Exporter, GitRepo, SkippedTag, WritableTag, EXPORT_LAYOUT};
 use crate::events;
 use crate::output::{self, CommandOutput};
 
@@ -23,6 +23,9 @@ const EXPORTED_PREFIX: &str = "refs/forklift/exported/";
 /// Where the mirror fetches each pallet's git branch to, for comparison only (D3).
 const REMOTE_PREFIX: &str = "refs/forklift/remote/";
 
+/// Where the mirror keeps each tag object it pushes, in its own repository.
+const TAGS_PREFIX: &str = "refs/forklift/tags/";
+
 /// The step every refusal over the mirror's own repository names.
 const DELETE_STEP: &str = "Delete .forklift/mirror.git and run \"forklift git mirror\": it exports again from \
     scratch, and git receives nothing it already holds.";
@@ -33,17 +36,21 @@ const GIT_STEP: &str = "Fix the cause git reports, then run \"forklift git mirro
 /// Handle the mirror command (§9.8): keep the git remote at `mirror.url` in step with the pallets
 /// the Forklift remote holds. Each mirrored pallet's remote head is fetched, exported
 /// incrementally into `.forklift/mirror.git` on the commits this warehouse wrote there before, and
-/// pushed to the git branch of the same name, never by force.
+/// pushed to the git branch of the same name, never by force. Then each tag the remote holds on a
+/// parcel of a branch now in step is pushed as the annotated tag `git export` writes, never by force
+/// either.
 ///
 /// Only what the Forklift remote holds is mirrored, never a local head that was not lifted:
 /// mirroring unlifted work and then undoing it would leave git ahead of anything Forklift could
 /// lift again.
 ///
 /// # Returns
-/// * `Ok(())`      - If every mirrored pallet is in step (or was skipped as not mirrorable).
+/// * `Ok(())`      - If every mirrored pallet is in step (or was skipped as not mirrorable) and
+///                   no tag was refused.
 /// * `Err(String)` - If the mirror is not configured, busy or damaged, or a pallet was refused or
-///                   its push failed (after the rest went through: `mirror_incomplete`, with the
-///                   run's report as its details).
+///                   its push failed, or a tag was refused or the tags could not be mirrored
+///                   (after the rest went through: `mirror_incomplete`, with the run's report as
+///                   its details).
 pub async fn handle_command() -> Result<(), String> {
     refuse_partial_view()?;
 
@@ -73,12 +80,19 @@ pub async fn handle_command() -> Result<(), String> {
     let trust = mirror_trust(&client, &info).await?;
 
     let mut run = Run::start(&repo, &client, trust, url.clone(), false).map_err(Problem::into_message)?;
-    let mut report = MirrorReport { url, pallets: Vec::new() };
+    let mut report = MirrorReport { url, pallets: Vec::new(), tags: TagsMirror::default() };
 
     for pallet in &pallets {
         let outcome = run.mirror(pallet, info.pallets.get(pallet).map(String::as_str), &mut record).await;
         report.pallets.push(outcome);
     }
+
+    // A tag goes over a commit git's branches already hold, so the tags follow the pallets.
+    let in_step: Vec<String> = report.pallets.iter()
+        .filter(|outcome| outcome.status.is_in_step())
+        .filter_map(|outcome| info.pallets.get(&outcome.pallet).cloned())
+        .collect();
+    report.tags = run.mirror_tags(info.pallets.get(&tags_pallet_key()).map(String::as_str), &in_step, false).await;
 
     // The record keeps the configured set: a pallet that went through, or was refused or failed
     // after its export, holds the entry its export wrote; one that failed before it keeps its
@@ -87,7 +101,7 @@ pub async fn handle_command() -> Result<(), String> {
     mirror_utils::write_mirror_roots(&record)?;
 
     let failed: Vec<&PalletMirror> = report.pallets.iter().filter(|outcome| outcome.status.is_failure()).collect();
-    if failed.is_empty() {
+    if failed.is_empty() && !report.tags.is_failure() {
         output::emit(&report);
         return Ok(());
     }
@@ -96,18 +110,19 @@ pub async fn handle_command() -> Result<(), String> {
         report.render_in_step();
     }
 
-    let message = format!(
-        "Did not mirror {} of {} pallet(s):\n{}",
-        failed.len(),
-        report.pallets.len(),
-        failed.iter().map(|outcome| format!("  \"{}\": {}", outcome.pallet, outcome.message.as_deref().unwrap_or_default()))
-            .collect::<Vec<_>>().join("\n")
-    );
+    let mut lines: Vec<String> = Vec::new();
+    if !failed.is_empty() {
+        lines.push(format!("Did not mirror {} of {} pallet(s):", failed.len(), report.pallets.len()));
+        lines.extend(failed.iter()
+            .map(|outcome| format!("  \"{}\": {}", outcome.pallet, outcome.message.as_deref().unwrap_or_default())));
+    }
+    lines.extend(report.tags.failure_lines());
+    let message = lines.join("\n");
 
     Err(CoreError::refusal_with_details(
         RefusalCode::MirrorIncomplete,
         message,
-        "Follow the step each pallet's message names, then run \"forklift git mirror\" again.",
+        "Follow the step each pallet's or tag's message names, then run \"forklift git mirror\" again.",
         serde_json::json!(report),
     ).into())
 }
@@ -115,12 +130,15 @@ pub async fn handle_command() -> Result<(), String> {
 /// Mirror the pallet a lift just landed, at the head it landed (the lift trigger). Runs only when
 /// `mirror.url` is set, `mirror.auto` is on and the pallet is in the mirrored set. The outcome is
 /// reported in the lift's result and never fails the lift; a pallet left behind is caught up by
-/// the next lift or `forklift git mirror`.
+/// the next lift or `forklift git mirror`. Once the pallet is in step, the remote's tags on its
+/// history follow it. They are verified against this warehouse's own office, which a lift does not
+/// first bring up to the remote's: while the remote's tags hold a key admitted since, a lift
+/// mirrors no tag and names `forklift git mirror`, which does.
 ///
 /// # Returns
-/// * `Some(PalletMirror)` - What the mirror did.
-/// * `None`               - If no mirror applies to this pallet.
-pub(crate) async fn after_lift(client: &RemoteClient, pallet: &str, head: &str) -> Option<PalletMirror> {
+/// * `Some(LiftMirror)` - What the mirror did.
+/// * `None`             - If no mirror applies to this pallet.
+pub(crate) async fn after_lift(client: &RemoteClient, pallet: &str, head: &str) -> Option<LiftMirror> {
     let applies = || -> Result<Option<String>, String> {
         let Some(url) = mirror_url()? else { return Ok(None) };
 
@@ -141,21 +159,21 @@ pub(crate) async fn after_lift(client: &RemoteClient, pallet: &str, head: &str) 
     let url = match applies() {
         Ok(Some(url)) => url,
         Ok(None) => return None,
-        Err(why) => return Some(PalletMirror::new(pallet, MirrorStatus::Failed, why)),
+        Err(why) => return Some(LiftMirror::pallet(PalletMirror::new(pallet, MirrorStatus::Failed, why))),
     };
 
     match scope_utils::is_scoped().and_then(|scoped| Ok(scoped || scope_utils::content_may_be_absent()?)) {
         Ok(false) => {}
-        Ok(true) => return Some(PalletMirror::new(pallet, MirrorStatus::Skipped,
+        Ok(true) => return Some(LiftMirror::pallet(PalletMirror::new(pallet, MirrorStatus::Skipped,
             "The mirror needs every file of the pallet, and this bay or warehouse may hold only \
-            part of it. Run \"forklift git mirror\" from a full workspace.".to_string())),
-        Err(why) => return Some(PalletMirror::new(pallet, MirrorStatus::Failed, why)),
+            part of it. Run \"forklift git mirror\" from a full workspace.".to_string()))),
+        Err(why) => return Some(LiftMirror::pallet(PalletMirror::new(pallet, MirrorStatus::Failed, why))),
     }
 
     let lock = match MirrorLock::try_acquire() {
         Ok(Some(lock)) => lock,
-        Ok(None) => return Some(PalletMirror::new(pallet, MirrorStatus::Busy, busy_message())),
-        Err(why) => return Some(PalletMirror::new(pallet, MirrorStatus::Failed, why)),
+        Ok(None) => return Some(LiftMirror::pallet(PalletMirror::new(pallet, MirrorStatus::Busy, busy_message()))),
+        Err(why) => return Some(LiftMirror::pallet(PalletMirror::new(pallet, MirrorStatus::Failed, why))),
     };
 
     let outcome = async {
@@ -163,11 +181,26 @@ pub(crate) async fn after_lift(client: &RemoteClient, pallet: &str, head: &str) 
         let mut record = load_record(&repo)?;
         let mut run = Run::start(&repo, client, TakeTrust::local()?, url, true)?;
 
-        Ok::<PalletMirror, Problem>(run.mirror(pallet, Some(head), &mut record).await)
+        let outcome = run.mirror(pallet, Some(head), &mut record).await;
+        if !outcome.status.is_in_step() {
+            return Ok::<LiftMirror, Problem>(LiftMirror::pallet(outcome));
+        }
+
+        let tags = match client.fetch_info().await {
+            Ok(info) => run.mirror_tags(info.pallets.get(&tags_pallet_key()).map(String::as_str), &[head.to_string()], true).await,
+            Err(why) => TagsMirror { tags_error: Some(why), ..TagsMirror::default() },
+        };
+
+        Ok(LiftMirror { pallet: outcome, tags })
     }.await;
     drop(lock);
 
-    Some(outcome.unwrap_or_else(|problem| problem.into_outcome(pallet)))
+    Some(outcome.unwrap_or_else(|problem| LiftMirror::pallet(problem.into_outcome(pallet))))
+}
+
+/// The key the remote's handshake lists `@tags` under.
+fn tags_pallet_key() -> String {
+    format!("{}{}", pallet_utils::META_QUALIFIER, tag_utils::TAGS_PALLET_NAME)
 }
 
 /// What every mirrored head is verified against before it is exported: git receives only history
@@ -794,6 +827,199 @@ impl<'a> Run<'a> {
         Ok(Verdict::Diverged(git.to_string()))
     }
 
+    /// Push every tag at `tags_head` (the remote's `@tags` head; none when it has no tags) whose
+    /// parcel is on one of the `in_step` heads, as the annotated tag `git export` writes over that
+    /// parcel's commit. A tag git already holds as another object is refused, never forced.
+    ///
+    /// For a `lift`, which mirrors one pallet, a tag on no `in_step` head and a tag cell that
+    /// cannot be read are passed over without being named (they may belong to any pallet), and
+    /// tags the local office cannot verify name `forklift git mirror`, which brings it up first.
+    async fn mirror_tags(&mut self, tags_head: Option<&str>, in_step: &[String], lift: bool) -> TagsMirror {
+        let Some(head) = tags_head else { return TagsMirror::default() };
+
+        match self.try_mirror_tags(head, in_step, lift).await {
+            Ok(tags) => tags,
+            Err(problem) => TagsMirror { tags_error: Some(problem.into_message()), ..TagsMirror::default() },
+        }
+    }
+
+    async fn try_mirror_tags(&mut self, head: &str, in_step: &[String], lift: bool) -> Result<TagsMirror, Problem> {
+        let mut mirrored = TagsMirror::default();
+
+        // Verified as a take of @tags is: git receives only tags the anchor vouches for, each
+        // signed one attributed through the office that verifies it.
+        remote_utils::fetch_meta_history(self.client, head, &self.progress).await?;
+        let (anchor, office_head) = match &self.trust {
+            TakeTrust::Untrusted => (None, None),
+            TakeTrust::Held { anchor, office } => (Some(anchor), office.head()),
+            TakeTrust::FirstContact { anchor, office_head, .. } => (Some(anchor), Some(office_head.as_str())),
+        };
+        let office = meta_tree::verify_meta_update(
+            tag_utils::TAGS_PALLET_NAME, &tag_utils::TagsRules, meta_tree::Admission::Audit, anchor, office_head, None, head,
+        ).map_err(|why| Problem::Failed(match lift {
+            false => format!("The Forklift remote's tags were refused: {}", why),
+            true => format!(
+                "The Forklift remote's tags were refused: {} Run \"forklift git mirror\", which first \
+                brings this warehouse's office up to the remote's.",
+                why
+            ),
+        }))?;
+
+        let read = tag_utils::read_tags_at(head, office.as_ref())?;
+        if !lift {
+            mirrored.skipped_tags = read.unreadable.iter()
+                .map(|tag| SkippedTag { name: tag.name.clone(), reason: format!("it cannot be read: {}", tag.reason) })
+                .collect();
+        }
+        if read.tags.is_empty() {
+            return Ok(mirrored);
+        }
+
+        let held = self.held_tags()?;
+        let held_names: Vec<String> = held.keys().cloned().collect();
+        // A tag off every in-step branch is an ordinary skip; a failure finding a commit (a damaged
+        // mirror, a store that cannot be read) fails the tags instead.
+        let repo = self.repo;
+        let mut off_branch: HashSet<String> = HashSet::new();
+        let mut failure: Option<Problem> = None;
+        let (writable, skipped) = export_git::plan_tags(
+            repo, &read.tags, office.as_ref().ok_or("this warehouse holds no trust anchor"), &held_names,
+            |attributed| match failure.is_some() {
+                true => Err(String::new()),
+                false => match self.tag_commit(&attributed.tag.subject, in_step) {
+                    Ok(Some(commit)) => Ok(commit),
+                    Ok(None) => {
+                        off_branch.insert(attributed.tag.name.clone());
+                        Err(format!("its parcel {} is on no branch the mirror holds in step with git", attributed.tag.subject))
+                    }
+                    Err(problem) => {
+                        failure = Some(problem);
+                        Err(String::new())
+                    }
+                },
+            },
+        )?;
+        if let Some(problem) = failure {
+            return Err(problem);
+        }
+        mirrored.skipped_tags.extend(skipped.into_iter()
+            .filter(|tag| !(lift && off_branch.contains(&tag.name))));
+
+        let mut pushes: Vec<(String, String)> = Vec::new();
+        for WritableTag { attributed, commit, tagger, signer, refname } in writable {
+            let name = &attributed.tag.name;
+            let skip = |reason: String| SkippedTag { name: name.clone(), reason };
+
+            let object = match self.exporter.write_tag(&commit, tagger, signer, attributed) {
+                Ok(object) => object,
+                Err(refused) => {
+                    mirrored.skipped_tags.push(skip(refused));
+                    continue;
+                }
+            };
+            match held.get(name) {
+                Some(git) if *git == object => {
+                    mirrored.tags_in_step += 1;
+                    continue;
+                }
+                Some(git) => {
+                    mirrored.refused_tags.push(skip(tag_conflict(name, Some(git))));
+                    continue;
+                }
+                None => {}
+            }
+
+            // A ref write can land and still report failure, so the ref read back decides.
+            let local = format!("{}{}", TAGS_PREFIX, name);
+            match self.repo.run(&["update-ref", &local, &object], None) {
+                Ok(_) => pushes.push((name.clone(), format!("{}:{}", local, refname))),
+                Err(_) if self.repo.run(&["rev-parse", "--verify", "-q", &local], None)
+                    .is_ok_and(|landed| landed.trim() == object) => pushes.push((name.clone(), format!("{}:{}", local, refname))),
+                Err(refused) => mirrored.skipped_tags.push(skip(refused)),
+            }
+        }
+        if pushes.is_empty() {
+            return Ok(mirrored);
+        }
+
+        // One push for every tag, none forced: git creates each tag or refuses it alone.
+        let mut args = vec!["push", "--porcelain", self.url.as_str()];
+        args.extend(pushes.iter().map(|(_, refspec)| refspec.as_str()));
+        let pushed = self.repo.network(&args, &self.from, self.unattended)?;
+        let stdout = String::from_utf8_lossy(&pushed.stdout).to_string();
+        let lines: HashMap<&str, (&str, &str)> = stdout.lines()
+            .filter_map(|line| {
+                let mut fields = line.splitn(3, '\t');
+                let flag = fields.next()?;
+                let to = fields.next()?.split_once(':')?.1;
+                Some((to.strip_prefix("refs/tags/")?, (flag, fields.next().unwrap_or_default())))
+            })
+            .collect();
+
+        for (name, _) in pushes {
+            match lines.get(name.as_str()) {
+                Some(&("*", _)) => mirrored.tags.push(name),
+                Some(&("=", _)) => mirrored.tags_in_step += 1,
+                Some(&(_, summary)) if summary.contains("already exists") || summary.contains("fetch first") => {
+                    let reason = tag_conflict(&name, None);
+                    mirrored.refused_tags.push(SkippedTag { name, reason });
+                }
+                Some(&(_, summary)) => {
+                    let reason = format!("git refused it: {}. {}", summary.trim(), GIT_STEP);
+                    mirrored.refused_tags.push(SkippedTag { name, reason });
+                }
+                None => {
+                    let reason = format!("{}\n{}", push_failure(&pushed), GIT_STEP);
+                    mirrored.refused_tags.push(SkippedTag { name, reason });
+                }
+            }
+        }
+
+        Ok(mirrored)
+    }
+
+    /// The commit a tag's parcel `subject` is exported as, or `None` when the parcel is on none of
+    /// the `in_step` heads. A tag never brings history of its own.
+    fn tag_commit(&mut self, subject: &str, in_step: &[String]) -> Result<Option<String>, Problem> {
+        let mut on_branch = false;
+        if file_utils::does_object_exist(subject)? {
+            for head in in_step {
+                if merge_utils::is_ancestor(subject, head)? {
+                    on_branch = true;
+                    break;
+                }
+            }
+        }
+        if !on_branch {
+            return Ok(None);
+        }
+
+        // An old parcel was exported by an earlier run, and is found below a boundary.
+        self.export(subject)?;
+        match self.exporter.commit_of(subject) {
+            Some(commit) => Ok(Some(commit.to_string())),
+            None => Err(Problem::Failed(format!("Parcel {} of a tag was not exported.", subject))),
+        }
+    }
+
+    /// Every tag git holds, by name, with its object.
+    fn held_tags(&self) -> Result<BTreeMap<String, String>, Problem> {
+        let listed = self.repo.network(&["ls-remote", "--tags", "--refs", &self.url], &self.from, self.unattended)?;
+        if !listed.status.success() {
+            return Err(Problem::Failed(format!(
+                "git ls-remote on the mirror failed: {}\n{}",
+                String::from_utf8_lossy(&listed.stderr).trim(), GIT_STEP
+            )));
+        }
+
+        Ok(String::from_utf8_lossy(&listed.stdout).lines()
+            .filter_map(|line| {
+                let (object, refname) = line.split_once('\t')?;
+                Some((refname.strip_prefix("refs/tags/")?.to_string(), object.to_string()))
+            })
+            .collect())
+    }
+
     /// `git merge-base --is-ancestor`.
     fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool, Problem> {
         let output = self.repo.output(&["merge-base", "--is-ancestor", ancestor, descendant])?;
@@ -806,6 +1032,15 @@ impl<'a> Run<'a> {
             ))),
         }
     }
+}
+
+/// Why a tag git already holds as another object was not pushed (`git`, that object, when known).
+fn tag_conflict(name: &str, git: Option<&str>) -> String {
+    format!(
+        "git already holds a different tag \"{}\"{}. Nothing was pushed for it, and it is never \
+        forced. Delete or rename git's tag, then run \"forklift git mirror\".",
+        name, git.map(|object| format!(" ({})", object)).unwrap_or_default()
+    )
 }
 
 /// What a failed push said: git's own message, with the rejected ref's porcelain line.
@@ -851,7 +1086,12 @@ impl MirrorStatus {
     /// Whether this outcome leaves the pallet out of step for a reason a run must report as a
     /// failure (a skip is not one).
     fn is_failure(self) -> bool {
-        !matches!(self, MirrorStatus::Pushed | MirrorStatus::UpToDate | MirrorStatus::AlreadyAhead | MirrorStatus::Skipped)
+        !self.is_in_step() && self != MirrorStatus::Skipped
+    }
+
+    /// Whether git's branch holds the export once this outcome is reached.
+    fn is_in_step(self) -> bool {
+        matches!(self, MirrorStatus::Pushed | MirrorStatus::UpToDate | MirrorStatus::AlreadyAhead)
     }
 }
 
@@ -884,7 +1124,7 @@ impl PalletMirror {
     }
 
     /// The outcome as one line of human output.
-    pub(crate) fn render_line(&self) {
+    fn render_line(&self) {
         let commit = self.commit.as_deref().unwrap_or_default();
         let message = self.message.as_deref().unwrap_or_default();
 
@@ -912,21 +1152,110 @@ pub(crate) struct MirrorReport {
 
     /// Each mirrored pallet's outcome.
     pallets: Vec<PalletMirror>,
+
+    #[serde(flatten)]
+    tags: TagsMirror,
 }
 
 impl MirrorReport {
-    /// The pallets in step or skipped, and what the mirror never carries.
+    /// The pallets in step or skipped, the tags mirrored or left out, and what the mirror never
+    /// carries.
     fn render_in_step(&self) {
         for outcome in self.pallets.iter().filter(|outcome| !outcome.status.is_failure()) {
             outcome.render_line();
         }
+        self.tags.render();
 
         println!("{}", NOT_MIRRORED);
     }
 }
 
+/// What the mirror did with the Forklift remote's tags.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize, Default)]
+pub(crate) struct TagsMirror {
+    /// The tags this run pushed to git, as the annotated tags `git export` writes.
+    tags: Vec<String>,
+
+    /// How many tags git already held as the very tag object this run would push.
+    tags_in_step: usize,
+
+    /// Tags left out, with why: on no branch in step with git, unreadable here, or not a name git
+    /// keeps. A tag left out does not fail the run.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    skipped_tags: Vec<SkippedTag>,
+
+    /// Tags git refused, or already holds as another object, with the step that clears each.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    refused_tags: Vec<SkippedTag>,
+
+    /// Why no tag could be mirrored, when none could.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tags_error: Option<String>,
+}
+
+impl TagsMirror {
+    /// Whether a tag was refused, or none could be mirrored.
+    fn is_failure(&self) -> bool {
+        !self.refused_tags.is_empty() || self.tags_error.is_some()
+    }
+
+    /// The tags pushed, in step and left out, as human output.
+    fn render(&self) {
+        if !self.tags.is_empty() {
+            println!("Mirrored {} tag(s) to git: {}.", self.tags.len(), self.tags.join(", "));
+        }
+        if self.tags_in_step > 0 {
+            println!("Git already has {} tag(s).", self.tags_in_step);
+        }
+        for skipped in &self.skipped_tags {
+            println!("  warning: tag \"{}\" was not mirrored: {}.", skipped.name, sanitize(&skipped.reason));
+        }
+    }
+
+    /// The tags refused and why none could be mirrored, one line each.
+    fn failure_lines(&self) -> Vec<String> {
+        let mut lines: Vec<String> = Vec::new();
+        if !self.refused_tags.is_empty() {
+            lines.push(format!("Did not mirror {} tag(s):", self.refused_tags.len()));
+            lines.extend(self.refused_tags.iter().map(|refused| format!("  tag \"{}\": {}", refused.name, refused.reason)));
+        }
+        if let Some(why) = &self.tags_error {
+            lines.push(format!("Did not mirror the tags: {}", why));
+        }
+
+        lines
+    }
+}
+
+/// What the lift trigger's mirror did: the lifted pallet, then the tags on its history.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct LiftMirror {
+    #[serde(flatten)]
+    pallet: PalletMirror,
+
+    #[serde(flatten)]
+    tags: TagsMirror,
+}
+
+impl LiftMirror {
+    fn pallet(pallet: PalletMirror) -> LiftMirror {
+        LiftMirror { pallet, tags: TagsMirror::default() }
+    }
+
+    /// The outcome as human output. Nothing here fails the lift, so a refusal is a warning.
+    pub(crate) fn render(&self) {
+        self.pallet.render_line();
+        self.tags.render();
+        for line in self.tags.failure_lines() {
+            println!("  warning: {}", sanitize(line.trim_start()));
+        }
+    }
+}
+
 /// What git has no home for, so no run mirrors it.
-pub(crate) const NOT_MIRRORED: &str = "Tags, the signed office, the @manifest and signatures are not \
+pub(crate) const NOT_MIRRORED: &str = "The signed office, the @manifest and signatures are not \
     mirrored: git has no equivalent.";
 
 impl CommandOutput for MirrorReport {

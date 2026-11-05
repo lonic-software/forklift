@@ -1284,3 +1284,152 @@ fn a_head_the_anchor_does_not_vouch_for_is_never_exported() {
     assert!(message.contains("Run \"forklift audit\""), "the pallet names its step: {}", message);
     assert_eq!(tip(&fixture.git, "main").unwrap(), mirrored);
 }
+
+/// A tag on an old parcel of a long-mirrored pallet follows the lift that lifts it, as an annotated
+/// tag over that parcel's commit, found below the exported ref in a run that exported nothing: the
+/// very object `git export` writes. The next run finds git holding it and pushes nothing.
+///
+/// Revert: drop the tags from the lift trigger → git has no tag; skip the export of a tag's parcel
+/// → it is left out as not exported; drop the held-object check → the second run counts nothing in
+/// step.
+#[test]
+fn a_tag_on_an_old_parcel_follows_the_lift_as_the_export_tag() {
+    let fixture = Fixture::new("tag-old");
+    let area = &fixture.area;
+
+    area.forklift_ok("a", &["git", "mirror"]);
+    area.stack("a", "code.txt", "v2\n", "second");
+    area.lift("a");
+    let main = tip(&fixture.git, "main").unwrap();
+
+    area.forklift_ok("a", &["tag", "create", "v1.0", &fixture.first, "-m", "release"]);
+    let lifted = area.lift("a");
+    assert_eq!(lifted["mirror"]["status"], "up_to_date", "{}", lifted);
+    assert_eq!(lifted["mirror"]["tags"], serde_json::json!(["v1.0"]), "{}", lifted);
+    let object = git_ok(&fixture.git, &["rev-parse", "refs/tags/v1.0"]);
+    assert_eq!(git_ok(&fixture.git, &["cat-file", "-t", &object]), "tag");
+    assert_eq!(git_ok(&fixture.git, &["rev-parse", "refs/tags/v1.0^{commit}"]), git_ok(&fixture.git, &["rev-parse", &format!("{}^", main)]));
+
+    let exported = area.path("exported");
+    area.forklift_ok("a", &["git", "export", exported.to_str().unwrap()]);
+    assert_eq!(git_ok(&exported, &["rev-parse", "refs/tags/v1.0"]), object);
+
+    let again = area.json("a", &["git", "mirror"]);
+    assert_eq!(again["tags"], serde_json::json!([]), "{}", again);
+    assert_eq!(again["tags_in_step"], 1, "{}", again);
+}
+
+/// A tag git already holds as another object is refused and never forced: the lift reports it and
+/// goes through, and `git mirror` fails naming the step. A name differing from one of git's own
+/// tags only in case is left out without failing anything.
+///
+/// Revert: skip the check against the object git holds and force the tag refspec → git's v1.0
+/// moves; read git's "already exists" as any other refusal → the step is not named; check case
+/// against the export's tags alone → "rc" is pushed.
+#[test]
+fn a_tag_git_holds_differently_is_refused_and_never_forced() {
+    let fixture = Fixture::new("tag-conflict");
+    let area = &fixture.area;
+
+    area.forklift_ok("a", &["git", "mirror"]);
+    let main = tip(&fixture.git, "main").unwrap();
+    git_ok(&fixture.git, &["update-ref", "refs/tags/v1.0", &main]);
+    git_ok(&fixture.git, &["update-ref", "refs/tags/RC", &main]);
+
+    area.forklift_ok("a", &["tag", "create", "v1.0", "main"]);
+    area.forklift_ok("a", &["tag", "create", "rc", "main"]);
+    area.forklift_ok("a", &["tag", "create", "v1.1", "main"]);
+    let lifted = area.lift("a");
+    assert_eq!(lifted["mirror"]["tags"], serde_json::json!(["v1.1"]), "{}", lifted);
+    assert_eq!(lifted["mirror"]["refused_tags"][0]["name"], "v1.0", "{}", lifted);
+    assert_eq!(lifted["mirror"]["skipped_tags"][0]["name"], "rc", "{}", lifted);
+    assert!(lifted["mirror"]["skipped_tags"][0]["reason"].as_str().unwrap().contains("only in case"), "{}", lifted);
+
+    let refused = area.forklift("a", &["--json", "git", "mirror"]);
+    assert!(!refused.status.success(), "{}", stdout(&refused));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&refused)).unwrap();
+    assert_eq!(value["error"]["code"], "mirror_incomplete", "{}", value);
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains("tag \"v1.0\"") && message.contains("never forced"), "{}", message);
+    assert_eq!(git_ok(&fixture.git, &["rev-parse", "refs/tags/v1.0"]), main);
+    // Listed rather than resolved: on a filesystem that folds case, "rc" would resolve to "RC".
+    assert_eq!(git_ok(&fixture.git, &["for-each-ref", "--format=%(refname)", "refs/tags"]), "refs/tags/RC\nrefs/tags/v1.0\nrefs/tags/v1.1");
+}
+
+/// A tag never brings history of its own: one on a parcel of a pallet the mirror does not carry is
+/// left out, and git receives neither the tag nor the parcel. A lift of another pallet passes it
+/// over without naming it.
+///
+/// Revert: drop the in-step check on a tag's parcel → the tag and its parcel's commit reach git;
+/// name every skip in a lift → the lift lists "f1".
+#[test]
+fn a_tag_on_a_pallet_not_mirrored_is_left_out() {
+    let fixture = Fixture::new("tag-unmirrored");
+    let area = &fixture.area;
+
+    fixture.franchise("b");
+    area.forklift_ok("b", &["pallet", "create", "feat"]);
+    area.stack("b", "feat.txt", "feat 1\n", "feat one");
+    area.forklift_ok("b", &["tag", "create", "f1", "feat"]);
+    area.lift("b");
+
+    area.forklift_ok("a", &["config", "set", "mirror.pallets", "main"]);
+    let report = area.json("a", &["git", "mirror"]);
+    assert_eq!(report["tags"], serde_json::json!([]), "{}", report);
+    assert_eq!(report["skipped_tags"][0]["name"], "f1", "{}", report);
+    assert!(report["skipped_tags"][0]["reason"].as_str().unwrap().contains("on no branch the mirror holds"), "{}", report);
+    assert!(!git(&fixture.git, &["rev-parse", "--verify", "-q", "refs/tags/f1"]).status.success());
+    assert_eq!(git_ok(&fixture.git, &["rev-list", "--all", "--count"]), "1");
+
+    area.stack("a", "code.txt", "v2\n", "second");
+    let lifted = area.lift("a");
+    assert_eq!(lifted["mirror"]["status"], "pushed", "{}", lifted);
+    assert!(lifted["mirror"].get("skipped_tags").is_none(), "{}", lifted);
+}
+
+/// A mirror repository found damaged while finding a tag's commit fails the run with the delete
+/// step; it is not a tag left out. The damage sits below the tip's own parent check: the commit of
+/// main's first parcel names another parcel, and git holds the same rewritten history, so main is
+/// in step and only the tag's descent reaches it.
+///
+/// Revert: let a problem finding a tag's commit be an ordinary skip → the run exits 0.
+#[test]
+fn a_damaged_mirror_under_a_tag_fails_the_tags() {
+    let fixture = Fixture::new("tag-damaged");
+    let area = &fixture.area;
+
+    area.forklift_ok("a", &["config", "set", "mirror.auto", "off"]);
+    area.stack("a", "code.txt", "v2\n", "second");
+    let second = area.lift("a")["head"].as_str().unwrap().to_string();
+    area.stack("a", "code.txt", "v3\n", "third");
+    area.lift("a");
+    area.forklift_ok("a", &["git", "mirror"]);
+
+    let mirror = fixture.mirror_dir("a");
+    let commits: Vec<String> = git_ok(&mirror, &["rev-list", "--reverse", "refs/forklift/exported/main"])
+        .lines().map(str::to_string).collect();
+    assert_eq!(commits.len(), 3);
+    let mut parent: Option<String> = None;
+    for (index, commit) in commits.iter().enumerate() {
+        let tree = git_ok(&mirror, &["rev-parse", &format!("{}^{{tree}}", commit)]);
+        let message = match index {
+            0 => format!("first\n\n{}\n", parcel_line(&second)),
+            _ => git_ok(&mirror, &["log", "-1", "--format=%B", commit]) + "\n",
+        };
+        let parents: Vec<&str> = parent.iter().map(String::as_str).collect();
+        parent = Some(write_commit(&mirror, &tree, &parents, &message));
+    }
+    let rewritten = parent.unwrap();
+    git_ok(&mirror, &["update-ref", "refs/forklift/exported/main", &rewritten]);
+    git_ok(&mirror, &["push", "-q", fixture.git.to_str().unwrap(), &format!("+{}:refs/heads/main", rewritten)]);
+
+    area.forklift_ok("a", &["tag", "create", "v0", &fixture.first]);
+    area.lift("a");
+    let run = area.forklift("a", &["--json", "git", "mirror"]);
+    assert_eq!(run.status.code(), Some(33), "{}", stdout(&run));
+    let document: serde_json::Value = serde_json::from_str(&stdout(&run)).unwrap();
+    let details = &document["error"]["details"];
+    assert_eq!(outcome(details, "main")["status"], "up_to_date", "{}", document);
+    assert!(details["tags_error"].as_str().unwrap().contains("Delete .forklift/mirror.git"), "{}", document);
+    assert!(!git(&fixture.git, &["rev-parse", "--verify", "-q", "refs/tags/v0"]).status.success());
+}
