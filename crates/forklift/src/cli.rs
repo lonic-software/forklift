@@ -1429,8 +1429,8 @@ pub enum RedactAction {
         target: String,
 
         /// Why the content is redacted
-        #[arg(long)]
-        reason: String,
+        #[arg(short = 'm', long)]
+        message: String,
     },
 
     /// List every redaction (the default)

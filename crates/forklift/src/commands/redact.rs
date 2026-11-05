@@ -11,8 +11,8 @@ use crate::output::{self, CommandOutput};
 /// Handle the redact command: permanent redactions of stored content. Without a subcommand, the
 /// redactions are listed.
 ///
-/// * `redact` / `redact list`              - List every redaction.
-/// * `redact record <target> --reason ...` - Record a redaction (admin only).
+/// * `redact` / `redact list`             - List every redaction.
+/// * `redact record <target> -m <reason>` - Record a redaction (admin only).
 ///
 /// # Arguments
 /// * `action` - The redact subcommand (`None` lists the redactions).
@@ -22,7 +22,7 @@ use crate::output::{self, CommandOutput};
 /// * `Err(String)` - If there was an error while handling the command.
 pub async fn handle_command(action: Option<RedactAction>) -> Result<(), String> {
     match action {
-        Some(RedactAction::Record { target, reason }) => record(&target, &reason),
+        Some(RedactAction::Record { target, message }) => record(&target, &message),
         Some(RedactAction::List) | None => list(),
     }
 }
@@ -69,8 +69,8 @@ fn record(target: &str, reason: &str) -> Result<(), String> {
         RedactedKind::Blob => None,
         RedactedKind::Recipe => {
             let chunks = object_utils::recipe_chunk_hashes(&hash).map_err(|e| format!(
-                "Object {} is a chunked file's recipe, and its chunk list cannot be read here ({}); \
-                record the redaction in a warehouse that holds the recipe.",
+                "Object {} is a chunked file's recipe, and its chunk list cannot be read here \
+                ({}); record the redaction in a warehouse that holds the recipe.",
                 hash, e
             ))?;
 
@@ -124,8 +124,10 @@ fn resolve_target(target: &str) -> Result<(String, RedactedKind), String> {
         ));
     };
 
-    let kind = redaction_utils::entry_kind(entry_type)
-        .ok_or(format!("\"{}\" is a directory at revision \"{}\"; name one file.", path, revision))?;
+    let kind = redaction_utils::entry_kind(entry_type).ok_or(format!(
+        "\"{}\" is a directory at revision \"{}\"; name one file.",
+        path, revision
+    ))?;
 
     Ok((hash, kind))
 }
@@ -184,7 +186,10 @@ impl CommandOutput for Recorded {
             false => "object",
         };
 
-        println!("Recorded the redaction of {} {} (@redactions head {}).", what, self.hash, short(&self.redactions_head));
+        println!(
+            "Recorded the redaction of {} {} (@redactions head {}).",
+            what, self.hash, short(&self.redactions_head)
+        );
     }
 }
 

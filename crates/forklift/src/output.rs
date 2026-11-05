@@ -35,9 +35,9 @@ pub const TOOL: &str = "forklift";
 /// `data` shape or the error-code registry changes incompatibly, so an agent can pin it and
 /// detect drift.
 ///
-/// Version 15 (this one): the `confirmation_required` error code exists, and `scope prune`'s
-/// report drops `dry_run`.
-/// Versions 10–14 are recorded in docs/MACHINE_INTERFACE.md.
+/// Versions 10–14 and 16 onward are recorded in docs/MACHINE_INTERFACE.md.
+/// Version 15: the `confirmation_required` error code exists, and `scope prune`'s report drops
+/// `dry_run`.
 /// Version 9: `batch_lane` may be `out_of_time`, when the remote ran out of time for a
 /// batch download and the rest of the command fetched one object at a time.
 /// Version 8: the `pallet_deleted_on_remote` error code exists; `palletize --remote`
@@ -62,7 +62,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 21;
+pub const SCHEMA_VERSION: u32 = 22;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]

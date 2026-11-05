@@ -120,7 +120,10 @@ fn validate_reason(reason: &str) -> Result<(), String> {
     }
 
     if reason.len() > MAX_REASON_BYTES {
-        return Err(format!("has a reason of {} bytes; at most {} are allowed", reason.len(), MAX_REASON_BYTES));
+        return Err(format!(
+            "has a reason of {} bytes; at most {} are allowed",
+            reason.len(), MAX_REASON_BYTES
+        ));
     }
 
     Ok(())
@@ -184,7 +187,8 @@ impl PalletRules for RedactionsRules {
 
             if cell.before.is_some() {
                 return Err(format!(
-                    "the redaction of {} already exists, and a redaction is never changed or removed",
+                    "the redaction of {} already exists, and a redaction is never changed or \
+                    removed",
                     cell.path
                 ));
             }
@@ -342,10 +346,12 @@ pub fn record_redaction(redaction: &Redaction,
     validate_reason(&redaction.reason).map_err(|why| format!("The redaction {}.", why))?;
 
     let stamp = writer.stamp(actor);
-    let edits = [meta_tree::set_cell(&redaction.hash, &stamp, REDACTION_SCHEMA, &redaction_value(redaction))?];
+    let value = redaction_value(redaction);
+    let edits = [meta_tree::set_cell(&redaction.hash, &stamp, REDACTION_SCHEMA, &value)?];
     let description = format!("redact {}", redaction.hash);
 
-    meta_tree::stack_meta_edits(REDACTIONS_PALLET_NAME, &RedactionsRules, writer, &edits, actor, &description)?
+    let rules = &RedactionsRules;
+    meta_tree::stack_meta_edits(REDACTIONS_PALLET_NAME, rules, writer, &edits, actor, &description)?
         .ok_or(format!("Object {} is already redacted.", redaction.hash))
 }
 
@@ -368,8 +374,10 @@ pub fn read_redactions() -> Result<RedactionsRead, String> {
             CellRead::Readable(envelope) => parse_value(&hash, &envelope.value)
                 .map(|redaction| (redaction, envelope.stamp))
                 .map_err(|why| format!("the value {}", why)),
-            CellRead::Unknown { schema, .. } =>
-                Err(format!("written with the schema \"{}\", which this forklift does not know", schema)),
+            CellRead::Unknown { schema, .. } => Err(format!(
+                "written with the schema \"{}\", which this forklift does not know",
+                schema
+            )),
             CellRead::Malformed(why) => Err(why),
         };
 
@@ -391,16 +399,22 @@ mod tests {
     use super::*;
 
     fn redaction() -> Redaction {
-        Redaction { hash: "a".repeat(64), reason: "leaked key".to_string(), redacted_at: 7, chunks: None }
+        Redaction {
+            hash: "a".repeat(64),
+            reason: "leaked key".to_string(),
+            redacted_at: 7,
+            chunks: None,
+        }
     }
 
     #[test]
     fn a_redaction_round_trips_through_its_value() {
-        assert_eq!(parse_value(&"a".repeat(64), &redaction_value(&redaction())).unwrap(), redaction());
+        let hash = "a".repeat(64);
+        assert_eq!(parse_value(&hash, &redaction_value(&redaction())).unwrap(), redaction());
 
         let mut chunked = redaction();
         chunked.chunks = Some(chunk_list_digest(&["b".repeat(64), "c".repeat(64)]));
-        assert_eq!(parse_value(&"a".repeat(64), &redaction_value(&chunked)).unwrap(), chunked);
+        assert_eq!(parse_value(&hash, &redaction_value(&chunked)).unwrap(), chunked);
     }
 
     #[test]
@@ -421,7 +435,8 @@ mod tests {
 
         let mut short = redaction();
         short.chunks = Some("abc".to_string());
-        assert!(parse_value(&hash, &redaction_value(&short)).unwrap_err().contains("not a full hash"));
+        let error = parse_value(&hash, &redaction_value(&short)).unwrap_err();
+        assert!(error.contains("not a full hash"), "{}", error);
 
         let mut untimed = redaction_value(&redaction());
         untimed.insert(FIELD_REDACTED_AT, value("yesterday"));
@@ -431,11 +446,14 @@ mod tests {
     #[test]
     fn the_chunk_list_digest_keeps_order() {
         let (b, c) = ("b".repeat(64), "c".repeat(64));
+        let digest = |chunks: &[&String]| {
+            chunk_list_digest(&chunks.iter().map(|chunk| chunk.to_string()).collect::<Vec<_>>())
+        };
 
-        assert_eq!(chunk_list_digest(&[b.clone(), c.clone()]), chunk_list_digest(&[b.clone(), c.clone()]));
-        assert_ne!(chunk_list_digest(&[b.clone(), c.clone()]), chunk_list_digest(&[c.clone(), b.clone()]));
-        assert_ne!(chunk_list_digest(&[b.clone()]), chunk_list_digest(&[b.clone(), b.clone()]));
-        assert!(object_utils::is_object_hash(&chunk_list_digest(&[b])));
+        assert_eq!(digest(&[&b, &c]), digest(&[&b, &c]));
+        assert_ne!(digest(&[&b, &c]), digest(&[&c, &b]));
+        assert_ne!(digest(&[&b]), digest(&[&b, &b]));
+        assert!(object_utils::is_object_hash(&digest(&[&b])));
     }
 
     #[test]

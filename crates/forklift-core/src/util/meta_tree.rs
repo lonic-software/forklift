@@ -49,8 +49,8 @@ use crate::util::office_utils::{KeyRecord, OfficeState, RevocationReason, TrustA
 use crate::util::pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions};
 use crate::util::sign_utils::ParcelSignature;
 use crate::util::{
-    haul_utils, kv_utils, manifest_utils, object_utils, office_utils, pallet_utils, redaction_utils, sign_utils,
-    tag_utils,
+    haul_utils, kv_utils, manifest_utils, object_utils, office_utils, pallet_utils, redaction_utils,
+    sign_utils, tag_utils,
 };
 
 /// The spine every meta tree keeps: `.forklift/tracked/`.

@@ -17,7 +17,8 @@ struct Warehouse {
 
 impl Warehouse {
     fn new(name: &str) -> Warehouse {
-        let base = std::env::temp_dir().join(format!("forklift-redaction-{}-{}", name, std::process::id()));
+        let base = std::env::temp_dir()
+            .join(format!("forklift-redaction-{}-{}", name, std::process::id()));
         let root = base.join("warehouse");
         let home = base.join("home");
         let _ = std::fs::remove_dir_all(&base);
@@ -82,7 +83,7 @@ fn hash_of(content: &[u8]) -> String {
 
 /// Record a redaction of `target`, which must succeed, and return the JSON report.
 fn recorded_hash(warehouse: &Warehouse, target: &str, reason: &str) -> serde_json::Value {
-    warehouse.json(&["redact", "record", target, "--reason", reason])
+    warehouse.json(&["redact", "record", target, "-m", reason])
 }
 
 #[test]
@@ -102,13 +103,13 @@ fn a_redaction_is_recorded_listed_and_never_recorded_twice() {
     assert_eq!(listed[0]["hash"], hash.as_str());
     assert_eq!(listed[0]["reason"], "leaked token");
     assert_eq!(listed[0]["redactor"], "redactor@forklift");
-    assert!(listed[0].get("signer").is_none(), "an unenrolled warehouse writes unsigned: {:?}", listed);
+    assert!(listed[0].get("signer").is_none(), "unenrolled, it writes unsigned: {:?}", listed);
     assert!(listed[0].get("chunks").is_none(), "{:?}", listed);
 
     // Again, by path and by hash: a redaction is permanent, and the second leaves the first as it
     // was.
     for target in ["main:secret.env", hash.as_str()] {
-        let again = warehouse.run(&["redact", "record", target, "--reason", "again"]);
+        let again = warehouse.run(&["redact", "record", target, "-m", "again"]);
         assert!(!again.status.success());
         assert!(String::from_utf8_lossy(&again.stderr).contains("already redacted"), "{:?}", again);
     }
@@ -121,8 +122,9 @@ fn a_held_hash_is_redacted_by_hash_and_only_file_content_is() {
     let warehouse = Warehouse::new("by-hash");
     warehouse.stack("dir/secret.env", b"TOKEN=hunter2\n", "leak");
 
-    // Not a file: a directory path (which the tree lookup does not find), a parcel hash, an absent hash, a malformed target.
-    let parcel = std::fs::read_to_string(warehouse.root.join(".forklift").join("pallets").join("main"))
+    // Not a file: a directory path (which the tree lookup does not find), a parcel hash,
+    // an absent hash, a malformed target, a missing path.
+    let parcel = std::fs::read_to_string(warehouse.root.join(".forklift/pallets/main"))
         .unwrap()
         .trim()
         .to_string();
@@ -135,15 +137,16 @@ fn a_held_hash_is_redacted_by_hash_and_only_file_content_is() {
         ("not-a-target", "neither a full object hash"),
         ("main:missing.txt", "was not found"),
     ] {
-        let refused = warehouse.run(&["redact", "record", target, "--reason", "r"]);
+        let refused = warehouse.run(&["redact", "record", target, "-m", "r"]);
         assert!(!refused.status.success(), "{} must be refused", target);
-        assert!(String::from_utf8_lossy(&refused.stderr).contains(expected), "{}: {:?}", target, refused);
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(stderr.contains(expected), "{}: {:?}", target, refused);
     }
 
     assert!(warehouse.redactions().is_empty());
 
     // An empty reason is refused before anything is written.
-    let empty = warehouse.run(&["redact", "record", "main:dir/secret.env", "--reason", " "]);
+    let empty = warehouse.run(&["redact", "record", "main:dir/secret.env", "-m", " "]);
     assert!(!empty.status.success());
     assert!(String::from_utf8_lossy(&empty.stderr).contains("empty reason"), "{:?}", empty);
 
@@ -162,11 +165,13 @@ fn content_a_meta_pallet_history_names_is_refused_with_its_code() {
     // @tags parcel's tree.
     warehouse.stack("marker.txt", b"forklift-meta 1 tags", "marker");
 
-    let refused = warehouse.run(&["--json", "redact", "record", "main:marker.txt", "--reason", "r"]);
-    assert_eq!(refused.status.code(), Some(48), "{}", String::from_utf8_lossy(&refused.stdout));
-    let document: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&refused.stdout)).unwrap();
-    assert_eq!(document["error"]["code"], "redaction_blocked", "{}", document);
-    assert_eq!(document["error"]["details"]["meta_pallets"], serde_json::json!(["@tags"]), "{}", document);
+    let refused = warehouse.run(&["--json", "redact", "record", "main:marker.txt", "-m", "r"]);
+    let stdout = String::from_utf8_lossy(&refused.stdout);
+    assert_eq!(refused.status.code(), Some(48), "{}", stdout);
+    let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let error = &document["error"];
+    assert_eq!(error["code"], "redaction_blocked", "{}", document);
+    assert_eq!(error["details"]["meta_pallets"], serde_json::json!(["@tags"]), "{}", document);
     assert!(warehouse.redactions().is_empty());
 
     // A file no meta pallet names is redacted as usual in the same warehouse.

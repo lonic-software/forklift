@@ -45,6 +45,7 @@ shift
 show
 stack
 stocktake
+redact: record list
 store: status compact peek evict
 tag: create show list
 undo
@@ -98,4 +99,5 @@ haul review
 manifest note
 manifest approve
 manifest provenance
+redact record
 tag create

@@ -159,6 +159,14 @@ If the merge conflicts, `lower` stops with `merge_conflicts` (exit 47). **Do not
 option: the wire is fast-forward only. A `lower <pallet>` of a pallet this bay is not on refuses as
 `diverged` instead, naming `forklift shift <pallet>` first.
 
+### `redaction_blocked` (exit 48)
+
+The content you tried to redact is also part of a meta pallet's history: the office, the
+manifest, the tags, the hauls, the custom metadata or the redactions themselves. That history is
+never rewritten, so the content can never be removed from this warehouse or any copy of it, and
+nothing was recorded. The error's `details.meta_pallets` names where it is. Treat the content as
+exposed: rotate or revoke the secret it holds.
+
 ### `merge_conflicts` (exit 47)
 
 `lower` merged the remote's diverged head into your pallet, and both sides changed the same paths.
