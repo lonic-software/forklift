@@ -2420,6 +2420,23 @@ pub(crate) mod tests {
             assert_incomplete(write("main", Some(&head), &next), "main", Some(&head));
         }
 
+        // Revert: hold an applied hash wherever the walk meets it → the write lands over the
+        // absent subtree a redaction can never have taken away.
+        #[test]
+        fn an_applied_hash_absent_as_a_tree_is_refused() {
+            let (_root, _scope) = scratch("closure-applied-tree");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let web = tree(&[("b", &blob("b1"), DirEntryType::Normal)]);
+            let src = tree(&[("a", &blob("a1"), DirEntryType::Normal)]);
+            let head = parcel(&tree(&[("src", &src, DirEntryType::Tree), ("web", &web, DirEntryType::Tree)]),
+                              &[&base]);
+            crate::util::applied_redactions::apply_for_test(&[&web]);
+            remove(&web);
+
+            assert_incomplete(write("main", Some(&base), &head), "main", Some(&base));
+        }
+
         // Revert: tolerate any absence once a record exists → the write lands over a root no
         // entry names.
         #[test]

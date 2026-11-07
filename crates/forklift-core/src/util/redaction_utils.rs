@@ -271,6 +271,14 @@ pub fn held_kind(hash: &str) -> Result<Option<RedactedKind>, String> {
     }
 }
 
+/// Whether the store holds `hash` as a file's content: present, and a blob or a recipe. An object
+/// it lacks, holds as a tree, a parcel or a chunk, or cannot read is not, so a caller about to take
+/// an object away under an applied redaction keeps every one it cannot tell is a copy of a file's
+/// content.
+pub fn holds_as_file_content(hash: &str) -> bool {
+    matches!(held_kind(hash), Ok(Some(_)))
+}
+
 /// The kind a tree entry's content is redacted as, or `None` for an entry with no content of its
 /// own (a subtree).
 pub fn entry_kind(entry_type: DirEntryType) -> Option<RedactedKind> {

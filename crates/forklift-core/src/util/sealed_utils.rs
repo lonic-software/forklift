@@ -89,6 +89,11 @@
 //! as it holds a recorded one, without descending, and keeps it apart: it is never damage, and
 //! never among the absences a caller treats as owed by an origin. [`Tolerated`] carries both sets,
 //! kept apart, to every walk that judges an absence; [`read_tolerated`] reads them.
+//!
+//! A redaction names a file's content, a blob or a recipe, never a tree or a chunk, so the walk
+//! holds it only where a file's content sits ([`At::File`]). A tree or a chunk absent under an
+//! applied hash, which only a cell naming such a hash by itself could bring about, is judged as if
+//! no redaction named it: a chunk no redaction covers, since other files may share it.
 
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::io::{Seek, Write};
@@ -425,17 +430,29 @@ pub enum Held {
     Redacted,
 }
 
+/// Where a walk meets an object: what an applied redaction may hold there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum At {
+    /// A file's content, a blob or a recipe: what a redaction names.
+    File,
+    /// A tree.
+    Tree,
+    /// A chunk of a recipe.
+    Chunk,
+}
+
 impl Tolerated {
     /// Only the applied redactions: for a warehouse whose every other object must be present.
     pub fn applied_only(applied: AppliedSet) -> Tolerated {
         Tolerated { sealed: SealedSet::default(), applied }
     }
 
-    /// Which set holds `hash`, if either does. An applied redaction wins over a record of the same
-    /// hash: nothing fetches a redacted object. Checks no presence: a held object that is present
-    /// is held by nothing, and walked.
-    pub fn held(&self, hash: &str) -> Option<Held> {
-        if self.applied.contains(hash) {
+    /// Which set holds `hash`, met `at`, if either does. An applied redaction holds a file's
+    /// content only (see Applied redactions in the module doc comment), and there wins over a
+    /// record of the same hash: nothing fetches a redacted object. Checks no presence: a held
+    /// object that is present is held by nothing, and walked.
+    pub fn held(&self, hash: &str, at: At) -> Option<Held> {
+        if at == At::File && self.applied.contains(hash) {
             Some(Held::Redacted)
         } else if self.sealed.contains(hash) {
             Some(Held::Sealed)
@@ -931,7 +948,8 @@ impl WalkDamage {
 pub struct Walked {
     /// Every object referenced, present or absent, absent parcels included.
     pub referenced: HashSet<String>,
-    /// The absent trees, files and chunks among them that no applied redaction names: the
+    /// The absent trees, files and chunks among them that nothing holds (an applied redaction holds
+    /// only a file's content, never a tree or a chunk): the
     /// boundaries the walk stopped at that a remote is leaned on for. Absent parcels are not among
     /// them.
     pub absent: HashSet<String>,
@@ -939,7 +957,7 @@ pub struct Walked {
 
 impl Walked {
     /// Note `hash` as referenced and say what it was met as.
-    fn meet(&mut self, hash: &str, tolerated: &Tolerated, unrecorded: Unrecorded) -> Result<Met, String> {
+    fn meet(&mut self, hash: &str, at: At, tolerated: &Tolerated, unrecorded: Unrecorded) -> Result<Met, String> {
         if !self.referenced.insert(hash.to_string()) {
             return Ok(Met::Again);
         }
@@ -948,7 +966,7 @@ impl Walked {
             return Ok(Met::Present);
         }
 
-        match tolerated.held(hash) {
+        match tolerated.held(hash, at) {
             // A boundary too, but never one a remote is leaned on for, so not among `absent`.
             Some(Held::Redacted) => return Ok(Met::Absent),
             Some(Held::Sealed) => {}
@@ -964,7 +982,7 @@ impl Walked {
     /// and not held, where that is damage, if any.
     fn meet_chunks(&mut self, hash: &str, tolerated: &Tolerated, unrecorded: Unrecorded) -> Result<Option<String>, String> {
         for chunk in object_utils::recipe_chunk_hashes(hash)? {
-            if let Met::Unrecorded = self.meet(&chunk, tolerated, unrecorded)? {
+            if let Met::Unrecorded = self.meet(&chunk, At::Chunk, tolerated, unrecorded)? {
                 return Ok(Some(chunk));
             }
         }
@@ -1013,7 +1031,7 @@ pub fn walk(parcels: &[String], tolerated: &Tolerated, unrecorded: Unrecorded) -
             continue;
         }
 
-        match walked.meet(hash, tolerated, unrecorded)? {
+        match walked.meet(hash, At::File, tolerated, unrecorded)? {
             Met::Unrecorded => return damage(hash, "staged work"),
             Met::Present if item_type.is_chunked() => {
                 if let Some(chunk) = walked.meet_chunks(hash, tolerated, unrecorded)? {
@@ -1026,7 +1044,7 @@ pub fn walk(parcels: &[String], tolerated: &Tolerated, unrecorded: Unrecorded) -
 
     // A tree is noted and judged when it is popped, with the object that named it for the message.
     while let Some((hash, named_by)) = trees.pop() {
-        match walked.meet(&hash, tolerated, unrecorded)? {
+        match walked.meet(&hash, At::Tree, tolerated, unrecorded)? {
             Met::Present => {}
             Met::Unrecorded => return damage(&hash, &named_by),
             Met::Again | Met::Absent => continue,
@@ -1035,7 +1053,7 @@ pub fn walk(parcels: &[String], tolerated: &Tolerated, unrecorded: Unrecorded) -
         let tree = object_utils::load_tree(&hash)?;
 
         for (_, file) in tree.get_files() {
-            match walked.meet(&file.hash, tolerated, unrecorded)? {
+            match walked.meet(&file.hash, At::File, tolerated, unrecorded)? {
                 Met::Unrecorded => return damage(&file.hash, &hash),
                 Met::Present if file.item_type.is_chunked() => {
                     if let Some(chunk) = walked.meet_chunks(&file.hash, tolerated, unrecorded)? {
@@ -2064,11 +2082,32 @@ mod tests {
         applied_redactions::apply_for_test(&[&both]);
 
         let tolerated = read_tolerated().unwrap();
-        assert_eq!(tolerated.held(&both), Some(Held::Redacted));
-        assert_eq!(tolerated.held(&sealed_only), Some(Held::Sealed));
-        assert_eq!(tolerated.held(&neither), None);
+        assert_eq!(tolerated.held(&both, At::File), Some(Held::Redacted));
+        assert_eq!(tolerated.held(&sealed_only, At::File), Some(Held::Sealed));
+        assert_eq!(tolerated.held(&neither, At::File), None);
         assert!(!tolerated.is_empty() && !Tolerated::applied_only(tolerated.applied.clone()).is_empty());
         assert!(Tolerated::default().is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An applied redaction holds a file's content only: met as a tree or a chunk, its hash is held
+    /// by the record alone, if at all.
+    ///
+    /// Revert: hold an applied hash wherever it is met → `Held::Redacted` at a tree and a chunk → red.
+    #[test]
+    fn an_applied_redaction_holds_nothing_met_as_a_tree_or_a_chunk() {
+        let (root, _scope) = scratch("held-at");
+        let (both, applied_only) = ("1".repeat(64), "4".repeat(64));
+        append(&[(SealOp::Record, &both)]).unwrap();
+        applied_redactions::apply_for_test(&[&both, &applied_only]);
+
+        let tolerated = read_tolerated().unwrap();
+        for at in [At::Tree, At::Chunk] {
+            assert_eq!(tolerated.held(&both, at), Some(Held::Sealed), "{:?}", at);
+            assert_eq!(tolerated.held(&applied_only, at), None, "{:?}", at);
+        }
+        assert_eq!(tolerated.held(&applied_only, At::File), Some(Held::Redacted));
 
         std::fs::remove_dir_all(&root).ok();
     }

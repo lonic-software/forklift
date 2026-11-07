@@ -43,10 +43,10 @@
 use std::collections::HashSet;
 use crate::util::lock_utils::{ServeLock, StoreAccessExclusive, StoreLock};
 use crate::util::progress_utils::Progress;
-use crate::util::sealed_utils::{self, SealOp, Tolerated};
+use crate::util::sealed_utils::{self, At, SealOp, Tolerated};
 use crate::util::{
     bay_utils, cache_miss, cherry_pick_utils, file_utils, gc_utils, merge_utils, object_utils, office_utils,
-    pack_utils, pallet_utils, park_utils, prune_utils, recovery_utils,
+    pack_utils, pallet_utils, park_utils, prune_utils, recovery_utils, redaction_utils,
 };
 
 /// What an eviction would do, computed without changing anything (safe for a dry run).
@@ -205,7 +205,11 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
     for hash in held.present {
         if checkout_keep.contains(&hash) {
             plan.kept_for_checkouts += 1;
-        } else if local_keep.contains(&hash) {
+        } else if local_keep.contains(&hash)
+            // An applied redaction holds an absence only as a file's content: a tree, a parcel or
+            // a chunk stored under its hash, freed, could neither be recorded nor held.
+            || (tolerated.applied.contains(&hash) && !redaction_utils::holds_as_file_content(&hash))
+        {
             plan.kept_local += 1;
         } else {
             // Present (the walk said so), so an object no pack holds is loose. One a pack holds
@@ -368,7 +372,7 @@ fn walk_held(parcels: &[String], sealed: &Tolerated) -> Result<HeldClosure, Stri
             continue;
         }
 
-        if !held_present(&hash, &named_by, sealed)? {
+        if !held_present(&hash, At::Tree, &named_by, sealed)? {
             continue;
         }
 
@@ -377,7 +381,7 @@ fn walk_held(parcels: &[String], sealed: &Tolerated) -> Result<HeldClosure, Stri
         stack.push(Step::Finalize(hash.clone()));
 
         for (_, file) in tree.get_files() {
-            if !closure.seen.insert(file.hash.clone()) || !held_present(&file.hash, &hash, sealed)? {
+            if !closure.seen.insert(file.hash.clone()) || !held_present(&file.hash, At::File, &hash, sealed)? {
                 continue;
             }
 
@@ -385,7 +389,7 @@ fn walk_held(parcels: &[String], sealed: &Tolerated) -> Result<HeldClosure, Stri
             // while it is still present, so a killed run that freed some leaves the rest listed.
             if file.item_type.is_chunked() {
                 for chunk in object_utils::recipe_chunk_hashes(&file.hash)? {
-                    if closure.seen.insert(chunk.clone()) && held_present(&chunk, &file.hash, sealed)? {
+                    if closure.seen.insert(chunk.clone()) && held_present(&chunk, At::Chunk, &file.hash, sealed)? {
                         closure.present.push(chunk);
                     }
                 }
@@ -402,15 +406,16 @@ fn walk_held(parcels: &[String], sealed: &Tolerated) -> Result<HeldClosure, Stri
     Ok(closure)
 }
 
-/// Whether `hash`, which `named_by` references in the origin's closure, is present: `false` when
-/// it is absent and held (recorded, or named by a redaction this warehouse applied, whose bytes
-/// were taken away on purpose), an error when it is absent and not.
-fn held_present(hash: &str, named_by: &str, sealed: &Tolerated) -> Result<bool, String> {
+/// Whether `hash`, met `at`, which `named_by` references in the origin's closure, is present:
+/// `false` when it is absent and held (recorded, or for a file's content, named by a redaction
+/// this warehouse applied, whose bytes were taken away on purpose), an error when it is absent
+/// and not.
+fn held_present(hash: &str, at: At, named_by: &str, sealed: &Tolerated) -> Result<bool, String> {
     if file_utils::is_present_for_sweep(hash)? {
         return Ok(true);
     }
 
-    if sealed.held(hash).is_some() {
+    if sealed.held(hash, at).is_some() {
         return Ok(false);
     }
 
@@ -1278,6 +1283,21 @@ mod tests {
         carry(&plan, &hold).unwrap();
         let record = sealed_utils::read_sealed().unwrap();
         assert!(!record.contains(&h.shared) && record.contains(&h.dir));
+    }
+
+    /// A present tree an applied redaction's hash names is kept: an applied redaction holds only a
+    /// file's content, so the tree, freed, would be an absence nothing holds.
+    ///
+    /// Revert: drop the kind check from the plan → the tree is listed to evict.
+    #[test]
+    fn plan_keeps_a_present_tree_an_applied_hash_names() {
+        let _scratch = Scratch::new("applied-tree");
+        let h = history();
+        crate::util::applied_redactions::apply_for_test(&[&h.dir]);
+        let hold = store_access();
+
+        let plan = plan_evict(&[h.held.clone()], &hold).unwrap();
+        assert!(!plan.to_evict.contains(&h.dir) && plan.to_evict.contains(&h.shared), "{:?}", plan.to_evict);
     }
 
     /// The bound walks past an absence an applied redaction names, as it walks past a recorded one,

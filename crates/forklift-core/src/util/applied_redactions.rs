@@ -218,7 +218,13 @@ pub struct RedactionStatus {
 /// heads that name its content (by hash, or for a recipe, by chunk list) and the meta pallets whose
 /// history names its hash. `None` when nothing does. A holder any walk found is reported ahead of
 /// another walk's error, as the more definite answer.
+///
+/// A hash this store holds as a tree, a parcel or a chunk is no file's content, so its redaction
+/// never applies: deleting it would take away a tree or a chunk that other content may share, and
+/// no walk holds such an absence. It is an error, which leaves the redaction undecided.
 fn scan(redaction: &Redaction) -> Result<Option<RedactionState>, String> {
+    redaction_utils::held_kind(&redaction.hash)?;
+
     let heads = redaction_utils::head_holders(redaction);
     let tombstones = redaction_utils::tombstone_holders(redaction);
     let meta_pallets = redaction_utils::meta_holders(&redaction.hash);
@@ -446,6 +452,29 @@ mod tests {
         assert_eq!(Judge { remote: true, partial: false }.clean(), RedactionState::AwaitingRemote);
         assert_eq!(Judge { remote: true, partial: true }.clean(), RedactionState::AwaitingRemote);
         assert!(matches!(Judge { remote: false, partial: true }.clean(), RedactionState::Undecided(_)));
+    }
+
+    /// A redaction naming an object this store holds as a chunk or a tree is never applied: its
+    /// scan is an error, which leaves it undecided.
+    ///
+    /// Revert: drop the kind check from the scan → both scans come back clean.
+    #[test]
+    fn a_redaction_naming_a_chunk_or_a_tree_is_never_scanned_clean() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::enums::dir_entry_type::DirEntryType;
+        use crate::model::tree_item::TreeItem;
+
+        let _scratch = Scratch::new("applied-kind");
+        let mut chunk = LooseObjectBuilder::build_chunk(&crate::model::chunk::Chunk { content: b"bytes".to_vec() });
+        chunk.store().unwrap();
+        let mut tree = LooseObjectBuilder::build_tree(&TreeItem::new(String::new(), String::new(), DirEntryType::Tree));
+        tree.store().unwrap();
+
+        for hash in [&chunk.hash, &tree.hash] {
+            let redaction = Redaction { hash: hash.clone(), reason: "r".to_string(), redacted_at: 0, chunks: None };
+            let error = scan(&redaction).unwrap_err();
+            assert!(error.contains("not a file's content"), "{}", error);
+        }
     }
 
     #[test]

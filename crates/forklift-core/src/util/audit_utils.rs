@@ -11,7 +11,7 @@ use crate::model::tree_item::TreeItem;
 use crate::util::office_utils::{KeyRecord, OfficeState, TrustAnchor};
 use crate::util::scope_utils::{PathScope, ScopeClass};
 use crate::util::{cache_miss, fanout_utils, file_utils, graph_utils, object_utils, office_utils, pallet_utils, sign_utils};
-use crate::util::sealed_utils::{Held, Tolerated};
+use crate::util::sealed_utils::{At, Held, Tolerated};
 use crate::util::pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions};
 
 /// Why an office chain did not verify. The heads answer the two classes differently: an
@@ -1823,15 +1823,16 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
 /// full scope: in a sparse warehouse the write verifies again at its own. The proof records
 /// `known_complete`, which a write accepts only as the head its compare-and-set expects.
 ///
-/// An absent object a redaction this warehouse applied names is tolerated, as the ref write's own
-/// verification tolerates it: the history of every head still names the content the redaction
-/// took away. Nothing else absent is. The applied record is read only when the walk without it
-/// fails, so a warehouse holding the whole closure never depends on it; and it only ever grows, so
-/// the write need not read it again under its lock.
+/// An absent file's content a redaction this warehouse applied names is tolerated, as the ref
+/// write's own verification tolerates it: the history of every head still names the content the
+/// redaction took away. The same hash absent where the closure names it as a tree or a chunk is
+/// not, since a redaction never takes either away. Nothing else absent is. The applied record is
+/// read only when the walk without it fails, so a warehouse holding the whole closure never depends
+/// on it; and it only ever grows, so the write need not read it again under its lock.
 ///
 /// # Returns
 /// * `Ok(VerifiedClosure)` - Everything is present, or absent only where an applied redaction
-///                           names it.
+///                           names it as a file's content.
 /// * `Err(String)`         - If a parcel, tree or blob is missing (or unreadable), or the applied
 ///                           record cannot be read.
 pub fn verify_parcel_closure_for_write(head: &str,
@@ -2066,11 +2067,12 @@ impl<'a> SealedTolerance<'a> {
         self.tolerated.is_empty()
     }
 
-    /// Whether the absent object `hash` is held, by the record or by an applied redaction, tallying
+    /// Whether the absent object `hash`, met `at`, is held, by the record or by an applied redaction
+    /// (a file's content only), tallying
     /// it under the one that holds it if so. Call only at an absence: a held object that is present
     /// is held by nothing.
-    fn holds_absent(&self, hash: &str) -> bool {
-        match self.tolerated.held(hash) {
+    fn holds_absent(&self, hash: &str, at: At) -> bool {
+        match self.tolerated.held(hash, at) {
             Some(Held::Sealed) => self.held.borrow_mut().insert(hash.to_string()),
             Some(Held::Redacted) => self.redacted.borrow_mut().insert(hash.to_string()),
             None => return false,
@@ -2080,8 +2082,8 @@ impl<'a> SealedTolerance<'a> {
 }
 
 /// [`SealedTolerance::holds_absent`], where `None` holds nothing.
-fn holds_absent(sealed: Option<&SealedTolerance>, hash: &str) -> bool {
-    sealed.is_some_and(|sealed| sealed.holds_absent(hash))
+fn holds_absent(sealed: Option<&SealedTolerance>, hash: &str, at: At) -> bool {
+    sealed.is_some_and(|sealed| sealed.holds_absent(hash, at))
 }
 
 /// The closure walk behind every verifier here.
@@ -2529,7 +2531,7 @@ fn verify_tree_closure_scoped(tree_hash: &str,
             continue; // a base carries it here: present by the base's own verification
         }
         if !blob_exists(&file.hash)? {
-            if holds_absent(sealed, &file.hash) {
+            if holds_absent(sealed, &file.hash, At::File) {
                 continue; // held by hash alone: a chunked file's recipe seals its chunks too
             }
             return Err(format!(
@@ -2741,7 +2743,7 @@ fn verify_tree_closure(tree_hash: &str,
             }
 
             if !blob_exists(&file.hash)? {
-                if holds_absent(sealed, &file.hash) {
+                if holds_absent(sealed, &file.hash, At::File) {
                     continue; // held by hash alone: a chunked file's recipe seals its chunks too
                 }
                 return Err(format!(
@@ -2806,7 +2808,7 @@ fn verify_chunked_file(
 ) -> Result<(), String> {
     // Absent chunks the record does not hold; those it holds are tolerated.
     let unheld = |mut missing: Vec<String>| -> Vec<String> {
-        missing.retain(|chunk| !holds_absent(sealed, chunk));
+        missing.retain(|chunk| !holds_absent(sealed, chunk, At::Chunk));
         missing
     };
 
@@ -2850,10 +2852,10 @@ fn verify_chunked_file(
 fn sealed_absent(sealed: Option<&SealedTolerance>,
                  tree_hash: &str,
                  object_exists: &dyn Fn(&str) -> Result<bool, String>) -> Result<bool, String> {
-    let Some(sealed) = sealed.filter(|sealed| sealed.tolerated.held(tree_hash).is_some()) else {
+    let Some(sealed) = sealed.filter(|sealed| sealed.tolerated.held(tree_hash, At::Tree).is_some()) else {
         return Ok(false);
     };
-    Ok(!object_exists(tree_hash)? && sealed.holds_absent(tree_hash))
+    Ok(!object_exists(tree_hash)? && sealed.holds_absent(tree_hash, At::Tree))
 }
 
 /// How many absent chunk hashes a closure-check failure names before summarizing the rest as
