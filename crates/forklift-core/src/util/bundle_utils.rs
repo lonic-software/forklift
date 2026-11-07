@@ -346,6 +346,9 @@ fn write_envelope_and_publish(temporary_path: &Path,
     }
     drop(writer);
 
+    #[cfg(test)]
+    tests::BEFORE_PUBLISH.with(|hook| if let Some(hook) = hook.borrow_mut().take() { hook() });
+
     // An apply withdraws the bundle under this lock after its mark, so a bundle published here
     // either lands before the mark, and is withdrawn, or is judged against it.
     let _lock = RefLock::acquire()?;
@@ -1551,6 +1554,59 @@ mod tests {
     use crate::model::recipe::{Recipe, RecipeChunk};
     use crate::model::tree_item::TreeItem;
     use crate::util::byte_utils::number_to_vlq_bytes;
+
+    thread_local! {
+        /// Run once right before a build takes the ref lock to publish.
+        pub(super) static BEFORE_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    }
+
+    // Revert: drop the plan's redacted skip → the bundle carries the redacted blob; drop the
+    // publish check → a build during which a redaction applied publishes it.
+    #[test]
+    fn a_bundle_never_carries_redacted_content() {
+        let source = Scratch::new("bundle-redacted-src");
+        let secret = store_blob(b"TOKEN=hunter2");
+        let later = store_blob(b"TOKEN=rotated");
+        let kept = store_blob(b"notes");
+        let first = store_head_parcel(&store_tree(&[("secret.env", &secret), ("notes.txt", &kept)], &[]), &[]);
+        store_head_parcel(&store_tree(&[("secret.env", &later), ("notes.txt", &kept)], &[]), &[&first]);
+        crate::util::applied_redactions::apply_for_test(&[&secret]);
+
+        build_bundle().unwrap();
+        let bundle = std::fs::read(get_latest_bundle_path()).unwrap();
+
+        // A redaction applied while the build runs keeps the build from publishing.
+        std::fs::remove_file(get_latest_bundle_path()).unwrap();
+        let applied_meanwhile = later.clone();
+        BEFORE_PUBLISH.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+            crate::util::applied_redactions::apply_for_test(&[&applied_meanwhile]);
+        })));
+        let refused = build_bundle().err().expect("a redaction applied during the build refuses it");
+        assert!(refused.contains("A redaction was applied while the bundle was built"), "{}", refused);
+        assert!(!get_latest_bundle_path().exists(), "nothing was published");
+        drop(source);
+
+        let _destination = Scratch::new("bundle-redacted-dst");
+        import_bundle_bytes(&bundle).unwrap();
+        assert!(!file_utils::does_object_exist(&secret).unwrap(), "the redacted blob is left out");
+        assert!(file_utils::does_object_exist(&later).unwrap() && file_utils::does_object_exist(&kept).unwrap());
+    }
+
+    // Revert: drop the partial bundle's redacted skip → the batch carries the redacted blob.
+    #[test]
+    fn a_partial_bundle_leaves_redacted_content_out_as_absent() {
+        let source = Scratch::new("partial-redacted-src");
+        let secret = store_blob(b"TOKEN=hunter2");
+        let kept = store_blob(b"notes");
+        crate::util::applied_redactions::apply_for_test(&[&secret]);
+        let bytes = build_partial_bundle(&[secret.clone(), kept.clone()]).unwrap();
+        drop(source);
+
+        let _destination = Scratch::new("partial-redacted-dst");
+        import_batch_bytes(&bytes, &[&secret, &kept]).unwrap();
+        assert!(!file_utils::does_object_exist(&secret).unwrap());
+        assert!(file_utils::does_object_exist(&kept).unwrap());
+    }
 
     /// Import an in-memory bundle, as `import_bundle` imports a file.
     fn import_bundle_bytes(bytes: &[u8]) -> Result<ImportStats, String> {

@@ -2532,6 +2532,35 @@ pub(crate) mod tests {
 
         // Revert: stop comparing the token's bound → a walk cut at a parcel no ref reaches skips the
         // root `head` reuses from it, so the write takes that token and lands over a lost blob.
+        // Revert: verify the server's write strictly again → a head whose history names content a
+        // redaction applied here took away is refused as incomplete.
+        #[test]
+        fn a_server_write_tolerates_only_an_absence_an_applied_redaction_names() {
+            let (_root, _scope) = scratch("closure-applied");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let leaked = parcel(&two_dirs("secret", "b0"), &[&base]);
+            let head = parcel(&two_dirs("a1", "b0"), &[&leaked]);
+            let secret = blob("secret");
+            remove(&secret);
+
+            let refused = crate::util::audit_utils::verify_parcel_closure_for_write(&head, Some(&base));
+            assert!(refused.is_err(), "an absence nothing names is damage");
+
+            crate::util::applied_redactions::apply_for_test(&[&secret]);
+            let token = crate::util::audit_utils::verify_parcel_closure_for_write(&head, Some(&base)).unwrap();
+            update_pallet_head_verified(
+                PalletNamespace::User, "main", Some(&base), &head, &RefPreconditions::NONE, &token, None
+            ).unwrap();
+            assert_eq!(get_pallet_head("main").unwrap().as_deref(), Some(head.as_str()));
+
+            // Anything else absent is still refused.
+            let damaged = parcel(&two_dirs("a2", "b0"), &[&head]);
+            let lost = blob("a2");
+            remove(&lost);
+            assert!(crate::util::audit_utils::verify_parcel_closure_for_write(&damaged, Some(&head)).is_err());
+        }
+
         #[test]
         fn a_token_walked_to_another_bound_does_not_let_a_write_skip_the_walk() {
             let (_root, _scope) = scratch("closure-bound");
