@@ -1653,6 +1653,133 @@ fn a_server_deletes_the_content_of_a_redaction_it_applied() {
     assert_eq!(fresh.head("main"), server.main());
 }
 
+/// A server root as a crash before an apply leaves it: a redaction is recorded, the ref write that
+/// let it apply landed, and the server stopped before applying it, so its bytes are still held. The
+/// killed server's lock stays behind, and is removed as its operator would.
+///
+/// # Returns
+/// The root, the redacted hash, and a kept file's hash.
+fn crashed_before_apply(name: &str) -> (PathBuf, String, String) {
+    let root = std::env::temp_dir().join(format!("forklift-redaction-{}-server-{}", name, std::process::id()));
+    let server = Server::start(&root);
+
+    let owner = Warehouse::cloned(&format!("{}-owner", name), &server.url);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+
+    let content = b"TOKEN=hunter2\n";
+    let hash = hash_of(content);
+    let (status, body) = http(&server.url, "PUT", &format!("/v1/objects/{}", hash), &object_utils::blob_bytes(content));
+    assert!(status.starts_with("HTTP/1.1 20"), "{} / {}", status, body);
+    let loose = root.join(".forklift/objects").join(&hash[..2]).join(&hash[2..]);
+    let bytes = std::fs::read(&loose).unwrap();
+
+    owner.redact_loaded("secret.env", content, "leaked token");
+    owner.run_ok(&["lift"]);
+    let mut gone = false;
+    for _ in 0..500 {
+        if !loose.exists() {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(gone, "the server deleted the content");
+    drop(server);
+
+    std::fs::remove_file(root.join(".forklift/serve.lock")).unwrap();
+    std::fs::remove_file(root.join(".forklift/redactions-applied")).unwrap();
+    std::fs::create_dir_all(loose.parent().unwrap()).unwrap();
+    std::fs::write(&loose, &bytes).unwrap();
+
+    (root, hash, hash_of(b"notes\n"))
+}
+
+/// Ask for `path` until it is answered other than `503`, and return that answer.
+fn past_503(server: &Server, path: &str) -> (String, String) {
+    let mut answered = (String::new(), String::new());
+    for _ in 0..1500 {
+        answered = http(&server.url, "GET", path, b"");
+        if !answered.0.starts_with("HTTP/1.1 503") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    answered
+}
+
+/// A redaction a crash left unapplied, after the ref write that let it apply landed, is never
+/// served once the server is back: until its first redaction run applies it, the content routes
+/// answer `503`, and then they refuse it as redacted. Once every redaction is applied, a server
+/// coming back serves content at once, though the ref lock is held: its first run's apply settles
+/// that without it.
+///
+/// Revert: let an object request through without waiting for the owed apply → the restored bytes
+/// are served `200` → red. Take the ref lock before settling that nothing is left to apply → the
+/// start's owe waits on the held lock, and the kept file is refused `503` → red.
+#[test]
+fn a_server_back_from_a_crash_before_an_apply_serves_none_of_its_content() {
+    let (root, hash, kept) = crashed_before_apply("crash");
+    let object = format!("/v1/objects/{}", hash);
+
+    let held = {
+        // The ref lock held here keeps the first run's apply waiting.
+        let _scope = forklift_core::globals::StorageRootScope::enter(&root);
+        let _lock = forklift_core::util::lock_utils::RefLock::acquire().unwrap();
+        let server = Server::serve(&root);
+        (http(&server.url, "GET", &object, b""), server)
+    };
+    let ((status, body), server) = held;
+    assert!(status.starts_with("HTTP/1.1 503"), "{} / {} bytes", status, body.len());
+
+    let (status, body) = past_503(&server, &object);
+    assert!(status.starts_with("HTTP/1.1 410"), "{} / {}", status, body);
+    assert!(body.contains("content_redacted"), "{}", body);
+    let loose = root.join(".forklift/objects").join(&hash[..2]).join(&hash[2..]);
+    for _ in 0..500 {
+        if !loose.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(!loose.exists(), "the server deleted the content");
+    drop(server);
+
+    // Back again with nothing left to apply or delete: content is served while the first run is
+    // held.
+    std::fs::remove_file(root.join(".forklift/serve.lock")).unwrap();
+    let _scope = forklift_core::globals::StorageRootScope::enter(&root);
+    let _lock = forklift_core::util::lock_utils::RefLock::acquire().unwrap();
+    let server = Server::serve(&root);
+    let (status, body) = http(&server.url, "GET", &format!("/v1/objects/{}", kept), b"");
+    assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, body);
+}
+
+/// An apply that cannot tell whether a head still names a redaction leaves the apply owed: the
+/// content stays unserved until a retry can tell, and is then refused as redacted.
+///
+/// Revert: count an undecided redaction as decided → the apply is discharged and the restored
+/// bytes are served `200` → red.
+#[test]
+fn a_server_serves_no_content_while_an_apply_cannot_decide_a_redaction() {
+    let (root, hash, _) = crashed_before_apply("undecided");
+    let object = format!("/v1/objects/{}", hash);
+
+    // The head's parcel is gone, so no scan can tell what the head names.
+    let head = std::fs::read_to_string(root.join(".forklift/pallets/main")).unwrap().trim().to_string();
+    let parcel = root.join(".forklift/objects").join(&head[..2]).join(&head[2..]);
+    let parcel_bytes = std::fs::read(&parcel).unwrap();
+    std::fs::remove_file(&parcel).unwrap();
+
+    let server = Server::serve(&root);
+    let (status, body) = http(&server.url, "GET", &object, b"");
+    assert!(status.starts_with("HTTP/1.1 503"), "{} / {} bytes", status, body.len());
+
+    std::fs::write(&parcel, &parcel_bytes).unwrap();
+    let (status, body) = past_503(&server, &object);
+    assert!(status.starts_with("HTTP/1.1 410"), "{} / {}", status, body);
+}
+
 /// A pallet deleted on forklift-server leaves a tombstone that keeps its head served and
 /// restorable, so a redaction that head names stays pending through the deletion.
 ///
