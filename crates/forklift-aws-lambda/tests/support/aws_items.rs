@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use forklift_aws_lambda::format::{gate, AWS_FORMAT};
 use forklift_aws_lambda::reissue::request_token;
-use forklift_aws_lambda::store::{CasOutcome, ExpectedHead, OfficePrecondition, RefStore, TrustOutcome};
+use forklift_aws_lambda::store::{CasOutcome, ExpectedHead, OfficePrecondition, RedactionsPrecondition, RefStore, TrustOutcome};
 use forklift_core::model::remote::TrustAnchorDto;
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::pallet_utils::PalletNamespace;
@@ -50,7 +50,7 @@ pub fn populate(refs: &impl RefStore) {
     let fence = || gate(refs).expect("the fixture warehouse is served");
     let set = |namespace, name, new: &str| {
         let outcome = refs.compare_and_set_head(
-            namespace, name, ExpectedHead::Unborn, new, OfficePrecondition::NotConsumed, None, &fence(), &request_token(),
+            namespace, name, ExpectedHead::Unborn, new, OfficePrecondition::NotConsumed, RedactionsPrecondition::NotConsumed, None, &fence(), &request_token(),
         ).unwrap();
         assert!(matches!(outcome, CasOutcome::Committed), "{:?}", outcome);
     };

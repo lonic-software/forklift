@@ -49,7 +49,8 @@ use forklift_core::model::parcel::Parcel;
 use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::authority_utils::{self, Denied, Principal};
 use forklift_core::util::office_utils::{self, OfficeState, TrustAnchor, OFFICE_PALLET_NAME};
-use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef};
+use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef, RefUpdateError};
+use forklift_core::util::redaction_utils::{self, REDACTIONS_PALLET_NAME};
 use forklift_core::util::haul_utils::{self, HAUL_PALLET_NAME};
 use forklift_core::util::{
     audit_utils, bundle_utils, file_utils, merge_utils, meta_tree, object_utils, pallet_utils, sign_utils,
@@ -58,10 +59,10 @@ use forklift_core::util::{
 use crate::error::{HeadError, HeadResult};
 use crate::format::fenced;
 use crate::reissue::reissue;
-use crate::scratch::{materialize, materialize_state, Mirror, Scratch};
+use crate::scratch::{materialize, materialize_state, MirroredObjects, Mirror, Scratch};
 use crate::store::{
     CasOutcome, ExpectedHead, ObjectAccess, ObjectStore, OffloadedResponse, OfficePrecondition, PromoteOutcome, PutTarget,
-    RefHead, RefStore, SignatureOutcome, TransientCause, TrustOutcome, TrustWriteOutcome,
+    RedactionsPrecondition, RefHead, RefStore, SignatureOutcome, TransientCause, TrustOutcome, TrustWriteOutcome,
 };
 
 /// The `genesis` of a stored anchor's bytes.
@@ -174,6 +175,10 @@ pub const BATCH_ANSWER_RESERVE: std::time::Duration = std::time::Duration::from_
 /// the anchor moved underneath it — the direct head's bound for the same loop. Only the last
 /// attempt's refusal is answered.
 const DELETE_ATTEMPTS: usize = 3;
+
+/// How many times a ref update checks its new head against `@redactions` again because a
+/// redaction was recorded between the check and the commit, before it answers `409`.
+const REDACTION_ATTEMPTS: usize = 3;
 
 /// The serverless protocol handler over an [`ObjectStore`] and a [`RefStore`].
 pub struct Head<O: ObjectStore, R: RefStore> {
@@ -1152,14 +1157,104 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             _ => OfficePrecondition::NotConsumed,
         };
 
-        // The commit: one DynamoDB transaction conditioned on every movable input the audit
-        // above consumed — the pallet's own head, the office head (when read), and the trust
-        // anchor — so a concurrent office lift or re-genesis refuses this update exactly as a
-        // concurrent lift to this same pallet always has (FORK-95 design memo, "Two
-        // instantiations of one invariant" / claim C13). A refusal that shows no input moved is
-        // re-issued — the transaction alone, never the audit — under one request token and one
-        // bounded budget before it is answered (claim C14, arm two; see `reissue.rs`). As for the
-        // anchor write, whether any attempt may have landed is tracked across all of them.
+        // Redaction: the new head may name no content `@redactions` records, judged as
+        // forklift-server judges a write it receives — a user pallet's whole tree (never pruned at
+        // `old_head`, since a redaction recorded after it was committed binds it too), a meta
+        // pallet's parcels by what each adds. The commit conditions on the `@redactions` head this
+        // read, so a redaction recorded between the check and the commit refuses the commit, and
+        // the check runs again from a fresh read, up to [`REDACTION_ATTEMPTS`] times. A write to
+        // `@redactions` itself is judged against the head it replaces, already conditioned on.
+        let is_redactions = is_meta && bare == REDACTIONS_PALLET_NAME;
+
+        for attempt in 1..=REDACTION_ATTEMPTS {
+            let redactions_head = if is_redactions {
+                request.old_head.clone()
+            } else {
+                self.refs
+                    .get_head(PalletNamespace::Meta, REDACTIONS_PALLET_NAME)
+                    .map_err(HeadError::internal)?
+                    .live()
+                    .map(str::to_string)
+            };
+
+            scratch.scoped(|| -> HeadResult<()> {
+                if let Some(head) = &redactions_head {
+                    materialize_state(&self.objects, head, &mut Mirror::default())
+                        .map_err(HeadError::internal)?;
+                }
+
+                redaction_utils::check_received_head_write(
+                    namespace,
+                    &bare,
+                    request.old_head.as_deref(),
+                    &request.new_head,
+                    redactions_head.as_deref(),
+                    &MirroredObjects::new(&self.objects),
+                )
+                .map_err(|error| match error {
+                    RefUpdateError::Redacted { .. } => HeadError::unprocessable(String::from(error)),
+                    other => HeadError::internal(String::from(other)),
+                })
+            })?;
+
+            let redactions_for_commit = if is_redactions {
+                RedactionsPrecondition::NotConsumed
+            } else {
+                RedactionsPrecondition::read(redactions_head.as_deref())
+            };
+
+            let (outcome, uncertain) = self.commit_ref_update(
+                namespace,
+                &bare,
+                expected,
+                request,
+                office_head_for_commit,
+                redactions_for_commit,
+                anchor_bytes.as_deref(),
+            )?;
+
+            match outcome {
+                CasOutcome::RedactionsMoved if attempt < REDACTION_ATTEMPTS => continue,
+                CasOutcome::RedactionsMoved => {
+                    return Err(HeadError::conflict(
+                        "Redactions kept being recorded while this update was checked; retry it."
+                            .to_string(),
+                    ))
+                }
+                CasOutcome::Committed => return Ok(()),
+                CasOutcome::Conflict { current } => {
+                    return Err(self.moved_or_deleted(&bare, &current, &request.old_head))
+                }
+                CasOutcome::OfficeMoved { current } => return Err(self.office_moved(&current)),
+                CasOutcome::AnchorMoved => return Err(self.anchor_moved()),
+                CasOutcome::Transient(_) => return Err(self.transient_contention(uncertain)),
+                CasOutcome::FormatMoved => unreachable!("`fenced` answers a moved format itself"),
+            }
+        }
+
+        unreachable!("the last attempt answers every outcome")
+    }
+
+    /// A ref update's commit: one DynamoDB transaction conditioned on every movable input the
+    /// audit consumed — the pallet's own head, the office head (when read), the `@redactions`
+    /// head (when read), and the trust anchor — so a concurrent office lift or re-genesis refuses
+    /// this update exactly as a concurrent lift to this same pallet always has (FORK-95 design
+    /// memo, "Two instantiations of one invariant" / claim C13). A refusal that shows no input
+    /// moved is re-issued — the transaction alone, never the audit — under one request token and
+    /// one bounded budget before it is answered (claim C14, arm two; see `reissue.rs`). As for the
+    /// anchor write, whether any attempt may have landed is tracked across all of them: the
+    /// answer's `bool`.
+    #[allow(clippy::too_many_arguments)]
+    fn commit_ref_update(
+        &self,
+        namespace: PalletNamespace,
+        bare: &str,
+        expected: ExpectedHead<'_>,
+        request: &RefUpdateRequest,
+        office_head: OfficePrecondition<'_>,
+        redactions: RedactionsPrecondition<'_>,
+        anchor_bytes: Option<&str>,
+    ) -> HeadResult<(CasOutcome, bool)> {
         let uncertain = Cell::new(false);
         let outcome = fenced(
             &self.refs,
@@ -1169,11 +1264,12 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     |token| {
                         self.refs.compare_and_set_head(
                             namespace,
-                            &bare,
+                            bare,
                             expected,
                             &request.new_head,
-                            office_head_for_commit,
-                            anchor_bytes.as_deref(),
+                            office_head,
+                            redactions,
+                            anchor_bytes,
                             fence,
                             token,
                         )
@@ -1188,14 +1284,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             |outcome| *outcome == CasOutcome::FormatMoved,
         )?;
 
-        match outcome {
-            CasOutcome::Committed => Ok(()),
-            CasOutcome::Conflict { current } => Err(self.moved_or_deleted(&bare, &current, &request.old_head)),
-            CasOutcome::OfficeMoved { current } => Err(self.office_moved(&current)),
-            CasOutcome::AnchorMoved => Err(self.anchor_moved()),
-            CasOutcome::Transient(_) => Err(self.transient_contention(uncertain.get())),
-            CasOutcome::FormatMoved => unreachable!("`fenced` answers a moved format itself"),
-        }
+        Ok((outcome, uncertain.get()))
     }
 
     /// `DELETE /v1/pallets/{name}?old_head=` — delete a user pallet the caller saw at `old_head`,
@@ -1307,6 +1396,10 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 CasOutcome::OfficeMoved { current } => return Err(self.office_moved(&current)),
                 CasOutcome::AnchorMoved => return Err(self.anchor_moved()),
                 CasOutcome::FormatMoved => unreachable!("`fenced` answers a moved format itself"),
+                CasOutcome::RedactionsMoved => {
+                    return Err(HeadError::internal("A pallet delete was refused on a @redactions \
+                        precondition it never built."))
+                }
                 CasOutcome::Transient(_) => {
                     // Under one token an earlier attempt may still have landed: the ref decides.
                     // A ref that left `old_head` some other way is answered as the commit's

@@ -22,7 +22,7 @@ use forklift_aws_lambda::memory::{MemoryObjectStore, MemoryRefStore};
 use forklift_aws_lambda::scratch::Scratch;
 use forklift_aws_lambda::store::{
     ExpectedHead, RefHead, RefListing,
-    CasOutcome, ObjectStore, OfficePrecondition, PromoteOutcome, PutOutcome, RefStore,
+    CasOutcome, ObjectStore, OfficePrecondition, RedactionsPrecondition, PromoteOutcome, PutOutcome, RefStore,
     SignatureOutcome, TransientCause, TrustOutcome, TrustWriteOutcome,
 };
 use forklift_aws_lambda::{AsyncBridge, BatchCut, BatchDelivery, BatchResult, Head};
@@ -442,7 +442,7 @@ fn gate_parcel<O: ObjectStore, R: RefStore>(head: &Head<O, R>,
 fn plant(refs: &MemoryRefStore, name: &str, new: &str) {
     let fence = forklift_aws_lambda::format::gate(refs).expect("format gate");
     let outcome = refs.compare_and_set_head(
-        pallet_utils::PalletNamespace::User, name, ExpectedHead::Unborn, new, OfficePrecondition::NotConsumed, None,
+        pallet_utils::PalletNamespace::User, name, ExpectedHead::Unborn, new, OfficePrecondition::NotConsumed, RedactionsPrecondition::NotConsumed, None,
         &fence, &request_token(),
     ).expect("plant");
     assert_eq!(outcome, CasOutcome::Committed);
@@ -994,6 +994,7 @@ fn a_writer_promoting_themselves_is_forbidden_and_an_admin_promoting_them_is_not
             ExpectedHead::At(&office_head),
             &by_worker,
             OfficePrecondition::NotConsumed,
+            RedactionsPrecondition::NotConsumed,
             trust.as_ref().map(|(_, raw)| raw.as_str()),
             &forklift_aws_lambda::format::gate(&head.refs).expect("format gate"),
             &request_token(),
@@ -1078,6 +1079,7 @@ fn an_office_and_an_anchor_never_exist_apart() {
             ExpectedHead::Unborn,
             &office_head,
             OfficePrecondition::NotConsumed,
+            RedactionsPrecondition::NotConsumed,
             None,
             &forklift_aws_lambda::format::gate(&*refs).expect("format gate"),
             &request_token(),
@@ -2198,12 +2200,13 @@ impl RefStore for AsyncRefStore {
         expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
+        redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
         self.bridge.block_on(suspending(|| {
-            self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
+            self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
         }))
     }
 
@@ -2342,11 +2345,12 @@ impl RefStore for SharedMemoryRefs {
         expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
+        redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.0.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
+        self.0.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
     }
 
     fn delete_head(
@@ -2445,6 +2449,7 @@ impl RefStore for OfficeMovesAfterTheSnapshot {
                         current.live().map_or(ExpectedHead::Unborn, ExpectedHead::At),
                         &self.move_to,
                         OfficePrecondition::NotConsumed,
+                        RedactionsPrecondition::NotConsumed,
                         anchor_bytes.as_deref(),
                         &forklift_aws_lambda::format::gate(&*self.inner).expect("format gate"),
                         &request_token(),
@@ -2468,11 +2473,12 @@ impl RefStore for OfficeMovesAfterTheSnapshot {
         expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
+        redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
     }
 
     fn delete_head(
@@ -2553,11 +2559,12 @@ impl RefStore for AnchorMovesAfterTheSnapshot {
         expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
+        redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
     }
 
     fn delete_head(
@@ -2709,6 +2716,7 @@ impl RefStore for TransientOnCommit {
         expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
+        redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
@@ -2733,7 +2741,7 @@ impl RefStore for TransientOnCommit {
             return Ok(self.refusal.clone());
         }
 
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
     }
 
     fn delete_head(
@@ -3181,6 +3189,7 @@ fn an_untrusted_warehouses_concurrent_office_move_does_not_refuse_the_commit() {
             ExpectedHead::Unborn,
             &office_head,
             OfficePrecondition::NotConsumed,
+            RedactionsPrecondition::NotConsumed,
             None,
             &forklift_aws_lambda::format::gate(&*store).expect("format gate"),
             &request_token(),
@@ -3359,6 +3368,7 @@ fn a_concurrently_moved_unrelated_pallet_does_not_refuse_the_commit() {
                 ExpectedHead::Unborn,
                 &"a".repeat(64),
                 OfficePrecondition::At(&office_head),
+                RedactionsPrecondition::NotConsumed,
                 Some(&anchor_bytes),
                 &forklift_aws_lambda::format::gate(&head.refs).expect("format gate"),
                 &request_token(),
@@ -3420,6 +3430,7 @@ fn seeded_trust(office_head: &str) -> (Arc<MemoryRefStore>, TrustAnchorDto, Stri
                 ExpectedHead::Unborn,
                 office_head,
                 OfficePrecondition::NotConsumed,
+                RedactionsPrecondition::NotConsumed,
                 Some(&bytes),
                 &forklift_aws_lambda::format::gate(&*store).expect("format gate"),
                 &request_token(),
@@ -3603,6 +3614,7 @@ fn a_concurrently_moved_unrelated_pallet_does_not_refuse_the_re_genesis() {
                 ExpectedHead::Unborn,
                 &"e".repeat(64),
                 OfficePrecondition::NotConsumed,
+                RedactionsPrecondition::NotConsumed,
                 Some(&bytes),
                 &forklift_aws_lambda::format::gate(&*store).expect("format gate"),
                 &request_token(),
@@ -3681,11 +3693,12 @@ impl RefStore for TransientOnAnchorWrite {
         expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
+        redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
     }
 
     fn delete_head(
@@ -3790,11 +3803,12 @@ impl RefStore for AnchorMovedOnAnchorWrite {
         expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
+        redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
     }
 
     fn delete_head(
@@ -4371,11 +4385,12 @@ impl RefStore for RacesTheDelete {
         expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
+        redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
     }
 
     fn delete_head(
@@ -4476,6 +4491,7 @@ fn racing_lift(from: String, to: String) -> RacingWrite {
                 ExpectedHead::At(&from),
                 &to,
                 OfficePrecondition::NotConsumed,
+                RedactionsPrecondition::NotConsumed,
                 None,
                 &forklift_aws_lambda::format::gate(&*store).expect("format gate"),
                 &request_token(),
@@ -4686,6 +4702,7 @@ fn an_office_lift_in_the_bootstrap_window_refuses_a_delete_it_denies() {
                 ExpectedHead::Unborn,
                 &feature_head,
                 OfficePrecondition::NotConsumed,
+                RedactionsPrecondition::NotConsumed,
                 anchor.as_deref(),
                 &forklift_aws_lambda::format::gate(&*store).expect("format gate"),
                 &request_token(),

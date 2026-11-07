@@ -40,7 +40,7 @@ use forklift_aws_lambda::aws::s3::parse_staging_key;
 use forklift_aws_lambda::aws::{build_clients, build_stores, AwsConfig, DynamoOps, S3Ops};
 use forklift_aws_lambda::store::{
     ExpectedHead, RefHead,
-    CasOutcome, ObjectAccess, ObjectStore, OffloadedResponse, OfficePrecondition, PromoteOutcome, PutOutcome,
+    CasOutcome, ObjectAccess, ObjectStore, OffloadedResponse, OfficePrecondition, RedactionsPrecondition, PromoteOutcome, PutOutcome,
     PutTarget, RefStore, SignatureOutcome, TrustOutcome, TrustWriteOutcome,
 };
 use forklift_aws_lambda::{
@@ -560,14 +560,14 @@ async fn dynamo_ref_store_upholds_the_cas_and_the_trust_door() {
         // `OfficePrecondition`'s docs), while the anchor `ConditionCheck` is always built and
         // resolves to its "absent" mode.
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::User, "main", ExpectedHead::At(&one), &two, OfficePrecondition::NotConsumed, None, &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &request_token())
+            refs.compare_and_set_head(PalletNamespace::User, "main", ExpectedHead::At(&one), &two, OfficePrecondition::NotConsumed, RedactionsPrecondition::NotConsumed, None, &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &request_token())
                 .expect("cas against a genuinely missing item"),
             CasOutcome::Conflict { current: RefHead::Absent }
         );
 
         // Create, expecting no entry.
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::User, "main", ExpectedHead::Unborn, &one, OfficePrecondition::NotConsumed, None, &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &request_token())
+            refs.compare_and_set_head(PalletNamespace::User, "main", ExpectedHead::Unborn, &one, OfficePrecondition::NotConsumed, RedactionsPrecondition::NotConsumed, None, &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &request_token())
                 .expect("create"),
             CasOutcome::Committed
         );
@@ -578,21 +578,21 @@ async fn dynamo_ref_store_upholds_the_cas_and_the_trust_door() {
 
         // A replay expecting no entry now conflicts, reporting the current head.
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::User, "main", ExpectedHead::Unborn, &two, OfficePrecondition::NotConsumed, None, &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &request_token())
+            refs.compare_and_set_head(PalletNamespace::User, "main", ExpectedHead::Unborn, &two, OfficePrecondition::NotConsumed, RedactionsPrecondition::NotConsumed, None, &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &request_token())
                 .expect("replay"),
             CasOutcome::Conflict { current: RefHead::Live(one.clone()) }
         );
 
         // A fast-forward from the right expected commits.
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::User, "main", ExpectedHead::At(&one), &two, OfficePrecondition::NotConsumed, None, &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &request_token())
+            refs.compare_and_set_head(PalletNamespace::User, "main", ExpectedHead::At(&one), &two, OfficePrecondition::NotConsumed, RedactionsPrecondition::NotConsumed, None, &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &request_token())
                 .expect("ff"),
             CasOutcome::Committed
         );
 
         // A stale expected conflicts, again reporting the actual head.
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::User, "main", ExpectedHead::At(&one), &one, OfficePrecondition::NotConsumed, None, &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &request_token())
+            refs.compare_and_set_head(PalletNamespace::User, "main", ExpectedHead::At(&one), &one, OfficePrecondition::NotConsumed, RedactionsPrecondition::NotConsumed, None, &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &request_token())
                 .expect("stale"),
             CasOutcome::Conflict { current: RefHead::Live(two.clone()) }
         );
@@ -602,7 +602,7 @@ async fn dynamo_ref_store_upholds_the_cas_and_the_trust_door() {
         // `ConditionCheck` is built regardless of what `office_head` names (the FORK-95 design
         // memo: "no two actions may target the same item").
         assert_eq!(
-            refs.compare_and_set_head(PalletNamespace::Meta, "office", ExpectedHead::Unborn, &one, OfficePrecondition::NotConsumed, None, &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &request_token())
+            refs.compare_and_set_head(PalletNamespace::Meta, "office", ExpectedHead::Unborn, &one, OfficePrecondition::NotConsumed, RedactionsPrecondition::NotConsumed, None, &forklift_aws_lambda::format::gate(&refs).expect("format gate"), &request_token())
                 .expect("office"),
             CasOutcome::Committed
         );
@@ -722,6 +722,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 ExpectedHead::Unborn,
                 &office_o1,
                 OfficePrecondition::NotConsumed,
+                RedactionsPrecondition::NotConsumed,
                 None,
                 &forklift_aws_lambda::format::gate(&refs).expect("format gate"),
                 &request_token(),
@@ -753,6 +754,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 ExpectedHead::Unborn,
                 &main_m1,
                 OfficePrecondition::At(&office_o1),
+                RedactionsPrecondition::NotConsumed,
                 Some(&bytes_a1),
                 &forklift_aws_lambda::format::gate(&refs).expect("format gate"),
                 &request_token(),
@@ -780,6 +782,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 ExpectedHead::At(&office_o1),
                 &office_o2,
                 OfficePrecondition::NotConsumed,
+                RedactionsPrecondition::NotConsumed,
                 Some(&bytes_a1),
                 &forklift_aws_lambda::format::gate(&refs).expect("format gate"),
                 &request_token(),
@@ -795,6 +798,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 ExpectedHead::At(&main_m1),
                 &main_m2,
                 OfficePrecondition::At(&office_o1), // stale: the office moved to office_o2 just above
+                RedactionsPrecondition::NotConsumed,
                 Some(&bytes_a1),
                 &forklift_aws_lambda::format::gate(&refs).expect("format gate"),
                 &request_token(),
@@ -838,6 +842,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 ExpectedHead::At(&main_m1),
                 &main_m2,
                 OfficePrecondition::At(&office_o2), // current: matches
+                RedactionsPrecondition::NotConsumed,
                 Some(&bytes_a1),  &forklift_aws_lambda::format::gate(&refs).expect("format gate"),  // stale: the anchor was replaced just above
                 &request_token(),
             )
@@ -860,6 +865,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 ExpectedHead::Unborn,
                 &side_s1,
                 OfficePrecondition::At(&office_o2),
+                RedactionsPrecondition::NotConsumed,
                 Some(&bytes_a2),
                 &forklift_aws_lambda::format::gate(&refs).expect("format gate"),
                 &request_token(),
@@ -874,6 +880,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 ExpectedHead::At(&side_s1),
                 &side_s2,
                 OfficePrecondition::At(&office_o2),
+                RedactionsPrecondition::NotConsumed,
                 Some(&bytes_a2),
                 &forklift_aws_lambda::format::gate(&refs).expect("format gate"),
                 &request_token(),
@@ -888,6 +895,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 ExpectedHead::At(&main_m1),
                 &main_m2,
                 OfficePrecondition::At(&office_o2),
+                RedactionsPrecondition::NotConsumed,
                 Some(&bytes_a2),
                 &forklift_aws_lambda::format::gate(&refs).expect("format gate"),
                 &request_token(),
@@ -907,6 +915,7 @@ async fn dynamo_ref_store_attributes_a_moved_precondition_to_its_position() {
                 ExpectedHead::At(&main_m1),
                 &main_m2,
                 OfficePrecondition::At(&office_o2),
+                RedactionsPrecondition::NotConsumed,
                 Some(&bytes_a2),
                 &forklift_aws_lambda::format::gate(&refs).expect("format gate"),
                 &request_token(),
@@ -977,6 +986,7 @@ async fn dynamo_ref_store_attributes_the_anchor_writes_preconditions_to_their_po
                 ExpectedHead::Unborn,
                 &office_o1,
                 OfficePrecondition::NotConsumed,
+                RedactionsPrecondition::NotConsumed,
                 Some(&bytes_a1),
                 &forklift_aws_lambda::format::gate(&refs).expect("format gate"),
                 &request_token(),
@@ -1065,6 +1075,7 @@ async fn dynamo_ref_store_attributes_the_anchor_writes_preconditions_to_their_po
                 ExpectedHead::Unborn,
                 &"6".repeat(64),
                 OfficePrecondition::At(&office_o1),
+                RedactionsPrecondition::NotConsumed,
                 Some(&bytes_a2),
                 &forklift_aws_lambda::format::gate(&refs).expect("format gate"),
                 &request_token(),
@@ -1196,7 +1207,7 @@ async fn dynamo_ref_store_records_and_fences_the_warehouse_format() {
         let current = AWS_FORMAT.to_string();
         let mark = format!("{}>{} operator 0", AWS_FORMAT, AWS_FORMAT + 1);
         let lift = |fence: &FormatFence, expected: ExpectedHead, to: &str| {
-            refs.compare_and_set_head(PalletNamespace::User, "main", expected, to, OfficePrecondition::NotConsumed, None, fence, &request_token())
+            refs.compare_and_set_head(PalletNamespace::User, "main", expected, to, OfficePrecondition::NotConsumed, RedactionsPrecondition::NotConsumed, None, fence, &request_token())
                 .expect("cas")
         };
 
@@ -1348,6 +1359,7 @@ async fn dynamo_ref_store_conditions_an_anchor_write_on_an_unborn_office() {
                 ExpectedHead::Unborn,
                 &office_o1,
                 OfficePrecondition::NotConsumed,
+                RedactionsPrecondition::NotConsumed,
                 Some(&bytes_a2),
                 &forklift_aws_lambda::format::gate(&refs).expect("format gate"),
                 &request_token(),

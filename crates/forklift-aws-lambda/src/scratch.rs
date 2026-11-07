@@ -57,6 +57,9 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use forklift_core::globals::StorageRootScope;
+use forklift_core::model::parcel::Parcel;
+use forklift_core::model::tree_item::TreeItem;
+use forklift_core::util::redaction_utils::WalkObjects;
 use forklift_core::util::{file_utils, object_utils, sign_utils, warehouse_utils};
 
 use crate::store::ObjectStore;
@@ -260,6 +263,70 @@ pub fn materialize_state(store: &dyn ObjectStore, parcel_hash: &str, mirror: &mu
     };
 
     materialize_tree(store, &parcel.tree_hash, true, mirror)
+}
+
+/// The objects a redaction walk reads (`redaction_utils::WalkObjects`), read from the current
+/// scratch (the caller must be inside [`Scratch::scoped`]) and, for what [`materialize`]'s bound
+/// left out of it, from the object store, mirroring each into the scratch as it is fetched. A
+/// [`prefetch`](WalkObjects::prefetch) fetches a whole round in one bulk read.
+pub struct MirroredObjects<'a> {
+    store: &'a dyn ObjectStore,
+}
+
+impl<'a> MirroredObjects<'a> {
+    /// The objects of `store`, through the current scratch.
+    pub fn new(store: &'a dyn ObjectStore) -> MirroredObjects<'a> {
+        MirroredObjects { store }
+    }
+
+    /// Mirror `hash` into the scratch unless it is there already; a missing object is an error.
+    fn ensure(&self, hash: &str) -> Result<(), String> {
+        if file_utils::does_object_exist(hash)? {
+            return Ok(());
+        }
+
+        let bytes = self.store.get(hash)?.ok_or_else(|| format!("Object {} is missing.", hash))?;
+
+        object_utils::store_object_bytes(hash, &bytes).map(|_| ())
+    }
+}
+
+impl WalkObjects for MirroredObjects<'_> {
+    fn load_tree(&self, hash: &str) -> Result<Arc<TreeItem>, String> {
+        self.ensure(hash)?;
+
+        object_utils::load_tree_shared(hash)
+    }
+
+    fn load_parcel(&self, hash: &str) -> Result<Parcel, String> {
+        self.ensure(hash)?;
+
+        object_utils::load_parcel(hash)
+    }
+
+    fn recipe_chunks(&self, hash: &str) -> Result<Vec<String>, String> {
+        self.ensure(hash)?;
+
+        object_utils::recipe_chunk_hashes(hash)
+    }
+
+    fn prefetch(&self, hashes: &[String]) {
+        let absent: Vec<String> = hashes.iter()
+            .filter(|hash| !file_utils::does_object_exist(hash).unwrap_or(false))
+            .cloned()
+            .collect();
+
+        if absent.is_empty() {
+            return;
+        }
+
+        // Best effort: an object this fails to mirror is fetched again, or reported, by its read.
+        for (hash, fetched) in absent.iter().zip(self.store.get_many(&absent)) {
+            if let Ok(Some(bytes)) = fetched {
+                let _ = object_utils::store_object_bytes(hash, &bytes);
+            }
+        }
+    }
 }
 
 /// Ensure `hash`'s bytes are in the scratch, fetching them from the store only when they
