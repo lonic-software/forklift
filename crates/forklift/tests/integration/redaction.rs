@@ -1442,6 +1442,45 @@ fn a_deletion_is_owed_while_another_process_uses_the_store() {
     assert_eq!(warehouse.json(&["redact", "apply"])["data"].get("deletion"), None);
 }
 
+/// The chunks a deletion cut short still owes are deleted by the next `redact apply`, though
+/// every applied redaction's own object is gone.
+///
+/// Revert: decide there is nothing to delete by the redacted objects alone → the chunk is kept.
+#[test]
+fn a_chunk_a_deletion_cut_short_owes_is_deleted_by_the_next_apply() {
+    let warehouse = Warehouse::new("owed-chunk");
+
+    // Above the chunking threshold, and varied, so the file is a recipe of several chunks.
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    let content: Vec<u8> = (0..9 * 1024 * 1024).map(|_| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state as u8
+    }).collect();
+    let leak = warehouse.leaked("big.bin", &content);
+
+    let recorded = recorded_hash(&warehouse, &format!("{}:big.bin", leak), "leaked dump");
+    let recipe = recorded["data"]["hash"].as_str().unwrap().to_string();
+    assert!(!warehouse.holds_loose(&recipe), "the deletion ran");
+
+    // As a deletion cut short between its passes leaves it: the recipe gone, a chunk of it left
+    // and owed in the journal.
+    let chunk = hash_of(b"an owed chunk\n");
+    let loose = warehouse.root.join(".forklift/objects").join(&chunk[..2]).join(&chunk[2..]);
+    std::fs::create_dir_all(loose.parent().unwrap()).unwrap();
+    std::fs::write(&loose, b"bytes the store holds").unwrap();
+    std::fs::write(
+        warehouse.root.join(".forklift/redactions-chunks-owed"),
+        forklift_core::util::record_utils::to_bytes("redactions-chunks-owed", 1, [format!("{} {}", recipe, chunk)]),
+    ).unwrap();
+
+    let applied = warehouse.json(&["redact", "apply"]);
+    assert_eq!(applied["data"]["deletion"]["chunks_deleted"], 1, "{}", applied);
+    assert!(!loose.exists(), "the owed chunk is deleted");
+    assert!(!warehouse.root.join(".forklift/redactions-chunks-owed").exists());
+}
+
 /// When every copy left is held, the deletion has nothing to do and takes no lock: the held copy is
 /// reported, not an owed deletion, even while another process uses the store.
 ///
@@ -1702,4 +1741,123 @@ fn a_lift_sends_no_chunk_of_a_file_the_server_applied_a_redaction_of() {
     assert_eq!(server.main(), behind.head("main"));
     let grown = stored_bytes(&objects) - before;
     assert!(grown < 1024 * 1024, "the server's store grew by {} bytes", grown);
+}
+
+/// While forklift-server owes the deletion of a chunked file's redaction, it serves the chunks only
+/// that file named as absent, by hash and in a batch, and the handshake reports
+/// the deletion owed; a chunk another file names is still served. Once the deletion runs, the
+/// handshake reports it deleted.
+///
+/// Revert: serve a redacted recipe's chunks by hash → the GET of one answers 200.
+#[test]
+fn a_server_owing_a_deletion_serves_the_chunks_only_its_recipe_names_as_absent() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-withheld-server-{}", std::process::id())));
+
+    let owner = Warehouse::cloned("withheld-owner", &server.url);
+
+    // Above the chunking threshold, and varied, so the file is a recipe of several chunks; the
+    // kept file shares its first half, so it names some of those chunks too.
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state as u8
+    };
+    let content: Vec<u8> = (0..9 * 1024 * 1024).map(|_| next()).collect();
+    let mut kept = content[..content.len() / 2].to_vec();
+    kept.extend((0..5 * 1024 * 1024).map(|_| next()));
+
+    std::fs::create_dir_all(owner.root.join("keep")).unwrap();
+    owner.stack("keep/kept.bin", &kept, "kept");
+    owner.run_ok(&["lift"]);
+
+    // The server holds the leak, then a head that names it no more.
+    owner.run_ok(&["pallet", "create", "scratch"]);
+    std::fs::create_dir_all(owner.root.join("dump")).unwrap();
+    owner.stack("dump/big.bin", &content, "leak");
+    let leak = owner.head("scratch");
+    owner.run_ok(&["lift"]);
+    owner.run_ok(&["remove", "dump/big.bin"]);
+    owner.run_ok(&["stack", "-m", "take the leak out"]);
+    let _ = std::fs::remove_file(owner.root.join("dump/big.bin"));
+
+    let recorded = recorded_hash(&owner, &format!("{}:dump/big.bin", leak), "leaked dump");
+    let recipe = recorded["data"]["hash"].as_str().unwrap().to_string();
+
+    // The leak's chunks, split by whether the kept file names them too.
+    let (own, shared): (Vec<String>, Vec<String>) = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&owner.root);
+        let root = object_utils::load_parcel(&owner.head("main")).unwrap().tree_hash;
+        let kept = match forklift_core::util::tree_utils::collect_subtree_closure(&root, "keep", usize::MAX).unwrap() {
+            Some(forklift_core::util::tree_utils::SubtreeClosure::Complete(closure)) => closure,
+            other => panic!("{:?}", other.is_some()),
+        };
+        let kept: std::collections::HashSet<String> = kept.iter()
+            .filter_map(|hash| object_utils::recipe_chunk_hashes(hash).ok())
+            .flatten()
+            .collect();
+        object_utils::recipe_chunk_hashes(&recipe).unwrap().into_iter().partition(|chunk| !kept.contains(chunk))
+    };
+    assert!(!own.is_empty() && !shared.is_empty(), "own {:?}, shared {:?}", own, shared);
+
+    // Waits out the drain a deletion attempt serves 503 through.
+    let report = || {
+        for _ in 0..500 {
+            let (status, info) = http(&server.url, "GET", "/v1/warehouse", b"");
+            if status.starts_with("HTTP/1.1 503") {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            }
+            assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, info);
+            return serde_json::from_str::<serde_json::Value>(&info).unwrap()["redactions"].clone();
+        }
+        panic!("the warehouse stayed drained");
+    };
+    let objects = server.root.join(".forklift/objects");
+
+    {
+        // Another process using the server's store keeps the deletion owed.
+        let _scope = forklift_core::globals::StorageRootScope::enter(&server.root);
+        let _store_access = forklift_core::util::lock_utils::StoreAccessLock::try_shared().unwrap();
+
+        owner.run_ok(&["lift"]);
+        assert_eq!(report(), serde_json::json!([{ "hash": recipe, "state": "deletion_owed" }]));
+
+        let (status, body) = http(&server.url, "GET", &format!("/v1/objects/{}", own[0]), b"");
+        assert!(status.starts_with("HTTP/1.1 404"), "{}, {} bytes", status, body.len());
+        assert!(objects.join(&own[0][..2]).join(&own[0][2..]).exists(), "the server still holds the chunk");
+
+        let (status, _) = http(&server.url, "GET", &format!("/v1/objects/{}", shared[0]), b"");
+        assert!(status.starts_with("HTTP/1.1 200"), "{}", status);
+
+        // A bundle of the leak's own chunks holds none of them; one of the shared chunks holds them.
+        let batch = |hashes: &[String]| {
+            let (status, body) = http(&server.url, "POST", "/v1/objects/batch",
+                                      serde_json::json!({ "hashes": hashes }).to_string().as_bytes());
+            assert!(status.starts_with("HTTP/1.1 200"), "{}", status);
+            body.len()
+        };
+        assert!(batch(&own) < 1024, "the bundle holds the leak's own chunks");
+        assert!(batch(&shared) > 1024, "the bundle holds the shared chunks");
+
+    }
+
+    // A ref write asks for a round, which deletes the content now the store is free.
+    owner.run_ok(&["shift", "main"]);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+    let mut state = serde_json::Value::Null;
+    for _ in 0..500 {
+        state = report();
+        if state == serde_json::json!([{ "hash": recipe, "state": "deleted" }]) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(state, serde_json::json!([{ "hash": recipe, "state": "deleted" }]));
+    assert!(!objects.join(&own[0][..2]).join(&own[0][2..]).exists(), "the chunk is deleted");
+    let (status, _) = http(&server.url, "GET", &format!("/v1/objects/{}", shared[0]), b"");
+    assert!(status.starts_with("HTTP/1.1 200"), "{}", status);
 }

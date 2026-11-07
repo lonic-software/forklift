@@ -199,7 +199,8 @@ pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
 }
 
 /// [`collect_live_set`], with `excluded` (the unheld applied redactions) given. An excluded hash a
-/// tree entry names is not marked, nor descended; one a live recipe names as a chunk stays live,
+/// tree entry or a staged shard names is not marked, nor descended; one a live recipe names as a
+/// chunk stays live,
 /// since a redaction's ban never extends to the chunks of another file.
 pub(crate) fn collect_live_set_excluding(excluded: &HashSet<String>) -> Result<HashSet<String>, String> {
     // Pallet heads (both namespaces), haul heads, tombstone heads, the git mirror's roots, bay-scoped
@@ -234,7 +235,11 @@ pub(crate) fn collect_live_set_excluding(excluded: &HashSet<String>) -> Result<H
     // Same leaf treatment as a tree's file entry below: the hash is marked live unread, and a
     // chunked entry's recipe is descended for its chunks.
     // Only a newly inserted recipe is descended, so one recipe staged in many bays is read once.
+    // An excluded hash is not marked, nor descended, as for a tree entry.
     for (hash, item_type) in &sources.shard_leaves {
+        if excluded.contains(hash) {
+            continue;
+        }
         if live.insert(hash.clone()) && item_type.is_chunked() {
             mark_recipe_chunks_live(hash, &mut live)?;
         }

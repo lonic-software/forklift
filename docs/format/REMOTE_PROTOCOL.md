@@ -139,10 +139,10 @@ entry per redacted object hash, with the state the remote holds it in:
 - `pending`: recorded, not applied. A pallet head, a deleted pallet's tombstone or metadata
   history on the remote still names the content, and the remote keeps serving it until none
   does.
-- `deletion_owed`: applied. The remote refuses the content on every route (below), and its copy
-  is still to be deleted.
-- `deleted`: applied, and the remote holds no copy of the content, whether it deleted one or
-  never held one.
+- `deletion_owed`: applied. The remote refuses the content on every route (below), and its copy,
+  or a chunk only that content named, is still to be deleted.
+- `deleted`: applied, and the remote holds no copy of the content, nor a chunk only it named,
+  whether it deleted one or never held one.
 
 A head applies a redaction once no pallet head, no tombstone and no metadata history it holds
 names the content, after each ref update or `DELETE`. Applying is permanent: an applied redaction is never
@@ -170,7 +170,9 @@ the remote's `@redactions` pallet holds as pending.
 object out, as they do one the remote lacks, so the client's loose `GET` for it receives the `410`;
 the bundle never carries it. What is refused is the redacted hash: for a chunked file, the
 recipe. Its chunks are not refused by hash, since other content may share them; a client never
-uploads one only that recipe names. A redaction names a file's content, never a tree or a chunk:
+uploads one only that recipe names. Until its deletion is done, forklift-server serves a chunk
+that only an applied redaction's recipe names as absent: `GET` answers `404` and `batch` leaves
+it out. A chunk another object names is served as before. A redaction names a file's content, never a tree or a chunk:
 an object's hash covers its type, so a chunk never shares a hash with a file's content. A remote
 that holds the named object, and holds it as a tree, a parcel or a chunk, never applies the
 redaction. A remote that lacks the object cannot tell what it is, so a redaction naming a tree or

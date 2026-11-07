@@ -126,7 +126,39 @@ struct WarehouseHandle {
     /// redaction recorded before an earlier process stopped may never have applied) and by a ref
     /// write whose own apply failed. A write that applied leaves the run nothing to apply.
     apply_owed: std::sync::atomic::AtomicBool,
+
+    /// Which chunks are served as absent while a redaction's deletion is owed ([`withheld_among`]).
+    chunk_gate: std::sync::Mutex<ChunkGate>,
+
+    /// Held while [`withheld_among`] walks the live set, so one request walks at a time and the
+    /// rest wait for its answer.
+    chunk_gate_walk: std::sync::Mutex<()>,
+
+    /// Counts the ref writes here, each counted before and after it: a withheld set walked at an
+    /// older count may miss a head that names one of its chunks.
+    ref_writes: std::sync::atomic::AtomicU64,
 }
+
+/// The chunks a warehouse serves as absent while a redaction's deletion is owed (see
+/// [`redaction_deleter::withheld_chunks`]), as last worked out.
+#[derive(Default)]
+struct ChunkGate {
+    /// The applied redactions `candidates` was read for; `None` until it is read, and once a
+    /// deletion has run.
+    basis: Option<AppliedSet>,
+
+    /// The chunks of the applied recipes the store held, and the chunks the journal owes.
+    candidates: std::collections::HashSet<String>,
+
+    /// The candidates no other object names, with the ref-write count read before the walk and
+    /// when it ended.
+    withheld: Option<(u64, std::time::Instant, std::collections::HashSet<String>)>,
+}
+
+/// How long a walked withheld set is trusted when no ref write here has landed since. A command
+/// run on the served root itself writes refs this server does not count, so a chunk it makes
+/// another file's is served again within this long.
+const CHUNK_GATE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl WarehouseHandle {
     /// A handle with no serve lock — for test fixtures, which are not a live served warehouse. A
@@ -149,6 +181,9 @@ impl WarehouseHandle {
             redaction_wake: Arc::new(tokio::sync::Notify::new()),
             first_run_due: std::sync::atomic::AtomicBool::new(false),
             apply_owed: std::sync::atomic::AtomicBool::new(false),
+            chunk_gate: std::sync::Mutex::new(ChunkGate::default()),
+            chunk_gate_walk: std::sync::Mutex::new(()),
+            ref_writes: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1365,22 +1400,25 @@ fn trust_install_outcome(installed: Result<office_utils::TrustInstalled, RefUpda
 }
 
 /// Where each redaction on this warehouse's `@redactions` stands here, for the handshake. An applied
-/// one is deleted once its object is gone from the store, and its deletion is owed while a copy is
-/// still there: the deleter has yet to run, could not drain the warehouse, or keeps a copy a bay
-/// here still holds. Nothing is walked: what holds a pending one is the scan's business after each
-/// ref write, not every handshake's. A cell this build cannot read is not reported.
+/// one is deleted once its object is gone from the store and the deletion owes none of its chunks
+/// (a deletion cut short after its recipe went leaves them, for the next one to delete), and its
+/// deletion is owed while a copy is still there: the deleter has yet to run, could not drain the
+/// warehouse, or keeps a copy a bay here still holds. Nothing is walked: what holds a pending one
+/// is the scan's business after each ref write, not every handshake's. A cell this build cannot
+/// read is not reported.
 fn served_redactions() -> Result<Vec<ServedRedaction>, HandlerError> {
     let applied = read_applied()?;
+    // Deleted is claimed only on seeing the object and its owed chunks absent: a journal or a store
+    // that cannot be read reports the deletion owed, as a handshake must not fail over one object.
+    let owing_chunks = redaction_deleter::recipes_owing_chunks();
 
     redaction_utils::read_redactions().map_err(internal)?.redactions.iter().map(|attributed| {
         let hash = attributed.redaction.hash.clone();
         let state = match applied.contains(&hash) {
             false => ServedRedactionState::Pending,
-            // Deleted is claimed only on seeing the object absent: a store that cannot be read
-            // reports the deletion owed, as a handshake must not fail over one object.
-            true => match file_utils::does_object_exist(&hash) {
-                Ok(false) => ServedRedactionState::Deleted,
-                Ok(true) | Err(_) => ServedRedactionState::DeletionOwed,
+            true => match (file_utils::does_object_exist(&hash), &owing_chunks) {
+                (Ok(false), Ok(owing)) if !owing.contains(&hash) => ServedRedactionState::Deleted,
+                _ => ServedRedactionState::DeletionOwed,
             },
         };
 
@@ -1399,6 +1437,87 @@ fn refuse_redacted(applied: &AppliedSet, hash: &str) -> Result<(), HandlerError>
     match applied.contains(hash) {
         true => Err((StatusCode::GONE, applied_redactions::served_refusal(hash))),
         false => Ok(()),
+    }
+}
+
+/// Of `hashes`, the chunks `warehouse` serves as absent: those only an applied redaction's recipe
+/// names, while its deletion is owed ([`redaction_deleter::withheld_chunks`]). They are not
+/// redacted (a redaction's ban never extends to a chunk), so they are answered as the deletion
+/// will leave them, absent, not refused. Run in a request's blocking closure, beside its
+/// `applied` read.
+///
+/// The candidates are read again whenever the applied set differs from theirs, which is cheap.
+/// Only a request naming a candidate needs the live set, walked once per ref write here (counted
+/// before and after each, so a walk overlapping one is never trusted) and at most every
+/// [`CHUNK_GATE_TTL`], one walk at a time.
+fn withheld_among(warehouse: &WarehouseHandle,
+                  applied: &AppliedSet,
+                  hashes: &[String]) -> Result<std::collections::HashSet<String>, HandlerError> {
+    use std::sync::atomic::Ordering;
+
+    // The withheld chunks among `hashes`, when the gate knows them now.
+    let answer = |gate: &mut ChunkGate| -> Result<Option<std::collections::HashSet<String>>, HandlerError> {
+        if gate.basis.as_ref() != Some(applied) {
+            gate.candidates = redaction_deleter::withheld_candidates(applied).map_err(internal)?;
+            gate.basis = Some(applied.clone());
+            gate.withheld = None;
+        }
+
+        let asked: Vec<&String> = hashes.iter().filter(|hash| gate.candidates.contains(*hash)).collect();
+        if asked.is_empty() {
+            return Ok(Some(std::collections::HashSet::new()));
+        }
+
+        match &gate.withheld {
+            Some((count, at, withheld)) if *count == warehouse.ref_writes.load(Ordering::SeqCst) && at.elapsed() < CHUNK_GATE_TTL => {
+                Ok(Some(asked.into_iter().filter(|hash| withheld.contains(*hash)).cloned().collect()))
+            }
+            _ => Ok(None),
+        }
+    };
+
+    if let Some(withheld) = answer(&mut lock_gate(warehouse))? {
+        return Ok(withheld);
+    }
+
+    let _walk = warehouse.chunk_gate_walk.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // Another request may have walked while this one waited.
+    if let Some(withheld) = answer(&mut lock_gate(warehouse))? {
+        return Ok(withheld);
+    }
+
+    let count = warehouse.ref_writes.load(Ordering::SeqCst);
+    let (candidates, withheld) = redaction_deleter::withheld_chunks(applied).map_err(internal)?;
+    let among = hashes.iter().filter(|hash| withheld.contains(*hash)).cloned().collect();
+
+    let mut gate = lock_gate(warehouse);
+    gate.basis = Some(applied.clone());
+    gate.candidates = candidates;
+    gate.withheld = Some((count, std::time::Instant::now(), withheld));
+
+    Ok(among)
+}
+
+/// The chunk gate of `warehouse`, locked.
+fn lock_gate(warehouse: &WarehouseHandle) -> std::sync::MutexGuard<'_, ChunkGate> {
+    warehouse.chunk_gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Counts a ref write here for the chunk gate ([`withheld_among`]): once when it starts, and again
+/// when the blocking closure making it drops this, landed or not, even if the request is gone.
+struct RefWriteCounted(Arc<WarehouseHandle>);
+
+impl RefWriteCounted {
+    fn start(warehouse: &Arc<WarehouseHandle>) -> Self {
+        warehouse.ref_writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        RefWriteCounted(Arc::clone(warehouse))
+    }
+}
+
+impl Drop for RefWriteCounted {
+    fn drop(&mut self) {
+        self.0.ref_writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -2482,8 +2601,12 @@ async fn post_objects_batch(State(state): State<Arc<AppState>>,
         return error_response(error);
     }
 
+    let gate = Arc::clone(&warehouse);
     let result = blocking(warehouse, move || {
-        bundle_utils::build_partial_bundle(&request.hashes).map_err(internal)
+        let withheld = withheld_among(&gate, &read_applied()?, &request.hashes)?;
+        let hashes: Vec<String> = request.hashes.into_iter().filter(|hash| !withheld.contains(hash)).collect();
+
+        bundle_utils::build_partial_bundle(&hashes).map_err(internal)
     }).await;
 
     match result {
@@ -2624,10 +2747,13 @@ async fn get_object(State(state): State<Arc<AppState>>,
         Err(error) => return error_response(error),
     };
 
+    let gate = Arc::clone(&warehouse);
     let result = blocking(warehouse, move || {
-        refuse_redacted(&read_applied()?, &hash)?;
+        let applied = read_applied()?;
+        refuse_redacted(&applied, &hash)?;
 
-        if !file_utils::does_object_exist(&hash).map_err(unprocessable)? {
+        if !file_utils::does_object_exist(&hash).map_err(unprocessable)?
+            || !withheld_among(&gate, &applied, std::slice::from_ref(&hash))?.is_empty() {
             return Err((StatusCode::NOT_FOUND, format!("No object {} exists.", hash)));
         }
 
@@ -2929,7 +3055,9 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
         _ => None,
     };
 
+    let counted = RefWriteCounted::start(&warehouse);
     let result = blocking(Arc::clone(&warehouse), move || {
+        let _counted = counted;
         // A meta pallet arrives as `@office`. The server routes by *namespace*, never by a
         // hard-coded name (DESIGN.html §3.3).
         let namespace = pallet_ref.namespace;
@@ -3262,7 +3390,9 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
         _ => None,
     };
 
+    let counted = RefWriteCounted::start(&warehouse);
     let result = blocking(Arc::clone(&warehouse), move || {
+        let _counted = counted;
         if pallet_ref.namespace == pallet_utils::PalletNamespace::Meta {
             return Err(unprocessable(format!(
                 "Meta pallet \"{}\" cannot be deleted: it is tracked metadata, not a line of work.",
@@ -3585,7 +3715,7 @@ async fn delete_applied_content(state: &AppState, warehouse: &Arc<WarehouseHandl
     }
 
     match blocking(Arc::clone(warehouse), || redaction_deleter::applied_copies().map_err(internal)).await {
-        Ok(copies) if copies.unheld == 0 => return false,
+        Ok(copies) if !copies.owes_deletion() => return false,
         Ok(_) => {}
         Err((_, error)) => {
             tracing::error!(error, "which redacted content is held could not be told; its deletion is owed");
@@ -3714,6 +3844,9 @@ fn delete_drained(warehouse: &WarehouseHandle) -> (Result<redaction_deleter::Del
     })();
 
     pack_utils::forget_warehouse();
+
+    // What the deletion dropped and the journal it emptied change the candidates: read them again.
+    *lock_gate(warehouse) = ChunkGate::default();
 
     if store_access.is_none() {
         match StoreAccessLock::try_shared() {

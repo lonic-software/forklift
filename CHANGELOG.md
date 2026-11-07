@@ -122,6 +122,12 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   The write that lets a redaction apply is answered once it is applied, without waiting for
   the deletion, and the handshake reports the redaction `deleted` once no copy is left. Every `503` the server sends now carries
   `Retry-After`.
+- **A redacted file's chunks are never served, and never left behind.** Until the server has
+  deleted a chunked file's redacted content, it answers a chunk only that file named as absent,
+  by hash or in a batch; a chunk another file shares is still served. A deletion cut short after
+  deleting a chunked file's recipe now leaves a record of the chunks it still owes, so the next
+  `redact apply`, or the server's next attempt, deletes them, and the server reports the
+  redaction `deleted` only once they are gone.
 - **`forklift redact` is listed, and the `--json` schema is now 27: an applied redaction's content
   is deleted.** Part of content redaction: once a redaction applies, `redact record` and
   `redact apply` delete every copy of its content in this warehouse, packed or loose, and a chunked
