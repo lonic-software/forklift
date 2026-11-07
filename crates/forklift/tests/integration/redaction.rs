@@ -1562,3 +1562,93 @@ fn a_server_applies_a_redaction_no_head_names_and_refuses_its_content() {
     assert!(String::from_utf8_lossy(&cloned.stderr).contains(&format!("Object {} is redacted", hash)),
             "{}", String::from_utf8_lossy(&cloned.stderr));
 }
+
+/// A pallet deleted on forklift-server leaves a tombstone that keeps its head served and
+/// restorable, so a redaction that head names stays pending through the deletion.
+///
+/// Revert: leave tombstones out of the apply scan → the handshake reports it applied.
+#[test]
+fn a_server_keeps_a_redaction_pending_while_a_tombstone_names_it() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-tombstone-server-{}", std::process::id())));
+
+    let owner = Warehouse::cloned("tombstone-owner", &server.url);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+
+    // Cloned before the leak, so no head here names it.
+    let redactor = Warehouse::cloned("tombstone-redactor", &server.url);
+    owner.run_ok(&["pallet", "create", "feature"]);
+    owner.stack("secret.env", b"TOKEN=hunter2\n", "leak");
+    owner.run_ok(&["lift"]);
+
+    let hash = redactor.redact_loaded("secret.env", b"TOKEN=hunter2\n", "leaked token");
+    redactor.run_ok(&["lift"]);
+    let pending = serde_json::json!([{ "hash": hash, "state": "pending" }]);
+    let report = || {
+        let (status, info) = http(&server.url, "GET", "/v1/warehouse", b"");
+        assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, info);
+        serde_json::from_str::<serde_json::Value>(&info).unwrap()["redactions"].clone()
+    };
+    assert_eq!(report(), pending, "the head of pallet feature names it");
+
+    owner.run_ok(&["shift", "main"]);
+    owner.run_ok(&["pallet", "delete", "feature", "--remote"]);
+    assert_eq!(report(), pending, "the tombstone of pallet feature keeps that head");
+    let (status, _) = http(&server.url, "GET", &format!("/v1/objects/{}", hash), b"");
+    assert!(status.starts_with("HTTP/1.1 200"), "{}", status);
+}
+
+/// The bytes of every object file under `dir`.
+fn stored_bytes(dir: &std::path::Path) -> u64 {
+    std::fs::read_dir(dir).unwrap().map(|entry| {
+        let entry = entry.unwrap();
+        match entry.file_type().unwrap().is_dir() {
+            true => stored_bytes(&entry.path()),
+            false => entry.metadata().unwrap().len(),
+        }
+    }).sum()
+}
+
+/// A lift of history naming a chunked file whose redaction the server applied sends neither the
+/// recipe nor the chunks only it names.
+///
+/// Revert: offer a redacted recipe's chunks → the server's store grows by the file.
+#[test]
+fn a_lift_sends_no_chunk_of_a_file_the_server_applied_a_redaction_of() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-chunks-server-{}", std::process::id())));
+
+    let owner = Warehouse::cloned("chunks-owner", &server.url);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+    let behind = Warehouse::cloned("chunks-behind", &server.url);
+
+    // Above the chunking threshold, and varied, so the file is a recipe of several chunks.
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    let content: Vec<u8> = (0..9 * 1024 * 1024).map(|_| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state as u8
+    }).collect();
+
+    // The owner records the redaction from a pallet it never lifts.
+    owner.run_ok(&["pallet", "create", "scratch"]);
+    owner.stack("big.bin", &content, "leak");
+    let leak = owner.head("scratch");
+    owner.run_ok(&["remove", "big.bin"]);
+    owner.run_ok(&["stack", "-m", "take the leak out"]);
+    recorded_hash(&owner, &format!("{}:big.bin", leak), "leaked dump");
+    owner.run_ok(&["shift", "main"]);
+    owner.run_ok(&["lift"]);
+
+    behind.leaked("big.bin", &content);
+    behind.run_ok(&["lower"]);
+    let objects = server.root.join(".forklift/objects");
+    let before = stored_bytes(&objects);
+    behind.run_ok(&["lift"]);
+    assert_eq!(server.main(), behind.head("main"));
+    let grown = stored_bytes(&objects) - before;
+    assert!(grown < 1024 * 1024, "the server's store grew by {} bytes", grown);
+}

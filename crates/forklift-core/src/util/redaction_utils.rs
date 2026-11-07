@@ -377,6 +377,29 @@ pub struct HeadHolder {
 /// Elsewhere an object the walk needs and the store lacks is an error, never a pass; a pallet that
 /// does name the content is reported ahead of that error.
 pub fn head_holders(redaction: &Redaction) -> Result<Vec<HeadHolder>, String> {
+    let mut heads = Vec::new();
+
+    for pallet in pallet_utils::list_pallets()? {
+        if let Some(head) = pallet_utils::get_pallet_head(&pallet)? {
+            heads.push((pallet, head));
+        }
+    }
+
+    holders_among(redaction, heads, "pallet")
+}
+
+/// Every deleted pallet whose tombstone's head names what `redaction` removes, by the rule of
+/// [`head_holders`]. A tombstone keeps its head served and restorable, so a redaction it holds
+/// cannot apply; dropping the tombstone, or restoring the pallet and taking the file out, frees it.
+/// Kept apart from [`head_holders`], since a recording is not refused over it: no write here can
+/// take the file out of a deleted pallet.
+pub fn tombstone_holders(redaction: &Redaction) -> Result<Vec<HeadHolder>, String> {
+    holders_among(redaction, crate::util::tombstone_utils::read_tombstones()?.into_iter().collect(), "deleted pallet")
+}
+
+/// Which of `heads`, each a pallet's name and head, names what `redaction` removes; `what` names
+/// that kind of pallet in an error.
+fn holders_among(redaction: &Redaction, heads: Vec<(String, String)>, what: &str) -> Result<Vec<HeadHolder>, String> {
     let set = RedactedSet {
         hashes: HashSet::from([redaction.hash.clone()]),
         chunk_lists: redaction.chunks.iter().map(|chunks| (chunks.clone(), HashSet::from([redaction.hash.clone()]))).collect(),
@@ -386,9 +409,7 @@ pub fn head_holders(redaction: &Redaction) -> Result<Vec<HeadHolder>, String> {
     let mut holders = Vec::new();
     let mut undecided = None;
 
-    for pallet in pallet_utils::list_pallets()? {
-        let Some(head) = pallet_utils::get_pallet_head(&pallet)? else { continue };
-
+    for (pallet, head) in heads {
         if partial && !file_utils::does_object_exist(&head)? {
             continue;
         }
@@ -402,9 +423,9 @@ pub fn head_holders(redaction: &Redaction) -> Result<Vec<HeadHolder>, String> {
             Ok(None) => {}
             Err(error) => {
                 undecided.get_or_insert(format!(
-                    "The head of pallet \"{}\" ({}) cannot be read ({}), so whether it names {} cannot \
+                    "The head of {} \"{}\" ({}) cannot be read ({}), so whether it names {} cannot \
                     be told.",
-                    pallet, head, error.trim_end_matches('.'), redaction.hash
+                    what, pallet, head, error.trim_end_matches('.'), redaction.hash
                 ));
             }
         }

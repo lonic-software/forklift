@@ -2530,8 +2530,6 @@ pub(crate) mod tests {
             update_meta_pallet_head(OFFICE, None, &"e".repeat(64), &RefPreconditions::NONE).unwrap();
         }
 
-        // Revert: stop comparing the token's bound → a walk cut at a parcel no ref reaches skips the
-        // root `head` reuses from it, so the write takes that token and lands over a lost blob.
         // Revert: verify the server's write strictly again → a head whose history names content a
         // redaction applied here took away is refused as incomplete.
         #[test]
@@ -2561,6 +2559,8 @@ pub(crate) mod tests {
             assert!(crate::util::audit_utils::verify_parcel_closure_for_write(&damaged, Some(&head)).is_err());
         }
 
+        // Revert: stop comparing the token's bound → a walk cut at a parcel no ref reaches skips the
+        // root `head` reuses from it, so the write takes that token and lands over a lost blob.
         #[test]
         fn a_token_walked_to_another_bound_does_not_let_a_write_skip_the_walk() {
             let (_root, _scope) = scratch("closure-bound");
@@ -2970,7 +2970,7 @@ pub(crate) mod tests {
             let pending = blob("pending");
             let redactions = pending_then_local(&pending, &blob("local"));
             let served = parcel(&two_dirs("a0", "pending"), &[]);
-            let reported = |state| vec![ServedRedaction { hash: pending.clone(), state, meta_pallets: Vec::new() }];
+            let reported = |state| vec![ServedRedaction { hash: pending.clone(), state }];
 
             for state in [ServedRedactionState::DeletionOwed, ServedRedactionState::Deleted, ServedRedactionState::Unknown] {
                 let report = reported(state);

@@ -183,9 +183,10 @@ pub enum RedactionState {
     /// content, and no head written since may name it anew.
     Applied,
 
-    /// Pending: these pallet heads, and the history of these meta pallets (by name), still name
-    /// it. A meta pallet's history is never rewritten, so a redaction it holds stays pending.
-    Held { heads: Vec<HeadHolder>, meta_pallets: Vec<String> },
+    /// Pending: these pallet heads, the heads these deleted pallets' tombstones keep, and the
+    /// history of these meta pallets (by name), still name it. A meta pallet's history is never
+    /// rewritten, so a redaction it holds stays pending.
+    Held { heads: Vec<HeadHolder>, tombstones: Vec<HeadHolder>, meta_pallets: Vec<String> },
 
     /// Pending: nothing here names it, and this warehouse has a remote, whose report that it is
     /// applied there it waits for.
@@ -213,24 +214,30 @@ pub struct RedactionStatus {
     pub state: RedactionState,
 }
 
-/// What still holds `redaction` pending here, by its own scan: the pallet heads that name its
-/// content (by hash, or for a recipe, by chunk list) and the meta pallets whose history names its
-/// hash. `None` when nothing does. A holder either walk found is reported ahead of the other
-/// walk's error, as the more definite answer.
+/// What still holds `redaction` pending here, by its own scan: the pallet heads and the tombstones'
+/// heads that name its content (by hash, or for a recipe, by chunk list) and the meta pallets whose
+/// history names its hash. `None` when nothing does. A holder any walk found is reported ahead of
+/// another walk's error, as the more definite answer.
 fn scan(redaction: &Redaction) -> Result<Option<RedactionState>, String> {
-    let (heads, meta_pallets) = match (
-        redaction_utils::head_holders(redaction),
-        redaction_utils::meta_holders(&redaction.hash),
-    ) {
-        (Ok(heads), Ok(meta_pallets)) => (heads, meta_pallets),
-        (Ok(heads), Err(_)) if !heads.is_empty() => (heads, Vec::new()),
-        (Err(_), Ok(meta_pallets)) if !meta_pallets.is_empty() => (Vec::new(), meta_pallets),
-        (Err(error), _) | (_, Err(error)) => return Err(error),
+    let heads = redaction_utils::head_holders(redaction);
+    let tombstones = redaction_utils::tombstone_holders(redaction);
+    let meta_pallets = redaction_utils::meta_holders(&redaction.hash);
+
+    let found = heads.as_ref().is_ok_and(|heads| !heads.is_empty())
+        || tombstones.as_ref().is_ok_and(|tombstones| !tombstones.is_empty())
+        || meta_pallets.as_ref().is_ok_and(|names| !names.is_empty());
+
+    let (heads, tombstones, meta_pallets) = match (heads, tombstones, meta_pallets) {
+        (Ok(heads), Ok(tombstones), Ok(meta_pallets)) => (heads, tombstones, meta_pallets),
+        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) if !found => return Err(error),
+        (heads, tombstones, meta_pallets) => (
+            heads.unwrap_or_default(), tombstones.unwrap_or_default(), meta_pallets.unwrap_or_default(),
+        ),
     };
 
-    Ok(match heads.is_empty() && meta_pallets.is_empty() {
+    Ok(match heads.is_empty() && tombstones.is_empty() && meta_pallets.is_empty() {
         true => None,
-        false => Some(RedactionState::Held { heads, meta_pallets }),
+        false => Some(RedactionState::Held { heads, tombstones, meta_pallets }),
     })
 }
 

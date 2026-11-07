@@ -675,6 +675,11 @@ pub(crate) struct StateView {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     heads: Vec<HeadView>,
 
+    /// For `held`, the deleted pallets whose tombstone keeps a head that names the content, served
+    /// and restorable: each with the `pallet` name, the `head` and the `path`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tombstones: Vec<HeadView>,
+
     /// For `held`, the meta pallets whose history names the hash. That history is never
     /// rewritten, so the redaction stays pending.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -701,19 +706,21 @@ pub(crate) struct HeadView {
 
 impl From<&RedactionState> for StateView {
     fn from(state: &RedactionState) -> Self {
-        let view = |state| StateView { state, heads: Vec::new(), meta_pallets: Vec::new(), reason: None };
+        let view = |state| StateView {
+            state, heads: Vec::new(), tombstones: Vec::new(), meta_pallets: Vec::new(), reason: None,
+        };
+        let heads = |holders: &[forklift_core::util::redaction_utils::HeadHolder]| holders.iter()
+            .map(|holder| HeadView { pallet: holder.pallet.clone(), head: holder.head.clone(), path: holder.path.clone() })
+            .collect();
 
         match state {
             RedactionState::Applied => view(StateName::Applied),
             RedactionState::AwaitingRemote => view(StateName::AwaitingRemote),
             RedactionState::Ready => view(StateName::Ready),
             RedactionState::Undecided(reason) => StateView { reason: Some(reason.clone()), ..view(StateName::Undecided) },
-            RedactionState::Held { heads, meta_pallets } => StateView {
-                heads: heads.iter()
-                    .map(|holder| HeadView {
-                        pallet: holder.pallet.clone(), head: holder.head.clone(), path: holder.path.clone(),
-                    })
-                    .collect(),
+            RedactionState::Held { heads: held, tombstones, meta_pallets } => StateView {
+                heads: heads(held),
+                tombstones: heads(tombstones),
                 meta_pallets: meta_pallets.iter().map(|name| format!("@{}", name)).collect(),
                 ..view(StateName::Held)
             },
@@ -733,6 +740,9 @@ impl StateView {
                 let mut by: Vec<String> = self.heads.iter()
                     .map(|head| format!("pallet \"{}\" as \"{}\"", sanitize(&head.pallet), sanitize(&head.path)))
                     .collect();
+                by.extend(self.tombstones.iter().map(|head| {
+                    format!("the tombstone of deleted pallet \"{}\" as \"{}\"", sanitize(&head.pallet), sanitize(&head.path))
+                }));
                 by.extend(self.meta_pallets.iter().map(|name| format!("the history of {}", sanitize(name))));
 
                 format!("pending: named by {}", by.join(", "))

@@ -64,6 +64,10 @@ struct WarehouseHandle {
     /// Whether a bundle rebuild is running right now (never two at once).
     bundling: std::sync::atomic::AtomicBool,
 
+    /// Whether the running rebuild must be followed by another: a redaction applied while it ran,
+    /// so it publishes nothing.
+    rebuild_again: std::sync::atomic::AtomicBool,
+
     /// The serve lock for this root, held for as long as the handle is served. `None` for
     /// handles that are not a live served warehouse (test fixtures). Held in the handle so the
     /// lock releases exactly when the served warehouse stops being served: when the server stops,
@@ -91,6 +95,7 @@ impl WarehouseHandle {
             root,
             lifts_since_bundle: std::sync::atomic::AtomicU32::new(0),
             bundling: std::sync::atomic::AtomicBool::new(false),
+            rebuild_again: std::sync::atomic::AtomicBool::new(false),
             _serve_lock: None,
             _store_access: None,
             _format_lease: None,
@@ -1292,23 +1297,20 @@ fn trust_install_outcome(installed: Result<office_utils::TrustInstalled, RefUpda
 
 /// Where each redaction on this warehouse's `@redactions` stands here, for the handshake. An applied
 /// one is reported with its deletion owed, since this head refuses the content but deletes no copy
-/// of it yet. A pending one names the meta pallets whose history holds it pending for good; the
-/// pallet heads that may hold it are not walked for, since a lift moves them often. A cell this
-/// build cannot read is not reported.
+/// of it yet. Nothing is walked: what holds a pending one is the scan's business after each ref
+/// write, not every handshake's. A cell this build cannot read is not reported.
 fn served_redactions() -> Result<Vec<ServedRedaction>, HandlerError> {
     let applied = read_applied()?;
 
-    redaction_utils::read_redactions().map_err(internal)?.redactions.iter().map(|attributed| {
+    Ok(redaction_utils::read_redactions().map_err(internal)?.redactions.iter().map(|attributed| {
         let hash = attributed.redaction.hash.clone();
+        let state = match applied.contains(&hash) {
+            true => ServedRedactionState::DeletionOwed,
+            false => ServedRedactionState::Pending,
+        };
 
-        Ok(match applied.contains(&hash) {
-            true => ServedRedaction { hash, state: ServedRedactionState::DeletionOwed, meta_pallets: Vec::new() },
-            false => {
-                let meta_pallets = redaction_utils::meta_holders(&hash).map_err(internal)?;
-                ServedRedaction { hash, state: ServedRedactionState::Pending, meta_pallets }
-            }
-        })
-    }).collect()
+        ServedRedaction { hash, state }
+    }).collect())
 }
 
 /// The redactions this warehouse applied, read for a request that serves or takes objects by hash.
@@ -2313,9 +2315,7 @@ async fn post_upload_targets(State(state): State<Arc<AppState>>,
     let result = blocking(warehouse, move || {
         let applied = read_applied()?;
 
-        if let Some(hash) = request.hashes.iter().find(|hash| applied.contains(hash)) {
-            refuse_redacted(&applied, hash)?;
-        }
+        request.hashes.iter().try_for_each(|hash| refuse_redacted(&applied, hash))?;
 
         let mut response = UploadTargetsResponse {
             present: Vec::new(),
@@ -3282,7 +3282,7 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
 /// or else when the accepted-lift counter reaches its threshold.
 async fn after_ref_write(state: &AppState, warehouse: Arc<WarehouseHandle>) {
     match apply_redactions(Arc::clone(&warehouse)).await {
-        Ok(true) => rebuild_bundle(state, warehouse),
+        Ok(true) => rebuild_bundle(state, warehouse, true),
         Ok(false) => maybe_rebuild_bundle(state, warehouse),
         // The write landed and stays landed; the next write here applies again.
         Err((_, error)) => {
@@ -3332,42 +3332,61 @@ fn maybe_rebuild_bundle(state: &AppState, warehouse: Arc<WarehouseHandle>) {
         return;
     }
 
-    rebuild_bundle(state, warehouse);
+    rebuild_bundle(state, warehouse, false);
 }
 
 /// Kick off a background bundle rebuild, when rebuilds are configured and none runs for this
-/// warehouse already. A rebuild already running when a redaction applied publishes nothing (see
-/// `bundle_utils::build_bundle`), so the warehouse has no bundle until the next rebuild.
-fn rebuild_bundle(state: &AppState, warehouse: Arc<WarehouseHandle>) {
+/// warehouse already. With `again` (a redaction was just applied, and the bundle withdrawn), a
+/// rebuild already running is followed by another once it ends: it began before the redaction, so
+/// it publishes nothing (see `bundle_utils::build_bundle`).
+fn rebuild_bundle(state: &AppState, warehouse: Arc<WarehouseHandle>, again: bool) {
     use std::sync::atomic::Ordering;
 
-    if state.rebuild_after_lifts.is_none() || warehouse.bundling.swap(true, Ordering::SeqCst) {
+    if state.rebuild_after_lifts.is_none() {
         return;
     }
 
+    // Asked for before the running rebuild is looked at, so that rebuild, ending, sees it.
+    if again {
+        warehouse.rebuild_again.store(true, Ordering::SeqCst);
+    }
+
+    if warehouse.bundling.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    // This rebuild starts after whatever asked for another, so it serves that ask.
+    warehouse.rebuild_again.store(false, Ordering::SeqCst);
     warehouse.lifts_since_bundle.store(0, Ordering::SeqCst);
 
     tokio::spawn(async move {
-        let worker = Arc::clone(&warehouse);
+        loop {
+            let worker = Arc::clone(&warehouse);
 
-        let result = tokio::task::spawn_blocking(move || {
-            let _scope = StorageRootScope::enter(&worker.root);
+            let result = tokio::task::spawn_blocking(move || {
+                let _scope = StorageRootScope::enter(&worker.root);
 
-            bundle_utils::build_bundle()
-        }).await;
+                bundle_utils::build_bundle()
+            }).await;
 
-        match result {
-            Ok(Ok(stats)) => tracing::info!(
-                objects = stats.objects,
-                deltas = stats.deltas,
-                signatures = stats.signatures,
-                "rebuilt the bundle"
-            ),
-            Ok(Err(error)) => tracing::error!(error, "the bundle rebuild failed"),
-            Err(error) => tracing::error!(%error, "the bundle rebuild task failed"),
+            match result {
+                Ok(Ok(stats)) => tracing::info!(
+                    objects = stats.objects,
+                    deltas = stats.deltas,
+                    signatures = stats.signatures,
+                    "rebuilt the bundle"
+                ),
+                Ok(Err(error)) => tracing::error!(error, "the bundle rebuild failed"),
+                Err(error) => tracing::error!(%error, "the bundle rebuild task failed"),
+            }
+
+            warehouse.bundling.store(false, Ordering::SeqCst);
+
+            // Another was asked for while this one ran, and no other rebuild has started since.
+            if !warehouse.rebuild_again.swap(false, Ordering::SeqCst) || warehouse.bundling.swap(true, Ordering::SeqCst) {
+                break;
+            }
         }
-
-        warehouse.bundling.store(false, Ordering::SeqCst);
     });
 }
 

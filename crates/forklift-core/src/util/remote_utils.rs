@@ -6570,8 +6570,13 @@ async fn upload_history(client: &RemoteClient,
     // closure.
     let mut candidates: Vec<String> = new_parcels.clone();
     let mut seen_trees: HashSet<String> = HashSet::new();
-    let mut seen_blobs: HashSet<String> = HashSet::new();
-    let mut seen_recipes: HashSet<String> = HashSet::new();
+
+    // Content the remote reports applied is never sent: it refuses it, and its ref update takes
+    // history naming it without it. Seen already, so the walk neither offers it nor descends a
+    // redacted recipe; a chunk of one is still offered when another recipe the walk reaches names it.
+    let redacted: HashSet<String> = info.applied_redactions().into_iter().map(str::to_string).collect();
+    let mut seen_blobs: HashSet<String> = redacted.clone();
+    let mut seen_recipes: HashSet<String> = redacted;
 
     // Parents first, guaranteed by `new_parcels_parents_first`: every parent of the parcel
     // being walked is remote-known or already processed, so everything a base "explains" is
@@ -6602,9 +6607,6 @@ async fn upload_history(client: &RemoteClient,
     // already built (`new_parcels`, `seen_trees` and `seen_recipes`), rather than re-deriving each
     // object's type on the wire. A recipe is small and structural (like a tree), so it belongs in
     // the synchronous half; its chunks are the large, many, out-of-band half.
-    let redacted = info.applied_redactions();
-    candidates.retain(|hash| !redacted.contains(hash.as_str()));
-
     let mut control_plane: HashSet<String> = new_parcels.iter().cloned().collect();
     control_plane.extend(seen_trees.iter().cloned());
     control_plane.extend(seen_recipes.iter().cloned());

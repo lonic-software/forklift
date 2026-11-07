@@ -114,11 +114,6 @@ pub struct ServedRedaction {
 
     /// Where it stands on the head.
     pub state: ServedRedactionState,
-
-    /// For a pending redaction, the meta pallets whose history names the content, which hold it
-    /// pending for good. Empty otherwise, and left out then.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub meta_pallets: Vec<String>,
 }
 
 /// Where a redaction stands on a head ([`ServedRedaction::state`]).

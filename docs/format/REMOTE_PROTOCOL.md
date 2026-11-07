@@ -104,7 +104,7 @@ The one-round-trip handshake: protocol version, refs and trust.
              "prior_genesis": "<hash, re-genesis only>", "adopts": "<hash, re-genesis only>" },
   "tombstones": { "old-feature": "<parcel-hash>" },
   "redactions": [{ "hash": "<hash>", "state": "deletion_owed" },
-                 { "hash": "<hash>", "state": "pending", "meta_pallets": ["@tags"] }]
+                 { "hash": "<hash>", "state": "pending" }]
 }
 ```
 
@@ -130,15 +130,15 @@ or `DELETE` whose `old_head` names a pallet that is gone because it was deleted 
 `redactions` (additive) lists every redaction recorded on this remote's `@redactions` pallet, one
 entry per redacted object hash, with the state the remote holds it in:
 
-- `pending`: recorded, not applied. A pallet head or metadata history on the remote still names
-  the content, and the remote keeps serving it until it does not. `meta_pallets` names the meta
-  pallets whose history names it, and is omitted when none does.
+- `pending`: recorded, not applied. A pallet head, a deleted pallet's tombstone or metadata
+  history on the remote still names the content, and the remote keeps serving it until none
+  does.
 - `deletion_owed`: applied. The remote refuses the content on every route (below), and its copy
   is still to be deleted.
 - `deleted`: applied, and the remote's copy is gone.
 
-A head applies a redaction once no pallet head and no metadata history it holds names the
-content, after each ref update or `DELETE`. Applying is permanent: an applied redaction is never
+A head applies a redaction once no pallet head, no tombstone and no metadata history it holds
+names the content, after each ref update or `DELETE`. Applying is permanent: an applied redaction is never
 pending again. A client reads a state it does not know as neither pending nor applied: it still
 uploads the content when a lift needs it, and refuses to take a head that names it. A head that
 does not apply redactions sends `null` or omits the field; a client then treats every redaction
@@ -148,7 +148,9 @@ the remote's `@redactions` pallet holds as pending.
 `/v1/objects/{hash}` for its hash answer `410` with `code` `content_redacted` and the hash in
 `details.hash`, and so does `upload-targets` naming it. `batch` and the subtree endpoint leave the
 object out, as they do one the remote lacks, so the client's loose `GET` for it receives the `410`;
-the bundle never carries it. A ref update tolerates the absence of an applied redaction's content
+the bundle never carries it. What is refused is the redacted hash: for a chunked file, the
+recipe. Its chunks are not refused by hash, since other content may share them; a client never
+uploads one only that recipe names. A ref update tolerates the absence of an applied redaction's content
 from the closure it checks, so a client lifting history that names the content does not upload
 it: it sends no candidate the handshake reports applied. A client that must fetch such content
 (a clone or `lower` of history that names it) is refused with `content_redacted`.
@@ -424,8 +426,8 @@ checks every reference before building the path and sends only valid ones.
 2. **Presence**: `new_head` is an object hash in its canonical spelling (64 lowercase hex
    characters), and the `new_head` parcel and the full closure of every parcel between
    `new_head` and `old_head` (parents, trees, blobs) are present, else `422` — a ref
-   must never point at missing history. A blob or chunk whose redaction the remote has applied
-   is the one absence allowed.
+   must never point at missing history. A blob or chunked file's recipe whose redaction the
+   remote has applied is the one absence allowed.
 3. **Ancestry**: `old_head` is an ancestor of `new_head` (fast-forward only; there is
    no force push in protocol v1), else `409`.
    A creation (`old_head: null`) of a user pallet that has a tombstone must acknowledge it,
