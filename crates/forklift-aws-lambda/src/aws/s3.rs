@@ -942,6 +942,12 @@ impl ObjectStore for S3ObjectStore {
         }))
     }
 
+    fn delete_staged_copy(&self, session: &str, hash: &str) -> Result<(), String> {
+        let key = staging_key(&self.warehouse, session, hash);
+
+        self.bridge.block_on(self.delete_every_version(&key, |listed| listed == key))
+    }
+
     fn work_get(&self, name: &str) -> Result<Option<Vec<u8>>, String> {
         let key = work_key(&self.warehouse, name);
 

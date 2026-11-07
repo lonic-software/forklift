@@ -5737,6 +5737,10 @@ impl ObjectStore for AppliesDuringPromotion {
     fn delete_staged(&self, hash: &str) -> Result<(), String> {
         self.inner.delete_staged(hash)
     }
+
+    fn delete_staged_copy(&self, session: &str, hash: &str) -> Result<(), String> {
+        self.inner.delete_staged_copy(session, hash)
+    }
 }
 
 /// A lift commit whose promotion of content lands just before that content's redaction applies
@@ -5760,6 +5764,29 @@ fn a_lift_commit_deletes_what_it_promoted_when_its_redaction_applied_meanwhile()
     let err = head.commit_lift(&Principal::Static, "lift-1", std::slice::from_ref(&leak), &[], false).expect_err("refused");
     assert_gone(&err, &leak);
     assert!(!head.objects.inner.exists(&leak).expect("exists"), "the promoted copy is deleted");
+}
+
+/// The same race over content already canonical when the commit promotes it: the promotion finds
+/// it present, and the check after it still deletes it.
+// Revert: check only what the promotion wrote → the present copy is kept → red.
+#[test]
+fn a_lift_commit_deletes_what_was_already_present_when_its_redaction_applied_meanwhile() {
+    let area = Area::new("redaction-present-race");
+    let (redactions, recorded) = recorded_redactions(&area, "red", &["leaked\n"]);
+    let refs = Arc::new(MemoryRefStore::new());
+    let head = Head::new(AppliesDuringPromotion { inner: MemoryObjectStore::new(), refs: refs.clone() }, SharedMemoryRefs(refs.clone()));
+    upload_all(&head, &recorded);
+    plant_meta(&refs, REDACTIONS_PALLET_NAME, None, &redactions[0]);
+    let object = forklift_core::builder::object::loose_object_builder::LooseObjectBuilder::build_blob(
+        &forklift_core::model::blob::Blob { content: b"leaked\n".to_vec() },
+    );
+    let leak = object.hash;
+    assert!(head.objects.inner.exists(&leak).expect("exists"), "already canonical");
+    head.objects.inner.stage("lift-1", &leak, object.content);
+
+    let err = head.commit_lift(&Principal::Static, "lift-1", std::slice::from_ref(&leak), &[], false).expect_err("refused");
+    assert_gone(&err, &leak);
+    assert!(!head.objects.inner.exists(&leak).expect("exists"), "the present copy is deleted");
 }
 
 /// A retried lift commit naming content whose redaction applied after an earlier attempt promoted
@@ -5809,11 +5836,13 @@ fn the_check_after_a_promotion_deletes_only_applied_file_content() {
     plant_item(&refs, &kept, &pending);
     plant_item(&refs, &recipe.hash, &applied);
 
-    let delete = |hash: &str| forklift_aws_lambda::head::delete_if_redaction_applied(&objects, &refs, hash).expect("checked");
-    assert!(delete(&gone));
-    assert!(!delete(&kept));
-    assert!(delete(&recipe.hash), "an applied recipe is applied, though it is kept");
-    assert!(!delete(&"e".repeat(64)), "no item: nothing to delete");
+    use forklift_aws_lambda::head::AppliedCopies;
+    let delete = |hash: &str| forklift_aws_lambda::head::delete_if_redaction_applied(&objects, &refs, "lift-1", hash).expect("checked");
+    assert_eq!(delete(&gone), AppliedCopies::Deleted);
+    assert_eq!(delete(&kept), AppliedCopies::Unapplied);
+    assert_eq!(delete(&recipe.hash), AppliedCopies::RecipeKept, "an applied recipe is applied, though it is kept");
+    assert!(AppliedCopies::RecipeKept.applied());
+    assert_eq!(delete(&"e".repeat(64)), AppliedCopies::Unapplied, "no item: nothing to delete");
 
     assert!(!objects.exists(&gone).expect("exists"));
     assert!(objects.exists(&kept).expect("exists"));

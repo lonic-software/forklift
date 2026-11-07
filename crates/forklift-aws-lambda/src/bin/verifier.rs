@@ -17,15 +17,16 @@
 //! so it runs on a blocking thread. It needs an object store and a ref store bound to the
 //! warehouse the staging key names ([`parse_staging_key`]): objects are keyed per warehouse, and
 //! the key is all an S3 event carries. The ref store is read for one thing only: the staged
-//! object's redaction item. Content already redacted from the warehouse when that item is read
-//! is not promoted — its staged copy is dropped instead, and the event consumed.
+//! object's redaction item, before promoting and again after. Content whose redaction has
+//! applied is not promoted: its staged copy is deleted, and so is a canonical copy a promotion
+//! wrote (a recipe is kept, as the judge keeps it), and the event is consumed.
 //!
 //! Build with `cargo build -p forklift-aws-lambda --features lambda --release`.
 
 use aws_lambda_events::event::s3::S3Event;
 use forklift_aws_lambda::aws::s3::parse_staging_key;
 use forklift_aws_lambda::aws::{build_clients, DynamoOps, DynamoRefStore, S3Ops};
-use forklift_aws_lambda::head::delete_if_redaction_applied;
+use forklift_aws_lambda::head::{delete_if_redaction_applied, AppliedCopies};
 use forklift_aws_lambda::store::{ObjectStore, PromoteOutcome};
 use forklift_aws_lambda::{config_from_env, AsyncBridge, S3ObjectStore};
 use lambda_runtime::{run, service_fn, Error, LambdaEvent};
@@ -119,9 +120,10 @@ async fn handler(event: LambdaEvent<S3Event>) -> Result<(), Error> {
         // anything is promoted, and an applied one has its copies deleted instead; it is read
         // again after the promotion, and an applied one has the copy just written deleted. An
         // item that cannot be read is a storage error too: never promoted on a guess.
-        let outcome = tokio::task::spawn_blocking(move || -> Result<Option<PromoteOutcome>, String> {
-            if delete_if_redaction_applied(&objects, &refs, &hash)? {
-                return Ok(None);
+        let outcome = tokio::task::spawn_blocking(move || -> Result<Result<PromoteOutcome, AppliedCopies>, String> {
+            let before = delete_if_redaction_applied(&objects, &refs, &session, &hash)?;
+            if before.applied() {
+                return Ok(Err(before));
             }
 
             let outcome = objects.verify_and_promote(&session, &hash)?;
@@ -130,19 +132,29 @@ async fn handler(event: LambdaEvent<S3Event>) -> Result<(), Error> {
             // applied after the check above may have found no object to delete, and an event
             // retried after a failed delete finds the copy already promoted. A corrupt copy was
             // discarded, and is reported as such.
-            if !matches!(outcome, PromoteOutcome::Corrupt { .. }) && delete_if_redaction_applied(&objects, &refs, &hash)? {
-                return Ok(None);
+            if !matches!(outcome, PromoteOutcome::Corrupt { .. }) {
+                let after = delete_if_redaction_applied(&objects, &refs, &session, &hash)?;
+                if after.applied() {
+                    return Ok(Err(after));
+                }
             }
 
-            Ok(Some(outcome))
+            Ok(Ok(outcome))
         })
         .await
         .map_err(|e| Error::from(format!("The verifier task panicked: {}", e)))?
         .map_err(Error::from)?;
 
-        let Some(outcome) = outcome else {
-            eprintln!("verifier: deleted staged object {} unpromoted: its content is redacted", key);
-            continue;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(AppliedCopies::RecipeKept) => {
+                eprintln!("verifier: deleted staged object {}: its content is redacted, and its recipe is kept", key);
+                continue;
+            }
+            Err(_) => {
+                eprintln!("verifier: deleted staged object {} and its canonical copy: its content is redacted", key);
+                continue;
+            }
         };
 
         match outcome {

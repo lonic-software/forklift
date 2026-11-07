@@ -534,6 +534,13 @@ pub trait ObjectStore {
         Err("This object store cannot delete an object.".to_string())
     }
 
+    /// Delete every version of the copy of `hash` staged under `session`, and no other: one
+    /// key, where [`delete_staged`](Self::delete_staged) lists the warehouse's whole staging
+    /// prefix. An absent copy is no error.
+    fn delete_staged_copy(&self, _session: &str, _hash: &str) -> Result<(), String> {
+        Err("This object store cannot delete an object.".to_string())
+    }
+
     /// The bytes of the redaction work object `name`, or `None` when there is none. Work
     /// objects hold a redaction scan's progress between invocations, under the warehouse's own
     /// `redaction-work/` prefix; they are never objects and never served.

@@ -402,6 +402,7 @@ async fn s3_deletion_leaves_no_version_of_a_redacted_copy() {
             format!("objects/{}/{}", wh, leak),
             format!("objects/{}/{}", wh, kept),
             format!("staging/{}/lift-1/{}", wh, leak),
+            format!("staging/{}/lift-1/{}", wh, leak),
             format!("staging/{}/lift-2/{}", wh, leak),
             format!("staging/{}/lift-1/{}", wh, kept),
             format!("staging/{}/lift-1/{}", other, leak),
@@ -409,6 +410,17 @@ async fn s3_deletion_leaves_no_version_of_a_redacted_copy() {
         ] {
             put(key).await;
         }
+
+        // One session's copy goes, every version of it; the other sessions' copies stay.
+        let objects = std::sync::Arc::new(objects);
+        let (one, deleting) = (objects.clone(), leak.clone());
+        tokio::task::spawn_blocking(move || one.delete_staged_copy("lift-1", &deleting).expect("delete one session's copy"))
+            .await
+            .expect("the delete task");
+        let listed = every_version(&s3, &config.bucket).await;
+        assert!(!listed.contains(&format!("staging/{}/lift-1/{}", wh, leak)), "versioned: {}", versioned);
+        assert!(listed.contains(&format!("staging/{}/lift-2/{}", wh, leak)), "versioned: {}", versioned);
+        assert!(listed.contains(&format!("staging/{}/lift-1/{}", wh, kept)), "versioned: {}", versioned);
 
         let deleting = leak.clone();
         tokio::task::spawn_blocking(move || {

@@ -261,6 +261,12 @@ impl ObjectStore for MemoryObjectStore {
         Ok(())
     }
 
+    fn delete_staged_copy(&self, session: &str, hash: &str) -> Result<(), String> {
+        self.staged.lock().unwrap().remove(&(session.to_string(), hash.to_string()));
+
+        Ok(())
+    }
+
     fn work_get(&self, name: &str) -> Result<Option<Vec<u8>>, String> {
         Ok(self.work.lock().unwrap().get(name).cloned())
     }

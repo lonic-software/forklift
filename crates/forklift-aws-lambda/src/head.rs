@@ -67,7 +67,7 @@ use crate::store::{
 
 mod redaction;
 
-pub use redaction::{delete_if_applied as delete_if_redaction_applied, is_applied as redaction_applied, record_state as redaction_record};
+pub use redaction::{delete_if_applied as delete_if_redaction_applied, AppliedCopies, is_applied as redaction_applied, record_state as redaction_record};
 
 /// The `genesis` of a stored anchor's bytes.
 ///
@@ -1631,9 +1631,10 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     ) -> HeadResult<()> {
         self.require_uploader(caller)?;
 
-        // A staged copy of redacted content is dropped, never promoted, and the commit refused.
+        // Redacted content is never promoted, and the commit is refused: its staged copy is
+        // deleted, and so is a canonical copy an earlier attempt of this commit promoted.
         let named: Vec<String> = control_plane.iter().chain(blobs.iter()).cloned().collect();
-        self.refuse_applied_staged(&named)?;
+        self.refuse_applied_staged(session, &named)?;
 
         let mut promoted = Vec::new();
 
@@ -1664,7 +1665,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
         // A redaction that applied between the check above and a promotion's write found no
         // object to delete: the copy just written is deleted here instead.
-        self.refuse_applied_promoted(&promoted)?;
+        self.refuse_applied_promoted(session, &promoted)?;
 
         self.check_blobs_promoted(session, blobs)?;
 
