@@ -1396,7 +1396,7 @@ mod tests {
         assert!(!set(&[], &[('x', &['a'])]).is_empty());
 
         let applied_part = set(&['a', 'b'], &[('x', &['a', 'b'])]).filtered(|hash| hash == applied);
-        assert!(applied_part.names_hash(&applied) && !applied_part.names_hash(&"b".repeat(64)));
+        assert!(applied_part.names_hash(&applied, &LocalObjects) && !applied_part.names_hash(&"b".repeat(64), &LocalObjects));
     }
 
     // Revert: skip the applied re-read in `holds` → a check that exempted a hash applied since
