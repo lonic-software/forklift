@@ -1187,7 +1187,8 @@ pub fn install_trust(install: &TrustInstall) -> Result<TrustInstalled, RefUpdate
     let (lock, redaction) = loop {
         let redaction = office_write
             .map(|new| crate::util::redaction_utils::check_head_write(
-                pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME, install.office, new, install.served,
+                pallet_utils::PalletNamespace::Meta, OFFICE_PALLET_NAME, install.office, new,
+                install.served.map(crate::util::redaction_utils::Served::chain),
             ));
 
         let lock = crate::util::lock_utils::RefLock::acquire()?;

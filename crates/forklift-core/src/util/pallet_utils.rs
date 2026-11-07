@@ -1111,7 +1111,24 @@ pub fn update_meta_pallet_head_served(name: &str,
                                       new: &str,
                                       served: &str,
                                       preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
+    let served = crate::util::redaction_utils::Served::chain(served);
+
     update_pallet_head_checked(PalletNamespace::Meta, name, expected, new, preconditions, None, None, Some(served))
+}
+
+/// [`update_pallet_head`] for a client adopting `served`, what the remote served for this user
+/// pallet in the same command: a lower or clone taking the remote's head. When `new` is exactly
+/// that head and this root has never been served, the redactions the remote reports pending do
+/// not refuse it (see
+/// [`redaction_utils::check_head_write`](crate::util::redaction_utils::check_head_write));
+/// otherwise the write is checked like any other. Never for a write a remote sends this
+/// warehouse.
+pub fn adopt_pallet_head(name: &str,
+                         expected: Option<&str>,
+                         new: &str,
+                         served: crate::util::redaction_utils::Served,
+                         preconditions: &RefPreconditions) -> Result<(), RefUpdateError> {
+    update_pallet_head_checked(PalletNamespace::User, name, expected, new, preconditions, None, None, Some(served))
 }
 
 /// Move the head of a pallet from `expected` to `new`: a compare-and-set, and the only way a
@@ -1253,7 +1270,7 @@ fn update_pallet_head_checked(
     preconditions: &RefPreconditions,
     verified: Option<&VerifiedClosure>,
     acknowledged: Option<&str>,
-    served: Option<&str>,
+    served: Option<crate::util::redaction_utils::Served>,
 ) -> Result<(), RefUpdateError> {
     // Checked before the lock too, so an invalid write never waits for it.
     validate_head_write(name, new)?;
@@ -2824,6 +2841,74 @@ pub(crate) mod tests {
             let taken = replay(&[]);
             update_meta_pallet_head_served("notes", Some(&local), &taken, &remote, &RefPreconditions::NONE).unwrap();
             assert_eq!(get_meta_pallet_head("notes").unwrap().as_deref(), Some(taken.as_str()));
+        }
+
+        /// A remote's `@redactions` head holding a redaction of `pending`, then one recorded only here
+        /// of `local`: the head the remote served, and the redactions it reports.
+        fn pending_then_local(pending: &str, local: &str) -> String {
+            redact(pending);
+            let served = get_meta_pallet_head(crate::util::redaction_utils::REDACTIONS_PALLET_NAME).unwrap().unwrap();
+            redact(local);
+            served
+        }
+
+        // Revert: never exempt a user head → adopting the served head naming the pending
+        // redaction is refused; or exempt every redaction once adopting → the one recorded only
+        // here lands too; or exempt any head while adopting → a parcel stacked on the served
+        // head lands naming it.
+        #[test]
+        fn adopting_the_served_head_is_exempt_from_what_the_remote_holds_pending_only() {
+            use crate::util::redaction_utils::Served;
+
+            let (_root, _scope) = scratch("redacted-adopted");
+            let pending = blob("pending");
+            let local = blob("local");
+            let redactions = pending_then_local(&pending, &local);
+            let served = parcel(&two_dirs("a0", "pending"), &[]);
+            let adopting = Served { head: &served, redactions: Some(&redactions) };
+
+            // Another head on the served one is a new parcel, judged in full.
+            let stacked = parcel(&two_dirs("a1", "pending"), &[&served]);
+            assert_redacted(adopt_pallet_head("side", None, &stacked, adopting, &RefPreconditions::NONE), "web/b", &pending);
+
+            // So is the served head without what the remote reports.
+            assert_redacted(
+                adopt_pallet_head("side", None, &served, Served { redactions: None, ..adopting }, &RefPreconditions::NONE),
+                "web/b",
+                &pending,
+            );
+
+            adopt_pallet_head("side", None, &served, adopting, &RefPreconditions::NONE).unwrap();
+            assert_eq!(get_pallet_head("side").unwrap().as_deref(), Some(served.as_str()));
+
+            // A redaction the remote does not hold still refuses its served head.
+            let names_local = parcel(&two_dirs("a0", "local"), &[]);
+            let adopting = Served { head: &names_local, redactions: Some(&redactions) };
+            assert_redacted(adopt_pallet_head("other", None, &names_local, adopting, &RefPreconditions::NONE), "web/b", &local);
+            assert_eq!(get_pallet_head("other").unwrap(), None, "nothing was written");
+        }
+
+        // Revert: drop the served-mark read from the adoption (in the check, or in the hold's
+        // re-check) → the adoption lands in a served root, or in one served between the check
+        // and the hold.
+        #[test]
+        fn adopting_into_a_served_root_is_checked_in_full() {
+            use crate::util::redaction_utils::Served;
+
+            let (_root, _scope) = scratch("redacted-adopted-served");
+            let pending = blob("pending");
+            let redactions = pending_then_local(&pending, &blob("local"));
+            let served = parcel(&two_dirs("a0", "pending"), &[]);
+            let adopting = Served { head: &served, redactions: Some(&redactions) };
+
+            BEFORE_HOLD.with(|slot| *slot.borrow_mut() = Some(Box::new(|| {
+                crate::util::tombstone_utils::mark_served(true).unwrap();
+            })));
+            assert_redacted(adopt_pallet_head("side", None, &served, adopting, &RefPreconditions::NONE), "web/b", &pending);
+            assert_eq!(get_pallet_head("side").unwrap(), None, "nothing was written");
+
+            // Served before the write began, too.
+            assert_redacted(adopt_pallet_head("side", None, &served, adopting, &RefPreconditions::NONE), "web/b", &pending);
         }
 
         // Revert: accept a locked write whatever check it is handed, or ignore the pallet's name

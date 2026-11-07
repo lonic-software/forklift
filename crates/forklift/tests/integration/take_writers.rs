@@ -31,6 +31,7 @@ enum Class {
 /// The ref-write primitives: a call of any of these writes a pallet ref.
 const PRIMITIVES: &[&str] = &[
     "update_pallet_head",
+    "adopt_pallet_head",
     "update_pallet_head_in",
     "update_pallet_head_verified",
     "update_pallet_head_locked",
@@ -55,6 +56,7 @@ const WRITERS: &[(&str, &str, Class)] = &[
     ("crates/forklift-core/src/util/pallet_utils.rs", "update_pallet_head", Class::Primitive),
     ("crates/forklift-core/src/util/pallet_utils.rs", "update_meta_pallet_head", Class::Meta),
     ("crates/forklift-core/src/util/pallet_utils.rs", "update_pallet_head_checked", Class::Primitive),
+    ("crates/forklift-core/src/util/shift_utils.rs", "write_head_or_roll_back", Class::Primitive),
     ("crates/forklift-core/src/util/shift_utils.rs", "write_head_or_roll_back", Class::Primitive),
     // Signed whenever an anchor is held; a consolidation's merged head is verified first.
     ("crates/forklift-core/src/util/stack_utils.rs", "write_head", Class::Signs),
