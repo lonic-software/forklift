@@ -20,13 +20,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::globals::{forklift_root, FOLDER_NAME_INVENTORY_ROOT};
 use crate::enums::object::parsed_object::ParsedObject;
-use crate::enums::object_type::ObjectType;
 use crate::parser::object::loose_object_parser;
 use crate::util::lock_utils::{ServeLock, StoreAccessExclusive, StoreLock};
 use crate::util::progress_utils::Progress;
 use crate::util::{
     applied_redactions, bay_utils, cache_miss, file_utils, gc_utils, object_utils, office_utils, pack_utils,
-    pallet_utils, prune_utils, recovery_utils,
+    pallet_utils, prune_utils, recovery_utils, redaction_utils,
 };
 
 /// A checkout: the warehouse's own working tree, or a named bay.
@@ -179,10 +178,11 @@ pub(crate) fn unheld_applied() -> Result<HashSet<String>, String> {
     unheld(&applied_redactions::read_applied()?.hashes().cloned().collect())
 }
 
-/// Of `applied`, the hashes the store may hold that no deletion census root names. A hash the
-/// store plainly lacks (one an earlier run deleted) is left out unread, so no census is taken once
-/// every applied object is gone; one whose presence cannot be told stays in, since excluding an
-/// absent hash costs nothing and the check never refuses.
+/// Of `applied`, the hashes the store holds as a file's content that no deletion census root names
+/// ([`maybe_present`]). A hash the store plainly lacks (one an earlier run deleted) is left out
+/// unread, so no census is taken once every applied object is gone; one whose presence or kind
+/// cannot be read is left out too, so a collection keeps it rather than take what it cannot tell
+/// is a copy.
 ///
 /// # Returns
 /// * `Ok(HashSet<String>)` - The excluded hashes.
@@ -194,27 +194,15 @@ pub(crate) fn unheld(applied: &HashSet<String>) -> Result<HashSet<String>, Strin
     Ok(targets.into_iter().filter(|hash| !held.contains_key(hash)).collect())
 }
 
-/// Of `hashes`, those the store may hold as a file's content: every one but those it plainly lacks,
-/// and those it holds as a tree, a parcel or a chunk. A redaction names a file's content, so such an
-/// object is no copy of it: it was stored under the hash after the redaction applied (only a cell
-/// naming that hash by itself allows it), and other content may share it.
+/// Of `hashes`, those the store holds as a file's content
+/// ([`redaction_utils::holds_as_file_content`]). One it plainly lacks (an earlier run deleted it) is
+/// left out unread. So is one it holds as a tree, a parcel or a chunk: a redaction names a file's
+/// content, so such an object is no copy of it, and other content may share it (only a cell naming
+/// that hash by itself, applied while the store lacked the object, lets one be stored under it).
+/// One whose presence or kind cannot be read is left out too, as the deletion must not take what it
+/// cannot tell is a copy; a deletion that runs again once the store reads finishes.
 fn maybe_present(hashes: &HashSet<String>) -> HashSet<String> {
-    hashes.iter()
-        .filter(|hash| match file_utils::does_object_exist(hash) {
-            Ok(false) => false,
-            Ok(true) => !holds_other_than_file(hash),
-            Err(_) => true,
-        })
-        .cloned()
-        .collect()
-}
-
-/// Whether the present object `hash` reads as something other than a blob or a recipe. One that
-/// cannot be read is not: whether it is a copy cannot be told.
-fn holds_other_than_file(hash: &str) -> bool {
-    file_utils::retrieve_object_by_hash_shared(hash).ok()
-        .and_then(|bytes| object_utils::peek_object_header(&bytes).ok())
-        .is_some_and(|(object_type, _)| !matches!(object_type, ObjectType::Blob | ObjectType::Recipe))
+    hashes.iter().filter(|hash| redaction_utils::holds_as_file_content(hash)).cloned().collect()
 }
 
 /// The copies of applied redactions' objects the store may still hold, as the census finds them
@@ -656,7 +644,27 @@ mod tests {
         assert!(present(&chunk));
     }
 
-    /// The second pass deletes a deleted recipe's chunk only it named, and keeps the one a live
+    /// An applied hash whose stored object cannot be read is kept: the deleter cannot tell it is a
+    /// copy of a file's content rather than a tree or a chunk other content shares.
+    ///
+    /// Revert: count an unreadable object as a file's content → it is deleted.
+    #[test]
+    fn the_deleter_keeps_an_applied_object_it_cannot_read() {
+        let _scratch = Scratch::new("unreadable-applied");
+        set_main(&store_parcel(&store_tree(&[]), Vec::new()));
+        let hash = "e".repeat(64);
+        let (folder, file) = file_utils::get_path_for_object(&hash).unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(std::path::Path::new(&folder).join(file), b"not an object").unwrap();
+        applied_redactions::apply_for_test(&[&hash]);
+
+        let deletion = delete().unwrap();
+
+        assert!(deletion.objects.is_empty(), "{:?}", deletion.objects);
+        assert!(present(&hash));
+    }
+
+
     /// recipe shares, which stays readable.
     ///
     /// Revert: take every chunk of a deleted recipe → the shared chunk goes; skip the second pass →

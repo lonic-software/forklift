@@ -1824,11 +1824,11 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
 /// `known_complete`, which a write accepts only as the head its compare-and-set expects.
 ///
 /// An absent file's content a redaction this warehouse applied names is tolerated, as the ref
-/// write's own verification tolerates it; the same hash absent where the closure names it as a
-/// tree or a chunk is not, since a redaction never takes either away: the history of every head still names the content the redaction
-/// took away. Nothing else absent is. The applied record is read only when the walk without it
-/// fails, so a warehouse holding the whole closure never depends on it; and it only ever grows, so
-/// the write need not read it again under its lock.
+/// write's own verification tolerates it: the history of every head still names the content the
+/// redaction took away. The same hash absent where the closure names it as a tree or a chunk is
+/// not, since a redaction never takes either away. Nothing else absent is. The applied record is
+/// read only when the walk without it fails, so a warehouse holding the whole closure never depends
+/// on it; and it only ever grows, so the write need not read it again under its lock.
 ///
 /// # Returns
 /// * `Ok(VerifiedClosure)` - Everything is present, or absent only where an applied redaction

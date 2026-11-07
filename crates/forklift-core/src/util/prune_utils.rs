@@ -958,9 +958,9 @@ fn resolve_unsealed_subtree(root_tree_hash: &str, key: &str, tolerated: &Tolerat
 }
 
 /// Whether `hash`, met `at`, is held by hash alone: recorded in `tolerated`'s sealed record, or
-/// (for a file's content) named by a redaction this warehouse applied, and absent. A held object that is present seals nothing. Presence is the
-/// fail-closed sweep form, so an object only an unreadable pack index might hold fails rather than
-/// reading as held.
+/// (for a file's content) named by a redaction this warehouse applied, and absent. A held object
+/// that is present seals nothing. Presence is the fail-closed sweep form, so an object only an
+/// unreadable pack index might hold fails rather than reading as held.
 fn held_by_hash(tolerated: &Tolerated, hash: &str, at: At) -> Result<bool, String> {
     Ok(tolerated.held(hash, at).is_some() && !file_utils::is_present_for_sweep(hash)?)
 }

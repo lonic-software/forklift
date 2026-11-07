@@ -46,7 +46,7 @@ use crate::util::progress_utils::Progress;
 use crate::util::sealed_utils::{self, At, SealOp, Tolerated};
 use crate::util::{
     bay_utils, cache_miss, cherry_pick_utils, file_utils, gc_utils, merge_utils, object_utils, office_utils,
-    pack_utils, pallet_utils, park_utils, prune_utils, recovery_utils,
+    pack_utils, pallet_utils, park_utils, prune_utils, recovery_utils, redaction_utils,
 };
 
 /// What an eviction would do, computed without changing anything (safe for a dry run).
@@ -205,7 +205,11 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
     for hash in held.present {
         if checkout_keep.contains(&hash) {
             plan.kept_for_checkouts += 1;
-        } else if local_keep.contains(&hash) {
+        } else if local_keep.contains(&hash)
+            // An applied redaction holds an absence only as a file's content: a tree, a parcel or
+            // a chunk stored under its hash, freed, could neither be recorded nor held.
+            || (tolerated.applied.contains(&hash) && !redaction_utils::holds_as_file_content(&hash))
+        {
             plan.kept_local += 1;
         } else {
             // Present (the walk said so), so an object no pack holds is loose. One a pack holds
@@ -1279,6 +1283,21 @@ mod tests {
         carry(&plan, &hold).unwrap();
         let record = sealed_utils::read_sealed().unwrap();
         assert!(!record.contains(&h.shared) && record.contains(&h.dir));
+    }
+
+    /// A present tree an applied redaction's hash names is kept: an applied redaction holds only a
+    /// file's content, so the tree, freed, would be an absence nothing holds.
+    ///
+    /// Revert: drop the kind check from the plan → the tree is listed to evict.
+    #[test]
+    fn plan_keeps_a_present_tree_an_applied_hash_names() {
+        let _scratch = Scratch::new("applied-tree");
+        let h = history();
+        crate::util::applied_redactions::apply_for_test(&[&h.dir]);
+        let hold = store_access();
+
+        let plan = plan_evict(&[h.held.clone()], &hold).unwrap();
+        assert!(!plan.to_evict.contains(&h.dir) && plan.to_evict.contains(&h.shared), "{:?}", plan.to_evict);
     }
 
     /// The bound walks past an absence an applied redaction names, as it walks past a recorded one,

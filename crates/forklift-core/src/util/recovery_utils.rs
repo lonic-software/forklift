@@ -2770,9 +2770,9 @@ fn check_leaf(
 }
 
 /// Whether an object, met `at`, is held: recorded in `sealed`'s record or (for a file's content)
-/// named by a redaction it applied, and not a corrupt boundary. This checks no presence: call it only for an object the walk found
-/// absent, or for a terminal leaf or chunk, which has nothing beneath it, so a present one is never
-/// reported either way. A corrupt object is present but wrong, so it stays a loss.
+/// named by a redaction it applied, and not a corrupt boundary. This checks no presence: call it
+/// only for an object the walk found absent, or for a terminal leaf or chunk, which has nothing
+/// beneath it, so a present one is never reported either way. A corrupt object is present but wrong, so it stays a loss.
 fn held_by_hash(sealed: Option<&Tolerated>, corrupt: &BTreeSet<String>, hash: &str, at: At) -> bool {
     !corrupt.contains(hash) && sealed.is_some_and(|sealed| sealed.held(hash, at).is_some())
 }
