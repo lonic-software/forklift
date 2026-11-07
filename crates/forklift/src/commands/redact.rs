@@ -47,9 +47,10 @@ pub async fn handle_command(action: Option<RedactAction>) -> Result<(), String> 
 ///
 /// Once the cell commits, the redaction is applied if it can be (see [`applied_redactions`]), and
 /// the copies of every applied redaction's content are deleted ([`delete_applied`]). It is
-/// recorded either way, so a failure to apply it or to delete does not fail the command: the
-/// redaction is reported pending, or the deletion owed, with the reason, and `redact apply` tries
-/// again.
+/// recorded either way. A failure to apply it does not fail the command, and neither does other
+/// maintenance holding the store: the redaction is reported pending, or the deletion owed, with the
+/// reason, and `redact apply` tries again. Any other failure to delete fails the command, naming
+/// `redact apply` as the way to finish.
 fn record(target: &str, reason: &str) -> Result<(), String> {
     let operator = config_utils::get_operator()?;
     let writer = lower::meta_writer(&operator)?;
