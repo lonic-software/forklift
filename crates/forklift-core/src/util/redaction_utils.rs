@@ -846,7 +846,7 @@ impl<'a> Served<'a> {
 ///
 /// - A user pallet's new head is refused when its tree names a redacted file anywhere. The whole
 ///   tree is walked, never only what differs from `expected`: a stale branch revived onto a ref
-///   must not bring the content back.
+///   must not bring the content back. The one exemption is an adoption, under `served` below.
 /// - A meta pallet's write is judged by the history it adds. Each meta parcel is the pallet's
 ///   whole state, so a parcel that carries a cell its parent already names passes, and only one
 ///   that adds a redacted object to the tree is refused; refusing the carry would freeze a pallet

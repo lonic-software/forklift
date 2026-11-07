@@ -649,7 +649,7 @@ fn remote_lacks_pallet(info: &forklift_core::model::remote::WarehouseInfo, palle
 /// The ref is written only once the fetch completed: every fetch stops at local ref heads,
 /// taking each for a closure already present, so a ref moved before its objects arrived would hide
 /// them from every later fetch. The write is a compare-and-set against the head read before the
-/// fetch, through [`pallet_utils::update_pallet_head`] alone: the bay-moving write lower's
+/// fetch, through [`pallet_utils::adopt_pallet_head`] alone: the bay-moving write lower's
 /// current-pallet path uses would re-point this bay at the pallet.
 async fn lower_named_pallet(client: &RemoteClient,
                             info: &forklift_core::model::remote::WarehouseInfo,

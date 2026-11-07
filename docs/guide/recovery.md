@@ -181,6 +181,13 @@ lift again: the new head no longer names it. The parcels before it still do, and
 it as history, so the remote receives the content. If the lift then fails over
 `@redactions`, `lower` reconciles it with the remote's, and the next lift sends the redaction.
 
+`clone` and `lower` take a pallet head exactly as the remote serves it, even when it names content
+redacted here, as long as the remote holds that redaction too: the remote keeps serving the pallet
+until its owner takes the file out, and that owner must still be able to fetch it. A redaction
+recorded only here still refuses, and so does anything you stack on that head while it names the
+content. In a warehouse a Forklift server has served, taking such a head is refused like any other
+write.
+
 ### `redaction_blocked` (exit 48)
 
 The content you tried to redact is also part of a meta pallet's history: the office, the

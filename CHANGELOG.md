@@ -115,7 +115,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   the same way to send a head that names it, even to a remote that has not yet received the
   redaction, and says how to stack a head without the file. Metadata history that `clone` and
   `lower` take from the remote is not refused this way, even when the remote does not hold the
-  redaction, since that history is never rewritten; what you stack on top of it is.
+  redaction, since that history is never rewritten; what you stack on top of it is. Nor is a pallet
+  head that `clone` or `lower` takes exactly as the remote serves it while the remote holds the
+  redaction too, so the pallet that needs the file taken out can still be fetched; in a warehouse a
+  Forklift server has served, that head is refused like any other.
 - **The `--json` schema is now 22, with the `redaction_blocked` error code (exit 48).** It belongs
   to content redaction, which is being built and whose command is not yet offered: it refuses to
   redact content that the history of a meta pallet (`@office`, `@tags` and the rest) holds, since
