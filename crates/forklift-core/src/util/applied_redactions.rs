@@ -125,6 +125,24 @@ pub(crate) fn absent_read_refusal(hash: &str) -> Result<Option<String>, String> 
     ).into()))
 }
 
+/// The [`RefusalCode::ContentRedacted`] refusal a server answers a request for `hash` with, read or
+/// upload, once a redaction it applied names it: whether or not the bytes are deleted yet, they are
+/// never served or taken again.
+///
+/// [`RefusalCode::ContentRedacted`]: crate::error::RefusalCode::ContentRedacted
+pub fn served_refusal(hash: &str) -> String {
+    crate::error::CoreError::refusal_with_details(
+        crate::error::RefusalCode::ContentRedacted,
+        format!(
+            "Object {} is redacted in this warehouse: it is no longer served, and cannot be uploaded \
+            again.",
+            hash
+        ),
+        "Run \"forklift lower\" to receive the redaction, then \"forklift redact list\" to see it.",
+        serde_json::json!({ "hash": hash }),
+    ).into()
+}
+
 /// Add `hashes` to the applied record, for a caller that holds the ref lock. The record is re-read
 /// under the lock and rewritten whole, atomically, holding what it held and `hashes`; nothing is
 /// written when it already holds them all.
@@ -295,14 +313,22 @@ pub fn statuses(read: &RedactionsRead) -> Result<Vec<RedactionStatus>, String> {
 /// local `@redactions` head, read after its cells committed, so nothing can come to name a clean
 /// redaction's content (see the module doc). In a warehouse with a remote configured, served or
 /// not, nothing is applied: each stays pending until the remote reports it applied. Whether a remote is
-/// configured is read again under the ref lock before the record is written. The caller holds the
-/// warehouse lock.
+/// configured is read again under the ref lock before the record is written. A CLI caller holds
+/// the warehouse lock; a server applies after each ref write it takes.
+///
+/// Under that same lock, before the record is written, the warehouse's bundle is withdrawn: it
+/// may hold the content, and a build publishes only under the lock and only when no redaction was
+/// applied since it began ([`bundle_utils::build_bundle`]). So no bundle holding applied content
+/// is published once the record is.
+///
+/// [`bundle_utils::build_bundle`]: crate::util::bundle_utils::build_bundle
 ///
 /// # Returns
 /// * `Ok(Vec<RedactionStatus>)` - One per redaction judged, in the order `read` lists them; each
 ///                                that reads as applied is applied on disk.
 /// * `Err(String)`              - The applied record, the configuration or the warehouse's mode
-///                                cannot be read, or the record could not be written.
+///                                cannot be read, or the bundle could not be withdrawn or the
+///                                record written.
 pub fn apply(read: &RedactionsRead, only: Option<&str>) -> Result<Vec<RedactionStatus>, String> {
     let applied = read_applied()?;
     let mut statuses = judge(&chosen(read, only), &applied, Judge::read()?);
@@ -327,6 +353,10 @@ pub fn apply(read: &RedactionsRead, only: Option<&str>) -> Result<Vec<RedactionS
 
         return Ok(statuses);
     }
+
+    file_utils::remove_unfollowed(&crate::util::bundle_utils::get_latest_bundle_path()).map_err(|e| format!(
+        "Cannot apply the redaction: the bundle, which may hold its content, could not be withdrawn. {}", e
+    ))?;
 
     add_locked(&lock, &newly)?;
 
