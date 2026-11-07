@@ -5641,7 +5641,8 @@ fn a_lift_commit_naming_applied_content_drops_it_unpromoted() {
 fn plant_item(refs: &MemoryRefStore, hash: &str, state: &str) {
     let fence = forklift_aws_lambda::format::gate(refs).expect("format gate");
     let expected = refs.get_redaction(hash).expect("item");
-    refs.put_redaction(hash, state, expected.as_deref(), &fence).expect("plant the item");
+    let outcome = refs.put_redaction(hash, state, expected.as_deref(), &fence).expect("plant the item");
+    assert_eq!(outcome, forklift_aws_lambda::store::RedactionWrite::Written);
 }
 
 /// An applied redaction's first request deletes every copy the store keeps of the content: its
@@ -5768,7 +5769,6 @@ fn the_check_after_a_promotion_deletes_only_applied_file_content() {
 
     let objects = MemoryObjectStore::new();
     let refs = MemoryRefStore::new();
-    let fence = forklift_aws_lambda::format::gate(&refs).expect("format gate");
     let applied = forklift_aws_lambda::head::redaction_record(true, &[], Some(1));
     let pending = forklift_aws_lambda::head::redaction_record(false, &[], None);
 
@@ -5784,9 +5784,9 @@ fn the_check_after_a_promotion_deletes_only_applied_file_content() {
         chunks: vec![RecipeChunk { hash: "d".repeat(64), size: 1 }],
     });
     objects.put_verified(&recipe.hash, &recipe.content).expect("put");
-    refs.put_redaction(&gone, &applied, None, &fence).expect("item");
-    refs.put_redaction(&kept, &pending, None, &fence).expect("item");
-    refs.put_redaction(&recipe.hash, &applied, None, &fence).expect("item");
+    plant_item(&refs, &gone, &applied);
+    plant_item(&refs, &kept, &pending);
+    plant_item(&refs, &recipe.hash, &applied);
 
     let delete = |hash: &str| forklift_aws_lambda::head::delete_if_redaction_applied(&objects, &refs, hash).expect("checked");
     assert!(delete(&gone));
