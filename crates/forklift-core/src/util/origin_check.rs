@@ -227,3 +227,38 @@ fn incomplete_refusal(url: &str, missing: &HashSet<String>) -> CoreError {
         }),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::enums::dir_entry_type::DirEntryType;
+    use crate::globals::{self, StorageRootScope};
+
+    /// An absent recipe a redaction this warehouse applied names is never queued to read from the
+    /// new server; an absent recipe none names is, and a present one is not.
+    ///
+    /// Revert: queue every absent recipe → the applied one is queued → red.
+    #[test]
+    fn an_absent_applied_recipe_is_never_read_from_the_new_server() {
+        let root = std::env::temp_dir().join(format!("forklift-origin-check-applied-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+
+        let (redacted, absent) = ("1".repeat(64), "2".repeat(64));
+        let applied = crate::util::applied_redactions::apply_for_test(&[&redacted]);
+        let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        tree.add_child(TreeItem::new("leak.bin".to_string(), redacted.clone(), DirEntryType::NormalChunked));
+        tree.add_child(TreeItem::new("big.bin".to_string(), absent.clone(), DirEntryType::NormalChunked));
+
+        let mut walk = ServerWalk {
+            applied: &applied, seen: HashSet::new(), local: Vec::new(), trees: Vec::new(), recipes: Vec::new(),
+        };
+        let mut missing: HashSet<String> = HashSet::new();
+        walk.descend(&tree, &mut missing).unwrap();
+
+        assert_eq!(walk.recipes, vec![absent]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
