@@ -252,6 +252,25 @@ pub enum RedactedKind {
 /// * `Ok(None)`       - The object is not in the local store.
 /// * `Err(String)`    - The object is some other type, or could not be read.
 pub fn held_kind(hash: &str) -> Result<Option<RedactedKind>, String> {
+    match stored_type(hash)? {
+        None => Ok(None),
+        Some(ObjectType::Blob) => Ok(Some(RedactedKind::Blob)),
+        Some(ObjectType::Recipe) => Ok(Some(RedactedKind::Recipe)),
+        Some(other) => Err(format!(
+            "Object {} is a {:?}, not a file's content; name the file to redact as \
+            <revision>:<path>.",
+            hash, other
+        )),
+    }
+}
+
+/// The type the store holds `hash` as, read from its header, or `None` when it lacks it.
+///
+/// # Returns
+/// * `Ok(Some(type))` - The object is held, as `type`.
+/// * `Ok(None)`       - The object is not in the local store.
+/// * `Err(String)`    - The object could not be read.
+pub fn stored_type(hash: &str) -> Result<Option<ObjectType>, String> {
     if !file_utils::does_object_exist(hash)? {
         return Ok(None);
     }
@@ -260,15 +279,7 @@ pub fn held_kind(hash: &str) -> Result<Option<RedactedKind>, String> {
     let (object_type, _) = object_utils::peek_object_header(&bytes)
         .map_err(|e| format!("Object {} cannot be read: {:?}", hash, e))?;
 
-    match object_type {
-        ObjectType::Blob => Ok(Some(RedactedKind::Blob)),
-        ObjectType::Recipe => Ok(Some(RedactedKind::Recipe)),
-        other => Err(format!(
-            "Object {} is a {:?}, not a file's content; name the file to redact as \
-            <revision>:<path>.",
-            hash, other
-        )),
-    }
+    Ok(Some(object_type))
 }
 
 /// Whether the store holds `hash` as a file's content: present, and a blob or a recipe. An object

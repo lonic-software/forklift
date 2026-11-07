@@ -94,7 +94,8 @@ redaction only while the remote reports that redaction pending. A `held` status 
 `pallet`, `head` and `path`: a served root keeps such a head, so the redaction cannot apply.
 
 **Schema 27**: a redaction's content is deleted. `redact record`'s result and `redact
-apply`'s list carry `deletion` when an applied redaction's object may still be in the store:
+apply`'s list carry `deletion` when an applied redaction's object may still be in the store, or
+a chunk of one that a deletion cut short still owes:
 `deleted` (the redacted objects deleted), `chunks_deleted`, `bytes_freed`, `kept` (each copy kept
 with its `hash` and its `holders`, each with a `kind` of `pallet`, `meta_history`,
 `adopted_history`, `base`, `parked`, `consolidation`, `pick` or `staged`, the `pallet` or `bay` it

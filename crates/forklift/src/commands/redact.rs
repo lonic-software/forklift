@@ -168,8 +168,9 @@ fn record(target: &str, reason: &str) -> Result<(), String> {
 /// decides.
 ///
 /// # Returns
-/// * `Ok(None)`              - If no applied redaction's object may be present: nothing to do,
-///                             and no lock was taken.
+/// * `Ok(None)`              - If no applied redaction's object may be present, nor a chunk a
+///                             deletion cut short still owes: nothing to do, and no lock was
+///                             taken.
 /// * `Ok(Some(DeletionView))` - What was deleted and kept, or why the deletion is owed (with the
 ///                             copies held as the first census found them, or, when it failed,
 ///                             none, and its failure added to the reason).
@@ -177,7 +178,7 @@ fn record(target: &str, reason: &str) -> Result<(), String> {
 ///                             out (an unreadable pack, bay state or recipe, or a failed delete).
 fn delete_applied() -> Result<Option<DeletionView>, String> {
     let (held, uncounted) = match redaction_deleter::applied_copies() {
-        Ok(copies) if copies.unheld == 0 => {
+        Ok(copies) if !copies.owes_deletion() => {
             return Ok((!copies.held.is_empty()).then(|| DeletionView::from(Deletion { held: copies.held, ..Deletion::default() })));
         }
         Ok(copies) => (copies.held, None),
