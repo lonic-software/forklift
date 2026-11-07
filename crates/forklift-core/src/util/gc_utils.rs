@@ -4,7 +4,9 @@
 //! The collector marks everything reachable from the GC roots — every pallet head, trust pin
 //! and head a haul not yet merged proposes, plus every bay's base, parked parcels, in-progress consolidation or cherry-pick
 //! and staged inventory, when those local states exist — and sweeps the rest, with an mtime grace
-//! period protecting the objects of in-flight lifts.
+//! period protecting the objects of in-flight lifts. An applied redaction's object is the one
+//! exception: it is swept unless a deletion census root names it, whatever else reaches it
+//! ([`redaction_deleter`]).
 //!
 //! The mark walk is presence-tolerant: a store can legitimately hold only some of a
 //! parcel's paths — an out-of-scope subtree is sealed by a hash the signed parcel commits
