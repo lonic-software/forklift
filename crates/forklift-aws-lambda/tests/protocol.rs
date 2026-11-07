@@ -33,6 +33,7 @@ use forklift_core::util::authority_utils::Principal;
 use forklift_core::model::remote::{HoldAnswer, RefUpdateRequest, TrustAnchorDto};
 use forklift_core::util::office_utils::{self, OFFICE_PALLET_NAME};
 use forklift_core::util::pallet_utils;
+use forklift_core::util::redaction_utils::REDACTIONS_PALLET_NAME;
 use forklift_core::util::{bundle_utils, file_utils, object_utils, sign_utils};
 
 // ---------------------------------------------------------------------------------------
@@ -547,6 +548,243 @@ fn the_gate_reads_the_new_heads_trees_from_the_audit_scratch() {
 
     // 41 trees and a parcel: a gate reading through the store would add at least 41 more.
     assert!(reads <= 42 + 5, "{} reads for 41 trees and a parcel", reads);
+}
+
+/// The blob hash of `content`, as a warehouse stores it.
+fn blob_hash(content: &str) -> String {
+    use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+    use forklift_core::model::blob::Blob;
+
+    LooseObjectBuilder::build_blob(&Blob { content: content.as_bytes().to_vec() }).hash
+}
+
+/// A warehouse in `area` at `dir` that records a redaction of each of `contents` in turn, by
+/// hash, while no head names it, harvesting the warehouse after each: the `@redactions` heads in
+/// recording order, and every object any of them needs.
+fn recorded_redactions(area: &Area, dir: &str, contents: &[&str]) -> (Vec<String>, Harvest) {
+    prepare(area, dir);
+    area.write_file(&format!("{}/notes.txt", dir), "notes\n");
+    area.forklift(dir, &["load", "."]);
+    area.forklift(dir, &["stack", "-m", "notes"]);
+
+    let mut heads = Vec::new();
+    for content in contents {
+        area.write_file(&format!("{}/loaded.txt", dir), content);
+        area.forklift(dir, &["load", "loaded.txt"]);
+        area.forklift(dir, &["redact", "record", &blob_hash(content), "-m", "a leak"]);
+        area.forklift(dir, &["unload", "loaded.txt"]);
+        std::fs::remove_file(area.path(&format!("{}/loaded.txt", dir))).expect("remove the loaded file");
+        heads.push(harvest(&area.path(dir)).head_of("@redactions").expect("a @redactions head"));
+    }
+
+    (heads, harvest(&area.path(dir)))
+}
+
+/// Plant `new` on meta pallet `name` past every check, as `plant` does a user pallet.
+fn plant_meta(refs: &MemoryRefStore, name: &str, expected: Option<&str>, new: &str) {
+    let fence = forklift_aws_lambda::format::gate(refs).expect("format gate");
+    let outcome = refs.compare_and_set_head(
+        pallet_utils::PalletNamespace::Meta, name, expected.map_or(ExpectedHead::Unborn, ExpectedHead::At), new,
+        OfficePrecondition::NotConsumed, RedactionsPrecondition::NotConsumed, None, &fence, &request_token(),
+    ).expect("plant");
+    assert_eq!(outcome, CasOutcome::Committed);
+}
+
+/// Assert `err` is the redacted-content refusal, naming `hash`.
+fn assert_content_redacted(err: &forklift_aws_lambda::error::HeadError, hash: &str) {
+    assert_eq!(err.status, Status::Unprocessable, "{}", err.message);
+    assert_eq!(refusal_code(&err.message), Some(RefusalCode::ContentRedacted), "{}", err.message);
+    assert!(err.message.contains(hash), "the refusal names the hash: {}", err.message);
+}
+
+/// A user head is judged whole: a redacted file deep in a subtree the update leaves as `old_head`
+/// had it, which the audit's mirror never reached, refuses the update; the head without it lifts.
+// Revert: drop the redaction check from `ref_update` → the edit commits → red. Revert: walk the
+// scratch alone (`LocalObjects`) → the unmirrored subtree is an internal error, not the refusal.
+#[test]
+fn a_user_head_naming_redacted_content_deep_in_an_unchanged_subtree_is_refused() {
+    let area = Area::new("redacted-deep");
+    let (redactions, recorded) = recorded_redactions(&area, "red", &["leaked\n"]);
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &recorded);
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions[0]);
+
+    let deep = gate_dir(&head, "a", vec![gate_dir(&head, "b", vec![gate_file(&head, "secret.env", "leaked\n")])]);
+    let before = gate_parcel(&head, &[], vec![deep.clone(), gate_file(&head, "x", "1")]);
+    plant(&head.refs, "main", &before);
+
+    let edit = gate_parcel(&head, &[&before], vec![deep, gate_file(&head, "x", "2")]);
+    let request = RefUpdateRequest { old_head: Some(before.clone()), new_head: edit, tombstone: None };
+    let err = head.ref_update(&Principal::Static, "main", &request).expect_err("the edit still names the leak");
+    assert_content_redacted(&err, &blob_hash("leaked\n"));
+    assert_eq!(user_head(&head, "main"), Some(before.clone()));
+
+    let clean = gate_parcel(&head, &[&before], vec![gate_file(&head, "x", "2")]);
+    let request = RefUpdateRequest { old_head: Some(before), new_head: clean.clone(), tombstone: None };
+    head.ref_update(&Principal::Static, "main", &request).expect("the head without the leak lifts");
+    assert_eq!(user_head(&head, "main"), Some(clean));
+}
+
+/// A meta parcel is judged by what it adds: the first `@tags` parcel adds the tags marker, so with
+/// the marker redacted it is refused, while a later parcel carrying the marker from a parent that
+/// already stands lifts.
+// Revert: drop the redaction check from `ref_update` → the first parcel commits → red.
+#[test]
+fn a_meta_parcel_adding_redacted_content_is_refused_and_one_carrying_it_is_not() {
+    let area = Area::new("redacted-meta");
+    prepare(&area, "wh");
+    area.write_file("wh/notes.txt", "notes\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "-m", "notes"]);
+    area.forklift("wh", &["tag", "create", "v1", "main"]);
+    let first = harvest(&area.path("wh")).head_of("@tags").expect("tags head");
+    area.forklift("wh", &["tag", "create", "v2", "main"]);
+    let tagged = harvest(&area.path("wh"));
+    let second = tagged.head_of("@tags").expect("tags head");
+
+    let marker = "forklift-meta 1 tags";
+    let (redactions, recorded) = recorded_redactions(&area, "red", &[marker]);
+    let meta_head = |head: &Head<MemoryObjectStore, MemoryRefStore>| {
+        head.refs.get_head(pallet_utils::PalletNamespace::Meta, "tags").unwrap().live().map(str::to_string)
+    };
+
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &tagged);
+    upload_all(&head, &recorded);
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions[0]);
+
+    let request = RefUpdateRequest { old_head: None, new_head: first.clone(), tombstone: None };
+    let err = head.ref_update(&Principal::Static, "@tags", &request).expect_err("the first parcel adds the marker");
+    assert_content_redacted(&err, &blob_hash(marker));
+    assert_eq!(meta_head(&head), None);
+
+    plant_meta(&head.refs, "tags", None, &first);
+    let request = RefUpdateRequest { old_head: Some(first), new_head: second.clone(), tombstone: None };
+    head.ref_update(&Principal::Static, "@tags", &request).expect("a parcel carrying the marker lifts");
+    assert_eq!(meta_head(&head), Some(second));
+}
+
+/// Wraps a shared [`MemoryRefStore`]; before each user-pallet commit while `moves` holds one,
+/// lifts `@redactions` to the next of `moves`, as a redaction recorded between `ref_update`'s
+/// check and its commit would. Forwards every other call.
+struct RedactionsMoveBeforeTheCommit {
+    inner: Arc<MemoryRefStore>,
+    moves: RefCell<Vec<String>>,
+}
+
+impl RefStore for RedactionsMoveBeforeTheCommit {
+    fn read_format(&self) -> Result<Option<String>, String> {
+        self.inner.read_format()
+    }
+
+    fn partition_has_items(&self) -> Result<bool, String> {
+        self.inner.partition_has_items()
+    }
+
+    fn get_head(&self, namespace: pallet_utils::PalletNamespace, name: &str) -> Result<RefHead, String> {
+        self.inner.get_head(namespace, name)
+    }
+
+    fn compare_and_set_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+        expected: ExpectedHead<'_>,
+        new: &str,
+        office_head: OfficePrecondition<'_>,
+        redactions: RedactionsPrecondition<'_>,
+        anchor: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
+        request_token: &str,
+    ) -> Result<CasOutcome, String> {
+        if namespace == pallet_utils::PalletNamespace::User && !self.moves.borrow().is_empty() {
+            let next = self.moves.borrow_mut().remove(0);
+            let current = self.inner.get_head(pallet_utils::PalletNamespace::Meta, REDACTIONS_PALLET_NAME)?;
+            plant_meta(&self.inner, REDACTIONS_PALLET_NAME, current.live(), &next);
+        }
+
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
+    }
+
+    fn delete_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+        old: &str,
+        office_head: OfficePrecondition<'_>,
+        anchor: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
+        request_token: &str,
+    ) -> Result<CasOutcome, String> {
+        self.inner.delete_head(namespace, name, old, office_head, anchor, format, request_token)
+    }
+
+    fn list_refs(&self) -> Result<RefListing, String> {
+        self.inner.list_refs()
+    }
+
+    fn default_pallet(&self) -> Result<String, String> {
+        self.inner.default_pallet()
+    }
+
+    fn get_trust(&self) -> Result<Option<(office_utils::TrustAnchor, String)>, String> {
+        self.inner.get_trust()
+    }
+
+    fn put_trust_if_absent(
+        &self,
+        anchor: &office_utils::TrustAnchor,
+        format: &forklift_aws_lambda::FormatFence,
+        request_token: &str,
+    ) -> Result<TrustOutcome, String> {
+        self.inner.put_trust_if_absent(anchor, format, request_token)
+    }
+
+    fn replace_trust(
+        &self,
+        anchor: &office_utils::TrustAnchor,
+        expected_anchor: &str,
+        office_head: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
+        request_token: &str,
+    ) -> Result<TrustWriteOutcome, String> {
+        self.inner.replace_trust(anchor, expected_anchor, office_head, format, request_token)
+    }
+}
+
+/// A redaction recorded between the check and the commit refuses the commit, and the check runs
+/// again against it: one naming the pushed content turns the update into the redacted refusal,
+/// and redactions that keep moving end in a retryable `409`, with nothing committed either way.
+// Revert: commit with `RedactionsPrecondition::NotConsumed` → the update commits over the new
+// redaction → red.
+#[test]
+fn a_redaction_recorded_during_the_check_refuses_the_commit_and_is_judged() {
+    let area = Area::new("redacted-race");
+    // Four redactions that leave the pushed content alone, then the one naming it.
+    let (redactions, recorded) =
+        recorded_redactions(&area, "red", &["other\n", "more\n", "most\n", "last\n", "leaked\n"]);
+    let racing = |moves: &[&String]| {
+        let inner = Arc::new(MemoryRefStore::new());
+        plant_meta(&inner, REDACTIONS_PALLET_NAME, None, &redactions[0]);
+        let refs = RedactionsMoveBeforeTheCommit {
+            inner: inner.clone(),
+            moves: RefCell::new(moves.iter().map(|head| head.to_string()).collect()),
+        };
+        let head = Head::new(MemoryObjectStore::new(), refs);
+        upload_all(&head, &recorded);
+        let pushed = gate_parcel(&head, &[], vec![gate_file(&head, "secret.env", "leaked\n")]);
+
+        let request = RefUpdateRequest { old_head: None, new_head: pushed, tombstone: None };
+        let answer = head.ref_update(&Principal::Static, "main", &request);
+        assert_eq!(inner.get_head(pallet_utils::PalletNamespace::User, "main").unwrap(), RefHead::Absent);
+        answer
+    };
+
+    let err = racing(&[&redactions[4]]).expect_err("the leak was redacted before the commit");
+    assert_content_redacted(&err, &blob_hash("leaked\n"));
+
+    let err = racing(&[&redactions[1], &redactions[2], &redactions[3]]).expect_err("the redactions kept moving");
+    assert_eq!(err.status, Status::Conflict, "{}", err.message);
 }
 
 /// Classify an object as a blob by trying to parse it as a parcel/tree under the source
