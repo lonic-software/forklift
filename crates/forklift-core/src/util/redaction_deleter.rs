@@ -201,17 +201,38 @@ fn maybe_present(hashes: &HashSet<String>) -> HashSet<String> {
         .collect()
 }
 
-/// Whether the store may still hold a copy of an applied redaction's object, so that
-/// [`delete_applied`] has something to look at. `false` once every applied object is gone, or
-/// when none is applied: the caller then needs no hold.
+/// The copies of applied redactions' objects the store may still hold, as the census finds them
+/// now, taken without any lock so a caller can tell whether [`delete_applied`] has anything to
+/// delete before it takes the locks the deletion needs. The deletion takes its own census under
+/// them; this one only decides whether to try.
+#[derive(Debug, Default)]
+pub struct AppliedCopies {
+    /// The copies the census names, each with its holders: kept.
+    pub held: BTreeMap<String, Vec<CopyHolder>>,
+
+    /// How many copies no census root names: the deletion's to delete.
+    pub unheld: usize,
+}
+
+/// Take the census of every applied redaction's object the store may still hold (see
+/// [`AppliedCopies`]). Both parts are empty once every applied object is gone, or when none is
+/// applied: no bay state is read then.
 ///
 /// # Returns
-/// * `Ok(bool)`    - Whether any applied object may be present.
-/// * `Err(String)` - If the applied record could not be read.
-pub fn any_applied_present() -> Result<bool, String> {
+/// * `Ok(AppliedCopies)` - The held copies and the count of unheld ones.
+/// * `Err(String)`       - If the applied record or the census could not be read.
+pub fn applied_copies() -> Result<AppliedCopies, String> {
     let applied: HashSet<String> = applied_redactions::read_applied()?.hashes().cloned().collect();
+    let present = maybe_present(&applied);
 
-    Ok(!maybe_present(&applied).is_empty())
+    if present.is_empty() {
+        return Ok(AppliedCopies::default());
+    }
+
+    let held = deletion_census(&present)?;
+    let unheld = present.iter().filter(|hash| !held.contains_key(*hash)).count();
+
+    Ok(AppliedCopies { held, unheld })
 }
 
 /// What [`delete_applied`] did.
@@ -270,9 +291,10 @@ pub fn delete_applied(store_lock: &StoreLock,
     let held = deletion_census(&present)?;
     let targets: HashSet<String> = present.into_iter().filter(|hash| !held.contains_key(hash)).collect();
 
-    // Only an unredacted live recipe can still name a target, as a chunk: it stays.
+    // An excluded target is never marked live, and a chunk's hash is never a blob's or a recipe's
+    // (an object's hash covers its type), so every target goes.
     let live = gc_utils::collect_live_set_excluding(&targets)?;
-    let objects: HashSet<String> = targets.into_iter().filter(|hash| !live.contains(hash)).collect();
+    let objects = targets;
 
     let mut chunks: HashSet<String> = HashSet::new();
     for hash in &objects {

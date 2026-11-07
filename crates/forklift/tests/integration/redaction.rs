@@ -1440,3 +1440,44 @@ fn a_deletion_is_owed_while_another_process_uses_the_store() {
     // Nothing is left to delete, so the next apply reports no deletion.
     assert_eq!(warehouse.json(&["redact", "apply"])["data"].get("deletion"), None);
 }
+
+/// When every copy left is held, the deletion has nothing to do and takes no lock: the held copy is
+/// reported, not an owed deletion, even while another process uses the store.
+///
+/// Revert: take the locks whatever the first census found → the deletion is owed, as the store is
+/// in use.
+#[test]
+fn a_held_copy_is_reported_without_the_locks_a_deletion_needs() {
+    let warehouse = Warehouse::new("held-unlocked");
+    let leak = warehouse.leaked("secret.env", b"TOKEN=hunter2\n");
+    warehouse.hold_parked(b"TOKEN=hunter2\n");
+
+    let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+    let _store_access = forklift_core::util::lock_utils::StoreAccessLock::try_shared().unwrap();
+
+    let recorded = recorded_hash(&warehouse, &format!("{}:secret.env", leak), "leaked token");
+    let deletion = &recorded["data"]["deletion"];
+    assert_eq!(deletion.get("owed"), None, "{}", recorded);
+    assert_eq!(deletion["kept"][0]["hash"], recorded["data"]["hash"], "{}", recorded);
+}
+
+/// Under trust, a redaction by an operator the office does not admit is refused as such, before
+/// anything about the target is told: even for a hash that is already redacted.
+///
+/// Revert: check for an existing redaction before the operator's checks → the refusal says the
+/// hash is already redacted.
+#[test]
+fn a_non_admin_is_refused_before_the_target_is_looked_at() {
+    let warehouse = Warehouse::new("non-admin");
+    warehouse.run_ok(&["office", "enroll"]);
+    let leak = warehouse.leaked("secret.env", b"TOKEN=hunter2\n");
+    let hash = recorded_hash(&warehouse, &format!("{}:secret.env", leak), "leaked token")["data"]["hash"]
+        .as_str().unwrap().to_string();
+
+    warehouse.run_ok(&["config", "set", "operator.identifier", "stranger@forklift"]);
+    let refused = warehouse.run(&["redact", "record", &hash, "-m", "again"]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("\"stranger@forklift\" is not enrolled"), "{:?}", refused);
+    assert!(!stderr.contains("already redacted"), "{:?}", refused);
+}

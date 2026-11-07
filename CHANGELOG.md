@@ -105,8 +105,8 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   (`deletion` in `--json`). A copy a checkout's base, parked work, a merge or pick in progress, or
   staged work still names is kept and listed with what holds it, until the file is taken out of
   that state and `redact apply` runs again. The deletion needs the object store to itself: while
-  a command in another bay or a server is using it, the deletion is reported as owed, and the
-  command still succeeds. `redact record` and `redact apply` are not `forklift mcp` tools.
+  a command in another bay, a server or other maintenance is using it, the deletion is reported as
+  owed, and the command still succeeds; any other failure to delete fails it. `redact record` and `redact apply` are not `forklift mcp` tools.
 - **The `--json` schema is now 26: a recorded redaction is applied, or says why it is still
   pending.** Part of content redaction:
   `redact record` and `redact list` report each redaction's state, `applied`, or pending as `held`
