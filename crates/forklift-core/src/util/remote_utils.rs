@@ -6572,11 +6572,11 @@ async fn upload_history(client: &RemoteClient,
     let mut seen_trees: HashSet<String> = HashSet::new();
 
     // Content the remote reports applied is never sent: it refuses it, and its ref update takes
-    // history naming it without it. Seen already, so the walk neither offers it nor descends a
-    // redacted recipe; a chunk of one is still offered when another recipe the walk reaches names it.
+    // history naming it without it. The walk neither offers a file entry naming it nor descends a
+    // redacted recipe; a chunk is still offered whenever a recipe the walk reaches names it.
     let redacted: HashSet<String> = info.applied_redactions().into_iter().map(str::to_string).collect();
-    let mut seen_blobs: HashSet<String> = redacted.clone();
-    let mut seen_recipes: HashSet<String> = redacted;
+    let mut seen_blobs: HashSet<String> = HashSet::new();
+    let mut seen_recipes: HashSet<String> = HashSet::new();
 
     // Parents first, guaranteed by `new_parcels_parents_first`: every parent of the parcel
     // being walked is remote-known or already processed, so everything a base "explains" is
@@ -6598,7 +6598,7 @@ async fn upload_history(client: &RemoteClient,
 
         collect_changed_closure(&parcel.tree_hash, "", &base_trees,
                                 &mut seen_trees, &mut seen_blobs, &mut seen_recipes,
-                                &mut candidates, chunking_supported)?;
+                                &mut candidates, chunking_supported, &redacted)?;
     }
 
     // Control-plane objects — parcels, trees, and recipes — are promoted synchronously when a
@@ -6795,7 +6795,8 @@ fn collect_changed_closure(tree_hash: &str,
                            seen_blobs: &mut HashSet<String>,
                            seen_recipes: &mut HashSet<String>,
                            candidates: &mut Vec<String>,
-                           chunking_supported: bool) -> Result<(), String> {
+                           chunking_supported: bool,
+                           redacted: &HashSet<String>) -> Result<(), String> {
     // Record the visit before checking base-explained, not after: content-addressing means the
     // same subtree hash can recur at another path in the same walk (e.g. a merge adopting one
     // side's out-of-scope subtree under two names), and that recurrence must be recognized even
@@ -6837,6 +6838,11 @@ fn collect_changed_closure(tree_hash: &str,
     for (name, file) in tree.get_files() {
         let explained = base_file_hashes.get(name.as_str())
             .is_some_and(|hashes| hashes.contains(&file.hash.as_str()));
+
+        // Content the remote applied a redaction of: not offered, and a recipe not descended.
+        if redacted.contains(&file.hash) {
+            continue;
+        }
 
         // A chunked file's entry hash names a recipe, whose chunks ride the byte plane as
         // ordinary objects. Two independent guards apply, in this order:
@@ -6892,7 +6898,7 @@ fn collect_changed_closure(tree_hash: &str,
 
         collect_changed_closure(&subtree.hash, &join_path(path_prefix, name), &child_bases,
                                 seen_trees, seen_blobs, seen_recipes, candidates,
-                                chunking_supported)?;
+                                chunking_supported, redacted)?;
     }
 
     Ok(())
@@ -9288,7 +9294,7 @@ mod tests {
             let mut seen_recipes = HashSet::new();
             let mut candidates = Vec::new();
             collect_changed_closure(&root_merge, "", bases, &mut seen_trees, &mut seen_blobs,
-                                    &mut seen_recipes, &mut candidates, true)
+                                    &mut seen_recipes, &mut candidates, true, &HashSet::new())
                 .expect("the closure walk must not load a pruned object");
             candidates
         };
@@ -9412,7 +9418,7 @@ mod tests {
                 .collect::<Result<_, _>>()
                 .expect("every parent resolves");
             collect_changed_closure(&parcel.tree_hash, "", &base_trees, &mut seen_trees,
-                                    &mut seen_blobs, &mut seen_recipes, &mut candidates, true)
+                                    &mut seen_blobs, &mut seen_recipes, &mut candidates, true, &HashSet::new())
                 .expect("the client walk must not load a pruned object");
         }
         let priced: HashSet<String> = candidates.iter().cloned().collect();
@@ -9505,7 +9511,7 @@ mod tests {
         let mut seen_recipes = HashSet::new();
         let mut candidates = Vec::new();
         collect_changed_closure(&new_root, "", &[base_root], &mut seen_trees, &mut seen_blobs,
-                                &mut seen_recipes, &mut candidates, true)
+                                &mut seen_recipes, &mut candidates, true, &HashSet::new())
             .expect("the second path must be recognized as already-seen, not re-loaded");
 
         assert!(!candidates.contains(&shared),
@@ -9574,7 +9580,7 @@ mod tests {
 
         // `false` = the remote's handshake omitted the chunking capability.
         let error = collect_changed_closure(&root, "", &[], &mut seen_trees, &mut seen_blobs,
-                                            &mut seen_recipes, &mut candidates, false)
+                                            &mut seen_recipes, &mut candidates, false, &HashSet::new())
             .expect_err("a chunked file entry must refuse a lift to a non-chunking remote");
 
         let (code, message, next_step) = scope_utils::decode_refusal(&error)
@@ -9611,7 +9617,7 @@ mod tests {
         let mut candidates = Vec::new();
 
         collect_changed_closure(&root, "", &[], &mut seen_trees, &mut seen_blobs,
-                                &mut seen_recipes, &mut candidates, true)
+                                &mut seen_recipes, &mut candidates, true, &HashSet::new())
             .expect("a chunked file must negotiate, not refuse, against a chunking remote");
 
         // The recipe is a control-plane candidate; every chunk is a blob candidate.
@@ -9624,6 +9630,46 @@ mod tests {
         // The recipe is not double-classified as a blob.
         assert!(!seen_blobs.contains(&recipe_hash), "the recipe is not a blob");
         assert!(candidates.contains(&plain), "the plain sibling still negotiates as a blob");
+    }
+
+    /// Content the remote applied a redaction of is skipped where a file entry names it, and a
+    /// redacted recipe is not descended, but a live recipe's chunk with the same hash is still
+    /// offered: the remote's closure check would otherwise take the live file without it.
+    ///
+    /// Revert: skip a redacted hash wherever the walk meets it → the live recipe's chunk is not
+    /// negotiated.
+    #[test]
+    fn the_lift_skips_redacted_files_but_never_a_live_recipes_chunk() {
+        use crate::enums::dir_entry_type::DirEntryType::{Normal, NormalChunked};
+
+        let _scratch = Scratch::new("closure-redacted");
+
+        let (redacted_recipe, redacted_chunks) = store_recipe(&["secret-a", "secret-b"]);
+        let (live_recipe, live_chunks) = store_recipe(&["shared", "live-b"]);
+        let shared = live_chunks[0].clone();
+        let root = store_tree(&[
+            ("dump.bin", &redacted_recipe, NormalChunked),
+            ("shared.txt", &shared, Normal),
+            ("live.bin", &live_recipe, NormalChunked),
+        ]);
+
+        let mut seen_trees = HashSet::new();
+        let mut seen_blobs = HashSet::new();
+        let mut seen_recipes = HashSet::new();
+        let mut candidates = Vec::new();
+        let redacted = HashSet::from([redacted_recipe.clone(), shared.clone()]);
+
+        collect_changed_closure(&root, "", &[], &mut seen_trees, &mut seen_blobs,
+                                &mut seen_recipes, &mut candidates, true, &redacted).unwrap();
+
+        assert!(!candidates.contains(&redacted_recipe), "a redacted recipe is not offered");
+        for chunk in &redacted_chunks {
+            assert!(!candidates.contains(chunk), "a redacted recipe is not descended: {}", chunk);
+        }
+        assert!(candidates.contains(&live_recipe));
+        for chunk in &live_chunks {
+            assert!(candidates.contains(chunk), "a live recipe's chunk is offered: {}", chunk);
+        }
     }
 
     /// Plant a blob above the whole-object ceiling directly, bypassing `LooseObject::store`'s
