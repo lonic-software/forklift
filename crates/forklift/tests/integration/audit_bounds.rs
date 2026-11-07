@@ -178,6 +178,15 @@ impl Warehouse {
         std::fs::write(self.root.join(".forklift").join("sealed"), bytes).unwrap();
     }
 
+    /// Write the record of applied redactions holding exactly `hashes`, as the apply would.
+    fn apply(&self, hashes: &[&str]) {
+        let mut sorted = hashes.to_vec();
+        sorted.sort();
+        let lines: String = sorted.iter().map(|hash| format!("{}\n", hash)).collect();
+        std::fs::write(self.root.join(".forklift").join("redactions-applied"),
+                       format!("/forklift-redactions-applied 1\n{}", lines)).unwrap();
+    }
+
     /// Run `work` inside this warehouse's storage scope.
     fn scoped<T>(&self, work: impl FnOnce() -> T) -> T {
         let _scope = StorageRootScope::enter(&self.root);
@@ -802,10 +811,16 @@ fn subtree(head: &str, path: &str) -> String {
 /// The audit as `forklift audit` runs it, against the warehouse's sealed record. Returns how many
 /// absent objects the record held.
 fn audit(head: &str, scope: &PathScope, full: bool) -> Result<usize, String> {
+    audit_counting(head, scope, full).map(|(held, _)| held)
+}
+
+/// [`audit`], returning how many absent objects the record held and how many an applied
+/// redaction did, apart.
+fn audit_counting(head: &str, scope: &PathScope, full: bool) -> Result<(usize, usize), String> {
     let tolerated = sealed_utils::read_tolerated()?;
     let tolerance = SealedTolerance::new(&tolerated);
     audit_utils::verify_parcel_closure_scoped(head, None, scope, full, Some(&tolerance))?;
-    Ok(tolerance.held())
+    Ok((tolerance.held(), tolerance.redacted()))
 }
 
 /// The blob (or recipe) a file path names in a parcel's root tree.
@@ -845,6 +860,35 @@ fn audit_tolerates_a_recorded_absent_tree_and_what_lies_under_it_but_the_push_ga
         let err = audit_utils::verify_parcel_closure(&head, None)
             .expect_err("the push gate tolerates no recorded absence");
         assert!(err.contains(&gone), "{}", err);
+    });
+}
+
+/// An absent blob or recipe an applied redaction names is tolerated with no sealed record, and
+/// counted apart from what the record holds; one a recorded hash names as well is counted as
+/// redacted. An absence neither names is still a loss.
+///
+/// Revert: tally an applied absence as held → `held` counts it → red; drop the applied set from
+/// the tolerance → the audit refuses the redacted blob → red.
+#[test]
+fn audit_tolerates_an_applied_absence_and_counts_it_apart() {
+    let warehouse = Warehouse::new("applied-blob");
+    let head = warehouse.stack_files(&[("a.txt", "a\n"), ("b.txt", "b\n"), ("c.txt", "c\n")], "K");
+
+    warehouse.scoped(|| {
+        let full = PathScope::full();
+        let (a, b, c) = (file_hash(&head, "a.txt"), file_hash(&head, "b.txt"), file_hash(&head, "c.txt"));
+        for hash in [&a, &b, &c] {
+            warehouse.delete_object(hash);
+        }
+        warehouse.apply(&[&a, &b]);
+        warehouse.seal(&[&b]);
+
+        let err = audit(&head, &full, false).expect_err("an absence neither names is a loss");
+        assert!(err.contains(&c), "{}", err);
+
+        warehouse.seal(&[&b, &c]);
+        assert_eq!(audit_counting(&head, &full, false).unwrap(), (1, 2), "c held; a and b redacted");
+        assert_eq!(audit_counting(&head, &full, true).unwrap(), (1, 2), "audit --full tolerates it too");
     });
 }
 
