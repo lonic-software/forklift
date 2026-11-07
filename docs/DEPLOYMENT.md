@@ -327,9 +327,12 @@ has no use for them, and a `staging/`-shaped key from a delete event would just 
 
 All three are **operator decisions**; none is required or read by the code:
 
-* **Versioning** — not referenced anywhere in `aws::s3`. Enable it if you want an audit trail of
+* **Versioning** — never read by `aws::s3`. Enable it if you want an audit trail of
   overwrites (there should be none in `objects/`/`signatures/`, since both are conditional
-  writes to immutable keys — a `412` on a second write, not a silent overwrite).
+  writes to immutable keys — a `412` on a second write, not a silent overwrite). It keeps no copy
+  of redacted content: an applied redaction's deletion lists the versions of every key it
+  removes and deletes each, which is why both roles hold `s3:ListBucketVersions` and
+  `s3:DeleteObjectVersion`.
 * **Encryption** — SSE-S3 or SSE-KMS at rest, your call; the SDK calls carry no
   encryption-context parameters either way.
 * **CORS — not needed.** Every client is the `forklift` CLI (a `reqwest`-based Rust binary)
@@ -610,7 +613,12 @@ Where each action in `iam/control-plane.policy.json` comes from: `HeadObject`/`G
 `PUT`/`CopyObject` destination → `s3:PutObject`; `CopyObject` source read → `s3:GetObject` on
 `staging/*`; `DeleteObject` (staged cleanup, session sweep, a dropped staged copy of redacted content) →
 `s3:DeleteObject`; the redaction scan's progress objects (`GetObject`/`PutObject`/`DeleteObject` under
-`redaction-work/{warehouse}/`) → the `RedactionScanWork` statement on `redaction-work/*`; `ListObjectsV2`
+`redaction-work/{warehouse}/`) → the `RedactionScanWork` statement on `redaction-work/*`; an applied
+redaction's deletion of a blob's canonical object and of every staged copy of it, which lists the
+keys' versions (`ListObjectVersions` → `s3:ListBucketVersions` on the bucket, the
+`ListRedactedVersions` statement) and deletes each by version id (`DeleteObject` naming a version →
+`s3:DeleteObjectVersion` on `objects/*` and `staging/*`, the `DeleteRedactedCopies` statement), so
+no earlier version survives on a bucket with versioning enabled or suspended; `ListObjectsV2`
 (`discard_session`'s sweep) and `HeadObject`/`GetObject` 404-vs-403 semantics (below) →
 `s3:ListBucket` on the **bucket** resource (not `bucket/*`); `GetItem`/`Query` (ref reads,
 enumeration, the format item and the partition check behind it) → the table ARN, no index ARN
@@ -627,7 +635,10 @@ its own CloudWatch log group.
 ### `forklift-aws-verifier`
 
 The verifier reads one DynamoDB item per staged object, its redaction item (`dynamodb:GetItem` on
-the table, the `ReadRedactionItems` statement), then calls `verify_and_promote`.
+the table, the `ReadRedactionItems` statement), then calls `verify_and_promote`, then reads the item
+again: content whose redaction applied while it was promoted has the canonical copy just written
+deleted, every version of it (`s3:ListBucketVersions` on the bucket and `s3:DeleteObjectVersion` on
+`objects/*`, the `ListRedactedVersions` and `DeleteRedactedPromotions` statements).
 `iam/verifier.policy.json`'s other statements: `s3:GetObject`/`s3:DeleteObject` on `staging/*` (read
 then clear the staged object once promoted), `s3:GetObject`/`s3:PutObject` on `objects/*` (write the
 promoted copy), `s3:ListBucket` on the bucket (404-vs-403 semantics, below — `verify_and_promote`'s

@@ -20,6 +20,18 @@
       "Resource": "${table_arn}"
     },
     {
+      "Sid": "DeleteRedactedPromotions",
+      "Effect": "Allow",
+      "Action": "s3:DeleteObjectVersion",
+      "Resource": "${bucket_arn}/objects/*"
+    },
+    {
+      "Sid": "ListRedactedVersions",
+      "Effect": "Allow",
+      "Action": "s3:ListBucketVersions",
+      "Resource": "${bucket_arn}"
+    },
+    {
       "Sid": "ListBucketFor404Semantics",
       "Effect": "Allow",
       "Action": "s3:ListBucket",

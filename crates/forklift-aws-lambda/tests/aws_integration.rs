@@ -341,6 +341,97 @@ async fn two_warehouses_on_one_bucket_never_see_each_others_objects() {
 
 /// verify-and-promote across the presigned path: a client's staged bytes are not fetchable
 /// until promoted, a corrupt staged object is discarded, and promotion is idempotent.
+/// Every key and version id the bucket holds, delete markers included, sorted.
+async fn every_version(s3: &aws_sdk_s3::Client, bucket: &str) -> Vec<String> {
+    let listed = s3.list_object_versions().bucket(bucket).send().await.expect("list versions");
+    let mut keys: Vec<String> = listed
+        .versions()
+        .iter()
+        .filter_map(|version| version.key().map(str::to_string))
+        .chain(listed.delete_markers().iter().filter_map(|marker| marker.key().map(|key| format!("{} (marker)", key))))
+        .collect();
+    keys.sort();
+
+    keys
+}
+
+/// A redaction's deletion leaves no version of what it deletes, on a bucket with versioning
+/// enabled as on one without: the canonical object's every version, and the staged copy of the
+/// hash in every session. Another hash's copies and another warehouse's are kept.
+// Revert: delete by key instead of by version → the versioned bucket keeps the older version and a
+// delete marker → red.
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_deletion_leaves_no_version_of_a_redacted_copy() {
+    let Some(endpoint) = endpoint() else {
+        eprintln!("skipping: FORKLIFT_AWS_TEST_ENDPOINT is unset");
+        return;
+    };
+
+    for versioned in [true, false] {
+        let config = test_config(&endpoint);
+        provision(&config).await;
+
+        let (s3, _dynamodb) = raw_clients(&config).await;
+        if versioned {
+            s3.put_bucket_versioning()
+                .bucket(&config.bucket)
+                .versioning_configuration(
+                    aws_sdk_s3::types::VersioningConfiguration::builder()
+                        .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                        .build(),
+                )
+                .send()
+                .await
+                .expect("enable versioning");
+        }
+
+        let bridge = AsyncBridge::current().expect("a multi-thread runtime");
+        let (objects, _refs) = build_stores(&config, bridge).await.expect("stores");
+        let leak = object_utils::hash_object_bytes(b"leaked");
+        let kept = object_utils::hash_object_bytes(b"kept");
+        let wh = config.warehouse_id.clone();
+        let other = format!("{}0", wh);
+
+        let put = |key: String| {
+            let s3 = s3.clone();
+            let bucket = config.bucket.clone();
+            async move {
+                s3.put_object().bucket(bucket).key(key).body(b"bytes".to_vec().into()).send().await.expect("put");
+            }
+        };
+        for key in [
+            format!("objects/{}/{}", wh, leak),
+            format!("objects/{}/{}", wh, leak),
+            format!("objects/{}/{}", wh, kept),
+            format!("staging/{}/lift-1/{}", wh, leak),
+            format!("staging/{}/lift-2/{}", wh, leak),
+            format!("staging/{}/lift-1/{}", wh, kept),
+            format!("staging/{}/lift-1/{}", other, leak),
+            format!("objects/{}/{}", other, leak),
+        ] {
+            put(key).await;
+        }
+
+        let deleting = leak.clone();
+        tokio::task::spawn_blocking(move || {
+            objects.delete_canonical(&deleting).expect("delete the canonical copy");
+            objects.delete_staged(&deleting).expect("delete the staged copies");
+            objects.delete_canonical(&deleting).expect("an absent object is no error");
+        })
+        .await
+        .expect("the delete task");
+
+        let mut expected = vec![
+            format!("objects/{}/{}", other, leak),
+            format!("objects/{}/{}", wh, kept),
+            format!("staging/{}/lift-1/{}", other, leak),
+            format!("staging/{}/lift-1/{}", wh, kept),
+        ];
+        expected.sort();
+        assert_eq!(every_version(&s3, &config.bucket).await, expected, "versioned: {}", versioned);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn s3_verify_and_promote_gates_the_canonical_namespace() {
     let Some(endpoint) = endpoint() else {

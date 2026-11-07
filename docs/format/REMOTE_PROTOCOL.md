@@ -175,10 +175,16 @@ heads, plus the parents of a metadata pallet seen naming the content whose head 
 redaction it cannot decide within the request is not served: `GET`, `PUT` and `upload-targets`
 answer `503` with `Retry-After`, and `batch` leaves the object out. A lift commit naming
 an applied redaction's hash is refused with `410`, and its staged copy is dropped, never
-promoted; so does the staging verifier. Both check before they promote, so a copy whose
-promotion was already under way when the redaction applied is still promoted. For now the
-serverless head deletes nothing: an applied redaction stays `deletion_owed`, its copy (and any
-copy promoted so) stays in storage unserved, and an applied recipe's chunks are still served.
+promoted; so does the staging verifier. Both check before they promote and again after it, so
+a copy whose promotion was under way when the redaction applied is deleted once written. The
+first request that finds a redaction applied deletes the copies the store keeps of a blob: its
+object and its staged copy in every lift session, every version of each. It holds a lease in the
+redaction's item while it does, so requests that find it applied together delete once, and one
+that ends holding the lease leaves the deletion to the first request after the lease runs out. A
+deletion that fails is logged and retried by a later request. For now an applied redaction stays
+`deletion_owed` after that: a `batch` answer that bundled the content before it applied may still
+be downloadable until its URL expires, and an applied recipe's object and chunks are kept, its
+chunks still served.
 
 forklift-server deletes an applied redaction's content in its own process right after applying
 it. It drains that one warehouse: new requests for it get `503` until the deletion ends (which may

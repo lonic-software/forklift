@@ -190,11 +190,14 @@ fn op_actions() -> BTreeMap<&'static str, &'static [&'static str]> {
         ("head_object", &["s3:GetObject"][..]),
         ("get_object", &["s3:GetObject"][..]),
         ("put_object", &["s3:PutObject"][..]),
-        ("delete_object", &["s3:DeleteObject"][..]),
+        // A redaction's deletion names a version (`aws/s3.rs::delete_every_version`), which
+        // S3 authorizes as `s3:DeleteObjectVersion`; every other delete names none.
+        ("delete_object", &["s3:DeleteObject", "s3:DeleteObjectVersion"][..]),
         // `copy_object` reads the source (`staging/*`) and writes the destination
         // (`objects/*`) — both actions, per docs/DEPLOYMENT.md's derivation table.
         ("copy_object", &["s3:GetObject", "s3:PutObject"][..]),
         ("list_objects_v2", &["s3:ListBucket"][..]),
+        ("list_object_versions", &["s3:ListBucketVersions"][..]),
         // DynamoDB (`aws/dynamo_ops.rs`).
         ("get_item", &["dynamodb:GetItem"][..]),
         ("query", &["dynamodb:Query"][..]),
