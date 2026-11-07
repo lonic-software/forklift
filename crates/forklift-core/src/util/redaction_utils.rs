@@ -1659,4 +1659,99 @@ mod tests {
             assert!(validate_redacted_hash(bad).is_err(), "{:?} must be refused", bad);
         }
     }
+    /// Trees and parcels by hash for a [`HoldingWalk`], failing the next read of `flaky` once.
+    struct Objects {
+        trees: HashMap<String, std::sync::Arc<crate::model::tree_item::TreeItem>>,
+        parcels: HashMap<String, std::sync::Arc<crate::model::parcel::Parcel>>,
+        flaky: std::cell::RefCell<Option<String>>,
+    }
+
+    impl Objects {
+        fn read<T: Clone>(&self, hash: &str, from: &HashMap<String, T>) -> Result<T, String> {
+            if self.flaky.borrow().as_deref() == Some(hash) {
+                self.flaky.replace(None);
+                return Err(format!("{} cannot be read", hash));
+            }
+            from.get(hash).cloned().ok_or_else(|| format!("no object {}", hash))
+        }
+    }
+
+    impl WalkObjects for Objects {
+        fn load_tree(&self, hash: &str) -> Result<std::sync::Arc<crate::model::tree_item::TreeItem>, String> {
+            self.read(hash, &self.trees)
+        }
+
+        fn load_parcel(&self, hash: &str) -> Result<crate::model::parcel::Parcel, String> {
+            let parcel = self.read(hash, &self.parcels)?;
+            Ok(crate::model::parcel::Parcel {
+                tree_hash: parcel.tree_hash.clone(),
+                parents: parcel.parents.clone(),
+                actions: Vec::new(),
+                description: None,
+            })
+        }
+
+        fn recipe_chunks(&self, hash: &str) -> Result<Vec<String>, String> {
+            Err(format!("no recipe {}", hash))
+        }
+    }
+
+    /// A parcel `p<n>` on `parents` whose root tree `t<n>` holds one subtree `s<n>` holding the
+    /// file of hash `file`.
+    fn history(objects: &mut Objects, n: u32, parents: &[&str], file: &str) -> String {
+        use crate::enums::dir_entry_type::DirEntryType;
+        use crate::model::tree_item::TreeItem;
+
+        let mut subtree = TreeItem::new("s".into(), format!("s{}", n), DirEntryType::Tree);
+        subtree.add_child(TreeItem::new("f".into(), file.into(), DirEntryType::Normal));
+        let mut root = TreeItem::new(String::new(), format!("t{}", n), DirEntryType::Tree);
+        root.add_child(subtree.clone());
+
+        objects.trees.insert(format!("s{}", n), std::sync::Arc::new(subtree));
+        objects.trees.insert(format!("t{}", n), std::sync::Arc::new(root));
+        objects.parcels.insert(format!("p{}", n), std::sync::Arc::new(crate::model::parcel::Parcel {
+            tree_hash: format!("t{}", n),
+            parents: parents.iter().map(|parent| parent.to_string()).collect(),
+            actions: Vec::new(),
+            description: None,
+        }));
+        format!("p{}", n)
+    }
+
+    /// Walk to the end, one step at a time, counting the steps.
+    fn walk_out(walk: &mut HoldingWalk, redaction: &Redaction, objects: &Objects) -> (WalkProgress, usize) {
+        for steps in 1..100 {
+            match walk.step(redaction, objects).expect("step") {
+                WalkProgress::Going => {}
+                done => return (done, steps),
+            }
+        }
+        panic!("the walk never ended");
+    }
+
+    // Revert: pop the frontier before the read → the failed step loses the subtree and the walk
+    // ends clear. Revert: follow parents in a tree walk → the user walk finds the old file.
+    #[test]
+    fn a_holding_walk_survives_a_failed_read_and_follows_history_only_for_meta() {
+        let leak = "l".repeat(64);
+        let redaction = Redaction { hash: leak.clone(), reason: "a leak".into(), redacted_at: 0, chunks: None };
+        let mut objects = Objects { trees: HashMap::new(), parcels: HashMap::new(), flaky: Default::default() };
+        let old = history(&mut objects, 1, &[], &leak);
+        let new = history(&mut objects, 2, &[&old], &"c".repeat(64));
+
+        let mut walk = HoldingWalk::of_tree(&old);
+        objects.flaky.replace(Some("s1".into()));
+        assert_eq!(walk.step(&redaction, &objects).expect("the parcel"), WalkProgress::Going);
+        assert_eq!(walk.step(&redaction, &objects).expect("the root"), WalkProgress::Going);
+        let before = walk.clone();
+        assert!(walk.step(&redaction, &objects).is_err(), "the subtree read fails");
+        assert_eq!(walk, before, "a failed step leaves the walk as it was");
+
+        let saved: HoldingWalk = serde_json::from_str(&serde_json::to_string(&walk).expect("save")).expect("load");
+        let mut walk = saved;
+        assert_eq!(walk.step(&redaction, &objects).expect("the subtree"), WalkProgress::Names);
+
+        assert_eq!(walk_out(&mut HoldingWalk::of_tree(&new), &redaction, &objects).0, WalkProgress::Clear);
+        assert_eq!(walk_out(&mut HoldingWalk::of_history(&new), &redaction, &objects).0, WalkProgress::Names);
+    }
 }
