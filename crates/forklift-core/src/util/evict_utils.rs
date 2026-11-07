@@ -43,7 +43,7 @@
 use std::collections::HashSet;
 use crate::util::lock_utils::{ServeLock, StoreAccessExclusive, StoreLock};
 use crate::util::progress_utils::Progress;
-use crate::util::sealed_utils::{self, SealOp, SealedSet};
+use crate::util::sealed_utils::{self, SealOp, Tolerated};
 use crate::util::{
     bay_utils, cache_miss, cherry_pick_utils, file_utils, gc_utils, merge_utils, object_utils, office_utils,
     pack_utils, pallet_utils, park_utils, prune_utils, recovery_utils,
@@ -134,7 +134,8 @@ pub struct EvictStats {
 ///                     record or the store cannot be read. Nothing is changed.
 pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -> Result<EvictPlan, String> {
     let _unfetched = cache_miss::Unfetched::enter();
-    let sealed = sealed_utils::read_sealed()?;
+    let tolerated = sealed_utils::read_tolerated()?;
+    let sealed = &tolerated.sealed;
 
     let mut heads_not_lowered = 0;
     let mut distinct: HashSet<&String> = HashSet::new();
@@ -145,7 +146,7 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
     }
 
     let held_parcels = sorted(gc_utils::collect_reachable_for_sweep(held_heads)?);
-    let held = walk_held(&held_parcels, &sealed)?;
+    let held = walk_held(&held_parcels, &tolerated)?;
 
     let bay_dirs = bay_utils::all_bay_state_dirs()?;
     let sources = recovery_utils::gc_root_sources(
@@ -233,7 +234,7 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
             .map_err(|error| error.refusal("\"forklift store evict\"", "nothing was changed"))?
     };
     plan.repack = !plan.to_drop.is_empty() || delta_on_loose;
-    plan.to_unseal = sealed_utils::present_recorded(&sealed)?
+    plan.to_unseal = sealed_utils::present_recorded(sealed)?
         .into_iter()
         .filter(|hash| checkout_keep.contains(hash) || local_keep.contains(hash))
         .collect();
@@ -332,7 +333,7 @@ struct HeldClosure {
 /// nothing beneath it is a target. An absent object the record does not hold fails the walk: the
 /// record is meant to cover every absence in a cache, so this one is damage, and recording it now
 /// would claim the origin holds what may simply be lost.
-fn walk_held(parcels: &[String], sealed: &SealedSet) -> Result<HeldClosure, String> {
+fn walk_held(parcels: &[String], sealed: &Tolerated) -> Result<HeldClosure, String> {
     /// One step of the explicit post-order walk: a tree to expand (with the object that named it,
     /// for the error), or one whose children are all done.
     enum Step {
@@ -397,13 +398,14 @@ fn walk_held(parcels: &[String], sealed: &SealedSet) -> Result<HeldClosure, Stri
 }
 
 /// Whether `hash`, which `named_by` references in the origin's closure, is present: `false` when
-/// it is absent and recorded, an error when it is absent and not.
-fn held_present(hash: &str, named_by: &str, sealed: &SealedSet) -> Result<bool, String> {
+/// it is absent and held (recorded, or named by a redaction this warehouse applied, whose bytes
+/// were taken away on purpose), an error when it is absent and not.
+fn held_present(hash: &str, named_by: &str, sealed: &Tolerated) -> Result<bool, String> {
     if file_utils::is_present_for_sweep(hash)? {
         return Ok(true);
     }
 
-    if sealed.contains(hash) {
+    if sealed.held(hash).is_some() {
         return Ok(false);
     }
 

@@ -53,7 +53,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::util::pallet_utils::PalletNamespace;
 use crate::util::scope_utils::{PathScope, ScopeClass};
-use crate::util::sealed_utils::{self, SealedSet};
+use crate::util::sealed_utils::{self, Tolerated};
 use crate::util::{
     bay_utils, file_utils, gc_utils, object_utils, office_utils, pack_utils, pallet_utils, recovery_utils,
 };
@@ -157,7 +157,7 @@ fn plan_from(
     removed_heads: &[String],
     sources: recovery_utils::GcRootSources,
 ) -> Result<PrunePlan, String> {
-    let sealed = sealed_utils::read_sealed().map_err(|error| format!("{} Then run the prune again.", error))?;
+    let sealed = sealed_utils::read_tolerated().map_err(|error| format!("{} Then run the prune again.", error))?;
     let (live_parcels, meta_parcels) = reachable_parcels(&sources.adopted_heads())?;
     // A haul's proposed head joins the local pallet heads like a removed one: a merge reads the
     // recorded head, which no ref need still reach.
@@ -347,7 +347,7 @@ fn unlifted_parcels(user_parcels: &[String], remote_heads: &[String]) -> Result<
 /// * `Ok((kept, touching))` - The objects to keep, and the unlifted parcels that changed some
 ///   pruned path, which are the ones whose lift needs any of them.
 /// * `Err(String)`          - If a present object cannot be read.
-fn retain_unlifted(unlifted: &HashSet<String>, pruned_prefixes: &[String], sealed: &SealedSet)
+fn retain_unlifted(unlifted: &HashSet<String>, pruned_prefixes: &[String], sealed: &Tolerated)
     -> Result<(HashSet<String>, HashSet<String>), String> {
     let mut kept: HashSet<String> = HashSet::new();
     let mut walked: HashSet<(String, Vec<String>)> = HashSet::new();
@@ -601,7 +601,7 @@ fn collect_retained(
     user_parcels: &[String],
     meta_parcels: &[String],
     post_prune: &PathScope,
-    sealed: &SealedSet,
+    sealed: &Tolerated,
 ) -> Result<HashSet<String>, String> {
     let mut retained: HashSet<String> = HashSet::new();
 
@@ -837,7 +837,7 @@ fn retain_recipe_chunks(recipe_hash: &str, retained: &mut HashSet<String>) -> Re
 fn collect_prune_targets(
     user_parcels: &[String],
     pruned_prefixes: &[String],
-    sealed: &SealedSet,
+    sealed: &Tolerated,
 ) -> Result<Vec<String>, String> {
     /// One step of the explicit (non-recursive) post-order walk: a tree not yet expanded, or a
     /// tree whose children have all been visited and is ready to be appended to `ordered`.
@@ -932,7 +932,7 @@ fn collect_prune_targets(
 /// absent tree on the way fails, as it does there.
 ///
 /// [`tree_utils::resolve_subtree_hash`]: crate::util::tree_utils::resolve_subtree_hash
-fn resolve_unsealed_subtree(root_tree_hash: &str, key: &str, sealed: &SealedSet) -> Result<Option<String>, String> {
+fn resolve_unsealed_subtree(root_tree_hash: &str, key: &str, sealed: &Tolerated) -> Result<Option<String>, String> {
     let mut current = root_tree_hash.to_string();
 
     // The empty key names the root itself, as it does there.
@@ -956,11 +956,12 @@ fn resolve_unsealed_subtree(root_tree_hash: &str, key: &str, sealed: &SealedSet)
     Ok(Some(current))
 }
 
-/// Whether `hash` is held by hash alone: recorded in `sealed` and absent. A recorded object that
-/// is present seals nothing. Presence is the fail-closed sweep form, so an object only an
-/// unreadable pack index might hold fails rather than reading as held.
-fn held_by_hash(sealed: &SealedSet, hash: &str) -> Result<bool, String> {
-    Ok(sealed.contains(hash) && !file_utils::is_present_for_sweep(hash)?)
+/// Whether `hash` is held by hash alone: recorded in `sealed`, or named by a redaction this
+/// warehouse applied, and absent. A held object that is present seals nothing. Presence is the
+/// fail-closed sweep form, so an object only an unreadable pack index might hold fails rather than
+/// reading as held.
+fn held_by_hash(sealed: &Tolerated, hash: &str) -> Result<bool, String> {
+    Ok(sealed.held(hash).is_some() && !file_utils::is_present_for_sweep(hash)?)
 }
 
 /// Whether a loose object file is present in the store (independent of any packed copy).

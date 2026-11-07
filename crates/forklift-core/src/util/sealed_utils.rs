@@ -79,6 +79,16 @@
 //! is garbage a sweep deletes, so what only it references is dropped with it in view. A walk that
 //! meets an absent object the record does not hold drops nothing: that is damage, and `heal`'s to
 //! judge, not a boundary to compact past.
+//!
+//! ## Applied redactions
+//!
+//! An object can be absent for a second reason the record does not hold: a redaction this
+//! warehouse applied names it ([`applied_redactions`]). That absence is not the record's: no
+//! remote is promised to hold the object, so nothing fetches it, and it is never written into the
+//! record (a push-down or a fetch's recording leaves it out). A walk that meets one absent holds it
+//! as it holds a recorded one, without descending, and keeps it apart: it is never damage, and
+//! never among the absences a caller treats as owed by an origin. [`Tolerated`] carries both sets,
+//! kept apart, to every walk that judges an absence; [`read_tolerated`] reads them.
 
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::io::{Seek, Write};
@@ -86,7 +96,8 @@ use std::path::{Path, PathBuf};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::enums::object_type::ObjectType;
 use crate::globals;
-use crate::util::{audit_utils, bay_utils, file_utils, object_utils, office_utils, origin_move, origin_utils, pack_utils, record_utils, recovery_utils, sign_utils};
+use crate::util::{applied_redactions, audit_utils, bay_utils, file_utils, object_utils, office_utils, origin_move, origin_utils, pack_utils, record_utils, recovery_utils, sign_utils};
+use crate::util::applied_redactions::AppliedSet;
 use crate::util::lock_utils::{RefLock, StoreAccessExclusive, StoreAccessLock};
 
 /// The record's file name under the shared forklift root.
@@ -396,6 +407,68 @@ pub fn read_sealed() -> Result<SealedSet, String> {
     })
 }
 
+/// Why a walk may meet an object absent without that being damage (see Applied redactions in the
+/// module doc comment): the sealed record holds it, or a redaction this warehouse applied names
+/// it. The two are kept apart, since only the record leans on a remote.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Tolerated {
+    pub sealed: SealedSet,
+    pub applied: AppliedSet,
+}
+
+/// Which set holds an absent object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Held {
+    /// The sealed record: the remote holds it, and a read may fetch it.
+    Sealed,
+    /// An applied redaction: nobody is promised to hold it, and nothing fetches it.
+    Redacted,
+}
+
+impl Tolerated {
+    /// Only the applied redactions: for a warehouse whose every other object must be present.
+    pub fn applied_only(applied: AppliedSet) -> Tolerated {
+        Tolerated { sealed: SealedSet::default(), applied }
+    }
+
+    /// Which set holds `hash`, if either does. An applied redaction wins over a record of the same
+    /// hash: nothing fetches a redacted object. Checks no presence: a held object that is present
+    /// is held by nothing, and walked.
+    pub fn held(&self, hash: &str) -> Option<Held> {
+        if self.applied.contains(hash) {
+            Some(Held::Redacted)
+        } else if self.sealed.contains(hash) {
+            Some(Held::Sealed)
+        } else {
+            None
+        }
+    }
+
+    /// Whether neither set holds anything.
+    pub fn is_empty(&self) -> bool {
+        self.sealed.is_empty() && self.applied.is_empty()
+    }
+}
+
+/// Read the sealed record and the applied redactions, for a walk that judges an absence.
+///
+/// # Returns
+/// * `Ok(Tolerated)` - Both sets.
+/// * `Err(String)`   - If either record cannot be read or parsed.
+pub fn read_tolerated() -> Result<Tolerated, String> {
+    Ok(Tolerated { sealed: read_sealed()?, applied: applied_redactions::read_applied()? })
+}
+
+/// Drop from `absent` every hash a redaction this warehouse applied names: such an absence is never
+/// recorded as held by a remote.
+fn drop_applied(absent: &mut Vec<String>) -> Result<(), String> {
+    let applied = applied_redactions::read_applied()?;
+    if !applied.is_empty() {
+        absent.retain(|hash| !applied.contains(hash));
+    }
+    Ok(())
+}
+
 /// Read and parse the record at `path`.
 ///
 /// # Returns
@@ -504,11 +577,6 @@ fn rebuild_locked(lock: &RefLock) -> Result<Option<Rebuilt>, String> {
     Ok(Some(Rebuilt { at: valid_len, dropped_bytes: bytes.len() - valid_len }))
 }
 
-/// Whether `hash` is in `sealed`, where `None` means no record applies (the push gate).
-pub fn is_recorded(sealed: Option<&SealedSet>, hash: &str) -> bool {
-    sealed.is_some_and(|set| set.contains(hash))
-}
-
 /// [`append_locked`] under a ref lock it takes and releases.
 pub fn append(ops: &[(SealOp, &str)]) -> Result<SealedSet, String> {
     let lock = RefLock::acquire()?;
@@ -568,6 +636,8 @@ pub fn record_absences_under(roots: &[String]) -> Result<(), String> {
             closed.extend(walk.walked);
         }
     }
+
+    drop_applied(&mut absent)?;
 
     if absent.is_empty() {
         return Ok(());
@@ -786,15 +856,17 @@ pub struct Bounded {
 /// * `Err(String)` - If a root source, a present object or the store cannot be read, or as
 ///                   [`compact_locked`]. Nothing is dropped then.
 pub fn bound(_hold: &StoreAccessExclusive, parcels: &[String]) -> Result<Bounded, String> {
-    let sealed = read_sealed()?;
-    if sealed.is_empty() {
+    let tolerated = read_tolerated()?;
+    if tolerated.sealed.is_empty() {
         return Ok(Bounded::default());
     }
 
-    let (drop, skipped) = match walk(parcels, &sealed, Unrecorded::Damage)? {
+    // An object absent by an applied redaction is a boundary like a recorded one, never damage,
+    // so a cache that applied a redaction still shrinks its record.
+    let (drop, skipped) = match walk(parcels, &tolerated, Unrecorded::Damage)? {
         Ok(walked) => {
             let mut drop = HashSet::new();
-            for hash in &sealed.hashes {
+            for hash in &tolerated.sealed.hashes {
                 if !walked.referenced.contains(hash) && !is_present(hash)? {
                     drop.insert(hash.clone());
                 }
@@ -818,14 +890,15 @@ enum Met {
     Again,
     /// In the store, to descend.
     Present,
-    /// Absent and recorded, or absent where the walk takes that as a boundary.
+    /// Absent and held (recorded, or redacted), or absent where the walk takes that as a boundary.
     Absent,
     /// Absent and not recorded, where the walk takes that as damage.
     Unrecorded,
 }
 
-/// How a [`walk`] takes an absent object the record does not hold: as damage in a cache, where the
-/// record holds every absence, or as one more boundary in a sparse warehouse, which records none.
+/// How a [`walk`] takes an absent object neither the record nor an applied redaction holds: as
+/// damage in a cache, where the record holds every absence, or as one more boundary in a sparse
+/// warehouse, which records none.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Unrecorded {
     Damage,
@@ -856,14 +929,18 @@ impl WalkDamage {
 pub struct Walked {
     /// Every object referenced, present or absent, absent parcels included.
     pub referenced: HashSet<String>,
-    /// The absent trees, files and chunks among them: the boundaries the walk stopped at. Absent
-    /// parcels are not among them.
+    /// The absent trees, files and chunks among them that no applied redaction names: the
+    /// boundaries the walk stopped at that a remote is leaned on for. Absent parcels are not among
+    /// them.
     pub absent: HashSet<String>,
+    /// The absent objects among them that an applied redaction names: boundaries too, which no
+    /// remote is leaned on for.
+    pub redacted: HashSet<String>,
 }
 
 impl Walked {
     /// Note `hash` as referenced and say what it was met as.
-    fn meet(&mut self, hash: &str, sealed: &SealedSet, unrecorded: Unrecorded) -> Result<Met, String> {
+    fn meet(&mut self, hash: &str, tolerated: &Tolerated, unrecorded: Unrecorded) -> Result<Met, String> {
         if !self.referenced.insert(hash.to_string()) {
             return Ok(Met::Again);
         }
@@ -872,8 +949,14 @@ impl Walked {
             return Ok(Met::Present);
         }
 
-        if unrecorded == Unrecorded::Damage && !sealed.contains(hash) {
-            return Ok(Met::Unrecorded);
+        match tolerated.held(hash) {
+            Some(Held::Redacted) => {
+                self.redacted.insert(hash.to_string());
+                return Ok(Met::Absent);
+            }
+            Some(Held::Sealed) => {}
+            None if unrecorded == Unrecorded::Damage => return Ok(Met::Unrecorded),
+            None => {}
         }
 
         self.absent.insert(hash.to_string());
@@ -881,10 +964,10 @@ impl Walked {
     }
 
     /// Note every chunk of the present recipe `hash` as referenced, and name the first one absent
-    /// and not recorded, where that is damage, if any.
-    fn meet_chunks(&mut self, hash: &str, sealed: &SealedSet, unrecorded: Unrecorded) -> Result<Option<String>, String> {
+    /// and not held, where that is damage, if any.
+    fn meet_chunks(&mut self, hash: &str, tolerated: &Tolerated, unrecorded: Unrecorded) -> Result<Option<String>, String> {
         for chunk in object_utils::recipe_chunk_hashes(hash)? {
-            if let Met::Unrecorded = self.meet(&chunk, sealed, unrecorded)? {
+            if let Met::Unrecorded = self.meet(&chunk, tolerated, unrecorded)? {
                 return Ok(Some(chunk));
             }
         }
@@ -899,15 +982,15 @@ impl Walked {
 ///
 /// # Arguments
 /// * `parcels`    - Parcels to root the walk at beyond the ones a sweep keeps.
-/// * `sealed`     - The record.
-/// * `unrecorded` - How to take an absent object the record does not hold.
+/// * `tolerated`  - The record and the applied redactions.
+/// * `unrecorded` - How to take an absent object neither holds.
 ///
 /// # Returns
-/// * `Ok(Ok(Walked))`       - Every object referenced, and the absent ones.
-/// * `Ok(Err(WalkDamage))`  - The walk met an absent object the record does not hold, where that is
+/// * `Ok(Ok(Walked))`       - Every object referenced, and the absent ones, redacted ones apart.
+/// * `Ok(Err(WalkDamage))`  - The walk met an absent object neither set holds, where that is
 ///                            damage.
 /// * `Err(String)`          - If a root source or a present object could not be read.
-pub fn walk(parcels: &[String], sealed: &SealedSet, unrecorded: Unrecorded) -> Result<Result<Walked, WalkDamage>, String> {
+pub fn walk(parcels: &[String], tolerated: &Tolerated, unrecorded: Unrecorded) -> Result<Result<Walked, WalkDamage>, String> {
     let bay_dirs = bay_utils::all_bay_state_dirs()?;
     let sources = recovery_utils::gc_root_sources(
         &bay_dirs, bay_utils::BayReadPolicy::FailClosed, office_utils::TrustPinReadPolicy::FailClosed,
@@ -917,7 +1000,7 @@ pub fn walk(parcels: &[String], sealed: &SealedSet, unrecorded: Unrecorded) -> R
     heads.extend(sources.heads());
 
     let (present_parcels, gaps) = audit_utils::collect_reachable_noting_gaps(&heads, is_present)?;
-    let mut walked = Walked { referenced: gaps.into_iter().collect(), absent: HashSet::new() };
+    let mut walked = Walked { referenced: gaps.into_iter().collect(), ..Walked::default() };
     let damage = |hash: &str, named_by: &str| Ok(Err(WalkDamage { hash: hash.to_string(), named_by: named_by.to_string() }));
 
     let mut trees: Vec<(String, String)> = Vec::new();
@@ -933,10 +1016,10 @@ pub fn walk(parcels: &[String], sealed: &SealedSet, unrecorded: Unrecorded) -> R
             continue;
         }
 
-        match walked.meet(hash, sealed, unrecorded)? {
+        match walked.meet(hash, tolerated, unrecorded)? {
             Met::Unrecorded => return damage(hash, "staged work"),
             Met::Present if item_type.is_chunked() => {
-                if let Some(chunk) = walked.meet_chunks(hash, sealed, unrecorded)? {
+                if let Some(chunk) = walked.meet_chunks(hash, tolerated, unrecorded)? {
                     return damage(&chunk, hash);
                 }
             }
@@ -946,7 +1029,7 @@ pub fn walk(parcels: &[String], sealed: &SealedSet, unrecorded: Unrecorded) -> R
 
     // A tree is noted and judged when it is popped, with the object that named it for the message.
     while let Some((hash, named_by)) = trees.pop() {
-        match walked.meet(&hash, sealed, unrecorded)? {
+        match walked.meet(&hash, tolerated, unrecorded)? {
             Met::Present => {}
             Met::Unrecorded => return damage(&hash, &named_by),
             Met::Again | Met::Absent => continue,
@@ -955,10 +1038,10 @@ pub fn walk(parcels: &[String], sealed: &SealedSet, unrecorded: Unrecorded) -> R
         let tree = object_utils::load_tree(&hash)?;
 
         for (_, file) in tree.get_files() {
-            match walked.meet(&file.hash, sealed, unrecorded)? {
+            match walked.meet(&file.hash, tolerated, unrecorded)? {
                 Met::Unrecorded => return damage(&file.hash, &hash),
                 Met::Present if file.item_type.is_chunked() => {
-                    if let Some(chunk) = walked.meet_chunks(&file.hash, sealed, unrecorded)? {
+                    if let Some(chunk) = walked.meet_chunks(&file.hash, tolerated, unrecorded)? {
                         return damage(&chunk, &file.hash);
                     }
                 }
@@ -1072,6 +1155,7 @@ pub fn unseal(_hold: &impl StoreAccessHold, hashes: &[String]) -> Result<Unseale
             still_absent.push(hash);
         }
     }
+    drop_applied(&mut still_absent)?;
 
     let lock = RefLock::acquire()?;
     let mut removed = Vec::new();
@@ -1168,6 +1252,8 @@ pub(crate) fn refill_all(_hold: &impl StoreAccessHold, objects: &[(&str, &[u8])]
             absent.push(leaf);
         }
     }
+
+    drop_applied(&mut absent)?;
 
     if !absent.is_empty() {
         let lock = RefLock::acquire()?;

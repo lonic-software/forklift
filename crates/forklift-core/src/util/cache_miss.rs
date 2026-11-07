@@ -1,7 +1,8 @@
 //! Reading content a cache warehouse lacks: an object the sealed-object record holds by hash is
 //! fetched from the origin when a read meets it absent, stored, and read again; and a mutation's
 //! presence phase ([`ensure_present`]) fetches every recorded object it is about to read in one
-//! batch, before it changes anything.
+//! batch, before it changes anything. An object a redaction this warehouse applied names is never
+//! fetched, recorded or not.
 //!
 //! The fetch is a hook the head registers ([`register`]); only the CLI does. Without one, or where
 //! fetching cannot be done safely, a read of a recorded object fails as it always has, naming why
@@ -230,10 +231,17 @@ fn refill_with(hook: Option<&FetchHook>, absent: &[String]) -> Result<bool, Stri
     }
 
     let named = describe(absent);
-    let record = sealed_utils::read_sealed()
-        .map_err(|why| format!("{} absent, and the sealed-object record could not be read: {}", named.is, why))?;
+    let tolerated = sealed_utils::read_tolerated().map_err(|why| format!(
+        "{} absent, and the sealed-object record or the record of applied redactions could not be read: {}",
+        named.is, why
+    ))?;
 
-    let wanted: Vec<String> = absent.iter().filter(|hash| record.contains(hash)).cloned().collect();
+    // An object a redaction this warehouse applied names is never fetched, even when the record
+    // holds it too: its bytes were taken away on purpose.
+    let wanted: Vec<String> = absent.iter()
+        .filter(|hash| tolerated.held(hash) == Some(sealed_utils::Held::Sealed))
+        .cloned()
+        .collect();
 
     if wanted.is_empty() {
         return Ok(false);

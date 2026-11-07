@@ -802,8 +802,8 @@ fn subtree(head: &str, path: &str) -> String {
 /// The audit as `forklift audit` runs it, against the warehouse's sealed record. Returns how many
 /// absent objects the record held.
 fn audit(head: &str, scope: &PathScope, full: bool) -> Result<usize, String> {
-    let record = sealed_utils::read_sealed()?;
-    let tolerance = SealedTolerance::new(&record);
+    let tolerated = sealed_utils::read_tolerated()?;
+    let tolerance = SealedTolerance::new(&tolerated);
     audit_utils::verify_parcel_closure_scoped(head, None, scope, full, Some(&tolerance))?;
     Ok(tolerance.held())
 }

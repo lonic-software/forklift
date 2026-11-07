@@ -3,7 +3,7 @@ use crate::error::{CoreError, RefusalCode};
 use crate::globals::{bay_root, forklift_root};
 use crate::util::{file_utils, object_utils};
 use crate::util::scope_utils::PathScope;
-use crate::util::sealed_utils::SealedSet;
+use crate::util::sealed_utils::Tolerated;
 
 /// The folder inside the forklift root that holds the *user* pallet ref files (branches).
 /// Each pallet is a file named after the pallet, containing the hash of its head parcel
@@ -1363,9 +1363,10 @@ fn update_pallet_head_checked(
             let current = crate::util::scope_utils::read_fetch_scope()?;
 
             // A record the verification leaned on is read again too: a refill or a repair may
-            // have dropped the entry that held an absence. An entry added since undoes nothing.
+            // have dropped the entry that held an absence. An entry added since undoes nothing,
+            // and the applied redactions only ever grow.
             let record_moved = match leaned_on {
-                Some(record) => !crate::util::sealed_utils::read_sealed()?.holds_all_of(record),
+                Some(tolerated) => !crate::util::sealed_utils::read_sealed()?.holds_all_of(&tolerated.sealed),
                 None => false,
             };
 
@@ -1483,19 +1484,21 @@ fn closure_to_verify(namespace: PalletNamespace, expected: Option<&str>, new: &s
 /// some user-pallet ref already reaches ([`audit_utils::verify_ref_head_closure`]), refusing with
 /// [`RefUpdateError::Incomplete`] otherwise. `expected`, the ref's current head, is one of those.
 ///
-/// In a partial warehouse (sparse, or a cache), an absent object the sealed-by-hash record holds
-/// is tolerated; a full warehouse tolerates nothing. The mode and the record are read only when
-/// the walk without them fails, so a warehouse holding the whole closure never depends on them.
+/// Any warehouse tolerates an absent object a redaction it applied names. A partial warehouse
+/// (sparse, or a cache) also tolerates one the sealed-by-hash record holds; a full warehouse
+/// tolerates nothing else. The mode and the records are read only when the walk without them
+/// fails, so a warehouse holding the whole closure never depends on them.
 ///
 /// # Returns
-/// * `Ok(None)`         - Everything is present.
-/// * `Ok(Some(record))` - Everything is present or held by `record`, which the walk leaned on.
+/// * `Ok(None)`            - Everything is present.
+/// * `Ok(Some(tolerated))` - Everything is present or held by `tolerated`, which the walk leaned
+///                           on.
 ///
 /// [`audit_utils::verify_ref_head_closure`]: crate::util::audit_utils::verify_ref_head_closure
 fn verify_new_head(name: &str,
                    expected: Option<&str>,
                    new: &str,
-                   scope: &PathScope) -> Result<Option<SealedSet>, RefUpdateError> {
+                   scope: &PathScope) -> Result<Option<Tolerated>, RefUpdateError> {
     let heads: Vec<String> = all_pallet_refs()?.into_iter()
         .filter(|(pallet, _)| pallet.namespace == PalletNamespace::User)
         .map(|(_, head)| head)
@@ -1512,30 +1515,33 @@ fn verify_new_head(name: &str,
         Err(missing) => missing,
     };
 
-    // Only a partial warehouse holds anything by hash alone: a full one must hold every object.
+    // Only a partial warehouse holds anything by hash alone: a full one must hold every object a
+    // redaction it applied does not name. Any warehouse may lack those, since its history names
+    // bytes the redaction took away.
     let partial = crate::util::scope_utils::content_may_be_absent().map_err(|error| RefUpdateError::Failed(format!(
         "Cannot tell whether the history of {} is complete: {}, and whether this warehouse may lack \
         content cannot be read. {}",
         &new[..new.len().min(12)], missing.trim_end_matches('.'), error
     )))?;
 
-    if !partial {
-        return Err(incomplete(missing));
-    }
-
-    let record = crate::util::sealed_utils::read_sealed().map_err(|error| RefUpdateError::Failed(format!(
+    let unreadable = |error: String| RefUpdateError::Failed(format!(
         "Cannot tell whether the history of {} is complete: {}, and the record of objects held by \
-        hash cannot be read. {}",
+        hash, or of the redactions applied here, cannot be read. {}",
         &new[..new.len().min(12)], missing.trim_end_matches('.'), error
-    )))?;
+    ));
 
-    if record.is_empty() {
+    let tolerated = match partial {
+        true => crate::util::sealed_utils::read_tolerated().map_err(unreadable)?,
+        false => Tolerated::applied_only(crate::util::applied_redactions::read_applied().map_err(unreadable)?),
+    };
+
+    if tolerated.is_empty() {
         return Err(incomplete(missing));
     }
 
-    verify(Some(&record)).map_err(incomplete)?;
+    verify(Some(&tolerated)).map_err(incomplete)?;
 
-    Ok(Some(record))
+    Ok(Some(tolerated))
 }
 
 /// The head a write of `new` over `expected` leaves no longer reached from its ref, when that
