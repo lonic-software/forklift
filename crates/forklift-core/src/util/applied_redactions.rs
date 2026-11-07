@@ -100,6 +100,31 @@ pub fn read_applied() -> Result<AppliedSet, String> {
     Ok(set)
 }
 
+/// The `content_redacted` refusal of a read that found `hash` held nowhere in the store, when it
+/// is absent because this warehouse applied its redaction: the bytes are gone for good, so the read
+/// is refused as redacted rather than reported as a missing object. `details` carries the hash.
+///
+/// # Returns
+/// * `Ok(Some(String))` - The refusal: a redaction applied here names `hash`.
+/// * `Ok(None)`         - None does; the absence is the caller's to report.
+/// * `Err(String)`      - The applied record cannot be read (see [`read_applied`]).
+pub(crate) fn absent_read_refusal(hash: &str) -> Result<Option<String>, String> {
+    if !read_applied()?.contains(hash) {
+        return Ok(None);
+    }
+
+    Ok(Some(crate::error::CoreError::refusal_with_details(
+        crate::error::RefusalCode::ContentRedacted,
+        format!(
+            "Cannot read object {}: it is redacted in this warehouse, and its content has been \
+            removed for good.",
+            hash
+        ),
+        "Run \"forklift redact list\" to see the redaction.",
+        serde_json::json!({ "hash": hash }),
+    ).into()))
+}
+
 /// Add `hashes` to the applied record, for a caller that holds the ref lock. The record is re-read
 /// under the lock and rewritten whole, atomically, holding what it held and `hashes`; nothing is
 /// written when it already holds them all.

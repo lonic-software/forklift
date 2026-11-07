@@ -2492,6 +2492,12 @@ fn read_object_uncached(hash: &str) -> Result<Vec<u8>, String> {
                 };
             }
 
+            // Absent because a redaction applied here removed it: refused as redacted, never as
+            // a missing object. The cache refill above never fetches such a hash.
+            if let Some(refusal) = super::applied_redactions::absent_read_refusal(hash)? {
+                return Err(refusal);
+            }
+
             // The same NotFound-shaped message the read path has always produced for this case —
             // reconstructed here (rather than carried on the `Absent` variant, which is bare by
             // design) since nothing about the message depends on which of the two `Absent`
