@@ -95,8 +95,9 @@ apply, preferring the event's own `url_decoded_key` field when present) and call
 `verify_and_promote` on a blocking thread. It builds an `S3ObjectStore` and a `DynamoRefStore`
 bound to the warehouse the key names: objects are keyed per warehouse, and the key is all an S3
 event carries. The ref store is read for one item only: before promoting, the verifier reads the
-staged object's redaction item, and drops the staged copy of content redacted from the warehouse
-instead of promoting it. It needs no `FORKLIFT_WAREHOUSE_ID`, so one verifier serves every warehouse in the
+staged object's redaction item, and deletes the staged copy of content redacted from the warehouse
+instead of promoting it; it reads the item again after promoting, and deletes what it promoted
+when the redaction applied meanwhile. It needs no `FORKLIFT_WAREHOUSE_ID`, so one verifier serves every warehouse in the
 bucket. A storage error propagates (so S3 retries
 the event); a semantic outcome (missing, corrupt) is logged and the event is consumed, since
 retrying a corrupt object would only rediscard it forever.
@@ -611,11 +612,11 @@ page.
 Where each action in `iam/control-plane.policy.json` comes from: `HeadObject`/`GetObject`/presigned
 `GET` → `s3:GetObject`; `PutObject` (conditional and unconditional)/presigned staging
 `PUT`/`CopyObject` destination → `s3:PutObject`; `CopyObject` source read → `s3:GetObject` on
-`staging/*`; `DeleteObject` (staged cleanup, session sweep, a dropped staged copy of redacted content) →
+`staging/*`; `DeleteObject` (staged cleanup, session sweep) →
 `s3:DeleteObject`; the redaction scan's progress objects (`GetObject`/`PutObject`/`DeleteObject` under
 `redaction-work/{warehouse}/`) → the `RedactionScanWork` statement on `redaction-work/*`; an applied
-redaction's deletion of a blob's canonical object and of every staged copy of it, which lists the
-keys' versions (`ListObjectVersions` → `s3:ListBucketVersions` on the bucket, the
+redaction's deletion of a blob's canonical object and of its staged copies (every session's in the
+sweep, the committing session's when a lift commit names it), which lists the keys' versions (`ListObjectVersions` → `s3:ListBucketVersions` on the bucket, the
 `ListRedactedVersions` statement) and deletes each by version id (`DeleteObject` naming a version →
 `s3:DeleteObjectVersion` on `objects/*` and `staging/*`, the `DeleteRedactedCopies` statement), so
 no earlier version survives on a bucket with versioning enabled or suspended; `ListObjectsV2`
@@ -637,7 +638,7 @@ its own CloudWatch log group.
 The verifier reads one DynamoDB item per staged object, its redaction item (`dynamodb:GetItem` on
 the table, the `ReadRedactionItems` statement), then calls `verify_and_promote`, then reads the item
 again. Content whose redaction has applied is never promoted, or has the canonical copy just written
-deleted, along with every staged copy of it, every version of each (`s3:ListBucketVersions` on the
+deleted, along with the staged copy, every version of each (`s3:ListBucketVersions` on the
 bucket and `s3:DeleteObjectVersion` on `objects/*` and `staging/*`, the `ListRedactedVersions` and
 `DeleteRedactedPromotions` statements).
 `iam/verifier.policy.json`'s other statements: `s3:GetObject`/`s3:DeleteObject` on `staging/*` (read

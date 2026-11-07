@@ -112,7 +112,7 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 - **The AWS head applies redactions.** A redaction that no pallet head, deleted pallet's tombstone
   or metadata history names applies on the AWS head when a request names its content, or after a
   lift or pallet deletion. The head then refuses that content as `content_redacted` on object
-  reads, uploads, upload negotiation and lift commits, leaves it out of `batch` answers, and drops
+  reads, uploads, upload negotiation and lift commits, leaves it out of `batch` answers, and deletes
   a staged copy of it rather than promote it, or deletes the copy a promotion under way when it
   applied wrote. Its handshake reports each redaction as pending or applied. The
   first time it judges a redaction it reads every pallet, which can take a few requests; until
