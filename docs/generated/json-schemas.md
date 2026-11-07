@@ -6262,6 +6262,36 @@ A command not listed here either reports only the generic human-message shape `{
       ],
       "type": "object"
     },
+    "StateName": {
+      "description": "A redaction's state.",
+      "oneOf": [
+        {
+          "const": "applied",
+          "description": "Applied.",
+          "type": "string"
+        },
+        {
+          "const": "held",
+          "description": "Pending: a pallet head or a meta pallet's history names it.",
+          "type": "string"
+        },
+        {
+          "const": "awaiting_remote",
+          "description": "Pending: nothing here names it, and the remote's report that it is applied there is waited\nfor.",
+          "type": "string"
+        },
+        {
+          "const": "undecided",
+          "description": "Pending: whether anything names it could not be told.",
+          "type": "string"
+        },
+        {
+          "const": "ready",
+          "description": "Pending: nothing here names it, and `redact apply` applies it. Only `redact list` reports\nit.",
+          "type": "string"
+        }
+      ]
+    },
     "StateView": {
       "description": "Where a redaction stands: applied, or pending, and why.",
       "properties": {
@@ -6287,8 +6317,8 @@ A command not listed here either reports only the generic human-message shape `{
           ]
         },
         "state": {
-          "description": "`applied`; or pending as `held` (a pallet head or a meta pallet's history names it),\n`awaiting_remote` (nothing here names it, and the remote's report that it is applied there\nis waited for), `undecided` (whether anything names it could not be told) or `ready`\n(nothing here names it, and `redact apply` applies it; only `redact list` reports it).",
-          "type": "string"
+          "$ref": "#/$defs/StateName",
+          "description": "The state."
         }
       },
       "required": [
@@ -6403,6 +6433,36 @@ A command not listed here either reports only the generic human-message shape `{
       ],
       "type": "object"
     },
+    "StateName": {
+      "description": "A redaction's state.",
+      "oneOf": [
+        {
+          "const": "applied",
+          "description": "Applied.",
+          "type": "string"
+        },
+        {
+          "const": "held",
+          "description": "Pending: a pallet head or a meta pallet's history names it.",
+          "type": "string"
+        },
+        {
+          "const": "awaiting_remote",
+          "description": "Pending: nothing here names it, and the remote's report that it is applied there is waited\nfor.",
+          "type": "string"
+        },
+        {
+          "const": "undecided",
+          "description": "Pending: whether anything names it could not be told.",
+          "type": "string"
+        },
+        {
+          "const": "ready",
+          "description": "Pending: nothing here names it, and `redact apply` applies it. Only `redact list` reports\nit.",
+          "type": "string"
+        }
+      ]
+    },
     "StateView": {
       "description": "Where a redaction stands: applied, or pending, and why.",
       "properties": {
@@ -6428,8 +6488,8 @@ A command not listed here either reports only the generic human-message shape `{
           ]
         },
         "state": {
-          "description": "`applied`; or pending as `held` (a pallet head or a meta pallet's history names it),\n`awaiting_remote` (nothing here names it, and the remote's report that it is applied there\nis waited for), `undecided` (whether anything names it could not be told) or `ready`\n(nothing here names it, and `redact apply` applies it; only `redact list` reports it).",
-          "type": "string"
+          "$ref": "#/$defs/StateName",
+          "description": "The state."
         }
       },
       "required": [
