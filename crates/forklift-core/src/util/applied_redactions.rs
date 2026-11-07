@@ -56,6 +56,14 @@ impl AppliedSet {
     }
 }
 
+/// Record `hashes` as applied, as `redact apply` would once nothing names them. For tests in other
+/// modules, which simulate the deletion that follows by removing the object themselves.
+#[cfg(test)]
+pub(crate) fn apply_for_test(hashes: &[&str]) -> AppliedSet {
+    let lock = RefLock::acquire().unwrap();
+    add_locked(&lock, &hashes.iter().map(|hash| hash.to_string()).collect::<Vec<_>>()).unwrap()
+}
+
 /// Read the applied record. No record reads as nothing applied.
 ///
 /// # Returns

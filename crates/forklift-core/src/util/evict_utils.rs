@@ -43,7 +43,7 @@
 use std::collections::HashSet;
 use crate::util::lock_utils::{ServeLock, StoreAccessExclusive, StoreLock};
 use crate::util::progress_utils::Progress;
-use crate::util::sealed_utils::{self, SealOp, SealedSet};
+use crate::util::sealed_utils::{self, SealOp, Tolerated};
 use crate::util::{
     bay_utils, cache_miss, cherry_pick_utils, file_utils, gc_utils, merge_utils, object_utils, office_utils,
     pack_utils, pallet_utils, park_utils, prune_utils, recovery_utils,
@@ -66,7 +66,8 @@ pub struct EvictPlan {
     /// loose copy holds, which the repack must re-encode before that copy is freed.
     pub repack: bool,
 
-    /// The objects of `to_evict` the record does not hold yet, recorded before anything is freed.
+    /// The objects of `to_evict` the record does not hold yet, recorded before anything is freed;
+    /// none a redaction applied here names.
     pub to_record: Vec<String>,
 
     /// Objects the origin holds that stay because a checkout's base tree needs them.
@@ -134,7 +135,8 @@ pub struct EvictStats {
 ///                     record or the store cannot be read. Nothing is changed.
 pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -> Result<EvictPlan, String> {
     let _unfetched = cache_miss::Unfetched::enter();
-    let sealed = sealed_utils::read_sealed()?;
+    let tolerated = sealed_utils::read_tolerated()?;
+    let sealed = &tolerated.sealed;
 
     let mut heads_not_lowered = 0;
     let mut distinct: HashSet<&String> = HashSet::new();
@@ -145,7 +147,7 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
     }
 
     let held_parcels = sorted(gc_utils::collect_reachable_for_sweep(held_heads)?);
-    let held = walk_held(&held_parcels, &sealed)?;
+    let held = walk_held(&held_parcels, &tolerated)?;
 
     let bay_dirs = bay_utils::all_bay_state_dirs()?;
     let sources = recovery_utils::gc_root_sources(
@@ -219,7 +221,11 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
         }
     }
 
-    plan.to_record = plan.to_evict.iter().filter(|hash| !sealed.contains(hash)).cloned().collect();
+    // A redaction applied here is never recorded as held by the remote: the append drops it, so
+    // the plan does not list it.
+    plan.to_record = plan.to_evict.iter()
+        .filter(|hash| !sealed.contains(hash) && !tolerated.applied.contains(hash))
+        .cloned().collect();
 
     // A packed delta can stand on a loose-only object: one a read fetched again after a
     // compaction, which a later compaction then used as a path base. A damaged pack refuses the
@@ -233,7 +239,7 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
             .map_err(|error| error.refusal("\"forklift store evict\"", "nothing was changed"))?
     };
     plan.repack = !plan.to_drop.is_empty() || delta_on_loose;
-    plan.to_unseal = sealed_utils::present_recorded(&sealed)?
+    plan.to_unseal = sealed_utils::present_recorded(sealed)?
         .into_iter()
         .filter(|hash| checkout_keep.contains(hash) || local_keep.contains(hash))
         .collect();
@@ -332,7 +338,7 @@ struct HeldClosure {
 /// nothing beneath it is a target. An absent object the record does not hold fails the walk: the
 /// record is meant to cover every absence in a cache, so this one is damage, and recording it now
 /// would claim the origin holds what may simply be lost.
-fn walk_held(parcels: &[String], sealed: &SealedSet) -> Result<HeldClosure, String> {
+fn walk_held(parcels: &[String], sealed: &Tolerated) -> Result<HeldClosure, String> {
     /// One step of the explicit post-order walk: a tree to expand (with the object that named it,
     /// for the error), or one whose children are all done.
     enum Step {
@@ -397,13 +403,14 @@ fn walk_held(parcels: &[String], sealed: &SealedSet) -> Result<HeldClosure, Stri
 }
 
 /// Whether `hash`, which `named_by` references in the origin's closure, is present: `false` when
-/// it is absent and recorded, an error when it is absent and not.
-fn held_present(hash: &str, named_by: &str, sealed: &SealedSet) -> Result<bool, String> {
+/// it is absent and held (recorded, or named by a redaction this warehouse applied, whose bytes
+/// were taken away on purpose), an error when it is absent and not.
+fn held_present(hash: &str, named_by: &str, sealed: &Tolerated) -> Result<bool, String> {
     if file_utils::is_present_for_sweep(hash)? {
         return Ok(true);
     }
 
-    if sealed.contains(hash) {
+    if sealed.held(hash).is_some() {
         return Ok(false);
     }
 
@@ -1225,5 +1232,72 @@ mod tests {
 
         assert_eq!((bounded.dropped, bounded.skipped), (vec![gone.clone()], None));
         assert_record(&[&staged, &kid, &parent, &stray], "kept");
+    }
+
+    /// Remove `hash`'s object, as the deletion that follows an applied redaction will.
+    fn delete_object(hash: &str) {
+        let (folder, file) = file_utils::get_path_for_object(hash).unwrap();
+        std::fs::remove_file(PathBuf::from(folder).join(file)).unwrap();
+    }
+
+    /// An absence an applied redaction names is a boundary the plan passes, not damage, and it is
+    /// never recorded as held by the remote: it is never among what the plan frees.
+    ///
+    /// Revert: drop the applied set from the plan's walk → the plan refuses the absence as damage.
+    #[test]
+    fn plan_passes_an_applied_absence_and_never_records_it() {
+        let _scratch = Scratch::new("applied-absence");
+        let h = history();
+        crate::util::applied_redactions::apply_for_test(&[&h.shared]);
+        delete_object(&h.shared);
+        let hold = store_access();
+
+        let plan = plan_evict(&[h.held.clone()], &hold).unwrap();
+        assert!(!plan.to_free.contains(&h.shared) && plan.to_free.contains(&h.dir), "{:?}", plan.to_free);
+        assert!(!plan.to_record.contains(&h.shared), "{:?}", plan.to_record);
+
+        carry(&plan, &hold).unwrap();
+        assert!(!sealed_utils::read_sealed().unwrap().contains(&h.shared));
+    }
+
+    /// A present object an applied redaction names, as before its bytes are deleted, is freed with
+    /// the rest but never listed to record nor recorded: the remote is not leaned on for it.
+    ///
+    /// Revert: build `to_record` from the sealed record alone → red on the plan's assertion.
+    #[test]
+    fn plan_frees_a_present_applied_object_without_recording_it() {
+        let _scratch = Scratch::new("applied-present");
+        let h = history();
+        crate::util::applied_redactions::apply_for_test(&[&h.shared]);
+        let hold = store_access();
+
+        let plan = plan_evict(&[h.held.clone()], &hold).unwrap();
+        assert!(plan.to_evict.contains(&h.shared), "{:?}", plan.to_evict);
+        assert!(!plan.to_record.contains(&h.shared) && plan.to_record.contains(&h.dir), "{:?}", plan.to_record);
+
+        carry(&plan, &hold).unwrap();
+        let record = sealed_utils::read_sealed().unwrap();
+        assert!(!record.contains(&h.shared) && record.contains(&h.dir));
+    }
+
+    /// The bound walks past an absence an applied redaction names, as it walks past a recorded one,
+    /// and still drops a record nothing names.
+    ///
+    /// Revert: take an applied absence the record does not hold as damage in the walk → the bound
+    /// is skipped and drops nothing.
+    #[test]
+    fn the_bound_walks_past_an_applied_absence() {
+        let _scratch = Scratch::new("bound-applied");
+        let h = history();
+        crate::util::applied_redactions::apply_for_test(&[&h.b]);
+        delete_object(&h.b);
+        let gone = "f".repeat(64);
+        sealed_utils::append(&[(SealOp::Record, gone.as_str())]).unwrap();
+        let hold = store_access();
+
+        let bounded = sealed_utils::bound(&hold, &[]).unwrap();
+
+        assert_eq!((bounded.dropped, bounded.skipped), (vec![gone], None));
+        assert!(!sealed_utils::read_sealed().unwrap().contains(&h.b));
     }
 }

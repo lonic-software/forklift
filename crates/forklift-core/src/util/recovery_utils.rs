@@ -246,7 +246,7 @@ use crate::util::{
     office_utils, pack_utils, pallet_utils, record_utils, remote_utils, scope_utils, sealed_utils, sign_utils, tag_utils,
     signature_table, taint_utils, tombstone_utils,
 };
-use crate::util::sealed_utils::SealedSet;
+use crate::util::sealed_utils::Tolerated;
 use crate::util::progress_utils::Progress;
 use crate::util::scope_utils::{PathScope, ScopeClass};
 
@@ -2043,9 +2043,11 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
 /// degraded source, and the walk then runs in full.
 ///
 /// Likewise an absent tree, recipe, chunk or leaf that the sealed-object record holds is held by
-/// hash alone (the remote holds it and its closure) and is neither recorded nor descended into. A
-/// parcel, a staged object and a corrupt boundary are never held. A sealed-object record that
-/// cannot be read is a degraded source, and the walk then holds nothing.
+/// hash alone (the remote holds it and its closure) and is neither recorded nor descended into, and
+/// so is one a redaction this warehouse applied names (its bytes were taken away on purpose, so it
+/// is not lost). A parcel, a staged object and a corrupt boundary are never held. A sealed-object
+/// record or a record of applied redactions that cannot be read is a degraded source, and the walk
+/// then holds nothing.
 ///
 /// `corrupt` is the §8.3 corrupt-boundary carve-out: a hash in this set that the walk reaches is
 /// treated exactly like a raw-absent one — recorded via the sink, not descended into — even
@@ -2076,14 +2078,14 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
         ));
         PathScope::full()
     });
-    // The same holds for the sealed-object record: without it, an object held by hash alone reads
-    // as lost.
-    let sealed = sealed_utils::read_sealed().unwrap_or_else(|error| {
+    // The same holds for the sealed-object record and the applied redactions: without them, an
+    // object held by hash alone, or redacted, reads as lost.
+    let sealed = sealed_utils::read_tolerated().unwrap_or_else(|error| {
         roots.degraded_sources.push(format!(
-            "objects held by hash alone could not be told apart from lost ones this run. {}.",
+            "objects held by hash alone or redacted could not be told apart from lost ones this run. {}.",
             error.trim_end_matches('.')
         ));
-        SealedSet::default()
+        Tolerated::default()
     });
     let empty_targets: BTreeSet<String> = BTreeSet::new();
     let mut absent: BTreeSet<String> = BTreeSet::new();
@@ -2202,7 +2204,7 @@ fn walk_closure_for(
     roots: &WalkRoots,
     corrupt: &BTreeSet<String>,
     scope: &PathScope,
-    sealed: Option<&SealedSet>,
+    sealed: Option<&Tolerated>,
     mut sink: Option<&mut dyn FnMut(&str)>,
 ) -> Result<WalkClosureOutcome, String> {
     let mut referenced: BTreeSet<String> = BTreeSet::new();
@@ -2400,7 +2402,7 @@ fn drain_parcel_queue(
     visited_parcels: &mut ParcelVisits,
     visited_trees: &mut TreeVisits,
     scope: &PathScope,
-    sealed: Option<&SealedSet>,
+    sealed: Option<&Tolerated>,
     mut sink: Option<&mut dyn FnMut(&str)>,
 ) -> Result<(), String> {
     while let Some((hash, policy, class)) = queue.pop_front() {
@@ -2494,7 +2496,7 @@ fn walk_tree(
     unwalked: &mut BTreeMap<String, String>,
     visited_trees: &mut TreeVisits,
     scope: &PathScope,
-    sealed: Option<&SealedSet>,
+    sealed: Option<&Tolerated>,
     mut sink: Option<&mut dyn FnMut(&str)>,
 ) -> Result<(), String> {
     // Each entry carries its warehouse path while it is on the spine of `scope`, and `None` once
@@ -2682,7 +2684,7 @@ fn check_leaf(
     item_type: DirEntryType,
     targets: &BTreeSet<String>,
     corrupt: &BTreeSet<String>,
-    sealed: Option<&SealedSet>,
+    sealed: Option<&Tolerated>,
     referenced: &mut BTreeSet<String>,
     unwalked: &mut BTreeMap<String, String>,
     mut sink: Option<&mut dyn FnMut(&str)>,
@@ -2736,12 +2738,12 @@ fn check_leaf(
     Ok(())
 }
 
-/// Whether an object is held by hash alone: recorded in `sealed`, and not a corrupt boundary. This
-/// checks no presence: call it only for an object the walk found absent, or for a terminal leaf
-/// or chunk, which has nothing beneath it, so a present one is never reported either way. A
-/// corrupt object is present but wrong, so it stays a loss.
-fn held_by_hash(sealed: Option<&SealedSet>, corrupt: &BTreeSet<String>, hash: &str) -> bool {
-    !corrupt.contains(hash) && sealed_utils::is_recorded(sealed, hash)
+/// Whether an object is held: recorded in `sealed`'s record or named by a redaction it applied, and
+/// not a corrupt boundary. This checks no presence: call it only for an object the walk found
+/// absent, or for a terminal leaf or chunk, which has nothing beneath it, so a present one is never
+/// reported either way. A corrupt object is present but wrong, so it stays a loss.
+fn held_by_hash(sealed: Option<&Tolerated>, corrupt: &BTreeSet<String>, hash: &str) -> bool {
+    !corrupt.contains(hash) && sealed.is_some_and(|sealed| sealed.held(hash).is_some())
 }
 
 /// Whether, and how cleanly, [`attempt_heal_driven_refetch`] actually consulted a configured
@@ -3959,6 +3961,41 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The enumerating walk holds an absent blob or recipe an applied redaction names, with no
+    /// sealed record at all, so a torn rescan's remainder leaves it out, while an absence no
+    /// redaction names is still reported.
+    ///
+    /// Revert: hold only what the sealed record names in `held_by_hash` → both redacted absences
+    /// are reported → red.
+    #[test]
+    fn the_enumerating_walk_holds_an_applied_redaction_absent() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::model::parcel::Parcel;
+        use crate::util::gc_utils::tests::store_tree;
+
+        let (dir, _scope) = enter_temp_root("applied-enumerate");
+        let (redacted_blob, redacted_recipe, lost_blob) = ("1".repeat(64), "2".repeat(64), "3".repeat(64));
+        let root = store_tree(&[
+            ("leak.env", &redacted_blob, DirEntryType::Normal),
+            ("leak.bin", &redacted_recipe, DirEntryType::NormalChunked),
+            ("lost.txt", &lost_blob, DirEntryType::Normal),
+        ]);
+        let mut parcel = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: root, parents: Vec::new(), actions: Vec::new(), description: None,
+        });
+        parcel.store().unwrap();
+        pallet_utils::tests::update_pallet_head_unverified("main", None, &parcel.hash, &pallet_utils::RefPreconditions::NONE)
+            .unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", None)).unwrap();
+        crate::util::applied_redactions::apply_for_test(&[&redacted_blob, &redacted_recipe]);
+
+        let walk = enumerate_absent_reachable(&BTreeSet::new()).unwrap();
+        assert!(walk.degraded_sources.is_empty(), "{:?}", walk.degraded_sources);
+        assert_eq!(walk.hashes, [lost_blob].into_iter().collect::<BTreeSet<String>>());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// FORK-133: a staged object is the bay's own work, so its absence is a loss even when its
     /// hash is recorded. Mutation: pass the record to the staged leaves' `check_leaf` → red.
     #[test]
@@ -3966,7 +4003,7 @@ mod tests {
         let (dir, _scope) = enter_temp_root("sealed-staged");
         let staged = "c".repeat(64);
         seal(&[&staged]);
-        let record = sealed_utils::read_sealed().unwrap();
+        let record = sealed_utils::read_tolerated().unwrap();
 
         let roots = WalkRoots {
             parcels: Vec::new(),
@@ -4007,7 +4044,7 @@ mod tests {
         std::fs::write(sealed_utils::sealed_path(), b"not a sealed record").unwrap();
 
         let walk = enumerate_absent_reachable(&BTreeSet::new()).unwrap();
-        assert!(walk.degraded_sources.iter().any(|note| note.contains("objects held by hash alone could not be told apart")),
+        assert!(walk.degraded_sources.iter().any(|note| note.contains("objects held by hash alone or redacted could not be told apart")),
             "{:?}", walk.degraded_sources);
         assert_eq!(walk.hashes, [held].into_iter().collect::<BTreeSet<String>>());
 

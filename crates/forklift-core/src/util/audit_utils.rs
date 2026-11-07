@@ -11,7 +11,7 @@ use crate::model::tree_item::TreeItem;
 use crate::util::office_utils::{KeyRecord, OfficeState, TrustAnchor};
 use crate::util::scope_utils::{PathScope, ScopeClass};
 use crate::util::{cache_miss, fanout_utils, file_utils, graph_utils, object_utils, office_utils, pallet_utils, sign_utils};
-use crate::util::sealed_utils::SealedSet;
+use crate::util::sealed_utils::{Held, Tolerated};
 use crate::util::pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions};
 
 /// Why an office chain did not verify. The heads answer the two classes differently: an
@@ -1997,41 +1997,51 @@ struct ClosureSeams<'a> {
     chunks_missing: &'a dyn Fn(&[String]) -> Result<Vec<String>, String>,
     load_recipe_chunks: &'a dyn Fn(&str) -> Result<Vec<String>, String>,
     load_base_tree: &'a dyn Fn(&str) -> Result<TreeItem, String>,
-    /// The sealed-by-hash record, for the audit and the client's ref gate; `None` on the push
-    /// gate, which tolerates no recorded absence.
+    /// The sealed-by-hash record and the applied redactions, for the audit and the client's ref
+    /// gate; `None` on the push gate, which tolerates no absence.
     sealed: Option<&'a SealedTolerance<'a>>,
 }
 
-/// The sealed-by-hash record a walk holds absences against, and the absent objects it held. The
-/// audit and the client's ref gate pass one; a remote's push gate never does, since a remote must
-/// hold the whole closure of every head it accepts.
+/// The sealed-by-hash record and the applied redactions a walk holds absences against, and the
+/// absent objects it held by each, kept apart. The audit and the client's ref gate pass one; a
+/// remote's push gate never does, since a remote must hold the whole closure of every head it
+/// accepts.
 pub struct SealedTolerance<'a> {
-    record: &'a SealedSet,
+    tolerated: &'a Tolerated,
     held: RefCell<HashSet<String>>,
+    redacted: RefCell<HashSet<String>>,
 }
 
 impl<'a> SealedTolerance<'a> {
-    pub fn new(record: &'a SealedSet) -> SealedTolerance<'a> {
-        SealedTolerance { record, held: RefCell::new(HashSet::new()) }
+    pub fn new(tolerated: &'a Tolerated) -> SealedTolerance<'a> {
+        SealedTolerance { tolerated, held: RefCell::new(HashSet::new()), redacted: RefCell::new(HashSet::new()) }
     }
 
-    /// How many distinct absent objects the walk held by hash alone.
+    /// How many distinct absent objects the walk held by hash alone, on the record.
     pub fn held(&self) -> usize {
         self.held.borrow().len()
     }
 
-    fn is_empty(&self) -> bool {
-        self.record.is_empty()
+    /// How many distinct absent objects the walk held because a redaction this warehouse applied
+    /// names them.
+    pub fn redacted(&self) -> usize {
+        self.redacted.borrow().len()
     }
 
-    /// Whether the absent object `hash` is held by the record, tallying it if so. Call only at an
-    /// absence: a recorded object that is present seals nothing.
+    fn is_empty(&self) -> bool {
+        self.tolerated.is_empty()
+    }
+
+    /// Whether the absent object `hash` is held, by the record or by an applied redaction, tallying
+    /// it under the one that holds it if so. Call only at an absence: a held object that is present
+    /// is held by nothing.
     fn holds_absent(&self, hash: &str) -> bool {
-        let held = self.record.contains(hash);
-        if held {
-            self.held.borrow_mut().insert(hash.to_string());
-        }
-        held
+        match self.tolerated.held(hash) {
+            Some(Held::Sealed) => self.held.borrow_mut().insert(hash.to_string()),
+            Some(Held::Redacted) => self.redacted.borrow_mut().insert(hash.to_string()),
+            None => return false,
+        };
+        true
     }
 }
 
@@ -2373,15 +2383,17 @@ pub fn verify_parcel_closure_scoped(
 /// parents are. A parcel no ref reaches is walked down to its root.
 ///
 /// An absent object `sealed` records is held by hash, as content outside the scope is: a cache
-/// fetch records the root trees it skips before the ref that names them moves. A recorded object
-/// that is present seals nothing, so a missing object beneath it still fails.
+/// fetch records the root trees it skips before the ref that names them moves. So is an absent
+/// object a redaction this warehouse applied names. A held object that is present holds nothing,
+/// so a missing object beneath it still fails.
 ///
 /// # Arguments
 /// * `head`           - The parcel the ref is about to hold.
 /// * `known_complete` - The ref heads whose history is known complete.
 /// * `base`           - The ref's current head, when it has one.
 /// * `scope`          - The warehouse fetch scope.
-/// * `sealed`         - The sealed-by-hash record, or `None` to tolerate no recorded absence.
+/// * `sealed`         - The sealed-by-hash record and the applied redactions, or `None` to tolerate
+///                      no absence.
 ///
 /// # Returns
 /// * `Ok(())`      - Everything within the scope is present or held by the record.
@@ -2390,7 +2402,7 @@ pub fn verify_ref_head_closure(head: &str,
                                known_complete: &[String],
                                base: Option<&str>,
                                scope: &PathScope,
-                               sealed: Option<&SealedSet>) -> Result<(), String> {
+                               sealed: Option<&Tolerated>) -> Result<(), String> {
     let bounds: Vec<&str> = known_complete.iter().map(String::as_str).collect();
     let tolerance = sealed.map(SealedTolerance::new);
     let seams = ClosureSeams {
@@ -2798,13 +2810,13 @@ fn verify_chunked_file(
     Ok(())
 }
 
-/// Whether a tree the walk is about to load is recorded as sealed by hash and absent: held by hash
-/// alone, so neither it nor anything beneath it is checked. A recorded tree that is present seals
-/// nothing and is walked. Probes presence only for a recorded hash.
+/// Whether a tree the walk is about to load is absent and held, by the sealed record or by an
+/// applied redaction, so neither it nor anything beneath it is checked. A held tree that is present
+/// is held by nothing and is walked. Probes presence only for a held hash.
 fn sealed_absent(sealed: Option<&SealedTolerance>,
                  tree_hash: &str,
                  object_exists: &dyn Fn(&str) -> Result<bool, String>) -> Result<bool, String> {
-    let Some(sealed) = sealed.filter(|sealed| sealed.record.contains(tree_hash)) else {
+    let Some(sealed) = sealed.filter(|sealed| sealed.tolerated.held(tree_hash).is_some()) else {
         return Ok(false);
     };
     Ok(!object_exists(tree_hash)? && sealed.holds_absent(tree_hash))

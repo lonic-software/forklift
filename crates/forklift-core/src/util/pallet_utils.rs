@@ -3,7 +3,7 @@ use crate::error::{CoreError, RefusalCode};
 use crate::globals::{bay_root, forklift_root};
 use crate::util::{file_utils, object_utils};
 use crate::util::scope_utils::PathScope;
-use crate::util::sealed_utils::SealedSet;
+use crate::util::sealed_utils::Tolerated;
 
 /// The folder inside the forklift root that holds the *user* pallet ref files (branches).
 /// Each pallet is a file named after the pallet, containing the hash of its head parcel
@@ -1363,10 +1363,13 @@ fn update_pallet_head_checked(
             let current = crate::util::scope_utils::read_fetch_scope()?;
 
             // A record the verification leaned on is read again too: a refill or a repair may
-            // have dropped the entry that held an absence. An entry added since undoes nothing.
+            // have dropped the entry that held an absence. An entry added since undoes nothing,
+            // and the applied redactions only ever grow. A full warehouse leaned on no record entry,
+            // so it reads no record.
             let record_moved = match leaned_on {
-                Some(record) => !crate::util::sealed_utils::read_sealed()?.holds_all_of(record),
-                None => false,
+                Some(tolerated) if !tolerated.sealed.is_empty() =>
+                    !crate::util::sealed_utils::read_sealed()?.holds_all_of(&tolerated.sealed),
+                _ => false,
             };
 
             if &current != scope || record_moved {
@@ -1483,19 +1486,21 @@ fn closure_to_verify(namespace: PalletNamespace, expected: Option<&str>, new: &s
 /// some user-pallet ref already reaches ([`audit_utils::verify_ref_head_closure`]), refusing with
 /// [`RefUpdateError::Incomplete`] otherwise. `expected`, the ref's current head, is one of those.
 ///
-/// In a partial warehouse (sparse, or a cache), an absent object the sealed-by-hash record holds
-/// is tolerated; a full warehouse tolerates nothing. The mode and the record are read only when
-/// the walk without them fails, so a warehouse holding the whole closure never depends on them.
+/// Any warehouse tolerates an absent object a redaction it applied names. A partial warehouse
+/// (sparse, or a cache) also tolerates one the sealed-by-hash record holds; a full warehouse
+/// tolerates nothing else. The mode and the records are read only when the walk without them
+/// fails, so a warehouse holding the whole closure never depends on them.
 ///
 /// # Returns
-/// * `Ok(None)`         - Everything is present.
-/// * `Ok(Some(record))` - Everything is present or held by `record`, which the walk leaned on.
+/// * `Ok(None)`            - Everything is present.
+/// * `Ok(Some(tolerated))` - Everything is present or held by `tolerated`, which the walk leaned
+///                           on.
 ///
 /// [`audit_utils::verify_ref_head_closure`]: crate::util::audit_utils::verify_ref_head_closure
 fn verify_new_head(name: &str,
                    expected: Option<&str>,
                    new: &str,
-                   scope: &PathScope) -> Result<Option<SealedSet>, RefUpdateError> {
+                   scope: &PathScope) -> Result<Option<Tolerated>, RefUpdateError> {
     let heads: Vec<String> = all_pallet_refs()?.into_iter()
         .filter(|(pallet, _)| pallet.namespace == PalletNamespace::User)
         .map(|(_, head)| head)
@@ -1512,30 +1517,33 @@ fn verify_new_head(name: &str,
         Err(missing) => missing,
     };
 
-    // Only a partial warehouse holds anything by hash alone: a full one must hold every object.
+    // Only a partial warehouse holds anything by hash alone: a full one must hold every object a
+    // redaction it applied does not name. Any warehouse may lack those, since its history names
+    // bytes the redaction took away.
     let partial = crate::util::scope_utils::content_may_be_absent().map_err(|error| RefUpdateError::Failed(format!(
         "Cannot tell whether the history of {} is complete: {}, and whether this warehouse may lack \
         content cannot be read. {}",
         &new[..new.len().min(12)], missing.trim_end_matches('.'), error
     )))?;
 
-    if !partial {
-        return Err(incomplete(missing));
-    }
-
-    let record = crate::util::sealed_utils::read_sealed().map_err(|error| RefUpdateError::Failed(format!(
+    let unreadable = |error: String| RefUpdateError::Failed(format!(
         "Cannot tell whether the history of {} is complete: {}, and the record of objects held by \
-        hash cannot be read. {}",
+        hash, or of the redactions applied here, cannot be read. {}",
         &new[..new.len().min(12)], missing.trim_end_matches('.'), error
-    )))?;
+    ));
 
-    if record.is_empty() {
+    let tolerated = match partial {
+        true => crate::util::sealed_utils::read_tolerated().map_err(unreadable)?,
+        false => Tolerated::applied_only(crate::util::applied_redactions::read_applied().map_err(unreadable)?),
+    };
+
+    if tolerated.is_empty() {
         return Err(incomplete(missing));
     }
 
-    verify(Some(&record)).map_err(incomplete)?;
+    verify(Some(&tolerated)).map_err(incomplete)?;
 
-    Ok(Some(record))
+    Ok(Some(tolerated))
 }
 
 /// The head a write of `new` over `expected` leaves no longer reached from its ref, when that
@@ -2390,6 +2398,26 @@ pub(crate) mod tests {
             // The same absence in a cache moves the ref.
             crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Cache);
             write("main", Some(&base), &head).unwrap();
+        }
+
+        // Revert: read no applied set in a full warehouse → the write is refused over the blob
+        // the applied redaction removed; tolerate any absence once something is applied → the
+        // second write lands over a blob nothing redacted.
+        #[test]
+        fn a_full_warehouse_tolerates_the_absence_of_an_applied_redaction_alone() {
+            let (_root, _scope) = scratch("closure-applied-full");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let head = parcel(&two_dirs("a1", "b-redacted"), &[&base]);
+            crate::util::applied_redactions::apply_for_test(&[&blob("b-redacted")]);
+            remove(&blob("b-redacted"));
+
+            write("main", Some(&base), &head).unwrap();
+            assert_eq!(get_pallet_head("main").unwrap().as_deref(), Some(head.as_str()));
+
+            let next = parcel(&two_dirs("a2", "b-lost"), &[&head]);
+            remove(&blob("b-lost"));
+            assert_incomplete(write("main", Some(&head), &next), "main", Some(&head));
         }
 
         // Revert: tolerate any absence once a record exists → the write lands over a root no

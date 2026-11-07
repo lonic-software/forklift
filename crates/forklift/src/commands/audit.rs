@@ -87,15 +87,17 @@ pub fn handle_command(pallet: Option<String>, full: bool) -> Result<(), String> 
         let is_cache = scope_utils::is_cache_mode()?;
 
         if is_sparse || full || is_cache {
-            let record = sealed_utils::read_sealed()?;
-            let sealed = SealedTolerance::new(&record);
+            // An object absent because a redaction this warehouse applied names it is held too,
+            // and tallied apart from what the record holds.
+            let tolerated = sealed_utils::read_tolerated()?;
+            let sealed = SealedTolerance::new(&tolerated);
             audit_utils::verify_parcel_closure_scoped(&head, None, &fetch_scope, full, Some(&sealed))?;
             report.scope = Some(AuditScope::new(
                 is_sparse.then(|| fetch_scope.prefixes().to_vec()),
                 is_cache,
                 full,
                 sealed.held(),
-                sealed_utils::present_recorded(&record)?.len(),
+                sealed_utils::present_recorded(&tolerated.sealed)?.len(),
             ));
         }
     }
@@ -163,7 +165,8 @@ pub(crate) struct AuditScope {
     signatures: &'static str,
 
     /// In-scope content: every tree was re-hashed on read and every blob confirmed present, except
-    /// the absent objects counted in `held_by_hash`.
+    /// the absent objects counted in `held_by_hash` and the absent content a redaction applied here
+    /// names.
     in_scope_content: &'static str,
 
     /// How many absent objects the warehouse's sealed record holds by hash alone: each is pinned to

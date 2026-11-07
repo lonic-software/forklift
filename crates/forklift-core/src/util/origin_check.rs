@@ -7,6 +7,9 @@
 //! sealed-object record), a sparse warehouse left it out of scope; either way the walk from the
 //! roots a sweep keeps meets it ([`sealed_utils::walk`]), and an absence the record should hold
 //! and does not is checked like any other, since the move needs only that the new server holds it.
+//! An object absent because a redaction this warehouse applied names it is not leaned on: only
+//! history names it, and this warehouse holds it absent whichever server it leans on. So the new
+//! server is never asked for one, not even read from it while looking for the rest.
 //!
 //! What the new server holds is the closure of the heads it serves: its pallets and its tombstones.
 //! The check fetches the parcels and signatures of that history it lacks
@@ -29,6 +32,7 @@ use crate::util::progress_utils::Progress;
 use crate::util::remote_utils::{self, RemoteClient};
 use crate::util::sealed_utils::{self, StoreAccessHold, Unrecorded};
 use crate::util::{audit_utils, object_utils};
+use crate::util::applied_redactions::AppliedSet;
 
 /// The most missing objects a refusal's message names.
 const NAMED_MISSING: usize = 10;
@@ -80,8 +84,8 @@ pub async fn check_new_origin(client: &RemoteClient,
 
     progress.status("Checking the new server's content");
 
-    let sealed = sealed_utils::read_sealed()?;
-    let walked = sealed_utils::walk(&[], &sealed, Unrecorded::Boundary)?
+    let tolerated = sealed_utils::read_tolerated()?;
+    let walked = sealed_utils::walk(&[], &tolerated, Unrecorded::Boundary)?
         .map_err(|damage| damage.describe("which a walk that passes absences never reports"))?;
     let mut missing: HashSet<String> = walked.absent;
     checked.absent_objects = missing.len();
@@ -98,7 +102,9 @@ pub async fn check_new_origin(client: &RemoteClient,
         )));
     }
 
-    let mut walk = ServerWalk { seen: HashSet::new(), local: Vec::new(), trees: Vec::new(), recipes: Vec::new() };
+    let mut walk = ServerWalk {
+        applied: &tolerated.applied, seen: HashSet::new(), local: Vec::new(), trees: Vec::new(), recipes: Vec::new(),
+    };
     for parcel in &parcels {
         walk.local.push(object_utils::load_parcel(parcel)?.tree_hash);
     }
@@ -134,7 +140,10 @@ pub async fn check_new_origin(client: &RemoteClient,
 }
 
 /// The new server's trees and recipes still to walk.
-struct ServerWalk {
+struct ServerWalk<'a> {
+    /// The redactions this warehouse applied: an absent object one names is never read from the
+    /// server.
+    applied: &'a AppliedSet,
     seen: HashSet<String>,
     /// Trees to judge here: walked where present, else queued to read from the server.
     local: Vec<String>,
@@ -144,7 +153,7 @@ struct ServerWalk {
     recipes: Vec<String>,
 }
 
-impl ServerWalk {
+impl ServerWalk<'_> {
     /// Meet the tree `hash` of the new server's history: one present here is descended, and an
     /// absent one is found and queued to read, since something present may name an absent object
     /// beneath it too.
@@ -157,6 +166,7 @@ impl ServerWalk {
         if sealed_utils::is_present(hash)? {
             self.descend(&object_utils::load_tree(hash)?, missing)
         } else {
+            // No redaction names a tree: only file content is redacted.
             self.trees.push(hash.to_string());
             Ok(())
         }
@@ -174,7 +184,7 @@ impl ServerWalk {
                 for chunk in object_utils::recipe_chunk_hashes(&file.hash)? {
                     missing.remove(&chunk);
                 }
-            } else {
+            } else if !self.applied.contains(&file.hash) {
                 self.recipes.push(file.hash.clone());
             }
         }
@@ -216,4 +226,39 @@ fn incomplete_refusal(url: &str, missing: &HashSet<String>) -> CoreError {
             "missing_count": named.len(),
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::enums::dir_entry_type::DirEntryType;
+    use crate::globals::{self, StorageRootScope};
+
+    /// An absent recipe a redaction this warehouse applied names is never queued to read from the
+    /// new server; an absent recipe none names is, and a present one is not.
+    ///
+    /// Revert: queue every absent recipe → the applied one is queued → red.
+    #[test]
+    fn an_absent_applied_recipe_is_never_read_from_the_new_server() {
+        let root = std::env::temp_dir().join(format!("forklift-origin-check-applied-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+
+        let (redacted, absent) = ("1".repeat(64), "2".repeat(64));
+        let applied = crate::util::applied_redactions::apply_for_test(&[&redacted]);
+        let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+        tree.add_child(TreeItem::new("leak.bin".to_string(), redacted.clone(), DirEntryType::NormalChunked));
+        tree.add_child(TreeItem::new("big.bin".to_string(), absent.clone(), DirEntryType::NormalChunked));
+
+        let mut walk = ServerWalk {
+            applied: &applied, seen: HashSet::new(), local: Vec::new(), trees: Vec::new(), recipes: Vec::new(),
+        };
+        let mut missing: HashSet<String> = HashSet::new();
+        walk.descend(&tree, &mut missing).unwrap();
+
+        assert_eq!(walk.recipes, vec![absent]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
