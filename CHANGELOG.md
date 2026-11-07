@@ -113,7 +113,11 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   from the remote, and `remote move` never asks the new server for it. A read that needs such
   content (`restore`, `pick`, `diff`, `blame`) is refused with `content_redacted` (exit 49), not
   as a missing object, whenever the record of applied redactions can be read. An audit that finds it absent counts it as `redacted` and passes, and a
-  `heal` that rescans after an interrupted write notes how many there are.
+  `heal` that rescans after an interrupted write notes how many there are. An applied
+  redaction's content, and a chunked file's chunks no other file shares, are now garbage unless a
+  pallet head, a metadata history or a checkout's base, parked work, merge or pick in progress, or
+  staged work still names them: a `store compact --all` drops their packed copies and a collection
+  their loose ones, and an incremental `store compact` leaves them loose rather than packing them.
 - **The `--json` schema is now 25: `load`, `park`, merges and `pick` refuse redacted content.** Part
   of content redaction: a file whose content is redacted is refused with `content_redacted` (exit 49)
   before anything reaches the bay, when `load` would stage it, `park` would park it, `lower` would
