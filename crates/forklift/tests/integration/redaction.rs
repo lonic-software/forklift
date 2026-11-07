@@ -1481,3 +1481,84 @@ fn a_non_admin_is_refused_before_the_target_is_looked_at() {
     assert!(stderr.contains("\"stranger@forklift\" is not enrolled"), "{:?}", refused);
     assert!(!stderr.contains("already redacted"), "{:?}", refused);
 }
+
+/// Send a raw HTTP request with `body` and return `(status line, response body)`.
+fn http(url: &str, method: &str, path: &str, body: &[u8]) -> (String, String) {
+    use std::io::{Read, Write};
+
+    let address = url.strip_prefix("http://").unwrap();
+    let mut stream = std::net::TcpStream::connect(address).unwrap();
+    write!(
+        stream,
+        "{} {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+        Connection: close\r\n\r\n",
+        method, path, address, body.len()
+    ).unwrap();
+    stream.write_all(body).unwrap();
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    let response = String::from_utf8_lossy(&response).into_owned();
+    let status = response.lines().next().unwrap_or_default().to_string();
+    let body = response.split("\r\n\r\n").nth(1).unwrap_or_default().to_string();
+
+    (status, body)
+}
+
+/// Once a lift leaves no head on forklift-server naming a recorded redaction, the server applies
+/// it: the handshake reports it applied, every surface that reads or takes content refuses it as
+/// redacted, and a warehouse whose unlifted history still names it lifts that history without it.
+///
+/// Revert: skip applying after a ref write → the handshake reports the redaction pending.
+#[test]
+fn a_server_applies_a_redaction_no_head_names_and_refuses_its_content() {
+    let root = std::env::temp_dir().join(format!("forklift-redaction-served-server-{}", std::process::id()));
+    let server = Server::start(&root);
+
+    let owner = Warehouse::cloned("served-owner", &server.url);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+
+    // Its history names the leak; it has lifted none of it.
+    let behind = Warehouse::cloned("served-behind", &server.url);
+    behind.leaked("secret.env", b"TOKEN=hunter2\n");
+
+    let hash = owner.redact_loaded("secret.env", b"TOKEN=hunter2\n", "leaked token");
+    owner.run_ok(&["lift"]);
+
+    let (status, info) = http(&server.url, "GET", "/v1/warehouse", b"");
+    assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, info);
+    let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+    assert_eq!(info["redactions"], serde_json::json!([{ "hash": hash, "state": "deletion_owed" }]), "{}", info);
+
+    let object = format!("/v1/objects/{}", hash);
+    let refusals = [
+        ("get", http(&server.url, "GET", &object, b"")),
+        ("put", http(&server.url, "PUT", &object, &object_utils::blob_bytes(b"TOKEN=hunter2\n"))),
+        ("upload-targets", http(&server.url, "POST", "/v1/objects/upload-targets",
+                                format!("{{\"session\":\"s\",\"hashes\":[\"{}\"]}}", hash).as_bytes())),
+    ];
+    for (surface, (status, body)) in refusals {
+        assert!(status.starts_with("HTTP/1.1 410"), "{}: {} / {}", surface, status, body);
+        assert!(body.contains("content_redacted"), "{}: {}", surface, body);
+    }
+
+    // The redaction comes down, and the history that names it goes up without the content.
+    behind.run_ok(&["lower"]);
+    behind.run_ok(&["lift"]);
+    let served = std::fs::read_to_string(root.join(".forklift/pallets/main")).unwrap();
+    assert_eq!(served.trim(), behind.head("main"));
+
+    // Until the server serves the redaction's absence, a fresh clone that must fetch the content
+    // is refused as redacted: loud, never a quiet gap.
+    let empty = Warehouse::empty("served-clone");
+    let cloned = forklift_command()
+        .args(["clone", &server.url, empty.root.to_str().unwrap()])
+        .env("FORKLIFT_GLOBAL_CONFIG", empty.home.join("global-config.toml"))
+        .env("FORKLIFT_KEYS_DIR", empty.home.join("keys"))
+        .output()
+        .unwrap();
+    assert!(!cloned.status.success());
+    assert!(String::from_utf8_lossy(&cloned.stderr).contains(&format!("Object {} is redacted", hash)),
+            "{}", String::from_utf8_lossy(&cloned.stderr));
+}
