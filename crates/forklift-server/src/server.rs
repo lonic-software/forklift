@@ -68,6 +68,11 @@ struct WarehouseHandle {
     /// so it publishes nothing.
     rebuild_again: std::sync::atomic::AtomicBool,
 
+    /// Whether a redaction run's round must rebuild the bundle after its deletion: a ref write
+    /// applied a redaction, withdrawing it. Read only by the round, never by a running rebuild, so
+    /// the build waits for the drain rather than run beside it.
+    rebuild_after_drain: std::sync::atomic::AtomicBool,
+
     /// The serve lock for this root, held for as long as the handle is served. `None` for
     /// handles that are not a live served warehouse (test fixtures). Held in the handle so the
     /// lock releases exactly when the served warehouse stops being served: when the server stops,
@@ -132,6 +137,7 @@ impl WarehouseHandle {
             lifts_since_bundle: std::sync::atomic::AtomicU32::new(0),
             bundling: std::sync::atomic::AtomicBool::new(false),
             rebuild_again: std::sync::atomic::AtomicBool::new(false),
+            rebuild_after_drain: std::sync::atomic::AtomicBool::new(false),
             _serve_lock: None,
             store_access: std::sync::Mutex::new(None),
             _format_lease: None,
@@ -3396,7 +3402,7 @@ async fn after_ref_write(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>)
     match apply_redactions(Arc::clone(&warehouse)).await {
         Ok(true) => {
             cut_bundle_downloads(&warehouse);
-            warehouse.rebuild_again.store(true, std::sync::atomic::Ordering::SeqCst);
+            warehouse.rebuild_after_drain.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         Ok(false) => maybe_rebuild_bundle(state, Arc::clone(&warehouse)),
         Err((_, error)) => {
@@ -3548,7 +3554,8 @@ async fn redaction_round(state: &AppState, warehouse: &Arc<WarehouseHandle>) -> 
     let owed = delete_applied_content(state, warehouse).await;
 
     // A rebuild the drain held back runs now, as does the one an apply calls for.
-    if applied || warehouse.rebuild_again.load(Ordering::SeqCst) {
+    let after_drain = warehouse.rebuild_after_drain.swap(false, Ordering::SeqCst);
+    if applied || after_drain || warehouse.rebuild_again.load(Ordering::SeqCst) {
         rebuild_bundle(state, Arc::clone(warehouse), true);
     }
 
@@ -6345,6 +6352,33 @@ mod tests {
         settle(&state, "w1").await;
         drop(state);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An apply that fails is owed to the redaction run, from a ref write's and from a round's
+    /// own: the run retries it rather than leave the content served until another write.
+    ///
+    /// Revert: drop the write's `apply_owed` store → nothing is owed after it → red. Drop the
+    /// round's → the failed round owes nothing → red.
+    #[tokio::test]
+    async fn a_failed_apply_is_owed_to_the_redaction_run() {
+        let root = scratch_dir("apply-owed");
+        mark_warehouse(&root);
+        // A record this build cannot read fails every apply.
+        std::fs::write(root.join(FOLDER_NAME_FORKLIFT_ROOT).join("redactions-applied"),
+                       b"/forklift-redactions-applied 2\n").unwrap();
+        let state = Arc::new(base_state(ServeMode::Single(Arc::new(WarehouseHandle::new(root.clone())))));
+        let handle = resolve_handle(&state, &PathParams::new()).unwrap();
+        // A run is under way, so the write starts none.
+        handle.redacting.store(true, Ordering::SeqCst);
+
+        after_ref_write(&state, Arc::clone(&handle)).await;
+        assert!(handle.apply_owed.load(Ordering::SeqCst), "the write's failed apply is owed");
+
+        assert!(redaction_round(&state, &handle).await, "the round that fails it again owes it");
+        assert!(handle.apply_owed.load(Ordering::SeqCst), "and it stays owed for the next round");
+
+        drop((handle, state));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Asking for a redaction round wakes only a run waiting out a retry: it leaves no permit that
