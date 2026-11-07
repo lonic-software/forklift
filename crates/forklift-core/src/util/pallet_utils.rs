@@ -771,6 +771,10 @@ pub enum RefUpdateError {
 
         /// The redacted hash.
         hash: String,
+
+        /// Whether this warehouse has applied that redaction, so the head came from a remote whose
+        /// history still names the content, which this warehouse can never take again.
+        applied: bool,
     },
 
     /// Anything else: an invalid name or value, or the ref could not be read or written.
@@ -783,12 +787,18 @@ impl RefUpdateError {
     /// reaches the command boundary, with `next_step` when the caller knows how its user takes the
     /// content out. `None` for every other variant.
     pub(crate) fn redacted_refusal(&self, message: String, next_step: Option<String>) -> Option<crate::error::CoreError> {
-        let RefUpdateError::Redacted { pallet, head, path, hash } = self else { return None };
+        let RefUpdateError::Redacted { pallet, head, path, hash, applied } = self else { return None };
+
+        // No caller's way of taking the content out helps once the redaction is applied here.
+        let next_step = match applied {
+            true => crate::util::redaction_utils::fresh_clone_next_step(),
+            false => next_step.unwrap_or_else(|| format!("leave \"{}\" out of what this command writes", path)),
+        };
 
         Some(crate::error::CoreError::refusal_with_details(
             crate::error::RefusalCode::ContentRedacted,
             message,
-            next_step.unwrap_or_else(|| format!("leave \"{}\" out of what this command writes", path)),
+            next_step,
             serde_json::json!({ "pallet": pallet.to_wire(), "head": head, "path": path, "hash": hash }),
         ))
     }
@@ -886,11 +896,13 @@ impl std::fmt::Display for WithOutcome<'_> {
                 outcome,
                 if pallet.namespace == PalletNamespace::Meta { "make a new change" } else { "stack a parcel" }
             ),
-            RefUpdateError::Redacted { pallet, head, path, hash } => write!(
+            RefUpdateError::Redacted { pallet, head, path, hash, applied } => write!(
                 f,
                 "Refusing to set pallet \"{}\" to {}: it names \"{}\", whose content ({}) is \
-                redacted in this warehouse and may never be named by a new head. {}",
-                pallet.to_wire(), &head[..head.len().min(12)], path, hash, outcome
+                redacted in this warehouse and may never be named by a new head{}. {}",
+                pallet.to_wire(), &head[..head.len().min(12)], path, hash,
+                if *applied { ", not even one the remote serves, since the redaction is applied here" } else { "" },
+                outcome
             ),
             RefUpdateError::Failed(message) => f.write_str(message),
         }
@@ -2729,6 +2741,7 @@ pub(crate) mod tests {
                 head: "a".repeat(64),
                 path: "secret.env".to_string(),
                 hash: "b".repeat(64),
+                applied: false,
             };
 
             let reported = crate::error::CoreError::from(refused.reported_with("Only the remote was written."));

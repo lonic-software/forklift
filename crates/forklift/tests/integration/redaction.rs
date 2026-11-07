@@ -988,3 +988,92 @@ fn an_applied_record_this_build_cannot_read_is_refused_loudly() {
 
     assert_eq!(std::fs::read(&record).unwrap(), b"/forklift-redactions-applied 2\n");
 }
+
+/// Unset the remote of `warehouse`, record the redaction of `content` loaded as `file`, which
+/// nothing there names, so it applies at once, then set the remote back to `url`.
+fn applied_without_remote(warehouse: &Warehouse, url: &str, file: &str, content: &[u8]) -> String {
+    warehouse.run_ok(&["config", "unset", "remote.url"]);
+    let hash = warehouse.redact_loaded(file, content, "applied before the remote");
+    assert_eq!(warehouse.redactions()[0]["status"], serde_json::json!({ "state": "applied" }));
+    warehouse.run_ok(&["config", "set", "remote.url", url]);
+
+    hash
+}
+
+/// A warehouse that applied a redaction while it had no remote never takes a head naming that
+/// content again, not even one the remote it has since gained serves: a named lower and a lower's
+/// fast-forward are refused, naming a fresh clone as the way out, and a fresh clone takes the head.
+///
+/// Revert: let the adoption exemption cover an applied hash → both lowers adopt the head.
+#[test]
+fn a_head_naming_a_hash_applied_here_is_never_adopted_from_the_remote() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-applied-adopt-server-{}", std::process::id())));
+
+    let owner = Warehouse::cloned("applied-adopt-owner", &server.url);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+    owner.run_ok(&["pallet", "create", "side"]);
+    owner.stack("side.txt", b"side\n", "side");
+    owner.run_ok(&["lift"]);
+
+    // Cloned before the leak, so neither names it.
+    let behind = Warehouse::cloned_with("applied-adopt-behind", &server.url, &["--pallet", "side"]);
+    let named = Warehouse::cloned("applied-adopt-named", &server.url);
+    owner.stack("secret.env", b"TOKEN=hunter2\n", "leak");
+    owner.run_ok(&["lift"]);
+
+    let fresh_clone = "this warehouse has applied that redaction, so it can never take history naming the \
+        content again; make a fresh clone of the remote with \"forklift clone\", which takes the remote's \
+        history with the redaction pending, and work there";
+
+    let hash = applied_without_remote(&named, &server.url, "secret.env", b"TOKEN=hunter2\n");
+    let error = content_redacted(&named, &["lower", "side"]);
+    assert_eq!(error["details"]["hash"], hash, "{}", error);
+    assert_eq!(error["next_step"], fresh_clone, "{}", error);
+    assert!(error["message"].as_str().unwrap().contains("not even one the remote serves"), "{}", error);
+    assert!(!named.root.join(".forklift/pallets/side").exists());
+
+    let before = behind.head("side");
+    applied_without_remote(&behind, &server.url, "secret.env", b"TOKEN=hunter2\n");
+    let error = content_redacted(&behind, &["lower"]);
+    assert_eq!(error["details"], serde_json::json!({ "path": "secret.env", "hash": hash }), "{}", error);
+    assert_eq!(error["next_step"], fresh_clone, "{}", error);
+    assert_eq!(behind.head("side"), before);
+    assert!(!behind.root.join("secret.env").exists(), "the content never reached the bay");
+
+    // The way out, as it says.
+    let fresh = Warehouse::cloned_with("applied-adopt-fresh", &server.url, &["--pallet", "side"]);
+    assert!(fresh.root.join("secret.env").exists());
+}
+
+/// The meta chain a remote serves is no exemption for a hash this warehouse applied: a lower that
+/// would take a meta history naming it is refused, naming a fresh clone. Lower reports a meta
+/// pallet's failure inside its own error, which carries no code.
+///
+/// Revert: judge the served chain by nothing → the lower takes @tags, whose history names the
+/// applied marker blob.
+#[test]
+fn a_meta_history_naming_a_hash_applied_here_is_never_taken_from_the_remote() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-applied-meta-server-{}", std::process::id())));
+
+    let other = Warehouse::cloned("applied-meta-other", &server.url);
+    other.stack("notes.txt", b"notes\n", "notes");
+    other.run_ok(&["lift"]);
+
+    // Cloned before the remote has any @tags, so no meta history here names the marker.
+    let warehouse = Warehouse::cloned("applied-meta", &server.url);
+    other.run_ok(&["tag", "create", "v1", "main"]);
+    other.run_ok(&["lift"]);
+
+    let marker = b"forklift-meta 1 tags";
+    let hash = applied_without_remote(&warehouse, &server.url, "marker.txt", marker);
+
+    let lowered = warehouse.json(&["lower"]);
+    let message = lowered["error"]["message"].as_str().unwrap();
+    assert!(message.contains(&format!("@tags: Refusing to set pallet \"@tags\"")), "{}", lowered);
+    assert!(message.contains(&format!("({}) is redacted in this warehouse", hash)), "{}", lowered);
+    assert!(message.contains("make a fresh clone of the remote"), "{}", lowered);
+    assert!(!warehouse.root.join(".forklift/meta/tags").exists(), "@tags was not taken");
+}
