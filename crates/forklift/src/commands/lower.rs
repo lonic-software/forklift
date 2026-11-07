@@ -286,7 +286,10 @@ async fn lower_working_pallet(client: &RemoteClient,
     refuse_carried_overlaps(&carried, &ops, &removed_dirs)?;
     alias_utils::refuse_collisions("Lowering", &shift_utils::collect_collisions(&ops, &removed_dirs)?)?;
     shift_utils::ensure_writes_present(&ops)?;
-    redaction_utils::refuse_redacted_writes(&ops, &format!("lower pallet \"{}\"", pallet), |path| format!(
+    // The head is the remote's as it served it, so a redaction the remote holds pending does not
+    // refuse it, in a root never served.
+    let served = redaction_utils::Served::adopting(remote_head, info);
+    redaction_utils::refuse_redacted_writes(&ops, Some(served), &format!("lower pallet \"{}\"", pallet), |path| format!(
         "change or delete \"{}\" on the remote so it no longer holds that content, then lower again",
         path
     ))?;
@@ -309,7 +312,7 @@ async fn lower_working_pallet(client: &RemoteClient,
 
     // A compare-and-set against the head this lower started from; the working tree goes back to
     // where it was if the pallet did not move (another bay moved it first, or the write failed).
-    let written = shift_utils::write_head_or_roll_back(&pallet, local_head.as_deref(), remote_head, &preconditions, &remote_tree, local_tree.as_deref(), anchor, &carried);
+    let written = shift_utils::write_head_or_roll_back(&pallet, local_head.as_deref(), remote_head, Some(served), &preconditions, &remote_tree, local_tree.as_deref(), anchor, &carried);
     // A write that reported an error can still have landed; the ref read back decides.
     if written.is_ok() || pallet_utils::get_pallet_head(&pallet).ok().flatten().as_deref() == Some(remote_head.as_str()) {
         record_served_head(&pallet, remote_head);
@@ -460,7 +463,7 @@ async fn repair_pallet(client: &RemoteClient,
     report.repair = Some(RepairReport { parcel: repair.parcel.clone(), removed: repair.removed.clone() });
 
     if named {
-        return write_named_head(&pallet, ref_head.as_deref(), &repair.parcel, &remote_head, &preconditions, report, LowerOutcome::Repaired);
+        return write_named_head(&pallet, ref_head.as_deref(), &repair.parcel, redaction_utils::Served::adopting(&remote_head, info), &preconditions, report, LowerOutcome::Repaired);
     }
 
     let local_tree = match &position.base {
@@ -477,7 +480,7 @@ async fn repair_pallet(client: &RemoteClient,
     refuse_carried_overlaps(&carried, &ops, &removed_dirs)?;
     alias_utils::refuse_collisions("Lowering", &shift_utils::collect_collisions(&ops, &removed_dirs)?)?;
     shift_utils::ensure_writes_present(&ops)?;
-    redaction_utils::refuse_redacted_writes(&ops, &format!("lower pallet \"{}\"", pallet), |path| format!(
+    redaction_utils::refuse_redacted_writes(&ops, None, &format!("lower pallet \"{}\"", pallet), |path| format!(
         "change or delete \"{}\" on the remote so it no longer holds that content, then lower again",
         path
     ))?;
@@ -498,7 +501,7 @@ async fn repair_pallet(client: &RemoteClient,
 
     shift_utils::materialize_tree(local_tree.as_deref(), &repair.tree, "Lowering", anchor, progress, &carried)?;
 
-    let written = shift_utils::write_head_or_roll_back(&pallet, ref_head.as_deref(), &repair.parcel, &preconditions, &repair.tree, local_tree.as_deref(), anchor, &carried);
+    let written = shift_utils::write_head_or_roll_back(&pallet, ref_head.as_deref(), &repair.parcel, None, &preconditions, &repair.tree, local_tree.as_deref(), anchor, &carried);
     // The held-heads record keeps H, the head the remote served, which the repair descends from.
     if written.is_ok() || pallet_utils::get_pallet_head(&pallet).ok().flatten().as_deref() == Some(repair.parcel.as_str()) {
         record_served_head(&pallet, &remote_head);
@@ -646,7 +649,7 @@ fn remote_lacks_pallet(info: &forklift_core::model::remote::WarehouseInfo, palle
 /// The ref is written only once the fetch completed: every fetch stops at local ref heads,
 /// taking each for a closure already present, so a ref moved before its objects arrived would hide
 /// them from every later fetch. The write is a compare-and-set against the head read before the
-/// fetch, through [`pallet_utils::update_pallet_head`] alone: the bay-moving write lower's
+/// fetch, through [`pallet_utils::adopt_pallet_head`] alone: the bay-moving write lower's
 /// current-pallet path uses would re-point this bay at the pallet.
 async fn lower_named_pallet(client: &RemoteClient,
                             info: &forklift_core::model::remote::WarehouseInfo,
@@ -707,23 +710,25 @@ async fn lower_named_pallet(client: &RemoteClient,
         refuse_a_bay_on_unborn(&pallet)?;
     }
 
-    write_named_head(&pallet, local_head.as_deref(), remote_head, remote_head, &preconditions, report, moved)
+    write_named_head(&pallet, local_head.as_deref(), remote_head, redaction_utils::Served::adopting(remote_head, info), &preconditions, report, moved)
 }
 
-/// Move the ref of `pallet`, which no bay here is lowering, from `expected` to `new` (the remote's
-/// head `served`, or a repair of it), recording `moved` as the outcome and `served` as a held head
-/// once the ref holds `new`. A write that reported an error can still have landed, so the ref read
-/// back decides.
+/// Move the ref of `pallet`, which no bay here is lowering, from `expected` to `new` (the head
+/// `served` carries, or a repair of it), recording `moved` as the outcome and the served head as a
+/// held head once the ref holds `new`. The write adopts what the remote served, so writing its
+/// head as it is is exempt from the redactions it holds pending, in a root never served; a repair
+/// is checked in full. A write that reported an error can still have landed, so the ref read back
+/// decides.
 fn write_named_head(pallet: &str,
                     expected: Option<&str>,
                     new: &str,
-                    served: &str,
+                    served: redaction_utils::Served,
                     preconditions: &pallet_utils::RefPreconditions,
                     report: &mut LowerReport,
                     moved: LowerOutcome) -> Result<(), String> {
-    let error = match pallet_utils::update_pallet_head(pallet, expected, new, preconditions) {
+    let error = match pallet_utils::adopt_pallet_head(pallet, expected, new, served, preconditions) {
         Ok(()) => {
-            record_served_head(pallet, served);
+            record_served_head(pallet, served.head);
             report.outcome = Some(moved);
             return Ok(());
         }
@@ -733,7 +738,7 @@ fn write_named_head(pallet: &str,
     match error {
         // Another writer already put the pallet where this lower would have.
         pallet_utils::RefUpdateError::Moved(found) if found.found.as_deref() == Some(new) => {
-            record_served_head(pallet, served);
+            record_served_head(pallet, served.head);
             report.outcome = Some(LowerOutcome::UpToDate);
             Ok(())
         }
@@ -745,7 +750,7 @@ fn write_named_head(pallet: &str,
         // composed around, never inside, a new message.
         pallet_utils::RefUpdateError::Failed(error) => match pallet_utils::get_pallet_head(pallet) {
             Ok(head) if head.as_deref() == Some(new) => {
-                record_served_head(pallet, served);
+                record_served_head(pallet, served.head);
                 Err(forklift_core::error::prefix_message(
                     &format!("Pallet \"{}\" now holds parcel {}, but its write reported an error", pallet, new), error,
                 ))
@@ -1785,7 +1790,7 @@ mod carry_tests {
         let (anchor, carried) = lower_files(&behind);
         assert_eq!(changes(&behind.remote_tree), before, "the lower itself carries them");
         move_main_elsewhere(&behind);
-        shift_utils::write_head_or_roll_back("main", Some(&behind.start), &behind.remote, &RefPreconditions::NONE,
+        shift_utils::write_head_or_roll_back("main", Some(&behind.start), &behind.remote, None, &RefPreconditions::NONE,
                                              &behind.remote_tree, Some(&behind.start_tree), anchor, &carried)
             .expect_err("a pallet another bay moved must roll the lower back");
 

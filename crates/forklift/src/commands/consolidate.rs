@@ -478,7 +478,7 @@ fn fast_forward(current: &str,
     )?;
     shift_utils::ensure_writes_present(&ops)?;
     // A head stacked before a redaction came down by `lower` can still name the content.
-    redaction_utils::refuse_redacted_writes(&ops, &format!("consolidate \"{}\" into \"{}\"", target, current), |path| format!(
+    redaction_utils::refuse_redacted_writes(&ops, None, &format!("consolidate \"{}\" into \"{}\"", target, current), |path| format!(
         "shift to \"{}\", take \"{}\" out of it and stack, then shift back to \"{}\" and consolidate again",
         target, path, current
     ))?;
@@ -504,7 +504,7 @@ fn fast_forward(current: &str,
 
     // A compare-and-set against the head this consolidation started from; the bay's work above
     // is undone if the pallet did not move (another bay moved it first, or the write failed).
-    shift_utils::write_head_or_roll_back(current, Some(our_head), their_head, &pallet_utils::RefPreconditions::NONE, their_tree_hash, Some(our_tree_hash), anchor, &[])?;
+    shift_utils::write_head_or_roll_back(current, Some(our_head), their_head, None, &pallet_utils::RefPreconditions::NONE, their_tree_hash, Some(our_tree_hash), anchor, &[])?;
 
     Ok(their_head.to_string())
 }

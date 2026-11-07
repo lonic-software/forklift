@@ -534,6 +534,13 @@ impl RedactedSet {
         Ok(set)
     }
 
+    /// This set less every hash and chunk list `other` holds.
+    fn without(mut self, other: &RedactedSet) -> RedactedSet {
+        self.hashes.retain(|hash| !other.hashes.contains(hash));
+        self.chunk_lists.retain(|chunks| !other.chunk_lists.contains(chunks));
+        self
+    }
+
     /// The redacted hash a file entry names: its own hash, or for a chunked file whose recipe the
     /// store holds, the hash of the redaction its chunk list matches. `partial` tolerates a recipe
     /// the store lacks, which then carries no chunks this warehouse could hand on, and records it
@@ -624,6 +631,9 @@ fn tree_names(tree: &str, set: &RedactedSet, mut partial: Option<&mut HashSet<St
 pub struct StagingGuard {
     set: RedactedSet,
     partial: bool,
+
+    /// The `@redactions` head `set` was read at.
+    head: String,
 }
 
 /// The guard for the redactions at the current `@redactions` head, or `None` while there are
@@ -641,7 +651,7 @@ pub fn staging_guard() -> Result<Option<StagingGuard>, String> {
 
     let partial = crate::util::scope_utils::content_may_be_absent()?;
 
-    Ok(Some(StagingGuard { set, partial }))
+    Ok(Some(StagingGuard { set, partial, head }))
 }
 
 impl StagingGuard {
@@ -664,13 +674,21 @@ impl StagingGuard {
 /// Refuse checking out a tree whose `ops`, what it writes into the bay, would bring back content a
 /// redaction removed, before the bay is touched: the head write it leads to would be refused too,
 /// but only once the content had reached the bay. Judged after the presence phase, which makes
-/// every recipe they write readable. `doing` names the operation; `next_step` is given the path.
+/// every recipe they write readable. `adopting` is what the remote served when the checkout takes
+/// its head as it is, which the head write then adopts: the redactions it holds pending are not
+/// judged here either, while this root has never been served (see [`check_head_write`]). `doing`
+/// names the operation; `next_step` is given the path.
 pub fn refuse_redacted_writes(ops: &[crate::util::shift_utils::FileOp],
+                              adopting: Option<Served>,
                               doing: &str,
                               next_step: impl Fn(&str) -> String) -> Result<(), String> {
-    let Some(guard) = staging_guard()? else {
+    let Some(mut guard) = staging_guard()? else {
         return Ok(());
     };
+
+    if let Some(served) = adopting {
+        guard.set = exempt_adoption(std::mem::take(&mut guard.set), Some(served), served.head, &guard.head)?.0;
+    }
 
     for op in ops {
         let crate::util::shift_utils::FileOp::Write { path, hash, item_type, .. } = op else {
@@ -717,6 +735,10 @@ pub struct RedactionCheck {
 
     /// What a partial warehouse's walk skipped as absent.
     skipped: HashSet<String>,
+
+    /// Whether the check exempted what the remote holds pending, as an adoption into a root never
+    /// served (see [`check_head_write`]).
+    adopted: bool,
 }
 
 impl RedactionCheck {
@@ -731,14 +753,21 @@ impl RedactionCheck {
             && self.new == new
     }
 
-    /// Whether the check still holds: `@redactions` is at the head it was checked against, and
-    /// nothing the walk skipped as absent is stored now. Read under the held ref lock, which every
+    /// Whether the check still holds: `@redactions` is at the head it was checked against,
+    /// nothing the walk skipped as absent is stored now, and an adoption's root is still not
+    /// served. Read under the held ref lock, which every
     /// `@redactions` write takes too, so a redaction either lands before the write's hold or after
     /// the write. Storing an object takes no ref lock, so a skipped object stored after this read
     /// can still land beside the written head, as one fetched after the write can; the receiving
     /// side of a lift, not this check, is what judges bytes handed on.
     pub(crate) fn holds(&self, _lock: &crate::util::lock_utils::RefLock) -> Result<bool, String> {
         if pallet_utils::get_meta_pallet_head(REDACTIONS_PALLET_NAME)? != self.redactions {
+            return Ok(false);
+        }
+
+        // The served mark is written under the ref lock too, so a root first served meanwhile
+        // sends the write round again, and it is checked in full.
+        if self.adopted && crate::util::tombstone_utils::is_served()? {
             return Ok(false);
         }
 
@@ -785,6 +814,34 @@ impl HeadWriteCheck {
     }
 }
 
+/// What the remote served in the same command for the pallet a client writes: the head it
+/// served, and the `@redactions` head it served beside it. Never for a write a remote sends this
+/// warehouse.
+#[derive(Clone, Copy, Debug)]
+pub struct Served<'a> {
+    /// The head the remote served for this pallet.
+    pub head: &'a str,
+
+    /// The `@redactions` head the remote served in the same handshake, `None` when it served
+    /// none. What it holds is what the remote reports pending; read for a user pallet only.
+    pub redactions: Option<&'a str>,
+}
+
+impl<'a> Served<'a> {
+    /// A meta pallet's served `head`: its chain is what the write takes.
+    pub fn chain(head: &'a str) -> Served<'a> {
+        Served { head, redactions: None }
+    }
+
+    /// A user pallet's served `head`, beside the `@redactions` head `info`, the remote's
+    /// handshake, serves.
+    pub fn adopting(head: &'a str, info: &'a crate::model::remote::WarehouseInfo) -> Served<'a> {
+        let redactions = info.pallets.get(&pallet_utils::PalletRef::meta(REDACTIONS_PALLET_NAME).to_wire());
+
+        Served { head, redactions: redactions.map(String::as_str) }
+    }
+}
+
 /// Check a ref write of `new` over `expected` against the redactions at the current `@redactions`
 /// head, and return the proof the compare-and-set takes. Run before the ref lock, since it walks;
 /// a redaction landing between this and the hold sends the write round again (see
@@ -792,19 +849,27 @@ impl HeadWriteCheck {
 ///
 /// - A user pallet's new head is refused when its tree names a redacted file anywhere. The whole
 ///   tree is walked, never only what differs from `expected`: a stale branch revived onto a ref
-///   must not bring the content back.
+///   must not bring the content back. The one exemption is an adoption, under `served` below.
 /// - A meta pallet's write is judged by the history it adds. Each meta parcel is the pallet's
 ///   whole state, so a parcel that carries a cell its parent already names passes, and only one
 ///   that adds a redacted object to the tree is refused; refusing the carry would freeze a pallet
 ///   whose history named the object before it was redacted.
-/// - `served`, a meta head the remote served in this same command, exempts the history it reaches:
+/// - `served`, for a meta pallet, exempts the history its head reaches:
 ///   the remote judged each of those parcels against its own redactions when it took it, which
 ///   need not hold this warehouse's, but whatever they name is held there by meta history that is
 ///   never rewritten, so refusing would only freeze the pallet behind it. A client adopting the remote's
 ///   chain (a lower's fast-forward, the trust install's office, a replay onto the remote's head) is
 ///   then not refused for history it merely takes. A parcel past `served` is judged as usual. It
-///   is `None` for every write a remote sends this warehouse, and it exempts nothing for a user
-///   pallet.
+///   is `None` for every write a remote sends this warehouse.
+/// - `served`, for a user pallet, exempts one write: adopting exactly the head the remote served
+///   (a lower or clone taking it), into a root that has never been served. It exempts only the
+///   redactions the remote reports pending, those at the `@redactions` head it served, and only
+///   once this warehouse's own `@redactions` reaches that head, so it was verified and taken here;
+///   one recorded only here still refuses. The remote's heads naming that content can only shrink, so
+///   adopting one adds none that anyone is served, and the owner can still fetch the pallet they
+///   must fix. In a root a forklift server has served the write is checked like any other, and
+///   the hold re-reads the served mark. A repair, a merge or any other new parcel is checked as
+///   usual.
 /// - A write that leaves the ref where it is, or one made while no redaction exists, walks
 ///   nothing.
 ///
@@ -818,7 +883,7 @@ pub fn check_head_write(namespace: pallet_utils::PalletNamespace,
                         name: &str,
                         expected: Option<&str>,
                         new: &str,
-                        served: Option<&str>) -> HeadWriteCheck {
+                        served: Option<Served>) -> HeadWriteCheck {
     let redactions = pallet_utils::get_meta_pallet_head(REDACTIONS_PALLET_NAME);
     let outcome = match &redactions {
         Ok(redactions) => check_head_write_at(namespace, name, expected, new, served, redactions.clone()),
@@ -833,7 +898,7 @@ fn check_head_write_at(namespace: pallet_utils::PalletNamespace,
                        name: &str,
                        expected: Option<&str>,
                        new: &str,
-                       served: Option<&str>,
+                       served: Option<Served>,
                        redactions: Option<String>) -> Result<RedactionCheck, pallet_utils::RefUpdateError> {
     let mut check = RedactionCheck {
         namespace,
@@ -842,14 +907,20 @@ fn check_head_write_at(namespace: pallet_utils::PalletNamespace,
         new: new.to_string(),
         redactions: redactions.clone(),
         skipped: HashSet::new(),
+        adopted: false,
     };
 
     let Some(redactions) = redactions.filter(|_| expected != Some(new)) else {
         return Ok(check);
     };
 
-    let set = RedactedSet::at(&redactions)?;
+    let mut set = RedactedSet::at(&redactions)?;
 
+    if namespace == pallet_utils::PalletNamespace::User {
+        (set, check.adopted) = exempt_adoption(set, served, new, &redactions)?;
+    }
+
+    // An adoption's check is still held to the served mark, though nothing may be left to walk.
     if set.hashes.is_empty() {
         return Ok(check);
     }
@@ -860,7 +931,7 @@ fn check_head_write_at(namespace: pallet_utils::PalletNamespace,
             let tree = object_utils::load_parcel(new)?.tree_hash;
             tree_names(&tree, &set, partial.then_some(&mut check.skipped))?
         }
-        pallet_utils::PalletNamespace::Meta => meta_parcels_add(expected, served, new, &set)?,
+        pallet_utils::PalletNamespace::Meta => meta_parcels_add(expected, served.map(|served| served.head), new, &set)?,
     };
 
     match named {
@@ -872,6 +943,31 @@ fn check_head_write_at(namespace: pallet_utils::PalletNamespace,
             hash,
         }),
     }
+}
+
+/// `set`, the redactions at this warehouse's `@redactions` head `local`, less those a user
+/// pallet's write of `new` is exempt from, and whether it is an adoption. It is one when `new` is
+/// the head the remote served beside `served`, and this root has never been served; it is then
+/// exempt from the redactions at the `@redactions` head the remote served, which the remote
+/// reports pending. Only once `local` reaches that head: this warehouse verified and took it, so a
+/// set the remote merely sent, or one it never served, exempts nothing.
+fn exempt_adoption(set: RedactedSet,
+                   served: Option<Served>,
+                   new: &str,
+                   local: &str) -> Result<(RedactedSet, bool), String> {
+    let Some(Served { head, redactions: Some(pending) }) = served else {
+        return Ok((set, false));
+    };
+
+    if head != new || crate::util::tombstone_utils::is_served()? {
+        return Ok((set, false));
+    }
+
+    if pending != local && !crate::util::merge_utils::is_ancestor(pending, local)? {
+        return Ok((set, false));
+    }
+
+    Ok((set.without(&RedactedSet::at(pending)?), true))
 }
 
 /// The first redacted object a parcel of the meta chain at `new` adds over its parents, among the

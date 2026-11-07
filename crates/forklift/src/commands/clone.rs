@@ -695,8 +695,11 @@ async fn franchise_into_prepared_target(
     operation_utils::raise(&Operation::new(OperationKind::Franchise, position.clone(), None, position))?;
 
     // A clone fills a fresh warehouse (a resume discarded every ref), so the pallet is unborn
-    // here. The write stands only on the trust the history was verified against.
-    pallet_utils::update_pallet_head(&pallet_name, None, &head, &take_utils::installed(&take_trust)?)?;
+    // here. The write stands only on the trust the history was verified against. It adopts the
+    // remote's head, so a redaction the remote holds pending does not refuse it; a repair is a
+    // new parcel, and is checked in full.
+    let served = forklift_core::util::redaction_utils::Served::adopting(&remote_head, &info);
+    pallet_utils::adopt_pallet_head(&pallet_name, None, &head, served, &take_utils::installed(&take_trust)?)?;
     pallet_utils::write_position(&pallet_utils::BayPosition::new(&pallet_name, Some(head.clone())))?;
 
     // The head this warehouse was filled from is one the remote held, so a scope prune may later
