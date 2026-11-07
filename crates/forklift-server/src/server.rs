@@ -3930,7 +3930,8 @@ async fn redaction_round(state: &AppState, warehouse: &Arc<WarehouseHandle>) -> 
 fn finish_round(state: &AppState, warehouse: &Arc<WarehouseHandle>, applied: bool, held_back: bool, owed: bool) {
     use std::sync::atomic::Ordering;
 
-    let due = applied || held_back;
+    // A rebuild the drain held back (`rebuild_again`) is carried on as one an apply calls for is.
+    let due = applied || held_back || warehouse.rebuild_again.load(Ordering::SeqCst);
 
     // Each leaves a round to follow: the write asks for a run after setting the flag, and a run
     // asked again goes round again. That round's start takes the flag.
@@ -3951,7 +3952,7 @@ fn finish_round(state: &AppState, warehouse: &Arc<WarehouseHandle>, applied: boo
         return;
     }
 
-    if due || warehouse.rebuild_again.load(Ordering::SeqCst) {
+    if due {
         rebuild_bundle(state, Arc::clone(warehouse), true);
     }
 }
@@ -8445,7 +8446,8 @@ mod tests {
     /// Revert: leave the rebuild to the next round whenever one follows → the first round does not
     /// rebuild → red. Ignore a write's apply, an owed deletion or an owed apply → that case
     /// rebuilds → red. Drop the call on deferring → it is not carried on → red. Carry a carried
-    /// rebuild on again → red. A refused write ignoring the carried rebuild → no run → red.
+    /// rebuild on again → red. A refused write ignoring the carried rebuild → no run → red. Carry
+    /// only an apply's rebuild → the held-back one is not carried → red.
     #[tokio::test]
     async fn a_round_rebuilds_the_bundle_unless_a_write_applied_meanwhile() {
         let root = scratch_dir("round-rebuild");
@@ -8489,6 +8491,13 @@ mod tests {
         assert!(!handle.rebuild_again.load(Ordering::SeqCst), "the apply goes first");
         assert!(handle.rebuild_after_drain.load(Ordering::SeqCst), "and the rebuild is carried on");
         assert!(!handle.redact_again.load(Ordering::SeqCst), "for the run settling the apply");
+
+        // So is one the drain held back, with nothing applied.
+        handle.rebuild_after_drain.store(false, Ordering::SeqCst);
+        handle.rebuild_again.store(true, Ordering::SeqCst);
+        finish_round(&state, &handle, false, false, false);
+        assert!(handle.rebuild_after_drain.load(Ordering::SeqCst), "a held-back rebuild is carried on");
+        handle.rebuild_again.store(false, Ordering::SeqCst);
 
         // A refused write that settles the apply without applying anything asks for that run.
         handle.redacting.store(true, Ordering::SeqCst);
