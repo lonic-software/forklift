@@ -533,15 +533,13 @@ impl RedactedSet {
         Ok(set)
     }
 
-    /// This set less every redaction `other` holds: its hashes, and its recipes' claim on each chunk
-    /// list, so a list another recipe here shares is still held.
+    /// This set less every redaction `other` holds: its hashes, and their claim on each chunk list,
+    /// so a list another recipe here shares is still held. A redaction `other` holds by hash goes
+    /// whole, whatever `other` read of its chunk list.
     fn without(mut self, other: &RedactedSet) -> RedactedSet {
         self.hashes.retain(|hash| !other.hashes.contains(hash));
-        self.chunk_lists.retain(|chunks, owners| {
-            if let Some(theirs) = other.chunk_lists.get(chunks) {
-                owners.retain(|owner| !theirs.contains(owner));
-            }
-
+        self.chunk_lists.retain(|_, owners| {
+            owners.retain(|owner| !other.hashes.contains(owner));
             !owners.is_empty()
         });
         self
@@ -561,7 +559,7 @@ impl RedactedSet {
 
     /// Whether this set names nothing.
     fn is_empty(&self) -> bool {
-        self.hashes.is_empty()
+        self.hashes.is_empty() && self.chunk_lists.is_empty()
     }
 
     /// Whether this set names `hash`, a file a walk found redacted: the hash itself, or a recipe
@@ -721,11 +719,17 @@ pub fn refuse_redacted_writes(ops: &[crate::util::shift_utils::FileOp],
         return Ok(());
     };
 
+    // What the adoption would have exempted but for this warehouse having applied it.
     let mut applied = RedactedSet::default();
 
     if let Some(served) = adopting {
-        applied = applied_part(&guard.set)?;
-        guard.set = exempt_adoption(std::mem::take(&mut guard.set), Some(served), served.head, &guard.head, &applied)?.set;
+        let applied_here = applied_part(&guard.set)?;
+        let exemption = exempt_adoption(std::mem::take(&mut guard.set), Some(served), served.head, &guard.head, &applied_here)?;
+        guard.set = exemption.set;
+
+        if exemption.adopted {
+            applied = applied_here;
+        }
     }
 
     for op in ops {
@@ -801,10 +805,11 @@ impl RedactionCheck {
     }
 
     /// Whether the check still holds: `@redactions` is at the head it was checked against,
-    /// nothing the walk skipped as absent is stored now, and an adoption's root is still not
-    /// served. Read under the held ref lock, which every
-    /// `@redactions` write takes too, so a redaction either lands before the write's hold or after
-    /// the write. Storing an object takes no ref lock, so a skipped object stored after this read
+    /// nothing the walk skipped as absent is stored now, an adoption's root is still not served,
+    /// and no redaction an exemption passed has been applied since. Read under the held ref lock,
+    /// which every
+    /// `@redactions` write and every write of the applied record takes too, so a redaction either
+    /// lands, or applies, before the write's hold or after the write. Storing an object takes no ref lock, so a skipped object stored after this read
     /// can still land beside the written head, as one fetched after the write can; the receiving
     /// side of a lift, not this check, is what judges bytes handed on.
     pub(crate) fn holds(&self, _lock: &crate::util::lock_utils::RefLock) -> Result<bool, String> {
@@ -994,13 +999,21 @@ fn check_head_write_at(namespace: pallet_utils::PalletNamespace,
         return Ok(check);
     }
 
-    let named = match namespace {
+    // `applied` says whether the refusal is one only because the redaction is applied here: the
+    // file came from what the remote served, which the exemption would have passed otherwise.
+    let (named, applied) = match namespace {
         pallet_utils::PalletNamespace::User => {
             let partial = crate::util::scope_utils::content_may_be_absent()?;
             let tree = object_utils::load_parcel(new)?.tree_hash;
-            tree_names(&tree, &set, partial.then_some(&mut check.skipped))?
+            let named = tree_names(&tree, &set, partial.then_some(&mut check.skipped))?;
+            let applied = check.adopted && named.as_ref().is_some_and(|(_, hash)| applied.names_hash(hash));
+
+            (named, applied)
         }
-        pallet_utils::PalletNamespace::Meta => meta_parcels_add(expected, served.map(|served| served.head), new, &set, &applied)?,
+        pallet_utils::PalletNamespace::Meta => match meta_parcels_add(expected, served.map(|served| served.head), new, &set, &applied)? {
+            Some(added) => (Some(added.named), added.served),
+            None => (None, false),
+        },
     };
 
     match named {
@@ -1008,7 +1021,7 @@ fn check_head_write_at(namespace: pallet_utils::PalletNamespace,
         Some((path, hash)) => Err(pallet_utils::RefUpdateError::Redacted {
             pallet: pallet_utils::PalletRef { namespace, name: name.to_string() },
             head: new.to_string(),
-            applied: applied.names_hash(&hash),
+            applied,
             path,
             hash,
         }),
@@ -1078,6 +1091,15 @@ fn exempt_adoption(set: RedactedSet,
     Ok(Exemption { set: set.without(&exempt), adopted: true, exempted })
 }
 
+/// What [`meta_parcels_add`] found.
+struct Added {
+    /// The redacted file, and its hash.
+    named: Named,
+
+    /// Whether a parcel of the served chain added it.
+    served: bool,
+}
+
 /// The first redacted object a parcel of the meta chain at `new` adds over its parents, among the
 /// parcels `expected` does not reach. One `served` reaches is judged only by `applied`, the
 /// redactions this warehouse has applied, which no exemption covers. A meta chain is complete
@@ -1086,13 +1108,14 @@ fn meta_parcels_add(expected: Option<&str>,
                     served: Option<&str>,
                     new: &str,
                     set: &RedactedSet,
-                    applied: &RedactedSet) -> Result<Option<Named>, String> {
-    let ancestry = |from: Option<&str>| -> Result<HashSet<String>, String> {
+                    applied: &RedactedSet) -> Result<Option<Added>, String> {
+    // The parcels `from` reaches that `stop` does not.
+    let ancestry = |from: Option<&str>, stop: &HashSet<String>| -> Result<HashSet<String>, String> {
         let mut reached: HashSet<String> = HashSet::new();
         let mut pending: Vec<String> = from.into_iter().map(str::to_string).collect();
 
         while let Some(parcel) = pending.pop() {
-            if reached.insert(parcel.clone()) {
+            if !stop.contains(&parcel) && reached.insert(parcel.clone()) {
                 pending.extend(object_utils::load_parcel(&parcel)?.parents);
             }
         }
@@ -1105,8 +1128,8 @@ fn meta_parcels_add(expected: Option<&str>,
         return Ok(None);
     }
 
-    let mut reached = ancestry(expected)?;
-    let chain = ancestry(served)?;
+    let mut reached = ancestry(expected, &HashSet::new())?;
+    let chain = ancestry(served, &reached)?;
     let mut pending = vec![new.to_string()];
 
     while let Some(hash) = pending.pop() {
@@ -1114,7 +1137,8 @@ fn meta_parcels_add(expected: Option<&str>,
             continue;
         }
 
-        // The served chain's own ancestors are all in it, so nothing below it is judged by `set`.
+        // The served chain's ancestors are in it or reached already, so nothing below it is judged
+        // by `set`.
         let judged = match chain.contains(&hash) {
             true if applied.is_empty() => continue,
             true => applied,
@@ -1129,7 +1153,7 @@ fn meta_parcels_add(expected: Option<&str>,
         }
 
         if let Some(named) = tree_adds(&parcel.tree_hash, &inherited, judged)? {
-            return Ok(Some(named));
+            return Ok(Some(Added { named, served: chain.contains(&hash) }));
         }
 
         pending.extend(parcel.parents);
@@ -1200,7 +1224,8 @@ mod tests {
 
     // Revert: drop a chunk list another holds whole in `without` → the applied recipe's list is
     // lost with the exempt one's; or keep every owner in `filtered` → the exempt part claims the
-    // applied recipe's list.
+    // applied recipe's list; or subtract only the other's chunk-list owners → a redaction it holds
+    // by hash alone keeps its list here.
     #[test]
     fn a_chunk_list_two_redactions_share_is_held_while_either_is() {
         let applied = "a".repeat(64);
@@ -1214,6 +1239,12 @@ mod tests {
         assert_eq!(judged.hashes, HashSet::from([applied.clone()]));
         assert_eq!(judged.chunk_lists, set(&[], &[('x', &['a'])]).chunk_lists);
 
+        // A redaction the other set holds by hash goes whole, though it read no chunk list for it;
+        // a set holding only a chunk list still names something.
+        let judged = set(&['a', 'b'], &[('x', &['a', 'b']), ('y', &['b'])]).without(&set(&['b'], &[]));
+        assert_eq!(judged.chunk_lists, set(&[], &[('x', &['a'])]).chunk_lists);
+        assert!(!set(&[], &[('x', &['a'])]).is_empty());
+
         let applied_part = set(&['a', 'b'], &[('x', &['a', 'b'])]).filtered(|hash| hash == applied);
         assert!(applied_part.names_hash(&applied) && !applied_part.names_hash(&"b".repeat(64)));
     }
@@ -1222,10 +1253,18 @@ mod tests {
     // still holds.
     #[test]
     fn an_exemption_does_not_hold_once_its_hash_is_applied() {
-        let root = std::env::temp_dir().join(format!("forklift-redaction-holds-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
-        let _scope = crate::globals::StorageRootScope::enter(&root);
+        struct Cleanup(std::path::PathBuf);
+
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = Cleanup(std::env::temp_dir().join(format!("forklift-redaction-holds-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&root.0);
+        std::fs::create_dir_all(root.0.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = crate::globals::StorageRootScope::enter(&root.0);
 
         let exempted = "e".repeat(64);
         let check = RedactionCheck {
@@ -1249,10 +1288,6 @@ mod tests {
         std::fs::write(crate::globals::forklift_root().join("redactions-applied"),
                        format!("/forklift-redactions-applied 1\n{}\n", exempted)).unwrap();
         assert!(!check.holds(&lock).unwrap());
-
-        drop(lock);
-        drop(_scope);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn redaction() -> Redaction {
