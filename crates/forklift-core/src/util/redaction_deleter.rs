@@ -19,9 +19,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::globals::{forklift_root, FOLDER_NAME_INVENTORY_ROOT};
+use crate::enums::object::parsed_object::ParsedObject;
+use crate::parser::object::loose_object_parser;
+use crate::util::lock_utils::{ServeLock, StoreAccessExclusive, StoreLock};
+use crate::util::progress_utils::Progress;
 use crate::util::{
-    applied_redactions, bay_utils, file_utils, gc_utils, object_utils, office_utils, pallet_utils,
-    recovery_utils,
+    applied_redactions, bay_utils, cache_miss, file_utils, gc_utils, object_utils, office_utils, pack_utils,
+    pallet_utils, prune_utils, recovery_utils,
 };
 
 /// A checkout: the warehouse's own working tree, or a named bay.
@@ -183,13 +187,215 @@ pub(crate) fn unheld_applied() -> Result<HashSet<String>, String> {
 /// * `Ok(HashSet<String>)` - The excluded hashes.
 /// * `Err(String)`         - If the census could not be taken.
 pub(crate) fn unheld(applied: &HashSet<String>) -> Result<HashSet<String>, String> {
-    let targets: HashSet<String> = applied.iter()
-        .filter(|hash| !matches!(file_utils::does_object_exist(hash), Ok(false)))
-        .cloned()
-        .collect();
+    let targets = maybe_present(applied);
     let held = deletion_census(&targets)?;
 
     Ok(targets.into_iter().filter(|hash| !held.contains_key(hash)).collect())
+}
+
+/// Of `hashes`, those the store may hold: every one but those it plainly lacks.
+fn maybe_present(hashes: &HashSet<String>) -> HashSet<String> {
+    hashes.iter()
+        .filter(|hash| !matches!(file_utils::does_object_exist(hash), Ok(false)))
+        .cloned()
+        .collect()
+}
+
+/// The copies of applied redactions' objects the store may still hold, as the census finds them
+/// now, taken without any lock so a caller can tell whether [`delete_applied`] has anything to
+/// delete before it takes the locks the deletion needs. The deletion takes its own census under
+/// them; this one only decides whether to try.
+#[derive(Debug, Default)]
+pub struct AppliedCopies {
+    /// The copies the census names, each with its holders: kept.
+    pub held: BTreeMap<String, Vec<CopyHolder>>,
+
+    /// How many copies no census root names: the deletion's to delete.
+    pub unheld: usize,
+}
+
+/// Take the census of every applied redaction's object the store may still hold (see
+/// [`AppliedCopies`]). Both parts are empty once every applied object is gone, or when none is
+/// applied: no bay state is read then.
+///
+/// # Returns
+/// * `Ok(AppliedCopies)` - The held copies and the count of unheld ones.
+/// * `Err(String)`       - If the applied record or the census could not be read.
+pub fn applied_copies() -> Result<AppliedCopies, String> {
+    let applied: HashSet<String> = applied_redactions::read_applied()?.hashes().cloned().collect();
+    let present = maybe_present(&applied);
+
+    if present.is_empty() {
+        return Ok(AppliedCopies::default());
+    }
+
+    let held = deletion_census(&present)?;
+    let unheld = present.iter().filter(|hash| !held.contains_key(*hash)).count();
+
+    Ok(AppliedCopies { held, unheld })
+}
+
+/// What [`delete_applied`] did.
+#[derive(Debug, Default)]
+pub struct Deletion {
+    /// The applied redactions' objects (blobs and recipes) deleted, sorted.
+    pub objects: Vec<String>,
+
+    /// The chunks deleted: those of a deleted recipe that no unredacted object names.
+    pub chunks: usize,
+
+    /// The bytes freed: loose files deleted, and what the old packs held beyond the new ones.
+    pub bytes_freed: u64,
+
+    /// The applied redactions whose copies are kept, each with the census roots that hold it.
+    pub held: BTreeMap<String, Vec<CopyHolder>>,
+}
+
+/// Delete every copy of an applied redaction's object that no deletion census root names, and the
+/// chunks of a deleted recipe that no unredacted object names. Copies the census names are kept and
+/// reported with their holders: once the file is taken out of that state, the next deletion
+/// removes them.
+///
+/// Runs under the locks a full repack takes, in its order, from before the census until the last
+/// delete, so no writer can publish a new reference to an object about to go. Nothing is fetched.
+///
+/// Every deletion follows evict's order: packed copies go by a full repack that keeps everything
+/// else, while loose copies of delta bases can still be read, then loose copies. It runs in two
+/// passes so that a present recipe never lacks a chunk, a state a walk reads as damage: the first
+/// deletes the redacted objects and keeps every chunk, the second deletes the chunks only they
+/// named. Each recipe's chunk list is read before anything is deleted. A run cut short at any point
+/// leaves either a recipe with all its chunks, which running it again deletes, or chunks nothing
+/// names: with their recipe gone a rerun cannot find them, and they are left as garbage, which the
+/// next collection or full repack deletes.
+///
+/// # Arguments
+/// * `store_lock`   - The object-store lock, held.
+/// * `serve_lock`   - The serve lock, held: no server may answer for an object about to go.
+/// * `store_access` - Exclusive store access, held.
+/// * `progress`     - Where a repack reports its phases.
+///
+/// # Returns
+/// * `Ok(Deletion)` - What was deleted, and what was kept.
+/// * `Err(String)`  - If the applied record, the census, a recipe or the packs could not be read
+///                    (nothing is deleted then), a repack or a delete failed, or the first
+///                    pass's repack left a copy inside a pack it found damaged (the chunks are
+///                    then all kept). Running it again finishes, as for a run cut short.
+pub fn delete_applied(store_lock: &StoreLock,
+                      serve_lock: &ServeLock,
+                      store_access: &StoreAccessExclusive,
+                      progress: &Progress) -> Result<Deletion, String> {
+    let _unfetched = cache_miss::Unfetched::enter();
+
+    let applied: HashSet<String> = applied_redactions::read_applied()?.hashes().cloned().collect();
+    let present = maybe_present(&applied);
+    let held = deletion_census(&present)?;
+    let targets: HashSet<String> = present.into_iter().filter(|hash| !held.contains_key(hash)).collect();
+
+    // An excluded target is never marked live, and a chunk's hash is never a blob's or a recipe's
+    // (an object's hash covers its type), so every target goes.
+    let live = gc_utils::collect_live_set_excluding(&targets)?;
+    let objects = targets;
+
+    let mut chunks: HashSet<String> = HashSet::new();
+    for hash in &objects {
+        if !file_utils::is_present_for_sweep(hash)? {
+            continue;
+        }
+        let bytes = file_utils::retrieve_object_by_hash_shared(hash)?;
+        if let ParsedObject::Recipe(recipe) = loose_object_parser::parse(&bytes)? {
+            chunks.extend(recipe.chunks.into_iter().map(|chunk| chunk.hash).filter(|chunk| !live.contains(chunk)));
+        }
+    }
+
+    let first = drop_copies(&objects, &chunks, store_lock, serve_lock, store_access, progress)?;
+
+    #[cfg(test)]
+    if tests::STOP_BETWEEN_PASSES.with(|stop| stop.get()) {
+        return Err("stopped between the passes".to_string());
+    }
+
+    let second = drop_copies(&chunks, &HashSet::new(), store_lock, serve_lock, store_access, progress)?;
+
+    let mut deleted = first.deleted;
+    deleted.sort();
+
+    Ok(Deletion {
+        objects: deleted,
+        chunks: second.deleted.len(),
+        bytes_freed: first.bytes_freed + second.bytes_freed,
+        held,
+    })
+}
+
+/// What one pass of [`delete_applied`] dropped.
+#[derive(Default)]
+struct Dropped {
+    deleted: Vec<String>,
+    bytes_freed: u64,
+}
+
+/// Drop every copy of `set`, packed and loose, keeping `kept` through the repack as if it were
+/// live.
+fn drop_copies(set: &HashSet<String>,
+               kept: &HashSet<String>,
+               store_lock: &StoreLock,
+               serve_lock: &ServeLock,
+               store_access: &StoreAccessExclusive,
+               progress: &Progress) -> Result<Dropped, String> {
+    let mut dropped = Dropped::default();
+
+    if set.is_empty() {
+        return Ok(dropped);
+    }
+
+    let mut packed: HashSet<String> = HashSet::new();
+    let mut loose: Vec<String> = Vec::new();
+
+    for hash in set {
+        if pack_utils::is_in_packs(hash)? {
+            packed.insert(hash.clone());
+        }
+        if file_utils::loose_dentry_exists(hash)? {
+            loose.push(hash.clone());
+        }
+    }
+
+    // A packed delta can stand on a loose-only copy; the repack re-encodes it before that copy is
+    // freed. A damaged pack refuses the pass, which could not tell what stands on what it deletes.
+    let loose_only: HashSet<String> = loose.iter().filter(|hash| !packed.contains(*hash)).cloned().collect();
+    let delta_on_loose = pack_utils::any_packed_delta_against(&loose_only)
+        .map_err(|error| error.refusal("Deleting a redacted object", "the objects it names were kept"))?;
+
+    if !packed.is_empty() || delta_on_loose {
+        dropped.bytes_freed += pack_utils::repack_redacting(set, kept, store_lock, serve_lock, store_access, progress)?
+            .pack_bytes_freed;
+
+        // A pack found damaged only during the repack is left as found, holding its copy. Stop
+        // here, before a later pass deletes the chunks of a recipe it still holds.
+        let mut still_packed = 0;
+        for hash in &packed {
+            if pack_utils::is_in_packs(hash)? {
+                still_packed += 1;
+            }
+        }
+        if still_packed > 0 {
+            return Err(format!(
+                "{} redacted object(s) are still inside a pack the repack found damaged, so they \
+                were kept. Run \"forklift store compact --all\" to salvage it, then \"forklift redact \
+                apply\" again.",
+                still_packed
+            ));
+        }
+    }
+
+    dropped.bytes_freed += prune_utils::free_objects(&loose, store_access)?.bytes;
+    dropped.deleted = packed.iter().chain(loose.iter())
+        .cloned()
+        .collect::<HashSet<String>>()
+        .into_iter()
+        .collect();
+
+    Ok(dropped)
 }
 
 /// A census in progress: the targets, the targets each tree walked so far reaches, and the holders
@@ -327,6 +533,138 @@ mod tests {
     }
 
     const FILE: DirEntryType = DirEntryType::Normal;
+
+    thread_local! {
+        /// Makes [`delete_applied`] stop between its two passes, as a run cut short there would.
+        pub(super) static STOP_BETWEEN_PASSES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Run the deleter under the locks it needs, as `forklift redact apply` takes them.
+    fn delete() -> Result<Deletion, String> {
+        let store_lock = StoreLock::acquire().expect("no other holder in a test root");
+        let serve_lock = ServeLock::acquire().expect("no other holder in a test root");
+        let store_access = crate::util::lock_utils::StoreAccessLock::try_exclusive().expect("no other holder in a test root");
+
+        delete_applied(&store_lock, &serve_lock, &store_access, &Progress::NONE)
+    }
+
+    /// Store a chunk into a pack, as a received pack can hold one (a compaction leaves a loose
+    /// chunk loose), and return its hash.
+    fn pack_chunk(content: &[u8]) -> String {
+        let object = LooseObjectBuilder::build_chunk(&crate::model::chunk::Chunk { content: content.to_vec() });
+        let mut ingest = pack_utils::StoreIngest::new().unwrap();
+        ingest.store_with_base(&object, None).unwrap();
+        ingest.finish().unwrap();
+
+        object.hash
+    }
+
+    /// A chunked file's recipe and one of its chunks only it names, both packed and named only by
+    /// old history, beside a live recipe sharing its other chunk. Returns (recipe, own chunk,
+    /// shared chunk, live recipe).
+    fn packed_chunked_leak() -> (String, String, String, String) {
+        let (own_chunk, shared_chunk, other_chunk) = (pack_chunk(b"own"), store_chunk(b"shared"), store_chunk(b"other"));
+        let recipe = store_recipe(&[(own_chunk.clone(), 3), (shared_chunk.clone(), 6)]);
+        let live_recipe = store_recipe(&[(shared_chunk.clone(), 6), (other_chunk, 5)]);
+
+        let old = store_parcel(&store_tree(&[("big.bin", &recipe, DirEntryType::NormalChunked)]), Vec::new());
+        set_main(&store_parcel(&store_tree(&[("other.bin", &live_recipe, DirEntryType::NormalChunked)]), vec![old]));
+        pack_utils::compact(true, false, false, &Progress::NONE).unwrap();
+        assert!(pack_utils::is_in_packs(&recipe).unwrap(), "the fixture packs the recipe");
+        assert!(pack_utils::is_in_packs(&own_chunk).unwrap(), "the fixture packs the chunk");
+        applied_redactions::apply_for_test(&[&recipe]);
+
+        (recipe, own_chunk, shared_chunk, live_recipe)
+    }
+
+    /// The deleter drops a packed and a loose copy of applied redactions' objects that nothing in
+    /// the census names, keeps the one a checkout's base names, and reports it with its holder.
+    ///
+    /// Revert: skip the repack → the packed copy stays; skip freeing the loose copies → the loose
+    /// one stays; delete every present applied object, census or not → the held copy goes.
+    #[test]
+    fn the_deleter_drops_packed_and_loose_copies_and_keeps_a_held_one() {
+        let _scratch = Scratch::new("delete");
+        let (packed, kept) = (store_blob("packed secret\n"), store_blob("kept\n"));
+        let p0 = store_parcel(&store_tree(&[("p.txt", &packed, FILE)]), Vec::new());
+        let p1 = store_parcel(&store_tree(&[("k.txt", &kept, FILE)]), vec![p0.clone()]);
+        set_main(&p1);
+        pack_utils::compact(true, false, false, &Progress::NONE).unwrap();
+        assert!(pack_utils::is_in_packs(&packed).unwrap(), "the fixture packs it");
+
+        let (loose, held) = (store_blob("loose secret\n"), store_blob("held\n"));
+        let p2 = store_parcel(&store_tree(&[("l.txt", &loose, FILE)]), vec![p1.clone()]);
+        let p3 = store_parcel(&store_tree(&[("k.txt", &kept, FILE)]), vec![p2.clone()]);
+        set_main(&p3);
+        let base = store_parcel(&store_tree(&[("held.txt", &held, FILE)]), Vec::new());
+        set_base(&base);
+        assert!(!pack_utils::is_in_packs(&loose).unwrap(), "the fixture leaves it loose");
+        applied_redactions::apply_for_test(&[&packed, &loose, &held]);
+
+        let deletion = delete().unwrap();
+
+        let mut expected = vec![packed.clone(), loose.clone()];
+        expected.sort();
+        assert_eq!(deletion.objects, expected);
+        assert_eq!(deletion.chunks, 0);
+        assert!(deletion.bytes_freed > 0, "{:?}", deletion);
+        assert_eq!(deletion.held, [(held.clone(), vec![CopyHolder::Base(Checkout::Main)])].into_iter().collect());
+        for hash in [&packed, &loose] {
+            assert!(!present(hash), "deleted: {}", hash);
+        }
+        for hash in [&held, &kept, &p0, &p1, &p2, &p3, &base] {
+            assert!(present(hash), "kept: {}", hash);
+        }
+
+        // Run again, nothing is left to delete, and the held copy is still reported.
+        let again = delete().unwrap();
+        assert!(again.objects.is_empty() && again.chunks == 0, "{:?}", again);
+        assert_eq!(again.held, deletion.held);
+    }
+
+    /// The second pass deletes a deleted recipe's chunk only it named, and keeps the one a live
+    /// recipe shares, which stays readable.
+    ///
+    /// Revert: take every chunk of a deleted recipe → the shared chunk goes; skip the second pass →
+    /// the recipe's own chunk stays.
+    #[test]
+    fn the_chunk_pass_keeps_a_chunk_a_live_recipe_shares() {
+        let _scratch = Scratch::new("chunks");
+        let (recipe, own_chunk, shared_chunk, live_recipe) = packed_chunked_leak();
+
+        let deletion = delete().unwrap();
+
+        assert_eq!(deletion.objects, vec![recipe.clone()]);
+        assert_eq!(deletion.chunks, 1);
+        assert!(!present(&recipe) && !present(&own_chunk));
+        assert!(present(&shared_chunk) && present(&live_recipe));
+        assert_eq!(read_fresh(&shared_chunk).unwrap(), file_utils::retrieve_object_by_hash_uncached(&shared_chunk).unwrap());
+    }
+
+    /// Cut short between its passes, the deleter leaves no present recipe missing a chunk: the
+    /// first pass deletes the recipe and keeps every chunk. The chunk it leaves is garbage, which a
+    /// full repack deletes.
+    ///
+    /// Revert: keep no chunk through the first pass's repack → the recipe's own chunk is gone
+    /// after the first pass; drop the kept set from the repack's live set → the same.
+    #[test]
+    fn a_deletion_cut_short_between_its_passes_leaves_every_chunk() {
+        let _scratch = Scratch::new("cut-short");
+        let (recipe, own_chunk, shared_chunk, _) = packed_chunked_leak();
+
+        STOP_BETWEEN_PASSES.with(|stop| stop.set(true));
+        let stopped = delete();
+        STOP_BETWEEN_PASSES.with(|stop| stop.set(false));
+
+        assert!(stopped.is_err(), "{:?}", stopped);
+        assert!(!present(&recipe), "the first pass deleted the recipe");
+        assert!(present(&own_chunk) && present(&shared_chunk), "and kept its chunks");
+
+        // With the recipe gone, nothing names the chunk: a full repack drops it as garbage.
+        pack_utils::compact(true, false, false, &Progress::NONE).unwrap();
+        assert!(!present(&own_chunk));
+        assert!(present(&shared_chunk));
+    }
 
     /// Each census root names the copies it holds and only those: a pallet's head, not its older
     /// history; a meta pallet's whole history; a checkout's base; another bay's staged work.

@@ -57,7 +57,7 @@ impl AppliedSet {
 }
 
 /// Record `hashes` as applied, as `redact apply` would once nothing names them. For tests in other
-/// modules, which simulate the deletion that follows by removing the object themselves.
+/// modules, which delete the object with [`delete_applied`](crate::util::redaction_deleter::delete_applied) or remove it themselves.
 #[cfg(test)]
 pub(crate) fn apply_for_test(hashes: &[&str]) -> AppliedSet {
     let lock = RefLock::acquire().unwrap();

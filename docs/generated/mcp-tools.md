@@ -71,6 +71,8 @@ Every tool `forklift mcp` serves, generated from the same command definition the
 | `tag_create` | `forklift tag create` | Create a signed tag pointing at a revision (admin only) | `name` (a string, required)<br>`revision` (a string)<br>`message` (a string) |
 | `tag_show` | `forklift tag show` | Show one tag in full (subject, tagger, message) | `name` (a string, required) |
 | `tag_list` | `forklift tag list` | List every tag (the default) |  |
+| `redact` | `forklift redact` | Redact stored content permanently: record an object that must be removed and never stored again |  |
+| `redact_list` | `forklift redact list` | List every redaction and where it stands (the default) |  |
 | `undo` | `forklift undo` | Undo the last stack, consolidate, pick, shift or pallet delete | `as` (a string) |
 | `unload` | `forklift unload` | Unstage a file or directory (keep your changes) | `path` (a string, required) |
 
@@ -96,6 +98,8 @@ Each of these commands, and every command below it, is a tool for nobody: a pers
 - `forklift self`: manages this binary itself: its updates and its `fl` alias are host concerns, and the description it gives Pult is the tool list agents already have.
 - `forklift scope prune`: destructive, warehouse-wide disk reclamation: an admin verb, never a sub-agent's.
 - `forklift store evict`: warehouse-wide disk reclamation in a cache: an admin verb, like scope prune.
+- `forklift redact record`: redacts content permanently, with no undo, and deletes it: an admin verb.
+- `forklift redact apply`: deletes redacted content warehouse-wide: an admin verb, like scope prune.
 - `forklift remote`: shows the remote configuration, like config, and repoints a partial warehouse at another server: setup.
 - `forklift mcp`: this server itself.
 - `forklift help`: meta.

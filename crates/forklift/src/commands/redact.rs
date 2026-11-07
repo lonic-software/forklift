@@ -1,12 +1,17 @@
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 use forklift_core::error::{sanitize, CoreError, RefusalCode};
 use forklift_core::util::kv_utils::short;
 use forklift_core::util::office_utils::Role;
 use forklift_core::util::applied_redactions::{self, RedactionState, RedactionStatus};
+use forklift_core::util::lock_utils::{ServeLock, StoreAccessLock, StoreLock};
+use forklift_core::util::redaction_deleter::{self, Checkout, CopyHolder, Deletion};
 use forklift_core::util::redaction_utils::{self, AttributedRedaction, HeadHolder, RedactedKind, Redaction};
 use forklift_core::util::{config_utils, object_utils, pallet_utils, remote_utils};
 use crate::cli::RedactAction;
 use crate::commands::lower;
+use crate::events;
 use crate::output::{self, CommandOutput};
 
 /// Handle the redact command: permanent redactions of stored content. Without a subcommand, the
@@ -40,12 +45,13 @@ pub async fn handle_command(action: Option<RedactAction>) -> Result<(), String> 
 /// remote, and no head written after the redaction may name the content; the checks here only
 /// refuse early, with a plainer message.
 ///
-/// Once the cell commits, the redaction is applied if it can be (see [`applied_redactions`]). It
-/// is recorded either way, so a failure to apply it does not fail the command: the redaction is
-/// reported pending, with the reason, and `redact apply` tries again.
+/// Once the cell commits, the redaction is applied if it can be (see [`applied_redactions`]), and
+/// the copies of every applied redaction's content are deleted ([`delete_applied`]). It is
+/// recorded either way. A failure to apply it does not fail the command, and neither does other
+/// maintenance holding the store: the redaction is reported pending, or the deletion owed, with the
+/// reason, and `redact apply` tries again. Any other failure to delete fails the command, naming
+/// `redact apply` as the way to finish.
 fn record(target: &str, reason: &str) -> Result<(), String> {
-    let (hash, kind) = resolve_target(target)?;
-
     let operator = config_utils::get_operator()?;
     let writer = lower::meta_writer(&operator)?;
 
@@ -61,11 +67,25 @@ fn record(target: &str, reason: &str) -> Result<(), String> {
         }
     }
 
+    // Read before resolving: an applied redaction's object is deleted, so a bare hash already
+    // redacted would otherwise be refused as absent from the store rather than as redacted.
     let read = redaction_utils::read_redactions()?;
+    let already = |hash: &str| read.redactions.iter().any(|existing| existing.redaction.hash == hash)
+        || read.unreadable.iter().any(|existing| existing.hash == hash);
+    let already_redacted = |hash: &str| format!(
+        "Object {} is already redacted; a redaction is permanent. \"forklift redact list\" shows \
+        where it stands.",
+        hash
+    );
 
-    if read.redactions.iter().any(|existing| existing.redaction.hash == hash)
-        || read.unreadable.iter().any(|existing| existing.hash == hash) {
-        return Err(format!("Object {} is already redacted; a redaction is permanent.", hash));
+    if already(target) {
+        return Err(already_redacted(target));
+    }
+
+    let (hash, kind) = resolve_target(target)?;
+
+    if already(&hash) {
+        return Err(already_redacted(&hash));
     }
 
     let holders = redaction_utils::meta_holders(&hash).map_err(nothing_recorded)?;
@@ -100,21 +120,103 @@ fn record(target: &str, reason: &str) -> Result<(), String> {
         return Err(head_held_refusal(&hash, &holders));
     }
 
-    let redactions_head = redaction_utils::record_redaction(&redaction, &writer, &operator)?;
+    // The cell write publishes objects, so it holds the store shared, as main holds it for other
+    // writers; it lets go before the deletion, whose exclusive try this hold would refuse.
+    let redactions_head = {
+        let _store_access = StoreAccessLock::shared(crate::announce_store_access_wait)?;
+        redaction_utils::record_redaction(&redaction, &writer, &operator)?
+    };
 
-    let state = redaction_utils::read_redactions()
-        .and_then(|read| applied_redactions::apply(&read, Some(&hash)))
+    let applied = redaction_utils::read_redactions()
+        .and_then(|read| applied_redactions::apply(&read, Some(&hash)));
+    let apply_failed = applied.is_err();
+    let state = applied
         .map(|statuses| statuses.into_iter().next().map(|status| status.state))
         .unwrap_or_else(|why| Some(RedactionState::Undecided(why)))
         .unwrap_or_else(|| RedactionState::Undecided(format!(
             "The redaction of {} is not readable at the new @redactions head.", hash
         )));
 
+    // An apply that failed could not read what the deletion reads; its status already says why.
+    if apply_failed {
+        output::emit(&Recorded {
+            hash, chunked: kind == RedactedKind::Recipe, redactions_head, status: StateView::from(&state), deletion: None,
+        });
+
+        return Ok(());
+    }
+
+    let deletion = delete_applied().map_err(|why| format!(
+        "The redaction of {} is recorded, but deleting the redacted content failed: {} Copies already \
+        deleted stay deleted; once that is fixed, run \"forklift redact apply\" to finish.",
+        hash, why.trim_end()
+    ))?;
+
     output::emit(&Recorded {
-        hash, chunked: kind == RedactedKind::Recipe, redactions_head, status: StateView::from(&state),
+        hash, chunked: kind == RedactedKind::Recipe, redactions_head, status: StateView::from(&state), deletion,
     });
 
     Ok(())
+}
+
+/// Delete the copies of every applied redaction's content that nothing here still needs, under the
+/// locks a full repack takes, in its order and without waiting. A lock refused leaves the deletion
+/// owed, with the reason: other maintenance is running, the store is in use by another process,
+/// or the root is served. A census taken first, without locks, decides whether to try: when every
+/// copy left is held, the held copies are reported and no lock is taken. That census can race a
+/// writer in another bay, so its failure only means trying under the locks, whose own census
+/// decides.
+///
+/// # Returns
+/// * `Ok(None)`              - If no applied redaction's object may be present: nothing to do,
+///                             and no lock was taken.
+/// * `Ok(Some(DeletionView))` - What was deleted and kept, or why the deletion is owed (with the
+///                             copies held as the first census found them, or, when it failed,
+///                             none, and its failure added to the reason).
+/// * `Err(String)`           - If the census under the locks or the deletion could not be carried
+///                             out (an unreadable pack, bay state or recipe, or a failed delete).
+fn delete_applied() -> Result<Option<DeletionView>, String> {
+    let (held, uncounted) = match redaction_deleter::applied_copies() {
+        Ok(copies) if copies.unheld == 0 => {
+            return Ok((!copies.held.is_empty()).then(|| DeletionView::from(Deletion { held: copies.held, ..Deletion::default() })));
+        }
+        Ok(copies) => (copies.held, None),
+        Err(why) => (BTreeMap::new(), Some(why)),
+    };
+    // A failure that was not a race shows again under the locks; until they are free, say it.
+    let owed = |why: String| Some(DeletionView::owed(&held, match &uncounted {
+        Some(census) => format!(
+            "{} Which copies are still held could not be told either: {}",
+            why.trim_end(), census.trim_end()
+        ),
+        None => why,
+    }));
+
+    // The store lock keeps out other maintenance, the serve lock a server answering for an object
+    // about to go, and exclusive store access every writer that could publish a new reference to
+    // one. None waits. `main` takes no shared hold for this command, which would refuse the last.
+    let store_lock = match StoreLock::acquire() {
+        Ok(lock) => lock,
+        Err(e) => return Ok(owed(format!(
+            "Other object-store maintenance is running on this warehouse; let it finish. If none is, the \
+            lock below was left by a compaction, gc or eviction that was killed and can be removed. {}", e
+        ))),
+    };
+    let serve_lock = match ServeLock::acquire() {
+        Ok(lock) => lock,
+        Err(e) => return Ok(owed(format!(
+            "This warehouse root is being served; stop the server first. If no server is running, the \
+            lock below was left by a server, gc or full repack that was killed and can be removed. {}", e
+        ))),
+    };
+    let store_access = match StoreAccessLock::try_exclusive() {
+        Ok(hold) => hold,
+        Err(e) => return Ok(owed(e)),
+    };
+
+    let deletion = redaction_deleter::delete_applied(&store_lock, &serve_lock, &store_access, &events::progress())?;
+
+    Ok(Some(DeletionView::from(deletion)))
 }
 
 /// Resolve what a redaction names: a full object hash held in the local store, or the content of
@@ -240,12 +342,19 @@ fn list() -> Result<(), String> {
     Ok(())
 }
 
-/// Apply every redaction that can be now, and list them all as [`list`] does.
+/// Apply every redaction that can be now, delete the copies of every applied redaction's content
+/// that nothing here still needs ([`delete_applied`]), and list them all as [`list`] does.
 fn apply() -> Result<(), String> {
     let read = redaction_utils::read_redactions()?;
     let statuses = applied_redactions::apply(&read, None)?;
+    let deletion = delete_applied().map_err(|why| format!(
+        "Every redaction that can be applied now is (see \"forklift redact list\"), but deleting the \
+        redacted content failed: {} Copies already deleted stay deleted; once that is fixed, run \
+        \"forklift redact apply\" again to finish.",
+        why.trim_end()
+    ))?;
 
-    output::emit(&RedactionList::new(&read, &statuses));
+    output::emit(&RedactionList { deletion, ..RedactionList::new(&read, &statuses) });
 
     Ok(())
 }
@@ -265,6 +374,11 @@ pub(crate) struct Recorded {
 
     /// Where the redaction stands now.
     status: StateView,
+
+    /// What deleting the copies of every applied redaction's content did; absent when no applied
+    /// redaction's object was left to delete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deletion: Option<DeletionView>,
 }
 
 impl CommandOutput for Recorded {
@@ -279,6 +393,171 @@ impl CommandOutput for Recorded {
             what, self.hash, short(&self.redactions_head)
         );
         println!("It is {}.", self.status.describe());
+
+        if let Some(deletion) = &self.deletion {
+            deletion.render_human();
+        }
+    }
+}
+
+/// What deleting the copies of the applied redactions' content did.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct DeletionView {
+    /// The applied redactions' objects (blobs and recipes) deleted.
+    deleted: Vec<String>,
+
+    /// Chunks deleted: those of a deleted recipe that no unredacted object names.
+    chunks_deleted: usize,
+
+    /// Bytes freed on disk: loose files deleted, plus what the old packs held beyond the packs a
+    /// repack wrote.
+    bytes_freed: u64,
+
+    /// Applied redactions whose copies are kept, because a checkout's state still names them (or a
+    /// pallet head or meta pallet's history, as a guard). Taking the file out of that state and
+    /// running `redact apply` again deletes them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    kept: Vec<KeptView>,
+
+    /// Why the deletion did not run, when it is owed because a lock it needs is taken: other
+    /// object-store maintenance is running, another process is using the object store, or the
+    /// warehouse root is being served. Running `redact apply` again once that ends finishes it.
+    /// `kept` then lists the copies held as a census taken without the locks found them; it is
+    /// empty, and the reason says why, when that census could not be taken. Any other failure to
+    /// delete fails the command instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owed: Option<String>,
+}
+
+/// An applied redaction whose copy is kept.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct KeptView {
+    /// The redacted object.
+    hash: String,
+
+    /// What names the copy.
+    holders: Vec<HolderView>,
+}
+
+/// What names a kept copy.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct HolderView {
+    /// The kind of holder.
+    kind: HolderKind,
+
+    /// For `pallet`, the pallet; for `meta_history`, the meta pallet, with its `@`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pallet: Option<String>,
+
+    /// For a checkout's state, the bay; absent for the warehouse's own working tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bay: Option<String>,
+
+    /// The holder in words, as the human output prints it (unsanitized).
+    description: String,
+}
+
+/// The kind of a kept copy's holder.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HolderKind {
+    /// A pallet head's tree.
+    Pallet,
+
+    /// A meta pallet's history.
+    MetaHistory,
+
+    /// The history the trust anchor adopts.
+    AdoptedHistory,
+
+    /// A checkout's base.
+    Base,
+
+    /// A parcel parked in a checkout.
+    Parked,
+
+    /// A consolidation in progress in a checkout.
+    Consolidation,
+
+    /// A cherry-pick in progress in a checkout.
+    Pick,
+
+    /// Work staged in a checkout.
+    Staged,
+}
+
+impl From<&CopyHolder> for HolderView {
+    fn from(holder: &CopyHolder) -> Self {
+        let bay = |checkout: &Checkout| match checkout {
+            Checkout::Main => None,
+            Checkout::Bay(name) => Some(name.clone()),
+        };
+        let (kind, pallet, bay) = match holder {
+            CopyHolder::Pallet(name) => (HolderKind::Pallet, Some(name.clone()), None),
+            CopyHolder::MetaHistory(name) => (HolderKind::MetaHistory, Some(format!("@{}", name)), None),
+            CopyHolder::AdoptedHistory => (HolderKind::AdoptedHistory, None, None),
+            CopyHolder::Base(checkout) => (HolderKind::Base, None, bay(checkout)),
+            CopyHolder::Parked(checkout) => (HolderKind::Parked, None, bay(checkout)),
+            CopyHolder::Consolidation(checkout) => (HolderKind::Consolidation, None, bay(checkout)),
+            CopyHolder::Pick(checkout) => (HolderKind::Pick, None, bay(checkout)),
+            CopyHolder::Staged(checkout) => (HolderKind::Staged, None, bay(checkout)),
+        };
+
+        HolderView { kind, pallet, bay, description: holder.describe() }
+    }
+}
+
+impl From<Deletion> for DeletionView {
+    fn from(deletion: Deletion) -> Self {
+        DeletionView {
+            deleted: deletion.objects,
+            chunks_deleted: deletion.chunks,
+            bytes_freed: deletion.bytes_freed,
+            kept: deletion.held.iter()
+                .map(|(hash, holders)| KeptView { hash: hash.clone(), holders: holders.iter().map(HolderView::from).collect() })
+                .collect(),
+            owed: None,
+        }
+    }
+}
+
+impl DeletionView {
+    /// A deletion that did not run, for `why`, with the copies the census found `held`.
+    fn owed(held: &BTreeMap<String, Vec<CopyHolder>>, why: String) -> Self {
+        DeletionView {
+            owed: Some(why),
+            ..DeletionView::from(Deletion { held: held.clone(), ..Deletion::default() })
+        }
+    }
+
+    fn render_human(&self) {
+        if let Some(why) = &self.owed {
+            println!(
+                "The redacted content was not deleted yet. {} Then run \"forklift redact apply\" again to delete it.",
+                sanitize(why)
+            );
+        }
+
+        if !self.deleted.is_empty() || self.chunks_deleted > 0 {
+            println!(
+                "Deleted {} redacted object(s) and {} chunk(s), freeing {}.",
+                self.deleted.len(), self.chunks_deleted, output::human_bytes(self.bytes_freed)
+            );
+        }
+
+        // Holder names are another operator's text, so they are sanitized.
+        for kept in &self.kept {
+            let by: Vec<String> = kept.holders.iter().map(|holder| sanitize(&holder.description)).collect();
+
+            println!(
+                "Kept {}: named by {}. Take the file out of it, then run \"forklift redact apply\" to delete it.",
+                kept.hash, by.join(", ")
+            );
+        }
     }
 }
 
@@ -292,6 +571,11 @@ pub(crate) struct RedactionList {
     /// dropped.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     unreadable: Vec<UnreadableView>,
+
+    /// For `redact apply`, what deleting the copies of every applied redaction's content did;
+    /// absent from `redact list`, and when no applied redaction's object was left to delete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deletion: Option<DeletionView>,
 }
 
 /// One redaction.
@@ -335,7 +619,7 @@ impl RedactionList {
             .map(|cell| UnreadableView { hash: cell.hash.clone(), reason: cell.reason.clone() })
             .collect();
 
-        RedactionList { redactions, unreadable }
+        RedactionList { redactions, unreadable, deletion: None }
     }
 }
 
@@ -493,6 +777,10 @@ impl CommandOutput for RedactionList {
 
         for cell in &self.unreadable {
             println!("{}  (unreadable: {})", cell.hash, sanitize(&cell.reason));
+        }
+
+        if let Some(deletion) = &self.deletion {
+            deletion.render_human();
         }
     }
 }

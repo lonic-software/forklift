@@ -911,18 +911,19 @@ pub enum Command {
 
     /// Redact stored content permanently: record an object that must be removed and never stored
     /// again
-    // Hidden until this build also refuses and deletes what it records: a redaction that only
-    // records would promise a removal nothing performs.
     #[command(
-        hide = true,
         long_about = "Redact stored content permanently. A redaction names one file's content \
                       (by object hash, or as <revision>:<path>) that must be removed from the \
                       warehouse and never stored in it again. It is a record on the \
                       \"@redactions\" meta pallet, never changed or removed; under trust only an \
                       admin may record one. Content a meta pallet's history names cannot be \
                       redacted, because that history is never rewritten; content a pallet head \
-                      names can be redacted once the file is taken out of that head. Without a \
-                      subcommand, the redactions are listed."
+                      names can be redacted once the file is taken out of that head. Once a \
+                      redaction applies, every copy this warehouse holds is deleted, except one a \
+                      checkout's base, parked work, a consolidation or cherry-pick in progress, or \
+                      staged work still names: those are listed, and kept until the file is taken \
+                      out of that state and \"forklift redact apply\" runs again. No later head may \
+                      name the content. Without a subcommand, the redactions are listed."
     )]
     Redact {
         #[command(subcommand)]
@@ -1446,12 +1447,16 @@ pub enum RedactAction {
     )]
     List,
 
-    /// Apply every redaction that nothing here names any more
+    /// Apply every redaction that nothing here names any more, and delete its content
     #[command(
         long_about = "Apply every pending redaction that no pallet head and no meta pallet's history \
-                      here names. A redaction is applied once by itself when it is recorded; run \
-                      this after taking the content out of the heads that held it. A warehouse with \
-                      a remote applies none yet: it waits for the remote to report each applied."
+                      here names, and delete the copies of every applied redaction's content that \
+                      nothing here still needs. A redaction is applied once by itself when it is \
+                      recorded; run this after taking the content out of the heads that held it, or \
+                      out of the checkout state that kept a copy. A warehouse with a remote applies \
+                      none yet: it waits for the remote to report each applied. The deletion needs \
+                      the object store to itself: while a command in another bay or a server is \
+                      using it, the deletion is reported as owed, and running this again finishes it."
     )]
     Apply,
 }
@@ -2264,10 +2269,11 @@ impl Command {
     /// that list that sets a pallet head, and it writes into a store it has just created, which
     /// no other process uses yet.
     ///
-    /// `store compact`, `store evict` and `scope prune` are excluded because they host deleters,
-    /// which take the exclusive side; their own shared hold would refuse them. They take the side
-    /// they need themselves: a full repack, evict and scope prune the exclusive one, incremental
-    /// compaction the shared one, tried.
+    /// `store compact`, `store evict`, `scope prune`, `redact record` and `redact apply` are
+    /// excluded because they host deleters, which take the exclusive side; their own shared hold
+    /// would refuse them. They take the side they need themselves: a full repack, evict, scope
+    /// prune and a redaction's deletion the exclusive one, incremental compaction the shared one,
+    /// tried, and `redact record` the shared one, waiting, around its cell write.
     ///
     /// # Returns
     /// * `true`  - Take the shared hold right after the warehouse lock.
@@ -2278,6 +2284,7 @@ impl Command {
                 self,
                 Command::Store { action: Some(StoreAction::Compact { .. } | StoreAction::Evict { .. }) }
                     | Command::Scope { action: Some(ScopeAction::Prune { .. }) }
+                    | Command::Redact { action: Some(RedactAction::Record { .. } | RedactAction::Apply) }
             )
     }
 

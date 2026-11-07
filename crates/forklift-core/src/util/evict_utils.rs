@@ -1234,7 +1234,7 @@ mod tests {
         assert_record(&[&staged, &kid, &parent, &stray], "kept");
     }
 
-    /// Remove `hash`'s object, as the deletion that follows an applied redaction will.
+    /// Remove `hash`'s object, as the deletion that follows an applied redaction does.
     fn delete_object(hash: &str) {
         let (folder, file) = file_utils::get_path_for_object(hash).unwrap();
         std::fs::remove_file(PathBuf::from(folder).join(file)).unwrap();

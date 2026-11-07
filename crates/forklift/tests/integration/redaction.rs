@@ -122,7 +122,20 @@ impl Warehouse {
         hash
     }
 
-    /// Remove the loose object `hash` from the store, as the deletion of an applied redaction will.
+    /// Park a file holding `content`, so a parked parcel names it and the deletion of an applied
+    /// redaction keeps its copy; the bay is left clean.
+    fn hold_parked(&self, content: &[u8]) {
+        std::fs::write(self.root.join("held.env"), content).unwrap();
+        self.run_ok(&["load", "held.env"]);
+        self.run_ok(&["park"]);
+    }
+
+    /// Whether the store holds a loose copy of `hash`.
+    fn holds_loose(&self, hash: &str) -> bool {
+        self.root.join(".forklift/objects").join(&hash[..2]).join(&hash[2..]).exists()
+    }
+
+    /// Remove the loose object `hash` from the store, as no redaction does: damage.
     fn remove_object(&self, hash: &str) {
         let path = self.root.join(".forklift/objects").join(&hash[..2]).join(&hash[2..]);
         std::fs::remove_file(&path).unwrap_or_else(|error| panic!("{}: {}", path.display(), error));
@@ -382,9 +395,9 @@ fn a_read_of_content_whose_redaction_is_applied_is_refused_as_redacted() {
     assert_eq!(recorded["data"]["status"], serde_json::json!({ "state": "applied" }), "{}", recorded);
     let hash = recorded["data"]["hash"].as_str().unwrap().to_string();
 
-    // Applied, but the bytes are still held: they still read.
-    warehouse.run_ok(&["blame", "-r", &leak, "secret.env"]);
-    warehouse.remove_object(&hash);
+    // Applied, and nothing names it, so its copy is deleted as it is recorded.
+    assert_eq!(recorded["data"]["deletion"]["deleted"], serde_json::json!([hash]), "{}", recorded);
+    assert!(!warehouse.holds_loose(&hash));
 
     let error = content_redacted(&warehouse, &["blame", "-r", &leak, "secret.env"]);
     assert_eq!(error["details"], serde_json::json!({ "hash": hash }), "{}", error);
@@ -440,15 +453,33 @@ fn a_full_audit_counts_an_applied_redaction_as_redacted_and_passes() {
     warehouse.run_ok(&["office", "enroll"]);
     warehouse.stack("notes.txt", b"notes\n", "notes");
     let leak = warehouse.leaked("secret.env", b"TOKEN=hunter2\n");
+
+    // Held by a parked parcel, the copy is kept and reported with its holder: nothing is absent.
+    warehouse.hold_parked(b"TOKEN=hunter2\n");
     let recorded = recorded_hash(&warehouse, &format!("{}:secret.env", leak), "leaked token");
     assert_eq!(recorded["data"]["status"], serde_json::json!({ "state": "applied" }), "{}", recorded);
-
-    // Applied, but the bytes are still held: nothing is absent.
+    let hash = recorded["data"]["hash"].as_str().unwrap();
+    assert_eq!(recorded["data"]["deletion"]["deleted"], serde_json::json!([]), "{}", recorded);
+    assert_eq!(recorded["data"]["deletion"]["kept"], serde_json::json!([{
+        "hash": hash,
+        "holders": [{ "kind": "parked", "description": "a parcel parked in the warehouse's own working tree" }],
+    }]), "{}", recorded);
+    assert!(warehouse.holds_loose(hash));
+    let human = String::from_utf8_lossy(&warehouse.run_ok(&["redact", "apply"]).stdout).into_owned();
+    assert!(human.contains(&format!(
+        "Kept {}: named by a parcel parked in the warehouse's own working tree. Take the file out of it, \
+        then run \"forklift redact apply\" to delete it.", hash
+    )), "{}", human);
     let audited = warehouse.json(&["audit", "--full"]);
     assert_eq!(audited["ok"], true, "{}", audited);
     assert_eq!(audited["data"]["scope"].get("redacted"), None, "{}", audited);
 
-    warehouse.remove_object(recorded["data"]["hash"].as_str().unwrap());
+    // Popped and taken out, nothing names it, and `redact apply` deletes it.
+    warehouse.run_ok(&["park", "pop"]);
+    warehouse.run_ok(&["unload", "held.env"]);
+    std::fs::remove_file(warehouse.root.join("held.env")).unwrap();
+    let applied = warehouse.json(&["redact", "apply"]);
+    assert_eq!(applied["data"]["deletion"]["deleted"], serde_json::json!([recorded["data"]["hash"]]), "{}", applied);
     let audited = warehouse.json(&["audit", "--full"]);
     assert_eq!(audited["ok"], true, "{}", audited);
     assert_eq!(audited["data"]["scope"]["redacted"], 1, "{}", audited);
@@ -600,8 +631,11 @@ fn a_pick_bringing_back_redacted_content_is_refused_before_it_touches_the_bay() 
     warehouse.run_ok(&["shift", "main"]);
     let leak = warehouse.leaked("secret.env", b"TOKEN=hunter2\n");
     let short = &leak[..12];
-    let recorded = recorded_hash(&warehouse, &format!("{}:secret.env", leak), "leaked token");
+    // A parked parcel holds the copy, so the pick's own refusal is what stops it, not a failed read.
     std::fs::remove_file(warehouse.root.join("secret.env")).unwrap();
+    warehouse.hold_parked(b"TOKEN=hunter2\n");
+    let recorded = recorded_hash(&warehouse, &format!("{}:secret.env", leak), "leaked token");
+    assert!(warehouse.holds_loose(recorded["data"]["hash"].as_str().unwrap()), "{}", recorded);
     warehouse.stack("fine.txt", b"fine\n", "fine");
     let fine = warehouse.head("main");
 
@@ -624,9 +658,15 @@ fn a_pick_bringing_back_redacted_content_is_refused_before_it_touches_the_bay() 
     assert_eq!(warehouse.head("side"), head);
     assert_eq!(warehouse.json(&["status"])["data"]["staged_count"], 0, "nothing was staged");
 
-    // Applied, as there is no remote: with the object removed, the pick is still refused as
-    // redacted, and nothing reaches the bay.
-    warehouse.remove_object(recorded["data"]["hash"].as_str().unwrap());
+    // With the parked parcel dropped and the copy deleted, the pick is still refused as redacted,
+    // and nothing reaches the bay.
+    warehouse.run_ok(&["shift", "main"]);
+    warehouse.run_ok(&["park", "pop"]);
+    warehouse.run_ok(&["unload", "held.env"]);
+    std::fs::remove_file(warehouse.root.join("held.env")).unwrap();
+    warehouse.run_ok(&["redact", "apply"]);
+    assert!(!warehouse.holds_loose(recorded["data"]["hash"].as_str().unwrap()));
+    warehouse.run_ok(&["shift", "side"]);
     let error = content_redacted(&warehouse, &["pick", &leak]);
     assert_eq!(error["details"]["hash"], recorded["data"]["hash"], "{}", error);
     assert!(!warehouse.root.join("secret.env").exists(), "the content never reached the bay");
@@ -784,6 +824,8 @@ fn a_pick_conflicting_with_their_redacted_version_is_refused() {
     warehouse.stack("shared.txt", b"TOKEN=hunter2\n", "leak");
     let leak = warehouse.head("main");
     warehouse.stack("shared.txt", b"rotated\n", "rotate");
+    // A parked parcel holds the copy, so the pick reads their version and refuses it by path.
+    warehouse.hold_parked(b"TOKEN=hunter2\n");
     let hash = recorded_hash(&warehouse, &format!("{}:shared.txt", leak), "leaked token")["data"]["hash"].clone();
 
     // Picked onto side, the file conflicts, and the markers would carry their version whole.
@@ -1359,4 +1401,83 @@ fn a_cache_that_applied_a_redaction_never_fetches_it_nor_asks_a_new_origin_for_i
     assert_eq!(moved["ok"], true, "{}", moved);
     assert_eq!(moved["data"]["origin"], server.url.as_str(), "{}", moved);
     assert!(moved["data"]["absent_objects"].as_u64().unwrap() > 0, "the move checked the new server: {}", moved);
+}
+
+/// While another process uses the object store, a redaction's deletion is owed: the record and
+/// the apply both succeed, keep the copy and say why, and `redact apply` deletes it once the
+/// store is free.
+///
+/// Revert: fail the command on the exclusive try's refusal → `redact apply` exits non-zero.
+/// Revert: hold record's shared store access through the deletion → a record nothing else holds
+/// owes it too (`a_read_of_content_whose_redaction_is_applied_is_refused_as_redacted`).
+#[test]
+fn a_deletion_is_owed_while_another_process_uses_the_store() {
+    let warehouse = Warehouse::new("owed");
+    let leak = warehouse.leaked("secret.env", b"TOKEN=hunter2\n");
+    let hash = hash_of(b"TOKEN=hunter2\n");
+
+    {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+        let _store_access = forklift_core::util::lock_utils::StoreAccessLock::try_shared().unwrap();
+
+        let recorded = recorded_hash(&warehouse, &format!("{}:secret.env", leak), "leaked token");
+        assert_eq!(recorded["data"]["status"], serde_json::json!({ "state": "applied" }), "{}", recorded);
+        let owed = recorded["data"]["deletion"]["owed"].as_str().unwrap();
+        assert!(owed.starts_with("Another forklift process is using the object store"), "{}", recorded);
+        assert!(warehouse.holds_loose(&hash));
+
+        let human = String::from_utf8_lossy(&warehouse.run_ok(&["redact", "apply"]).stdout).into_owned();
+        assert!(human.contains("The redacted content was not deleted yet. Another forklift process is using"), "{}", human);
+        assert!(human.contains("Then run \"forklift redact apply\" again to delete it."), "{}", human);
+        assert!(warehouse.holds_loose(&hash));
+    }
+
+    let applied = warehouse.json(&["redact", "apply"]);
+    assert_eq!(applied["data"]["deletion"]["deleted"], serde_json::json!([hash]), "{}", applied);
+    assert_eq!(applied["data"]["deletion"].get("owed"), None, "{}", applied);
+    assert!(!warehouse.holds_loose(&hash));
+
+    // Nothing is left to delete, so the next apply reports no deletion.
+    assert_eq!(warehouse.json(&["redact", "apply"])["data"].get("deletion"), None);
+}
+
+/// When every copy left is held, the deletion has nothing to do and takes no lock: the held copy is
+/// reported, not an owed deletion, even while another process uses the store.
+///
+/// Revert: take the locks whatever the first census found → the deletion is owed, as the store is
+/// in use.
+#[test]
+fn a_held_copy_is_reported_without_the_locks_a_deletion_needs() {
+    let warehouse = Warehouse::new("held-unlocked");
+    let leak = warehouse.leaked("secret.env", b"TOKEN=hunter2\n");
+    warehouse.hold_parked(b"TOKEN=hunter2\n");
+
+    let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+    let _store_access = forklift_core::util::lock_utils::StoreAccessLock::try_shared().unwrap();
+
+    let recorded = recorded_hash(&warehouse, &format!("{}:secret.env", leak), "leaked token");
+    let deletion = &recorded["data"]["deletion"];
+    assert_eq!(deletion.get("owed"), None, "{}", recorded);
+    assert_eq!(deletion["kept"][0]["hash"], recorded["data"]["hash"], "{}", recorded);
+}
+
+/// Under trust, a redaction by an operator the office does not admit is refused as such, before
+/// anything about the target is told: even for a hash that is already redacted.
+///
+/// Revert: check for an existing redaction before the operator's checks → the refusal says the
+/// hash is already redacted.
+#[test]
+fn a_non_admin_is_refused_before_the_target_is_looked_at() {
+    let warehouse = Warehouse::new("non-admin");
+    warehouse.run_ok(&["office", "enroll"]);
+    let leak = warehouse.leaked("secret.env", b"TOKEN=hunter2\n");
+    let hash = recorded_hash(&warehouse, &format!("{}:secret.env", leak), "leaked token")["data"]["hash"]
+        .as_str().unwrap().to_string();
+
+    warehouse.run_ok(&["config", "set", "operator.identifier", "stranger@forklift"]);
+    let refused = warehouse.run(&["redact", "record", &hash, "-m", "again"]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("\"stranger@forklift\" is not enrolled"), "{:?}", refused);
+    assert!(!stderr.contains("already redacted"), "{:?}", refused);
 }

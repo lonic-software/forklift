@@ -85,7 +85,20 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 26** (current): a redaction has a state. `redact record`'s result and each entry of
+**Schema 27** (current): a redaction's content is deleted. `redact record`'s result and `redact
+apply`'s list carry `deletion` when an applied redaction's object may still be in the store:
+`deleted` (the redacted objects deleted), `chunks_deleted`, `bytes_freed`, `kept` (each copy kept
+with its `hash` and its `holders`, each with a `kind` of `pallet`, `meta_history`,
+`adopted_history`, `base`, `parked`, `consolidation`, `pick` or `staged`, the `pallet` or `bay` it
+names, and a `description`) and, when the deletion did not run because a lock it needs is taken,
+`owed`, the reason: other object-store maintenance is running, another process is using the object
+store, or the root is being served (`kept` then lists the held copies a census taken without the
+locks found; it is empty, and `owed` says why, when that census could not be taken). `redact
+list` never carries `deletion`. Any other failure to delete fails the command, saying what was
+already recorded or applied.
+`redact record` and `redact apply` are not MCP tools.
+
+**Schema 26**: a redaction has a state. `redact record`'s result and each entry of
 `redact list` carry `status`, whose `state` is `applied`, `held` (with the `heads`, each with its
 `pallet`, `head` and `path`, and the `meta_pallets` that name it), `awaiting_remote`, `undecided`
 (with a `reason`) or, in `redact list` only, `ready`. `redact apply` exists and reports the same

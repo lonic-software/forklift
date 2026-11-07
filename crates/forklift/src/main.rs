@@ -454,7 +454,7 @@ async fn forklift(cli: Cli) -> Result<(), ForkliftError> {
 /// Say why a mutating command is not starting yet: another process holds the store exclusively
 /// for maintenance. One line, on stderr so it never mixes into a command's result, and as a
 /// status report on the progress-events channel.
-fn announce_store_access_wait() {
+pub(crate) fn announce_store_access_wait() {
     const WAITING: &str = "Waiting for object-store maintenance in another process…";
 
     if !output::is_json() {
