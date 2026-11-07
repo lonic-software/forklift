@@ -3553,7 +3553,16 @@ async fn redaction_round(state: &AppState, warehouse: &Arc<WarehouseHandle>) -> 
 
     let owed = delete_applied_content(state, warehouse).await;
 
-    // A rebuild the drain held back runs now, as does the one an apply calls for.
+    // A rebuild the drain held back runs now, as does the one an apply calls for, unless another
+    // round follows: that round may drain for what a write applied meanwhile, so the rebuild and
+    // its flags are left to the run's last round.
+    if warehouse.redact_again.load(Ordering::SeqCst) {
+        if applied {
+            warehouse.rebuild_after_drain.store(true, Ordering::SeqCst);
+        }
+        return owed || apply_failed;
+    }
+
     let after_drain = warehouse.rebuild_after_drain.swap(false, Ordering::SeqCst);
     if applied || after_drain || warehouse.rebuild_again.load(Ordering::SeqCst) {
         rebuild_bundle(state, Arc::clone(warehouse), true);
