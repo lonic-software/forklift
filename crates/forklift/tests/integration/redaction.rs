@@ -820,16 +820,15 @@ fn a_head_the_remote_serves_is_adopted_while_the_remote_holds_its_redaction_pend
     let server = Server::start(&std::env::temp_dir()
         .join(format!("forklift-redaction-adopt-server-{}", std::process::id())));
 
-    // One warehouse lifts a pallet naming the content, which another clones, and lifts a later
-    // head of it.
+    // One warehouse lifts a pallet, which another clones, then a head of it naming the content.
     let owner = Warehouse::cloned("adopt-owner", &server.url);
     owner.stack("notes.txt", b"notes\n", "notes");
     owner.run_ok(&["lift"]);
     owner.run_ok(&["pallet", "create", "side"]);
-    owner.stack("secret.env", b"TOKEN=hunter2\n", "leak");
+    owner.stack("side.txt", b"side\n", "side");
     owner.run_ok(&["lift"]);
     let behind = Warehouse::cloned_with("adopt-behind", &server.url, &["--pallet", "side"]);
-    owner.stack("more.txt", b"more\n", "more");
+    owner.stack("secret.env", b"TOKEN=hunter2\n", "leak");
     owner.run_ok(&["lift"]);
 
     // A third, which never held that pallet, records the redaction and lifts it. The remote still
@@ -851,7 +850,7 @@ fn a_head_the_remote_serves_is_adopted_while_the_remote_holds_its_redaction_pend
     behind.run_ok(&["lower"]);
     assert_eq!(behind.head("side"), owner.head("side"));
     assert_eq!(behind.redactions().len(), 1);
-    assert!(behind.root.join("more.txt").exists());
+    assert!(behind.root.join("secret.env").exists());
 
     // Work of its own is no adoption: it is checked in full.
     std::fs::write(fresh.root.join("mine.txt"), b"mine\n").unwrap();
