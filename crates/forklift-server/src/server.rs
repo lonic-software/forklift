@@ -1462,8 +1462,10 @@ fn withheld_among(warehouse: &WarehouseHandle,
         return Ok(std::collections::HashSet::new());
     }
 
-    // The withheld chunks among `hashes`, when the gate knows them now.
-    let answer = |gate: &mut ChunkGate| -> Result<Option<std::collections::HashSet<String>>, HandlerError> {
+    // The withheld chunks among `hashes` when the gate knows them now, or else the candidates
+    // for this applied set, which a walk is to judge.
+    type Answer = Result<std::collections::HashSet<String>, std::collections::HashSet<String>>;
+    let answer = |gate: &mut ChunkGate| -> Result<Answer, HandlerError> {
         if gate.basis.as_ref() != Some(applied) {
             gate.candidates = redaction_deleter::withheld_candidates(applied).map_err(internal)?;
             gate.basis = Some(applied.clone());
@@ -1472,36 +1474,36 @@ fn withheld_among(warehouse: &WarehouseHandle,
 
         let asked: Vec<&String> = hashes.iter().filter(|hash| gate.candidates.contains(*hash)).collect();
         if asked.is_empty() {
-            return Ok(Some(std::collections::HashSet::new()));
+            return Ok(Ok(std::collections::HashSet::new()));
         }
 
         match &gate.withheld {
             Some((started, at, withheld))
                 if *started == warehouse.ref_writes_started.load(Ordering::SeqCst) && at.elapsed() < CHUNK_GATE_TTL => {
-                Ok(Some(asked.into_iter().filter(|hash| withheld.contains(*hash)).cloned().collect()))
+                Ok(Ok(asked.into_iter().filter(|hash| withheld.contains(*hash)).cloned().collect()))
             }
-            _ => Ok(None),
+            _ => Ok(Err(gate.candidates.clone())),
         }
     };
 
-    if let Some(withheld) = answer(&mut lock_gate(warehouse))? {
+    if let Ok(withheld) = answer(&mut lock_gate(warehouse))? {
         return Ok(withheld);
     }
 
     let _walk = warehouse.chunk_gate_walk.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    // Another request may have walked while this one waited.
-    if let Some(withheld) = answer(&mut lock_gate(warehouse))? {
-        return Ok(withheld);
-    }
+    // Another request may have walked while this one waited. The candidates come from the same
+    // look, under the same lock, that matched them to this applied set.
+    let candidates = match answer(&mut lock_gate(warehouse))? {
+        Ok(withheld) => return Ok(withheld),
+        Err(candidates) => candidates,
+    };
 
     // Started read before finished: equal, no write was in flight once both were read.
     let started = warehouse.ref_writes_started.load(Ordering::SeqCst);
     let settled = started == warehouse.ref_writes_finished.load(Ordering::SeqCst);
     let at = std::time::Instant::now();
 
-    // The answer above read the candidates for this applied set; the gate holds them.
-    let candidates = lock_gate(warehouse).candidates.clone();
     let withheld = redaction_deleter::withheld_among_candidates(&candidates, applied).map_err(internal)?;
     let among = hashes.iter().filter(|hash| withheld.contains(*hash)).cloned().collect();
 

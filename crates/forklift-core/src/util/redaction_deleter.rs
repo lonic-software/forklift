@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::globals::{forklift_root, FOLDER_NAME_INVENTORY_ROOT};
 use crate::enums::object::parsed_object::ParsedObject;
+use crate::enums::object_type::ObjectType;
 use crate::parser::object::loose_object_parser;
 use crate::util::lock_utils::{ServeLock, StoreAccessExclusive, StoreLock};
 use crate::util::progress_utils::Progress;
@@ -414,8 +415,9 @@ pub fn withheld_among_candidates(candidates: &HashSet<String>,
         return Ok(HashSet::new());
     }
 
-    // Every applied hash is excluded, present or not: one that cannot be told is a file's content
-    // keeps out what it names, so a chunk only it reaches is withheld rather than served.
+    // Every applied hash is excluded, present or not, so a chunk only one reaches is withheld
+    // rather than served. The walk excludes a hash only where a file entry names it and always
+    // descends a subtree, so an applied hash held as a tree keeps nothing beneath it out.
     let live = gc_utils::collect_live_set_excluding(&applied.hashes().cloned().collect())?;
 
     Ok(candidates.iter().filter(|chunk| !live.contains(*chunk)).cloned().collect())
@@ -427,19 +429,33 @@ pub fn withheld_among_candidates(candidates: &HashSet<String>,
 /// # Returns
 /// * `Ok(HashSet<String>)` - The candidates.
 /// * `Err(String)`         - If the journal could not be read, or an applied redaction's object
-///                           the store holds could not be told a blob or a recipe, or read: its
-///                           chunks are never served on a guess.
+///                           the store holds could not be read: its chunks are never served on a
+///                           guess. One held as a tree, a parcel or a chunk names none.
 pub fn withheld_candidates(applied: &AppliedSet) -> Result<HashSet<String>, String> {
     let mut candidates = read_chunks_owed()?.chunks();
 
     for hash in applied.hashes() {
-        if redaction_utils::held_kind(hash)? == Some(redaction_utils::RedactedKind::Recipe) {
+        if stored_type(hash)? == Some(ObjectType::Recipe) {
             candidates.extend(object_utils::recipe_chunk_hashes(hash)?);
         }
     }
 
     Ok(candidates)
 }
+
+/// The type the store holds `hash` as, read from its header, or `None` when it lacks it.
+fn stored_type(hash: &str) -> Result<Option<ObjectType>, String> {
+    if !file_utils::does_object_exist(hash)? {
+        return Ok(None);
+    }
+
+    let bytes = file_utils::retrieve_object_by_hash_shared(hash)?;
+    let (object_type, _) = object_utils::peek_object_header(&bytes)
+        .map_err(|e| format!("Object {} cannot be read: {:?}", hash, e))?;
+
+    Ok(Some(object_type))
+}
+
 
 /// What [`delete_applied`] did.
 #[derive(Debug, Default)]
@@ -1008,6 +1024,22 @@ mod tests {
         delete().unwrap();
         let (candidates, withheld) = withheld_chunks(&applied).unwrap();
         assert!(candidates.is_empty() && withheld.is_empty(), "{:?} {:?}", candidates, withheld);
+    }
+
+    /// An applied hash the store holds as a live tree names no chunk and keeps out nothing: the
+    /// candidates are read, and a chunk a file under that tree shares is still served.
+    ///
+    /// Revert: refuse a non-file object as unreadable → the candidates fail.
+    #[test]
+    fn an_applied_hash_held_as_a_live_tree_withholds_nothing_under_it() {
+        let _scratch = Scratch::new("withheld-tree");
+        let (_, own_chunk, _, live_recipe) = packed_chunked_leak();
+        let tree = store_tree(&[("other.bin", &live_recipe, DirEntryType::NormalChunked)]);
+        applied_redactions::apply_for_test(&[&tree]);
+
+        let (_, withheld) = withheld_chunks(&applied_redactions::read_applied().unwrap()).unwrap();
+
+        assert_eq!(withheld, HashSet::from([own_chunk]));
     }
 
     /// An applied redaction's object the store holds but cannot read refuses the candidates, so a
