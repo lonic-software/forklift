@@ -995,6 +995,7 @@ fn error_response(error: HeadError) -> Response<Vec<u8>> {
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
     let commit_not_ready = error.commit_not_ready;
+    let retry_after = error.retry_after_seconds;
 
     let body = serde_json::to_vec(&error_body(status, error.message))
         .unwrap_or_else(|_| b"{\"error\":\"internal error\"}".to_vec());
@@ -1015,6 +1016,10 @@ fn error_response(error: HeadError) -> Response<Vec<u8>> {
         builder = builder
             .header(header::RETRY_AFTER, COMMIT_NOT_READY_RETRY_AFTER_SECONDS)
             .header(LIFT_COMMIT_HEADER, LIFT_COMMIT_NOT_READY);
+    }
+
+    if let Some(seconds) = retry_after {
+        builder = builder.header(header::RETRY_AFTER, seconds.to_string());
     }
 
     builder.body(body).expect("a valid error response")

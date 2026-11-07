@@ -230,6 +230,12 @@ fn signature_key(warehouse: &str, parcel_hash: &str) -> String {
     format!("signatures/{}/{}", warehouse, parcel_hash)
 }
 
+/// `warehouse`'s key for the redaction work object `name`: a scan's progress between invocations.
+/// A distinct prefix, so a work object is never an object, a staged upload or a response.
+fn work_key(warehouse: &str, name: &str) -> String {
+    format!("redaction-work/{}/{}", warehouse, name)
+}
+
 /// The ephemeral, content-addressed key of an offloaded response body. Outside `objects/`, so
 /// nothing here is ever an object at a hash key.
 fn response_key(content_hash: &str) -> String {
@@ -867,6 +873,48 @@ impl ObjectStore for S3ObjectStore {
             Ok(OffloadedResponse::Url(url))
         })
     }
+
+    fn drop_staged_copy(&self, session: &str, hash: &str) -> Result<(), String> {
+        let key = staging_key(&self.warehouse, session, hash);
+
+        self.bridge.block_on(async {
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(|err| describe("S3 delete_object", err))
+        })
+    }
+
+    fn work_get(&self, name: &str) -> Result<Option<Vec<u8>>, String> {
+        let key = work_key(&self.warehouse, name);
+
+        self.bridge.block_on(self.key_bytes(&key))
+    }
+
+    fn work_put(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
+        let key = work_key(&self.warehouse, name);
+
+        self.bridge.block_on(self.put_overwrite(&key, bytes.to_vec()))
+    }
+
+    fn work_delete(&self, name: &str) -> Result<(), String> {
+        let key = work_key(&self.warehouse, name);
+
+        self.bridge.block_on(async {
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(|err| describe("S3 delete_object", err))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -908,6 +956,15 @@ mod tests {
         assert!(!staging_key(b, "s", &hash).starts_with(&staging_prefix(a, "s")));
 
         assert_ne!(object_key(a, &hash), format!("objects/{}", hash), "the format 1 key");
+    }
+
+    #[test]
+    fn the_work_prefix_is_its_own_and_names_the_warehouse() {
+        let hash = "a".repeat(64);
+        let key = work_key("wh-a", &format!("{}/pallets", hash));
+
+        assert_eq!(key, format!("redaction-work/wh-a/{}/pallets", hash));
+        assert!(!key.starts_with("objects/") && !key.starts_with("staging/") && !key.starts_with("responses/"));
     }
 
     #[test]

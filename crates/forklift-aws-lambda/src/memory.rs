@@ -24,11 +24,12 @@ use forklift_core::util::redaction_utils::REDACTIONS_PALLET_NAME;
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef, DEFAULT_PALLET_NAME};
 
 use crate::aws::dynamo::{
-    ATTR_ANCHOR, ATTR_DELETED_HEAD, ATTR_HEAD, ATTR_STATE, ENTITY_FORMAT, ENTITY_PALLET_PREFIX, ENTITY_TRUST,
+    ATTR_ANCHOR, ATTR_DELETED_HEAD, ATTR_HEAD, ATTR_STATE, ENTITY_FORMAT, ENTITY_PALLET_PREFIX, ENTITY_REDACTION_PREFIX,
+    ENTITY_TRUST,
 };
 use crate::store::{
     CasOutcome, ExpectedHead, FormatFence, FormatStore, ObjectAccess, ObjectStore, OffloadedResponse,
-    OfficePrecondition, PromoteOutcome, PutOutcome, PutTarget, RedactionsPrecondition, RefHead, RefListing, RefStore,
+    OfficePrecondition, PromoteOutcome, PutOutcome, PutTarget, RedactionWrite, RedactionsPrecondition, RefHead, RefListing, RefStore,
     SignatureOutcome, TrustOutcome, TrustWriteOutcome,
 };
 
@@ -51,6 +52,9 @@ pub struct MemoryObjectStore {
     redirect_base: Option<String>,
     /// How long each object read takes, standing in for a slow store.
     read_delay: Option<std::time::Duration>,
+    /// Redaction work objects, keyed by name — the stand-in for the `redaction-work/{wh}/`
+    /// prefix. Never objects.
+    work: Mutex<HashMap<String, Vec<u8>>>,
 }
 
 impl MemoryObjectStore {
@@ -86,6 +90,13 @@ impl MemoryObjectStore {
     /// How many uploads are still sitting in staging (for test assertions).
     pub fn staged_count(&self) -> usize {
         self.staged.lock().unwrap().len()
+    }
+
+    /// The names of the redaction work objects the store holds, sorted (for test assertions).
+    pub fn work_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.work.lock().unwrap().keys().cloned().collect();
+        names.sort();
+        names
     }
 
     /// How many object bodies have been read from the store — an S3 `GET` apiece.
@@ -238,6 +249,28 @@ impl ObjectStore for MemoryObjectStore {
         Ok(())
     }
 
+    fn drop_staged_copy(&self, session: &str, hash: &str) -> Result<(), String> {
+        self.staged.lock().unwrap().remove(&(session.to_string(), hash.to_string()));
+
+        Ok(())
+    }
+
+    fn work_get(&self, name: &str) -> Result<Option<Vec<u8>>, String> {
+        Ok(self.work.lock().unwrap().get(name).cloned())
+    }
+
+    fn work_put(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
+        self.work.lock().unwrap().insert(name.to_string(), bytes.to_vec());
+
+        Ok(())
+    }
+
+    fn work_delete(&self, name: &str) -> Result<(), String> {
+        self.work.lock().unwrap().remove(name);
+
+        Ok(())
+    }
+
     fn offload_response(&self, bytes: Vec<u8>) -> Result<OffloadedResponse, String> {
         let Some(base) = &self.redirect_base else {
             return Ok(OffloadedResponse::Inline(bytes));
@@ -273,6 +306,8 @@ struct RefState {
     /// The format item's state, or `None` while the warehouse has none — the item
     /// `DynamoRefStore` keeps beside the pallets and the anchor.
     format: Option<String>,
+    /// Each redaction item's stored state, keyed by the redacted hash.
+    redactions: HashMap<String, String>,
 }
 
 /// An in-memory [`RefStore`]. Pallet heads are keyed by their qualified wire reference
@@ -285,7 +320,12 @@ pub struct MemoryRefStore {
 impl Default for MemoryRefStore {
     fn default() -> MemoryRefStore {
         MemoryRefStore {
-            state: Mutex::new(RefState { pallets: HashMap::new(), trust: None, format: None }),
+            state: Mutex::new(RefState {
+                pallets: HashMap::new(),
+                trust: None,
+                format: None,
+                redactions: HashMap::new(),
+            }),
             default_pallet: DEFAULT_PALLET_NAME.to_string(),
         }
     }
@@ -316,6 +356,9 @@ impl MemoryRefStore {
         }
         if let Some(trust) = &state.trust {
             items.push((ENTITY_TRUST.to_string(), ATTR_ANCHOR.to_string(), trust.clone()));
+        }
+        for (hash, redaction) in &state.redactions {
+            items.push((format!("{}{}", ENTITY_REDACTION_PREFIX, hash), ATTR_STATE.to_string(), redaction.clone()));
         }
         for (wire, head) in &state.pallets {
             let entity = format!("{}{}", ENTITY_PALLET_PREFIX, wire);
@@ -348,9 +391,13 @@ impl MemoryRefStore {
                 return Err(format!("The item \"{}\" is listed twice.", entity));
             }
             let pallet = entity.strip_prefix(ENTITY_PALLET_PREFIX).filter(|wire| !wire.is_empty());
+            let redaction = entity.strip_prefix(ENTITY_REDACTION_PREFIX).filter(|hash| !hash.is_empty());
 
             match (entity.as_str(), pallet, attribute.as_str()) {
                 (ENTITY_FORMAT, _, ATTR_STATE) => state.format = Some(value.clone()),
+                (_, None, ATTR_STATE) if redaction.is_some() => {
+                    state.redactions.insert(redaction.unwrap_or_default().to_string(), value.clone());
+                }
                 (ENTITY_TRUST, _, ATTR_ANCHOR) => state.trust = Some(value.clone()),
                 (_, Some(wire), ATTR_HEAD) => { state.pallets.insert(wire.to_string(), RefHead::Live(value.clone())); }
                 (_, Some(wire), ATTR_DELETED_HEAD) => {
@@ -597,6 +644,33 @@ impl RefStore for MemoryRefStore {
 
     fn default_pallet(&self) -> Result<String, String> {
         Ok(self.default_pallet.clone())
+    }
+
+    fn get_redaction(&self, hash: &str) -> Result<Option<String>, String> {
+        Ok(self.state.lock().unwrap().redactions.get(hash).cloned())
+    }
+
+    fn put_redaction(
+        &self,
+        hash: &str,
+        state: &str,
+        expected: Option<&str>,
+        format: &FormatFence,
+    ) -> Result<RedactionWrite, String> {
+        let mut guard = self.state.lock().unwrap();
+
+        if !guard.format_holds(format) {
+            return Ok(RedactionWrite::FormatMoved);
+        }
+
+        if guard.redactions.get(hash).map(String::as_str) != expected {
+            return Ok(RedactionWrite::Moved);
+        }
+
+        guard.apply_format(format);
+        guard.redactions.insert(hash.to_string(), state.to_string());
+
+        Ok(RedactionWrite::Written)
     }
 
     fn get_trust(&self) -> Result<Option<(TrustAnchor, String)>, String> {

@@ -14,6 +14,12 @@
       "Resource": "${bucket_arn}/objects/*"
     },
     {
+      "Sid": "ReadRedactionItems",
+      "Effect": "Allow",
+      "Action": "dynamodb:GetItem",
+      "Resource": "${table_arn}"
+    },
+    {
       "Sid": "ListBucketFor404Semantics",
       "Effect": "Allow",
       "Action": "s3:ListBucket",

@@ -27,10 +27,10 @@ locals {
     var.dev_endpoint_url != null ? { FORKLIFT_AWS_ENDPOINT_URL = var.dev_endpoint_url } : {},
   )
 
-  # The verifier calls the same config_from_env, so FORKLIFT_DYNAMODB_TABLE must be set even
-  # though verify_and_promote never issues a single DynamoDB operation (the "operator quirk",
-  # docs/DEPLOYMENT.md, pinned by C4) — a module that wires both functions from one config
-  # cannot forget this. No credential (the verifier is never invoked by a bearer-carrying
+  # The verifier reads the table: before it promotes a staged object it reads that object's
+  # redaction item (one GetItem), so content redacted from the warehouse is never promoted.
+  # It calls the same config_from_env, so a module that wires both functions from one config
+  # cannot forget FORKLIFT_DYNAMODB_TABLE. No credential (the verifier is never invoked by a bearer-carrying
   # client — it is triggered by an S3 event, entrypoint.rs), no FORKLIFT_WAREHOUSE_ID (each staged
   # key names its warehouse, so one verifier serves them all), no FORKLIFT_DEFAULT_PALLET
   # (control-plane only).
@@ -288,6 +288,7 @@ resource "aws_iam_role_policy" "verifier" {
   # finding #6) — see README.md's "Consumption scope" section.
   policy = templatefile("${path.module}/../../crates/forklift-aws-lambda/iam/verifier.policy.json", {
     bucket_arn    = aws_s3_bucket.this.arn
+    table_arn     = aws_dynamodb_table.this.arn
     log_group_arn = local.verifier_log_group_arn
   })
 }

@@ -65,6 +65,10 @@ use crate::store::{
     RedactionsPrecondition, RefHead, RefStore, SignatureOutcome, TransientCause, TrustOutcome, TrustWriteOutcome,
 };
 
+mod redaction;
+
+pub use redaction::is_applied as redaction_applied;
+
 /// The `genesis` of a stored anchor's bytes.
 ///
 /// Used only to name the incumbent in a refusal message. Bytes that will not decode yield `None`
@@ -197,6 +201,9 @@ pub struct Head<O: ObjectStore, R: RefStore> {
     /// When a `batch` answer stops: past this many object bytes, or this close to `deadline`.
     batch_byte_budget: u64,
     batch_answer_reserve: std::time::Duration,
+    /// When set, how many object reads one request's redaction scans may spend in all: a test's
+    /// knob, so a scan spans requests. `None` bounds them by `deadline` alone.
+    scan_step_limit: Option<usize>,
 }
 
 impl<O: ObjectStore, R: RefStore> Head<O, R> {
@@ -212,6 +219,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             deadline: None,
             batch_byte_budget: BATCH_BYTE_BUDGET,
             batch_answer_reserve: BATCH_ANSWER_RESERVE,
+            scan_step_limit: None,
         }
     }
 
@@ -239,6 +247,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             deadline: Some(deadline),
             batch_byte_budget: BATCH_BYTE_BUDGET,
             batch_answer_reserve: BATCH_ANSWER_RESERVE,
+            scan_step_limit: None,
         }
     }
 
@@ -357,8 +366,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             // Always present, empty or not: this head deletes pallets, and a client reads an absent
             // map as a head that keeps no tombstones.
             tombstones: Some(tombstones),
-            // This head does not apply redactions yet, so it reports none.
-            redactions: None,
+            // Every redaction `@redactions` records, each unapplied one judged first.
+            redactions: Some(self.served_redactions()?),
         })
     }
 
@@ -447,6 +456,10 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         let unique: Vec<String> =
             hashes.iter().filter(|hash| seen.insert(hash.as_str())).cloned().collect();
 
+        // Redacted content is never accepted again, and undecided content not yet: refused before
+        // any probe or presign, so no target is ever handed out for it.
+        self.refuse_redacted(&unique)?;
+
         // One bulk probe instead of one `exists` per unique hash: on the AWS head this is the
         // bounded-concurrency S3 `HeadObject` batch, not up to a thousand serial round trips for
         // a large negotiation. `put_target` (a local presign, no network round trip) still runs
@@ -486,6 +499,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// `GET /v1/objects/{hash}` — the raw object bytes, or a redirect to storage.
     pub fn object_get(&self, hash: &str) -> HeadResult<ObjectReadResult> {
         require_object_hash(hash)?;
+        self.refuse_redacted(&[hash.to_string()])?;
 
         match self.objects.access(hash).map_err(HeadError::internal)? {
             Some(ObjectAccess::Direct(bytes)) => Ok(ObjectReadResult::Bytes(bytes)),
@@ -511,6 +525,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     ) -> HeadResult<ObjectWriteResult> {
         self.require_uploader(caller)?;
         require_object_hash(hash)?;
+        self.refuse_redacted(&[hash.to_string()])?;
 
         match self.objects.put_target(session, hash).map_err(HeadError::internal)? {
             PutTarget::Staged(url) => Ok(ObjectWriteResult::Redirect(url)),
@@ -1232,7 +1247,10 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                             .to_string(),
                     ))
                 }
-                CasOutcome::Committed => return Ok(()),
+                CasOutcome::Committed => {
+                    self.judge_after_write();
+                    return Ok(());
+                }
                 CasOutcome::Conflict { current } => {
                     return Err(self.moved_or_deleted(&bare, &current, &request.old_head))
                 }
@@ -1404,7 +1422,10 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             )?;
 
             match outcome {
-                CasOutcome::Committed => return Ok(()),
+                CasOutcome::Committed => {
+                    self.judge_after_write();
+                    return Ok(());
+                }
                 CasOutcome::OfficeMoved { .. } | CasOutcome::AnchorMoved if !last => continue,
                 // Two deletes racing from the same head: the loser finds the tombstone the winner
                 // wrote, which is what it asked for.
@@ -1481,6 +1502,13 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     pub fn batch(&self, hashes: &[String]) -> HeadResult<BatchResult> {
         self.reject_malformed_batch(hashes)?;
 
+        // A recorded hash is judged first: an applied or undecided one is left out of the bundle,
+        // as an object the store lacks is.
+        let verdicts = self.judge_hashes(hashes)?;
+        let withheld = |hash: &str| {
+            matches!(verdicts.get(hash), Some(redaction::Verdict::Applied | redaction::Verdict::Undecided(_)))
+        };
+
         let scratch = self.scratch().map_err(HeadError::internal)?;
 
         let (bundle, cut) = scratch.scoped(|| -> HeadResult<(Vec<u8>, Option<BatchCut>)> {
@@ -1489,7 +1517,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             let mut cut = None;
 
             for hash in hashes {
-                if !seen.insert(hash.as_str()) {
+                if !seen.insert(hash.as_str()) || withheld(hash) {
                     continue;
                 }
 
@@ -1601,6 +1629,10 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         more: bool,
     ) -> HeadResult<()> {
         self.require_uploader(caller)?;
+
+        // A staged copy of redacted content is dropped, never promoted, and the commit refused.
+        let named: Vec<String> = control_plane.iter().chain(blobs.iter()).cloned().collect();
+        self.refuse_applied_staged(session, &named)?;
 
         for hash in control_plane {
             let outcome =

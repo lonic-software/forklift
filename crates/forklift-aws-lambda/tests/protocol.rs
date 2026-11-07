@@ -30,7 +30,7 @@ use forklift_aws_lambda::{AsyncBridge, BatchCut, BatchDelivery, BatchResult, Hea
 use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::globals::StorageRootScope;
 use forklift_core::util::authority_utils::Principal;
-use forklift_core::model::remote::{HoldAnswer, RefUpdateRequest, TrustAnchorDto};
+use forklift_core::model::remote::{HoldAnswer, RefUpdateRequest, ServedRedactionState, TrustAnchorDto};
 use forklift_core::util::office_utils::{self, OFFICE_PALLET_NAME};
 use forklift_core::util::pallet_utils;
 use forklift_core::util::redaction_utils::REDACTIONS_PALLET_NAME;
@@ -606,11 +606,12 @@ fn a_user_head_naming_redacted_content_deep_in_an_unchanged_subtree_is_refused()
     let (redactions, recorded) = recorded_redactions(&area, "red", &["leaked\n"]);
     let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
     upload_all(&head, &recorded);
-    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions[0]);
 
+    // Pushed before the redaction is recorded: once it applies, the content is not taken again.
     let deep = gate_dir(&head, "a", vec![gate_dir(&head, "b", vec![gate_file(&head, "secret.env", "leaked\n")])]);
     let before = gate_parcel(&head, &[], vec![deep.clone(), gate_file(&head, "x", "1")]);
     plant(&head.refs, "main", &before);
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions[0]);
 
     let edit = gate_parcel(&head, &[&before], vec![deep, gate_file(&head, "x", "2")]);
     let request = RefUpdateRequest { old_head: Some(before.clone()), new_head: edit, tombstone: None };
@@ -728,6 +729,20 @@ impl RefStore for RedactionsMoveBeforeTheCommit {
         self.inner.read_format()
     }
 
+    fn get_redaction(&self, hash: &str) -> Result<Option<String>, String> {
+        self.inner.get_redaction(hash)
+    }
+
+    fn put_redaction(
+        &self,
+        hash: &str,
+        state: &str,
+        expected: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
+    ) -> Result<forklift_aws_lambda::store::RedactionWrite, String> {
+        self.inner.put_redaction(hash, state, expected, format)
+    }
+
     fn partition_has_items(&self) -> Result<bool, String> {
         self.inner.partition_has_items()
     }
@@ -816,13 +831,13 @@ fn a_redaction_recorded_during_the_check_refuses_the_commit_and_is_judged() {
         recorded_redactions(&area, "red", &["other\n", "more\n", "most\n", "last\n", "leaked\n"]);
     let racing = |moves: &[&String]| {
         let inner = Arc::new(MemoryRefStore::new());
-        plant_meta(&inner, REDACTIONS_PALLET_NAME, None, &redactions[0]);
         let refs = RedactionsMoveBeforeTheCommit {
             inner: inner.clone(),
             moves: RefCell::new(moves.iter().map(|head| head.to_string()).collect()),
         };
         let head = Head::new(MemoryObjectStore::new(), refs);
         upload_all(&head, &recorded);
+        plant_meta(&inner, REDACTIONS_PALLET_NAME, None, &redactions[0]);
         let pushed = gate_parcel(&head, &[], vec![gate_file(&head, "secret.env", "leaked\n")]);
 
         let request = RefUpdateRequest { old_head: None, new_head: pushed, tombstone: None };
@@ -839,13 +854,13 @@ fn a_redaction_recorded_during_the_check_refuses_the_commit_and_is_judged() {
 
     // With no time left in the invocation, the first move answers the `409` at once.
     let inner = Arc::new(MemoryRefStore::new());
-    plant_meta(&inner, REDACTIONS_PALLET_NAME, None, &redactions[0]);
     let refs = RedactionsMoveBeforeTheCommit {
         inner: inner.clone(),
         moves: RefCell::new(vec![redactions[1].clone(), redactions[2].clone()]),
     };
     let head = Head::new(MemoryObjectStore::new(), refs).with_deadline(std::time::SystemTime::now());
     upload_all(&head, &recorded);
+    plant_meta(&inner, REDACTIONS_PALLET_NAME, None, &redactions[0]);
     let pushed = gate_parcel(&head, &[], vec![gate_file(&head, "secret.env", "leaked\n")]);
     let request = RefUpdateRequest { old_head: None, new_head: pushed, tombstone: None };
     let err = head.ref_update(&Principal::Static, "main", &request).expect_err("no time for another check");
@@ -5032,4 +5047,226 @@ fn an_office_lift_in_the_bootstrap_window_refuses_a_delete_it_denies() {
     let err = attack.delete_pallet(&reader, "feature", &feature_head).expect_err("the office denies the reader");
     assert_eq!(err.status, Status::Forbidden, "{}", err.message);
     assert_eq!(store.get_head(pallet_utils::PalletNamespace::User, "feature").expect("get"), RefHead::Live(feature_head));
+}
+
+// ---------------------------------------------------------------------------------------
+// Applying redactions: holder verdicts, the apply, and the refusals.
+// ---------------------------------------------------------------------------------------
+
+/// A memory head holding every object of a warehouse that recorded a redaction of `content`,
+/// with no pallet and no `@redactions` head planted yet: the area, the head, the `@redactions`
+/// head to plant, and the redacted hash.
+fn unplanted_redaction(name: &str, content: &str) -> (Area, Head<MemoryObjectStore, MemoryRefStore>, String, String) {
+    let area = Area::new(name);
+    let (redactions, recorded) = recorded_redactions(&area, "red", &[content]);
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &recorded);
+
+    (area, head, redactions[0].clone(), blob_hash(content))
+}
+
+/// Assert `err` is the applied redaction's `410`, naming `hash`.
+fn assert_gone(err: &forklift_aws_lambda::error::HeadError, hash: &str) {
+    assert_eq!(err.status, Status::Gone, "{}", err.message);
+    assert_eq!(refusal_code(&err.message), Some(RefusalCode::ContentRedacted), "{}", err.message);
+    assert!(err.message.contains(hash), "the refusal names the hash: {}", err.message);
+}
+
+/// Where the handshake says the redaction of `hash` stands.
+fn served_state(head: &Head<MemoryObjectStore, MemoryRefStore>, hash: &str) -> Option<ServedRedactionState> {
+    let info = head.handshake().expect("handshake");
+    let redactions = info.redactions.expect("the head reports its redactions");
+    redactions.into_iter().find(|served| served.hash == hash).map(|served| served.state)
+}
+
+/// Whether the object `hash` is served.
+fn served<O: ObjectStore, R: RefStore>(head: &Head<O, R>, hash: &str) -> bool {
+    match head.object_get(hash) {
+        Ok(_) => true,
+        Err(err) if err.status == Status::Gone => false,
+        Err(err) => panic!("object {} answered {}: {}", hash, err.status.as_u16(), err.message),
+    }
+}
+
+/// A redaction nothing holds applies on the first request for its content, and its content is then
+/// refused on every route that serves or takes it by hash, while other content is served.
+// Revert: drop the judge from `object_get` → the content is served → red. Revert: drop it from
+// `batch` → the bundle carries it → red.
+#[test]
+fn an_unheld_redaction_applies_and_its_content_is_refused_on_every_route() {
+    let (area, head, redactions, leak) = unplanted_redaction("redaction-applies", "leaked\n");
+    let clean = gate_parcel(&head, &[], vec![gate_file(&head, "x", "1")]);
+    let other = blob_hash("1");
+    plant(&head.refs, "main", &clean);
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions);
+
+    assert_gone(&head.object_get(&leak).expect_err("applied content is not served"), &leak);
+    assert!(served(&head, &other));
+
+    let err = head.object_put(&Principal::Static, None, &leak, b"leaked\n").expect_err("nor taken again");
+    assert_gone(&err, &leak);
+    let Err(err) = head.upload_targets(&Principal::Static, "lift-1", &[other.clone(), leak.clone()]) else {
+        panic!("applied content is not negotiated");
+    };
+    assert_gone(&err, &leak);
+
+    let requested = vec![leak.clone(), other.clone()];
+    let answer = head.batch(&requested).expect("batch");
+    assert_eq!(bundled(&area, "fetch", answer, &requested), vec![other]);
+
+    assert_eq!(served_state(&head, &leak), Some(ServedRedactionState::DeletionOwed));
+    assert!(forklift_aws_lambda::head::redaction_applied(&head.refs, &leak).expect("item"));
+}
+
+/// A redaction a pallet's head names stays pending, and its content served, until that pallet moves
+/// off the head it was seen at; the move's own write applies it.
+// Revert: judge a holder free whatever its head → the content is refused while held → red. Revert:
+// drop the judge after a committed ref update → the handshake still says pending → red.
+#[test]
+fn a_redaction_a_head_names_is_served_until_that_head_moves() {
+    let (_area, head, redactions, leak) = unplanted_redaction("redaction-held", "leaked\n");
+    let holding = gate_parcel(&head, &[], vec![gate_file(&head, "secret.env", "leaked\n")]);
+    plant(&head.refs, "main", &holding);
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions);
+
+    assert!(served(&head, &leak), "a held redaction is served");
+    assert_eq!(served_state(&head, &leak), Some(ServedRedactionState::Pending));
+
+    let clean = gate_parcel(&head, &[&holding], vec![gate_file(&head, "x", "1")]);
+    let request = RefUpdateRequest { old_head: Some(holding), new_head: clean, tombstone: None };
+    head.ref_update(&Principal::Static, "main", &request).expect("the clean head lifts");
+
+    assert!(forklift_aws_lambda::head::redaction_applied(&head.refs, &leak).expect("item"), "the write applied it");
+    assert!(!served(&head, &leak));
+}
+
+/// A deleted pallet's tombstone still holds what its head named: the content can come back by a
+/// restore, so the redaction stays pending.
+// Revert: judge user holders by their live heads alone → the redaction applies → red.
+#[test]
+fn a_tombstone_holds_what_its_head_named() {
+    let (_area, head, redactions, leak) = unplanted_redaction("redaction-tombstone", "leaked\n");
+    let holding = gate_parcel(&head, &[], vec![gate_file(&head, "secret.env", "leaked\n")]);
+    plant(&head.refs, "side", &holding);
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions);
+
+    assert!(served(&head, &leak));
+    head.delete_pallet(&Principal::Static, "side", &holding).expect("delete side");
+
+    assert!(served(&head, &leak), "the tombstone holds it");
+    assert_eq!(served_state(&head, &leak), Some(ServedRedactionState::Pending));
+}
+
+/// A meta pallet seen naming the content holds it while its head descends from the head seen, its
+/// history still naming it; a head that does not descend from it is scanned again, and holds
+/// nothing.
+// Revert: free a moved meta holder unchecked → the descendant does not hold → red. Revert: hold
+// on any moved meta holder → the unrelated head still holds → red.
+#[test]
+fn a_meta_holder_holds_while_its_head_descends_from_the_one_seen() {
+    let (_area, head, redactions, leak) = unplanted_redaction("redaction-meta", "leaked\n");
+    let first = gate_parcel(&head, &[], vec![gate_file(&head, "leak", "leaked\n")]);
+    plant_meta(&head.refs, "tags", None, &first);
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions);
+
+    assert!(served(&head, &leak), "the meta pallet's head names it");
+
+    let descendant = gate_parcel(&head, &[&first], vec![gate_file(&head, "x", "2")]);
+    plant_meta(&head.refs, "tags", Some(&first), &descendant);
+    assert!(served(&head, &leak), "its history still names it");
+
+    let unrelated = gate_parcel(&head, &[], vec![gate_file(&head, "y", "3")]);
+    plant_meta(&head.refs, "tags", Some(&descendant), &unrelated);
+    assert!(!served(&head, &leak), "a head off that history holds nothing");
+}
+
+/// A scan the request cannot finish answers `503` with `Retry-After` and saves where it stopped,
+/// so the requests after it go on from there, until the redaction applies and its work objects
+/// are gone.
+// Revert: start each walk over rather than load the saved one → no request finishes it → red.
+#[test]
+fn a_scan_spans_requests_and_goes_on_where_it_stopped() {
+    let (_area, head, redactions, leak) = unplanted_redaction("redaction-resume", "leaked\n");
+    let head = head.with_scan_step_limit(3);
+
+    for pallet in 0..4 {
+        let files = (0..3).map(|dir| gate_dir(&head, &format!("d{}", dir), vec![gate_file(&head, "f", &format!("{}-{}", pallet, dir))]));
+        let parcel = gate_parcel(&head, &[], files.collect());
+        plant(&head.refs, &format!("p{}", pallet), &parcel);
+    }
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions);
+
+    let mut undecided = 0;
+    let outcome = loop {
+        assert!(undecided < 50, "the scan never finished");
+
+        match head.object_get(&leak) {
+            Err(err) if err.status == Status::ServiceUnavailable => {
+                assert_eq!(err.retry_after_seconds, Some(2), "{}", err.message);
+                assert!(!head.objects.work_names().is_empty(), "the scan saved where it stopped");
+                undecided += 1;
+            }
+            other => break other,
+        }
+    };
+
+    assert!(undecided >= 2, "a 3-read budget cannot walk four pallets in one request");
+    assert_gone(&outcome.expect_err("the redaction applied"), &leak);
+    assert_eq!(head.objects.work_names(), Vec::<String>::new(), "a finished scan leaves no work behind");
+}
+
+/// A redaction recorded by a ref update starts its scan in that write, and applies there when
+/// nothing holds it: no request for its content is needed.
+// Revert: drop the judge after a committed ref update → no item exists → red.
+#[test]
+fn recording_a_redaction_applies_it_when_nothing_holds_it() {
+    let area = Area::new("redaction-recorded");
+    let (redactions, recorded) = recorded_redactions(&area, "red", &["one\n", "two\n"]);
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &recorded);
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions[0]);
+
+    let wire = format!("@{}", REDACTIONS_PALLET_NAME);
+    let request = RefUpdateRequest { old_head: Some(redactions[0].clone()), new_head: redactions[1].clone(), tombstone: None };
+    head.ref_update(&Principal::Static, &wire, &request).expect("the second redaction lifts");
+
+    for content in ["one\n", "two\n"] {
+        let hash = blob_hash(content);
+        assert!(forklift_aws_lambda::head::redaction_applied(&head.refs, &hash).expect("item"), "{}", content.trim());
+    }
+}
+
+/// A redaction item of a version this build does not read fails every request for that content,
+/// loudly, and is never written over: it may record an apply.
+// Revert: read an unknown version as no item → the scan starts and the item is overwritten → red.
+#[test]
+fn a_redaction_item_of_an_unknown_version_is_a_loud_failure_never_pending() {
+    let (_area, head, redactions, leak) = unplanted_redaction("redaction-unknown", "leaked\n");
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions);
+
+    let future = r#"{"version":2,"applied_at":1}"#;
+    let fence = forklift_aws_lambda::format::gate(&head.refs).expect("format gate");
+    head.refs.put_redaction(&leak, future, None, &fence).expect("plant the item");
+
+    let err = head.object_get(&leak).expect_err("unknown item");
+    assert_eq!(err.status, Status::Internal, "{}", err.message);
+    assert_eq!(head.refs.get_redaction(&leak).expect("item").as_deref(), Some(future));
+    assert!(head.handshake().is_err(), "the handshake cannot say where it stands either");
+}
+
+/// A lift commit naming applied content drops its staged copy, never promoting it, and is refused.
+// Revert: drop the check from `commit_lift` → the commit succeeds → red.
+#[test]
+fn a_lift_commit_naming_applied_content_drops_it_unpromoted() {
+    let (_area, head, redactions, leak) = unplanted_redaction("redaction-commit", "leaked\n");
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions);
+    assert!(!served(&head, &leak), "applied");
+
+    for (control_plane, blobs) in [(vec![leak.clone()], vec![]), (vec![], vec![leak.clone()])] {
+        head.objects.stage("lift-1", &leak, b"leaked\n".to_vec());
+
+        let err = head.commit_lift(&Principal::Static, "lift-1", &control_plane, &blobs, false).expect_err("refused");
+        assert_gone(&err, &leak);
+        assert_eq!(head.objects.staged_count(), 0, "the staged copy is dropped");
+    }
 }

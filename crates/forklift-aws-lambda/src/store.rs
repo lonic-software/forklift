@@ -218,6 +218,20 @@ pub enum ExpectedHead<'a> {
     At(&'a str),
 }
 
+/// The outcome of [`RefStore::put_redaction`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedactionWrite {
+    /// The item now holds the new state.
+    Written,
+    /// The item no longer held what the caller expected; nothing was written.
+    Moved,
+    /// The format item no longer held what the fence names; nothing was written.
+    FormatMoved,
+    /// Refused for a reason that shows nothing moved, or with an unknown fate: read the item
+    /// again to learn which.
+    Transient(TransientCause),
+}
+
 /// Every pallet with an entry, across both namespaces: those live, and those deleted.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RefListing {
@@ -505,6 +519,31 @@ pub trait ObjectStore {
     fn offload_response(&self, bytes: Vec<u8>) -> Result<OffloadedResponse, String> {
         Ok(OffloadedResponse::Inline(bytes))
     }
+
+    /// Delete the copy of `hash` staged under `session`, if any: a staged object whose
+    /// redaction applied is dropped, never promoted. The default store stages nothing.
+    fn drop_staged_copy(&self, _session: &str, _hash: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// The bytes of the redaction work object `name`, or `None` when there is none. Work
+    /// objects hold a redaction scan's progress between invocations, under the warehouse's own
+    /// `redaction-work/` prefix; they are never objects and never served.
+    ///
+    /// The default keeps no work objects and fails, loudly.
+    fn work_get(&self, _name: &str) -> Result<Option<Vec<u8>>, String> {
+        Err("This object store keeps no redaction work objects.".to_string())
+    }
+
+    /// Write the redaction work object `name`, replacing what it held.
+    fn work_put(&self, _name: &str, _bytes: &[u8]) -> Result<(), String> {
+        Err("This object store keeps no redaction work objects.".to_string())
+    }
+
+    /// Delete the redaction work object `name`; an absent one is no error.
+    fn work_delete(&self, _name: &str) -> Result<(), String> {
+        Err("This object store keeps no redaction work objects.".to_string())
+    }
 }
 
 /// The consistency point: pallet heads and the trust anchor.
@@ -588,9 +627,34 @@ pub trait RefStore {
         request_token: &str,
     ) -> Result<CasOutcome, String>;
 
-    /// Every pallet with an entry, across both namespaces, live and deleted. Explicit because
-    /// object storage has no directory walk (unlike `pallet_utils::all_pallet_refs`).
+    /// Every pallet with an entry, across both namespaces, live and deleted, read strongly
+    /// consistently: a redaction's scan and its judge decide from this listing, so it must show
+    /// every write committed before it. Explicit because object storage has no directory walk
+    /// (unlike `pallet_utils::all_pallet_refs`).
     fn list_refs(&self) -> Result<RefListing, String>;
+
+    /// The stored state of the redaction item for `hash`, read strongly consistently, or `None`
+    /// when the head has not begun deciding that redaction. The bytes are returned as stored, so
+    /// [`put_redaction`](RefStore::put_redaction) can condition on exactly them.
+    ///
+    /// The default keeps no redaction items and fails every read, loudly: a store that cannot
+    /// say whether a redaction applied must never be read as one where it is pending.
+    fn get_redaction(&self, _hash: &str) -> Result<Option<String>, String> {
+        Err("This ref store keeps no redaction items.".to_string())
+    }
+
+    /// Write `state` as the redaction item for `hash`, on condition that the item still holds
+    /// `expected`, the bytes [`get_redaction`](RefStore::get_redaction) returned (`None`: no item
+    /// yet), and that the format item still holds what `format` names.
+    fn put_redaction(
+        &self,
+        _hash: &str,
+        _state: &str,
+        _expected: Option<&str>,
+        _format: &FormatFence,
+    ) -> Result<RedactionWrite, String> {
+        Err("This ref store keeps no redaction items.".to_string())
+    }
 
     /// The pallet a clone checks out when the user does not choose (git's `HEAD`).
     fn default_pallet(&self) -> Result<String, String>;
