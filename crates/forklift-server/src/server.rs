@@ -3827,11 +3827,11 @@ fn run_redactions(state: Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
             let weak = Arc::downgrade(&warehouse);
             drop(warehouse);
 
+            // Owing nothing, the run ended above; so without a deletion, it owes an apply.
             let wait = match (owes.deletion, owes.apply) {
                 (true, true) => retry.min(apply_retry),
                 (true, false) => retry,
-                (false, true) => apply_retry,
-                (false, false) => unreachable!("a run owing nothing has ended"),
+                (false, _) => apply_retry,
             };
 
             tokio::select! {
