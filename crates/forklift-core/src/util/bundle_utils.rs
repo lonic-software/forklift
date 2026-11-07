@@ -12,9 +12,11 @@ use crate::globals::forklift_root;
 use crate::model::remote::MAX_MISSING_BATCH;
 use crate::model::tree_item::TreeItem;
 use crate::util::{
-    audit_utils, delta_utils, fanout_utils, file_utils, object_utils, pack_utils, pallet_utils,
-    scope_utils, sign_utils,
+    applied_redactions, audit_utils, delta_utils, fanout_utils, file_utils, object_utils, pack_utils,
+    pallet_utils, scope_utils, sign_utils,
 };
+use crate::util::applied_redactions::AppliedSet;
+use crate::util::lock_utils::RefLock;
 
 /// The uncompressed ASCII header line (without the newline) that opens every whole-warehouse
 /// bundle this build writes. Version 4 made the object payload one or more native `.pack`/`.idx`
@@ -190,11 +192,22 @@ pub fn is_current_bundle_prefix(prefix: &[u8]) -> bool {
 /// each parcel's signature sidecar, and the full tree/blob closure — each object once.
 /// The bundle is written atomically to the `latest` path.
 ///
+/// A file whose content a redaction applied here names is left out: the bundle never carries
+/// redacted content, whether or not its bytes are deleted yet. Applying a redaction withdraws the
+/// bundle under the ref lock ([`applied_redactions::apply`]), and the build publishes under that
+/// lock only when no redaction was applied since it started, so a build begun before the mark
+/// never publishes the content after it.
+///
+/// [`applied_redactions::apply`]: crate::util::applied_redactions::apply
+///
 /// # Returns
 /// * `Ok(BuildStats)` - What was packed, and where.
-/// * `Err(String)`    - If an object could not be read or the bundle written.
+/// * `Err(String)`    - If an object could not be read or the bundle written, the record of
+///                      applied redactions cannot be read, or a redaction was applied during the
+///                      build.
 pub fn build_bundle() -> Result<BuildStats, String> {
     let bundle_path = get_latest_bundle_path();
+    let redacted = applied_redactions::read_applied()?;
 
     if let Some(parent) = bundle_path.parent() {
         file_utils::create_folder_if_not_exists(parent)?;
@@ -224,7 +237,7 @@ pub fn build_bundle() -> Result<BuildStats, String> {
     // deltas against it (the importer must have the base stored to reconstruct the delta).
     let order = topo_order_oldest_first(&parcels)?;
 
-    let plan = plan_emission(&order, PLAN_PARCEL_TREES)?;
+    let plan = plan_emission(&order, PLAN_PARCEL_TREES, &redacted)?;
     let mut depths: Vec<u32> = vec![0; plan.len()];
     let mut next = 0usize;
 
@@ -249,7 +262,7 @@ pub fn build_bundle() -> Result<BuildStats, String> {
     signature_writer.flush()
         .map_err(|e| format!("Error while flushing bundle signature staging: {}", e))?;
     drop(signature_writer);
-    write_native_bundle(&bundle_path, &artifacts, &signature_path, stats.signatures)?;
+    write_native_bundle(&bundle_path, &artifacts, &signature_path, stats.signatures, &redacted)?;
 
     Ok(stats)
 }
@@ -262,7 +275,8 @@ pub fn build_bundle() -> Result<BuildStats, String> {
 fn write_native_bundle(bundle_path: &Path,
                        artifacts: &[pack_utils::TransportPackArtifact],
                        signature_path: &Path,
-                       signature_count: usize) -> Result<(), String> {
+                       signature_count: usize,
+                       redacted: &AppliedSet) -> Result<(), String> {
     if artifacts.len() > pack_utils::MAX_TRANSPORT_PACKS {
         return Err(format!(
             "Cannot bundle {} native packs: the format limit is {}.",
@@ -272,7 +286,7 @@ fn write_native_bundle(bundle_path: &Path,
 
     let temporary_path = unique_sibling_temp(bundle_path, "latest.bundle");
     let result = write_envelope_and_publish(
-        &temporary_path, bundle_path, artifacts, signature_path, signature_count
+        &temporary_path, bundle_path, artifacts, signature_path, signature_count, redacted
     );
     if result.is_err() {
         // A failed write or rename must not strand a store-sized temp envelope until the stale
@@ -282,12 +296,15 @@ fn write_native_bundle(bundle_path: &Path,
     result
 }
 
-/// Write the envelope to `temporary_path`, then atomically publish it at `bundle_path`.
+/// Write the envelope to `temporary_path`, then atomically publish it at `bundle_path`, under the
+/// ref lock and only while the applied redactions are still `redacted`, the ones the build left
+/// out.
 fn write_envelope_and_publish(temporary_path: &Path,
                               bundle_path: &Path,
                               artifacts: &[pack_utils::TransportPackArtifact],
                               signature_path: &Path,
-                              signature_count: usize) -> Result<(), String> {
+                              signature_count: usize,
+                              redacted: &AppliedSet) -> Result<(), String> {
     let file = std::fs::File::create(temporary_path)
         .map_err(|e| format!("Error while creating the bundle file: {}", e))?;
     let mut writer = DigestingWriter {
@@ -328,6 +345,20 @@ fn write_envelope_and_publish(temporary_path: &Path,
             .map_err(|e| format!("Error while syncing the bundle file: {}", e))?;
     }
     drop(writer);
+
+    #[cfg(test)]
+    tests::BEFORE_PUBLISH.with(|hook| if let Some(hook) = hook.borrow_mut().take() { hook() });
+
+    // An apply withdraws the bundle under this lock after its mark, so a bundle published here
+    // either lands before the mark, and is withdrawn, or is judged against it.
+    let _lock = RefLock::acquire()?;
+
+    if applied_redactions::read_applied()?.hashes().any(|hash| !redacted.contains(hash)) {
+        return Err(
+            "A redaction was applied while the bundle was built, so the bundle was not published: \
+            it may hold the redacted content. Build it again.".to_string()
+        );
+    }
 
     file_utils::rename(temporary_path, bundle_path)
         .map_err(|e| format!("Error while moving the bundle into place: {}", e))?;
@@ -466,6 +497,9 @@ fn remove_stale_staging(parent: &Path) {
 /// writer-side refusal `build_bundle` gives, rather than silently omitting content the
 /// caller asked for by name.
 ///
+/// An object a redaction applied here names is left out as an absent one is, whether or not its
+/// bytes are deleted yet: the client's loose fetch of it is then refused as redacted.
+///
 /// A hash repeated in `hashes` is written once, at its first occurrence (see [`BundleWriter`]).
 ///
 /// # Arguments
@@ -473,13 +507,15 @@ fn remove_stale_staging(parent: &Path) {
 ///
 /// # Returns
 /// * `Ok(Vec<u8>)` - The bundle bytes (header line + one zstd stream of records).
-/// * `Err(String)` - If a present object could not be read, or one is above the ceiling.
+/// * `Err(String)` - If a present object could not be read, or one is above the ceiling, or the
+///                   record of applied redactions cannot be read.
 pub fn build_partial_bundle(hashes: &[String]) -> Result<Vec<u8>, String> {
+    let redacted = applied_redactions::read_applied()?;
     let mut bundle = BundleWriter::new()?;
     let mut looked: HashSet<&str> = HashSet::new();
 
     for hash in hashes {
-        if !looked.insert(hash.as_str()) || !file_utils::does_object_exist(hash)? {
+        if !looked.insert(hash.as_str()) || redacted.contains(hash) || !file_utils::does_object_exist(hash)? {
             continue;
         }
 
@@ -592,6 +628,8 @@ struct PlanWalk {
     latest_blob_at_path: HashMap<Arc<str>, usize>,
     /// The directory names the plan's trees share.
     directories: HashSet<Arc<str>>,
+    /// The redactions applied here, whose content the plan leaves out.
+    redacted: AppliedSet,
 }
 
 /// Walk every parcel's closure (trees and blobs, each once) into the records the bundle holds,
@@ -608,7 +646,7 @@ struct PlanWalk {
 ///
 /// A chunked file anywhere in the closure, or a tree that cannot be read, refuses the build here,
 /// before any record is written.
-fn plan_emission(order: &[String], parcel_trees: usize) -> Result<Vec<Emission>, String> {
+fn plan_emission(order: &[String], parcel_trees: usize, redacted: &AppliedSet) -> Result<Vec<Emission>, String> {
     let mut tree_of: HashMap<&str, String> = HashMap::new();
     let mut walks: Vec<(&str, String, Option<String>)> = Vec::new();
 
@@ -619,7 +657,7 @@ fn plan_emission(order: &[String], parcel_trees: usize) -> Result<Vec<Emission>,
         walks.push((parcel_hash, parcel.tree_hash, parent_tree));
     }
 
-    let mut walk = PlanWalk::default();
+    let mut walk = PlanWalk { redacted: redacted.clone(), ..PlanWalk::default() };
 
     fanout_utils::prefetch_in_order(
         &walks,
@@ -698,6 +736,11 @@ fn plan_tree_closure(walk: &mut PlanWalk,
     };
 
     for (name, file) in tree.get_files() {
+        // Redacted content is never bundled, and is no base for a later version to delta against.
+        if walk.redacted.contains(&file.hash) {
+            continue;
+        }
+
         let path = join_path(path_prefix, name);
 
         // Chunk transport is **per-object** (a chunked file's chunks ride the loose GET/PUT byte
@@ -1512,6 +1555,59 @@ mod tests {
     use crate::model::tree_item::TreeItem;
     use crate::util::byte_utils::number_to_vlq_bytes;
 
+    thread_local! {
+        /// Run once right before a build takes the ref lock to publish.
+        pub(super) static BEFORE_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    }
+
+    // Revert: drop the plan's redacted skip → the bundle carries the redacted blob; drop the
+    // publish check → a build during which a redaction applied publishes it.
+    #[test]
+    fn a_bundle_never_carries_redacted_content() {
+        let source = Scratch::new("bundle-redacted-src");
+        let secret = store_blob(b"TOKEN=hunter2");
+        let later = store_blob(b"TOKEN=rotated");
+        let kept = store_blob(b"notes");
+        let first = store_head_parcel(&store_tree(&[("secret.env", &secret), ("notes.txt", &kept)], &[]), &[]);
+        store_head_parcel(&store_tree(&[("secret.env", &later), ("notes.txt", &kept)], &[]), &[&first]);
+        crate::util::applied_redactions::apply_for_test(&[&secret]);
+
+        build_bundle().unwrap();
+        let bundle = std::fs::read(get_latest_bundle_path()).unwrap();
+
+        // A redaction applied while the build runs keeps the build from publishing.
+        std::fs::remove_file(get_latest_bundle_path()).unwrap();
+        let applied_meanwhile = later.clone();
+        BEFORE_PUBLISH.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+            crate::util::applied_redactions::apply_for_test(&[&applied_meanwhile]);
+        })));
+        let refused = build_bundle().err().expect("a redaction applied during the build refuses it");
+        assert!(refused.contains("A redaction was applied while the bundle was built"), "{}", refused);
+        assert!(!get_latest_bundle_path().exists(), "nothing was published");
+        drop(source);
+
+        let _destination = Scratch::new("bundle-redacted-dst");
+        import_bundle_bytes(&bundle).unwrap();
+        assert!(!file_utils::does_object_exist(&secret).unwrap(), "the redacted blob is left out");
+        assert!(file_utils::does_object_exist(&later).unwrap() && file_utils::does_object_exist(&kept).unwrap());
+    }
+
+    // Revert: drop the partial bundle's redacted skip → the batch carries the redacted blob.
+    #[test]
+    fn a_partial_bundle_leaves_redacted_content_out_as_absent() {
+        let source = Scratch::new("partial-redacted-src");
+        let secret = store_blob(b"TOKEN=hunter2");
+        let kept = store_blob(b"notes");
+        crate::util::applied_redactions::apply_for_test(&[&secret]);
+        let bytes = build_partial_bundle(&[secret.clone(), kept.clone()]).unwrap();
+        drop(source);
+
+        let _destination = Scratch::new("partial-redacted-dst");
+        import_batch_bytes(&bytes, &[&secret, &kept]).unwrap();
+        assert!(!file_utils::does_object_exist(&secret).unwrap());
+        assert!(file_utils::does_object_exist(&kept).unwrap());
+    }
+
     /// Import an in-memory bundle, as `import_bundle` imports a file.
     fn import_bundle_bytes(bytes: &[u8]) -> Result<ImportStats, String> {
         import_bundle_reader(std::io::Cursor::new(bytes))
@@ -1897,7 +1993,7 @@ mod tests {
             let signatures = staging.join("signatures");
             std::fs::write(&signatures, b"").unwrap();
             let bundle_path = source.root.join("rollover.bundle");
-            write_native_bundle(&bundle_path, &artifacts, &signatures, 0).unwrap();
+            write_native_bundle(&bundle_path, &artifacts, &signatures, 0, &AppliedSet::default()).unwrap();
             std::fs::read(&bundle_path).unwrap()
         };
 
@@ -2366,7 +2462,7 @@ mod tests {
         let parcel = store_head_parcel(&root, &[]);
 
         PLAN_WALK_READS.with(|reads| reads.set(0));
-        let plan = plan_emission(&[parcel.clone()], CAP).unwrap();
+        let plan = plan_emission(&[parcel.clone()], CAP, &AppliedSet::default()).unwrap();
         assert!(PLAN_WALK_READS.with(|reads| reads.get()) > 0, "the walk read the trees past the cap");
 
         let planned = |kind: fn(&Emission) -> bool| -> HashSet<PlanHash> {

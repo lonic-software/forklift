@@ -6467,6 +6467,13 @@ A command not listed here either reports only the generic human-message shape `{
         "state": {
           "$ref": "#/$defs/StateName",
           "description": "The state."
+        },
+        "tombstones": {
+          "description": "For `held`, the deleted pallets whose tombstone keeps a head that names the content, served\nand restorable: each with the `pallet` name, the `head` and the `path`.",
+          "items": {
+            "$ref": "#/$defs/HeadView"
+          },
+          "type": "array"
         }
       },
       "required": [
@@ -6791,6 +6798,13 @@ A command not listed here either reports only the generic human-message shape `{
         "state": {
           "$ref": "#/$defs/StateName",
           "description": "The state."
+        },
+        "tombstones": {
+          "description": "For `held`, the deleted pallets whose tombstone keeps a head that names the content, served\nand restorable: each with the `pallet` name, the `head` and the `path`.",
+          "items": {
+            "$ref": "#/$defs/HeadView"
+          },
+          "type": "array"
         }
       },
       "required": [

@@ -2530,6 +2530,35 @@ pub(crate) mod tests {
             update_meta_pallet_head(OFFICE, None, &"e".repeat(64), &RefPreconditions::NONE).unwrap();
         }
 
+        // Revert: verify the server's write strictly again → a head whose history names content a
+        // redaction applied here took away is refused as incomplete.
+        #[test]
+        fn a_server_write_tolerates_only_an_absence_an_applied_redaction_names() {
+            let (_root, _scope) = scratch("closure-applied");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let leaked = parcel(&two_dirs("secret", "b0"), &[&base]);
+            let head = parcel(&two_dirs("a1", "b0"), &[&leaked]);
+            let secret = blob("secret");
+            remove(&secret);
+
+            let refused = crate::util::audit_utils::verify_parcel_closure_for_write(&head, Some(&base));
+            assert!(refused.is_err(), "an absence nothing names is damage");
+
+            crate::util::applied_redactions::apply_for_test(&[&secret]);
+            let token = crate::util::audit_utils::verify_parcel_closure_for_write(&head, Some(&base)).unwrap();
+            update_pallet_head_verified(
+                PalletNamespace::User, "main", Some(&base), &head, &RefPreconditions::NONE, &token, None
+            ).unwrap();
+            assert_eq!(get_pallet_head("main").unwrap().as_deref(), Some(head.as_str()));
+
+            // Anything else absent is still refused.
+            let damaged = parcel(&two_dirs("a2", "b0"), &[&head]);
+            let lost = blob("a2");
+            remove(&lost);
+            assert!(crate::util::audit_utils::verify_parcel_closure_for_write(&damaged, Some(&head)).is_err());
+        }
+
         // Revert: stop comparing the token's bound → a walk cut at a parcel no ref reaches skips the
         // root `head` reuses from it, so the write takes that token and lands over a lost blob.
         #[test]
@@ -2906,7 +2935,7 @@ pub(crate) mod tests {
             let local = blob("local");
             let redactions = pending_then_local(&pending, &local);
             let served = parcel(&two_dirs("a0", "pending"), &[]);
-            let adopting = Served { head: &served, redactions: Some(&redactions) };
+            let adopting = Served { head: &served, redactions: Some(&redactions), report: None };
 
             // Another head on the served one is a new parcel, judged in full.
             let stacked = parcel(&two_dirs("a1", "pending"), &[&served]);
@@ -2924,9 +2953,36 @@ pub(crate) mod tests {
 
             // A redaction the remote does not hold still refuses its served head.
             let names_local = parcel(&two_dirs("a0", "local"), &[]);
-            let adopting = Served { head: &names_local, redactions: Some(&redactions) };
+            let adopting = Served { head: &names_local, redactions: Some(&redactions), report: None };
             assert_redacted(adopt_pallet_head("other", None, &names_local, adopting, &RefPreconditions::NONE), "web/b", &local);
             assert_eq!(get_pallet_head("other").unwrap(), None, "nothing was written");
+        }
+
+        // Revert: ignore the remote's report → adopting a head naming a redaction the remote
+        // reports applied lands; or read any reported state as pending → a state this build does
+        // not know exempts too.
+        #[test]
+        fn adopting_is_exempt_only_from_what_the_remote_reports_pending() {
+            use crate::model::remote::{ServedRedaction, ServedRedactionState};
+            use crate::util::redaction_utils::Served;
+
+            let (_root, _scope) = scratch("redacted-adopted-report");
+            let pending = blob("pending");
+            let redactions = pending_then_local(&pending, &blob("local"));
+            let served = parcel(&two_dirs("a0", "pending"), &[]);
+            let reported = |state| vec![ServedRedaction { hash: pending.clone(), state }];
+
+            for state in [ServedRedactionState::DeletionOwed, ServedRedactionState::Deleted, ServedRedactionState::Unknown] {
+                let report = reported(state);
+                let adopting = Served { head: &served, redactions: Some(&redactions), report: Some(&report) };
+                assert_redacted(adopt_pallet_head("side", None, &served, adopting, &RefPreconditions::NONE), "web/b", &pending);
+                assert_eq!(get_pallet_head("side").unwrap(), None, "nothing was written for {:?}", state);
+            }
+
+            let report = reported(ServedRedactionState::Pending);
+            let adopting = Served { head: &served, redactions: Some(&redactions), report: Some(&report) };
+            adopt_pallet_head("side", None, &served, adopting, &RefPreconditions::NONE).unwrap();
+            assert_eq!(get_pallet_head("side").unwrap().as_deref(), Some(served.as_str()));
         }
 
         // Revert: exempt any served `@redactions` head the store holds → one this warehouse never
@@ -2945,7 +3001,7 @@ pub(crate) mod tests {
 
             // Stored here, and naming the content, but not on this warehouse's chain.
             let served = parcel(&two_dirs("a0", "secret"), &[]);
-            let adopting = Served { head: &served, redactions: Some(&untaken) };
+            let adopting = Served { head: &served, redactions: Some(&untaken), report: None };
             assert_redacted(adopt_pallet_head("side", None, &served, adopting, &RefPreconditions::NONE), "web/b", &secret);
             assert_eq!(get_pallet_head("side").unwrap(), None, "nothing was written");
         }
@@ -2961,7 +3017,7 @@ pub(crate) mod tests {
             let pending = blob("pending");
             let redactions = pending_then_local(&pending, &blob("local"));
             let served = parcel(&two_dirs("a0", "pending"), &[]);
-            let adopting = Served { head: &served, redactions: Some(&redactions) };
+            let adopting = Served { head: &served, redactions: Some(&redactions), report: None };
 
             BEFORE_HOLD.with(|slot| *slot.borrow_mut() = Some(Box::new(|| {
                 crate::util::tombstone_utils::mark_served(true).unwrap();

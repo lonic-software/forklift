@@ -377,6 +377,29 @@ pub struct HeadHolder {
 /// Elsewhere an object the walk needs and the store lacks is an error, never a pass; a pallet that
 /// does name the content is reported ahead of that error.
 pub fn head_holders(redaction: &Redaction) -> Result<Vec<HeadHolder>, String> {
+    let mut heads = Vec::new();
+
+    for pallet in pallet_utils::list_pallets()? {
+        if let Some(head) = pallet_utils::get_pallet_head(&pallet)? {
+            heads.push((pallet, head));
+        }
+    }
+
+    holders_among(redaction, heads, "pallet")
+}
+
+/// Every deleted pallet whose tombstone's head names what `redaction` removes, by the rule of
+/// [`head_holders`]. A tombstone keeps its head served and restorable, so a redaction it holds
+/// cannot apply; dropping the tombstone, or restoring the pallet and taking the file out, frees it.
+/// Kept apart from [`head_holders`], since a recording is not refused over it: no write here can
+/// take the file out of a deleted pallet.
+pub fn tombstone_holders(redaction: &Redaction) -> Result<Vec<HeadHolder>, String> {
+    holders_among(redaction, crate::util::tombstone_utils::read_tombstones()?.into_iter().collect(), "deleted pallet")
+}
+
+/// Which of `heads`, each a pallet's name and head, names what `redaction` removes; `what` names
+/// that kind of pallet in an error.
+fn holders_among(redaction: &Redaction, heads: Vec<(String, String)>, what: &str) -> Result<Vec<HeadHolder>, String> {
     let set = RedactedSet {
         hashes: HashSet::from([redaction.hash.clone()]),
         chunk_lists: redaction.chunks.iter().map(|chunks| (chunks.clone(), HashSet::from([redaction.hash.clone()]))).collect(),
@@ -386,9 +409,7 @@ pub fn head_holders(redaction: &Redaction) -> Result<Vec<HeadHolder>, String> {
     let mut holders = Vec::new();
     let mut undecided = None;
 
-    for pallet in pallet_utils::list_pallets()? {
-        let Some(head) = pallet_utils::get_pallet_head(&pallet)? else { continue };
-
+    for (pallet, head) in heads {
         if partial && !file_utils::does_object_exist(&head)? {
             continue;
         }
@@ -402,9 +423,9 @@ pub fn head_holders(redaction: &Redaction) -> Result<Vec<HeadHolder>, String> {
             Ok(None) => {}
             Err(error) => {
                 undecided.get_or_insert(format!(
-                    "The head of pallet \"{}\" ({}) cannot be read ({}), so whether it names {} cannot \
+                    "The head of {} \"{}\" ({}) cannot be read ({}), so whether it names {} cannot \
                     be told.",
-                    pallet, head, error.trim_end_matches('.'), redaction.hash
+                    what, pallet, head, error.trim_end_matches('.'), redaction.hash
                 ));
             }
         }
@@ -881,14 +902,18 @@ pub struct Served<'a> {
     pub head: &'a str,
 
     /// The `@redactions` head the remote served in the same handshake, `None` when it served
-    /// none. What it holds is what the remote reports pending; read for a user pallet only.
+    /// none. What it holds is what the remote may report pending; read for a user pallet only.
     pub redactions: Option<&'a str>,
+
+    /// Where the remote reports each of those redactions stands, `None` when its handshake carries
+    /// no report: a head that applies no redaction, so every one it holds is pending there.
+    pub report: Option<&'a [crate::model::remote::ServedRedaction]>,
 }
 
 impl<'a> Served<'a> {
     /// A meta pallet's served `head`: its chain is what the write takes.
     pub fn chain(head: &'a str) -> Served<'a> {
-        Served { head, redactions: None }
+        Served { head, redactions: None, report: None }
     }
 
     /// A user pallet's served `head`, beside the `@redactions` head `info`, the remote's
@@ -896,7 +921,18 @@ impl<'a> Served<'a> {
     pub fn adopting(head: &'a str, info: &'a crate::model::remote::WarehouseInfo) -> Served<'a> {
         let redactions = info.pallets.get(&pallet_utils::PalletRef::meta(REDACTIONS_PALLET_NAME).to_wire());
 
-        Served { head, redactions: redactions.map(String::as_str) }
+        Served { head, redactions: redactions.map(String::as_str), report: info.redactions.as_deref() }
+    }
+
+    /// Whether the remote reports the redaction of `hash` pending: with no report, every one it
+    /// holds is; with one, only those it lists in that state.
+    fn reports_pending(&self, hash: &str) -> bool {
+        match self.report {
+            None => true,
+            Some(report) => report.iter().any(|redaction| {
+                redaction.hash == hash && redaction.state == crate::model::remote::ServedRedactionState::Pending
+            }),
+        }
     }
 }
 
@@ -1066,8 +1102,8 @@ struct Exemption {
 /// `set`, the redactions at this warehouse's `@redactions` head `local`, less those a user
 /// pallet's write of `new` is exempt from, and whether it is an adoption. It is one when `new` is
 /// the head the remote served beside `served`, and this root has never been served; it is then
-/// exempt from the redactions at the `@redactions` head the remote served, which the remote
-/// reports pending. Only once `local` reaches that head: this warehouse verified and took it, so a
+/// exempt from the redactions at the `@redactions` head the remote served that the remote reports
+/// pending. Only once `local` reaches that head: this warehouse verified and took it, so a
 /// set the remote merely sent, or one it never served, exempts nothing. Nor is any redaction in
 /// `applied`, those this warehouse has applied, exempt.
 fn exempt_adoption(set: RedactedSet,
@@ -1077,7 +1113,7 @@ fn exempt_adoption(set: RedactedSet,
                    applied: &RedactedSet) -> Result<Exemption, String> {
     let none = |set| Ok(Exemption { set, adopted: false, exempted: HashSet::new(), withheld: RedactedSet::default() });
 
-    let Some(Served { head, redactions: Some(pending) }) = served else {
+    let Some(served @ Served { head, redactions: Some(pending), .. }) = served else {
         return none(set);
     };
 
@@ -1090,7 +1126,7 @@ fn exempt_adoption(set: RedactedSet,
     }
 
     let pending = RedactedSet::at(pending)?;
-    let exempt = pending.filtered(|hash| !applied.hashes.contains(hash));
+    let exempt = pending.filtered(|hash| !applied.hashes.contains(hash) && served.reports_pending(hash));
     let withheld = pending.filtered(|hash| applied.hashes.contains(hash));
     let exempted = exempt.hashes.clone();
 

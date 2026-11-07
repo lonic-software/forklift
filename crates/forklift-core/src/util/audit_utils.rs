@@ -1823,12 +1823,44 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
 /// full scope: in a sparse warehouse the write verifies again at its own. The proof records
 /// `known_complete`, which a write accepts only as the head its compare-and-set expects.
 ///
+/// An absent object a redaction this warehouse applied names is tolerated, as the ref write's own
+/// verification tolerates it: the history of every head still names the content the redaction
+/// took away. Nothing else absent is. The applied record is read only when the walk without it
+/// fails, so a warehouse holding the whole closure never depends on it; and it only ever grows, so
+/// the write need not read it again under its lock.
+///
 /// # Returns
-/// * `Ok(VerifiedClosure)` - Everything is present.
-/// * `Err(String)`         - If a parcel, tree or blob is missing (or unreadable).
+/// * `Ok(VerifiedClosure)` - Everything is present, or absent only where an applied redaction
+///                           names it.
+/// * `Err(String)`         - If a parcel, tree or blob is missing (or unreadable), or the applied
+///                           record cannot be read.
 pub fn verify_parcel_closure_for_write(head: &str,
                                        known_complete: Option<&str>) -> Result<pallet_utils::VerifiedClosure, String> {
-    verify_parcel_closure(head, known_complete)?;
+    if let Err(missing) = verify_parcel_closure(head, known_complete) {
+        let applied = crate::util::applied_redactions::read_applied().map_err(|error| format!(
+            "{} The record of the redactions applied here cannot be read either: {}",
+            missing, error
+        ))?;
+
+        if applied.is_empty() {
+            return Err(missing);
+        }
+
+        let tolerated = Tolerated::applied_only(applied);
+        let tolerance = SealedTolerance::new(&tolerated);
+        let seams = ClosureSeams {
+            blob_exists: &|hash| file_utils::does_object_exist(hash),
+            chunks_missing: &local_chunks_missing,
+            load_recipe_chunks: &|hash| object_utils::recipe_chunk_hashes(hash),
+            load_base_tree: &|hash| object_utils::load_tree(hash),
+            sealed: Some(&tolerance),
+        };
+
+        verify_closure_core(
+            head, known_complete.as_ref().map(std::slice::from_ref), known_complete, &PathScope::full(),
+            false, &seams,
+        )?;
+    }
 
     Ok(pallet_utils::VerifiedClosure::new(head, PathScope::full(), known_complete))
 }
@@ -1980,8 +2012,9 @@ pub fn verify_parcel_closure_with(
     load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
     load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>,
 ) -> Result<(), String> {
-    // A remote must hold the whole closure of every head it accepts: the push gate tolerates no
-    // recorded absence.
+    // A remote must hold the whole closure of every head it accepts: this push gate tolerates no
+    // recorded absence. forklift-server's tolerates the redactions it applied
+    // (`verify_parcel_closure_for_write`).
     let seams = ClosureSeams { blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, sealed: None };
 
     verify_closure_core(
@@ -1998,14 +2031,15 @@ struct ClosureSeams<'a> {
     load_recipe_chunks: &'a dyn Fn(&str) -> Result<Vec<String>, String>,
     load_base_tree: &'a dyn Fn(&str) -> Result<TreeItem, String>,
     /// The sealed-by-hash record and the applied redactions, for the audit and the client's ref
-    /// gate; `None` on the push gate, which tolerates no absence.
+    /// gate, or the applied redactions alone for forklift-server's push gate; `None` on the
+    /// serverless head's push gate, which tolerates no absence.
     sealed: Option<&'a SealedTolerance<'a>>,
 }
 
 /// The sealed-by-hash record and the applied redactions a walk holds absences against, and the
-/// absent objects it held by each, kept apart. The audit and the client's ref gate pass one; a
-/// remote's push gate never does, since a remote must hold the whole closure of every head it
-/// accepts.
+/// absent objects it held by each, kept apart. The audit and the client's ref gate pass one, and
+/// forklift-server's push gate passes the applied redactions alone: a remote must hold the whole
+/// closure of every head it accepts but for the content it redacted.
 pub struct SealedTolerance<'a> {
     tolerated: &'a Tolerated,
     held: RefCell<HashSet<String>>,

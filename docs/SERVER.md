@@ -320,6 +320,17 @@ revocation by more than about a day.
   `forklift-server tombstone list --root …` shows them; `forklift-server tombstone drop --root …
   NAME` frees the name for unrelated history and lets the next `gc` collect what only the
   tombstone held. Dropping is refused while the root is served, like `gc`.
+- **Redactions:** after every pallet update or deletion, the server applies each redaction
+  recorded on `@redactions` that no pallet head, tombstone or metadata history it holds still
+  names. One a tombstone holds applies at the first pallet update after `forklift-server
+  tombstone drop` frees it. From
+  then on it refuses that content on every route with `410` (`content_redacted`), takes the
+  latest bundle down (every bundle built after leaves the content out, and with
+  `rebuild_after_lifts` set the next one is built at once), and accepts lifts whose history names it
+  without the content. The applied redactions are kept in `<root>/.forklift/redactions-applied`.
+  The server does not delete its copy of the content yet, and until it serves the redaction's
+  absence, a fresh clone or `lower` that must fetch history naming the content is refused with
+  `content_redacted`.
 - **Repack:** `forklift store compact --all` against a served root is refused for the same reason
   as `gc` — it drops unreachable packed objects with no grace period at all — so it also
   belongs in the maintenance window. Plain `forklift store compact` (incremental) never drops an

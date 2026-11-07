@@ -696,6 +696,7 @@ fn a_meta_pallet_may_not_start_naming_redacted_content() {
 struct Server {
     child: std::process::Child,
     url: String,
+    root: PathBuf,
 }
 
 impl Server {
@@ -725,7 +726,13 @@ impl Server {
         let url = line.trim().rsplit(' ').next().unwrap().to_string();
         assert!(url.starts_with("http://"), "unexpected startup line: {}", line);
 
-        Server { child, url }
+        Server { child, url, root: PathBuf::from(root) }
+    }
+
+    /// The head this server serves for `main`, read from its own ref: a fresh clone could not
+    /// fetch history naming content whose redaction the server has applied.
+    fn main(&self) -> String {
+        std::fs::read_to_string(self.root.join(".forklift/pallets/main")).unwrap().trim().to_string()
     }
 }
 
@@ -734,12 +741,6 @@ impl Drop for Server {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-}
-
-/// The head the remote at `url` serves for `main`, read through a fresh clone named `name`.
-fn served_main(url: &str, name: &str) -> String {
-    let clone = Warehouse::cloned(name, url);
-    std::fs::read_to_string(clone.root.join(".forklift/pallets/main")).unwrap().trim().to_string()
 }
 
 /// A head stacked before a redaction came down by `lower` is refused by this warehouse's own check
@@ -766,7 +767,7 @@ fn a_lift_is_refused_for_a_head_stacked_before_a_redaction_came_down() {
     other.run_ok(&["lift"]);
     warehouse.run_ok(&["lower"]);
     assert_eq!(warehouse.redactions().len(), 1);
-    let served = served_main(&server.url, "lift-before");
+    let served = server.main();
 
     // A stack that only carries the file over from its parent, unchanged, is refused too.
     let stacked = warehouse.head("main");
@@ -790,7 +791,7 @@ fn a_lift_is_refused_for_a_head_stacked_before_a_redaction_came_down() {
         "from the working tree's root, forklift remove secret.env, then forklift stack -m <description>, then forklift lift",
         "{}", error
     );
-    assert_eq!(served_main(&server.url, "lift-refused"), served, "nothing was lifted");
+    assert_eq!(server.main(), served, "nothing was lifted");
 
     // Another warehouse lifts a change of its own to main, so this lift would merge it in first.
     // It is refused in lift's own words, before any merge is written.
@@ -808,7 +809,7 @@ fn a_lift_is_refused_for_a_head_stacked_before_a_redaction_came_down() {
     warehouse.run_ok(&["remove", "secret.env"]);
     warehouse.run_ok(&["stack", "-m", "without the secret"]);
     warehouse.run_ok(&["lift"]);
-    assert_eq!(served_main(&server.url, "lift-after"), warehouse.head("main"));
+    assert_eq!(server.main(), warehouse.head("main"));
 }
 
 #[test]
@@ -1480,4 +1481,174 @@ fn a_non_admin_is_refused_before_the_target_is_looked_at() {
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(stderr.contains("\"stranger@forklift\" is not enrolled"), "{:?}", refused);
     assert!(!stderr.contains("already redacted"), "{:?}", refused);
+}
+
+/// Send a raw HTTP request with `body` and return `(status line, response body)`.
+fn http(url: &str, method: &str, path: &str, body: &[u8]) -> (String, String) {
+    use std::io::{Read, Write};
+
+    let address = url.strip_prefix("http://").unwrap();
+    let mut stream = std::net::TcpStream::connect(address).unwrap();
+    write!(
+        stream,
+        "{} {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+        Connection: close\r\n\r\n",
+        method, path, address, body.len()
+    ).unwrap();
+    stream.write_all(body).unwrap();
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    let response = String::from_utf8_lossy(&response).into_owned();
+    let status = response.lines().next().unwrap_or_default().to_string();
+    let body = response.split("\r\n\r\n").nth(1).unwrap_or_default().to_string();
+
+    (status, body)
+}
+
+/// Once a lift leaves no head on forklift-server naming a recorded redaction, the server applies
+/// it: the handshake reports it applied, every surface that reads or takes content refuses it as
+/// redacted, and a warehouse whose unlifted history still names it lifts that history without it.
+///
+/// Revert: skip applying after a ref write → the handshake reports the redaction pending.
+#[test]
+fn a_server_applies_a_redaction_no_head_names_and_refuses_its_content() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-served-server-{}", std::process::id())));
+
+    let owner = Warehouse::cloned("served-owner", &server.url);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+
+    // Its history names the leak; it has lifted none of it.
+    let behind = Warehouse::cloned("served-behind", &server.url);
+    behind.leaked("secret.env", b"TOKEN=hunter2\n");
+
+    let hash = owner.redact_loaded("secret.env", b"TOKEN=hunter2\n", "leaked token");
+    owner.run_ok(&["lift"]);
+
+    let (status, info) = http(&server.url, "GET", "/v1/warehouse", b"");
+    assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, info);
+    let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+    assert_eq!(info["redactions"], serde_json::json!([{ "hash": hash, "state": "deletion_owed" }]), "{}", info);
+
+    let object = format!("/v1/objects/{}", hash);
+    let refusals = [
+        ("get", http(&server.url, "GET", &object, b"")),
+        ("put", http(&server.url, "PUT", &object, &object_utils::blob_bytes(b"TOKEN=hunter2\n"))),
+        ("upload-targets", http(&server.url, "POST", "/v1/objects/upload-targets",
+                                format!("{{\"session\":\"s\",\"hashes\":[\"{}\"]}}", hash).as_bytes())),
+    ];
+    for (surface, (status, body)) in refusals {
+        assert!(status.starts_with("HTTP/1.1 410"), "{}: {} / {}", surface, status, body);
+        assert!(body.contains("content_redacted"), "{}: {}", surface, body);
+    }
+
+    // The redaction comes down, and the history that names it goes up without the content.
+    behind.run_ok(&["lower"]);
+    behind.run_ok(&["lift"]);
+    assert_eq!(server.main(), behind.head("main"));
+
+    // Until the server serves the redaction's absence, a fresh clone that must fetch the content
+    // is refused as redacted: loud, never a quiet gap.
+    let empty = Warehouse::empty("served-clone");
+    let cloned = forklift_command()
+        .args(["clone", &server.url, empty.root.to_str().unwrap()])
+        .env("FORKLIFT_GLOBAL_CONFIG", empty.home.join("global-config.toml"))
+        .env("FORKLIFT_KEYS_DIR", empty.home.join("keys"))
+        .output()
+        .unwrap();
+    assert!(!cloned.status.success());
+    assert!(String::from_utf8_lossy(&cloned.stderr).contains(&format!("Object {} is redacted", hash)),
+            "{}", String::from_utf8_lossy(&cloned.stderr));
+}
+
+/// A pallet deleted on forklift-server leaves a tombstone that keeps its head served and
+/// restorable, so a redaction that head names stays pending through the deletion.
+///
+/// Revert: leave tombstones out of the apply scan → the handshake reports it applied.
+#[test]
+fn a_server_keeps_a_redaction_pending_while_a_tombstone_names_it() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-tombstone-server-{}", std::process::id())));
+
+    let owner = Warehouse::cloned("tombstone-owner", &server.url);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+
+    // Cloned before the leak, so no head here names it.
+    let redactor = Warehouse::cloned("tombstone-redactor", &server.url);
+    owner.run_ok(&["pallet", "create", "feature"]);
+    owner.stack("secret.env", b"TOKEN=hunter2\n", "leak");
+    owner.run_ok(&["lift"]);
+
+    let hash = redactor.redact_loaded("secret.env", b"TOKEN=hunter2\n", "leaked token");
+    redactor.run_ok(&["lift"]);
+    let pending = serde_json::json!([{ "hash": hash, "state": "pending" }]);
+    let report = || {
+        let (status, info) = http(&server.url, "GET", "/v1/warehouse", b"");
+        assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, info);
+        serde_json::from_str::<serde_json::Value>(&info).unwrap()["redactions"].clone()
+    };
+    assert_eq!(report(), pending, "the head of pallet feature names it");
+
+    owner.run_ok(&["shift", "main"]);
+    owner.run_ok(&["pallet", "delete", "feature", "--remote"]);
+    assert_eq!(report(), pending, "the tombstone of pallet feature keeps that head");
+    let (status, _) = http(&server.url, "GET", &format!("/v1/objects/{}", hash), b"");
+    assert!(status.starts_with("HTTP/1.1 200"), "{}", status);
+}
+
+/// The bytes of every object file under `dir`.
+fn stored_bytes(dir: &std::path::Path) -> u64 {
+    std::fs::read_dir(dir).unwrap().map(|entry| {
+        let entry = entry.unwrap();
+        match entry.file_type().unwrap().is_dir() {
+            true => stored_bytes(&entry.path()),
+            false => entry.metadata().unwrap().len(),
+        }
+    }).sum()
+}
+
+/// A lift of history naming a chunked file whose redaction the server applied sends neither the
+/// recipe nor the chunks only it names.
+///
+/// Revert: offer a redacted recipe's chunks → the server's store grows by the file.
+#[test]
+fn a_lift_sends_no_chunk_of_a_file_the_server_applied_a_redaction_of() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-chunks-server-{}", std::process::id())));
+
+    let owner = Warehouse::cloned("chunks-owner", &server.url);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+    let behind = Warehouse::cloned("chunks-behind", &server.url);
+
+    // Above the chunking threshold, and varied, so the file is a recipe of several chunks.
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    let content: Vec<u8> = (0..9 * 1024 * 1024).map(|_| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state as u8
+    }).collect();
+
+    // The owner records the redaction from a pallet it never lifts.
+    owner.run_ok(&["pallet", "create", "scratch"]);
+    owner.stack("big.bin", &content, "leak");
+    let leak = owner.head("scratch");
+    owner.run_ok(&["remove", "big.bin"]);
+    owner.run_ok(&["stack", "-m", "take the leak out"]);
+    recorded_hash(&owner, &format!("{}:big.bin", leak), "leaked dump");
+    owner.run_ok(&["shift", "main"]);
+    owner.run_ok(&["lift"]);
+
+    behind.leaked("big.bin", &content);
+    behind.run_ok(&["lower"]);
+    let objects = server.root.join(".forklift/objects");
+    let before = stored_bytes(&objects);
+    behind.run_ok(&["lift"]);
+    assert_eq!(server.main(), behind.head("main"));
+    let grown = stored_bytes(&objects) - before;
+    assert!(grown < 1024 * 1024, "the server's store grew by {} bytes", grown);
 }

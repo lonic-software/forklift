@@ -32,7 +32,7 @@ use forklift_core::model::hooks::{
 use forklift_core::model::remote::{
     ErrorResponse, HoldAnswer, HoldsRequest, HoldsResponse, MissingObjectsRequest,
     MissingObjectsResponse, RefDeleteRequest, RefUpdateRequest,
-    ResolveRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest, UploadTargetsResponse,
+    ResolveRequest, ResolveResponse, ServedRedaction, ServedRedactionState, TrustAnchorDto, UploadTargetsRequest, UploadTargetsResponse,
     WarehouseInfo, MAX_MISSING_BATCH, MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
     REFUSAL_NOT_AN_OBJECT_HASH, distinct_resolve_identifiers, resolve_answer_cap,
 };
@@ -43,9 +43,11 @@ use forklift_core::util::pallet_utils::{
 };
 use forklift_core::util::lock_utils::{self, BaseServeLock, FormatLease, ServeLock, StoreAccessLock};
 use forklift_core::util::{
-    audit_utils, body_utils, bay_utils, bundle_utils, file_utils, franchise_utils, hook_utils, merge_utils, meta_tree,
-    object_utils, office_utils, origin_utils, pack_utils, pallet_utils, scope_utils, sealed_utils, sign_utils, tree_utils, warehouse_utils,
+    applied_redactions, audit_utils, body_utils, bay_utils, bundle_utils, file_utils, franchise_utils, hook_utils, merge_utils, meta_tree,
+    object_utils, office_utils, origin_utils, pack_utils, pallet_utils, redaction_utils, scope_utils, sealed_utils, sign_utils, tree_utils,
+    warehouse_utils,
 };
+use forklift_core::util::applied_redactions::AppliedSet;
 use subtle::ConstantTimeEq;
 
 /// One served warehouse: its storage root, its bundle-rebuild state and the locks it is served
@@ -61,6 +63,10 @@ struct WarehouseHandle {
 
     /// Whether a bundle rebuild is running right now (never two at once).
     bundling: std::sync::atomic::AtomicBool,
+
+    /// Whether the running rebuild must be followed by another: a redaction applied while it ran,
+    /// so it publishes nothing.
+    rebuild_again: std::sync::atomic::AtomicBool,
 
     /// The serve lock for this root, held for as long as the handle is served. `None` for
     /// handles that are not a live served warehouse (test fixtures). Held in the handle so the
@@ -89,6 +95,7 @@ impl WarehouseHandle {
             root,
             lifts_since_bundle: std::sync::atomic::AtomicU32::new(0),
             bundling: std::sync::atomic::AtomicBool::new(false),
+            rebuild_again: std::sync::atomic::AtomicBool::new(false),
             _serve_lock: None,
             _store_access: None,
             _format_lease: None,
@@ -1288,6 +1295,38 @@ fn trust_install_outcome(installed: Result<office_utils::TrustInstalled, RefUpda
     }
 }
 
+/// Where each redaction on this warehouse's `@redactions` stands here, for the handshake. An applied
+/// one is reported with its deletion owed, since this head refuses the content but deletes no copy
+/// of it yet. Nothing is walked: what holds a pending one is the scan's business after each ref
+/// write, not every handshake's. A cell this build cannot read is not reported.
+fn served_redactions() -> Result<Vec<ServedRedaction>, HandlerError> {
+    let applied = read_applied()?;
+
+    Ok(redaction_utils::read_redactions().map_err(internal)?.redactions.iter().map(|attributed| {
+        let hash = attributed.redaction.hash.clone();
+        let state = match applied.contains(&hash) {
+            true => ServedRedactionState::DeletionOwed,
+            false => ServedRedactionState::Pending,
+        };
+
+        ServedRedaction { hash, state }
+    }).collect())
+}
+
+/// The redactions this warehouse applied, read for a request that serves or takes objects by hash.
+fn read_applied() -> Result<AppliedSet, HandlerError> {
+    applied_redactions::read_applied().map_err(internal)
+}
+
+/// Refuse a request naming `hash` with a `410`, when a redaction this warehouse applied names it:
+/// its bytes are never served or taken again, whether or not they are deleted yet.
+fn refuse_redacted(applied: &AppliedSet, hash: &str) -> Result<(), HandlerError> {
+    match applied.contains(hash) {
+        true => Err((StatusCode::GONE, applied_redactions::served_refusal(hash))),
+        false => Ok(()),
+    }
+}
+
 /// Map an internal storage error to a 500.
 fn internal(message: String) -> HandlerError {
     (StatusCode::INTERNAL_SERVER_ERROR, message)
@@ -2132,6 +2171,7 @@ async fn get_warehouse(State(state): State<Arc<AppState>>,
             // This head deletes pallets, and every tombstone it keeps is listed, as widely as the
             // live refs are.
             tombstones: Some(forklift_core::util::tombstone_utils::read_tombstones().map_err(internal)?),
+            redactions: Some(served_redactions()?),
         })
     }).await;
 
@@ -2273,6 +2313,10 @@ async fn post_upload_targets(State(state): State<Arc<AppState>>,
     }
 
     let result = blocking(warehouse, move || {
+        let applied = read_applied()?;
+
+        request.hashes.iter().try_for_each(|hash| refuse_redacted(&applied, hash))?;
+
         let mut response = UploadTargetsResponse {
             present: Vec::new(),
             targets: std::collections::BTreeMap::new(),
@@ -2470,6 +2514,8 @@ async fn get_object(State(state): State<Arc<AppState>>,
     };
 
     let result = blocking(warehouse, move || {
+        refuse_redacted(&read_applied()?, &hash)?;
+
         if !file_utils::does_object_exist(&hash).map_err(unprocessable)? {
             return Err((StatusCode::NOT_FOUND, format!("No object {} exists.", hash)));
         }
@@ -2505,6 +2551,10 @@ async fn put_object(State(state): State<Arc<AppState>>,
 
     let result = blocking(warehouse, move || {
         require_uploader(&principal)?;
+
+        // An upload that checked before a redaction applied and stores after is never served: every
+        // read checks too.
+        refuse_redacted(&read_applied()?, &hash)?;
 
         object_utils::store_object_bytes(&hash, &body).map_err(unprocessable)
     }).await;
@@ -3055,7 +3105,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                 emit_event(&state, event);
             }
 
-            maybe_rebuild_bundle(&state, warehouse);
+            after_ref_write(&state, warehouse).await;
 
             StatusCode::OK.into_response()
         }
@@ -3218,13 +3268,52 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
         Ok(Some(event)) => {
             emit_event(&state, event);
 
-            maybe_rebuild_bundle(&state, warehouse);
+            after_ref_write(&state, warehouse).await;
 
             StatusCode::OK.into_response()
         }
         Ok(None) => StatusCode::OK.into_response(),
         Err(error) => error_response(error),
     }
+}
+
+/// What follows a ref write this warehouse took: every redaction the write may have let apply is
+/// applied ([`apply_redactions`]), and the bundle is rebuilt, at once when an apply withdrew it,
+/// or else when the accepted-lift counter reaches its threshold.
+async fn after_ref_write(state: &AppState, warehouse: Arc<WarehouseHandle>) {
+    match apply_redactions(Arc::clone(&warehouse)).await {
+        Ok(true) => rebuild_bundle(state, warehouse, true),
+        Ok(false) => maybe_rebuild_bundle(state, warehouse),
+        // The write landed and stays landed; the next write here applies again.
+        Err((_, error)) => {
+            tracing::error!(error, "applying the redactions after a ref write failed");
+            maybe_rebuild_bundle(state, warehouse);
+        }
+    }
+}
+
+/// Apply every redaction of this warehouse's `@redactions` that its scan now finds unheld: a write
+/// that moved the last head naming the content, or that recorded the redaction, is what lets one
+/// apply. Each applied one is refused on every surface from then on. A warehouse with a remote
+/// configured applies none until its remote reports them applied, which no remote reports yet.
+///
+/// # Returns
+/// * `Ok(bool)`          - Whether a redaction was applied, which withdrew the bundle.
+/// * `Err(HandlerError)` - The redactions, the applied record or the configuration could not be
+///                         read, or the apply could not be written.
+async fn apply_redactions(warehouse: Arc<WarehouseHandle>) -> Result<bool, HandlerError> {
+    blocking(warehouse, || {
+        let before = read_applied()?;
+        let read = redaction_utils::read_redactions().map_err(internal)?;
+
+        if read.redactions.iter().all(|attributed| before.contains(&attributed.redaction.hash)) {
+            return Ok(false);
+        }
+
+        applied_redactions::apply(&read, None).map_err(internal)?;
+
+        Ok(read_applied()?.hashes().any(|hash| !before.contains(hash)))
+    }).await
 }
 
 /// Kick off a background bundle rebuild when the accepted-lift counter reaches the
@@ -3239,33 +3328,67 @@ fn maybe_rebuild_bundle(state: &AppState, warehouse: Arc<WarehouseHandle>) {
 
     let lifts = warehouse.lifts_since_bundle.fetch_add(1, Ordering::SeqCst) + 1;
 
-    if lifts < threshold || warehouse.bundling.swap(true, Ordering::SeqCst) {
+    if lifts < threshold {
         return;
     }
 
+    rebuild_bundle(state, warehouse, false);
+}
+
+/// Kick off a background bundle rebuild, when rebuilds are configured and none runs for this
+/// warehouse already. With `again` (a redaction was just applied, and the bundle withdrawn), a
+/// rebuild already running is followed by another once it ends: it began before the redaction, so
+/// it publishes nothing (see `bundle_utils::build_bundle`).
+fn rebuild_bundle(state: &AppState, warehouse: Arc<WarehouseHandle>, again: bool) {
+    use std::sync::atomic::Ordering;
+
+    if state.rebuild_after_lifts.is_none() {
+        return;
+    }
+
+    // Asked for before the running rebuild is looked at, so that rebuild, ending, sees it.
+    if again {
+        warehouse.rebuild_again.store(true, Ordering::SeqCst);
+    }
+
+    if warehouse.bundling.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    // This rebuild starts after whatever asked for another, so it serves that ask.
+    warehouse.rebuild_again.store(false, Ordering::SeqCst);
     warehouse.lifts_since_bundle.store(0, Ordering::SeqCst);
 
     tokio::spawn(async move {
-        let worker = Arc::clone(&warehouse);
+        loop {
+            let worker = Arc::clone(&warehouse);
 
-        let result = tokio::task::spawn_blocking(move || {
-            let _scope = StorageRootScope::enter(&worker.root);
+            let result = tokio::task::spawn_blocking(move || {
+                let _scope = StorageRootScope::enter(&worker.root);
 
-            bundle_utils::build_bundle()
-        }).await;
+                bundle_utils::build_bundle()
+            }).await;
 
-        match result {
-            Ok(Ok(stats)) => tracing::info!(
-                objects = stats.objects,
-                deltas = stats.deltas,
-                signatures = stats.signatures,
-                "rebuilt the bundle"
-            ),
-            Ok(Err(error)) => tracing::error!(error, "the bundle rebuild failed"),
-            Err(error) => tracing::error!(%error, "the bundle rebuild task failed"),
+            match result {
+                Ok(Ok(stats)) => tracing::info!(
+                    objects = stats.objects,
+                    deltas = stats.deltas,
+                    signatures = stats.signatures,
+                    "rebuilt the bundle"
+                ),
+                Ok(Err(error)) => tracing::error!(error, "the bundle rebuild failed"),
+                Err(error) => tracing::error!(%error, "the bundle rebuild task failed"),
+            }
+
+            warehouse.bundling.store(false, Ordering::SeqCst);
+
+            // Another was asked for while this one ran, and no other rebuild has started since.
+            if !warehouse.rebuild_again.swap(false, Ordering::SeqCst) || warehouse.bundling.swap(true, Ordering::SeqCst) {
+                break;
+            }
+
+            warehouse.lifts_since_bundle.store(0, Ordering::SeqCst);
         }
-
-        warehouse.bundling.store(false, Ordering::SeqCst);
     });
 }
 

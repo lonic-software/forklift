@@ -85,7 +85,15 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 27** (current): a redaction's content is deleted. `redact record`'s result and `redact
+**Schema 28** (current): a `forklift-server` remote applies redactions. `content_redacted`
+(exit 49) is also returned by `clone`, `lower` and `lift` when the remote refuses content whose
+redaction it has applied, with the remote's words in `message` and no `details`. `lift` no longer
+uploads content the remote reports applied, and taking a head the remote serves is allowed over a
+redaction only while the remote reports that redaction pending. A `held` status also carries
+`tombstones`, the deleted pallets whose tombstone keeps a head naming the content, each with its
+`pallet`, `head` and `path`: a served root keeps such a head, so the redaction cannot apply.
+
+**Schema 27**: a redaction's content is deleted. `redact record`'s result and `redact
 apply`'s list carry `deletion` when an applied redaction's object may still be in the store:
 `deleted` (the redacted objects deleted), `chunks_deleted`, `bytes_freed`, `kept` (each copy kept
 with its `hash` and its `holders`, each with a `kind` of `pallet`, `meta_history`,
