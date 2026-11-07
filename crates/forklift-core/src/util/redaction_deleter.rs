@@ -435,27 +435,13 @@ pub fn withheld_candidates(applied: &AppliedSet) -> Result<HashSet<String>, Stri
     let mut candidates = read_chunks_owed()?.chunks();
 
     for hash in applied.hashes() {
-        if stored_type(hash)? == Some(ObjectType::Recipe) {
+        if redaction_utils::stored_type(hash)? == Some(ObjectType::Recipe) {
             candidates.extend(object_utils::recipe_chunk_hashes(hash)?);
         }
     }
 
     Ok(candidates)
 }
-
-/// The type the store holds `hash` as, read from its header, or `None` when it lacks it.
-fn stored_type(hash: &str) -> Result<Option<ObjectType>, String> {
-    if !file_utils::does_object_exist(hash)? {
-        return Ok(None);
-    }
-
-    let bytes = file_utils::retrieve_object_by_hash_shared(hash)?;
-    let (object_type, _) = object_utils::peek_object_header(&bytes)
-        .map_err(|e| format!("Object {} cannot be read: {:?}", hash, e))?;
-
-    Ok(Some(object_type))
-}
-
 
 /// What [`delete_applied`] did.
 #[derive(Debug, Default)]
@@ -1026,12 +1012,12 @@ mod tests {
         assert!(candidates.is_empty() && withheld.is_empty(), "{:?} {:?}", candidates, withheld);
     }
 
-    /// An applied hash the store holds as a live tree names no chunk and keeps out nothing: the
-    /// candidates are read, and a chunk a file under that tree shares is still served.
+    /// An applied hash the store holds as a tree names no chunk: the candidates are read, not
+    /// refused, and the withheld set is the recipe's own chunk.
     ///
     /// Revert: refuse a non-file object as unreadable → the candidates fail.
     #[test]
-    fn an_applied_hash_held_as_a_live_tree_withholds_nothing_under_it() {
+    fn an_applied_hash_held_as_a_tree_names_no_candidate() {
         let _scratch = Scratch::new("withheld-tree");
         let (_, own_chunk, _, live_recipe) = packed_chunked_leak();
         let tree = store_tree(&[("other.bin", &live_recipe, DirEntryType::NormalChunked)]);
