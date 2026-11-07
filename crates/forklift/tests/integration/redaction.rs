@@ -1123,6 +1123,8 @@ fn a_hash_applied_here_that_the_remote_never_redacted_names_no_fresh_clone() {
     // Recorded and applied with no remote, and never lifted.
     warehouse.run_ok(&["config", "unset", "remote.url"]);
     let hash = warehouse.redact_loaded("secret.env", b"TOKEN=hunter2\n", "applied here only");
+    let status = warehouse.redactions().into_iter().find(|listed| listed["hash"] == hash.as_str()).unwrap();
+    assert_eq!(status["status"], serde_json::json!({ "state": "applied" }), "{}", status);
     warehouse.run_ok(&["config", "set", "remote.url", &server.url]);
 
     let error = content_redacted(&warehouse, &["lower", "side"]);
