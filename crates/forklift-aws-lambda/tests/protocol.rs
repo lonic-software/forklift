@@ -5410,6 +5410,128 @@ fn a_list_saved_for_an_earlier_scan_is_never_walked() {
     assert!(served(&head, &leak), "the rewritten head still names it");
 }
 
+/// A ref store on which every write of a rescan's record loses, as to another request rescanning
+/// from the same record.
+struct LosesEveryRescan {
+    inner: Arc<MemoryRefStore>,
+}
+
+impl RefStore for LosesEveryRescan {
+    fn read_format(&self) -> Result<Option<String>, String> {
+        self.inner.read_format()
+    }
+
+    fn get_redaction(&self, hash: &str) -> Result<Option<String>, String> {
+        self.inner.get_redaction(hash)
+    }
+
+    fn put_redaction(
+        &self,
+        hash: &str,
+        state: &str,
+        expected: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
+    ) -> Result<forklift_aws_lambda::store::RedactionWrite, String> {
+        if state.contains("\"scan\":1") {
+            return Ok(forklift_aws_lambda::store::RedactionWrite::Moved);
+        }
+
+        self.inner.put_redaction(hash, state, expected, format)
+    }
+
+    fn partition_has_items(&self) -> Result<bool, String> {
+        self.inner.partition_has_items()
+    }
+
+    fn get_head(&self, namespace: pallet_utils::PalletNamespace, name: &str) -> Result<RefHead, String> {
+        self.inner.get_head(namespace, name)
+    }
+
+    fn compare_and_set_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+        expected: ExpectedHead<'_>,
+        new: &str,
+        office_head: OfficePrecondition<'_>,
+        redactions: RedactionsPrecondition<'_>,
+        anchor: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
+        request_token: &str,
+    ) -> Result<CasOutcome, String> {
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
+    }
+
+    fn delete_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+        old: &str,
+        office_head: OfficePrecondition<'_>,
+        anchor: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
+        request_token: &str,
+    ) -> Result<CasOutcome, String> {
+        self.inner.delete_head(namespace, name, old, office_head, anchor, format, request_token)
+    }
+
+    fn list_refs(&self) -> Result<RefListing, String> {
+        self.inner.list_refs()
+    }
+
+    fn default_pallet(&self) -> Result<String, String> {
+        self.inner.default_pallet()
+    }
+
+    fn get_trust(&self) -> Result<Option<(office_utils::TrustAnchor, String)>, String> {
+        self.inner.get_trust()
+    }
+
+    fn put_trust_if_absent(
+        &self,
+        anchor: &office_utils::TrustAnchor,
+        format: &forklift_aws_lambda::FormatFence,
+        request_token: &str,
+    ) -> Result<TrustOutcome, String> {
+        self.inner.put_trust_if_absent(anchor, format, request_token)
+    }
+
+    fn replace_trust(
+        &self,
+        anchor: &office_utils::TrustAnchor,
+        expected_anchor: &str,
+        office_head: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
+        request_token: &str,
+    ) -> Result<TrustWriteOutcome, String> {
+        self.inner.replace_trust(anchor, expected_anchor, office_head, format, request_token)
+    }
+}
+
+/// A request whose rescan's record write loses saves no list for that rescan: the winner computed
+/// the same next scan, so the loser's list would pass for the winner's and be walked under it.
+// Revert: save the rescan's list ahead of its record write → the lost rescan leaves its list →
+// red.
+#[test]
+fn a_rescan_that_loses_its_record_write_saves_no_list() {
+    let area = Area::new("redaction-lost-rescan");
+    let (redactions, recorded) = recorded_redactions(&area, "red", &["leaked\n"]);
+    let leak = blob_hash("leaked\n");
+    let refs = Arc::new(MemoryRefStore::new());
+    let head = Head::new(MemoryObjectStore::new(), LosesEveryRescan { inner: Arc::clone(&refs) });
+    upload_all(&head, &recorded);
+    let first = gate_parcel(&head, &[], vec![gate_file(&head, "leak", "leaked\n")]);
+    plant_meta(&refs, "tags", None, &first);
+    plant_meta(&refs, REDACTIONS_PALLET_NAME, None, &redactions[0]);
+    assert!(served(&head, &leak), "the meta pallet's head names it");
+
+    let unrelated = gate_parcel(&head, &[], vec![gate_file(&head, "y", "3")]);
+    plant_meta(&refs, "tags", Some(&first), &unrelated);
+    let err = head.object_get(&leak).expect_err("every rescan write loses");
+    assert_eq!(err.status, Status::ServiceUnavailable, "{}", err.message);
+    assert_eq!(head.objects.work_get(&format!("{}/pallets", leak)).expect("work"), None, "no list was saved for the lost rescan");
+}
+
 /// A scan the request cannot finish answers `503` with `Retry-After` and saves where it stopped,
 /// so the requests after it go on from there, until the redaction applies and its work objects
 /// are gone.

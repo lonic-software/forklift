@@ -554,7 +554,6 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 Holding::Rescan { holder, head } => {
                     let again = Seen { pallet: holder.pallet.clone(), head };
                     let scan = record.scan + 1;
-                    self.put_remaining(hash, scan, &[again])?;
 
                     let next = Record {
                         scan,
@@ -562,7 +561,13 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                         holders: record.holders.iter().filter(|seen| **seen != holder).cloned().collect(),
                         ..record
                     };
-                    self.write_record(hash, &next, Some(&stored), budget)?;
+
+                    // The list follows the record it belongs to, and only once that record has
+                    // landed: a request whose rescan lost computed the same next scan, so a list
+                    // it saved would pass for the winner's. One lost to a crash is listed again.
+                    if self.write_record(hash, &next, Some(&stored), budget)? {
+                        self.put_remaining(hash, scan, &[again])?;
+                    }
                 }
                 Holding::Free => {
                     if let Some(verdict) = self.never_applies(hash)? {
@@ -616,10 +621,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             None => None,
         };
 
-        // The list is written before the item that needs it, and removed only after the item
-        // records the scan complete, so a missing one was lost to a crash or a race, and one of
-        // another scan was saved over this one's by a request that read an older record: list
-        // again. Every pallet it adds was written after the redaction was recorded, so walking it
+        // A list is removed only after the item records its scan complete, so a missing one was
+        // lost to a crash or a race, and one of another scan was saved over this one's by a
+        // request that read an older record: list again. Every pallet it adds was written after the redaction was recorded, so walking it
         // is only extra work.
         let Some(mut remaining) = remaining else {
             let listing = self.refs.list_refs().map_err(HeadError::internal)?;
