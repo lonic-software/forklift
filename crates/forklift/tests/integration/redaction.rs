@@ -1154,13 +1154,14 @@ fn loose_copies(dir: &std::path::Path, hash: &str) -> Vec<PathBuf> {
 }
 
 /// A cache that applied a redaction holds the content's absence as redacted, not as held by the
-/// remote: a read that needs it fetches nothing, though the remote still serves the bytes, and a
-/// move to a server lacking the content goes through, never asking that server for it. Until a
-/// remote applies redactions, a cache never reaches the applied state itself, so the test writes
-/// the record.
+/// remote. A read that needs the content fetches nothing, though the remote still serves the bytes.
+/// A move to a server whose history never reaches content only this cache's own history names goes
+/// through, never asking that server for it. Until a remote applies redactions, a cache never
+/// reaches the applied state itself, so the test writes the record.
 ///
-/// Revert: let the miss hook fetch an applied hash → the read fetches the content back; let the
-/// origin check ask the new server for one → the move refuses as `origin_move_incomplete`.
+/// Revert: let the miss hook fetch an applied hash → the read fetches the content back; leave the
+/// walk's redacted absences among the ones the move leans on the new server for → the move refuses
+/// as `origin_move_incomplete`.
 #[test]
 fn a_cache_that_applied_a_redaction_never_fetches_it_nor_asks_a_new_origin_for_it() {
     let temp = std::env::temp_dir();
@@ -1176,24 +1177,37 @@ fn a_cache_that_applied_a_redaction_never_fetches_it_nor_asks_a_new_origin_for_i
     // Read once and evicted, so the sealed record holds the content before the redaction applies.
     cached.run_ok(&["show", &format!("{}:secret.env", leak)]);
     cached.run_ok(&["store", "evict"]);
-    let recorded = recorded_hash(&cached, &format!("{}:secret.env", leak), "leaked token");
-    let hash = recorded["data"]["hash"].as_str().unwrap().to_string();
+    // A leak in history only this cache holds, never lifted.
+    cached.run_ok(&["pallet", "create", "local"]);
+    cached.stack("local.env", b"LOCAL=1\n", "local leak");
+    let local_leak = cached.head("local");
+    cached.run_ok(&["remove", "local.env"]);
+    cached.run_ok(&["stack", "-m", "take the local leak out"]);
+
+    let hashes: Vec<String> = [format!("{}:secret.env", leak), format!("{}:local.env", local_leak)].iter()
+        .map(|target| recorded_hash(&cached, target, "leaked token")["data"]["hash"].as_str().unwrap().to_string())
+        .collect();
     // A cache applies a redaction only once its remote has, which nothing does yet: the record is
     // written as the apply would write it.
-    std::fs::write(cached.root.join(".forklift/redactions-applied"), format!("/forklift-redactions-applied 1\n{}\n", hash))
-        .unwrap();
-    assert_eq!(cached.redactions()[0]["status"], serde_json::json!({ "state": "applied" }));
+    let mut sorted = hashes.clone();
+    sorted.sort();
+    std::fs::write(cached.root.join(".forklift/redactions-applied"),
+                   format!("/forklift-redactions-applied 1\n{}\n", sorted.join("\n"))).unwrap();
+    assert!(cached.redactions().iter().all(|listed| listed["status"] == serde_json::json!({ "state": "applied" })));
     // The deletion that follows an applied redaction, whether or not the clone fetched the bytes.
-    for copy in loose_copies(&cached.root.join(".forklift/objects"), &hash) {
-        std::fs::remove_file(copy).unwrap();
+    for hash in &hashes {
+        for copy in loose_copies(&cached.root.join(".forklift/objects"), hash) {
+            std::fs::remove_file(copy).unwrap();
+        }
     }
 
     let read = cached.run(&["show", &format!("{}:secret.env", leak)]);
     assert!(!read.status.success(), "{:?}", read);
-    assert!(loose_copies(&cached.root.join(".forklift/objects"), &hash).is_empty(), "nothing fetched it back");
-    assert!(!loose_copies(&first_root, &hash).is_empty(), "the remote still serves the bytes");
+    assert!(loose_copies(&cached.root.join(".forklift/objects"), &hashes[0]).is_empty(), "nothing fetched it back");
+    assert!(!loose_copies(&first_root, &hashes[0]).is_empty(), "the remote still serves the bytes");
 
-    // A copy of the server's root that lacks the content, served once the first has stopped.
+    // A copy of the server's root, served once the first has stopped. Its history never reaches
+    // the local leak.
     drop(server);
     let second_root = temp.join(format!("forklift-redaction-applied-cache-copy-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&second_root);
@@ -1201,11 +1215,6 @@ fn a_cache_that_applied_a_redaction_never_fetches_it_nor_asks_a_new_origin_for_i
     assert!(copied.status.success(), "{:?}", copied);
     // The lock the first server held is not the copy's: no process holds it.
     std::fs::remove_file(second_root.join(".forklift/serve.lock")).unwrap();
-    let copies = loose_copies(&second_root, &hash);
-    assert!(!copies.is_empty());
-    for copy in copies {
-        std::fs::remove_file(copy).unwrap();
-    }
     let server = Server::serve(&second_root);
 
     let moved = cached.json(&["remote", "move", &server.url]);
