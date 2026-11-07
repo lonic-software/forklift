@@ -106,9 +106,17 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   lifts of history that names it without the content; `lift` no longer uploads it, nor a chunked
   file's chunks that only it names. Its handshake
   reports each redaction as pending or applied, and a warehouse takes a head the server serves over
-  a redaction only while the server reports it pending. The server does not delete its copy yet,
-  and a fresh `clone` or a `lower` that must fetch history naming the content is refused with
-  `content_redacted` for now. The AWS head does not apply redactions yet.
+  a redaction only while the server reports it pending. A fresh `clone` or a `lower` that must
+  fetch history naming the content is refused with `content_redacted` for now. The AWS head does
+  not apply redactions yet.
+- **forklift-server deletes an applied redaction's content.** Right after it applies a redaction,
+  the server deletes its copy of the content in its own process. For the moment that takes, it
+  answers requests for that one warehouse with `503` and a `Retry-After`, and cuts any download of
+  its bundle. A deletion it cannot carry out yet, because requests did not end in time or a command
+  on the server's machine holds the warehouse, is retried later and whenever the server starts.
+  Its handshake reports the redaction `deleted` once no copy is left, and answers only once what
+  the writes before it let apply is applied. Every `503` the server sends now carries
+  `Retry-After`.
 - **`forklift redact` is listed, and the `--json` schema is now 27: an applied redaction's content
   is deleted.** Part of content redaction: once a redaction applies, `redact record` and
   `redact apply` delete every copy of its content in this warehouse, packed or loose, and a chunked
