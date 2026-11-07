@@ -518,8 +518,9 @@ On the AWS serverless head, the CAS in step 1 also conditions on the office head
 own head — so a concurrent office lift or re-genesis is caught at commit time even after the audit
 already passed, and is reported `409` there too. A redaction recorded between step 5 and the
 commit does not answer the push: the head runs step 5 again against it, so the push is refused
-with `content_redacted` if the new redaction names its content and commits otherwise, and answers
-`409` only when `@redactions` moved under it three times in a row. That same head can additionally answer
+with `content_redacted` if the new redaction names its content and commits otherwise. It answers
+`409` when `@redactions` has moved under it three times in a row, or sooner when the invocation
+has no time left for another check. That same head can additionally answer
 **`503`**: its commit is a single backend transaction, and the backend's own concurrency
 control can cancel it for a reason that establishes nothing about whether any input
 actually changed (contention from another push touching a shared item, principally the

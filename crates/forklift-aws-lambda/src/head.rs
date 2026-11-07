@@ -177,7 +177,8 @@ pub const BATCH_ANSWER_RESERVE: std::time::Duration = std::time::Duration::from_
 const DELETE_ATTEMPTS: usize = 3;
 
 /// How many times a ref update checks its new head against `@redactions` again because a
-/// redaction was recorded between the check and the commit, before it answers `409`.
+/// redaction was recorded between the check and the commit, before it answers `409` (sooner when
+/// the invocation's window affords no other).
 const REDACTION_ATTEMPTS: usize = 3;
 
 /// The serverless protocol handler over an [`ObjectStore`] and a [`RefStore`].
@@ -1223,7 +1224,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 CasOutcome::RedactionsMoved if attempt < REDACTION_ATTEMPTS && self.affords_another(started.elapsed()) => continue,
                 CasOutcome::RedactionsMoved => {
                     return Err(HeadError::conflict(
-                        "Redactions kept being recorded while this update was checked; retry it."
+                        "A redaction was recorded while this update was checked; retry it."
                             .to_string(),
                     ))
                 }
@@ -1241,12 +1242,13 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         unreachable!("the last attempt answers every outcome")
     }
 
-    /// Whether this invocation's window can take another attempt that took `attempt` (with as
-    /// much to spare), so a ref update that keeps losing to new redactions answers its `409`
-    /// rather than run out of time with no answer. Without a deadline, always.
+    /// Whether this invocation's window can take another attempt that took `attempt`, with as
+    /// much again to spare and [`HOLDS_ANSWER_RESERVE`] to answer in, so a ref update that keeps
+    /// losing to new redactions answers its `409` rather than run out of time with no answer.
+    /// Without a deadline, always.
     fn affords_another(&self, attempt: std::time::Duration) -> bool {
         self.deadline.is_none_or(|deadline| {
-            deadline.duration_since(SystemTime::now()).unwrap_or_default() > attempt * 2
+            deadline.duration_since(SystemTime::now()).unwrap_or_default() > attempt * 2 + HOLDS_ANSWER_RESERVE
         })
     }
 
