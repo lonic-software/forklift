@@ -328,9 +328,19 @@ revocation by more than about a day.
   latest bundle down (every bundle built after leaves the content out, and with
   `rebuild_after_lifts` set the next one is built at once), and accepts lifts whose history names it
   without the content. The applied redactions are kept in `<root>/.forklift/redactions-applied`.
-  The server does not delete its copy of the content yet, and until it serves the redaction's
-  absence, a fresh clone or `lower` that must fetch history naming the content is refused with
-  `content_redacted`.
+  Right after applying, the server deletes its copy of the content in its own process. It drains
+  that one warehouse: requests for it get `503` with `Retry-After` until the deletion ends (a repack of its
+  packs included), its
+  bundle downloads are cut, and the requests already running get 30 seconds to end. Then it
+  deletes the content, packed or loose, and serves the warehouse again, all without letting go of
+  the warehouse's serve lock or format lease. A deletion it cannot carry out, because requests
+  ran past the 30 seconds or a `forklift` command in one of the root's bays holds the object store,
+  stays owed. The server logs it and retries, 30 seconds later and then twice as long each time up
+  to an hour, at the next pallet update, and whenever it serves the warehouse anew, including at
+  startup. A copy that a bay in the root still holds is kept until the bay lets it go and
+  `forklift redact apply` runs there, or the server's next deletion. Until it serves the
+  redaction's absence, a fresh clone or `lower` that must fetch history naming the content is
+  refused with `content_redacted`.
 - **Repack:** `forklift store compact --all` against a served root is refused for the same reason
   as `gc` — it drops unreachable packed objects with no grace period at all — so it also
   belongs in the maintenance window. Plain `forklift store compact` (incremental) never drops an

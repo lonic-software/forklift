@@ -44,8 +44,8 @@ use forklift_core::util::pallet_utils::{
 use forklift_core::util::lock_utils::{self, BaseServeLock, FormatLease, ServeLock, StoreAccessLock};
 use forklift_core::util::{
     applied_redactions, audit_utils, body_utils, bay_utils, bundle_utils, file_utils, franchise_utils, hook_utils, merge_utils, meta_tree,
-    object_utils, office_utils, origin_utils, pack_utils, pallet_utils, redaction_utils, scope_utils, sealed_utils, sign_utils, tree_utils,
-    warehouse_utils,
+    object_utils, office_utils, origin_utils, pack_utils, pallet_utils, progress_utils, redaction_deleter, redaction_utils, scope_utils,
+    sealed_utils, sign_utils, tree_utils, warehouse_utils,
 };
 use forklift_core::util::applied_redactions::AppliedSet;
 use subtle::ConstantTimeEq;
@@ -68,6 +68,11 @@ struct WarehouseHandle {
     /// so it publishes nothing.
     rebuild_again: std::sync::atomic::AtomicBool,
 
+    /// Whether a redaction run's round must rebuild the bundle after its deletion: a ref write
+    /// applied a redaction, withdrawing it. Read only by the round, never by a running rebuild, so
+    /// the build waits for the drain rather than run beside it.
+    rebuild_after_drain: std::sync::atomic::AtomicBool,
+
     /// The serve lock for this root, held for as long as the handle is served. `None` for
     /// handles that are not a live served warehouse (test fixtures). Held in the handle so the
     /// lock releases exactly when the served warehouse stops being served: when the server stops,
@@ -80,11 +85,47 @@ struct WarehouseHandle {
     /// another process on this root — so a lift can never dedup against an object one of them is
     /// about to delete. (Scope-prune, the other deleter, runs only on a sparse warehouse, which is
     /// never served.)
-    _store_access: Option<StoreAccessLock>,
+    ///
+    /// Behind a mutex only so the redaction deleter can trade it for the exclusive side while the
+    /// warehouse is drained ([`delete_drained`]), and take it back before anything is served
+    /// again. Nothing else touches it.
+    store_access: std::sync::Mutex<Option<StoreAccessLock>>,
 
     /// The format lease for this root, held for the handle's lifetime, so nothing upgrades a
     /// warehouse while it is served. `None` exactly when the two above are.
     _format_lease: Option<FormatLease>,
+
+    /// Whether the warehouse is drained for the redaction deleter: while set, every request that
+    /// resolves it is refused with a `503`, so no new reference to the handle is taken. Read and
+    /// written only under the registry mutex, which every resolve takes.
+    draining: std::sync::atomic::AtomicBool,
+
+    /// Cancelled to cut every bundle download running from this handle, then replaced for the
+    /// downloads that start after. A download takes the token in force before it opens the bundle.
+    bundle_cut: std::sync::Mutex<tokio_util::sync::CancellationToken>,
+
+    /// Whether a redaction run ([`run_redactions`]) is running or waiting to retry for this handle
+    /// (never two at once).
+    redacting: std::sync::atomic::AtomicBool,
+
+    /// Whether the running redaction run must go round again: a ref write landed while it ran.
+    redact_again: std::sync::atomic::AtomicBool,
+
+    /// How many redaction rounds have been asked for ([`run_redactions`]).
+    redactions_asked: std::sync::atomic::AtomicU64,
+
+    /// Wakes a redaction run waiting to retry an owed deletion, when a ref write asks for a round.
+    redaction_wake: Arc<tokio::sync::Notify>,
+
+    /// Whether this handle's first redaction run is still to start. Set for a served handle, so
+    /// a deletion owed when an earlier process stopped serving the warehouse is carried out once
+    /// it is served again, ref write or not.
+    first_run_due: std::sync::atomic::AtomicBool,
+
+    /// Whether a redaction run's next round must apply what it finds: set for a served handle (a
+    /// redaction recorded before an earlier process stopped may never have applied) and by a ref
+    /// write whose own apply failed. A write that applied leaves the run nothing to apply.
+    apply_owed: std::sync::atomic::AtomicBool,
 }
 
 impl WarehouseHandle {
@@ -96,9 +137,18 @@ impl WarehouseHandle {
             lifts_since_bundle: std::sync::atomic::AtomicU32::new(0),
             bundling: std::sync::atomic::AtomicBool::new(false),
             rebuild_again: std::sync::atomic::AtomicBool::new(false),
+            rebuild_after_drain: std::sync::atomic::AtomicBool::new(false),
             _serve_lock: None,
-            _store_access: None,
+            store_access: std::sync::Mutex::new(None),
             _format_lease: None,
+            draining: std::sync::atomic::AtomicBool::new(false),
+            bundle_cut: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
+            redacting: std::sync::atomic::AtomicBool::new(false),
+            redact_again: std::sync::atomic::AtomicBool::new(false),
+            redactions_asked: std::sync::atomic::AtomicU64::new(0),
+            redaction_wake: Arc::new(tokio::sync::Notify::new()),
+            first_run_due: std::sync::atomic::AtomicBool::new(false),
+            apply_owed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -181,7 +231,9 @@ impl WarehouseHandle {
         };
         let mut handle = WarehouseHandle::new(root);
         handle._serve_lock = Some(serve_lock);
-        handle._store_access = Some(store_access);
+        handle.store_access = std::sync::Mutex::new(Some(store_access));
+        handle.first_run_due = std::sync::atomic::AtomicBool::new(true);
+        handle.apply_owed = std::sync::atomic::AtomicBool::new(true);
         handle._format_lease = Some(format_lease);
         Ok(handle)
     }
@@ -867,6 +919,14 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
         open: options.open,
     });
 
+    // A deletion owed when the warehouse was last served is carried out now, not at the first
+    // ref write.
+    if let ServeMode::Single(handle) = &state.mode {
+        if handle.first_run_due.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            run_redactions(Arc::clone(&state), Arc::clone(handle));
+        }
+    }
+
     // `auth_configured` was computed above, before the startup refusal, and is still valid here
     // (a `bool` copy) — used only for the startup-bind warning once the address is actually
     // bound. Reaching this point at all means `auth_configured || options.open` held.
@@ -1114,9 +1174,18 @@ fn parse_operator_tokens(path: &str) -> Result<HashMap<String, String>, String> 
     Ok(tokens)
 }
 
-/// Build the JSON error response of a handler error.
+/// Build the JSON error response of a handler error. A `503` says when to try again: each one is
+/// a refusal for now (a warehouse drained for the redaction deleter, under maintenance, or not
+/// yet servable), never for good.
 fn error_response(error: HandlerError) -> Response {
-    (error.0, Json(error_body(error.1))).into_response()
+    let status = error.0;
+    let mut response = (status, Json(error_body(error.1))).into_response();
+
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        response.headers_mut().insert(axum::http::header::RETRY_AFTER, HeaderValue::from(RETRY_AFTER_SECONDS));
+    }
+
+    response
 }
 
 /// Build the JSON error body, threading a classified refusal's stable code (§7.4) onto the wire.
@@ -1296,21 +1365,27 @@ fn trust_install_outcome(installed: Result<office_utils::TrustInstalled, RefUpda
 }
 
 /// Where each redaction on this warehouse's `@redactions` stands here, for the handshake. An applied
-/// one is reported with its deletion owed, since this head refuses the content but deletes no copy
-/// of it yet. Nothing is walked: what holds a pending one is the scan's business after each ref
-/// write, not every handshake's. A cell this build cannot read is not reported.
+/// one is deleted once its object is gone from the store, and its deletion is owed while a copy is
+/// still there: the deleter has yet to run, could not drain the warehouse, or keeps a copy a bay
+/// here still holds. Nothing is walked: what holds a pending one is the scan's business after each
+/// ref write, not every handshake's. A cell this build cannot read is not reported.
 fn served_redactions() -> Result<Vec<ServedRedaction>, HandlerError> {
     let applied = read_applied()?;
 
-    Ok(redaction_utils::read_redactions().map_err(internal)?.redactions.iter().map(|attributed| {
+    redaction_utils::read_redactions().map_err(internal)?.redactions.iter().map(|attributed| {
         let hash = attributed.redaction.hash.clone();
         let state = match applied.contains(&hash) {
-            true => ServedRedactionState::DeletionOwed,
             false => ServedRedactionState::Pending,
+            // Deleted is claimed only on seeing the object absent: a store that cannot be read
+            // reports the deletion owed, as a handshake must not fail over one object.
+            true => match file_utils::does_object_exist(&hash) {
+                Ok(false) => ServedRedactionState::Deleted,
+                Ok(true) | Err(_) => ServedRedactionState::DeletionOwed,
+            },
         };
 
-        ServedRedaction { hash, state }
-    }).collect())
+        Ok(ServedRedaction { hash, state })
+    }).collect()
 }
 
 /// The redactions this warehouse applied, read for a request that serves or takes objects by hash.
@@ -1800,25 +1875,61 @@ fn validate_warehouse_id(id: &str) -> Result<(), HandlerError> {
     forklift_core::util::warehouse_utils::validate_warehouse_id(id).map_err(unprocessable)
 }
 
+/// Resolve the warehouse a request addresses ([`resolve_handle`]), and start the first redaction
+/// run of a handle served for it just now.
+fn resolve_warehouse(state: &Arc<AppState>,
+                     params: &PathParams) -> Result<Arc<WarehouseHandle>, HandlerError> {
+    let handle = resolve_handle(state, params)?;
+
+    if handle.first_run_due.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        run_redactions(Arc::clone(state), Arc::clone(&handle));
+    }
+
+    Ok(handle)
+}
+
+/// How long a client refused while a warehouse is drained, or otherwise unavailable for now, is
+/// told to wait before trying again (the `Retry-After` of every `503`).
+const RETRY_AFTER_SECONDS: u64 = 10;
+
+/// The `503` of a request for a warehouse drained for the redaction deleter.
+fn draining_refusal() -> HandlerError {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "The warehouse is briefly unavailable while content redacted from it is deleted. Try again \
+        shortly.".to_string(),
+    )
+}
+
 /// Resolve the warehouse a request addresses: the served one in single mode, the one
 /// named by the `warehouse` path parameter in multi mode. A warehouse that does not
 /// exist on disk is a `404` — creation is explicit (`PUT /warehouses/{id}`), never a
-/// side effect.
-fn resolve_warehouse(state: &AppState,
-                     params: &PathParams) -> Result<Arc<WarehouseHandle>, HandlerError> {
+/// side effect. One drained for the redaction deleter is a `503`.
+///
+/// Every reference to a served handle is taken here, under the registry mutex, which is what
+/// lets the deleter's drain ([`drain`]) tell that nothing holds the handle but the registry and
+/// itself.
+fn resolve_handle(state: &AppState,
+                  params: &PathParams) -> Result<Arc<WarehouseHandle>, HandlerError> {
+    let mut registry = state.warehouses.lock()
+        .map_err(|_| internal("The warehouse registry lock is poisoned.".to_string()))?;
+
     let base = match &state.mode {
-        ServeMode::Single(handle) => return Ok(Arc::clone(handle)),
+        ServeMode::Single(handle) => return match handle.draining.load(std::sync::atomic::Ordering::SeqCst) {
+            true => Err(draining_refusal()),
+            false => Ok(Arc::clone(handle)),
+        },
         ServeMode::Multi { base } => base,
     };
 
     let id = param(params, "warehouse")?;
     validate_warehouse_id(&id)?;
 
-    let mut registry = state.warehouses.lock()
-        .map_err(|_| internal("The warehouse registry lock is poisoned.".to_string()))?;
-
     if let Some(handle) = registry.get(&id) {
-        return Ok(handle);
+        return match handle.draining.load(std::sync::atomic::Ordering::SeqCst) {
+            true => Err(draining_refusal()),
+            false => Ok(handle),
+        };
     }
 
     let root = base.join(&id);
@@ -3277,17 +3388,377 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
     }
 }
 
-/// What follows a ref write this warehouse took: every redaction the write may have let apply is
-/// applied ([`apply_redactions`]), and the bundle is rebuilt, at once when an apply withdrew it,
-/// or else when the accepted-lift counter reaches its threshold.
-async fn after_ref_write(state: &AppState, warehouse: Arc<WarehouseHandle>) {
+/// What follows a ref write this warehouse took. The write's answer waits for the apply of every
+/// redaction the write let apply ([`apply_redactions`]), so content a write let apply is refused
+/// before the write is answered, then cuts the downloads of the bundle the apply withdrew. The
+/// deletion after is a redaction run's ([`run_redactions`]), and is not waited for. So is the
+/// bundle rebuild: the accepted-lift counter's, or, when the write applied a redaction, the run's
+/// after its deletion, so no build runs beside the drain.
+///
+/// An apply that fails is logged, and the write is answered all the same: the ref is written,
+/// and what the apply found stays pending, refused nowhere, until a later write applies it or the
+/// run's retry does.
+async fn after_ref_write(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
     match apply_redactions(Arc::clone(&warehouse)).await {
-        Ok(true) => rebuild_bundle(state, warehouse, true),
-        Ok(false) => maybe_rebuild_bundle(state, warehouse),
-        // The write landed and stays landed; the next write here applies again.
+        Ok(true) => {
+            cut_bundle_downloads(&warehouse);
+            warehouse.rebuild_after_drain.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(false) => maybe_rebuild_bundle(state, Arc::clone(&warehouse)),
         Err((_, error)) => {
-            tracing::error!(error, "applying the redactions after a ref write failed");
-            maybe_rebuild_bundle(state, warehouse);
+            tracing::error!(error, "applying the redactions failed; the redaction run retries it");
+            warehouse.apply_owed.store(true, std::sync::atomic::Ordering::SeqCst);
+            maybe_rebuild_bundle(state, Arc::clone(&warehouse));
+        }
+    }
+
+    run_redactions(Arc::clone(state), warehouse);
+}
+
+/// How long the redaction deleter waits for a drained warehouse's requests to end before it gives
+/// up and lets the warehouse be served again, its deletion owed. Every request refused meanwhile
+/// is a `503`, so this bounds how long a warehouse is unavailable for one attempt.
+const DRAIN_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How often a drain looks whether the warehouse's requests have ended.
+const DRAIN_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// How long a redaction run waits for a running bundle rebuild to end before it drains anyway: a
+/// rebuild holds the handle throughout and cannot be cut, so draining while one runs would only
+/// make clients wait out a drain that cannot finish.
+const REBUILD_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The first and longest wait before a redaction run retries a deletion it owes. Each owed
+/// attempt doubles the wait; a ref write here starts a run at once.
+const FIRST_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+const LAST_RETRY: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Start a redaction run for `warehouse`, or, when one runs already, have it go round again.
+///
+/// A round applies every redaction the warehouse's scan now finds unheld ([`apply_redactions`])
+/// when an apply is owed (the handle's first, or one a write could not carry out), cuts the
+/// downloads of the bundle that apply withdrew, deletes the applied content no bay here
+/// holds ([`delete_applied_content`]) and rebuilds the bundle an apply withdrew. A deletion that
+/// could not be carried out — the warehouse could not be drained, or other maintenance holds its
+/// store — is owed, as is an apply that failed: the run tries again later, waiting longer each time, while the warehouse is
+/// served. A run starts after each ref write and once for each handle served, so a deletion owed
+/// when a process stopped is carried out by the next one to serve the warehouse.
+fn run_redactions(state: Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
+    use std::sync::atomic::Ordering;
+
+    // Asked for before the running run is looked at, so that run, ending, sees it. Only a run
+    // waiting out a retry is woken: no permit is left behind to cut a later wait short.
+    warehouse.redactions_asked.fetch_add(1, Ordering::SeqCst);
+    warehouse.redact_again.store(true, Ordering::SeqCst);
+    warehouse.redaction_wake.notify_waiters();
+
+    if warehouse.redacting.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut warehouse = warehouse;
+        let mut retry = FIRST_RETRY;
+
+        loop {
+            warehouse.redact_again.store(false, Ordering::SeqCst);
+
+            let owed = redaction_round(&state, &warehouse).await;
+
+            if !owed {
+                retry = FIRST_RETRY;
+            }
+
+            // Listening before the ask is looked at, so an ask after the look wakes the wait.
+            let wake = Arc::clone(&warehouse.redaction_wake);
+            let woken = wake.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+
+            if warehouse.redact_again.load(Ordering::SeqCst) {
+                continue;
+            }
+
+            if !owed {
+                warehouse.redacting.store(false, Ordering::SeqCst);
+
+                // Asked for between the look above and the store: the ask found this run still
+                // marked, so this run serves it, unless another has started since.
+                if !warehouse.redact_again.load(Ordering::SeqCst) || warehouse.redacting.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+
+                continue;
+            }
+
+            // The wait holds no reference to the handle, so an idle warehouse may still be let go
+            // meanwhile; the next handle served for it starts a run of its own.
+            let weak = Arc::downgrade(&warehouse);
+            drop(warehouse);
+
+            tokio::select! {
+                () = tokio::time::sleep(retry) => {}
+                () = woken => {}
+            }
+
+            warehouse = match still_served(&state, &weak) {
+                Some(warehouse) => warehouse,
+                None => return,
+            };
+            retry = (retry * 2).min(LAST_RETRY);
+        }
+    });
+}
+
+/// The handle `weak` names, when it is still the one served for its warehouse. Taken under the
+/// registry mutex, as every reference to a served handle is (see [`resolve_handle`]): a handle
+/// being let go is never taken back.
+fn still_served(state: &AppState, weak: &std::sync::Weak<WarehouseHandle>) -> Option<Arc<WarehouseHandle>> {
+    let registry = state.warehouses.lock().ok()?;
+    let handle = weak.upgrade()?;
+
+    let served = match &state.mode {
+        ServeMode::Single(served) => Arc::ptr_eq(served, &handle),
+        ServeMode::Multi { .. } => registry.entries.values().any(|entry| Arc::ptr_eq(&entry.handle, &handle)),
+    };
+
+    served.then_some(handle)
+}
+
+/// One round of a redaction run ([`run_redactions`]).
+///
+/// # Returns
+/// Whether a deletion or an apply is owed that a later round should try again.
+async fn redaction_round(state: &AppState, warehouse: &Arc<WarehouseHandle>) -> bool {
+    use std::sync::atomic::Ordering;
+
+    // Only an apply owed: a write applies what it let apply before it is answered.
+    let (applied, apply_failed) = match warehouse.apply_owed.swap(false, Ordering::SeqCst) {
+        false => (false, false),
+        true => match apply_redactions(Arc::clone(warehouse)).await {
+            Ok(applied) => (applied, false),
+            // Still owed: a later round retries it, as it would a deletion.
+            Err((_, error)) => {
+                tracing::error!(error, "applying the redactions failed; retrying later");
+                warehouse.apply_owed.store(true, Ordering::SeqCst);
+                (false, true)
+            }
+        },
+    };
+
+    // The apply withdrew the bundle, which may hold the content; downloads of it stop here.
+    if applied {
+        cut_bundle_downloads(warehouse);
+    }
+
+    let owed = delete_applied_content(state, warehouse).await;
+
+    // A rebuild the drain held back runs now, as does the one an apply calls for, unless another
+    // round follows: that round may drain for what a write applied meanwhile, so the rebuild and
+    // its flags are left to the run's last round.
+    if warehouse.redact_again.load(Ordering::SeqCst) {
+        if applied {
+            warehouse.rebuild_after_drain.store(true, Ordering::SeqCst);
+        }
+        return owed || apply_failed;
+    }
+
+    let after_drain = warehouse.rebuild_after_drain.swap(false, Ordering::SeqCst);
+    if applied || after_drain || warehouse.rebuild_again.load(Ordering::SeqCst) {
+        rebuild_bundle(state, Arc::clone(warehouse), true);
+    }
+
+    owed || apply_failed
+}
+
+/// Delete the applied content this warehouse holds that no bay here holds, when there is any:
+/// drain the warehouse ([`drain`]), then delete it ([`delete_drained`]) and serve the warehouse
+/// again. A handle that is not a served warehouse's (a test fixture) holds no locks to delete
+/// under, and deletes nothing.
+///
+/// # Returns
+/// Whether the deletion is owed: the census failed, or the warehouse could not be drained, or its
+/// store was busy with other maintenance, or the deletion failed.
+async fn delete_applied_content(state: &AppState, warehouse: &Arc<WarehouseHandle>) -> bool {
+    if warehouse._serve_lock.is_none() {
+        return false;
+    }
+
+    match blocking(Arc::clone(warehouse), || redaction_deleter::applied_copies().map_err(internal)).await {
+        Ok(copies) if copies.unheld == 0 => return false,
+        Ok(_) => {}
+        Err((_, error)) => {
+            tracing::error!(error, "which redacted content is held could not be told; its deletion is owed");
+            return true;
+        }
+    }
+
+    // A rebuild running now would hold the drain open; it ends first.
+    let rebuilding = tokio::time::Instant::now() + REBUILD_WAIT;
+    while warehouse.bundling.load(std::sync::atomic::Ordering::SeqCst) && tokio::time::Instant::now() < rebuilding {
+        tokio::time::sleep(DRAIN_POLL).await;
+    }
+
+    if !drain(state, warehouse, DRAIN_WAIT).await {
+        tracing::warn!(
+            root = %warehouse.root.display(),
+            "requests did not end in time to drain the warehouse; deleting its redacted content is owed"
+        );
+        return true;
+    }
+
+    let worker = Arc::clone(warehouse);
+    let (deletion, holds_store) = tokio::task::spawn_blocking(move || delete_drained(&worker)).await
+        .unwrap_or_else(|error| (Err(format!("The deletion task failed: {}", error)), false));
+
+    let owed = match deletion {
+        Ok(deletion) => {
+            tracing::info!(
+                objects = deletion.objects.len(),
+                chunks = deletion.chunks,
+                bytes_freed = deletion.bytes_freed,
+                held = deletion.held.len(),
+                "deleted redacted content"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(error, "deleting redacted content is owed");
+            true
+        }
+    };
+
+    if !holds_store {
+        retake_store_access(warehouse).await;
+    }
+
+    undrain(state, warehouse);
+
+    owed
+}
+
+/// Mark `warehouse` drained, cut its bundle downloads, and wait up to `wait` ([`DRAIN_WAIT`]) for
+/// every request on it to end.
+///
+/// From the mark on, every request that resolves the warehouse is refused, and every reference to
+/// its handle is taken under the registry mutex (see [`resolve_handle`]), so once nothing holds
+/// the handle but the registry (or single mode's own) and this run, nothing can again. A request
+/// already answered whose body is in memory (an object, a batch, a subtree) dropped its reference
+/// when the body was read: those bytes already left, and nothing here can call them back.
+///
+/// # Returns
+/// Whether the warehouse is drained. When it is not, the mark is withdrawn.
+async fn drain(state: &AppState, warehouse: &Arc<WarehouseHandle>, wait: std::time::Duration) -> bool {
+    use std::sync::atomic::Ordering;
+
+    let Ok(registry) = state.warehouses.lock() else {
+        return false;
+    };
+    warehouse.draining.store(true, Ordering::SeqCst);
+    drop(registry);
+
+    cut_bundle_downloads(warehouse);
+
+    let deadline = tokio::time::Instant::now() + wait;
+
+    loop {
+        // The registry's (or single mode's) reference and this run's.
+        if Arc::strong_count(warehouse) == 2 {
+            return true;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            undrain(state, warehouse);
+            return false;
+        }
+
+        tokio::time::sleep(DRAIN_POLL).await;
+    }
+}
+
+/// Serve a drained warehouse again.
+fn undrain(state: &AppState, warehouse: &WarehouseHandle) {
+    let _registry = state.warehouses.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    warehouse.draining.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Delete the applied content of a drained warehouse that no bay here holds, under the store lock
+/// and exclusive store access: the handle's shared store-access hold is traded for the exclusive
+/// side for the deletion and taken back after it. The serve lock and the format lease stay held
+/// throughout, so no other server and no upgrade comes in between. The caches of the warehouse's
+/// objects are forgotten after, so nothing answers "present" for what was deleted.
+///
+/// # Returns
+/// The deletion, or why it is owed (the store lock or the exclusive side was taken, or the
+/// deletion failed), and whether the handle holds its shared store-access hold again: when it was
+/// released and another process took the exclusive side before it was taken back, it does not.
+fn delete_drained(warehouse: &WarehouseHandle) -> (Result<redaction_deleter::Deletion, String>, bool) {
+    let _scope = StorageRootScope::enter(&warehouse.root);
+
+    let Some(serve_lock) = warehouse._serve_lock.as_ref() else {
+        return (Err("The warehouse is not served.".to_string()), true);
+    };
+    let mut store_access = warehouse.store_access.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let deletion = (|| {
+        // Taken before the shared hold is let go, so other maintenance refuses this attempt
+        // without the hold ever being released for it.
+        let store_lock = lock_utils::StoreLock::acquire()?;
+
+        *store_access = None;
+
+        let exclusive = StoreAccessLock::try_exclusive()?;
+
+        redaction_deleter::delete_applied(&store_lock, serve_lock, &exclusive, &progress_utils::Progress::NONE)
+    })();
+
+    pack_utils::forget_warehouse();
+
+    if store_access.is_none() {
+        match StoreAccessLock::try_shared() {
+            Ok(hold) => *store_access = Some(hold),
+            Err(error) => tracing::warn!(error, "the shared store-access hold could not be taken back yet"),
+        }
+    }
+
+    (deletion, store_access.is_some())
+}
+
+/// Take a drained warehouse's shared store-access hold back, once whatever took the exclusive side
+/// while it was let go is done. Until then the warehouse stays drained: serving it without the hold
+/// would let that other process delete objects a request is relying on.
+async fn retake_store_access(warehouse: &Arc<WarehouseHandle>) {
+    for attempt in 1u64.. {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        // Said at once and every minute after: the warehouse answers 503 until this ends.
+        if attempt % 60 == 1 {
+            tracing::warn!(
+                root = %warehouse.root.display(),
+                seconds = attempt - 1,
+                "another process holds the warehouse's store exclusively; it is refused until that ends"
+            );
+        }
+
+        let worker = Arc::clone(warehouse);
+        let retaken = tokio::task::spawn_blocking(move || {
+            let _scope = StorageRootScope::enter(&worker.root);
+            let mut store_access = worker.store_access.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+            match StoreAccessLock::try_shared() {
+                Ok(hold) => {
+                    // What the other process deleted is forgotten too.
+                    pack_utils::forget_warehouse();
+                    *store_access = Some(hold);
+                    true
+                }
+                Err(_) => false,
+            }
+        }).await.unwrap_or(false);
+
+        if retaken {
+            return;
         }
     }
 }
@@ -3351,6 +3822,12 @@ fn rebuild_bundle(state: &AppState, warehouse: Arc<WarehouseHandle>, again: bool
         warehouse.rebuild_again.store(true, Ordering::SeqCst);
     }
 
+    // A rebuild would hold the drain open; the redaction run that drains asks again after.
+    if warehouse.draining.load(Ordering::SeqCst) {
+        warehouse.rebuild_again.store(true, Ordering::SeqCst);
+        return;
+    }
+
     if warehouse.bundling.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -3381,6 +3858,11 @@ fn rebuild_bundle(state: &AppState, warehouse: Arc<WarehouseHandle>, again: bool
             }
 
             warehouse.bundling.store(false, Ordering::SeqCst);
+
+            // A drain began while this one ran: the ask stays for the redaction run to serve after.
+            if warehouse.draining.load(Ordering::SeqCst) {
+                break;
+            }
 
             // Another was asked for while this one ran, and no other rebuild has started since.
             if !warehouse.rebuild_again.swap(false, Ordering::SeqCst) || warehouse.bundling.swap(true, Ordering::SeqCst) {
@@ -3469,18 +3951,93 @@ async fn post_resolve(State(state): State<Arc<AppState>>,
     Json(ResolveResponse { names }).into_response()
 }
 
-/// A file being streamed out, together with the handle of the warehouse it belongs to.
-struct PinnedFile {
-    file: tokio::fs::File,
-    _warehouse: Arc<WarehouseHandle>,
+/// The body of a bundle download: `length` bytes of `file`, read by a task of its own that holds
+/// the warehouse's handle until its last byte, so the warehouse is never let go while it streams.
+///
+/// The task stops the moment `cut` is cancelled, whether it is reading the file or waiting for a
+/// slow client to take the next chunk, and the body ends in an error ([`CutBody`]): an
+/// applied redaction cuts every download of the bundle it withdrew, which may hold the content, and
+/// the redaction deleter's drain cuts whatever still streams. The client sees a download cut off,
+/// and its resume finds the bundle gone or replaced.
+fn bundle_body(file: tokio::fs::File,
+               length: u64,
+               warehouse: Arc<WarehouseHandle>,
+               cut: tokio_util::sync::CancellationToken) -> Body {
+    use tokio_stream::StreamExt;
+
+    let (sender, receiver) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(4);
+
+    let body = CutBody {
+        receiver,
+        cut: Box::pin(cut.clone().cancelled_owned()),
+        ended: false,
+    };
+
+    tokio::spawn(async move {
+        let _warehouse = warehouse;
+        let mut chunks = tokio_util::io::ReaderStream::new(tokio::io::AsyncReadExt::take(file, length));
+
+        loop {
+            let chunk = tokio::select! {
+                biased;
+                () = cut.cancelled() => return,
+                chunk = chunks.next() => match chunk {
+                    Some(chunk) => chunk,
+                    None => return,
+                },
+            };
+
+            tokio::select! {
+                biased;
+                () = cut.cancelled() => return,
+                sent = sender.send(chunk) => if sent.is_err() {
+                    // The client went away.
+                    return;
+                },
+            }
+        }
+    });
+
+    Body::from_stream(body)
 }
 
-impl tokio::io::AsyncRead for PinnedFile {
-    fn poll_read(mut self: std::pin::Pin<&mut Self>,
-                 context: &mut std::task::Context<'_>,
-                 buffer: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.file).poll_read(context, buffer)
+/// A bundle download's body ([`bundle_body`]): the chunks its task reads, until the cut. The cut
+/// is looked at before every chunk, here on the side the client reads, so it ends the body in an
+/// error however many chunks are waiting: the connection is aborted, never closed as if the
+/// download were whole.
+struct CutBody {
+    receiver: tokio::sync::mpsc::Receiver<std::io::Result<Bytes>>,
+    cut: std::pin::Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
+    ended: bool,
+}
+
+impl tokio_stream::Stream for CutBody {
+    type Item = std::io::Result<Bytes>;
+
+    fn poll_next(mut self: std::pin::Pin<&mut Self>,
+                 context: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+        use std::future::Future;
+
+        if self.ended {
+            return std::task::Poll::Ready(None);
+        }
+
+        if self.cut.as_mut().poll(context).is_ready() {
+            self.ended = true;
+            return std::task::Poll::Ready(Some(Err(std::io::Error::other("the bundle download was cut"))));
+        }
+
+        self.receiver.poll_recv(context)
     }
+}
+
+/// Cut every bundle download running from `warehouse` ([`bundle_body`]); those that start after
+/// take the fresh token.
+fn cut_bundle_downloads(warehouse: &WarehouseHandle) {
+    let mut cut = warehouse.bundle_cut.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    cut.cancel();
+    *cut = tokio_util::sync::CancellationToken::new();
 }
 
 /// `GET /v1/bundles/latest` — the most recent bundle, when one was built. The file is
@@ -3502,6 +4059,16 @@ async fn get_bundle(State(state): State<Arc<AppState>>,
         Ok(warehouse) => warehouse,
         Err(error) => return error_response(error),
     };
+
+    // Taken before the bundle is opened: an apply withdraws the bundle before it cuts the
+    // downloads, so a download that takes the token after the cut finds no bundle to open.
+    let cut = warehouse.bundle_cut.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+
+    // Resolved before a drain's mark, but took the token after its cut: the drain waits for this
+    // request, so it stops here rather than stream past the cut.
+    if warehouse.draining.load(std::sync::atomic::Ordering::SeqCst) {
+        return error_response(draining_refusal());
+    }
 
     // The path resolves synchronously under the scope; only the streaming is async.
     let path = {
@@ -3560,10 +4127,8 @@ async fn get_bundle(State(state): State<Arc<AppState>>,
         }
     }
 
-    // The download holds the handle until its last byte, so the warehouse is never let go while
-    // it streams. It never sends more than the length it announced.
-    let body = tokio::io::AsyncReadExt::take(PinnedFile { file, _warehouse: warehouse }, length - offset);
-    let mut response = Body::from_stream(tokio_util::io::ReaderStream::new(body)).into_response();
+    // It never sends more than the length it announced.
+    let mut response = bundle_body(file, length - offset, warehouse, cut).into_response();
     let response_headers = response.headers_mut();
 
     response_headers.insert(axum::http::header::CONTENT_TYPE,
@@ -4928,8 +5493,8 @@ mod tests {
         let root = scratch_dir("resolve-single");
         let state = single_mode_state(root.clone());
 
-        let first = resolve_warehouse(&state, &PathParams::new()).unwrap();
-        let second = resolve_warehouse(&state, &PathParams::new()).unwrap();
+        let first = resolve_handle(&state, &PathParams::new()).unwrap();
+        let second = resolve_handle(&state, &PathParams::new()).unwrap();
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(first.root, root);
 
@@ -4944,7 +5509,7 @@ mod tests {
         let mut params = PathParams::new();
         params.insert("warehouse".to_string(), "ghost".to_string());
 
-        let error = resolve_warehouse(&state, &params).err().unwrap();
+        let error = resolve_handle(&state, &params).err().unwrap();
         assert_eq!(error.0, StatusCode::NOT_FOUND);
 
         let _ = std::fs::remove_dir_all(&base);
@@ -4965,7 +5530,7 @@ mod tests {
         let state = base_state(ServeMode::Multi { base: base.clone() });
 
         let listable = std::fs::read_dir(&shut).is_ok();
-        let error = resolve_warehouse(&state, &warehouse_params("shut")).err().unwrap();
+        let error = resolve_handle(&state, &warehouse_params("shut")).err().unwrap();
         std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o700)).unwrap();
         if !listable {
             assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR, "{}", error.1);
@@ -4984,7 +5549,7 @@ mod tests {
         std::fs::create_dir_all(base.join("old").join(FOLDER_NAME_FORKLIFT_ROOT).join("objects")).unwrap();
         let state = base_state(ServeMode::Multi { base: base.clone() });
 
-        let error = resolve_warehouse(&state, &warehouse_params("old")).err().unwrap();
+        let error = resolve_handle(&state, &warehouse_params("old")).err().unwrap();
         assert_eq!(error.0, StatusCode::CONFLICT, "{}", error.1);
         assert!(error.1.starts_with("\"old\" exists on this server but is not a usable warehouse"), "{}", error.1);
         assert!(!error.1.contains(&*base.to_string_lossy()), "no server path reaches the client: {}", error.1);
@@ -4997,10 +5562,10 @@ mod tests {
         std::fs::write(bay.join(bay_utils::FILE_NAME_BAY_REDIRECT), b"x").unwrap();
         mark_warehouse(&base.join("newer"));
         std::fs::write(base.join("newer").join(FOLDER_NAME_FORKLIFT_ROOT).join(warehouse_utils::FILE_NAME_WAREHOUSE_MARKER), b"/forklift-warehouse 99\n").unwrap();
-        let error = resolve_warehouse(&state, &warehouse_params("bay")).err().unwrap();
+        let error = resolve_handle(&state, &warehouse_params("bay")).err().unwrap();
         assert_eq!(error.0, StatusCode::CONFLICT, "{}", error.1);
         // One that cannot be judged is offered no remedy that would destroy it.
-        let error = resolve_warehouse(&state, &warehouse_params("newer")).err().unwrap();
+        let error = resolve_handle(&state, &warehouse_params("newer")).err().unwrap();
         assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR, "{}", error.1);
 
         // A file, or a folder with content, would refuse a creation too; an empty folder would not.
@@ -5009,7 +5574,7 @@ mod tests {
         std::fs::write(base.join("full").join("data.txt"), b"x").unwrap();
         std::fs::create_dir_all(base.join("empty")).unwrap();
         for (id, status) in [("file", StatusCode::CONFLICT), ("full", StatusCode::CONFLICT), ("empty", StatusCode::NOT_FOUND)] {
-            let error = resolve_warehouse(&state, &warehouse_params(id)).err().unwrap();
+            let error = resolve_handle(&state, &warehouse_params(id)).err().unwrap();
             assert_eq!(error.0, status, "{}: {}", id, error.1);
         }
 
@@ -5024,7 +5589,7 @@ mod tests {
         let mut params = PathParams::new();
         params.insert("warehouse".to_string(), "../escape".to_string());
 
-        let error = resolve_warehouse(&state, &params).err().unwrap();
+        let error = resolve_handle(&state, &params).err().unwrap();
         assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
 
         let _ = std::fs::remove_dir_all(&base);
@@ -5038,7 +5603,7 @@ mod tests {
         let mut params = PathParams::new();
         params.insert("warehouse".to_string(), "Acme".to_string());
 
-        let error = resolve_warehouse(&state, &params).err().unwrap();
+        let error = resolve_handle(&state, &params).err().unwrap();
         assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(error.1.contains("the lowercase \"acme\" is valid"), "{}", error.1);
 
@@ -5054,8 +5619,8 @@ mod tests {
         let mut params = PathParams::new();
         params.insert("warehouse".to_string(), "wh1".to_string());
 
-        let first = resolve_warehouse(&state, &params).unwrap();
-        let second = resolve_warehouse(&state, &params).unwrap();
+        let first = resolve_handle(&state, &params).unwrap();
+        let second = resolve_handle(&state, &params).unwrap();
         assert!(Arc::ptr_eq(&first, &second), "the same warehouse must reuse one handle");
 
         let _ = std::fs::remove_dir_all(&base);
@@ -5073,8 +5638,8 @@ mod tests {
         let mut params2 = PathParams::new();
         params2.insert("warehouse".to_string(), "wh2".to_string());
 
-        let handle1 = resolve_warehouse(&state, &params1).unwrap();
-        let handle2 = resolve_warehouse(&state, &params2).unwrap();
+        let handle1 = resolve_handle(&state, &params1).unwrap();
+        let handle2 = resolve_handle(&state, &params2).unwrap();
 
         assert!(!Arc::ptr_eq(&handle1, &handle2), "two tenants must never share a handle");
         assert_ne!(handle1.root, handle2.root);
@@ -5138,12 +5703,12 @@ mod tests {
                              ("older", "/forklift-warehouse 3\nformat 0\nfull\n"),
                              ("halfway", "/forklift-warehouse 3\nformat 1\nfull\nupgrading 2 0\n")] {
             std::fs::write(base.join(id).join(FOLDER_NAME_FORKLIFT_ROOT).join(warehouse_utils::FILE_NAME_WAREHOUSE_MARKER), marker).unwrap();
-            let error = resolve_warehouse(&state, &warehouse_params(id)).err().unwrap();
+            let error = resolve_handle(&state, &warehouse_params(id)).err().unwrap();
             assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE, "{}: {}", id, error.1);
             assert!(!error.1.contains(base.to_str().unwrap()), "{}: {}", id, error.1);
         }
 
-        resolve_warehouse(&state, &warehouse_params("fine")).unwrap();
+        resolve_handle(&state, &warehouse_params("fine")).unwrap();
         assert_eq!(live_ids(&state), ["fine".to_string()].into());
 
         drop(state);
@@ -5165,7 +5730,7 @@ mod tests {
         let _ = std::fs::remove_file(forklift.join("format.lock"));
         std::fs::set_permissions(&forklift, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-        let error = resolve_warehouse(&state, &warehouse_params("w")).err().unwrap();
+        let error = resolve_handle(&state, &warehouse_params("w")).err().unwrap();
         std::fs::set_permissions(&forklift, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR, "{}", error.1);
 
@@ -5186,10 +5751,10 @@ mod tests {
             file.try_lock().is_ok()
         };
 
-        drop(resolve_warehouse(&state, &warehouse_params("w1")).unwrap());
+        drop(resolve_handle(&state, &warehouse_params("w1")).unwrap());
         assert!(!exclusive("w1"), "serving w1 holds its format");
 
-        drop(resolve_warehouse(&state, &warehouse_params("w2")).unwrap());
+        drop(resolve_handle(&state, &warehouse_params("w2")).unwrap());
         assert!(exclusive("w1"), "w1 was let go");
         assert!(!exclusive("w2"));
 
@@ -5208,25 +5773,25 @@ mod tests {
         let base = scratch_dir("cap-busy-idle");
         let state = capped_state(&base, 1, &["w1", "w2", "w3"]);
 
-        let held = resolve_warehouse(&state, &warehouse_params("w1")).unwrap();
+        let held = resolve_handle(&state, &warehouse_params("w1")).unwrap();
 
         // Nothing is idle, so w2 is admitted over the cap rather than refused.
-        drop(resolve_warehouse(&state, &warehouse_params("w2")).unwrap());
+        drop(resolve_handle(&state, &warehouse_params("w2")).unwrap());
         assert_eq!(live_ids(&state), ["w1", "w2"].map(String::from).into());
 
         // w2 is idle now, w1 is not: serving w3 lets exactly w2 go.
-        drop(resolve_warehouse(&state, &warehouse_params("w3")).unwrap());
+        drop(resolve_handle(&state, &warehouse_params("w3")).unwrap());
         assert_eq!(live_ids(&state), ["w1", "w3"].map(String::from).into());
         assert!(!serve_lock_exists(&base, "w2"), "a warehouse let go releases its serve lock");
         assert!(serve_lock_exists(&base, "w1"));
 
-        let again = resolve_warehouse(&state, &warehouse_params("w1"))
+        let again = resolve_handle(&state, &warehouse_params("w1"))
             .unwrap_or_else(|e| panic!("the busy warehouse must still be live: {:?}", e));
         assert!(Arc::ptr_eq(&held, &again), "one handle per warehouse, still the held one");
 
         // A warehouse that was let go is served again, under a new serve lock.
         drop((held, again));
-        resolve_warehouse(&state, &warehouse_params("w2")).unwrap();
+        resolve_handle(&state, &warehouse_params("w2")).unwrap();
         assert!(serve_lock_exists(&base, "w2"));
 
         drop(state);
@@ -5244,8 +5809,8 @@ mod tests {
         let state = capped_state(&base, 1, &["w1", "busy"]);
         std::fs::write(base.join("busy").join(FOLDER_NAME_FORKLIFT_ROOT).join("serve.lock"), b"1").unwrap();
 
-        drop(resolve_warehouse(&state, &warehouse_params("w1")).unwrap());
-        let refused = resolve_warehouse(&state, &warehouse_params("busy")).err().expect("refused");
+        drop(resolve_handle(&state, &warehouse_params("w1")).unwrap());
+        let refused = resolve_handle(&state, &warehouse_params("busy")).err().expect("refused");
         assert_eq!(refused.0, StatusCode::SERVICE_UNAVAILABLE, "{}", refused.1);
         assert_eq!(live_ids(&state), ["w1"].map(String::from).into());
 
@@ -5275,17 +5840,17 @@ mod tests {
             let _scope = StorageRootScope::enter(&base.join("sparse"));
             StoreAccessLock::try_exclusive().expect("exclusive hold")
         };
-        let refused = resolve_warehouse(&state, &warehouse_params("sparse")).err().expect("refused");
+        let refused = resolve_handle(&state, &warehouse_params("sparse")).err().expect("refused");
         assert_eq!(refused.0, StatusCode::CONFLICT, "{}", refused.1);
         drop(pruning);
 
-        let refused = resolve_warehouse(&state, &warehouse_params("sparse")).err().expect("refused");
+        let refused = resolve_handle(&state, &warehouse_params("sparse")).err().expect("refused");
         assert_eq!(refused.0, StatusCode::CONFLICT, "{}", refused.1);
         assert!(refused.1.starts_with("Warehouse \"sparse\" is a partial warehouse"), "{}", refused.1);
         assert!(refused.1.contains("without --only or --cache"), "{}", refused.1);
         assert!(!serve_lock_exists(&base, "sparse"), "a refused warehouse keeps no serve lock");
 
-        drop(resolve_warehouse(&state, &warehouse_params("full")).unwrap());
+        drop(resolve_handle(&state, &warehouse_params("full")).unwrap());
         assert_eq!(live_ids(&state), ["full"].map(String::from).into());
 
         drop(state);
@@ -5448,17 +6013,17 @@ mod tests {
             origin_utils::write_for_tests("http://origin.example");
         }
 
-        let refused = resolve_warehouse(&state, &warehouse_params("sealed")).err().expect("refused");
+        let refused = resolve_handle(&state, &warehouse_params("sealed")).err().expect("refused");
         assert_eq!(refused.0, StatusCode::CONFLICT, "{}", refused.1);
         assert!(refused.1.starts_with("Warehouse \"sealed\" records 1 object it holds by hash alone"), "{}", refused.1);
         assert!(!serve_lock_exists(&base, "sealed"), "a refused warehouse keeps no serve lock");
 
-        let refused = resolve_warehouse(&state, &warehouse_params("origined")).err().expect("refused");
+        let refused = resolve_handle(&state, &warehouse_params("origined")).err().expect("refused");
         assert_eq!(refused.0, StatusCode::CONFLICT, "{}", refused.1);
         assert!(refused.1.starts_with("Warehouse \"origined\" records an origin (.forklift/origin)"), "{}", refused.1);
         assert!(!serve_lock_exists(&base, "origined"), "a refused warehouse keeps no serve lock");
 
-        drop(resolve_warehouse(&state, &warehouse_params("full")).unwrap());
+        drop(resolve_handle(&state, &warehouse_params("full")).unwrap());
         assert_eq!(live_ids(&state), ["full"].map(String::from).into());
 
         drop(state);
@@ -5477,7 +6042,7 @@ mod tests {
 
         let forklift = base.join("unfinished").join(FOLDER_NAME_FORKLIFT_ROOT);
         std::fs::write(franchise_utils::record_path(&forklift), b"torn").unwrap();
-        let refused = resolve_warehouse(&state, &warehouse_params("unfinished")).err().expect("refused");
+        let refused = resolve_handle(&state, &warehouse_params("unfinished")).err().expect("refused");
         assert_eq!(refused.0, StatusCode::SERVICE_UNAVAILABLE, "{}", refused.1);
         assert!(refused.1.starts_with("Warehouse \"unfinished\" is temporarily unavailable"), "{}", refused.1);
         assert!(!refused.1.contains(&*base.to_string_lossy()), "no server path reaches the client: {}", refused.1);
@@ -5488,7 +6053,7 @@ mod tests {
             let _scope = StorageRootScope::enter(&base.join("garbled"));
             std::fs::write(scope_utils::fetch_scope_path(), b"not a scope file").unwrap();
         }
-        let refused = resolve_warehouse(&state, &warehouse_params("garbled")).err().expect("refused");
+        let refused = resolve_handle(&state, &warehouse_params("garbled")).err().expect("refused");
         assert_eq!(refused.0, StatusCode::INTERNAL_SERVER_ERROR, "{}", refused.1);
 
         assert!(live_ids(&state).is_empty());
@@ -5505,10 +6070,10 @@ mod tests {
         let base = scratch_dir("cap-lru");
         let state = capped_state(&base, 2, &["a", "b", "c"]);
 
-        drop(resolve_warehouse(&state, &warehouse_params("a")).unwrap());
-        drop(resolve_warehouse(&state, &warehouse_params("b")).unwrap());
-        drop(resolve_warehouse(&state, &warehouse_params("a")).unwrap());
-        drop(resolve_warehouse(&state, &warehouse_params("c")).unwrap());
+        drop(resolve_handle(&state, &warehouse_params("a")).unwrap());
+        drop(resolve_handle(&state, &warehouse_params("b")).unwrap());
+        drop(resolve_handle(&state, &warehouse_params("a")).unwrap());
+        drop(resolve_handle(&state, &warehouse_params("c")).unwrap());
 
         assert_eq!(live_ids(&state), ["a", "c"].map(String::from).into());
 
@@ -5543,7 +6108,7 @@ mod tests {
         assert!(std::fs::read_dir(&pack_folder).unwrap().next().is_some(), "the object is packed");
 
         let present = |state: &AppState| {
-            let handle = resolve_warehouse(state, &warehouse_params("w1")).unwrap();
+            let handle = resolve_handle(state, &warehouse_params("w1")).unwrap();
             let _scope = StorageRootScope::enter(&handle.root);
             file_utils::does_object_exist(&hash).unwrap()
         };
@@ -5551,7 +6116,7 @@ mod tests {
 
         // w1 is idle, so serving w2 lets it go; then its pack disappears, as a repack run by
         // another process would make it.
-        drop(resolve_warehouse(&state, &warehouse_params("w2")).unwrap());
+        drop(resolve_handle(&state, &warehouse_params("w2")).unwrap());
         assert!(!live_ids(&state).contains("w1"));
         for entry in std::fs::read_dir(&pack_folder).unwrap() {
             std::fs::remove_file(entry.unwrap().path()).unwrap();
@@ -5580,7 +6145,7 @@ mod tests {
         }
 
         let (blob, tree) = {
-            let handle = resolve_warehouse(&state, &warehouse_params("w1")).unwrap();
+            let handle = resolve_handle(&state, &warehouse_params("w1")).unwrap();
             let _scope = StorageRootScope::enter(&handle.root);
             let bytes: &[u8] = &object_utils::blob_bytes(b"an object read while served");
             let blob = object_utils::hash_object_bytes(bytes);
@@ -5592,19 +6157,38 @@ mod tests {
         };
 
         // w1 goes idle and is let go; then its objects disappear, as `gc` would make them.
-        drop(resolve_warehouse(&state, &warehouse_params("w2")).unwrap());
+        drop(resolve_handle(&state, &warehouse_params("w2")).unwrap());
         assert!(!live_ids(&state).contains("w1"));
         let objects = root.join(FOLDER_NAME_FORKLIFT_ROOT).join("objects");
         std::fs::remove_dir_all(&objects).unwrap();
         std::fs::create_dir(&objects).unwrap();
 
-        let handle = resolve_warehouse(&state, &warehouse_params("w1")).unwrap();
+        let handle = resolve_handle(&state, &warehouse_params("w1")).unwrap();
         let _scope = StorageRootScope::enter(&handle.root);
         assert!(file_utils::retrieve_object_by_hash(&blob).is_err(), "the deleted blob must not load");
         assert!(object_utils::load_tree_shared(&tree).is_err(), "the deleted tree must not load");
 
         drop((_scope, handle, state));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Wait, up to five seconds, until nothing but the registry holds warehouse `id`'s handle and
+    /// no redaction run is running for it: the tasks a request leaves behind (a download's, a
+    /// redaction run's) let go of it only once they are scheduled.
+    async fn settle(state: &AppState, id: &str) {
+        for _ in 0..500 {
+            let settled = state.warehouses.lock().unwrap().entries.get(id).is_none_or(|entry| {
+                Arc::strong_count(&entry.handle) == 1 && !entry.handle.redacting.load(Ordering::SeqCst)
+            });
+
+            if settled {
+                return;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        panic!("warehouse {} did not settle", id);
     }
 
     /// A bundle download holds its warehouse until the body is dropped, so the warehouse is not
@@ -5623,19 +6207,208 @@ mod tests {
             std::fs::write(&path, format!("{}\nbundle bytes", bundle_utils::BUNDLE_HEADER)).unwrap();
         }
 
+        // Its first redaction run, which also holds it, ends before the download starts.
+        drop(resolve_warehouse(&state, &warehouse_params("w1")).unwrap());
+        settle(&state, "w1").await;
+
         let response = get_bundle(State(Arc::clone(&state)), HeaderMap::new(),
                                   Path(warehouse_params("w1"))).await;
         assert_eq!(response.status(), StatusCode::OK);
 
-        drop(resolve_warehouse(&state, &warehouse_params("w2")).unwrap());
+        drop(resolve_handle(&state, &warehouse_params("w2")).unwrap());
         assert!(live_ids(&state).contains("w1"), "a streaming download keeps its warehouse live");
 
         drop(response);
-        drop(resolve_warehouse(&state, &warehouse_params("w3")).unwrap());
+        settle(&state, "w1").await;
+        drop(resolve_handle(&state, &warehouse_params("w3")).unwrap());
         assert!(!live_ids(&state).contains("w1"), "once the body is gone, the warehouse is idle");
 
         drop(state);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A drained warehouse is refused with a `503` that says when to try again, and served again
+    /// once the drain ends.
+    ///
+    /// Revert: resolve without looking at the drain mark → the request is served → red. Drop the
+    /// `Retry-After` → red.
+    #[tokio::test]
+    async fn a_drained_warehouse_is_refused_until_it_is_served_again() {
+        let base = scratch_dir("drain-refused");
+        let state = capped_state(&base, 4, &["w1"]);
+        let handle = resolve_handle(&state, &warehouse_params("w1")).unwrap();
+
+        assert!(drain(&state, &handle, std::time::Duration::from_secs(5)).await, "nothing else holds it");
+        let refused = resolve_handle(&state, &warehouse_params("w1")).err().expect("refused while drained");
+        assert_eq!(refused.0, StatusCode::SERVICE_UNAVAILABLE);
+        let response = error_response(refused);
+        assert_eq!(response.headers().get(axum::http::header::RETRY_AFTER).unwrap(), &RETRY_AFTER_SECONDS.to_string());
+
+        undrain(&state, &handle);
+        let again = resolve_handle(&state, &warehouse_params("w1")).expect("served again");
+        assert!(Arc::ptr_eq(&again, &handle), "the same handle, never a second one");
+
+        drop((again, handle, state));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A drain waits for the requests holding the warehouse, and past its bound gives up and serves
+    /// the warehouse again; once they end, it drains.
+    ///
+    /// Revert: drain without waiting for the handle to go idle → the first drain succeeds → red.
+    /// Keep the mark when the drain gives up → the warehouse stays refused → red.
+    #[tokio::test]
+    async fn a_drain_waits_for_requests_and_gives_up_at_its_bound() {
+        let base = scratch_dir("drain-bound");
+        let state = capped_state(&base, 4, &["w1"]);
+        let handle = resolve_handle(&state, &warehouse_params("w1")).unwrap();
+        let request = resolve_handle(&state, &warehouse_params("w1")).unwrap();
+
+        assert!(!drain(&state, &handle, std::time::Duration::from_millis(100)).await, "a request holds it");
+        drop(resolve_handle(&state, &warehouse_params("w1")).expect("served again after the drain gave up"));
+
+        drop(request);
+        assert!(drain(&state, &handle, std::time::Duration::from_secs(5)).await, "the request ended");
+        undrain(&state, &handle);
+
+        drop((handle, state));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The deleter trades the served warehouse's shared store-access hold for the exclusive side,
+    /// and takes the shared hold back after: from then on another process's deleter is refused
+    /// again. While another holder shares the store, the deletion is owed and the hold is kept.
+    ///
+    /// Revert: leave the shared hold released after the deletion → a deleter runs beside the served
+    /// warehouse → red. Keep the shared hold while trying the exclusive side → the deletion is
+    /// always owed → red.
+    #[tokio::test]
+    async fn the_deleter_takes_the_shared_hold_back_after_it() {
+        let base = scratch_dir("deleter-hold");
+        std::fs::create_dir_all(base.join("w1")).unwrap();
+        {
+            let _scope = StorageRootScope::enter(&base.join("w1"));
+            warehouse_utils::prepare_warehouse(warehouse_utils::PrepareMode::Full).unwrap();
+        }
+        let state = capped_state(&base, 4, &[]);
+        let handle = resolve_handle(&state, &warehouse_params("w1")).unwrap();
+        let _scope = StorageRootScope::enter(&handle.root);
+
+        let (deletion, holds_store) = delete_drained(&handle);
+        deletion.expect("nothing else holds the store");
+        assert!(holds_store);
+        assert!(StoreAccessLock::try_exclusive().is_err(), "the served warehouse holds the store again");
+
+        let other = StoreAccessLock::try_shared().unwrap();
+        let (deletion, holds_store) = delete_drained(&handle);
+        assert!(deletion.is_err(), "owed while another holder shares the store");
+        assert!(holds_store);
+        drop(other);
+        assert!(StoreAccessLock::try_exclusive().is_err(), "the served warehouse still holds the store");
+
+        drop((_scope, handle, state));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Cutting a warehouse's bundle downloads ends one whose client takes nothing in an error,
+    /// never as if it were whole; one started after the cut is whole.
+    ///
+    /// Revert: stream the file without the cut → the stalled download is whole → red. End the cut
+    /// body quietly → it reads as complete → red.
+    #[tokio::test]
+    async fn a_cut_ends_a_stalled_bundle_download_short() {
+        let base = scratch_dir("bundle-cut");
+        let state = Arc::new(capped_state(&base, 4, &["w1"]));
+        let bundle = {
+            let _scope = StorageRootScope::enter(&base.join("w1"));
+            let path = bundle_utils::get_latest_bundle_path();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut bundle = format!("{}\n", bundle_utils::BUNDLE_HEADER).into_bytes();
+            bundle.resize(4 * 1024 * 1024, b'x');
+            std::fs::write(&path, &bundle).unwrap();
+            bundle
+        };
+
+        let stalled = get_bundle(State(Arc::clone(&state)), HeaderMap::new(), Path(warehouse_params("w1"))).await;
+        assert_eq!(stalled.status(), StatusCode::OK);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        cut_bundle_downloads(&resolve_handle(&state, &warehouse_params("w1")).unwrap());
+        let received = axum::body::to_bytes(stalled.into_body(), usize::MAX).await;
+        assert!(received.is_err(), "the cut download ends in an error, never as if whole");
+
+        let whole = get_bundle(State(Arc::clone(&state)), HeaderMap::new(), Path(warehouse_params("w1"))).await;
+        assert_eq!(axum::body::to_bytes(whole.into_body(), usize::MAX).await.unwrap().len(), bundle.len());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A handle served for the first time starts a redaction run of its own, once, so a deletion
+    /// owed when the warehouse was last served is carried out without waiting for a ref write.
+    ///
+    /// Revert: start runs only after ref writes → no round is asked → red.
+    #[tokio::test]
+    async fn a_warehouse_served_anew_starts_one_redaction_run() {
+        let base = scratch_dir("first-run");
+        let state = Arc::new(capped_state(&base, 4, &["w1"]));
+
+        let handle = resolve_warehouse(&state, &warehouse_params("w1")).unwrap();
+        drop(resolve_warehouse(&state, &warehouse_params("w1")).unwrap());
+        assert_eq!(handle.redactions_asked.load(Ordering::SeqCst), 1, "one run, at the first serve");
+
+        drop(handle);
+        settle(&state, "w1").await;
+        drop(state);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An apply that fails is owed to the redaction run, from a ref write's and from a round's
+    /// own: the run retries it rather than leave the content served until another write.
+    ///
+    /// Revert: drop the write's `apply_owed` store → nothing is owed after it → red. Drop the
+    /// round's → the failed round owes nothing → red.
+    #[tokio::test]
+    async fn a_failed_apply_is_owed_to_the_redaction_run() {
+        let root = scratch_dir("apply-owed");
+        mark_warehouse(&root);
+        // A record this build cannot read fails every apply.
+        std::fs::write(root.join(FOLDER_NAME_FORKLIFT_ROOT).join("redactions-applied"),
+                       b"/forklift-redactions-applied 2\n").unwrap();
+        let state = Arc::new(base_state(ServeMode::Single(Arc::new(WarehouseHandle::new(root.clone())))));
+        let handle = resolve_handle(&state, &PathParams::new()).unwrap();
+        // A run is under way, so the write starts none.
+        handle.redacting.store(true, Ordering::SeqCst);
+
+        after_ref_write(&state, Arc::clone(&handle)).await;
+        assert!(handle.apply_owed.load(Ordering::SeqCst), "the write's failed apply is owed");
+
+        assert!(redaction_round(&state, &handle).await, "the round that fails it again owes it");
+        assert!(handle.apply_owed.load(Ordering::SeqCst), "and it stays owed for the next round");
+
+        drop((handle, state));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Asking for a redaction round wakes only a run waiting out a retry: it leaves no permit that
+    /// would cut the run's next wait short.
+    ///
+    /// Revert: wake with `notify_one` → the permit stays and a later wait ends at once → red.
+    #[tokio::test]
+    async fn an_ask_leaves_no_wake_behind() {
+        let root = scratch_dir("wake-permit");
+        mark_warehouse(&root);
+        let state = Arc::new(base_state(ServeMode::Single(Arc::new(WarehouseHandle::new(root.clone())))));
+        let handle = resolve_handle(&state, &PathParams::new()).unwrap();
+        handle.redacting.store(true, Ordering::SeqCst);
+
+        run_redactions(Arc::clone(&state), Arc::clone(&handle));
+
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(50), handle.redaction_wake.notified()).await;
+        assert!(waited.is_err(), "no wake was left behind");
+
+        drop((handle, state));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A bundle in another version than this build writes is answered `404`, so a client falls
@@ -5867,7 +6640,7 @@ mod tests {
         let (_, headers, _) = get_bundle_with(&state, &[]).await;
         let old_tag = header(&headers, "etag").unwrap().to_string();
 
-        let root = resolve_warehouse(&state, &warehouse_params("w1")).unwrap().root.clone();
+        let root = resolve_handle(&state, &warehouse_params("w1")).unwrap().root.clone();
         let swap_path = path.clone();
         let swap = move || {
             let old_modified = std::fs::metadata(&swap_path).unwrap().modified().unwrap();
@@ -5984,7 +6757,7 @@ mod tests {
         std::fs::write(forklift.join(bay_utils::FILE_NAME_BAY_REDIRECT), b"redirect").unwrap();
         let state = base_state(ServeMode::Multi { base: base.clone() });
 
-        let error = resolve_warehouse(&state, &warehouse_params("bay")).err().expect("a bay must not be served");
+        let error = resolve_handle(&state, &warehouse_params("bay")).err().expect("a bay must not be served");
         assert_eq!(error.0, StatusCode::CONFLICT, "{}", error.1);
 
         let error = create_warehouse(&base, "bay").err().expect("a bay must not read as an existing warehouse");
@@ -5995,7 +6768,7 @@ mod tests {
         // A `.forklift` that is neither (a redirect that is a folder) cannot be judged: a lookup
         // answers it as a server fault with no remedy, and a creation finds the name taken.
         std::fs::create_dir_all(base.join("broken").join(FOLDER_NAME_FORKLIFT_ROOT).join(bay_utils::FILE_NAME_BAY_REDIRECT)).unwrap();
-        let error = resolve_warehouse(&state, &warehouse_params("broken")).err().expect("a broken entry must not be served");
+        let error = resolve_handle(&state, &warehouse_params("broken")).err().expect("a broken entry must not be served");
         assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR, "{}", error.1);
         let error = create_warehouse(&base, "broken").err().expect("a broken entry must not read as a warehouse");
         assert_eq!(error.0, StatusCode::CONFLICT, "{}", error.1);

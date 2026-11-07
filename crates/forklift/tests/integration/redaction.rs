@@ -1507,10 +1507,12 @@ fn http(url: &str, method: &str, path: &str, body: &[u8]) -> (String, String) {
 }
 
 /// Once a lift leaves no head on forklift-server naming a recorded redaction, the server applies
-/// it: the handshake reports it applied, every surface that reads or takes content refuses it as
-/// redacted, and a warehouse whose unlifted history still names it lifts that history without it.
+/// it: the handshake right after the lift reports it applied (deleted, since the server never held
+/// the content), every surface that reads or takes content refuses it as redacted, and a warehouse
+/// whose unlifted history still names it lifts that history without it.
 ///
-/// Revert: skip applying after a ref write → the handshake reports the redaction pending.
+/// Revert: skip applying after a ref write → the handshake reports the redaction pending (the
+/// redaction run applies only what a write could not).
 #[test]
 fn a_server_applies_a_redaction_no_head_names_and_refuses_its_content() {
     let server = Server::start(&std::env::temp_dir()
@@ -1530,7 +1532,7 @@ fn a_server_applies_a_redaction_no_head_names_and_refuses_its_content() {
     let (status, info) = http(&server.url, "GET", "/v1/warehouse", b"");
     assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, info);
     let info: serde_json::Value = serde_json::from_str(&info).unwrap();
-    assert_eq!(info["redactions"], serde_json::json!([{ "hash": hash, "state": "deletion_owed" }]), "{}", info);
+    assert_eq!(info["redactions"], serde_json::json!([{ "hash": hash, "state": "deleted" }]), "{}", info);
 
     let object = format!("/v1/objects/{}", hash);
     let refusals = [
@@ -1561,6 +1563,55 @@ fn a_server_applies_a_redaction_no_head_names_and_refuses_its_content() {
     assert!(!cloned.status.success());
     assert!(String::from_utf8_lossy(&cloned.stderr).contains(&format!("Object {} is redacted", hash)),
             "{}", String::from_utf8_lossy(&cloned.stderr));
+}
+
+/// Content forklift-server holds is deleted once a redaction of it applies: the server drains the
+/// warehouse, deletes the bytes in its own process and serves it again, and the handshake then
+/// reports the redaction deleted. Before the apply, the bytes were there.
+///
+/// Revert: skip the deletion after an apply → the handshake keeps reporting the deletion owed, and
+/// the bytes stay.
+#[test]
+fn a_server_deletes_the_content_of_a_redaction_it_applied() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-deleted-server-{}", std::process::id())));
+
+    let owner = Warehouse::cloned("deleted-owner", &server.url);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+
+    // The server holds the bytes, and no head names them.
+    let content = b"TOKEN=hunter2\n";
+    let hash = hash_of(content);
+    let (status, body) = http(&server.url, "PUT", &format!("/v1/objects/{}", hash), &object_utils::blob_bytes(content));
+    assert!(status.starts_with("HTTP/1.1 20"), "{} / {}", status, body);
+    let loose = server.root.join(".forklift/objects").join(&hash[..2]).join(&hash[2..]);
+    assert!(loose.exists(), "the server holds the content");
+
+    owner.redact_loaded("secret.env", content, "leaked token");
+    owner.run_ok(&["lift"]);
+
+    let mut state = serde_json::Value::Null;
+    for _ in 0..500 {
+        let (status, info) = http(&server.url, "GET", "/v1/warehouse", b"");
+        if status.starts_with("HTTP/1.1 200") {
+            let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+            state = info["redactions"].clone();
+            if state == serde_json::json!([{ "hash": hash, "state": "deleted" }]) {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(state, serde_json::json!([{ "hash": hash, "state": "deleted" }]));
+    assert!(!loose.exists(), "the content is deleted");
+
+    let (status, body) = http(&server.url, "GET", &format!("/v1/objects/{}", hash), b"");
+    assert!(status.starts_with("HTTP/1.1 410"), "{} / {}", status, body);
+
+    // Served again after the drain.
+    let fresh = Warehouse::cloned("deleted-fresh", &server.url);
+    assert_eq!(fresh.head("main"), server.main());
 }
 
 /// A pallet deleted on forklift-server leaves a tombstone that keeps its head served and

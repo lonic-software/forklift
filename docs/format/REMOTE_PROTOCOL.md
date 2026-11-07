@@ -61,6 +61,12 @@ offers zstd/gzip; clients send `Accept-Encoding`). The hash always covers the
 uncompressed object (invariant 3), so verification is untouched; responses that are
 already zstd streams (bundles, batches) are marked `identity` and never re-wrapped.
 
+**Unavailable for now:** every `503` from forklift-server carries `Retry-After` (delta-seconds)
+and is a refusal for now, sent before the request changed anything. The warehouse may be drained
+while content redacted from it is deleted (below), under maintenance, or not yet servable, or a
+hook it depends on may be unreachable. The request can be sent again after the wait. The
+serverless head's `503`s are described with the endpoints that send them.
+
 **Redirects:** `GET`/`PUT` on object endpoints may answer `307` with a `Location`
 pointing at a storage URL (a presigned S3 URL in the hosted service). Clients must
 follow redirects for object bodies. The server head serves bytes directly.
@@ -135,11 +141,25 @@ entry per redacted object hash, with the state the remote holds it in:
   does.
 - `deletion_owed`: applied. The remote refuses the content on every route (below), and its copy
   is still to be deleted.
-- `deleted`: applied, and the remote's copy is gone.
+- `deleted`: applied, and the remote holds no copy of the content, whether it deleted one or
+  never held one.
 
 A head applies a redaction once no pallet head, no tombstone and no metadata history it holds
 names the content, after each ref update or `DELETE`. Applying is permanent: an applied redaction is never
-pending again. A client reads a state it does not know as neither pending nor applied: it still
+pending again. forklift-server applies before it answers the write, so a client that lifted and
+then reads the handshake sees what its lift let apply. The deletion that follows is not waited
+for. An apply that fails is logged and the write is answered all the same: the ref is written, and
+what the apply found stays pending until a later write, or the server's retry, applies it.
+
+forklift-server deletes an applied redaction's content in its own process right after applying
+it. It drains that one warehouse: new requests for it get `503` until the deletion ends (which may
+include repacking its packs, so the wait is not bounded by the drain's), downloads
+of its bundle are cut, and the requests already running get a bounded time to end. It then deletes
+the content and serves the warehouse again. A deletion it cannot carry out (the requests did not
+end in time, or a command run on the server's machine holds the warehouse) stays owed. The server
+retries it later, waiting longer each time, at the next write, and whenever it serves the warehouse
+anew, including at startup. A copy that a bay on the server's machine still holds is kept, and the
+redaction stays `deletion_owed`. A client reads a state it does not know as neither pending nor applied: it still
 uploads the content when a lift needs it, and refuses to take a head that names it. A head that
 does not apply redactions sends `null` or omits the field; a client then treats every redaction
 the remote's `@redactions` pallet holds as pending.
@@ -656,7 +676,9 @@ Everything else gets `200` with the whole current bundle under its own tag (RFC 
 semantics): an `If-Range` naming a stale or weak tag or a date, another range form, or a repeated
 `Range` or `If-Range` line. A tag names one built file, never a path: a rebuild publishes a new
 file and gets a new tag, and a download that started before the rebuild finishes the file it began
-under that file's tag. Two builds may rarely share a tag. That is safe, because a resumed bundle is
+under that file's tag. The one exception is a redaction applied while the download runs: the
+server withdraws the bundle, which may hold the content, and cuts the download short of its
+`Content-Length`. Its resume finds no bundle, or the replacement under another tag. Two builds may rarely share a tag. That is safe, because a resumed bundle is
 checked against its own digest before any of it is stored (see `BUNDLE_FORMAT.md`), so a collision
 costs one more full download, never a misread.
 
