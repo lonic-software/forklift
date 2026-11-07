@@ -328,6 +328,11 @@ revocation by more than about a day.
   latest bundle down (every bundle built after leaves the content out, and with
   `rebuild_after_lifts` set the next one is built at once), and accepts lifts whose history names it
   without the content. The applied redactions are kept in `<root>/.forklift/redactions-applied`.
+  No content is served while an apply may be owed: from just before a pallet update until an
+  apply after it has decided every redaction, and from startup until the first one has, so a
+  redaction a server stopped before applying is never served once it is back. Content requests
+  wait up to 10 seconds for it and then get `503` with `Retry-After`; a failed apply is retried
+  every 10 seconds at most.
   Right after applying, the server deletes its copy of the content in its own process. It drains
   that one warehouse: requests for it get `503` with `Retry-After` until the deletion ends (a repack of its
   packs included), its

@@ -122,10 +122,23 @@ struct WarehouseHandle {
     /// it is served again, ref write or not.
     first_run_due: std::sync::atomic::AtomicBool,
 
-    /// Whether a redaction run's next round must apply what it finds: set for a served handle (a
-    /// redaction recorded before an earlier process stopped may never have applied) and by a ref
-    /// write whose own apply failed. A write that applied leaves the run nothing to apply.
-    apply_owed: std::sync::atomic::AtomicBool,
+    /// The applies owed here, numbered in order, and the number up to which an apply has since
+    /// discharged them ([`apply_discharging`]): while one is not discharged, a redaction the
+    /// warehouse's scan would apply may be unapplied, and no content is served
+    /// ([`await_applies`]). One is owed by each ref write here, from just before it may land
+    /// ([`WarehouseHandle::owe_apply`]), and, for a served handle, when some redaction it records is
+    /// not applied: a ref write an earlier process took may have let it apply.
+    applies_owed: std::sync::atomic::AtomicU64,
+    applies_discharged: std::sync::atomic::AtomicU64,
+
+    /// The numbers of the applies owed by ref writes that have not returned yet: an apply
+    /// discharges only those owed before the earliest of them, since its scan may miss what one
+    /// still in flight writes. Each is numbered and added under this mutex.
+    applies_in_flight: std::sync::Mutex<std::collections::BTreeSet<u64>>,
+
+    /// Wakes the requests waiting for the owed applies ([`await_applies`]), when an apply
+    /// discharges some and when the warehouse is drained.
+    applies_wake: tokio::sync::Notify,
 
     /// Which chunks are served as absent while a redaction's deletion is owed ([`withheld_among`]).
     chunk_gate: std::sync::Mutex<ChunkGate>,
@@ -182,7 +195,10 @@ impl WarehouseHandle {
             redactions_asked: std::sync::atomic::AtomicU64::new(0),
             redaction_wake: Arc::new(tokio::sync::Notify::new()),
             first_run_due: std::sync::atomic::AtomicBool::new(false),
-            apply_owed: std::sync::atomic::AtomicBool::new(false),
+            applies_owed: std::sync::atomic::AtomicU64::new(0),
+            applies_discharged: std::sync::atomic::AtomicU64::new(0),
+            applies_in_flight: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            applies_wake: tokio::sync::Notify::new(),
             chunk_gate: std::sync::Mutex::new(ChunkGate::default()),
             chunk_gate_walk: std::sync::Mutex::new(()),
             ref_writes_started: std::sync::atomic::AtomicU64::new(0),
@@ -271,9 +287,56 @@ impl WarehouseHandle {
         handle._serve_lock = Some(serve_lock);
         handle.store_access = std::sync::Mutex::new(Some(store_access));
         handle.first_run_due = std::sync::atomic::AtomicBool::new(true);
-        handle.apply_owed = std::sync::atomic::AtomicBool::new(true);
+        // A ref write an earlier process took may have let a redaction apply, and the process
+        // stopped before applying it: the first run's apply is owed before any content is served.
+        // With every redaction applied, that apply reads two records and settles it.
+        handle.applies_owed = std::sync::atomic::AtomicU64::new(1);
         handle._format_lease = Some(format_lease);
         Ok(handle)
+    }
+
+    /// Owe an apply ([`WarehouseHandle::applies_owed`]): taken just before a ref write here may
+    /// land, and dropped once the write returns, landed or not. Content waits from the moment the
+    /// write could let a redaction apply until an apply that began after it returned discharges it
+    /// ([`apply_discharging`]).
+    fn owe_apply(self: &Arc<Self>) -> OwedApply {
+        let mut in_flight = self.applies_in_flight.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let number = self.applies_owed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        in_flight.insert(number);
+
+        OwedApply { warehouse: Arc::clone(self), number }
+    }
+
+    /// The number up to which an apply beginning now may discharge the applies owed: every one
+    /// owed so far, less those of ref writes still in flight and any owed after them.
+    fn dischargeable(&self) -> u64 {
+        let in_flight = self.applies_in_flight.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        match in_flight.first() {
+            Some(earliest) => earliest - 1,
+            None => self.applies_owed.load(std::sync::atomic::Ordering::SeqCst),
+        }
+    }
+
+    /// Whether an apply is owed here, so no content is served ([`await_applies`]).
+    fn applies_closed(&self) -> bool {
+        use std::sync::atomic::Ordering;
+
+        self.applies_discharged.load(Ordering::SeqCst) < self.applies_owed.load(Ordering::SeqCst)
+    }
+}
+
+/// An apply a ref write owes, while the write is in flight ([`WarehouseHandle::owe_apply`]).
+struct OwedApply {
+    warehouse: Arc<WarehouseHandle>,
+    number: u64,
+}
+
+impl Drop for OwedApply {
+    fn drop(&mut self) {
+        self.warehouse.applies_in_flight.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.number);
     }
 }
 
@@ -2611,6 +2674,10 @@ async fn post_objects_batch(State(state): State<Arc<AppState>>,
         Err(error) => return error_response(error),
     };
 
+    if let Err(error) = await_applies(&warehouse).await {
+        return error_response(error);
+    }
+
     if request.hashes.len() > MAX_MISSING_BATCH {
         return error_response(unprocessable(format!(
             "At most {} hashes per request; batch larger sets.",
@@ -2661,6 +2728,10 @@ async fn get_subtree(State(state): State<Arc<AppState>>,
         Ok(warehouse) => warehouse,
         Err(error) => return error_response(error),
     };
+
+    if let Err(error) = await_applies(&warehouse).await {
+        return error_response(error);
+    }
 
     let parcel = match param(&params, "parcel") {
         Ok(parcel) => parcel,
@@ -2762,6 +2833,10 @@ async fn get_object(State(state): State<Arc<AppState>>,
         Ok(warehouse) => warehouse,
         Err(error) => return error_response(error),
     };
+
+    if let Err(error) = await_applies(&warehouse).await {
+        return error_response(error);
+    }
 
     let hash = match hash_param(&params) {
         Ok(hash) => hash,
@@ -3081,7 +3156,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
 
     let counted = RefWriteCounted::start(&warehouse);
     let result = blocking(Arc::clone(&warehouse), move || {
-        let _counted = counted;
+        let counted = counted;
         // A meta pallet arrives as `@office`. The server routes by *namespace*, never by a
         // hard-coded name (DESIGN.html §3.3).
         let namespace = pallet_ref.namespace;
@@ -3322,10 +3397,15 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                 pallets: PalletsPrecondition::NotConsumed,
             };
 
-            match pallet_utils::update_pallet_head_verified(
+            // Owed from before the write may land until it returns; its apply discharges it.
+            let owed = counted.0.owe_apply();
+            let written = pallet_utils::update_pallet_head_verified(
                 namespace, &bare, request.old_head.as_deref(), &request.new_head, &preconditions, &verified,
                 request.tombstone.as_deref()
-            ) {
+            );
+            drop(owed);
+
+            match written {
                 Ok(()) => return Ok(events),
                 // The office or the anchor the decision consumed moved under it, the pallet did
                 // not: decide again against what stands now, rather than tell the client to lower a
@@ -3372,7 +3452,10 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
 
             StatusCode::OK.into_response()
         }
-        Err(error) => error_response(error),
+        Err(error) => {
+            after_failed_ref_write(&state, warehouse);
+            error_response(error)
+        }
     }
 }
 
@@ -3416,7 +3499,7 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
 
     let counted = RefWriteCounted::start(&warehouse);
     let result = blocking(Arc::clone(&warehouse), move || {
-        let _counted = counted;
+        let counted = counted;
         if pallet_ref.namespace == pallet_utils::PalletNamespace::Meta {
             return Err(unprocessable(format!(
                 "Meta pallet \"{}\" cannot be deleted: it is tracked metadata, not a line of work.",
@@ -3492,9 +3575,14 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
                 pallets: PalletsPrecondition::NotConsumed,
             };
 
-            let removed = match pallet_utils::remove_pallet_head_in(
+            // Owed from before the removal may land until it returns, as for a ref update.
+            let owed = counted.0.owe_apply();
+            let removal = pallet_utils::remove_pallet_head_in(
                 pallet_utils::PalletNamespace::User, &bare, &old_head, &preconditions, None
-            ) {
+            );
+            drop(owed);
+
+            let removed = match removal {
                 Ok(()) => true,
                 Err(RefUpdateError::OfficeMoved { .. } | RefUpdateError::AnchorMoved) if attempt < REF_UPDATE_ATTEMPTS => false,
                 // A retry racing the try that landed finds the ref gone under the lock: its
@@ -3537,8 +3625,14 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
 
             StatusCode::OK.into_response()
         }
-        Ok(None) => StatusCode::OK.into_response(),
-        Err(error) => error_response(error),
+        Ok(None) => {
+            after_failed_ref_write(&state, warehouse);
+            StatusCode::OK.into_response()
+        }
+        Err(error) => {
+            after_failed_ref_write(&state, warehouse);
+            error_response(error)
+        }
     }
 }
 
@@ -3549,24 +3643,35 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
 /// bundle rebuild: the accepted-lift counter's, or, when the write applied a redaction, the run's
 /// after its deletion, so no build runs beside the drain.
 ///
-/// An apply that fails is logged, and the write is answered all the same: the ref is written,
-/// and what the apply found stays pending, refused nowhere, until a later write applies it or the
-/// run's retry does.
+/// An apply that fails, or cannot decide a redaction, is logged, and the write is answered all
+/// the same: the ref is written, and the apply the write owed ([`WarehouseHandle::owe_apply`])
+/// stays owed, so no content is served until the run's retry or a later write's apply discharges
+/// it.
 async fn after_ref_write(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
-    match apply_redactions(Arc::clone(&warehouse)).await {
-        Ok(true) => {
-            cut_bundle_downloads(&warehouse);
-            warehouse.rebuild_after_drain.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-        Ok(false) => maybe_rebuild_bundle(state, Arc::clone(&warehouse)),
-        Err((_, error)) => {
-            tracing::error!(error, "applying the redactions failed; the redaction run retries it");
-            warehouse.apply_owed.store(true, std::sync::atomic::Ordering::SeqCst);
-            maybe_rebuild_bundle(state, Arc::clone(&warehouse));
-        }
+    let (applied, apply) = apply_discharging(&warehouse).await;
+
+    if applied {
+        cut_bundle_downloads(&warehouse);
+        warehouse.rebuild_after_drain.store(true, std::sync::atomic::Ordering::SeqCst);
+    } else {
+        maybe_rebuild_bundle(state, Arc::clone(&warehouse));
+    }
+
+    if let Err(error) = apply {
+        tracing::error!(error, "applying the redactions failed; the redaction run retries it");
     }
 
     run_redactions(Arc::clone(state), warehouse);
+}
+
+/// What follows a ref write this warehouse may have taken and that applied nothing, answered with
+/// an error or as already done: an apply
+/// owed before the write may have landed ([`WarehouseHandle::owe_apply`]) is the redaction run's,
+/// so content is served again once it applies, without waiting for another write.
+fn after_failed_ref_write(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
+    if warehouse.applies_closed() {
+        run_redactions(Arc::clone(state), warehouse);
+    }
 }
 
 /// How long the redaction deleter waits for a drained warehouse's requests to end before it gives
@@ -3586,6 +3691,16 @@ const REBUILD_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
 /// attempt doubles the wait; a ref write here starts a run at once.
 const FIRST_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
 const LAST_RETRY: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// The wait before a redaction run retries an apply it owes, which is never doubled: no content is
+/// served while one is owed, and an apply only reads the warehouse.
+const APPLY_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a content request waits for the applies owed here before it is refused with a `503`
+/// ([`await_applies`]). Shorter than [`DRAIN_WAIT`], so a drain started meanwhile outlasts the
+/// requests waiting here.
+const APPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+const _: () = assert!(APPLY_WAIT.as_secs() < DRAIN_WAIT.as_secs());
 
 /// Start a redaction run for `warehouse`, or, when one runs already, have it go round again.
 ///
@@ -3617,9 +3732,10 @@ fn run_redactions(state: Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
         loop {
             warehouse.redact_again.store(false, Ordering::SeqCst);
 
-            let owed = redaction_round(&state, &warehouse).await;
+            let owes = redaction_round(&state, &warehouse).await;
+            let owed = owes.deletion || owes.apply;
 
-            if !owed {
+            if !owes.deletion {
                 retry = FIRST_RETRY;
             }
 
@@ -3650,8 +3766,13 @@ fn run_redactions(state: Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
             let weak = Arc::downgrade(&warehouse);
             drop(warehouse);
 
+            let wait = match owes.apply {
+                true => retry.min(APPLY_RETRY),
+                false => retry,
+            };
+
             tokio::select! {
-                () = tokio::time::sleep(retry) => {}
+                () = tokio::time::sleep(wait) => {}
                 () = woken => {}
             }
 
@@ -3659,7 +3780,10 @@ fn run_redactions(state: Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
                 Some(warehouse) => warehouse,
                 None => return,
             };
-            retry = (retry * 2).min(LAST_RETRY);
+
+            if owes.deletion {
+                retry = (retry * 2).min(LAST_RETRY);
+            }
         }
     });
 }
@@ -3679,25 +3803,32 @@ fn still_served(state: &AppState, weak: &std::sync::Weak<WarehouseHandle>) -> Op
     served.then_some(handle)
 }
 
+/// What a redaction round ([`redaction_round`]) leaves owed, for a later round to try again.
+struct RoundOwes {
+    /// A deletion: it could not be carried out.
+    deletion: bool,
+
+    /// An apply: one is owed that this round did not discharge.
+    apply: bool,
+}
+
 /// One round of a redaction run ([`run_redactions`]).
-///
-/// # Returns
-/// Whether a deletion or an apply is owed that a later round should try again.
-async fn redaction_round(state: &AppState, warehouse: &Arc<WarehouseHandle>) -> bool {
+async fn redaction_round(state: &AppState, warehouse: &Arc<WarehouseHandle>) -> RoundOwes {
     use std::sync::atomic::Ordering;
 
     // Only an apply owed: a write applies what it let apply before it is answered.
-    let (applied, apply_failed) = match warehouse.apply_owed.swap(false, Ordering::SeqCst) {
-        false => (false, false),
-        true => match apply_redactions(Arc::clone(warehouse)).await {
-            Ok(applied) => (applied, false),
-            // Still owed: a later round retries it, as it would a deletion.
-            Err((_, error)) => {
+    let applied = match warehouse.applies_closed() {
+        false => false,
+        true => {
+            let (applied, apply) = apply_discharging(warehouse).await;
+
+            // Still owed: a later round retries it.
+            if let Err(error) = apply {
                 tracing::error!(error, "applying the redactions failed; retrying later");
-                warehouse.apply_owed.store(true, Ordering::SeqCst);
-                (false, true)
             }
-        },
+
+            applied
+        }
     };
 
     // The apply withdrew the bundle, which may hold the content; downloads of it stop here.
@@ -3714,7 +3845,7 @@ async fn redaction_round(state: &AppState, warehouse: &Arc<WarehouseHandle>) -> 
         if applied {
             warehouse.rebuild_after_drain.store(true, Ordering::SeqCst);
         }
-        return owed || apply_failed;
+        return RoundOwes { deletion: owed, apply: warehouse.applies_closed() };
     }
 
     let after_drain = warehouse.rebuild_after_drain.swap(false, Ordering::SeqCst);
@@ -3722,7 +3853,7 @@ async fn redaction_round(state: &AppState, warehouse: &Arc<WarehouseHandle>) -> 
         rebuild_bundle(state, Arc::clone(warehouse), true);
     }
 
-    owed || apply_failed
+    RoundOwes { deletion: owed, apply: warehouse.applies_closed() }
 }
 
 /// Delete the applied content this warehouse holds that no bay here holds, when there is any:
@@ -3811,6 +3942,8 @@ async fn drain(state: &AppState, warehouse: &Arc<WarehouseHandle>, wait: std::ti
     warehouse.draining.store(true, Ordering::SeqCst);
     drop(registry);
 
+    // Requests waiting for an apply are refused now rather than hold the drain open.
+    warehouse.applies_wake.notify_waiters();
     cut_bundle_downloads(warehouse);
 
     let deadline = tokio::time::Instant::now() + wait;
@@ -3926,22 +4059,106 @@ async fn retake_store_access(warehouse: &Arc<WarehouseHandle>) {
 /// configured applies none until its remote reports them applied, which no remote reports yet.
 ///
 /// # Returns
-/// * `Ok(bool)`          - Whether a redaction was applied, which withdrew the bundle.
+/// * `Ok(ApplyOutcome)`  - What it applied, and whether it decided every redaction.
 /// * `Err(HandlerError)` - The redactions, the applied record or the configuration could not be
 ///                         read, or the apply could not be written.
-async fn apply_redactions(warehouse: Arc<WarehouseHandle>) -> Result<bool, HandlerError> {
+async fn apply_redactions(warehouse: Arc<WarehouseHandle>) -> Result<ApplyOutcome, HandlerError> {
     blocking(warehouse, || {
         let before = read_applied()?;
         let read = redaction_utils::read_redactions().map_err(internal)?;
 
         if read.redactions.iter().all(|attributed| before.contains(&attributed.redaction.hash)) {
-            return Ok(false);
+            return Ok(ApplyOutcome { applied: false, undecided: None });
         }
 
-        applied_redactions::apply(&read, None).map_err(internal)?;
+        let statuses = applied_redactions::apply(&read, None).map_err(internal)?;
+        let undecided = statuses.iter().find_map(|status| match &status.state {
+            applied_redactions::RedactionState::Undecided(why) => Some(format!(
+                "Whether anything names the content of redaction {} could not be told: {}", status.hash, why
+            )),
+            _ => None,
+        });
 
-        Ok(read_applied()?.hashes().any(|hash| !before.contains(hash)))
+        Ok(ApplyOutcome { applied: read_applied()?.hashes().any(|hash| !before.contains(hash)), undecided })
     }).await
+}
+
+/// What [`apply_redactions`] did.
+struct ApplyOutcome {
+    /// Whether it applied a redaction, which withdrew the bundle.
+    applied: bool,
+
+    /// Why it could not tell whether a redaction is still named here, when it could not for one:
+    /// that redaction may be one the warehouse should apply, and is left unapplied.
+    undecided: Option<String>,
+}
+
+/// Apply ([`apply_redactions`]), and when it decides every redaction, discharge the applies owed
+/// by the ref writes that returned before it began ([`WarehouseHandle::owe_apply`]). Its scan read
+/// the warehouse after each of those writes had landed or failed, so whatever they let apply, it
+/// applied.
+///
+/// # Returns
+/// Whether it applied a redaction, and the error that left the applies owed, if one did.
+async fn apply_discharging(warehouse: &Arc<WarehouseHandle>) -> (bool, Result<(), String>) {
+    use std::sync::atomic::Ordering;
+
+    let owed = warehouse.dischargeable();
+
+    let outcome = match apply_redactions(Arc::clone(warehouse)).await {
+        Ok(outcome) => outcome,
+        Err((_, error)) => return (false, Err(error)),
+    };
+
+    if let Some(why) = outcome.undecided {
+        return (outcome.applied, Err(why));
+    }
+
+    warehouse.applies_discharged.fetch_max(owed, Ordering::SeqCst);
+    warehouse.applies_wake.notify_waiters();
+
+    (outcome.applied, Ok(()))
+}
+
+/// Wait, up to [`APPLY_WAIT`], until no apply is owed for `warehouse` (see
+/// [`WarehouseHandle::applies_owed`]): content is answered only once every redaction a ref write
+/// here may have let apply is applied, and so refused. Every request that answers with content
+/// waits here first: an object, a batch, a subtree and the bundle.
+///
+/// # Returns
+/// * `Ok(())`            - No apply is owed.
+/// * `Err(HandlerError)` - A `503`: one is still owed at the bound, or the warehouse is drained.
+async fn await_applies(warehouse: &WarehouseHandle) -> Result<(), HandlerError> {
+    let deadline = tokio::time::Instant::now() + APPLY_WAIT;
+
+    loop {
+        // Listening before the counters are looked at, so a discharge after the look wakes it.
+        let woken = warehouse.applies_wake.notified();
+        tokio::pin!(woken);
+        woken.as_mut().enable();
+
+        if warehouse.draining.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(draining_refusal());
+        }
+
+        if !warehouse.applies_closed() {
+            return Ok(());
+        }
+
+        tokio::select! {
+            () = tokio::time::sleep_until(deadline) => return Err(applying_refusal()),
+            () = woken => {}
+        }
+    }
+}
+
+/// The `503` of a content request while an apply is owed ([`await_applies`]).
+fn applying_refusal() -> HandlerError {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "The warehouse is briefly unavailable while it settles which content redacted from it is \
+        no longer served. Try again shortly.".to_string(),
+    )
 }
 
 /// Kick off a background bundle rebuild when the accepted-lift counter reaches the
@@ -4216,6 +4433,10 @@ async fn get_bundle(State(state): State<Arc<AppState>>,
         Ok(warehouse) => warehouse,
         Err(error) => return error_response(error),
     };
+
+    if let Err(error) = await_applies(&warehouse).await {
+        return error_response(error);
+    }
 
     // Taken before the bundle is opened: an apply withdraws the bundle before it cuts the
     // downloads, so a download that takes the token after the cut finds no bundle to open.
@@ -6523,8 +6744,8 @@ mod tests {
     /// An apply that fails is owed to the redaction run, from a ref write's and from a round's
     /// own: the run retries it rather than leave the content served until another write.
     ///
-    /// Revert: drop the write's `apply_owed` store → nothing is owed after it → red. Drop the
-    /// round's → the failed round owes nothing → red.
+    /// Revert: discharge a failed apply's owes → nothing is owed after the write → red. Report a
+    /// round's apply as settled whatever it did → the failed round owes nothing → red.
     #[tokio::test]
     async fn a_failed_apply_is_owed_to_the_redaction_run() {
         let root = scratch_dir("apply-owed");
@@ -6537,11 +6758,76 @@ mod tests {
         // A run is under way, so the write starts none.
         handle.redacting.store(true, Ordering::SeqCst);
 
+        drop(handle.owe_apply());
         after_ref_write(&state, Arc::clone(&handle)).await;
-        assert!(handle.apply_owed.load(Ordering::SeqCst), "the write's failed apply is owed");
+        assert!(handle.applies_closed(), "the write's failed apply is owed");
 
-        assert!(redaction_round(&state, &handle).await, "the round that fails it again owes it");
-        assert!(handle.apply_owed.load(Ordering::SeqCst), "and it stays owed for the next round");
+        assert!(redaction_round(&state, &handle).await.apply, "the round that fails it again owes it");
+        assert!(handle.applies_closed(), "and it stays owed for the next round");
+
+        drop((handle, state));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An apply discharges only the owes of writes that returned before it began: one still
+    /// writing may land after the apply read the warehouse, so its owe outlives that apply.
+    ///
+    /// Revert: discharge every owe taken (`applies_owed` alone) → the write still in flight is
+    /// discharged → red.
+    #[tokio::test]
+    async fn an_apply_leaves_a_write_in_flight_owed() {
+        let root = scratch_dir("apply-in-flight");
+        mark_warehouse(&root);
+        let handle = Arc::new(WarehouseHandle::new(root.clone()));
+
+        drop(handle.owe_apply());
+        let writing = handle.owe_apply();
+        let (_, applied) = apply_discharging(&handle).await;
+        applied.unwrap();
+        assert!(handle.applies_closed(), "the write in flight is still owed");
+
+        drop(writing);
+        apply_discharging(&handle).await.1.unwrap();
+        assert!(!handle.applies_closed(), "an apply after it returned discharges it");
+
+        drop(handle);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A content request waiting on an owed apply is answered as soon as one discharges it, and a
+    /// drain answers it at once rather than at the wait's bound.
+    ///
+    /// Revert: leave the waiters unwoken by a discharge → it waits out the bound and is refused →
+    /// red. Leave them unwoken by the drain → it waits past the 1 s the test allows → red.
+    #[tokio::test]
+    async fn a_content_wait_ends_on_a_discharge_or_a_drain() {
+        let root = scratch_dir("apply-wait");
+        mark_warehouse(&root);
+        let state = Arc::new(base_state(ServeMode::Single(Arc::new(WarehouseHandle::new(root.clone())))));
+        let handle = resolve_handle(&state, &PathParams::new()).unwrap();
+        let bound = std::time::Duration::from_secs(1);
+
+        drop(handle.owe_apply());
+        let waiting = tokio::spawn({
+            let handle = Arc::clone(&handle);
+            async move { await_applies(&handle).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        apply_discharging(&handle).await.1.unwrap();
+        let answered = tokio::time::timeout(bound, waiting).await.expect("woken by the discharge");
+        assert!(answered.unwrap().is_ok(), "content is served once nothing is owed");
+
+        drop(handle.owe_apply());
+        let waiting = tokio::spawn({
+            let handle = Arc::clone(&handle);
+            async move { await_applies(&handle).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // The drain waits for the waiter to let go of the handle, which it does once woken.
+        let (_, refused) = tokio::join!(drain(&state, &handle, std::time::Duration::from_millis(200)),
+                                        tokio::time::timeout(bound, waiting));
+        let refused = refused.expect("woken by the drain").unwrap().unwrap_err();
+        assert_eq!(refused, draining_refusal());
 
         drop((handle, state));
         let _ = std::fs::remove_dir_all(&root);

@@ -128,6 +128,12 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   deleting a chunked file's recipe now leaves a record of the chunks it still owes, so the next
   `redact apply`, or the server's next attempt, deletes them, and the server reports the
   redaction `deleted` only once they are gone.
+- **forklift-server serves no content a redaction may cover until it has applied it.** A server
+  that stopped between a pallet update and applying what it let apply served that content again
+  once restarted, until its first apply. Now no object, batch, subtree or bundle is served while
+  an apply may be owed, from just before a pallet update and from startup: such a request waits up
+  to 10 seconds and is then answered `503` with `Retry-After`. An apply that fails, or cannot tell
+  whether a head still names a redaction, is retried every 10 seconds at most.
 - **`forklift redact` is listed, and the `--json` schema is now 27: an applied redaction's content
   is deleted.** Part of content redaction: once a redaction applies, `redact record` and
   `redact apply` delete every copy of its content in this warehouse, packed or loose, and a chunked

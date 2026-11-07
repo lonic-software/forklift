@@ -63,8 +63,9 @@ already zstd streams (bundles, batches) are marked `identity` and never re-wrapp
 
 **Unavailable for now:** every `503` from forklift-server carries `Retry-After` (delta-seconds)
 and is a refusal for now, sent before the request changed anything. The warehouse may be drained
-while content redacted from it is deleted (below), under maintenance, or not yet servable, or a
-hook it depends on may be unreachable. The request can be sent again after the wait. The
+while content redacted from it is deleted (below), settling which redacted content it no
+longer serves (below), under maintenance, or not yet servable, or a hook it depends on may be
+unreachable. The request can be sent again after the wait. The
 serverless head's `503`s are described with the endpoints that send them.
 
 **Redirects:** `GET`/`PUT` on object endpoints may answer `307` with a `Location`
@@ -150,6 +151,15 @@ pending again. forklift-server applies before it answers the write, so a client 
 then reads the handshake sees what its lift let apply. The deletion that follows is not waited
 for. An apply that fails is logged and the write is answered all the same: the ref is written, and
 what the apply found stays pending until a later write, or the server's retry, applies it.
+
+forklift-server serves no content while an apply may be owed: from just before a ref update or
+`DELETE` may land until an apply that began after it returned has decided every redaction, and,
+when it serves a warehouse anew, until its first apply has. The content routes (`GET` of an object,
+`objects/batch`, `subtree` and `bundle`) wait for that, up to 10 seconds, and then answer `503`.
+An apply that fails, or cannot tell whether a head still names a redaction, leaves it owed, and
+the server retries it every 10 seconds at most. Routes that move no bytes out (`objects/missing`,
+`upload-targets`, an object `PUT`) do not wait. So a redaction a write let apply is never served
+after the write, even when the server stopped before applying it.
 
 forklift-server deletes an applied redaction's content in its own process right after applying
 it. It drains that one warehouse: new requests for it get `503` until the deletion ends (which may
