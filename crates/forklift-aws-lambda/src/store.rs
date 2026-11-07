@@ -239,9 +239,9 @@ pub enum FormatFence {
     Stamp(String),
 }
 
-/// The outcome of a commit that conditions on every movable input a ref-update audit
-/// consumed — the pallet's own head, the office head, and the trust anchor (FORK-95 design
-/// memo, "The movable inputs: exactly three" / claim C6). A caller needs to know *which*
+/// The outcome of a commit that conditions on every movable input a ref update's checks
+/// consumed — the pallet's own head, the office head, the `@redactions` head, and the trust
+/// anchor (FORK-95 design memo, "The movable inputs" / claim C6). A caller needs to know *which*
 /// precondition failed, not just that one did: a moved office head means the pallet itself
 /// never budged but something it was audited against did, and the client-facing refusal
 /// differs accordingly.
@@ -262,15 +262,15 @@ pub enum CasOutcome {
     /// The trust anchor the audit consumed has since moved: established, replaced by a
     /// re-genesis, or (unreachable today, since nothing deletes it) removed. Nothing at this
     /// call site needs the anchor's new bytes — the caller re-reads and re-decides — so
-    /// unlike its two siblings this variant carries no payload.
+    /// unlike `Conflict` and `OfficeMoved` this variant carries no payload.
     AnchorMoved,
     /// The format item no longer holds what the [`FormatFence`] expected: an upgrade marked it,
     /// or a concurrent first write stamped it. The caller reads it again.
     FormatMoved,
-    /// The commit was refused for a reason that establishes nothing about whether any of the
-    /// three inputs actually moved — on DynamoDB, `TransactionConflict` (another transaction
+    /// The commit was refused for a reason that establishes nothing about whether any of its
+    /// inputs actually moved — on DynamoDB, `TransactionConflict` (another transaction
     /// concurrently touching one of this commit's items, the shared office item principally).
-    /// A retry may succeed with nothing having changed, unlike the three variants above, each
+    /// A retry may succeed with nothing having changed, unlike the variants above, each
     /// of which asserts a specific value differs from what was consumed. The head re-issues the
     /// identical transaction under the same request token, within one bounded budget per
     /// request, and answers `503` only once that budget is spent (FORK-95 design memo, claim

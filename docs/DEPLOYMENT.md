@@ -364,14 +364,15 @@ first write records the format.
 `compare_and_set_head` is a real conditional write, not a read-then-write — the atomicity that
 lets this head scale horizontally, where `forklift-server`'s compare-and-set rests on a file lock
 on one machine's filesystem.
-As of FORK-95 it is a `TransactWriteItems` of up to three actions rather than a single-item
+As of FORK-95 it is a `TransactWriteItems` of up to four actions rather than a single-item
 `UpdateItem`: an `Update` on the target pallet's own item (`ConditionExpression` encoding the
 item state the caller expects: no item for a creation, `head` at the old head for a move, or
 `deleted_head` at the tombstone for an acknowledged re-creation), a `ConditionCheck` on the office
 pallet's item at the office head a ref update's audit consumed (skipped when the target pallet
 *is* the office pallet — the `Update` above already pins that item, and DynamoDB refuses two
-actions on one item in the same transaction), and a `ConditionCheck` on the trust item at the
-anchor's stored serialization. DynamoDB either applies the whole transaction with every
+actions on one item in the same transaction), a `ConditionCheck` on the `@redactions` pallet's
+item at the head the redaction check read (skipped, the same way, when the target is
+`@redactions`), and a `ConditionCheck` on the trust item at the anchor's stored serialization. DynamoDB either applies the whole transaction with every
 condition holding or applies nothing; on a condition failure
 `ReturnValuesOnConditionCheckFailure=ALL_OLD` hands back the failed item, so the store reports
 which precondition moved without a second round trip. `put_trust_if_absent`, the one-way trust
@@ -410,7 +411,7 @@ row maps the *operation* onto the IAM actions `ConditionCheckItem`/`DeleteItem`/
 types the transaction contains. Between them the transactions carry `Update`, `Put` and
 `ConditionCheck` actions, so the deployed role needs `dynamodb:UpdateItem` (the pallet head
 write), `dynamodb:PutItem` (the anchor writes and the format stamp) and
-`dynamodb:ConditionCheckItem` (the format, office and anchor checks) — see the derivation table
+`dynamodb:ConditionCheckItem` (the format, office, `@redactions` and anchor checks) — see the derivation table
 below. No single-item `PutItem` is issued any more: `PutItem` is granted for the `Put` actions
 these transactions carry.
 

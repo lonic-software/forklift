@@ -555,8 +555,8 @@ pub trait WalkObjects {
     /// The chunk hashes, in order, of the recipe `hash`.
     fn recipe_chunks(&self, hash: &str) -> Result<Vec<String>, String>;
 
-    /// A hint that the walk is about to read each of `hashes`, trees or recipes, so a store whose
-    /// reads are remote can fetch them in one round. What it cannot fetch the read reports.
+    /// A hint that the walk is about to read each of the recipes `hashes`, so a store whose reads
+    /// are remote can fetch them in one round. What it cannot fetch the read reports.
     fn prefetch(&self, _hashes: &[String]) {}
 }
 
@@ -706,11 +706,10 @@ fn tree_names(tree: &str,
     let mut seen: HashSet<String> = HashSet::new();
     let mut level = vec![(String::new(), tree.to_string())];
 
-    // Level by level, so each level's trees, and the recipes its chunked files name while a recipe
-    // is redacted, are hinted to `objects` together.
+    // Level by level, so the recipes a level's chunked files name while a recipe is redacted are
+    // hinted to `objects` together.
     while !level.is_empty() {
         level.retain(|(_, hash)| seen.insert(hash.clone()));
-        objects.prefetch(&level.iter().map(|(_, hash)| hash.clone()).collect::<Vec<_>>());
 
         let mut loaded_level = Vec::with_capacity(level.len());
 

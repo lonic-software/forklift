@@ -496,6 +496,14 @@ checks every reference before building the path and sends only valid ones.
    * for any other pallet: the full history from `new_head` is audited — every parcel
      signed by a tracked key, unsigned parcels tolerated only when reachable from the
      anchor boundary. Failure is `422`.
+5. **Redactions**: `new_head` names no content the remote's `@redactions` pallet records, else
+   `422` with `code` `content_redacted`, naming the pallet, the refused head, and the path and
+   hash of the redacted content. A user pallet's whole tree at `new_head` is judged, including
+   what it shares with `old_head`, since a redaction recorded after `old_head` binds it too. A
+   chunked file names a redacted recipe when its own hash is that recipe's or its chunk list is
+   the same. A meta pallet is judged by what each parcel `old_head` does not reach adds over its
+   parents, so history that already carried the content goes on carrying it. A write to
+   `@redactions` itself is judged against the redactions at `old_head`.
 
 `forklift-server` audits incrementally: everything reachable from `old_head` was
 verified when `old_head` was committed, so neither the signature walk nor the closure
@@ -505,10 +513,13 @@ generation numbers rather than by stopping at a single hash, which is the exact 
 of a linear lift but not of a merge (whose frontier is the merge-base set). A creation
 (`old_head` absent) audits the full history.
 
-On the AWS serverless head, the CAS in step 1 also conditions on the office head and the
-trust anchor the audit above consumed, atomically with the pallet's own head — so a
-concurrent office lift or re-genesis is caught at commit time even after the audit
-already passed, and is reported `409` there too. That same head can additionally answer
+On the AWS serverless head, the CAS in step 1 also conditions on the office head, the
+`@redactions` head and the trust anchor the checks above consumed, atomically with the pallet's
+own head — so a concurrent office lift or re-genesis is caught at commit time even after the audit
+already passed, and is reported `409` there too. A redaction recorded between step 5 and the
+commit does not answer the push: the head runs step 5 again against it, so the push is refused
+with `content_redacted` if the new redaction names its content and commits otherwise, and answers
+`409` only when `@redactions` moved under it three times in a row. That same head can additionally answer
 **`503`**: its commit is a single backend transaction, and the backend's own concurrency
 control can cancel it for a reason that establishes nothing about whether any input
 actually changed (contention from another push touching a shared item, principally the

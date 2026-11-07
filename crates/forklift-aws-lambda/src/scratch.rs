@@ -266,9 +266,11 @@ pub fn materialize_state(store: &dyn ObjectStore, parcel_hash: &str, mirror: &mu
 }
 
 /// The objects a redaction walk reads (`redaction_utils::WalkObjects`), read from the current
-/// scratch (the caller must be inside [`Scratch::scoped`]) and, for what [`materialize`]'s bound
-/// left out of it, from the object store, mirroring each into the scratch as it is fetched. A
-/// [`prefetch`](WalkObjects::prefetch) fetches a whole round in one bulk read.
+/// scratch (the caller must be inside [`Scratch::scoped`]) and, for what it does not hold, from
+/// the object store, mirroring each into the scratch as it is fetched. [`materialize`] mirrors a
+/// new head's whole tree, so what is fetched is mostly chunked files' recipes, which the audit
+/// reads from the store and never mirrors; a [`prefetch`](WalkObjects::prefetch) fetches a whole
+/// level's in one bulk read.
 pub struct MirroredObjects<'a> {
     store: &'a dyn ObjectStore,
 }

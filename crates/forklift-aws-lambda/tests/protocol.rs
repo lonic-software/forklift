@@ -597,10 +597,9 @@ fn assert_content_redacted(err: &forklift_aws_lambda::error::HeadError, hash: &s
     assert!(err.message.contains(hash), "the refusal names the hash: {}", err.message);
 }
 
-/// A user head is judged whole: a redacted file deep in a subtree the update leaves as `old_head`
-/// had it, which the audit's mirror never reached, refuses the update; the head without it lifts.
-// Revert: drop the redaction check from `ref_update` → the edit commits → red. Revert: walk the
-// scratch alone (`LocalObjects`) → the unmirrored subtree is an internal error, not the refusal.
+/// A user head is judged whole, never pruned at `old_head`: a redacted file deep in a subtree the
+/// update leaves as `old_head` had it refuses the update; the head without it lifts.
+// Revert: drop the redaction check from `ref_update` → the edit commits → red.
 #[test]
 fn a_user_head_naming_redacted_content_deep_in_an_unchanged_subtree_is_refused() {
     let area = Area::new("redacted-deep");
@@ -2700,8 +2699,8 @@ impl RefStore for OfficeMovesAfterTheSnapshot {
             && !self.fired.replace(true)
         {
             if let Ok(current) = &result {
-                // This injected CAS is itself subject to the same three-way precondition —
-                // the anchor is checked unconditionally, regardless of which pallet is being
+                // This injected CAS is itself subject to the same preconditions — the anchor
+                // is checked unconditionally, regardless of which pallet is being
                 // updated — so it must supply the anchor's *current* bytes to commit
                 // uncontested. `office_head` is irrelevant here: the target *is* `@office`
                 // itself, so `checks_office_separately` is false and that parameter is never
@@ -3589,9 +3588,9 @@ fn a_concurrent_trust_anchor_change_refuses_the_commit_as_anchor_moved_not_palle
 }
 
 /// Falsifier 2 (over-tightened): a pallet the transaction never names moving concurrently must
-/// never refuse this commit — the precondition is scoped to exactly three inputs (the target
-/// pallet, the office pallet, the trust anchor), never to "nothing else in the warehouse
-/// moved" (FORK-95 design memo, "The movable inputs: exactly three").
+/// never refuse this commit — the precondition is scoped to exactly the inputs the checks read
+/// (the target pallet, the office pallet, `@redactions`, the trust anchor), never to "nothing
+/// else in the warehouse moved" (FORK-95 design memo, "The movable inputs").
 #[test]
 fn a_concurrently_moved_unrelated_pallet_does_not_refuse_the_commit() {
     let area = Area::new("unrelated-pallet-races");
