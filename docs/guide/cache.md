@@ -120,7 +120,7 @@ the first parcel's files, which stay on the origin, pinned by the hash that sign
 $ forklift audit
 Office chain verified back to genesis ….
 Pallet "main" verified: 2 signed parcel(s) valid.
-This warehouse is a cache: it may lack content its history reaches. Signatures are verified in full; every tree it holds was re-hashed and every blob and chunk it names confirmed present, except those held by hash below.
+This warehouse is a cache: it may lack content its history reaches. Signatures are verified in full; every tree it holds was re-hashed and every blob and chunk it names confirmed present, except those accounted for below.
 1 absent object(s) are held by hash alone: each is pinned to the hash a parent that is present commits, but is not on disk, and nothing beneath it was checked.
 ```
 
@@ -189,7 +189,7 @@ hash alone, and reading the first draft fetches it again:
 $ forklift audit
 Office chain verified back to genesis ….
 Pallet "main" verified: 3 signed parcel(s) valid.
-This warehouse is a cache: it may lack content its history reaches. Signatures are verified in full; every tree it holds was re-hashed and every blob and chunk it names confirmed present, except those held by hash below.
+This warehouse is a cache: it may lack content its history reaches. Signatures are verified in full; every tree it holds was re-hashed and every blob and chunk it names confirmed present, except those accounted for below.
 2 absent object(s) are held by hash alone: each is pinned to the hash a parent that is present commits, but is not on disk, and nothing beneath it was checked.
 $ forklift show <first>:maps/forest.map
 forest, first draft

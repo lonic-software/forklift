@@ -122,6 +122,12 @@ impl Warehouse {
         hash
     }
 
+    /// Remove the loose object `hash` from the store, as the deletion of an applied redaction will.
+    fn remove_object(&self, hash: &str) {
+        let path = self.root.join(".forklift/objects").join(&hash[..2]).join(&hash[2..]);
+        std::fs::remove_file(&path).unwrap_or_else(|error| panic!("{}: {}", path.display(), error));
+    }
+
     fn head(&self, pallet: &str) -> String {
         std::fs::read_to_string(self.root.join(".forklift/pallets").join(pallet)).unwrap().trim().to_string()
     }
@@ -361,6 +367,128 @@ fn content_redacted(warehouse: &Warehouse, args: &[&str]) -> serde_json::Value {
     document["error"].clone()
 }
 
+/// Once a redaction is applied and its object removed, a read that needs the bytes is refused as
+/// redacted, naming the hash. The parcel's other content still reads, and an absent object that no
+/// redaction names still fails as a missing object.
+///
+/// Revert: drop the applied check from the store's read → blame and diff fail with code `error`.
+#[test]
+fn a_read_of_content_whose_redaction_is_applied_is_refused_as_redacted() {
+    let warehouse = Warehouse::new("read-applied");
+    warehouse.stack("notes.txt", b"notes\n", "notes");
+    let before = warehouse.head("main");
+    let leak = warehouse.leaked("secret.env", b"TOKEN=hunter2\n");
+    let recorded = recorded_hash(&warehouse, &format!("{}:secret.env", leak), "leaked token");
+    assert_eq!(recorded["data"]["status"], serde_json::json!({ "state": "applied" }), "{}", recorded);
+    let hash = recorded["data"]["hash"].as_str().unwrap().to_string();
+
+    // Applied, but the bytes are still held: they still read.
+    warehouse.run_ok(&["blame", "-r", &leak, "secret.env"]);
+    warehouse.remove_object(&hash);
+
+    let error = content_redacted(&warehouse, &["blame", "-r", &leak, "secret.env"]);
+    assert_eq!(error["details"], serde_json::json!({ "hash": hash }), "{}", error);
+    assert_eq!(
+        error["message"].as_str().unwrap(),
+        format!("Cannot read object {}: it is redacted in this warehouse, and its content has been \
+                removed for good.", hash)
+    );
+    assert_eq!(error["next_step"], "Run \"forklift redact list\" to see the redaction.", "{}", error);
+
+    // A diff's report names the file without its lines, so it needs no bytes; its printed lines do.
+    let listed = warehouse.json(&["diff", &before, &leak]);
+    assert_eq!(listed["data"]["files"], serde_json::json!([{ "kind": "added", "path": "secret.env" }]), "{}", listed);
+
+    let reads: [&[&str]; 3] = [
+        &["blame", "-r", &leak, "secret.env"],
+        &["diff", &before, &leak],
+        &["diff", &before, &leak, "secret.env"],
+    ];
+
+    for args in reads {
+        let human = warehouse.run(args);
+        assert_eq!(human.status.code(), Some(49), "{:?}: {:?}", args, human);
+        assert!(String::from_utf8_lossy(&human.stderr).contains("is redacted in this warehouse"), "{:?}: {:?}", args, human);
+    }
+
+    // The parcel's other content is untouched.
+    warehouse.run_ok(&["blame", "-r", &leak, "notes.txt"]);
+
+    // An object absent with no redaction naming it is missing, not redacted.
+    warehouse.remove_object(&hash_of(b"notes\n"));
+    let missing = warehouse.json(&["blame", "-r", &leak, "notes.txt"]);
+    assert_eq!(missing["error"]["code"], "error", "{}", missing);
+    assert!(missing["error"]["message"].as_str().unwrap().contains("entity not found"), "{}", missing);
+
+    // An applied record that cannot be read leaves the absence undecided: the read still names
+    // the missing object, with the record's own error added rather than in its place.
+    std::fs::write(warehouse.root.join(".forklift/redactions-applied"), "/forklift-redactions-applied 99\n").unwrap();
+    let undecided = warehouse.json(&["blame", "-r", &leak, "notes.txt"]);
+    let message = undecided["error"]["message"].as_str().unwrap();
+    assert!(message.contains("entity not found"), "{}", undecided);
+    assert!(message.contains("Whether a redaction removed it could not be told"), "{}", undecided);
+}
+
+/// A full audit of a warehouse whose applied redaction's object is gone passes, and counts the
+/// object as redacted, apart from what the sealed record holds; an absent object no redaction
+/// names still fails it.
+///
+/// Revert: leave the redacted count out of the scope → `redacted` is missing from the report.
+#[test]
+fn a_full_audit_counts_an_applied_redaction_as_redacted_and_passes() {
+    let warehouse = Warehouse::new("audit-applied");
+    warehouse.run_ok(&["office", "enroll"]);
+    warehouse.stack("notes.txt", b"notes\n", "notes");
+    let leak = warehouse.leaked("secret.env", b"TOKEN=hunter2\n");
+    let recorded = recorded_hash(&warehouse, &format!("{}:secret.env", leak), "leaked token");
+    assert_eq!(recorded["data"]["status"], serde_json::json!({ "state": "applied" }), "{}", recorded);
+
+    // Applied, but the bytes are still held: nothing is absent.
+    let audited = warehouse.json(&["audit", "--full"]);
+    assert_eq!(audited["ok"], true, "{}", audited);
+    assert_eq!(audited["data"]["scope"].get("redacted"), None, "{}", audited);
+
+    warehouse.remove_object(recorded["data"]["hash"].as_str().unwrap());
+    let audited = warehouse.json(&["audit", "--full"]);
+    assert_eq!(audited["ok"], true, "{}", audited);
+    assert_eq!(audited["data"]["scope"]["redacted"], 1, "{}", audited);
+    assert_eq!(audited["data"]["scope"].get("held_by_hash"), None, "{}", audited);
+
+    let human = warehouse.run_ok(&["audit", "--full"]);
+    assert!(
+        String::from_utf8_lossy(&human.stdout).contains("1 absent object(s) are redacted"),
+        "{}", String::from_utf8_lossy(&human.stdout)
+    );
+
+    // An object absent with no redaction naming it is damage.
+    warehouse.remove_object(&hash_of(b"notes\n"));
+    let damaged = warehouse.run(&["audit", "--full"]);
+    assert!(!damaged.status.success(), "{:?}", damaged);
+}
+
+/// A restore from the inventory of a file whose staged content is redacted, applied and removed is
+/// refused as redacted, and leaves the working file as it was.
+///
+/// Revert: drop the applied check from the store's read → the restore fails with code `error`.
+#[test]
+fn a_restore_of_staged_content_whose_redaction_is_applied_is_refused_as_redacted() {
+    let warehouse = Warehouse::new("restore-applied");
+    warehouse.stack("notes.txt", b"notes\n", "notes");
+
+    // Redacted while it is only loaded: no head names it, so it applies; the inventory still does.
+    std::fs::write(warehouse.root.join("secret.env"), b"TOKEN=hunter2\n").unwrap();
+    warehouse.run_ok(&["load", "secret.env"]);
+    let hash = hash_of(b"TOKEN=hunter2\n");
+    let recorded = recorded_hash(&warehouse, &hash, "leaked token");
+    assert_eq!(recorded["data"]["status"], serde_json::json!({ "state": "applied" }), "{}", recorded);
+    warehouse.remove_object(&hash);
+
+    std::fs::write(warehouse.root.join("secret.env"), b"TOKEN=rotated\n").unwrap();
+    let error = content_redacted(&warehouse, &["restore", "secret.env", "--confirm"]);
+    assert_eq!(error["details"], serde_json::json!({ "hash": hash }), "{}", error);
+    assert_eq!(std::fs::read(warehouse.root.join("secret.env")).unwrap(), b"TOKEN=rotated\n");
+}
+
 #[test]
 fn a_stack_naming_redacted_content_is_refused_until_the_file_is_gone() {
     let warehouse = Warehouse::new("stack");
@@ -495,6 +623,14 @@ fn a_pick_bringing_back_redacted_content_is_refused_before_it_touches_the_bay() 
     assert!(!warehouse.root.join("secret.env").exists(), "the content never reached the bay");
     assert_eq!(warehouse.head("side"), head);
     assert_eq!(warehouse.json(&["status"])["data"]["staged_count"], 0, "nothing was staged");
+
+    // Applied, as there is no remote: with the object removed, the pick is still refused as
+    // redacted, and nothing reaches the bay.
+    warehouse.remove_object(recorded["data"]["hash"].as_str().unwrap());
+    let error = content_redacted(&warehouse, &["pick", &leak]);
+    assert_eq!(error["details"]["hash"], recorded["data"]["hash"], "{}", error);
+    assert!(!warehouse.root.join("secret.env").exists(), "the content never reached the bay");
+    assert_eq!(warehouse.head("side"), head);
 
     // No pick was left standing: another one goes ahead.
     warehouse.run_ok(&["pick", &fine]);

@@ -167,6 +167,11 @@ redaction means no new head may name it again. Nothing was written. The error's 
 delete it from the bay and `load` again before `stack`, for instance — and run the command again.
 The same bytes under another name are the same content, so renaming the file does not help.
 
+A read refuses with this code too when it needs content that a redaction applied in this
+warehouse removed: `restore`, `pick`, a `diff` showing changes, `blame` and the like. The
+`details.hash` names the content; `forklift redact list` shows the redaction. That content is gone
+for good, so there is nothing to fetch back: read a version of the file that does not name it.
+
 `load`, `park`, `lower`, a merge (`consolidate`, `haul`, `lift`'s merge) and `pick` refuse with this
 code too, before anything reaches the bay, when they would stage, park or write the content. Change
 or delete the file and run `load` or `park` again. `lower`, a merge or a pick brings the content from

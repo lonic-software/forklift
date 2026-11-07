@@ -963,6 +963,16 @@ fn never_held_pin_note(hash: &str) -> String {
     )
 }
 
+/// Plain-language note for the objects a torn rescan held because a redaction applied here names
+/// them — see [`ClosureWalkResult::redacted_absent`].
+fn redacted_absent_note(count: usize) -> String {
+    format!(
+        "{} object(s) that redactions applied in this warehouse name are absent from the store: their \
+        content was removed on purpose, and none of them is counted as lost.",
+        count
+    )
+}
+
 /// Plain-language note for a tag read that failed (FORK-83) — see [`WalkRoots::tags_unread`].
 /// The error can quote a synced `@tags` record, so it is sanitized.
 fn tags_unread_note(error: &str) -> String {
@@ -1187,6 +1197,9 @@ fn rescan_torn_taint(
         }
         if let Some(error) = &walk.tags_unread {
             notes.push(tags_unread_note(error));
+        }
+        if walk.redacted_absent > 0 {
+            notes.push(redacted_absent_note(walk.redacted_absent));
         }
 
         Ok(HealOutcome {
@@ -1988,6 +2001,11 @@ pub(crate) struct ClosureWalkResult {
     pub never_held_tags: Vec<(String, String, TagGap)>,
     /// [`WalkRoots::tags_unread`], carried through to a note — see [`tags_unread_note`].
     pub tags_unread: Option<String>,
+    /// How many objects a redaction this warehouse applied names are absent from the store, which
+    /// [`enumerate_absent_reachable`] holds rather than records: counted over the applied record,
+    /// reached or not. Zero for every other walk. Folded into a note on the `Ok` path only — see
+    /// [`redacted_absent_note`].
+    pub redacted_absent: usize,
 }
 
 /// Walk every durable ref source's closure looking for `targets`, returning the subset actually
@@ -2003,6 +2021,7 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
         return Ok(ClosureWalkResult {
             hashes: BTreeSet::new(), degraded_sources: Vec::new(), unwalked: Vec::new(),
             never_held_pins: BTreeSet::new(), never_held_tags: Vec::new(), tags_unread: None,
+            redacted_absent: 0,
         });
     }
 
@@ -2023,6 +2042,7 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
         never_held_pins: outcome.never_held_pins,
         never_held_tags: outcome.never_held_tags,
         tags_unread: roots.tags_unread,
+        redacted_absent: 0,
     })
 }
 
@@ -2093,6 +2113,16 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
         let mut collecting_sink = |hash: &str| { absent.insert(hash.to_string()); };
         walk_closure_for(&empty_targets, &roots, corrupt, &scope, Some(&sealed), Some(&mut collecting_sink))?
     };
+    let mut redacted_absent = 0;
+
+    // Only a note reads this count, so a presence check that fails counts nothing rather than
+    // failing the rescan the walk itself completed.
+    for hash in sealed.applied.hashes() {
+        if matches!(file_utils::raw_object_present(hash), Ok(false)) {
+            redacted_absent += 1;
+        }
+    }
+
     Ok(ClosureWalkResult {
         hashes: absent,
         degraded_sources: roots.degraded_sources,
@@ -2100,6 +2130,7 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
         never_held_pins: outcome.never_held_pins,
         never_held_tags: outcome.never_held_tags,
         tags_unread: roots.tags_unread,
+        redacted_absent,
     })
 }
 
@@ -5222,6 +5253,53 @@ mod tests {
         assert!(!state.torn, "the taint must no longer be torn after a clean rescan");
         assert!(state.recorded.is_empty(), "nothing may remain recorded after a clean rescan");
         assert!(taint_utils::gate_check(&forklift).is_ok(), "the in-memory gate must clear too");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A torn taint over a store whose only absent reachable object is one a redaction applied
+    /// here names clears, and its outcome notes the redacted absence rather than passing over it.
+    ///
+    /// Revert: leave the note out of the clearing outcome → the notes never name it → red.
+    #[test]
+    fn torn_taint_clears_over_an_applied_redaction_and_notes_it() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::globals::StorageRootScope;
+        use crate::model::parcel::Parcel;
+        use crate::util::gc_utils::tests::store_tree;
+
+        let _serial = lock_activation();
+        taint_utils::activate();
+
+        let root = std::env::temp_dir()
+            .join(format!("forklift-recovery-utils-torn-redacted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let _scope = StorageRootScope::enter(&root);
+        crate::util::warehouse_utils::mark_for_test(crate::util::warehouse_utils::WarehouseMode::Full);
+        crate::util::pallet_utils::create_position_if_not_exists().unwrap();
+        let forklift = forklift_root();
+
+        let redacted = "1".repeat(64);
+        let tree = store_tree(&[("leak.env", &redacted, DirEntryType::Normal)]);
+        let mut parcel = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: tree, parents: Vec::new(), actions: Vec::new(), description: None,
+        });
+        parcel.store().unwrap();
+        pallet_utils::tests::update_pallet_head_unverified("main", None, &parcel.hash, &pallet_utils::RefPreconditions::NONE)
+            .unwrap();
+        crate::util::applied_redactions::apply_for_test(&[&redacted]);
+
+        plant_torn_taint(&forklift, &[]);
+        let outcome = run_heal().expect("a redacted absence is no loss, so the rescan clears");
+        assert!(outcome.was_tainted);
+        assert!(
+            outcome.notes.iter().any(|note| note.starts_with(
+                "1 object(s) that redactions applied in this warehouse name are absent"
+            )),
+            "{:?}", outcome.notes
+        );
+        assert!(taint_utils::read_taints(&forklift).unwrap().recorded.is_empty());
 
         std::fs::remove_dir_all(&root).ok();
     }

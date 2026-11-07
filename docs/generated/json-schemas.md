@@ -54,7 +54,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "integer"
         },
         "in_scope_content": {
-          "description": "In-scope content: every tree was re-hashed on read and every blob confirmed present, except\nthe absent objects counted in `held_by_hash` and the absent content a redaction applied here\nnames.",
+          "description": "In-scope content: every tree was re-hashed on read and every blob confirmed present, except\nthe absent objects counted in `held_by_hash` and in `redacted`.",
           "type": "string"
         },
         "out_of_scope_content": {
@@ -66,6 +66,12 @@ A command not listed here either reports only the generic human-message shape `{
         },
         "present_and_recorded": {
           "description": "How many objects the sealed record names that are on disk all the same. That fails\nnothing: a recorded object that is present is checked like any other. `heal` removes the\nrecords it can, and notes each one it keeps. Omitted when none.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "redacted": {
+          "description": "How many absent objects are absent because a redaction this warehouse applied names them:\ntheir content was removed on purpose, so they are accounted for, not damage, and fail\nnothing. Nothing beneath them was checked. Omitted when none.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"

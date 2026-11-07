@@ -1036,6 +1036,10 @@ could not have left, fails the audit rather than being taken as empty. The failu
 out: for damage, `forklift heal`, which rebuilds the record (see `heal`); for a record in another
 version, that version of Forklift.
 
+An absent object that a redaction applied in this warehouse names is not damage and fails
+nothing: its content was removed on purpose, so an audit that finds it absent accounts for it,
+checks nothing beneath it, and reports how many it found (`redacted` under `--json`).
+
 **Run `--full` periodically as your own scrub against bit-rot.** Every `lift`/push used to
 incidentally re-presence-check a pushed pallet's whole tree, chunked files included; a large
 chunked file's subtree that a push leaves untouched is now pruned from that check (it is proven
@@ -2650,6 +2654,10 @@ intact entry this version cannot read, is never rewritten; the note names the wa
 that fails stops `heal` before it does anything else; when the rewrite itself fails, the message
 says what it drops, since it may have landed. Running `heal` again retries. A record that cannot be read at all is not
 known to be damaged, so `heal` carries on and notes it.
+
+An absent object that a redaction applied in this warehouse names was removed on purpose, so a
+rescan after an interrupted write counts none of them as lost, and `heal` notes how many there
+are.
 
 Once nothing is left to resolve, `heal` also removes from the sealed-object record every object
 that is on disk again, such as one fetched back by a refill whose own removal was interrupted. An
