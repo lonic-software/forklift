@@ -131,8 +131,8 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 - **forklift-server serves no content a redaction may cover until it has applied it.** A server
   that stopped between a pallet update and applying what it let apply served that content again
   once restarted, until its first apply. Now no object, batch, subtree or bundle is served while
-  an apply may be owed, from just before a pallet update and from startup: such a request waits up
-  to 10 seconds and is then answered `503` with `Retry-After`. An apply that fails, or cannot tell
+  an apply may be owed, from just before a pallet update or deletion through the server, and from
+  startup: such a request waits up to 10 seconds and is then answered `503` with `Retry-After`. An apply that fails, or cannot tell
   whether a head still names a redaction, is retried 10 seconds later, then twice as long each
   time up to 5 minutes.
 - **`forklift redact` is listed, and the `--json` schema is now 27: an applied redaction's content

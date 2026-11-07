@@ -126,8 +126,8 @@ struct WarehouseHandle {
     /// discharged them ([`apply_discharging`]): while one is not discharged, a redaction the
     /// warehouse's scan would apply may be unapplied, and no content is served
     /// ([`await_applies`]). One is owed by each ref write here, from just before it may land
-    /// ([`WarehouseHandle::owe_apply`]), and, for a served handle, when some redaction it records is
-    /// not applied: a ref write an earlier process took may have let it apply.
+    /// ([`WarehouseHandle::owe_apply`]), and one by a served handle from the start, settled by its
+    /// first run's apply: a ref write an earlier process took may have let a redaction apply.
     applies_owed: std::sync::atomic::AtomicU64,
     applies_discharged: std::sync::atomic::AtomicU64,
 
