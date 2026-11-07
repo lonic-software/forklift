@@ -171,17 +171,18 @@ object out, as they do one the remote lacks, so the client's loose `GET` for it 
 the bundle never carries it. What is refused is the redacted hash: for a chunked file, the
 recipe. Its chunks are not refused by hash, since other content may share them; a client never
 uploads one only that recipe names. A redaction names a file's content, never a tree or a chunk:
-an object's hash covers its type, so a chunk never shares a hash with a file's content, and a
-remote holding the named object as a tree, a parcel or a chunk never applies the redaction. A
-remote lacking the object cannot tell what it is, so a redaction naming a tree or a chunk by itself
-can apply there: a tree or a chunk the client uploads is always offered, and were its hash such a
-redaction's, the remote refuses that `PUT` with `410`, so the lift fails rather than landing
-history without it. No lift naming that object lands there again; `redact record` never names a
-tree or a chunk, so only a cell written otherwise reaches this. A ref update tolerates the absence of an applied redaction's content
-where the closure it checks names it as a file's content, never as a tree or a chunk, so a client lifting history that names the content does not upload
-it: it offers no file entry naming content the handshake reports applied, and does not descend
-such a recipe. A client that must fetch such content
-(a clone or `lower` of history that names it) is refused with `content_redacted`.
+an object's hash covers its type, so a chunk never shares a hash with a file's content. A remote
+that holds the named object, and holds it as a tree, a parcel or a chunk, never applies the
+redaction. A remote that lacks the object cannot tell what it is, so a redaction naming a tree or
+a chunk by itself can apply there: a tree or a chunk the client uploads is always offered, and
+were its hash such a redaction's, the remote refuses that `PUT` with `410`, so the lift fails
+rather than landing history without it. No lift naming that object lands there again;
+`redact record` never names a tree or a chunk, so only a cell written otherwise reaches this.
+A ref update tolerates the absence of an applied redaction's content where the closure it checks
+names it as a file's content, never as a tree or a chunk, so a client lifting history that names
+the content does not upload it: it offers no file entry naming content the handshake reports
+applied, and does not descend such a recipe. A client that must fetch such content (a clone or
+`lower` of history that names it) is refused with `content_redacted`.
 
 **Pallet reference form.** Keys in `pallets` (and the `{name}` of the ref-update
 endpoint) are *qualified references*: a user pallet is bare (`main`), a **meta pallet** —

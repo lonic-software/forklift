@@ -664,7 +664,7 @@ mod tests {
         assert!(present(&hash));
     }
 
-
+    /// The second pass deletes a deleted recipe's chunk only it named, and keeps the one a live
     /// recipe shares, which stays readable.
     ///
     /// Revert: take every chunk of a deleted recipe → the shared chunk goes; skip the second pass →
