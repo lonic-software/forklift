@@ -454,10 +454,22 @@ fn a_full_audit_counts_an_applied_redaction_as_redacted_and_passes() {
     warehouse.stack("notes.txt", b"notes\n", "notes");
     let leak = warehouse.leaked("secret.env", b"TOKEN=hunter2\n");
 
-    // Held by a parked parcel, the copy is kept: nothing is absent.
+    // Held by a parked parcel, the copy is kept and reported with its holder: nothing is absent.
     warehouse.hold_parked(b"TOKEN=hunter2\n");
     let recorded = recorded_hash(&warehouse, &format!("{}:secret.env", leak), "leaked token");
     assert_eq!(recorded["data"]["status"], serde_json::json!({ "state": "applied" }), "{}", recorded);
+    let hash = recorded["data"]["hash"].as_str().unwrap();
+    assert_eq!(recorded["data"]["deletion"]["deleted"], serde_json::json!([]), "{}", recorded);
+    assert_eq!(recorded["data"]["deletion"]["kept"], serde_json::json!([{
+        "hash": hash,
+        "holders": [{ "kind": "parked", "description": "a parcel parked in the warehouse's own working tree" }],
+    }]), "{}", recorded);
+    assert!(warehouse.holds_loose(hash));
+    let human = String::from_utf8_lossy(&warehouse.run_ok(&["redact", "apply"]).stdout).into_owned();
+    assert!(human.contains(&format!(
+        "Kept {}: named by a parcel parked in the warehouse's own working tree. Take the file out of it, \
+        then run \"forklift redact apply\" to delete it.", hash
+    )), "{}", human);
     let audited = warehouse.json(&["audit", "--full"]);
     assert_eq!(audited["ok"], true, "{}", audited);
     assert_eq!(audited["data"]["scope"].get("redacted"), None, "{}", audited);
@@ -1389,4 +1401,42 @@ fn a_cache_that_applied_a_redaction_never_fetches_it_nor_asks_a_new_origin_for_i
     assert_eq!(moved["ok"], true, "{}", moved);
     assert_eq!(moved["data"]["origin"], server.url.as_str(), "{}", moved);
     assert!(moved["data"]["absent_objects"].as_u64().unwrap() > 0, "the move checked the new server: {}", moved);
+}
+
+/// While another process uses the object store, a redaction's deletion is owed: the record and
+/// the apply both succeed, keep the copy and say why, and `redact apply` deletes it once the
+/// store is free.
+///
+/// Revert: fail the command on the exclusive try's refusal → `redact apply` exits non-zero.
+/// Revert: hold record's shared store access through the deletion → a record nothing else holds
+/// owes it too (`a_read_of_content_whose_redaction_is_applied_is_refused_as_redacted`).
+#[test]
+fn a_deletion_is_owed_while_another_process_uses_the_store() {
+    let warehouse = Warehouse::new("owed");
+    let leak = warehouse.leaked("secret.env", b"TOKEN=hunter2\n");
+    let hash = hash_of(b"TOKEN=hunter2\n");
+
+    {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&warehouse.root);
+        let _store_access = forklift_core::util::lock_utils::StoreAccessLock::try_shared().unwrap();
+
+        let recorded = recorded_hash(&warehouse, &format!("{}:secret.env", leak), "leaked token");
+        assert_eq!(recorded["data"]["status"], serde_json::json!({ "state": "applied" }), "{}", recorded);
+        let owed = recorded["data"]["deletion"]["owed"].as_str().unwrap();
+        assert!(owed.starts_with("Another forklift process is using the object store"), "{}", recorded);
+        assert!(warehouse.holds_loose(&hash));
+
+        let human = String::from_utf8_lossy(&warehouse.run_ok(&["redact", "apply"]).stdout).into_owned();
+        assert!(human.contains("The redacted content was not deleted yet. Another forklift process is using"), "{}", human);
+        assert!(human.contains("Then run \"forklift redact apply\" again to delete it."), "{}", human);
+        assert!(warehouse.holds_loose(&hash));
+    }
+
+    let applied = warehouse.json(&["redact", "apply"]);
+    assert_eq!(applied["data"]["deletion"]["deleted"], serde_json::json!([hash]), "{}", applied);
+    assert_eq!(applied["data"]["deletion"].get("owed"), None, "{}", applied);
+    assert!(!warehouse.holds_loose(&hash));
+
+    // Nothing is left to delete, so the next apply reports no deletion.
+    assert_eq!(warehouse.json(&["redact", "apply"])["data"].get("deletion"), None);
 }

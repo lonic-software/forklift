@@ -158,14 +158,14 @@ fn delete_applied() -> Result<Option<DeletionView>, String> {
     let store_lock = match StoreLock::acquire() {
         Ok(lock) => lock,
         Err(e) => return Ok(Some(DeletionView::owed(format!(
-            "other object-store maintenance is running on this warehouse. If none is, the lock below \
-            was left by a compaction, gc or eviction that was killed and can be removed. {}", e
+            "Other object-store maintenance is running on this warehouse; let it finish. If none is, the \
+            lock below was left by a compaction, gc or eviction that was killed and can be removed. {}", e
         )))),
     };
     let serve_lock = match ServeLock::acquire() {
         Ok(lock) => lock,
         Err(e) => return Ok(Some(DeletionView::owed(format!(
-            "this warehouse root is being served; stop the server first. If no server is running, the \
+            "This warehouse root is being served; stop the server first. If no server is running, the \
             lock below was left by a server, gc or full repack that was killed and can be removed. {}", e
         )))),
     };
@@ -369,10 +369,6 @@ pub(crate) struct DeletionView {
     /// repack wrote.
     bytes_freed: u64,
 
-    /// Objects and chunks to delete still inside a pack: one found damaged during the repack,
-    /// which it leaves as found. `store compact --all` salvages it; `redact apply` then deletes it.
-    still_packed: usize,
-
     /// Applied redactions whose copies are kept, because a checkout's state still names them (or a
     /// pallet head or meta pallet's history, as a guard). Taking the file out of that state and
     /// running `redact apply` again deletes them.
@@ -472,7 +468,6 @@ impl From<Deletion> for DeletionView {
             deleted: deletion.objects,
             chunks_deleted: deletion.chunks,
             bytes_freed: deletion.bytes_freed,
-            still_packed: deletion.still_packed,
             kept: deletion.held.iter()
                 .map(|(hash, holders)| KeptView { hash: hash.clone(), holders: holders.iter().map(HolderView::from).collect() })
                 .collect(),
@@ -485,15 +480,15 @@ impl DeletionView {
     /// A deletion that did not run, for `why`.
     fn owed(why: String) -> Self {
         DeletionView {
-            deleted: Vec::new(), chunks_deleted: 0, bytes_freed: 0, still_packed: 0, kept: Vec::new(), owed: Some(why),
+            deleted: Vec::new(), chunks_deleted: 0, bytes_freed: 0, kept: Vec::new(), owed: Some(why),
         }
     }
 
     fn render_human(&self) {
         if let Some(why) = &self.owed {
             println!(
-                "Its content was not deleted yet: {}. Run \"forklift redact apply\" again to delete it.",
-                sanitize(why).trim_end_matches('.')
+                "The redacted content was not deleted yet. {} Then run \"forklift redact apply\" again to delete it.",
+                sanitize(why)
             );
             return;
         }
@@ -505,13 +500,6 @@ impl DeletionView {
             );
         }
 
-        if self.still_packed > 0 {
-            println!(
-                "{} object(s) to delete are still inside a damaged pack; run \"forklift store compact --all\" \
-                to salvage it, then \"forklift redact apply\".",
-                self.still_packed
-            );
-        }
 
         // Holder names are another operator's text, so they are sanitized.
         for kept in &self.kept {

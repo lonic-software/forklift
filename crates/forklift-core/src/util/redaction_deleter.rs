@@ -226,11 +226,6 @@ pub struct Deletion {
     /// The bytes freed: loose files deleted, and what the old packs held beyond the new ones.
     pub bytes_freed: u64,
 
-    /// Objects and chunks to delete still inside a pack after the repack: one found damaged only
-    /// during it, which a repack leaves as found. `store compact --all` salvages it, and the next
-    /// deletion deletes it.
-    pub still_packed: usize,
-
     /// The applied redactions whose copies are kept, each with the census roots that hold it.
     pub held: BTreeMap<String, Vec<CopyHolder>>,
 }
@@ -261,8 +256,9 @@ pub struct Deletion {
 /// # Returns
 /// * `Ok(Deletion)` - What was deleted, and what was kept.
 /// * `Err(String)`  - If the applied record, the census, a recipe or the packs could not be read
-///                    (nothing is deleted then), or a repack or a delete failed. Running it again
-///                    finishes, as for a run cut short.
+///                    (nothing is deleted then), a repack or a delete failed, or the first
+///                    pass's repack left a copy inside a pack it found damaged (the chunks are
+///                    then all kept). Running it again finishes, as for a run cut short.
 pub fn delete_applied(store_lock: &StoreLock,
                       serve_lock: &ServeLock,
                       store_access: &StoreAccessExclusive,
@@ -305,7 +301,6 @@ pub fn delete_applied(store_lock: &StoreLock,
         objects: deleted,
         chunks: second.deleted.len(),
         bytes_freed: first.bytes_freed + second.bytes_freed,
-        still_packed: first.still_packed + second.still_packed,
         held,
     })
 }
@@ -315,7 +310,6 @@ pub fn delete_applied(store_lock: &StoreLock,
 struct Dropped {
     deleted: Vec<String>,
     bytes_freed: u64,
-    still_packed: usize,
 }
 
 /// Drop every copy of `set`, packed and loose, keeping `kept` through the repack as if it were
@@ -350,22 +344,30 @@ fn drop_copies(set: &HashSet<String>,
     let delta_on_loose = pack_utils::any_packed_delta_against(&loose_only)
         .map_err(|error| error.refusal("Deleting a redacted object", "the objects it names were kept"))?;
 
-    let mut still_packed: HashSet<String> = HashSet::new();
     if !packed.is_empty() || delta_on_loose {
         dropped.bytes_freed += pack_utils::repack_redacting(set, kept, store_lock, serve_lock, store_access, progress)?
             .pack_bytes_freed;
 
+        // A pack found damaged only during the repack is left as found, holding its copy. Stop
+        // here, before a later pass deletes the chunks of a recipe it still holds.
+        let mut still_packed = 0;
         for hash in &packed {
             if pack_utils::is_in_packs(hash)? {
-                still_packed.insert(hash.clone());
+                still_packed += 1;
             }
+        }
+        if still_packed > 0 {
+            return Err(format!(
+                "{} redacted object(s) are still inside a pack the repack found damaged, so they \
+                were kept. Run \"forklift store compact --all\" to salvage it, then \"forklift redact \
+                apply\" again.",
+                still_packed
+            ));
         }
     }
 
     dropped.bytes_freed += prune_utils::free_objects(&loose, store_access)?.bytes;
-    dropped.still_packed = still_packed.len();
     dropped.deleted = packed.iter().chain(loose.iter())
-        .filter(|hash| !still_packed.contains(*hash))
         .cloned()
         .collect::<HashSet<String>>()
         .into_iter()
@@ -583,7 +585,6 @@ mod tests {
         expected.sort();
         assert_eq!(deletion.objects, expected);
         assert_eq!(deletion.chunks, 0);
-        assert_eq!(deletion.still_packed, 0);
         assert!(deletion.bytes_freed > 0, "{:?}", deletion);
         assert_eq!(deletion.held, [(held.clone(), vec![CopyHolder::Base(Checkout::Main)])].into_iter().collect());
         for hash in [&packed, &loose] {
