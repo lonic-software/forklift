@@ -1,4 +1,6 @@
 # The versions format 1 writes. Frozen: never edit this file.
+applied_redactions::APPLIED_RECORD = "redactions-applied"
+applied_redactions::APPLIED_VERSION = 1
 bay_utils::BAY_PATH_RECORD = "bay-path"
 bay_utils::BAY_PATH_VERSION = 1
 bay_utils::BAY_REDIRECT_RECORD = "bay"

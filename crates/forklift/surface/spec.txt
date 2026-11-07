@@ -45,7 +45,7 @@ shift
 show
 stack
 stocktake
-redact: record list
+redact: record list apply
 store: status compact peek evict
 tag: create show list
 undo

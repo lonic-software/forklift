@@ -327,9 +327,8 @@ pub(crate) fn chain_names(pallet: &str, head: &str, hash: &str) -> Result<bool, 
         let missing = |error: String| match file_utils::does_object_exist(&object) {
             Ok(false) => format!(
                 "The store is damaged: object {} of @{}'s history is missing, so whether that \
-                history names {} cannot be told, and nothing was recorded. If this warehouse has \
-                a remote, record the redaction in a fresh clone of it; otherwise the missing \
-                history cannot be recovered here.",
+                history names {} cannot be told. If this warehouse has a remote, a fresh clone \
+                of it holds that history; otherwise the missing history cannot be recovered here.",
                 object, pallet, hash
             ),
             _ => error,
@@ -404,7 +403,7 @@ pub fn head_holders(redaction: &Redaction) -> Result<Vec<HeadHolder>, String> {
             Err(error) => {
                 undecided.get_or_insert(format!(
                     "The head of pallet \"{}\" ({}) cannot be read ({}), so whether it names {} cannot \
-                    be told, and nothing was recorded.",
+                    be told.",
                     pallet, head, error.trim_end_matches('.'), redaction.hash
                 ));
             }
