@@ -696,6 +696,7 @@ fn a_meta_pallet_may_not_start_naming_redacted_content() {
 struct Server {
     child: std::process::Child,
     url: String,
+    root: PathBuf,
 }
 
 impl Server {
@@ -725,7 +726,13 @@ impl Server {
         let url = line.trim().rsplit(' ').next().unwrap().to_string();
         assert!(url.starts_with("http://"), "unexpected startup line: {}", line);
 
-        Server { child, url }
+        Server { child, url, root: PathBuf::from(root) }
+    }
+
+    /// The head this server serves for `main`, read from its own ref: a fresh clone could not
+    /// fetch history naming content whose redaction the server has applied.
+    fn main(&self) -> String {
+        std::fs::read_to_string(self.root.join(".forklift/pallets/main")).unwrap().trim().to_string()
     }
 }
 
@@ -734,12 +741,6 @@ impl Drop for Server {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-}
-
-/// The head the remote at `url` serves for `main`, read through a fresh clone named `name`.
-fn served_main(url: &str, name: &str) -> String {
-    let clone = Warehouse::cloned(name, url);
-    std::fs::read_to_string(clone.root.join(".forklift/pallets/main")).unwrap().trim().to_string()
 }
 
 /// A head stacked before a redaction came down by `lower` is refused by this warehouse's own check
@@ -766,7 +767,7 @@ fn a_lift_is_refused_for_a_head_stacked_before_a_redaction_came_down() {
     other.run_ok(&["lift"]);
     warehouse.run_ok(&["lower"]);
     assert_eq!(warehouse.redactions().len(), 1);
-    let served = served_main(&server.url, "lift-before");
+    let served = server.main();
 
     // A stack that only carries the file over from its parent, unchanged, is refused too.
     let stacked = warehouse.head("main");
@@ -790,7 +791,7 @@ fn a_lift_is_refused_for_a_head_stacked_before_a_redaction_came_down() {
         "from the working tree's root, forklift remove secret.env, then forklift stack -m <description>, then forklift lift",
         "{}", error
     );
-    assert_eq!(served_main(&server.url, "lift-refused"), served, "nothing was lifted");
+    assert_eq!(server.main(), served, "nothing was lifted");
 
     // Another warehouse lifts a change of its own to main, so this lift would merge it in first.
     // It is refused in lift's own words, before any merge is written.
@@ -808,7 +809,7 @@ fn a_lift_is_refused_for_a_head_stacked_before_a_redaction_came_down() {
     warehouse.run_ok(&["remove", "secret.env"]);
     warehouse.run_ok(&["stack", "-m", "without the secret"]);
     warehouse.run_ok(&["lift"]);
-    assert_eq!(served_main(&server.url, "lift-after"), warehouse.head("main"));
+    assert_eq!(server.main(), warehouse.head("main"));
 }
 
 #[test]
@@ -1512,8 +1513,8 @@ fn http(url: &str, method: &str, path: &str, body: &[u8]) -> (String, String) {
 /// Revert: skip applying after a ref write → the handshake reports the redaction pending.
 #[test]
 fn a_server_applies_a_redaction_no_head_names_and_refuses_its_content() {
-    let root = std::env::temp_dir().join(format!("forklift-redaction-served-server-{}", std::process::id()));
-    let server = Server::start(&root);
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-served-server-{}", std::process::id())));
 
     let owner = Warehouse::cloned("served-owner", &server.url);
     owner.stack("notes.txt", b"notes\n", "notes");
@@ -1546,8 +1547,7 @@ fn a_server_applies_a_redaction_no_head_names_and_refuses_its_content() {
     // The redaction comes down, and the history that names it goes up without the content.
     behind.run_ok(&["lower"]);
     behind.run_ok(&["lift"]);
-    let served = std::fs::read_to_string(root.join(".forklift/pallets/main")).unwrap();
-    assert_eq!(served.trim(), behind.head("main"));
+    assert_eq!(server.main(), behind.head("main"));
 
     // Until the server serves the redaction's absence, a fresh clone that must fetch the content
     // is refused as redacted: loud, never a quiet gap.
