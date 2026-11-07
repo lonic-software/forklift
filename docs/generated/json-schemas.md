@@ -6238,6 +6238,95 @@ A command not listed here either reports only the generic human-message shape `{
 
 ```json
 {
+  "$defs": {
+    "HeadView": {
+      "description": "A pallet head that names a redaction's content.",
+      "properties": {
+        "head": {
+          "description": "Its head.",
+          "type": "string"
+        },
+        "pallet": {
+          "description": "The pallet.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Where the head's tree holds the content.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pallet",
+        "head",
+        "path"
+      ],
+      "type": "object"
+    },
+    "StateName": {
+      "description": "A redaction's state.",
+      "oneOf": [
+        {
+          "const": "applied",
+          "description": "Applied.",
+          "type": "string"
+        },
+        {
+          "const": "held",
+          "description": "Pending: a pallet head or a meta pallet's history names it.",
+          "type": "string"
+        },
+        {
+          "const": "awaiting_remote",
+          "description": "Pending: nothing here names it, and the remote's report that it is applied there is waited\nfor.",
+          "type": "string"
+        },
+        {
+          "const": "undecided",
+          "description": "Pending: whether anything names it could not be told.",
+          "type": "string"
+        },
+        {
+          "const": "ready",
+          "description": "Pending: nothing here names it, and `redact apply` applies it. Only `redact list` reports\nit.",
+          "type": "string"
+        }
+      ]
+    },
+    "StateView": {
+      "description": "Where a redaction stands: applied, or pending, and why.",
+      "properties": {
+        "heads": {
+          "description": "For `held`, the pallet heads that name the content.",
+          "items": {
+            "$ref": "#/$defs/HeadView"
+          },
+          "type": "array"
+        },
+        "meta_pallets": {
+          "description": "For `held`, the meta pallets whose history names the hash. That history is never\nrewritten, so the redaction stays pending.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "reason": {
+          "description": "For `undecided`, why.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/StateName",
+          "description": "The state."
+        }
+      },
+      "required": [
+        "state"
+      ],
+      "type": "object"
+    }
+  },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The result of recording a redaction.",
   "properties": {
@@ -6252,12 +6341,17 @@ A command not listed here either reports only the generic human-message shape `{
     "redactions_head": {
       "description": "The new head of the @redactions meta pallet.",
       "type": "string"
+    },
+    "status": {
+      "$ref": "#/$defs/StateView",
+      "description": "Where the redaction stands now."
     }
   },
   "required": [
     "hash",
     "chunked",
-    "redactions_head"
+    "redactions_head",
+    "status"
   ],
   "title": "Recorded",
   "type": "object"
@@ -6269,6 +6363,29 @@ A command not listed here either reports only the generic human-message shape `{
 ```json
 {
   "$defs": {
+    "HeadView": {
+      "description": "A pallet head that names a redaction's content.",
+      "properties": {
+        "head": {
+          "description": "Its head.",
+          "type": "string"
+        },
+        "pallet": {
+          "description": "The pallet.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Where the head's tree holds the content.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pallet",
+        "head",
+        "path"
+      ],
+      "type": "object"
+    },
     "RedactionView": {
       "description": "One redaction.",
       "properties": {
@@ -6301,13 +6418,82 @@ A command not listed here either reports only the generic human-message shape `{
             "string",
             "null"
           ]
+        },
+        "status": {
+          "$ref": "#/$defs/StateView",
+          "description": "Where the redaction stands."
         }
       },
       "required": [
         "hash",
         "reason",
         "redacted_at",
-        "redactor"
+        "redactor",
+        "status"
+      ],
+      "type": "object"
+    },
+    "StateName": {
+      "description": "A redaction's state.",
+      "oneOf": [
+        {
+          "const": "applied",
+          "description": "Applied.",
+          "type": "string"
+        },
+        {
+          "const": "held",
+          "description": "Pending: a pallet head or a meta pallet's history names it.",
+          "type": "string"
+        },
+        {
+          "const": "awaiting_remote",
+          "description": "Pending: nothing here names it, and the remote's report that it is applied there is waited\nfor.",
+          "type": "string"
+        },
+        {
+          "const": "undecided",
+          "description": "Pending: whether anything names it could not be told.",
+          "type": "string"
+        },
+        {
+          "const": "ready",
+          "description": "Pending: nothing here names it, and `redact apply` applies it. Only `redact list` reports\nit.",
+          "type": "string"
+        }
+      ]
+    },
+    "StateView": {
+      "description": "Where a redaction stands: applied, or pending, and why.",
+      "properties": {
+        "heads": {
+          "description": "For `held`, the pallet heads that name the content.",
+          "items": {
+            "$ref": "#/$defs/HeadView"
+          },
+          "type": "array"
+        },
+        "meta_pallets": {
+          "description": "For `held`, the meta pallets whose history names the hash. That history is never\nrewritten, so the redaction stays pending.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "reason": {
+          "description": "For `undecided`, why.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/StateName",
+          "description": "The state."
+        }
+      },
+      "required": [
+        "state"
       ],
       "type": "object"
     },

@@ -1436,8 +1436,24 @@ pub enum RedactAction {
         message: String,
     },
 
-    /// List every redaction (the default)
+    /// List every redaction and where it stands (the default)
+    #[command(
+        long_about = "List every redaction and where it stands: applied, or pending while a pallet \
+                      head or a meta pallet's history names the content, while a warehouse with a \
+                      remote waits for the remote to report it applied, or while whether anything \
+                      names it cannot be told. Applies nothing: one that `forklift redact apply` would apply \
+                      is listed as ready."
+    )]
     List,
+
+    /// Apply every redaction that nothing here names any more
+    #[command(
+        long_about = "Apply every pending redaction that no pallet head and no meta pallet's history \
+                      here names. A redaction is applied once by itself when it is recorded; run \
+                      this after taking the content out of the heads that held it. A warehouse with \
+                      a remote applies none yet: it waits for the remote to report each applied."
+    )]
+    Apply,
 }
 
 #[derive(Subcommand)]
@@ -2232,7 +2248,7 @@ impl Command {
                 | Command::Shift { .. }
                 | Command::Stack { .. }
                 | Command::Tag { .. }
-                | Command::Redact { action: Some(RedactAction::Record { .. }) }
+                | Command::Redact { action: Some(RedactAction::Record { .. } | RedactAction::Apply) }
                 | Command::Undo { .. }
                 | Command::Unload { .. }
         )

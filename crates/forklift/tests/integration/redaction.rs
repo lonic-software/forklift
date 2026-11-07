@@ -857,3 +857,134 @@ fn a_head_the_remote_serves_is_adopted_while_the_remote_holds_its_redaction_pend
     let error = content_redacted(&fresh, &["load", "."]);
     assert_eq!(error["details"], serde_json::json!({ "path": "secret.env", "hash": hash }), "{}", error);
 }
+
+/// The record of applied redactions in `warehouse`, as its raw text; empty when there is none.
+fn applied_record(warehouse: &Warehouse) -> String {
+    std::fs::read_to_string(warehouse.root.join(".forklift/redactions-applied")).unwrap_or_default()
+}
+
+/// In a warehouse with no remote, a redaction that nothing names applies as it is recorded, and is
+/// listed applied from then on.
+///
+/// Revert: judge a clean scan as pending with no remote → the state is not `applied` and the
+/// record never names the hash.
+#[test]
+fn a_redaction_nothing_names_applies_as_it_is_recorded_without_a_remote() {
+    let warehouse = Warehouse::new("apply-local");
+    let leak = warehouse.leaked("secret.env", b"TOKEN=hunter2\n");
+
+    let recorded = recorded_hash(&warehouse, &format!("{}:secret.env", leak), "leaked token");
+    let hash = recorded["data"]["hash"].as_str().unwrap().to_string();
+    assert_eq!(recorded["data"]["status"], serde_json::json!({ "state": "applied" }), "{}", recorded);
+    assert_eq!(applied_record(&warehouse), format!("/forklift-redactions-applied 1\n{}\n", hash));
+
+    let listed = warehouse.redactions();
+    assert_eq!(listed[0]["status"], serde_json::json!({ "state": "applied" }), "{:?}", listed);
+
+    let human = warehouse.run_ok(&["redact", "list"]);
+    assert!(String::from_utf8_lossy(&human.stdout).contains("    applied"), "{:?}", human);
+
+    // A re-scan leaves the record as it was.
+    let applied = warehouse.json(&["redact", "apply"]);
+    assert_eq!(applied["data"]["redactions"], serde_json::Value::Array(listed), "{}", applied);
+    assert_eq!(applied_record(&warehouse), format!("/forklift-redactions-applied 1\n{}\n", hash));
+}
+
+/// A warehouse with a remote applies nothing by its own scan: a redaction nothing here names waits
+/// for the remote. One a pallet head names is held by it, with or without a remote; once the remote
+/// is gone and the file taken out, `redact apply` applies it.
+///
+/// Revert: read no remote when judging → the redactor's redaction applies at once. Revert: drop the
+/// head scan → the holder's redaction applies while its head still names the content.
+#[test]
+fn a_remote_holds_a_redaction_pending_and_a_head_holds_it_until_the_file_is_out() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-apply-server-{}", std::process::id())));
+
+    let owner = Warehouse::cloned("apply-owner", &server.url);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+
+    // Cloned before the leak, so no head here names it.
+    let redactor = Warehouse::cloned("apply-redactor", &server.url);
+    owner.stack("secret.env", b"TOKEN=hunter2\n", "leak");
+    owner.run_ok(&["lift"]);
+
+    std::fs::write(redactor.root.join("secret.env"), b"TOKEN=hunter2\n").unwrap();
+    redactor.run_ok(&["load", "secret.env"]);
+    let hash = hash_of(b"TOKEN=hunter2\n");
+    let recorded = recorded_hash(&redactor, &hash, "leaked token");
+    assert_eq!(recorded["data"]["status"], serde_json::json!({ "state": "awaiting_remote" }), "{}", recorded);
+    redactor.run_ok(&["unload", "secret.env"]);
+    std::fs::remove_file(redactor.root.join("secret.env")).unwrap();
+
+    // Its main is behind the remote's, which it leaves alone; @redactions goes up.
+    let lifted = redactor.run(&["lift"]);
+    assert!(String::from_utf8_lossy(&lifted.stdout).contains("Lifted the @redactions pallet"), "{:?}", lifted);
+
+    let listed = redactor.json(&["redact", "apply"]);
+    assert_eq!(listed["data"]["redactions"][0]["status"]["state"], "awaiting_remote", "{}", listed);
+    assert_eq!(applied_record(&redactor), "");
+
+    // A clone takes the head that names the content, and the redaction with it.
+    let holder = Warehouse::cloned("apply-holder", &server.url);
+    let held = serde_json::json!({
+        "state": "held",
+        "heads": [{ "pallet": "main", "head": holder.head("main"), "path": "secret.env" }],
+    });
+    assert_eq!(holder.redactions()[0]["status"], held);
+
+    // A meta pallet whose history is damaged cannot be judged, but the head that names the content
+    // is still reported ahead of that error.
+    holder.run_ok(&["tag", "create", "v1", "main"]);
+    let tags = std::fs::read_to_string(holder.root.join(".forklift/meta/tags")).unwrap().trim().to_string();
+    let loose = holder.root.join(".forklift/objects").join(&tags[..2]).join(&tags[2..]);
+    let parcel = std::fs::read(&loose).unwrap();
+    std::fs::remove_file(&loose).unwrap();
+    assert_eq!(holder.redactions()[0]["status"], held);
+    std::fs::write(&loose, parcel).unwrap();
+
+    holder.run_ok(&["config", "unset", "remote.url"]);
+    let applied = holder.json(&["redact", "apply"]);
+    assert_eq!(applied["data"]["redactions"][0]["status"]["state"], "held", "{}", applied);
+    assert_eq!(applied_record(&holder), "");
+
+    let human = holder.run_ok(&["redact", "list"]);
+    assert!(String::from_utf8_lossy(&human.stdout).contains("pending: named by pallet \"main\" as \"secret.env\""),
+            "{:?}", human);
+
+    holder.run_ok(&["remove", "secret.env"]);
+    holder.run_ok(&["stack", "-m", "take the leak out"]);
+
+    // Listing applies nothing: it says the redaction is ready.
+    assert_eq!(holder.redactions()[0]["status"], serde_json::json!({ "state": "ready" }));
+    assert_eq!(applied_record(&holder), "");
+
+    let applied = holder.json(&["redact", "apply"]);
+    assert_eq!(applied["data"]["redactions"][0]["status"]["state"], "applied", "{}", applied);
+    assert_eq!(applied_record(&holder), format!("/forklift-redactions-applied 1\n{}\n", hash));
+}
+
+/// A record of applied redactions this build cannot read fails every command that reads it, and is
+/// never written over. A redaction recorded meanwhile is still recorded, and reported undecided.
+///
+/// Revert: read an unknown version as nothing applied → `redact list` succeeds.
+#[test]
+fn an_applied_record_this_build_cannot_read_is_refused_loudly() {
+    let warehouse = Warehouse::new("apply-unknown");
+    let leak = warehouse.leaked("secret.env", b"TOKEN=hunter2\n");
+    let record = warehouse.root.join(".forklift/redactions-applied");
+    std::fs::write(&record, b"/forklift-redactions-applied 2\n").unwrap();
+
+    let recorded = recorded_hash(&warehouse, &format!("{}:secret.env", leak), "leaked token");
+    assert_eq!(recorded["data"]["status"]["state"], "undecided", "{}", recorded);
+    assert!(recorded["data"]["status"]["reason"].as_str().unwrap().contains("does not know"), "{}", recorded);
+
+    for args in [["redact", "list"], ["redact", "apply"]] {
+        let refused = warehouse.run(&args);
+        assert!(!refused.status.success(), "{:?}", args);
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("does not know"), "{:?}", refused);
+    }
+
+    assert_eq!(std::fs::read(&record).unwrap(), b"/forklift-redactions-applied 2\n");
+}

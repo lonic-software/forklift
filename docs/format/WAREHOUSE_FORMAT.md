@@ -210,6 +210,7 @@ name in a row is a constant, and every path in every fixture matches a row.
 | `served` | rewritable | `tombstone_utils::FILE_NAME_SERVED` |
 | `tombstones` | rewritable | `tombstone_utils::FILE_NAME_TOMBSTONES` |
 | `sealed` | rewritable | `sealed_utils::FILE_NAME_SEALED` |
+| `redactions-applied` | rewritable | `applied_redactions::FILE_NAME_APPLIED` |
 | `unvouched-heads` | rewritable | `take_utils::FILE_NAME_UNVOUCHED` |
 | `held-heads` | rewritable | `held_heads::FILE_NAME` |
 | `fetched-heads` | rewritable | `fetch_ledger::FILE_NAME_LEDGER` |

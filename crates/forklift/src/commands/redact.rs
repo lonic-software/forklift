@@ -2,6 +2,7 @@ use serde::Serialize;
 use forklift_core::error::{sanitize, CoreError, RefusalCode};
 use forklift_core::util::kv_utils::short;
 use forklift_core::util::office_utils::Role;
+use forklift_core::util::applied_redactions::{self, RedactionState, RedactionStatus};
 use forklift_core::util::redaction_utils::{self, AttributedRedaction, HeadHolder, RedactedKind, Redaction};
 use forklift_core::util::{config_utils, object_utils, pallet_utils, remote_utils};
 use crate::cli::RedactAction;
@@ -11,8 +12,9 @@ use crate::output::{self, CommandOutput};
 /// Handle the redact command: permanent redactions of stored content. Without a subcommand, the
 /// redactions are listed.
 ///
-/// * `redact` / `redact list`             - List every redaction.
-/// * `redact record <target> -m <reason>` - Record a redaction (admin only).
+/// * `redact` / `redact list`             - List every redaction and where it stands.
+/// * `redact record <target> -m <reason>` - Record a redaction (admin only), and apply it if it can.
+/// * `redact apply`                       - Apply every redaction that can be now.
 ///
 /// # Arguments
 /// * `action` - The redact subcommand (`None` lists the redactions).
@@ -23,6 +25,7 @@ use crate::output::{self, CommandOutput};
 pub async fn handle_command(action: Option<RedactAction>) -> Result<(), String> {
     match action {
         Some(RedactAction::Record { target, message }) => record(&target, &message),
+        Some(RedactAction::Apply) => apply(),
         Some(RedactAction::List) | None => list(),
     }
 }
@@ -36,6 +39,10 @@ pub async fn handle_command(action: Option<RedactAction>) -> Result<(), String> 
 /// The admin rule and immutability are the pallet's own, checked on every write and by the
 /// remote, and no head written after the redaction may name the content; the checks here only
 /// refuse early, with a plainer message.
+///
+/// Once the cell commits, the redaction is applied if it can be (see [`applied_redactions`]). It
+/// is recorded either way, so a failure to apply it does not fail the command: the redaction is
+/// reported pending, with the reason, and `redact apply` tries again.
 fn record(target: &str, reason: &str) -> Result<(), String> {
     let (hash, kind) = resolve_target(target)?;
 
@@ -61,7 +68,7 @@ fn record(target: &str, reason: &str) -> Result<(), String> {
         return Err(format!("Object {} is already redacted; a redaction is permanent.", hash));
     }
 
-    let holders = redaction_utils::meta_holders(&hash)?;
+    let holders = redaction_utils::meta_holders(&hash).map_err(nothing_recorded)?;
 
     if !holders.is_empty() {
         return Err(meta_held_refusal(&hash, &holders));
@@ -87,7 +94,7 @@ fn record(target: &str, reason: &str) -> Result<(), String> {
         chunks,
     };
 
-    let holders = redaction_utils::head_holders(&redaction)?;
+    let holders = redaction_utils::head_holders(&redaction).map_err(nothing_recorded)?;
 
     if !holders.is_empty() {
         return Err(head_held_refusal(&hash, &holders));
@@ -95,7 +102,17 @@ fn record(target: &str, reason: &str) -> Result<(), String> {
 
     let redactions_head = redaction_utils::record_redaction(&redaction, &writer, &operator)?;
 
-    output::emit(&Recorded { hash, chunked: kind == RedactedKind::Recipe, redactions_head });
+    let state = redaction_utils::read_redactions()
+        .and_then(|read| applied_redactions::apply(&read, Some(&hash)))
+        .map(|statuses| statuses.into_iter().next().map(|status| status.state))
+        .unwrap_or_else(|why| Some(RedactionState::Undecided(why)))
+        .unwrap_or_else(|| RedactionState::Undecided(format!(
+            "The redaction of {} is not readable at the new @redactions head.", hash
+        )));
+
+    output::emit(&Recorded {
+        hash, chunked: kind == RedactedKind::Recipe, redactions_head, status: StateView::from(&state),
+    });
 
     Ok(())
 }
@@ -138,6 +155,11 @@ fn resolve_target(target: &str) -> Result<(String, RedactedKind), String> {
     ))?;
 
     Ok((hash, kind))
+}
+
+/// A scan error from before the cell is written, with that said.
+fn nothing_recorded(error: String) -> String {
+    format!("{} Nothing was recorded.", error)
 }
 
 /// The [`RefusalCode::RedactionBlocked`] refusal for `hash`, which the history of every meta
@@ -206,16 +228,24 @@ fn record_step(hash: &str, chosen: &HeadHolder, holders: &[HeadHolder]) -> Strin
     }
 }
 
-/// List every redaction, attributed to its redactor, and every cell this forklift cannot read.
+/// List every redaction, attributed to its redactor, with where it stands, and every cell this
+/// forklift cannot read. Applies nothing: a redaction that `redact apply` would apply lists as
+/// ready.
 fn list() -> Result<(), String> {
     let read = redaction_utils::read_redactions()?;
+    let statuses = applied_redactions::statuses(&read)?;
 
-    let redactions = read.redactions.iter().map(RedactionView::from).collect();
-    let unreadable = read.unreadable.iter()
-        .map(|cell| UnreadableView { hash: cell.hash.clone(), reason: cell.reason.clone() })
-        .collect();
+    output::emit(&RedactionList::new(&read, &statuses));
 
-    output::emit(&RedactionList { redactions, unreadable });
+    Ok(())
+}
+
+/// Apply every redaction that can be now, and list them all as [`list`] does.
+fn apply() -> Result<(), String> {
+    let read = redaction_utils::read_redactions()?;
+    let statuses = applied_redactions::apply(&read, None)?;
+
+    output::emit(&RedactionList::new(&read, &statuses));
 
     Ok(())
 }
@@ -232,6 +262,9 @@ pub(crate) struct Recorded {
 
     /// The new head of the @redactions meta pallet.
     redactions_head: String,
+
+    /// Where the redaction stands now.
+    status: StateView,
 }
 
 impl CommandOutput for Recorded {
@@ -245,6 +278,7 @@ impl CommandOutput for Recorded {
             "Recorded the redaction of {} {} (@redactions head {}).",
             what, self.hash, short(&self.redactions_head)
         );
+        println!("It is {}.", self.status.describe());
     }
 }
 
@@ -283,10 +317,30 @@ pub(crate) struct RedactionView {
     /// For a chunked file, the digest of its ordered chunk list.
     #[serde(skip_serializing_if = "Option::is_none")]
     chunks: Option<String>,
+
+    /// Where the redaction stands.
+    status: StateView,
 }
 
-impl From<&AttributedRedaction> for RedactionView {
-    fn from(attributed: &AttributedRedaction) -> Self {
+impl RedactionList {
+    /// The list of `read`'s redactions, each with its status from `statuses`, which holds one per
+    /// readable redaction in `read`'s order.
+    fn new(read: &redaction_utils::RedactionsRead, statuses: &[RedactionStatus]) -> RedactionList {
+        assert_eq!(read.redactions.len(), statuses.len(), "one status per readable redaction");
+
+        let redactions = read.redactions.iter().zip(statuses)
+            .map(|(attributed, status)| RedactionView::new(attributed, &status.state))
+            .collect();
+        let unreadable = read.unreadable.iter()
+            .map(|cell| UnreadableView { hash: cell.hash.clone(), reason: cell.reason.clone() })
+            .collect();
+
+        RedactionList { redactions, unreadable }
+    }
+}
+
+impl RedactionView {
+    fn new(attributed: &AttributedRedaction, state: &RedactionState) -> Self {
         let redaction = &attributed.redaction;
 
         RedactionView {
@@ -298,6 +352,108 @@ impl From<&AttributedRedaction> for RedactionView {
             redactor: attributed.redactor.clone(),
             signer: attributed.signer.clone(),
             chunks: redaction.chunks.clone(),
+            status: StateView::from(state),
+        }
+    }
+}
+
+/// A redaction's state.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StateName {
+    /// Applied.
+    Applied,
+
+    /// Pending: a pallet head or a meta pallet's history names it.
+    Held,
+
+    /// Pending: nothing here names it, and the remote's report that it is applied there is waited
+    /// for.
+    AwaitingRemote,
+
+    /// Pending: whether anything names it could not be told.
+    Undecided,
+
+    /// Pending: nothing here names it, and `redact apply` applies it. Only `redact list` reports
+    /// it.
+    Ready,
+}
+
+/// Where a redaction stands: applied, or pending, and why.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct StateView {
+    /// The state.
+    state: StateName,
+
+    /// For `held`, the pallet heads that name the content.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    heads: Vec<HeadView>,
+
+    /// For `held`, the meta pallets whose history names the hash. That history is never
+    /// rewritten, so the redaction stays pending.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    meta_pallets: Vec<String>,
+
+    /// For `undecided`, why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+/// A pallet head that names a redaction's content.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct HeadView {
+    /// The pallet.
+    pallet: String,
+
+    /// Its head.
+    head: String,
+
+    /// Where the head's tree holds the content.
+    path: String,
+}
+
+impl From<&RedactionState> for StateView {
+    fn from(state: &RedactionState) -> Self {
+        let view = |state| StateView { state, heads: Vec::new(), meta_pallets: Vec::new(), reason: None };
+
+        match state {
+            RedactionState::Applied => view(StateName::Applied),
+            RedactionState::AwaitingRemote => view(StateName::AwaitingRemote),
+            RedactionState::Ready => view(StateName::Ready),
+            RedactionState::Undecided(reason) => StateView { reason: Some(reason.clone()), ..view(StateName::Undecided) },
+            RedactionState::Held { heads, meta_pallets } => StateView {
+                heads: heads.iter()
+                    .map(|holder| HeadView {
+                        pallet: holder.pallet.clone(), head: holder.head.clone(), path: holder.path.clone(),
+                    })
+                    .collect(),
+                meta_pallets: meta_pallets.iter().map(|name| format!("@{}", name)).collect(),
+                ..view(StateName::Held)
+            },
+        }
+    }
+}
+
+impl StateView {
+    /// The status as a phrase that follows "It is ". Pallet names and paths are another
+    /// operator's text, so they are sanitized.
+    fn describe(&self) -> String {
+        match self.state {
+            StateName::Applied => "applied".to_string(),
+            StateName::AwaitingRemote => "pending until the remote reports it applied".to_string(),
+            StateName::Ready => "pending, and nothing names it any more: `forklift redact apply` applies it".to_string(),
+            StateName::Held => {
+                let mut by: Vec<String> = self.heads.iter()
+                    .map(|head| format!("pallet \"{}\" as \"{}\"", sanitize(&head.pallet), sanitize(&head.path)))
+                    .collect();
+                by.extend(self.meta_pallets.iter().map(|name| format!("the history of {}", sanitize(name))));
+
+                format!("pending: named by {}", by.join(", "))
+            }
+            StateName::Undecided => format!("pending: {}", sanitize(self.reason.as_deref().unwrap_or("")).trim_end_matches('.')),
         }
     }
 }
@@ -332,6 +488,7 @@ impl CommandOutput for RedactionList {
                 "{}  {}{}  {}",
                 redaction.hash, sanitize(&redaction.redactor), signed, sanitize(&redaction.reason)
             );
+            println!("    {}", redaction.status.describe());
         }
 
         for cell in &self.unreadable {
