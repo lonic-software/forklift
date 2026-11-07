@@ -23,7 +23,7 @@ use forklift_aws_lambda::reissue::request_token;
 use forklift_aws_lambda::memory::{MemoryObjectStore, MemoryRefStore};
 use forklift_aws_lambda::store::{
     ExpectedHead, RefHead, RefListing,
-    CasOutcome, ObjectAccess, ObjectStore, OffloadedResponse, OfficePrecondition, PromoteOutcome, PutOutcome,
+    CasOutcome, ObjectAccess, ObjectStore, OffloadedResponse, OfficePrecondition, RedactionsPrecondition, PromoteOutcome, PutOutcome,
     PutTarget, RefStore, SignatureOutcome, TrustOutcome, TrustWriteOutcome,
 };
 use forklift_aws_lambda::{handle, AuthConfig, Credentials, Head, Routing, TokenDigest};
@@ -107,11 +107,12 @@ impl RefStore for SharedRefs {
         expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
+        redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.0.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
+        self.0.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
     }
     fn delete_head(
         &self,
@@ -1098,6 +1099,7 @@ fn a_shared_bearer_holder_may_move_any_pallet_including_the_office() {
                 ExpectedHead::Unborn,
                 &office_head,
                 OfficePrecondition::NotConsumed,
+                RedactionsPrecondition::NotConsumed,
                 Some(stored_anchor.as_str()),
                 &forklift_aws_lambda::format::gate(&*main_fixture.refs).expect("format gate"),
                 &request_token(),
@@ -1796,12 +1798,13 @@ impl RefStore for MarkedMidRequest {
         expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
+        redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
         self.0.set_format(Some("2>3 operator 0"));
-        self.0.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
+        self.0.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
     }
     fn delete_head(
         &self,

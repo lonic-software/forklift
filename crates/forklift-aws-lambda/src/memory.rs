@@ -20,6 +20,7 @@ use std::sync::Mutex;
 use forklift_core::model::remote::TrustAnchorDto;
 use forklift_core::util::object_utils;
 use forklift_core::util::office_utils::{TrustAnchor, OFFICE_PALLET_NAME};
+use forklift_core::util::redaction_utils::REDACTIONS_PALLET_NAME;
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef, DEFAULT_PALLET_NAME};
 
 use crate::aws::dynamo::{
@@ -27,8 +28,8 @@ use crate::aws::dynamo::{
 };
 use crate::store::{
     CasOutcome, ExpectedHead, FormatFence, FormatStore, ObjectAccess, ObjectStore, OffloadedResponse,
-    OfficePrecondition, PromoteOutcome, PutOutcome, PutTarget, RefHead, RefListing, RefStore, SignatureOutcome,
-    TrustOutcome, TrustWriteOutcome,
+    OfficePrecondition, PromoteOutcome, PutOutcome, PutTarget, RedactionsPrecondition, RefHead, RefListing, RefStore,
+    SignatureOutcome, TrustOutcome, TrustWriteOutcome,
 };
 
 /// An in-memory [`ObjectStore`]. Object bytes are the uncompressed wire form, keyed by hash.
@@ -404,11 +405,26 @@ impl MemoryRefStore {
         }
     }
 
-    /// Check the office and anchor preconditions under the held guard: `Some` names the one that
-    /// failed, `None` means both hold.
+    /// The `@redactions` head a commit to `key` conditions on, by the same rule as
+    /// [`office_condition`](Self::office_condition): none for a write of `@redactions` itself.
+    fn redactions_condition<'a>(key: &str, redactions: RedactionsPrecondition<'a>) -> Option<Option<&'a str>> {
+        if key == Self::key(PalletNamespace::Meta, REDACTIONS_PALLET_NAME) {
+            return None;
+        }
+
+        match redactions {
+            RedactionsPrecondition::NotConsumed => None,
+            RedactionsPrecondition::Unborn => Some(None),
+            RedactionsPrecondition::At(head) => Some(Some(head)),
+        }
+    }
+
+    /// Check the office, `@redactions` and anchor preconditions under the held guard: `Some`
+    /// names the one that failed, `None` means all hold.
     fn moved_inputs(
         state: &RefState,
         office: Option<Option<&str>>,
+        redactions: Option<Option<&str>>,
         anchor: Option<&str>,
     ) -> Option<CasOutcome> {
         if let Some(office_head) = office {
@@ -416,6 +432,14 @@ impl MemoryRefStore {
 
             if current_office.as_deref() != office_head {
                 return Some(CasOutcome::OfficeMoved { current: current_office });
+            }
+        }
+
+        if let Some(redactions_head) = redactions {
+            let current = state.live_head(&Self::key(PalletNamespace::Meta, REDACTIONS_PALLET_NAME));
+
+            if current.as_deref() != redactions_head {
+                return Some(CasOutcome::RedactionsMoved);
             }
         }
 
@@ -479,12 +503,14 @@ impl RefStore for MemoryRefStore {
         expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
+        redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
         format: &FormatFence,
         _request_token: &str,
     ) -> Result<CasOutcome, String> {
         let key = Self::key(namespace, name);
         let office = Self::office_condition(&key, office_head);
+        let redactions = Self::redactions_condition(&key, redactions);
 
         let mut state = self.state.lock().unwrap();
 
@@ -492,7 +518,7 @@ impl RefStore for MemoryRefStore {
             return Ok(CasOutcome::FormatMoved);
         }
 
-        // All three preconditions are evaluated, and the commit made, under this one guard —
+        // Every precondition is evaluated, and the commit made, under this one guard —
         // the property this whole struct exists to provide (see `RefState`'s docs).
         let current = state.entry(&key);
 
@@ -507,7 +533,7 @@ impl RefStore for MemoryRefStore {
             return Ok(CasOutcome::Conflict { current });
         }
 
-        if let Some(moved) = Self::moved_inputs(&state, office, anchor) {
+        if let Some(moved) = Self::moved_inputs(&state, office, redactions, anchor) {
             return Ok(moved);
         }
 
@@ -542,7 +568,7 @@ impl RefStore for MemoryRefStore {
             return Ok(CasOutcome::Conflict { current });
         }
 
-        if let Some(moved) = Self::moved_inputs(&state, office, anchor) {
+        if let Some(moved) = Self::moved_inputs(&state, office, None, anchor) {
             return Ok(moved);
         }
 

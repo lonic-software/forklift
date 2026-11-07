@@ -107,8 +107,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   file's chunks that only it names. Its handshake
   reports each redaction as pending or applied, and a warehouse takes a head the server serves over
   a redaction only while the server reports it pending. A fresh `clone` or a `lower` that must
-  fetch history naming the content is refused with `content_redacted` for now. The AWS head does
-  not apply redactions yet.
+  fetch history naming the content is refused with `content_redacted` for now. The AWS head
+  refuses a lift naming content `@redactions` records, as `content_redacted`, but does not apply
+  redactions yet.
 - **A redaction applies only to a file's content.** A redaction naming an object a warehouse holds
   as a directory or as a chunk of a chunked file is never applied there (`redact list` reports it
   undecided, with why), and the deleter leaves such an object in place. The reads, `audit`, `heal`

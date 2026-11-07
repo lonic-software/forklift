@@ -22,7 +22,7 @@ use forklift_aws_lambda::memory::{MemoryObjectStore, MemoryRefStore};
 use forklift_aws_lambda::scratch::Scratch;
 use forklift_aws_lambda::store::{
     ExpectedHead, RefHead, RefListing,
-    CasOutcome, ObjectStore, OfficePrecondition, PromoteOutcome, PutOutcome, RefStore,
+    CasOutcome, ObjectStore, OfficePrecondition, RedactionsPrecondition, PromoteOutcome, PutOutcome, RefStore,
     SignatureOutcome, TransientCause, TrustOutcome, TrustWriteOutcome,
 };
 use forklift_aws_lambda::{AsyncBridge, BatchCut, BatchDelivery, BatchResult, Head};
@@ -33,6 +33,7 @@ use forklift_core::util::authority_utils::Principal;
 use forklift_core::model::remote::{HoldAnswer, RefUpdateRequest, TrustAnchorDto};
 use forklift_core::util::office_utils::{self, OFFICE_PALLET_NAME};
 use forklift_core::util::pallet_utils;
+use forklift_core::util::redaction_utils::REDACTIONS_PALLET_NAME;
 use forklift_core::util::{bundle_utils, file_utils, object_utils, sign_utils};
 
 // ---------------------------------------------------------------------------------------
@@ -442,7 +443,7 @@ fn gate_parcel<O: ObjectStore, R: RefStore>(head: &Head<O, R>,
 fn plant(refs: &MemoryRefStore, name: &str, new: &str) {
     let fence = forklift_aws_lambda::format::gate(refs).expect("format gate");
     let outcome = refs.compare_and_set_head(
-        pallet_utils::PalletNamespace::User, name, ExpectedHead::Unborn, new, OfficePrecondition::NotConsumed, None,
+        pallet_utils::PalletNamespace::User, name, ExpectedHead::Unborn, new, OfficePrecondition::NotConsumed, RedactionsPrecondition::NotConsumed, None,
         &fence, &request_token(),
     ).expect("plant");
     assert_eq!(outcome, CasOutcome::Committed);
@@ -547,6 +548,309 @@ fn the_gate_reads_the_new_heads_trees_from_the_audit_scratch() {
 
     // 41 trees and a parcel: a gate reading through the store would add at least 41 more.
     assert!(reads <= 42 + 5, "{} reads for 41 trees and a parcel", reads);
+}
+
+/// The blob hash of `content`, as a warehouse stores it.
+fn blob_hash(content: &str) -> String {
+    use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+    use forklift_core::model::blob::Blob;
+
+    LooseObjectBuilder::build_blob(&Blob { content: content.as_bytes().to_vec() }).hash
+}
+
+/// A warehouse in `area` at `dir` that records a redaction of each of `contents` in turn, by
+/// hash, while no head names it, harvesting the warehouse after each: the `@redactions` heads in
+/// recording order, and every object any of them needs.
+fn recorded_redactions(area: &Area, dir: &str, contents: &[&str]) -> (Vec<String>, Harvest) {
+    prepare(area, dir);
+    area.write_file(&format!("{}/notes.txt", dir), "notes\n");
+    area.forklift(dir, &["load", "."]);
+    area.forklift(dir, &["stack", "-m", "notes"]);
+
+    let mut heads = Vec::new();
+    for content in contents {
+        area.write_file(&format!("{}/loaded.txt", dir), content);
+        area.forklift(dir, &["load", "loaded.txt"]);
+        area.forklift(dir, &["redact", "record", &blob_hash(content), "-m", "a leak"]);
+        area.forklift(dir, &["unload", "loaded.txt"]);
+        std::fs::remove_file(area.path(&format!("{}/loaded.txt", dir))).expect("remove the loaded file");
+        heads.push(harvest(&area.path(dir)).head_of("@redactions").expect("a @redactions head"));
+    }
+
+    (heads, harvest(&area.path(dir)))
+}
+
+/// Plant `new` on meta pallet `name` past every check, as `plant` does a user pallet.
+fn plant_meta(refs: &MemoryRefStore, name: &str, expected: Option<&str>, new: &str) {
+    let fence = forklift_aws_lambda::format::gate(refs).expect("format gate");
+    let outcome = refs.compare_and_set_head(
+        pallet_utils::PalletNamespace::Meta, name, expected.map_or(ExpectedHead::Unborn, ExpectedHead::At), new,
+        OfficePrecondition::NotConsumed, RedactionsPrecondition::NotConsumed, None, &fence, &request_token(),
+    ).expect("plant");
+    assert_eq!(outcome, CasOutcome::Committed);
+}
+
+/// Assert `err` is the redacted-content refusal, naming `hash`.
+fn assert_content_redacted(err: &forklift_aws_lambda::error::HeadError, hash: &str) {
+    assert_eq!(err.status, Status::Unprocessable, "{}", err.message);
+    assert_eq!(refusal_code(&err.message), Some(RefusalCode::ContentRedacted), "{}", err.message);
+    assert!(err.message.contains(hash), "the refusal names the hash: {}", err.message);
+}
+
+/// A user head is judged whole, never pruned at `old_head`: a redacted file deep in a subtree the
+/// update leaves as `old_head` had it refuses the update; the head without it lifts.
+// Revert: drop the redaction check from `ref_update` → the edit commits → red.
+#[test]
+fn a_user_head_naming_redacted_content_deep_in_an_unchanged_subtree_is_refused() {
+    let area = Area::new("redacted-deep");
+    let (redactions, recorded) = recorded_redactions(&area, "red", &["leaked\n"]);
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &recorded);
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions[0]);
+
+    let deep = gate_dir(&head, "a", vec![gate_dir(&head, "b", vec![gate_file(&head, "secret.env", "leaked\n")])]);
+    let before = gate_parcel(&head, &[], vec![deep.clone(), gate_file(&head, "x", "1")]);
+    plant(&head.refs, "main", &before);
+
+    let edit = gate_parcel(&head, &[&before], vec![deep, gate_file(&head, "x", "2")]);
+    let request = RefUpdateRequest { old_head: Some(before.clone()), new_head: edit, tombstone: None };
+    let err = head.ref_update(&Principal::Static, "main", &request).expect_err("the edit still names the leak");
+    assert_content_redacted(&err, &blob_hash("leaked\n"));
+    assert_eq!(user_head(&head, "main"), Some(before.clone()));
+
+    let clean = gate_parcel(&head, &[&before], vec![gate_file(&head, "x", "2")]);
+    let request = RefUpdateRequest { old_head: Some(before), new_head: clean.clone(), tombstone: None };
+    head.ref_update(&Principal::Static, "main", &request).expect("the head without the leak lifts");
+    assert_eq!(user_head(&head, "main"), Some(clean));
+}
+
+/// A redaction carrying a chunk list makes the check read every chunked file's recipe, which the
+/// audit's mirror never holds: an unrelated chunked file's is read from the store, and it lifts.
+// Revert: walk the scratch alone (`LocalObjects`) → the unrelated file's recipe is missing → red.
+#[test]
+fn a_chunked_redaction_reads_each_pushed_recipe_from_the_store() {
+    let area = Area::new("redacted-chunked");
+    prepare(&area, "red");
+    area.write_large_file("red/big.bin", 0xBAD, CHUNK_THRESHOLD + 50_000);
+    area.forklift("red", &["load", "."]);
+    area.forklift("red", &["stack", "-m", "leak"]);
+    let leak = harvest(&area.path("red")).head_of("main").expect("main head");
+    area.forklift("red", &["remove", "big.bin"]);
+    area.forklift("red", &["stack", "-m", "take the leak out"]);
+    area.forklift("red", &["redact", "record", &format!("{}:big.bin", leak), "-m", "a leak"]);
+    let recorded = harvest(&area.path("red"));
+
+    prepare(&area, "wh");
+    area.write_large_file("wh/other.bin", 0x600D, CHUNK_THRESHOLD + 50_000);
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "-m", "other"]);
+    let other = harvest(&area.path("wh"));
+
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &recorded);
+    upload_all(&head, &other);
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &recorded.head_of("@redactions").expect("@redactions"));
+
+    let main = other.head_of("main").expect("main head");
+    let request = RefUpdateRequest { old_head: None, new_head: main.clone(), tombstone: None };
+    head.ref_update(&Principal::Static, "main", &request).expect("an unrelated chunked file lifts");
+    assert_eq!(user_head(&head, "main"), Some(main));
+}
+
+/// A meta parcel is judged by what it adds: the first `@tags` parcel adds the tags marker, so with
+/// the marker redacted it is refused, while a later parcel carrying the marker from a parent that
+/// already stands lifts.
+// Revert: drop the redaction check from `ref_update` → the first parcel commits → red.
+#[test]
+fn a_meta_parcel_adding_redacted_content_is_refused_and_one_carrying_it_is_not() {
+    let area = Area::new("redacted-meta");
+    prepare(&area, "wh");
+    area.write_file("wh/notes.txt", "notes\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "-m", "notes"]);
+    area.forklift("wh", &["tag", "create", "v1", "main"]);
+    let first = harvest(&area.path("wh")).head_of("@tags").expect("tags head");
+    area.forklift("wh", &["tag", "create", "v2", "main"]);
+    let tagged = harvest(&area.path("wh"));
+    let second = tagged.head_of("@tags").expect("tags head");
+
+    let marker = "forklift-meta 1 tags";
+    let (redactions, recorded) = recorded_redactions(&area, "red", &[marker]);
+    let meta_head = |head: &Head<MemoryObjectStore, MemoryRefStore>| {
+        head.refs.get_head(pallet_utils::PalletNamespace::Meta, "tags").unwrap().live().map(str::to_string)
+    };
+
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &tagged);
+    upload_all(&head, &recorded);
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions[0]);
+
+    let request = RefUpdateRequest { old_head: None, new_head: first.clone(), tombstone: None };
+    let err = head.ref_update(&Principal::Static, "@tags", &request).expect_err("the first parcel adds the marker");
+    assert_content_redacted(&err, &blob_hash(marker));
+    assert_eq!(meta_head(&head), None);
+
+    plant_meta(&head.refs, "tags", None, &first);
+    let request = RefUpdateRequest { old_head: Some(first), new_head: second.clone(), tombstone: None };
+    head.ref_update(&Principal::Static, "@tags", &request).expect("a parcel carrying the marker lifts");
+    assert_eq!(meta_head(&head), Some(second));
+}
+
+/// A write to `@redactions` itself is judged against the redactions it replaces and conditions on
+/// no `@redactions` item but its own: recording a second redaction lifts.
+// The memory store does not model DynamoDB's refusal of two actions on one item, so this pins
+// only that the write is judged and lifts; `dynamo.rs` drops the self-condition.
+#[test]
+fn a_redactions_write_lifts_over_the_head_it_replaces() {
+    let area = Area::new("redactions-write");
+    let (redactions, recorded) = recorded_redactions(&area, "red", &["one\n", "two\n"]);
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &recorded);
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions[0]);
+
+    let wire = format!("@{}", REDACTIONS_PALLET_NAME);
+    let request = RefUpdateRequest { old_head: Some(redactions[0].clone()), new_head: redactions[1].clone(), tombstone: None };
+    head.ref_update(&Principal::Static, &wire, &request).expect("a second redaction lifts");
+    let current = head.refs.get_head(pallet_utils::PalletNamespace::Meta, REDACTIONS_PALLET_NAME).unwrap();
+    assert_eq!(current.live(), Some(redactions[1].as_str()));
+}
+
+/// Wraps a shared [`MemoryRefStore`]; before each user-pallet commit while `moves` holds one,
+/// lifts `@redactions` to the next of `moves`, as a redaction recorded between `ref_update`'s
+/// check and its commit would. Forwards every other call.
+struct RedactionsMoveBeforeTheCommit {
+    inner: Arc<MemoryRefStore>,
+    moves: RefCell<Vec<String>>,
+}
+
+impl RefStore for RedactionsMoveBeforeTheCommit {
+    fn read_format(&self) -> Result<Option<String>, String> {
+        self.inner.read_format()
+    }
+
+    fn partition_has_items(&self) -> Result<bool, String> {
+        self.inner.partition_has_items()
+    }
+
+    fn get_head(&self, namespace: pallet_utils::PalletNamespace, name: &str) -> Result<RefHead, String> {
+        self.inner.get_head(namespace, name)
+    }
+
+    fn compare_and_set_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+        expected: ExpectedHead<'_>,
+        new: &str,
+        office_head: OfficePrecondition<'_>,
+        redactions: RedactionsPrecondition<'_>,
+        anchor: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
+        request_token: &str,
+    ) -> Result<CasOutcome, String> {
+        if namespace == pallet_utils::PalletNamespace::User && !self.moves.borrow().is_empty() {
+            let next = self.moves.borrow_mut().remove(0);
+            let current = self.inner.get_head(pallet_utils::PalletNamespace::Meta, REDACTIONS_PALLET_NAME)?;
+            plant_meta(&self.inner, REDACTIONS_PALLET_NAME, current.live(), &next);
+        }
+
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
+    }
+
+    fn delete_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+        old: &str,
+        office_head: OfficePrecondition<'_>,
+        anchor: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
+        request_token: &str,
+    ) -> Result<CasOutcome, String> {
+        self.inner.delete_head(namespace, name, old, office_head, anchor, format, request_token)
+    }
+
+    fn list_refs(&self) -> Result<RefListing, String> {
+        self.inner.list_refs()
+    }
+
+    fn default_pallet(&self) -> Result<String, String> {
+        self.inner.default_pallet()
+    }
+
+    fn get_trust(&self) -> Result<Option<(office_utils::TrustAnchor, String)>, String> {
+        self.inner.get_trust()
+    }
+
+    fn put_trust_if_absent(
+        &self,
+        anchor: &office_utils::TrustAnchor,
+        format: &forklift_aws_lambda::FormatFence,
+        request_token: &str,
+    ) -> Result<TrustOutcome, String> {
+        self.inner.put_trust_if_absent(anchor, format, request_token)
+    }
+
+    fn replace_trust(
+        &self,
+        anchor: &office_utils::TrustAnchor,
+        expected_anchor: &str,
+        office_head: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
+        request_token: &str,
+    ) -> Result<TrustWriteOutcome, String> {
+        self.inner.replace_trust(anchor, expected_anchor, office_head, format, request_token)
+    }
+}
+
+/// A redaction recorded between the check and the commit refuses the commit, and the check runs
+/// again against it: one naming the pushed content turns the update into the redacted refusal,
+/// and redactions that keep moving end in a retryable `409`, with nothing committed either way.
+// Revert: commit with `RedactionsPrecondition::NotConsumed` → the update commits over the new
+// redaction → red. Revert: retry whatever the deadline → the last arm spends every move → red.
+#[test]
+fn a_redaction_recorded_during_the_check_refuses_the_commit_and_is_judged() {
+    let area = Area::new("redacted-race");
+    // Four redactions that leave the pushed content alone, then the one naming it.
+    let (redactions, recorded) =
+        recorded_redactions(&area, "red", &["other\n", "more\n", "most\n", "last\n", "leaked\n"]);
+    let racing = |moves: &[&String]| {
+        let inner = Arc::new(MemoryRefStore::new());
+        plant_meta(&inner, REDACTIONS_PALLET_NAME, None, &redactions[0]);
+        let refs = RedactionsMoveBeforeTheCommit {
+            inner: inner.clone(),
+            moves: RefCell::new(moves.iter().map(|head| head.to_string()).collect()),
+        };
+        let head = Head::new(MemoryObjectStore::new(), refs);
+        upload_all(&head, &recorded);
+        let pushed = gate_parcel(&head, &[], vec![gate_file(&head, "secret.env", "leaked\n")]);
+
+        let request = RefUpdateRequest { old_head: None, new_head: pushed, tombstone: None };
+        let answer = head.ref_update(&Principal::Static, "main", &request);
+        assert_eq!(inner.get_head(pallet_utils::PalletNamespace::User, "main").unwrap(), RefHead::Absent);
+        answer
+    };
+
+    let err = racing(&[&redactions[4]]).expect_err("the leak was redacted before the commit");
+    assert_content_redacted(&err, &blob_hash("leaked\n"));
+
+    let err = racing(&[&redactions[1], &redactions[2], &redactions[3]]).expect_err("the redactions kept moving");
+    assert_eq!(err.status, Status::Conflict, "{}", err.message);
+
+    // With no time left in the invocation, the first move answers the `409` at once.
+    let inner = Arc::new(MemoryRefStore::new());
+    plant_meta(&inner, REDACTIONS_PALLET_NAME, None, &redactions[0]);
+    let refs = RedactionsMoveBeforeTheCommit {
+        inner: inner.clone(),
+        moves: RefCell::new(vec![redactions[1].clone(), redactions[2].clone()]),
+    };
+    let head = Head::new(MemoryObjectStore::new(), refs).with_deadline(std::time::SystemTime::now());
+    upload_all(&head, &recorded);
+    let pushed = gate_parcel(&head, &[], vec![gate_file(&head, "secret.env", "leaked\n")]);
+    let request = RefUpdateRequest { old_head: None, new_head: pushed, tombstone: None };
+    let err = head.ref_update(&Principal::Static, "main", &request).expect_err("no time for another check");
+    assert_eq!(err.status, Status::Conflict, "{}", err.message);
+    assert_eq!(head.refs.moves.borrow().len(), 1, "one attempt, not three");
 }
 
 /// Classify an object as a blob by trying to parse it as a parcel/tree under the source
@@ -994,6 +1298,7 @@ fn a_writer_promoting_themselves_is_forbidden_and_an_admin_promoting_them_is_not
             ExpectedHead::At(&office_head),
             &by_worker,
             OfficePrecondition::NotConsumed,
+            RedactionsPrecondition::NotConsumed,
             trust.as_ref().map(|(_, raw)| raw.as_str()),
             &forklift_aws_lambda::format::gate(&head.refs).expect("format gate"),
             &request_token(),
@@ -1078,6 +1383,7 @@ fn an_office_and_an_anchor_never_exist_apart() {
             ExpectedHead::Unborn,
             &office_head,
             OfficePrecondition::NotConsumed,
+            RedactionsPrecondition::NotConsumed,
             None,
             &forklift_aws_lambda::format::gate(&*refs).expect("format gate"),
             &request_token(),
@@ -2198,12 +2504,13 @@ impl RefStore for AsyncRefStore {
         expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
+        redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
         self.bridge.block_on(suspending(|| {
-            self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
+            self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
         }))
     }
 
@@ -2342,11 +2649,12 @@ impl RefStore for SharedMemoryRefs {
         expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
+        redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.0.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
+        self.0.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
     }
 
     fn delete_head(
@@ -2425,8 +2733,8 @@ impl RefStore for OfficeMovesAfterTheSnapshot {
             && !self.fired.replace(true)
         {
             if let Ok(current) = &result {
-                // This injected CAS is itself subject to the same three-way precondition —
-                // the anchor is checked unconditionally, regardless of which pallet is being
+                // This injected CAS is itself subject to the same preconditions — the anchor
+                // is checked unconditionally, regardless of which pallet is being
                 // updated — so it must supply the anchor's *current* bytes to commit
                 // uncontested. `office_head` is irrelevant here: the target *is* `@office`
                 // itself, so `checks_office_separately` is false and that parameter is never
@@ -2445,6 +2753,7 @@ impl RefStore for OfficeMovesAfterTheSnapshot {
                         current.live().map_or(ExpectedHead::Unborn, ExpectedHead::At),
                         &self.move_to,
                         OfficePrecondition::NotConsumed,
+                        RedactionsPrecondition::NotConsumed,
                         anchor_bytes.as_deref(),
                         &forklift_aws_lambda::format::gate(&*self.inner).expect("format gate"),
                         &request_token(),
@@ -2468,11 +2777,12 @@ impl RefStore for OfficeMovesAfterTheSnapshot {
         expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
+        redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
     }
 
     fn delete_head(
@@ -2553,11 +2863,12 @@ impl RefStore for AnchorMovesAfterTheSnapshot {
         expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
+        redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
     }
 
     fn delete_head(
@@ -2709,6 +3020,7 @@ impl RefStore for TransientOnCommit {
         expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
+        redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
@@ -2733,7 +3045,7 @@ impl RefStore for TransientOnCommit {
             return Ok(self.refusal.clone());
         }
 
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
     }
 
     fn delete_head(
@@ -3181,6 +3493,7 @@ fn an_untrusted_warehouses_concurrent_office_move_does_not_refuse_the_commit() {
             ExpectedHead::Unborn,
             &office_head,
             OfficePrecondition::NotConsumed,
+            RedactionsPrecondition::NotConsumed,
             None,
             &forklift_aws_lambda::format::gate(&*store).expect("format gate"),
             &request_token(),
@@ -3309,9 +3622,9 @@ fn a_concurrent_trust_anchor_change_refuses_the_commit_as_anchor_moved_not_palle
 }
 
 /// Falsifier 2 (over-tightened): a pallet the transaction never names moving concurrently must
-/// never refuse this commit — the precondition is scoped to exactly three inputs (the target
-/// pallet, the office pallet, the trust anchor), never to "nothing else in the warehouse
-/// moved" (FORK-95 design memo, "The movable inputs: exactly three").
+/// never refuse this commit — the precondition is scoped to exactly the inputs the checks read
+/// (the target pallet, the office pallet, `@redactions`, the trust anchor), never to "nothing
+/// else in the warehouse moved" (FORK-95 design memo, "The movable inputs").
 #[test]
 fn a_concurrently_moved_unrelated_pallet_does_not_refuse_the_commit() {
     let area = Area::new("unrelated-pallet-races");
@@ -3359,6 +3672,7 @@ fn a_concurrently_moved_unrelated_pallet_does_not_refuse_the_commit() {
                 ExpectedHead::Unborn,
                 &"a".repeat(64),
                 OfficePrecondition::At(&office_head),
+                RedactionsPrecondition::NotConsumed,
                 Some(&anchor_bytes),
                 &forklift_aws_lambda::format::gate(&head.refs).expect("format gate"),
                 &request_token(),
@@ -3420,6 +3734,7 @@ fn seeded_trust(office_head: &str) -> (Arc<MemoryRefStore>, TrustAnchorDto, Stri
                 ExpectedHead::Unborn,
                 office_head,
                 OfficePrecondition::NotConsumed,
+                RedactionsPrecondition::NotConsumed,
                 Some(&bytes),
                 &forklift_aws_lambda::format::gate(&*store).expect("format gate"),
                 &request_token(),
@@ -3603,6 +3918,7 @@ fn a_concurrently_moved_unrelated_pallet_does_not_refuse_the_re_genesis() {
                 ExpectedHead::Unborn,
                 &"e".repeat(64),
                 OfficePrecondition::NotConsumed,
+                RedactionsPrecondition::NotConsumed,
                 Some(&bytes),
                 &forklift_aws_lambda::format::gate(&*store).expect("format gate"),
                 &request_token(),
@@ -3681,11 +3997,12 @@ impl RefStore for TransientOnAnchorWrite {
         expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
+        redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
     }
 
     fn delete_head(
@@ -3790,11 +4107,12 @@ impl RefStore for AnchorMovedOnAnchorWrite {
         expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
+        redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
     }
 
     fn delete_head(
@@ -4371,11 +4689,12 @@ impl RefStore for RacesTheDelete {
         expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
+        redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, anchor, format, request_token)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
     }
 
     fn delete_head(
@@ -4476,6 +4795,7 @@ fn racing_lift(from: String, to: String) -> RacingWrite {
                 ExpectedHead::At(&from),
                 &to,
                 OfficePrecondition::NotConsumed,
+                RedactionsPrecondition::NotConsumed,
                 None,
                 &forklift_aws_lambda::format::gate(&*store).expect("format gate"),
                 &request_token(),
@@ -4686,6 +5006,7 @@ fn an_office_lift_in_the_bootstrap_window_refuses_a_delete_it_denies() {
                 ExpectedHead::Unborn,
                 &feature_head,
                 OfficePrecondition::NotConsumed,
+                RedactionsPrecondition::NotConsumed,
                 anchor.as_deref(),
                 &forklift_aws_lambda::format::gate(&*store).expect("format gate"),
                 &request_token(),

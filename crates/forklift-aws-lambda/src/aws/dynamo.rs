@@ -94,13 +94,14 @@ use aws_sdk_dynamodb::types::{
 use forklift_core::model::remote::TrustAnchorDto;
 use forklift_core::util::office_utils::{TrustAnchor, OFFICE_PALLET_NAME};
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef};
+use forklift_core::util::redaction_utils::REDACTIONS_PALLET_NAME;
 
 use crate::aws::dynamo_ops::DynamoOps;
 use crate::aws::sdk::describe;
 use crate::blocking::AsyncBridge;
 use crate::reissue::request_token;
 use crate::store::{
-    CasOutcome, ExpectedHead, FormatFence, FormatStore, OfficePrecondition, RefHead, RefListing,
+    CasOutcome, ExpectedHead, FormatFence, FormatStore, OfficePrecondition, RedactionsPrecondition, RefHead, RefListing,
     RefStore, TransientCause, TrustOutcome, TrustWriteOutcome, TRANSACTION_ATTEMPT_TIMEOUT,
 };
 
@@ -322,34 +323,34 @@ impl DynamoRefStore {
             .build()
     }
 
-    /// The `ConditionCheck` on the office pallet's item: its head must still equal
-    /// `office_head` exactly, `None` meaning "the office pallet must be unborn". Built only when
-    /// the caller actually consumed the office — see [`Self::commit`], which skips this action
-    /// both when the target *is* `@office` itself (the `Update` above already pins that exact
-    /// item; AWS refuses two actions on one item in the same transaction) and when the caller's
-    /// [`OfficePrecondition`] is `NotConsumed`, meaning it never read one.
+    /// The `ConditionCheck` on a meta pallet's item, the office's or `@redactions`': its head must
+    /// still equal `head` exactly, `None` meaning "the pallet must be unborn". Built only when the
+    /// caller actually consumed that head — see [`Self::commit`], which skips this action both
+    /// when the target *is* that pallet itself (the `Update` above already pins that exact item;
+    /// AWS refuses two actions on one item in the same transaction) and when the caller's
+    /// precondition is `NotConsumed`, meaning it never read one.
     ///
-    /// The `None` arm is reached from two callers, each of which genuinely consumed "the office
-    /// is unborn". `replace_trust`: `put_trust` reads the office head unconditionally to run its
-    /// `adopts` check, so an anchor adopting nothing is one whose validation depended on the
-    /// office still being unborn. A pallet delete, through `OfficePrecondition::Unborn`, on every
-    /// warehouse whose office is unborn: in the trust-bootstrap window its authority check admits
-    /// the caller because no office head exists yet, so an office lift landing before the commit
-    /// must refuse it. A ref update never
-    /// reaches it — an audit that found the office pallet missing refuses before the commit
-    /// (`head.rs::ref_update`) — and the distinction lives in the callers' parameter types, not
-    /// in this method, which only builds what it is told.
-    fn office_condition_check(
+    /// For the office, the `None` arm is reached from two callers, each of which genuinely
+    /// consumed "the office is unborn". `replace_trust`: `put_trust` reads the office head
+    /// unconditionally to run its `adopts` check, so an anchor adopting nothing is one whose
+    /// validation depended on the office still being unborn. A pallet delete, through
+    /// `OfficePrecondition::Unborn`, on every warehouse whose office is unborn: in the
+    /// trust-bootstrap window its authority check admits the caller because no office head exists
+    /// yet, so an office lift landing before the commit must refuse it. A ref update reaches it for
+    /// `@redactions` alone, whenever its redaction check found no redaction recorded: one recorded
+    /// before the commit must refuse it. The distinction lives in the callers' parameter types,
+    /// not in this method, which only builds what it is told.
+    fn head_condition_check(
         &self,
-        office_entity: &str,
-        office_head: Option<&str>,
+        entity: &str,
+        head: Option<&str>,
     ) -> TransactWriteItem {
         let mut builder = ConditionCheck::builder()
-            .set_key(Some(self.key(office_entity)))
+            .set_key(Some(self.key(entity)))
             .table_name(&self.table)
             .return_values_on_condition_check_failure(ReturnValuesOnConditionCheckFailure::AllOld);
 
-        builder = match office_head {
+        builder = match head {
             Some(head) => builder
                 .condition_expression("#h = :h")
                 .expression_attribute_names("#h", ATTR_HEAD)
@@ -435,6 +436,8 @@ enum Precondition {
     PalletHead,
     /// The office pallet's head, as the caller's audit or validation consumed it.
     OfficeHead,
+    /// The `@redactions` head, as the caller's redaction check read it.
+    RedactionsHead,
     /// The trust anchor's stored bytes, as [`RefStore::get_trust`] returned them.
     Anchor,
 }
@@ -648,6 +651,7 @@ impl DynamoRefStore {
         entity: &str,
         write: PalletWrite<'_>,
         office_head: OfficePrecondition<'_>,
+        redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
         format: &FormatFence,
         label: &str,
@@ -674,6 +678,20 @@ impl DynamoRefStore {
             }
         };
 
+        // The `@redactions` check is built by the same two rules: a write of `@redactions` itself
+        // already conditions on its own item, and a check that read no `@redactions` head leaves
+        // nothing to condition on.
+        let redactions_entity = pallet_entity(PalletNamespace::Meta, REDACTIONS_PALLET_NAME);
+        let redactions_condition = if entity == redactions_entity {
+            None
+        } else {
+            match redactions {
+                RedactionsPrecondition::NotConsumed => None,
+                RedactionsPrecondition::Unborn => Some(None),
+                RedactionsPrecondition::At(head) => Some(Some(head)),
+            }
+        };
+
         // Each action is pushed with the precondition it conditions on, so the layout `classify`
         // later reads is built here rather than restated there — see `ConditionedTransaction`.
         let mut transaction = ConditionedTransaction::new();
@@ -683,8 +701,15 @@ impl DynamoRefStore {
 
         if let Some(office_head) = office_condition {
             transaction.push(
-                self.office_condition_check(&office_entity, office_head),
+                self.head_condition_check(&office_entity, office_head),
                 Precondition::OfficeHead,
+            );
+        }
+
+        if let Some(redactions_head) = redactions_condition {
+            transaction.push(
+                self.head_condition_check(&redactions_entity, redactions_head),
+                Precondition::RedactionsHead,
             );
         }
 
@@ -701,6 +726,7 @@ impl DynamoRefStore {
             Some(Refusal::Moved(Precondition::OfficeHead, item)) => {
                 CasOutcome::OfficeMoved { current: item.as_ref().and_then(head_of) }
             }
+            Some(Refusal::Moved(Precondition::RedactionsHead, _)) => CasOutcome::RedactionsMoved,
             Some(Refusal::Moved(Precondition::Anchor, _)) => CasOutcome::AnchorMoved,
             Some(Refusal::Moved(Precondition::Format, _)) => CasOutcome::FormatMoved,
         })
@@ -752,6 +778,7 @@ impl RefStore for DynamoRefStore {
         expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
+        redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
         format: &FormatFence,
         request_token: &str,
@@ -763,6 +790,7 @@ impl RefStore for DynamoRefStore {
             &entity,
             write,
             office_head,
+            redactions,
             anchor,
             format,
             "DynamoDB ref-update commit",
@@ -784,10 +812,12 @@ impl RefStore for DynamoRefStore {
         let entity = pallet_entity(namespace, name);
         let write = PalletWrite::Delete { old };
 
+        // A delete adds no content, so it checks nothing against the redactions.
         self.bridge.block_on(self.commit(
             &entity,
             write,
             office_head,
+            RedactionsPrecondition::NotConsumed,
             anchor,
             format,
             "DynamoDB pallet delete",
@@ -952,7 +982,7 @@ impl RefStore for DynamoRefStore {
             transaction.push(self.format_action(format), Precondition::Format);
             transaction.push(self.trust_put(&json, expected_anchor), Precondition::Anchor);
             transaction.push(
-                self.office_condition_check(&office_entity, office_head),
+                self.head_condition_check(&office_entity, office_head),
                 Precondition::OfficeHead,
             );
 
@@ -995,6 +1025,11 @@ impl RefStore for DynamoRefStore {
                 // name one: the layout it reads is the one pushed above.
                 Some(Refusal::Moved(Precondition::PalletHead, _)) => {
                     return Err("DynamoDB anchor write was refused on a pallet-head \
+                        precondition it never built."
+                        .to_string())
+                }
+                Some(Refusal::Moved(Precondition::RedactionsHead, _)) => {
+                    return Err("DynamoDB anchor write was refused on a @redactions \
                         precondition it never built."
                         .to_string())
                 }

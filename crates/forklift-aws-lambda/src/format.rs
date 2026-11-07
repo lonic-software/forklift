@@ -479,7 +479,7 @@ fn lost_the_mark(warehouse: &str) -> String {
 mod tests {
     use super::*;
     use crate::memory::MemoryRefStore;
-    use crate::store::{CasOutcome, ExpectedHead, OfficePrecondition, RefHead};
+    use crate::store::{CasOutcome, ExpectedHead, OfficePrecondition, RedactionsPrecondition, RefHead};
     use forklift_core::util::pallet_utils::PalletNamespace;
     use std::sync::Mutex;
 
@@ -491,7 +491,7 @@ mod tests {
     }
 
     fn lift(refs: &dyn RefStore, fence: &FormatFence, expected: ExpectedHead, new: &str) -> CasOutcome {
-        refs.compare_and_set_head(PalletNamespace::User, "main", expected, new, OfficePrecondition::NotConsumed, None, fence, "t")
+        refs.compare_and_set_head(PalletNamespace::User, "main", expected, new, OfficePrecondition::NotConsumed, RedactionsPrecondition::NotConsumed, None, fence, "t")
             .expect("the fake does not fail")
     }
 

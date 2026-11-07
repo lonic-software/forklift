@@ -435,7 +435,7 @@ fn holders_among(redaction: &Redaction, heads: Vec<(String, String)>, what: &str
 
         let mut skipped = HashSet::new();
         let named = object_utils::load_parcel(&head)
-            .and_then(|parcel| tree_names(&parcel.tree_hash, &set, partial.then_some(&mut skipped)));
+            .and_then(|parcel| tree_names(&parcel.tree_hash, &set, &LocalObjects, partial.then_some(&mut skipped)));
 
         match named {
             Ok(Some((path, hash))) => holders.push(HeadHolder { pallet, head, path, hash }),
@@ -542,6 +542,41 @@ pub fn read_redactions() -> Result<RedactionsRead, String> {
     Ok(read)
 }
 
+/// Where a redaction walk reads the objects it judges: trees, parcels and recipes. A warehouse
+/// reads its own store ([`LocalObjects`]); a head that audits a write inside a partial mirror
+/// reads the mirror first and its object store for what the mirror lacks.
+pub trait WalkObjects {
+    /// The tree `hash`.
+    fn load_tree(&self, hash: &str) -> Result<std::sync::Arc<crate::model::tree_item::TreeItem>, String>;
+
+    /// The parcel `hash`.
+    fn load_parcel(&self, hash: &str) -> Result<crate::model::parcel::Parcel, String>;
+
+    /// The chunk hashes, in order, of the recipe `hash`.
+    fn recipe_chunks(&self, hash: &str) -> Result<Vec<String>, String>;
+
+    /// A hint that the walk is about to read each of the recipes `hashes`, so a store whose reads
+    /// are remote can fetch them in one round. What it cannot fetch the read reports.
+    fn prefetch(&self, _hashes: &[String]) {}
+}
+
+/// The warehouse's own store, read through `object_utils`.
+pub struct LocalObjects;
+
+impl WalkObjects for LocalObjects {
+    fn load_tree(&self, hash: &str) -> Result<std::sync::Arc<crate::model::tree_item::TreeItem>, String> {
+        object_utils::load_tree_shared(hash)
+    }
+
+    fn load_parcel(&self, hash: &str) -> Result<crate::model::parcel::Parcel, String> {
+        object_utils::load_parcel(hash)
+    }
+
+    fn recipe_chunks(&self, hash: &str) -> Result<Vec<String>, String> {
+        object_utils::recipe_chunk_hashes(hash)
+    }
+}
+
 /// What the redactions at one `@redactions` head forbid a new head to name: every redacted hash,
 /// readable or not (a cell this build cannot read still names its hash, and still refuses it),
 /// and the chunk-list digest of every redacted recipe, with the redacted recipes whose list it is.
@@ -605,12 +640,12 @@ impl RedactedSet {
     /// Whether this set names `hash`, a file a walk found redacted: the hash itself, or a recipe
     /// whose chunk list is one this set holds. Only ever asked of a file the walk could read, so a
     /// recipe that cannot be read is not one this set names.
-    fn names_hash(&self, hash: &str) -> bool {
+    fn names_hash(&self, hash: &str, objects: &dyn WalkObjects) -> bool {
         if self.hashes.contains(hash) {
             return true;
         }
 
-        !self.chunk_lists.is_empty() && object_utils::recipe_chunk_hashes(hash)
+        !self.chunk_lists.is_empty() && objects.recipe_chunks(hash)
             .is_ok_and(|chunks| self.chunk_lists.contains_key(&chunk_list_digest(&chunks)))
     }
 
@@ -620,14 +655,16 @@ impl RedactedSet {
     /// as skipped.
     fn named_by(&self,
                 entry: &crate::model::tree_item::TreeItem,
+                objects: &dyn WalkObjects,
                 partial: Option<&mut HashSet<String>>) -> Result<Option<String>, String> {
-        self.names_file(&entry.hash, entry.item_type, partial)
+        self.names_file(&entry.hash, entry.item_type, objects, partial)
     }
 
     /// [`RedactedSet::named_by`] for a file of content `hash` stored as `item_type`.
     fn names_file(&self,
                   hash: &str,
                   item_type: DirEntryType,
+                  objects: &dyn WalkObjects,
                   partial: Option<&mut HashSet<String>>) -> Result<Option<String>, String> {
         if self.hashes.contains(hash) {
             return Ok(Some(hash.to_string()));
@@ -637,7 +674,7 @@ impl RedactedSet {
             return Ok(None);
         }
 
-        let chunks = match object_utils::recipe_chunk_hashes(hash) {
+        let chunks = match objects.recipe_chunks(hash) {
             Ok(chunks) => chunks,
             Err(error) => match partial {
                 Some(skipped) if !file_utils::does_object_exist(hash)? => {
@@ -658,38 +695,59 @@ type Named = (String, String);
 /// The first file under `tree` that names content in `set`, walking every subtree once. `partial`
 /// (a sparse or cache warehouse) skips a subtree or recipe the store does not hold: its bytes are
 /// not here, so this warehouse cannot hand them on. A head that receives the parcel judges it
-/// against its own redactions, if it checks at all (the AWS head does not yet), so a redaction
-/// recorded only here does not follow a skipped subtree. Each skipped object is recorded in
+/// against its own redactions, so a redaction recorded only here does not follow a skipped
+/// subtree. Each skipped object is recorded in
 /// `partial`, so the write's hold can see one stored meanwhile. In a full warehouse a missing
 /// object is an error, never a pass.
-fn tree_names(tree: &str, set: &RedactedSet, mut partial: Option<&mut HashSet<String>>) -> Result<Option<Named>, String> {
+fn tree_names(tree: &str,
+              set: &RedactedSet,
+              objects: &dyn WalkObjects,
+              mut partial: Option<&mut HashSet<String>>) -> Result<Option<Named>, String> {
     let mut seen: HashSet<String> = HashSet::new();
-    let mut pending = vec![(String::new(), tree.to_string())];
+    let mut level = vec![(String::new(), tree.to_string())];
 
-    while let Some((prefix, hash)) = pending.pop() {
-        if !seen.insert(hash.clone()) {
-            continue;
-        }
+    // Level by level, so the recipes a level's chunked files name while a recipe is redacted are
+    // hinted to `objects` together.
+    while !level.is_empty() {
+        level.retain(|(_, hash)| seen.insert(hash.clone()));
 
-        let loaded = match object_utils::load_tree_shared(&hash) {
-            Ok(loaded) => loaded,
-            Err(error) => match partial.as_deref_mut() {
-                Some(skipped) if !file_utils::does_object_exist(&hash)? => {
-                    skipped.insert(hash);
-                    continue;
-                }
-                _ => return Err(error),
-            },
-        };
+        let mut loaded_level = Vec::with_capacity(level.len());
 
-        for (name, file) in loaded.get_files() {
-            if let Some(redacted) = set.named_by(file, partial.as_deref_mut())? {
-                return Ok(Some((format!("{}{}", prefix, name), redacted)));
+        for (prefix, hash) in level {
+            match objects.load_tree(&hash) {
+                Ok(loaded) => loaded_level.push((prefix, loaded)),
+                Err(error) => match partial.as_deref_mut() {
+                    Some(skipped) if !file_utils::does_object_exist(&hash)? => {
+                        skipped.insert(hash);
+                    }
+                    _ => return Err(error),
+                },
             }
         }
 
-        pending.extend(loaded.get_subtrees()
-            .map(|(name, subtree)| (format!("{}{}/", prefix, name), subtree.hash.clone())));
+        if !set.chunk_lists.is_empty() {
+            let recipes: Vec<String> = loaded_level.iter()
+                .flat_map(|(_, loaded)| loaded.get_files())
+                .filter(|(_, file)| file.item_type.is_chunked() && !set.hashes.contains(&file.hash))
+                .map(|(_, file)| file.hash.clone())
+                .collect();
+            objects.prefetch(&recipes);
+        }
+
+        let mut next = Vec::new();
+
+        for (prefix, loaded) in &loaded_level {
+            for (name, file) in loaded.get_files() {
+                if let Some(redacted) = set.named_by(file, objects, partial.as_deref_mut())? {
+                    return Ok(Some((format!("{}{}", prefix, name), redacted)));
+                }
+            }
+
+            next.extend(loaded.get_subtrees()
+                .map(|(name, subtree)| (format!("{}{}/", prefix, name), subtree.hash.clone())));
+        }
+
+        level = next;
     }
 
     Ok(None)
@@ -732,7 +790,7 @@ impl StagingGuard {
     pub fn names_file(&self, hash: &str, item_type: DirEntryType) -> Result<Option<String>, String> {
         let mut skipped = HashSet::new();
 
-        self.set.names_file(hash, item_type, self.partial.then_some(&mut skipped))
+        self.set.names_file(hash, item_type, &LocalObjects, self.partial.then_some(&mut skipped))
     }
 
     /// The first file under `tree` naming redacted content, as its path from the tree's root and
@@ -740,7 +798,7 @@ impl StagingGuard {
     pub fn names_tree(&self, tree: &str) -> Result<Option<(String, String)>, String> {
         let mut skipped = HashSet::new();
 
-        tree_names(tree, &self.set, self.partial.then_some(&mut skipped))
+        tree_names(tree, &self.set, &LocalObjects, self.partial.then_some(&mut skipped))
     }
 }
 
@@ -775,7 +833,7 @@ pub fn refuse_redacted_writes(ops: &[crate::util::shift_utils::FileOp],
         };
 
         if let Some(hash) = guard.names_file(hash, *item_type)? {
-            let next_step = match applied.names_hash(&hash) {
+            let next_step = match applied.names_hash(&hash, &LocalObjects) {
                 true => fresh_clone_next_step(),
                 false => next_step(path),
             };
@@ -1002,20 +1060,47 @@ pub fn check_head_write(namespace: pallet_utils::PalletNamespace,
                         served: Option<Served>) -> HeadWriteCheck {
     let redactions = pallet_utils::get_meta_pallet_head(REDACTIONS_PALLET_NAME);
     let outcome = match &redactions {
-        Ok(redactions) => check_head_write_at(namespace, name, expected, new, served, redactions.clone()),
+        Ok(redactions) => check_head_write_at(namespace, name, expected, new, served, redactions.clone(), &LocalObjects,
+                                              crate::util::scope_utils::content_may_be_absent),
         Err(error) => Err(error.clone().into()),
     };
 
     HeadWriteCheck { redactions: redactions.ok(), outcome }
 }
 
-/// [`check_head_write`]'s decision against the redactions at `redactions`.
+/// Check a ref write of `new` over `expected` that a head received, against the redactions at
+/// `redactions`, the `@redactions` head the receiving head read: [`check_head_write`]'s rules for
+/// a write with no `served` exemption, in a store that holds every object the write's history
+/// names. The walk reads the new head's trees, parcels and recipes through `objects`; the
+/// redactions' own state is read from the local store, so the caller has it there.
+///
+/// # Returns
+/// * `Ok(())`                          - Nothing the write adds names redacted content.
+/// * `Err(RefUpdateError::Redacted)`   - It does.
+/// * `Err(RefUpdateError::Failed)`     - `@redactions` or an object the check needs could not be
+///                                       read.
+pub fn check_received_head_write(namespace: pallet_utils::PalletNamespace,
+                                 name: &str,
+                                 expected: Option<&str>,
+                                 new: &str,
+                                 redactions: Option<&str>,
+                                 objects: &dyn WalkObjects) -> Result<(), pallet_utils::RefUpdateError> {
+    check_head_write_at(namespace, name, expected, new, None, redactions.map(str::to_string), objects, || Ok(false))
+        .map(|_| ())
+}
+
+/// [`check_head_write`]'s decision against the redactions at `redactions`, walking `objects`.
+/// `partial` says whether to tolerate a subtree or recipe the local store lacks, as a sparse or
+/// cache warehouse does; it is read only for a user pallet's walk, when there is one.
+#[allow(clippy::too_many_arguments)]
 fn check_head_write_at(namespace: pallet_utils::PalletNamespace,
                        name: &str,
                        expected: Option<&str>,
                        new: &str,
                        served: Option<Served>,
-                       redactions: Option<String>) -> Result<RedactionCheck, pallet_utils::RefUpdateError> {
+                       redactions: Option<String>,
+                       objects: &dyn WalkObjects,
+                       partial: impl FnOnce() -> Result<bool, String>) -> Result<RedactionCheck, pallet_utils::RefUpdateError> {
     let mut check = RedactionCheck {
         namespace,
         name: name.to_string(),
@@ -1058,14 +1143,14 @@ fn check_head_write_at(namespace: pallet_utils::PalletNamespace,
     // file came from what the remote served, which the exemption would have passed otherwise.
     let (named, applied) = match namespace {
         pallet_utils::PalletNamespace::User => {
-            let partial = crate::util::scope_utils::content_may_be_absent()?;
-            let tree = object_utils::load_parcel(new)?.tree_hash;
-            let named = tree_names(&tree, &set, partial.then_some(&mut check.skipped))?;
-            let applied = named.as_ref().is_some_and(|(_, hash)| withheld.names_hash(hash));
+            let tree = objects.load_parcel(new)?.tree_hash;
+            let partial = partial()?;
+            let named = tree_names(&tree, &set, objects, partial.then_some(&mut check.skipped))?;
+            let applied = named.as_ref().is_some_and(|(_, hash)| withheld.names_hash(hash, objects));
 
             (named, applied)
         }
-        pallet_utils::PalletNamespace::Meta => match meta_parcels_add(expected, served.map(|served| served.head), new, &set, &applied)? {
+        pallet_utils::PalletNamespace::Meta => match meta_parcels_add(expected, served.map(|served| served.head), new, &set, &applied, objects)? {
             Some(added) => (Some(added.named), added.served),
             None => (None, false),
         },
@@ -1169,7 +1254,8 @@ fn meta_parcels_add(expected: Option<&str>,
                     served: Option<&str>,
                     new: &str,
                     set: &RedactedSet,
-                    applied: &RedactedSet) -> Result<Option<Added>, String> {
+                    applied: &RedactedSet,
+                    objects: &dyn WalkObjects) -> Result<Option<Added>, String> {
     // The parcels `from` reaches that `stop` does not.
     let ancestry = |from: Option<&str>, stop: &HashSet<String>| -> Result<HashSet<String>, String> {
         let mut reached: HashSet<String> = HashSet::new();
@@ -1177,7 +1263,7 @@ fn meta_parcels_add(expected: Option<&str>,
 
         while let Some(parcel) = pending.pop() {
             if !stop.contains(&parcel) && reached.insert(parcel.clone()) {
-                pending.extend(object_utils::load_parcel(&parcel)?.parents);
+                pending.extend(objects.load_parcel(&parcel)?.parents);
             }
         }
 
@@ -1206,14 +1292,14 @@ fn meta_parcels_add(expected: Option<&str>,
             false => set,
         };
 
-        let parcel = object_utils::load_parcel(&hash)?;
+        let parcel = objects.load_parcel(&hash)?;
         let mut inherited: HashSet<String> = HashSet::new();
 
         for parent in &parcel.parents {
-            inherited.extend(tree_objects(&object_utils::load_parcel(parent)?.tree_hash)?);
+            inherited.extend(tree_objects(&objects.load_parcel(parent)?.tree_hash, objects)?);
         }
 
-        if let Some(named) = tree_adds(&parcel.tree_hash, &inherited, judged)? {
+        if let Some(named) = tree_adds(&parcel.tree_hash, &inherited, judged, objects)? {
             return Ok(Some(Added { named, served: chain.contains(&hash) }));
         }
 
@@ -1224,26 +1310,29 @@ fn meta_parcels_add(expected: Option<&str>,
 }
 
 /// Every object a meta parcel's tree holds: its subtrees and files, at any depth.
-fn tree_objects(tree: &str) -> Result<HashSet<String>, String> {
-    let mut objects: HashSet<String> = HashSet::new();
+fn tree_objects(tree: &str, objects: &dyn WalkObjects) -> Result<HashSet<String>, String> {
+    let mut held: HashSet<String> = HashSet::new();
     let mut pending = vec![tree.to_string()];
 
     while let Some(hash) = pending.pop() {
-        if !objects.insert(hash.clone()) {
+        if !held.insert(hash.clone()) {
             continue;
         }
 
-        let loaded = object_utils::load_tree_shared(&hash)?;
-        objects.extend(loaded.get_files().map(|(_, file)| file.hash.clone()));
+        let loaded = objects.load_tree(&hash)?;
+        held.extend(loaded.get_files().map(|(_, file)| file.hash.clone()));
         pending.extend(loaded.get_subtrees().map(|(_, subtree)| subtree.hash.clone()));
     }
 
-    Ok(objects)
+    Ok(held)
 }
 
 /// The first file under meta tree `tree` naming a redacted object that `inherited` (everything
 /// its parents' trees hold) does not. A subtree its parents hold is skipped whole.
-fn tree_adds(tree: &str, inherited: &HashSet<String>, set: &RedactedSet) -> Result<Option<Named>, String> {
+fn tree_adds(tree: &str,
+             inherited: &HashSet<String>,
+             set: &RedactedSet,
+             objects: &dyn WalkObjects) -> Result<Option<Named>, String> {
     let mut pending = vec![(String::new(), tree.to_string())];
 
     while let Some((prefix, hash)) = pending.pop() {
@@ -1251,14 +1340,14 @@ fn tree_adds(tree: &str, inherited: &HashSet<String>, set: &RedactedSet) -> Resu
             continue;
         }
 
-        let loaded = object_utils::load_tree_shared(&hash)?;
+        let loaded = objects.load_tree(&hash)?;
 
         for (name, file) in loaded.get_files() {
             if inherited.contains(&file.hash) {
                 continue;
             }
 
-            if let Some(redacted) = set.named_by(file, None)? {
+            if let Some(redacted) = set.named_by(file, objects, None)? {
                 return Ok(Some((format!("{}{}", prefix, name), redacted)));
             }
         }
@@ -1307,7 +1396,7 @@ mod tests {
         assert!(!set(&[], &[('x', &['a'])]).is_empty());
 
         let applied_part = set(&['a', 'b'], &[('x', &['a', 'b'])]).filtered(|hash| hash == applied);
-        assert!(applied_part.names_hash(&applied) && !applied_part.names_hash(&"b".repeat(64)));
+        assert!(applied_part.names_hash(&applied, &LocalObjects) && !applied_part.names_hash(&"b".repeat(64), &LocalObjects));
     }
 
     // Revert: skip the applied re-read in `holds` → a check that exempted a hash applied since

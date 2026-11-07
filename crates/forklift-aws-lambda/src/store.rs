@@ -156,6 +156,29 @@ pub enum OfficePrecondition<'a> {
     At(&'a str),
 }
 
+/// The `@redactions` head a ref update's redaction check read, as the commit conditions on it.
+///
+/// A head checked against one set of redactions must not commit once another has landed, so the
+/// commit conditions on the `@redactions` head being what the check read: a redaction recorded in
+/// between refuses it with [`CasOutcome::RedactionsMoved`], and the head checks again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedactionsPrecondition<'a> {
+    /// The write checked nothing against the redactions, or is a write of `@redactions` itself,
+    /// whose own expected head already pins the item. No condition is built.
+    NotConsumed,
+    /// The check found `@redactions` unborn; the commit conditions on it still being unborn.
+    Unborn,
+    /// The check read this `@redactions` head; the commit conditions on it unchanged.
+    At(&'a str),
+}
+
+impl<'a> RedactionsPrecondition<'a> {
+    /// The precondition for a check that read `head`, `None` meaning unborn.
+    pub fn read(head: Option<&'a str>) -> RedactionsPrecondition<'a> {
+        head.map_or(RedactionsPrecondition::Unborn, RedactionsPrecondition::At)
+    }
+}
+
 /// What a pallet's ref holds: a live head, a tombstone, or nothing at all.
 ///
 /// A delete keeps the pallet's entry and turns it into a tombstone carrying the head it held
@@ -216,9 +239,9 @@ pub enum FormatFence {
     Stamp(String),
 }
 
-/// The outcome of a commit that conditions on every movable input a ref-update audit
-/// consumed — the pallet's own head, the office head, and the trust anchor (FORK-95 design
-/// memo, "The movable inputs: exactly three" / claim C6). A caller needs to know *which*
+/// The outcome of a commit that conditions on every movable input a ref update's checks
+/// consumed — the pallet's own head, the office head, the `@redactions` head, and the trust
+/// anchor (FORK-95 design memo, "The movable inputs" / claim C6). A caller needs to know *which*
 /// precondition failed, not just that one did: a moved office head means the pallet itself
 /// never budged but something it was audited against did, and the client-facing refusal
 /// differs accordingly.
@@ -233,18 +256,21 @@ pub enum CasOutcome {
     /// The office head the audit consumed has since moved (or the office pallet was born or
     /// retired underneath it). Carries the office pallet's actual current head.
     OfficeMoved { current: Option<String> },
+    /// The `@redactions` head the redaction check read has since moved: a redaction was recorded
+    /// between the check and the commit. The caller checks the head again against the new one.
+    RedactionsMoved,
     /// The trust anchor the audit consumed has since moved: established, replaced by a
     /// re-genesis, or (unreachable today, since nothing deletes it) removed. Nothing at this
     /// call site needs the anchor's new bytes — the caller re-reads and re-decides — so
-    /// unlike its two siblings this variant carries no payload.
+    /// unlike `Conflict` and `OfficeMoved` this variant carries no payload.
     AnchorMoved,
     /// The format item no longer holds what the [`FormatFence`] expected: an upgrade marked it,
     /// or a concurrent first write stamped it. The caller reads it again.
     FormatMoved,
-    /// The commit was refused for a reason that establishes nothing about whether any of the
-    /// three inputs actually moved — on DynamoDB, `TransactionConflict` (another transaction
+    /// The commit was refused for a reason that establishes nothing about whether any of its
+    /// inputs actually moved — on DynamoDB, `TransactionConflict` (another transaction
     /// concurrently touching one of this commit's items, the shared office item principally).
-    /// A retry may succeed with nothing having changed, unlike the three variants above, each
+    /// A retry may succeed with nothing having changed, unlike the variants above, each
     /// of which asserts a specific value differs from what was consumed. The head re-issues the
     /// identical transaction under the same request token, within one bounded budget per
     /// request, and answers `503` only once that budget is spent (FORK-95 design memo, claim
@@ -518,7 +544,11 @@ pub trait RefStore {
     /// * `format` — the [`FormatFence`] the request's gate built. A format item that moved
     ///   commits nothing and is reported as [`CasOutcome::FormatMoved`].
     ///
-    /// A mismatch on any of the three commits nothing and reports *which* input moved via
+    /// * `redactions` — see [`RedactionsPrecondition`]: the `@redactions` head the new head was
+    ///   checked against. Ignored when `namespace`/`name` name `@redactions` itself, as
+    ///   `office_head` is for the office. A moved one is [`CasOutcome::RedactionsMoved`].
+    ///
+    /// A mismatch on any of them commits nothing and reports *which* input moved via
     /// [`CasOutcome`] — the caller cannot tell a moved pallet head from a moved office head
     /// or a moved anchor without that distinction, and the client-facing refusal differs
     /// per case.
@@ -535,6 +565,7 @@ pub trait RefStore {
         expected: ExpectedHead<'_>,
         new: &str,
         office_head: OfficePrecondition<'_>,
+        redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
         format: &FormatFence,
         request_token: &str,
