@@ -1171,6 +1171,8 @@ fn a_cache_that_applied_a_redaction_never_fetches_it_nor_asks_a_new_origin_for_i
     let server = Server::start(&first_root);
 
     let owner = Warehouse::cloned("applied-cache-owner", &server.url);
+    // A draft the cache never fetches, so the move leans on the new server for something.
+    owner.stack("notes.txt", b"draft\n", "draft");
     owner.stack("notes.txt", b"notes\n", "notes");
     let leak = owner.leaked("secret.env", b"TOKEN=hunter2\n");
     let _ = std::fs::remove_file(owner.root.join("secret.env"));
@@ -1240,4 +1242,5 @@ fn a_cache_that_applied_a_redaction_never_fetches_it_nor_asks_a_new_origin_for_i
     let moved = cached.json(&["remote", "move", &server.url]);
     assert_eq!(moved["ok"], true, "{}", moved);
     assert_eq!(moved["data"]["origin"], server.url.as_str(), "{}", moved);
+    assert!(moved["data"]["absent_objects"].as_u64().unwrap() > 0, "the move checked the new server: {}", moved);
 }
