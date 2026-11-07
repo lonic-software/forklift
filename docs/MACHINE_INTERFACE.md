@@ -89,7 +89,9 @@ exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a deat
 (exit 49) is also returned by `clone`, `lower` and `lift` when the remote refuses content whose
 redaction it has applied, with the remote's words in `message` and no `details`. `lift` no longer
 uploads content the remote reports applied, and taking a head the remote serves is allowed over a
-redaction only while the remote reports that redaction pending.
+redaction only while the remote reports that redaction pending. A `held` status also carries
+`tombstones`, the deleted pallets whose tombstone keeps a head naming the content, each with its
+`pallet`, `head` and `path`: a served root keeps such a head, so the redaction cannot apply.
 
 **Schema 27**: a redaction's content is deleted. `redact record`'s result and `redact
 apply`'s list carry `deletion` when an applied redaction's object may still be in the store:

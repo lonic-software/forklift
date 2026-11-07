@@ -100,9 +100,11 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 - **forklift-server applies redactions, and the `--json` schema is now 28.** Part of content
   redaction: after each lift or pallet deletion, the server applies every recorded redaction that
-  none of its pallet heads or metadata history names. It then refuses that content on every route
+  none of its pallet heads, deleted pallets' tombstones or metadata history names (`redact list`
+  names such a tombstone as what holds a redaction, `tombstones` in `--json`). It then refuses that content on every route
   as `content_redacted` (exit 49 on the client), drops it from the bundle it serves, and accepts
-  lifts of history that names it without the content; `lift` no longer uploads it. Its handshake
+  lifts of history that names it without the content; `lift` no longer uploads it, nor a chunked
+  file's chunks that only it names. Its handshake
   reports each redaction as pending or applied, and a warehouse takes a head the server serves over
   a redaction only while the server reports it pending. The server does not delete its copy yet,
   and a fresh `clone` or a `lower` that must fetch history naming the content is refused with
