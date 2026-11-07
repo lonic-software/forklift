@@ -3161,6 +3161,9 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
     };
 
     let counted = RefWriteCounted::start(&warehouse);
+    // Whether the write reached the point where it may land, and so owes an apply.
+    let took = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let took_owe = Arc::clone(&took);
     let write = blocking(Arc::clone(&warehouse), move || {
         let counted = counted;
         // A meta pallet arrives as `@office`. The server routes by *namespace*, never by a
@@ -3404,6 +3407,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             };
 
             // Owed from before the write may land until it returns; its apply discharges it.
+            took_owe.store(true, std::sync::atomic::Ordering::SeqCst);
             let owed = counted.0.owe_apply();
             let written = pallet_utils::update_pallet_head_verified(
                 namespace, &bare, request.old_head.as_deref(), &request.new_head, &preconditions, &verified,
@@ -3463,7 +3467,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                     Ok(())
                 }
                 Err(error) => {
-                    after_failed_ref_write(&state, warehouse).await;
+                    after_failed_ref_write(&state, warehouse, took.load(std::sync::atomic::Ordering::SeqCst)).await;
                     Err(error)
                 }
             }
@@ -3516,6 +3520,9 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
     };
 
     let counted = RefWriteCounted::start(&warehouse);
+    // Whether the write reached the point where it may land, and so owes an apply.
+    let took = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let took_owe = Arc::clone(&took);
     let deletion = blocking(Arc::clone(&warehouse), move || {
         let counted = counted;
         if pallet_ref.namespace == pallet_utils::PalletNamespace::Meta {
@@ -3594,6 +3601,7 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
             };
 
             // Owed from before the removal may land until it returns, as for a ref update.
+            took_owe.store(true, std::sync::atomic::Ordering::SeqCst);
             let owed = counted.0.owe_apply();
             let removal = pallet_utils::remove_pallet_head_in(
                 pallet_utils::PalletNamespace::User, &bare, &old_head, &preconditions, None
@@ -3647,11 +3655,11 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
                     Ok(())
                 }
                 Ok(None) => {
-                    after_failed_ref_write(&state, warehouse).await;
+                    after_failed_ref_write(&state, warehouse, took.load(std::sync::atomic::Ordering::SeqCst)).await;
                     Ok(())
                 }
                 Err(error) => {
-                    after_failed_ref_write(&state, warehouse).await;
+                    after_failed_ref_write(&state, warehouse, took.load(std::sync::atomic::Ordering::SeqCst)).await;
                     Err(error)
                 }
             }
@@ -3693,13 +3701,14 @@ async fn after_ref_write(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>)
     run_redactions(Arc::clone(state), warehouse);
 }
 
-/// What follows a ref write this warehouse may have taken and that moved no ref, answered with an
-/// error or as already done. The apply it may have owed ([`WarehouseHandle::owe_apply`]) is
-/// carried out here, before the answer, as a write's is, so content is served again without
-/// waiting for another write. Only an apply that fails asks for a redaction run, to retry it: a
-/// refused request never cuts short the wait of a run retrying a deletion.
-async fn after_failed_ref_write(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
-    if !warehouse.apply_owed() {
+/// What follows a ref write request here that moved no ref, answered with an error or as already
+/// done. One that reached its write (`owed`) owes an apply ([`WarehouseHandle::owe_apply`]),
+/// carried out here before the answer, as a write's is, so content is served again without
+/// waiting for another write; one that fails asks for a redaction run, as a write does. One
+/// refused before its write owes nothing and does nothing here: it neither scans the warehouse
+/// nor cuts short the wait of a run retrying an apply or a deletion.
+async fn after_failed_ref_write(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>, owed: bool) {
+    if !owed || !warehouse.apply_owed() {
         return;
     }
 
@@ -3821,7 +3830,8 @@ fn run_redactions(state: Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
             let wait = match (owes.deletion, owes.apply) {
                 (true, true) => retry.min(apply_retry),
                 (true, false) => retry,
-                (false, _) => apply_retry,
+                (false, true) => apply_retry,
+                (false, false) => unreachable!("a run owing nothing has ended"),
             };
 
             tokio::select! {
@@ -4212,8 +4222,8 @@ async fn await_applies(warehouse: &WarehouseHandle) -> Result<(), HandlerError> 
 fn applying_refusal() -> HandlerError {
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        "The warehouse is briefly unavailable while it settles which content redacted from it is \
-        no longer served. Try again shortly.".to_string(),
+        "The warehouse is unavailable while it settles which content redacted from it is no longer \
+        served. Try again shortly; if this persists, the server's log says why.".to_string(),
     )
 }
 
@@ -8391,12 +8401,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A ref write refused or answered as done asks for a redaction run only when the apply it
-    /// carries out fails: a refusal with nothing owed, or with only another write's owe in flight,
-    /// never wakes a run waiting to retry a deletion.
+    /// A ref write refused or answered as done asks for a redaction run only when it reached its
+    /// write and the apply it carries out fails: one with nothing owed, with only another write's
+    /// owe in flight, or refused before its write while an apply stays owed, never wakes a run
+    /// waiting out a retry.
     ///
     /// Revert: ask for a run whenever an owe is open → the refusal beside a write in flight asks →
-    /// red. Ask for none after a failed apply → nothing retries it → red.
+    /// red. Ignore whether the request reached its write → the early refusal asks → red. Ask for
+    /// none after a failed apply → nothing retries it → red.
     #[tokio::test]
     async fn a_refused_write_asks_for_a_run_only_when_its_apply_fails() {
         let root = scratch_dir("refused-write");
@@ -8405,16 +8417,18 @@ mod tests {
         let handle = resolve_handle(&state, &PathParams::new()).unwrap();
         handle.redacting.store(true, Ordering::SeqCst);
 
-        after_failed_ref_write(&state, Arc::clone(&handle)).await;
+        after_failed_ref_write(&state, Arc::clone(&handle), true).await;
         let writing = handle.owe_apply();
-        after_failed_ref_write(&state, Arc::clone(&handle)).await;
+        after_failed_ref_write(&state, Arc::clone(&handle), true).await;
         assert_eq!(handle.redactions_asked.load(Ordering::SeqCst), 0, "nothing for a run to apply");
         drop(writing);
 
-        // A record this build cannot read fails every apply.
+        // A record this build cannot read fails every apply, so one stays owed.
         std::fs::write(root.join(FOLDER_NAME_FORKLIFT_ROOT).join("redactions-applied"),
                        b"/forklift-redactions-applied 2\n").unwrap();
-        after_failed_ref_write(&state, Arc::clone(&handle)).await;
+        after_failed_ref_write(&state, Arc::clone(&handle), false).await;
+        assert_eq!(handle.redactions_asked.load(Ordering::SeqCst), 0, "a request refused before its write");
+        after_failed_ref_write(&state, Arc::clone(&handle), true).await;
         assert_eq!(handle.redactions_asked.load(Ordering::SeqCst), 1, "the failed apply is the run's");
         assert!(handle.applies_closed());
 
