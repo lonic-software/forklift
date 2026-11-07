@@ -863,8 +863,9 @@ impl<'a> Served<'a> {
 ///   is `None` for every write a remote sends this warehouse.
 /// - `served`, for a user pallet, exempts one write: adopting exactly the head the remote served
 ///   (a lower or clone taking it), into a root that has never been served. It exempts only the
-///   redactions the remote reports pending, those at the `@redactions` head it served; one
-///   recorded only here still refuses. The remote's heads naming that content can only shrink, so
+///   redactions the remote reports pending, those at the `@redactions` head it served, and only
+///   once this warehouse's own `@redactions` reaches that head, so it was verified and taken here;
+///   one recorded only here still refuses. The remote's heads naming that content can only shrink, so
 ///   adopting one adds none that anyone is served, and the owner can still fetch the pallet they
 ///   must fix. In a root a forklift server has served the write is checked like any other, and
 ///   the hold re-reads the served mark. A repair, a merge or any other new parcel is checked as
