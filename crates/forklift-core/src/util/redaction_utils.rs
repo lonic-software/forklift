@@ -917,6 +917,9 @@ impl<'a> Served<'a> {
 ///   chain (a lower's fast-forward, the trust install's office, a replay onto the remote's head) is
 ///   then not refused for history it merely takes. A parcel past `served` is judged as usual. It
 ///   is `None` for every write a remote sends this warehouse.
+/// - Neither exemption covers a redaction this warehouse has applied: the served chain's parcels
+///   are judged against those, and an adoption is refused for one, naming a fresh clone as the way
+///   out (see [`fresh_clone_next_step`]).
 /// - `served`, for a user pallet, exempts one write: adopting exactly the head the remote served
 ///   (a lower or clone taking it), into a root that has never been served. It exempts only the
 ///   redactions the remote reports pending, those at the `@redactions` head it served, and only
