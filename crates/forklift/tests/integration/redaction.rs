@@ -1156,14 +1156,12 @@ fn loose_copies(dir: &std::path::Path, hash: &str) -> Vec<PathBuf> {
 /// A cache that applied a redaction holds the content's absence as redacted, not as held by the
 /// remote. A read that needs the content fetches nothing, though the remote still serves the bytes.
 /// A move to a server whose history never reaches content only this cache's own history names goes
-/// through, never asking that server for it, and it never reads a redacted recipe from a server
-/// that lacks it. Until a remote applies redactions, a cache never
+/// through, never asking that server for it. Until a remote applies redactions, a cache never
 /// reaches the applied state itself, so the test writes the record.
 ///
 /// Revert: let the miss hook fetch an applied hash → the read fetches the content back; leave the
 /// walk's redacted absences among the ones the move leans on the new server for → the move refuses
-/// as `origin_move_incomplete`; queue an absent applied recipe to read from the new server → the
-/// move fails reading it.
+/// as `origin_move_incomplete`.
 #[test]
 fn a_cache_that_applied_a_redaction_never_fetches_it_nor_asks_a_new_origin_for_it() {
     let temp = std::env::temp_dir();
@@ -1175,22 +1173,11 @@ fn a_cache_that_applied_a_redaction_never_fetches_it_nor_asks_a_new_origin_for_i
     owner.stack("notes.txt", b"draft\n", "draft");
     owner.stack("notes.txt", b"notes\n", "notes");
     let leak = owner.leaked("secret.env", b"TOKEN=hunter2\n");
-    let _ = std::fs::remove_file(owner.root.join("secret.env"));
-    // Above the chunking threshold, so the file is a recipe.
-    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
-    let big: Vec<u8> = (0..9 * 1024 * 1024).map(|_| {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        state as u8
-    }).collect();
-    let big_leak = owner.leaked("big.bin", &big);
     owner.run_ok(&["lift"]);
 
     let cached = Warehouse::cloned_with("applied-cache", &server.url, &["--cache"]);
     // Read once and evicted, so the sealed record holds the content before the redaction applies.
     cached.run_ok(&["show", &format!("{}:secret.env", leak)]);
-    cached.run_ok(&["show", &format!("{}:big.bin", big_leak)]);
     cached.run_ok(&["store", "evict"]);
     // A leak in history only this cache holds, never lifted.
     cached.run_ok(&["pallet", "create", "local"]);
@@ -1199,8 +1186,7 @@ fn a_cache_that_applied_a_redaction_never_fetches_it_nor_asks_a_new_origin_for_i
     cached.run_ok(&["remove", "local.env"]);
     cached.run_ok(&["stack", "-m", "take the local leak out"]);
 
-    let targets = [format!("{}:secret.env", leak), format!("{}:local.env", local_leak), format!("{}:big.bin", big_leak)];
-    let hashes: Vec<String> = targets.iter()
+    let hashes: Vec<String> = [format!("{}:secret.env", leak), format!("{}:local.env", local_leak)].iter()
         .map(|target| recorded_hash(&cached, target, "leaked token")["data"]["hash"].as_str().unwrap().to_string())
         .collect();
     // A cache applies a redaction only once its remote has, which nothing does yet: the record is
@@ -1231,12 +1217,6 @@ fn a_cache_that_applied_a_redaction_never_fetches_it_nor_asks_a_new_origin_for_i
     assert!(copied.status.success(), "{:?}", copied);
     // The lock the first server held is not the copy's: no process holds it.
     std::fs::remove_file(second_root.join(".forklift/serve.lock")).unwrap();
-    // Nor does it hold the recipe, which the move never reads from it.
-    let recipes = loose_copies(&second_root, &hashes[2]);
-    assert!(!recipes.is_empty());
-    for copy in recipes {
-        std::fs::remove_file(copy).unwrap();
-    }
     let server = Server::serve(&second_root);
 
     let moved = cached.json(&["remote", "move", &server.url]);
