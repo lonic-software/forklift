@@ -5366,6 +5366,36 @@ fn a_scan_cut_off_by_a_store_error_keeps_what_it_walked() {
     assert_eq!(saved["pallets"].as_array().expect("pallets").len(), pallets - 2, "the two walked pallets are off it");
 }
 
+/// A list of pallets saved for an earlier scan, by a request that read an older record, is never
+/// walked by the rescan that followed: the pallets are listed again, so a moved meta holder whose
+/// new head still names the content keeps holding it.
+// Revert: walk whatever list is stored, whichever scan it was saved for → the stale empty list
+// completes the rescan unwalked and the redaction applies → red.
+#[test]
+fn a_list_saved_for_an_earlier_scan_is_never_walked() {
+    let (_area, head, redactions, leak) = unplanted_redaction("redaction-stale-list", "leaked\n");
+    let first = gate_parcel(&head, &[], vec![gate_file(&head, "leak", "leaked\n")]);
+    plant_meta(&head.refs, "tags", None, &first);
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions);
+    assert!(served(&head, &leak), "the meta pallet's head names it");
+
+    // Reset off that history to a head that names the content all the same; a one-read budget
+    // finds the reset and starts the rescan, and stops before it walks the new head.
+    let rewritten = gate_parcel(&head, &[], vec![gate_file(&head, "leak", "leaked\n"), gate_file(&head, "y", "3")]);
+    plant_meta(&head.refs, "tags", Some(&first), &rewritten);
+    let head = head.with_scan_step_limit(1);
+    match head.object_get(&leak) {
+        Err(err) if err.status == Status::ServiceUnavailable => {}
+        other => panic!("the rescan cannot finish in one read: {:?}", other.map(|_| ()).map_err(|err| err.message)),
+    }
+
+    // A request that read the first scan's record saves its emptied list over the rescan's.
+    head.objects.work_put(&format!("{}/pallets", leak), br#"{"version":1,"scan":0,"pallets":[]}"#).expect("put");
+
+    let head = head.with_scan_step_limit(usize::MAX);
+    assert!(served(&head, &leak), "the rewritten head still names it");
+}
+
 /// A scan the request cannot finish answers `503` with `Retry-After` and saves where it stopped,
 /// so the requests after it go on from there, until the redaction applies and its work objects
 /// are gone.

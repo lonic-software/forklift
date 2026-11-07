@@ -116,6 +116,18 @@ struct Record {
     /// Written only once true: a record without it is one where that was never found.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     never_applies: bool,
+
+    /// Which scan of the redaction the record's verdicts come from: every rescan of a moved meta
+    /// holder starts the next. The list of pallets a scan has still to walk carries it, so a list
+    /// written for another scan, by a request that read an older record, is never walked: the
+    /// pallets are listed again instead. Written only once past the first scan.
+    #[serde(default, skip_serializing_if = "is_first_scan")]
+    scan: u64,
+}
+
+/// Whether `scan` is the first scan, which a record leaves unwritten.
+fn is_first_scan(scan: &u64) -> bool {
+    *scan == 0
 }
 
 /// One pallet, by its wire reference, and the head a scan saw it at.
@@ -131,6 +143,10 @@ struct Seen {
 #[serde(deny_unknown_fields)]
 struct Remaining {
     version: u64,
+
+    /// The scan this list belongs to: [`Record::scan`] of the record it was written for.
+    scan: u64,
+
     pallets: Vec<Seen>,
 }
 
@@ -289,6 +305,7 @@ pub fn record_state(scan_complete: bool, holders: &[(String, String)], applied_a
         holders: holders.iter().map(|(pallet, head)| Seen { pallet: pallet.clone(), head: head.clone() }).collect(),
         applied_at,
         never_applies: false,
+        scan: 0,
     };
 
     serde_json::to_string(&record).expect("a record encodes")
@@ -474,6 +491,14 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             };
 
             let Some(record) = record else {
+                // No item, so not applied: a request out of time leaves the start to another.
+                if !budget.timely() {
+                    return Ok(Verdict::Undecided(format!(
+                        "The redaction of {} could not be judged within this request.",
+                        hash
+                    )));
+                }
+
                 self.start_scan(hash, budget)?;
                 continue;
             };
@@ -528,9 +553,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 Holding::Stopped(why) => return Ok(Verdict::Undecided(why)),
                 Holding::Rescan { holder, head } => {
                     let again = Seen { pallet: holder.pallet.clone(), head };
-                    self.put_remaining(hash, &[again])?;
+                    let scan = record.scan + 1;
+                    self.put_remaining(hash, scan, &[again])?;
 
                     let next = Record {
+                        scan,
                         scan_complete: false,
                         holders: record.holders.iter().filter(|seen| **seen != holder).cloned().collect(),
                         ..record
@@ -573,9 +600,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             .map(|(pallet, head)| Seen { pallet: pallet.to_wire(), head: head.clone() })
             .collect();
 
-        self.put_remaining(hash, &pallets)?;
+        self.put_remaining(hash, 0, &pallets)?;
 
-        let record = Record { version: RECORD_VERSION, scan_complete: false, holders: Vec::new(), applied_at: None, never_applies: false };
+        let record = Record { version: RECORD_VERSION, scan_complete: false, holders: Vec::new(), applied_at: None, never_applies: false, scan: 0 };
         // Lost to another request's start: the judge reads its item instead.
         self.write_record(hash, &record, None, budget).map(|_| ())
     }
@@ -585,20 +612,21 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         let hash = &redaction.hash;
 
         let remaining = match self.objects.work_get(&remaining_name(hash)).map_err(HeadError::internal)? {
-            Some(bytes) => decode_work::<Remaining>(&bytes),
+            Some(bytes) => decode_work::<Remaining>(&bytes).filter(|remaining| remaining.scan == record.scan),
             None => None,
         };
 
         // The list is written before the item that needs it, and removed only after the item
-        // records the scan complete, so a missing one was lost to a crash or a race: list again.
-        // Every pallet it adds was written after the redaction was recorded, so walking it is
-        // only extra work.
+        // records the scan complete, so a missing one was lost to a crash or a race, and one of
+        // another scan was saved over this one's by a request that read an older record: list
+        // again. Every pallet it adds was written after the redaction was recorded, so walking it
+        // is only extra work.
         let Some(mut remaining) = remaining else {
             let listing = self.refs.list_refs().map_err(HeadError::internal)?;
             let pallets: Vec<Seen> = listing.live.iter().chain(listing.tombstones.iter())
                 .map(|(pallet, head)| Seen { pallet: pallet.to_wire(), head: head.clone() })
                 .collect();
-            self.put_remaining(hash, &pallets)?;
+            self.put_remaining(hash, record.scan, &pallets)?;
 
             return Ok(Advance::Moved);
         };
@@ -611,7 +639,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         let outcome = self.walk_remaining(&scratch, redaction, stored, record, budget, &mut remaining.pallets, &mut walked);
 
         if walked {
-            let saved = self.put_remaining(hash, &remaining.pallets);
+            let saved = self.put_remaining(hash, record.scan, &remaining.pallets);
             return outcome.and_then(|advance| saved.map(|()| advance));
         }
 
@@ -834,8 +862,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     }
 
     /// Save `pallets` as the pallets the scan of `hash` has still to walk.
-    fn put_remaining(&self, hash: &str, pallets: &[Seen]) -> HeadResult<()> {
-        let bytes = serde_json::to_vec(&Remaining { version: WORK_VERSION, pallets: pallets.to_vec() })
+    fn put_remaining(&self, hash: &str, scan: u64, pallets: &[Seen]) -> HeadResult<()> {
+        let bytes = serde_json::to_vec(&Remaining { version: WORK_VERSION, scan, pallets: pallets.to_vec() })
             .map_err(|error| HeadError::internal(format!("encoding a redaction scan failed: {}", error)))?;
 
         self.objects.work_put(&remaining_name(hash), &bytes).map_err(HeadError::internal)
@@ -908,8 +936,8 @@ mod tests {
 
     #[test]
     fn a_work_object_of_another_version_is_dropped() {
-        let other = br#"{"version":9,"pallets":[]}"#;
-        let current = br#"{"version":1,"pallets":[{"pallet":"main","head":"h"}]}"#;
+        let other = br#"{"version":9,"scan":0,"pallets":[]}"#;
+        let current = br#"{"version":1,"scan":0,"pallets":[{"pallet":"main","head":"h"}]}"#;
 
         assert!(decode_work::<Remaining>(other).is_none());
         assert_eq!(decode_work::<Remaining>(current).unwrap().pallets.len(), 1);
