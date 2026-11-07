@@ -97,9 +97,67 @@ pub struct WarehouseInfo {
     /// [`Self::chunking`]: an older head never writes it, and an older client ignores it.
     #[serde(default)]
     pub tombstones: Option<BTreeMap<String, String>>,
+
+    /// Where each redaction recorded on this head's `@redactions` stands here. `Some` (possibly
+    /// empty) also says the head refuses the content of every redaction it lists applied, with a
+    /// `410` and code `content_redacted`, on every route that serves or takes objects by hash; absent
+    /// or `None` says it reports nothing. An **additive** field like [`Self::tombstones`].
+    #[serde(default)]
+    pub redactions: Option<Vec<ServedRedaction>>,
+}
+
+/// One redaction, as a head reports it in [`WarehouseInfo::redactions`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServedRedaction {
+    /// The redacted object's hash.
+    pub hash: String,
+
+    /// Where it stands on the head.
+    pub state: ServedRedactionState,
+
+    /// For a pending redaction, the meta pallets whose history names the content, which hold it
+    /// pending for good. Empty otherwise, and left out then.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub meta_pallets: Vec<String>,
+}
+
+/// Where a redaction stands on a head ([`ServedRedaction::state`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServedRedactionState {
+    /// Not applied: the head still serves the content, since a head or a meta pallet's history
+    /// there may name it.
+    Pending,
+
+    /// Applied: the head refuses the content, and has not deleted every copy of it yet.
+    DeletionOwed,
+
+    /// Applied, and every copy the head held is deleted.
+    Deleted,
+
+    /// A state this build does not know. It is read as neither pending nor applied: it exempts no
+    /// adoption, and a lift still offers the content, which the head then refuses if it must.
+    #[serde(other)]
+    Unknown,
+}
+
+impl ServedRedactionState {
+    /// Whether the head applied the redaction, so it refuses the content.
+    pub fn is_applied(self) -> bool {
+        matches!(self, ServedRedactionState::DeletionOwed | ServedRedactionState::Deleted)
+    }
 }
 
 impl WarehouseInfo {
+    /// The hashes of the redactions this head reports applied: content it refuses, so a lift never
+    /// offers it.
+    pub fn applied_redactions(&self) -> std::collections::BTreeSet<&str> {
+        self.redactions.iter().flatten()
+            .filter(|redaction| redaction.state.is_applied())
+            .map(|redaction| redaction.hash.as_str())
+            .collect()
+    }
+
     /// The head this remote holds history from for each pallet name: a listed pallet's head, else
     /// the head of its tombstone, which the remote keeps rooted and serves until it is dropped. A
     /// name listed with a tombstone too is taken at its live head, as the holds route walks it.
@@ -491,6 +549,7 @@ mod tests {
             trust: None,
             chunking: true,
             tombstones: None,
+            redactions: None,
         };
 
         let wire = serde_json::to_string(&info).expect("serialize");

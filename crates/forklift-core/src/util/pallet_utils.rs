@@ -2906,7 +2906,7 @@ pub(crate) mod tests {
             let local = blob("local");
             let redactions = pending_then_local(&pending, &local);
             let served = parcel(&two_dirs("a0", "pending"), &[]);
-            let adopting = Served { head: &served, redactions: Some(&redactions) };
+            let adopting = Served { head: &served, redactions: Some(&redactions), report: None };
 
             // Another head on the served one is a new parcel, judged in full.
             let stacked = parcel(&two_dirs("a1", "pending"), &[&served]);
@@ -2924,9 +2924,36 @@ pub(crate) mod tests {
 
             // A redaction the remote does not hold still refuses its served head.
             let names_local = parcel(&two_dirs("a0", "local"), &[]);
-            let adopting = Served { head: &names_local, redactions: Some(&redactions) };
+            let adopting = Served { head: &names_local, redactions: Some(&redactions), report: None };
             assert_redacted(adopt_pallet_head("other", None, &names_local, adopting, &RefPreconditions::NONE), "web/b", &local);
             assert_eq!(get_pallet_head("other").unwrap(), None, "nothing was written");
+        }
+
+        // Revert: ignore the remote's report → adopting a head naming a redaction the remote
+        // reports applied lands; or read any reported state as pending → a state this build does
+        // not know exempts too.
+        #[test]
+        fn adopting_is_exempt_only_from_what_the_remote_reports_pending() {
+            use crate::model::remote::{ServedRedaction, ServedRedactionState};
+            use crate::util::redaction_utils::Served;
+
+            let (_root, _scope) = scratch("redacted-adopted-report");
+            let pending = blob("pending");
+            let redactions = pending_then_local(&pending, &blob("local"));
+            let served = parcel(&two_dirs("a0", "pending"), &[]);
+            let reported = |state| vec![ServedRedaction { hash: pending.clone(), state, meta_pallets: Vec::new() }];
+
+            for state in [ServedRedactionState::DeletionOwed, ServedRedactionState::Deleted, ServedRedactionState::Unknown] {
+                let report = reported(state);
+                let adopting = Served { head: &served, redactions: Some(&redactions), report: Some(&report) };
+                assert_redacted(adopt_pallet_head("side", None, &served, adopting, &RefPreconditions::NONE), "web/b", &pending);
+                assert_eq!(get_pallet_head("side").unwrap(), None, "nothing was written for {:?}", state);
+            }
+
+            let report = reported(ServedRedactionState::Pending);
+            let adopting = Served { head: &served, redactions: Some(&redactions), report: Some(&report) };
+            adopt_pallet_head("side", None, &served, adopting, &RefPreconditions::NONE).unwrap();
+            assert_eq!(get_pallet_head("side").unwrap().as_deref(), Some(served.as_str()));
         }
 
         // Revert: exempt any served `@redactions` head the store holds → one this warehouse never
@@ -2945,7 +2972,7 @@ pub(crate) mod tests {
 
             // Stored here, and naming the content, but not on this warehouse's chain.
             let served = parcel(&two_dirs("a0", "secret"), &[]);
-            let adopting = Served { head: &served, redactions: Some(&untaken) };
+            let adopting = Served { head: &served, redactions: Some(&untaken), report: None };
             assert_redacted(adopt_pallet_head("side", None, &served, adopting, &RefPreconditions::NONE), "web/b", &secret);
             assert_eq!(get_pallet_head("side").unwrap(), None, "nothing was written");
         }
@@ -2961,7 +2988,7 @@ pub(crate) mod tests {
             let pending = blob("pending");
             let redactions = pending_then_local(&pending, &blob("local"));
             let served = parcel(&two_dirs("a0", "pending"), &[]);
-            let adopting = Served { head: &served, redactions: Some(&redactions) };
+            let adopting = Served { head: &served, redactions: Some(&redactions), report: None };
 
             BEFORE_HOLD.with(|slot| *slot.borrow_mut() = Some(Box::new(|| {
                 crate::util::tombstone_utils::mark_served(true).unwrap();

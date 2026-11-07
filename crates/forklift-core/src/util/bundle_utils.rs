@@ -1937,7 +1937,7 @@ mod tests {
             let signatures = staging.join("signatures");
             std::fs::write(&signatures, b"").unwrap();
             let bundle_path = source.root.join("rollover.bundle");
-            write_native_bundle(&bundle_path, &artifacts, &signatures, 0).unwrap();
+            write_native_bundle(&bundle_path, &artifacts, &signatures, 0, &AppliedSet::default()).unwrap();
             std::fs::read(&bundle_path).unwrap()
         };
 

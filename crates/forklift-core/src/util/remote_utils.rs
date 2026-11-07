@@ -6333,7 +6333,7 @@ async fn lift_pallet_inner(client: &RemoteClient,
         // An acknowledged tombstone's head is held on the remote (a gc root), so a re-creation
         // uploads only the work past it.
         upload_history(client, local_head, remote_head.or(tombstone),
-                       &held_elsewhere(info, pallet), info.chunking, progress).await?;
+                       &held_elsewhere(info, pallet), info, progress).await?;
 
     client.update_ref(pallet, remote_head, local_head, tombstone).await?;
 
@@ -6542,6 +6542,9 @@ fn held_elsewhere(info: &WarehouseInfo, pallet: &str) -> Vec<String> {
 /// [`push_local_trust`] uses it alone for a re-genesis anchor's adopted office history, which no
 /// ref on the remote names.
 ///
+/// `info` is the remote's handshake. Content of a redaction it reports applied is never offered:
+/// the remote refuses it, and holds it absent in the closure of the heads it takes.
+///
 /// # Returns
 /// * `Ok((usize, usize, usize))` - The new parcels, uploaded objects and uploaded signatures.
 /// * `Err(String)`               - If the history could not be read or a transfer failed.
@@ -6549,8 +6552,10 @@ async fn upload_history(client: &RemoteClient,
                         local_head: &str,
                         remote_head: Option<&str>,
                         elsewhere: &[String],
-                        chunking_supported: bool,
+                        info: &WarehouseInfo,
                         progress: &Progress) -> Result<(usize, usize, usize), String> {
+    let chunking_supported = info.chunking;
+
     // The new parcels the remote does not have, ordered parents-first — see
     // `new_parcels_parents_first`, which owns both the walk and the order the candidate
     // loop below depends on.
@@ -6597,6 +6602,9 @@ async fn upload_history(client: &RemoteClient,
     // already built (`new_parcels`, `seen_trees` and `seen_recipes`), rather than re-deriving each
     // object's type on the wire. A recipe is small and structural (like a tree), so it belongs in
     // the synchronous half; its chunks are the large, many, out-of-band half.
+    let redacted = info.applied_redactions();
+    candidates.retain(|hash| !redacted.contains(hash.as_str()));
+
     let mut control_plane: HashSet<String> = new_parcels.iter().cloned().collect();
     control_plane.extend(seen_trees.iter().cloned());
     control_plane.extend(seen_recipes.iter().cloned());
@@ -8014,7 +8022,7 @@ pub async fn push_local_trust(client: &RemoteClient,
         // refuses an anchor whose adopted history it does not hold, and every warehouse that
         // later adopts this anchor fetches that history from it.
         if let Some(adopts) = &local.adopts {
-            upload_history(client, adopts, None, &[], info.chunking, &Progress::NONE).await?;
+            upload_history(client, adopts, None, &[], info, &Progress::NONE).await?;
         }
         client.put_trust(&TrustAnchorDto::from(&local)).await?;
     }
@@ -9233,6 +9241,7 @@ mod tests {
             trust: None,
             chunking: true,
             tombstones: Some(BTreeMap::from([("gone".to_string(), deleted)])),
+            redactions: None,
         };
 
         assert_eq!(held_elsewhere(&info, "feature"), vec![main.clone()]);

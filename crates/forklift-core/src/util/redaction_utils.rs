@@ -881,14 +881,18 @@ pub struct Served<'a> {
     pub head: &'a str,
 
     /// The `@redactions` head the remote served in the same handshake, `None` when it served
-    /// none. What it holds is what the remote reports pending; read for a user pallet only.
+    /// none. What it holds is what the remote may report pending; read for a user pallet only.
     pub redactions: Option<&'a str>,
+
+    /// Where the remote reports each of those redactions stands, `None` when its handshake carries
+    /// no report: a head that applies no redaction, so every one it holds is pending there.
+    pub report: Option<&'a [crate::model::remote::ServedRedaction]>,
 }
 
 impl<'a> Served<'a> {
     /// A meta pallet's served `head`: its chain is what the write takes.
     pub fn chain(head: &'a str) -> Served<'a> {
-        Served { head, redactions: None }
+        Served { head, redactions: None, report: None }
     }
 
     /// A user pallet's served `head`, beside the `@redactions` head `info`, the remote's
@@ -896,7 +900,18 @@ impl<'a> Served<'a> {
     pub fn adopting(head: &'a str, info: &'a crate::model::remote::WarehouseInfo) -> Served<'a> {
         let redactions = info.pallets.get(&pallet_utils::PalletRef::meta(REDACTIONS_PALLET_NAME).to_wire());
 
-        Served { head, redactions: redactions.map(String::as_str) }
+        Served { head, redactions: redactions.map(String::as_str), report: info.redactions.as_deref() }
+    }
+
+    /// Whether the remote reports the redaction of `hash` pending: with no report, every one it
+    /// holds is; with one, only those it lists in that state.
+    fn reports_pending(&self, hash: &str) -> bool {
+        match self.report {
+            None => true,
+            Some(report) => report.iter().any(|redaction| {
+                redaction.hash == hash && redaction.state == crate::model::remote::ServedRedactionState::Pending
+            }),
+        }
     }
 }
 
@@ -1066,8 +1081,8 @@ struct Exemption {
 /// `set`, the redactions at this warehouse's `@redactions` head `local`, less those a user
 /// pallet's write of `new` is exempt from, and whether it is an adoption. It is one when `new` is
 /// the head the remote served beside `served`, and this root has never been served; it is then
-/// exempt from the redactions at the `@redactions` head the remote served, which the remote
-/// reports pending. Only once `local` reaches that head: this warehouse verified and took it, so a
+/// exempt from the redactions at the `@redactions` head the remote served that the remote reports
+/// pending. Only once `local` reaches that head: this warehouse verified and took it, so a
 /// set the remote merely sent, or one it never served, exempts nothing. Nor is any redaction in
 /// `applied`, those this warehouse has applied, exempt.
 fn exempt_adoption(set: RedactedSet,
@@ -1077,7 +1092,7 @@ fn exempt_adoption(set: RedactedSet,
                    applied: &RedactedSet) -> Result<Exemption, String> {
     let none = |set| Ok(Exemption { set, adopted: false, exempted: HashSet::new(), withheld: RedactedSet::default() });
 
-    let Some(Served { head, redactions: Some(pending) }) = served else {
+    let Some(served @ Served { head, redactions: Some(pending), .. }) = served else {
         return none(set);
     };
 
@@ -1090,7 +1105,7 @@ fn exempt_adoption(set: RedactedSet,
     }
 
     let pending = RedactedSet::at(pending)?;
-    let exempt = pending.filtered(|hash| !applied.hashes.contains(hash));
+    let exempt = pending.filtered(|hash| !applied.hashes.contains(hash) && served.reports_pending(hash));
     let withheld = pending.filtered(|hash| applied.hashes.contains(hash));
     let exempted = exempt.hashes.clone();
 

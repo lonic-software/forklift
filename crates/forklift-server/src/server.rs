@@ -32,7 +32,7 @@ use forklift_core::model::hooks::{
 use forklift_core::model::remote::{
     ErrorResponse, HoldAnswer, HoldsRequest, HoldsResponse, MissingObjectsRequest,
     MissingObjectsResponse, RefDeleteRequest, RefUpdateRequest,
-    ResolveRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest, UploadTargetsResponse,
+    ResolveRequest, ResolveResponse, ServedRedaction, ServedRedactionState, TrustAnchorDto, UploadTargetsRequest, UploadTargetsResponse,
     WarehouseInfo, MAX_MISSING_BATCH, MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
     REFUSAL_NOT_AN_OBJECT_HASH, distinct_resolve_identifiers, resolve_answer_cap,
 };
@@ -1290,6 +1290,27 @@ fn trust_install_outcome(installed: Result<office_utils::TrustInstalled, RefUpda
     }
 }
 
+/// Where each redaction on this warehouse's `@redactions` stands here, for the handshake. An applied
+/// one is reported with its deletion owed, since this head refuses the content but deletes no copy
+/// of it yet. A pending one names the meta pallets whose history holds it pending for good; the
+/// pallet heads that may hold it are not walked for, since a lift moves them often. A cell this
+/// build cannot read is not reported.
+fn served_redactions() -> Result<Vec<ServedRedaction>, HandlerError> {
+    let applied = read_applied()?;
+
+    redaction_utils::read_redactions().map_err(internal)?.redactions.iter().map(|attributed| {
+        let hash = attributed.redaction.hash.clone();
+
+        Ok(match applied.contains(&hash) {
+            true => ServedRedaction { hash, state: ServedRedactionState::DeletionOwed, meta_pallets: Vec::new() },
+            false => {
+                let meta_pallets = redaction_utils::meta_holders(&hash).map_err(internal)?;
+                ServedRedaction { hash, state: ServedRedactionState::Pending, meta_pallets }
+            }
+        })
+    }).collect()
+}
+
 /// The redactions this warehouse applied, read for a request that serves or takes objects by hash.
 fn read_applied() -> Result<AppliedSet, HandlerError> {
     applied_redactions::read_applied().map_err(internal)
@@ -2148,6 +2169,7 @@ async fn get_warehouse(State(state): State<Arc<AppState>>,
             // This head deletes pallets, and every tombstone it keeps is listed, as widely as the
             // live refs are.
             tombstones: Some(forklift_core::util::tombstone_utils::read_tombstones().map_err(internal)?),
+            redactions: Some(served_redactions()?),
         })
     }).await;
 

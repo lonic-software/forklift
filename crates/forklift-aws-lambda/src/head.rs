@@ -347,6 +347,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             // Always present, empty or not: this head deletes pallets, and a client reads an absent
             // map as a head that keeps no tombstones.
             tombstones: Some(tombstones),
+            // This head does not apply redactions yet, so it reports none.
+            redactions: None,
         })
     }
 
