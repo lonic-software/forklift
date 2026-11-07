@@ -3961,6 +3961,41 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The enumerating walk holds an absent blob or recipe an applied redaction names, with no
+    /// sealed record at all, so a torn rescan's remainder leaves it out, while an absence no
+    /// redaction names is still reported.
+    ///
+    /// Revert: hold only what the sealed record names in `held_by_hash` → both redacted absences
+    /// are reported → red.
+    #[test]
+    fn the_enumerating_walk_holds_an_applied_redaction_absent() {
+        use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+        use crate::model::parcel::Parcel;
+        use crate::util::gc_utils::tests::store_tree;
+
+        let (dir, _scope) = enter_temp_root("applied-enumerate");
+        let (redacted_blob, redacted_recipe, lost_blob) = ("1".repeat(64), "2".repeat(64), "3".repeat(64));
+        let root = store_tree(&[
+            ("leak.env", &redacted_blob, DirEntryType::Normal),
+            ("leak.bin", &redacted_recipe, DirEntryType::NormalChunked),
+            ("lost.txt", &lost_blob, DirEntryType::Normal),
+        ]);
+        let mut parcel = LooseObjectBuilder::build_parcel(&Parcel {
+            tree_hash: root, parents: Vec::new(), actions: Vec::new(), description: None,
+        });
+        parcel.store().unwrap();
+        pallet_utils::tests::update_pallet_head_unverified("main", None, &parcel.hash, &pallet_utils::RefPreconditions::NONE)
+            .unwrap();
+        pallet_utils::write_position(&pallet_utils::BayPosition::new("main", None)).unwrap();
+        crate::util::applied_redactions::apply_for_test(&[&redacted_blob, &redacted_recipe]);
+
+        let walk = enumerate_absent_reachable(&BTreeSet::new()).unwrap();
+        assert!(walk.degraded_sources.is_empty(), "{:?}", walk.degraded_sources);
+        assert_eq!(walk.hashes, [lost_blob].into_iter().collect::<BTreeSet<String>>());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// FORK-133: a staged object is the bay's own work, so its absence is a loss even when its
     /// hash is recorded. Mutation: pass the record to the staged leaves' `check_leaf` → red.
     #[test]
