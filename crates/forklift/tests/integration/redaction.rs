@@ -421,6 +421,43 @@ fn a_read_of_content_whose_redaction_is_applied_is_refused_as_redacted() {
     assert!(missing["error"]["message"].as_str().unwrap().contains("entity not found"), "{}", missing);
 }
 
+/// A full audit of a warehouse whose applied redaction's object is gone passes, and counts the
+/// object as redacted, apart from what the sealed record holds; an absent object no redaction
+/// names still fails it.
+///
+/// Revert: leave the redacted count out of the scope → `redacted` is missing from the report.
+#[test]
+fn a_full_audit_counts_an_applied_redaction_as_redacted_and_passes() {
+    let warehouse = Warehouse::new("audit-applied");
+    warehouse.run_ok(&["office", "enroll"]);
+    warehouse.stack("notes.txt", b"notes\n", "notes");
+    let leak = warehouse.leaked("secret.env", b"TOKEN=hunter2\n");
+    let recorded = recorded_hash(&warehouse, &format!("{}:secret.env", leak), "leaked token");
+    assert_eq!(recorded["data"]["status"], serde_json::json!({ "state": "applied" }), "{}", recorded);
+
+    // Applied, but the bytes are still held: nothing is absent.
+    let audited = warehouse.json(&["audit", "--full"]);
+    assert_eq!(audited["ok"], true, "{}", audited);
+    assert_eq!(audited["data"]["scope"].get("redacted"), None, "{}", audited);
+
+    warehouse.remove_object(recorded["data"]["hash"].as_str().unwrap());
+    let audited = warehouse.json(&["audit", "--full"]);
+    assert_eq!(audited["ok"], true, "{}", audited);
+    assert_eq!(audited["data"]["scope"]["redacted"], 1, "{}", audited);
+    assert_eq!(audited["data"]["scope"].get("held_by_hash"), None, "{}", audited);
+
+    let human = warehouse.run_ok(&["audit", "--full"]);
+    assert!(
+        String::from_utf8_lossy(&human.stdout).contains("1 absent object(s) are redacted"),
+        "{}", String::from_utf8_lossy(&human.stdout)
+    );
+
+    // An object absent with no redaction naming it is damage.
+    warehouse.remove_object(&hash_of(b"notes\n"));
+    let damaged = warehouse.run(&["audit", "--full"]);
+    assert!(!damaged.status.success(), "{:?}", damaged);
+}
+
 /// A restore from the inventory of a file whose staged content is redacted, applied and removed is
 /// refused as redacted, and leaves the working file as it was.
 ///

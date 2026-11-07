@@ -97,6 +97,7 @@ pub fn handle_command(pallet: Option<String>, full: bool) -> Result<(), String> 
                 is_cache,
                 full,
                 sealed.held(),
+                sealed.redacted(),
                 sealed_utils::present_recorded(&tolerated.sealed)?.len(),
             ));
         }
@@ -165,8 +166,7 @@ pub(crate) struct AuditScope {
     signatures: &'static str,
 
     /// In-scope content: every tree was re-hashed on read and every blob confirmed present, except
-    /// the absent objects counted in `held_by_hash` and the absent content a redaction applied here
-    /// names.
+    /// the absent objects counted in `held_by_hash` and in `redacted`.
     in_scope_content: &'static str,
 
     /// How many absent objects the warehouse's sealed record holds by hash alone: each is pinned to
@@ -174,6 +174,12 @@ pub(crate) struct AuditScope {
     /// checked. Omitted when none.
     #[serde(skip_serializing_if = "crate::output::is_zero")]
     held_by_hash: usize,
+
+    /// How many absent objects are absent because a redaction this warehouse applied names them:
+    /// their content was removed on purpose, so they are accounted for, not damage, and fail
+    /// nothing. Nothing beneath them was checked. Omitted when none.
+    #[serde(skip_serializing_if = "crate::output::is_zero")]
+    redacted: usize,
 
     /// How many objects the sealed record names that are on disk all the same. That fails
     /// nothing: a recorded object that is present is checked like any other. `heal` removes the
@@ -203,8 +209,9 @@ impl AuditScope {
     /// * `cache`       - Whether the warehouse is a cache.
     /// * `full`        - Whether `--full` re-read and re-verified chunks (vs. presence-checked).
     /// * `held`        - How many absent objects the sealed record held by hash alone.
+    /// * `redacted`    - How many absent objects a redaction applied here held.
     /// * `present`     - How many objects the sealed record names that the store holds.
-    fn new(fetch_scope: Option<Vec<String>>, cache: bool, full: bool, held: usize, present: usize) -> AuditScope {
+    fn new(fetch_scope: Option<Vec<String>>, cache: bool, full: bool, held: usize, redacted: usize, present: usize) -> AuditScope {
         let sparse = fetch_scope.is_some();
 
         AuditScope {
@@ -213,6 +220,7 @@ impl AuditScope {
             signatures: "verified",
             in_scope_content: "verified",
             held_by_hash: held,
+            redacted,
             present_and_recorded: present,
             chunks: if full {
                 "re-read and re-hashed; each fully-present chunked file re-assembled to verify its content hash"
@@ -222,6 +230,11 @@ impl AuditScope {
             out_of_scope_content: sparse.then_some("sealed"),
             enforcement: sparse.then_some("advisory"),
         }
+    }
+
+    /// Whether the walk passed over any absent object, held by hash or redacted.
+    fn excepts_absent(&self) -> bool {
+        self.held_by_hash > 0 || self.redacted > 0
     }
 }
 
@@ -266,8 +279,8 @@ impl CommandOutput for AuditReport {
             println!(
                 "Signatures are verified in full; within the fetched scope every tree was \
                 re-hashed and every blob and chunk confirmed present{}.",
-                if self.scope.as_ref().is_some_and(|scope| scope.held_by_hash > 0) {
-                    ", except those held by hash below"
+                if self.scope.as_ref().is_some_and(AuditScope::excepts_absent) {
+                    ", except those accounted for below"
                 } else {
                     ""
                 }
@@ -279,12 +292,12 @@ impl CommandOutput for AuditReport {
             );
         }
 
-        if let Some(AuditScope { cache: true, held_by_hash, .. }) = &self.scope {
+        if let Some(scope @ AuditScope { cache: true, .. }) = &self.scope {
             println!(
                 "This warehouse is a cache: it may lack content its history reaches. Signatures are \
                 verified in full; every tree it holds was re-hashed and every blob and chunk it \
                 names confirmed present{}.",
-                if *held_by_hash > 0 { ", except those held by hash below" } else { "" }
+                if scope.excepts_absent() { ", except those accounted for below" } else { "" }
             );
         }
 
@@ -294,6 +307,15 @@ impl CommandOutput for AuditReport {
                 "{} absent object(s) are held by hash alone: each is pinned to the hash a parent \
                 that is present commits, but is not on disk, and nothing beneath it was checked.",
                 held
+            );
+        }
+
+        if let Some(AuditScope { redacted: redacted @ 1.., .. }) = &self.scope {
+            println!(
+                "{} absent object(s) are redacted: a redaction applied in this warehouse removed \
+                their content on purpose, so they are accounted for, not damage. Nothing beneath \
+                them was checked.",
+                redacted
             );
         }
 
