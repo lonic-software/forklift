@@ -98,7 +98,8 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Added
 
-- **A recorded redaction is applied, or says why it is still pending.** Part of content redaction:
+- **The `--json` schema is now 26: a recorded redaction is applied, or says why it is still
+  pending.** Part of content redaction:
   `redact record` and `redact list` report each redaction's state, `applied`, or pending as `held`
   (naming the pallet heads or the metadata history that still hold the content), `awaiting_remote`,
   `undecided` or `ready` (for `redact apply` to apply), in `--json` as `status`. A warehouse with no remote applies a redaction once

@@ -85,7 +85,13 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 25** (current): `content_redacted` (exit 49) is also returned before anything lands in
+**Schema 26** (current): a redaction has a state. `redact record`'s result and each entry of
+`redact list` carry `status`, whose `state` is `applied`, `held` (with the `heads`, each with its
+`pallet`, `head` and `path`, and the `meta_pallets` that name it), `awaiting_remote`, `undecided`
+(with a `reason`) or, in `redact list` only, `ready`. `redact apply` exists and reports the same
+list.
+
+**Schema 25**: `content_redacted` (exit 49) is also returned before anything lands in
 the bay: by `load` for a file it would stage, by `park` for a file it would park or restage, by
 `lower` for a file the remote's head would write, and by a merge (`consolidate`, `haul`, `lower`,
 `lift`'s merge) or `pick` for a file it would write or whose other side it would bring in. These carry

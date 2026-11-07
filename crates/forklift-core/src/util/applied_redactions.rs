@@ -6,7 +6,9 @@
 //! since this warehouse's meta history may lag the remote's. No head written after the cell may
 //! name the content anew, so a clean scan stays clean, and the scan needs no fence over other ref
 //! writes. Meta history holds a redaction pending for good: a meta pallet's verification loads
-//! every cell blob its chain adds, so that blob must stay.
+//! every cell blob its chain adds, so that blob must stay. Bay state (staged, parked, consolidation
+//! and cherry-pick state) never holds a redaction pending: it is no pallet head, and what of it
+//! names the content is kept by the deletion's own census, not by this scan.
 //!
 //! Applying is local state, not history: the record at `<forklift root>/redactions-applied` lists
 //! every applied hash, in the [`record_utils`] form, one hash per line, sorted. It only ever grows,
@@ -126,7 +128,8 @@ fn has_remote() -> Result<bool, String> {
 /// Where one redaction stands.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RedactionState {
-    /// Applied: nothing here names the content, nor ever may again, so it is ready to be removed.
+    /// Applied: when its scan ran, no pallet head and no meta pallet's history here named the
+    /// content, and no head written since may name it anew.
     Applied,
 
     /// Pending: these pallet heads, and the history of these meta pallets (by name), still name
@@ -161,10 +164,18 @@ pub struct RedactionStatus {
 
 /// What still holds `redaction` pending here, by its own scan: the pallet heads that name its
 /// content (by hash, or for a recipe, by chunk list) and the meta pallets whose history names its
-/// hash. `None` when nothing does.
+/// hash. `None` when nothing does. A holder either walk found is reported ahead of the other
+/// walk's error, as the more definite answer.
 fn scan(redaction: &Redaction) -> Result<Option<RedactionState>, String> {
-    let heads = redaction_utils::head_holders(redaction)?;
-    let meta_pallets = redaction_utils::meta_holders(&redaction.hash)?;
+    let (heads, meta_pallets) = match (
+        redaction_utils::head_holders(redaction),
+        redaction_utils::meta_holders(&redaction.hash),
+    ) {
+        (Ok(heads), Ok(meta_pallets)) => (heads, meta_pallets),
+        (Ok(heads), Err(_)) if !heads.is_empty() => (heads, Vec::new()),
+        (Err(_), Ok(meta_pallets)) if !meta_pallets.is_empty() => (Vec::new(), meta_pallets),
+        (Err(error), _) | (_, Err(error)) => return Err(error),
+    };
 
     Ok(match heads.is_empty() && meta_pallets.is_empty() {
         true => None,
@@ -249,8 +260,8 @@ pub fn statuses(read: &RedactionsRead) -> Result<Vec<RedactionStatus>, String> {
 /// Apply every redaction `read` lists (with `only`, just the one of that hash) that a scan now
 /// finds unheld, in a full warehouse with no remote, and report where each stands. `read` is the
 /// local `@redactions` head, read after its cells committed, so nothing can come to name a clean
-/// redaction's content (see the module doc). In a warehouse with a remote, a served root included,
-/// nothing is applied: each stays pending until the remote reports it applied. Whether a remote is
+/// redaction's content (see the module doc). In a warehouse with a remote configured, served or
+/// not, nothing is applied: each stays pending until the remote reports it applied. Whether a remote is
 /// configured is read again under the ref lock before the record is written. The caller holds the
 /// warehouse lock.
 ///

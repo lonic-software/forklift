@@ -323,17 +323,13 @@ pub(crate) struct RedactionView {
 }
 
 impl RedactionList {
-    /// The list of `read`'s redactions, each with its status from `statuses`.
+    /// The list of `read`'s redactions, each with its status from `statuses`, which holds one per
+    /// readable redaction in `read`'s order.
     fn new(read: &redaction_utils::RedactionsRead, statuses: &[RedactionStatus]) -> RedactionList {
-        let redactions = read.redactions.iter()
-            .map(|attributed| {
-                let state = statuses.iter()
-                    .find(|status| status.hash == attributed.redaction.hash)
-                    .map(|status| status.state.clone())
-                    .unwrap_or_else(|| RedactionState::Undecided("It was not judged.".to_string()));
+        assert_eq!(read.redactions.len(), statuses.len(), "one status per readable redaction");
 
-                RedactionView::new(attributed, &state)
-            })
+        let redactions = read.redactions.iter().zip(statuses)
+            .map(|(attributed, status)| RedactionView::new(attributed, &status.state))
             .collect();
         let unreadable = read.unreadable.iter()
             .map(|cell| UnreadableView { hash: cell.hash.clone(), reason: cell.reason.clone() })
@@ -361,15 +357,35 @@ impl RedactionView {
     }
 }
 
+/// A redaction's state.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StateName {
+    /// Applied.
+    Applied,
+
+    /// Pending: a pallet head or a meta pallet's history names it.
+    Held,
+
+    /// Pending: nothing here names it, and the remote's report that it is applied there is waited
+    /// for.
+    AwaitingRemote,
+
+    /// Pending: whether anything names it could not be told.
+    Undecided,
+
+    /// Pending: nothing here names it, and `redact apply` applies it. Only `redact list` reports
+    /// it.
+    Ready,
+}
+
 /// Where a redaction stands: applied, or pending, and why.
 #[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
 pub(crate) struct StateView {
-    /// `applied`; or pending as `held` (a pallet head or a meta pallet's history names it),
-    /// `awaiting_remote` (nothing here names it, and the remote's report that it is applied there
-    /// is waited for), `undecided` (whether anything names it could not be told) or `ready`
-    /// (nothing here names it, and `redact apply` applies it; only `redact list` reports it).
-    state: &'static str,
+    /// The state.
+    state: StateName,
 
     /// For `held`, the pallet heads that name the content.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -404,10 +420,10 @@ impl From<&RedactionState> for StateView {
         let view = |state| StateView { state, heads: Vec::new(), meta_pallets: Vec::new(), reason: None };
 
         match state {
-            RedactionState::Applied => view("applied"),
-            RedactionState::AwaitingRemote => view("awaiting_remote"),
-            RedactionState::Ready => view("ready"),
-            RedactionState::Undecided(reason) => StateView { reason: Some(reason.clone()), ..view("undecided") },
+            RedactionState::Applied => view(StateName::Applied),
+            RedactionState::AwaitingRemote => view(StateName::AwaitingRemote),
+            RedactionState::Ready => view(StateName::Ready),
+            RedactionState::Undecided(reason) => StateView { reason: Some(reason.clone()), ..view(StateName::Undecided) },
             RedactionState::Held { heads, meta_pallets } => StateView {
                 heads: heads.iter()
                     .map(|holder| HeadView {
@@ -415,7 +431,7 @@ impl From<&RedactionState> for StateView {
                     })
                     .collect(),
                 meta_pallets: meta_pallets.iter().map(|name| format!("@{}", name)).collect(),
-                ..view("held")
+                ..view(StateName::Held)
             },
         }
     }
@@ -426,10 +442,10 @@ impl StateView {
     /// operator's text, so they are sanitized.
     fn describe(&self) -> String {
         match self.state {
-            "applied" => "applied".to_string(),
-            "awaiting_remote" => "pending until the remote reports it applied".to_string(),
-            "ready" => "pending, and nothing names it any more: `forklift redact apply` applies it".to_string(),
-            "held" => {
+            StateName::Applied => "applied".to_string(),
+            StateName::AwaitingRemote => "pending until the remote reports it applied".to_string(),
+            StateName::Ready => "pending, and nothing names it any more: `forklift redact apply` applies it".to_string(),
+            StateName::Held => {
                 let mut by: Vec<String> = self.heads.iter()
                     .map(|head| format!("pallet \"{}\" as \"{}\"", sanitize(&head.pallet), sanitize(&head.path)))
                     .collect();
@@ -437,7 +453,7 @@ impl StateView {
 
                 format!("pending: named by {}", by.join(", "))
             }
-            _ => format!("pending: {}", sanitize(self.reason.as_deref().unwrap_or("")).trim_end_matches('.')),
+            StateName::Undecided => format!("pending: {}", sanitize(self.reason.as_deref().unwrap_or("")).trim_end_matches('.')),
         }
     }
 }
