@@ -636,9 +636,10 @@ its own CloudWatch log group.
 
 The verifier reads one DynamoDB item per staged object, its redaction item (`dynamodb:GetItem` on
 the table, the `ReadRedactionItems` statement), then calls `verify_and_promote`, then reads the item
-again: content whose redaction applied while it was promoted has the canonical copy just written
-deleted, every version of it (`s3:ListBucketVersions` on the bucket and `s3:DeleteObjectVersion` on
-`objects/*`, the `ListRedactedVersions` and `DeleteRedactedPromotions` statements).
+again. Content whose redaction has applied is never promoted, or has the canonical copy just written
+deleted, along with every staged copy of it, every version of each (`s3:ListBucketVersions` on the
+bucket and `s3:DeleteObjectVersion` on `objects/*` and `staging/*`, the `ListRedactedVersions` and
+`DeleteRedactedPromotions` statements).
 `iam/verifier.policy.json`'s other statements: `s3:GetObject`/`s3:DeleteObject` on `staging/*` (read
 then clear the staged object once promoted), `s3:GetObject`/`s3:PutObject` on `objects/*` (write the
 promoted copy), `s3:ListBucket` on the bucket (404-vs-403 semantics, below — `verify_and_promote`'s

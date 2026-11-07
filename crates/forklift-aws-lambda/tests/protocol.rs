@@ -5733,6 +5733,10 @@ impl ObjectStore for AppliesDuringPromotion {
     fn delete_canonical(&self, hash: &str) -> Result<(), String> {
         self.inner.delete_canonical(hash)
     }
+
+    fn delete_staged(&self, hash: &str) -> Result<(), String> {
+        self.inner.delete_staged(hash)
+    }
 }
 
 /// A lift commit whose promotion of content lands just before that content's redaction applies
@@ -5758,8 +5762,25 @@ fn a_lift_commit_deletes_what_it_promoted_when_its_redaction_applied_meanwhile()
     assert!(!head.objects.inner.exists(&leak).expect("exists"), "the promoted copy is deleted");
 }
 
+/// A retried lift commit naming content whose redaction applied after an earlier attempt promoted
+/// it, past the sweep, is refused, and deletes the canonical copy that attempt left: the staged
+/// copy is already gone, so the check before promoting is the only one that runs.
+// Revert: drop only the staged copy before refusing → the canonical copy is kept → red.
+#[test]
+fn a_retried_lift_commit_deletes_the_copy_an_earlier_attempt_promoted() {
+    let (_area, head, redactions, leak) = unplanted_redaction("redaction-commit-retry", "leaked\n");
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions);
+    plant_item(&head.refs, &leak, &forklift_aws_lambda::head::redaction_record(true, &[], Some(1)));
+    assert!(head.objects.exists(&leak).expect("exists"), "the earlier attempt's promotion");
+
+    let err = head.commit_lift(&Principal::Static, "lift-1", std::slice::from_ref(&leak), &[], false).expect_err("refused");
+    assert_gone(&err, &leak);
+    assert!(!head.objects.exists(&leak).expect("exists"), "the promoted copy is deleted");
+}
+
 /// The staging verifier's check after its write deletes a promoted copy whose redaction applied,
-/// leaves one whose redaction did not, and keeps an applied recipe, as the judge does.
+/// leaves one whose redaction did not, and keeps an applied recipe, as the judge does, while
+/// still answering that it applied.
 // Revert: delete whatever the item says → the unapplied copy is gone → red. Revert: delete a
 // recipe too → it is gone → red.
 #[test]
@@ -5791,7 +5812,7 @@ fn the_check_after_a_promotion_deletes_only_applied_file_content() {
     let delete = |hash: &str| forklift_aws_lambda::head::delete_if_redaction_applied(&objects, &refs, hash).expect("checked");
     assert!(delete(&gone));
     assert!(!delete(&kept));
-    assert!(!delete(&recipe.hash));
+    assert!(delete(&recipe.hash), "an applied recipe is applied, though it is kept");
     assert!(!delete(&"e".repeat(64)), "no item: nothing to delete");
 
     assert!(!objects.exists(&gone).expect("exists"));

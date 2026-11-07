@@ -339,8 +339,6 @@ async fn two_warehouses_on_one_bucket_never_see_each_others_objects() {
     .expect("the blocking assertions");
 }
 
-/// verify-and-promote across the presigned path: a client's staged bytes are not fetchable
-/// until promoted, a corrupt staged object is discarded, and promotion is idempotent.
 /// Every key and version id the bucket holds, delete markers included, sorted.
 async fn every_version(s3: &aws_sdk_s3::Client, bucket: &str) -> Vec<String> {
     let listed = s3.list_object_versions().bucket(bucket).send().await.expect("list versions");
@@ -432,6 +430,8 @@ async fn s3_deletion_leaves_no_version_of_a_redacted_copy() {
     }
 }
 
+/// verify-and-promote across the presigned path: a client's staged bytes are not fetchable
+/// until promoted, a corrupt staged object is discarded, and promotion is idempotent.
 #[tokio::test(flavor = "multi_thread")]
 async fn s3_verify_and_promote_gates_the_canonical_namespace() {
     let Some(endpoint) = endpoint() else {

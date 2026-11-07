@@ -520,12 +520,6 @@ pub trait ObjectStore {
         Ok(OffloadedResponse::Inline(bytes))
     }
 
-    /// Delete the copy of `hash` staged under `session`, if any: a staged object whose
-    /// redaction applied is dropped, never promoted. The default store stages nothing.
-    fn drop_staged_copy(&self, _session: &str, _hash: &str) -> Result<(), String> {
-        Ok(())
-    }
-
     /// Delete every version of `hash`'s canonical object: what an applied redaction of a file's
     /// content owes the store. An absent object is no error.
     ///

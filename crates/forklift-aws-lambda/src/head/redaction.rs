@@ -319,24 +319,27 @@ fn stored_type<O: ObjectStore + ?Sized>(objects: &O, hash: &str) -> Result<Optio
         .map_err(|error| format!("Object {} cannot be read: {:?}", hash, error))
 }
 
-/// After `hash` was promoted to its canonical object, delete that object again if its redaction
-/// applied meanwhile: the staging verifier's and a lift commit's check after the write. The
-/// promotion checked the item before it wrote, but a redaction that applied between the check
-/// and the write saw no canonical object to delete. A recipe is kept, as the judge keeps it.
+/// If the redaction of `hash` has applied, delete every copy of it a promotion may have left or
+/// be about to promote: every staged copy, in every lift session, and the canonical object unless
+/// the store holds it as a recipe, which is kept as the judge keeps it. What the staging verifier
+/// and a lift commit check before they promote, and again after: a redaction that applied
+/// between the first check and the promotion's write may already have been swept, finding no
+/// canonical object to delete.
 ///
 /// # Returns
-/// * `Ok(bool)`    - Whether it was deleted.
-/// * `Err(String)` - The item or the object could not be read, or the delete failed.
+/// * `Ok(bool)`    - Whether the redaction has applied: the content must not be promoted, and a
+///                   lift commit naming it is refused.
+/// * `Err(String)` - The item or the object could not be read, or a delete failed.
 pub fn delete_if_applied<O: ObjectStore + ?Sized, R: RefStore + ?Sized>(objects: &O, refs: &R, hash: &str) -> Result<bool, String> {
     if !is_applied(refs, hash)? {
         return Ok(false);
     }
 
-    if stored_type(objects, hash)? == Some(ObjectType::Recipe) {
-        return Ok(false);
-    }
+    objects.delete_staged(hash)?;
 
-    objects.delete_canonical(hash)?;
+    if stored_type(objects, hash)? != Some(ObjectType::Recipe) {
+        objects.delete_canonical(hash)?;
+    }
 
     Ok(true)
 }
@@ -428,9 +431,10 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         let recorded = self.recorded().map_err(|error| error.to_string())?;
         let mut applied = Vec::new();
 
-        for hash in recorded.hashes() {
-            if is_applied(&self.refs, &hash)? {
-                applied.push(hash);
+        // Only a redaction this build reads can have applied here: the judge never judges another.
+        for hash in recorded.readable.keys() {
+            if is_applied(&self.refs, hash)? {
+                applied.push(hash.clone());
             }
         }
 
@@ -484,15 +488,16 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         Ok(())
     }
 
-    /// Refuse a lift commit naming a hash whose redaction applied, dropping each such staged copy
-    /// first: it is never promoted. Reads only the item, and applies nothing.
-    pub(super) fn refuse_applied_staged(&self, session: &str, hashes: &[String]) -> HeadResult<()> {
+    /// Refuse a lift commit naming a hash whose redaction applied, deleting each such content's
+    /// copies first ([`delete_if_applied`]): it is never promoted, and a copy an earlier attempt
+    /// of the commit promoted after the redaction's sweep is deleted too. Reads only the item,
+    /// and applies nothing.
+    pub(super) fn refuse_applied_staged(&self, hashes: &[String]) -> HeadResult<()> {
         let recorded = self.recorded()?;
         let mut refused = None;
 
         for hash in hashes.iter().filter(|hash| recorded.contains(hash)) {
-            if is_applied(&self.refs, hash).map_err(HeadError::internal)? {
-                self.objects.drop_staged_copy(session, hash).map_err(HeadError::internal)?;
+            if delete_if_applied(&self.objects, &self.refs, hash).map_err(HeadError::internal)? {
                 self.evict(hash)?;
                 refused.get_or_insert(hash);
             }
@@ -506,9 +511,10 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
     /// After a lift commit promoted `promoted`, delete each one whose redaction applied while it
     /// was promoted, and refuse the commit as
-    /// [`refuse_applied_staged`](Self::refuse_applied_staged) does. `@redactions` is read after
-    /// the promotions landed, so a redaction it does not record yet applies only after them, and
-    /// its own deletion finds their objects.
+    /// [`refuse_applied_staged`](Self::refuse_applied_staged) does. `promoted` includes what was
+    /// already present: an earlier attempt of the same commit may have written it and ended
+    /// before this check. `@redactions` is read after the promotions landed, so a redaction it
+    /// does not record yet applies only after them, and its own deletion finds their objects.
     pub(super) fn refuse_applied_promoted(&self, promoted: &[String]) -> HeadResult<()> {
         let recorded = self.recorded()?;
         let mut refused = None;

@@ -1633,7 +1633,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
         // A staged copy of redacted content is dropped, never promoted, and the commit refused.
         let named: Vec<String> = control_plane.iter().chain(blobs.iter()).cloned().collect();
-        self.refuse_applied_staged(session, &named)?;
+        self.refuse_applied_staged(&named)?;
 
         let mut promoted = Vec::new();
 
@@ -1642,8 +1642,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 self.objects.verify_and_promote(session, hash).map_err(HeadError::internal)?;
 
             match outcome {
-                PromoteOutcome::Promoted => promoted.push(hash.clone()),
-                PromoteOutcome::AlreadyPresent => {}
+                PromoteOutcome::Promoted | PromoteOutcome::AlreadyPresent => promoted.push(hash.clone()),
                 PromoteOutcome::Missing => {
                     // Not "never arrived": an earlier attempt of this commit whose answer was
                     // lost may have discarded it as corrupt or too large.

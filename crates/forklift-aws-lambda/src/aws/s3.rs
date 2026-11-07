@@ -445,9 +445,6 @@ impl S3ObjectStore {
             .map_err(|err| describe("S3 put_object", err))
     }
 
-    /// Best-effort delete of a staged key. A failure here never fails the caller: a leftover
-    /// staged object is unfetchable (it is not at a hash key) and is swept by
-    /// [`discard_session`](S3ObjectStore::discard_session) later.
     /// Delete every version, and every delete marker, of each key under `prefix` that `wanted`
     /// accepts. Listing versions rather than keys is what makes the delete complete on a bucket
     /// with versioning enabled or suspended; on an unversioned bucket each key lists as one
@@ -500,6 +497,9 @@ impl S3ObjectStore {
         }
     }
 
+    /// Best-effort delete of a staged key. A failure here never fails the caller: a leftover
+    /// staged object is unfetchable (it is not at a hash key) and is swept by
+    /// [`discard_session`](S3ObjectStore::discard_session) later.
     async fn drop_staged(&self, key: &str) {
         let _ = self.client.delete_object().bucket(&self.bucket).key(key).send().await;
     }
@@ -924,21 +924,6 @@ impl ObjectStore for S3ObjectStore {
             let url = self.presign_get(&key).await?;
 
             Ok(OffloadedResponse::Url(url))
-        })
-    }
-
-    fn drop_staged_copy(&self, session: &str, hash: &str) -> Result<(), String> {
-        let key = staging_key(&self.warehouse, session, hash);
-
-        self.bridge.block_on(async {
-            self.client
-                .delete_object()
-                .bucket(&self.bucket)
-                .key(&key)
-                .send()
-                .await
-                .map(|_| ())
-                .map_err(|err| describe("S3 delete_object", err))
         })
     }
 

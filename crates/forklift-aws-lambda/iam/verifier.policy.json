@@ -23,7 +23,7 @@
       "Sid": "DeleteRedactedPromotions",
       "Effect": "Allow",
       "Action": "s3:DeleteObjectVersion",
-      "Resource": "${bucket_arn}/objects/*"
+      "Resource": ["${bucket_arn}/objects/*", "${bucket_arn}/staging/*"]
     },
     {
       "Sid": "ListRedactedVersions",
