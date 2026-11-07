@@ -7,16 +7,16 @@
 //! What may go is decided by the deletion census ([`deletion_census`]), not by the collector's
 //! roots. The census is what this warehouse holds a copy *for*: every pallet head's tree, every meta
 //! pallet's whole history, and each checkout's own state (its base, its parked parcels, a
-//! consolidation or cherry-pick in progress, and staged work). Old history is not in it, and
-//! neither are the roots that keep history only for others or for an undo: tombstones, hauls, the
-//! git mirror's roots, trust pins and a journal's removed heads. A copy only those name is the one
+//! consolidation or cherry-pick in progress, and staged work). The history the trust anchor adopts
+//! is meta history, so it is in it too. Old history is not, and neither are the roots that keep
+//! history only for others or for an undo: tombstones, hauls, the git mirror's roots, the other
+//! trust pins and a journal's removed heads. A copy only those name is the one
 //! the redaction exists to delete, and reads already tolerate its absence.
 //!
 //! The census names hashes, never the objects above them: no parcel or tree is deleted, only the
 //! redacted blob or recipe, and the chunks of a recipe no unredacted object names.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::globals::{forklift_root, FOLDER_NAME_INVENTORY_ROOT};
 use crate::util::{
@@ -130,8 +130,10 @@ pub fn deletion_census(targets: &HashSet<String>) -> Result<BTreeMap<String, Vec
         }
     }
 
-    for dir in bay_utils::all_bay_state_dirs()? {
-        let checkout = checkout_of(&dir);
+    let checkouts = std::iter::once((Checkout::Main, forklift_root()))
+        .chain(bay_utils::list_bays()?.into_iter().map(|name| (Checkout::Bay(name.clone()), bay_utils::bay_state_dir(&name))));
+
+    for (checkout, dir) in checkouts {
         let state = bay_utils::read_bay_state_roots_in(&dir)?;
 
         if let Some(base) = state.base {
@@ -160,46 +162,29 @@ pub fn deletion_census(targets: &HashSet<String>) -> Result<BTreeMap<String, Vec
     Ok(census.held)
 }
 
-/// The applied redactions whose objects the store still holds and no census root names: the
-/// hashes the collector and a repack treat as unreferenced, and the deleter deletes. Empty, with no
-/// census taken, when no applied object is present.
+/// The applied redactions no deletion census root names: the hashes the collector and a repack
+/// treat as unreferenced, and the deleter deletes. Empty, with no census taken, when none is
+/// applied.
+///
+/// # Returns
+/// * `Ok(HashSet<String>)` - The excluded hashes, present or not.
+/// * `Err(String)`         - If the applied record could not be read, or the census could not be
+///                           taken.
+pub(crate) fn unheld_applied() -> Result<HashSet<String>, String> {
+    unheld(&applied_redactions::read_applied()?.hashes().cloned().collect())
+}
+
+/// Of `applied`, the hashes no deletion census root names. Presence is never probed: a hash an
+/// earlier run deleted is excluded again at no cost, and an unreadable pack index the census never
+/// needs refuses nothing.
 ///
 /// # Returns
 /// * `Ok(HashSet<String>)` - The excluded hashes.
-/// * `Err(String)`         - If the applied record could not be read, presence could not be told,
-///                           or the census could not be taken.
-pub(crate) fn unheld_applied() -> Result<HashSet<String>, String> {
-    let present = present_applied()?;
-    let held = deletion_census(&present)?;
+/// * `Err(String)`         - If the census could not be taken.
+pub(crate) fn unheld(applied: &HashSet<String>) -> Result<HashSet<String>, String> {
+    let held = deletion_census(applied)?;
 
-    Ok(present.into_iter().filter(|hash| !held.contains_key(hash)).collect())
-}
-
-/// The applied redactions whose objects the store still holds, loose or packed.
-///
-/// # Returns
-/// * `Ok(HashSet<String>)` - The present applied hashes.
-/// * `Err(String)`         - If the applied record could not be read, or presence could not be
-///                           told (an unreadable pack index might hold one).
-pub fn present_applied() -> Result<HashSet<String>, String> {
-    let mut present = HashSet::new();
-
-    for hash in applied_redactions::read_applied()?.hashes() {
-        if file_utils::is_present_for_sweep(hash)? {
-            present.insert(hash.clone());
-        }
-    }
-
-    Ok(present)
-}
-
-/// The checkout whose state lives in the bay-local state dir `dir`.
-fn checkout_of(dir: &Path) -> Checkout {
-    if dir == forklift_root() {
-        Checkout::Main
-    } else {
-        Checkout::Bay(dir.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default())
-    }
+    Ok(applied.iter().filter(|hash| !held.contains_key(*hash)).cloned().collect())
 }
 
 /// A census in progress: the targets, the targets each tree walked so far reaches, and the holders
@@ -450,6 +435,27 @@ mod tests {
 
         assert!(read_fresh(&secret.hash).is_err(), "the packed copy is dropped");
         assert_eq!(read_fresh(&kept.hash).unwrap(), kept.content, "the delta on it is re-encoded");
+    }
+
+    /// An incremental compaction leaves an applied redaction's loose object loose, where a
+    /// collection deletes it, and packs the rest.
+    ///
+    /// Revert: pack every loose object → the secret lands in a pack and the collection, which
+    /// sweeps loose objects only, leaves it.
+    #[test]
+    fn an_incremental_compaction_leaves_an_applied_object_loose_for_the_collection() {
+        let _scratch = Scratch::new("incremental");
+        let (secret, kept) = (store_blob("secret\n"), store_blob("kept\n"));
+        let old = store_parcel(&store_tree(&[("f", &secret, FILE)]), Vec::new());
+        set_main(&store_parcel(&store_tree(&[("f", &kept, FILE)]), vec![old]));
+        applied_redactions::apply_for_test(&[&secret]);
+
+        pack_utils::compact(false, false, false, &Progress::NONE).unwrap();
+        assert!(!pack_utils::is_in_packs(&secret).unwrap() && pack_utils::is_in_packs(&kept).unwrap());
+
+        gc_utils::collect_garbage(0).unwrap();
+        assert!(!present(&secret), "the collection deletes the loose copy");
+        assert!(present(&kept));
     }
 
     /// No applied redaction's object is offered as a delta base, even one the census still names,
