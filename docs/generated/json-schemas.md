@@ -6275,7 +6275,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "array"
         },
         "owed": {
-          "description": "Why the deletion did not run, when it is owed because a lock it needs is taken: other\nobject-store maintenance is running, another process is using the object store, or the\nwarehouse root is being served. Running `redact apply` again once that ends finishes it.\n`kept` then lists the copies held as a census taken without the locks found them. Any other\nfailure to delete fails the command instead.",
+          "description": "Why the deletion did not run, when it is owed because a lock it needs is taken: other\nobject-store maintenance is running, another process is using the object store, or the\nwarehouse root is being served. Running `redact apply` again once that ends finishes it.\n`kept` then lists the copies held as a census taken without the locks found them; it is\nempty, and the reason says why, when that census could not be taken. Any other failure to\ndelete fails the command instead.",
           "type": [
             "string",
             "null"
@@ -6552,7 +6552,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "array"
         },
         "owed": {
-          "description": "Why the deletion did not run, when it is owed because a lock it needs is taken: other\nobject-store maintenance is running, another process is using the object store, or the\nwarehouse root is being served. Running `redact apply` again once that ends finishes it.\n`kept` then lists the copies held as a census taken without the locks found them. Any other\nfailure to delete fails the command instead.",
+          "description": "Why the deletion did not run, when it is owed because a lock it needs is taken: other\nobject-store maintenance is running, another process is using the object store, or the\nwarehouse root is being served. Running `redact apply` again once that ends finishes it.\n`kept` then lists the copies held as a census taken without the locks found them; it is\nempty, and the reason says why, when that census could not be taken. Any other failure to\ndelete fails the command instead.",
           "type": [
             "string",
             "null"

@@ -73,8 +73,8 @@ fn record(target: &str, reason: &str) -> Result<(), String> {
     let already = |hash: &str| read.redactions.iter().any(|existing| existing.redaction.hash == hash)
         || read.unreadable.iter().any(|existing| existing.hash == hash);
     let already_redacted = |hash: &str| format!(
-        "Object {} is already redacted; a redaction is permanent. \"forklift redact apply\" finishes \
-        applying it and deleting its content.",
+        "Object {} is already redacted; a redaction is permanent. \"forklift redact list\" shows \
+        where it stands.",
         hash
     );
 
@@ -171,38 +171,47 @@ fn record(target: &str, reason: &str) -> Result<(), String> {
 /// * `Ok(None)`              - If no applied redaction's object may be present: nothing to do,
 ///                             and no lock was taken.
 /// * `Ok(Some(DeletionView))` - What was deleted and kept, or why the deletion is owed (with the
-///                             copies held as the first census found them).
+///                             copies held as the first census found them, or, when it failed,
+///                             none, and its failure added to the reason).
 /// * `Err(String)`           - If the census under the locks or the deletion could not be carried
 ///                             out (an unreadable pack, bay state or recipe, or a failed delete).
 fn delete_applied() -> Result<Option<DeletionView>, String> {
-    let held = match redaction_deleter::applied_copies() {
+    let (held, uncounted) = match redaction_deleter::applied_copies() {
         Ok(copies) if copies.unheld == 0 => {
             return Ok((!copies.held.is_empty()).then(|| DeletionView::from(Deletion { held: copies.held, ..Deletion::default() })));
         }
-        Ok(copies) => copies.held,
-        Err(_) => BTreeMap::new(),
+        Ok(copies) => (copies.held, None),
+        Err(why) => (BTreeMap::new(), Some(why)),
     };
+    // A failure that was not a race shows again under the locks; until they are free, say it.
+    let owed = |why: String| Some(DeletionView::owed(&held, match &uncounted {
+        Some(census) => format!(
+            "{} Which copies are still held could not be told either: {}",
+            why.trim_end(), census.trim_end()
+        ),
+        None => why,
+    }));
 
     // The store lock keeps out other maintenance, the serve lock a server answering for an object
     // about to go, and exclusive store access every writer that could publish a new reference to
     // one. None waits. `main` takes no shared hold for this command, which would refuse the last.
     let store_lock = match StoreLock::acquire() {
         Ok(lock) => lock,
-        Err(e) => return Ok(Some(DeletionView::owed(&held, format!(
+        Err(e) => return Ok(owed(format!(
             "Other object-store maintenance is running on this warehouse; let it finish. If none is, the \
             lock below was left by a compaction, gc or eviction that was killed and can be removed. {}", e
-        )))),
+        ))),
     };
     let serve_lock = match ServeLock::acquire() {
         Ok(lock) => lock,
-        Err(e) => return Ok(Some(DeletionView::owed(&held, format!(
+        Err(e) => return Ok(owed(format!(
             "This warehouse root is being served; stop the server first. If no server is running, the \
             lock below was left by a server, gc or full repack that was killed and can be removed. {}", e
-        )))),
+        ))),
     };
     let store_access = match StoreAccessLock::try_exclusive() {
         Ok(hold) => hold,
-        Err(e) => return Ok(Some(DeletionView::owed(&held, e))),
+        Err(e) => return Ok(owed(e)),
     };
 
     let deletion = redaction_deleter::delete_applied(&store_lock, &serve_lock, &store_access, &events::progress())?;
@@ -339,9 +348,9 @@ fn apply() -> Result<(), String> {
     let read = redaction_utils::read_redactions()?;
     let statuses = applied_redactions::apply(&read, None)?;
     let deletion = delete_applied().map_err(|why| format!(
-        "The redactions that could be applied are, as \"forklift redact list\" shows, but deleting \
-        the redacted content failed: {} Copies already deleted stay deleted; once that is fixed, run \"forklift \
-        redact apply\" again to finish.",
+        "Every redaction that can be applied now is (see \"forklift redact list\"), but deleting the \
+        redacted content failed: {} Copies already deleted stay deleted; once that is fixed, run \
+        \"forklift redact apply\" again to finish.",
         why.trim_end()
     ))?;
 
@@ -414,8 +423,9 @@ pub(crate) struct DeletionView {
     /// Why the deletion did not run, when it is owed because a lock it needs is taken: other
     /// object-store maintenance is running, another process is using the object store, or the
     /// warehouse root is being served. Running `redact apply` again once that ends finishes it.
-    /// `kept` then lists the copies held as a census taken without the locks found them. Any other
-    /// failure to delete fails the command instead.
+    /// `kept` then lists the copies held as a census taken without the locks found them; it is
+    /// empty, and the reason says why, when that census could not be taken. Any other failure to
+    /// delete fails the command instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     owed: Option<String>,
 }
