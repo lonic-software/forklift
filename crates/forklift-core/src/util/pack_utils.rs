@@ -3694,7 +3694,7 @@ fn compact_bounded(all: bool,
         (None, Some(lock_utils::StoreAccessLock::try_shared()?))
     };
 
-    compact_held(all, redelta, salvage, progress, table_bound, &HashSet::new())
+    compact_held(all, redelta, salvage, progress, table_bound, &HashSet::new(), &HashSet::new())
 }
 
 /// A full repack for an eviction (DESIGN.html §7.6.1): [`compact`] with `all`, keeping the live set
@@ -3725,17 +3725,45 @@ pub fn repack_evicting(evicted: &HashSet<String>,
                        _store_access: &lock_utils::StoreAccessExclusive,
                        progress: &Progress) -> Result<CompactStats, String> {
     file_utils::create_folder_if_not_exists(&pack_folder())?;
-    compact_held(true, false, false, progress, signature_table::MAX_TABLE_ENTRIES, evicted)
+    compact_held(true, false, false, progress, signature_table::MAX_TABLE_ENTRIES, evicted, &HashSet::new())
 }
 
-/// The body of [`compact_bounded`] and [`repack_evicting`], once the caller holds the locks the run
-/// needs. `evicted` is subtracted from a full repack's live set; it must be empty unless `all`.
+/// A full repack for a redaction's deletion: [`repack_evicting`] with `redacted` as what goes, and
+/// `kept` added to the live set although nothing live may reach it. The deleter drops a redacted
+/// recipe before its chunks, so a present recipe never lacks one: the chunks only that recipe named
+/// are kept through the repack that drops it, and dropped by the next.
+///
+/// # Arguments
+/// * `redacted`      - The objects the deletion drops, packed or loose.
+/// * `kept`          - Objects kept as if live, none of them in `redacted`.
+/// * `_store_lock`   - The object-store lock, held.
+/// * `_serve_lock`   - The serve lock, held.
+/// * `_store_access` - Exclusive store access, held.
+/// * `progress`      - Where to report the run's phases.
+///
+/// # Returns
+/// * `Ok(CompactStats)` - What was repacked and how many pack bytes it freed.
+/// * `Err(String)`      - As [`compact`]: no object outside `redacted` is lost on failure.
+pub(crate) fn repack_redacting(redacted: &HashSet<String>,
+                               kept: &HashSet<String>,
+                               _store_lock: &lock_utils::StoreLock,
+                               _serve_lock: &lock_utils::ServeLock,
+                               _store_access: &lock_utils::StoreAccessExclusive,
+                               progress: &Progress) -> Result<CompactStats, String> {
+    file_utils::create_folder_if_not_exists(&pack_folder())?;
+    compact_held(true, false, false, progress, signature_table::MAX_TABLE_ENTRIES, redacted, kept)
+}
+
+/// The body of [`compact_bounded`], [`repack_evicting`] and [`repack_redacting`], once the caller
+/// holds the locks the run needs. `evicted` is subtracted from a full repack's live set and `kept`
+/// added to it; both must be empty unless `all`.
 fn compact_held(all: bool,
                 redelta: bool,
                 salvage: bool,
                 progress: &Progress,
                 table_bound: usize,
-                evicted: &HashSet<String>) -> Result<CompactStats, String> {
+                evicted: &HashSet<String>,
+                kept: &HashSet<String>) -> Result<CompactStats, String> {
     let pack_folder = pack_folder();
     remove_stale_temp_files(&pack_folder);
 
@@ -3773,7 +3801,7 @@ fn compact_held(all: bool,
         let CollectedTargets {
             targets, old_packs, source_packs, damaged_packs_dropped, damaged_packs_kept, damaged_packs_skipped,
             salvage_registration,
-        } = collect_targets(all, redelta, salvage, evicted, &applied)?;
+        } = collect_targets(all, redelta, salvage, evicted, kept, &applied)?;
 
         // Path-aware base selection (phase 2b) is only needed to *build* new deltas — for loose
         // objects and for the rare object whose base is dropped. A repack that only copies existing
@@ -5139,11 +5167,13 @@ struct CollectedTargets {
 /// object is dropped like garbage, and a delta against one is reconstructed like any delta whose
 /// base is dropped. Of `applied` (every applied redaction), a repack's live set does not mark those no
 /// deletion census root names ([`redaction_deleter::unheld`]), and an incremental compaction
-/// leaves their loose copies unpacked, for a collection to delete.
+/// leaves their loose copies unpacked, for a collection to delete. `kept` is added to a repack's
+/// live set (see [`repack_redacting`]).
 fn collect_targets(all: bool,
                    redelta: bool,
                    salvage: bool,
                    evicted: &HashSet<String>,
+                   kept: &HashSet<String>,
                    applied: &HashSet<String>) -> Result<CollectedTargets, String> {
     if !all {
         // An applied redaction's loose object stays loose, where a collection can delete it.
@@ -5176,6 +5206,7 @@ fn collect_targets(all: bool,
     let excluded = redaction_deleter::unheld(applied)?;
     let mut live = crate::util::gc_utils::collect_live_set_excluding(&excluded)?;
     live.retain(|hash| !evicted.contains(hash));
+    live.extend(kept.iter().cloned());
     let mut targets = Vec::new();
     // Hash -> index of its already-pushed target in `targets` (FORK-55): a later duplicate of a
     // live hash resolves against the target already selected instead of being skipped outright,

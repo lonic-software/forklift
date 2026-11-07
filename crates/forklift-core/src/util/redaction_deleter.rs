@@ -19,9 +19,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::globals::{forklift_root, FOLDER_NAME_INVENTORY_ROOT};
+use crate::enums::object::parsed_object::ParsedObject;
+use crate::parser::object::loose_object_parser;
+use crate::util::lock_utils::{ServeLock, StoreAccessExclusive, StoreLock};
+use crate::util::progress_utils::Progress;
 use crate::util::{
-    applied_redactions, bay_utils, file_utils, gc_utils, object_utils, office_utils, pallet_utils,
-    recovery_utils,
+    applied_redactions, bay_utils, cache_miss, file_utils, gc_utils, object_utils, office_utils, pack_utils,
+    pallet_utils, prune_utils, recovery_utils,
 };
 
 /// A checkout: the warehouse's own working tree, or a named bay.
@@ -183,13 +187,184 @@ pub(crate) fn unheld_applied() -> Result<HashSet<String>, String> {
 /// * `Ok(HashSet<String>)` - The excluded hashes.
 /// * `Err(String)`         - If the census could not be taken.
 pub(crate) fn unheld(applied: &HashSet<String>) -> Result<HashSet<String>, String> {
-    let targets: HashSet<String> = applied.iter()
-        .filter(|hash| !matches!(file_utils::does_object_exist(hash), Ok(false)))
-        .cloned()
-        .collect();
+    let targets = maybe_present(applied);
     let held = deletion_census(&targets)?;
 
     Ok(targets.into_iter().filter(|hash| !held.contains_key(hash)).collect())
+}
+
+/// Of `hashes`, those the store may hold: every one but those it plainly lacks.
+fn maybe_present(hashes: &HashSet<String>) -> HashSet<String> {
+    hashes.iter()
+        .filter(|hash| !matches!(file_utils::does_object_exist(hash), Ok(false)))
+        .cloned()
+        .collect()
+}
+
+/// Whether the store may still hold a copy of an applied redaction's object, so that
+/// [`delete_applied`] has something to look at. `false` once every applied object is gone, or
+/// when none is applied: the caller then needs no hold.
+///
+/// # Returns
+/// * `Ok(bool)`    - Whether any applied object may be present.
+/// * `Err(String)` - If the applied record could not be read.
+pub fn any_applied_present() -> Result<bool, String> {
+    let applied: HashSet<String> = applied_redactions::read_applied()?.hashes().cloned().collect();
+
+    Ok(!maybe_present(&applied).is_empty())
+}
+
+/// What [`delete_applied`] did.
+#[derive(Debug, Default)]
+pub struct Deletion {
+    /// The applied redactions' objects (blobs and recipes) deleted, sorted.
+    pub objects: Vec<String>,
+
+    /// The chunks deleted: those of a deleted recipe that no unredacted object names.
+    pub chunks: usize,
+
+    /// The bytes freed: loose files deleted, and what the old packs held beyond the new ones.
+    pub bytes_freed: u64,
+
+    /// Objects and chunks to delete still inside a pack after the repack: one found damaged only
+    /// during it, which a repack leaves as found. `store compact --all` salvages it, and the next
+    /// deletion deletes it.
+    pub still_packed: usize,
+
+    /// The applied redactions whose copies are kept, each with the census roots that hold it.
+    pub held: BTreeMap<String, Vec<CopyHolder>>,
+}
+
+/// Delete every copy of an applied redaction's object that no deletion census root names, and the
+/// chunks of a deleted recipe that no unredacted object names. Copies the census names are kept and
+/// reported with their holders: once the file is taken out of that state, the next deletion
+/// removes them.
+///
+/// Runs under the locks a full repack takes, in its order, from before the census until the last
+/// delete, so no writer can publish a new reference to an object about to go. Nothing is fetched.
+///
+/// Every deletion follows evict's order: packed copies go by a full repack that keeps everything
+/// else, while loose copies of delta bases can still be read, then loose copies. It runs in two
+/// passes so that a present recipe never lacks a chunk, a state a walk reads as damage: the first
+/// deletes the redacted objects and keeps every chunk, the second deletes the chunks only they
+/// named. Each recipe's chunk list is read before anything is deleted. A run cut short at any point
+/// leaves either a recipe with all its chunks, or chunks nothing names, and running it again
+/// finishes the job.
+///
+/// # Arguments
+/// * `store_lock`   - The object-store lock, held.
+/// * `serve_lock`   - The serve lock, held: no server may answer for an object about to go.
+/// * `store_access` - Exclusive store access, held.
+/// * `progress`     - Where a repack reports its phases.
+///
+/// # Returns
+/// * `Ok(Deletion)` - What was deleted, and what was kept.
+/// * `Err(String)`  - If the applied record, the census, a recipe or the packs could not be read
+///                    (nothing is deleted then), or a repack or a delete failed. Either way,
+///                    running it again finishes.
+pub fn delete_applied(store_lock: &StoreLock,
+                      serve_lock: &ServeLock,
+                      store_access: &StoreAccessExclusive,
+                      progress: &Progress) -> Result<Deletion, String> {
+    let _unfetched = cache_miss::Unfetched::enter();
+
+    let applied: HashSet<String> = applied_redactions::read_applied()?.hashes().cloned().collect();
+    let present = maybe_present(&applied);
+    let held = deletion_census(&present)?;
+    let targets: HashSet<String> = present.into_iter().filter(|hash| !held.contains_key(hash)).collect();
+
+    // Only an unredacted live recipe can still name a target, as a chunk: it stays.
+    let live = gc_utils::collect_live_set_excluding(&targets)?;
+    let objects: HashSet<String> = targets.into_iter().filter(|hash| !live.contains(hash)).collect();
+
+    let mut chunks: HashSet<String> = HashSet::new();
+    for hash in &objects {
+        if !file_utils::is_present_for_sweep(hash)? {
+            continue;
+        }
+        let bytes = file_utils::retrieve_object_by_hash_shared(hash)?;
+        if let ParsedObject::Recipe(recipe) = loose_object_parser::parse(&bytes)? {
+            chunks.extend(recipe.chunks.into_iter().map(|chunk| chunk.hash).filter(|chunk| !live.contains(chunk)));
+        }
+    }
+
+    let first = drop_copies(&objects, &chunks, store_lock, serve_lock, store_access, progress)?;
+    let second = drop_copies(&chunks, &HashSet::new(), store_lock, serve_lock, store_access, progress)?;
+
+    let mut deleted = first.deleted;
+    deleted.sort();
+
+    Ok(Deletion {
+        objects: deleted,
+        chunks: second.deleted.len(),
+        bytes_freed: first.bytes_freed + second.bytes_freed,
+        still_packed: first.still_packed + second.still_packed,
+        held,
+    })
+}
+
+/// What one pass of [`delete_applied`] dropped.
+#[derive(Default)]
+struct Dropped {
+    deleted: Vec<String>,
+    bytes_freed: u64,
+    still_packed: usize,
+}
+
+/// Drop every copy of `set`, packed and loose, keeping `kept` through the repack as if it were
+/// live.
+fn drop_copies(set: &HashSet<String>,
+               kept: &HashSet<String>,
+               store_lock: &StoreLock,
+               serve_lock: &ServeLock,
+               store_access: &StoreAccessExclusive,
+               progress: &Progress) -> Result<Dropped, String> {
+    let mut dropped = Dropped::default();
+
+    if set.is_empty() {
+        return Ok(dropped);
+    }
+
+    let mut packed: HashSet<String> = HashSet::new();
+    let mut loose: Vec<String> = Vec::new();
+
+    for hash in set {
+        if pack_utils::is_in_packs(hash)? {
+            packed.insert(hash.clone());
+        }
+        if file_utils::loose_dentry_exists(hash)? {
+            loose.push(hash.clone());
+        }
+    }
+
+    // A packed delta can stand on a loose-only copy; the repack re-encodes it before that copy is
+    // freed. A damaged pack refuses the pass, which could not tell what stands on what it deletes.
+    let loose_only: HashSet<String> = loose.iter().filter(|hash| !packed.contains(*hash)).cloned().collect();
+    let delta_on_loose = pack_utils::any_packed_delta_against(&loose_only)
+        .map_err(|error| error.refusal("Deleting a redacted object", "the objects it names were kept"))?;
+
+    let mut still_packed: HashSet<String> = HashSet::new();
+    if !packed.is_empty() || delta_on_loose {
+        dropped.bytes_freed += pack_utils::repack_redacting(set, kept, store_lock, serve_lock, store_access, progress)?
+            .pack_bytes_freed;
+
+        for hash in &packed {
+            if pack_utils::is_in_packs(hash)? {
+                still_packed.insert(hash.clone());
+            }
+        }
+    }
+
+    dropped.bytes_freed += prune_utils::free_objects(&loose, store_access)?.bytes;
+    dropped.still_packed = still_packed.len();
+    dropped.deleted = packed.iter().chain(loose.iter())
+        .filter(|hash| !still_packed.contains(*hash))
+        .cloned()
+        .collect::<HashSet<String>>()
+        .into_iter()
+        .collect();
+
+    Ok(dropped)
 }
 
 /// A census in progress: the targets, the targets each tree walked so far reaches, and the holders
