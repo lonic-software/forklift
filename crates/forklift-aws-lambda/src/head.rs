@@ -181,6 +181,10 @@ const DELETE_ATTEMPTS: usize = 3;
 /// the invocation's window affords no other).
 const REDACTION_ATTEMPTS: usize = 3;
 
+/// The time a ref update keeps, past another redaction check's own, to answer in before the
+/// invocation deadline.
+const REDACTION_ANSWER_RESERVE: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// The serverless protocol handler over an [`ObjectStore`] and a [`RefStore`].
 pub struct Head<O: ObjectStore, R: RefStore> {
     pub objects: O,
@@ -1243,12 +1247,12 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     }
 
     /// Whether this invocation's window can take another attempt that took `attempt`, with as
-    /// much again to spare and [`HOLDS_ANSWER_RESERVE`] to answer in, so a ref update that keeps
+    /// much again to spare and [`REDACTION_ANSWER_RESERVE`] to answer in, so a ref update that keeps
     /// losing to new redactions answers its `409` rather than run out of time with no answer.
     /// Without a deadline, always.
     fn affords_another(&self, attempt: std::time::Duration) -> bool {
         self.deadline.is_none_or(|deadline| {
-            deadline.duration_since(SystemTime::now()).unwrap_or_default() > attempt * 2 + HOLDS_ANSWER_RESERVE
+            deadline.duration_since(SystemTime::now()).unwrap_or_default() > attempt * 2 + REDACTION_ANSWER_RESERVE
         })
     }
 
