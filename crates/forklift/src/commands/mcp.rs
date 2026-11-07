@@ -762,6 +762,8 @@ pub(crate) const HUMAN_ONLY: &[(&str, &str)] = &[
     ("self", "manages this binary itself: its updates and its `fl` alias are host concerns, and the description it gives Pult is the tool list agents already have"),
     ("scope prune", "destructive, warehouse-wide disk reclamation: an admin verb, never a sub-agent's"),
     ("store evict", "warehouse-wide disk reclamation in a cache: an admin verb, like scope prune"),
+    ("redact record", "redacts content permanently, with no undo, and deletes it: an admin verb"),
+    ("redact apply", "deletes redacted content warehouse-wide: an admin verb, like scope prune"),
     ("remote", "shows the remote configuration, like config, and repoints a partial warehouse at another server: setup"),
     ("mcp", "this server itself"),
     ("help", "meta"),

@@ -2185,6 +2185,24 @@ object here is one only local history names (the origin's history was checked be
 freed), so the record keeps everything until that content is back, for example by restoring it from
 a copy that has it.
 
+### `redact` — remove leaked content for good
+
+```sh
+forklift redact record <revision>:<path> -m "leaked token"   # admin only; permanent
+forklift redact list                                          # every redaction and its state
+forklift redact apply                                         # apply and delete what can be now
+```
+
+A redaction is for content that must never be stored again: a leaked secret, an oversized file, a
+legal takedown. It is recorded on the `@redactions` meta pallet and cannot be undone. Once it
+applies, every copy of the content in this warehouse is deleted, packed or loose, together with a
+large file's chunks that no other file shares, except a copy that a checkout's base, parked work, a
+consolidation or pick in progress, or staged work still names. Those copies are listed with what
+holds them, and kept until the file is taken out of that state and `forklift redact apply` runs
+again. The deletion needs the object store to itself: while a command in another bay or a server is
+using it, the deletion is reported as owed, and `forklift redact apply` finishes it later. Neither
+`redact record` nor `redact apply` is an agent tool under `forklift mcp`.
+
 ### `remote` — the remote and the origin
 
 ```sh

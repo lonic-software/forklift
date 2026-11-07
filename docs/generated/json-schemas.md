@@ -6245,6 +6245,50 @@ A command not listed here either reports only the generic human-message shape `{
 ```json
 {
   "$defs": {
+    "DeletionView": {
+      "description": "What deleting the copies of the applied redactions' content did.",
+      "properties": {
+        "bytes_freed": {
+          "description": "Bytes freed on disk: loose files deleted, plus what the old packs held beyond the packs a\nrepack wrote.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "chunks_deleted": {
+          "description": "Chunks deleted: those of a deleted recipe that no unredacted object names.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "deleted": {
+          "description": "The applied redactions' objects (blobs and recipes) deleted.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "kept": {
+          "description": "Applied redactions whose copies are kept, because a checkout's state still names them (or a\npallet head or meta pallet's history, as a guard). Taking the file out of that state and\nrunning `redact apply` again deletes them.",
+          "items": {
+            "$ref": "#/$defs/KeptView"
+          },
+          "type": "array"
+        },
+        "owed": {
+          "description": "Why the deletion did not run, when it is owed: another process is using the object store, or\nthe warehouse root is being served. Running `redact apply` again finishes it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "deleted",
+        "chunks_deleted",
+        "bytes_freed"
+      ],
+      "type": "object"
+    },
     "HeadView": {
       "description": "A pallet head that names a redaction's content.",
       "properties": {
@@ -6265,6 +6309,104 @@ A command not listed here either reports only the generic human-message shape `{
         "pallet",
         "head",
         "path"
+      ],
+      "type": "object"
+    },
+    "HolderKind": {
+      "description": "The kind of a kept copy's holder.",
+      "oneOf": [
+        {
+          "const": "pallet",
+          "description": "A pallet head's tree.",
+          "type": "string"
+        },
+        {
+          "const": "meta_history",
+          "description": "A meta pallet's history.",
+          "type": "string"
+        },
+        {
+          "const": "adopted_history",
+          "description": "The history the trust anchor adopts.",
+          "type": "string"
+        },
+        {
+          "const": "base",
+          "description": "A checkout's base.",
+          "type": "string"
+        },
+        {
+          "const": "parked",
+          "description": "A parcel parked in a checkout.",
+          "type": "string"
+        },
+        {
+          "const": "consolidation",
+          "description": "A consolidation in progress in a checkout.",
+          "type": "string"
+        },
+        {
+          "const": "pick",
+          "description": "A cherry-pick in progress in a checkout.",
+          "type": "string"
+        },
+        {
+          "const": "staged",
+          "description": "Work staged in a checkout.",
+          "type": "string"
+        }
+      ]
+    },
+    "HolderView": {
+      "description": "What names a kept copy.",
+      "properties": {
+        "bay": {
+          "description": "For a checkout's state, the bay; absent for the warehouse's own working tree.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "description": "The holder in words, as the human output prints it (unsanitized).",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/HolderKind",
+          "description": "The kind of holder."
+        },
+        "pallet": {
+          "description": "For `pallet`, the pallet; for `meta_history`, the meta pallet, with its `@`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "description"
+      ],
+      "type": "object"
+    },
+    "KeptView": {
+      "description": "An applied redaction whose copy is kept.",
+      "properties": {
+        "hash": {
+          "description": "The redacted object.",
+          "type": "string"
+        },
+        "holders": {
+          "description": "What names the copy.",
+          "items": {
+            "$ref": "#/$defs/HolderView"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "hash",
+        "holders"
       ],
       "type": "object"
     },
@@ -6340,6 +6482,17 @@ A command not listed here either reports only the generic human-message shape `{
       "description": "Whether the object is a chunked file's recipe, whose chunk list is redacted with it.",
       "type": "boolean"
     },
+    "deletion": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DeletionView"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "What deleting the copies of every applied redaction's content did; absent when no applied\nredaction's object was left to delete."
+    },
     "hash": {
       "description": "The redacted object.",
       "type": "string"
@@ -6369,6 +6522,50 @@ A command not listed here either reports only the generic human-message shape `{
 ```json
 {
   "$defs": {
+    "DeletionView": {
+      "description": "What deleting the copies of the applied redactions' content did.",
+      "properties": {
+        "bytes_freed": {
+          "description": "Bytes freed on disk: loose files deleted, plus what the old packs held beyond the packs a\nrepack wrote.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "chunks_deleted": {
+          "description": "Chunks deleted: those of a deleted recipe that no unredacted object names.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "deleted": {
+          "description": "The applied redactions' objects (blobs and recipes) deleted.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "kept": {
+          "description": "Applied redactions whose copies are kept, because a checkout's state still names them (or a\npallet head or meta pallet's history, as a guard). Taking the file out of that state and\nrunning `redact apply` again deletes them.",
+          "items": {
+            "$ref": "#/$defs/KeptView"
+          },
+          "type": "array"
+        },
+        "owed": {
+          "description": "Why the deletion did not run, when it is owed: another process is using the object store, or\nthe warehouse root is being served. Running `redact apply` again finishes it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "deleted",
+        "chunks_deleted",
+        "bytes_freed"
+      ],
+      "type": "object"
+    },
     "HeadView": {
       "description": "A pallet head that names a redaction's content.",
       "properties": {
@@ -6389,6 +6586,104 @@ A command not listed here either reports only the generic human-message shape `{
         "pallet",
         "head",
         "path"
+      ],
+      "type": "object"
+    },
+    "HolderKind": {
+      "description": "The kind of a kept copy's holder.",
+      "oneOf": [
+        {
+          "const": "pallet",
+          "description": "A pallet head's tree.",
+          "type": "string"
+        },
+        {
+          "const": "meta_history",
+          "description": "A meta pallet's history.",
+          "type": "string"
+        },
+        {
+          "const": "adopted_history",
+          "description": "The history the trust anchor adopts.",
+          "type": "string"
+        },
+        {
+          "const": "base",
+          "description": "A checkout's base.",
+          "type": "string"
+        },
+        {
+          "const": "parked",
+          "description": "A parcel parked in a checkout.",
+          "type": "string"
+        },
+        {
+          "const": "consolidation",
+          "description": "A consolidation in progress in a checkout.",
+          "type": "string"
+        },
+        {
+          "const": "pick",
+          "description": "A cherry-pick in progress in a checkout.",
+          "type": "string"
+        },
+        {
+          "const": "staged",
+          "description": "Work staged in a checkout.",
+          "type": "string"
+        }
+      ]
+    },
+    "HolderView": {
+      "description": "What names a kept copy.",
+      "properties": {
+        "bay": {
+          "description": "For a checkout's state, the bay; absent for the warehouse's own working tree.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "description": "The holder in words, as the human output prints it (unsanitized).",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/HolderKind",
+          "description": "The kind of holder."
+        },
+        "pallet": {
+          "description": "For `pallet`, the pallet; for `meta_history`, the meta pallet, with its `@`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "description"
+      ],
+      "type": "object"
+    },
+    "KeptView": {
+      "description": "An applied redaction whose copy is kept.",
+      "properties": {
+        "hash": {
+          "description": "The redacted object.",
+          "type": "string"
+        },
+        "holders": {
+          "description": "What names the copy.",
+          "items": {
+            "$ref": "#/$defs/HolderView"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "hash",
+        "holders"
       ],
       "type": "object"
     },
@@ -6525,6 +6820,17 @@ A command not listed here either reports only the generic human-message shape `{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "The list of redactions.",
   "properties": {
+    "deletion": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DeletionView"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "For `redact apply`, what deleting the copies of every applied redaction's content did;\nabsent from `redact list`, and when no applied redaction's object was left to delete."
+    },
     "redactions": {
       "items": {
         "$ref": "#/$defs/RedactionView"

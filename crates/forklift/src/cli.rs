@@ -1447,7 +1447,7 @@ pub enum RedactAction {
     )]
     List,
 
-    /// Apply every redaction that nothing here names any more
+    /// Apply every redaction that nothing here names any more, and delete its content
     #[command(
         long_about = "Apply every pending redaction that no pallet head and no meta pallet's history \
                       here names, and delete the copies of every applied redaction's content that \

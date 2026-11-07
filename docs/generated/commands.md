@@ -86,6 +86,10 @@ Every `forklift` command and subcommand, generated from the same command definit
 | `profile use` |  |  | Act as this profile in the current warehouse |
 | `profile keygen` |  |  | Generate a keypair locally and print its public half + proof-of-possession |
 | `query` |  |  | Query parcel history by signed identity, signer and parcel facts |
+| `redact` |  |  | Redact stored content permanently: record an object that must be removed and never stored again |
+| `redact record` |  |  | Record a permanent redaction of one file's content (admin only) |
+| `redact list` |  |  | List every redaction and where it stands (the default) |
+| `redact apply` |  |  | Apply every redaction that nothing here names any more, and delete its content |
 | `remote` |  |  | Show the remote and the origin, or move a partial warehouse's origin to another server |
 | `remote move` |  |  | Move a partial warehouse's origin to another server that holds its content |
 | `remote abort` |  |  | Abandon a move that stopped before it started rewriting the origin |
