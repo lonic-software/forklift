@@ -151,10 +151,11 @@ async fn handler(event: LambdaEvent<S3Event>) -> Result<(), Error> {
                 eprintln!("verifier: deleted staged object {}: its content is redacted, and its recipe is kept", key);
                 continue;
             }
-            Err(_) => {
-                eprintln!("verifier: deleted staged object {} and its canonical copy: its content is redacted", key);
+            Err(AppliedCopies::Deleted) => {
+                eprintln!("verifier: deleted staged object {} and any canonical copy: its content is redacted", key);
                 continue;
             }
+            Err(AppliedCopies::Unapplied) => unreachable!("only an applied redaction stops a promotion"),
         };
 
         match outcome {

@@ -344,9 +344,11 @@ impl AppliedCopies {
 /// left or be about to promote: that session's staged copy, and the canonical object unless the
 /// store holds it as a recipe. What the staging verifier and a lift commit check before they
 /// promote, and again after: a redaction that applied between the first check and the
-/// promotion's write may already have been swept, finding no canonical object to delete. Other
-/// sessions' staged copies are the sweep's, which lists the whole staging prefix once per lease;
-/// this reads one key, so a client retrying applied content costs no listing.
+/// promotion's write may already have been swept, finding no canonical object to delete. This
+/// reads one key, so a client retrying applied content costs no listing. Other sessions' copies
+/// are not touched: one staged before the sweep is the sweep's, one staged after it is deleted by
+/// its own verifier event or the lift commit naming it, and one neither reaches is left to the
+/// `staging/` lifecycle rule.
 ///
 /// # Returns
 /// * `Ok(AppliedCopies)` - Whether the redaction has applied, and what was deleted.
@@ -516,9 +518,10 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         Ok(())
     }
 
-    /// Refuse a lift commit naming a hash whose redaction applied, deleting each such content's
-    /// copies first ([`delete_if_applied`]): it is never promoted, and a copy an earlier attempt
-    /// of the commit promoted after the redaction's sweep is deleted too. Reads only the item,
+    /// Refuse a lift commit naming a hash whose redaction applied, deleting the session's staged
+    /// copy of each such content first, and its canonical object ([`delete_if_applied`]): it is
+    /// never promoted, and a copy an earlier attempt of the commit promoted after the redaction's
+    /// sweep is deleted too. Reads only the item,
     /// and applies nothing.
     pub(super) fn refuse_applied_staged(&self, session: &str, hashes: &[String]) -> HeadResult<()> {
         let recorded = self.recorded()?;

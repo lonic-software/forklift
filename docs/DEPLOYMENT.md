@@ -304,6 +304,11 @@ unswept forever. This is explicitly called out as an operational, not a code, ga
 * **Suggested age: 7 days** — comfortably longer than any legitimate lift (including a
   paginated one) is expected to take, short enough that abandoned sessions do not accumulate
   indefinitely.
+* **On a versioned bucket, expire noncurrent versions too** (`infra/aws-serverless` sets 1 day).
+  An expiry there only adds a delete marker, and the staged bytes stay a noncurrent version. That
+  matters for redacted content: a copy staged after its redaction's deletion ran is deleted,
+  every version of it, by its own verifier event or the lift commit naming it; one whose event
+  never succeeds is left to this rule.
 
 ### Recommended: expire the `responses/` prefix
 
@@ -333,7 +338,8 @@ All three are **operator decisions**; none is required or read by the code:
   writes to immutable keys — a `412` on a second write, not a silent overwrite). It keeps no copy
   of redacted content: an applied redaction's deletion lists the versions of every key it
   removes and deletes each, which is why both roles hold `s3:ListBucketVersions` and
-  `s3:DeleteObjectVersion`.
+  `s3:DeleteObjectVersion`. A staged copy no deletion reaches is left to the `staging/` rule's
+  noncurrent-version expiry (above), so set one.
 * **Encryption** — SSE-S3 or SSE-KMS at rest, your call; the SDK calls carry no
   encryption-context parameters either way.
 * **CORS — not needed.** Every client is the `forklift` CLI (a `reqwest`-based Rust binary)
