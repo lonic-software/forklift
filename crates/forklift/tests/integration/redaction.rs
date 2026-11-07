@@ -1087,7 +1087,7 @@ fn a_meta_history_naming_a_hash_applied_here_is_never_taken_from_the_remote() {
 
     let lowered = warehouse.json(&["lower"]);
     let message = lowered["error"]["message"].as_str().unwrap();
-    assert!(message.contains(&format!("@tags: Refusing to set pallet \"@tags\"")), "{}", lowered);
+    assert!(message.contains("@tags: Refusing to set pallet \"@tags\""), "{}", lowered);
     assert!(message.contains(&format!("({}) is redacted in this warehouse", hash)), "{}", lowered);
     assert!(message.contains("make a fresh clone of the remote"), "{}", lowered);
     assert!(!warehouse.root.join(".forklift/meta/tags").exists(), "@tags was not taken");
