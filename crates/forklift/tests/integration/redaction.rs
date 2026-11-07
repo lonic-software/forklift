@@ -934,6 +934,16 @@ fn a_remote_holds_a_redaction_pending_and_a_head_holds_it_until_the_file_is_out(
     });
     assert_eq!(holder.redactions()[0]["status"], held);
 
+    // A meta pallet whose history is damaged cannot be judged, but the head that names the content
+    // is still reported ahead of that error.
+    holder.run_ok(&["tag", "create", "v1", "main"]);
+    let tags = std::fs::read_to_string(holder.root.join(".forklift/meta/tags")).unwrap().trim().to_string();
+    let loose = holder.root.join(".forklift/objects").join(&tags[..2]).join(&tags[2..]);
+    let parcel = std::fs::read(&loose).unwrap();
+    std::fs::remove_file(&loose).unwrap();
+    assert_eq!(holder.redactions()[0]["status"], held);
+    std::fs::write(&loose, parcel).unwrap();
+
     holder.run_ok(&["config", "unset", "remote.url"]);
     let applied = holder.json(&["redact", "apply"]);
     assert_eq!(applied["data"]["redactions"][0]["status"]["state"], "held", "{}", applied);
