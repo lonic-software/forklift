@@ -146,9 +146,10 @@ entry per redacted object hash, with the state the remote holds it in:
 
 A head applies a redaction once no pallet head, no tombstone and no metadata history it holds
 names the content, after each ref update or `DELETE`. Applying is permanent: an applied redaction is never
-pending again. forklift-server answers the write only once what it let apply is applied, so a
-client that lifted and then reads the handshake sees what its lift let apply. The deletion that
-follows is not waited for.
+pending again. forklift-server applies before it answers the write, so a client that lifted and
+then reads the handshake sees what its lift let apply. The deletion that follows is not waited
+for. An apply that fails is logged and the write is answered all the same: the ref is written, and
+what the apply found stays pending until a later write, or the server's retry, applies it.
 
 forklift-server deletes an applied redaction's content in its own process right after applying
 it. It drains that one warehouse: new requests for it get `503` until the deletion ends (which may

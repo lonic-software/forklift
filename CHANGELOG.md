@@ -114,8 +114,8 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   include repacking the warehouse's packs, it answers requests for that one warehouse with `503`
   and a `Retry-After`, and cuts any download of its bundle. A deletion it cannot carry out yet, because requests did not end in time or a command
   on the server's machine holds the warehouse, is retried later and whenever the server starts.
-  A write is answered only once what it let apply is applied, and the handshake reports the
-  redaction `deleted` once no copy is left. Every `503` the server sends now carries
+  The write that lets a redaction apply is answered once it is applied, without waiting for
+  the deletion, and the handshake reports the redaction `deleted` once no copy is left. Every `503` the server sends now carries
   `Retry-After`.
 - **`forklift redact` is listed, and the `--json` schema is now 27: an applied redaction's content
   is deleted.** Part of content redaction: once a redaction applies, `redact record` and

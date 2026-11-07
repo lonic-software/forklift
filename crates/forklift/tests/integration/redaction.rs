@@ -1511,7 +1511,8 @@ fn http(url: &str, method: &str, path: &str, body: &[u8]) -> (String, String) {
 /// the content), every surface that reads or takes content refuses it as redacted, and a warehouse
 /// whose unlifted history still names it lifts that history without it.
 ///
-/// Revert: skip applying after a ref write → the handshake reports the redaction pending.
+/// Revert: skip applying after a ref write → the handshake reports the redaction pending (the
+/// redaction run applies only what a write could not).
 #[test]
 fn a_server_applies_a_redaction_no_head_names_and_refuses_its_content() {
     let server = Server::start(&std::env::temp_dir()

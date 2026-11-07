@@ -106,11 +106,8 @@ struct WarehouseHandle {
     /// Whether the running redaction run must go round again: a ref write landed while it ran.
     redact_again: std::sync::atomic::AtomicBool,
 
-    /// How many redaction rounds have been asked for ([`run_redactions`]), and the count the last
-    /// finished apply had seen when it began: a handshake waits until every round asked before it
-    /// has applied, so a client reads what its own ref write let apply.
+    /// How many redaction rounds have been asked for ([`run_redactions`]).
     redactions_asked: std::sync::atomic::AtomicU64,
-    applied_through: tokio::sync::watch::Sender<u64>,
 
     /// Wakes a redaction run waiting to retry an owed deletion, when a ref write asks for a round.
     redaction_wake: Arc<tokio::sync::Notify>,
@@ -119,6 +116,11 @@ struct WarehouseHandle {
     /// a deletion owed when an earlier process stopped serving the warehouse is carried out once
     /// it is served again, ref write or not.
     first_run_due: std::sync::atomic::AtomicBool,
+
+    /// Whether a redaction run's next round must apply what it finds: set for a served handle (a
+    /// redaction recorded before an earlier process stopped may never have applied) and by a ref
+    /// write whose own apply failed. A write that applied leaves the run nothing to apply.
+    apply_owed: std::sync::atomic::AtomicBool,
 }
 
 impl WarehouseHandle {
@@ -138,9 +140,9 @@ impl WarehouseHandle {
             redacting: std::sync::atomic::AtomicBool::new(false),
             redact_again: std::sync::atomic::AtomicBool::new(false),
             redactions_asked: std::sync::atomic::AtomicU64::new(0),
-            applied_through: tokio::sync::watch::Sender::new(0),
             redaction_wake: Arc::new(tokio::sync::Notify::new()),
             first_run_due: std::sync::atomic::AtomicBool::new(false),
+            apply_owed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -225,6 +227,7 @@ impl WarehouseHandle {
         handle._serve_lock = Some(serve_lock);
         handle.store_access = std::sync::Mutex::new(Some(store_access));
         handle.first_run_due = std::sync::atomic::AtomicBool::new(true);
+        handle.apply_owed = std::sync::atomic::AtomicBool::new(true);
         handle._format_lease = Some(format_lease);
         Ok(handle)
     }
@@ -3379,22 +3382,31 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
     }
 }
 
-/// What follows a ref write this warehouse took: a redaction run ([`run_redactions`]), for every
-/// redaction the write may have let apply, and the bundle rebuild the accepted-lift counter may
-/// call for. The write's answer waits for the run's apply, so content a write let apply is refused
-/// before the write is answered; it does not wait for the deletion after.
+/// What follows a ref write this warehouse took. The write's answer waits for the apply of every
+/// redaction the write let apply ([`apply_redactions`]), so content a write let apply is refused
+/// before the write is answered, then cuts the downloads of the bundle the apply withdrew. The
+/// deletion after is a redaction run's ([`run_redactions`]), and is not waited for. So is the
+/// bundle rebuild: the accepted-lift counter's, or, when the write applied a redaction, the run's
+/// after its deletion, so no build runs beside the drain.
 ///
-/// The wait holds no reference to the handle: a round the wait follows may be draining the
-/// warehouse, and its drain waits for every reference to go.
+/// An apply that fails is logged, and the write is answered all the same: the ref is written,
+/// and what the apply found stays pending, refused nowhere, until a later write applies it or the
+/// run's retry does.
 async fn after_ref_write(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
-    let asked = run_redactions(Arc::clone(state), Arc::clone(&warehouse));
-    maybe_rebuild_bundle(state, Arc::clone(&warehouse));
+    match apply_redactions(Arc::clone(&warehouse)).await {
+        Ok(true) => {
+            cut_bundle_downloads(&warehouse);
+            warehouse.rebuild_again.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(false) => maybe_rebuild_bundle(state, Arc::clone(&warehouse)),
+        Err((_, error)) => {
+            tracing::error!(error, "applying the redactions failed; the redaction run retries it");
+            warehouse.apply_owed.store(true, std::sync::atomic::Ordering::SeqCst);
+            maybe_rebuild_bundle(state, Arc::clone(&warehouse));
+        }
+    }
 
-    let mut through = warehouse.applied_through.subscribe();
-    drop(warehouse);
-
-    // The sender goes only with the handle, which a run serving the ask holds until it applied.
-    let _ = through.wait_for(|&through| through >= asked).await;
+    run_redactions(Arc::clone(state), warehouse);
 }
 
 /// How long the redaction deleter waits for a drained warehouse's requests to end before it gives
@@ -3417,24 +3429,25 @@ const LAST_RETRY: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// Start a redaction run for `warehouse`, or, when one runs already, have it go round again.
 ///
-/// A round applies every redaction the warehouse's scan now finds unheld ([`apply_redactions`]),
-/// cuts the downloads of the bundle an apply withdrew, deletes the applied content no bay here
+/// A round applies every redaction the warehouse's scan now finds unheld ([`apply_redactions`])
+/// when an apply is owed (the handle's first, or one a write could not carry out), cuts the
+/// downloads of the bundle that apply withdrew, deletes the applied content no bay here
 /// holds ([`delete_applied_content`]) and rebuilds the bundle an apply withdrew. A deletion that
 /// could not be carried out — the warehouse could not be drained, or other maintenance holds its
-/// store — is owed: the run tries again later, waiting longer each time, while the warehouse is
+/// store — is owed, as is an apply that failed: the run tries again later, waiting longer each time, while the warehouse is
 /// served. A run starts after each ref write and once for each handle served, so a deletion owed
 /// when a process stopped is carried out by the next one to serve the warehouse.
-fn run_redactions(state: Arc<AppState>, warehouse: Arc<WarehouseHandle>) -> u64 {
+fn run_redactions(state: Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
     use std::sync::atomic::Ordering;
 
     // Asked for before the running run is looked at, so that run, ending, sees it. Only a run
     // waiting out a retry is woken: no permit is left behind to cut a later wait short.
-    let asked = warehouse.redactions_asked.fetch_add(1, Ordering::SeqCst) + 1;
+    warehouse.redactions_asked.fetch_add(1, Ordering::SeqCst);
     warehouse.redact_again.store(true, Ordering::SeqCst);
     warehouse.redaction_wake.notify_waiters();
 
     if warehouse.redacting.swap(true, Ordering::SeqCst) {
-        return asked;
+        return;
     }
 
     tokio::spawn(async move {
@@ -3489,8 +3502,6 @@ fn run_redactions(state: Arc<AppState>, warehouse: Arc<WarehouseHandle>) -> u64 
             retry = (retry * 2).min(LAST_RETRY);
         }
     });
-
-    asked
 }
 
 /// The handle `weak` names, when it is still the one served for its warehouse. Taken under the
@@ -3511,23 +3522,23 @@ fn still_served(state: &AppState, weak: &std::sync::Weak<WarehouseHandle>) -> Op
 /// One round of a redaction run ([`run_redactions`]).
 ///
 /// # Returns
-/// Whether a deletion is owed that a later round should try again.
+/// Whether a deletion or an apply is owed that a later round should try again.
 async fn redaction_round(state: &AppState, warehouse: &Arc<WarehouseHandle>) -> bool {
     use std::sync::atomic::Ordering;
 
-    // Read after the run cleared its ask: an ask after this one asks for another round.
-    let asked = warehouse.redactions_asked.load(Ordering::SeqCst);
-
-    let applied = match apply_redactions(Arc::clone(warehouse)).await {
-        Ok(applied) => applied,
-        // What the scan found stays unapplied; the next ref write here applies it.
-        Err((_, error)) => {
-            tracing::error!(error, "applying the redactions failed");
-            false
-        }
+    // Only an apply owed: a write applies what it let apply before it is answered.
+    let (applied, apply_failed) = match warehouse.apply_owed.swap(false, Ordering::SeqCst) {
+        false => (false, false),
+        true => match apply_redactions(Arc::clone(warehouse)).await {
+            Ok(applied) => (applied, false),
+            // Still owed: a later round retries it, as it would a deletion.
+            Err((_, error)) => {
+                tracing::error!(error, "applying the redactions failed; retrying later");
+                warehouse.apply_owed.store(true, Ordering::SeqCst);
+                (false, true)
+            }
+        },
     };
-
-    warehouse.applied_through.send_replace(asked);
 
     // The apply withdrew the bundle, which may hold the content; downloads of it stop here.
     if applied {
@@ -3541,7 +3552,7 @@ async fn redaction_round(state: &AppState, warehouse: &Arc<WarehouseHandle>) -> 
         rebuild_bundle(state, Arc::clone(warehouse), true);
     }
 
-    owed
+    owed || apply_failed
 }
 
 /// Delete the applied content this warehouse holds that no bay here holds, when there is any:
@@ -3928,7 +3939,7 @@ async fn post_resolve(State(state): State<Arc<AppState>>,
 /// the warehouse's handle until its last byte, so the warehouse is never let go while it streams.
 ///
 /// The task stops the moment `cut` is cancelled, whether it is reading the file or waiting for a
-/// slow client to take the next chunk, and the body ends short of the length it announced: an
+/// slow client to take the next chunk, and the body ends in an error ([`CutBody`]): an
 /// applied redaction cuts every download of the bundle it withdrew, which may hold the content, and
 /// the redaction deleter's drain cuts whatever still streams. The client sees a download cut off,
 /// and its resume finds the bundle gone or replaced.
@@ -3940,11 +3951,10 @@ fn bundle_body(file: tokio::fs::File,
 
     let (sender, receiver) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(4);
 
-    // The body ends in an error, never quietly, so the connection is aborted rather than closed
-    // as if complete. Sent without waiting: a client too slow to take it loses the connection
-    // all the same once the sender goes.
-    let cut_short = |sender: &tokio::sync::mpsc::Sender<std::io::Result<Bytes>>| {
-        let _ = sender.try_send(Err(std::io::Error::other("the bundle download was cut")));
+    let body = CutBody {
+        receiver,
+        cut: Box::pin(cut.clone().cancelled_owned()),
+        ended: false,
     };
 
     tokio::spawn(async move {
@@ -3954,7 +3964,7 @@ fn bundle_body(file: tokio::fs::File,
         loop {
             let chunk = tokio::select! {
                 biased;
-                () = cut.cancelled() => return cut_short(&sender),
+                () = cut.cancelled() => return,
                 chunk = chunks.next() => match chunk {
                     Some(chunk) => chunk,
                     None => return,
@@ -3963,7 +3973,7 @@ fn bundle_body(file: tokio::fs::File,
 
             tokio::select! {
                 biased;
-                () = cut.cancelled() => return cut_short(&sender),
+                () = cut.cancelled() => return,
                 sent = sender.send(chunk) => if sent.is_err() {
                     // The client went away.
                     return;
@@ -3972,7 +3982,37 @@ fn bundle_body(file: tokio::fs::File,
         }
     });
 
-    Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(receiver))
+    Body::from_stream(body)
+}
+
+/// A bundle download's body ([`bundle_body`]): the chunks its task reads, until the cut. The cut
+/// is looked at before every chunk, here on the side the client reads, so it ends the body in an
+/// error however many chunks are waiting: the connection is aborted, never closed as if the
+/// download were whole.
+struct CutBody {
+    receiver: tokio::sync::mpsc::Receiver<std::io::Result<Bytes>>,
+    cut: std::pin::Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
+    ended: bool,
+}
+
+impl tokio_stream::Stream for CutBody {
+    type Item = std::io::Result<Bytes>;
+
+    fn poll_next(mut self: std::pin::Pin<&mut Self>,
+                 context: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+        use std::future::Future;
+
+        if self.ended {
+            return std::task::Poll::Ready(None);
+        }
+
+        if self.cut.as_mut().poll(context).is_ready() {
+            self.ended = true;
+            return std::task::Poll::Ready(Some(Err(std::io::Error::other("the bundle download was cut"))));
+        }
+
+        self.receiver.poll_recv(context)
+    }
 }
 
 /// Cut every bundle download running from `warehouse` ([`bundle_body`]); those that start after
@@ -6305,36 +6345,6 @@ mod tests {
         settle(&state, "w1").await;
         drop(state);
         let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// A ref write's answer waits for the redaction round its run asks for to apply, holding no
-    /// reference to the handle meanwhile, since that round may be draining the warehouse.
-    ///
-    /// Revert: answer without waiting → it finishes while the apply is outstanding → red. Wait
-    /// holding the handle → the handle counts the waiter's reference → red.
-    #[tokio::test]
-    async fn a_ref_write_is_answered_once_its_apply_is_done() {
-        let root = scratch_dir("write-applies");
-        mark_warehouse(&root);
-        let state = Arc::new(base_state(ServeMode::Single(Arc::new(WarehouseHandle::new(root.clone())))));
-        let handle = resolve_handle(&state, &PathParams::new()).unwrap();
-        // A run is under way, so the write's ask is that run's to serve.
-        handle.redacting.store(true, Ordering::SeqCst);
-
-        let answer = tokio::spawn({
-            let (state, handle) = (Arc::clone(&state), Arc::clone(&handle));
-            async move { after_ref_write(&state, handle).await }
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert!(!answer.is_finished(), "the answer waits while the apply is outstanding");
-        assert_eq!(Arc::strong_count(&handle), 2, "the wait holds no reference: single mode's and this test's");
-
-        handle.applied_through.send_replace(1);
-        tokio::time::timeout(std::time::Duration::from_secs(5), answer).await
-            .expect("answered once the apply is done").unwrap();
-
-        drop((handle, state));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Asking for a redaction round wakes only a run waiting out a retry: it leaves no permit that
