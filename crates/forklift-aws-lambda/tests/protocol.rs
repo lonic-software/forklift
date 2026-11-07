@@ -625,6 +625,39 @@ fn a_user_head_naming_redacted_content_deep_in_an_unchanged_subtree_is_refused()
     assert_eq!(user_head(&head, "main"), Some(clean));
 }
 
+/// A redaction carrying a chunk list makes the check read every chunked file's recipe, which the
+/// audit's mirror never holds: an unrelated chunked file's is read from the store, and it lifts.
+// Revert: walk the scratch alone (`LocalObjects`) → the unrelated file's recipe is missing → red.
+#[test]
+fn a_chunked_redaction_reads_each_pushed_recipe_from_the_store() {
+    let area = Area::new("redacted-chunked");
+    prepare(&area, "red");
+    area.write_large_file("red/big.bin", 0xBAD, CHUNK_THRESHOLD + 50_000);
+    area.forklift("red", &["load", "."]);
+    area.forklift("red", &["stack", "-m", "leak"]);
+    let leak = harvest(&area.path("red")).head_of("main").expect("main head");
+    area.forklift("red", &["remove", "big.bin"]);
+    area.forklift("red", &["stack", "-m", "take the leak out"]);
+    area.forklift("red", &["redact", "record", &format!("{}:big.bin", leak), "-m", "a leak"]);
+    let recorded = harvest(&area.path("red"));
+
+    prepare(&area, "wh");
+    area.write_large_file("wh/other.bin", 0x600D, CHUNK_THRESHOLD + 50_000);
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "-m", "other"]);
+    let other = harvest(&area.path("wh"));
+
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &recorded);
+    upload_all(&head, &other);
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &recorded.head_of("@redactions").expect("@redactions"));
+
+    let main = other.head_of("main").expect("main head");
+    let request = RefUpdateRequest { old_head: None, new_head: main.clone(), tombstone: None };
+    head.ref_update(&Principal::Static, "main", &request).expect("an unrelated chunked file lifts");
+    assert_eq!(user_head(&head, "main"), Some(main));
+}
+
 /// A meta parcel is judged by what it adds: the first `@tags` parcel adds the tags marker, so with
 /// the marker redacted it is refused, while a later parcel carrying the marker from a parent that
 /// already stands lifts.
