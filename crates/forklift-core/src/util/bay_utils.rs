@@ -747,23 +747,51 @@ pub fn collect_bay_scoped_parcel_roots(
 /// put the ref back behind it, leaving the tree this bay holds reachable from no ref. So is every
 /// head a delete in the bay's journal removed: no ref reaches it, and its undo puts it back.
 fn read_one_bay_scoped_roots(dir: &Path) -> Result<Vec<String>, String> {
-    let mut roots: Vec<String> = pallet_utils::read_position_in(dir)?.base.into_iter().collect();
+    let state = read_bay_state_roots_in(dir)?;
+    let mut roots: Vec<String> = state.base.into_iter().collect();
 
-    roots.append(&mut park_utils::read_parked_in(dir)?);
-
-    if let Some(consolidation) = merge_utils::read_consolidation_state_in(dir)? {
-        roots.push(consolidation.their_head);
-        roots.push(consolidation.our_head);
-    }
-
-    if let Some(pick) = cherry_pick_utils::read_state_in(dir)? {
-        roots.push(pick.source);
-        roots.push(pick.our_head);
-    }
-
+    roots.extend(state.parked);
+    roots.extend(state.consolidation);
+    roots.extend(state.pick);
     roots.append(&mut journal_utils::removed_heads_in(dir)?);
 
     Ok(roots)
+}
+
+/// The parcels a bay's own state names: what its checkout, its parked work and an operation in
+/// progress in it stand on. A journal's removed heads are not among them: they are history an
+/// undo can restore, not state the bay holds.
+pub struct BayStateRoots {
+    /// The checkout's base.
+    pub base: Option<String>,
+
+    /// The parked parcels.
+    pub parked: Vec<String>,
+
+    /// An in-progress consolidation's `their_head` and `our_head`.
+    pub consolidation: Vec<String>,
+
+    /// An in-progress cherry-pick's `source` and `our_head`.
+    pub pick: Vec<String>,
+}
+
+/// Read the [`BayStateRoots`] of the bay-local state dir `dir`.
+///
+/// # Returns
+/// * `Ok(BayStateRoots)` - What the bay's state names.
+/// * `Err(String)`       - If the bay's `position`, `parked`, `consolidation` or cherry-pick
+///                         state could not be read or was malformed.
+pub fn read_bay_state_roots_in(dir: &Path) -> Result<BayStateRoots, String> {
+    let base = pallet_utils::read_position_in(dir)?.base;
+    let parked = park_utils::read_parked_in(dir)?;
+    let consolidation = merge_utils::read_consolidation_state_in(dir)?
+        .map(|state| vec![state.their_head, state.our_head])
+        .unwrap_or_default();
+    let pick = cherry_pick_utils::read_state_in(dir)?
+        .map(|state| vec![state.source, state.our_head])
+        .unwrap_or_default();
+
+    Ok(BayStateRoots { base, parked, consolidation, pick })
 }
 
 /// Plain-language note for a bay [`collect_bay_scoped_parcel_roots`] skipped under

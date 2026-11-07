@@ -41,8 +41,8 @@ use crate::enums::object_type::ObjectType;
 use crate::model::object::loose_object::LooseObject;
 
 use crate::util::{
-    audit_utils, bundle_utils, byte_utils, delta_utils, fanout_utils, file_utils, graph_utils,
-    lock_utils, object_utils, pallet_utils, sign_utils,
+    applied_redactions, audit_utils, bundle_utils, byte_utils, delta_utils, fanout_utils, file_utils, graph_utils,
+    lock_utils, object_utils, pallet_utils, redaction_deleter, sign_utils,
 };
 use crate::util::signature_table::{self, SignatureTable, FILE_EXTENSION_SIGNATURE_TABLE};
 
@@ -3750,6 +3750,13 @@ fn compact_held(all: bool,
 
     progress.status("Collecting objects");
 
+    // An applied redaction's object no deletion census root names is dropped by a repack like
+    // garbage. No applied redaction's object, named or not, is offered as a new delta base: a
+    // delta on one would keep it in the store after the redaction deletes it.
+    let excluded = if all { redaction_deleter::unheld_applied()? } else { HashSet::new() };
+    let mut never_bases = evicted.clone();
+    never_bases.extend(applied_redactions::read_applied()?.hashes().cloned());
+
     // The objects to pack, and the old pack files a repack supersedes.
     //
     // One shared reachability pass (D/P3). Both the garbage decision (`collect_live_set`, inside
@@ -3765,14 +3772,14 @@ fn compact_held(all: bool,
         let CollectedTargets {
             targets, old_packs, source_packs, damaged_packs_dropped, damaged_packs_kept, damaged_packs_skipped,
             salvage_registration,
-        } = collect_targets(all, redelta, salvage, evicted)?;
+        } = collect_targets(all, redelta, salvage, evicted, &excluded)?;
 
         // Path-aware base selection (phase 2b) is only needed to *build* new deltas — for loose
         // objects and for the rare object whose base is dropped. A repack that only copies existing
         // records (the common case) skips the whole DAG walk.
         let needs_delta = targets.iter().any(|t| !matches!(t.source, Source::CopyRecord { .. }));
         let path_bases = if needs_delta {
-            compute_path_bases(evicted)?
+            compute_path_bases(&never_bases)?
         } else {
             PathBases { base_of: HashMap::new(), sequence: HashMap::new() }
         };
@@ -4067,8 +4074,12 @@ fn compact_held(all: bool,
             // that fell through to full (never tried the window, `window_depth` stayed 0) — a
             // future window base's depth must be *known*, and the window's own bookkeeping can
             // only guarantee that by construction if only fallback-full/window objects ever
-            // enter it (see `is_chain_target`'s doc comment above).
-            if !path_delta && prep.deltable && !is_chain_target {
+            // enter it (see `is_chain_target`'s doc comment above). Nor does an applied
+            // redaction's object, which `never_bases` holds: its deleter must find nothing kept
+            // standing on it.
+            if !path_delta && prep.deltable && !is_chain_target
+                && (never_bases.is_empty() || !never_bases.contains(&sign_utils::to_hex(&target.hash)))
+            {
                 window_bytes += prep.raw.len();
                 window.push_back(WindowEntry { hash: target.hash, raw: prep.raw, depth: window_depth });
                 while window.len() > DELTA_WINDOW || (window_bytes > DELTA_WINDOW_MEMORY && window.len() > 1) {
@@ -5128,8 +5139,13 @@ struct CollectedTargets {
 ///
 /// A repack's live set excludes `evicted` (what an eviction deletes, empty otherwise): an evicted
 /// object is dropped like garbage, and a delta against one is reconstructed like any delta whose
-/// base is dropped.
-fn collect_targets(all: bool, redelta: bool, salvage: bool, evicted: &HashSet<String>) -> Result<CollectedTargets, String> {
+/// base is dropped. `excluded` is the unheld applied redactions, which the live set does not mark
+/// ([`gc_utils::collect_live_set_excluding`](crate::util::gc_utils::collect_live_set_excluding)).
+fn collect_targets(all: bool,
+                   redelta: bool,
+                   salvage: bool,
+                   evicted: &HashSet<String>,
+                   excluded: &HashSet<String>) -> Result<CollectedTargets, String> {
     if !all {
         return Ok(CollectedTargets {
             targets: enumerate_loose_objects()?,
@@ -5154,7 +5170,7 @@ fn collect_targets(all: bool, redelta: bool, salvage: bool, evicted: &HashSet<St
         (HashSet::new(), None)
     };
 
-    let mut live = crate::util::gc_utils::collect_live_set()?;
+    let mut live = crate::util::gc_utils::collect_live_set_excluding(excluded)?;
     live.retain(|hash| !evicted.contains(hash));
     let mut targets = Vec::new();
     // Hash -> index of its already-pushed target in `targets` (FORK-55): a later duplicate of a
@@ -5608,8 +5624,8 @@ impl Bloom {
 /// memory is bounded (a bit budget) rather than one entry per object — what keeps it viable at
 /// kernel scale (see [`Bloom`]).
 ///
-/// No object of `evicted` (what an eviction deletes) is ever offered as a base: it is deleted once
-/// the repack is done, so a kept object encoded against it would no longer decode. An evicted
+/// No object of `evicted` (what an eviction deletes, and every applied redaction's object) is ever
+/// offered as a base: it is deleted once the repack is done, or by the redaction's deleter, so a kept object encoded against it would no longer decode. An evicted
 /// object is not recorded at its path at all, so the next version there takes the previous kept
 /// version as its base instead; an evicted tree is still descended, since a kept object can sit
 /// beneath it.

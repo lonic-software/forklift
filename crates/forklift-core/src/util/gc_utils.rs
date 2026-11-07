@@ -18,7 +18,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::time::SystemTime;
-use crate::util::{audit_utils, bay_utils, file_utils, lock_utils, object_utils, pack_utils};
+use crate::util::{audit_utils, bay_utils, file_utils, lock_utils, object_utils, pack_utils, redaction_deleter};
 // Test-only: `collect_live_set`'s own pallet-head root gathering moved into the shared
 // `recovery_utils::gc_root_sources`, so this module's non-test code no
 // longer calls `pallet_utils` directly — only its own test fixtures still build pallet refs by
@@ -188,7 +188,18 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
 /// — see that function's own doc comment for why a sweep and a non-deleting recovery walk are
 /// allowed to differ here the way they already differ on an unreadable bay
 /// (`bay_utils::BayReadPolicy`).
+///
+/// An applied redaction's object no deletion census root names is not live
+/// ([`redaction_deleter::unheld_applied`]), and a recipe of one is not descended for its chunks: the
+/// collection and a repack then delete it like garbage, and every chunk only it named.
 pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
+    collect_live_set_excluding(&redaction_deleter::unheld_applied()?)
+}
+
+/// [`collect_live_set`], with `excluded` (the unheld applied redactions) given. An excluded hash a
+/// tree entry names is not marked, nor descended; one a live recipe names as a chunk stays live,
+/// since a redaction's ban never extends to the chunks of another file.
+pub(crate) fn collect_live_set_excluding(excluded: &HashSet<String>) -> Result<HashSet<String>, String> {
     // Pallet heads (both namespaces), haul heads, tombstone heads, the git mirror's roots, bay-scoped
     // parcel roots, trust-pin roots and staged shard leaves: the sources this function shares, hash
     // for hash, with `recovery_utils::collect_walk_roots` through `recovery_utils::gc_root_sources`,
@@ -275,6 +286,10 @@ pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
         let tree = object_utils::load_tree(&tree_hash)?;
 
         for (_, file) in tree.get_files() {
+            if excluded.contains(&file.hash) {
+                continue;
+            }
+
             // A blob reference gets the same treatment for free: its hash is recorded live here
             // and its bytes are never loaded by this walk, so an absent (sealed-but-unfetched)
             // blob is tolerated with no check at all — marked, and skipped by never being read.

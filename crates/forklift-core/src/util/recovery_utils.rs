@@ -1786,7 +1786,7 @@ fn collect_walk_roots() -> Result<WalkRoots, String> {
     })
 }
 
-fn walk_shard_files(folder: &Path, hashes: &mut Vec<(String, DirEntryType)>) -> Result<(), String> {
+pub(crate) fn walk_shard_files(folder: &Path, hashes: &mut Vec<(String, DirEntryType)>) -> Result<(), String> {
     let mut data_files = Vec::new();
     walk_shard_data_files(folder, &mut data_files)?;
 
