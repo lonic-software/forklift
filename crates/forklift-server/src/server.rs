@@ -3704,7 +3704,8 @@ async fn after_ref_write(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>)
 /// What follows a ref write request here that moved no ref, answered with an error or as already
 /// done. One that reached its write (`owed`) owes an apply ([`WarehouseHandle::owe_apply`]),
 /// carried out here before the answer, as a write's is, so content is served again without
-/// waiting for another write; one that fails asks for a redaction run, as a write does. One
+/// waiting for another write; one that fails asks for a redaction run, as a write does, and so
+/// does one that settles it while a round has left the bundle rebuild for after it. One
 /// refused before its write owes nothing and does nothing here: it neither scans the warehouse
 /// nor cuts short the wait of a run retrying an apply or a deletion.
 async fn after_failed_ref_write(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>, owed: bool) {
