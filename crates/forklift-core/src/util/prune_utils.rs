@@ -2328,6 +2328,28 @@ mod tests {
         assert_eq!(freed, [f.web_tree, f.web_blob].into_iter().collect());
     }
 
+    /// An in-scope recipe an applied redaction names and the store lacks is held, never loaded
+    /// for its chunks, with no sealed record at all.
+    ///
+    /// Revert: hold only what the sealed record names in `held_by_hash` → the plan fails loading
+    /// the absent recipe → red.
+    #[test]
+    fn plan_prune_retains_an_applied_absent_recipe_in_scope_without_loading_it() {
+        let _scratch = Scratch::new("applied-in-scope");
+        let f = build_fixture();
+        let redacted = "7".repeat(64);
+        plant_other(&store_tree(&[
+            ("src", &f.src_tree, DirEntryType::Tree),
+            ("leak.bin", &redacted, DirEntryType::NormalChunked),
+        ]), Vec::new());
+        crate::util::applied_redactions::apply_for_test(&[&redacted]);
+
+        let post_prune = PathScope::from_prefixes(["src/api", "leak.bin"]);
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
+        let freed: HashSet<String> = plan.to_free.iter().cloned().collect();
+        assert_eq!(freed, [f.web_tree, f.web_blob].into_iter().collect());
+    }
+
     /// FORK-133: a recorded tree that is present seals nothing: it is walked, so a blob it shares
     /// with the pruned path is kept. Mutation: drop the presence half of `held_by_hash` → the
     /// shared blob is freed → red.
