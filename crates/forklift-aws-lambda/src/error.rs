@@ -32,6 +32,9 @@ pub enum Status {
     NotFound,
     /// `409` — a CAS conflict: the ref moved, or trust is a one-way door.
     Conflict,
+    /// `410` — the content asked for was redacted from this warehouse, and is never served or
+    /// accepted again (`content_redacted`).
+    Gone,
     /// `422` — a verification failure: a bad hash, a missing closure, a failed audit.
     Unprocessable,
     /// `503` — a transient refusal that does not claim any input moved (DynamoDB transaction
@@ -53,6 +56,7 @@ impl Status {
             Status::Forbidden => 403,
             Status::NotFound => 404,
             Status::Conflict => 409,
+            Status::Gone => 410,
             Status::Unprocessable => 422,
             Status::ServiceUnavailable => 503,
             Status::Internal => 500,
@@ -69,6 +73,9 @@ pub struct HeadError {
     /// Set only by [`HeadError::commit_not_ready`]: the adapter answers it with `Retry-After` and
     /// `Forklift-Commit: not-ready`, the headers a client classifies a lift commit by.
     pub commit_not_ready: bool,
+    /// Set only by [`HeadError::retry_after`]: the seconds the adapter's `Retry-After` header
+    /// names.
+    pub retry_after_seconds: Option<u32>,
 }
 
 /// The result of a handler.
@@ -76,7 +83,7 @@ pub type HeadResult<T> = Result<T, HeadError>;
 
 impl HeadError {
     fn with(status: Status, message: impl Into<String>) -> HeadError {
-        HeadError { status, message: message.into(), commit_not_ready: false }
+        HeadError { status, message: message.into(), commit_not_ready: false, retry_after_seconds: None }
     }
 
     /// A `404 Not Found`.
@@ -129,6 +136,18 @@ impl HeadError {
     /// adds, never the message, so a body that is cut short or rewritten cannot hide it.
     pub fn commit_not_ready(message: impl Into<String>) -> HeadError {
         HeadError { commit_not_ready: true, ..HeadError::with(Status::ServiceUnavailable, message) }
+    }
+
+    /// A `410 Gone` — content redacted from this warehouse. `message` is the classified refusal
+    /// `applied_redactions::served_refusal` frames, so the body carries `content_redacted`.
+    pub fn gone(message: impl Into<String>) -> HeadError {
+        HeadError::with(Status::Gone, message)
+    }
+
+    /// A `503 Service Unavailable` answered with `Retry-After: seconds`: the request may succeed
+    /// once work this head has started finishes, with nothing the client sent having changed.
+    pub fn retry_after(message: impl Into<String>, seconds: u32) -> HeadError {
+        HeadError { retry_after_seconds: Some(seconds), ..HeadError::with(Status::ServiceUnavailable, message) }
     }
 
     /// A `500 Internal Server Error` — a storage-layer failure. Storage errors bubble up

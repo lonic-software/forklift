@@ -17,7 +17,7 @@
 //! it; that refusal only comes early, since no head written after the redaction may name the
 //! content either way.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use toml_edit::{value, Table};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::enums::object_type::ObjectType;
@@ -419,10 +419,7 @@ pub fn tombstone_holders(redaction: &Redaction) -> Result<Vec<HeadHolder>, Strin
 /// Which of `heads`, each a pallet's name and head, names what `redaction` removes; `what` names
 /// that kind of pallet in an error.
 fn holders_among(redaction: &Redaction, heads: Vec<(String, String)>, what: &str) -> Result<Vec<HeadHolder>, String> {
-    let set = RedactedSet {
-        hashes: HashSet::from([redaction.hash.clone()]),
-        chunk_lists: redaction.chunks.iter().map(|chunks| (chunks.clone(), HashSet::from([redaction.hash.clone()]))).collect(),
-    };
+    let set = RedactedSet::of(redaction);
 
     let partial = crate::util::scope_utils::content_may_be_absent()?;
     let mut holders = Vec::new();
@@ -453,6 +450,125 @@ fn holders_among(redaction: &Redaction, heads: Vec<(String, String)>, what: &str
     match undecided {
         Some(error) if holders.is_empty() => Err(error),
         _ => Ok(holders),
+    }
+}
+
+/// One pallet's walk for whether it names what a redaction removes, made resumable for a head
+/// that cannot finish it in one invocation: its frontier and the objects it has read are plain
+/// data, saved between steps and resumed where they stopped.
+///
+/// A user pallet's walk reads its head's tree by the rule of [`head_holders`]: the redacted hash
+/// anywhere in the tree, or for a recipe, a chunked file with the same chunk list. A meta pallet's
+/// walk reads its whole history by the rule of [`meta_holders`]: the hash as any object of a
+/// parcel, or as a file in its tree. Each walk has its own visited set, so a tree one pallet's
+/// walk read is never skipped by another's. An object the walk needs and the store lacks is an
+/// error, never a pass, and the step that met it can be taken again.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HoldingWalk {
+    /// Whether the walk follows the head's history (a meta pallet), else only its tree.
+    history: bool,
+
+    /// The objects still to read: each a hash, and whether it is a parcel (else a tree).
+    frontier: Vec<(String, bool)>,
+
+    /// Every object already read.
+    visited: BTreeSet<String>,
+}
+
+/// Where a [`HoldingWalk`] stands after a step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkProgress {
+    /// The walk found the content: the pallet holds the redaction.
+    Names,
+
+    /// The walk read everything and found nothing: the pallet does not hold it.
+    Clear,
+
+    /// The walk has more to read.
+    Going,
+}
+
+impl HoldingWalk {
+    /// The walk of a user pallet at `head`: its tree.
+    pub fn of_tree(head: &str) -> HoldingWalk {
+        HoldingWalk { history: false, frontier: vec![(head.to_string(), true)], visited: BTreeSet::new() }
+    }
+
+    /// The walk of a meta pallet at `head`: its whole history.
+    pub fn of_history(head: &str) -> HoldingWalk {
+        HoldingWalk { history: true, frontier: vec![(head.to_string(), true)], visited: BTreeSet::new() }
+    }
+
+    /// Read the next object of the walk, judging it against `redaction`. A step that fails
+    /// leaves the walk as it was.
+    ///
+    /// # Returns
+    /// * `Ok(WalkProgress)` - Where the walk stands now.
+    /// * `Err(String)`      - An object it needs could not be read.
+    pub fn step(&mut self, redaction: &Redaction, objects: &dyn WalkObjects) -> Result<WalkProgress, String> {
+        let Some((object, is_parcel)) = self.frontier.last().cloned() else {
+            return Ok(WalkProgress::Clear);
+        };
+
+        if self.history && object == redaction.hash {
+            return Ok(WalkProgress::Names);
+        }
+
+        if self.visited.contains(&object) {
+            self.frontier.pop();
+            return Ok(self.progress());
+        }
+
+        let next: Vec<(String, bool)> = if is_parcel {
+            let parcel = objects.load_parcel(&object)?;
+            let mut next = match self.history {
+                true => parcel.parents.into_iter().map(|parent| (parent, true)).collect(),
+                false => Vec::new(),
+            };
+            next.push((parcel.tree_hash, false));
+            next
+        } else {
+            let tree = objects.load_tree(&object)?;
+
+            if self.history {
+                if tree.get_files().any(|(_, file)| file.hash == redaction.hash) {
+                    return Ok(WalkProgress::Names);
+                }
+            } else {
+                let set = RedactedSet::of(redaction);
+
+                if !set.chunk_lists.is_empty() {
+                    let recipes: Vec<String> = tree.get_files()
+                        .filter(|(_, file)| file.item_type.is_chunked() && file.hash != redaction.hash)
+                        .map(|(_, file)| file.hash.clone())
+                        .collect();
+                    objects.prefetch(&recipes);
+                }
+
+                for (_, file) in tree.get_files() {
+                    if set.named_by(file, objects, None)?.is_some() {
+                        return Ok(WalkProgress::Names);
+                    }
+                }
+            }
+
+            tree.get_subtrees().map(|(_, subtree)| (subtree.hash.clone(), false)).collect()
+        };
+
+        self.frontier.pop();
+        self.visited.insert(object);
+        self.frontier.extend(next);
+
+        Ok(self.progress())
+    }
+
+    /// Whether the walk has more to read.
+    fn progress(&self) -> WalkProgress {
+        match self.frontier.is_empty() {
+            true => WalkProgress::Clear,
+            false => WalkProgress::Going,
+        }
     }
 }
 
@@ -512,6 +628,17 @@ pub fn read_redactions() -> Result<RedactionsRead, String> {
         return Ok(RedactionsRead::default());
     };
 
+    Ok(attributed(state))
+}
+
+/// Every redaction at `head`, a head of `@redactions` whose chain the store holds, read as
+/// [`read_redactions`] reads the local head's.
+pub fn read_redactions_at(head: &str) -> Result<RedactionsRead, String> {
+    meta_tree::read_meta_state(REDACTIONS_PALLET_NAME, head, &RedactionsRules).map(attributed)
+}
+
+/// The redactions `state`, a state of `@redactions`, holds, attributed through the local office.
+fn attributed(state: meta_tree::MetaState) -> RedactionsRead {
     let office = office_utils::read_office_state()
         .unwrap_or(OfficeState { users: Vec::new(), keys: Vec::new() });
 
@@ -539,7 +666,7 @@ pub fn read_redactions() -> Result<RedactionsRead, String> {
         }
     }
 
-    Ok(read)
+    read
 }
 
 /// Where a redaction walk reads the objects it judges: trees, parcels and recipes. A warehouse
@@ -587,6 +714,16 @@ struct RedactedSet {
 }
 
 impl RedactedSet {
+    /// The set of `redaction` alone: its hash, and its chunk list when it is a recipe.
+    fn of(redaction: &Redaction) -> RedactedSet {
+        RedactedSet {
+            hashes: HashSet::from([redaction.hash.clone()]),
+            chunk_lists: redaction.chunks.iter()
+                .map(|chunks| (chunks.clone(), HashSet::from([redaction.hash.clone()])))
+                .collect(),
+        }
+    }
+
     /// The set at `head`, the head of `@redactions`.
     fn at(head: &str) -> Result<RedactedSet, String> {
         let state = meta_tree::read_meta_state(REDACTIONS_PALLET_NAME, head, &RedactionsRules)?;
@@ -1521,5 +1658,100 @@ mod tests {
         for bad in ["", "abc", &"a".repeat(63), &"g".repeat(64), "v1.0"] {
             assert!(validate_redacted_hash(bad).is_err(), "{:?} must be refused", bad);
         }
+    }
+    /// Trees and parcels by hash for a [`HoldingWalk`], failing the next read of `flaky` once.
+    struct Objects {
+        trees: HashMap<String, std::sync::Arc<crate::model::tree_item::TreeItem>>,
+        parcels: HashMap<String, std::sync::Arc<crate::model::parcel::Parcel>>,
+        flaky: std::cell::RefCell<Option<String>>,
+    }
+
+    impl Objects {
+        fn read<T: Clone>(&self, hash: &str, from: &HashMap<String, T>) -> Result<T, String> {
+            if self.flaky.borrow().as_deref() == Some(hash) {
+                self.flaky.replace(None);
+                return Err(format!("{} cannot be read", hash));
+            }
+            from.get(hash).cloned().ok_or_else(|| format!("no object {}", hash))
+        }
+    }
+
+    impl WalkObjects for Objects {
+        fn load_tree(&self, hash: &str) -> Result<std::sync::Arc<crate::model::tree_item::TreeItem>, String> {
+            self.read(hash, &self.trees)
+        }
+
+        fn load_parcel(&self, hash: &str) -> Result<crate::model::parcel::Parcel, String> {
+            let parcel = self.read(hash, &self.parcels)?;
+            Ok(crate::model::parcel::Parcel {
+                tree_hash: parcel.tree_hash.clone(),
+                parents: parcel.parents.clone(),
+                actions: Vec::new(),
+                description: None,
+            })
+        }
+
+        fn recipe_chunks(&self, hash: &str) -> Result<Vec<String>, String> {
+            Err(format!("no recipe {}", hash))
+        }
+    }
+
+    /// A parcel `p<n>` on `parents` whose root tree `t<n>` holds one subtree `s<n>` holding the
+    /// file of hash `file`.
+    fn history(objects: &mut Objects, n: u32, parents: &[&str], file: &str) -> String {
+        use crate::enums::dir_entry_type::DirEntryType;
+        use crate::model::tree_item::TreeItem;
+
+        let mut subtree = TreeItem::new("s".into(), format!("s{}", n), DirEntryType::Tree);
+        subtree.add_child(TreeItem::new("f".into(), file.into(), DirEntryType::Normal));
+        let mut root = TreeItem::new(String::new(), format!("t{}", n), DirEntryType::Tree);
+        root.add_child(subtree.clone());
+
+        objects.trees.insert(format!("s{}", n), std::sync::Arc::new(subtree));
+        objects.trees.insert(format!("t{}", n), std::sync::Arc::new(root));
+        objects.parcels.insert(format!("p{}", n), std::sync::Arc::new(crate::model::parcel::Parcel {
+            tree_hash: format!("t{}", n),
+            parents: parents.iter().map(|parent| parent.to_string()).collect(),
+            actions: Vec::new(),
+            description: None,
+        }));
+        format!("p{}", n)
+    }
+
+    /// Walk to the end, one step at a time, counting the steps.
+    fn walk_out(walk: &mut HoldingWalk, redaction: &Redaction, objects: &Objects) -> (WalkProgress, usize) {
+        for steps in 1..100 {
+            match walk.step(redaction, objects).expect("step") {
+                WalkProgress::Going => {}
+                done => return (done, steps),
+            }
+        }
+        panic!("the walk never ended");
+    }
+
+    // Revert: pop the frontier before the read → the failed step loses the subtree and the walk
+    // ends clear. Revert: follow parents in a tree walk → the user walk finds the old file.
+    #[test]
+    fn a_holding_walk_survives_a_failed_read_and_follows_history_only_for_meta() {
+        let leak = "l".repeat(64);
+        let redaction = Redaction { hash: leak.clone(), reason: "a leak".into(), redacted_at: 0, chunks: None };
+        let mut objects = Objects { trees: HashMap::new(), parcels: HashMap::new(), flaky: Default::default() };
+        let old = history(&mut objects, 1, &[], &leak);
+        let new = history(&mut objects, 2, &[&old], &"c".repeat(64));
+
+        let mut walk = HoldingWalk::of_tree(&old);
+        objects.flaky.replace(Some("s1".into()));
+        assert_eq!(walk.step(&redaction, &objects).expect("the parcel"), WalkProgress::Going);
+        assert_eq!(walk.step(&redaction, &objects).expect("the root"), WalkProgress::Going);
+        let before = walk.clone();
+        assert!(walk.step(&redaction, &objects).is_err(), "the subtree read fails");
+        assert_eq!(walk, before, "a failed step leaves the walk as it was");
+
+        let saved: HoldingWalk = serde_json::from_str(&serde_json::to_string(&walk).expect("save")).expect("load");
+        let mut walk = saved;
+        assert_eq!(walk.step(&redaction, &objects).expect("the subtree"), WalkProgress::Names);
+
+        assert_eq!(walk_out(&mut HoldingWalk::of_tree(&new), &redaction, &objects).0, WalkProgress::Clear);
+        assert_eq!(walk_out(&mut HoldingWalk::of_history(&new), &redaction, &objects).0, WalkProgress::Names);
     }
 }

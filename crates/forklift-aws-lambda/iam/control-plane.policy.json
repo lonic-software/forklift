@@ -18,6 +18,12 @@
       "Resource": "${bucket_arn}/staging/*"
     },
     {
+      "Sid": "RedactionScanWork",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": "${bucket_arn}/redaction-work/*"
+    },
+    {
       "Sid": "ListBucketFor404Semantics",
       "Effect": "Allow",
       "Action": "s3:ListBucket",

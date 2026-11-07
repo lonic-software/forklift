@@ -122,6 +122,15 @@ state the request read, which never rewrites it, or, for a new warehouse, a `Put
 that holds only while the item is absent. A write whose check fails is gated again, so a write
 prepared before an upgrade began cannot land once it has.
 
+A redaction the head has judged keeps an item of its own, `entity = "redaction#<hash>"`, whose
+`state` is a versioned JSON record: whether its scan has a verdict for every pallet, the pallets
+it saw naming the content with the heads it saw them at, and when it applied. Every write of it
+is conditioned on the exact bytes its writer read, behind the same format check. A record of a
+version the build does not read fails every request that needs that redaction with a `500`, and
+is never written over, since it may record an apply. The scan's progress lives beside it in S3,
+under `redaction-work/{warehouse}/`, and holds no verdict: a build that cannot read it does the
+work again.
+
 `forklift-aws-upgrade` upgrades a warehouse in place. It runs from an operator's machine, never from a
 Lambda, and takes warehouse ids or `--all`:
 
@@ -284,7 +293,8 @@ skeleton's reader, which only a partial checkout's consolidation reaches.
 
 The AWS head's items are frozen the same way, against `AWS_FORMAT`:
 `crates/forklift-aws-lambda/tests/fixtures/aws-format-<N>/items` lists the DynamoDB items a warehouse
-holding a live pallet, a deleted one, the office pallet and a trust anchor is written as, on the
+holding a live pallet, a deleted one, the office pallet, a trust anchor and an applied redaction's
+item is written as, on the
 memory store. The current build must write exactly those items and serve them back, and the LocalStack
 suite writes the same warehouse through DynamoDB and requires the very same items there, so the fixture
 holds what DynamoDB stores rather than only the memory store's mapping. An older AWS format's items must

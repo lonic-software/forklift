@@ -158,8 +158,8 @@ run "c3_notification_scoped_to_staging" {
 }
 
 # ---------------------------------------------------------------------------------------------
-# C4 — the verifier's env carries FORKLIFT_DYNAMODB_TABLE even though it never calls DynamoDB
-# (the "operator quirk" both binaries share via config_from_env).
+# C4 — the verifier's env carries FORKLIFT_DYNAMODB_TABLE: it reads each staged object's
+# redaction item there before promoting it.
 # ---------------------------------------------------------------------------------------------
 
 run "c4_verifier_env_carries_table" {
@@ -340,6 +340,7 @@ run "c6_deployed_policy_matches_crate_json" {
       "../../crates/forklift-aws-lambda/iam/verifier.policy.json",
       {
         bucket_arn    = aws_s3_bucket.this.arn
+        table_arn     = aws_dynamodb_table.this.arn
         log_group_arn = trimsuffix(aws_cloudwatch_log_group.verifier.arn, ":*")
       },
     )

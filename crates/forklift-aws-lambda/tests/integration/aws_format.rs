@@ -61,7 +61,8 @@ fn this_build_writes_the_frozen_items() {
 
 /// This build serves the warehouse its format's fixture froze, and reads every item back.
 ///
-/// Revert: make the gate refuse its own state, or the anchor fail to decode → the assertion.
+/// Revert: make the gate refuse its own state, or the anchor or the redaction item fail to decode
+/// → the assertion.
 #[test]
 fn this_build_serves_the_frozen_items() {
     let refs = MemoryRefStore::from_items(&frozen_items()).unwrap();
@@ -76,6 +77,8 @@ fn this_build_serves_the_frozen_items() {
 
     let (anchor, _) = refs.get_trust().unwrap().expect("the anchor reads back");
     assert_eq!(TrustAnchorDto::from(&anchor).genesis, hash('4'));
+
+    assert!(forklift_aws_lambda::head::redaction_applied(&refs, &hash('8')).unwrap(), "the redaction item reads back");
 }
 
 /// Every older AWS format's fixture the chain reaches upgrades through it and is then served; one

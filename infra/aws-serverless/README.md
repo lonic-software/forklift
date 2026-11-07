@@ -94,8 +94,8 @@ Build the two zips with `cargo lambda build --release --arm64` (see
   in `crates/forklift-aws-lambda` ever revisits an abandoned lift session, so without this an
   abandoned or paginating client leaks staged bytes forever.
 - **The verifier missing its table env var.** Both Lambdas are wired from one config in this
-  module, so `FORKLIFT_DYNAMODB_TABLE` cannot be forgotten — even though the verifier never
-  issues a single DynamoDB operation (`config_from_env` requires it regardless).
+  module, so `FORKLIFT_DYNAMODB_TABLE` cannot be forgotten: the verifier reads each staged
+  object's redaction item from the table before it promotes it.
 - **A named API Gateway stage.** An HTTP API deployed to a *named* stage prepends `/{stage}` to
   every request path, and the router (`entrypoint::handle`) matches absolute paths — so every
   route would 404. This module hard-codes `$default` and exposes no stage variable at all.

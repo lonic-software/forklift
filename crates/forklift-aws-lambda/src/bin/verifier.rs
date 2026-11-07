@@ -14,15 +14,18 @@
 //! signature covers the key.
 //!
 //! Same blocking discipline as the control plane: `verify_and_promote` bridges S3 futures,
-//! so it runs on a blocking thread. It needs only an object store — no ref store — bound to the
+//! so it runs on a blocking thread. It needs an object store and a ref store bound to the
 //! warehouse the staging key names ([`parse_staging_key`]): objects are keyed per warehouse, and
-//! the key is all an S3 event carries.
+//! the key is all an S3 event carries. The ref store is read for one thing only: the staged
+//! object's redaction item. Content already redacted from the warehouse when that item is read
+//! is not promoted — its staged copy is dropped instead, and the event consumed.
 //!
 //! Build with `cargo build -p forklift-aws-lambda --features lambda --release`.
 
 use aws_lambda_events::event::s3::S3Event;
 use forklift_aws_lambda::aws::s3::parse_staging_key;
-use forklift_aws_lambda::aws::{build_clients, S3Ops};
+use forklift_aws_lambda::aws::{build_clients, DynamoOps, DynamoRefStore, S3Ops};
+use forklift_aws_lambda::head::redaction_applied;
 use forklift_aws_lambda::store::{ObjectStore, PromoteOutcome};
 use forklift_aws_lambda::{config_from_env, AsyncBridge, S3ObjectStore};
 use lambda_runtime::{run, service_fn, Error, LambdaEvent};
@@ -32,7 +35,10 @@ use tokio::sync::OnceCell;
 /// built once per cold start. The store itself is built per staged object, for its warehouse.
 struct Context {
     s3: S3Ops,
+    dynamodb: DynamoOps,
     bucket: String,
+    table: String,
+    default_pallet: String,
     bridge: AsyncBridge,
 }
 
@@ -43,10 +49,17 @@ async fn context() -> Result<&'static Context, Error> {
     CONTEXT
         .get_or_try_init(|| async {
             let (config, _routing) = config_from_env().map_err(Error::from)?;
-            let (s3, _dynamodb) = build_clients(&config).await.map_err(Error::from)?;
+            let (s3, dynamodb) = build_clients(&config).await.map_err(Error::from)?;
             let bridge = AsyncBridge::current().map_err(Error::from)?;
 
-            Ok(Context { s3, bucket: config.bucket, bridge })
+            Ok(Context {
+                s3,
+                dynamodb,
+                bucket: config.bucket,
+                table: config.table,
+                default_pallet: config.default_pallet,
+                bridge,
+            })
         })
         .await
 }
@@ -92,14 +105,35 @@ async fn handler(event: LambdaEvent<S3Event>) -> Result<(), Error> {
             }
         };
 
+        let refs = DynamoRefStore::new(
+            context.dynamodb.clone(),
+            context.table.clone(),
+            staged.warehouse.to_string(),
+            context.default_pallet.clone(),
+            context.bridge.clone(),
+        );
+
         // A storage error propagates (the event retries); a semantic outcome is logged and the
         // event is consumed — a corrupt object was discarded, not promoted, and retrying it
-        // would only rediscard it.
-        let outcome =
-            tokio::task::spawn_blocking(move || objects.verify_and_promote(&session, &hash))
-                .await
-                .map_err(|e| Error::from(format!("The verifier task panicked: {}", e)))?
-                .map_err(Error::from)?;
+        // would only rediscard it. So is redacted content: its redaction item is read before
+        // anything is promoted, and an applied one has its staged copy dropped instead. An item
+        // that cannot be read is a storage error too: never promoted on a guess.
+        let outcome = tokio::task::spawn_blocking(move || -> Result<Option<PromoteOutcome>, String> {
+            if redaction_applied(&refs, &hash)? {
+                objects.drop_staged_copy(&session, &hash)?;
+                return Ok(None);
+            }
+
+            objects.verify_and_promote(&session, &hash).map(Some)
+        })
+        .await
+        .map_err(|e| Error::from(format!("The verifier task panicked: {}", e)))?
+        .map_err(Error::from)?;
+
+        let Some(outcome) = outcome else {
+            eprintln!("verifier: dropped staged object {} unpromoted: its content is redacted", key);
+            continue;
+        };
 
         match outcome {
             PromoteOutcome::Promoted | PromoteOutcome::AlreadyPresent => {}

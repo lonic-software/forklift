@@ -164,6 +164,22 @@ after 10 seconds, then twice as long each time up to 5 minutes. Routes that move
 the server let apply is never served after that write, even when the server stopped before
 applying it.
 
+The serverless head decides each redaction where its content would move, from strongly
+consistent reads. A `GET` or `PUT` of an object, `upload-targets` and `batch` judge each hash
+they name that `@redactions` records, and apply a redaction nothing holds before they answer.
+After each ref update or `DELETE` commits, and at the handshake, the head judges every
+redaction not yet applied, as best effort: a failure there is logged, and the write is answered
+all the same. The first judge of a redaction reads every pallet's tree and every metadata
+history, which may take several requests. What it found is kept, so later judges read the pallet
+heads, plus the parents of a metadata pallet seen naming the content whose head has moved. A
+redaction it cannot decide within the request is not served: `GET`, `PUT` and `upload-targets`
+answer `503` with `Retry-After`, and `batch` leaves the object out. A lift commit naming
+an applied redaction's hash is refused with `410`, and its staged copy is dropped, never
+promoted; so does the staging verifier. Both check before they promote, so a copy whose
+promotion was already under way when the redaction applied is still promoted. For now the
+serverless head deletes nothing: an applied redaction stays `deletion_owed`, its copy (and any
+copy promoted so) stays in storage unserved, and an applied recipe's chunks are still served.
+
 forklift-server deletes an applied redaction's content in its own process right after applying
 it. It drains that one warehouse: new requests for it get `503` until the deletion ends (which may
 include repacking its packs, so the wait is not bounded by the drain's), downloads

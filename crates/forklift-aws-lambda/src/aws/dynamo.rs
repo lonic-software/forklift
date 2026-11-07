@@ -13,6 +13,7 @@
 //! | `<warehouse>` | `pallet#old`     | `deleted_head = …` | a deleted pallet's tombstone   |
 //! | `<warehouse>` | `trust`          | `anchor = <json>`  | the trust anchor               |
 //! | `<warehouse>` | `format`         | `state = <state>`  | the warehouse's format         |
+//! | `<warehouse>` | `redaction#<hash>` | `state = <json>` | where one redaction stands     |
 //!
 //! The format item's `state` is the format number (`1`), or `N>M owner step` while an upgrade
 //! from `N` to `M` holds it (`crate::format`). Every ref and trust write carries a fence on it as
@@ -32,6 +33,12 @@
 //! item not existing (`attribute_not_exists(entity)`) refuses a deleted pallet exactly as it
 //! refuses a live one, and only an acknowledged re-creation, conditioned on the tombstone, lifts
 //! it back.
+//!
+//! A redaction item exists for each redaction recorded on `@redactions` that the head has begun
+//! deciding (`crate::redaction`): its `state` is a versioned JSON record of the scan's verdicts
+//! and whether the redaction has applied. It is written by a `Put` conditioned on the exact
+//! bytes the writer read, behind the format fence, so two judges never overwrite each other's
+//! verdicts. A record of a version this build does not know fails every read of it.
 //!
 //! The table's key schema must be `wh` (S, partition) and `entity` (S, sort); a deployment
 //! provisions it that way (the integration test creates exactly this table).
@@ -101,7 +108,8 @@ use crate::aws::sdk::describe;
 use crate::blocking::AsyncBridge;
 use crate::reissue::request_token;
 use crate::store::{
-    CasOutcome, ExpectedHead, FormatFence, FormatStore, OfficePrecondition, RedactionsPrecondition, RefHead, RefListing,
+    CasOutcome, ExpectedHead, FormatFence, FormatStore, OfficePrecondition, RedactionWrite, RedactionsPrecondition,
+    RefHead, RefListing,
     RefStore, TransientCause, TrustOutcome, TrustWriteOutcome, TRANSACTION_ATTEMPT_TIMEOUT,
 };
 
@@ -124,6 +132,8 @@ pub(crate) const ENTITY_PALLET_PREFIX: &str = "pallet#";
 pub(crate) const ENTITY_TRUST: &str = "trust";
 /// The sort key of the single format item.
 pub(crate) const ENTITY_FORMAT: &str = "format";
+/// The sort-key prefix of a redaction item: `redaction#<hash>`.
+pub(crate) const ENTITY_REDACTION_PREFIX: &str = "redaction#";
 
 /// The sort key of a pallet head — `pallet#{wire}`, the qualified reference the fake keys on.
 fn pallet_entity(namespace: PalletNamespace, name: &str) -> String {
@@ -440,6 +450,8 @@ enum Precondition {
     RedactionsHead,
     /// The trust anchor's stored bytes, as [`RefStore::get_trust`] returned them.
     Anchor,
+    /// A redaction item's stored state, as [`RefStore::get_redaction`] returned it.
+    Redaction,
 }
 
 /// A `TransactWriteItems` under construction, together with the positional map of what each of
@@ -729,6 +741,10 @@ impl DynamoRefStore {
             Some(Refusal::Moved(Precondition::RedactionsHead, _)) => CasOutcome::RedactionsMoved,
             Some(Refusal::Moved(Precondition::Anchor, _)) => CasOutcome::AnchorMoved,
             Some(Refusal::Moved(Precondition::Format, _)) => CasOutcome::FormatMoved,
+            // No action of a ref update conditions on a redaction item.
+            Some(Refusal::Moved(Precondition::Redaction, _)) => {
+                return Err(format!("{} was refused on a redaction-item precondition it never built.", label))
+            }
         })
     }
 }
@@ -839,7 +855,8 @@ impl RefStore for DynamoRefStore {
                     .expression_attribute_names("#wh", ATTR_WAREHOUSE)
                     .expression_attribute_names("#e", ATTR_ENTITY)
                     .expression_attribute_values(":wh", s(self.warehouse.clone()))
-                    .expression_attribute_values(":prefix", s(ENTITY_PALLET_PREFIX));
+                    .expression_attribute_values(":prefix", s(ENTITY_PALLET_PREFIX))
+                    .consistent_read(true);
 
                 if let Some(key) = start_key.take() {
                     request = request.set_exclusive_start_key(Some(key));
@@ -876,6 +893,74 @@ impl RefStore for DynamoRefStore {
 
     fn default_pallet(&self) -> Result<String, String> {
         Ok(self.default_pallet.clone())
+    }
+
+    fn get_redaction(&self, hash: &str) -> Result<Option<String>, String> {
+        let entity = format!("{}{}", ENTITY_REDACTION_PREFIX, hash);
+
+        self.bridge.block_on(async {
+            let Some(item) = self.get_item(&entity).await? else {
+                return Ok(None);
+            };
+
+            // An item with no readable state is not one this build wrote; reading it as absent
+            // would start the redaction over as pending.
+            match item.get(ATTR_STATE).and_then(|value| value.as_s().ok()) {
+                Some(state) => Ok(Some(state.clone())),
+                None => Err(format!("The redaction item for {} carries no state this build can read.", hash)),
+            }
+        })
+    }
+
+    fn put_redaction(
+        &self,
+        hash: &str,
+        state: &str,
+        expected: Option<&str>,
+        format: &FormatFence,
+    ) -> Result<RedactionWrite, String> {
+        let entity = format!("{}{}", ENTITY_REDACTION_PREFIX, hash);
+        let mut item = self.key(&entity);
+        item.insert(ATTR_STATE.to_string(), s(state));
+
+        let builder = Put::builder()
+            .set_item(Some(item))
+            .table_name(&self.table)
+            .return_values_on_condition_check_failure(ReturnValuesOnConditionCheckFailure::AllOld);
+
+        // String equality on the stored bytes, as the anchor's condition is: whatever moved
+        // them, the writer's verdicts were read from something else.
+        let put = match expected {
+            Some(bytes) => builder
+                .condition_expression("#s = :s")
+                .expression_attribute_names("#s", ATTR_STATE)
+                .expression_attribute_values(":s", s(bytes)),
+            None => builder
+                .condition_expression("attribute_not_exists(#e)")
+                .expression_attribute_names("#e", ATTR_ENTITY),
+        }
+        .build()
+        .expect("every required Put field is set");
+
+        let mut transaction = ConditionedTransaction::new();
+
+        transaction.push(self.format_action(format), Precondition::Format);
+        transaction.push(TransactWriteItem::builder().put(put).build(), Precondition::Redaction);
+
+        self.bridge.block_on(async {
+            let refusal = transaction.send(&self.client, "DynamoDB redaction write", &request_token()).await?;
+
+            match refusal {
+                None => Ok(RedactionWrite::Written),
+                Some(Refusal::Transient(cause)) => Ok(RedactionWrite::Transient(cause)),
+                Some(Refusal::Moved(Precondition::Format, _)) => Ok(RedactionWrite::FormatMoved),
+                Some(Refusal::Moved(Precondition::Redaction, _)) => Ok(RedactionWrite::Moved),
+                Some(Refusal::Moved(precondition, _)) => Err(format!(
+                    "DynamoDB redaction write was refused on a {:?} precondition it never built.",
+                    precondition
+                )),
+            }
+        })
     }
 
     fn get_trust(&self) -> Result<Option<(TrustAnchor, String)>, String> {
@@ -1030,6 +1115,11 @@ impl RefStore for DynamoRefStore {
                 }
                 Some(Refusal::Moved(Precondition::RedactionsHead, _)) => {
                     return Err("DynamoDB anchor write was refused on a @redactions \
+                        precondition it never built."
+                        .to_string())
+                }
+                Some(Refusal::Moved(Precondition::Redaction, _)) => {
+                    return Err("DynamoDB anchor write was refused on a redaction-item \
                         precondition it never built."
                         .to_string())
                 }
