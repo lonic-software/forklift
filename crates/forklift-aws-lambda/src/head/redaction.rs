@@ -111,6 +111,11 @@ struct Record {
 
     /// When the redaction applied, in seconds since the Unix epoch; `None` while pending.
     applied_at: Option<u64>,
+
+    /// Whether the store holds the hash as no file's content, so the redaction never applies.
+    /// Written only once true: a record without it is one where that was never found.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    never_applies: bool,
 }
 
 /// One pallet, by its wire reference, and the head a scan saw it at.
@@ -283,6 +288,7 @@ pub fn record_state(scan_complete: bool, holders: &[(String, String)], applied_a
         scan_complete,
         holders: holders.iter().map(|(pallet, head)| Seen { pallet: pallet.clone(), head: head.clone() }).collect(),
         applied_at,
+        never_applies: false,
     };
 
     serde_json::to_string(&record).expect("a record encodes")
@@ -461,13 +467,6 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         let lost = budget.lost;
 
         while budget.lost - lost < WRITE_ATTEMPTS {
-            if !budget.timely() {
-                return Ok(Verdict::Undecided(format!(
-                    "The redaction of {} could not be judged within this request.",
-                    hash
-                )));
-            }
-
             let stored = self.refs.get_redaction(hash).map_err(HeadError::internal)?;
             let record = match &stored {
                 Some(bytes) => Some(decode_record(hash, bytes).map_err(HeadError::internal)?),
@@ -481,6 +480,19 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
             if record.applied_at.is_some() {
                 return Ok(Verdict::Applied);
+            }
+
+            if record.never_applies {
+                return Ok(Verdict::Pending);
+            }
+
+            // The item read above is cheap and decides an applied redaction; only the scan and
+            // the holder checks below wait on the time left.
+            if !budget.timely() {
+                return Ok(Verdict::Undecided(format!(
+                    "The redaction of {} could not be judged within this request.",
+                    hash
+                )));
             }
 
             let stored = stored.unwrap_or_default();
@@ -527,6 +539,13 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 }
                 Holding::Free => {
                     if let Some(verdict) = self.never_applies(hash)? {
+                        if verdict == Verdict::Pending {
+                            // Kept, so no later judge lists the pallets or reads the object again;
+                            // one lost to another request changes nothing about this verdict.
+                            let next = Record { never_applies: true, ..record };
+                            self.write_record(hash, &next, Some(&stored), budget)?;
+                        }
+
                         return Ok(verdict);
                     }
 
@@ -556,7 +575,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
         self.put_remaining(hash, &pallets)?;
 
-        let record = Record { version: RECORD_VERSION, scan_complete: false, holders: Vec::new(), applied_at: None };
+        let record = Record { version: RECORD_VERSION, scan_complete: false, holders: Vec::new(), applied_at: None, never_applies: false };
         // Lost to another request's start: the judge reads its item instead.
         self.write_record(hash, &record, None, budget).map(|_| ())
     }
@@ -586,38 +605,57 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
         let scratch = self.scratch().map_err(HeadError::internal)?;
 
-        // Pallets walked off `remaining` since it was last saved. The list is saved again only
-        // before this call returns: one lost to a crash is walked again, which is extra work only.
+        // Pallets walked off `remaining` since it was last saved. The list is saved again once,
+        // on every way out of the walk, an error's included, so what this request walked is kept.
         let mut walked = false;
+        let outcome = self.walk_remaining(&scratch, redaction, stored, record, budget, &mut remaining.pallets, &mut walked);
+
+        if walked {
+            let saved = self.put_remaining(hash, &remaining.pallets);
+            return outcome.and_then(|advance| saved.map(|()| advance));
+        }
+
+        outcome
+    }
+
+    /// Walk the pallets of `remaining` in turn, taking each walked one off it and setting
+    /// `walked`, until one names the content, the walks stop, or none is left and the scan is
+    /// recorded complete. The caller saves `remaining` when `walked` is set.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_remaining(
+        &self,
+        scratch: &Scratch,
+        redaction: &Redaction,
+        stored: &str,
+        record: &Record,
+        budget: &mut Budget,
+        remaining: &mut Vec<Seen>,
+        walked: &mut bool,
+    ) -> HeadResult<Advance> {
+        let hash = &redaction.hash;
 
         loop {
-            let Some(seen) = remaining.pallets.first().cloned() else {
+            let Some(seen) = remaining.first().cloned() else {
                 let next = Record { scan_complete: true, ..record.clone() };
 
                 if self.write_record(hash, &next, Some(stored), budget)? {
+                    // The list goes with the scan it served; nothing is left to save.
+                    *walked = false;
                     self.objects.work_delete(&remaining_name(hash)).map_err(HeadError::internal)?;
                 }
 
                 return Ok(Advance::Moved);
             };
 
-            let (walk, resumed) = self.walk_pallet(&scratch, redaction, &seen, budget)?;
+            let (walk, resumed) = self.walk_pallet(scratch, redaction, &seen, budget)?;
 
             let names = match walk {
                 Ok(Some(names)) => names,
-                stopped => {
-                    if walked {
-                        self.put_remaining(hash, &remaining.pallets)?;
-                    }
-
-                    return Ok(Advance::Stopped(match stopped {
-                        Err(why) => why,
-                        _ => format!(
-                            "The scan of the pallets that may hold the redaction of {} has not finished yet.",
-                            hash
-                        ),
-                    }));
-                }
+                Ok(None) => return Ok(Advance::Stopped(format!(
+                    "The scan of the pallets that may hold the redaction of {} has not finished yet.",
+                    hash
+                ))),
+                Err(why) => return Ok(Advance::Stopped(why)),
             };
 
             if names {
@@ -629,24 +667,18 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 let next = Record { holders, ..record.clone() };
 
                 if !self.write_record(hash, &next, Some(stored), budget)? {
-                    if walked {
-                        self.put_remaining(hash, &remaining.pallets)?;
-                    }
-
                     return Ok(Advance::Moved);
                 }
             }
 
-            remaining.pallets.retain(|pallet| *pallet != seen);
-            walked = true;
+            remaining.retain(|pallet| *pallet != seen);
+            *walked = true;
 
             if resumed {
                 self.objects.work_delete(&walk_name(hash, &seen)).map_err(HeadError::internal)?;
             }
 
             if names {
-                self.put_remaining(hash, &remaining.pallets)?;
-
                 return Ok(Advance::Moved);
             }
         }

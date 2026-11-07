@@ -5250,7 +5250,8 @@ impl ObjectStore for PosesAsATree {
 
 /// A redaction naming an object the store holds as a tree never applies, as core never applies
 /// it: nothing holds it, yet it stays pending, and the object is served.
-// Revert: answer such a redaction undecided → the object answers `503` → red.
+// Revert: answer such a redaction undecided → the object answers `503` → red. Revert: drop the
+// write keeping that verdict → the item never says so → red.
 #[test]
 fn a_redaction_naming_a_tree_stays_pending_and_is_served() {
     use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
@@ -5265,10 +5266,104 @@ fn a_redaction_naming_a_tree_stays_pending_and_is_served() {
     plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions[0]);
 
     assert!(served(&head, &leak), "a tree's redaction never applies, and is served");
+    let item = head.refs.get_redaction(&leak).expect("item").expect("the judge wrote the item");
+    assert!(item.contains("\"never_applies\":true"), "kept, so no later judge reads the object again: {}", item);
     let info = head.handshake().expect("handshake");
     let state = info.redactions.expect("redactions").into_iter().find(|served| served.hash == leak).map(|served| served.state);
     assert_eq!(state, Some(ServedRedactionState::Pending));
     assert!(!forklift_aws_lambda::head::redaction_applied(&head.refs, &leak).expect("item"));
+}
+
+/// An applied redaction reads as applied even once the request's time is spent: its item is read
+/// before the deadline is looked at, so it is refused as `410`, and the handshake says
+/// `deletion_owed`, never `pending`.
+// Revert: look at the deadline before reading the item → `503`, and `pending` → red.
+#[test]
+fn an_applied_redaction_reads_as_applied_after_the_deadline() {
+    let (_area, head, redactions, leak) = unplanted_redaction("redaction-late", "leaked\n");
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions);
+    assert!(!served(&head, &leak), "nothing holds it: it applies");
+
+    let late = head.with_deadline(std::time::SystemTime::now());
+    assert_gone(&late.object_get(&leak).expect_err("still refused"), &leak);
+    let info = late.handshake().expect("handshake");
+    let state = info.redactions.expect("redactions").into_iter().find(|served| served.hash == leak).map(|served| served.state);
+    assert_eq!(state, Some(ServedRedactionState::DeletionOwed));
+}
+
+/// An object store whose `n`th read of a pallet walk fails, to cut a scan off part way.
+struct FailsAWalkRead {
+    inner: MemoryObjectStore,
+    reads: AtomicU64,
+    fail_at: u64,
+}
+
+impl ObjectStore for FailsAWalkRead {
+    fn exists(&self, hash: &str) -> Result<bool, String> {
+        self.inner.exists(hash)
+    }
+
+    fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, String> {
+        self.inner.get(hash)
+    }
+
+    fn objects_staged(&self, session: &str, hashes: &[String]) -> Result<Vec<String>, String> {
+        self.inner.objects_staged(session, hashes)
+    }
+
+    fn put_verified(&self, hash: &str, bytes: &[u8]) -> Result<PutOutcome, String> {
+        self.inner.put_verified(hash, bytes)
+    }
+
+    fn get_signature(&self, parcel_hash: &str) -> Result<Option<Vec<u8>>, String> {
+        self.inner.get_signature(parcel_hash)
+    }
+
+    fn put_signature(&self, parcel_hash: &str, bytes: &[u8]) -> Result<SignatureOutcome, String> {
+        self.inner.put_signature(parcel_hash, bytes)
+    }
+
+    fn work_get(&self, name: &str) -> Result<Option<Vec<u8>>, String> {
+        if name.contains("/walk-") && self.reads.fetch_add(1, Ordering::SeqCst) + 1 == self.fail_at {
+            return Err("the work read failed".to_string());
+        }
+
+        self.inner.work_get(name)
+    }
+
+    fn work_put(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
+        self.inner.work_put(name, bytes)
+    }
+
+    fn work_delete(&self, name: &str) -> Result<(), String> {
+        self.inner.work_delete(name)
+    }
+}
+
+/// A scan cut off by a failed store call keeps the pallets it walked: the list of pallets still
+/// to walk is saved on that way out too, so the next request goes on after them.
+// Revert: save the list only on the walk's own stops → the error keeps every pallet → red.
+#[test]
+fn a_scan_cut_off_by_a_store_error_keeps_what_it_walked() {
+    let area = Area::new("redaction-cut-off");
+    let (redactions, recorded) = recorded_redactions(&area, "red", &["leaked\n"]);
+    let leak = blob_hash("leaked\n");
+    let head = Head::new(FailsAWalkRead { inner: MemoryObjectStore::new(), reads: AtomicU64::new(0), fail_at: 3 }, MemoryRefStore::new());
+    upload_all(&head, &recorded);
+    for pallet in 0..4 {
+        let parcel = gate_parcel(&head, &[], vec![gate_file(&head, "n", &pallet.to_string())]);
+        plant(&head.refs, &format!("p{}", pallet), &parcel);
+    }
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions[0]);
+    let listing = head.refs.list_refs().expect("list");
+    let pallets = listing.live.len() + listing.tombstones.len();
+
+    let err = head.object_get(&leak).expect_err("the third walk's read fails");
+    assert_eq!(err.status, Status::Internal, "{}", err.message);
+
+    let saved = head.objects.inner.work_get(&format!("{}/pallets", leak)).expect("work").expect("the list is kept");
+    let saved: serde_json::Value = serde_json::from_slice(&saved).expect("a list");
+    assert_eq!(saved["pallets"].as_array().expect("pallets").len(), pallets - 2, "the two walked pallets are off it");
 }
 
 /// A scan the request cannot finish answers `503` with `Retry-After` and saves where it stopped,
