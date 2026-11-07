@@ -27,9 +27,15 @@ impl Warehouse {
 
     /// A clone of the remote at `url`.
     fn cloned(name: &str, url: &str) -> Warehouse {
+        Warehouse::cloned_with(name, url, &[])
+    }
+
+    /// A clone of the remote at `url`, with `extra` arguments.
+    fn cloned_with(name: &str, url: &str, extra: &[&str]) -> Warehouse {
         let warehouse = Warehouse::empty(name);
         let cloned = forklift_command()
             .args(["clone", url, warehouse.root.to_str().unwrap()])
+            .args(extra)
             .env("FORKLIFT_GLOBAL_CONFIG", warehouse.home.join("global-config.toml"))
             .env("FORKLIFT_KEYS_DIR", warehouse.home.join("keys"))
             .output()
@@ -807,4 +813,48 @@ fn a_meta_history_the_remote_serves_is_taken_though_it_names_a_redacted_hash() {
 
     // A parcel past the served head only carries the marker its parent names, so it is written.
     warehouse.run_ok(&["tag", "create", "v2", "main"]);
+}
+
+#[test]
+fn a_head_the_remote_serves_is_adopted_while_the_remote_holds_its_redaction_pending() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-adopt-server-{}", std::process::id())));
+
+    // One warehouse lifts a pallet naming the content, which another clones, and lifts a later
+    // head of it.
+    let owner = Warehouse::cloned("adopt-owner", &server.url);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+    owner.run_ok(&["pallet", "create", "side"]);
+    owner.stack("secret.env", b"TOKEN=hunter2\n", "leak");
+    owner.run_ok(&["lift"]);
+    let behind = Warehouse::cloned_with("adopt-behind", &server.url, &["--pallet", "side"]);
+    owner.stack("more.txt", b"more\n", "more");
+    owner.run_ok(&["lift"]);
+
+    // A third, which never held that pallet, records the redaction and lifts it. The remote still
+    // serves the pallet: the redaction is pending there until its owner takes the content out.
+    let redactor = Warehouse::cloned("adopt-redactor", &server.url);
+    let hash = redactor.redact_loaded("secret.env", b"TOKEN=hunter2\n", "leaked token");
+    redactor.run_ok(&["lift"]);
+
+    // A clone takes the pallet as the remote serves it, and the redaction with it.
+    let fresh = Warehouse::cloned_with("adopt-fresh", &server.url, &["--pallet", "side"]);
+    assert_eq!(fresh.redactions().len(), 1);
+    assert!(fresh.root.join("secret.env").exists());
+
+    // So does a named lower of it.
+    redactor.run_ok(&["lower", "side"]);
+    assert_eq!(redactor.head("side"), owner.head("side"));
+
+    // And a lower's fast-forward of the working pallet to the head the remote serves.
+    behind.run_ok(&["lower"]);
+    assert_eq!(behind.head("side"), owner.head("side"));
+    assert_eq!(behind.redactions().len(), 1);
+    assert!(behind.root.join("more.txt").exists());
+
+    // Work of its own is no adoption: it is checked in full.
+    std::fs::write(fresh.root.join("mine.txt"), b"mine\n").unwrap();
+    let error = content_redacted(&fresh, &["load", "."]);
+    assert_eq!(error["details"], serde_json::json!({ "path": "secret.env", "hash": hash }), "{}", error);
 }
