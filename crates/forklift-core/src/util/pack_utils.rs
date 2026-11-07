@@ -3731,7 +3731,9 @@ pub fn repack_evicting(evicted: &HashSet<String>,
 /// A full repack for a redaction's deletion: [`repack_evicting`] with `redacted` as what goes, and
 /// `kept` added to the live set although nothing live may reach it. The deleter drops a redacted
 /// recipe before its chunks, so a present recipe never lacks one: the chunks only that recipe named
-/// are kept through the repack that drops it, and dropped by the next.
+/// are kept through the repack that drops it, and dropped by the next. A compaction leaves a loose
+/// chunk loose, so this matters only for a chunk a pack holds: one a received pack carried, or a
+/// duplicate a repack had to pack.
 ///
 /// # Arguments
 /// * `redacted`      - The objects the deletion drops, packed or loose.
