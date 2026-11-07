@@ -109,6 +109,11 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   a redaction only while the server reports it pending. A fresh `clone` or a `lower` that must
   fetch history naming the content is refused with `content_redacted` for now. The AWS head does
   not apply redactions yet.
+- **A redaction applies only to a file's content.** A redaction naming an object a warehouse holds
+  as a directory or as a chunk of a chunked file is never applied there (`redact list` reports it
+  undecided, with why), and the deleter leaves such an object in place. The reads, `audit`, `heal`
+  and a ref update tolerate an applied redaction's absence only where it stands as a file's content.
+  `redact record` already refused to record such an object.
 - **forklift-server deletes an applied redaction's content.** Right after it applies a redaction,
   the server deletes its copy of the content in its own process. While it deletes, which can
   include repacking the warehouse's packs, it answers requests for that one warehouse with `503`
