@@ -596,7 +596,8 @@ fn local_roots(user_parcels: &[String], meta_parcels: &[String], sources: recove
 ///
 /// A tree or recipe `tolerated` holds (recorded, or named by a redaction this warehouse applied)
 /// and absent is held by hash alone: it is retained and not descended, as a fresh clone would
-/// hold it. A held one that is present is walked like any other. Any other absent tree or recipe the walk loads fails the plan.
+/// hold it. A held one that is present is walked like any other. Any other absent tree or recipe
+/// the walk loads fails the plan.
 fn collect_retained(
     user_parcels: &[String],
     meta_parcels: &[String],
@@ -956,8 +957,8 @@ fn resolve_unsealed_subtree(root_tree_hash: &str, key: &str, tolerated: &Tolerat
     Ok(Some(current))
 }
 
-/// Whether `hash` is held by hash alone: recorded in `tolerated`'s sealed record, or named by a redaction this
-/// warehouse applied, and absent. A held object that is present seals nothing. Presence is the
+/// Whether `hash` is held by hash alone: recorded in `tolerated`'s sealed record, or named by a
+/// redaction this warehouse applied, and absent. A held object that is present seals nothing. Presence is the
 /// fail-closed sweep form, so an object only an unreadable pack index might hold fails rather than
 /// reading as held.
 fn held_by_hash(tolerated: &Tolerated, hash: &str) -> Result<bool, String> {

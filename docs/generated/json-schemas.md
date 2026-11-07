@@ -54,7 +54,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "integer"
         },
         "in_scope_content": {
-          "description": "In-scope content: every tree was re-hashed on read and every blob confirmed present, except\nthe absent objects counted in `held_by_hash`.",
+          "description": "In-scope content: every tree was re-hashed on read and every blob confirmed present, except\nthe absent objects counted in `held_by_hash` and the absent content a redaction applied here\nnames.",
           "type": "string"
         },
         "out_of_scope_content": {
