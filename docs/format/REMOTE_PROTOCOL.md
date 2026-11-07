@@ -150,7 +150,9 @@ the remote's `@redactions` pallet holds as pending.
 object out, as they do one the remote lacks, so the client's loose `GET` for it receives the `410`;
 the bundle never carries it. What is refused is the redacted hash: for a chunked file, the
 recipe. Its chunks are not refused by hash, since other content may share them; a client never
-uploads one only that recipe names. A ref update tolerates the absence of an applied redaction's content
+uploads one only that recipe names. A chunk of a recipe the client does upload is always offered,
+even when its bytes are an applied redaction's content: the remote refuses that `PUT` with `410`,
+so the lift fails rather than landing a file without it. A ref update tolerates the absence of an applied redaction's content
 from the closure it checks, so a client lifting history that names the content does not upload
 it: it sends no candidate the handshake reports applied. A client that must fetch such content
 (a clone or `lower` of history that names it) is refused with `content_redacted`.
@@ -426,8 +428,8 @@ checks every reference before building the path and sends only valid ones.
 2. **Presence**: `new_head` is an object hash in its canonical spelling (64 lowercase hex
    characters), and the `new_head` parcel and the full closure of every parcel between
    `new_head` and `old_head` (parents, trees, blobs) are present, else `422` — a ref
-   must never point at missing history. A blob or chunked file's recipe whose redaction the
-   remote has applied is the one absence allowed.
+   must never point at missing history. An object whose hash is an applied redaction is the
+   one absence allowed.
 3. **Ancestry**: `old_head` is an ancestor of `new_head` (fast-forward only; there is
    no force push in protocol v1), else `409`.
    A creation (`old_head: null`) of a user pallet that has a tombstone must acknowledge it,
