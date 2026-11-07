@@ -329,7 +329,8 @@ revocation by more than about a day.
   `rebuild_after_lifts` set the next one is built at once), and accepts lifts whose history names it
   without the content. The applied redactions are kept in `<root>/.forklift/redactions-applied`.
   Right after applying, the server deletes its copy of the content in its own process. It drains
-  that one warehouse: requests for it get `503` with `Retry-After` until the deletion ends, its
+  that one warehouse: requests for it get `503` with `Retry-After` until the deletion ends (a repack of its
+  packs included), its
   bundle downloads are cut, and the requests already running get 30 seconds to end. Then it
   deletes the content, packed or loose, and serves the warehouse again, all without letting go of
   the warehouse's serve lock or format lease. A deletion it cannot carry out, because requests

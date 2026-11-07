@@ -1367,9 +1367,11 @@ fn served_redactions() -> Result<Vec<ServedRedaction>, HandlerError> {
         let hash = attributed.redaction.hash.clone();
         let state = match applied.contains(&hash) {
             false => ServedRedactionState::Pending,
-            true => match file_utils::does_object_exist(&hash).map_err(internal)? {
-                true => ServedRedactionState::DeletionOwed,
-                false => ServedRedactionState::Deleted,
+            // Deleted is claimed only on seeing the object absent: a store that cannot be read
+            // reports the deletion owed, as a handshake must not fail over one object.
+            true => match file_utils::does_object_exist(&hash) {
+                Ok(false) => ServedRedactionState::Deleted,
+                Ok(true) | Err(_) => ServedRedactionState::DeletionOwed,
             },
         };
 
@@ -2237,20 +2239,6 @@ async fn put_warehouse(State(state): State<Arc<AppState>>,
     }
 }
 
-/// How long a handshake waits for the redaction rounds asked before it to apply
-/// ([`applies_settled`]). Past it, the handshake reports the redactions as they stand.
-const APPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Wait, up to [`APPLY_WAIT`], until every redaction round asked for `warehouse` so far has
-/// applied what it found: a ref write's answer does not wait on its apply, so a handshake right
-/// after it would otherwise report a redaction pending that the write let apply.
-async fn applies_settled(warehouse: &WarehouseHandle) {
-    let asked = warehouse.redactions_asked.load(std::sync::atomic::Ordering::SeqCst);
-    let mut through = warehouse.applied_through.subscribe();
-
-    let _ = tokio::time::timeout(APPLY_WAIT, through.wait_for(|&through| through >= asked)).await;
-}
-
 /// `GET /v1/warehouse` — the handshake: protocol version, refs and trust.
 async fn get_warehouse(State(state): State<Arc<AppState>>,
                        Path(params): Path<PathParams>) -> Response {
@@ -2258,8 +2246,6 @@ async fn get_warehouse(State(state): State<Arc<AppState>>,
         Ok(warehouse) => warehouse,
         Err(error) => return error_response(error),
     };
-
-    applies_settled(&warehouse).await;
 
     let result = blocking(warehouse, move || {
         let mut pallets = std::collections::BTreeMap::new();
@@ -3221,7 +3207,7 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
                 emit_event(&state, event);
             }
 
-            after_ref_write(&state, warehouse);
+            after_ref_write(&state, warehouse).await;
 
             StatusCode::OK.into_response()
         }
@@ -3384,7 +3370,7 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
         Ok(Some(event)) => {
             emit_event(&state, event);
 
-            after_ref_write(&state, warehouse);
+            after_ref_write(&state, warehouse).await;
 
             StatusCode::OK.into_response()
         }
@@ -3395,10 +3381,20 @@ async fn delete_ref(State(state): State<Arc<AppState>>,
 
 /// What follows a ref write this warehouse took: a redaction run ([`run_redactions`]), for every
 /// redaction the write may have let apply, and the bundle rebuild the accepted-lift counter may
-/// call for. Neither is waited for: the write's answer does not wait on the scan.
-fn after_ref_write(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
-    run_redactions(Arc::clone(state), Arc::clone(&warehouse));
-    maybe_rebuild_bundle(state, warehouse);
+/// call for. The write's answer waits for the run's apply, so content a write let apply is refused
+/// before the write is answered; it does not wait for the deletion after.
+///
+/// The wait holds no reference to the handle: a round the wait follows may be draining the
+/// warehouse, and its drain waits for every reference to go.
+async fn after_ref_write(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
+    let asked = run_redactions(Arc::clone(state), Arc::clone(&warehouse));
+    maybe_rebuild_bundle(state, Arc::clone(&warehouse));
+
+    let mut through = warehouse.applied_through.subscribe();
+    drop(warehouse);
+
+    // The sender goes only with the handle, which a run serving the ask holds until it applied.
+    let _ = through.wait_for(|&through| through >= asked).await;
 }
 
 /// How long the redaction deleter waits for a drained warehouse's requests to end before it gives
@@ -3428,16 +3424,17 @@ const LAST_RETRY: std::time::Duration = std::time::Duration::from_secs(3600);
 /// store — is owed: the run tries again later, waiting longer each time, while the warehouse is
 /// served. A run starts after each ref write and once for each handle served, so a deletion owed
 /// when a process stopped is carried out by the next one to serve the warehouse.
-fn run_redactions(state: Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
+fn run_redactions(state: Arc<AppState>, warehouse: Arc<WarehouseHandle>) -> u64 {
     use std::sync::atomic::Ordering;
 
-    // Asked for before the running run is looked at, so that run, ending, sees it.
-    warehouse.redactions_asked.fetch_add(1, Ordering::SeqCst);
+    // Asked for before the running run is looked at, so that run, ending, sees it. Only a run
+    // waiting out a retry is woken: no permit is left behind to cut a later wait short.
+    let asked = warehouse.redactions_asked.fetch_add(1, Ordering::SeqCst) + 1;
     warehouse.redact_again.store(true, Ordering::SeqCst);
-    warehouse.redaction_wake.notify_one();
+    warehouse.redaction_wake.notify_waiters();
 
     if warehouse.redacting.swap(true, Ordering::SeqCst) {
-        return;
+        return asked;
     }
 
     tokio::spawn(async move {
@@ -3452,6 +3449,12 @@ fn run_redactions(state: Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
             if !owed {
                 retry = FIRST_RETRY;
             }
+
+            // Listening before the ask is looked at, so an ask after the look wakes the wait.
+            let wake = Arc::clone(&warehouse.redaction_wake);
+            let woken = wake.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
 
             if warehouse.redact_again.load(Ordering::SeqCst) {
                 continue;
@@ -3471,13 +3474,12 @@ fn run_redactions(state: Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
 
             // The wait holds no reference to the handle, so an idle warehouse may still be let go
             // meanwhile; the next handle served for it starts a run of its own.
-            let wake = Arc::clone(&warehouse.redaction_wake);
             let weak = Arc::downgrade(&warehouse);
             drop(warehouse);
 
             tokio::select! {
                 () = tokio::time::sleep(retry) => {}
-                () = wake.notified() => {}
+                () = woken => {}
             }
 
             warehouse = match still_served(&state, &weak) {
@@ -3487,6 +3489,8 @@ fn run_redactions(state: Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
             retry = (retry * 2).min(LAST_RETRY);
         }
     });
+
+    asked
 }
 
 /// The handle `weak` names, when it is still the one served for its warehouse. Taken under the
@@ -3698,8 +3702,17 @@ fn delete_drained(warehouse: &WarehouseHandle) -> (Result<redaction_deleter::Del
 /// while it was let go is done. Until then the warehouse stays drained: serving it without the hold
 /// would let that other process delete objects a request is relying on.
 async fn retake_store_access(warehouse: &Arc<WarehouseHandle>) {
-    loop {
+    for attempt in 1u64.. {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        // Said at once and every minute after: the warehouse answers 503 until this ends.
+        if attempt % 60 == 1 {
+            tracing::warn!(
+                root = %warehouse.root.display(),
+                seconds = attempt - 1,
+                "another process holds the warehouse's store exclusively; it is refused until that ends"
+            );
+        }
 
         let worker = Arc::clone(warehouse);
         let retaken = tokio::task::spawn_blocking(move || {
@@ -3819,6 +3832,11 @@ fn rebuild_bundle(state: &AppState, warehouse: Arc<WarehouseHandle>, again: bool
 
             warehouse.bundling.store(false, Ordering::SeqCst);
 
+            // A drain began while this one ran: the ask stays for the redaction run to serve after.
+            if warehouse.draining.load(Ordering::SeqCst) {
+                break;
+            }
+
             // Another was asked for while this one ran, and no other rebuild has started since.
             if !warehouse.rebuild_again.swap(false, Ordering::SeqCst) || warehouse.bundling.swap(true, Ordering::SeqCst) {
                 break;
@@ -3922,6 +3940,13 @@ fn bundle_body(file: tokio::fs::File,
 
     let (sender, receiver) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(4);
 
+    // The body ends in an error, never quietly, so the connection is aborted rather than closed
+    // as if complete. Sent without waiting: a client too slow to take it loses the connection
+    // all the same once the sender goes.
+    let cut_short = |sender: &tokio::sync::mpsc::Sender<std::io::Result<Bytes>>| {
+        let _ = sender.try_send(Err(std::io::Error::other("the bundle download was cut")));
+    };
+
     tokio::spawn(async move {
         let _warehouse = warehouse;
         let mut chunks = tokio_util::io::ReaderStream::new(tokio::io::AsyncReadExt::take(file, length));
@@ -3929,7 +3954,7 @@ fn bundle_body(file: tokio::fs::File,
         loop {
             let chunk = tokio::select! {
                 biased;
-                () = cut.cancelled() => return,
+                () = cut.cancelled() => return cut_short(&sender),
                 chunk = chunks.next() => match chunk {
                     Some(chunk) => chunk,
                     None => return,
@@ -3938,7 +3963,7 @@ fn bundle_body(file: tokio::fs::File,
 
             tokio::select! {
                 biased;
-                () = cut.cancelled() => return,
+                () = cut.cancelled() => return cut_short(&sender),
                 sent = sender.send(chunk) => if sent.is_err() {
                     // The client went away.
                     return;
@@ -3982,6 +4007,12 @@ async fn get_bundle(State(state): State<Arc<AppState>>,
     // Taken before the bundle is opened: an apply withdraws the bundle before it cuts the
     // downloads, so a download that takes the token after the cut finds no bundle to open.
     let cut = warehouse.bundle_cut.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+
+    // Resolved before a drain's mark, but took the token after its cut: the drain waits for this
+    // request, so it stops here rather than stream past the cut.
+    if warehouse.draining.load(std::sync::atomic::Ordering::SeqCst) {
+        return error_response(draining_refusal());
+    }
 
     // The path resolves synchronously under the scope; only the streaming is async.
     let path = {
@@ -6223,10 +6254,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Cutting a warehouse's bundle downloads ends one whose client takes nothing, short of the
-    /// length it announced; one started after the cut is whole.
+    /// Cutting a warehouse's bundle downloads ends one whose client takes nothing in an error,
+    /// never as if it were whole; one started after the cut is whole.
     ///
-    /// Revert: stream the file without the cut → the stalled download is whole → red.
+    /// Revert: stream the file without the cut → the stalled download is whole → red. End the cut
+    /// body quietly → it reads as complete → red.
     #[tokio::test]
     async fn a_cut_ends_a_stalled_bundle_download_short() {
         let base = scratch_dir("bundle-cut");
@@ -6246,8 +6278,8 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         cut_bundle_downloads(&resolve_handle(&state, &warehouse_params("w1")).unwrap());
-        let received = axum::body::to_bytes(stalled.into_body(), usize::MAX).await.unwrap();
-        assert!(received.len() < bundle.len(), "the download was cut: {} of {} bytes", received.len(), bundle.len());
+        let received = axum::body::to_bytes(stalled.into_body(), usize::MAX).await;
+        assert!(received.is_err(), "the cut download ends in an error, never as if whole");
 
         let whole = get_bundle(State(Arc::clone(&state)), HeaderMap::new(), Path(warehouse_params("w1"))).await;
         assert_eq!(axum::body::to_bytes(whole.into_body(), usize::MAX).await.unwrap().len(), bundle.len());
@@ -6275,26 +6307,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A handshake waits for the redaction rounds asked before it to apply, so a client reads what
-    /// its own ref write let apply.
+    /// A ref write's answer waits for the redaction round its run asks for to apply, holding no
+    /// reference to the handle meanwhile, since that round may be draining the warehouse.
     ///
-    /// Revert: answer the handshake without waiting → it answers while the apply is outstanding →
-    /// red.
+    /// Revert: answer without waiting → it finishes while the apply is outstanding → red. Wait
+    /// holding the handle → the handle counts the waiter's reference → red.
     #[tokio::test]
-    async fn a_handshake_waits_for_the_applies_asked_before_it() {
-        let root = scratch_dir("handshake-applies");
+    async fn a_ref_write_is_answered_once_its_apply_is_done() {
+        let root = scratch_dir("write-applies");
         mark_warehouse(&root);
         let state = Arc::new(base_state(ServeMode::Single(Arc::new(WarehouseHandle::new(root.clone())))));
         let handle = resolve_handle(&state, &PathParams::new()).unwrap();
-        handle.redactions_asked.store(1, Ordering::SeqCst);
+        // A run is under way, so the write's ask is that run's to serve.
+        handle.redacting.store(true, Ordering::SeqCst);
 
-        let handshake = tokio::spawn(get_warehouse(State(Arc::clone(&state)), Path(PathParams::new())));
+        let answer = tokio::spawn({
+            let (state, handle) = (Arc::clone(&state), Arc::clone(&handle));
+            async move { after_ref_write(&state, handle).await }
+        });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert!(!handshake.is_finished(), "the handshake waits while the apply is outstanding");
+        assert!(!answer.is_finished(), "the answer waits while the apply is outstanding");
+        assert_eq!(Arc::strong_count(&handle), 2, "the wait holds no reference: single mode's and this test's");
 
         handle.applied_through.send_replace(1);
-        tokio::time::timeout(std::time::Duration::from_secs(5), handshake).await
+        tokio::time::timeout(std::time::Duration::from_secs(5), answer).await
             .expect("answered once the apply is done").unwrap();
+
+        drop((handle, state));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Asking for a redaction round wakes only a run waiting out a retry: it leaves no permit that
+    /// would cut the run's next wait short.
+    ///
+    /// Revert: wake with `notify_one` → the permit stays and a later wait ends at once → red.
+    #[tokio::test]
+    async fn an_ask_leaves_no_wake_behind() {
+        let root = scratch_dir("wake-permit");
+        mark_warehouse(&root);
+        let state = Arc::new(base_state(ServeMode::Single(Arc::new(WarehouseHandle::new(root.clone())))));
+        let handle = resolve_handle(&state, &PathParams::new()).unwrap();
+        handle.redacting.store(true, Ordering::SeqCst);
+
+        run_redactions(Arc::clone(&state), Arc::clone(&handle));
+
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(50), handle.redaction_wake.notified()).await;
+        assert!(waited.is_err(), "no wake was left behind");
 
         drop((handle, state));
         let _ = std::fs::remove_dir_all(&root);
