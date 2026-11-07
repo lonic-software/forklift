@@ -419,6 +419,14 @@ fn a_read_of_content_whose_redaction_is_applied_is_refused_as_redacted() {
     let missing = warehouse.json(&["blame", "-r", &leak, "notes.txt"]);
     assert_eq!(missing["error"]["code"], "error", "{}", missing);
     assert!(missing["error"]["message"].as_str().unwrap().contains("entity not found"), "{}", missing);
+
+    // An applied record that cannot be read leaves the absence undecided: the read still names
+    // the missing object, with the record's own error added rather than in its place.
+    std::fs::write(warehouse.root.join(".forklift/redactions-applied"), "/forklift-redactions-applied 99\n").unwrap();
+    let undecided = warehouse.json(&["blame", "-r", &leak, "notes.txt"]);
+    let message = undecided["error"]["message"].as_str().unwrap();
+    assert!(message.contains("entity not found"), "{}", undecided);
+    assert!(message.contains("Whether a redaction removed it could not be told"), "{}", undecided);
 }
 
 /// A full audit of a warehouse whose applied redaction's object is gone passes, and counts the

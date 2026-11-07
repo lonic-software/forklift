@@ -1032,12 +1032,13 @@ the record still names that are on disk again (`present_and_recorded`): that fai
 `forklift heal` removes the records it can. `--full` cannot re-assemble a large
 file one of whose chunks is held this way, so it re-reads that file's present chunks instead. A
 sealed-object record this version cannot read, or one with damage that an interrupted last write
-could not have left, fails the audit rather than being taken as empty. An absent object that a
-redaction applied in this warehouse names is not damage either: its content was removed on
-purpose, so audit accounts for it, checks nothing beneath it, and reports how many it found
-(`redacted` under `--json`). The failure names the way
+could not have left, fails the audit rather than being taken as empty. The failure names the way
 out: for damage, `forklift heal`, which rebuilds the record (see `heal`); for a record in another
 version, that version of Forklift.
+
+An absent object that a redaction applied in this warehouse names is not damage and fails
+nothing: its content was removed on purpose, so an audit that finds it absent accounts for it,
+checks nothing beneath it, and reports how many it found (`redacted` under `--json`).
 
 **Run `--full` periodically as your own scrub against bit-rot.** Every `lift`/push used to
 incidentally re-presence-check a pushed pallet's whole tree, chunked files included; a large

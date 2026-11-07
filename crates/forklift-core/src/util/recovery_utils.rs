@@ -967,8 +967,8 @@ fn never_held_pin_note(hash: &str) -> String {
 /// them — see [`ClosureWalkResult::redacted_absent`].
 fn redacted_absent_note(count: usize) -> String {
     format!(
-        "{} object(s) that redactions applied in this warehouse name are absent: their content was \
-        removed on purpose, so the rescan counted none of them as lost.",
+        "{} object(s) that redactions applied in this warehouse name are absent from the store: their \
+        content was removed on purpose, and none of them is counted as lost.",
         count
     )
 }
@@ -2115,8 +2115,10 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
     };
     let mut redacted_absent = 0;
 
+    // Only a note reads this count, so a presence check that fails counts nothing rather than
+    // failing the rescan the walk itself completed.
     for hash in sealed.applied.hashes() {
-        if !file_utils::raw_object_present(hash)? {
+        if matches!(file_utils::raw_object_present(hash), Ok(false)) {
             redacted_absent += 1;
         }
     }

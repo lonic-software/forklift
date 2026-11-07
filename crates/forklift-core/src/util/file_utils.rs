@@ -2493,8 +2493,11 @@ fn read_object_uncached(hash: &str) -> Result<Vec<u8>, String> {
             }
 
             // Absent because a redaction applied here removed it: refused as redacted, never as
-            // a missing object. The cache refill above never fetches such a hash.
-            if let Some(refusal) = super::applied_redactions::absent_read_refusal(hash)? {
+            // a missing object. The cache refill above never fetches such a hash. An unreadable
+            // applied record leaves the absence undecided, so the missing-object error below
+            // stands, with the record's own error added rather than in its place.
+            let applied = super::applied_redactions::absent_read_refusal(hash);
+            if let Ok(Some(refusal)) = applied {
                 return Err(refusal);
             }
 
@@ -2504,10 +2507,16 @@ fn read_object_uncached(hash: &str) -> Result<Vec<u8>, String> {
             // sources in `read_object_classified` produced it.
             let (path, file_name) = get_path_for_object(hash)?;
             let file_path = path.add(PATH_SEPARATOR).add(&file_name);
-            Err(format!(
+            let missing = format!(
                 "Error while reading object from file \"{}\": {}",
                 file_path, std::io::Error::from(std::io::ErrorKind::NotFound)
-            ))
+            );
+            Err(match applied {
+                Err(record) => format!(
+                    "{}. Whether a redaction removed it could not be told: {}", missing, record
+                ),
+                Ok(_) => missing,
+            })
         }
     }
 }

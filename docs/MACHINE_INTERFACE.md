@@ -89,7 +89,11 @@ exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a deat
 `redact list` carry `status`, whose `state` is `applied`, `held` (with the `heads`, each with its
 `pallet`, `head` and `path`, and the `meta_pallets` that name it), `awaiting_remote`, `undecided`
 (with a `reason`) or, in `redact list` only, `ready`. `redact apply` exists and reports the same
-list.
+list. `content_redacted` (exit 49) is also returned by a read that needs content a redaction
+applied in this warehouse removed (`restore`, `pick`, a `diff` showing changes, `blame` and the
+like). Such a refusal carries only `details.hash`, since the read is of an object, not a path. An
+audit's `scope` carries `redacted`, the count of absent objects that an applied redaction names;
+they fail nothing.
 
 **Schema 25**: `content_redacted` (exit 49) is also returned before anything lands in
 the bay: by `load` for a file it would stage, by `park` for a file it would park or restage, by
