@@ -134,9 +134,11 @@ struct WarehouseHandle {
     /// rest wait for its answer.
     chunk_gate_walk: std::sync::Mutex<()>,
 
-    /// Counts the ref writes here, each counted before and after it: a withheld set walked at an
-    /// older count may miss a head that names one of its chunks.
-    ref_writes: std::sync::atomic::AtomicU64,
+    /// The ref writes this server has started here, and those it has finished, landed or not
+    /// ([`RefWriteCounted`]): a withheld set is trusted only when walked with none in flight and
+    /// none started since, so it never misses a head that names one of its chunks.
+    ref_writes_started: std::sync::atomic::AtomicU64,
+    ref_writes_finished: std::sync::atomic::AtomicU64,
 }
 
 /// The chunks a warehouse serves as absent while a redaction's deletion is owed (see
@@ -150,8 +152,8 @@ struct ChunkGate {
     /// The chunks of the applied recipes the store held, and the chunks the journal owes.
     candidates: std::collections::HashSet<String>,
 
-    /// The candidates no other object names, with the ref-write count read before the walk and
-    /// when it ended.
+    /// The candidates no other object names, with the count of ref writes started before the walk
+    /// and when the walk began: kept only for a walk no ref write here overlapped.
     withheld: Option<(u64, std::time::Instant, std::collections::HashSet<String>)>,
 }
 
@@ -183,7 +185,8 @@ impl WarehouseHandle {
             apply_owed: std::sync::atomic::AtomicBool::new(false),
             chunk_gate: std::sync::Mutex::new(ChunkGate::default()),
             chunk_gate_walk: std::sync::Mutex::new(()),
-            ref_writes: std::sync::atomic::AtomicU64::new(0),
+            ref_writes_started: std::sync::atomic::AtomicU64::new(0),
+            ref_writes_finished: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1446,14 +1449,18 @@ fn refuse_redacted(applied: &AppliedSet, hash: &str) -> Result<(), HandlerError>
 /// will leave them, absent, not refused. Run in a request's blocking closure, beside its
 /// `applied` read.
 ///
-/// The candidates are read again whenever the applied set differs from theirs, which is cheap.
-/// Only a request naming a candidate needs the live set, walked once per ref write here (counted
-/// before and after each, so a walk overlapping one is never trusted) and at most every
-/// [`CHUNK_GATE_TTL`], one walk at a time.
+/// The candidates are read again whenever the applied set differs from theirs, which is cheap,
+/// and not at all while nothing is applied: then nothing was ever deleted, and no journal written.
+/// Only a request naming a candidate needs the live set, walked once per ref write here (a walk
+/// a ref write overlapped is never kept) and at most every [`CHUNK_GATE_TTL`], one walk at a time.
 fn withheld_among(warehouse: &WarehouseHandle,
                   applied: &AppliedSet,
                   hashes: &[String]) -> Result<std::collections::HashSet<String>, HandlerError> {
     use std::sync::atomic::Ordering;
+
+    if applied.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
 
     // The withheld chunks among `hashes`, when the gate knows them now.
     let answer = |gate: &mut ChunkGate| -> Result<Option<std::collections::HashSet<String>>, HandlerError> {
@@ -1469,7 +1476,8 @@ fn withheld_among(warehouse: &WarehouseHandle,
         }
 
         match &gate.withheld {
-            Some((count, at, withheld)) if *count == warehouse.ref_writes.load(Ordering::SeqCst) && at.elapsed() < CHUNK_GATE_TTL => {
+            Some((started, at, withheld))
+                if *started == warehouse.ref_writes_started.load(Ordering::SeqCst) && at.elapsed() < CHUNK_GATE_TTL => {
                 Ok(Some(asked.into_iter().filter(|hash| withheld.contains(*hash)).cloned().collect()))
             }
             _ => Ok(None),
@@ -1487,14 +1495,20 @@ fn withheld_among(warehouse: &WarehouseHandle,
         return Ok(withheld);
     }
 
-    let count = warehouse.ref_writes.load(Ordering::SeqCst);
-    let (candidates, withheld) = redaction_deleter::withheld_chunks(applied).map_err(internal)?;
+    // Started read before finished: equal, no write was in flight once both were read.
+    let started = warehouse.ref_writes_started.load(Ordering::SeqCst);
+    let settled = started == warehouse.ref_writes_finished.load(Ordering::SeqCst);
+    let at = std::time::Instant::now();
+
+    // The answer above read the candidates for this applied set; the gate holds them.
+    let candidates = lock_gate(warehouse).candidates.clone();
+    let withheld = redaction_deleter::withheld_among_candidates(&candidates, applied).map_err(internal)?;
     let among = hashes.iter().filter(|hash| withheld.contains(*hash)).cloned().collect();
 
     let mut gate = lock_gate(warehouse);
-    gate.basis = Some(applied.clone());
-    gate.candidates = candidates;
-    gate.withheld = Some((count, std::time::Instant::now(), withheld));
+    if settled && gate.basis.as_ref() == Some(applied) {
+        gate.withheld = Some((started, at, withheld));
+    }
 
     Ok(among)
 }
@@ -1504,20 +1518,22 @@ fn lock_gate(warehouse: &WarehouseHandle) -> std::sync::MutexGuard<'_, ChunkGate
     warehouse.chunk_gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Counts a ref write here for the chunk gate ([`withheld_among`]): once when it starts, and again
-/// when the blocking closure making it drops this, landed or not, even if the request is gone.
+/// Counts a ref write here for the chunk gate ([`withheld_among`]): started when it is made, and
+/// finished when the blocking closure making it drops this, landed or not, even if the request is
+/// gone. Every handler that writes a pallet head or the office takes one: a ref update, a pallet
+/// deletion and a trust install.
 struct RefWriteCounted(Arc<WarehouseHandle>);
 
 impl RefWriteCounted {
     fn start(warehouse: &Arc<WarehouseHandle>) -> Self {
-        warehouse.ref_writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        warehouse.ref_writes_started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         RefWriteCounted(Arc::clone(warehouse))
     }
 }
 
 impl Drop for RefWriteCounted {
     fn drop(&mut self) {
-        self.0.ref_writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.ref_writes_finished.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -2431,11 +2447,14 @@ async fn post_missing(State(state): State<Arc<AppState>>,
         return error_response(error);
     }
 
+    let gate = Arc::clone(&warehouse);
     let result = blocking(warehouse, move || {
+        // A withheld chunk is missing here, as `GET` answers it: a lift naming it uploads it.
+        let withheld = withheld_among(&gate, &read_applied()?, &request.hashes)?;
         let mut missing: Vec<String> = Vec::new();
 
         for hash in request.hashes {
-            if !file_utils::does_object_exist(&hash).map_err(internal)? {
+            if withheld.contains(&hash) || !file_utils::does_object_exist(&hash).map_err(internal)? {
                 missing.push(hash);
             }
         }
@@ -2892,7 +2911,10 @@ async fn put_trust(State(state): State<Arc<AppState>>,
     // Trust establishment is a one-way door, held by the install's preconditions rather than by
     // ordering requests: two first contacts can both read "no anchor" below, and the second to
     // install finds the anchor no longer absent and is refused (or finds its own anchor in place).
+    let counted = RefWriteCounted::start(&warehouse);
     let result = blocking(Arc::clone(&warehouse), move || {
+        let _counted = counted;
+
         match office_utils::read_trust_anchor_with_bytes().map_err(internal)? {
             Some((existing, existing_bytes)) => {
                 if TrustAnchorDto::from(&existing) == anchor {

@@ -397,16 +397,28 @@ pub fn recipes_owing_chunks() -> Result<HashSet<String>, String> {
 /// * `Err(String)` - If the journal, a recipe or the live set could not be read.
 pub fn withheld_chunks(applied: &AppliedSet) -> Result<(HashSet<String>, HashSet<String>), String> {
     let candidates = withheld_candidates(applied)?;
-
-    if candidates.is_empty() {
-        return Ok((candidates, HashSet::new()));
-    }
-
-    let present: HashSet<String> = maybe_present(&applied.hashes().cloned().collect());
-    let live = gc_utils::collect_live_set_excluding(&present)?;
-    let withheld = candidates.iter().filter(|chunk| !live.contains(*chunk)).cloned().collect();
+    let withheld = withheld_among_candidates(&candidates, applied)?;
 
     Ok((candidates, withheld))
+}
+
+/// Of `candidates`, as [`withheld_candidates`] read them for `applied`, the chunks no object but an
+/// applied redaction's names: walks the live set, unless there is no candidate.
+///
+/// # Returns
+/// * `Ok(HashSet<String>)` - The withheld chunks.
+/// * `Err(String)`         - If the live set could not be read.
+pub fn withheld_among_candidates(candidates: &HashSet<String>,
+                                 applied: &AppliedSet) -> Result<HashSet<String>, String> {
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    // Every applied hash is excluded, present or not: one that cannot be told is a file's content
+    // keeps out what it names, so a chunk only it reaches is withheld rather than served.
+    let live = gc_utils::collect_live_set_excluding(&applied.hashes().cloned().collect())?;
+
+    Ok(candidates.iter().filter(|chunk| !live.contains(*chunk)).cloned().collect())
 }
 
 /// The chunks [`withheld_chunks`] judges: every chunk of an applied redaction's recipe the store
@@ -414,13 +426,15 @@ pub fn withheld_chunks(applied: &AppliedSet) -> Result<(HashSet<String>, HashSet
 ///
 /// # Returns
 /// * `Ok(HashSet<String>)` - The candidates.
-/// * `Err(String)`         - If the journal or a present applied recipe could not be read.
+/// * `Err(String)`         - If the journal could not be read, or an applied redaction's object
+///                           the store holds could not be told a blob or a recipe, or read: its
+///                           chunks are never served on a guess.
 pub fn withheld_candidates(applied: &AppliedSet) -> Result<HashSet<String>, String> {
     let mut candidates = read_chunks_owed()?.chunks();
 
-    for hash in maybe_present(&applied.hashes().cloned().collect()) {
-        if let ParsedObject::Recipe(recipe) = loose_object_parser::parse(&file_utils::retrieve_object_by_hash_shared(&hash)?)? {
-            candidates.extend(recipe.chunks.into_iter().map(|chunk| chunk.hash));
+    for hash in applied.hashes() {
+        if redaction_utils::held_kind(hash)? == Some(redaction_utils::RedactedKind::Recipe) {
+            candidates.extend(object_utils::recipe_chunk_hashes(hash)?);
         }
     }
 
@@ -994,6 +1008,24 @@ mod tests {
         delete().unwrap();
         let (candidates, withheld) = withheld_chunks(&applied).unwrap();
         assert!(candidates.is_empty() && withheld.is_empty(), "{:?} {:?}", candidates, withheld);
+    }
+
+    /// An applied redaction's object the store holds but cannot read refuses the candidates, so a
+    /// recipe it might be never has its chunks served on a guess.
+    ///
+    /// Revert: skip an object that cannot be told a file's content → no candidate, no error.
+    #[test]
+    fn an_unreadable_applied_object_refuses_the_candidates() {
+        let _scratch = Scratch::new("withheld-unreadable");
+        let hash = object_utils::hash_object_bytes(b"not an object the store wrote");
+        let loose = forklift_root().join("objects").join(&hash[..2]).join(&hash[2..]);
+        std::fs::create_dir_all(loose.parent().unwrap()).unwrap();
+        std::fs::write(&loose, b"not an object the store wrote").unwrap();
+        applied_redactions::apply_for_test(&[&hash]);
+
+        let candidates = withheld_candidates(&applied_redactions::read_applied().unwrap());
+
+        assert!(candidates.is_err(), "{:?}", candidates);
     }
 
     /// A redacted recipe held only by a bay's staged work has its own chunk withheld too: the

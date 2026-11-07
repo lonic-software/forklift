@@ -1744,7 +1744,7 @@ fn a_lift_sends_no_chunk_of_a_file_the_server_applied_a_redaction_of() {
 }
 
 /// While forklift-server owes the deletion of a chunked file's redaction, it serves the chunks only
-/// that file named as absent, by hash and in a batch, and the handshake reports
+/// that file named as absent, by hash, in a batch and as missing, and the handshake reports
 /// the deletion owed; a chunk another file names is still served. Once the deletion runs, the
 /// handshake reports it deleted.
 ///
@@ -1841,6 +1841,14 @@ fn a_server_owing_a_deletion_serves_the_chunks_only_its_recipe_names_as_absent()
         };
         assert!(batch(&own) < 1024, "the bundle holds the leak's own chunks");
         assert!(batch(&shared) > 1024, "the bundle holds the shared chunks");
+
+        // And missing, so a lift naming one uploads it.
+        let asked = [own[0].clone(), shared[0].clone()];
+        let (status, body) = http(&server.url, "POST", "/v1/objects/missing",
+                                  serde_json::json!({ "hashes": asked }).to_string().as_bytes());
+        assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, body);
+        let missing: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(missing["missing"], serde_json::json!([own[0]]), "{}", body);
 
     }
 
