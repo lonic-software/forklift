@@ -391,23 +391,24 @@ mod tests {
     /// chunks no other file names; it keeps a copy the census names, and a chunk another recipe shares.
     ///
     /// Revert: mark an excluded tree entry live anyway → the blob, the recipe and its own chunk
-    /// stay; exclude a census-named hash → the staged copy goes.
+    /// stay; exclude a census-named hash → the copy the checkout's base names goes.
     #[test]
     fn gc_deletes_an_unheld_applied_object_and_keeps_a_held_one() {
         let _scratch = Scratch::new("gc");
-        let (secret, staged) = (store_blob("secret\n"), store_blob("staged\n"));
+        let (secret, held) = (store_blob("secret\n"), store_blob("held\n"));
         let (own_chunk, shared_chunk, other_chunk) = (store_chunk(b"own"), store_chunk(b"shared"), store_chunk(b"other"));
         let recipe = store_recipe(&[(own_chunk.clone(), 3), (shared_chunk.clone(), 6)]);
         let other_recipe = store_recipe(&[(shared_chunk.clone(), 6), (other_chunk.clone(), 5)]);
 
         let old_tree = store_tree(&[
-            ("secret.txt", &secret, FILE), ("big.bin", &recipe, DirEntryType::NormalChunked), ("staged.txt", &staged, FILE),
+            ("secret.txt", &secret, FILE), ("big.bin", &recipe, DirEntryType::NormalChunked), ("held.txt", &held, FILE),
         ]);
         let old = store_parcel(&old_tree, Vec::new());
         let head = store_parcel(&store_tree(&[("other.bin", &other_recipe, DirEntryType::NormalChunked)]), vec![old.clone()]);
         set_main(&head);
-        plant_staged_shard("b", &[("staged.txt", &staged, FILE)]);
-        applied_redactions::apply_for_test(&[&secret, &recipe, &staged]);
+        let base = store_parcel(&store_tree(&[("held.txt", &held, FILE)]), Vec::new());
+        set_base(&base);
+        applied_redactions::apply_for_test(&[&secret, &recipe, &held]);
 
         let stats = gc_utils::collect_garbage(0).unwrap();
 
@@ -415,7 +416,7 @@ mod tests {
         for hash in [&secret, &recipe, &own_chunk] {
             assert!(!present(hash), "deleted: {}", hash);
         }
-        for hash in [&staged, &shared_chunk, &other_chunk, &other_recipe, &old, &old_tree, &head] {
+        for hash in [&held, &shared_chunk, &other_chunk, &other_recipe, &old, &old_tree, &head] {
             assert!(present(hash), "kept: {}", hash);
         }
     }
