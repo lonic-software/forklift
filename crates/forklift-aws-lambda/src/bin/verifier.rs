@@ -17,8 +17,8 @@
 //! so it runs on a blocking thread. It needs an object store and a ref store bound to the
 //! warehouse the staging key names ([`parse_staging_key`]): objects are keyed per warehouse, and
 //! the key is all an S3 event carries. The ref store is read for one thing only: the staged
-//! object's redaction item. Content redacted from the warehouse is never promoted — its staged
-//! copy is dropped instead, and the event consumed.
+//! object's redaction item. Content already redacted from the warehouse when that item is read
+//! is not promoted — its staged copy is dropped instead, and the event consumed.
 //!
 //! Build with `cargo build -p forklift-aws-lambda --features lambda --release`.
 

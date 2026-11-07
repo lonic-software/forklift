@@ -340,6 +340,7 @@ run "c6_deployed_policy_matches_crate_json" {
       "../../crates/forklift-aws-lambda/iam/verifier.policy.json",
       {
         bucket_arn    = aws_s3_bucket.this.arn
+        table_arn     = aws_dynamodb_table.this.arn
         log_group_arn = trimsuffix(aws_cloudwatch_log_group.verifier.arn, ":*")
       },
     )
