@@ -5291,6 +5291,20 @@ fn an_applied_redaction_reads_as_applied_after_the_deadline() {
     assert_eq!(state, Some(ServedRedactionState::DeletionOwed));
 }
 
+/// A request whose time is spent starts no scan: the redaction answers `503`, and its item is left
+/// for a request with time to start it.
+// Revert: start the scan whatever the time → the item is written → red.
+#[test]
+fn a_request_out_of_time_starts_no_scan() {
+    let (_area, head, redactions, leak) = unplanted_redaction("redaction-no-start", "leaked\n");
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions);
+
+    let late = head.with_deadline(std::time::SystemTime::now());
+    let err = late.object_get(&leak).expect_err("undecided");
+    assert_eq!(err.status, Status::ServiceUnavailable, "{}", err.message);
+    assert_eq!(late.refs.get_redaction(&leak).expect("item"), None, "no scan was started");
+}
+
 /// An object store whose `n`th read of a pallet walk fails, to cut a scan off part way.
 struct FailsAWalkRead {
     inner: MemoryObjectStore,
