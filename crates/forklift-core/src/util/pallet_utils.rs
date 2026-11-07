@@ -2888,6 +2888,27 @@ pub(crate) mod tests {
             assert_eq!(get_pallet_head("other").unwrap(), None, "nothing was written");
         }
 
+        // Revert: exempt any served `@redactions` head the store holds → one this warehouse never
+        // took exempts the redaction recorded here.
+        #[test]
+        fn a_served_redactions_head_this_warehouse_never_took_exempts_nothing() {
+            use crate::util::redaction_utils::{Served, REDACTIONS_PALLET_NAME};
+
+            let (_root, _scope) = scratch("redacted-adopted-untaken");
+            let secret = blob("secret");
+            redact(&secret);
+            let taken = get_meta_pallet_head(REDACTIONS_PALLET_NAME).unwrap().unwrap();
+            redact(&blob("other"));
+            let untaken = get_meta_pallet_head(REDACTIONS_PALLET_NAME).unwrap().unwrap();
+            update_meta_pallet_head(REDACTIONS_PALLET_NAME, Some(&untaken), &taken, &RefPreconditions::NONE).unwrap();
+
+            // Stored here, and naming the content, but not on this warehouse's chain.
+            let served = parcel(&two_dirs("a0", "secret"), &[]);
+            let adopting = Served { head: &served, redactions: Some(&untaken) };
+            assert_redacted(adopt_pallet_head("side", None, &served, adopting, &RefPreconditions::NONE), "web/b", &secret);
+            assert_eq!(get_pallet_head("side").unwrap(), None, "nothing was written");
+        }
+
         // Revert: drop the served-mark read from the adoption (in the check, or in the hold's
         // re-check) → the adoption lands in a served root, or in one served between the check
         // and the hold.

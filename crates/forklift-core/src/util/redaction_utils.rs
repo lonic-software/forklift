@@ -631,6 +631,9 @@ fn tree_names(tree: &str, set: &RedactedSet, mut partial: Option<&mut HashSet<St
 pub struct StagingGuard {
     set: RedactedSet,
     partial: bool,
+
+    /// The `@redactions` head `set` was read at.
+    head: String,
 }
 
 /// The guard for the redactions at the current `@redactions` head, or `None` while there are
@@ -648,7 +651,7 @@ pub fn staging_guard() -> Result<Option<StagingGuard>, String> {
 
     let partial = crate::util::scope_utils::content_may_be_absent()?;
 
-    Ok(Some(StagingGuard { set, partial }))
+    Ok(Some(StagingGuard { set, partial, head }))
 }
 
 impl StagingGuard {
@@ -683,8 +686,8 @@ pub fn refuse_redacted_writes(ops: &[crate::util::shift_utils::FileOp],
         return Ok(());
     };
 
-    if let Some(pending) = adopting.map(|served| adoption_pending(Some(served), served.head)).transpose()?.flatten() {
-        guard.set = guard.set.without(&RedactedSet::at(pending)?);
+    if let Some(served) = adopting {
+        guard.set = exempt_adoption(std::mem::take(&mut guard.set), Some(served), served.head, &guard.head)?.0;
     }
 
     for op in ops {
@@ -912,17 +915,17 @@ fn check_head_write_at(namespace: pallet_utils::PalletNamespace,
 
     let mut set = RedactedSet::at(&redactions)?;
 
+    if namespace == pallet_utils::PalletNamespace::User {
+        (set, check.adopted) = exempt_adoption(set, served, new, &redactions)?;
+    }
+
+    // An adoption's check is still held to the served mark, though nothing may be left to walk.
     if set.hashes.is_empty() {
         return Ok(check);
     }
 
     let named = match namespace {
         pallet_utils::PalletNamespace::User => {
-            if let Some(pending) = adoption_pending(served, new)? {
-                set = set.without(&RedactedSet::at(pending)?);
-                check.adopted = true;
-            }
-
             let partial = crate::util::scope_utils::content_may_be_absent()?;
             let tree = object_utils::load_parcel(new)?.tree_hash;
             tree_names(&tree, &set, partial.then_some(&mut check.skipped))?
@@ -941,20 +944,29 @@ fn check_head_write_at(namespace: pallet_utils::PalletNamespace,
     }
 }
 
-/// The `@redactions` head whose redactions a user pallet's write of `new` is exempt from: the one
-/// the remote served beside `served`, when `new` is the head it served and this root has never
-/// been served. A served `@redactions` head this warehouse does not hold exempts nothing: what the
-/// remote holds pending is not known here.
-fn adoption_pending<'a>(served: Option<Served<'a>>, new: &str) -> Result<Option<&'a str>, String> {
+/// `set`, the redactions at this warehouse's `@redactions` head `local`, less those a user
+/// pallet's write of `new` is exempt from, and whether it is an adoption. It is one when `new` is
+/// the head the remote served beside `served`, and this root has never been served; it is then
+/// exempt from the redactions at the `@redactions` head the remote served, which the remote
+/// reports pending. Only once `local` reaches that head: this warehouse verified and took it, so a
+/// set the remote merely sent, or one it never served, exempts nothing.
+fn exempt_adoption(set: RedactedSet,
+                   served: Option<Served>,
+                   new: &str,
+                   local: &str) -> Result<(RedactedSet, bool), String> {
     let Some(Served { head, redactions: Some(pending) }) = served else {
-        return Ok(None);
+        return Ok((set, false));
     };
 
-    if head != new || crate::util::tombstone_utils::is_served()? || !file_utils::does_object_exist(pending)? {
-        return Ok(None);
+    if head != new || crate::util::tombstone_utils::is_served()? {
+        return Ok((set, false));
     }
 
-    Ok(Some(pending))
+    if pending != local && !crate::util::merge_utils::is_ancestor(pending, local)? {
+        return Ok((set, false));
+    }
+
+    Ok((set.without(&RedactedSet::at(pending)?), true))
 }
 
 /// The first redacted object a parcel of the meta chain at `new` adds over its parents, among the
