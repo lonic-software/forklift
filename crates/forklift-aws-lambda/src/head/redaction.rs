@@ -505,9 +505,10 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     }
 
     /// After a lift commit promoted `promoted`, delete each one whose redaction applied while it
-    /// was promoted, and refuse the commit as [`refuse_applied_staged`](Self::refuse_applied_staged)
-    /// does. `@redactions` is read after the promotions landed, so a redaction it does not record
-    /// yet applies only after them, and its own deletion finds their objects.
+    /// was promoted, and refuse the commit as
+    /// [`refuse_applied_staged`](Self::refuse_applied_staged) does. `@redactions` is read after
+    /// the promotions landed, so a redaction it does not record yet applies only after them, and
+    /// its own deletion finds their objects.
     pub(super) fn refuse_applied_promoted(&self, promoted: &[String]) -> HeadResult<()> {
         let recorded = self.recorded()?;
         let mut refused = None;
