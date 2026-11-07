@@ -66,7 +66,8 @@ pub struct EvictPlan {
     /// loose copy holds, which the repack must re-encode before that copy is freed.
     pub repack: bool,
 
-    /// The objects of `to_evict` the record does not hold yet, recorded before anything is freed.
+    /// The objects of `to_evict` the record does not hold yet, recorded before anything is freed;
+    /// none a redaction applied here names.
     pub to_record: Vec<String>,
 
     /// Objects the origin holds that stay because a checkout's base tree needs them.
@@ -220,7 +221,11 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
         }
     }
 
-    plan.to_record = plan.to_evict.iter().filter(|hash| !sealed.contains(hash)).cloned().collect();
+    // A redaction applied here is never recorded as held by the remote: the append drops it, so
+    // the plan does not list it.
+    plan.to_record = plan.to_evict.iter()
+        .filter(|hash| !sealed.contains(hash) && !tolerated.applied.contains(hash))
+        .cloned().collect();
 
     // A packed delta can stand on a loose-only object: one a read fetched again after a
     // compaction, which a later compaction then used as a path base. A damaged pack refuses the
@@ -1253,6 +1258,26 @@ mod tests {
 
         carry(&plan, &hold).unwrap();
         assert!(!sealed_utils::read_sealed().unwrap().contains(&h.shared));
+    }
+
+    /// A present object an applied redaction names, as before its bytes are deleted, is freed with
+    /// the rest but never listed to record nor recorded: the remote is not leaned on for it.
+    ///
+    /// Revert: build `to_record` from the sealed record alone → red on the plan's assertion.
+    #[test]
+    fn plan_frees_a_present_applied_object_without_recording_it() {
+        let _scratch = Scratch::new("applied-present");
+        let h = history();
+        crate::util::applied_redactions::apply_for_test(&[&h.shared]);
+        let hold = store_access();
+
+        let plan = plan_evict(&[h.held.clone()], &hold).unwrap();
+        assert!(plan.to_evict.contains(&h.shared), "{:?}", plan.to_evict);
+        assert!(!plan.to_record.contains(&h.shared) && plan.to_record.contains(&h.dir), "{:?}", plan.to_record);
+
+        carry(&plan, &hold).unwrap();
+        let record = sealed_utils::read_sealed().unwrap();
+        assert!(!record.contains(&h.shared) && record.contains(&h.dir));
     }
 
     /// The bound walks past an absence an applied redaction names, as it walks past a recorded one,

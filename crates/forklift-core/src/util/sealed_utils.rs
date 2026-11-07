@@ -588,11 +588,14 @@ pub fn append(ops: &[(SealOp, &str)]) -> Result<SealedSet, String> {
 /// * `ops`  - What to record and remove, in order. None writes nothing.
 ///
 /// # Returns
-/// * `Ok(SealedSet)` - The set the record now replays to.
-/// * `Err(String)`   - If a hash is not an object hash, the record cannot be read or parsed, an
-///                     entry would be added where no origin is recorded, a move of the origin
-///                     is pending (`origin_move_pending`), or the write fails. Nothing is
-///                     written in the first four cases. A failed
+/// * `Ok(SealedSet)` - The set the record now replays to. A `Record` naming a redaction this
+///                     warehouse applied is dropped, never written: its absence is not held by
+///                     a remote.
+/// * `Err(String)`   - If a hash is not an object hash, the record cannot be read or parsed, the
+///                     record of applied redactions cannot be read when `ops` record anything,
+///                     an entry would be added where no origin is recorded, a move of the
+///                     origin is pending (`origin_move_pending`), or the write fails. Nothing is
+///                     written in the first five cases. A failed
 ///                     write may still have landed: some of its frames whole (and perhaps a
 ///                     torn one, which the next write drops), or the whole new record when the
 ///                     create failed after its rename. Read the record back to learn which.
@@ -2071,11 +2074,11 @@ mod tests {
     }
 
     /// No absence an applied redaction names is recorded as held by the remote: not by a fetch's
-    /// recording, not by an unseal's push-down, not by a refill's push-down. An absence no
-    /// redaction names is recorded by each, which shows each records at all.
+    /// recording, not by an unseal's push-down, not by a refill's push-down, not by a plain append.
+    /// An absence no redaction names is recorded by each, which shows each records at all.
     ///
-    /// Revert: drop the applied filter from `record_absences_under` → red on the first record
-    /// assertion; from `unseal` → red on `pushed_down`; from `refill_all` → red on the last.
+    /// Revert: drop the applied filter from `append_decided_locked` → red on the first record
+    /// assertion; drop unseal's narrowing of `pushed_down` to what was recorded → red on it.
     #[test]
     fn no_append_records_an_absence_an_applied_redaction_names() {
         use crate::enums::dir_entry_type::DirEntryType;
