@@ -190,9 +190,9 @@ write.
 
 Once this warehouse has applied a redaction, it never takes back history naming that content, not
 even a head or metadata history the remote serves. This happens when the redaction was applied
-here while the warehouse had no remote, and the remote it has since still holds the redaction
-pending. The refusal names the way out: make a fresh clone of the remote with `forklift clone` and
-work there, since the clone takes the remote's history with the redaction pending.
+here while the warehouse had no remote, and the remote it has since still serves history naming
+the content. When the refusal names a fresh clone, make one with `forklift clone` and work there:
+the clone takes the remote's history and redactions as the remote holds them.
 
 ### `redaction_blocked` (exit 48)
 

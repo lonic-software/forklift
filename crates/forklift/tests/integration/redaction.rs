@@ -1037,7 +1037,7 @@ fn a_head_naming_a_hash_applied_here_is_never_adopted_from_the_remote() {
 
     let fresh_clone = "this warehouse has applied that redaction, so it can never take history naming the \
         content again; make a fresh clone of the remote with \"forklift clone\", which takes the remote's \
-        history with the redaction pending, and work there";
+        history and redactions as the remote holds them, and work there";
 
     let hash = applied_without_remote(&named, &server.url, "secret.env", b"TOKEN=hunter2\n");
     let error = content_redacted(&named, &["lower", "side"]);
@@ -1091,4 +1091,42 @@ fn a_meta_history_naming_a_hash_applied_here_is_never_taken_from_the_remote() {
     assert!(message.contains(&format!("({}) is redacted in this warehouse", hash)), "{}", lowered);
     assert!(message.contains("make a fresh clone of the remote"), "{}", lowered);
     assert!(!warehouse.root.join(".forklift/meta/tags").exists(), "@tags was not taken");
+}
+
+/// A redaction applied here that the remote does not hold is no exemption the remote's adoption
+/// would have given, so the refusal is the ordinary one: a fresh clone would take the content with
+/// no redaction at all.
+///
+/// Revert: report a refused adoption applied whenever the hash is applied here → the next step
+/// names a fresh clone.
+#[test]
+fn a_hash_applied_here_that_the_remote_never_redacted_names_no_fresh_clone() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-applied-unshared-server-{}", std::process::id())));
+
+    let owner = Warehouse::cloned("applied-unshared-owner", &server.url);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+    owner.run_ok(&["pallet", "create", "side"]);
+    owner.stack("side.txt", b"side\n", "side");
+    owner.run_ok(&["lift"]);
+
+    // The remote holds another redaction, which the warehouse takes, so the remote's @redactions
+    // head is one its own reaches and the lower below is an adoption.
+    let other = Warehouse::cloned("applied-unshared-other", &server.url);
+    other.redact_loaded("other.env", b"OTHER=1\n", "another leak");
+    other.run_ok(&["lift"]);
+    let warehouse = Warehouse::cloned("applied-unshared", &server.url);
+    owner.stack("secret.env", b"TOKEN=hunter2\n", "leak");
+    owner.run_ok(&["lift"]);
+
+    // Recorded and applied with no remote, and never lifted.
+    warehouse.run_ok(&["config", "unset", "remote.url"]);
+    let hash = warehouse.redact_loaded("secret.env", b"TOKEN=hunter2\n", "applied here only");
+    warehouse.run_ok(&["config", "set", "remote.url", &server.url]);
+
+    let error = content_redacted(&warehouse, &["lower", "side"]);
+    assert_eq!(error["details"]["hash"], hash, "{}", error);
+    assert!(!error["next_step"].as_str().unwrap().contains("fresh clone"), "{}", error);
+    assert!(!error["message"].as_str().unwrap().contains("not even one the remote serves"), "{}", error);
 }

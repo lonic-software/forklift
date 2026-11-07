@@ -726,10 +726,7 @@ pub fn refuse_redacted_writes(ops: &[crate::util::shift_utils::FileOp],
         let applied_here = applied_part(&guard.set)?;
         let exemption = exempt_adoption(std::mem::take(&mut guard.set), Some(served), served.head, &guard.head, &applied_here)?;
         guard.set = exemption.set;
-
-        if exemption.adopted {
-            applied = applied_here;
-        }
+        applied = exemption.withheld;
     }
 
     for op in ops {
@@ -807,11 +804,11 @@ impl RedactionCheck {
     /// Whether the check still holds: `@redactions` is at the head it was checked against,
     /// nothing the walk skipped as absent is stored now, an adoption's root is still not served,
     /// and no redaction an exemption passed has been applied since. Read under the held ref lock,
-    /// which every
-    /// `@redactions` write and every write of the applied record takes too, so a redaction either
-    /// lands, or applies, before the write's hold or after the write. Storing an object takes no ref lock, so a skipped object stored after this read
-    /// can still land beside the written head, as one fetched after the write can; the receiving
-    /// side of a lift, not this check, is what judges bytes handed on.
+    /// which every `@redactions` write and every write of the applied record takes too, so a
+    /// redaction either lands, or applies, before the write's hold or after the write. Storing an
+    /// object takes no ref lock, so a skipped object stored after this read can still land beside
+    /// the written head, as one fetched after the write can; the receiving side of a lift, not this
+    /// check, is what judges bytes handed on.
     pub(crate) fn holds(&self, _lock: &crate::util::lock_utils::RefLock) -> Result<bool, String> {
         if pallet_utils::get_meta_pallet_head(REDACTIONS_PALLET_NAME)? != self.redactions {
             return Ok(false);
@@ -987,9 +984,12 @@ fn check_head_write_at(namespace: pallet_utils::PalletNamespace,
         None => RedactedSet::default(),
     };
 
+    // What the adoption would have exempted but for this warehouse having applied it.
+    let mut withheld = RedactedSet::default();
+
     if namespace == pallet_utils::PalletNamespace::User {
         let exemption = exempt_adoption(set, served, new, &redactions, &applied)?;
-        (set, check.adopted, check.exempted) = (exemption.set, exemption.adopted, exemption.exempted);
+        (set, check.adopted, check.exempted, withheld) = (exemption.set, exemption.adopted, exemption.exempted, exemption.withheld);
     } else if served.is_some() {
         check.exempted = set.hashes.iter().filter(|hash| !applied.hashes.contains(*hash)).cloned().collect();
     }
@@ -1006,7 +1006,7 @@ fn check_head_write_at(namespace: pallet_utils::PalletNamespace,
             let partial = crate::util::scope_utils::content_may_be_absent()?;
             let tree = object_utils::load_parcel(new)?.tree_hash;
             let named = tree_names(&tree, &set, partial.then_some(&mut check.skipped))?;
-            let applied = check.adopted && named.as_ref().is_some_and(|(_, hash)| applied.names_hash(hash));
+            let applied = named.as_ref().is_some_and(|(_, hash)| withheld.names_hash(hash));
 
             (named, applied)
         }
@@ -1039,12 +1039,12 @@ fn applied_part(set: &RedactedSet) -> Result<RedactedSet, String> {
 }
 
 /// The way out of a write refused for history naming a hash this warehouse applied: the remote
-/// still serves that history, and nothing here can take it again, but a fresh clone takes it as the
-/// remote holds it, with the redaction pending.
+/// still serves that history, and nothing here can take it again, but a fresh clone takes it, and
+/// the remote's redactions, as the remote holds them.
 pub(crate) fn fresh_clone_next_step() -> String {
     "this warehouse has applied that redaction, so it can never take history naming the content \
     again; make a fresh clone of the remote with \"forklift clone\", which takes the remote's history \
-    with the redaction pending, and work there".to_string()
+    and redactions as the remote holds them, and work there".to_string()
 }
 
 /// What [`exempt_adoption`] decided.
@@ -1057,6 +1057,10 @@ struct Exemption {
 
     /// The redactions it is exempt from.
     exempted: HashSet<String>,
+
+    /// The redactions the remote holds pending that it would be exempt from but for this warehouse
+    /// having applied them.
+    withheld: RedactedSet,
 }
 
 /// `set`, the redactions at this warehouse's `@redactions` head `local`, less those a user
@@ -1071,7 +1075,7 @@ fn exempt_adoption(set: RedactedSet,
                    new: &str,
                    local: &str,
                    applied: &RedactedSet) -> Result<Exemption, String> {
-    let none = |set| Ok(Exemption { set, adopted: false, exempted: HashSet::new() });
+    let none = |set| Ok(Exemption { set, adopted: false, exempted: HashSet::new(), withheld: RedactedSet::default() });
 
     let Some(Served { head, redactions: Some(pending) }) = served else {
         return none(set);
@@ -1085,10 +1089,12 @@ fn exempt_adoption(set: RedactedSet,
         return none(set);
     }
 
-    let exempt = RedactedSet::at(pending)?.filtered(|hash| !applied.hashes.contains(hash));
+    let pending = RedactedSet::at(pending)?;
+    let exempt = pending.filtered(|hash| !applied.hashes.contains(hash));
+    let withheld = pending.filtered(|hash| applied.hashes.contains(hash));
     let exempted = exempt.hashes.clone();
 
-    Ok(Exemption { set: set.without(&exempt), adopted: true, exempted })
+    Ok(Exemption { set: set.without(&exempt), adopted: true, exempted, withheld })
 }
 
 /// What [`meta_parcels_add`] found.
