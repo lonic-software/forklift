@@ -989,15 +989,27 @@ fn an_applied_record_this_build_cannot_read_is_refused_loudly() {
     assert_eq!(std::fs::read(&record).unwrap(), b"/forklift-redactions-applied 2\n");
 }
 
-/// Unset the remote of `warehouse`, record the redaction of `content` loaded as `file`, which
-/// nothing there names, so it applies at once, then set the remote back to `url`.
+/// Record the redaction of `content`, loaded as `file`, which nothing in `warehouse` names, and
+/// lift it, so the remote holds it pending and an adoption of what the remote serves is exempt from
+/// it. Then unset the remote, so `redact apply` applies it by this warehouse's own scan, and set
+/// the remote back to `url`.
 fn applied_without_remote(warehouse: &Warehouse, url: &str, file: &str, content: &[u8]) -> String {
-    warehouse.run_ok(&["config", "unset", "remote.url"]);
-    let hash = warehouse.redact_loaded(file, content, "applied before the remote");
-    assert_eq!(warehouse.redactions()[0]["status"], serde_json::json!({ "state": "applied" }));
-    warehouse.run_ok(&["config", "set", "remote.url", url]);
+    let hash = warehouse.redact_loaded(file, content, "applied without the remote");
+    let lifted = warehouse.run(&["lift"]);
+    assert!(String::from_utf8_lossy(&lifted.stdout).contains("Lifted the @redactions pallet"), "{:?}", lifted);
+
+    apply_without_remote(warehouse, url);
 
     hash
+}
+
+/// Apply every redaction `warehouse` holds by its own scan, with its remote unset, then set the
+/// remote back to `url`.
+fn apply_without_remote(warehouse: &Warehouse, url: &str) {
+    warehouse.run_ok(&["config", "unset", "remote.url"]);
+    let applied = warehouse.json(&["redact", "apply"]);
+    assert_eq!(applied["data"]["redactions"][0]["status"], serde_json::json!({ "state": "applied" }), "{}", applied);
+    warehouse.run_ok(&["config", "set", "remote.url", url]);
 }
 
 /// A warehouse that applied a redaction while it had no remote never takes a head naming that
@@ -1034,8 +1046,11 @@ fn a_head_naming_a_hash_applied_here_is_never_adopted_from_the_remote() {
     assert!(error["message"].as_str().unwrap().contains("not even one the remote serves"), "{}", error);
     assert!(!named.root.join(".forklift/pallets/side").exists());
 
+    // This one takes the remote's @redactions as it is with a lower of main, which never named
+    // the content, so the remote's pending set is its own.
     let before = behind.head("side");
-    applied_without_remote(&behind, &server.url, "secret.env", b"TOKEN=hunter2\n");
+    behind.run_ok(&["lower", "main"]);
+    apply_without_remote(&behind, &server.url);
     let error = content_redacted(&behind, &["lower"]);
     assert_eq!(error["details"], serde_json::json!({ "path": "secret.env", "hash": hash }), "{}", error);
     assert_eq!(error["next_step"], fresh_clone, "{}", error);
