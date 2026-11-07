@@ -157,7 +157,7 @@ fn plan_from(
     removed_heads: &[String],
     sources: recovery_utils::GcRootSources,
 ) -> Result<PrunePlan, String> {
-    let sealed = sealed_utils::read_tolerated().map_err(|error| format!("{} Then run the prune again.", error))?;
+    let tolerated = sealed_utils::read_tolerated().map_err(|error| format!("{} Then run the prune again.", error))?;
     let (live_parcels, meta_parcels) = reachable_parcels(&sources.adopted_heads())?;
     // A haul's proposed head joins the local pallet heads like a removed one: a merge reads the
     // recorded head, which no ref need still reach.
@@ -171,7 +171,7 @@ fn plan_from(
     let user_parcels = with_held(&live_parcels, proposed.iter().chain(&mirrored).chain(&removed));
     let local = local_roots(&user_parcels, &meta_parcels, sources)?;
 
-    let mut retained = collect_retained(&user_parcels, &meta_parcels, post_prune, &sealed)?;
+    let mut retained = collect_retained(&user_parcels, &meta_parcels, post_prune, &tolerated)?;
     retain_local_closure(&local, post_prune, &mut retained)?;
 
     let unlifted = unlifted_parcels(&user_parcels, remote_heads)?;
@@ -187,10 +187,10 @@ fn plan_from(
         held_unlifted.into_iter().partition(|parcel| proposed.contains(parcel));
     let (mirror_unlifted, deleted_unlifted): (HashSet<String>, HashSet<String>) =
         rest_unlifted.into_iter().partition(|parcel| mirrored.contains(parcel));
-    let (kept_for_live, mut touching) = retain_unlifted(&live_unlifted, pruned_prefixes, &sealed)?;
-    let (kept_for_proposed, touching_proposed) = retain_unlifted(&haul_unlifted, pruned_prefixes, &sealed)?;
-    let (kept_for_mirrored, touching_mirrored) = retain_unlifted(&mirror_unlifted, pruned_prefixes, &sealed)?;
-    let (kept_for_removed, touching_removed) = retain_unlifted(&deleted_unlifted, pruned_prefixes, &sealed)?;
+    let (kept_for_live, mut touching) = retain_unlifted(&live_unlifted, pruned_prefixes, &tolerated)?;
+    let (kept_for_proposed, touching_proposed) = retain_unlifted(&haul_unlifted, pruned_prefixes, &tolerated)?;
+    let (kept_for_mirrored, touching_mirrored) = retain_unlifted(&mirror_unlifted, pruned_prefixes, &tolerated)?;
+    let (kept_for_removed, touching_removed) = retain_unlifted(&deleted_unlifted, pruned_prefixes, &tolerated)?;
     touching.extend(touching_proposed);
     touching.extend(touching_mirrored);
     touching.extend(touching_removed);
@@ -198,7 +198,7 @@ fn plan_from(
     // Ordered children-before-parents (see the module doc): filtering this sequence (never
     // reordering it) preserves that property in `to_free`, which is what makes a partial
     // `free_objects` run — and a later re-`plan_prune` call over the same path — resumable.
-    let targets = collect_prune_targets(&user_parcels, pruned_prefixes, &sealed)?;
+    let targets = collect_prune_targets(&user_parcels, pruned_prefixes, &tolerated)?;
 
     let mut to_free: Vec<String> = Vec::new();
     let mut still_packed = 0usize;
@@ -347,7 +347,7 @@ fn unlifted_parcels(user_parcels: &[String], remote_heads: &[String]) -> Result<
 /// * `Ok((kept, touching))` - The objects to keep, and the unlifted parcels that changed some
 ///   pruned path, which are the ones whose lift needs any of them.
 /// * `Err(String)`          - If a present object cannot be read.
-fn retain_unlifted(unlifted: &HashSet<String>, pruned_prefixes: &[String], sealed: &Tolerated)
+fn retain_unlifted(unlifted: &HashSet<String>, pruned_prefixes: &[String], tolerated: &Tolerated)
     -> Result<(HashSet<String>, HashSet<String>), String> {
     let mut kept: HashSet<String> = HashSet::new();
     let mut walked: HashSet<(String, Vec<String>)> = HashSet::new();
@@ -368,13 +368,13 @@ fn retain_unlifted(unlifted: &HashSet<String>, pruned_prefixes: &[String], seale
         }
 
         for prefix in pruned_prefixes {
-            let Some(subtree) = resolve_unsealed_subtree(&loaded.tree_hash, prefix, sealed)? else {
+            let Some(subtree) = resolve_unsealed_subtree(&loaded.tree_hash, prefix, tolerated)? else {
                 continue;
             };
 
             let mut bases: Vec<String> = Vec::new();
             for root in &parent_roots {
-                if let Some(base) = resolve_unsealed_subtree(root, prefix, sealed)? {
+                if let Some(base) = resolve_unsealed_subtree(root, prefix, tolerated)? {
                     bases.push(base);
                 }
             }
@@ -601,7 +601,7 @@ fn collect_retained(
     user_parcels: &[String],
     meta_parcels: &[String],
     post_prune: &PathScope,
-    sealed: &Tolerated,
+    tolerated: &Tolerated,
 ) -> Result<HashSet<String>, String> {
     let mut retained: HashSet<String> = HashSet::new();
 
@@ -631,7 +631,7 @@ fn collect_retained(
         }
 
         retained.insert(tree_hash.clone());
-        if held_by_hash(sealed, &tree_hash)? {
+        if held_by_hash(tolerated, &tree_hash)? {
             continue;
         }
         let tree = object_utils::load_tree(&tree_hash)?;
@@ -647,7 +647,7 @@ fn collect_retained(
                 // retain every chunk too: a chunk this in-scope file shares with an out-of-scope
                 // pruned file must never be freed (the multi-bay/shared-content guard, one level
                 // deeper than the shared-blob guard the subtraction already provides).
-                if file.item_type.is_chunked() && !held_by_hash(sealed, &file.hash)? {
+                if file.item_type.is_chunked() && !held_by_hash(tolerated, &file.hash)? {
                     retain_recipe_chunks(&file.hash, &mut retained)?;
                 }
             }
@@ -676,7 +676,7 @@ fn collect_retained(
         }
 
         retained.insert(tree_hash.clone());
-        if held_by_hash(sealed, &tree_hash)? {
+        if held_by_hash(tolerated, &tree_hash)? {
             continue;
         }
         let tree = object_utils::load_tree(&tree_hash)?;
@@ -686,7 +686,7 @@ fn collect_retained(
 
             // Everything under an in-scope (or meta) subtree is retained in full, chunks included
             // — the same recipe descent the spine walk above does, for the same reason.
-            if file.item_type.is_chunked() && !held_by_hash(sealed, &file.hash)? {
+            if file.item_type.is_chunked() && !held_by_hash(tolerated, &file.hash)? {
                 retain_recipe_chunks(&file.hash, &mut retained)?;
             }
         }
@@ -837,7 +837,7 @@ fn retain_recipe_chunks(recipe_hash: &str, retained: &mut HashSet<String>) -> Re
 fn collect_prune_targets(
     user_parcels: &[String],
     pruned_prefixes: &[String],
-    sealed: &Tolerated,
+    tolerated: &Tolerated,
 ) -> Result<Vec<String>, String> {
     /// One step of the explicit (non-recursive) post-order walk: a tree not yet expanded, or a
     /// tree whose children have all been visited and is ready to be appended to `ordered`.
@@ -854,7 +854,7 @@ fn collect_prune_targets(
         let root = object_utils::load_parcel(parcel)?.tree_hash;
 
         for prefix in pruned_prefixes {
-            if let Some(subtree) = resolve_unsealed_subtree(&root, prefix, sealed)? {
+            if let Some(subtree) = resolve_unsealed_subtree(&root, prefix, tolerated)? {
                 stack.push(Step::Expand(subtree));
             }
         }
@@ -932,13 +932,13 @@ fn collect_prune_targets(
 /// absent tree on the way fails, as it does there.
 ///
 /// [`tree_utils::resolve_subtree_hash`]: crate::util::tree_utils::resolve_subtree_hash
-fn resolve_unsealed_subtree(root_tree_hash: &str, key: &str, sealed: &Tolerated) -> Result<Option<String>, String> {
+fn resolve_unsealed_subtree(root_tree_hash: &str, key: &str, tolerated: &Tolerated) -> Result<Option<String>, String> {
     let mut current = root_tree_hash.to_string();
 
     // The empty key names the root itself, as it does there.
     let components = if key.is_empty() { None } else { Some(key.split('/')) };
     for component in components.into_iter().flatten() {
-        if held_by_hash(sealed, &current)? {
+        if held_by_hash(tolerated, &current)? {
             return Ok(None);
         }
 
@@ -950,7 +950,7 @@ fn resolve_unsealed_subtree(root_tree_hash: &str, key: &str, sealed: &Tolerated)
         }
     }
 
-    if held_by_hash(sealed, &current)? {
+    if held_by_hash(tolerated, &current)? {
         return Ok(None);
     }
     Ok(Some(current))
@@ -960,8 +960,8 @@ fn resolve_unsealed_subtree(root_tree_hash: &str, key: &str, sealed: &Tolerated)
 /// warehouse applied, and absent. A held object that is present seals nothing. Presence is the
 /// fail-closed sweep form, so an object only an unreadable pack index might hold fails rather than
 /// reading as held.
-fn held_by_hash(sealed: &Tolerated, hash: &str) -> Result<bool, String> {
-    Ok(sealed.held(hash).is_some() && !file_utils::is_present_for_sweep(hash)?)
+fn held_by_hash(tolerated: &Tolerated, hash: &str) -> Result<bool, String> {
+    Ok(tolerated.held(hash).is_some() && !file_utils::is_present_for_sweep(hash)?)
 }
 
 /// Whether a loose object file is present in the store (independent of any packed copy).

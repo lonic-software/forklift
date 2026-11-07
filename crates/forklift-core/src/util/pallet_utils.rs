@@ -1364,10 +1364,12 @@ fn update_pallet_head_checked(
 
             // A record the verification leaned on is read again too: a refill or a repair may
             // have dropped the entry that held an absence. An entry added since undoes nothing,
-            // and the applied redactions only ever grow.
+            // and the applied redactions only ever grow. A full warehouse leaned on no record entry,
+            // so it reads no record.
             let record_moved = match leaned_on {
-                Some(tolerated) => !crate::util::sealed_utils::read_sealed()?.holds_all_of(&tolerated.sealed),
-                None => false,
+                Some(tolerated) if !tolerated.sealed.is_empty() =>
+                    !crate::util::sealed_utils::read_sealed()?.holds_all_of(&tolerated.sealed),
+                _ => false,
             };
 
             if &current != scope || record_moved {
