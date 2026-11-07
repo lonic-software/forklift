@@ -93,8 +93,8 @@ with its `hash` and its `holders`, each with a `kind` of `pallet`, `meta_history
 names, and a `description`) and, when the deletion did not run because a lock it needs is taken,
 `owed`, the reason: other object-store maintenance is running, another process is using the object
 store, or the root is being served (`kept` then lists the held copies a census taken without the
-locks found). Any other failure to delete fails the command, saying what was already recorded or
-applied. `redact list` never carries it.
+locks found). `redact list` never carries `deletion`. Any other failure to delete fails the
+command, saying what was already recorded or applied.
 `redact record` and `redact apply` are not MCP tools.
 
 **Schema 26**: a redaction has a state. `redact record`'s result and each entry of

@@ -72,7 +72,11 @@ fn record(target: &str, reason: &str) -> Result<(), String> {
     let read = redaction_utils::read_redactions()?;
     let already = |hash: &str| read.redactions.iter().any(|existing| existing.redaction.hash == hash)
         || read.unreadable.iter().any(|existing| existing.hash == hash);
-    let already_redacted = |hash: &str| format!("Object {} is already redacted; a redaction is permanent.", hash);
+    let already_redacted = |hash: &str| format!(
+        "Object {} is already redacted; a redaction is permanent. \"forklift redact apply\" finishes \
+        applying it and deleting its content.",
+        hash
+    );
 
     if already(target) {
         return Err(already_redacted(target));
@@ -159,23 +163,25 @@ fn record(target: &str, reason: &str) -> Result<(), String> {
 /// locks a full repack takes, in its order and without waiting. A lock refused leaves the deletion
 /// owed, with the reason: other maintenance is running, the store is in use by another process,
 /// or the root is served. A census taken first, without locks, decides whether to try: when every
-/// copy left is held, the held copies are reported and no lock is taken.
+/// copy left is held, the held copies are reported and no lock is taken. That census can race a
+/// writer in another bay, so its failure only means trying under the locks, whose own census
+/// decides.
 ///
 /// # Returns
 /// * `Ok(None)`              - If no applied redaction's object may be present: nothing to do,
 ///                             and no lock was taken.
 /// * `Ok(Some(DeletionView))` - What was deleted and kept, or why the deletion is owed (with the
 ///                             copies held as the first census found them).
-/// * `Err(String)`           - If the census or the deletion could not be carried out (an
-///                             unreadable pack, bay state or recipe, or a failed delete).
+/// * `Err(String)`           - If the census under the locks or the deletion could not be carried
+///                             out (an unreadable pack, bay state or recipe, or a failed delete).
 fn delete_applied() -> Result<Option<DeletionView>, String> {
-    let copies = redaction_deleter::applied_copies()?;
-
-    if copies.unheld == 0 {
-        return Ok((!copies.held.is_empty()).then(|| DeletionView::from(Deletion { held: copies.held, ..Deletion::default() })));
-    }
-
-    let held = copies.held;
+    let held = match redaction_deleter::applied_copies() {
+        Ok(copies) if copies.unheld == 0 => {
+            return Ok((!copies.held.is_empty()).then(|| DeletionView::from(Deletion { held: copies.held, ..Deletion::default() })));
+        }
+        Ok(copies) => copies.held,
+        Err(_) => BTreeMap::new(),
+    };
 
     // The store lock keeps out other maintenance, the serve lock a server answering for an object
     // about to go, and exclusive store access every writer that could publish a new reference to
@@ -333,8 +339,8 @@ fn apply() -> Result<(), String> {
     let read = redaction_utils::read_redactions()?;
     let statuses = applied_redactions::apply(&read, None)?;
     let deletion = delete_applied().map_err(|why| format!(
-        "The redactions are applied as listed by \"forklift redact list\", but deleting the redacted \
-        content failed: {} Copies already deleted stay deleted; once that is fixed, run \"forklift \
+        "The redactions that could be applied are, as \"forklift redact list\" shows, but deleting \
+        the redacted content failed: {} Copies already deleted stay deleted; once that is fixed, run \"forklift \
         redact apply\" again to finish.",
         why.trim_end()
     ))?;
