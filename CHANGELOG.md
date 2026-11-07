@@ -110,7 +110,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   serves naming it is refused, with a fresh clone of the remote as the way out. Content a redaction
   applied here names may be missing from the store without being damage: `audit`, `heal`,
   `store evict`, `scope prune` and ref writes pass over its absence, a cache never fetches it back
-  from the remote, and `remote move` never asks the new server for it.
+  from the remote, and `remote move` never asks the new server for it. A read that needs such
+  content (`restore`, `pick`, `diff`, `blame`) is refused with `content_redacted` (exit 49), never
+  as a missing object; `audit` counts it as `redacted` and passes, and `heal` notes how many there
+  are.
 - **The `--json` schema is now 25: `load`, `park`, merges and `pick` refuse redacted content.** Part
   of content redaction: a file whose content is redacted is refused with `content_redacted` (exit 49)
   before anything reaches the bay, when `load` would stage it, `park` would park it, `lower` would

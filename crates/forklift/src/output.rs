@@ -813,7 +813,7 @@ impl ErrorCode {
             ErrorCode::RedactionBlocked =>
                 "The object to redact is named by a meta pallet's history, which is never rewritten, so it cannot be removed; nothing was recorded",
             ErrorCode::ContentRedacted =>
-                "A pallet head would have named a file whose content is redacted, or a load, park, merge or pick would have brought it into the bay; nothing was written",
+                "A pallet head would have named a file whose content is redacted, or a load, park, merge or pick would have brought it into the bay, and nothing was written; or a read needed content that a redaction applied in this warehouse removed",
             ErrorCode::HeadNamesContent =>
                 "The object to redact is in a pallet head; take the file out of that head first. Nothing was recorded",
         }

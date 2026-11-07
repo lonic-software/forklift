@@ -1032,7 +1032,10 @@ the record still names that are on disk again (`present_and_recorded`): that fai
 `forklift heal` removes the records it can. `--full` cannot re-assemble a large
 file one of whose chunks is held this way, so it re-reads that file's present chunks instead. A
 sealed-object record this version cannot read, or one with damage that an interrupted last write
-could not have left, fails the audit rather than being taken as empty. The failure names the way
+could not have left, fails the audit rather than being taken as empty. An absent object that a
+redaction applied in this warehouse names is not damage either: its content was removed on
+purpose, so audit accounts for it, checks nothing beneath it, and reports how many it found
+(`redacted` under `--json`). The failure names the way
 out: for damage, `forklift heal`, which rebuilds the record (see `heal`); for a record in another
 version, that version of Forklift.
 
@@ -2650,6 +2653,10 @@ intact entry this version cannot read, is never rewritten; the note names the wa
 that fails stops `heal` before it does anything else; when the rewrite itself fails, the message
 says what it drops, since it may have landed. Running `heal` again retries. A record that cannot be read at all is not
 known to be damaged, so `heal` carries on and notes it.
+
+An absent object that a redaction applied in this warehouse names was removed on purpose, so a
+rescan after an interrupted write counts none of them as lost, and `heal` notes how many there
+are.
 
 Once nothing is left to resolve, `heal` also removes from the sealed-object record every object
 that is on disk again, such as one fetched back by a refill whose own removal was interrupted. An
