@@ -1162,11 +1162,17 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         // `old_head`, since a redaction recorded after it was committed binds it too), a meta
         // pallet's parcels by what each adds. The commit conditions on the `@redactions` head this
         // read, so a redaction recorded between the check and the commit refuses the commit, and
-        // the check runs again from a fresh read, up to [`REDACTION_ATTEMPTS`] times. A write to
+        // the check runs again from a fresh read, up to [`REDACTION_ATTEMPTS`] times and while the
+        // invocation's window affords another. A write to
         // `@redactions` itself is judged against the head it replaces, already conditioned on.
         let is_redactions = is_meta && bare == REDACTIONS_PALLET_NAME;
 
+        // One mirror across the attempts: a `@redactions` head read again holds every object the
+        // previous one did but those it adds.
+        let mut redactions_mirror = Mirror::default();
+
         for attempt in 1..=REDACTION_ATTEMPTS {
+            let started = std::time::Instant::now();
             let redactions_head = if is_redactions {
                 request.old_head.clone()
             } else {
@@ -1179,7 +1185,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
             scratch.scoped(|| -> HeadResult<()> {
                 if let Some(head) = &redactions_head {
-                    materialize_state(&self.objects, head, &mut Mirror::default())
+                    materialize_state(&self.objects, head, &mut redactions_mirror)
                         .map_err(HeadError::internal)?;
                 }
 
@@ -1214,7 +1220,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             )?;
 
             match outcome {
-                CasOutcome::RedactionsMoved if attempt < REDACTION_ATTEMPTS => continue,
+                CasOutcome::RedactionsMoved if attempt < REDACTION_ATTEMPTS && self.affords_another(started.elapsed()) => continue,
                 CasOutcome::RedactionsMoved => {
                     return Err(HeadError::conflict(
                         "Redactions kept being recorded while this update was checked; retry it."
@@ -1233,6 +1239,15 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         }
 
         unreachable!("the last attempt answers every outcome")
+    }
+
+    /// Whether this invocation's window can take another attempt that took `attempt` (with as
+    /// much to spare), so a ref update that keeps losing to new redactions answers its `409`
+    /// rather than run out of time with no answer. Without a deadline, always.
+    fn affords_another(&self, attempt: std::time::Duration) -> bool {
+        self.deadline.is_none_or(|deadline| {
+            deadline.duration_since(SystemTime::now()).unwrap_or_default() > attempt * 2
+        })
     }
 
     /// A ref update's commit: one DynamoDB transaction conditioned on every movable input the

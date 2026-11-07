@@ -696,6 +696,25 @@ fn a_meta_parcel_adding_redacted_content_is_refused_and_one_carrying_it_is_not()
     assert_eq!(meta_head(&head), Some(second));
 }
 
+/// A write to `@redactions` itself is judged against the redactions it replaces and conditions on
+/// no `@redactions` item but its own: recording a second redaction lifts.
+// The memory store does not model DynamoDB's refusal of two actions on one item, so this pins
+// only that the write is judged and lifts; `dynamo.rs` drops the self-condition.
+#[test]
+fn a_redactions_write_lifts_over_the_head_it_replaces() {
+    let area = Area::new("redactions-write");
+    let (redactions, recorded) = recorded_redactions(&area, "red", &["one\n", "two\n"]);
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &recorded);
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions[0]);
+
+    let wire = format!("@{}", REDACTIONS_PALLET_NAME);
+    let request = RefUpdateRequest { old_head: Some(redactions[0].clone()), new_head: redactions[1].clone(), tombstone: None };
+    head.ref_update(&Principal::Static, &wire, &request).expect("a second redaction lifts");
+    let current = head.refs.get_head(pallet_utils::PalletNamespace::Meta, REDACTIONS_PALLET_NAME).unwrap();
+    assert_eq!(current.live(), Some(redactions[1].as_str()));
+}
+
 /// Wraps a shared [`MemoryRefStore`]; before each user-pallet commit while `moves` holds one,
 /// lifts `@redactions` to the next of `moves`, as a redaction recorded between `ref_update`'s
 /// check and its commit would. Forwards every other call.
@@ -788,7 +807,7 @@ impl RefStore for RedactionsMoveBeforeTheCommit {
 /// again against it: one naming the pushed content turns the update into the redacted refusal,
 /// and redactions that keep moving end in a retryable `409`, with nothing committed either way.
 // Revert: commit with `RedactionsPrecondition::NotConsumed` → the update commits over the new
-// redaction → red.
+// redaction → red. Revert: retry whatever the deadline → the last arm spends every move → red.
 #[test]
 fn a_redaction_recorded_during_the_check_refuses_the_commit_and_is_judged() {
     let area = Area::new("redacted-race");
@@ -817,6 +836,21 @@ fn a_redaction_recorded_during_the_check_refuses_the_commit_and_is_judged() {
 
     let err = racing(&[&redactions[1], &redactions[2], &redactions[3]]).expect_err("the redactions kept moving");
     assert_eq!(err.status, Status::Conflict, "{}", err.message);
+
+    // With no time left in the invocation, the first move answers the `409` at once.
+    let inner = Arc::new(MemoryRefStore::new());
+    plant_meta(&inner, REDACTIONS_PALLET_NAME, None, &redactions[0]);
+    let refs = RedactionsMoveBeforeTheCommit {
+        inner: inner.clone(),
+        moves: RefCell::new(vec![redactions[1].clone(), redactions[2].clone()]),
+    };
+    let head = Head::new(MemoryObjectStore::new(), refs).with_deadline(std::time::SystemTime::now());
+    upload_all(&head, &recorded);
+    let pushed = gate_parcel(&head, &[], vec![gate_file(&head, "secret.env", "leaked\n")]);
+    let request = RefUpdateRequest { old_head: None, new_head: pushed, tombstone: None };
+    let err = head.ref_update(&Principal::Static, "main", &request).expect_err("no time for another check");
+    assert_eq!(err.status, Status::Conflict, "{}", err.message);
+    assert_eq!(head.refs.moves.borrow().len(), 1, "one attempt, not three");
 }
 
 /// Classify an object as a blob by trying to parse it as a parcel/tree under the source

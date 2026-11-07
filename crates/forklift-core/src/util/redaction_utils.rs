@@ -1060,9 +1060,8 @@ pub fn check_head_write(namespace: pallet_utils::PalletNamespace,
                         served: Option<Served>) -> HeadWriteCheck {
     let redactions = pallet_utils::get_meta_pallet_head(REDACTIONS_PALLET_NAME);
     let outcome = match &redactions {
-        Ok(redactions) => crate::util::scope_utils::content_may_be_absent()
-            .map_err(pallet_utils::RefUpdateError::from)
-            .and_then(|partial| check_head_write_at(namespace, name, expected, new, served, redactions.clone(), &LocalObjects, partial)),
+        Ok(redactions) => check_head_write_at(namespace, name, expected, new, served, redactions.clone(), &LocalObjects,
+                                              crate::util::scope_utils::content_may_be_absent),
         Err(error) => Err(error.clone().into()),
     };
 
@@ -1086,13 +1085,13 @@ pub fn check_received_head_write(namespace: pallet_utils::PalletNamespace,
                                  new: &str,
                                  redactions: Option<&str>,
                                  objects: &dyn WalkObjects) -> Result<(), pallet_utils::RefUpdateError> {
-    check_head_write_at(namespace, name, expected, new, None, redactions.map(str::to_string), objects, false)
+    check_head_write_at(namespace, name, expected, new, None, redactions.map(str::to_string), objects, || Ok(false))
         .map(|_| ())
 }
 
 /// [`check_head_write`]'s decision against the redactions at `redactions`, walking `objects`.
-/// `partial` tolerates a subtree or recipe the local store lacks, as a sparse or cache warehouse
-/// does.
+/// `partial` says whether to tolerate a subtree or recipe the local store lacks, as a sparse or
+/// cache warehouse does; it is read only for a user pallet's walk, when there is one.
 #[allow(clippy::too_many_arguments)]
 fn check_head_write_at(namespace: pallet_utils::PalletNamespace,
                        name: &str,
@@ -1101,7 +1100,7 @@ fn check_head_write_at(namespace: pallet_utils::PalletNamespace,
                        served: Option<Served>,
                        redactions: Option<String>,
                        objects: &dyn WalkObjects,
-                       partial: bool) -> Result<RedactionCheck, pallet_utils::RefUpdateError> {
+                       partial: impl FnOnce() -> Result<bool, String>) -> Result<RedactionCheck, pallet_utils::RefUpdateError> {
     let mut check = RedactionCheck {
         namespace,
         name: name.to_string(),
@@ -1145,6 +1144,7 @@ fn check_head_write_at(namespace: pallet_utils::PalletNamespace,
     let (named, applied) = match namespace {
         pallet_utils::PalletNamespace::User => {
             let tree = objects.load_parcel(new)?.tree_hash;
+            let partial = partial()?;
             let named = tree_names(&tree, &set, objects, partial.then_some(&mut check.skipped))?;
             let applied = named.as_ref().is_some_and(|(_, hash)| withheld.names_hash(hash, objects));
 

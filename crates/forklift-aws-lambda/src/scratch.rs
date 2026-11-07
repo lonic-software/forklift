@@ -265,6 +265,9 @@ pub fn materialize_state(store: &dyn ObjectStore, parcel_hash: &str, mirror: &mu
     materialize_tree(store, &parcel.tree_hash, true, mirror)
 }
 
+/// How many objects one [`MirroredObjects`] prefetch round fetches and holds at once.
+const PREFETCH_ROUND: usize = 64;
+
 /// The objects a redaction walk reads (`redaction_utils::WalkObjects`), read from the current
 /// scratch (the caller must be inside [`Scratch::scoped`]) and, for what it does not hold, from
 /// the object store, mirroring each into the scratch as it is fetched. [`materialize`] mirrors a
@@ -323,9 +326,13 @@ impl WalkObjects for MirroredObjects<'_> {
         }
 
         // Best effort: an object this fails to mirror is fetched again, or reported, by its read.
-        for (hash, fetched) in absent.iter().zip(self.store.get_many(&absent)) {
-            if let Ok(Some(bytes)) = fetched {
-                let _ = object_utils::store_object_bytes(hash, &bytes);
+        // In bounded rounds, each written before the next is fetched, so a wide level of large
+        // recipes is never held in memory at once.
+        for round in absent.chunks(PREFETCH_ROUND) {
+            for (hash, fetched) in round.iter().zip(self.store.get_many(round)) {
+                if let Ok(Some(bytes)) = fetched {
+                    let _ = object_utils::store_object_bytes(hash, &bytes);
+                }
             }
         }
     }
