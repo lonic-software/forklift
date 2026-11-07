@@ -1173,6 +1173,9 @@ fn a_cache_that_applied_a_redaction_never_fetches_it_nor_asks_a_new_origin_for_i
     owner.run_ok(&["lift"]);
 
     let cached = Warehouse::cloned_with("applied-cache", &server.url, &["--cache"]);
+    // Read once and evicted, so the sealed record holds the content before the redaction applies.
+    cached.run_ok(&["show", &format!("{}:secret.env", leak)]);
+    cached.run_ok(&["store", "evict"]);
     let recorded = recorded_hash(&cached, &format!("{}:secret.env", leak), "leaked token");
     let hash = recorded["data"]["hash"].as_str().unwrap().to_string();
     // A cache applies a redaction only once its remote has, which nothing does yet: the record is
