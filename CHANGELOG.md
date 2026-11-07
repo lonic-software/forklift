@@ -98,6 +98,15 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Added
 
+- **forklift-server applies redactions, and the `--json` schema is now 28.** Part of content
+  redaction: after each lift or pallet deletion, the server applies every recorded redaction that
+  none of its pallet heads or metadata history names. It then refuses that content on every route
+  as `content_redacted` (exit 49 on the client), drops it from the bundle it serves, and accepts
+  lifts of history that names it without the content; `lift` no longer uploads it. Its handshake
+  reports each redaction as pending or applied, and a warehouse takes a head the server serves over
+  a redaction only while the server reports it pending. The server does not delete its copy yet,
+  and a fresh `clone` or a `lower` that must fetch history naming the content is refused with
+  `content_redacted` for now. The AWS head does not apply redactions yet.
 - **`forklift redact` is listed, and the `--json` schema is now 27: an applied redaction's content
   is deleted.** Part of content redaction: once a redaction applies, `redact record` and
   `redact apply` delete every copy of its content in this warehouse, packed or loose, and a chunked
