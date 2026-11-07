@@ -3386,6 +3386,8 @@ fn rebuild_bundle(state: &AppState, warehouse: Arc<WarehouseHandle>, again: bool
             if !warehouse.rebuild_again.swap(false, Ordering::SeqCst) || warehouse.bundling.swap(true, Ordering::SeqCst) {
                 break;
             }
+
+            warehouse.lifts_since_bundle.store(0, Ordering::SeqCst);
         }
     });
 }
