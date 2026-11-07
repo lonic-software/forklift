@@ -3704,7 +3704,8 @@ async fn after_ref_write(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>)
 /// What follows a ref write request here that moved no ref, answered with an error or as already
 /// done. One that reached its write (`owed`) owes an apply ([`WarehouseHandle::owe_apply`]),
 /// carried out here before the answer, as a write's is, so content is served again without
-/// waiting for another write; one that fails asks for a redaction run, as a write does. One
+/// waiting for another write; one that fails asks for a redaction run, as a write does, and so
+/// does one that settles it while a round has left the bundle rebuild for after it. One
 /// refused before its write owes nothing and does nothing here: it neither scans the warehouse
 /// nor cuts short the wait of a run retrying an apply or a deletion.
 async fn after_failed_ref_write(state: &Arc<AppState>, warehouse: Arc<WarehouseHandle>, owed: bool) {
@@ -3723,7 +3724,8 @@ async fn after_failed_ref_write(state: &Arc<AppState>, warehouse: Arc<WarehouseH
         tracing::error!(error, "applying the redactions failed; the redaction run retries it");
     }
 
-    if applied || warehouse.apply_owed() {
+    // A rebuild a round left for after the apply ([`finish_round`]) is a run's to carry out.
+    if applied || warehouse.apply_owed() || warehouse.rebuild_after_drain.load(std::sync::atomic::Ordering::SeqCst) {
         run_redactions(Arc::clone(state), warehouse);
     }
 }
@@ -3882,6 +3884,10 @@ struct RoundOwes {
 async fn redaction_round(state: &AppState, warehouse: &Arc<WarehouseHandle>) -> RoundOwes {
     use std::sync::atomic::Ordering;
 
+    // A rebuild a write's apply called for, after this round's drain. Taken first, so the flag
+    // set again by the end of the round says a write applied a redaction while it ran.
+    let held_back = warehouse.rebuild_after_drain.swap(false, Ordering::SeqCst);
+
     // Only an apply owed: a write applies what it let apply before it is answered.
     let applied = match warehouse.apply_owed() {
         false => false,
@@ -3904,22 +3910,51 @@ async fn redaction_round(state: &AppState, warehouse: &Arc<WarehouseHandle>) -> 
 
     let owed = delete_applied_content(state, warehouse).await;
 
-    // A rebuild the drain held back runs now, as does the one an apply calls for, unless another
-    // round follows: that round may drain for what a write applied meanwhile, so the rebuild and
-    // its flags are left to the run's last round.
-    if warehouse.redact_again.load(Ordering::SeqCst) {
-        if applied {
-            warehouse.rebuild_after_drain.store(true, Ordering::SeqCst);
-        }
-        return RoundOwes { deletion: owed, apply: warehouse.apply_owed() };
-    }
-
-    let after_drain = warehouse.rebuild_after_drain.swap(false, Ordering::SeqCst);
-    if applied || after_drain || warehouse.rebuild_again.load(Ordering::SeqCst) {
-        rebuild_bundle(state, Arc::clone(warehouse), true);
-    }
+    finish_round(state, warehouse, applied, held_back, owed);
 
     RoundOwes { deletion: owed, apply: warehouse.apply_owed() }
+}
+
+/// Rebuild the bundle after a redaction round's deletion, when it is due (the round `applied` a
+/// redaction, or a write's apply called for it, `held_back`) or the drain held a rebuild back,
+/// unless the run's next round would only find it in the way, and leaves it to that round:
+/// - a write applied a redaction while the round ran, so the next round drains for it;
+/// - an apply is owed, so no bundle is served until one settles it, and one that applies
+///   withdraws the bundle again;
+/// - the round applied a redaction and its deletion is `owed`, and a write asked for another
+///   round, which drains for it at once. Only this round's own apply is left so: under traffic
+///   that keeps both true, the next round rebuilds rather than leave the bundle withdrawn.
+///
+/// A write that applied nothing leaves the rebuild here, so a steady stream of them does not put
+/// it off.
+fn finish_round(state: &AppState, warehouse: &Arc<WarehouseHandle>, applied: bool, held_back: bool, owed: bool) {
+    use std::sync::atomic::Ordering;
+
+    // A rebuild the drain held back (`rebuild_again`) is carried on as one an apply calls for is.
+    let due = applied || held_back || warehouse.rebuild_again.load(Ordering::SeqCst);
+
+    // Each leaves a round to follow: the write asks for a run after setting the flag, and a run
+    // asked again goes round again. That round's start takes the flag.
+    let follows = warehouse.rebuild_after_drain.load(Ordering::SeqCst)
+        || (applied && owed && warehouse.redact_again.load(Ordering::SeqCst));
+
+    if follows || warehouse.apply_owed() {
+        if due {
+            warehouse.rebuild_after_drain.store(true, Ordering::SeqCst);
+
+            // A refused write that settles the owed apply asks for a run when it sees the flag
+            // ([`after_failed_ref_write`]); one settled before the flag was set leaves this run
+            // to go round again for the rebuild.
+            if !follows && !warehouse.apply_owed() {
+                warehouse.redact_again.store(true, Ordering::SeqCst);
+            }
+        }
+        return;
+    }
+
+    if due {
+        rebuild_bundle(state, Arc::clone(warehouse), true);
+    }
 }
 
 /// Delete the applied content this warehouse holds that no bay here holds, when there is any:
@@ -8398,6 +8433,80 @@ mod tests {
         assert!(handle.applies_closed(), "and it is not discharged");
 
         drop((writing, handle, state));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A round rebuilds the bundle a write's apply called for even when another round follows, as a
+    /// steady stream of writes makes one follow every round; it carries the rebuild on to the next
+    /// round only when that round drains or applies first: a write applied a redaction while it
+    /// ran, its deletion is owed with another round asked for, or an apply is owed.
+    ///
+    /// A refused write that settles an owed apply asks for the run a carried rebuild needs.
+    ///
+    /// Revert: leave the rebuild to the next round whenever one follows → the first round does not
+    /// rebuild → red. Ignore a write's apply, an owed deletion or an owed apply → that case
+    /// rebuilds → red. Drop the call on deferring → it is not carried on → red. Carry a carried
+    /// rebuild on again → red. A refused write ignoring the carried rebuild → no run → red. Carry
+    /// only an apply's rebuild → the held-back one is not carried → red.
+    #[tokio::test]
+    async fn a_round_rebuilds_the_bundle_unless_a_write_applied_meanwhile() {
+        let root = scratch_dir("round-rebuild");
+        mark_warehouse(&root);
+        let mut state = base_state(ServeMode::Single(Arc::new(WarehouseHandle::new(root.clone()))));
+        state.rebuild_after_lifts = Some(1000);
+        let state = Arc::new(state);
+        let handle = resolve_handle(&state, &PathParams::new()).unwrap();
+        handle.redacting.store(true, Ordering::SeqCst);
+        handle.bundling.store(true, Ordering::SeqCst);
+
+        // A write applied before the round and another asked for a run: the round rebuilds. The
+        // rebuild marked running is asked again, so the round's ask shows as `rebuild_again`.
+        handle.rebuild_after_drain.store(true, Ordering::SeqCst);
+        handle.redact_again.store(true, Ordering::SeqCst);
+        redaction_round(&state, &handle).await;
+        assert!(handle.rebuild_again.swap(false, Ordering::SeqCst), "the round rebuilds");
+        assert!(!handle.rebuild_after_drain.load(Ordering::SeqCst), "and settles the write's call");
+
+        // A write applied while the round ran: its rebuild is the next round's.
+        handle.rebuild_after_drain.store(true, Ordering::SeqCst);
+        finish_round(&state, &handle, true, false, false);
+        assert!(!handle.rebuild_again.load(Ordering::SeqCst), "the next round rebuilds");
+        assert!(handle.rebuild_after_drain.load(Ordering::SeqCst), "and is still called for");
+
+        // The round applied, its deletion is owed and another round follows at once: that round
+        // drains first. A rebuild already carried on to the round is not carried again.
+        handle.rebuild_after_drain.store(false, Ordering::SeqCst);
+        finish_round(&state, &handle, true, false, true);
+        assert!(!handle.rebuild_again.load(Ordering::SeqCst), "the drain goes first");
+        assert!(handle.rebuild_after_drain.swap(false, Ordering::SeqCst), "and the rebuild is carried on");
+        finish_round(&state, &handle, false, true, true);
+        assert!(handle.rebuild_again.swap(false, Ordering::SeqCst), "a carried rebuild is not put off again");
+
+        // An apply is owed: no bundle is served until one settles it.
+        handle.rebuild_after_drain.store(false, Ordering::SeqCst);
+        handle.redact_again.store(false, Ordering::SeqCst);
+        let owe = handle.owe_apply();
+        drop(owe);
+        finish_round(&state, &handle, true, false, false);
+        assert!(!handle.rebuild_again.load(Ordering::SeqCst), "the apply goes first");
+        assert!(handle.rebuild_after_drain.load(Ordering::SeqCst), "and the rebuild is carried on");
+        assert!(!handle.redact_again.load(Ordering::SeqCst), "for the run settling the apply");
+
+        // So is one the drain held back, with nothing applied.
+        handle.rebuild_after_drain.store(false, Ordering::SeqCst);
+        handle.rebuild_again.store(true, Ordering::SeqCst);
+        finish_round(&state, &handle, false, false, false);
+        assert!(handle.rebuild_after_drain.load(Ordering::SeqCst), "a held-back rebuild is carried on");
+        handle.rebuild_again.store(false, Ordering::SeqCst);
+
+        // A refused write that settles the apply without applying anything asks for that run.
+        handle.redacting.store(true, Ordering::SeqCst);
+        handle.redactions_asked.store(0, Ordering::SeqCst);
+        after_failed_ref_write(&state, Arc::clone(&handle), true).await;
+        assert!(!handle.apply_owed(), "the write settles the apply");
+        assert_eq!(handle.redactions_asked.load(Ordering::SeqCst), 1, "and asks for the run");
+
+        drop((handle, state));
         let _ = std::fs::remove_dir_all(&root);
     }
 
