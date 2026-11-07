@@ -2715,6 +2715,20 @@ impl RefStore for SharedMemoryRefs {
     ) -> Result<TrustWriteOutcome, String> {
         self.0.replace_trust(anchor, expected_anchor, office_head, format, request_token)
     }
+
+    fn get_redaction(&self, hash: &str) -> Result<Option<String>, String> {
+        self.0.get_redaction(hash)
+    }
+
+    fn put_redaction(
+        &self,
+        hash: &str,
+        state: &str,
+        expected: Option<&str>,
+        format: &forklift_aws_lambda::FormatFence,
+    ) -> Result<forklift_aws_lambda::store::RedactionWrite, String> {
+        self.0.put_redaction(hash, state, expected, format)
+    }
 }
 
 /// Wraps a shared [`MemoryRefStore`]; the first time `ref_update`'s office-head snapshot read
@@ -5621,4 +5635,190 @@ fn a_lift_commit_naming_applied_content_drops_it_unpromoted() {
         assert_gone(&err, &leak);
         assert_eq!(head.objects.staged_count(), 0, "the staged copy is dropped");
     }
+}
+
+/// Plant `state` as the redaction item of `hash`, over whatever it holds.
+fn plant_item(refs: &MemoryRefStore, hash: &str, state: &str) {
+    let fence = forklift_aws_lambda::format::gate(refs).expect("format gate");
+    let expected = refs.get_redaction(hash).expect("item");
+    refs.put_redaction(hash, state, expected.as_deref(), &fence).expect("plant the item");
+}
+
+/// An applied redaction's first request deletes every copy the store keeps of the content: its
+/// canonical object, and its staged copy in every session. Other content is kept, and the item
+/// records the deletion done.
+// Revert: drop the sweep from the judge → the object is still stored → red.
+#[test]
+fn an_applied_redaction_deletes_its_canonical_and_staged_copies() {
+    let (_area, head, redactions, leak) = unplanted_redaction("redaction-deletes", "leaked\n");
+    gate_file(&head, "x", "leaked\n");
+    let kept = gate_file(&head, "y", "kept\n").hash;
+    head.objects.stage("lift-1", &leak, b"leaked\n".to_vec());
+    head.objects.stage("lift-2", &leak, b"leaked\n".to_vec());
+    head.objects.stage("lift-1", &kept, b"kept\n".to_vec());
+    assert!(head.objects.exists(&leak).expect("exists"));
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions);
+
+    assert_gone(&head.object_get(&leak).expect_err("applied"), &leak);
+
+    assert!(!head.objects.exists(&leak).expect("exists"), "the canonical copy is deleted");
+    assert_eq!(head.objects.staged_count(), 1, "every staged copy of it is deleted, and only those");
+    assert!(head.objects.exists(&kept).expect("exists"));
+    let item = head.refs.get_redaction(&leak).expect("item").expect("an item");
+    assert!(item.contains(r#""swept":true"#) && !item.contains("lease_until"), "{}", item);
+    assert_eq!(served_state(&head, &leak), Some(ServedRedactionState::DeletionOwed));
+}
+
+/// A deletion another request holds the lease of is left to it; once the lease has run out, the
+/// next request deletes.
+// Revert: ignore the lease → the first request deletes → red. Revert: treat every lease as live →
+// the second never deletes → red.
+#[test]
+fn a_held_deletion_lease_is_left_alone_until_it_runs_out() {
+    let (_area, head, redactions, leak) = unplanted_redaction("redaction-lease", "leaked\n");
+    gate_file(&head, "x", "leaked\n");
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions);
+
+    let held = r#"{"version":1,"scan_complete":true,"holders":[],"applied_at":1,"lease_until":99999999999}"#;
+    plant_item(&head.refs, &leak, held);
+    assert_gone(&head.object_get(&leak).expect_err("applied"), &leak);
+    assert!(head.objects.exists(&leak).expect("exists"), "another request holds the deletion");
+    assert_eq!(head.refs.get_redaction(&leak).expect("item").as_deref(), Some(held));
+
+    plant_item(&head.refs, &leak, r#"{"version":1,"scan_complete":true,"holders":[],"applied_at":1,"lease_until":1}"#);
+    assert_gone(&head.object_get(&leak).expect_err("applied"), &leak);
+    assert!(!head.objects.exists(&leak).expect("exists"), "the lease ran out: deleted");
+}
+
+/// A store whose every promotion is met by the redaction of what it promotes applying, just after
+/// the promotion's write: the race the check after the write closes.
+struct AppliesDuringPromotion {
+    inner: MemoryObjectStore,
+    refs: Arc<MemoryRefStore>,
+}
+
+impl ObjectStore for AppliesDuringPromotion {
+    fn exists(&self, hash: &str) -> Result<bool, String> {
+        self.inner.exists(hash)
+    }
+
+    fn objects_staged(&self, session: &str, hashes: &[String]) -> Result<Vec<String>, String> {
+        self.inner.objects_staged(session, hashes)
+    }
+
+    fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, String> {
+        self.inner.get(hash)
+    }
+
+    fn put_verified(&self, hash: &str, bytes: &[u8]) -> Result<PutOutcome, String> {
+        self.inner.put_verified(hash, bytes)
+    }
+
+    fn get_signature(&self, parcel_hash: &str) -> Result<Option<Vec<u8>>, String> {
+        self.inner.get_signature(parcel_hash)
+    }
+
+    fn put_signature(&self, parcel_hash: &str, bytes: &[u8]) -> Result<SignatureOutcome, String> {
+        self.inner.put_signature(parcel_hash, bytes)
+    }
+
+    fn verify_and_promote(&self, session: &str, hash: &str) -> Result<PromoteOutcome, String> {
+        let outcome = self.inner.verify_and_promote(session, hash)?;
+        plant_item(&self.refs, hash, &forklift_aws_lambda::head::redaction_record(true, &[], Some(1)));
+
+        Ok(outcome)
+    }
+
+    fn delete_canonical(&self, hash: &str) -> Result<(), String> {
+        self.inner.delete_canonical(hash)
+    }
+}
+
+/// A lift commit whose promotion of content lands just before that content's redaction applies
+/// deletes the copy it wrote, and is refused.
+// Revert: drop the check after the promotions from `commit_lift` → the commit succeeds → red.
+#[test]
+fn a_lift_commit_deletes_what_it_promoted_when_its_redaction_applied_meanwhile() {
+    let area = Area::new("redaction-promote-race");
+    let (redactions, recorded) = recorded_redactions(&area, "red", &["leaked\n"]);
+    let refs = Arc::new(MemoryRefStore::new());
+    let head = Head::new(AppliesDuringPromotion { inner: MemoryObjectStore::new(), refs: refs.clone() }, SharedMemoryRefs(refs.clone()));
+    upload_all(&head, &recorded);
+    plant_meta(&refs, REDACTIONS_PALLET_NAME, None, &redactions[0]);
+    let object = forklift_core::builder::object::loose_object_builder::LooseObjectBuilder::build_blob(
+        &forklift_core::model::blob::Blob { content: b"leaked\n".to_vec() },
+    );
+    let leak = object.hash;
+    head.objects.inner.delete_canonical(&leak).expect("only the staged copy");
+    head.objects.inner.stage("lift-1", &leak, object.content);
+
+    let err = head.commit_lift(&Principal::Static, "lift-1", std::slice::from_ref(&leak), &[], false).expect_err("refused");
+    assert_gone(&err, &leak);
+    assert!(!head.objects.inner.exists(&leak).expect("exists"), "the promoted copy is deleted");
+}
+
+/// The staging verifier's check after its write deletes a promoted copy whose redaction applied,
+/// leaves one whose redaction did not, and keeps an applied recipe, as the judge does.
+// Revert: delete whatever the item says → the unapplied copy is gone → red. Revert: delete a
+// recipe too → it is gone → red.
+#[test]
+fn the_check_after_a_promotion_deletes_only_applied_file_content() {
+    use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+    use forklift_core::model::recipe::{Recipe, RecipeChunk};
+
+    let objects = MemoryObjectStore::new();
+    let refs = MemoryRefStore::new();
+    let fence = forklift_aws_lambda::format::gate(&refs).expect("format gate");
+    let applied = forklift_aws_lambda::head::redaction_record(true, &[], Some(1));
+    let pending = forklift_aws_lambda::head::redaction_record(false, &[], None);
+
+    let blob = |content: &str| {
+        let object = LooseObjectBuilder::build_blob(&forklift_core::model::blob::Blob { content: content.as_bytes().to_vec() });
+        objects.put_verified(&object.hash, &object.content).expect("put");
+        object.hash
+    };
+    let (gone, kept) = (blob("applied\n"), blob("pending\n"));
+    let recipe = LooseObjectBuilder::build_recipe(&Recipe {
+        content_hash: "c".repeat(64),
+        total_size: 1,
+        chunks: vec![RecipeChunk { hash: "d".repeat(64), size: 1 }],
+    });
+    objects.put_verified(&recipe.hash, &recipe.content).expect("put");
+    refs.put_redaction(&gone, &applied, None, &fence).expect("item");
+    refs.put_redaction(&kept, &pending, None, &fence).expect("item");
+    refs.put_redaction(&recipe.hash, &applied, None, &fence).expect("item");
+
+    let delete = |hash: &str| forklift_aws_lambda::head::delete_if_redaction_applied(&objects, &refs, hash).expect("checked");
+    assert!(delete(&gone));
+    assert!(!delete(&kept));
+    assert!(!delete(&recipe.hash));
+    assert!(!delete(&"e".repeat(64)), "no item: nothing to delete");
+
+    assert!(!objects.exists(&gone).expect("exists"));
+    assert!(objects.exists(&kept).expect("exists"));
+    assert!(objects.exists(&recipe.hash).expect("exists"));
+}
+
+/// A new pallet whose history names applied content no longer stored, below a head that does not
+/// name it, lands: the push gate tolerates the absence of applied file content, as
+/// `forklift-server`'s does. Content that is absent and not applied is still refused.
+// Revert: pass the gate no applied set → the push is refused as missing the content → red.
+#[test]
+fn a_push_whose_history_names_deleted_applied_content_lands() {
+    let (_area, head, redactions, leak) = unplanted_redaction("redaction-gate", "leaked\n");
+    let named = gate_parcel(&head, &[], vec![gate_file(&head, "x", "leaked\n")]);
+    let after = gate_parcel(&head, &[&named], vec![gate_file(&head, "y", "1")]);
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions);
+    assert!(!served(&head, &leak), "nothing holds it: it applies");
+    assert!(!head.objects.exists(&leak).expect("exists"), "and is deleted");
+
+    let request = RefUpdateRequest { old_head: None, new_head: after.clone(), tombstone: None };
+    head.ref_update(&Principal::Static, "copy", &request).expect("the applied content's absence is tolerated");
+    assert_eq!(user_head(&head, "copy"), Some(after));
+
+    let lost = gate_parcel(&head, &[], vec![gate_file(&head, "z", "lost\n")]);
+    head.objects.delete_canonical(&blob_hash("lost\n")).expect("delete");
+    let request = RefUpdateRequest { old_head: None, new_head: lost, tombstone: None };
+    let err = head.ref_update(&Principal::Static, "lost", &request).expect_err("unapplied content is required");
+    assert_eq!(err.status, Status::Unprocessable, "{}", err.message);
 }

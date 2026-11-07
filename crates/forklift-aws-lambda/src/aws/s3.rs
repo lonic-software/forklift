@@ -448,6 +448,58 @@ impl S3ObjectStore {
     /// Best-effort delete of a staged key. A failure here never fails the caller: a leftover
     /// staged object is unfetchable (it is not at a hash key) and is swept by
     /// [`discard_session`](S3ObjectStore::discard_session) later.
+    /// Delete every version, and every delete marker, of each key under `prefix` that `wanted`
+    /// accepts. Listing versions rather than keys is what makes the delete complete on a bucket
+    /// with versioning enabled or suspended; on an unversioned bucket each key lists as one
+    /// `null` version, and deleting that version deletes the object.
+    async fn delete_every_version(&self, prefix: &str, wanted: impl Fn(&str) -> bool) -> Result<(), String> {
+        let mut markers: Option<(String, Option<String>)> = None;
+
+        loop {
+            let mut request = self.client.list_object_versions().bucket(&self.bucket).prefix(prefix);
+
+            if let Some((key, version)) = markers.take() {
+                request = request.key_marker(key).set_version_id_marker(version);
+            }
+
+            let page = request.send().await.map_err(|err| describe("S3 list_object_versions", err))?;
+
+            let listed = page
+                .versions()
+                .iter()
+                .map(|version| (version.key(), version.version_id()))
+                .chain(page.delete_markers().iter().map(|marker| (marker.key(), marker.version_id())));
+
+            for (key, version) in listed {
+                let (Some(key), Some(version)) = (key, version) else {
+                    continue;
+                };
+
+                if !wanted(key) {
+                    continue;
+                }
+
+                self.client
+                    .delete_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .version_id(version)
+                    .send()
+                    .await
+                    .map_err(|err| describe("S3 delete_object", err))?;
+            }
+
+            if !page.is_truncated().unwrap_or(false) {
+                return Ok(());
+            }
+
+            match page.next_key_marker() {
+                Some(key) => markers = Some((key.to_string(), page.next_version_id_marker().map(str::to_string))),
+                None => return Err("S3 list_object_versions was truncated but named no marker to continue from.".to_string()),
+            }
+        }
+    }
+
     async fn drop_staged(&self, key: &str) {
         let _ = self.client.delete_object().bucket(&self.bucket).key(key).send().await;
     }
@@ -888,6 +940,21 @@ impl ObjectStore for S3ObjectStore {
                 .map(|_| ())
                 .map_err(|err| describe("S3 delete_object", err))
         })
+    }
+
+    fn delete_canonical(&self, hash: &str) -> Result<(), String> {
+        let key = object_key(&self.warehouse, hash);
+
+        self.bridge.block_on(self.delete_every_version(&key, |listed| listed == key))
+    }
+
+    fn delete_staged(&self, hash: &str) -> Result<(), String> {
+        let prefix = format!("staging/{}/", self.warehouse);
+
+        // Every session's copy of it, and nothing else under the prefix.
+        self.bridge.block_on(self.delete_every_version(&prefix, |listed| {
+            parse_staging_key(listed).is_some_and(|staged| staged.warehouse == self.warehouse && staged.hash == hash)
+        }))
     }
 
     fn work_get(&self, name: &str) -> Result<Option<Vec<u8>>, String> {

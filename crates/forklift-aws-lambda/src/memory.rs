@@ -255,6 +255,18 @@ impl ObjectStore for MemoryObjectStore {
         Ok(())
     }
 
+    fn delete_canonical(&self, hash: &str) -> Result<(), String> {
+        self.objects.lock().unwrap().remove(hash);
+
+        Ok(())
+    }
+
+    fn delete_staged(&self, hash: &str) -> Result<(), String> {
+        self.staged.lock().unwrap().retain(|(_, staged), _| staged != hash);
+
+        Ok(())
+    }
+
     fn work_get(&self, name: &str) -> Result<Option<Vec<u8>>, String> {
         Ok(self.work.lock().unwrap().get(name).cloned())
     }

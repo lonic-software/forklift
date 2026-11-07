@@ -25,7 +25,7 @@
 use aws_lambda_events::event::s3::S3Event;
 use forklift_aws_lambda::aws::s3::parse_staging_key;
 use forklift_aws_lambda::aws::{build_clients, DynamoOps, DynamoRefStore, S3Ops};
-use forklift_aws_lambda::head::redaction_applied;
+use forklift_aws_lambda::head::{delete_if_redaction_applied, redaction_applied};
 use forklift_aws_lambda::store::{ObjectStore, PromoteOutcome};
 use forklift_aws_lambda::{config_from_env, AsyncBridge, S3ObjectStore};
 use lambda_runtime::{run, service_fn, Error, LambdaEvent};
@@ -116,22 +116,32 @@ async fn handler(event: LambdaEvent<S3Event>) -> Result<(), Error> {
         // A storage error propagates (the event retries); a semantic outcome is logged and the
         // event is consumed — a corrupt object was discarded, not promoted, and retrying it
         // would only rediscard it. So is redacted content: its redaction item is read before
-        // anything is promoted, and an applied one has its staged copy dropped instead. An item
-        // that cannot be read is a storage error too: never promoted on a guess.
+        // anything is promoted, and an applied one has its staged copy dropped instead; it is
+        // read again after the promotion, and an applied one has the copy just written deleted.
+        // An item that cannot be read is a storage error too: never promoted on a guess.
         let outcome = tokio::task::spawn_blocking(move || -> Result<Option<PromoteOutcome>, String> {
             if redaction_applied(&refs, &hash)? {
                 objects.drop_staged_copy(&session, &hash)?;
                 return Ok(None);
             }
 
-            objects.verify_and_promote(&session, &hash).map(Some)
+            let outcome = objects.verify_and_promote(&session, &hash)?;
+
+            // Read again after the write, whatever it found: a redaction that applied after the
+            // check above found no object to delete, and an event retried after a failed delete
+            // finds the copy already promoted.
+            if delete_if_redaction_applied(&objects, &refs, &hash)? {
+                return Ok(None);
+            }
+
+            Ok(Some(outcome))
         })
         .await
         .map_err(|e| Error::from(format!("The verifier task panicked: {}", e)))?
         .map_err(Error::from)?;
 
         let Some(outcome) = outcome else {
-            eprintln!("verifier: dropped staged object {} unpromoted: its content is redacted", key);
+            eprintln!("verifier: kept no copy of staged object {}: its content is redacted", key);
             continue;
         };
 

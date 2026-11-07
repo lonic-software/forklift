@@ -526,6 +526,20 @@ pub trait ObjectStore {
         Ok(())
     }
 
+    /// Delete every version of `hash`'s canonical object: what an applied redaction of a file's
+    /// content owes the store. An absent object is no error.
+    ///
+    /// The default keeps nothing it could delete and fails, loudly.
+    fn delete_canonical(&self, _hash: &str) -> Result<(), String> {
+        Err("This object store cannot delete an object.".to_string())
+    }
+
+    /// Delete every version of every staged copy of `hash`, in every lift session. An absent
+    /// copy is no error.
+    fn delete_staged(&self, _hash: &str) -> Result<(), String> {
+        Err("This object store cannot delete an object.".to_string())
+    }
+
     /// The bytes of the redaction work object `name`, or `None` when there is none. Work
     /// objects hold a redaction scan's progress between invocations, under the warehouse's own
     /// `redaction-work/` prefix; they are never objects and never served.

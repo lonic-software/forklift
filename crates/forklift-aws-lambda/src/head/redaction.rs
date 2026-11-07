@@ -123,6 +123,16 @@ struct Record {
     /// pallets are listed again instead. Written only once past the first scan.
     #[serde(default, skip_serializing_if = "is_first_scan")]
     scan: u64,
+
+    /// Whether the copies of the content the store keeps have been deleted since it applied: every
+    /// staged copy, and a blob's canonical object. Written only once true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    swept: bool,
+
+    /// Until when, in seconds since the Unix epoch, one request holds the deletion: no other
+    /// starts it before then. Written only while held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lease_until: Option<u64>,
 }
 
 /// Whether `scan` is the first scan, which a record leaves unwritten.
@@ -283,6 +293,54 @@ fn decode_work<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Option<T> {
     }
 }
 
+/// How long a deletion's lease runs past the request's deadline, in seconds.
+const SWEEP_LEASE_MARGIN: u64 = 60;
+
+/// How long a deletion's lease runs from its start when the request has no deadline, in seconds:
+/// a Lambda invocation's longest.
+const SWEEP_LEASE_WITHOUT_DEADLINE: u64 = 900;
+
+/// `time` in whole seconds since the Unix epoch.
+fn epoch_seconds(time: SystemTime) -> u64 {
+    time.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |since| since.as_secs())
+}
+
+/// The type `objects` holds `hash` as, from its header; `None` when it holds no object.
+///
+/// # Returns
+/// * `Err(String)` - The object could not be read, or its header could not be parsed.
+fn stored_type<O: ObjectStore + ?Sized>(objects: &O, hash: &str) -> Result<Option<ObjectType>, String> {
+    let Some(bytes) = objects.get(hash)? else {
+        return Ok(None);
+    };
+
+    object_utils::peek_object_header(&bytes)
+        .map(|(object_type, _)| Some(object_type))
+        .map_err(|error| format!("Object {} cannot be read: {:?}", hash, error))
+}
+
+/// After `hash` was promoted to its canonical object, delete that object again if its redaction
+/// applied meanwhile: the staging verifier's and a lift commit's check after the write. The
+/// promotion checked the item before it wrote, but a redaction that applied between the check
+/// and the write saw no canonical object to delete. A recipe is kept, as the judge keeps it.
+///
+/// # Returns
+/// * `Ok(bool)`    - Whether it was deleted.
+/// * `Err(String)` - The item or the object could not be read, or the delete failed.
+pub fn delete_if_applied<O: ObjectStore + ?Sized, R: RefStore + ?Sized>(objects: &O, refs: &R, hash: &str) -> Result<bool, String> {
+    if !is_applied(refs, hash)? {
+        return Ok(false);
+    }
+
+    if stored_type(objects, hash)? == Some(ObjectType::Recipe) {
+        return Ok(false);
+    }
+
+    objects.delete_canonical(hash)?;
+
+    Ok(true)
+}
+
 /// Whether the redaction of `hash` has applied, by its item in `refs`: what the staging verifier
 /// and a lift commit read before they promote a staged copy.
 ///
@@ -306,6 +364,8 @@ pub fn record_state(scan_complete: bool, holders: &[(String, String)], applied_a
         applied_at,
         never_applies: false,
         scan: 0,
+        swept: false,
+        lease_until: None,
     };
 
     serde_json::to_string(&record).expect("a record encodes")
@@ -359,6 +419,22 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         cache.lock().map_err(|e| HeadError::internal(e.to_string()))?.insert(head, Arc::clone(&recorded));
 
         Ok(recorded)
+    }
+
+    /// Every hash `@redactions` records whose item says it applied: the file content a push gate
+    /// tolerates the absence of. Read only when a closure walk has already found something
+    /// missing, so its one item read per recorded redaction is never paid by a complete push.
+    pub(super) fn applied_set(&self) -> Result<applied_redactions::AppliedSet, String> {
+        let recorded = self.recorded().map_err(|error| error.to_string())?;
+        let mut applied = Vec::new();
+
+        for hash in recorded.hashes() {
+            if is_applied(&self.refs, &hash)? {
+                applied.push(hash);
+            }
+        }
+
+        Ok(applied_redactions::AppliedSet::of(applied))
     }
 
     /// Judge each of `hashes` that `@redactions` records, within one request's budget, and take
@@ -417,6 +493,27 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         for hash in hashes.iter().filter(|hash| recorded.contains(hash)) {
             if is_applied(&self.refs, hash).map_err(HeadError::internal)? {
                 self.objects.drop_staged_copy(session, hash).map_err(HeadError::internal)?;
+                self.evict(hash)?;
+                refused.get_or_insert(hash);
+            }
+        }
+
+        match refused {
+            Some(hash) => Err(HeadError::gone(applied_redactions::served_refusal(hash))),
+            None => Ok(()),
+        }
+    }
+
+    /// After a lift commit promoted `promoted`, delete each one whose redaction applied while it
+    /// was promoted, and refuse the commit as [`refuse_applied_staged`](Self::refuse_applied_staged)
+    /// does. `@redactions` is read after the promotions landed, so a redaction it does not record
+    /// yet applies only after them, and its own deletion finds their objects.
+    pub(super) fn refuse_applied_promoted(&self, promoted: &[String]) -> HeadResult<()> {
+        let recorded = self.recorded()?;
+        let mut refused = None;
+
+        for hash in promoted.iter().filter(|hash| recorded.contains(hash)) {
+            if delete_if_applied(&self.objects, &self.refs, hash).map_err(HeadError::internal)? {
                 self.evict(hash)?;
                 refused.get_or_insert(hash);
             }
@@ -504,6 +601,14 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             };
 
             if record.applied_at.is_some() {
+                // The deletion is owed by whichever request reads it applied first and has the
+                // time; a failed one leaves it owed, and never changes the verdict.
+                if !record.swept && budget.timely() {
+                    if let Err(error) = self.sweep(hash, stored.as_deref().unwrap_or_default(), &record, budget) {
+                        eprintln!("forklift-aws-lambda: the copies of applied redaction {} were not deleted: {}", hash, error);
+                    }
+                }
+
                 return Ok(Verdict::Applied);
             }
 
@@ -607,7 +712,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
         self.put_remaining(hash, 0, &pallets)?;
 
-        let record = Record { version: RECORD_VERSION, scan_complete: false, holders: Vec::new(), applied_at: None, never_applies: false, scan: 0 };
+        let record = Record { version: RECORD_VERSION, scan_complete: false, holders: Vec::new(), applied_at: None, never_applies: false, scan: 0, swept: false, lease_until: None };
         // Lost to another request's start: the judge reads its item instead.
         self.write_record(hash, &record, None, budget).map(|_| ())
     }
@@ -854,14 +959,49 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// store holds it as a blob or a recipe, or not at all. A blob is below the chunking
     /// threshold, and a recipe a list of chunks, so reading the whole object stays small.
     fn never_applies(&self, hash: &str) -> HeadResult<Option<Verdict>> {
-        let Some(bytes) = self.objects.get(hash).map_err(HeadError::internal)? else {
-            return Ok(None);
-        };
+        match stored_type(&self.objects, hash) {
+            Ok(None | Some(ObjectType::Blob | ObjectType::Recipe)) => Ok(None),
+            Ok(Some(_)) => Ok(Some(Verdict::Pending)),
+            Err(error) => Ok(Some(Verdict::Undecided(error))),
+        }
+    }
 
-        match object_utils::peek_object_header(&bytes) {
-            Ok((ObjectType::Blob | ObjectType::Recipe, _)) => Ok(None),
-            Ok(_) => Ok(Some(Verdict::Pending)),
-            Err(error) => Ok(Some(Verdict::Undecided(format!("Object {} cannot be read: {:?}", hash, error)))),
+    /// Delete the copies the store keeps of `hash`, applied as `record` (stored as `stored`):
+    /// every staged copy, and a blob's canonical object. A recipe's object stays, with the chunks
+    /// it names, until chunks are deleted too. Run under a lease the item holds, so two requests
+    /// reading the redaction applied at once delete once; the lease outlasts this request, so one
+    /// that dies holding it leaves the deletion to the first request after it ends.
+    fn sweep(&self, hash: &str, stored: &str, record: &Record, budget: &mut Budget) -> HeadResult<()> {
+        let now = epoch_seconds(SystemTime::now());
+
+        if record.lease_until.is_some_and(|until| until > now) {
+            return Ok(());
+        }
+
+        let until = budget.deadline.map_or(now + SWEEP_LEASE_WITHOUT_DEADLINE, epoch_seconds) + SWEEP_LEASE_MARGIN;
+        let leased = Record { lease_until: Some(until), ..record.clone() };
+
+        if !self.write_record(hash, &leased, Some(stored), budget)? {
+            return Ok(());
+        }
+        let stored = encode_record(&leased)?;
+
+        let deleted = self.delete_copies(hash);
+        let next = Record { swept: deleted.is_ok(), lease_until: None, ..leased };
+        // Lost, the lease simply runs out and the next request after it deletes again.
+        self.write_record(hash, &next, Some(&stored), budget)?;
+
+        deleted
+    }
+
+    /// Delete every staged copy of `hash`, and its canonical object unless the store holds it as
+    /// a recipe. An object that cannot be read is kept: the deletion stays owed.
+    fn delete_copies(&self, hash: &str) -> HeadResult<()> {
+        self.objects.delete_staged(hash).map_err(HeadError::internal)?;
+
+        match stored_type(&self.objects, hash).map_err(HeadError::internal)? {
+            Some(ObjectType::Recipe) => Ok(()),
+            _ => self.objects.delete_canonical(hash).map_err(HeadError::internal),
         }
     }
 

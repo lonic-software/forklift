@@ -67,7 +67,7 @@ use crate::store::{
 
 mod redaction;
 
-pub use redaction::{is_applied as redaction_applied, record_state as redaction_record};
+pub use redaction::{delete_if_applied as delete_if_redaction_applied, is_applied as redaction_applied, record_state as redaction_record};
 
 /// The `genesis` of a stored anchor's bytes.
 ///
@@ -1043,6 +1043,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 &chunks_missing,
                 &load_recipe_chunks,
                 &load_base_tree,
+                &|| self.applied_set(),
             )
             .map_err(HeadError::unprocessable)?;
 
@@ -1634,12 +1635,15 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         let named: Vec<String> = control_plane.iter().chain(blobs.iter()).cloned().collect();
         self.refuse_applied_staged(session, &named)?;
 
+        let mut promoted = Vec::new();
+
         for hash in control_plane {
             let outcome =
                 self.objects.verify_and_promote(session, hash).map_err(HeadError::internal)?;
 
             match outcome {
-                PromoteOutcome::Promoted | PromoteOutcome::AlreadyPresent => {}
+                PromoteOutcome::Promoted => promoted.push(hash.clone()),
+                PromoteOutcome::AlreadyPresent => {}
                 PromoteOutcome::Missing => {
                     // Not "never arrived": an earlier attempt of this commit whose answer was
                     // lost may have discarded it as corrupt or too large.
@@ -1658,6 +1662,10 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 }
             }
         }
+
+        // A redaction that applied between the check above and a promotion's write found no
+        // object to delete: the copy just written is deleted here instead.
+        self.refuse_applied_promoted(&promoted)?;
 
         self.check_blobs_promoted(session, blobs)?;
 
@@ -1898,6 +1906,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     },
                     // A creation (`known_complete: None`) takes no prune candidates.
                     &|hash| Err(format!("Tree {} was read as a prune base, but nothing bounds this walk.", hash)),
+                    &|| self.applied_set(),
                 )
             };
 
