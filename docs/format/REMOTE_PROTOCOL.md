@@ -170,10 +170,13 @@ the remote's `@redactions` pallet holds as pending.
 object out, as they do one the remote lacks, so the client's loose `GET` for it receives the `410`;
 the bundle never carries it. What is refused is the redacted hash: for a chunked file, the
 recipe. Its chunks are not refused by hash, since other content may share them; a client never
-uploads one only that recipe names. A chunk of a recipe the client does upload is always offered,
-even when its bytes are an applied redaction's content: the remote refuses that `PUT` with `410`,
-so the lift fails rather than landing a file without it. A ref update tolerates the absence of an applied redaction's content
-from the closure it checks, so a client lifting history that names the content does not upload
+uploads one only that recipe names. A redaction names a file's content, never a tree or a chunk:
+an object's hash covers its type, so a chunk never shares a hash with a file's content, and a
+remote holding the named object as a tree, a parcel or a chunk never applies the redaction. A
+chunk of a recipe the client does upload is always offered; were its hash one a redaction applied
+while the remote lacked it, the remote refuses that `PUT` with `410`, so the lift fails rather than
+landing a file without it. A ref update tolerates the absence of an applied redaction's content
+where the closure it checks names it as a file's content, never as a tree or a chunk, so a client lifting history that names the content does not upload
 it: it offers no file entry naming content the handshake reports applied, and does not descend
 such a recipe. A client that must fetch such content
 (a clone or `lower` of history that names it) is refused with `content_redacted`.

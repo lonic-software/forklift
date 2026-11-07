@@ -53,7 +53,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::util::pallet_utils::PalletNamespace;
 use crate::util::scope_utils::{PathScope, ScopeClass};
-use crate::util::sealed_utils::{self, Tolerated};
+use crate::util::sealed_utils::{self, At, Tolerated};
 use crate::util::{
     bay_utils, file_utils, gc_utils, object_utils, office_utils, pack_utils, pallet_utils, recovery_utils,
 };
@@ -632,7 +632,7 @@ fn collect_retained(
         }
 
         retained.insert(tree_hash.clone());
-        if held_by_hash(tolerated, &tree_hash)? {
+        if held_by_hash(tolerated, &tree_hash, At::Tree)? {
             continue;
         }
         let tree = object_utils::load_tree(&tree_hash)?;
@@ -648,7 +648,7 @@ fn collect_retained(
                 // retain every chunk too: a chunk this in-scope file shares with an out-of-scope
                 // pruned file must never be freed (the multi-bay/shared-content guard, one level
                 // deeper than the shared-blob guard the subtraction already provides).
-                if file.item_type.is_chunked() && !held_by_hash(tolerated, &file.hash)? {
+                if file.item_type.is_chunked() && !held_by_hash(tolerated, &file.hash, At::File)? {
                     retain_recipe_chunks(&file.hash, &mut retained)?;
                 }
             }
@@ -677,7 +677,7 @@ fn collect_retained(
         }
 
         retained.insert(tree_hash.clone());
-        if held_by_hash(tolerated, &tree_hash)? {
+        if held_by_hash(tolerated, &tree_hash, At::Tree)? {
             continue;
         }
         let tree = object_utils::load_tree(&tree_hash)?;
@@ -687,7 +687,7 @@ fn collect_retained(
 
             // Everything under an in-scope (or meta) subtree is retained in full, chunks included
             // — the same recipe descent the spine walk above does, for the same reason.
-            if file.item_type.is_chunked() && !held_by_hash(tolerated, &file.hash)? {
+            if file.item_type.is_chunked() && !held_by_hash(tolerated, &file.hash, At::File)? {
                 retain_recipe_chunks(&file.hash, &mut retained)?;
             }
         }
@@ -939,7 +939,7 @@ fn resolve_unsealed_subtree(root_tree_hash: &str, key: &str, tolerated: &Tolerat
     // The empty key names the root itself, as it does there.
     let components = if key.is_empty() { None } else { Some(key.split('/')) };
     for component in components.into_iter().flatten() {
-        if held_by_hash(tolerated, &current)? {
+        if held_by_hash(tolerated, &current, At::Tree)? {
             return Ok(None);
         }
 
@@ -951,18 +951,18 @@ fn resolve_unsealed_subtree(root_tree_hash: &str, key: &str, tolerated: &Tolerat
         }
     }
 
-    if held_by_hash(tolerated, &current)? {
+    if held_by_hash(tolerated, &current, At::Tree)? {
         return Ok(None);
     }
     Ok(Some(current))
 }
 
-/// Whether `hash` is held by hash alone: recorded in `tolerated`'s sealed record, or named by a
-/// redaction this warehouse applied, and absent. A held object that is present seals nothing. Presence is the
+/// Whether `hash`, met `at`, is held by hash alone: recorded in `tolerated`'s sealed record, or
+/// (for a file's content) named by a redaction this warehouse applied, and absent. A held object that is present seals nothing. Presence is the
 /// fail-closed sweep form, so an object only an unreadable pack index might hold fails rather than
 /// reading as held.
-fn held_by_hash(tolerated: &Tolerated, hash: &str) -> Result<bool, String> {
-    Ok(tolerated.held(hash).is_some() && !file_utils::is_present_for_sweep(hash)?)
+fn held_by_hash(tolerated: &Tolerated, hash: &str, at: At) -> Result<bool, String> {
+    Ok(tolerated.held(hash, at).is_some() && !file_utils::is_present_for_sweep(hash)?)
 }
 
 /// Whether a loose object file is present in the store (independent of any packed copy).

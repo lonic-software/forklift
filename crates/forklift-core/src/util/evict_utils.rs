@@ -43,7 +43,7 @@
 use std::collections::HashSet;
 use crate::util::lock_utils::{ServeLock, StoreAccessExclusive, StoreLock};
 use crate::util::progress_utils::Progress;
-use crate::util::sealed_utils::{self, SealOp, Tolerated};
+use crate::util::sealed_utils::{self, At, SealOp, Tolerated};
 use crate::util::{
     bay_utils, cache_miss, cherry_pick_utils, file_utils, gc_utils, merge_utils, object_utils, office_utils,
     pack_utils, pallet_utils, park_utils, prune_utils, recovery_utils,
@@ -368,7 +368,7 @@ fn walk_held(parcels: &[String], sealed: &Tolerated) -> Result<HeldClosure, Stri
             continue;
         }
 
-        if !held_present(&hash, &named_by, sealed)? {
+        if !held_present(&hash, At::Tree, &named_by, sealed)? {
             continue;
         }
 
@@ -377,7 +377,7 @@ fn walk_held(parcels: &[String], sealed: &Tolerated) -> Result<HeldClosure, Stri
         stack.push(Step::Finalize(hash.clone()));
 
         for (_, file) in tree.get_files() {
-            if !closure.seen.insert(file.hash.clone()) || !held_present(&file.hash, &hash, sealed)? {
+            if !closure.seen.insert(file.hash.clone()) || !held_present(&file.hash, At::File, &hash, sealed)? {
                 continue;
             }
 
@@ -385,7 +385,7 @@ fn walk_held(parcels: &[String], sealed: &Tolerated) -> Result<HeldClosure, Stri
             // while it is still present, so a killed run that freed some leaves the rest listed.
             if file.item_type.is_chunked() {
                 for chunk in object_utils::recipe_chunk_hashes(&file.hash)? {
-                    if closure.seen.insert(chunk.clone()) && held_present(&chunk, &file.hash, sealed)? {
+                    if closure.seen.insert(chunk.clone()) && held_present(&chunk, At::Chunk, &file.hash, sealed)? {
                         closure.present.push(chunk);
                     }
                 }
@@ -402,15 +402,16 @@ fn walk_held(parcels: &[String], sealed: &Tolerated) -> Result<HeldClosure, Stri
     Ok(closure)
 }
 
-/// Whether `hash`, which `named_by` references in the origin's closure, is present: `false` when
-/// it is absent and held (recorded, or named by a redaction this warehouse applied, whose bytes
-/// were taken away on purpose), an error when it is absent and not.
-fn held_present(hash: &str, named_by: &str, sealed: &Tolerated) -> Result<bool, String> {
+/// Whether `hash`, met `at`, which `named_by` references in the origin's closure, is present:
+/// `false` when it is absent and held (recorded, or for a file's content, named by a redaction
+/// this warehouse applied, whose bytes were taken away on purpose), an error when it is absent
+/// and not.
+fn held_present(hash: &str, at: At, named_by: &str, sealed: &Tolerated) -> Result<bool, String> {
     if file_utils::is_present_for_sweep(hash)? {
         return Ok(true);
     }
 
-    if sealed.held(hash).is_some() {
+    if sealed.held(hash, at).is_some() {
         return Ok(false);
     }
 

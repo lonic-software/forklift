@@ -246,7 +246,7 @@ use crate::util::{
     office_utils, pack_utils, pallet_utils, record_utils, remote_utils, scope_utils, sealed_utils, sign_utils, tag_utils,
     signature_table, taint_utils, tombstone_utils,
 };
-use crate::util::sealed_utils::Tolerated;
+use crate::util::sealed_utils::{At, Tolerated};
 use crate::util::progress_utils::Progress;
 use crate::util::scope_utils::{PathScope, ScopeClass};
 
@@ -2564,7 +2564,7 @@ fn walk_tree(
         match descent {
             Descent::Present => {}
             Descent::Absent => {
-                if !held_by_hash(sealed, corrupt, &tree_hash) {
+                if !held_by_hash(sealed, corrupt, &tree_hash, At::Tree) {
                     if let Some(s) = reborrow_sink(&mut sink) { s(&tree_hash); }
                 }
                 continue;
@@ -2734,7 +2734,7 @@ fn check_leaf(
         match descent {
             Descent::Present => {}
             Descent::Absent => {
-                if !held_by_hash(sealed, corrupt, hash) {
+                if !held_by_hash(sealed, corrupt, hash, At::File) {
                     if let Some(s) = reborrow_sink(&mut sink) { s(hash); }
                 }
                 return Ok(());
@@ -2753,7 +2753,7 @@ fn check_leaf(
             // Enumerating-mode only (gated on the sink, not merely no-opped): the targeted walk
             // never needs a chunk's raw presence, only whether it is a target (handled above).
             if let Some(s) = reborrow_sink(&mut sink) {
-                if !held_by_hash(sealed, corrupt, &chunk) && !file_utils::raw_object_present(&chunk)? {
+                if !held_by_hash(sealed, corrupt, &chunk, At::Chunk) && !file_utils::raw_object_present(&chunk)? {
                     s(&chunk);
                 }
             }
@@ -2761,7 +2761,7 @@ fn check_leaf(
     } else if let Some(s) = reborrow_sink(&mut sink) {
         // Enumerating-mode only, same reasoning: a plain leaf's bytes are never loaded by this
         // walk either way.
-        if !held_by_hash(sealed, corrupt, hash) && !file_utils::raw_object_present(hash)? {
+        if !held_by_hash(sealed, corrupt, hash, At::File) && !file_utils::raw_object_present(hash)? {
             s(hash);
         }
     }
@@ -2769,12 +2769,12 @@ fn check_leaf(
     Ok(())
 }
 
-/// Whether an object is held: recorded in `sealed`'s record or named by a redaction it applied, and
-/// not a corrupt boundary. This checks no presence: call it only for an object the walk found
+/// Whether an object, met `at`, is held: recorded in `sealed`'s record or (for a file's content)
+/// named by a redaction it applied, and not a corrupt boundary. This checks no presence: call it only for an object the walk found
 /// absent, or for a terminal leaf or chunk, which has nothing beneath it, so a present one is never
 /// reported either way. A corrupt object is present but wrong, so it stays a loss.
-fn held_by_hash(sealed: Option<&Tolerated>, corrupt: &BTreeSet<String>, hash: &str) -> bool {
-    !corrupt.contains(hash) && sealed.is_some_and(|sealed| sealed.held(hash).is_some())
+fn held_by_hash(sealed: Option<&Tolerated>, corrupt: &BTreeSet<String>, hash: &str, at: At) -> bool {
+    !corrupt.contains(hash) && sealed.is_some_and(|sealed| sealed.held(hash, at).is_some())
 }
 
 /// Whether, and how cleanly, [`attempt_heal_driven_refetch`] actually consulted a configured

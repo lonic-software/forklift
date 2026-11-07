@@ -237,9 +237,10 @@ fn refill_with(hook: Option<&FetchHook>, absent: &[String]) -> Result<bool, Stri
     ))?;
 
     // An object a redaction this warehouse applied names is never fetched, even when the record
-    // holds it too: its bytes were taken away on purpose.
+    // holds it too: its bytes were taken away on purpose. Met as a file's content, since what a
+    // miss is met as is not known here, so no applied hash is fetched at all.
     let wanted: Vec<String> = absent.iter()
-        .filter(|hash| tolerated.held(hash) == Some(sealed_utils::Held::Sealed))
+        .filter(|hash| tolerated.held(hash, sealed_utils::At::File) == Some(sealed_utils::Held::Sealed))
         .cloned()
         .collect();
 

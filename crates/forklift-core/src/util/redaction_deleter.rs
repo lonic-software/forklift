@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::globals::{forklift_root, FOLDER_NAME_INVENTORY_ROOT};
 use crate::enums::object::parsed_object::ParsedObject;
+use crate::enums::object_type::ObjectType;
 use crate::parser::object::loose_object_parser;
 use crate::util::lock_utils::{ServeLock, StoreAccessExclusive, StoreLock};
 use crate::util::progress_utils::Progress;
@@ -193,12 +194,27 @@ pub(crate) fn unheld(applied: &HashSet<String>) -> Result<HashSet<String>, Strin
     Ok(targets.into_iter().filter(|hash| !held.contains_key(hash)).collect())
 }
 
-/// Of `hashes`, those the store may hold: every one but those it plainly lacks.
+/// Of `hashes`, those the store may hold as a file's content: every one but those it plainly lacks,
+/// and those it holds as a tree, a parcel or a chunk. A redaction names a file's content, so such an
+/// object is no copy of it: it was stored under the hash after the redaction applied (only a cell
+/// naming that hash by itself allows it), and other content may share it.
 fn maybe_present(hashes: &HashSet<String>) -> HashSet<String> {
     hashes.iter()
-        .filter(|hash| !matches!(file_utils::does_object_exist(hash), Ok(false)))
+        .filter(|hash| match file_utils::does_object_exist(hash) {
+            Ok(false) => false,
+            Ok(true) => !holds_other_than_file(hash),
+            Err(_) => true,
+        })
         .cloned()
         .collect()
+}
+
+/// Whether the present object `hash` reads as something other than a blob or a recipe. One that
+/// cannot be read is not: whether it is a copy cannot be told.
+fn holds_other_than_file(hash: &str) -> bool {
+    file_utils::retrieve_object_by_hash_shared(hash).ok()
+        .and_then(|bytes| object_utils::peek_object_header(&bytes).ok())
+        .is_some_and(|(object_type, _)| !matches!(object_type, ObjectType::Blob | ObjectType::Recipe))
 }
 
 /// The copies of applied redactions' objects the store may still hold, as the census finds them
@@ -620,6 +636,24 @@ mod tests {
         let again = delete().unwrap();
         assert!(again.objects.is_empty() && again.chunks == 0, "{:?}", again);
         assert_eq!(again.held, deletion.held);
+    }
+
+    /// An applied hash this store holds as a chunk is no file's content, so the deleter leaves it,
+    /// even when nothing names it: the walks that tolerate an applied absence hold it only where
+    /// it stands as a file.
+    ///
+    /// Revert: count every present applied object as a target → the chunk is deleted.
+    #[test]
+    fn the_deleter_leaves_an_applied_hash_held_as_a_chunk() {
+        let _scratch = Scratch::new("chunk-applied");
+        let chunk = store_chunk(b"bytes");
+        set_main(&store_parcel(&store_tree(&[]), Vec::new()));
+        applied_redactions::apply_for_test(&[&chunk]);
+
+        let deletion = delete().unwrap();
+
+        assert!(deletion.objects.is_empty(), "{:?}", deletion.objects);
+        assert!(present(&chunk));
     }
 
     /// The second pass deletes a deleted recipe's chunk only it named, and keeps the one a live
