@@ -166,9 +166,8 @@ impl ServerWalk<'_> {
         if sealed_utils::is_present(hash)? {
             self.descend(&object_utils::load_tree(hash)?, missing)
         } else {
-            if !self.applied.contains(hash) {
-                self.trees.push(hash.to_string());
-            }
+            // No redaction names a tree: only file content is redacted.
+            self.trees.push(hash.to_string());
             Ok(())
         }
     }
