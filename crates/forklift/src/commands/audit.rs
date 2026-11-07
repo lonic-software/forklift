@@ -165,7 +165,8 @@ pub(crate) struct AuditScope {
     signatures: &'static str,
 
     /// In-scope content: every tree was re-hashed on read and every blob confirmed present, except
-    /// the absent objects counted in `held_by_hash`.
+    /// the absent objects counted in `held_by_hash` and the absent content a redaction applied here
+    /// names.
     in_scope_content: &'static str,
 
     /// How many absent objects the warehouse's sealed record holds by hash alone: each is pinned to
