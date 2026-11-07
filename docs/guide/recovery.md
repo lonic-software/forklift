@@ -195,9 +195,9 @@ write.
 
 A `forklift-server` remote applies a redaction once none of its pallet heads names the content,
 and from then on refuses that content with this code; the message names the object. A `lift` of
-history that names the content leaves it out, since the remote no longer takes it; an older build
-that still sends it is refused, and `forklift lower` brings down the redaction that tells it not
-to. A `clone` or `lower` that must fetch history naming the content is refused too, and this build
+history that names the content leaves it out, since the remote no longer takes it. When the remote
+applied the redaction while the lift was running, the upload is refused: run `forklift lift` again.
+A `clone` or `lower` that must fetch history naming the content is refused too, and this build
 has no way around that yet: keep working in a warehouse that already holds that history.
 
 Once this warehouse has applied a redaction, it never takes back history naming that content, not
