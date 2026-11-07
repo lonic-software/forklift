@@ -35,8 +35,8 @@
 //!
 //! A redaction stays pending, and is served, while a cell of it cannot be read: what it says of a
 //! recipe's chunk list cannot be scanned for. A hash the store holds as a tree, a parcel or a
-//! chunk is no file's content, so its redaction never applies: it stays undecided, as core's
-//! scan leaves it.
+//! chunk is no file's content, so its redaction never applies, as core's scan never applies it:
+//! it stays pending, and is served.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -62,8 +62,9 @@ const RECORD_VERSION: u64 = 1;
 /// The version of the work objects this build writes and reads.
 const WORK_VERSION: u64 = 1;
 
-/// How many times one judge reads an item again after a write that lost a race to another, or
-/// whose fate is unknown, before it answers the redaction undecided.
+/// How many of one judge's item writes may lose a race to another request, or end with their fate
+/// unknown, before it answers the redaction undecided. A write that lands is the judge's own
+/// progress, and is never counted.
 const WRITE_ATTEMPTS: usize = 8;
 
 /// The `Retry-After` an undecided redaction's `503` carries, in seconds.
@@ -142,7 +143,8 @@ pub enum Verdict {
     /// Applied: refused on every route.
     Applied,
 
-    /// Pending: something still holds it, or a cell of it cannot be read. Served.
+    /// Pending: something still holds it, a cell of it cannot be read, or it names no file's
+    /// content. Served.
     Pending,
 
     /// Not decided within this request, for this reason. Not served.
@@ -154,14 +156,22 @@ pub enum Verdict {
 struct Budget {
     steps: Option<usize>,
     deadline: Option<SystemTime>,
+
+    /// How many item writes this request has lost to another, or left with their fate unknown.
+    lost: usize,
 }
 
 impl Budget {
+    /// Whether the invocation's time, less `REDACTION_ANSWER_RESERVE`, is not yet spent.
+    fn timely(&self) -> bool {
+        self.deadline.is_none_or(|deadline| {
+            deadline.duration_since(SystemTime::now()).unwrap_or_default() > super::REDACTION_ANSWER_RESERVE
+        })
+    }
+
     /// Whether another step is affordable; spends it when it is.
     fn spend(&mut self) -> bool {
-        let timely = self.deadline.is_none_or(|deadline| {
-            deadline.duration_since(SystemTime::now()).unwrap_or_default() > super::REDACTION_ANSWER_RESERVE
-        });
+        let timely = self.timely();
 
         match &mut self.steps {
             _ if !timely => false,
@@ -188,6 +198,10 @@ enum Advance {
 enum Holding {
     /// A holder still holds the redaction.
     Held,
+
+    /// This meta holder still holds it, at `head`, which descends from the head seen: record
+    /// `head` as seen, so the next judge walks only the parents added after it.
+    Advanced { holder: Seen, head: String },
 
     /// Nothing holds it.
     Free,
@@ -283,7 +297,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
     /// A fresh budget for one request.
     fn scan_budget(&self) -> Budget {
-        Budget { steps: self.scan_step_limit, deadline: self.deadline }
+        Budget { steps: self.scan_step_limit, deadline: self.deadline, lost: 0 }
     }
 
     /// What `@redactions` records at its live head; nothing while it is unborn.
@@ -444,7 +458,16 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     fn judge(&self, redaction: &Redaction, budget: &mut Budget, listing: &mut Option<RefListing>) -> HeadResult<Verdict> {
         let hash = &redaction.hash;
 
-        for _ in 0..WRITE_ATTEMPTS {
+        let lost = budget.lost;
+
+        while budget.lost - lost < WRITE_ATTEMPTS {
+            if !budget.timely() {
+                return Ok(Verdict::Undecided(format!(
+                    "The redaction of {} could not be judged within this request.",
+                    hash
+                )));
+            }
+
             let stored = self.refs.get_redaction(hash).map_err(HeadError::internal)?;
             let record = match &stored {
                 Some(bytes) => Some(decode_record(hash, bytes).map_err(HeadError::internal)?),
@@ -452,7 +475,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             };
 
             let Some(record) = record else {
-                self.start_scan(hash)?;
+                self.start_scan(hash, budget)?;
                 continue;
             };
 
@@ -476,6 +499,20 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
             match self.holding(&record, pallets, budget)? {
                 Holding::Held => return Ok(Verdict::Pending),
+                Holding::Advanced { holder, head } => {
+                    let advanced = Seen { pallet: holder.pallet.clone(), head };
+                    let next = Record {
+                        holders: record.holders.iter()
+                            .map(|seen| if *seen == holder { advanced.clone() } else { seen.clone() })
+                            .collect(),
+                        ..record
+                    };
+                    // Only a saving for later judges: one lost to another request changes nothing
+                    // about this verdict.
+                    self.write_record(hash, &next, Some(&stored), budget)?;
+
+                    return Ok(Verdict::Pending);
+                }
                 Holding::Stopped(why) => return Ok(Verdict::Undecided(why)),
                 Holding::Rescan { holder, head } => {
                     let again = Seen { pallet: holder.pallet.clone(), head };
@@ -486,18 +523,18 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                         holders: record.holders.iter().filter(|seen| **seen != holder).cloned().collect(),
                         ..record
                     };
-                    self.write_record(hash, &next, Some(&stored))?;
+                    self.write_record(hash, &next, Some(&stored), budget)?;
                 }
                 Holding::Free => {
-                    if let Some(why) = self.not_file_content(hash)? {
-                        return Ok(Verdict::Undecided(why));
+                    if let Some(verdict) = self.never_applies(hash)? {
+                        return Ok(verdict);
                     }
 
                     let applied_at = SystemTime::now()
                         .duration_since(SystemTime::UNIX_EPOCH)
                         .map_or(0, |since| since.as_secs());
                     let next = Record { applied_at: Some(applied_at), ..record };
-                    self.write_record(hash, &next, Some(&stored))?;
+                    self.write_record(hash, &next, Some(&stored), budget)?;
                 }
             }
         }
@@ -511,7 +548,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// Start the scan of `hash`: list every pallet item, save the list as the pallets to walk, and
     /// create the item. The caller has read a `@redactions` head recording it, so every head the
     /// listing shows was written after the redaction could refuse it, or is judged by the walk.
-    fn start_scan(&self, hash: &str) -> HeadResult<()> {
+    fn start_scan(&self, hash: &str, budget: &mut Budget) -> HeadResult<()> {
         let listing = self.refs.list_refs().map_err(HeadError::internal)?;
         let pallets: Vec<Seen> = listing.live.iter().chain(listing.tombstones.iter())
             .map(|(pallet, head)| Seen { pallet: pallet.to_wire(), head: head.clone() })
@@ -521,7 +558,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
         let record = Record { version: RECORD_VERSION, scan_complete: false, holders: Vec::new(), applied_at: None };
         // Lost to another request's start: the judge reads its item instead.
-        self.write_record(hash, &record, None).map(|_| ())
+        self.write_record(hash, &record, None, budget).map(|_| ())
     }
 
     /// Walk the scan of `redaction` on from where it stopped, within `budget`.
@@ -549,24 +586,38 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
         let scratch = self.scratch().map_err(HeadError::internal)?;
 
+        // Pallets walked off `remaining` since it was last saved. The list is saved again only
+        // before this call returns: one lost to a crash is walked again, which is extra work only.
+        let mut walked = false;
+
         loop {
             let Some(seen) = remaining.pallets.first().cloned() else {
                 let next = Record { scan_complete: true, ..record.clone() };
 
-                if self.write_record(hash, &next, Some(stored))? {
+                if self.write_record(hash, &next, Some(stored), budget)? {
                     self.objects.work_delete(&remaining_name(hash)).map_err(HeadError::internal)?;
                 }
 
                 return Ok(Advance::Moved);
             };
 
-            let names = match self.walk_pallet(&scratch, redaction, &seen, budget)? {
+            let (walk, resumed) = self.walk_pallet(&scratch, redaction, &seen, budget)?;
+
+            let names = match walk {
                 Ok(Some(names)) => names,
-                Ok(None) => return Ok(Advance::Stopped(format!(
-                    "The scan of the pallets that may hold the redaction of {} has not finished yet.",
-                    hash
-                ))),
-                Err(why) => return Ok(Advance::Stopped(why)),
+                stopped => {
+                    if walked {
+                        self.put_remaining(hash, &remaining.pallets)?;
+                    }
+
+                    return Ok(Advance::Stopped(match stopped {
+                        Err(why) => why,
+                        _ => format!(
+                            "The scan of the pallets that may hold the redaction of {} has not finished yet.",
+                            hash
+                        ),
+                    }));
+                }
             };
 
             if names {
@@ -577,16 +628,25 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
                 let next = Record { holders, ..record.clone() };
 
-                if !self.write_record(hash, &next, Some(stored))? {
+                if !self.write_record(hash, &next, Some(stored), budget)? {
+                    if walked {
+                        self.put_remaining(hash, &remaining.pallets)?;
+                    }
+
                     return Ok(Advance::Moved);
                 }
             }
 
             remaining.pallets.retain(|pallet| *pallet != seen);
-            self.put_remaining(hash, &remaining.pallets)?;
-            self.objects.work_delete(&walk_name(hash, &seen)).map_err(HeadError::internal)?;
+            walked = true;
+
+            if resumed {
+                self.objects.work_delete(&walk_name(hash, &seen)).map_err(HeadError::internal)?;
+            }
 
             if names {
+                self.put_remaining(hash, &remaining.pallets)?;
+
                 return Ok(Advance::Moved);
             }
         }
@@ -596,25 +656,28 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// when it stops part way.
     ///
     /// # Returns
-    /// * `Ok(Ok(Some(names)))` - The walk finished: whether the pallet names the content.
-    /// * `Ok(Ok(None))`        - The budget ran out first.
-    /// * `Ok(Err(why))`        - An object the walk needs could not be read.
-    /// * `Err(HeadError)`      - A work object could not be read or written.
+    /// How the walk went, beside whether it resumed a saved walk:
+    /// * `Ok(Some(names))`, the walk finished: whether the pallet names the content.
+    /// * `Ok(None)`, the budget ran out first.
+    /// * `Err(why)`, an object the walk needs could not be read.
+    ///
+    /// `Err(HeadError)` when a work object could not be read or written.
     fn walk_pallet(
         &self,
         scratch: &Scratch,
         redaction: &Redaction,
         seen: &Seen,
         budget: &mut Budget,
-    ) -> HeadResult<Result<Option<bool>, String>> {
+    ) -> HeadResult<(Result<Option<bool>, String>, bool)> {
         let name = walk_name(&redaction.hash, seen);
         let meta = PalletRef::parse(&seen.pallet).map_err(HeadError::internal)?.namespace == PalletNamespace::Meta;
 
-        let mut walk = match self.objects.work_get(&name).map_err(HeadError::internal)? {
-            Some(bytes) => decode_work::<SavedWalk>(&bytes).map(|saved| saved.walk),
-            None => None,
-        }
-        .unwrap_or_else(|| match meta {
+        let saved = self.objects.work_get(&name).map_err(HeadError::internal)?;
+        let resumed = saved.is_some();
+
+        let mut walk = saved
+            .and_then(|bytes| decode_work::<SavedWalk>(&bytes).map(|saved| saved.walk))
+            .unwrap_or_else(|| match meta {
             true => HoldingWalk::of_history(&seen.head),
             false => HoldingWalk::of_tree(&seen.head),
         });
@@ -636,16 +699,18 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         });
 
         match stepped {
-            Ok(Some(names)) => Ok(Ok(Some(names))),
+            Ok(Some(names)) => Ok((Ok(Some(names)), resumed)),
             stopped => {
                 let saved = serde_json::to_vec(&SavedWalk { version: WORK_VERSION, walk })
                     .map_err(|error| HeadError::internal(format!("encoding a redaction walk failed: {}", error)))?;
                 self.objects.work_put(&name, &saved).map_err(HeadError::internal)?;
 
-                Ok(stopped.map(|_| None).map_err(|why| format!(
+                let walk = stopped.map(|_| None).map_err(|why| format!(
                     "Whether pallet {} names the content of redaction {} cannot be told yet: {}",
                     seen.pallet, redaction.hash, why
-                )))
+                ));
+
+                Ok((walk, true))
             }
         }
     }
@@ -672,7 +737,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             }
 
             match self.descends(current, &holder.head, budget)? {
-                Ok(Some(true)) => return Ok(Holding::Held),
+                Ok(Some(true)) => return Ok(Holding::Advanced { holder: holder.clone(), head: current.clone() }),
                 Ok(Some(false)) => return Ok(Holding::Rescan { holder: holder.clone(), head: current.clone() }),
                 Ok(None) => return Ok(Holding::Stopped(format!(
                     "Whether meta pallet {} still holds a redaction has not been checked yet.",
@@ -719,21 +784,20 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         }))
     }
 
-    /// Why the redaction of `hash` can never apply, when the store holds it as no file's content:
-    /// a tree, a parcel or a chunk, which other content may share. `None` when it holds it as a
-    /// blob or a recipe, or not at all.
-    fn not_file_content(&self, hash: &str) -> HeadResult<Option<String>> {
+    /// What keeps the redaction of `hash` from applying though nothing holds it: `Pending` when the
+    /// store holds it as no file's content (a tree, a parcel or a chunk, which other content may
+    /// share), so it never applies; `Undecided` when its header cannot be read. `None` when the
+    /// store holds it as a blob or a recipe, or not at all. A blob is below the chunking
+    /// threshold, and a recipe a list of chunks, so reading the whole object stays small.
+    fn never_applies(&self, hash: &str) -> HeadResult<Option<Verdict>> {
         let Some(bytes) = self.objects.get(hash).map_err(HeadError::internal)? else {
             return Ok(None);
         };
 
         match object_utils::peek_object_header(&bytes) {
             Ok((ObjectType::Blob | ObjectType::Recipe, _)) => Ok(None),
-            Ok((other, _)) => Ok(Some(format!(
-                "Object {} is a {:?}, not a file's content, so its redaction never applies.",
-                hash, other
-            ))),
-            Err(error) => Ok(Some(format!("Object {} cannot be read: {:?}", hash, error))),
+            Ok(_) => Ok(Some(Verdict::Pending)),
+            Err(error) => Ok(Some(Verdict::Undecided(format!("Object {} cannot be read: {:?}", hash, error)))),
         }
     }
 
@@ -752,7 +816,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// * `Ok(false)`      - The item moved, or the write's fate is unknown: read it again.
     /// * `Err(HeadError)` - The write failed, or the warehouse's format moved to one this build
     ///                      does not serve.
-    fn write_record(&self, hash: &str, record: &Record, expected: Option<&str>) -> HeadResult<bool> {
+    fn write_record(&self, hash: &str, record: &Record, expected: Option<&str>, budget: &mut Budget) -> HeadResult<bool> {
         let state = encode_record(record)?;
 
         let outcome = crate::format::fenced(
@@ -761,7 +825,12 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             |outcome| *outcome == RedactionWrite::FormatMoved,
         )?;
 
-        Ok(outcome == RedactionWrite::Written)
+        let written = outcome == RedactionWrite::Written;
+        if !written {
+            budget.lost += 1;
+        }
+
+        Ok(written)
     }
 }
 

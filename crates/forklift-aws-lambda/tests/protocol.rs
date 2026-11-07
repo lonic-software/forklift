@@ -5161,7 +5161,8 @@ fn a_tombstone_holds_what_its_head_named() {
 /// history still naming it; a head that does not descend from it is scanned again, and holds
 /// nothing.
 // Revert: free a moved meta holder unchecked → the descendant does not hold → red. Revert: hold
-// on any moved meta holder → the unrelated head still holds → red.
+// on any moved meta holder → the unrelated head still holds → red. Revert: keep the head first
+// seen → the item never names the descendant → red.
 #[test]
 fn a_meta_holder_holds_while_its_head_descends_from_the_one_seen() {
     let (_area, head, redactions, leak) = unplanted_redaction("redaction-meta", "leaked\n");
@@ -5174,10 +5175,100 @@ fn a_meta_holder_holds_while_its_head_descends_from_the_one_seen() {
     let descendant = gate_parcel(&head, &[&first], vec![gate_file(&head, "x", "2")]);
     plant_meta(&head.refs, "tags", Some(&first), &descendant);
     assert!(served(&head, &leak), "its history still names it");
+    let item = head.refs.get_redaction(&leak).expect("item").expect("the scan wrote the item");
+    assert!(item.contains(&descendant), "the descendant is recorded as seen, so it is walked once: {}", item);
 
     let unrelated = gate_parcel(&head, &[], vec![gate_file(&head, "y", "3")]);
     plant_meta(&head.refs, "tags", Some(&descendant), &unrelated);
     assert!(!served(&head, &leak), "a head off that history holds nothing");
+}
+
+/// A redaction many pallets name is decided in one request: each holder the scan finds is the
+/// request's own progress, never counted as a write lost to another request.
+// Revert: count every item write against the lost-write bound → the request answers `503` →
+// red.
+#[test]
+fn a_redaction_many_pallets_name_is_decided_in_one_request() {
+    let (_area, head, redactions, leak) = unplanted_redaction("redaction-many-holders", "leaked\n");
+    for pallet in 0..12 {
+        let parcel = gate_parcel(&head, &[], vec![gate_file(&head, "secret.env", "leaked\n"), gate_file(&head, "n", &pallet.to_string())]);
+        plant(&head.refs, &format!("p{}", pallet), &parcel);
+    }
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions);
+
+    assert!(served(&head, &leak), "twelve holders keep it pending, decided in this request");
+}
+
+/// An object store that holds a tree's bytes under `hash`, the hash a redaction records, and
+/// delegates everything else.
+struct PosesAsATree {
+    inner: MemoryObjectStore,
+    hash: String,
+    tree: Vec<u8>,
+}
+
+impl ObjectStore for PosesAsATree {
+    fn exists(&self, hash: &str) -> Result<bool, String> {
+        Ok(hash == self.hash || self.inner.exists(hash)?)
+    }
+
+    fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, String> {
+        match hash == self.hash {
+            true => Ok(Some(self.tree.clone())),
+            false => self.inner.get(hash),
+        }
+    }
+
+    fn objects_staged(&self, session: &str, hashes: &[String]) -> Result<Vec<String>, String> {
+        self.inner.objects_staged(session, hashes)
+    }
+
+    fn put_verified(&self, hash: &str, bytes: &[u8]) -> Result<PutOutcome, String> {
+        self.inner.put_verified(hash, bytes)
+    }
+
+    fn get_signature(&self, parcel_hash: &str) -> Result<Option<Vec<u8>>, String> {
+        self.inner.get_signature(parcel_hash)
+    }
+
+    fn put_signature(&self, parcel_hash: &str, bytes: &[u8]) -> Result<SignatureOutcome, String> {
+        self.inner.put_signature(parcel_hash, bytes)
+    }
+
+    fn work_get(&self, name: &str) -> Result<Option<Vec<u8>>, String> {
+        self.inner.work_get(name)
+    }
+
+    fn work_put(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
+        self.inner.work_put(name, bytes)
+    }
+
+    fn work_delete(&self, name: &str) -> Result<(), String> {
+        self.inner.work_delete(name)
+    }
+}
+
+/// A redaction naming an object the store holds as a tree never applies, as core never applies
+/// it: nothing holds it, yet it stays pending, and the object is served.
+// Revert: answer such a redaction undecided → the object answers `503` → red.
+#[test]
+fn a_redaction_naming_a_tree_stays_pending_and_is_served() {
+    use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+    use forklift_core::enums::dir_entry_type::DirEntryType;
+
+    let area = Area::new("redaction-tree");
+    let (redactions, recorded) = recorded_redactions(&area, "red", &["leaked\n"]);
+    let leak = blob_hash("leaked\n");
+    let tree = LooseObjectBuilder::build_tree(&forklift_core::model::tree_item::TreeItem::new(String::new(), String::new(), DirEntryType::Tree));
+    let head = Head::new(PosesAsATree { inner: MemoryObjectStore::new(), hash: leak.clone(), tree: tree.content }, MemoryRefStore::new());
+    upload_all(&head, &recorded);
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions[0]);
+
+    assert!(served(&head, &leak), "a tree's redaction never applies, and is served");
+    let info = head.handshake().expect("handshake");
+    let state = info.redactions.expect("redactions").into_iter().find(|served| served.hash == leak).map(|served| served.state);
+    assert_eq!(state, Some(ServedRedactionState::Pending));
+    assert!(!forklift_aws_lambda::head::redaction_applied(&head.refs, &leak).expect("item"));
 }
 
 /// A scan the request cannot finish answers `503` with `Retry-After` and saves where it stopped,
