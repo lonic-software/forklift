@@ -621,10 +621,10 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             None => None,
         };
 
-        // A list is removed only after the item records its scan complete, so a missing one was
-        // lost to a crash or a race, and one of another scan was saved over this one's by a
-        // request that read an older record: list again. Every pallet it adds was written after the redaction was recorded, so walking it
-        // is only extra work.
+        // A list is missing while a rescan's record has landed and its list is not yet saved, or
+        // once lost to a crash; one of another scan was saved over this one's by a request that
+        // read an older record. Either way, list again: every pallet the listing adds was written
+        // after the redaction was recorded, so walking it is only extra work.
         let Some(mut remaining) = remaining else {
             let listing = self.refs.list_refs().map_err(HeadError::internal)?;
             let pallets: Vec<Seen> = listing.live.iter().chain(listing.tombstones.iter())
