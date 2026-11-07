@@ -154,7 +154,8 @@ uploads one only that recipe names. A chunk of a recipe the client does upload i
 even when its bytes are an applied redaction's content: the remote refuses that `PUT` with `410`,
 so the lift fails rather than landing a file without it. A ref update tolerates the absence of an applied redaction's content
 from the closure it checks, so a client lifting history that names the content does not upload
-it: it sends no candidate the handshake reports applied. A client that must fetch such content
+it: it offers no file entry naming content the handshake reports applied, and does not descend
+such a recipe. A client that must fetch such content
 (a clone or `lower` of history that names it) is refused with `content_redacted`.
 
 **Pallet reference form.** Keys in `pallets` (and the `{name}` of the ref-update
