@@ -108,8 +108,17 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   reports each redaction as pending or applied, and a warehouse takes a head the server serves over
   a redaction only while the server reports it pending. A fresh `clone` or a `lower` that must
   fetch history naming the content is refused with `content_redacted` for now. The AWS head
-  refuses a lift naming content `@redactions` records, as `content_redacted`, but does not apply
-  redactions yet.
+  refuses a lift naming content `@redactions` records, as `content_redacted`.
+- **The AWS head applies redactions.** A redaction that no pallet head, deleted pallet's tombstone
+  or metadata history names applies on the AWS head when a request names its content, or after a
+  lift or pallet deletion. The head then refuses that content as `content_redacted` on object
+  reads, uploads, upload negotiation and lift commits, leaves it out of `batch` answers, and never
+  promotes a staged copy of it. Its handshake reports each redaction as pending or applied. The
+  first time it judges a redaction it reads every pallet, which can take a few requests; until
+  then that content is not served, and the request answers `503` with `Retry-After`. It does not
+  delete redacted content yet: an applied redaction stays `deletion_owed`, and a redacted chunked
+  file's chunks are still served. Deploying this needs the updated IAM policies: the verifier
+  reads the DynamoDB table, and the control plane keeps scan progress under `redaction-work/`.
 - **A redaction applies only to a file's content.** A redaction naming an object a warehouse holds
   as a directory or as a chunk of a chunked file is never applied there (`redact list` reports it
   undecided, with why), and the deleter leaves such an object in place. The reads, `audit`, `heal`

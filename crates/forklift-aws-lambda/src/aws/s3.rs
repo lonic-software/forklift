@@ -431,7 +431,8 @@ impl S3ObjectStore {
     }
 
     /// An unconditional `PUT` — for the ephemeral response prefix, where a repeated offload of
-    /// the same content-addressed bundle harmlessly overwrites itself.
+    /// the same content-addressed bundle harmlessly overwrites itself, and for a redaction scan's
+    /// work objects, which only ever hold its latest progress.
     async fn put_overwrite(&self, key: &str, bytes: Vec<u8>) -> Result<(), String> {
         self.client
             .put_object()

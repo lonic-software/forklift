@@ -67,7 +67,7 @@ use crate::store::{
 
 mod redaction;
 
-pub use redaction::is_applied as redaction_applied;
+pub use redaction::{is_applied as redaction_applied, record_state as redaction_record};
 
 /// The `genesis` of a stored anchor's bytes.
 ///

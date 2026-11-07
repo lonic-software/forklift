@@ -261,6 +261,19 @@ pub fn is_applied<R: RefStore + ?Sized>(refs: &R, hash: &str) -> Result<bool, St
     }
 }
 
+/// The item state of a record of this shape, exactly as the judge writes it: what the AWS format
+/// fixture freezes. `holders` are `(pallet, head)` pairs, the pallet by its wire reference.
+pub fn record_state(scan_complete: bool, holders: &[(String, String)], applied_at: Option<u64>) -> String {
+    let record = Record {
+        version: RECORD_VERSION,
+        scan_complete,
+        holders: holders.iter().map(|(pallet, head)| Seen { pallet: pallet.clone(), head: head.clone() }).collect(),
+        applied_at,
+    };
+
+    serde_json::to_string(&record).expect("a record encodes")
+}
+
 impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// The same head, with every request's scans bounded to `steps` object reads in all, so a test
     /// can make a scan span requests.

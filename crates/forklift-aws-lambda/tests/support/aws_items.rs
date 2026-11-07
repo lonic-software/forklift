@@ -7,7 +7,10 @@ use std::path::PathBuf;
 
 use forklift_aws_lambda::format::{gate, AWS_FORMAT};
 use forklift_aws_lambda::reissue::request_token;
-use forklift_aws_lambda::store::{CasOutcome, ExpectedHead, OfficePrecondition, RedactionsPrecondition, RefStore, TrustOutcome};
+use forklift_aws_lambda::head::redaction_record;
+use forklift_aws_lambda::store::{
+    CasOutcome, ExpectedHead, OfficePrecondition, RedactionWrite, RedactionsPrecondition, RefStore, TrustOutcome,
+};
 use forklift_core::model::remote::TrustAnchorDto;
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::pallet_utils::PalletNamespace;
@@ -44,8 +47,9 @@ pub fn hash(digit: char) -> String {
 }
 
 /// Write a warehouse holding every kind of item: the format, a live pallet, a deleted one, the
-/// office pallet and the trust anchor, each through the store's own write paths, each with its own
-/// request token as a Lambda's are (DynamoDB refuses a token reused for a different transaction).
+/// office pallet, the trust anchor and an applied redaction's item, which records a holder. Each
+/// goes through the store's own write paths, each with its own request token as a Lambda's are
+/// (DynamoDB refuses a token reused for a different transaction).
 pub fn populate(refs: &impl RefStore) {
     let fence = || gate(refs).expect("the fixture warehouse is served");
     let set = |namespace, name, new: &str| {
@@ -73,4 +77,8 @@ pub fn populate(refs: &impl RefStore) {
     };
     let trust = refs.put_trust_if_absent(&anchor.to_anchor(), &fence(), &request_token()).unwrap();
     assert!(matches!(trust, TrustOutcome::Established), "{:?}", trust);
+
+    let record = redaction_record(true, &[("gone".to_string(), hash('2'))], Some(1_780_000_001));
+    let written = refs.put_redaction(&hash('8'), &record, None, &fence()).unwrap();
+    assert!(matches!(written, RedactionWrite::Written), "{:?}", written);
 }

@@ -92,17 +92,17 @@ so the ref-update audit's mirroring cost is amortized rather than paid on every 
 **Staging verifier.** Even thinner: for every S3 event record it parses the
 `staging/{warehouse}/{session}/{hash}` key (decoding the `+`/`%XX` escaping S3 event notifications
 apply, preferring the event's own `url_decoded_key` field when present) and calls
-`verify_and_promote` on a blocking thread. It builds only an `S3ObjectStore`, no `DynamoRefStore`,
+`verify_and_promote` on a blocking thread. It builds an `S3ObjectStore` and a `DynamoRefStore`
 bound to the warehouse the key names: objects are keyed per warehouse, and the key is all an S3
-event carries. It needs no `FORKLIFT_WAREHOUSE_ID`, so one verifier serves every warehouse in the
+event carries. The ref store is read for one item only: before promoting, the verifier reads the
+staged object's redaction item, and drops the staged copy of content redacted from the warehouse
+instead of promoting it. It needs no `FORKLIFT_WAREHOUSE_ID`, so one verifier serves every warehouse in the
 bucket. A storage error propagates (so S3 retries
 the event); a semantic outcome (missing, corrupt) is logged and the event is consumed, since
 retrying a corrupt object would only rediscard it forever.
 
-**Operator quirk:** both binaries call the same `config_from_env()`, which requires
-`FORKLIFT_DYNAMODB_TABLE` to be set and non-empty — even for the verifier, which builds a
-DynamoDB client it never calls a single operation on. Give the verifier some valid table name
-(the same table is fine) or its cold start fails outright.
+Both binaries call the same `config_from_env()`, which requires `FORKLIFT_DYNAMODB_TABLE` to be
+set and non-empty. Give the verifier the control plane's table: it reads redaction items there.
 
 ### Building the deployment artifacts
 
@@ -277,6 +277,7 @@ whether another holds an object.
 | `staging/{warehouse}/{session}/{hash}` | Unverified bytes a client `PUT` straight into, via a presigned URL. Invisible to `exists`/`get`. | The client, via a presigned `PUT` |
 | `signatures/{warehouse}/{parcel_hash}` | Parcel signature sidecars — a distinct prefix so a sidecar never collides with its parcel's own object at `objects/{warehouse}/{parcel_hash}`. | `put_signature` |
 | `responses/{content_hash}` | Ephemeral, content-addressed `batch`-bundle bodies offloaded from the control plane, shared by every warehouse and reached only through a presigned URL. Never `objects/`. | `offload_response` |
+| `redaction-work/{warehouse}/{hash}/…` | A redaction scan's progress: the pallets it has still to walk, and each walk stopped part way. Holds no verdict, and is deleted as the scan finishes. Never served. | The control plane's redaction judge |
 
 A warehouse in AWS format 1 kept one `objects/{hash}` and `signatures/{hash}` key for every
 warehouse in the bucket. Nothing reads those keys, and the format gate refuses such a warehouse with
@@ -347,10 +348,11 @@ docs, and the exact shape `tests/aws_integration.rs`'s `provision()` creates):
 | Attribute | Type | Role |
 |---|---|---|
 | `wh` | `S` | Partition key — the warehouse id |
-| `entity` | `S` | Sort key — `pallet#{qualified-ref}` (e.g. `pallet#main`, `pallet#@office`) or one of the literal strings `trust` and `format` |
+| `entity` | `S` | Sort key — `pallet#{qualified-ref}` (e.g. `pallet#main`, `pallet#@office`), `redaction#{hash}`, or one of the literal strings `trust` and `format` |
 
 Item payload attributes (`head` for a live pallet item, `deleted_head` for a deleted one's
-tombstone, `anchor` — a JSON string — for the trust item, `state` for the format item) are not part
+tombstone, `anchor` — a JSON string — for the trust item, `state` for the format item and, a JSON string, for
+a redaction item) are not part
 of the key schema and need no separate declaration when you create the table; DynamoDB is
 schemaless beyond the key.
 
@@ -606,7 +608,9 @@ page.
 Where each action in `iam/control-plane.policy.json` comes from: `HeadObject`/`GetObject`/presigned
 `GET` → `s3:GetObject`; `PutObject` (conditional and unconditional)/presigned staging
 `PUT`/`CopyObject` destination → `s3:PutObject`; `CopyObject` source read → `s3:GetObject` on
-`staging/*`; `DeleteObject` (staged cleanup, session sweep) → `s3:DeleteObject`; `ListObjectsV2`
+`staging/*`; `DeleteObject` (staged cleanup, session sweep, a dropped staged copy of redacted content) →
+`s3:DeleteObject`; the redaction scan's progress objects (`GetObject`/`PutObject`/`DeleteObject` under
+`redaction-work/{warehouse}/`) → the `RedactionScanWork` statement on `redaction-work/*`; `ListObjectsV2`
 (`discard_session`'s sweep) and `HeadObject`/`GetObject` 404-vs-403 semantics (below) →
 `s3:ListBucket` on the **bucket** resource (not `bucket/*`); `GetItem`/`Query` (ref reads,
 enumeration, the format item and the partition check behind it) → the table ARN, no index ARN
@@ -622,9 +626,9 @@ its own CloudWatch log group.
 
 ### `forklift-aws-verifier`
 
-The verifier calls only `verify_and_promote` — no DynamoDB permissions of any kind (it builds a
-DynamoDB client via `config_from_env`/`build_clients`, but never issues a single operation against
-it). `iam/verifier.policy.json`'s statements: `s3:GetObject`/`s3:DeleteObject` on `staging/*` (read
+The verifier reads one DynamoDB item per staged object, its redaction item (`dynamodb:GetItem` on
+the table, the `ReadRedactionItems` statement), then calls `verify_and_promote`.
+`iam/verifier.policy.json`'s other statements: `s3:GetObject`/`s3:DeleteObject` on `staging/*` (read
 then clear the staged object once promoted), `s3:GetObject`/`s3:PutObject` on `objects/*` (write the
 promoted copy), `s3:ListBucket` on the bucket (404-vs-403 semantics, below — `verify_and_promote`'s
 `key_exists` check against the canonical `objects/{warehouse}/{hash}` key, absent by definition for a
@@ -712,7 +716,7 @@ binaries share it) or the AWS SDK's own default provider chain:
 | Variable | Required | Read by | Meaning |
 |---|---|---|---|
 | `FORKLIFT_S3_BUCKET` | **Required** | Both | The object-plane bucket name. |
-| `FORKLIFT_DYNAMODB_TABLE` | **Required** | Both (verifier builds but never calls the resulting client) | The ref/trust table name. |
+| `FORKLIFT_DYNAMODB_TABLE` | **Required** | Both (the verifier reads redaction items there) | The ref/trust table name. |
 | `FORKLIFT_WAREHOUSE_ID` | Optional | Control plane | Set (non-empty) → single-warehouse mode, serving fixed `/v1/…`. Unset or empty → multi-warehouse mode, `/warehouses/{id}/v1/…`. An empty string is treated as unset. A set id must be a valid warehouse id (see `REMOTE_PROTOCOL.md`, warehouse creation), or the function refuses to start. |
 | `FORKLIFT_AWS_ENDPOINT_URL` | Optional | Both | Endpoint override for LocalStack/MinIO; switches the S3 client to path-style addressing. An empty string is treated as unset. |
 | `FORKLIFT_DEFAULT_PALLET` | Optional | Control plane | The pallet a clone checks out by default. Defaults to `main`. An empty string is treated as unset. A set value must be a valid pallet name (lowercase; see `format/PALLET_REFS.md`), or the function refuses to start. |
