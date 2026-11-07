@@ -2398,6 +2398,26 @@ pub(crate) mod tests {
             write("main", Some(&base), &head).unwrap();
         }
 
+        // Revert: read no applied set in a full warehouse → the write is refused over the blob
+        // the applied redaction removed; tolerate any absence once something is applied → the
+        // second write lands over a blob nothing redacted.
+        #[test]
+        fn a_full_warehouse_tolerates_the_absence_of_an_applied_redaction_alone() {
+            let (_root, _scope) = scratch("closure-applied-full");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            write("main", None, &base).unwrap();
+            let head = parcel(&two_dirs("a1", "b-redacted"), &[&base]);
+            crate::util::applied_redactions::apply_for_test(&[&blob("b-redacted")]);
+            remove(&blob("b-redacted"));
+
+            write("main", Some(&base), &head).unwrap();
+            assert_eq!(get_pallet_head("main").unwrap().as_deref(), Some(head.as_str()));
+
+            let next = parcel(&two_dirs("a2", "b-lost"), &[&head]);
+            remove(&blob("b-lost"));
+            assert_incomplete(write("main", Some(&head), &next), "main", Some(&head));
+        }
+
         // Revert: tolerate any absence once a record exists → the write lands over a root no
         // entry names.
         #[test]

@@ -1228,4 +1228,51 @@ mod tests {
         assert_eq!((bounded.dropped, bounded.skipped), (vec![gone.clone()], None));
         assert_record(&[&staged, &kid, &parent, &stray], "kept");
     }
+
+    /// Remove `hash`'s object, as the deletion that follows an applied redaction will.
+    fn delete_object(hash: &str) {
+        let (folder, file) = file_utils::get_path_for_object(hash).unwrap();
+        std::fs::remove_file(PathBuf::from(folder).join(file)).unwrap();
+    }
+
+    /// An absence an applied redaction names is a boundary the plan passes, not damage, and it is
+    /// never recorded as held by the remote: it is never among what the plan frees.
+    ///
+    /// Revert: drop the applied set from the plan's walk → the plan refuses the absence as damage.
+    #[test]
+    fn plan_passes_an_applied_absence_and_never_records_it() {
+        let _scratch = Scratch::new("applied-absence");
+        let h = history();
+        crate::util::applied_redactions::apply_for_test(&[&h.shared]);
+        delete_object(&h.shared);
+        let hold = store_access();
+
+        let plan = plan_evict(&[h.held.clone()], &hold).unwrap();
+        assert!(!plan.to_free.contains(&h.shared) && plan.to_free.contains(&h.dir), "{:?}", plan.to_free);
+        assert!(!plan.to_record.contains(&h.shared), "{:?}", plan.to_record);
+
+        carry(&plan, &hold).unwrap();
+        assert!(!sealed_utils::read_sealed().unwrap().contains(&h.shared));
+    }
+
+    /// The bound walks past an absence an applied redaction names, as it walks past a recorded one,
+    /// and still drops a record nothing names.
+    ///
+    /// Revert: take an applied absence the record does not hold as damage in the walk → the bound
+    /// is skipped and drops nothing.
+    #[test]
+    fn the_bound_walks_past_an_applied_absence() {
+        let _scratch = Scratch::new("bound-applied");
+        let h = history();
+        crate::util::applied_redactions::apply_for_test(&[&h.b]);
+        delete_object(&h.b);
+        let gone = "f".repeat(64);
+        sealed_utils::append(&[(SealOp::Record, gone.as_str())]).unwrap();
+        let hold = store_access();
+
+        let bounded = sealed_utils::bound(&hold, &[]).unwrap();
+
+        assert_eq!((bounded.dropped, bounded.skipped), (vec![gone], None));
+        assert!(!sealed_utils::read_sealed().unwrap().contains(&h.b));
+    }
 }

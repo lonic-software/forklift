@@ -524,14 +524,19 @@ struct Server {
 
 impl Server {
     fn start(root: &std::path::Path) -> Server {
-        use std::io::BufRead;
-
         let _ = std::fs::remove_dir_all(root);
-        let root = root.to_str().unwrap();
         let prepared = std::process::Command::new(common::server_binary()).env("FORKLIFT_FSYNC", "0")
-            .args(["prepare", "--root", root]).output().unwrap();
+            .args(["prepare", "--root", root.to_str().unwrap()]).output().unwrap();
         assert!(prepared.status.success(), "{}", String::from_utf8_lossy(&prepared.stderr));
 
+        Server::serve(root)
+    }
+
+    /// Serve the server root at `root` as it is.
+    fn serve(root: &std::path::Path) -> Server {
+        use std::io::BufRead;
+
+        let root = root.to_str().unwrap();
         let mut child = std::process::Command::new(common::server_binary()).env("FORKLIFT_FSYNC", "0")
             .args(["serve", "--root", root, "--addr", "127.0.0.1:0", "--open"])
             .stdout(std::process::Stdio::piped())
@@ -1131,4 +1136,76 @@ fn a_hash_applied_here_that_the_remote_never_redacted_names_no_fresh_clone() {
     assert_eq!(error["details"]["hash"], hash, "{}", error);
     assert!(!error["next_step"].as_str().unwrap().contains("fresh clone"), "{}", error);
     assert!(!error["message"].as_str().unwrap().contains("not even one the remote serves"), "{}", error);
+}
+
+/// Every file under `dir` named as the loose object `hash` is stored.
+fn loose_copies(dir: &std::path::Path, hash: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            found.extend(loose_copies(&path, hash));
+        } else if path.file_name().unwrap() == &hash[2..]
+            && path.parent().unwrap().file_name().unwrap() == &hash[..2] {
+            found.push(path);
+        }
+    }
+    found
+}
+
+/// A cache that applied a redaction holds the content's absence as redacted, not as held by the
+/// remote: a read that needs it fetches nothing, though the remote still serves the bytes, and a
+/// move to a server lacking the content goes through, never asking that server for it. Until a
+/// remote applies redactions, a cache never reaches the applied state itself, so the test writes
+/// the record.
+///
+/// Revert: let the miss hook fetch an applied hash → the read fetches the content back; let the
+/// origin check ask the new server for one → the move refuses as `origin_move_incomplete`.
+#[test]
+fn a_cache_that_applied_a_redaction_never_fetches_it_nor_asks_a_new_origin_for_it() {
+    let temp = std::env::temp_dir();
+    let first_root = temp.join(format!("forklift-redaction-applied-cache-server-{}", std::process::id()));
+    let server = Server::start(&first_root);
+
+    let owner = Warehouse::cloned("applied-cache-owner", &server.url);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    let leak = owner.leaked("secret.env", b"TOKEN=hunter2\n");
+    owner.run_ok(&["lift"]);
+
+    let cached = Warehouse::cloned_with("applied-cache", &server.url, &["--cache"]);
+    let recorded = recorded_hash(&cached, &format!("{}:secret.env", leak), "leaked token");
+    let hash = recorded["data"]["hash"].as_str().unwrap().to_string();
+    // A cache applies a redaction only once its remote has, which nothing does yet: the record is
+    // written as the apply would write it.
+    std::fs::write(cached.root.join(".forklift/redactions-applied"), format!("/forklift-redactions-applied 1\n{}\n", hash))
+        .unwrap();
+    assert_eq!(cached.redactions()[0]["status"], serde_json::json!({ "state": "applied" }));
+    // The deletion that follows an applied redaction, whether or not the clone fetched the bytes.
+    for copy in loose_copies(&cached.root.join(".forklift/objects"), &hash) {
+        std::fs::remove_file(copy).unwrap();
+    }
+
+    let read = cached.run(&["show", &format!("{}:secret.env", leak)]);
+    assert!(!read.status.success(), "{:?}", read);
+    assert!(loose_copies(&cached.root.join(".forklift/objects"), &hash).is_empty(), "nothing fetched it back");
+    assert!(!loose_copies(&first_root, &hash).is_empty(), "the remote still serves the bytes");
+
+    // A copy of the server's root that lacks the content, served once the first has stopped.
+    drop(server);
+    let second_root = temp.join(format!("forklift-redaction-applied-cache-copy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&second_root);
+    let copied = std::process::Command::new("cp").arg("-R").arg(&first_root).arg(&second_root).output().unwrap();
+    assert!(copied.status.success(), "{:?}", copied);
+    // The lock the first server held is not the copy's: no process holds it.
+    std::fs::remove_file(second_root.join(".forklift/serve.lock")).unwrap();
+    let copies = loose_copies(&second_root, &hash);
+    assert!(!copies.is_empty());
+    for copy in copies {
+        std::fs::remove_file(copy).unwrap();
+    }
+    let server = Server::serve(&second_root);
+
+    let moved = cached.json(&["remote", "move", &server.url]);
+    assert_eq!(moved["ok"], true, "{}", moved);
+    assert_eq!(moved["data"]["origin"], server.url.as_str(), "{}", moved);
 }
