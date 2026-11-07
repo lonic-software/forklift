@@ -167,24 +167,29 @@ pub fn deletion_census(targets: &HashSet<String>) -> Result<BTreeMap<String, Vec
 /// applied.
 ///
 /// # Returns
-/// * `Ok(HashSet<String>)` - The excluded hashes, present or not.
+/// * `Ok(HashSet<String>)` - The excluded hashes.
 /// * `Err(String)`         - If the applied record could not be read, or the census could not be
 ///                           taken.
 pub(crate) fn unheld_applied() -> Result<HashSet<String>, String> {
     unheld(&applied_redactions::read_applied()?.hashes().cloned().collect())
 }
 
-/// Of `applied`, the hashes no deletion census root names. Presence is never probed: a hash an
-/// earlier run deleted is excluded again at no cost, and an unreadable pack index the census never
-/// needs refuses nothing.
+/// Of `applied`, the hashes the store may hold that no deletion census root names. A hash the
+/// store plainly lacks (one an earlier run deleted) is left out unread, so no census is taken once
+/// every applied object is gone; one whose presence cannot be told stays in, since excluding an
+/// absent hash costs nothing and the check never refuses.
 ///
 /// # Returns
 /// * `Ok(HashSet<String>)` - The excluded hashes.
 /// * `Err(String)`         - If the census could not be taken.
 pub(crate) fn unheld(applied: &HashSet<String>) -> Result<HashSet<String>, String> {
-    let held = deletion_census(applied)?;
+    let targets: HashSet<String> = applied.iter()
+        .filter(|hash| !matches!(file_utils::does_object_exist(hash), Ok(false)))
+        .cloned()
+        .collect();
+    let held = deletion_census(&targets)?;
 
-    Ok(applied.iter().filter(|hash| !held.contains_key(*hash)).cloned().collect())
+    Ok(targets.into_iter().filter(|hash| !held.contains_key(hash)).collect())
 }
 
 /// A census in progress: the targets, the targets each tree walked so far reaches, and the holders
@@ -456,6 +461,30 @@ mod tests {
         gc_utils::collect_garbage(0).unwrap();
         assert!(!present(&secret), "the collection deletes the loose copy");
         assert!(present(&kept));
+    }
+
+    /// No census is taken once every applied object is gone, and one is while one remains: an
+    /// unreadable bay state fails a census, so it shows which.
+    ///
+    /// Revert: take the census over every applied hash → the exclusion fails on the bad bay.
+    #[test]
+    fn no_census_is_taken_once_every_applied_object_is_gone() {
+        let _scratch = Scratch::new("gone");
+        let secret = store_blob("secret\n");
+        set_main(&store_parcel(&store_tree(&[("f", &store_blob("kept\n"), FILE)]), Vec::new()));
+        applied_redactions::apply_for_test(&[&secret]);
+        gc_utils::collect_garbage(0).unwrap();
+        assert!(!present(&secret));
+
+        let bay = bay_utils::bay_state_dir("broken");
+        std::fs::create_dir_all(&bay).unwrap();
+        std::fs::write(bay.join(pallet_utils::FILE_NAME_POSITION), b"not a position").unwrap();
+
+        let gone: HashSet<String> = [secret].into_iter().collect();
+        assert_eq!(unheld(&gone).expect("no census once the applied object is gone"), HashSet::new());
+
+        let remaining: HashSet<String> = [store_blob("secret again\n")].into_iter().collect();
+        assert!(unheld(&remaining).is_err(), "a census over a present object reads every bay");
     }
 
     /// No applied redaction's object is offered as a delta base, even one the census still names,
