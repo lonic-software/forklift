@@ -105,7 +105,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   `undecided` or `ready` (for `redact apply` to apply), in `--json` as `status`. A warehouse with no remote applies a redaction once
   nothing in it names the content; one with a remote waits for the remote to report it applied. The
   new `redact apply` applies what can be after the content was taken out of the heads that held it.
-  The applied redactions are kept in `.forklift/redactions-applied`.
+  The applied redactions are kept in `.forklift/redactions-applied`. A warehouse never takes back
+  content it has applied a redaction of: a `lower` of a head or metadata history the remote still
+  serves naming it is refused, with a fresh clone of the remote as the way out.
 - **The `--json` schema is now 25: `load`, `park`, merges and `pick` refuse redacted content.** Part
   of content redaction: a file whose content is redacted is refused with `content_redacted` (exit 49)
   before anything reaches the bay, when `load` would stage it, `park` would park it, `lower` would

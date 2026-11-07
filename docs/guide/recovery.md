@@ -188,6 +188,12 @@ recorded only here still refuses, and so does anything you stack on that head wh
 content. In a warehouse a Forklift server has served, taking such a head is refused like any other
 write.
 
+Once this warehouse has applied a redaction, it never takes back history naming that content, not
+even a head or metadata history the remote serves. This happens when the redaction was applied
+here while the warehouse had no remote, and the remote it has since still serves history naming
+the content. When the refusal names a fresh clone, make one with `forklift clone` and work there:
+the clone takes the remote's history and redactions as the remote holds them.
+
 ### `redaction_blocked` (exit 48)
 
 The content you tried to redact is also part of a meta pallet's history: the office, the
