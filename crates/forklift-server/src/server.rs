@@ -2670,12 +2670,19 @@ async fn post_upload_targets(State(state): State<Arc<AppState>>,
         return error_response(error);
     }
 
+    let gate = Arc::clone(&warehouse);
     let result = blocking(warehouse, move || {
         let (applied, withheld) = (read_applied()?, read_withheld()?);
 
         // A redacted hash refuses the lift: the client checks its history against its own
         // redactions first, so one asked about here is a client that did not.
         request.hashes.iter().try_for_each(|hash| refuse_removed(&applied, &WithheldSet::default(), hash))?;
+
+        // A chunk an owed deletion withholds is answered `direct`, as `missing` lists it, so the
+        // lift uploads it: should the deletion take the stored copy before the upload, the upload
+        // stores it again. One the deletion takes between the upload and the ref write is gone,
+        // and the ref write refuses the lift.
+        let owed_chunks = withheld_among(&gate, &withholding::removed_from(&applied, &withheld), &request.hashes)?;
 
         let mut response = UploadTargetsResponse {
             present: Vec::new(),
@@ -2695,7 +2702,7 @@ async fn post_upload_targets(State(state): State<Arc<AppState>>,
             // tolerates the absence. So it is answered apart rather than refusing the lift.
             if withheld.contains(&hash) {
                 response.withheld.push(hash);
-            } else if file_utils::does_object_exist(&hash).map_err(unprocessable)? {
+            } else if !owed_chunks.contains(&hash) && file_utils::does_object_exist(&hash).map_err(unprocessable)? {
                 response.present.push(hash);
             } else {
                 // No staging prefix here — the client PUTs the body and the head verifies it

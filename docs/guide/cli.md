@@ -1041,7 +1041,9 @@ version, that version of Forklift.
 
 An absent object that a redaction applied in this warehouse names is not damage and fails
 nothing: its content was removed on purpose, so an audit that finds it absent accounts for it,
-checks nothing beneath it, and reports how many it found (`redacted` under `--json`).
+checks nothing beneath it, and reports how many it found (`redacted` under `--json`). The same
+holds for a file's content the host of a served root withholds (`forklift-server withhold`), counted
+apart (`withheld` under `--json`).
 
 **Run `--full` periodically as your own scrub against bit-rot.** Every `lift`/push used to
 incidentally re-presence-check a pushed pallet's whole tree, chunked files included; a large

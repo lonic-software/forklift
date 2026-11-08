@@ -257,7 +257,8 @@ the bundle never carries it. What is refused is the redacted hash: for a chunked
 recipe. Its chunks are not refused by hash, since other content may share them; a client never
 uploads one only that recipe names. Until its deletion is done, forklift-server serves a chunk
 that only an applied redaction's recipe names as absent: `GET` answers `404`, `batch` leaves
-it out and `missing` lists it, so a lift naming it uploads it. A chunk another object names is
+it out, `missing` lists it and `upload-targets` answers it in `direct`, so a lift naming it
+uploads it. A chunk another object names is
 served as before. Until a deletion has run since, a chunk a cut-short deletion still owes keeps
 the redaction `deletion_owed`, even if another object has come to name it. A redaction names a file's content, never a tree or a chunk:
 an object's hash covers its type, so a chunk never shares a hash with a file's content. A remote
