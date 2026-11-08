@@ -521,8 +521,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// Refuse a lift commit naming a hash whose redaction applied, deleting the session's staged
     /// copy of each such content first, and its canonical object ([`delete_if_applied`]): it is
     /// never promoted, and a copy an earlier attempt of the commit promoted after the redaction's
-    /// sweep is deleted too. Reads only the item,
-    /// and applies nothing.
+    /// sweep is deleted too. Reads only the item, and applies nothing.
     pub(super) fn refuse_applied_staged(&self, session: &str, hashes: &[String]) -> HeadResult<()> {
         let recorded = self.recorded()?;
         let mut refused = None;

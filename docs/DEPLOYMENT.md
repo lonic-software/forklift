@@ -304,11 +304,14 @@ unswept forever. This is explicitly called out as an operational, not a code, ga
 * **Suggested age: 7 days** — comfortably longer than any legitimate lift (including a
   paginated one) is expected to take, short enough that abandoned sessions do not accumulate
   indefinitely.
-* **On a versioned bucket, expire noncurrent versions too** (`infra/aws-serverless` sets 1 day).
-  An expiry there only adds a delete marker, and the staged bytes stay a noncurrent version. That
+* **On a versioned bucket, expire noncurrent versions too** (`infra/aws-serverless` sets 1 day),
+  **and expired delete markers** (a second `staging/` rule, `expired_object_delete_marker`). An
+  expiry there only adds a delete marker, and the staged bytes stay a noncurrent version; the
+  markers left once those go would otherwise accumulate, and the redaction sweep lists them. That
   matters for redacted content: a copy staged after its redaction's deletion ran is deleted,
-  every version of it, by its own verifier event or the lift commit naming it; one whose event
-  never succeeds is left to this rule.
+  every version of it, by its own verifier event or the lift commit naming it. One whose event
+  never succeeds is left to these rules, and is gone only after the staging expiry plus the
+  noncurrent expiry: 8 days at the suggested 7, current for the first 7.
 
 ### Recommended: expire the `responses/` prefix
 
