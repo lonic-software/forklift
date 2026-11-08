@@ -174,17 +174,10 @@ pub async fn handle_command(pallet: Option<String>,
 
     // Only once everything went through, so the report that carries what was applied reaches the
     // output: a failed or conflicting meta pallet fails the command, and its error document has no
-    // room for it. A redaction that would have applied is named in a warning, for `redact apply`.
+    // room for it. Nothing is lost by waiting: the next lower that goes through, or `redact
+    // apply`, applies on the remote's report as this one would have.
     if lowered.is_ok() && report.meta_failed.is_empty() && report.meta_conflicts.is_empty() {
         report.redactions = settle_redactions(client.url(), &info, store_access);
-    } else if lowered.is_ok() {
-        let remote = forklift_core::util::applied_redactions::RemoteReport::of(client.url(), &info);
-        if redact::report_lists_unapplied(&remote).unwrap_or(false) {
-            output::warn_redactions_unsettled(
-                "The remote reports redactions applied that are not applied here, and this lower did not \
-                apply them, since a meta pallet did not lower."
-            );
-        }
     }
 
     // The most severe outcome decides the exit: the working pallet's own failure, then a meta

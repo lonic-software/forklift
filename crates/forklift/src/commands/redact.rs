@@ -414,19 +414,6 @@ pub(crate) fn apply_on_report(report: &RemoteReport) -> Result<Vec<String>, Stri
         .collect())
 }
 
-/// Whether `report`, the remote's, lists applied a redaction recorded here that is not applied
-/// here yet: one that [`apply_on_report`] may apply.
-///
-/// # Returns
-/// * `Ok(bool)`    - Whether it lists one.
-/// * `Err(String)` - The redactions or the applied record could not be read.
-pub(crate) fn report_lists_unapplied(report: &RemoteReport) -> Result<bool, String> {
-    let before = applied_redactions::read_applied()?;
-    let read = redaction_utils::read_redactions()?;
-
-    Ok(lists_unapplied(&read, &before, report))
-}
-
 /// Whether `report` lists a redaction `read` holds that `applied` does not.
 fn lists_unapplied(read: &redaction_utils::RedactionsRead, applied: &applied_redactions::AppliedSet,
                    report: &RemoteReport) -> bool {
