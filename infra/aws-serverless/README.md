@@ -95,7 +95,8 @@ Build the two zips with `cargo lambda build --release --arm64` (see
   abandoned or paginating client leaks staged bytes forever.
 - **The verifier missing its table env var.** Both Lambdas are wired from one config in this
   module, so `FORKLIFT_DYNAMODB_TABLE` cannot be forgotten: the verifier reads each staged
-  object's redaction item from the table before it promotes it.
+  object's redaction item from the table before it promotes it, and again after, deleting a copy
+  whose redaction applied meanwhile.
 - **A named API Gateway stage.** An HTTP API deployed to a *named* stage prepends `/{stage}` to
   every request path, and the router (`entrypoint::handle`) matches absolute paths — so every
   route would 404. This module hard-codes `$default` and exposes no stage variable at all.

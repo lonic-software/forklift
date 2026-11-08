@@ -95,8 +95,9 @@ apply, preferring the event's own `url_decoded_key` field when present) and call
 `verify_and_promote` on a blocking thread. It builds an `S3ObjectStore` and a `DynamoRefStore`
 bound to the warehouse the key names: objects are keyed per warehouse, and the key is all an S3
 event carries. The ref store is read for one item only: before promoting, the verifier reads the
-staged object's redaction item, and drops the staged copy of content redacted from the warehouse
-instead of promoting it. It needs no `FORKLIFT_WAREHOUSE_ID`, so one verifier serves every warehouse in the
+staged object's redaction item, and deletes the staged copy of content redacted from the warehouse
+instead of promoting it; it reads the item again after promoting, and deletes what it promoted
+when the redaction applied meanwhile. It needs no `FORKLIFT_WAREHOUSE_ID`, so one verifier serves every warehouse in the
 bucket. A storage error propagates (so S3 retries
 the event); a semantic outcome (missing, corrupt) is logged and the event is consumed, since
 retrying a corrupt object would only rediscard it forever.
@@ -303,6 +304,15 @@ unswept forever. This is explicitly called out as an operational, not a code, ga
 * **Suggested age: 7 days** — comfortably longer than any legitimate lift (including a
   paginated one) is expected to take, short enough that abandoned sessions do not accumulate
   indefinitely.
+* **On a versioned bucket, expire noncurrent versions too** (`infra/aws-serverless` sets 1 day),
+  **and expired delete markers** (a second `staging/` rule, `expired_object_delete_marker`). An
+  expiry there only adds a delete marker, and the staged bytes stay a noncurrent version; the
+  markers left once those go would otherwise accumulate, and the redaction sweep lists them. That
+  matters for redacted content: a copy staged after its redaction's deletion ran is deleted,
+  every version of it, by its own verifier event or the lift commit naming it. One whose event
+  never succeeds is left to these rules, and is gone no sooner than the staging expiry plus the
+  noncurrent expiry: 8 days at the suggested 7, current for the first 7, and often a day or two
+  later (S3 rounds each to midnight UTC and runs lifecycle actions asynchronously).
 
 ### Recommended: expire the `responses/` prefix
 
@@ -327,9 +337,13 @@ has no use for them, and a `staging/`-shaped key from a delete event would just 
 
 All three are **operator decisions**; none is required or read by the code:
 
-* **Versioning** — not referenced anywhere in `aws::s3`. Enable it if you want an audit trail of
+* **Versioning** — never read by `aws::s3`. Enable it if you want an audit trail of
   overwrites (there should be none in `objects/`/`signatures/`, since both are conditional
-  writes to immutable keys — a `412` on a second write, not a silent overwrite).
+  writes to immutable keys — a `412` on a second write, not a silent overwrite). It keeps no copy
+  of redacted content: an applied redaction's deletion lists the versions of every key it
+  removes and deletes each, which is why both roles hold `s3:ListBucketVersions` and
+  `s3:DeleteObjectVersion`. A staged copy no deletion reaches is left to the `staging/` rule's
+  noncurrent-version expiry (above), so set one.
 * **Encryption** — SSE-S3 or SSE-KMS at rest, your call; the SDK calls carry no
   encryption-context parameters either way.
 * **CORS — not needed.** Every client is the `forklift` CLI (a `reqwest`-based Rust binary)
@@ -608,9 +622,14 @@ page.
 Where each action in `iam/control-plane.policy.json` comes from: `HeadObject`/`GetObject`/presigned
 `GET` → `s3:GetObject`; `PutObject` (conditional and unconditional)/presigned staging
 `PUT`/`CopyObject` destination → `s3:PutObject`; `CopyObject` source read → `s3:GetObject` on
-`staging/*`; `DeleteObject` (staged cleanup, session sweep, a dropped staged copy of redacted content) →
+`staging/*`; `DeleteObject` (staged cleanup, session sweep) →
 `s3:DeleteObject`; the redaction scan's progress objects (`GetObject`/`PutObject`/`DeleteObject` under
-`redaction-work/{warehouse}/`) → the `RedactionScanWork` statement on `redaction-work/*`; `ListObjectsV2`
+`redaction-work/{warehouse}/`) → the `RedactionScanWork` statement on `redaction-work/*`; an applied
+redaction's deletion of a blob's canonical object and of its staged copies (every session's in the
+sweep, the committing session's when a lift commit names it), which lists the keys' versions (`ListObjectVersions` → `s3:ListBucketVersions` on the bucket, the
+`ListRedactedVersions` statement) and deletes each by version id (`DeleteObject` naming a version →
+`s3:DeleteObjectVersion` on `objects/*` and `staging/*`, the `DeleteRedactedCopies` statement), so
+no earlier version survives on a bucket with versioning enabled or suspended; `ListObjectsV2`
 (`discard_session`'s sweep) and `HeadObject`/`GetObject` 404-vs-403 semantics (below) →
 `s3:ListBucket` on the **bucket** resource (not `bucket/*`); `GetItem`/`Query` (ref reads,
 enumeration, the format item and the partition check behind it) → the table ARN, no index ARN
@@ -627,7 +646,11 @@ its own CloudWatch log group.
 ### `forklift-aws-verifier`
 
 The verifier reads one DynamoDB item per staged object, its redaction item (`dynamodb:GetItem` on
-the table, the `ReadRedactionItems` statement), then calls `verify_and_promote`.
+the table, the `ReadRedactionItems` statement), then calls `verify_and_promote`, then reads the item
+again. Content whose redaction has applied is never promoted, or has the canonical copy just written
+deleted, along with the staged copy, every version of each (`s3:ListBucketVersions` on the
+bucket and `s3:DeleteObjectVersion` on `objects/*` and `staging/*`, the `ListRedactedVersions` and
+`DeleteRedactedPromotions` statements).
 `iam/verifier.policy.json`'s other statements: `s3:GetObject`/`s3:DeleteObject` on `staging/*` (read
 then clear the staged object once promoted), `s3:GetObject`/`s3:PutObject` on `objects/*` (write the
 promoted copy), `s3:ListBucket` on the bucket (404-vs-403 semantics, below — `verify_and_promote`'s

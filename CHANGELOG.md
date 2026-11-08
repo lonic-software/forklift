@@ -112,14 +112,17 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 - **The AWS head applies redactions.** A redaction that no pallet head, deleted pallet's tombstone
   or metadata history names applies on the AWS head when a request names its content, or after a
   lift or pallet deletion. The head then refuses that content as `content_redacted` on object
-  reads, uploads, upload negotiation and lift commits, leaves it out of `batch` answers, and drops
-  a staged copy of it rather than promote it; a copy whose promotion was already under way when
-  the redaction applied is still promoted, and stays in storage unserved. Its handshake reports each redaction as pending or applied. The
+  reads, uploads, upload negotiation and lift commits, leaves it out of `batch` answers, and deletes
+  a staged copy of it rather than promote it, or deletes the copy a promotion under way when it
+  applied wrote. Its handshake reports each redaction as pending or applied. The
   first time it judges a redaction it reads every pallet, which can take a few requests; until
-  then that content is not served, and the request answers `503` with `Retry-After`. It does not
-  delete redacted content yet: an applied redaction stays `deletion_owed`, and a redacted chunked
-  file's chunks are still served. Deploying this needs the updated IAM policies: the verifier
-  reads the DynamoDB table, and the control plane keeps scan progress under `redaction-work/`.
+  then that content is not served, and the request answers `503` with `Retry-After`. The first
+  request to find a redaction applied deletes the stored copies of a redacted file, every version
+  of each; a lift whose history names such content no longer stored lands without it. An applied
+  redaction still reports `deletion_owed` for now, and a redacted chunked file's recipe and chunks
+  are kept, its chunks still served. Deploying this needs the updated IAM policies: the verifier
+  reads the DynamoDB table and deletes object versions, and the control plane keeps scan progress
+  under `redaction-work/` and deletes object versions.
 - **A redaction applies only to a file's content.** A redaction naming an object a warehouse holds
   as a directory or as a chunk of a chunked file is never applied there (`redact list` reports it
   undecided, with why), and the deleter leaves such an object in place. The reads, `audit`, `heal`

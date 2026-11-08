@@ -124,7 +124,9 @@ prepared before an upgrade began cannot land once it has.
 
 A redaction the head has judged keeps an item of its own, `entity = "redaction#<hash>"`, whose
 `state` is a versioned JSON record: whether its scan has a verdict for every pallet, the pallets
-it saw naming the content with the heads it saw them at, and when it applied. Every write of it
+it saw naming the content with the heads it saw them at, when it applied, whether the copies of
+an applied redaction's content have been deleted since, and until when one request holds that
+deletion, so no other starts it meanwhile. Every write of it
 is conditioned on the exact bytes its writer read, behind the same format check. A record of a
 version the build does not read fails every request that needs that redaction with a `500`, and
 is never written over, since it may record an apply. The scan's progress lives beside it in S3,

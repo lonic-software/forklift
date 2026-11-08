@@ -128,6 +128,29 @@ resource "aws_s3_bucket_lifecycle_configuration" "this" {
     expiration {
       days = var.staging_expiry_days
     }
+
+    # On a versioned bucket an expiry only adds a delete marker: the staged bytes stay a
+    # noncurrent version. Redacted content staged after its redaction's sweep, whose verifier
+    # event never succeeds, would survive so; this removes every version. A no-op unversioned.
+    noncurrent_version_expiration {
+      noncurrent_days = 1
+    }
+  }
+
+  # The delete markers those expiries leave on a versioned bucket, once no version stands behind
+  # them: without this every abandoned staged key keeps one, and the redaction sweep's version
+  # listing of staging/ grows with them. A rule of its own: it cannot share `days`'s block.
+  rule {
+    id     = "expire-staging-delete-markers"
+    status = "Enabled"
+
+    filter {
+      prefix = "staging/"
+    }
+
+    expiration {
+      expired_object_delete_marker = true
+    }
   }
 
   dynamic "rule" {

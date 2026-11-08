@@ -249,7 +249,19 @@ impl ObjectStore for MemoryObjectStore {
         Ok(())
     }
 
-    fn drop_staged_copy(&self, session: &str, hash: &str) -> Result<(), String> {
+    fn delete_canonical(&self, hash: &str) -> Result<(), String> {
+        self.objects.lock().unwrap().remove(hash);
+
+        Ok(())
+    }
+
+    fn delete_staged(&self, hash: &str) -> Result<(), String> {
+        self.staged.lock().unwrap().retain(|(_, staged), _| staged != hash);
+
+        Ok(())
+    }
+
+    fn delete_staged_copy(&self, session: &str, hash: &str) -> Result<(), String> {
         self.staged.lock().unwrap().remove(&(session.to_string(), hash.to_string()));
 
         Ok(())

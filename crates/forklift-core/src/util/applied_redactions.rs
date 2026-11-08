@@ -40,6 +40,12 @@ pub struct AppliedSet {
 }
 
 impl AppliedSet {
+    /// The set of `hashes`, for a remote that keeps its applied redactions somewhere other than
+    /// this record: the serverless head keeps each in its redaction's item.
+    pub fn of(hashes: impl IntoIterator<Item = String>) -> AppliedSet {
+        AppliedSet { hashes: hashes.into_iter().collect() }
+    }
+
     /// Whether the redaction of `hash` is applied.
     pub fn contains(&self, hash: &str) -> bool {
         self.hashes.contains(hash)

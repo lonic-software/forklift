@@ -24,6 +24,18 @@
       "Resource": "${bucket_arn}/redaction-work/*"
     },
     {
+      "Sid": "DeleteRedactedCopies",
+      "Effect": "Allow",
+      "Action": "s3:DeleteObjectVersion",
+      "Resource": ["${bucket_arn}/objects/*", "${bucket_arn}/staging/*"]
+    },
+    {
+      "Sid": "ListRedactedVersions",
+      "Effect": "Allow",
+      "Action": "s3:ListBucketVersions",
+      "Resource": "${bucket_arn}"
+    },
+    {
       "Sid": "ListBucketFor404Semantics",
       "Effect": "Allow",
       "Action": "s3:ListBucket",

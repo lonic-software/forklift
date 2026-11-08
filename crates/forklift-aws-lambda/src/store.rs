@@ -520,10 +520,25 @@ pub trait ObjectStore {
         Ok(OffloadedResponse::Inline(bytes))
     }
 
-    /// Delete the copy of `hash` staged under `session`, if any: a staged object whose
-    /// redaction applied is dropped, never promoted. The default store stages nothing.
-    fn drop_staged_copy(&self, _session: &str, _hash: &str) -> Result<(), String> {
-        Ok(())
+    /// Delete every version of `hash`'s canonical object: what an applied redaction of a file's
+    /// content owes the store. An absent object is no error.
+    ///
+    /// The default keeps nothing it could delete and fails, loudly.
+    fn delete_canonical(&self, _hash: &str) -> Result<(), String> {
+        Err("This object store cannot delete an object.".to_string())
+    }
+
+    /// Delete every version of every staged copy of `hash`, in every lift session. An absent
+    /// copy is no error.
+    fn delete_staged(&self, _hash: &str) -> Result<(), String> {
+        Err("This object store cannot delete an object.".to_string())
+    }
+
+    /// Delete every version of the copy of `hash` staged under `session`, and no other: one
+    /// key, where [`delete_staged`](Self::delete_staged) lists the warehouse's whole staging
+    /// prefix. An absent copy is no error.
+    fn delete_staged_copy(&self, _session: &str, _hash: &str) -> Result<(), String> {
+        Err("This object store cannot delete an object.".to_string())
     }
 
     /// The bytes of the redaction work object `name`, or `None` when there is none. Work

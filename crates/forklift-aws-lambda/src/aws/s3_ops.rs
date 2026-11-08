@@ -90,6 +90,7 @@ use aws_sdk_s3::operation::copy_object::builders::CopyObjectFluentBuilder;
 use aws_sdk_s3::operation::delete_object::builders::DeleteObjectFluentBuilder;
 use aws_sdk_s3::operation::get_object::builders::GetObjectFluentBuilder;
 use aws_sdk_s3::operation::head_object::builders::HeadObjectFluentBuilder;
+use aws_sdk_s3::operation::list_object_versions::builders::ListObjectVersionsFluentBuilder;
 use aws_sdk_s3::operation::list_objects_v2::builders::ListObjectsV2FluentBuilder;
 use aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder;
 
@@ -155,5 +156,9 @@ impl S3Ops {
 
     pub(crate) fn list_objects_v2(&self) -> ListObjectsV2FluentBuilder {
         self.0.list_objects_v2()
+    }
+
+    pub(crate) fn list_object_versions(&self) -> ListObjectVersionsFluentBuilder {
+        self.0.list_object_versions()
     }
 }

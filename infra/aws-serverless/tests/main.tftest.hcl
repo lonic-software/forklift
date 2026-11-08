@@ -103,6 +103,19 @@ run "c2_staging_lifecycle_rule" {
     condition     = aws_s3_bucket_lifecycle_configuration.this.rule[0].status == "Enabled"
     error_message = "C2: the staging lifecycle rule must be enabled."
   }
+
+  assert {
+    condition     = aws_s3_bucket_lifecycle_configuration.this.rule[0].noncurrent_version_expiration[0].noncurrent_days == 1
+    error_message = "The staging lifecycle rule must expire noncurrent versions, so no staged copy outlives it on a versioned bucket."
+  }
+
+  assert {
+    condition = anytrue([
+      for rule in aws_s3_bucket_lifecycle_configuration.this.rule :
+      rule.id == "expire-staging-delete-markers" && rule.filter[0].prefix == "staging/" && rule.expiration[0].expired_object_delete_marker == true
+    ])
+    error_message = "A staging/ rule must expire the delete markers the staging expiry leaves, so the sweep's version listing does not grow."
+  }
 }
 
 run "c2_staging_expiry_floor_rejects_zero" {
