@@ -118,11 +118,15 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   first time it judges a redaction it reads every pallet, which can take a few requests; until
   then that content is not served, and the request answers `503` with `Retry-After`. The first
   request to find a redaction applied deletes the stored copies of a redacted file, every version
-  of each; a lift whose history names such content no longer stored lands without it. An applied
-  redaction still reports `deletion_owed` for now, and a redacted chunked file's recipe and chunks
-  are kept, its chunks still served. Deploying this needs the updated IAM policies: the verifier
-  reads the DynamoDB table and deletes object versions, and the control plane keeps scan progress
-  under `redaction-work/` and deletes object versions.
+  of each; a lift whose history names such content no longer stored lands without it. About half an
+  hour after it applied, once every request then running has ended and every bundle URL handed out
+  before has expired, the next request deletes those copies again, the bundles written before, and
+  the redaction's scan progress; the handshake then reports it `deleted`. A redacted chunked file's
+  recipe and chunks are kept, its chunks still served, and it stays `deletion_owed`. Offloaded
+  bundles now live under `responses/{warehouse}/`; the `responses/` lifecycle rule expires the old
+  shared keys. Deploying this needs the updated IAM policies: the verifier reads the DynamoDB table
+  and deletes object versions, and the control plane keeps scan progress under `redaction-work/`
+  and deletes object versions, including under `responses/` and `redaction-work/`.
 - **A redaction applies only to a file's content.** A redaction naming an object a warehouse holds
   as a directory or as a chunk of a chunked file is never applied there (`redact list` reports it
   undecided, with why), and the deleter leaves such an object in place. The reads, `audit`, `heal`

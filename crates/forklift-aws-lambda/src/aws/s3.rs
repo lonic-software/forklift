@@ -22,10 +22,11 @@
 //! * `signatures/{warehouse}/{parcel_hash}` — signature sidecars, immutable like objects. A
 //!   distinct prefix, never `objects/`, because a parcel's sidecar shares the parcel's hash and
 //!   must not collide with the parcel object.
-//! * `responses/{content_hash}` — offloaded `batch` bundles, ephemeral and content-addressed,
-//!   deliberately outside `objects/` so nothing here is reachable as an object (invariant 1
-//!   is not in play; the client verifies every record on import regardless). Shared by every
-//!   warehouse: a response is reached only through the presigned URL the head hands back.
+//! * `responses/{warehouse}/{content_hash}` — offloaded `batch` bundles, ephemeral and
+//!   content-addressed, deliberately outside `objects/` so nothing here is reachable as an object
+//!   (invariant 1 is not in play; the client verifies every record on import regardless). A
+//!   response is reached only through the presigned URL the head hands back; it is keyed by its
+//!   warehouse so an applied redaction's late sweep can find the bundles that may hold its content.
 //!
 //! Warehouses in AWS format 1 kept objects and signatures at `objects/{hash}` and
 //! `signatures/{hash}`, shared by every warehouse. Nothing here reads those keys, and the format
@@ -110,7 +111,7 @@
 //! closes it here, and it must be re-verified whenever the deployment/infrastructure story for this
 //! head is documented or automated (Terraform/CDK, a setup script, an operator runbook).
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::presigning::PresigningConfig;
@@ -236,10 +237,15 @@ fn work_key(warehouse: &str, name: &str) -> String {
     format!("redaction-work/{}/{}", warehouse, name)
 }
 
-/// The ephemeral, content-addressed key of an offloaded response body. Outside `objects/`, so
-/// nothing here is ever an object at a hash key.
-fn response_key(content_hash: &str) -> String {
-    format!("responses/{}", content_hash)
+/// `warehouse`'s prefix for offloaded response bodies.
+fn response_prefix(warehouse: &str) -> String {
+    format!("responses/{}/", warehouse)
+}
+
+/// `warehouse`'s ephemeral, content-addressed key of an offloaded response body. Outside
+/// `objects/`, so nothing here is ever an object at a hash key.
+fn response_key(warehouse: &str, content_hash: &str) -> String {
+    format!("{}{}", response_prefix(warehouse), content_hash)
 }
 
 /// Percent-encode a key for the key portion of a `CopySource` value (`bucket/key`). AWS
@@ -446,10 +452,11 @@ impl S3ObjectStore {
     }
 
     /// Delete every version, and every delete marker, of each key under `prefix` that `wanted`
-    /// accepts. Listing versions rather than keys is what makes the delete complete on a bucket
+    /// accepts, given the key and when that version was last modified (`None` when S3 names no
+    /// time). Listing versions rather than keys is what makes the delete complete on a bucket
     /// with versioning enabled or suspended; on an unversioned bucket each key lists as one
     /// `null` version, and deleting that version deletes the object.
-    async fn delete_every_version(&self, prefix: &str, wanted: impl Fn(&str) -> bool) -> Result<(), String> {
+    async fn delete_every_version(&self, prefix: &str, wanted: impl Fn(&str, Option<SystemTime>) -> bool) -> Result<(), String> {
         let mut markers: Option<(String, Option<String>)> = None;
 
         loop {
@@ -464,15 +471,15 @@ impl S3ObjectStore {
             let listed = page
                 .versions()
                 .iter()
-                .map(|version| (version.key(), version.version_id()))
-                .chain(page.delete_markers().iter().map(|marker| (marker.key(), marker.version_id())));
+                .map(|version| (version.key(), version.version_id(), version.last_modified()))
+                .chain(page.delete_markers().iter().map(|marker| (marker.key(), marker.version_id(), marker.last_modified())));
 
-            for (key, version) in listed {
+            for (key, version, modified) in listed {
                 let (Some(key), Some(version)) = (key, version) else {
                     continue;
                 };
 
-                if !wanted(key) {
+                if !wanted(key, modified.and_then(|time| SystemTime::try_from(*time).ok())) {
                     continue;
                 }
 
@@ -916,7 +923,7 @@ impl ObjectStore for S3ObjectStore {
     fn offload_response(&self, bytes: Vec<u8>) -> Result<OffloadedResponse, String> {
         // A content-addressed key in the ephemeral response prefix — never an object. Two
         // identical bundles land on the same key, so the write is an idempotent overwrite.
-        let key = response_key(&object_utils::hash_object_bytes(&bytes));
+        let key = response_key(&self.warehouse, &object_utils::hash_object_bytes(&bytes));
 
         self.bridge.block_on(async {
             self.put_overwrite(&key, bytes).await?;
@@ -930,14 +937,14 @@ impl ObjectStore for S3ObjectStore {
     fn delete_canonical(&self, hash: &str) -> Result<(), String> {
         let key = object_key(&self.warehouse, hash);
 
-        self.bridge.block_on(self.delete_every_version(&key, |listed| listed == key))
+        self.bridge.block_on(self.delete_every_version(&key, |listed, _| listed == key))
     }
 
     fn delete_staged(&self, hash: &str) -> Result<(), String> {
         let prefix = format!("staging/{}/", self.warehouse);
 
         // Every session's copy of it, and nothing else under the prefix.
-        self.bridge.block_on(self.delete_every_version(&prefix, |listed| {
+        self.bridge.block_on(self.delete_every_version(&prefix, |listed, _| {
             parse_staging_key(listed).is_some_and(|staged| staged.warehouse == self.warehouse && staged.hash == hash)
         }))
     }
@@ -945,7 +952,14 @@ impl ObjectStore for S3ObjectStore {
     fn delete_staged_copy(&self, session: &str, hash: &str) -> Result<(), String> {
         let key = staging_key(&self.warehouse, session, hash);
 
-        self.bridge.block_on(self.delete_every_version(&key, |listed| listed == key))
+        self.bridge.block_on(self.delete_every_version(&key, |listed, _| listed == key))
+    }
+
+    fn delete_responses_before(&self, cutoff: SystemTime) -> Result<(), String> {
+        // A version S3 names no time for is deleted: it may be from before the cutoff.
+        self.bridge.block_on(self.delete_every_version(&response_prefix(&self.warehouse), |_, modified| {
+            modified.is_none_or(|modified| modified < cutoff)
+        }))
     }
 
     fn work_get(&self, name: &str) -> Result<Option<Vec<u8>>, String> {
@@ -958,6 +972,12 @@ impl ObjectStore for S3ObjectStore {
         let key = work_key(&self.warehouse, name);
 
         self.bridge.block_on(self.put_overwrite(&key, bytes.to_vec()))
+    }
+
+    fn work_delete_under(&self, prefix: &str) -> Result<(), String> {
+        let prefix = work_key(&self.warehouse, prefix);
+
+        self.bridge.block_on(self.delete_every_version(&prefix, |listed, _| listed.starts_with(&prefix)))
     }
 
     fn work_delete(&self, name: &str) -> Result<(), String> {
@@ -1013,6 +1033,7 @@ mod tests {
         assert!(!object_key(b, &hash).starts_with(&a_objects), "{}", a_objects);
         assert!(!signature_key(b, &hash).starts_with(&signature_key(a, "")));
         assert!(!staging_key(b, "s", &hash).starts_with(&staging_prefix(a, "s")));
+        assert!(!response_key(b, &hash).starts_with(&response_prefix(a)), "a response sweep keeps to its warehouse");
 
         assert_ne!(object_key(a, &hash), format!("objects/{}", hash), "the format 1 key");
     }
@@ -1035,8 +1056,8 @@ mod tests {
         assert_ne!(signature_key("wh-a", &hash), object_key("wh-a", &hash));
 
         // A response body is never reachable as an object at a hash key.
-        assert_eq!(response_key(&hash), format!("responses/{}", hash));
-        assert!(!response_key(&hash).starts_with("objects/"));
+        assert_eq!(response_key("wh-a", &hash), format!("responses/wh-a/{}", hash));
+        assert!(!response_key("wh-a", &hash).starts_with("objects/"));
     }
 
     #[test]

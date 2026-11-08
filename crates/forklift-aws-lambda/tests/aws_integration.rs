@@ -442,6 +442,88 @@ async fn s3_deletion_leaves_no_version_of_a_redacted_copy() {
     }
 }
 
+/// A redaction's late sweep deletes, every version of each, the warehouse's responses written
+/// before its cutoff and the redaction's own work objects. A response written after the cutoff,
+/// another warehouse's responses, and another redaction's work objects are kept.
+// Revert: ignore the cutoff → the early sweep deletes a younger response → red; a work delete
+// that matches nothing → the redaction's work objects stay → red.
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_late_sweep_deletes_old_responses_and_the_redactions_work_objects() {
+    let Some(endpoint) = endpoint() else {
+        eprintln!("skipping: FORKLIFT_AWS_TEST_ENDPOINT is unset");
+        return;
+    };
+
+    let config = test_config(&endpoint);
+    provision(&config).await;
+    let (s3, _dynamodb) = raw_clients(&config).await;
+    s3.put_bucket_versioning()
+        .bucket(&config.bucket)
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .expect("enable versioning");
+
+    let bridge = AsyncBridge::current().expect("a multi-thread runtime");
+    let (objects, _refs) = build_stores(&config, bridge).await.expect("stores");
+    let leak = object_utils::hash_object_bytes(b"leaked");
+    let kept = object_utils::hash_object_bytes(b"kept");
+    let wh = config.warehouse_id.clone();
+    let other = format!("{}0", wh);
+    let put = |key: String| {
+        let s3 = s3.clone();
+        let bucket = config.bucket.clone();
+        async move {
+            s3.put_object().bucket(bucket).key(key).body(b"bytes".to_vec().into()).send().await.expect("put");
+        }
+    };
+    for key in [
+        format!("responses/{}/{}", wh, leak),
+        format!("responses/{}/{}", wh, leak),
+        format!("responses/{}/{}", other, leak),
+        format!("redaction-work/{}/{}/pallets", wh, leak),
+        format!("redaction-work/{}/{}/walk-1", wh, leak),
+        format!("redaction-work/{}/{}/pallets", wh, kept),
+        format!("redaction-work/{}/{}/pallets", other, leak),
+    ] {
+        put(key).await;
+    }
+    let all = every_version(&s3, &config.bucket).await;
+
+    // A cutoff before every write keeps every response.
+    let objects = std::sync::Arc::new(objects);
+    let early = objects.clone();
+    tokio::task::spawn_blocking(move || {
+        let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        early.delete_responses_before(cutoff).expect("delete no response")
+    })
+    .await
+    .expect("the delete task");
+    assert_eq!(every_version(&s3, &config.bucket).await, all, "a response younger than the cutoff is kept");
+
+    let (late, prefix) = (objects.clone(), format!("{}/", leak));
+    tokio::task::spawn_blocking(move || {
+        let cutoff = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        late.delete_responses_before(cutoff).expect("delete the old responses");
+        late.work_delete_under(&prefix).expect("delete the redaction's work objects");
+        late.work_delete_under(&prefix).expect("an absent prefix is no error");
+    })
+    .await
+    .expect("the delete task");
+
+    let mut expected = vec![
+        format!("redaction-work/{}/{}/pallets", other, leak),
+        format!("redaction-work/{}/{}/pallets", wh, kept),
+        format!("responses/{}/{}", other, leak),
+    ];
+    expected.sort();
+    assert_eq!(every_version(&s3, &config.bucket).await, expected);
+}
+
 /// verify-and-promote across the presigned path: a client's staged bytes are not fetchable
 /// until promoted, a corrupt staged object is discarded, and promotion is idempotent.
 #[tokio::test(flavor = "multi_thread")]
@@ -529,7 +611,7 @@ async fn s3_verify_and_promote_gates_the_canonical_namespace() {
         // A response body offloads to a presigned GET outside the object namespace.
         match objects.offload_response(b"a bundle".to_vec()).expect("offload") {
             OffloadedResponse::Url(url) => {
-                assert!(url.contains("responses/"), "{}", url);
+                assert!(url.contains(&format!("responses/{}/", config.warehouse_id)), "{}", url);
                 assert!(!url.contains("/objects/"), "a response is never an object");
             }
             OffloadedResponse::Inline(_) => panic!("an offloading store hands out a URL"),

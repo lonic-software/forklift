@@ -541,6 +541,17 @@ pub trait ObjectStore {
         Err("This object store cannot delete an object.".to_string())
     }
 
+    /// Delete every version of every response bundle [`offload_response`](Self::offload_response)
+    /// wrote for this warehouse before `cutoff`, and of none written since: what the late sweep of
+    /// an applied redaction owes the bundles that may hold its content. An absent bundle is no
+    /// error.
+    ///
+    /// The default fails, loudly, as every delete here does: a store that offloads bundles and
+    /// inherits it would otherwise report them deleted.
+    fn delete_responses_before(&self, _cutoff: std::time::SystemTime) -> Result<(), String> {
+        Err("This object store cannot delete a response.".to_string())
+    }
+
     /// The bytes of the redaction work object `name`, or `None` when there is none. Work
     /// objects hold a redaction scan's progress between invocations, under the warehouse's own
     /// `redaction-work/` prefix; they are never objects and never served.
@@ -557,6 +568,11 @@ pub trait ObjectStore {
 
     /// Delete the redaction work object `name`; an absent one is no error.
     fn work_delete(&self, _name: &str) -> Result<(), String> {
+        Err("This object store keeps no redaction work objects.".to_string())
+    }
+
+    /// Delete every redaction work object whose name starts with `prefix`, every version of it.
+    fn work_delete_under(&self, _prefix: &str) -> Result<(), String> {
         Err("This object store keeps no redaction work objects.".to_string())
     }
 }

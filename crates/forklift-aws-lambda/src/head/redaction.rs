@@ -129,6 +129,18 @@ struct Record {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     swept: bool,
 
+    /// Whether the store held the content as a recipe when it was swept. A recipe's object is its
+    /// chunk list, so it is kept, and its deletion is not done, until its chunks are deleted too.
+    /// Written only once true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    recipe: bool,
+
+    /// Whether the late sweep has deleted every copy of the content the bucket holds: what the
+    /// first sweep deletes, again, and every response bundle that may hold the content. Written
+    /// only once true, and never for a recipe.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    deleted: bool,
+
     /// Until when, in seconds since the Unix epoch, one request holds the deletion: no other
     /// starts it before then. Written only while held.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -171,8 +183,9 @@ struct SavedWalk {
 /// Where one redaction stands, as a route judges it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
-    /// Applied: refused on every route.
-    Applied,
+    /// Applied: refused on every route. `deleted` once the late sweep has deleted every copy of
+    /// the content the bucket holds.
+    Applied { deleted: bool },
 
     /// Pending: something still holds it, a cell of it cannot be read, or it names no file's
     /// content. Served.
@@ -244,14 +257,19 @@ enum Holding {
     Stopped(String),
 }
 
+/// The prefix every work object of the redaction of `hash` is named under.
+fn work_prefix(hash: &str) -> String {
+    format!("{}/", hash)
+}
+
 /// The name of the work object listing the pallets the scan of `hash` has still to walk.
 fn remaining_name(hash: &str) -> String {
-    format!("{}/pallets", hash)
+    format!("{}pallets", work_prefix(hash))
 }
 
 /// The name of the work object holding the walk of `seen` for the redaction of `hash`.
 fn walk_name(hash: &str, seen: &Seen) -> String {
-    format!("{}/walk-{}", hash, object_utils::hash_object_bytes(format!("{}\n{}", seen.pallet, seen.head).as_bytes()))
+    format!("{}walk-{}", work_prefix(hash), object_utils::hash_object_bytes(format!("{}\n{}", seen.pallet, seen.head).as_bytes()))
 }
 
 /// The record `stored` holds, for the redaction of `hash`.
@@ -296,9 +314,33 @@ fn decode_work<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Option<T> {
 /// How long a deletion's lease runs past the request's deadline, in seconds.
 const SWEEP_LEASE_MARGIN: u64 = 60;
 
-/// How long a deletion's lease runs from its start when the request has no deadline, in seconds:
-/// a Lambda invocation's longest.
-const SWEEP_LEASE_WITHOUT_DEADLINE: u64 = 900;
+/// A Lambda invocation's longest, in seconds: how long a deletion's lease runs from its start when
+/// the request has no deadline, and how long after a redaction applied a request that judged it
+/// pending first may still write a response bundle holding its content.
+const INVOCATION_CEILING: u64 = 900;
+
+/// How long past [`late_sweep_due`] the late sweep waits on top, in seconds: for clocks that
+/// disagree, and a presigned URL minted a moment after its object was written.
+const LATE_SWEEP_MARGIN: u64 = 60;
+
+/// When, in seconds since the Unix epoch, a response bundle last written may still hold the
+/// content of a redaction that applied at `applied_at`: a request that judged the redaction
+/// pending before it applied ends within [`INVOCATION_CEILING`], and every later one leaves the
+/// content out.
+fn response_cutoff(applied_at: u64) -> u64 {
+    applied_at.saturating_add(INVOCATION_CEILING)
+}
+
+/// When the late sweep of a redaction that applied at `applied_at` is due, in seconds since the
+/// Unix epoch: once every presigned URL that could reach a copy has expired. A response written
+/// before [`response_cutoff`] was presigned then, and a staged `PUT` presigned before the apply
+/// lands within the same window, so nothing the sweep deletes is still reachable, and nothing it
+/// should delete can still arrive.
+fn late_sweep_due(applied_at: u64) -> u64 {
+    response_cutoff(applied_at)
+        .saturating_add(crate::aws::PRESIGN_TTL.as_secs())
+        .saturating_add(LATE_SWEEP_MARGIN)
+}
 
 /// `time` in whole seconds since the Unix epoch.
 fn epoch_seconds(time: SystemTime) -> u64 {
@@ -398,6 +440,8 @@ pub fn record_state(scan_complete: bool, holders: &[(String, String)], applied_a
         never_applies: false,
         scan: 0,
         swept: false,
+        recipe: false,
+        deleted: false,
         lease_until: None,
     };
 
@@ -490,7 +534,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 None => Verdict::Pending,
             };
 
-            if verdict == Verdict::Applied {
+            if matches!(verdict, Verdict::Applied { .. }) {
                 self.evict(hash)?;
             }
 
@@ -505,7 +549,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     pub(super) fn refuse_redacted(&self, hashes: &[String]) -> HeadResult<()> {
         let verdicts = self.judge_hashes(hashes)?;
 
-        if let Some(hash) = hashes.iter().find(|hash| verdicts.get(*hash) == Some(&Verdict::Applied)) {
+        if let Some(hash) = hashes.iter().find(|hash| matches!(verdicts.get(*hash), Some(Verdict::Applied { .. }))) {
             return Err(HeadError::gone(applied_redactions::served_refusal(hash)));
         }
 
@@ -562,8 +606,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         }
     }
 
-    /// Where every redaction `@redactions` records stands, for the handshake: each unapplied one
-    /// judged first, within the request's budget.
+    /// Where every redaction `@redactions` records stands, for the handshake: each one judged
+    /// first, within the request's budget, so an unapplied one may apply and an applied one runs
+    /// the sweep it is owed.
     pub(super) fn served_redactions(&self) -> HeadResult<Vec<ServedRedaction>> {
         let recorded = self.recorded()?;
         let hashes = recorded.hashes();
@@ -571,7 +616,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
         Ok(hashes.into_iter().map(|hash| {
             let state = match verdicts.get(&hash) {
-                Some(Verdict::Applied) => ServedRedactionState::DeletionOwed,
+                Some(Verdict::Applied { deleted: true }) => ServedRedactionState::Deleted,
+                Some(Verdict::Applied { deleted: false }) => ServedRedactionState::DeletionOwed,
                 _ => ServedRedactionState::Pending,
             };
 
@@ -579,9 +625,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         }).collect())
     }
 
-    /// After a committed write: judge every recorded, unapplied redaction, as best effort and
-    /// within the request's budget, so one the write let apply applies now, and one the write
-    /// recorded starts its scan. A failure here is logged, never answered: the write committed,
+    /// After a committed write: judge every recorded redaction, as best effort and within the
+    /// request's budget, so one the write let apply applies now, one the write recorded starts its
+    /// scan, and an applied one runs the sweep it is owed. A failure here is logged, never answered: the write committed,
     /// and the next request for the content judges it anyway.
     pub(super) fn judge_after_write(&self) {
         if let Err(error) = self.served_redactions() {
@@ -637,16 +683,23 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 continue;
             };
 
-            if record.applied_at.is_some() {
+            if let Some(applied_at) = record.applied_at {
                 // The deletion is owed by whichever request reads it applied first and has the
-                // time; a failed one leaves it owed, and never changes the verdict.
-                if !record.swept && budget.timely() {
-                    if let Err(error) = self.sweep(hash, stored.as_deref().unwrap_or_default(), &record, budget) {
-                        eprintln!("forklift-aws-lambda: the copies of applied redaction {} were not deleted: {}", hash, error);
+                // time, and the late sweep by the first after it is due; a failed one leaves it
+                // owed, and never changes the verdict.
+                let late = epoch_seconds(SystemTime::now()) >= late_sweep_due(applied_at);
+                let owed = !record.swept || (late && !record.deleted && !record.recipe);
+
+                if owed && budget.timely() {
+                    match self.sweep(hash, stored.as_deref().unwrap_or_default(), &record, late, budget) {
+                        Ok(deleted) => return Ok(Verdict::Applied { deleted }),
+                        Err(error) => {
+                            eprintln!("forklift-aws-lambda: the copies of applied redaction {} were not deleted: {}", hash, error);
+                        }
                     }
                 }
 
-                return Ok(Verdict::Applied);
+                return Ok(Verdict::Applied { deleted: record.deleted });
             }
 
             if record.never_applies {
@@ -749,7 +802,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
         self.put_remaining(hash, 0, &pallets)?;
 
-        let record = Record { version: RECORD_VERSION, scan_complete: false, holders: Vec::new(), applied_at: None, never_applies: false, scan: 0, swept: false, lease_until: None };
+        let record = Record { version: RECORD_VERSION, scan_complete: false, holders: Vec::new(), applied_at: None, never_applies: false, scan: 0, swept: false, recipe: false, deleted: false, lease_until: None };
         // Lost to another request's start: the judge reads its item instead.
         self.write_record(hash, &record, None, budget).map(|_| ())
     }
@@ -1005,41 +1058,77 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
     /// Delete the copies the store keeps of `hash`, applied as `record` (stored as `stored`):
     /// every staged copy, and a blob's canonical object. A recipe's object stays, with the chunks
-    /// it names, until chunks are deleted too. Run under a lease the item holds, so two requests
-    /// reading the redaction applied at once delete once; the lease outlasts this request, so one
-    /// that dies holding it leaves the deletion to the first request after it ends.
-    fn sweep(&self, hash: &str, stored: &str, record: &Record, budget: &mut Budget) -> HeadResult<()> {
+    /// it names, until chunks are deleted too. The `late` sweep, once [`late_sweep_due`], deletes
+    /// them again, catching a staged upload presigned before the apply that landed after the first
+    /// sweep, and also every response bundle written before [`response_cutoff`] and the scan's work
+    /// objects; for a blob, it ends the deletion. Run under a lease the item holds, so two
+    /// requests reading the redaction applied at once delete once; the lease outlasts this
+    /// request, so one that dies holding it leaves the deletion to the first request after it
+    /// ends.
+    ///
+    /// # Returns
+    /// * `Ok(bool)`       - Whether the deletion is done; `false` too while another request holds
+    ///                      the lease.
+    /// * `Err(HeadError)` - A read or a delete failed: the deletion stays owed.
+    fn sweep(&self, hash: &str, stored: &str, record: &Record, late: bool, budget: &mut Budget) -> HeadResult<bool> {
         let now = epoch_seconds(SystemTime::now());
 
         if record.lease_until.is_some_and(|until| until > now) {
-            return Ok(());
+            return Ok(record.deleted);
         }
 
-        let until = budget.deadline.map_or(now + SWEEP_LEASE_WITHOUT_DEADLINE, epoch_seconds) + SWEEP_LEASE_MARGIN;
+        let until = budget.deadline.map_or(now + INVOCATION_CEILING, epoch_seconds) + SWEEP_LEASE_MARGIN;
         let leased = Record { lease_until: Some(until), ..record.clone() };
 
         if !self.write_record(hash, &leased, Some(stored), budget)? {
-            return Ok(());
+            return Ok(record.deleted);
         }
         let stored = encode_record(&leased)?;
 
-        let deleted = self.delete_copies(hash);
-        let next = Record { swept: deleted.is_ok(), lease_until: None, ..leased };
+        let swept = self.delete_copies(hash, late.then_some(leased.applied_at.unwrap_or_default()));
+        let next = match &swept {
+            Ok(kept) => Record {
+                swept: true,
+                recipe: leased.recipe || *kept == Some(ObjectType::Recipe),
+                deleted: late && *kept != Some(ObjectType::Recipe),
+                lease_until: None,
+                ..leased
+            },
+            Err(_) => Record { lease_until: None, ..leased },
+        };
         // Lost, the lease simply runs out and the next request after it deletes again.
         self.write_record(hash, &next, Some(&stored), budget)?;
 
-        deleted
+        swept.map(|_| next.deleted)
     }
 
     /// Delete every staged copy of `hash`, and its canonical object unless the store holds it as
-    /// a recipe. An object that cannot be read is kept: the deletion stays owed.
-    fn delete_copies(&self, hash: &str) -> HeadResult<()> {
+    /// a recipe. An object that cannot be read is kept: the deletion stays owed. For the late
+    /// sweep of a redaction that applied at `late`, delete too every response bundle written
+    /// before [`response_cutoff`], and, unless a recipe is kept, the scan's work objects: no
+    /// request still walking for it can outlive the wait before the late sweep.
+    ///
+    /// # Returns
+    /// * `Ok(Option<ObjectType>)` - The type the store held the canonical object as before the
+    ///                              deletion; `None` when it held none.
+    fn delete_copies(&self, hash: &str, late: Option<u64>) -> HeadResult<Option<ObjectType>> {
         self.objects.delete_staged(hash).map_err(HeadError::internal)?;
 
-        match stored_type(&self.objects, hash).map_err(HeadError::internal)? {
-            Some(ObjectType::Recipe) => Ok(()),
-            _ => self.objects.delete_canonical(hash).map_err(HeadError::internal),
+        let stored = stored_type(&self.objects, hash).map_err(HeadError::internal)?;
+        if stored != Some(ObjectType::Recipe) {
+            self.objects.delete_canonical(hash).map_err(HeadError::internal)?;
         }
+
+        if let Some(applied_at) = late {
+            let cutoff = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(response_cutoff(applied_at));
+            self.objects.delete_responses_before(cutoff).map_err(HeadError::internal)?;
+
+            if stored != Some(ObjectType::Recipe) {
+                self.objects.work_delete_under(&work_prefix(hash)).map_err(HeadError::internal)?;
+            }
+        }
+
+        Ok(stored)
     }
 
     /// Save `pallets` as the pallets the scan of `hash` has still to walk.
@@ -1110,7 +1199,7 @@ mod tests {
 
     #[test]
     fn a_record_with_a_field_this_build_does_not_know_is_refused() {
-        let stored = r#"{"version":1,"scan_complete":true,"holders":[],"applied_at":null,"deleted":true}"#;
+        let stored = r#"{"version":1,"scan_complete":true,"holders":[],"applied_at":null,"purged":true}"#;
 
         assert!(decode_record(&"a".repeat(64), stored).is_err());
     }

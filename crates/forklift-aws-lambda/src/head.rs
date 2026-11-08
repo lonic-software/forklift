@@ -366,7 +366,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             // Always present, empty or not: this head deletes pallets, and a client reads an absent
             // map as a head that keeps no tombstones.
             tombstones: Some(tombstones),
-            // Every redaction `@redactions` records, each unapplied one judged first.
+            // Every redaction `@redactions` records, each judged first.
             redactions: Some(self.served_redactions()?),
         })
     }
@@ -1507,7 +1507,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         // as an object the store lacks is.
         let verdicts = self.judge_hashes(hashes)?;
         let withheld = |hash: &str| {
-            matches!(verdicts.get(hash), Some(redaction::Verdict::Applied | redaction::Verdict::Undecided(_)))
+            matches!(verdicts.get(hash), Some(redaction::Verdict::Applied { .. } | redaction::Verdict::Undecided(_)))
         };
 
         let scratch = self.scratch().map_err(HeadError::internal)?;

@@ -125,8 +125,9 @@ prepared before an upgrade began cannot land once it has.
 A redaction the head has judged keeps an item of its own, `entity = "redaction#<hash>"`, whose
 `state` is a versioned JSON record: whether its scan has a verdict for every pallet, the pallets
 it saw naming the content with the heads it saw them at, when it applied, whether the copies of
-an applied redaction's content have been deleted since, and until when one request holds that
-deletion, so no other starts it meanwhile. Every write of it
+an applied redaction's content have been deleted since, whether its content was found to be a
+recipe, which keeps that object, whether its late sweep has run too, and until when one request
+holds a deletion, so no other starts it meanwhile. Every write of it
 is conditioned on the exact bytes its writer read, behind the same format check. A record of a
 version the build does not read fails every request that needs that redaction with a `500`, and
 is never written over, since it may record an apply. The scan's progress lives beside it in S3,
@@ -152,8 +153,10 @@ only the warehouse's own DynamoDB partition: a step is given no object store, an
 bucket's keys, so an S3 layout change has no in-place path.
 
 Since AWS format 2 every warehouse has its own keys in the bucket: `objects/{warehouse}/{hash}`,
-`signatures/{warehouse}/{parcel_hash}` and `staging/{warehouse}/{session}/{hash}`. Only `responses/`,
-which holds transient bundle bodies reached through a presigned URL, is shared. AWS format 1 kept one
+`signatures/{warehouse}/{parcel_hash}`, `staging/{warehouse}/{session}/{hash}`, and
+`responses/{warehouse}/{hash}` for the transient bundle bodies reached through a presigned URL.
+Those bodies were once shared under `responses/{hash}`; no format bump marks the change, since
+nothing reads a response once its URL expires. AWS format 1 kept one
 `objects/{hash}` and one `signatures/{hash}` key per object for every warehouse in the bucket, so a
 warehouse could learn from the answers whether another one held an object. No step can tell whose a
 shared key was, so the chain does not reach format 1: a format 1 warehouse is refused, never read
