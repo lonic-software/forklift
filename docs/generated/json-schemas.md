@@ -1502,7 +1502,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "string"
         },
         "redacted": {
-          "description": "The files left out of the commits this run wrote, because this warehouse applied a\nredaction of their content: each by path, with the parcels whose commits left it out.\nCommits written before the redaction applied keep the file (`.forklift/mirror.git`).",
+          "description": "The files left out of the commits this run wrote, because this warehouse applied a\nredaction of their content: each by path, with the parcels whose commits left it out. A\ncommit is written once per run, so a file is named only under the first pallet whose export\nwrote it. Commits written before the redaction applied keep the file\n(`.forklift/mirror.git`).",
           "items": {
             "$ref": "#/$defs/RedactedFile"
           },
@@ -2420,7 +2420,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "string"
         },
         "redacted": {
-          "description": "The files left out of the commits this run wrote, because this warehouse applied a\nredaction of their content: each by path, with the parcels whose commits left it out.\nCommits written before the redaction applied keep the file (`.forklift/mirror.git`).",
+          "description": "The files left out of the commits this run wrote, because this warehouse applied a\nredaction of their content: each by path, with the parcels whose commits left it out. A\ncommit is written once per run, so a file is named only under the first pallet whose export\nwrote it. Commits written before the redaction applied keep the file\n(`.forklift/mirror.git`).",
           "items": {
             "$ref": "#/$defs/RedactedFile"
           },

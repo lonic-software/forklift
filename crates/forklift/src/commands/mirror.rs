@@ -113,8 +113,10 @@ pub async fn handle_command() -> Result<(), String> {
     let mut lines: Vec<String> = Vec::new();
     if !failed.is_empty() {
         lines.push(format!("Did not mirror {} of {} pallet(s):", failed.len(), report.pallets.len()));
-        lines.extend(failed.iter()
-            .map(|outcome| format!("  \"{}\": {}", outcome.pallet, outcome.message.as_deref().unwrap_or_default())));
+        for outcome in &failed {
+            lines.push(format!("  \"{}\": {}", outcome.pallet, outcome.message.as_deref().unwrap_or_default()));
+            lines.extend(export_git::redacted_lines(&outcome.redacted).into_iter().map(|line| format!("    {line}")));
+        }
     }
     lines.extend(report.tags.failure_lines());
     let message = lines.join("\n");
@@ -1117,8 +1119,10 @@ pub(crate) struct PalletMirror {
     message: Option<String>,
 
     /// The files left out of the commits this run wrote, because this warehouse applied a
-    /// redaction of their content: each by path, with the parcels whose commits left it out.
-    /// Commits written before the redaction applied keep the file (`.forklift/mirror.git`).
+    /// redaction of their content: each by path, with the parcels whose commits left it out. A
+    /// commit is written once per run, so a file is named only under the first pallet whose export
+    /// wrote it. Commits written before the redaction applied keep the file
+    /// (`.forklift/mirror.git`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     redacted: Vec<RedactedFile>,
 }

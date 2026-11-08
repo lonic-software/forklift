@@ -563,7 +563,8 @@ struct ExportedCommit {
 /// A file whose content is an applied redaction's hash is left out of the git tree, and a folder
 /// that held nothing else is left out with it. Whatever this run converts it converts that way, but
 /// a seeded commit may have been written before the redaction applied, so a tree of one is reused
-/// only when nothing under it is redacted.
+/// only when nothing under it is redacted. While any redaction is applied, that check reads every
+/// tree under such a reused commit once per run, so the cost is no longer only the changed paths.
 pub(crate) struct Exporter<'a> {
     repo: &'a GitRepo,
     exported: HashMap<String, ExportedCommit>,
@@ -678,8 +679,10 @@ impl<'a> Exporter<'a> {
         let base = parents.first().map(|parent| (parent.forklift_tree.clone(), parent.git_tree.clone()));
 
         let tree = self.convert_tree(&parcel.tree_hash, base.as_ref().map(|(forklift, git)| (forklift.as_str(), git.as_str())))?;
-        for (path, hash) in self.omitted_in.get(&parcel.tree_hash).cloned().unwrap_or_default() {
-            self.redacted.entry((path, hash)).or_default().push(forklift_hash.to_string());
+        if let Some(omitted) = self.omitted_in.get(&parcel.tree_hash) {
+            for (path, hash) in omitted {
+                self.redacted.entry((path.clone(), hash.clone())).or_default().push(forklift_hash.to_string());
+            }
         }
         let mut args = vec!["commit-tree".to_string(), tree.clone()];
         for commit in parent_commits {
@@ -1149,12 +1152,19 @@ pub(crate) struct RedactedFile {
 
 /// Print each of `redacted` as a line of human output.
 pub(crate) fn render_redacted(redacted: &[RedactedFile]) {
-    for file in redacted {
-        println!(
-            "  Left out \"{}\" ({}) of {} commit(s): its redaction is applied here.",
-            sanitize(&file.path), file.hash, file.parcels.len()
-        );
+    for line in redacted_lines(redacted) {
+        println!("  {line}");
     }
+}
+
+/// One line per file an export left out because its redaction is applied here, unindented.
+pub(crate) fn redacted_lines(redacted: &[RedactedFile]) -> Vec<String> {
+    redacted.iter()
+        .map(|file| format!(
+            "Left out \"{}\" ({}) of {} commit(s): its redaction is applied here.",
+            sanitize(&file.path), file.hash, file.parcels.len()
+        ))
+        .collect()
 }
 
 /// How an export's human output names a meta pallet it did not export.

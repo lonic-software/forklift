@@ -184,7 +184,8 @@ export's last line names each one the warehouse (or its remote) holds; `--json` 
 `not_exported`. Parked work (`park`) is on no pallet, so it is not exported either; a warning counts
 it, in every bay (`parked`). A file whose redaction this warehouse applied (`redact`) is left out
 of each commit that carried it, with nothing in its place; the export names it with those parcels
-(`redacted` in `--json`), and so does `git mirror` for each pallet it pushed.
+(`redacted` in `--json`), and so does `git mirror`, under the first pallet whose export wrote
+those commits. A commit a mirror wrote before the redaction applied keeps the file.
 
 Only what this warehouse holds is exported, so with a remote configured, the export also asks the
 remote for its pallets. Each one the export has no branch for as it stands there (none of that
