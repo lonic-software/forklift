@@ -52,6 +52,7 @@ pub mod memory;
 pub mod scratch;
 pub mod head;
 pub mod reissue;
+pub mod withheld;
 
 pub use aws::{AwsConfig, DynamoRefStore, S3ObjectStore};
 pub use blocking::AsyncBridge;

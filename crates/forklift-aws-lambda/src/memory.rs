@@ -25,7 +25,7 @@ use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef, DEFAULT_PALL
 
 use crate::aws::dynamo::{
     item_entity, ATTR_ANCHOR, ATTR_DELETED_HEAD, ATTR_HEAD, ATTR_STATE, ENTITY_CHUNK_FENCE, ENTITY_CHUNK_LEDGER,
-    ENTITY_FORMAT, ENTITY_PALLET_PREFIX, ENTITY_REDACTION_PREFIX, ENTITY_TRUST,
+    ENTITY_FORMAT, ENTITY_PALLET_PREFIX, ENTITY_REDACTION_PREFIX, ENTITY_TRUST, ENTITY_WITHHELD_PREFIX,
 };
 use crate::store::{
     CasOutcome, ExpectedHead, FormatFence, FormatStore, ObjectAccess, ObjectStore, OffloadedResponse,
@@ -442,13 +442,14 @@ impl MemoryRefStore {
             }
             let pallet = entity.strip_prefix(ENTITY_PALLET_PREFIX).filter(|wire| !wire.is_empty());
             let redaction = entity.strip_prefix(ENTITY_REDACTION_PREFIX).filter(|hash| !hash.is_empty());
+            let withheld = entity.strip_prefix(ENTITY_WITHHELD_PREFIX).filter(|hash| !hash.is_empty());
 
             match (entity.as_str(), pallet, attribute.as_str()) {
                 (ENTITY_FORMAT, _, ATTR_STATE) => state.format = Some(value.clone()),
                 (ENTITY_CHUNK_FENCE | ENTITY_CHUNK_LEDGER, _, ATTR_STATE) => {
                     state.items.insert(entity.clone(), value.clone());
                 }
-                (_, None, ATTR_STATE) if redaction.is_some() => {
+                (_, None, ATTR_STATE) if redaction.is_some() || withheld.is_some() => {
                     state.items.insert(entity.clone(), value.clone());
                 }
                 (ENTITY_TRUST, _, ATTR_ANCHOR) => state.trust = Some(value.clone()),
@@ -709,6 +710,21 @@ impl RefStore for MemoryRefStore {
 
     fn get_item(&self, key: ItemKey<'_>) -> Result<Option<String>, String> {
         Ok(self.state.lock().unwrap().items.get(&item_entity(key)).cloned())
+    }
+
+    fn list_withheld(&self) -> Result<Vec<(String, String)>, String> {
+        let state = self.state.lock().unwrap();
+        let mut withheld: Vec<(String, String)> = state
+            .items
+            .iter()
+            .filter_map(|(entity, item)| {
+                entity.strip_prefix(ENTITY_WITHHELD_PREFIX).map(|hash| (hash.to_string(), item.clone()))
+            })
+            .collect();
+
+        // In sort-key order, as a `Query` returns them.
+        withheld.sort();
+        Ok(withheld)
     }
 
     fn put_items(&self, writes: &[ItemWrite<'_>], format: &FormatFence) -> Result<RedactionWrite, String> {
