@@ -2320,8 +2320,8 @@ pub struct RemoteClient {
     /// slow.
     batch_lane_closed: std::sync::Arc<std::sync::OnceLock<BatchLaneClosure>>,
     /// The file contents a fetch walk through this client, or any clone of it, never asks for nor
-    /// descends: content the remote reports redacted, set by [`Self::skip_files`]. Empty unless a
-    /// command set it, so every walk asks for every file it reaches by default.
+    /// descends beyond what this warehouse applied: content the remote reports redacted, set by
+    /// [`Self::skip_files`]. Empty unless a command set it.
     skip_files: std::sync::Arc<std::sync::RwLock<std::sync::Arc<HashSet<String>>>>,
     /// The members of `skip_files` a walk met and left out, read by [`Self::skipped_files`].
     skipped_files: std::sync::Arc<std::sync::Mutex<HashSet<String>>>,
@@ -3254,6 +3254,9 @@ impl RemoteClient {
     /// redaction here before writing a head over the history, since a ref write takes history
     /// naming absent content only once the redaction is applied here (see
     /// [`applied_redactions::apply`](crate::util::applied_redactions::apply)).
+    ///
+    /// Every walk leaves out the content of a redaction this warehouse applied whatever this
+    /// holds: its bytes were removed here on purpose, and a ref write already holds their absence.
     pub fn skip_files(&self, hashes: HashSet<String>) {
         *self.skip_files.write().unwrap_or_else(std::sync::PoisonError::into_inner) = std::sync::Arc::new(hashes);
     }
@@ -3275,9 +3278,18 @@ impl RemoteClient {
         true
     }
 
-    /// The files a walk leaves out (see [`Self::skip_files`]).
+    /// The files a walk leaves out (see [`Self::skip_files`]): those set, and the content of every
+    /// redaction this warehouse applied. When the record of applied redactions cannot be read, only
+    /// those set: the walk then asks for what it meets, and the remote refuses it as redacted.
     fn skip_set(&self) -> std::sync::Arc<HashSet<String>> {
-        self.skip_files.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        let set = self.skip_files.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+
+        match crate::util::applied_redactions::read_applied() {
+            Ok(applied) if !applied.is_empty() => {
+                std::sync::Arc::new(set.iter().cloned().chain(applied.hashes().cloned()).collect())
+            }
+            _ => set,
+        }
     }
 
     /// The head-wait budget to arm for *this* client instance's call to [`Self::missing_objects`]
@@ -5639,11 +5651,15 @@ impl Expansion {
     }
 }
 
-/// The refusal for a closure `scope fetch` cannot widen.
+/// The refusal for a closure `scope fetch` cannot widen, keeping the code of a refusal `error`
+/// carries, such as the remote's `content_redacted`.
 fn unservable(pallet: &str, error: &str) -> String {
-    format!(
-        "Pallet \"{}\" cannot be fetched at the widened scope: {} Nothing was recorded.",
-        pallet, error
+    crate::error::append_to_message(
+        crate::error::prefix_message(
+            &format!("Pallet \"{}\" cannot be fetched at the widened scope", pallet),
+            error.to_string(),
+        ),
+        "Nothing was recorded.",
     )
 }
 

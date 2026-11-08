@@ -2274,3 +2274,98 @@ fn a_first_contact_lower_takes_history_naming_applied_content_without_it() {
     assert!(!fresh.holds_loose(&hash));
     assert_eq!(applied_record(&fresh), format!("/forklift-redactions-applied 1\n{}\n", hash));
 }
+
+/// A sparse warehouse and a cache that took history naming a leak, before their remote applied a
+/// redaction of it, and have not lowered since: the remote reports the redaction applied, and this
+/// warehouse holds no `@redactions` cell for it.
+struct Behind {
+    server: Server,
+    sparse: Warehouse,
+    cache: Warehouse,
+    leak: String,
+    hash: String,
+}
+
+fn behind_an_applied_redaction(name: &str) -> Behind {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-{}-server-{}", name, std::process::id())));
+    let content = b"TOKEN=hunter2\n";
+
+    let owner = Warehouse::cloned(&format!("{}-owner", name), &server.url);
+    owner.stack("src/keep.txt", b"keep\n", "keep");
+    owner.stack("other/keep.txt", b"keep\n", "keep");
+    owner.run_ok(&["lift"]);
+    let leak = owner.leaked("other/secret.env", content);
+    owner.run_ok(&["lift"]);
+
+    // Neither holds the content: it is out of the sparse scope, and a cache fetches no content.
+    let sparse = Warehouse::cloned_with(&format!("{}-sparse", name), &server.url, &["--only", "src"]);
+    let cache = Warehouse::cloned_with(&format!("{}-cache", name), &server.url, &["--cache"]);
+
+    // No head names it, so the server applies the redaction at once and deletes its copy.
+    std::fs::create_dir_all(owner.root.join("other")).unwrap();
+    let hash = owner.redact_loaded("other/secret.env", content, "leaked token");
+    owner.run_ok(&["lift"]);
+    let (_, info) = http(&server.url, "GET", "/v1/warehouse", b"");
+    let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+    assert_eq!(info["redactions"], serde_json::json!([{ "hash": hash, "state": "deleted" }]), "{}", info);
+
+    Behind { server, sparse, cache, leak, hash }
+}
+
+/// `scope fetch` widens a sparse warehouse over history naming content its remote applied a
+/// redaction of: before this warehouse applies it, the remote's refusal is the widening's, coded
+/// `content_redacted`; once a lower applied it, the widening leaves the content out and goes
+/// through, holding no copy.
+///
+/// Revert: walk only the files a command set to skip, not the content applied here → the second
+/// widening asks the remote and is refused. Revert: frame the widening's refusal as plain text →
+/// the first is refused as `error`.
+#[test]
+fn a_scope_fetch_widens_over_history_naming_content_applied_here() {
+    let behind = behind_an_applied_redaction("widen");
+    let sparse = &behind.sparse;
+
+    let refused = content_redacted(sparse, &["scope", "fetch", "other"]);
+    assert!(refused["message"].as_str().unwrap().contains("cannot be fetched at the widened scope"), "{}", refused);
+    assert_eq!(sparse.json(&["scope"])["data"]["fetch_scope"], serde_json::json!(["src"]));
+
+    let lowered = sparse.json(&["lower"]);
+    assert_eq!(lowered["ok"], true, "{}", lowered);
+    assert_eq!(lowered["data"]["redactions"]["applied"], serde_json::json!([behind.hash]), "{}", lowered);
+
+    let widened = sparse.json(&["scope", "fetch", "other"]);
+    assert_eq!(widened["ok"], true, "{}", widened);
+    assert!(!sparse.holds_loose(&behind.hash));
+    assert_eq!(sparse.head("main"), behind.server.main());
+}
+
+/// A cache reads content its remote applied a redaction of as redacted: before the cache applies
+/// it, the fetch the read makes is refused by the remote, and the read with it, coded
+/// `content_redacted`; once a lower applied it, the read is refused here, asking nothing, and a
+/// fresh cache clone applies it as it takes the history. Neither holds a copy.
+///
+/// Revert: word the miss hook's failed fetch as plain text → the first read is refused as `error`.
+#[test]
+fn a_cache_reads_content_its_remote_applied_a_redaction_of_as_redacted() {
+    let behind = behind_an_applied_redaction("cache-read");
+    let cache = &behind.cache;
+    let target = format!("{}:other/secret.env", behind.leak);
+
+    let refused = content_redacted(cache, &["show", &target]);
+    assert!(refused["message"].as_str().unwrap().contains("could not be fetched")
+                || refused["message"].as_str().unwrap().contains("from the origin"), "{}", refused);
+    assert!(!cache.holds_loose(&behind.hash));
+
+    let lowered = cache.json(&["lower"]);
+    assert_eq!(lowered["ok"], true, "{}", lowered);
+    assert_eq!(lowered["data"]["redactions"]["applied"], serde_json::json!([behind.hash]), "{}", lowered);
+    let refused = content_redacted(cache, &["show", &target]);
+    assert!(refused["message"].as_str().unwrap().contains("its content has been removed for good"), "{}", refused);
+
+    let fresh = Warehouse::cloned_with("cache-read-fresh", &behind.server.url, &["--cache"]);
+    assert_eq!(applied_record(&fresh), format!("/forklift-redactions-applied 1\n{}\n", behind.hash));
+    let refused = content_redacted(&fresh, &["show", &target]);
+    assert!(refused["message"].as_str().unwrap().contains("its content has been removed for good"), "{}", refused);
+    assert!(!fresh.holds_loose(&behind.hash));
+}

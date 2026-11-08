@@ -307,9 +307,14 @@ fn refill_with(hook: Option<&FetchHook>, absent: &[String]) -> Result<bool, Stri
             ),
             refusal.into(),
         )),
-        Fetched::Failed(why) => return Err(format!(
-            "{} not in this cache warehouse, and fetching {} from the origin failed: {}",
-            describe(&still_absent(&wanted).unwrap_or(wanted.clone())).is, named.them, why
+        // Keeps the code of a refusal the origin answered, such as `content_redacted` for content
+        // it applied a redaction of that this warehouse has not.
+        Fetched::Failed(why) => return Err(crate::error::prefix_message(
+            &format!(
+                "{} not in this cache warehouse, and fetching {} from the origin failed",
+                describe(&still_absent(&wanted).unwrap_or(wanted.clone())).is, named.them
+            ),
+            why,
         )),
     }
 
