@@ -129,6 +129,46 @@ enum Command {
         #[command(subcommand)]
         action: TombstoneAction,
     },
+
+    /// Withhold a file's content on its host's authority, or list what is withheld
+    #[command(
+        long_about = "Withholding is a takedown: the host stops serving a file's content and \
+                      refuses to take it, at once, whatever names it, and a read or upload of it is \
+                      answered with the host's statement. Pallets keep naming the file; the \
+                      warehouse's history is unchanged. Clients keep the copies they hold. It \
+                      takes effect while the warehouse is being served."
+    )]
+    Withhold {
+        #[command(subcommand)]
+        action: WithholdAction,
+    },
+}
+
+/// What `forklift-server withhold` does.
+#[derive(Subcommand)]
+enum WithholdAction {
+    /// Withhold a file's content, by its object hash, with a statement saying why. Withholding a
+    /// hash again replaces its statement. A chunked file cannot be withheld yet
+    Add {
+        /// The warehouse root to change
+        #[arg(long)]
+        root: String,
+
+        /// The content's object hash
+        hash: String,
+
+        /// Why it is withheld, as a refused request is told: one plain line of at most 1000
+        /// characters, with no control character, separator or direction mark
+        #[arg(long)]
+        statement: String,
+    },
+
+    /// List each withheld hash and its statement
+    List {
+        /// The warehouse root to read
+        #[arg(long)]
+        root: String,
+    },
 }
 
 /// What `forklift-server tombstone` does.
@@ -177,6 +217,8 @@ async fn async_main() {
         Command::Gc { root, grace_hours } => gc(&root, grace_hours),
         Command::Tombstone { action: TombstoneAction::List { root } } => list_tombstones(&root),
         Command::Tombstone { action: TombstoneAction::Drop { root, name } } => drop_tombstone(&root, &name),
+        Command::Withhold { action: WithholdAction::Add { root, hash, statement } } => withhold(&root, &hash, &statement),
+        Command::Withhold { action: WithholdAction::List { root } } => list_withheld(&root),
     };
 
     if let Err(e) = result {
@@ -721,6 +763,43 @@ fn drop_tombstone(root: &str, name: &str) -> Result<(), String> {
         collects that history unless something else reaches it.",
         name, head
     );
+
+    Ok(())
+}
+
+/// Withhold `hash` in the warehouse at `root`, with `statement`.
+fn withhold(root: &str, hash: &str, statement: &str) -> Result<(), String> {
+    use forklift_core::util::withholding::{self, Withheld};
+
+    let opened = server::open_root(root)?;
+    let _scope = forklift_core::globals::StorageRootScope::enter(&opened.root);
+
+    match withholding::withhold(hash, statement)? {
+        Withheld::Added => println!(
+            "Withheld {}: it is no longer served or taken, and a read or upload of it is given \
+            the statement.", hash
+        ),
+        Withheld::Restated => println!("{} was withheld already; its statement is replaced.", hash),
+        Withheld::Unchanged => println!("{} is withheld already, with this statement.", hash),
+    }
+
+    Ok(())
+}
+
+/// List what the warehouse at `root` withholds.
+fn list_withheld(root: &str) -> Result<(), String> {
+    let opened = server::open_root(root)?;
+    let _scope = forklift_core::globals::StorageRootScope::enter(&opened.root);
+
+    let withheld = forklift_core::util::withholding::read_withheld()?;
+
+    if withheld.is_empty() {
+        println!("This warehouse withholds nothing.");
+    }
+
+    for (hash, statement) in withheld.entries() {
+        println!("{} {}", hash, statement);
+    }
 
     Ok(())
 }

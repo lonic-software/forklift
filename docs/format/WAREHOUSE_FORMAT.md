@@ -241,6 +241,7 @@ name in a row is a constant, and every path in every fixture matches a row.
 | `sealed` | rewritable | `sealed_utils::FILE_NAME_SEALED` |
 | `redactions-applied` | rewritable | `applied_redactions::FILE_NAME_APPLIED` |
 | `redactions-chunks-owed` | rewritable | `redaction_deleter::FILE_NAME_CHUNKS_OWED` |
+| `withheld` | rewritable | `withholding::FILE_NAME_WITHHELD` |
 | `unvouched-heads` | rewritable | `take_utils::FILE_NAME_UNVOUCHED` |
 | `held-heads` | rewritable | `held_heads::FILE_NAME` |
 | `fetched-heads` | rewritable | `fetch_ledger::FILE_NAME_LEDGER` |

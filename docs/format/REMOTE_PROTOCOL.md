@@ -126,7 +126,8 @@ The one-round-trip handshake: protocol version, refs and trust.
              "prior_genesis": "<hash, re-genesis only>", "adopts": "<hash, re-genesis only>" },
   "tombstones": { "old-feature": "<parcel-hash>" },
   "redactions": [{ "hash": "<hash>", "state": "deletion_owed" },
-                 { "hash": "<hash>", "state": "pending" }]
+                 { "hash": "<hash>", "state": "pending" }],
+  "withheld": [{ "hash": "<hash>", "statement": "<the host's words>", "state": "deletion_owed" }]
 }
 ```
 
@@ -224,6 +225,23 @@ redaction stays `deletion_owed`. A client reads a state it does not know as neit
 uploads the content when a lift needs it, and refuses to take a head that names it. A head that
 does not apply redactions sends `null` or omits the field; a client then treats every redaction
 the remote's `@redactions` pallet holds as pending.
+
+`withheld` (additive) lists the content this remote's host withholds: a takedown, the host's act
+rather than the warehouse's, by the hash a tree names for a file, with the host's `statement` (one
+plain line, at most 1000 characters). Unlike a redaction it needs nothing to stop naming the
+content: pallet heads keep naming the file and history is unchanged. From the moment the host
+lists it, the remote refuses the content on the routes below with `451`, and the bundle never
+carries it. `missing` still answers for it as for any object: held while the remote keeps its
+copy, missing once it lacks it, so a lift naming it then uploads it and is refused. `state` is
+`deletion_owed` while the remote still holds a copy, `deleted` once it holds none; a client reads a
+state it does not know as `deletion_owed`. A head that does not withhold content sends `null` or
+omits the field.
+
+**Withheld content is refused.** `GET` and `PUT` of `/v1/objects/{hash}` for a withheld hash, and
+`upload-targets` naming it, answer `451` with `code` `content_withheld`, the host's statement in
+the message, and `details.hash` and `details.statement`. `batch` and the subtree endpoint leave it
+out, as they do an applied redaction's content. A hash both redacted and withheld is answered
+`410`.
 
 **Applied redactions are refused.** Once a head has applied a redaction, `GET` and `PUT` of
 `/v1/objects/{hash}` for its hash answer `410` with `code` `content_redacted` and the hash in
@@ -394,7 +412,8 @@ changes what is fetchable, only how fast.
 ### `GET /v1/objects/{hash}`
 
 The raw (uncompressed) object bytes, or `404`, or `410` with `code` `content_redacted` when the
-remote has applied a redaction of it. The client verifies the hash before storing. A client that falls back from the batch endpoint sends many of these at once, so a
+remote has applied a redaction of it, or `451` with `code` `content_withheld` when its host
+withholds it. The client verifies the hash before storing. A client that falls back from the batch endpoint sends many of these at once, so a
 rate-limited head may answer `429`, which the client waits out as every refusal for now
 (above).
 
@@ -402,7 +421,8 @@ rate-limited head may answer `429`, which the client waits out as every refusal 
 
 Body: the raw object bytes. The remote verifies `Blake3(body) == hash` **before** the
 object becomes fetchable; a mismatch is `422` and nothing is stored. A hash whose redaction the
-remote has applied is `410` with `code` `content_redacted`, whatever the body. Uploading an
+remote has applied is `410` with `code` `content_redacted`, and one its host withholds `451` with
+`code` `content_withheld`, whatever the body. Uploading an
 already-present hash is a no-op `200` (objects are immutable, so equal hash means equal
 content). Success is `201`.
 

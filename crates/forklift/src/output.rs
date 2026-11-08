@@ -60,7 +60,7 @@ pub const TOOL: &str = "forklift";
 /// this field before relying on a field, to know whether the command it is about to run supports
 /// the capability it needs — the version bump *is* the capability-detection mechanism, so it is
 /// worth pinning rather than sniffing for a field's presence.
-pub const SCHEMA_VERSION: u32 = 30;
+pub const SCHEMA_VERSION: u32 = 31;
 
 /// How the process renders its output.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -572,6 +572,9 @@ error_codes! {
 
     /// `redact` found the object in a pallet head; nothing was recorded.
     HeadNamesContent,
+
+    /// The remote's host withholds content the command needed; nothing it would have written was.
+    ContentWithheld,
 }
 
 impl ErrorCode {
@@ -627,6 +630,7 @@ impl ErrorCode {
             ErrorCode::RedactionBlocked => RefusalCode::RedactionBlocked.as_str(),
             ErrorCode::ContentRedacted => RefusalCode::ContentRedacted.as_str(),
             ErrorCode::HeadNamesContent => RefusalCode::HeadNamesContent.as_str(),
+            ErrorCode::ContentWithheld => RefusalCode::ContentWithheld.as_str(),
         }
     }
 
@@ -685,6 +689,7 @@ impl ErrorCode {
             ErrorCode::RedactionBlocked => 48,
             ErrorCode::ContentRedacted => 49,
             ErrorCode::HeadNamesContent => 50,
+            ErrorCode::ContentWithheld => 51,
         }
     }
 
@@ -816,6 +821,8 @@ impl ErrorCode {
                 "A pallet head would have named a file whose content is redacted, or a load, park, merge or pick would have brought it into the bay, and nothing was written; or a read needed content that a redaction applied in this warehouse removed",
             ErrorCode::HeadNamesContent =>
                 "The object to redact is in a pallet head; take the file out of that head first. Nothing was recorded",
+            ErrorCode::ContentWithheld =>
+                "The remote's host withholds content the command needed (a takedown, not a redaction), so the remote neither serves nor takes it; a copy this warehouse holds is kept",
         }
     }
 
@@ -872,6 +879,7 @@ impl ErrorCode {
             RefusalCode::RedactionBlocked => ErrorCode::RedactionBlocked,
             RefusalCode::ContentRedacted => ErrorCode::ContentRedacted,
             RefusalCode::HeadNamesContent => ErrorCode::HeadNamesContent,
+            RefusalCode::ContentWithheld => ErrorCode::ContentWithheld,
         }
     }
 }
@@ -1474,6 +1482,7 @@ mod tests {
             (RefusalCode::RedactionBlocked, "redaction_blocked", 48),
             (RefusalCode::ContentRedacted, "content_redacted", 49),
             (RefusalCode::HeadNamesContent, "head_names_content", 50),
+            (RefusalCode::ContentWithheld, "content_withheld", 51),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

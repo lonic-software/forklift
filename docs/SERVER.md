@@ -320,6 +320,19 @@ revocation by more than about a day.
   `forklift-server tombstone list --root …` shows them; `forklift-server tombstone drop --root …
   NAME` frees the name for unrelated history and lets the next `gc` collect what only the
   tombstone held. Dropping is refused while the root is served, like `gc`.
+- **Withholding:** `forklift-server withhold add --root … HASH --statement "…"` withholds a
+  file's content on the host's own authority, as for a legal takedown, and `forklift-server
+  withhold list --root …` shows what is withheld. It takes effect at once, while the root is
+  served: a read or upload of the content by its hash is answered with `451`
+  (`content_withheld`) and the statement, a batch or subtree fetch leaves it out, the latest bundle is taken down and every bundle built
+  after leaves the content out. Pallets keep naming the file, and the handshake lists the hash
+  and the statement (one plain line, at most 1000 characters). The list is kept in
+  `<root>/.forklift/withheld`. Not yet: a chunked file this server holds cannot be withheld (its
+  chunks would still be served), and if a hash withheld before it arrived turns out to be a
+  chunked file's, its chunks are still taken and served; the stored copy is kept (the handshake says `deletion_owed`), `missing` reports it
+  missing once the server lacks it, so a lift naming it uploads it and is refused, a bundle
+  download already under way is not cut, the bundle is rebuilt only when it next would be, and
+  there is no command to lift a takedown.
 - **Redactions:** after every pallet update or deletion, the server applies each redaction
   recorded on `@redactions` that no pallet head, tombstone or metadata history it holds still
   names. One a tombstone holds applies at the first pallet update after `forklift-server

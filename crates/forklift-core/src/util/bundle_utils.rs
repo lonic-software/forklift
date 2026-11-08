@@ -12,7 +12,7 @@ use crate::globals::forklift_root;
 use crate::model::remote::MAX_MISSING_BATCH;
 use crate::model::tree_item::TreeItem;
 use crate::util::{
-    applied_redactions, audit_utils, delta_utils, fanout_utils, file_utils, object_utils, pack_utils,
+    audit_utils, withholding, delta_utils, fanout_utils, file_utils, object_utils, pack_utils,
     pallet_utils, scope_utils, sign_utils,
 };
 use crate::util::applied_redactions::AppliedSet;
@@ -192,22 +192,24 @@ pub fn is_current_bundle_prefix(prefix: &[u8]) -> bool {
 /// each parcel's signature sidecar, and the full tree/blob closure — each object once.
 /// The bundle is written atomically to the `latest` path.
 ///
-/// A file whose content a redaction applied here names is left out: the bundle never carries
-/// redacted content, whether or not its bytes are deleted yet. Applying a redaction withdraws the
-/// bundle under the ref lock ([`applied_redactions::apply`]), and the build publishes under that
-/// lock only when no redaction was applied since it started, so a build begun before the mark
-/// never publishes the content after it.
+/// A file whose content a redaction applied here names, or that this head withholds, is left out:
+/// the bundle never carries redacted or withheld content, whether or not its bytes are deleted
+/// yet. Applying a redaction or withholding content withdraws the bundle under the ref lock
+/// ([`applied_redactions::apply`], [`withholding::withhold`]), and the build publishes under that
+/// lock only when nothing was applied or withheld since it started, so a build begun before the
+/// mark never publishes the content after it.
 ///
 /// [`applied_redactions::apply`]: crate::util::applied_redactions::apply
+/// [`withholding::withhold`]: crate::util::withholding::withhold
 ///
 /// # Returns
 /// * `Ok(BuildStats)` - What was packed, and where.
 /// * `Err(String)`    - If an object could not be read or the bundle written, the record of
-///                      applied redactions cannot be read, or a redaction was applied during the
-///                      build.
+///                      applied redactions or of withheld content cannot be read, or a redaction
+///                      was applied or content withheld during the build.
 pub fn build_bundle() -> Result<BuildStats, String> {
     let bundle_path = get_latest_bundle_path();
-    let redacted = applied_redactions::read_applied()?;
+    let redacted = withholding::removed()?;
 
     if let Some(parent) = bundle_path.parent() {
         file_utils::create_folder_if_not_exists(parent)?;
@@ -297,8 +299,8 @@ fn write_native_bundle(bundle_path: &Path,
 }
 
 /// Write the envelope to `temporary_path`, then atomically publish it at `bundle_path`, under the
-/// ref lock and only while the applied redactions are still `redacted`, the ones the build left
-/// out.
+/// ref lock and only while the applied redactions and withheld content are still `redacted`, the
+/// ones the build left out.
 fn write_envelope_and_publish(temporary_path: &Path,
                               bundle_path: &Path,
                               artifacts: &[pack_utils::TransportPackArtifact],
@@ -349,14 +351,14 @@ fn write_envelope_and_publish(temporary_path: &Path,
     #[cfg(test)]
     tests::BEFORE_PUBLISH.with(|hook| if let Some(hook) = hook.borrow_mut().take() { hook() });
 
-    // An apply withdraws the bundle under this lock after its mark, so a bundle published here
-    // either lands before the mark, and is withdrawn, or is judged against it.
+    // An apply or a withholding withdraws the bundle under this lock after its mark, so a bundle
+    // published here either lands before the mark, and is withdrawn, or is judged against it.
     let _lock = RefLock::acquire()?;
 
-    if applied_redactions::read_applied()?.hashes().any(|hash| !redacted.contains(hash)) {
+    if withholding::removed()?.hashes().any(|hash| !redacted.contains(hash)) {
         return Err(
-            "A redaction was applied while the bundle was built, so the bundle was not published: \
-            it may hold the redacted content. Build it again.".to_string()
+            "A redaction was applied or content withheld while the bundle was built, so the bundle \
+            was not published: it may hold that content. Build it again.".to_string()
         );
     }
 
@@ -497,8 +499,9 @@ fn remove_stale_staging(parent: &Path) {
 /// writer-side refusal `build_bundle` gives, rather than silently omitting content the
 /// caller asked for by name.
 ///
-/// An object a redaction applied here names is left out as an absent one is, whether or not its
-/// bytes are deleted yet: the client's loose fetch of it is then refused as redacted.
+/// An object a redaction applied here names, or that this head withholds, is left out as an absent
+/// one is, whether or not its bytes are deleted yet: the client's loose fetch of it is then
+/// refused as redacted or withheld.
 ///
 /// A hash repeated in `hashes` is written once, at its first occurrence (see [`BundleWriter`]).
 ///
@@ -508,9 +511,9 @@ fn remove_stale_staging(parent: &Path) {
 /// # Returns
 /// * `Ok(Vec<u8>)` - The bundle bytes (header line + one zstd stream of records).
 /// * `Err(String)` - If a present object could not be read, or one is above the ceiling, or the
-///                   record of applied redactions cannot be read.
+///                   record of applied redactions or of withheld content cannot be read.
 pub fn build_partial_bundle(hashes: &[String]) -> Result<Vec<u8>, String> {
-    let redacted = applied_redactions::read_applied()?;
+    let redacted = withholding::removed()?;
     let mut bundle = BundleWriter::new()?;
     let mut looked: HashSet<&str> = HashSet::new();
 
@@ -1582,13 +1585,44 @@ mod tests {
             crate::util::applied_redactions::apply_for_test(&[&applied_meanwhile]);
         })));
         let refused = build_bundle().err().expect("a redaction applied during the build refuses it");
-        assert!(refused.contains("A redaction was applied while the bundle was built"), "{}", refused);
+        assert!(refused.contains("A redaction was applied or content withheld while the bundle was built"), "{}", refused);
         assert!(!get_latest_bundle_path().exists(), "nothing was published");
         drop(source);
 
         let _destination = Scratch::new("bundle-redacted-dst");
         import_bundle_bytes(&bundle).unwrap();
         assert!(!file_utils::does_object_exist(&secret).unwrap(), "the redacted blob is left out");
+        assert!(file_utils::does_object_exist(&later).unwrap() && file_utils::does_object_exist(&kept).unwrap());
+    }
+
+    // Revert: read only the applied redactions in the plan → the bundle carries the withheld blob;
+    // in the publish check → a build during which content was withheld publishes it.
+    #[test]
+    fn a_bundle_never_carries_withheld_content() {
+        let source = Scratch::new("bundle-withheld-src");
+        let secret = store_blob(b"leaked film");
+        let later = store_blob(b"another film");
+        let kept = store_blob(b"notes");
+        let first = store_head_parcel(&store_tree(&[("film.mkv", &secret), ("notes.txt", &kept)], &[]), &[]);
+        store_head_parcel(&store_tree(&[("film.mkv", &later), ("notes.txt", &kept)], &[]), &[&first]);
+        crate::util::withholding::withhold(&secret, "DMCA notice").unwrap();
+
+        build_bundle().unwrap();
+        let bundle = std::fs::read(get_latest_bundle_path()).unwrap();
+
+        std::fs::remove_file(get_latest_bundle_path()).unwrap();
+        let withheld_meanwhile = later.clone();
+        BEFORE_PUBLISH.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+            crate::util::withholding::withhold(&withheld_meanwhile, "DMCA notice").unwrap();
+        })));
+        let refused = build_bundle().err().expect("content withheld during the build refuses it");
+        assert!(refused.contains("content withheld while the bundle was built"), "{}", refused);
+        assert!(!get_latest_bundle_path().exists(), "nothing was published");
+        drop(source);
+
+        let _destination = Scratch::new("bundle-withheld-dst");
+        import_bundle_bytes(&bundle).unwrap();
+        assert!(!file_utils::does_object_exist(&secret).unwrap(), "the withheld blob is left out");
         assert!(file_utils::does_object_exist(&later).unwrap() && file_utils::does_object_exist(&kept).unwrap());
     }
 

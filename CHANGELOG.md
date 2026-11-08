@@ -105,6 +105,14 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Added
 
+- **A forklift-server host can withhold content, as for a legal takedown.** `forklift-server
+  withhold add --root … HASH --statement "…"` stops the server serving or taking a file's content
+  at once: a read or upload of it is answered `451` with the host's statement; `withhold list`
+  shows what is withheld. History is unchanged and pallets keep naming the file. A chunked file
+  cannot be withheld yet. A command that
+  needs the content from that remote fails with the new `content_withheld` code (exit 51), and the
+  `--json` schema is now 31.
+
 - **forklift-server applies redactions, and the `--json` schema is now 28.** Part of content
   redaction: after each lift or pallet deletion, the server applies every recorded redaction that
   none of its pallet heads, deleted pallets' tombstones or metadata history names (`redact list`
