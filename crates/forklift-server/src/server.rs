@@ -4157,7 +4157,8 @@ async fn retake_store_access(warehouse: &Arc<WarehouseHandle>) {
 /// Apply every redaction of this warehouse's `@redactions` that its scan now finds unheld: a write
 /// that moved the last head naming the content, or that recorded the redaction, is what lets one
 /// apply. Each applied one is refused on every surface from then on. A warehouse with a remote
-/// configured applies none until its remote reports them applied, which no remote reports yet.
+/// configured applies none here: it applies only on its remote's report, which this run does not
+/// read, so a command run in the root (`lower`, `redact apply`) that reads it applies them.
 ///
 /// # Returns
 /// * `Ok(ApplyOutcome)`  - What it applied, and whether it decided every redaction.
@@ -4172,7 +4173,7 @@ async fn apply_redactions(warehouse: Arc<WarehouseHandle>) -> Result<ApplyOutcom
             return Ok(ApplyOutcome { applied: false, undecided: None });
         }
 
-        let statuses = applied_redactions::apply(&read, None).map_err(internal)?;
+        let statuses = applied_redactions::apply(&read, None, None).map_err(internal)?;
         let undecided = statuses.iter().find_map(|status| match &status.state {
             applied_redactions::RedactionState::Undecided(why) => Some(format!(
                 "Whether anything names the content of redaction {} could not be told: {}", status.hash, why

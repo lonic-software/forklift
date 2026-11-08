@@ -1096,6 +1096,32 @@ fn held_head_unrecorded_warning_text(mode: OutputMode, error: &str) -> String {
     }
 }
 
+/// The `--json` warning code for a lower or clone that went through but could not apply the
+/// redactions its remote reports applied, or delete their copies.
+pub const CODE_REDACTIONS_UNSETTLED: &str = "redactions_unsettled";
+
+/// What to do about [`CODE_REDACTIONS_UNSETTLED`].
+pub const REDACTIONS_UNSETTLED_NEXT_STEP: &str =
+    "Resolve the reported cause, then run \"forklift redact apply\", which applies what the remote reports \
+     applied and deletes the copies. The command's own work is unaffected.";
+
+/// Surface a lower or clone that could not settle its remote's applied redactions, on the stderr
+/// side-channel the other warnings use: the command succeeded, and the exit code stays its own.
+pub fn warn_redactions_unsettled(error: &str) {
+    eprintln!("{}", redactions_unsettled_warning_text(mode(), error));
+}
+
+/// The pure half of [`warn_redactions_unsettled`], asserted in both modes without capturing stderr.
+fn redactions_unsettled_warning_text(mode: OutputMode, error: &str) -> String {
+    match mode {
+        OutputMode::Human => format!(
+            "Warning: the redactions the remote reports applied were not applied or deleted here. {} {}",
+            forklift_core::error::sanitize_lines(error), REDACTIONS_UNSETTLED_NEXT_STEP
+        ),
+        OutputMode::Json => warning_envelope(CODE_REDACTIONS_UNSETTLED, error, REDACTIONS_UNSETTLED_NEXT_STEP, None),
+    }
+}
+
 /// The `--json` warning code for a pallet whose recorded heads the remote did not answer about.
 pub const CODE_HOLDS_UNANSWERED: &str = "holds_unanswered";
 
@@ -1529,6 +1555,20 @@ mod tests {
         assert_eq!(value["warning"], "held_head_unrecorded");
         assert_eq!(value["message"], error);
         assert!(value["next_step"].as_str().unwrap().contains("unaffected"), "next_step: {}", value["next_step"]);
+    }
+
+    #[test]
+    fn the_redactions_unsettled_warning_carries_the_cause_and_names_redact_apply_in_both_modes() {
+        let error = "The record of applied redactions \"/w/.forklift/redactions-applied\" is of version 2.";
+
+        let human = redactions_unsettled_warning_text(OutputMode::Human, error);
+        assert!(human.contains(error) && human.contains("forklift redact apply"), "human text: {}", human);
+
+        let value: serde_json::Value =
+            serde_json::from_str(&redactions_unsettled_warning_text(OutputMode::Json, error)).unwrap();
+        assert_eq!(value["warning"], "redactions_unsettled");
+        assert_eq!(value["message"], error);
+        assert!(value["next_step"].as_str().unwrap().contains("forklift redact apply"), "next_step: {}", value["next_step"]);
     }
 
     /// The sibling of the test above, for the second warning on the same channel. The `Human` arm

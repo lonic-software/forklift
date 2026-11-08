@@ -175,11 +175,33 @@ fn add_locked(_lock: &RefLock, hashes: &[String]) -> Result<AppliedSet, String> 
     Ok(set)
 }
 
-/// Whether this warehouse has a remote configured, in its own configuration or the global one.
-/// One that is configured but broken still counts: what decides is whose report the warehouse
-/// waits for, not whether it can reach it.
-fn has_remote() -> Result<bool, String> {
-    Ok(config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)?.is_some())
+/// The remote this warehouse has configured, in its own configuration or the global one. One that
+/// is configured but broken still counts: what decides is whose report the warehouse waits for,
+/// not whether it can reach it.
+fn configured_remote() -> Result<Option<String>, String> {
+    Ok(config_utils::get_effective_value(config_utils::KEY_REMOTE_URL)?.map(|(url, _)| url))
+}
+
+/// What a remote reported applied in its handshake, and which remote it is. A warehouse with a
+/// remote applies a redaction only once its own scan is clean and this report, from the remote it
+/// still has configured, lists it.
+#[derive(Clone, Debug)]
+pub struct RemoteReport {
+    url: String,
+    applied: AppliedSet,
+}
+
+impl RemoteReport {
+    /// The report of the remote at `url`, whose handshake is `info`.
+    pub fn of(url: &str, info: &crate::model::remote::WarehouseInfo) -> RemoteReport {
+        RemoteReport { url: url.to_string(), applied: AppliedSet::of(info.applied_redactions().into_iter().map(str::to_string)) }
+    }
+
+    /// Whether this report is from `configured`, the remote the warehouse has now, and lists the
+    /// redaction of `hash` as applied.
+    fn applies(&self, configured: &str, hash: &str) -> bool {
+        crate::util::origin_utils::same_remote(&self.url, configured) && self.applied.contains(hash)
+    }
 }
 
 /// Where one redaction stands.
@@ -195,7 +217,7 @@ pub enum RedactionState {
     Held { heads: Vec<HeadHolder>, tombstones: Vec<HeadHolder>, meta_pallets: Vec<String> },
 
     /// Pending: nothing here names it, and this warehouse has a remote, whose report that it is
-    /// applied there it waits for.
+    /// applied there it waits for: no report was read, or the one read does not list it.
     AwaitingRemote,
 
     /// Pending: the scan could not tell whether anything names it, for this reason.
@@ -255,42 +277,52 @@ fn scan(redaction: &Redaction) -> Result<Option<RedactionState>, String> {
 
 /// Who decides a clean scan: this warehouse alone, or its remote too.
 #[derive(Clone, Copy)]
-struct Judge {
-    /// A remote is configured.
-    remote: bool,
+struct Judge<'a> {
+    /// The remote configured, if one is.
+    remote: Option<&'a str>,
 
     /// The warehouse is sparse or a cache, so its scan skipped heads and trees it never fetched.
     partial: bool,
+
+    /// What a remote reported applied, if its handshake was read.
+    report: Option<&'a RemoteReport>,
 }
 
-impl Judge {
-    fn read() -> Result<Judge, String> {
-        Ok(Judge { remote: has_remote()?, partial: scope_utils::content_may_be_absent()? })
-    }
-
-    /// Where a redaction stands that is not applied and whose scan found nothing holding it.
-    fn clean(self) -> RedactionState {
+impl<'a> Judge<'a> {
+    /// Where a redaction of `hash` stands that is not applied and whose scan found nothing holding
+    /// it. With a remote configured, its report decides, even in a partial warehouse: an applied
+    /// remote serves no head naming the content, and a head here naming it in a part never fetched
+    /// holds no copy of it here.
+    fn clean(self, hash: &str) -> RedactionState {
         match (self.remote, self.partial) {
-            (true, _) => RedactionState::AwaitingRemote,
-            (false, true) => RedactionState::Undecided(
+            (Some(remote), _) => match self.report.is_some_and(|report| report.applies(remote, hash)) {
+                true => RedactionState::Applied,
+                false => RedactionState::AwaitingRemote,
+            },
+            (None, true) => RedactionState::Undecided(
                 "This warehouse holds only part of its pallets' content and has no remote, so a \
                 head may name the content in a part it never fetched."
                     .to_string()
             ),
-            (false, false) => RedactionState::Applied,
+            (None, false) => RedactionState::Applied,
         }
     }
 }
 
+/// The remote configured and the warehouse's mode, which a [`Judge`] reads.
+fn read_judged() -> Result<(Option<String>, bool), String> {
+    Ok((configured_remote()?, scope_utils::content_may_be_absent()?))
+}
+
 /// Where each of `redactions` stands, by the applied record and, for each not yet applied, a scan
 /// of this warehouse. Applies none.
-fn judge(redactions: &[&Redaction], applied: &AppliedSet, judge: Judge) -> Vec<RedactionStatus> {
+fn judge(redactions: &[&Redaction], applied: &AppliedSet, judge: Judge<'_>) -> Vec<RedactionStatus> {
     redactions.iter().map(|redaction| {
         let state = match applied.contains(&redaction.hash) {
             true => RedactionState::Applied,
             false => match scan(redaction) {
                 Ok(Some(held)) => held,
-                Ok(None) => judge.clean(),
+                Ok(None) => judge.clean(&redaction.hash),
                 Err(why) => RedactionState::Undecided(why),
             },
         };
@@ -308,17 +340,20 @@ fn chosen<'a>(read: &'a RedactionsRead, only: Option<&str>) -> Vec<&'a Redaction
         .collect()
 }
 
-/// Where every redaction `read` lists stands, without applying any: an unapplied one whose scan
-/// comes back clean in a full warehouse with no remote reads as [`RedactionState::Ready`]. A cell this build cannot read has no status here; it stays pending, since what it says
-/// about a chunk list cannot be scanned for.
+/// Where every redaction `read` lists stands, without applying any: an unapplied one that
+/// [`apply`] would apply reads as [`RedactionState::Ready`]. `report` is the remote's, as for
+/// [`apply`]; without one, a warehouse with a remote reads each clean one as awaiting it. A cell
+/// this build cannot read has no status here; it stays pending, since what it says about a chunk
+/// list cannot be scanned for.
 ///
 /// # Returns
 /// * `Ok(Vec<RedactionStatus>)` - One per readable redaction, in the order `read` lists them.
 /// * `Err(String)`              - The applied record, the configuration or the warehouse's mode
 ///                                cannot be read.
-pub fn statuses(read: &RedactionsRead) -> Result<Vec<RedactionStatus>, String> {
+pub fn statuses(read: &RedactionsRead, report: Option<&RemoteReport>) -> Result<Vec<RedactionStatus>, String> {
     let applied = read_applied()?;
-    let mut statuses = judge(&chosen(read, None), &applied, Judge::read()?);
+    let (remote, partial) = read_judged()?;
+    let mut statuses = judge(&chosen(read, None), &applied, Judge { remote: remote.as_deref(), partial, report });
 
     for status in statuses.iter_mut().filter(|status| status.state.is_applied() && !applied.contains(&status.hash)) {
         status.state = RedactionState::Ready;
@@ -328,12 +363,13 @@ pub fn statuses(read: &RedactionsRead) -> Result<Vec<RedactionStatus>, String> {
 }
 
 /// Apply every redaction `read` lists (with `only`, just the one of that hash) that a scan now
-/// finds unheld, in a full warehouse with no remote, and report where each stands. `read` is the
-/// local `@redactions` head, read after its cells committed, so nothing can come to name a clean
-/// redaction's content (see the module doc). In a warehouse with a remote configured, served or
-/// not, nothing is applied: each stays pending until the remote reports it applied. Whether a remote is
-/// configured is read again under the ref lock before the record is written. A CLI caller holds
-/// the warehouse lock; a server applies after each ref write it takes.
+/// finds unheld, and report where each stands. `read` is the local `@redactions` head, read after
+/// its cells committed, so nothing can come to name a clean redaction's content (see the module
+/// doc). A full warehouse with no remote applies by its scan alone. One with a remote configured,
+/// served or not, applies a clean one only when `report`, read from that same remote, lists it
+/// applied; without a report, each stays pending. The remote configured is read again under the
+/// ref lock before the record is written, so a report from a remote replaced meanwhile applies
+/// nothing. A CLI caller holds the warehouse lock; a server applies after each ref write it takes.
 ///
 /// Under that same lock, before the record is written, the warehouse's bundle is withdrawn: it
 /// may hold the content, and a build publishes only under the lock and only when no redaction was
@@ -348,28 +384,36 @@ pub fn statuses(read: &RedactionsRead) -> Result<Vec<RedactionStatus>, String> {
 /// * `Err(String)`              - The applied record, the configuration or the warehouse's mode
 ///                                cannot be read, or the bundle could not be withdrawn or the
 ///                                record written.
-pub fn apply(read: &RedactionsRead, only: Option<&str>) -> Result<Vec<RedactionStatus>, String> {
+pub fn apply(read: &RedactionsRead,
+             only: Option<&str>,
+             report: Option<&RemoteReport>) -> Result<Vec<RedactionStatus>, String> {
     let applied = read_applied()?;
-    let mut statuses = judge(&chosen(read, only), &applied, Judge::read()?);
+    let (remote, partial) = read_judged()?;
+    let mut statuses = judge(&chosen(read, only), &applied, Judge { remote: remote.as_deref(), partial, report });
 
-    let newly: Vec<String> = statuses.iter()
-        .filter(|status| status.state.is_applied() && !applied.contains(&status.hash))
-        .map(|status| status.hash.clone())
-        .collect();
+    let newly = |statuses: &[RedactionStatus]| -> Vec<String> {
+        statuses.iter()
+            .filter(|status| status.state.is_applied() && !applied.contains(&status.hash))
+            .map(|status| status.hash.clone())
+            .collect()
+    };
 
-    if newly.is_empty() {
+    if newly(&statuses).is_empty() {
         return Ok(statuses);
     }
 
     let lock = RefLock::acquire()?;
-    let now = Judge::read()?;
+    let (remote, partial) = read_judged()?;
+    let now = Judge { remote: remote.as_deref(), partial, report };
 
-    // A remote configured since the scan waits for its report instead.
-    if !now.clean().is_applied() {
-        for status in statuses.iter_mut().filter(|status| newly.contains(&status.hash)) {
-            status.state = now.clean();
-        }
+    // A remote configured or replaced since the scan decides by its own report instead.
+    for status in statuses.iter_mut().filter(|status| status.state.is_applied() && !applied.contains(&status.hash)) {
+        status.state = now.clean(&status.hash);
+    }
 
+    let newly = newly(&statuses);
+
+    if newly.is_empty() {
         return Ok(statuses);
     }
 
@@ -454,10 +498,33 @@ mod tests {
     /// Revert: let a partial warehouse with no remote decide by its own scan → it applies.
     #[test]
     fn only_a_full_warehouse_with_no_remote_applies_by_its_own_scan() {
-        assert!(Judge { remote: false, partial: false }.clean().is_applied());
-        assert_eq!(Judge { remote: true, partial: false }.clean(), RedactionState::AwaitingRemote);
-        assert_eq!(Judge { remote: true, partial: true }.clean(), RedactionState::AwaitingRemote);
-        assert!(matches!(Judge { remote: false, partial: true }.clean(), RedactionState::Undecided(_)));
+        let judge = |remote, partial| Judge { remote, partial, report: None };
+
+        assert!(judge(None, false).clean(&hash('a')).is_applied());
+        assert_eq!(judge(Some("http://r"), false).clean(&hash('a')), RedactionState::AwaitingRemote);
+        assert_eq!(judge(Some("http://r"), true).clean(&hash('a')), RedactionState::AwaitingRemote);
+        assert!(matches!(judge(None, true).clean(&hash('a')), RedactionState::Undecided(_)));
+    }
+
+    /// A warehouse with a remote applies a clean redaction only on a report from the remote it has
+    /// configured that lists that very hash, in a full warehouse or a partial one.
+    ///
+    /// Revert: ignore the report's URL → the other remote's report applies; ignore its hashes →
+    /// a hash it does not list applies.
+    #[test]
+    fn a_remote_s_report_applies_only_what_it_lists_and_only_from_that_remote() {
+        let report = RemoteReport { url: "http://r/".to_string(), applied: AppliedSet::of([hash('a')]) };
+        let judge = |remote, partial| Judge { remote: Some(remote), partial, report: Some(&report) };
+
+        for partial in [false, true] {
+            assert!(judge("http://r", partial).clean(&hash('a')).is_applied(), "the same remote, spelt with no slash");
+            assert_eq!(judge("http://r", partial).clean(&hash('b')), RedactionState::AwaitingRemote, "not listed");
+            assert_eq!(judge("http://other", partial).clean(&hash('a')), RedactionState::AwaitingRemote, "another remote");
+        }
+
+        // With no remote configured the report is not this warehouse's to wait for.
+        let alone = Judge { remote: None, partial: true, report: Some(&report) };
+        assert!(matches!(alone.clean(&hash('a')), RedactionState::Undecided(_)));
     }
 
     /// A redaction naming an object this store holds as a chunk or a tree is never applied: its

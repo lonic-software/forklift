@@ -423,7 +423,7 @@ async fn forklift(cli: Cli) -> Result<(), ForkliftError> {
     // A mutating command adds loose objects; captured before `dispatch` consumes `cli`.
     let auto_maintenance = cli.command.triggers_auto_maintenance();
 
-    let result = dispatch(cli, store_access.as_ref()).await;
+    let result = dispatch(cli, &mut store_access).await;
 
     if let Some((op, pre)) = journal_pre {
         if result.is_ok() {
@@ -466,8 +466,10 @@ pub(crate) fn announce_store_access_wait() {
 
 /// Dispatch a parsed command to its handler. Handlers own presentation and return a
 /// plain `Result<(), String>`; the generic error is classified by the caller. `store_access` is
-/// the command's shared store-access hold, when it takes one ([`Command::holds_store_access`]).
-async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) -> Result<(), String> {
+/// the command's shared store-access hold, when it takes one ([`Command::holds_store_access`]): a
+/// handler that has published everything it writes may release it early, as `lower` does before
+/// it deletes redacted copies, which needs the store exclusive.
+async fn dispatch(cli: Cli, store_access: &mut Option<lock_utils::StoreAccessLock>) -> Result<(), String> {
     match cli.command {
         Command::Audit { pallet, full } => commands::audit::handle_command(pallet, full),
         Command::Blame { path, rev } => commands::blame::handle_command(&path, rev).await,
@@ -496,7 +498,7 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
         Command::Clone { url, directory, pallet, token, only, cache, expect, repair } =>
             commands::clone::handle_command(&url, &directory, pallet, token, only, cache, expect, repair).await,
         Command::Heal => {
-            let store_access = store_access.ok_or("heal ran without its store-access hold.")?;
+            let store_access = store_access.as_ref().ok_or("heal ran without its store-access hold.")?;
             commands::heal::handle_command(store_access).await
         }
         Command::History { revision, limit, after, oneline } => commands::history::handle_command(revision, limit, after, oneline).await,
@@ -513,7 +515,8 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
         },
         Command::Lift { recreate } => commands::lift::handle_command(recreate).await,
         Command::Load { path } => commands::load::handle_command(&path).await,
-        Command::Lower { pallet, expect, keep, confirm, repair } => commands::lower::handle_command(pallet, expect, keep, confirm, repair).await,
+        Command::Lower { pallet, expect, keep, confirm, repair } =>
+            commands::lower::handle_command(pallet, expect, keep, confirm, repair, store_access).await,
         Command::Manifest { action } => commands::manifest::handle_command(action),
         Command::Haul { action } => commands::haul::handle_command(action).await,
         Command::Mcp { root } => commands::mcp::handle_command(root),
@@ -580,7 +583,7 @@ async fn dispatch(cli: Cli, store_access: Option<&lock_utils::StoreAccessLock>) 
         Command::Remote { action } => match action {
             None => commands::remote::show(),
             Some(RemoteAction::Move { url, token }) => {
-                let store_access = store_access.ok_or("remote move ran without its store-access hold.")?;
+                let store_access = store_access.as_ref().ok_or("remote move ran without its store-access hold.")?;
                 commands::remote::move_origin(url, token, store_access).await
             }
             Some(RemoteAction::Abort) => commands::remote::abort_move(),

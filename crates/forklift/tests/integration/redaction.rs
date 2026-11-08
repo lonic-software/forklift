@@ -1996,3 +1996,105 @@ fn a_server_owing_a_deletion_serves_the_chunks_only_its_recipe_names_as_absent()
     let (status, _) = http(&server.url, "GET", &format!("/v1/objects/{}", shared[0]), b"");
     assert!(status.starts_with("HTTP/1.1 200"), "{}", status);
 }
+
+/// A warehouse that took content before its remote applied a redaction of it applies the redaction
+/// on the remote's report once nothing here names the content, and deletes its own copy; the lower
+/// says so, and names the git mirror's copy, which nothing here deletes. While the remote still
+/// holds the redaction pending, a lower applies nothing, though nothing here names the content.
+///
+/// Revert: apply on any report, not only the hashes it lists → the first lower applies the pending
+/// redaction. Revert: drop the apply after the pallet lands → the second lower applies nothing and
+/// the copy stays.
+#[test]
+fn a_lower_applies_what_the_remote_reports_applied_and_deletes_the_copy_here() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-settle-server-{}", std::process::id())));
+    let content = b"TOKEN=hunter2\n";
+    let hash = hash_of(content);
+
+    let owner = Warehouse::cloned("settle-owner", &server.url);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+
+    // Cloned before the leak, so no head here names it.
+    let redactor = Warehouse::cloned("settle-redactor", &server.url);
+    owner.stack("secret.env", content, "leak");
+    owner.run_ok(&["lift"]);
+
+    // This warehouse takes the leak, so it holds a copy, and takes the file out without lifting.
+    let holder = Warehouse::cloned("settle-holder", &server.url);
+    assert!(holder.holds_loose(&hash));
+    holder.run_ok(&["remove", "secret.env"]);
+    holder.run_ok(&["stack", "-m", "take the leak out"]);
+    std::fs::create_dir_all(holder.root.join(".forklift/mirror.git")).unwrap();
+
+    // The redaction goes up while the server's main still names the content: pending there.
+    std::fs::write(redactor.root.join("secret.env"), content).unwrap();
+    redactor.run_ok(&["load", "secret.env"]);
+    recorded_hash(&redactor, &hash, "leaked token");
+    redactor.run_ok(&["unload", "secret.env"]);
+    std::fs::remove_file(redactor.root.join("secret.env")).unwrap();
+    let lifted = redactor.run(&["lift"]);
+    assert!(String::from_utf8_lossy(&lifted.stdout).contains("Lifted the @redactions pallet"), "{:?}", lifted);
+
+    let pending = holder.json(&["lower"]);
+    assert_eq!(pending["ok"], true, "{}", pending);
+    assert_eq!(pending["data"].get("redactions"), None, "{}", pending);
+    assert!(holder.holds_loose(&hash));
+    assert_eq!(applied_record(&holder), "");
+    assert_eq!(holder.redactions()[0]["status"]["state"], "awaiting_remote");
+
+    // Once the server's main no longer names the content, the server applies the redaction.
+    holder.run_ok(&["lift"]);
+    let (_, info) = http(&server.url, "GET", "/v1/warehouse", b"");
+    let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+    assert_ne!(info["redactions"][0]["state"], "pending", "{}", info);
+
+    let lowered = holder.json(&["lower"]);
+    assert_eq!(lowered["ok"], true, "{}", lowered);
+    let settled = &lowered["data"]["redactions"];
+    assert_eq!(settled["applied"], serde_json::json!([hash]), "{}", lowered);
+    assert_eq!(settled["deletion"]["deleted"], serde_json::json!([hash]), "{}", lowered);
+    assert!(settled["mirror_copy"].as_str().unwrap().contains("mirror.git"), "{}", lowered);
+    assert!(!holder.holds_loose(&hash), "the copy here is deleted");
+    assert_eq!(applied_record(&holder), format!("/forklift-redactions-applied 1\n{}\n", hash));
+    assert_eq!(holder.redactions()[0]["status"]["state"], "applied");
+
+    let human = String::from_utf8_lossy(&holder.run_ok(&["lower"]).stdout).into_owned();
+    assert!(!human.contains("mirror"), "nothing was applied this time: {}", human);
+}
+
+/// `redact apply` in a warehouse with a remote reads the remote's handshake, and applies on its
+/// report; a remote it cannot reach leaves a clean redaction pending, and the list says why.
+///
+/// Revert: apply with no report in `redact apply` → the reachable case stays pending.
+#[test]
+fn redact_apply_reads_the_remote_s_report_and_says_when_it_cannot() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-report-server-{}", std::process::id())));
+    let content = b"TOKEN=hunter2\n";
+
+    let owner = Warehouse::cloned("report-owner", &server.url);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+    let hash = owner.redact_loaded("secret.env", content, "leaked token");
+    owner.run_ok(&["lift"]);
+
+    // The owner recorded it before the remote had it, so it is still pending here.
+    assert_eq!(owner.redactions()[0]["status"]["state"], "awaiting_remote");
+
+    owner.run_ok(&["config", "set", "remote.url", "http://127.0.0.1:9"]);
+    let unread = owner.json(&["redact", "apply"]);
+    assert_eq!(unread["ok"], true, "{}", unread);
+    assert!(unread["data"]["remote_unread"].is_string(), "{}", unread);
+    assert_eq!(unread["data"]["redactions"][0]["status"]["state"], "awaiting_remote", "{}", unread);
+    let human = String::from_utf8_lossy(&owner.run_ok(&["redact", "apply"]).stdout).into_owned();
+    assert!(human.contains("The remote's report of what it has applied could not be read"), "{}", human);
+    assert_eq!(applied_record(&owner), "");
+
+    owner.run_ok(&["config", "set", "remote.url", &server.url]);
+    let applied = owner.json(&["redact", "apply"]);
+    assert_eq!(applied["data"].get("remote_unread"), None, "{}", applied);
+    assert_eq!(applied["data"]["redactions"][0]["status"]["state"], "applied", "{}", applied);
+    assert_eq!(applied_record(&owner), format!("/forklift-redactions-applied 1\n{}\n", hash));
+}

@@ -17,7 +17,8 @@ use forklift_core::util::{
 };
 use forklift_core::util::operation_utils::{Operation, OperationKind};
 use forklift_core::util::take_utils::{FetchAt, TakeTrust};
-use crate::commands::lower::RepairReport;
+use crate::commands::lower::{self, RepairReport};
+use crate::commands::redact;
 use crate::output::{self, CommandOutput};
 
 /// Handle the clone command: open a local clone of a remote
@@ -562,6 +563,7 @@ async fn franchise_into_prepared_target(
         densify_suggested: false,
         repair: None,
         batch_lane: None,
+        redactions: None,
     };
 
     // The bundle is a fast start, not a requirement: whatever it lacks (or if there is none) is
@@ -636,6 +638,7 @@ async fn franchise_into_prepared_target(
 
         report.pallet = pallet_name;
         report.unborn = true;
+        report.redactions = lower::settle_redactions(client.url(), &info, &mut None);
         emit_report(&mut report, client);
 
         return Ok(());
@@ -728,6 +731,10 @@ async fn franchise_into_prepared_target(
     report.head = Some(remote_head.clone());
     report.repair = repair.map(|repair| RepairReport { parcel: repair.parcel, removed: repair.removed });
     report.fetched_objects = stats.fetched_objects;
+
+    // Once the clone is finished: a failure only warns, and `redact apply` finishes it. Nothing
+    // here holds the store shared, so the deletion is not owed to this command's own hold.
+    report.redactions = lower::settle_redactions(client.url(), &info, &mut None);
     emit_report(&mut report, client);
 
     Ok(())
@@ -921,6 +928,11 @@ pub(crate) struct CloneReport {
     /// Why the remote's batch download stopped being used, when it did. Absent when it stayed open.
     #[serde(skip_serializing_if = "Option::is_none")]
     batch_lane: Option<BatchLaneClosure>,
+
+    /// What was done about the redactions the remote reports applied: those applied here, and the
+    /// copies deleted and kept. Absent when nothing was applied and no copy was left to delete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redactions: Option<redact::Settled>,
 }
 
 impl CommandOutput for CloneReport {
@@ -975,6 +987,10 @@ impl CommandOutput for CloneReport {
                 hash — widen with \"forklift scope fetch\".",
                 self.scope.join(", ")
             );
+        }
+
+        if let Some(redactions) = &self.redactions {
+            redactions.render_human();
         }
 
         output::print_batch_lane(self.batch_lane);
