@@ -186,9 +186,16 @@ deletion that fails is logged and retried by a later request. The redaction stay
 be downloadable until its URL expires, and a request that was running when it applied may still
 write a copy. The first request to judge it once every such request has ended and every such URL
 has expired (at least 1920 seconds after it applied) deletes the copies again, and the
-`batch` answers written before those requests ended; the redaction is then `deleted`. For now an
-applied recipe's object and chunks are kept, its chunks still served, and it stays
-`deletion_owed`.
+`batch` answers written before those requests ended; the redaction is then `deleted`. An applied
+recipe's chunks are deleted in rounds, each of which first takes a census of every pallet head,
+tombstone and proposed haul head to find the chunks nothing else names. Until a round has done so,
+every chunk of the recipe answers `503` with `Retry-After`, is left out of `batch`, and is not
+stored again; while the census and the deletion run, a ref update answers `503` with
+`Retry-After` and moves nothing. Once the round has decided, a chunk only that recipe names is
+absent as on forklift-server, and any other is served. A second round, at least 1920 seconds after
+the redaction applied, deletes a copy that landed since, then the recipe; only then is the
+redaction `deleted`. Between rounds, a chunk the first round deleted that is written again is
+served until the second deletes it.
 
 forklift-server deletes an applied redaction's content in its own process right after applying
 it. It drains that one warehouse: new requests for it get `503` until the deletion ends (which may

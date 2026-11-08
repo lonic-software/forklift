@@ -278,7 +278,8 @@ whether another holds an object.
 | `staging/{warehouse}/{session}/{hash}` | Unverified bytes a client `PUT` straight into, via a presigned URL. Invisible to `exists`/`get`. | The client, via a presigned `PUT` |
 | `signatures/{warehouse}/{parcel_hash}` | Parcel signature sidecars — a distinct prefix so a sidecar never collides with its parcel's own object at `objects/{warehouse}/{parcel_hash}`. | `put_signature` |
 | `responses/{warehouse}/{content_hash}` | Ephemeral, content-addressed `batch`-bundle bodies offloaded from the control plane, reached only through a presigned URL. Never `objects/`. | `offload_response` |
-| `redaction-work/{warehouse}/{hash}/…` | A redaction scan's progress: the pallets it has still to walk, and each walk stopped part way. Holds no verdict, and is deleted as the scan finishes; a walk object a request left behind is deleted by the redaction's late sweep (for now, not one of a redacted chunked file's). Never served. | The control plane's redaction judge |
+| `redaction-work/{warehouse}/{hash}/…` | A redaction scan's progress: the pallets it has still to walk, and each walk stopped part way. Holds no verdict, and is deleted as the scan finishes; a walk object a request left behind is deleted by the redaction's late sweep. Never served. | The control plane's redaction judge |
+| `redaction-work/{warehouse}/chunks/census-{round}[-final]` | A chunk round's census: which of its recipes' chunks something else names, as far as the walk has gone, and, once finished, the chunks nothing else names, written once and never rewritten. Both are deleted as the round ends. Never served. | The control plane's chunk round |
 
 A warehouse in AWS format 1 kept one `objects/{hash}` and `signatures/{hash}` key for every
 warehouse in the bucket. Nothing reads those keys, and the format gate refuses such a warehouse with
@@ -336,8 +337,25 @@ presigned URL TTL (900 s) plus twice 60 s after it applied deletes, every versio
 warehouse's `responses/` objects last written before the apply plus 960 s, the staged and canonical
 copies again, and the redaction's `redaction-work/` objects. Only then does the handshake report
 the redaction `deleted`. Nothing runs it on a timer: a warehouse no request reaches keeps those
-copies until one does. A redacted chunked file's recipe is not swept again, and stays
-`deletion_owed`.
+copies until one does.
+
+### A redacted chunked file's chunks
+
+A chunked file's redaction names its recipe; its chunks may be shared with other files, so they
+are deleted in **rounds** that first find which of them nothing else in the warehouse names. Two
+DynamoDB items hold the rounds, `chunk-fence` (the running round and its phase) and
+`chunk-ledger` (each applied recipe and where its deletion stands). A round is announced, waits
+out 960 s so every request that began before it has ended, then walks every pallet head, every
+deleted pallet's tombstone and every proposed haul head (its **census**, saved under
+`redaction-work/` and resumed by the next request when one runs out of time), and deletes, every
+version of each, the canonical and staged copies of each chunk nothing else names. Until the
+round ends, no chunk of its recipes is promoted or written, and until its census is done, every
+one answers `503`; while the census and the deletion run, a ref update answers `503` and moves nothing,
+so no head comes to name a chunk under deletion. After that a deleted chunk is absent and a kept
+one is served. A second round, due as the late sweep is, deletes a copy landed since; then the
+recipe object is deleted, and only then is the redaction `deleted`. A delete S3 refuses is logged,
+and that recipe waits an hour for its next round, twice that after each further refusal, up to a
+day; it stays `deletion_owed` meanwhile. Rounds run only when a request reaches the warehouse.
 
 ### Event notification wiring
 

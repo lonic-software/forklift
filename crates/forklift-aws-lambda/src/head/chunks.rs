@@ -27,10 +27,10 @@
 //! round started, and the round's recipes, read from the fence alone for the rest of the round.
 //! No item reads as `down` at version 0.
 //!
-//! 1. **Announced.** A request that finds the fence down and a ledger entry due raises it. While a
-//!    round runs, no promotion writes a chunk of one of its recipes. A promotion that read the fence
-//!    down ends within one invocation, so the census waits that out first: nothing it judges can
-//!    still be landing.
+//! 1. **Announced.** A request that finds the fence down and a ledger entry due raises it. While
+//!    a round runs, no promotion writes a chunk of one of its recipes. A promotion that read the
+//!    fence down ends within one invocation, so the census waits that out first: nothing it
+//!    judges can still be landing.
 //! 2. **Census.** Every ref update commits on the fence's exact bytes, so one that read it before
 //!    the census began fails its commit, and none starts while the census or the delete runs.
 //!    The census walks every pallet's whole history, tombstones and meta pallets included, and the

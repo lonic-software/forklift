@@ -16,10 +16,12 @@
 //! Same blocking discipline as the control plane: `verify_and_promote` bridges S3 futures,
 //! so it runs on a blocking thread. It needs an object store and a ref store bound to the
 //! warehouse the staging key names ([`parse_staging_key`]): objects are keyed per warehouse, and
-//! the key is all an S3 event carries. The ref store is read for one thing only: the staged
-//! object's redaction item, before promoting and again after. Content whose redaction has
-//! applied is not promoted: its staged copy is deleted, and so is a canonical copy a promotion
-//! wrote (a recipe is kept, as the judge keeps it), and the event is consumed.
+//! the key is all an S3 event carries. The ref store is read for two things only: the staged
+//! object's redaction item, before promoting and again after, and the chunk round's fence.
+//! Content whose redaction has applied is not promoted: its staged copy is deleted, and so is a
+//! canonical copy a promotion wrote (a recipe whose chunks are still owed is kept, as the judge
+//! keeps it), and the event is consumed. Neither is a chunk of a recipe whose chunk round is
+//! running: its staged copy is deleted, so the lift naming it fails and is retried.
 //!
 //! Build with `cargo build -p forklift-aws-lambda --features lambda --release`.
 
@@ -160,7 +162,7 @@ async fn handler(event: LambdaEvent<S3Event>) -> Result<(), Error> {
                 continue;
             }
             Err(Refused::Applied(AppliedCopies::RecipeKept)) => {
-                eprintln!("verifier: deleted staged object {}: its content is redacted, and its recipe is kept", key);
+                eprintln!("verifier: deleted staged object {}: its content is redacted, and the recipe is kept until its chunks are deleted", key);
                 continue;
             }
             Err(Refused::Applied(AppliedCopies::Deleted)) => {

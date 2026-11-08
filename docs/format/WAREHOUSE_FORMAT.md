@@ -126,13 +126,28 @@ A redaction the head has judged keeps an item of its own, `entity = "redaction#<
 `state` is a versioned JSON record: whether its scan has a verdict for every pallet, the pallets
 it saw naming the content with the heads it saw them at, when it applied, whether the copies of
 an applied redaction's content have been deleted since, whether its content was found to be a
-recipe, which keeps that object, whether its late sweep has run too, and until when one request
-holds a deletion, so no other starts it meanwhile. Every write of it
+recipe, which keeps that object until its chunks are deleted, whether its late sweep has run too,
+whether the recipe object has been deleted, and until when one request holds a deletion, so no
+other starts it meanwhile. Every write of it
 is conditioned on the exact bytes its writer read, behind the same format check. A record of a
 version the build does not read fails every request that needs that redaction with a `500`, and
 is never written over, since it may record an apply. The scan's progress lives beside it in S3,
 under `redaction-work/{warehouse}/`, and holds no verdict: a build that cannot read it does the
 work again.
+
+An applied recipe's chunks are deleted in rounds, which two more items hold, each a versioned JSON
+`state`: `entity = "chunk-ledger"`, each applied recipe with where its deletion stands (owed, owed
+a late round, or its recipe object due for deletion), when it applied, when its next round is due,
+the last round that settled it and how many deletes S3 has refused it in a row; and
+`entity = "chunk-fence"`, the latest round's number, its phase (down, announced, census or
+deleting), when it was announced, its recipes, and until when one request holds its deletion. The
+write recording a recipe's apply journals it in the ledger in the same transaction, and every ref
+commit is conditioned on the fence bytes its writer read before its audit. Either item of a version
+the build does not read fails every object read and ref update with a `500`, and is never written
+over. A round's
+census lives in S3 under `redaction-work/{warehouse}/chunks/`; the census still running holds no
+verdict and is taken again if unreadable, while the finished one is written once and the deletion
+reads only it.
 
 `forklift-aws-upgrade` upgrades a warehouse in place. It runs from an operator's machine, never from a
 Lambda, and takes warehouse ids or `--all`:
@@ -298,8 +313,8 @@ skeleton's reader, which only a partial checkout's consolidation reaches.
 
 The AWS head's items are frozen the same way, against `AWS_FORMAT`:
 `crates/forklift-aws-lambda/tests/fixtures/aws-format-<N>/items` lists the DynamoDB items a warehouse
-holding a live pallet, a deleted one, the office pallet, a trust anchor and an applied redaction's
-item is written as, on the
+holding a live pallet, a deleted one, the office pallet, a trust anchor, an applied redaction's
+item and a chunk round's ledger and fence is written as, on the
 memory store. The current build must write exactly those items and serve them back, and the LocalStack
 suite writes the same warehouse through DynamoDB and requires the very same items there, so the fixture
 holds what DynamoDB stores rather than only the memory store's mapping. An older AWS format's items must

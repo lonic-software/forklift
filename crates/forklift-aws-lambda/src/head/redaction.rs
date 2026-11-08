@@ -398,13 +398,14 @@ impl AppliedCopies {
 
 /// If the redaction of `hash` has applied, delete the copies a promotion from `session` may have
 /// left or be about to promote: that session's staged copy, and the canonical object unless the
-/// store holds it as a recipe whose chunks are not deleted yet. What the staging verifier and a lift commit check before they
-/// promote, and again after: a redaction that applied between the first check and the
-/// promotion's write may already have been swept, finding no canonical object to delete. This
-/// reads one key, so a client retrying applied content costs no listing. Other sessions' copies
-/// are not touched: one staged before the sweep is the sweep's, one staged after it is deleted by
-/// its own verifier event or the lift commit naming it, and one neither reaches is left to the
-/// `staging/` lifecycle rule.
+/// store holds it as a recipe whose chunks are not deleted yet. What the staging verifier and a
+/// lift commit check before they promote, and again after: a redaction that applied between the
+/// first check and the promotion's write may already have been swept, finding no canonical object
+/// to delete. This reads one item, and the ledger for a recipe, so a client retrying applied
+/// content costs no listing. Other
+/// sessions' copies are not touched: one staged before the sweep is the sweep's, one staged after
+/// it is deleted by its own verifier event or the lift commit naming it, and one neither reaches is
+/// left to the `staging/` lifecycle rule.
 ///
 /// # Returns
 /// * `Ok(AppliedCopies)` - Whether the redaction has applied, and what was deleted.
@@ -1100,10 +1101,10 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// there. The `late` sweep, once [`late_sweep_due`], deletes them again, catching a staged
     /// upload presigned before the apply that landed after the first sweep, and also every
     /// response bundle written before [`response_cutoff`] and the scan's work objects; for a blob,
-    /// it ends the deletion, and for a recipe, so does deleting its object. Run under a lease the item holds, so two
-    /// requests reading the redaction applied at once delete once; the lease outlasts this
-    /// request, so one that dies holding it leaves the deletion to the first request after it
-    /// ends.
+    /// it ends the deletion, and for a recipe, so does deleting its object. Run under a lease the
+    /// item holds, so two requests reading the redaction applied at once delete once; the lease
+    /// outlasts this request, so one that dies holding it leaves the deletion to the first request
+    /// after it ends.
     ///
     /// # Returns
     /// * `Ok(bool)`       - Whether the deletion is done; `false` too while another request holds
