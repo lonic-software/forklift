@@ -6150,10 +6150,11 @@ fn a_retried_lift_commit_deletes_the_copy_an_earlier_attempt_promoted() {
 }
 
 /// The staging verifier's check after its write deletes a promoted copy whose redaction applied,
-/// leaves one whose redaction did not, and keeps an applied recipe, as the judge does, while
-/// still answering that it applied.
+/// leaves one whose redaction did not, and keeps an applied recipe whose chunks the ledger still
+/// owes, as the judge does, while still answering that it applied. A recipe the ledger no longer
+/// holds is deleted as a blob is.
 // Revert: delete whatever the item says → the unapplied copy is gone → red. Revert: delete a
-// recipe too → it is gone → red.
+// recipe too → it is gone → red. Revert: keep every recipe → the one off the ledger is kept → red.
 #[test]
 fn the_check_after_a_promotion_deletes_only_applied_file_content() {
     use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
@@ -6179,6 +6180,10 @@ fn the_check_after_a_promotion_deletes_only_applied_file_content() {
     plant_item(&refs, &gone, &applied);
     plant_item(&refs, &kept, &pending);
     plant_item(&refs, &recipe.hash, &applied);
+    let (ledger, _) = forklift_aws_lambda::head::chunk_fixture_items([&recipe.hash, &"8".repeat(64), &"9".repeat(64)]).expect("items");
+    let fence = forklift_aws_lambda::format::gate(&refs).expect("format gate");
+    let written = refs.put_items(&[ItemWrite { key: ItemKey::ChunkLedger, state: &ledger, expected: None }], &fence).expect("write");
+    assert_eq!(written, RedactionWrite::Written);
 
     use forklift_aws_lambda::head::AppliedCopies;
     let delete = |hash: &str| forklift_aws_lambda::head::delete_if_redaction_applied(&objects, &refs, "lift-1", hash).expect("checked");
@@ -6191,6 +6196,16 @@ fn the_check_after_a_promotion_deletes_only_applied_file_content() {
     assert!(!objects.exists(&gone).expect("exists"));
     assert!(objects.exists(&kept).expect("exists"));
     assert!(objects.exists(&recipe.hash).expect("exists"));
+
+    let done = LooseObjectBuilder::build_recipe(&Recipe {
+        content_hash: "f".repeat(64),
+        total_size: 1,
+        chunks: vec![RecipeChunk { hash: "d".repeat(64), size: 1 }],
+    });
+    objects.put_verified(&done.hash, &done.content).expect("put");
+    plant_item(&refs, &done.hash, &applied);
+    assert_eq!(delete(&done.hash), AppliedCopies::Deleted, "off the ledger, its chunks are done");
+    assert!(!objects.exists(&done.hash).expect("exists"));
 }
 
 /// A new pallet whose history names applied content no longer stored, below a head that does not
