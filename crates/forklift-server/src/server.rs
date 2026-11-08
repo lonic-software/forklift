@@ -6967,7 +6967,8 @@ mod tests {
     }
 
     /// A handle served for the first time starts a redaction run of its own, once, so a deletion
-    /// owed when the warehouse was last served is carried out without waiting for a ref write.
+    /// owed when the warehouse was last served is carried out without waiting for a ref write. It
+    /// starts once the withheld record's watch has read its baseline ([`start_serving`]).
     ///
     /// Revert: start runs only after ref writes → no round is asked → red.
     #[tokio::test]
@@ -6977,6 +6978,11 @@ mod tests {
 
         let handle = resolve_warehouse(&state, &warehouse_params("w1")).unwrap();
         drop(resolve_warehouse(&state, &warehouse_params("w1")).unwrap());
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while handle.redactions_asked.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(handle.redactions_asked.load(Ordering::SeqCst), 1, "one run, at the first serve");
 
         drop(handle);
