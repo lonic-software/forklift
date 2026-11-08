@@ -319,16 +319,17 @@ const SWEEP_LEASE_MARGIN: u64 = 60;
 /// pending first may still write a response bundle holding its content.
 const INVOCATION_CEILING: u64 = 900;
 
-/// How long past [`late_sweep_due`] the late sweep waits on top, in seconds: for clocks that
-/// disagree, and a presigned URL minted a moment after its object was written.
+/// How much later than its bound each of [`response_cutoff`] and [`late_sweep_due`] falls, in
+/// seconds: `applied_at` is rounded down and taken before the apply's write lands, S3 stamps a
+/// response on its own clock, and a URL is presigned a moment after its object is written.
 const LATE_SWEEP_MARGIN: u64 = 60;
 
 /// When, in seconds since the Unix epoch, a response bundle last written may still hold the
 /// content of a redaction that applied at `applied_at`: a request that judged the redaction
 /// pending before it applied ends within [`INVOCATION_CEILING`], and every later one leaves the
-/// content out.
+/// content out. [`LATE_SWEEP_MARGIN`] later still, for the clocks.
 fn response_cutoff(applied_at: u64) -> u64 {
-    applied_at.saturating_add(INVOCATION_CEILING)
+    applied_at.saturating_add(INVOCATION_CEILING).saturating_add(LATE_SWEEP_MARGIN)
 }
 
 /// When the late sweep of a redaction that applied at `applied_at` is due, in seconds since the
@@ -1096,10 +1097,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             },
             Err(_) => Record { lease_until: None, ..leased },
         };
-        // Lost, the lease simply runs out and the next request after it deletes again.
-        self.write_record(hash, &next, Some(&stored), budget)?;
+        // Lost, the lease simply runs out and the next request after it deletes again. Until
+        // then the item says what it said, so this request reports that too.
+        let written = self.write_record(hash, &next, Some(&stored), budget)?;
 
-        swept.map(|_| next.deleted)
+        swept.map(|_| if written { next.deleted } else { record.deleted })
     }
 
     /// Delete every staged copy of `hash`, and its canonical object unless the store holds it as
@@ -1180,6 +1182,19 @@ fn undecided(hash: &str, why: &str) -> HeadError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bundle written up to the Lambda ceiling after the apply, and a moment past it on a clock
+    /// that disagrees, is swept; the sweep waits a URL's lifetime past that, and a moment more.
+    // Revert: drop the margin from the cutoff → red.
+    #[test]
+    fn the_late_sweeps_bounds_keep_a_margin_past_each_wait() {
+        let applied_at = 1_000_000;
+        assert!(response_cutoff(applied_at) >= applied_at + INVOCATION_CEILING + LATE_SWEEP_MARGIN);
+        assert!(
+            late_sweep_due(applied_at)
+                >= response_cutoff(applied_at) + crate::aws::PRESIGN_TTL.as_secs() + LATE_SWEEP_MARGIN
+        );
+    }
 
     #[test]
     fn a_record_of_another_version_is_refused_never_read_as_pending() {

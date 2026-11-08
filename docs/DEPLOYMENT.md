@@ -278,7 +278,7 @@ whether another holds an object.
 | `staging/{warehouse}/{session}/{hash}` | Unverified bytes a client `PUT` straight into, via a presigned URL. Invisible to `exists`/`get`. | The client, via a presigned `PUT` |
 | `signatures/{warehouse}/{parcel_hash}` | Parcel signature sidecars — a distinct prefix so a sidecar never collides with its parcel's own object at `objects/{warehouse}/{parcel_hash}`. | `put_signature` |
 | `responses/{warehouse}/{content_hash}` | Ephemeral, content-addressed `batch`-bundle bodies offloaded from the control plane, reached only through a presigned URL. Never `objects/`. | `offload_response` |
-| `redaction-work/{warehouse}/{hash}/…` | A redaction scan's progress: the pallets it has still to walk, and each walk stopped part way. Holds no verdict, and is deleted as the scan finishes; a walk object a request left behind is deleted by the redaction's late sweep. Never served. | The control plane's redaction judge |
+| `redaction-work/{warehouse}/{hash}/…` | A redaction scan's progress: the pallets it has still to walk, and each walk stopped part way. Holds no verdict, and is deleted as the scan finishes; a walk object a request left behind is deleted by the redaction's late sweep (for now, not one of a redacted chunked file's). Never served. | The control plane's redaction judge |
 
 A warehouse in AWS format 1 kept one `objects/{hash}` and `signatures/{hash}` key for every
 warehouse in the bucket. Nothing reads those keys, and the format gate refuses such a warehouse with
@@ -332,8 +332,8 @@ answer that bundled the content before the redaction applied may still sit under
 presigned URL still valid, and a request already running when it applied may still stage or write
 a copy. So the control plane sweeps once more, lazily. The first request to judge the redaction at
 least 900 s (the Lambda ceiling, which ends every request that began before the apply) plus the
-presigned URL TTL (900 s) plus 60 s after it applied deletes, every version of each: the
-warehouse's `responses/` objects last written before the apply plus 900 s, the staged and canonical
+presigned URL TTL (900 s) plus twice 60 s after it applied deletes, every version of each: the
+warehouse's `responses/` objects last written before the apply plus 960 s, the staged and canonical
 copies again, and the redaction's `redaction-work/` objects. Only then does the handshake report
 the redaction `deleted`. Nothing runs it on a timer: a warehouse no request reaches keeps those
 copies until one does. A redacted chunked file's recipe is not swept again, and stays
@@ -645,9 +645,9 @@ redaction's deletion of a blob's canonical object and of its staged copies (ever
 sweep, the committing session's when a lift commit names it), which lists the keys' versions (`ListObjectVersions` → `s3:ListBucketVersions` on the bucket, the
 `ListRedactedVersions` statement) and deletes each by version id (`DeleteObject` naming a version →
 `s3:DeleteObjectVersion` on `objects/*` and `staging/*`, the `DeleteRedactedCopies` statement), so
-no earlier version survives on a bucket with versioning enabled or suspended; the late sweep, which
-deletes the same way the warehouse's older `responses/` objects and the redaction's
-`redaction-work/` objects (`DeleteRedactedCopies` on `responses/*` and `redaction-work/*`); `ListObjectsV2`
+no earlier version survives on a bucket with versioning enabled or suspended; the late sweep deletes the
+warehouse's older `responses/` objects and the redaction's `redaction-work/` objects the same way
+(`DeleteRedactedCopies` on `responses/*` and `redaction-work/*`); `ListObjectsV2`
 (`discard_session`'s sweep) and `HeadObject`/`GetObject` 404-vs-403 semantics (below) →
 `s3:ListBucket` on the **bucket** resource (not `bucket/*`); `GetItem`/`Query` (ref reads,
 enumeration, the format item and the partition check behind it) → the table ARN, no index ARN

@@ -5700,7 +5700,7 @@ fn applied_item(ago: u64, extra: &str) -> String {
 
 /// How long after its apply a redaction's late sweep is due: the Lambda ceiling, a presigned URL's
 /// lifetime and the margin, written out here rather than read from the code under test.
-const LATE_SWEEP_AFTER: u64 = 900 + 900 + 60;
+const LATE_SWEEP_AFTER: u64 = 900 + 60 + 900 + 60;
 
 /// An applied blob's late sweep, once a presigned URL's lifetime past the last request that could
 /// have judged it pending, deletes what arrived since the first sweep, every response bundle

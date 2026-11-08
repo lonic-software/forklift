@@ -185,7 +185,7 @@ deletion that fails is logged and retried by a later request. The redaction stay
 `deletion_owed` after that: a `batch` answer that bundled the content before it applied may still
 be downloadable until its URL expires, and a request that was running when it applied may still
 write a copy. The first request to judge it once every such request has ended and every such URL
-has expired (at least 1860 seconds after it applied) deletes the copies again, and the
+has expired (at least 1920 seconds after it applied) deletes the copies again, and the
 `batch` answers written before those requests ended; the redaction is then `deleted`. For now an
 applied recipe's object and chunks are kept, its chunks still served, and it stays
 `deletion_owed`.
