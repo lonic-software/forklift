@@ -1949,10 +1949,11 @@ batch downloads gets the same line, worded for that (`batch_lane: "endpoint_abse
 does one that runs out of time partway through a batch (`batch_lane: "out_of_time"`): what it
 sent is kept. A remote that sends only part of a batch because the objects asked for are too
 large for one answer is simply asked again for the rest. A remote
-that rate-limits its fetches is waited out, for up to 30 seconds per request, and so is one that
-is unavailable for a moment and says when to try again (a `503` with `Retry-After`, such as a
-server deleting redacted content), for up to 2 minutes; `lift` waits both out on its uploads and
-on moving the remote's pallet as well. The same holds
+that rate-limits its fetches is waited out, for up to 30 seconds at a stretch, and so is one
+that is unavailable for a moment and says when to try again (a `503` with `Retry-After`, such as
+a server deleting redacted content), for up to 2 minutes at a stretch; a request that meets both
+in turn waits 2½ minutes at most in all. `lift` waits both out on its uploads and on moving the
+remote's pallet as well. The same holds
 for every command that fetches (`clone`, `lower`, `scope fetch`, and `lift` when it auto-merges);
 `office accept-regenesis` adds the line to its message instead of a `batch_lane` field. A fetch
 that fails reports only its own failure, not whether the batch download had stopped first.

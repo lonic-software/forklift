@@ -77,8 +77,10 @@ out on every request but `POST /v1/resolve` (best effort, which takes any refusa
 resolved) and the lift commit (which retries on its own terms, below): each wait is the
 `Retry-After` when it is delta-seconds, never sooner than the client's own backoff, plus a random
 share of that backoff, so a wave of refused requests does not return at once. It stops after a
-bounded time, 30 seconds from the first `429` and 2 minutes from the first `503`, or sooner when
-the next wait would pass that bound, and then fails with the remote's last answer. Outside
+bounded time, and then fails with the remote's last answer: 30 seconds from the first of a run of
+`429`s and 2 minutes from the first of a run of `503`s, where a refusal of the other kind ends a
+run, and 2½ minutes in all from the first refusal of either; or sooner, when the next wait would
+pass one of those bounds. Outside
 the lift commit, the client does not send a request again after a `503` without `Retry-After`.
 
 **Redirects:** `GET`/`PUT` on object endpoints may answer `307` with a `Location`

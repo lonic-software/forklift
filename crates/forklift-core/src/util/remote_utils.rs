@@ -316,19 +316,22 @@ fn refused_for_now(response: &reqwest::Response, budgets: &Budgets) -> Option<st
 
 /// How one request's re-sends are paced while its remote refuses it for now (see
 /// [`refused_for_now`]). Each wait is the remote's `Retry-After` floored at the backoff (see
-/// [`throttle_wait`]), [`jittered`], the backoff doubling up to [`RETRY_BACKOFF_CAP`]. Each kind
-/// of refusal has its own backoff and its own patience, counted from the first refusal of that
-/// kind: a throttle met after a server came back from a drain is waited out as any throttle is,
-/// rather than charged the time and the backoff the drain ran up. Alternating refusals are still
-/// bounded, by the two patiences summed.
+/// [`throttle_wait`]), [`jittered`], the backoff doubling up to [`RETRY_BACKOFF_CAP`].
+///
+/// A run of one kind of refusal has its own backoff and its own patience, counted from the run's
+/// first refusal, and a refusal of the other kind ends it: a throttle met after a server came back
+/// from a drain is waited out as any throttle is, rather than charged the time and the backoff
+/// that run, or an earlier throttle, ran up. Since runs can then alternate, the whole wait is also
+/// capped at the two patiences summed, from the first refusal of any kind.
 struct RefusalPacer {
-    throttled: Option<RefusalRun>,
-    unavailable: Option<RefusalRun>,
+    first: Option<tokio::time::Instant>,
+    run: Option<RefusalRun>,
 }
 
-/// One kind of refusal's run within a [`RefusalPacer`]: when it was first met, and the backoff
-/// its next wait is floored at.
+/// The current run of one kind of refusal within a [`RefusalPacer`]: which kind, when its first
+/// refusal came, and the backoff its next wait is floored at.
 struct RefusalRun {
+    throttled: bool,
     since: tokio::time::Instant,
     delay: std::time::Duration,
 }
@@ -345,23 +348,30 @@ enum Pace {
 
 impl RefusalPacer {
     fn new() -> RefusalPacer {
-        RefusalPacer { throttled: None, unavailable: None }
+        RefusalPacer { first: None, run: None }
     }
 
     fn pace(&mut self, response: reqwest::Response, budgets: &Budgets) -> Pace {
         let Some(patience) = refused_for_now(&response, budgets) else { return Pace::Answer(response) };
         let now = tokio::time::Instant::now();
-        let run = if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            &mut self.throttled
-        } else {
-            &mut self.unavailable
-        };
-        let run = run.get_or_insert(RefusalRun { since: now, delay: RETRY_BACKOFF_START });
+        let throttled = response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS;
+        let first = *self.first.get_or_insert(now);
+        if self.run.as_ref().is_none_or(|run| run.throttled != throttled) {
+            self.run = Some(RefusalRun { throttled, since: now, delay: RETRY_BACKOFF_START });
+        }
+        let run = self.run.as_mut().expect("a run was just started");
 
         let wait = jittered(throttle_wait(retry_after_seconds(&response), run.delay), run.delay);
         run.delay = (run.delay * 2).min(RETRY_BACKOFF_CAP);
+        let cap = budgets.throttle_patience + budgets.unavailable_patience;
 
-        if now + wait >= run.since + patience { Pace::GiveUp(response, patience) } else { Pace::Wait(wait) }
+        if now + wait >= run.since + patience {
+            Pace::GiveUp(response, patience)
+        } else if now + wait >= first + cap {
+            Pace::GiveUp(response, cap)
+        } else {
+            Pace::Wait(wait)
+        }
     }
 }
 
@@ -11528,7 +11538,7 @@ mod tests {
         // and at most half as long again, well inside this unavailable patience.
         let budgets = Budgets { unavailable_patience: std::time::Duration::from_secs(9), ..FAST };
         let (url, requests) = start_answering_remote(vec![
-            UNAVAILABLE, UNAVAILABLE, UNAVAILABLE, UNAVAILABLE, THROTTLED, ABSENT,
+            THROTTLED, UNAVAILABLE, UNAVAILABLE, UNAVAILABLE, UNAVAILABLE, THROTTLED, ABSENT,
         ]);
         let client = RemoteClient::new_test_with_budgets(&url, budgets);
 
@@ -11539,8 +11549,32 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(signature.is_none(), "the 404 after the refusals is an unsigned parcel");
-        assert_eq!(*requests.lock().unwrap(), 6);
+        assert_eq!(*requests.lock().unwrap(), 7);
         assert!(elapsed > FAST.throttle_patience, "the 503s outlasted the throttle patience ({:?})", elapsed);
+    }
+
+    /// Alternating refusals restart their runs, so neither kind's patience ends them; the cap on
+    /// the whole wait, the two patiences summed from the first refusal, does. Revert: drop the cap
+    /// → the hundred alternating answers are all waited out, well past it.
+    #[test]
+    fn alternating_refusals_end_at_the_summed_patience() {
+        const UNAVAILABLE: &str = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\n\
+            Content-Length: 0\r\nConnection: close\r\n\r\n";
+        const THROTTLED: &str = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\n\
+            Content-Length: 0\r\nConnection: close\r\n\r\n";
+        let answers: Vec<&'static str> = (0..100).map(|i| if i % 2 == 0 { THROTTLED } else { UNAVAILABLE }).collect();
+        let (url, _) = start_answering_remote(answers);
+        let client = fast_client(&url);
+        let cap = FAST.throttle_patience + FAST.unavailable_patience;
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let started = std::time::Instant::now();
+        let error = runtime.block_on(client.fetch_signature(&"p".repeat(64)))
+            .expect_err("refusals that never stop must fail");
+        let elapsed = started.elapsed();
+
+        assert!(error.contains(&format!("after retrying for up to {:?}", cap)), "the error names the cap: {}", error);
+        assert!(elapsed < cap, "elapsed {:?} overran the cap {:?}", elapsed, cap);
     }
 
     /// Which answers are a refusal for now, and under which patience: the header's presence is the
