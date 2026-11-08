@@ -2758,3 +2758,127 @@ fn a_served_root_deletes_a_withheld_copy_and_rebuilds_its_bundle() {
         assert!(status.starts_with("HTTP/1.1 451"), "{} / {}", status, body);
     }
 }
+
+/// A takedown of a chunked file withholds its recipe, and a served root serves the chunks only the
+/// recipe names as absent until its deletion is done, though a head names the file and nothing is
+/// applied; a chunk another file shares stays served. Once the store is free, a round deletes the
+/// recipe and its own chunks, and keeps the shared ones.
+///
+/// Revert: judge the chunks by the applied redactions alone on `GET` → the own chunk is a `200`;
+/// refuse a recipe's hash → the takedown fails.
+#[test]
+fn a_served_root_withholds_a_chunked_file_and_the_chunks_only_it_names() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-takedown-chunked-server-{}", std::process::id())));
+
+    let owner = Warehouse::cloned("takedown-chunked-owner", &server.url);
+
+    // Above the chunking threshold, and varied, so the file is a recipe of several chunks; the
+    // kept file shares its first half, so it names some of those chunks too.
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state as u8
+    };
+    let content: Vec<u8> = (0..9 * 1024 * 1024).map(|_| next()).collect();
+    let mut kept = content[..content.len() / 2].to_vec();
+    kept.extend((0..5 * 1024 * 1024).map(|_| next()));
+
+    std::fs::create_dir_all(owner.root.join("keep")).unwrap();
+    std::fs::create_dir_all(owner.root.join("film")).unwrap();
+    owner.stack("keep/kept.bin", &kept, "kept");
+    owner.stack("film/film.mkv", &content, "film");
+    owner.run_ok(&["lift"]);
+
+    // The film's recipe and its chunks, split by whether the kept file names them too.
+    let closure = |root: &str, path: &str| match forklift_core::util::tree_utils::collect_subtree_closure(root, path, usize::MAX).unwrap() {
+        Some(forklift_core::util::tree_utils::SubtreeClosure::Complete(closure)) => closure,
+        other => panic!("{:?}", other.is_some()),
+    };
+    let (recipe, own, shared): (String, Vec<String>, Vec<String>) = {
+        let _scope = forklift_core::globals::StorageRootScope::enter(&owner.root);
+        let root = object_utils::load_parcel(&owner.head("main")).unwrap().tree_hash;
+        let recipes = |path: &str| -> Vec<String> {
+            closure(&root, path).into_iter().filter(|hash| object_utils::recipe_chunk_hashes(hash).is_ok()).collect()
+        };
+        let recipe = recipes("film").pop().unwrap();
+        let kept: std::collections::HashSet<String> = recipes("keep").iter()
+            .flat_map(|hash| object_utils::recipe_chunk_hashes(hash).unwrap())
+            .collect();
+        let (own, shared) = object_utils::recipe_chunk_hashes(&recipe).unwrap().into_iter()
+            .partition(|chunk| !kept.contains(chunk));
+        (recipe, own, shared)
+    };
+    assert!(!own.is_empty() && !shared.is_empty(), "own {:?}, shared {:?}", own, shared);
+
+    // A deletion attempt drains the warehouse briefly: a request it refuses is asked again.
+    let ask = |method: &str, path: &str, body: &[u8]| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let (status, answer) = http(&server.url, method, path, body);
+            if !status.starts_with("HTTP/1.1 503") || std::time::Instant::now() >= deadline {
+                return (status, answer);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    };
+    let withheld_state = || {
+        let (status, info) = ask("GET", "/v1/warehouse", b"");
+        assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, info);
+        let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+        assert!(info["redactions"].as_array().is_none_or(|applied| applied.is_empty()), "{}", info);
+        info["withheld"][0]["state"].as_str().unwrap_or_default().to_string()
+    };
+    let objects = server.root.join(".forklift/objects");
+    let stored = |hash: &str| objects.join(&hash[..2]).join(&hash[2..]).exists();
+
+    {
+        // Another process using the server's store keeps the deletion owed.
+        let _scope = forklift_core::globals::StorageRootScope::enter(&server.root);
+        let _store_access = forklift_core::util::lock_utils::StoreAccessLock::try_shared().unwrap();
+
+        let added = withhold(&server.root, &["add", &recipe, "--statement", "DMCA notice 2026-119"]);
+        assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+        assert_eq!(withheld_state(), "deletion_owed");
+
+        let (status, body) = ask("GET", &format!("/v1/objects/{}", recipe), b"");
+        assert!(status.starts_with("HTTP/1.1 451"), "{} / {}", status, body);
+
+        let (status, body) = ask("GET", &format!("/v1/objects/{}", own[0]), b"");
+        assert!(status.starts_with("HTTP/1.1 404"), "{}, {} bytes", status, body.len());
+        assert!(stored(&recipe) && stored(&own[0]), "the server still holds the recipe and chunk");
+
+        let (status, _) = ask("GET", &format!("/v1/objects/{}", shared[0]), b"");
+        assert!(status.starts_with("HTTP/1.1 200"), "{}", status);
+
+        // A bundle of the film's own chunks holds none of them; one of the shared chunks holds them.
+        let batch = |hashes: &[String]| {
+            let (status, body) = ask("POST", "/v1/objects/batch", serde_json::json!({ "hashes": hashes }).to_string().as_bytes());
+            assert!(status.starts_with("HTTP/1.1 200"), "{}", status);
+            body.len()
+        };
+        assert!(batch(&own) < 1024, "the bundle holds the film's own chunks");
+        assert!(batch(&shared) > 1024, "the bundle holds the shared chunks");
+
+        // Missing lists the own chunk, never the withheld recipe.
+        let asked = [own[0].clone(), shared[0].clone(), recipe.clone()];
+        let (status, body) = ask("POST", "/v1/objects/missing", serde_json::json!({ "hashes": asked }).to_string().as_bytes());
+        assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, body);
+        let missing: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(missing["missing"], serde_json::json!([own[0]]), "{}", body);
+    }
+
+    // A ref write asks for a round, which deletes the content now the store is free.
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while withheld_state() != "deleted" {
+        assert!(std::time::Instant::now() < deadline, "the deletion stayed owed");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(!stored(&recipe) && !stored(&own[0]), "the recipe and its own chunk are deleted");
+    let (status, _) = ask("GET", &format!("/v1/objects/{}", shared[0]), b"");
+    assert!(status.starts_with("HTTP/1.1 200"), "{}", status);
+}
