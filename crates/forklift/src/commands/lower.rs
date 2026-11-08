@@ -174,8 +174,8 @@ pub async fn handle_command(pallet: Option<String>,
 
     // Only once everything went through, so the report that carries what was applied reaches the
     // output: a failed or conflicting meta pallet fails the command, and its error document has no
-    // room for it. Nothing is lost by waiting: the next lower that goes through, or `redact
-    // apply`, applies on the remote's report as this one would have.
+    // room for it. The apply is deferred, and the local copy stays until then: the next lower that
+    // goes through, or `redact apply`, applies on the remote's report as this one would have.
     if lowered.is_ok() && report.meta_failed.is_empty() && report.meta_conflicts.is_empty() {
         report.redactions = settle_redactions(client.url(), &info, store_access);
     }

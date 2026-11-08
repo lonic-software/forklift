@@ -116,7 +116,8 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   first, and says when it cannot reach it. A command that applied a redaction also names the git
   mirror (`.forklift/mirror.git`), whose copy exported before the redaction nothing here deletes.
   When a `lower` or `clone` cannot finish this, it warns `redactions_unsettled` and names
-  `forklift redact apply`.
+  `forklift redact apply`; a `lower` whose metadata did not lower applies nothing, and the next one
+  that goes through does.
 - **The AWS head applies redactions.** A redaction that no pallet head, deleted pallet's tombstone
   or metadata history names applies on the AWS head when a request names its content, or after a
   lift or pallet deletion. The head then refuses that content as `content_redacted` on object
