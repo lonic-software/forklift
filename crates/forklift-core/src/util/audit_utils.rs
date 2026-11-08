@@ -1864,10 +1864,27 @@ pub fn verify_parcel_closure_for_write(head: &str,
         verify_closure_core(
             head, known_complete.as_ref().map(std::slice::from_ref), known_complete, &PathScope::full(),
             false, &seams,
-        )?;
+        )
+        .map_err(|refusal| withheld_beyond_files(refusal, &tolerated.withheld))?;
     }
 
     Ok(pallet_utils::VerifiedClosure::new(head, PathScope::full(), known_complete))
+}
+
+/// `refusal`, a closure walk's, saying so when it names a hash this head withholds: such a hash is
+/// tolerated absent only as a file's content, so one the walk met as a tree, a parcel or a chunk
+/// still refuses the write, and the plain refusal would read as history the client failed to upload
+/// (the negotiation never asks for withheld content). A refusal may name the hash as an object's
+/// path, `<2 hex>/<62 hex>`, so the hash is found by its tail.
+fn withheld_beyond_files(refusal: String, withheld: &WithheldSet) -> String {
+    match withheld.entries().find(|(hash, _)| hash.get(2..).is_some_and(|tail| refusal.contains(tail))) {
+        Some((hash, _)) => format!(
+            "{} This server's host withholds {}, so it never takes it, and it is tolerated absent only \
+            as a file's content; here history names it as something else.",
+            refusal, hash
+        ),
+        None => refusal,
+    }
 }
 
 /// The path of the first entry of `head`'s tree that no client can check out, because
@@ -2069,7 +2086,6 @@ pub struct SealedTolerance<'a> {
     tolerated: &'a Tolerated,
     held: RefCell<HashSet<String>>,
     redacted: RefCell<HashSet<String>>,
-    withheld: RefCell<HashSet<String>>,
 }
 
 impl<'a> SealedTolerance<'a> {
@@ -2078,7 +2094,6 @@ impl<'a> SealedTolerance<'a> {
             tolerated,
             held: RefCell::new(HashSet::new()),
             redacted: RefCell::new(HashSet::new()),
-            withheld: RefCell::new(HashSet::new()),
         }
     }
 
@@ -2093,12 +2108,6 @@ impl<'a> SealedTolerance<'a> {
         self.redacted.borrow().len()
     }
 
-    /// How many distinct absent objects the walk held because this warehouse's head withholds
-    /// them.
-    pub fn withheld(&self) -> usize {
-        self.withheld.borrow().len()
-    }
-
     fn is_empty(&self) -> bool {
         self.tolerated.is_empty()
     }
@@ -2110,15 +2119,15 @@ impl<'a> SealedTolerance<'a> {
         matches!(self.tolerated.held(hash, At::File), Some(Held::Redacted | Held::Withheld))
     }
 
-    /// Whether the absent object `hash`, met `at`, is held, by the record or by an applied redaction
-    /// (a file's content only), tallying
-    /// it under the one that holds it if so. Call only at an absence: a held object that is present
+    /// Whether the absent object `hash`, met `at`, is held, by the record, or by an applied redaction
+    /// or a withholding (a file's content only), tallying it under the record or the redaction that
+    /// holds it if so; withheld content is not tallied. Call only at an absence: a held object that is present
     /// is held by nothing.
     fn holds_absent(&self, hash: &str, at: At) -> bool {
         match self.tolerated.held(hash, at) {
             Some(Held::Sealed) => self.held.borrow_mut().insert(hash.to_string()),
             Some(Held::Redacted) => self.redacted.borrow_mut().insert(hash.to_string()),
-            Some(Held::Withheld) => self.withheld.borrow_mut().insert(hash.to_string()),
+            Some(Held::Withheld) => true,
             None => return false,
         };
         true

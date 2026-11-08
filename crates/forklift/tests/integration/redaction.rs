@@ -2559,6 +2559,39 @@ fn a_lift_naming_withheld_content_lands_without_its_bytes() {
     assert!(status.starts_with("HTTP/1.1 451"), "{} / {}", status, body);
 }
 
+/// Only a file's content is tolerated absent for being withheld: a lift whose history names a
+/// withheld hash as a parcel is refused, and the refusal says the host withholds it, since the
+/// negotiation never asked for it.
+///
+/// Revert: drop either note → the refusal reads as history the client failed to upload.
+#[test]
+fn a_lift_naming_a_withheld_hash_as_history_says_the_host_withholds_it() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-takedown-parcel-server-{}", std::process::id())));
+
+    let owner = Warehouse::cloned("takedown-parcel-owner", &server.url);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+    let lifted = server.main();
+
+    // The head itself.
+    owner.stack("draft.txt", b"draft\n", "draft");
+    let draft = owner.head("main");
+    let added = withhold(&server.root, &["add", &draft, "--statement", "court order 2026-42"]);
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    let refused = owner.run(&["lift"]);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success() && stderr.contains("host withholds it"), "{}", stderr);
+    assert_eq!(server.main(), lifted);
+
+    // A parcel the new head descends from.
+    owner.stack("final.txt", b"final\n", "final");
+    let refused = owner.run(&["lift"]);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success() && stderr.contains(&format!("host withholds {}", draft)), "{}", stderr);
+    assert_eq!(server.main(), lifted);
+}
+
 /// Run `forklift-server withhold` with `args` against the server root at `root`.
 fn withhold(root: &std::path::Path, args: &[&str]) -> Output {
     std::process::Command::new(common::server_binary()).env("FORKLIFT_FSYNC", "0")

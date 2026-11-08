@@ -2550,15 +2550,15 @@ async fn post_missing(State(state): State<Arc<AppState>>,
         // A chunk a redaction's owed deletion withholds is missing here, as `GET` answers it: a
         // lift naming it uploads it. Content the host withholds is never missing, held or not:
         // this head takes none of it, and its ref writes tolerate its absence.
-        let withheld = withheld_among(&gate, &read_applied()?, &request.hashes)?;
-        let taken_down = read_withheld()?;
+        let owed_chunks = withheld_among(&gate, &read_applied()?, &request.hashes)?;
+        let host_withheld = read_withheld()?;
         let mut missing: Vec<String> = Vec::new();
 
         for hash in request.hashes {
-            if taken_down.contains(&hash) {
+            if host_withheld.contains(&hash) {
                 continue;
             }
-            if withheld.contains(&hash) || !file_utils::does_object_exist(&hash).map_err(internal)? {
+            if owed_chunks.contains(&hash) || !file_utils::does_object_exist(&hash).map_err(internal)? {
                 missing.push(hash);
             }
         }
@@ -3120,6 +3120,8 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                 // A first anchor arrives over an unborn office, so nothing above ties its
                 // `adopts` to held history — but every warehouse that adopts this anchor later
                 // fetches that history from here. The client uploads it before the anchor.
+                // Strictly, nothing tolerated: a pin is served whole to every adopter, so one naming
+                // content this head withholds or redacted is a pin it can never serve.
                 audit_utils::require_adopted_history(
                     anchor.adopts.as_deref(),
                     &|head| audit_utils::verify_parcel_closure(head, None),
@@ -3282,9 +3284,14 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             }
 
             if !file_utils::does_object_exist(&request.new_head).map_err(internal)? {
+                // The negotiation never asks for withheld content, so say why this one is absent.
+                let why = match read_withheld()?.contains(&request.new_head) {
+                    true => " This server's host withholds it, so it never takes it.",
+                    false => "",
+                };
                 return Err(unprocessable(format!(
-                    "The new head {} has not been uploaded.",
-                    request.new_head
+                    "The new head {} has not been uploaded.{}",
+                    request.new_head, why
                 )));
             }
 

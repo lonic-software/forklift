@@ -5,8 +5,11 @@
 //! once nothing names its content. A takedown is neither: the operator of the head lists a file's
 //! content hash, with a statement saying why, and the head stops serving and taking it at once,
 //! whatever names it. Heads keep naming the file: a takedown adds no check on what a ref write may
-//! name. The handshake's withheld list publishes it, so a client can tell the content is unavailable
-//! from that remote rather than damaged or redacted; no client reads the list yet.
+//! name, and relaxes one, since the head tolerates the absence of withheld content where a file
+//! names it ([`sealed_utils::Tolerated`](crate::util::sealed_utils::Tolerated)). So the upload
+//! negotiation answers it as withheld rather than asking for it. The handshake's withheld list
+//! publishes it, so a client can tell the content is unavailable from that remote rather than
+//! damaged or redacted; no client reads the list yet.
 //!
 //! (The chunks a redaction's deletion serves as absent are a different thing, named "withheld" in
 //! [`redaction_deleter`](crate::util::redaction_deleter) only for how they are served.)
