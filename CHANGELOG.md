@@ -108,8 +108,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 - **A forklift-server host can withhold content, as for a legal takedown.** `forklift-server
   withhold add --root … HASH --statement "…"` stops the server serving or taking a file's content
   at once: a read or upload of it is answered `451` with the host's statement; `withhold list`
-  shows what is withheld. History is unchanged and pallets keep naming the file. A chunked file
-  cannot be withheld yet. A command that
+  shows what is withheld. History is unchanged and pallets keep naming the file, and a lift may
+  keep naming it too without uploading it: the upload negotiation answers it in a new `withheld`
+  list. A chunked file cannot be withheld yet. A command that
   needs the content from that remote fails with the new `content_withheld` code (exit 51), and the
   `--json` schema is now 31.
 

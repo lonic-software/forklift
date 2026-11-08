@@ -2506,9 +2506,9 @@ fn git_export_leaves_out_a_file_whose_redaction_is_applied_and_names_it() {
 /// ref writes tolerate its absence, including one that moves the file to another directory. The
 /// server still lacks it, and refuses it.
 ///
-/// Revert: answer a withheld hash as `direct` in the negotiation → the lift uploads it and gets a
-/// `451`; drop the withheld arm of the closure tolerance → the ref write is refused as incomplete;
-/// list a withheld hash as missing → `missing` names it.
+/// Revert: answer a withheld hash as `direct` in the negotiation → the negotiation names it there;
+/// drop the withheld arm of the closure tolerance → the lift's ref write is refused; list a
+/// withheld hash as missing → `missing` names it.
 #[test]
 fn a_lift_naming_withheld_content_lands_without_its_bytes() {
     let server = Server::start(&std::env::temp_dir()
@@ -2542,7 +2542,8 @@ fn a_lift_naming_withheld_content_lands_without_its_bytes() {
 
     // A tree that moves the file elsewhere names it again; the write tolerates that too.
     std::fs::create_dir_all(owner.root.join("films")).unwrap();
-    std::fs::rename(owner.root.join("film.mkv"), owner.root.join("films/film.mkv")).unwrap();
+    std::fs::write(owner.root.join("films/film.mkv"), content).unwrap();
+    std::fs::remove_file(owner.root.join("film.mkv")).unwrap();
     owner.run_ok(&["load", "."]);
     owner.run_ok(&["stack", "-m", "move the film"]);
     owner.run_ok(&["lift"]);
