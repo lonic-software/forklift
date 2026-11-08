@@ -344,9 +344,8 @@ revocation by more than about a day.
   stays owed. The server logs it and retries, 30 seconds later and then twice as long each time up
   to an hour, at the next pallet update, and whenever it serves the warehouse anew, including at
   startup. A copy that a bay in the root still holds is kept until the bay lets it go and
-  `forklift redact apply` runs there, or the server's next deletion. Until it serves the
-  redaction's absence, a fresh clone or `lower` that must fetch history naming the content is
-  refused with `content_redacted`.
+  `forklift redact apply` runs there, or the server's next deletion. A clone or `lower` that takes
+  history naming the content never asks for it, and applies the redaction before writing the head.
 - **Repack:** `forklift store compact --all` against a served root is refused for the same reason
   as `gc` — it drops unreachable packed objects with no grace period at all — so it also
   belongs in the maintenance window. Plain `forklift store compact` (incremental) never drops an

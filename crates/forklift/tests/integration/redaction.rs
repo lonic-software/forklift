@@ -1589,19 +1589,6 @@ fn a_server_applies_a_redaction_no_head_names_and_refuses_its_content() {
     behind.run_ok(&["lower"]);
     behind.run_ok(&["lift"]);
     assert_eq!(server.main(), behind.head("main"));
-
-    // Until the server serves the redaction's absence, a fresh clone that must fetch the content
-    // is refused as redacted: loud, never a quiet gap.
-    let empty = Warehouse::empty("served-clone");
-    let cloned = forklift_command()
-        .args(["clone", &server.url, empty.root.to_str().unwrap()])
-        .env("FORKLIFT_GLOBAL_CONFIG", empty.home.join("global-config.toml"))
-        .env("FORKLIFT_KEYS_DIR", empty.home.join("keys"))
-        .output()
-        .unwrap();
-    assert!(!cloned.status.success());
-    assert!(String::from_utf8_lossy(&cloned.stderr).contains(&format!("Object {} is redacted", hash)),
-            "{}", String::from_utf8_lossy(&cloned.stderr));
 }
 
 /// Content forklift-server holds is deleted once a redaction of it applies: the server drains the
@@ -2121,5 +2108,61 @@ fn redact_apply_reads_the_remote_s_report_and_says_when_it_cannot() {
         .unwrap();
     let cloned: serde_json::Value = serde_json::from_slice(&cloned.stdout).unwrap();
     assert_eq!(cloned["data"]["redactions"]["applied"], serde_json::json!([hash]), "{}", cloned);
+    assert_eq!(applied_record(&empty), format!("/forklift-redactions-applied 1\n{}\n", hash));
+}
+
+/// A lower into a warehouse that never held the content, and a fresh clone, take history naming
+/// content the remote reports applied without fetching it: each applies the redaction on the
+/// remote's report before it writes the pallet's head, whose history check then holds the absence
+/// as redacted. Neither holds a copy, and each lands on the remote's head.
+///
+/// Revert: fetch every file the history names, whatever the remote reports applied → the remote
+/// refuses the content and the lower fails as redacted. Revert: apply only once the pallet has
+/// landed → the head write finds the history incomplete.
+#[test]
+fn a_lower_and_a_clone_take_history_naming_applied_content_without_it() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-absent-server-{}", std::process::id())));
+    let content = b"TOKEN=hunter2\n";
+
+    let owner = Warehouse::cloned("absent-owner", &server.url);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+
+    // Cloned before the leak goes up, so it never holds the content.
+    let late = Warehouse::cloned("absent-late", &server.url);
+
+    // Its history names the leak; the redaction goes up first, so the server applies it at once
+    // and takes that history without the content.
+    let behind = Warehouse::cloned("absent-behind", &server.url);
+    behind.leaked("secret.env", content);
+    let hash = owner.redact_loaded("secret.env", content, "leaked token");
+    owner.run_ok(&["lift"]);
+    behind.run_ok(&["lower"]);
+    behind.run_ok(&["lift"]);
+    let (_, info) = http(&server.url, "GET", "/v1/warehouse", b"");
+    let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+    assert_eq!(info["redactions"], serde_json::json!([{ "hash": hash, "state": "deleted" }]), "{}", info);
+
+    let lowered = late.json(&["lower"]);
+    assert_eq!(lowered["ok"], true, "{}", lowered);
+    assert_eq!(lowered["data"]["redactions"]["applied"], serde_json::json!([hash]), "{}", lowered);
+    assert_eq!(late.head("main"), server.main());
+    assert!(!late.holds_loose(&hash));
+    assert_eq!(applied_record(&late), format!("/forklift-redactions-applied 1\n{}\n", hash));
+
+    let empty = Warehouse::empty("absent-clone");
+    let cloned = forklift_command()
+        .args(["--json", "clone", &server.url, empty.root.to_str().unwrap()])
+        .env("FORKLIFT_GLOBAL_CONFIG", empty.home.join("global-config.toml"))
+        .env("FORKLIFT_KEYS_DIR", empty.home.join("keys"))
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&cloned.stdout)
+        .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&cloned.stderr)));
+    assert_eq!(report["ok"], true, "{}", report);
+    assert_eq!(report["data"]["redactions"]["applied"], serde_json::json!([hash]), "{}", report);
+    assert_eq!(empty.head("main"), server.main());
+    assert!(!empty.holds_loose(&hash));
     assert_eq!(applied_record(&empty), format!("/forklift-redactions-applied 1\n{}\n", hash));
 }

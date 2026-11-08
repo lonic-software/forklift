@@ -145,6 +145,10 @@ pub async fn handle_command(pallet: Option<String>,
     // materialized; diverged ones are reconciled by their pallet's policy.
     let meta = sync_meta(&client, &info, &keeps).await;
 
+    // Before any pallet's head is written, which may take history naming content the remote
+    // reports applied, and so never fetched.
+    let early = apply_reported(client.url(), &info);
+
     let mut report = LowerReport {
         adopted_genesis: trust.adopted_genesis,
         office_moved: trust.office_moved,
@@ -174,10 +178,12 @@ pub async fn handle_command(pallet: Option<String>,
 
     // Only once everything went through, so the report that carries what was applied reaches the
     // output: a failed or conflicting meta pallet fails the command, and its error document has no
-    // room for it. The apply is deferred, and the local copy stays until then: the next lower that
-    // goes through, or `redact apply`, applies on the remote's report as this one would have.
+    // room for it. What was applied early keeps its copies until then, with a warning: the next
+    // lower that goes through, or `redact apply`, deletes them, and applies what is left.
     if lowered.is_ok() && report.meta_failed.is_empty() && report.meta_conflicts.is_empty() {
-        report.redactions = settle_redactions(client.url(), &info, store_access);
+        report.redactions = settle_redactions(client.url(), &info, early, store_access);
+    } else {
+        warn_applied_unsettled(&early);
     }
 
     // The most severe outcome decides the exit: the working pallet's own failure, then a meta
@@ -1090,8 +1096,30 @@ impl CommandOutput for LowerReport {
     }
 }
 
+/// Apply, before lower or clone writes a user pallet's head, every redaction the remote at `url`,
+/// whose handshake is `info`, reports applied and nothing here names. A fetch never asks the remote
+/// for a file it reports applied, so the head's history may name content this warehouse never
+/// held, and the head write holds that absence only for a redaction applied here, from a cell of
+/// this warehouse's own `@redactions`: so this runs once the meta pallets are adopted. Its copies
+/// are deleted once the command went through ([`settle_redactions`]). A failure only warns: a head
+/// write that needed the redaction then refuses history it lacks content for.
+///
+/// # Returns
+/// The redactions this applied; none when the apply failed.
+pub(crate) fn apply_reported(url: &str, info: &forklift_core::model::remote::WarehouseInfo) -> Vec<String> {
+    let report = forklift_core::util::applied_redactions::RemoteReport::of(url, info);
+
+    redact::apply_on_report(&report).unwrap_or_else(|why| {
+        output::warn_redactions_unsettled(&format!(
+            "The redactions the remote reports applied were not applied here: {}", why.trim_end()
+        ));
+        Vec::new()
+    })
+}
+
 /// Apply the redactions the remote at `url`, whose handshake is `info`, reports applied, once the
-/// pallet has landed and nothing here names their content any more, and delete their copies.
+/// pallet has landed and nothing here names their content any more, and delete the copies of
+/// those and of `early`, the ones [`apply_reported`] applied before the pallet's head was written.
 /// Deleting needs the store exclusive, so when something was applied `store_access`, this
 /// command's shared hold, is released first: everything the command writes is published by then.
 /// A failure only warns, naming `redact apply`, since the lower itself went through; a deletion
@@ -1101,22 +1129,38 @@ impl CommandOutput for LowerReport {
 /// What was applied, deleted and kept; `None` when nothing was applied, or the apply failed.
 pub(crate) fn settle_redactions(url: &str,
                                 info: &forklift_core::model::remote::WarehouseInfo,
+                                early: Vec<String>,
                                 store_access: &mut Option<forklift_core::util::lock_utils::StoreAccessLock>) -> Option<redact::Settled> {
     let report = forklift_core::util::applied_redactions::RemoteReport::of(url, info);
-    let applied = match redact::apply_on_report(&report) {
-        Ok(applied) if applied.is_empty() => return None,
-        Ok(applied) => applied,
-        Err(why) => {
-            output::warn_redactions_unsettled(&format!(
-                "The redactions the remote reports applied were not applied here: {}", why.trim_end()
-            ));
-            return None;
-        }
-    };
+    let later = redact::apply_on_report(&report).unwrap_or_else(|why| {
+        output::warn_redactions_unsettled(&format!(
+            "The redactions the remote reports applied were not applied here: {}", why.trim_end()
+        ));
+        Vec::new()
+    });
+    let applied: Vec<String> = early.into_iter().chain(later).collect();
+
+    if applied.is_empty() {
+        return None;
+    }
 
     drop(store_access.take());
 
     Some(redact::settle_applied(applied))
+}
+
+/// Warn that `early`, the redactions [`apply_reported`] applied, keep their copies here, because
+/// the command did not go through and so never settled them; `redact apply` deletes them.
+pub(crate) fn warn_applied_unsettled(early: &[String]) {
+    if early.is_empty() {
+        return;
+    }
+
+    output::warn_redactions_unsettled(&format!(
+        "The redactions of {} were applied here, as the remote reports them applied, but the command \
+        did not go through, so their copies here are not deleted yet.",
+        early.join(", ")
+    ));
 }
 
 /// Refuse a lower whose diff (`ops` and `removed_dirs`) reaches a path with a local change: it

@@ -1096,8 +1096,8 @@ fn held_head_unrecorded_warning_text(mode: OutputMode, error: &str) -> String {
     }
 }
 
-/// The `--json` warning code for a lower or clone that went through but could not apply the
-/// redactions its remote reports applied, or delete their copies.
+/// The `--json` warning code for a lower or clone that could not apply the redactions its remote
+/// reports applied, or delete their copies, including a lower that applied them and then failed.
 pub const CODE_REDACTIONS_UNSETTLED: &str = "redactions_unsettled";
 
 /// What to do about [`CODE_REDACTIONS_UNSETTLED`].
@@ -1106,7 +1106,7 @@ pub const REDACTIONS_UNSETTLED_NEXT_STEP: &str =
      applied and deletes the copies. The command's own work is unaffected.";
 
 /// Surface a lower or clone that could not settle its remote's applied redactions, on the stderr
-/// side-channel the other warnings use: the command succeeded, and the exit code stays its own.
+/// side-channel the other warnings use: the exit code stays the command's own.
 pub fn warn_redactions_unsettled(error: &str) {
     eprintln!("{}", redactions_unsettled_warning_text(mode(), error));
 }

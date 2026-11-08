@@ -623,6 +623,10 @@ async fn franchise_into_prepared_target(
 
     report.meta_adopted = meta.adopted;
 
+    // Before the pallet's head is written, whose history may name content the remote reports
+    // applied, and so never fetched. A clone that fails after this keeps the redactions applied.
+    let early = lower::apply_reported(client.url(), &info);
+
     let (Some(remote_head), Some(stats)) = (remote_head, fetched) else {
         // Legitimately unborn: `resolve_pallet` already ruled out a typo before any of this
         // warehouse's mutation began, so reaching this branch means either the remote's own
@@ -638,7 +642,7 @@ async fn franchise_into_prepared_target(
 
         report.pallet = pallet_name;
         report.unborn = true;
-        report.redactions = lower::settle_redactions(client.url(), &info, &mut None);
+        report.redactions = lower::settle_redactions(client.url(), &info, early, &mut None);
         emit_report(&mut report, client);
 
         return Ok(());
@@ -734,7 +738,7 @@ async fn franchise_into_prepared_target(
 
     // Once the clone is finished: a failure only warns, and `redact apply` finishes it. Nothing
     // here holds the store shared, so the deletion is not owed to this command's own hold.
-    report.redactions = lower::settle_redactions(client.url(), &info, &mut None);
+    report.redactions = lower::settle_redactions(client.url(), &info, early, &mut None);
     emit_report(&mut report, client);
 
     Ok(())
