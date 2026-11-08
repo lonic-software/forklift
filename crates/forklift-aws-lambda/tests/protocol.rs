@@ -5928,9 +5928,11 @@ fn assert_withheld(err: &forklift_aws_lambda::error::HeadError, hash: &str) {
 /// withheld with a `503` and none is stored again; once it has, a chunk another file names is
 /// served and the rest are deleted, absent. A copy landed after the first round is deleted by the
 /// late one, and only after the recipe is deleted does the handshake say `deleted`.
-// Revert: never withhold a chunk → the first GET answers 200 → red. Revert: delete every chunk of
-// the recipe → the shared one is gone → red. Revert: skip the late round → the late copy is kept →
-// red. Revert: never delete the recipe → it is kept and the state stays `deletion_owed` → red.
+// Revert: never withhold a chunk → the first GET answers 200 → red. Revert: refuse no promotion
+// while a round runs → the PUT stores the chunk → red. Revert: delete every chunk of the recipe →
+// the shared one is gone → red. Revert: settle a first round straight to the recipe's deletion →
+// the recipe is gone before the late round → red. Revert: never delete the recipe → it is kept →
+// red. Revert: let the audit verify a redacted recipe's chunks → the history is refused → red.
 #[test]
 fn an_applied_recipe_and_the_chunks_only_it_names_are_deleted_over_two_rounds() {
     let area = Area::new("redaction-chunk-rounds");
@@ -5964,6 +5966,10 @@ fn an_applied_recipe_and_the_chunks_only_it_names_are_deleted_over_two_rounds() 
     assert_eq!(head.object_get(&own[0]).expect_err("deleted").status, Status::NotFound);
     assert_eq!(head.missing(&[own[0].clone(), shared[0].clone()]).expect("missing"), vec![own[0].clone()]);
     assert!(head.objects.exists(&recipe).expect("exists"), "the recipe waits for the late round");
+    // A head whose history names the redacted file, its recipe still there and its own chunks
+    // gone, lifts: the audit does not read the chunks of a redacted recipe.
+    let request = RefUpdateRequest { old_head: None, new_head: main.clone(), tombstone: None };
+    head.ref_update(&Principal::Static, "again", &request).expect("the history lifts");
 
     // A copy lands after the round, staged and canonical; the late round deletes both, then the
     // recipe.
