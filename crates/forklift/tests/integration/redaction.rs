@@ -711,11 +711,16 @@ impl Server {
 
     /// Serve the server root at `root` as it is.
     fn serve(root: &std::path::Path) -> Server {
+        Server::serve_with(root, &[])
+    }
+
+    /// Serve the server root at `root` as it is, with `args` added to `serve`'s.
+    fn serve_with(root: &std::path::Path, args: &[&str]) -> Server {
         use std::io::BufRead;
 
         let root = root.to_str().unwrap();
         let mut child = std::process::Command::new(common::server_binary()).env("FORKLIFT_FSYNC", "0")
-            .args(["serve", "--root", root, "--addr", "127.0.0.1:0", "--open"])
+            .args(["serve", "--root", root, "--addr", "127.0.0.1:0", "--open"]).args(args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .spawn()
@@ -2601,7 +2606,9 @@ fn withhold(root: &std::path::Path, args: &[&str]) -> Output {
 
 /// A takedown on forklift-server takes effect while it serves: every surface that reads or takes
 /// the content answers `451` with the host's statement, the handshake lists
-/// it with the deletion owed, and the head naming the file is untouched. The bundle that held it is
+/// it, and the head naming the file is untouched. The served root deletes the copy within seconds,
+/// draining the warehouse meanwhile, so a request refused as unavailable is asked again and the
+/// deletion is listed owed or done. The bundle that held it is
 /// withdrawn. A tree's hash is refused, as a redaction's would be.
 ///
 /// Revert: answer a withheld hash as served on `GET` (drop the withheld arm of the refusal) → the
@@ -2634,17 +2641,31 @@ fn a_server_withholds_content_on_its_hosts_statement_while_it_serves() {
     let listed = withhold(&server.root, &["list"]);
     assert_eq!(String::from_utf8_lossy(&listed.stdout), format!("{} {}\n", hash, statement));
 
-    let (status, info) = http(&server.url, "GET", "/v1/warehouse", b"");
+    // The deletion drains the warehouse briefly: a request it refuses is asked again.
+    let ask = |method: &str, path: &str, body: &[u8]| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let (status, answer) = http(&server.url, method, path, body);
+            if !status.starts_with("HTTP/1.1 503") || std::time::Instant::now() >= deadline {
+                return (status, answer);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    };
+
+    let (status, info) = ask("GET", "/v1/warehouse", b"");
     assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, info);
     let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+    let state = info["withheld"][0]["state"].as_str().unwrap_or_default().to_string();
+    assert!(state == "deletion_owed" || state == "deleted", "{}", info);
     assert_eq!(info["withheld"], serde_json::json!([
-        { "hash": hash, "statement": statement, "state": "deletion_owed" }
+        { "hash": hash, "statement": statement, "state": state }
     ]), "{}", info);
 
     let object = format!("/v1/objects/{}", hash);
     let refusals = [
-        ("get", http(&server.url, "GET", &object, b"")),
-        ("put", http(&server.url, "PUT", &object, &object_utils::blob_bytes(content))),
+        ("get", ask("GET", &object, b"")),
+        ("put", ask("PUT", &object, &object_utils::blob_bytes(content))),
     ];
     for (surface, (status, body)) in refusals {
         assert!(status.starts_with("HTTP/1.1 451"), "{}: {} / {}", surface, status, body);
@@ -2658,4 +2679,82 @@ fn a_server_withholds_content_on_its_hosts_statement_while_it_serves() {
     let parcel = withhold(&server.root, &["add", &head, "--statement", statement]);
     assert!(!parcel.status.success(), "{:?}", parcel);
     assert_eq!(withhold(&server.root, &["list"]).stdout, listed.stdout);
+}
+
+/// A takedown deletes the copy on a served root, though the head still names the file: the server
+/// notices the record the withhold command wrote and deletes the copy, then rebuilds the bundle
+/// the takedown withdrew. One withheld while nothing serves the root is deleted, and the bundle
+/// rebuilt, once it is served again.
+///
+/// Revert: never watch the record → the copy withheld while served stays `deletion_owed`; leave
+/// the withheld hashes out of the deletion's targets → both stay; never rebuild on the first round
+/// → no bundle is published after the restart.
+#[test]
+fn a_served_root_deletes_a_withheld_copy_and_rebuilds_its_bundle() {
+    let root = std::env::temp_dir().join(format!("forklift-takedown-deletion-{}", std::process::id()));
+    let serve = ["--rebuild-after-lifts", "1000"];
+    // A killed server leaves its serve lock behind; no process holds it.
+    let stop = |server: Server| {
+        drop(server);
+        std::fs::remove_file(root.join(".forklift/serve.lock")).unwrap();
+    };
+    stop(Server::start(&root));
+    let server = Server::serve_with(&root, &serve);
+
+    let owner = Warehouse::cloned("takedown-deletion-owner", &server.url);
+    let (film, trailer) = (b"leaked film 2\n".as_slice(), b"leaked trailer\n".as_slice());
+    owner.stack("film.mkv", film, "film");
+    owner.stack("trailer.mkv", trailer, "trailer");
+    owner.run_ok(&["lift"]);
+    let head = server.main();
+    let (film, trailer) = (hash_of(film), hash_of(trailer));
+    let bundle = root.join(".forklift/bundles/latest");
+
+    let state = |server: &Server, hash: &str| {
+        let (status, info) = http(&server.url, "GET", "/v1/warehouse", b"");
+        // The deletion drains the warehouse: a handshake meanwhile is refused for now.
+        if status.starts_with("HTTP/1.1 503") {
+            return None;
+        }
+        assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, info);
+        let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+        info["withheld"].as_array().unwrap().iter()
+            .find(|entry| entry["hash"] == hash).map(|entry| entry["state"].as_str().unwrap().to_string())
+    };
+    let wait_for = |what: &str, done: &dyn Fn() -> bool| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for {}", what);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    };
+
+    // Withheld while nothing serves the root: its first round deletes the copy and rebuilds.
+    stop(server);
+    let built = std::process::Command::new(common::server_binary()).env("FORKLIFT_FSYNC", "0")
+        .args(["bundle", "--root", root.to_str().unwrap()]).output().unwrap();
+    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+    let added = withhold(&root, &["add", &trailer, "--statement", "court order 11"]);
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    assert!(!bundle.exists(), "the takedown withdraws the bundle");
+
+    let server = Server::serve_with(&root, &serve);
+    wait_for("the unserved takedown's deletion", &|| state(&server, &trailer).as_deref() == Some("deleted"));
+    wait_for("the rebuild after it", &|| bundle.exists());
+
+    // Withheld while served: the watch notices, deletes the copy and rebuilds again.
+    let rebuilt = std::fs::metadata(&bundle).unwrap().modified().unwrap();
+    let added = withhold(&root, &["add", &film, "--statement", "DMCA notice 2026-118"]);
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    wait_for("the served takedown's deletion", &|| state(&server, &film).as_deref() == Some("deleted"));
+    wait_for("the rebuild after it", &|| {
+        std::fs::metadata(&bundle).ok().and_then(|meta| meta.modified().ok()).is_some_and(|at| at != rebuilt)
+    });
+
+    // History is the warehouse's: the head naming both files stays, and both are still refused.
+    assert_eq!(server.main(), head);
+    for hash in [&film, &trailer] {
+        let (status, body) = http(&server.url, "GET", &format!("/v1/objects/{}", hash), b"");
+        assert!(status.starts_with("HTTP/1.1 451"), "{} / {}", status, body);
+    }
 }

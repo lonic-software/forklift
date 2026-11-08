@@ -1031,7 +1031,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
     // ref write.
     if let ServeMode::Single(handle) = &state.mode {
         if handle.first_run_due.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            run_redactions(Arc::clone(&state), Arc::clone(handle));
+            start_serving(&state, handle);
         }
     }
 
@@ -1545,7 +1545,8 @@ fn refuse_removed(applied: &AppliedSet, withheld: &WithheldSet, hash: &str) -> R
 /// `applied` read.
 ///
 /// The candidates are read again whenever the applied set differs from theirs, which is cheap,
-/// and not at all while nothing is applied: then nothing was ever deleted, and no journal written.
+/// and not at all while nothing is applied. Then the only deletion can be a withheld one, and
+/// withholding refuses a recipe's hash, so no chunk is owed to it.
 /// Only a request naming a candidate needs the live set, walked once per ref write here (a walk
 /// a ref write overlapped is never kept) and at most every [`CHUNK_GATE_TTL`], one walk at a time.
 fn withheld_among(warehouse: &WarehouseHandle,
@@ -2107,14 +2108,14 @@ fn validate_warehouse_id(id: &str) -> Result<(), HandlerError> {
     forklift_core::util::warehouse_utils::validate_warehouse_id(id).map_err(unprocessable)
 }
 
-/// Resolve the warehouse a request addresses ([`resolve_handle`]), and start the first redaction
-/// run of a handle served for it just now.
+/// Resolve the warehouse a request addresses ([`resolve_handle`]), and start serving a handle
+/// served for it just now ([`start_serving`]).
 fn resolve_warehouse(state: &Arc<AppState>,
                      params: &PathParams) -> Result<Arc<WarehouseHandle>, HandlerError> {
     let handle = resolve_handle(state, params)?;
 
     if handle.first_run_due.swap(false, std::sync::atomic::Ordering::SeqCst) {
-        run_redactions(Arc::clone(state), Arc::clone(&handle));
+        start_serving(state, &handle);
     }
 
     Ok(handle)
@@ -2128,8 +2129,8 @@ const RETRY_AFTER_SECONDS: u64 = 10;
 fn draining_refusal() -> HandlerError {
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        "The warehouse is briefly unavailable while content redacted from it is deleted. Try again \
-        shortly.".to_string(),
+        "The warehouse is briefly unavailable while content redacted or withheld from it is deleted. \
+        Try again shortly.".to_string(),
     )
 }
 
@@ -3815,12 +3816,14 @@ const _: () = assert!(APPLY_WAIT.as_secs() < DRAIN_WAIT.as_secs());
 ///
 /// A round applies every redaction the warehouse's scan now finds unheld ([`apply_redactions`])
 /// when an apply is owed (the handle's first, or one a write could not carry out), cuts the
-/// downloads of the bundle that apply withdrew, deletes the applied content no bay here
-/// holds ([`delete_applied_content`]) and rebuilds the bundle an apply withdrew. A deletion that
-/// could not be carried out — the warehouse could not be drained, or other maintenance holds its
-/// store — is owed, as is an apply that failed: the run tries again later, waiting longer each time, while the warehouse is
-/// served. A run starts after each ref write and once for each handle served, so a deletion owed
-/// when a process stopped is carried out by the next one to serve the warehouse.
+/// downloads of the bundle that apply withdrew, deletes the applied and withheld content no census
+/// root holds ([`delete_applied_content`]) and rebuilds the bundle an apply or a takedown
+/// withdrew. A deletion that could not be carried out — the warehouse could not be drained, or
+/// other maintenance holds its store — is owed, as is an apply that failed: the run tries again
+/// later, waiting longer each time, while the warehouse is served. A run starts after each ref
+/// write, once for each handle served, and when the withheld record gains a hash
+/// ([`watch_withheld`]), so a deletion owed when a process stopped is carried out by the next one
+/// to serve the warehouse.
 fn run_redactions(state: Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
     use std::sync::atomic::Ordering;
 
@@ -3891,9 +3894,9 @@ fn run_redactions(state: Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
                 () = woken => {}
             }
 
-            warehouse = match still_served(&state, &weak) {
-                Some(warehouse) => warehouse,
-                None => return,
+            warehouse = match still_served(&state, &weak, false) {
+                Served::Handle(warehouse) => warehouse,
+                Served::Draining | Served::Gone => return,
             };
 
             if owes.deletion {
@@ -3908,17 +3911,133 @@ fn run_redactions(state: Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
 
 /// The handle `weak` names, when it is still the one served for its warehouse. Taken under the
 /// registry mutex, as every reference to a served handle is (see [`resolve_handle`]): a handle
-/// being let go is never taken back.
-fn still_served(state: &AppState, weak: &std::sync::Weak<WarehouseHandle>) -> Option<Arc<WarehouseHandle>> {
-    let registry = state.warehouses.lock().ok()?;
-    let handle = weak.upgrade()?;
-
-    let served = match &state.mode {
-        ServeMode::Single(served) => Arc::ptr_eq(served, &handle),
-        ServeMode::Multi { .. } => registry.entries.values().any(|entry| Arc::ptr_eq(&entry.handle, &handle)),
+/// being let go is never taken back. With `undrained`, a handle being drained is not taken either,
+/// as no request's is ([`drain`]): it is found by the served reference alone, so no reference to
+/// it is taken meanwhile.
+fn still_served(state: &AppState, weak: &std::sync::Weak<WarehouseHandle>, undrained: bool) -> Served {
+    let Ok(registry) = state.warehouses.lock() else {
+        return Served::Gone;
     };
 
-    served.then_some(handle)
+    let served = match &state.mode {
+        ServeMode::Single(served) => std::ptr::eq(Arc::as_ptr(served), weak.as_ptr()).then_some(served),
+        ServeMode::Multi { .. } => registry.entries.values().map(|entry| &entry.handle)
+            .find(|handle| std::ptr::eq(Arc::as_ptr(handle), weak.as_ptr())),
+    };
+
+    match served {
+        None => Served::Gone,
+        Some(handle) if undrained && handle.draining.load(std::sync::atomic::Ordering::SeqCst) => Served::Draining,
+        Some(handle) => Served::Handle(Arc::clone(handle)),
+    }
+}
+
+/// What [`still_served`] finds of a handle.
+enum Served {
+    /// It is served, and this is a reference to it.
+    Handle(Arc<WarehouseHandle>),
+
+    /// It is served, and being drained.
+    Draining,
+
+    /// It is no longer served.
+    Gone,
+}
+
+/// How often a served warehouse's watch ([`watch_withheld`]) reads its withheld record. The
+/// record is written by `forklift-server withhold`, another process, so this bounds how long a
+/// bundle download of content just withheld keeps streaming, and how long its deletion waits.
+const WITHHELD_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Start serving `handle`, a handle served just now: read its withheld record as its watch's
+/// baseline, start its first redaction run, then watch the record ([`watch_withheld`]). The
+/// baseline is read first, so a hash withheld after it is the watch's to act on, at worst asking
+/// for one more round. Requests are served before it is read, so a hash in it may have been
+/// withheld while a bundle download already ran: when its bundle is withdrawn, the downloads are
+/// cut, as the watch cuts them. A run that finds something withheld and no bundle published
+/// rebuilds it, since withholding withdrew it whether or not a copy is here to delete.
+fn start_serving(state: &Arc<AppState>, handle: &Arc<WarehouseHandle>) {
+    let state = Arc::clone(state);
+    let handle = Arc::clone(handle);
+
+    tokio::spawn(async move {
+        let baseline = blocking(Arc::clone(&handle), || {
+            let withheld = read_withheld()?;
+            let withdrawn = !withheld.is_empty() && !bundle_utils::get_latest_bundle_path().exists();
+
+            Ok((withheld_hashes(&withheld), withdrawn))
+        }).await;
+
+        let seen = match baseline {
+            Ok((seen, withdrawn)) => {
+                if withdrawn {
+                    cut_bundle_downloads(&handle);
+                    handle.rebuild_after_drain.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                Some(seen)
+            }
+            Err((_, error)) => {
+                tracing::error!(error, "the withheld record could not be read; reading it again later");
+                None
+            }
+        };
+
+        let weak = Arc::downgrade(&handle);
+        run_redactions(Arc::clone(&state), handle);
+
+        watch_withheld(state, weak, seen).await;
+    });
+}
+
+/// The hashes `withheld` names.
+fn withheld_hashes(withheld: &WithheldSet) -> std::collections::BTreeSet<String> {
+    withheld.entries().map(|(hash, _)| hash.clone()).collect()
+}
+
+/// Watch the withheld record of the handle `weak` names while it is served, every
+/// [`WITHHELD_POLL`]. When the record withholds a hash `seen` did not (or, with no `seen`, when
+/// it is first read withholding anything), the bundle downloads are cut, since a bundle published
+/// before may hold the content, and a redaction round is asked for, which deletes the copies no
+/// census root holds ([`delete_applied_content`]) and rebuilds the bundle after, as one after a
+/// write that applied a redaction does.
+///
+/// Between reads the watch holds no reference to the handle, and it takes none while the handle is
+/// drained, so a drain and an idle let-go are not held up by it; it ends once the handle is no
+/// longer served. A record that cannot be read is read again at the next poll: the requests that
+/// read it are refused meanwhile.
+async fn watch_withheld(state: Arc<AppState>,
+                        weak: std::sync::Weak<WarehouseHandle>,
+                        mut seen: Option<std::collections::BTreeSet<String>>) {
+    loop {
+        tokio::time::sleep(WITHHELD_POLL).await;
+
+        // A drained warehouse is skipped this poll; the round draining it deletes what it can.
+        let warehouse = match still_served(&state, &weak, true) {
+            Served::Handle(warehouse) => warehouse,
+            Served::Draining => continue,
+            Served::Gone => return,
+        };
+
+        let now = match blocking(Arc::clone(&warehouse), || read_withheld()).await {
+            Ok(withheld) => withheld_hashes(&withheld),
+            Err((_, error)) => {
+                tracing::error!(error, "the withheld record could not be read; reading it again later");
+                continue;
+            }
+        };
+
+        let gained = match &seen {
+            Some(seen) => now.iter().any(|hash| !seen.contains(hash)),
+            None => !now.is_empty(),
+        };
+        seen = Some(now);
+
+        if gained {
+            cut_bundle_downloads(&warehouse);
+            warehouse.rebuild_after_drain.store(true, std::sync::atomic::Ordering::SeqCst);
+            run_redactions(Arc::clone(&state), warehouse);
+        }
+    }
 }
 
 /// What a redaction round ([`redaction_round`]) leaves owed, for a later round to try again.
@@ -4007,10 +4126,10 @@ fn finish_round(state: &AppState, warehouse: &Arc<WarehouseHandle>, applied: boo
     }
 }
 
-/// Delete the applied content this warehouse holds that no bay here holds, when there is any:
-/// drain the warehouse ([`drain`]), then delete it ([`delete_drained`]) and serve the warehouse
-/// again. A handle that is not a served warehouse's (a test fixture) holds no locks to delete
-/// under, and deletes nothing.
+/// Delete the applied and withheld content this warehouse holds that no census root holds
+/// ([`redaction_deleter::applied_copies`]), when there is any: drain the warehouse ([`drain`]),
+/// then delete it ([`delete_drained`]) and serve the warehouse again. A handle that is not a
+/// served warehouse's (a test fixture) holds no locks to delete under, and deletes nothing.
 ///
 /// # Returns
 /// Whether the deletion is owed: the census failed, or the warehouse could not be drained, or its
@@ -6611,6 +6730,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// The handshake reports a withheld hash's deletion owed while the store holds a copy, and
+    /// done once it holds none.
+    ///
+    /// Revert: report every withheld hash deleted → the stored one is not `deletion_owed`.
+    #[test]
+    fn the_handshake_owes_a_withheld_deletion_while_a_copy_is_stored() {
+        let root = scratch_dir("withheld-handshake");
+        let _scope = StorageRootScope::enter(&root);
+        warehouse_utils::prepare_warehouse(warehouse_utils::PrepareMode::Full).unwrap();
+
+        let bytes: &[u8] = &object_utils::blob_bytes(b"a withheld copy still stored");
+        let stored = object_utils::hash_object_bytes(bytes);
+        object_utils::store_object_bytes(&stored, bytes).unwrap();
+        let gone = object_utils::hash_object_bytes(&object_utils::blob_bytes(b"never stored here"));
+        withholding::withhold(&stored, "statement").unwrap();
+        withholding::withhold(&gone, "statement").unwrap();
+
+        let states: HashMap<String, ServedWithholdingState> = served_withheld().unwrap().into_iter()
+            .map(|served| (served.hash, served.state)).collect();
+        assert!(matches!(states[&stored], ServedWithholdingState::DeletionOwed));
+        assert!(matches!(states[&gone], ServedWithholdingState::Deleted));
+
+        drop(_scope);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Letting a warehouse go forgets its cached packs. Once it is not live, another process may
     /// delete packed objects (a full repack), and a cached pack set is trusted on a hit, so a kept
     /// one would answer "present" for an object that is gone — to a client deciding what to
@@ -6875,7 +7020,8 @@ mod tests {
     }
 
     /// A handle served for the first time starts a redaction run of its own, once, so a deletion
-    /// owed when the warehouse was last served is carried out without waiting for a ref write.
+    /// owed when the warehouse was last served is carried out without waiting for a ref write. It
+    /// starts once the withheld record's watch has read its baseline ([`start_serving`]).
     ///
     /// Revert: start runs only after ref writes → no round is asked → red.
     #[tokio::test]
@@ -6885,6 +7031,11 @@ mod tests {
 
         let handle = resolve_warehouse(&state, &warehouse_params("w1")).unwrap();
         drop(resolve_warehouse(&state, &warehouse_params("w1")).unwrap());
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while handle.redactions_asked.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(handle.redactions_asked.load(Ordering::SeqCst), 1, "one run, at the first serve");
 
         drop(handle);

@@ -13,6 +13,11 @@
 //! trust pins and a journal's removed heads. A copy only those name is the one
 //! the redaction exists to delete, and reads already tolerate its absence.
 //!
+//! What this head's host withholds ([`withholding`]) is deleted the same way, under a census that
+//! keeps a copy for less ([`Removal::Withheld`]): every pallet head and every checkout's base still
+//! names a withheld file, as the takedown leaves history as it is, so neither holds its copy.
+//! Meta history, the adopted history and a checkout's uncommitted state still do.
+//!
 //! The census names hashes, never the objects above them: no parcel or tree is deleted, only the
 //! redacted blob or recipe, and the chunks of a recipe no unredacted object names. Those chunks
 //! are recorded in a journal ([`ChunksOwed`]) before the recipe goes, so a deletion cut short
@@ -30,7 +35,7 @@ use crate::util::lock_utils::{ServeLock, StoreAccessExclusive, StoreLock};
 use crate::util::progress_utils::Progress;
 use crate::util::{
     applied_redactions, bay_utils, cache_miss, file_utils, gc_utils, object_utils, office_utils, pack_utils,
-    pallet_utils, prune_utils, record_utils, recovery_utils, redaction_utils,
+    pallet_utils, prune_utils, record_utils, recovery_utils, redaction_utils, withholding,
 };
 use crate::util::applied_redactions::AppliedSet;
 
@@ -193,8 +198,22 @@ impl CopyHolder {
     }
 }
 
-/// Which census roots name each of `targets`: a target no root names is absent from the map, and
-/// every listed holder appears once per target, sorted.
+/// Why a copy is to be deleted, which decides what the census keeps it for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Removal {
+    /// An applied redaction names it: nothing this warehouse holds names it but old history, so
+    /// every census root holds a copy.
+    Applied,
+
+    /// This head's host withholds it ([`withholding`]). History still names it, so neither a
+    /// user pallet's head nor a checkout's base holds a copy: counting either would keep it for
+    /// as long as that history stands. Meta history and the adopted history still do, since a
+    /// meta cell is verified by loading it, and so does a checkout's uncommitted state.
+    Withheld,
+}
+
+/// Which census roots name each of `targets`, for the `removal` they are deleted for: a target no
+/// root names is absent from the map, and every listed holder appears once per target, sorted.
 ///
 /// The walk is presence-tolerant, as the collector's is: an absent parcel or tree is skipped, since
 /// a copy present beneath an absent tree is named through another, present path or by nothing.
@@ -206,7 +225,8 @@ impl CopyHolder {
 /// * `Err(String)` - If a pallet ref, the trust anchor, a bay's state or a staged shard could not
 ///                   be read, or a present parcel or tree could not be loaded: the census is then
 ///                   unknown, and nothing may be deleted on it.
-pub fn deletion_census(targets: &HashSet<String>) -> Result<BTreeMap<String, Vec<CopyHolder>>, String> {
+pub fn deletion_census(targets: &HashSet<String>,
+                       removal: Removal) -> Result<BTreeMap<String, Vec<CopyHolder>>, String> {
     let mut census = Census { targets, under: HashMap::new(), held: BTreeMap::new() };
 
     if targets.is_empty() {
@@ -217,6 +237,7 @@ pub fn deletion_census(targets: &HashSet<String>) -> Result<BTreeMap<String, Vec
 
     for (pallet_ref, head) in pallet_utils::all_pallet_refs()? {
         match pallet_ref.namespace {
+            pallet_utils::PalletNamespace::User if removal == Removal::Withheld => {}
             pallet_utils::PalletNamespace::User => census.parcel_tree(&head, CopyHolder::Pallet(pallet_ref.name))?,
             pallet_utils::PalletNamespace::Meta => meta_heads.push((head, CopyHolder::MetaHistory(pallet_ref.name))),
         }
@@ -241,7 +262,7 @@ pub fn deletion_census(targets: &HashSet<String>) -> Result<BTreeMap<String, Vec
     for (checkout, dir) in checkouts {
         let state = bay_utils::read_bay_state_roots_in(&dir)?;
 
-        if let Some(base) = state.base {
+        if let Some(base) = state.base.filter(|_| removal == Removal::Applied) {
             census.parcel_tree(&base, CopyHolder::Base(checkout.clone()))?;
         }
         for parked in state.parked {
@@ -290,7 +311,7 @@ pub(crate) fn unheld_applied() -> Result<HashSet<String>, String> {
 /// * `Err(String)`         - If the census could not be taken.
 pub(crate) fn unheld(applied: &HashSet<String>) -> Result<HashSet<String>, String> {
     let targets = maybe_present(applied);
-    let held = deletion_census(&targets)?;
+    let held = deletion_census(&targets, Removal::Applied)?;
 
     Ok(targets.into_iter().filter(|hash| !held.contains_key(hash)).collect())
 }
@@ -306,10 +327,32 @@ fn maybe_present(hashes: &HashSet<String>) -> HashSet<String> {
     hashes.iter().filter(|hash| redaction_utils::holds_as_file_content(hash)).cloned().collect()
 }
 
-/// The copies of applied redactions' objects the store may still hold, as the census finds them
-/// now, and the chunks the journal still owes, taken without any lock so a caller can tell whether
-/// [`delete_applied`] has anything to delete before it takes the locks the deletion needs. The
-/// deletion takes its own census under them; this one only decides whether to try.
+/// The copies a deletion is for: each applied redaction's and each withheld hash's object the
+/// store may hold as a file's content ([`maybe_present`]), with the holders the census finds for
+/// each. A hash both applied and withheld is censused as applied.
+///
+/// # Returns
+/// * `Ok((HashSet<String>, BTreeMap<String, Vec<CopyHolder>>))` - The copies, and of them the held.
+/// * `Err(String)` - If the applied or withheld record could not be read, or the census taken.
+fn removal_census() -> Result<(HashSet<String>, BTreeMap<String, Vec<CopyHolder>>), String> {
+    let applied: HashSet<String> = applied_redactions::read_applied()?.hashes().cloned().collect();
+    let withheld: HashSet<String> = withholding::read_withheld()?.entries()
+        .map(|(hash, _)| hash.clone())
+        .filter(|hash| !applied.contains(hash))
+        .collect();
+
+    let (applied, withheld) = (maybe_present(&applied), maybe_present(&withheld));
+    let mut held = deletion_census(&applied, Removal::Applied)?;
+    held.extend(deletion_census(&withheld, Removal::Withheld)?);
+
+    Ok((applied.into_iter().chain(withheld).collect(), held))
+}
+
+/// The copies of applied redactions' and withheld hashes' objects the store may still hold, as the
+/// census finds them now, and the chunks the journal still owes, taken without any lock so a
+/// caller can tell whether [`delete_applied`] has anything to delete before it takes the locks the
+/// deletion needs. The deletion takes its own census under them; this one only decides whether to
+/// try.
 #[derive(Debug, Default)]
 pub struct AppliedCopies {
     /// The copies the census names, each with its holders: kept.
@@ -330,24 +373,18 @@ impl AppliedCopies {
     }
 }
 
-/// Take the census of every applied redaction's object the store may still hold, and count the
-/// journal's owed chunks it still holds (see [`AppliedCopies`]). Every part is empty once every
-/// applied object and owed chunk is gone, or when none is applied: no bay state is read then.
+/// Take the census of every applied redaction's and withheld hash's object the store may still
+/// hold ([`removal_census`]), and count the journal's owed chunks it still holds (see
+/// [`AppliedCopies`]). Every part is empty once every such object and owed chunk is gone, or when
+/// none is applied or withheld: no bay state is read then.
 ///
 /// # Returns
 /// * `Ok(AppliedCopies)` - The held copies, the count of unheld ones and of owed chunks.
-/// * `Err(String)`       - If the applied record, the journal or the census could not be read, or
-///                         whether an owed chunk is present could not be told.
+/// * `Err(String)`       - If the applied or withheld record, the journal or the census could not
+///                         be read, or whether an owed chunk is present could not be told.
 pub fn applied_copies() -> Result<AppliedCopies, String> {
-    let applied: HashSet<String> = applied_redactions::read_applied()?.hashes().cloned().collect();
     let owed_chunks = present_owed_chunks(&read_chunks_owed()?)?.len();
-    let present = maybe_present(&applied);
-
-    if present.is_empty() {
-        return Ok(AppliedCopies { owed_chunks, ..AppliedCopies::default() });
-    }
-
-    let held = deletion_census(&present)?;
+    let (present, held) = removal_census()?;
     let unheld = present.iter().filter(|hash| !held.contains_key(*hash)).count();
 
     Ok(AppliedCopies { held, unheld, owed_chunks })
@@ -446,7 +483,7 @@ pub fn withheld_candidates(applied: &AppliedSet) -> Result<HashSet<String>, Stri
 /// What [`delete_applied`] did.
 #[derive(Debug, Default)]
 pub struct Deletion {
-    /// The applied redactions' objects (blobs and recipes) deleted, sorted.
+    /// The applied redactions' and withheld hashes' objects (blobs and recipes) deleted, sorted.
     pub objects: Vec<String>,
 
     /// The chunks deleted: those of a deleted recipe that no unredacted object names.
@@ -455,14 +492,15 @@ pub struct Deletion {
     /// The bytes freed: loose files deleted, and what the old packs held beyond the new ones.
     pub bytes_freed: u64,
 
-    /// The applied redactions whose copies are kept, each with the census roots that hold it.
+    /// The applied redactions and withheld hashes whose copies are kept, each with the census
+    /// roots that hold it.
     pub held: BTreeMap<String, Vec<CopyHolder>>,
 }
 
-/// Delete every copy of an applied redaction's object that no deletion census root names, and the
-/// chunks of a deleted recipe that no unredacted object names. Copies the census names are kept and
-/// reported with their holders: once the file is taken out of that state, the next deletion
-/// removes them.
+/// Delete every copy of an applied redaction's or a withheld hash's object that no deletion census
+/// root names ([`removal_census`]), and the chunks of a deleted recipe that no other object names.
+/// Copies the census names are kept and reported with their holders: once the file is taken out
+/// of that state, the next deletion removes them.
 ///
 /// Runs under the locks a full repack takes, in its order, from before the census until the last
 /// delete, so no writer can publish a new reference to an object about to go. Nothing is fetched.
@@ -485,21 +523,19 @@ pub struct Deletion {
 ///
 /// # Returns
 /// * `Ok(Deletion)` - What was deleted, and what was kept.
-/// * `Err(String)`  - If the applied record, the journal, the census, a recipe or the packs could
-///                    not be read (nothing is deleted then), the journal could not be written, a
-///                    repack or a delete failed, or the first
-///                    pass's repack left a copy inside a pack it found damaged (the chunks are
-///                    then all kept). Running it again finishes, as for a run cut short.
+/// * `Err(String)`  - If the applied or withheld record, the journal, the census, a recipe or the
+///                    packs could not be read (nothing is deleted then), the journal could not
+///                    be written, a repack or a delete failed, or the first pass's repack left a
+///                    copy inside a pack it found damaged (the chunks are then all kept). Running
+///                    it again finishes, as for a run cut short.
 pub fn delete_applied(store_lock: &StoreLock,
                       serve_lock: &ServeLock,
                       store_access: &StoreAccessExclusive,
                       progress: &Progress) -> Result<Deletion, String> {
     let _unfetched = cache_miss::Unfetched::enter();
 
-    let applied: HashSet<String> = applied_redactions::read_applied()?.hashes().cloned().collect();
     let owed = read_chunks_owed()?;
-    let present = maybe_present(&applied);
-    let held = deletion_census(&present)?;
+    let (present, held) = removal_census()?;
     let targets: HashSet<String> = present.into_iter().filter(|hash| !held.contains_key(hash)).collect();
 
     if targets.is_empty() && owed.is_empty() {
@@ -1084,7 +1120,7 @@ mod tests {
         plant_staged_shard("b", &[("wip.txt", &staged, FILE)]);
 
         let targets: HashSet<String> = [&old, &base, &head, &meta, &staged].into_iter().cloned().collect();
-        let census = deletion_census(&targets).unwrap();
+        let census = deletion_census(&targets, Removal::Applied).unwrap();
 
         let expected: BTreeMap<String, Vec<CopyHolder>> = [
             (base, vec![CopyHolder::Base(Checkout::Main)]),
@@ -1105,7 +1141,7 @@ mod tests {
         set_main(&parcel);
         set_base(&parcel);
 
-        let census = deletion_census(&[shared.clone()].into_iter().collect()).unwrap();
+        let census = deletion_census(&[shared.clone()].into_iter().collect(), Removal::Applied).unwrap();
 
         assert_eq!(census[&shared], vec![CopyHolder::Pallet("main".to_string()), CopyHolder::Base(Checkout::Main)]);
     }
@@ -1245,5 +1281,47 @@ mod tests {
             matches!(pack_utils::any_packed_delta_against(&[secret].into_iter().collect()), Ok(false)),
             "no packed delta stands on the secret: {}", kept
         );
+    }
+
+    /// A withheld copy goes though the head and the checkout's base still name it, as history
+    /// keeps naming a withheld file; one a checkout has staged, or meta history names, is kept and
+    /// reported with its holder. A hash both applied and withheld is censused as applied, so the
+    /// base holds it. The cheap count before the locks sees the withheld copy too.
+    ///
+    /// Revert: census a withheld hash as applied → the named copy is held by the head and base;
+    /// leave the withheld record out of the targets → nothing is deleted; leave it out of the
+    /// count → `owes_deletion` is false.
+    #[test]
+    fn a_withheld_copy_is_deleted_though_history_names_it() {
+        let _scratch = Scratch::new("withheld");
+        let (named, staged, meta, both) =
+            (store_blob("film\n"), store_blob("staged film\n"), store_blob("meta film\n"), store_blob("both\n"));
+        let head = store_parcel(&store_tree(&[("film.mkv", &named, FILE), ("both.txt", &both, FILE)]), Vec::new());
+        set_main(&head);
+        set_base(&head);
+        plant_staged_shard("b", &[("wip.mkv", &staged, FILE)]);
+        let cell = store_parcel(&store_tree(&[("record", &meta, FILE)]), Vec::new());
+        pallet_utils::update_meta_pallet_head("notes", None, &cell, &pallet_utils::RefPreconditions::NONE).unwrap();
+        for hash in [&named, &staged, &meta, &both] {
+            withholding::withhold(hash, "DMCA notice 9").unwrap();
+        }
+        applied_redactions::apply_for_test(&[&both]);
+
+        let copies = applied_copies().unwrap();
+        assert!(copies.owes_deletion() && copies.unheld == 1, "{:?}", copies);
+
+        let deletion = delete().unwrap();
+
+        assert_eq!(deletion.objects, vec![named.clone()]);
+        assert_eq!(deletion.held, [
+            (staged.clone(), vec![CopyHolder::Staged(Checkout::Bay("b".to_string()))]),
+            (meta.clone(), vec![CopyHolder::MetaHistory("notes".to_string())]),
+            (both.clone(), vec![CopyHolder::Pallet("main".to_string()), CopyHolder::Base(Checkout::Main)]),
+        ].into_iter().collect());
+        assert!(!present(&named), "the withheld copy is deleted");
+        for hash in [&staged, &meta, &both, &head, &cell] {
+            assert!(present(hash), "kept: {}", hash);
+        }
+        assert!(!applied_copies().unwrap().owes_deletion(), "nothing is left to delete");
     }
 }
