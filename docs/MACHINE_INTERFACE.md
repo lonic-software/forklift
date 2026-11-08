@@ -85,7 +85,18 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 28** (current): a `forklift-server` remote applies redactions. `content_redacted`
+**Schema 29** (current): a warehouse with a remote applies a redaction on the remote's report.
+`lower` and `clone` carry `redactions` when they applied one, or deleted copies of applied
+content: `applied` (the hashes this command applied: the remote reports them applied, and nothing
+here names their content), `deletion` (as `redact apply`'s), and `mirror_copy` (a sentence naming
+`.forklift/mirror.git`, which may hold a copy exported before the redaction and is never deleted).
+`redact apply` reads the remote's handshake first; when it cannot, its list carries
+`remote_unread` with the reason, and every redaction waiting for the remote stays pending. `redact
+record` and `redact apply` carry `mirror_copy` when they applied a redaction. The
+`redactions_unsettled` warning says a lower or clone could not apply on the remote's report or
+delete the copies, and names `forklift redact apply`.
+
+**Schema 28**: a `forklift-server` remote applies redactions. `content_redacted`
 (exit 49) is also returned by `clone`, `lower` and `lift` when the remote refuses content whose
 redaction it has applied, with the remote's words in `message` and no `details`. `lift` no longer
 uploads content the remote reports applied, and taking a head the remote serves is allowed over a
@@ -989,6 +1000,10 @@ Example session:
   (a server too old to know the check answers `404`; a busy one answers `unknown`) writes a `holds_unanswered` warning to the
   same channel, with `details` `{ "pallet": "<name>" }`; `message` names the cause. The command frees
   only what the remote's current heads allow; its result and exit code are its own.
+* A `lower` or `clone` that could not apply the redactions its remote reports applied, or could not
+  delete the copies of applied content, writes a `redactions_unsettled` warning to the same channel;
+  `message` names the cause and `next_step` names `forklift redact apply`, which finishes both.
+  The command's own result stands and its exit code is unchanged.
 * The same stderr channel also carries a maintenance warning, in the same shape:
   `{ "lonic_json": 1, "tool": "forklift", "warning": "maintenance_unavailable", "message": "…", "next_step":
   "Resolve the reported cause; …" }`. It means background auto-maintenance could not even decide

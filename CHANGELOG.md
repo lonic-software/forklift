@@ -109,6 +109,14 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   a redaction only while the server reports it pending. A fresh `clone` or a `lower` that must
   fetch history naming the content is refused with `content_redacted` for now. The AWS head
   refuses a lift naming content `@redactions` records, as `content_redacted`.
+- **A warehouse applies a redaction once its remote has, and the `--json` schema is now 29.**
+  `lower` and `clone` read which redactions the remote reports applied and, for each one nothing
+  here names any more, apply it here too and delete the local copies of its content; the result
+  says what was applied and deleted (`redactions` in `--json`). `redact apply` asks the remote
+  first, and says when it cannot reach it. A command that applied a redaction also names the git
+  mirror (`.forklift/mirror.git`), whose copy exported before the redaction nothing here deletes.
+  When a `lower` or `clone` cannot finish this, it warns `redactions_unsettled` and names
+  `forklift redact apply`.
 - **The AWS head applies redactions.** A redaction that no pallet head, deleted pallet's tombstone
   or metadata history names applies on the AWS head when a request names its content, or after a
   lift or pallet deletion. The head then refuses that content as `content_redacted` on object
