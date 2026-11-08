@@ -271,9 +271,8 @@ mod tests {
         MemoryRefStore::from_items(&items).expect("a served store")
     }
 
-    // Revert: write the item unconditioned → the restate overwrites the head's progress, and the
-    // add over an unchanged statement writes. Revert: take the stamp fence → the empty warehouse is
-    // made by the add.
+    // Revert: write a restate conditioned on absence → it never lands → red. Revert: take the stamp
+    // fence → the add makes the empty warehouse → red.
     #[test]
     fn an_add_writes_a_new_item_restates_one_and_never_makes_a_warehouse() {
         let refs = served();
@@ -315,8 +314,7 @@ mod tests {
         assert!(list(&refs).unwrap().is_empty());
     }
 
-    // Revert: skip an item of an unknown version in the listing → the listing reads as withholding
-    // nothing. Revert: accept an unknown field → the newer record is read.
+    // Revert: read any version → the newer item is listed → red.
     #[test]
     fn a_listing_fails_loudly_on_an_item_this_build_cannot_read() {
         let hash = "d".repeat(64);
