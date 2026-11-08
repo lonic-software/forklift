@@ -148,7 +148,7 @@ enum Command {
 #[derive(Subcommand)]
 enum WithholdAction {
     /// Withhold a file's content, by its object hash, with a statement saying why. Withholding a
-    /// hash again replaces its statement
+    /// hash again replaces its statement. A chunked file cannot be withheld yet
     Add {
         /// The warehouse root to change
         #[arg(long)]
@@ -157,7 +157,7 @@ enum WithholdAction {
         /// The content's object hash
         hash: String,
 
-        /// Why it is withheld, as every request for it is told (at most 1000 characters)
+        /// Why it is withheld, as every request for it is told: one line, at most 1000 characters
         #[arg(long)]
         statement: String,
     },
@@ -797,7 +797,7 @@ fn list_withheld(root: &str) -> Result<(), String> {
     }
 
     for (hash, statement) in withheld.entries() {
-        println!("{} {}", hash, statement.replace('\n', " "));
+        println!("{} {}", hash, statement);
     }
 
     Ok(())
