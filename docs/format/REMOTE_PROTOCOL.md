@@ -63,7 +63,7 @@ already zstd streams (bundles, batches) are marked `identity` and never re-wrapp
 
 **Unavailable for now:** every `503` from forklift-server carries `Retry-After` (delta-seconds)
 and is a refusal for now, sent before the request changed anything. The warehouse may be drained
-while content redacted from it is deleted (below), settling which redacted content it no
+while content redacted or withheld from it is deleted (below), settling which redacted content it no
 longer serves (below), under maintenance, or not yet servable, or a hook it depends on may be
 unreachable. The request can be sent again after the wait. The
 serverless head's `503`s are described with the endpoints that send them.
