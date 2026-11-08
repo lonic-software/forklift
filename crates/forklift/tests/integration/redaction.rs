@@ -2362,8 +2362,7 @@ fn a_cache_reads_content_its_remote_applied_a_redaction_of_as_redacted() {
     let target = format!("{}:other/secret.env", behind.leak);
 
     let refused = content_redacted(cache, &["show", &target]);
-    assert!(refused["message"].as_str().unwrap().contains("could not be fetched")
-                || refused["message"].as_str().unwrap().contains("from the origin"), "{}", refused);
+    assert!(refused["message"].as_str().unwrap().contains("from the origin failed"), "{}", refused);
     assert!(!cache.holds_loose(&behind.hash));
 
     let lowered = cache.json(&["lower"]);
@@ -2413,4 +2412,33 @@ fn a_sparse_clone_takes_history_naming_an_applied_ignore_file_above_its_scope() 
     assert_eq!(report["data"]["redactions"]["applied"], serde_json::json!([hash]), "{}", report);
     assert_eq!(empty.head("main"), server.main());
     assert!(!empty.holds_loose(&hash));
+}
+
+/// A walk over an unreadable record of applied redactions is refused, rather than asking for what
+/// it meets: the remote still serves content this warehouse removed on purpose, and nothing of it
+/// comes back.
+///
+/// Revert: let the walk fall back to skipping nothing → the lower fetches the applied content back.
+#[test]
+fn a_walk_over_an_unreadable_applied_record_takes_nothing_back() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-applied-unreadable-server-{}", std::process::id())));
+
+    let warehouse = Warehouse::cloned("applied-unreadable", &server.url);
+    warehouse.stack("notes.txt", b"notes\n", "notes");
+    warehouse.run_ok(&["lift"]);
+
+    let other = Warehouse::cloned("applied-unreadable-other", &server.url);
+    let hash = applied_without_remote(&warehouse, &server.url, "secret.env", b"TOKEN=unreadable\n");
+    assert!(!warehouse.holds_loose(&hash));
+
+    other.stack("notes.txt", b"notes, again\n", "more notes");
+    other.run_ok(&["lift"]);
+
+    std::fs::write(warehouse.root.join(".forklift/redactions-applied"), b"not a record\n").unwrap();
+
+    let lowered = warehouse.json(&["lower"]);
+    assert_eq!(lowered["ok"], false, "{}", lowered);
+    assert!(lowered["error"]["message"].as_str().unwrap().contains("record of applied redactions"), "{}", lowered);
+    assert!(!warehouse.holds_loose(&hash), "the applied content was fetched back");
 }
