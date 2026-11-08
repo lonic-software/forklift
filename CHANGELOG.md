@@ -119,7 +119,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   with `content_redacted`: it never asks for the content, and applies the redaction before writing
   the pallet's head. A `lower` or `clone` that then fails, or a `lower` whose metadata did not
   lower, keeps the copies and warns; the next one that goes through, or `redact apply`, deletes
-  them.
+  them. `scope fetch` likewise never asks for content a redaction applied here
+  removed, and widens over history naming it; and a cache's read of content its remote reports
+  redacted is refused as `content_redacted` (exit 49), as `scope fetch` over it is, rather than as
+  a generic error.
 - **The AWS head applies redactions.** A redaction that no pallet head, deleted pallet's tombstone
   or metadata history names applies on the AWS head when a request names its content, or after a
   lift or pallet deletion. The head then refuses that content as `content_redacted` on object
