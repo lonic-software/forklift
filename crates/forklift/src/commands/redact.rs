@@ -342,7 +342,7 @@ fn record_step(hash: &str, chosen: &HeadHolder, holders: &[HeadHolder]) -> Strin
 /// ready.
 fn list() -> Result<(), String> {
     let read = redaction_utils::read_redactions()?;
-    let statuses = applied_redactions::statuses(&read, None)?;
+    let statuses = applied_redactions::statuses(&read)?;
 
     output::emit(&RedactionList::new(&read, &statuses));
 
@@ -352,18 +352,21 @@ fn list() -> Result<(), String> {
 /// Apply every redaction that can be now, delete the copies of every applied redaction's content
 /// that nothing here still needs ([`delete_applied`]), and list them all as [`list`] does. With a
 /// remote configured, its handshake is read first, since only its report applies a redaction
-/// here; a remote that cannot be read leaves every clean one pending, and the list says why.
+/// here, and only while some redaction is not applied yet; a remote that cannot be read leaves
+/// every clean one pending, and the list says why.
 async fn apply() -> Result<(), String> {
-    let (report, remote_unread) = match RemoteClient::is_configured() {
+    let read = redaction_utils::read_redactions()?;
+    let before = applied_redactions::read_applied()?;
+
+    // The remote is asked only while some redaction here is still to apply.
+    let waiting = read.redactions.iter().any(|attributed| !before.contains(&attributed.redaction.hash));
+    let (report, remote_unread) = match waiting && RemoteClient::is_configured() {
         true => match remote_report().await {
             Ok(report) => (Some(report), None),
             Err(why) => (None, Some(why)),
         },
         false => (None, None),
     };
-
-    let read = redaction_utils::read_redactions()?;
-    let before = applied_redactions::read_applied()?;
     let statuses = applied_redactions::apply(&read, None, report.as_ref())?;
     let deletion = delete_applied().map_err(|why| format!(
         "Every redaction that can be applied now is (see \"forklift redact list\"), but deleting the \
@@ -399,7 +402,12 @@ pub(crate) fn apply_on_report(report: &RemoteReport) -> Result<Vec<String>, Stri
     let before = applied_redactions::read_applied()?;
     let read = redaction_utils::read_redactions()?;
 
-    if read.redactions.iter().all(|attributed| before.contains(&attributed.redaction.hash)) {
+    // Only a redaction the report lists can apply here, so with none that is not applied yet
+    // nothing is scanned.
+    if !read.redactions.iter().any(|attributed| {
+        let hash = &attributed.redaction.hash;
+        !before.contains(hash) && report.lists(hash)
+    }) {
         return Ok(Vec::new());
     }
 
@@ -411,22 +419,20 @@ pub(crate) fn apply_on_report(report: &RemoteReport) -> Result<Vec<String>, Stri
 
 /// Delete the copies of every applied redaction's content that nothing here still needs
 /// ([`delete_applied`]), after lower or clone applied `applied`, and say what that did. The
-/// command's store-access hold must be released first, or the deletion is owed.
-///
-/// # Returns
-/// * `Ok(Some(Settled))` - What was applied, deleted and kept, and the mirror's copy.
-/// * `Ok(None)`          - Nothing was applied, and no copy was left to delete.
-/// * `Err(String)`       - The deletion could not be carried out ([`delete_applied`]).
-pub(crate) fn settle_applied(applied: Vec<String>) -> Result<Option<Settled>, String> {
-    let deletion = delete_applied()?;
+/// command's store-access hold must be released first, or the deletion is owed. A deletion that
+/// fails only warns, naming `redact apply`: the redactions stay applied, and the result says so.
+pub(crate) fn settle_applied(applied: Vec<String>) -> Settled {
+    let deletion = delete_applied().unwrap_or_else(|why| {
+        output::warn_redactions_unsettled(&format!(
+            "The redactions the remote reports applied were applied here, but deleting their content \
+            failed: {} Copies already deleted stay deleted.",
+            why.trim_end()
+        ));
+        None
+    });
+    let mirror_copy = mirror_copy(true);
 
-    if applied.is_empty() && deletion.is_none() {
-        return Ok(None);
-    }
-
-    let mirror_copy = mirror_copy(!applied.is_empty());
-
-    Ok(Some(Settled { applied, deletion, mirror_copy }))
+    Settled { applied, deletion, mirror_copy }
 }
 
 /// What to say about the git mirror's copy once `applied` says a redaction was applied in this

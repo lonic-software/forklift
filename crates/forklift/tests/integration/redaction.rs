@@ -2060,6 +2060,9 @@ fn a_lower_applies_what_the_remote_reports_applied_and_deletes_the_copy_here() {
     assert_eq!(applied_record(&holder), format!("/forklift-redactions-applied 1\n{}\n", hash));
     assert_eq!(holder.redactions()[0]["status"]["state"], "applied");
 
+    // A lower that applies nothing says nothing about redactions.
+    let again = holder.json(&["lower"]);
+    assert_eq!(again["data"].get("redactions"), None, "{}", again);
     let human = String::from_utf8_lossy(&holder.run_ok(&["lower"]).stdout).into_owned();
     assert!(!human.contains("mirror"), "nothing was applied this time: {}", human);
 }
@@ -2069,7 +2072,8 @@ fn a_lower_applies_what_the_remote_reports_applied_and_deletes_the_copy_here() {
 /// fresh clone applies on the report too.
 ///
 /// Revert: apply with no report in `redact apply` → the reachable case stays pending. Revert:
-/// drop the apply in clone → the clone reports nothing applied.
+/// drop the apply in clone → the clone reports nothing applied. Revert: ask the remote with
+/// nothing left to apply → the unreachable remote is reported.
 #[test]
 fn redact_apply_reads_the_remote_s_report_and_says_when_it_cannot() {
     let server = Server::start(&std::env::temp_dir()
@@ -2099,6 +2103,13 @@ fn redact_apply_reads_the_remote_s_report_and_says_when_it_cannot() {
     assert_eq!(applied["data"].get("remote_unread"), None, "{}", applied);
     assert_eq!(applied["data"]["redactions"][0]["status"]["state"], "applied", "{}", applied);
     assert_eq!(applied_record(&owner), format!("/forklift-redactions-applied 1\n{}\n", hash));
+
+    // With every redaction applied, the remote is not asked, so one that cannot be reached is not
+    // reported.
+    owner.run_ok(&["config", "set", "remote.url", "http://127.0.0.1:9"]);
+    let settled = owner.json(&["redact", "apply"]);
+    assert_eq!(settled["data"].get("remote_unread"), None, "{}", settled);
+    owner.run_ok(&["config", "set", "remote.url", &server.url]);
 
     // A fresh clone applies it as it takes the remote's warehouse.
     let empty = Warehouse::empty("report-clone");

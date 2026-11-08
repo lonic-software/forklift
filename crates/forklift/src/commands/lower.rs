@@ -49,7 +49,7 @@ use crate::output::{self, CommandOutput};
 /// * `repair`  - Whether a remote head no client can check out is repaired: a parcel stacked on it
 ///              removes every name that opens the metadata folder (see [`repair_pallet`]).
 /// * `store_access` - The command's shared store-access hold, released once the pallet has landed
-///              so that the copies of a redaction applied then can be deleted ([`settle_redactions`]).
+///              and a redaction was applied, so that its copies can be deleted ([`settle_redactions`]).
 ///
 /// # Returns
 /// * `Ok(())`      - If every pallet is now in sync with the remote (or ahead of it).
@@ -172,7 +172,10 @@ pub async fn handle_command(pallet: Option<String>,
 
     report.batch_lane = client.batch_lane_closure();
 
-    if lowered.is_ok() {
+    // Only once everything went through, so the report that carries what was applied reaches the
+    // output: a failed or conflicting meta pallet fails the command, and its error document has no
+    // room for it. `redact apply` applies it later.
+    if lowered.is_ok() && report.meta_failed.is_empty() && report.meta_conflicts.is_empty() {
         report.redactions = settle_redactions(client.url(), &info, store_access);
     }
 
@@ -1087,27 +1090,31 @@ impl CommandOutput for LowerReport {
 
 /// Apply the redactions the remote at `url`, whose handshake is `info`, reports applied, once the
 /// pallet has landed and nothing here names their content any more, and delete their copies.
-/// Deleting needs the store exclusive, so `store_access`, this command's shared hold, is released
-/// first: everything the command writes is published by then. A failure only warns, naming
-/// `redact apply`, since the lower itself went through.
+/// Deleting needs the store exclusive, so when something was applied `store_access`, this
+/// command's shared hold, is released first: everything the command writes is published by then.
+/// A failure only warns, naming `redact apply`, since the lower itself went through; a deletion
+/// owed by an earlier command is left to `redact apply` too.
 ///
 /// # Returns
-/// What was applied, deleted and kept; `None` when nothing was, or when it failed.
+/// What was applied, deleted and kept; `None` when nothing was applied, or the apply failed.
 pub(crate) fn settle_redactions(url: &str,
                                 info: &forklift_core::model::remote::WarehouseInfo,
                                 store_access: &mut Option<forklift_core::util::lock_utils::StoreAccessLock>) -> Option<redact::Settled> {
     let report = forklift_core::util::applied_redactions::RemoteReport::of(url, info);
-    let applied = redact::apply_on_report(&report);
+    let applied = match redact::apply_on_report(&report) {
+        Ok(applied) if applied.is_empty() => return None,
+        Ok(applied) => applied,
+        Err(why) => {
+            output::warn_redactions_unsettled(&format!(
+                "The redactions the remote reports applied were not applied here: {}", why.trim_end()
+            ));
+            return None;
+        }
+    };
 
     drop(store_access.take());
 
-    match applied.and_then(redact::settle_applied) {
-        Ok(settled) => settled,
-        Err(why) => {
-            output::warn_redactions_unsettled(&why);
-            None
-        }
-    }
+    Some(redact::settle_applied(applied))
 }
 
 /// Refuse a lower whose diff (`ops` and `removed_dirs`) reaches a path with a local change: it

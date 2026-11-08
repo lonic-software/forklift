@@ -1115,7 +1115,7 @@ pub fn warn_redactions_unsettled(error: &str) {
 fn redactions_unsettled_warning_text(mode: OutputMode, error: &str) -> String {
     match mode {
         OutputMode::Human => format!(
-            "Warning: the redactions the remote reports applied were not applied or deleted here. {} {}",
+            "Warning: {} {}",
             forklift_core::error::sanitize_lines(error), REDACTIONS_UNSETTLED_NEXT_STEP
         ),
         OutputMode::Json => warning_envelope(CODE_REDACTIONS_UNSETTLED, error, REDACTIONS_UNSETTLED_NEXT_STEP, None),

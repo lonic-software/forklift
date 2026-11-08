@@ -197,10 +197,15 @@ impl RemoteReport {
         RemoteReport { url: url.to_string(), applied: AppliedSet::of(info.applied_redactions().into_iter().map(str::to_string)) }
     }
 
+    /// Whether this report lists the redaction of `hash` as applied, whichever remote it is from.
+    pub fn lists(&self, hash: &str) -> bool {
+        self.applied.contains(hash)
+    }
+
     /// Whether this report is from `configured`, the remote the warehouse has now, and lists the
     /// redaction of `hash` as applied.
     fn applies(&self, configured: &str, hash: &str) -> bool {
-        crate::util::origin_utils::same_remote(&self.url, configured) && self.applied.contains(hash)
+        crate::util::origin_utils::same_remote(&self.url, configured) && self.lists(hash)
     }
 }
 
@@ -341,8 +346,8 @@ fn chosen<'a>(read: &'a RedactionsRead, only: Option<&str>) -> Vec<&'a Redaction
 }
 
 /// Where every redaction `read` lists stands, without applying any: an unapplied one that
-/// [`apply`] would apply reads as [`RedactionState::Ready`]. `report` is the remote's, as for
-/// [`apply`]; without one, a warehouse with a remote reads each clean one as awaiting it. A cell
+/// [`apply`] would apply with no remote's report reads as [`RedactionState::Ready`]: this asks no
+/// remote, so in a warehouse with a remote each clean one reads as awaiting it. A cell
 /// this build cannot read has no status here; it stays pending, since what it says about a chunk
 /// list cannot be scanned for.
 ///
@@ -350,10 +355,10 @@ fn chosen<'a>(read: &'a RedactionsRead, only: Option<&str>) -> Vec<&'a Redaction
 /// * `Ok(Vec<RedactionStatus>)` - One per readable redaction, in the order `read` lists them.
 /// * `Err(String)`              - The applied record, the configuration or the warehouse's mode
 ///                                cannot be read.
-pub fn statuses(read: &RedactionsRead, report: Option<&RemoteReport>) -> Result<Vec<RedactionStatus>, String> {
+pub fn statuses(read: &RedactionsRead) -> Result<Vec<RedactionStatus>, String> {
     let applied = read_applied()?;
     let (remote, partial) = read_judged()?;
-    let mut statuses = judge(&chosen(read, None), &applied, Judge { remote: remote.as_deref(), partial, report });
+    let mut statuses = judge(&chosen(read, None), &applied, Judge { remote: remote.as_deref(), partial, report: None });
 
     for status in statuses.iter_mut().filter(|status| status.state.is_applied() && !applied.contains(&status.hash)) {
         status.state = RedactionState::Ready;
