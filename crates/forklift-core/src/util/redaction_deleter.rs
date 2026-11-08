@@ -212,12 +212,6 @@ pub enum Removal {
     Withheld,
 }
 
-/// Which census roots name each of `targets`, as [`deletion_census_of`] finds them for an applied
-/// redaction.
-pub fn deletion_census(targets: &HashSet<String>) -> Result<BTreeMap<String, Vec<CopyHolder>>, String> {
-    deletion_census_of(targets, Removal::Applied)
-}
-
 /// Which census roots name each of `targets`, for the `removal` they are deleted for: a target no
 /// root names is absent from the map, and every listed holder appears once per target, sorted.
 ///
@@ -231,8 +225,8 @@ pub fn deletion_census(targets: &HashSet<String>) -> Result<BTreeMap<String, Vec
 /// * `Err(String)` - If a pallet ref, the trust anchor, a bay's state or a staged shard could not
 ///                   be read, or a present parcel or tree could not be loaded: the census is then
 ///                   unknown, and nothing may be deleted on it.
-pub fn deletion_census_of(targets: &HashSet<String>,
-                          removal: Removal) -> Result<BTreeMap<String, Vec<CopyHolder>>, String> {
+pub fn deletion_census(targets: &HashSet<String>,
+                       removal: Removal) -> Result<BTreeMap<String, Vec<CopyHolder>>, String> {
     let mut census = Census { targets, under: HashMap::new(), held: BTreeMap::new() };
 
     if targets.is_empty() {
@@ -317,7 +311,7 @@ pub(crate) fn unheld_applied() -> Result<HashSet<String>, String> {
 /// * `Err(String)`         - If the census could not be taken.
 pub(crate) fn unheld(applied: &HashSet<String>) -> Result<HashSet<String>, String> {
     let targets = maybe_present(applied);
-    let held = deletion_census(&targets)?;
+    let held = deletion_census(&targets, Removal::Applied)?;
 
     Ok(targets.into_iter().filter(|hash| !held.contains_key(hash)).collect())
 }
@@ -348,8 +342,8 @@ fn removal_census() -> Result<(HashSet<String>, BTreeMap<String, Vec<CopyHolder>
         .collect();
 
     let (applied, withheld) = (maybe_present(&applied), maybe_present(&withheld));
-    let mut held = deletion_census_of(&applied, Removal::Applied)?;
-    held.extend(deletion_census_of(&withheld, Removal::Withheld)?);
+    let mut held = deletion_census(&applied, Removal::Applied)?;
+    held.extend(deletion_census(&withheld, Removal::Withheld)?);
 
     Ok((applied.into_iter().chain(withheld).collect(), held))
 }
@@ -532,7 +526,8 @@ pub struct Deletion {
 /// * `Err(String)`  - If the applied or withheld record, the journal, the census, a recipe or the
 ///                    packs could not be read (nothing is deleted then), the journal could not
 ///                    be written, a repack or a delete failed, or the first pass's repack left a
-///                    copy inside a pack it found damaged (the chunks are then all kept). Running it again finishes, as for a run cut short.
+///                    copy inside a pack it found damaged (the chunks are then all kept). Running
+///                    it again finishes, as for a run cut short.
 pub fn delete_applied(store_lock: &StoreLock,
                       serve_lock: &ServeLock,
                       store_access: &StoreAccessExclusive,
@@ -1125,7 +1120,7 @@ mod tests {
         plant_staged_shard("b", &[("wip.txt", &staged, FILE)]);
 
         let targets: HashSet<String> = [&old, &base, &head, &meta, &staged].into_iter().cloned().collect();
-        let census = deletion_census(&targets).unwrap();
+        let census = deletion_census(&targets, Removal::Applied).unwrap();
 
         let expected: BTreeMap<String, Vec<CopyHolder>> = [
             (base, vec![CopyHolder::Base(Checkout::Main)]),
@@ -1146,7 +1141,7 @@ mod tests {
         set_main(&parcel);
         set_base(&parcel);
 
-        let census = deletion_census(&[shared.clone()].into_iter().collect()).unwrap();
+        let census = deletion_census(&[shared.clone()].into_iter().collect(), Removal::Applied).unwrap();
 
         assert_eq!(census[&shared], vec![CopyHolder::Pallet("main".to_string()), CopyHolder::Base(Checkout::Main)]);
     }

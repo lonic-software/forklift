@@ -2606,7 +2606,9 @@ fn withhold(root: &std::path::Path, args: &[&str]) -> Output {
 
 /// A takedown on forklift-server takes effect while it serves: every surface that reads or takes
 /// the content answers `451` with the host's statement, the handshake lists
-/// it with the deletion owed, and the head naming the file is untouched. The bundle that held it is
+/// it, and the head naming the file is untouched. The served root deletes the copy within seconds,
+/// draining the warehouse meanwhile, so a request refused as unavailable is asked again and the
+/// deletion is listed owed or done. The bundle that held it is
 /// withdrawn. A tree's hash is refused, as a redaction's would be.
 ///
 /// Revert: answer a withheld hash as served on `GET` (drop the withheld arm of the refusal) → the
@@ -2639,17 +2641,31 @@ fn a_server_withholds_content_on_its_hosts_statement_while_it_serves() {
     let listed = withhold(&server.root, &["list"]);
     assert_eq!(String::from_utf8_lossy(&listed.stdout), format!("{} {}\n", hash, statement));
 
-    let (status, info) = http(&server.url, "GET", "/v1/warehouse", b"");
+    // The deletion drains the warehouse briefly: a request it refuses is asked again.
+    let ask = |method: &str, path: &str, body: &[u8]| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let (status, answer) = http(&server.url, method, path, body);
+            if !status.starts_with("HTTP/1.1 503") || std::time::Instant::now() >= deadline {
+                return (status, answer);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    };
+
+    let (status, info) = ask("GET", "/v1/warehouse", b"");
     assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, info);
     let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+    let state = info["withheld"][0]["state"].as_str().unwrap_or_default().to_string();
+    assert!(state == "deletion_owed" || state == "deleted", "{}", info);
     assert_eq!(info["withheld"], serde_json::json!([
-        { "hash": hash, "statement": statement, "state": "deletion_owed" }
+        { "hash": hash, "statement": statement, "state": state }
     ]), "{}", info);
 
     let object = format!("/v1/objects/{}", hash);
     let refusals = [
-        ("get", http(&server.url, "GET", &object, b"")),
-        ("put", http(&server.url, "PUT", &object, &object_utils::blob_bytes(content))),
+        ("get", ask("GET", &object, b"")),
+        ("put", ask("PUT", &object, &object_utils::blob_bytes(content))),
     ];
     for (surface, (status, body)) in refusals {
         assert!(status.starts_with("HTTP/1.1 451"), "{}: {} / {}", surface, status, body);

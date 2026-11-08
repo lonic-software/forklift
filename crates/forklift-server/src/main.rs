@@ -137,8 +137,8 @@ enum Command {
                       answered with the host's statement. Pallets keep naming the file; the \
                       warehouse's history is unchanged. Clients keep the copies they hold. It \
                       takes effect while the warehouse is being served, and the server deletes its \
-                      own copy within seconds, unless metadata history or a checkout's unfinished \
-                      work still names it."
+                      own copy within seconds, unless metadata history, the history the trust \
+                      anchor adopted, or a checkout's unfinished work still names it."
     )]
     Withhold {
         #[command(subcommand)]

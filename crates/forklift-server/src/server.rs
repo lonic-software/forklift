@@ -1545,8 +1545,8 @@ fn refuse_removed(applied: &AppliedSet, withheld: &WithheldSet, hash: &str) -> R
 /// `applied` read.
 ///
 /// The candidates are read again whenever the applied set differs from theirs, which is cheap,
-/// and not at all while nothing is applied. Then the only deletion can be a withheld one, whose
-/// recipe, if one was uploaded while it was withheld, still has its chunks served here.
+/// and not at all while nothing is applied. Then the only deletion can be a withheld one, and
+/// withholding refuses a recipe's hash, so no chunk is owed to it.
 /// Only a request naming a candidate needs the live set, walked once per ref write here (a walk
 /// a ref write overlapped is never kept) and at most every [`CHUNK_GATE_TTL`], one walk at a time.
 fn withheld_among(warehouse: &WarehouseHandle,
@@ -3894,9 +3894,9 @@ fn run_redactions(state: Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
                 () = woken => {}
             }
 
-            warehouse = match still_served(&state, &weak) {
-                Some(warehouse) => warehouse,
-                None => return,
+            warehouse = match still_served(&state, &weak, false) {
+                Served::Handle(warehouse) => warehouse,
+                Served::Draining | Served::Gone => return,
             };
 
             if owes.deletion {
@@ -3911,17 +3911,37 @@ fn run_redactions(state: Arc<AppState>, warehouse: Arc<WarehouseHandle>) {
 
 /// The handle `weak` names, when it is still the one served for its warehouse. Taken under the
 /// registry mutex, as every reference to a served handle is (see [`resolve_handle`]): a handle
-/// being let go is never taken back.
-fn still_served(state: &AppState, weak: &std::sync::Weak<WarehouseHandle>) -> Option<Arc<WarehouseHandle>> {
-    let registry = state.warehouses.lock().ok()?;
-    let handle = weak.upgrade()?;
-
-    let served = match &state.mode {
-        ServeMode::Single(served) => Arc::ptr_eq(served, &handle),
-        ServeMode::Multi { .. } => registry.entries.values().any(|entry| Arc::ptr_eq(&entry.handle, &handle)),
+/// being let go is never taken back. With `undrained`, a handle being drained is not taken either,
+/// as no request's is ([`drain`]): it is found by the served reference alone, so no reference to
+/// it is taken meanwhile.
+fn still_served(state: &AppState, weak: &std::sync::Weak<WarehouseHandle>, undrained: bool) -> Served {
+    let Ok(registry) = state.warehouses.lock() else {
+        return Served::Gone;
     };
 
-    served.then_some(handle)
+    let served = match &state.mode {
+        ServeMode::Single(served) => std::ptr::eq(Arc::as_ptr(served), weak.as_ptr()).then_some(served),
+        ServeMode::Multi { .. } => registry.entries.values().map(|entry| &entry.handle)
+            .find(|handle| std::ptr::eq(Arc::as_ptr(handle), weak.as_ptr())),
+    };
+
+    match served {
+        None => Served::Gone,
+        Some(handle) if undrained && handle.draining.load(std::sync::atomic::Ordering::SeqCst) => Served::Draining,
+        Some(handle) => Served::Handle(Arc::clone(handle)),
+    }
+}
+
+/// What [`still_served`] finds of a handle.
+enum Served {
+    /// It is served, and this is a reference to it.
+    Handle(Arc<WarehouseHandle>),
+
+    /// It is served, and being drained.
+    Draining,
+
+    /// It is no longer served.
+    Gone,
 }
 
 /// How often a served warehouse's watch ([`watch_withheld`]) reads its withheld record. The
@@ -3932,8 +3952,10 @@ const WITHHELD_POLL: std::time::Duration = std::time::Duration::from_secs(5);
 /// Start serving `handle`, a handle served just now: read its withheld record as its watch's
 /// baseline, start its first redaction run, then watch the record ([`watch_withheld`]). The
 /// baseline is read first, so a hash withheld after it is the watch's to act on, at worst asking
-/// for one more round. A run that finds something withheld and no bundle published rebuilds it,
-/// since withholding withdrew it whether or not a copy is here to delete.
+/// for one more round. Requests are served before it is read, so a hash in it may have been
+/// withheld while a bundle download already ran: with anything withheld, the downloads are cut,
+/// as the watch cuts them. A run that finds something withheld and no bundle published rebuilds
+/// it, since withholding withdrew it whether or not a copy is here to delete.
 fn start_serving(state: &Arc<AppState>, handle: &Arc<WarehouseHandle>) {
     let state = Arc::clone(state);
     let handle = Arc::clone(handle);
@@ -3948,6 +3970,9 @@ fn start_serving(state: &Arc<AppState>, handle: &Arc<WarehouseHandle>) {
 
         let seen = match baseline {
             Ok((seen, withdrawn)) => {
+                if !seen.is_empty() {
+                    cut_bundle_downloads(&handle);
+                }
                 if withdrawn {
                     handle.rebuild_after_drain.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
@@ -3978,8 +4003,9 @@ fn withheld_hashes(withheld: &WithheldSet) -> std::collections::BTreeSet<String>
 /// census root holds ([`delete_applied_content`]) and rebuilds the bundle after, as one after a
 /// write that applied a redaction does.
 ///
-/// Between reads the watch holds no reference to the handle, so a drain and an idle let-go are not
-/// held up by it; it ends once the handle is no longer served. A record that cannot be read is
+/// Between reads the watch holds no reference to the handle, and it takes none while the handle is
+/// drained, so a drain and an idle let-go are not held up by it; it ends once the handle is no
+/// longer served. A record that cannot be read is
 /// read again at the next poll: the requests that read it are refused meanwhile.
 async fn watch_withheld(state: Arc<AppState>,
                         weak: std::sync::Weak<WarehouseHandle>,
@@ -3987,8 +4013,11 @@ async fn watch_withheld(state: Arc<AppState>,
     loop {
         tokio::time::sleep(WITHHELD_POLL).await;
 
-        let Some(warehouse) = still_served(&state, &weak) else {
-            return;
+        // A drained warehouse is skipped this poll; the round draining it deletes what it can.
+        let warehouse = match still_served(&state, &weak, true) {
+            Served::Handle(warehouse) => warehouse,
+            Served::Draining => continue,
+            Served::Gone => return,
         };
 
         let now = match blocking(Arc::clone(&warehouse), || read_withheld()).await {
@@ -4100,8 +4129,8 @@ fn finish_round(state: &AppState, warehouse: &Arc<WarehouseHandle>, applied: boo
 }
 
 /// Delete the applied and withheld content this warehouse holds that no census root holds
-/// ([`redaction_deleter::applied_copies`]), when there is any: drain the warehouse ([`drain`]), then delete it ([`delete_drained`]) and serve the warehouse
-/// again. A handle that is not a served warehouse's (a test fixture) holds no locks to delete
+/// ([`redaction_deleter::applied_copies`]), when there is any: drain the warehouse ([`drain`]),
+/// then delete it ([`delete_drained`]) and serve the warehouse again. A handle that is not a served warehouse's (a test fixture) holds no locks to delete
 /// under, and deletes nothing.
 ///
 /// # Returns
