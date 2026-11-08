@@ -2518,9 +2518,9 @@ fn withhold(root: &std::path::Path, args: &[&str]) -> Output {
 #[test]
 fn a_server_withholds_content_on_its_hosts_statement_while_it_serves() {
     let server = Server::start(&std::env::temp_dir()
-        .join(format!("forklift-withheld-server-{}", std::process::id())));
+        .join(format!("forklift-takedown-server-{}", std::process::id())));
 
-    let owner = Warehouse::cloned("withheld-owner", &server.url);
+    let owner = Warehouse::cloned("takedown-owner", &server.url);
     let content = b"leaked film\n";
     owner.stack("film.mkv", content, "film");
     owner.stack("notes.txt", b"notes\n", "notes");

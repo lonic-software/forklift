@@ -79,3 +79,5 @@ tree_version::CODE_VERSION_2026_07_02 = 2
 warehouse_utils::WAREHOUSE_FORMAT = 1
 warehouse_utils::WAREHOUSE_MARKER_RECORD = "warehouse"
 warehouse_utils::WAREHOUSE_MARKER_VERSION = 3
+withholding::WITHHELD_RECORD = "withheld"
+withholding::WITHHELD_VERSION = 1
