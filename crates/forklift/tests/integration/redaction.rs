@@ -2414,31 +2414,29 @@ fn a_sparse_clone_takes_history_naming_an_applied_ignore_file_above_its_scope() 
     assert!(!empty.holds_loose(&hash));
 }
 
-/// A walk over an unreadable record of applied redactions is refused, rather than asking for what
-/// it meets: the remote still serves content this warehouse removed on purpose, and nothing of it
-/// comes back.
+/// A walk over an unreadable record of applied redactions is refused before it asks for anything:
+/// the record is what says which content was removed here on purpose, so a walk that cannot read
+/// it would take back from the remote whatever it meets. `scope fetch` reads the record first
+/// through the walk itself.
 ///
-/// Revert: let the walk fall back to skipping nothing → the lower fetches the applied content back.
+/// Revert: let the walk fall back to skipping nothing → the widening fetches the content first.
 #[test]
 fn a_walk_over_an_unreadable_applied_record_takes_nothing_back() {
     let server = Server::start(&std::env::temp_dir()
         .join(format!("forklift-redaction-applied-unreadable-server-{}", std::process::id())));
 
-    let warehouse = Warehouse::cloned("applied-unreadable", &server.url);
-    warehouse.stack("notes.txt", b"notes\n", "notes");
-    warehouse.run_ok(&["lift"]);
+    let owner = Warehouse::cloned("applied-unreadable-owner", &server.url);
+    owner.stack("src/keep.txt", b"keep\n", "src");
+    owner.stack("other/secret.env", b"TOKEN=unreadable\n", "other");
+    owner.run_ok(&["lift"]);
+    let hash = hash_of(b"TOKEN=unreadable\n");
 
-    let other = Warehouse::cloned("applied-unreadable-other", &server.url);
-    let hash = applied_without_remote(&warehouse, &server.url, "secret.env", b"TOKEN=unreadable\n");
-    assert!(!warehouse.holds_loose(&hash));
+    let sparse = Warehouse::cloned_with("applied-unreadable-sparse", &server.url, &["--only", "src"]);
+    assert!(!sparse.holds_loose(&hash));
+    std::fs::write(sparse.root.join(".forklift/redactions-applied"), b"not a record\n").unwrap();
 
-    other.stack("notes.txt", b"notes, again\n", "more notes");
-    other.run_ok(&["lift"]);
-
-    std::fs::write(warehouse.root.join(".forklift/redactions-applied"), b"not a record\n").unwrap();
-
-    let lowered = warehouse.json(&["lower"]);
-    assert_eq!(lowered["ok"], false, "{}", lowered);
-    assert!(lowered["error"]["message"].as_str().unwrap().contains("record of applied redactions"), "{}", lowered);
-    assert!(!warehouse.holds_loose(&hash), "the applied content was fetched back");
+    let widened = sparse.json(&["scope", "fetch", "other"]);
+    assert_eq!(widened["ok"], false, "{}", widened);
+    assert!(widened["error"]["message"].as_str().unwrap().contains("record of applied redactions"), "{}", widened);
+    assert!(!sparse.holds_loose(&hash), "the walk fetched content past an unreadable record");
 }
