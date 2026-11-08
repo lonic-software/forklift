@@ -2419,7 +2419,7 @@ fn a_sparse_clone_takes_history_naming_an_applied_ignore_file_above_its_scope() 
 /// it would take back from the remote whatever it meets. `scope fetch` reads the record first
 /// through the walk itself.
 ///
-/// Revert: let the walk fall back to skipping nothing → the widening fetches the content first.
+/// Revert: let the walk fall back to skipping nothing → the widening succeeds, taking the content.
 #[test]
 fn a_walk_over_an_unreadable_applied_record_takes_nothing_back() {
     let server = Server::start(&std::env::temp_dir()
