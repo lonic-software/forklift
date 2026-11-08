@@ -597,18 +597,25 @@ async fn franchise_into_prepared_target(
     // Leave out the content the remote reports redacted: it no longer serves it. Whether this
     // clone can apply those redactions too is known only once the meta pallets are adopted below,
     // and a head over history missing one it cannot is refused then.
-    client.skip_files(info.applied_redactions().into_iter().map(str::to_string).collect());
+    // The meta pallets' own walks, below, take everything, as before.
+    client.skip_files(lower::reported_applied(&info));
 
-    let fetched = match &remote_head {
-        Some(remote_head) => {
-            let mut stats = remote_utils::fetch_history_at(client, remote_head, &pallet_name, &fetch_scope, &Progress::NONE).await?;
-            take_utils::verify_take(Some(client), &take_trust, remote_head, &pallet_name, FetchAt::Scope(&fetch_scope)).await?;
-            stats.add(&remote_utils::fetch_head_content(client, remote_head, &Progress::NONE).await?);
-            Some(stats)
+    let fetched = async {
+        match &remote_head {
+            Some(remote_head) => {
+                let mut stats = remote_utils::fetch_history_at(client, remote_head, &pallet_name, &fetch_scope, &Progress::NONE).await?;
+                take_utils::verify_take(Some(client), &take_trust, remote_head, &pallet_name, FetchAt::Scope(&fetch_scope)).await?;
+                stats.add(&remote_utils::fetch_head_content(client, remote_head, &Progress::NONE).await?);
+                Ok::<_, String>(Some(stats))
+            }
+            // Unborn on the remote: no history to judge.
+            None => Ok(None),
         }
-        // Unborn on the remote: no history to judge.
-        None => None,
-    };
+    }.await;
+
+    client.skip_files(std::collections::HashSet::new());
+
+    let fetched = fetched?;
 
     // A new warehouse holds no pallet head yet, so this judges nothing; a first-contact install
     // still refuses without it.

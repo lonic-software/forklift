@@ -121,7 +121,13 @@ pub async fn handle_command(pallet: Option<String>,
         let mut verified = Vec::new();
 
         if let Some(remote_head) = info.pallets.get(target) {
-            remote_utils::fetch_history_scoped(&client, remote_head, target, &progress).await?;
+            // Before any `@redactions` is here to tell whether this warehouse applies what the
+            // remote reports applied: the fetch leaves it all out, and once the meta pallets are
+            // synced below, history missing one this warehouse does not apply is refused.
+            client.skip_files(reported_applied(&info));
+            let fetched = remote_utils::fetch_history_scoped(&client, remote_head, target, &progress).await;
+            client.skip_files(std::collections::HashSet::new());
+            fetched?;
             take_utils::verify_take(Some(&client), &first_contact, remote_head, target, FetchAt::Warehouse).await?;
             verified.push(remote_head.as_str());
         }
@@ -149,6 +155,12 @@ pub async fn handle_command(pallet: Option<String>,
     // remote no longer serves it; nothing else is left out, so a head write here never meets
     // absent content it does not tolerate.
     let early = apply_reported(client.url(), &info);
+
+    if let Err(why) = refuse_unapplied_skips(&client) {
+        warn_applied_unsettled(&early);
+        return Err(why.into());
+    }
+
     skip_applied_reported(&client, &info);
 
     let mut report = LowerReport {
@@ -1119,6 +1131,11 @@ pub(crate) fn apply_reported(url: &str, info: &forklift_core::model::remote::War
     })
 }
 
+/// The content the remote whose handshake is `info` reports redacted and applied.
+pub(crate) fn reported_applied(info: &forklift_core::model::remote::WarehouseInfo) -> std::collections::HashSet<String> {
+    info.applied_redactions().into_iter().map(str::to_string).collect()
+}
+
 /// Make `client`'s fetch walks leave out the content its handshake `info` reports redacted where
 /// this warehouse has applied that redaction too, so a ref write tolerates its absence. When the
 /// applied record cannot be read nothing is left out, and a fetch that needs the content is refused
@@ -1139,8 +1156,14 @@ pub(crate) fn skip_applied_reported(client: &forklift_core::util::remote_utils::
 ///
 /// [`RemoteClient::skip_files`]: forklift_core::util::remote_utils::RemoteClient::skip_files
 pub(crate) fn refuse_unapplied_skips(client: &forklift_core::util::remote_utils::RemoteClient) -> Result<(), String> {
+    let skipped = client.skipped_files();
+
+    if skipped.is_empty() {
+        return Ok(());
+    }
+
     let applied = forklift_core::util::applied_redactions::read_applied()?;
-    let mut unapplied: Vec<String> = client.skipped_files().into_iter().filter(|hash| !applied.contains(hash)).collect();
+    let mut unapplied: Vec<String> = skipped.into_iter().filter(|hash| !applied.contains(hash)).collect();
 
     unapplied.sort();
 

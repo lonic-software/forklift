@@ -2239,3 +2239,33 @@ fn a_lower_refused_after_applying_a_redaction_warns_it_unsettled() {
     assert_eq!(lowered["ok"], true, "{}", lowered);
     assert_eq!(late.head("main"), server.main());
 }
+
+/// A first-contact lower fetches the pallet's history before any `@redactions` is here: it leaves
+/// out what the remote reports applied, applies it once the meta pallets are synced, and takes the
+/// head. Revert: fetching every file at first contact, and the lower is refused as redacted.
+#[test]
+fn a_first_contact_lower_takes_history_naming_applied_content_without_it() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-first-server-{}", std::process::id())));
+    let content = b"TOKEN=hunter2\n";
+
+    let owner = Warehouse::cloned("first-owner", &server.url);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+
+    let behind = Warehouse::cloned("first-behind", &server.url);
+    behind.leaked("secret.env", content);
+    let hash = owner.redact_loaded("secret.env", content, "leaked token");
+    owner.run_ok(&["lift"]);
+    behind.run_ok(&["lower"]);
+    behind.run_ok(&["lift"]);
+
+    let fresh = Warehouse::new("first-fresh");
+    fresh.run_ok(&["config", "set", "remote.url", &server.url]);
+    let lowered = fresh.json(&["lower"]);
+    assert_eq!(lowered["ok"], true, "{}", lowered);
+    assert_eq!(lowered["data"]["redactions"]["applied"], serde_json::json!([hash]), "{}", lowered);
+    assert_eq!(fresh.head("main"), server.main());
+    assert!(!fresh.holds_loose(&hash));
+    assert_eq!(applied_record(&fresh), format!("/forklift-redactions-applied 1\n{}\n", hash));
+}
