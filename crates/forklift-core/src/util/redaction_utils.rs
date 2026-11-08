@@ -507,11 +507,40 @@ impl HoldingWalk {
     /// * `Ok(WalkProgress)` - Where the walk stands now.
     /// * `Err(String)`      - An object it needs could not be read.
     pub fn step(&mut self, redaction: &Redaction, objects: &dyn WalkObjects) -> Result<WalkProgress, String> {
+        self.step_judging(&redaction.hash, Some(redaction), objects)
+    }
+
+    /// Read the next object of a meta pallet's walk ([`HoldingWalk::of_history`]), judging it
+    /// against `hash` alone: a history walk looks for the hash itself and needs nothing else a
+    /// redaction says, so content no redaction names, such as withheld content, can be walked for.
+    /// A step that fails leaves the walk as it was.
+    ///
+    /// # Returns
+    /// * `Ok(WalkProgress)` - Where the walk stands now.
+    /// * `Err(String)`      - An object it needs could not be read, or this is a user pallet's walk,
+    ///                        which judges a recipe by its redaction's chunk list.
+    pub fn step_for_hash(&mut self, hash: &str, objects: &dyn WalkObjects) -> Result<WalkProgress, String> {
+        self.step_judging(hash, None, objects)
+    }
+
+    /// [`HoldingWalk::step`] for content of `hash`, which `redaction` names when there is one.
+    fn step_judging(&mut self,
+                    hash: &str,
+                    redaction: Option<&Redaction>,
+                    objects: &dyn WalkObjects) -> Result<WalkProgress, String> {
+        if !self.history && redaction.is_none() {
+            return Err(format!(
+                "A user pallet's walk for {} judges a recipe by its redaction's chunk list, and was \
+                given no redaction.",
+                hash
+            ));
+        }
+
         let Some((object, is_parcel)) = self.frontier.last().cloned() else {
             return Ok(WalkProgress::Clear);
         };
 
-        if self.history && object == redaction.hash {
+        if self.history && object == hash {
             return Ok(WalkProgress::Names);
         }
 
@@ -532,10 +561,10 @@ impl HoldingWalk {
             let tree = objects.load_tree(&object)?;
 
             if self.history {
-                if tree.get_files().any(|(_, file)| file.hash == redaction.hash) {
+                if tree.get_files().any(|(_, file)| file.hash == hash) {
                     return Ok(WalkProgress::Names);
                 }
-            } else {
+            } else if let Some(redaction) = redaction {
                 let set = RedactedSet::of(redaction);
 
                 if !set.chunk_lists.is_empty() {
@@ -1753,5 +1782,37 @@ mod tests {
 
         assert_eq!(walk_out(&mut HoldingWalk::of_tree(&new), &redaction, &objects).0, WalkProgress::Clear);
         assert_eq!(walk_out(&mut HoldingWalk::of_history(&new), &redaction, &objects).0, WalkProgress::Names);
+    }
+
+    /// Walk a meta pallet's history for a bare hash to the end, one step at a time.
+    fn walk_out_for(walk: &mut HoldingWalk, hash: &str, objects: &Objects) -> WalkProgress {
+        for _ in 1..100 {
+            match walk.step_for_hash(hash, objects).expect("step") {
+                WalkProgress::Going => {}
+                done => return done,
+            }
+        }
+        panic!("the walk never ended");
+    }
+
+    // Revert: judge a tree's files against anything but the given hash → the old file is not
+    // found. Revert: take a hash-only step on a tree walk → it walks instead of refusing.
+    #[test]
+    fn a_history_walk_for_a_bare_hash_finds_it_anywhere_in_history() {
+        let kept = "k".repeat(64);
+        let other = "o".repeat(64);
+        let mut objects = Objects { trees: HashMap::new(), parcels: HashMap::new(), flaky: Default::default() };
+        let old = history(&mut objects, 1, &[], &kept);
+        let new = history(&mut objects, 2, &[&old], &"c".repeat(64));
+
+        assert_eq!(walk_out_for(&mut HoldingWalk::of_history(&new), &kept, &objects), WalkProgress::Names);
+        assert_eq!(walk_out_for(&mut HoldingWalk::of_history(&new), &other, &objects), WalkProgress::Clear);
+        assert_eq!(walk_out_for(&mut HoldingWalk::of_history(&new), &old, &objects), WalkProgress::Names,
+                   "a parcel of the history is named too");
+
+        let mut tree_walk = HoldingWalk::of_tree(&old);
+        let before = tree_walk.clone();
+        assert!(tree_walk.step_for_hash(&kept, &objects).is_err(), "a tree walk needs a redaction");
+        assert_eq!(tree_walk, before);
     }
 }

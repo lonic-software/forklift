@@ -1817,7 +1817,7 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
         &local_chunks_missing,
         &|hash| object_utils::recipe_chunk_hashes(hash),
         &|hash| object_utils::load_tree(hash),
-        &|| Ok(AppliedSet::default()),
+        &|| Ok((AppliedSet::default(), WithheldSet::default())),
     )
 }
 
@@ -2027,13 +2027,14 @@ pub fn head_not_materializable_message(path: &str) -> String {
 ///                          this parameter and the mode stops mattering. On the self-host head
 ///                          everything comes from the local store. Never called for a creation
 ///                          (`known_complete: None`), which takes no candidates at all.
-/// * `applied`            - Reads the redactions the remote applied. A remote must hold the whole
-///                          closure of every head it accepts but for the content it redacted, so an
-///                          absent file's content one of them names is tolerated, as
-///                          [`verify_parcel_closure_for_write`] tolerates it, and the same hash
-///                          absent as a tree or a chunk is not. Called only once the walk without
-///                          it has failed, so a remote holding the whole closure never depends on
-///                          it.
+/// * `removed`            - Reads the redactions the remote applied and the content it withholds.
+///                          A remote must hold the whole closure of every head it accepts but for
+///                          the content it redacted or withholds, so an absent file's content one
+///                          of them names is tolerated, as [`verify_parcel_closure_for_write`]
+///                          tolerates it, and the same hash absent as a tree or a chunk is not. A
+///                          refusal naming withheld content says the host withholds it
+///                          ([`withheld_beyond_files`]). Called only once the walk without it has
+///                          failed, so a remote holding the whole closure never depends on it.
 pub fn verify_parcel_closure_with(
     head: &str,
     known_complete: Option<&str>,
@@ -2041,7 +2042,7 @@ pub fn verify_parcel_closure_with(
     chunks_missing: &dyn Fn(&[String]) -> Result<Vec<String>, String>,
     load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
     load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>,
-    applied: &dyn Fn() -> Result<AppliedSet, String>,
+    removed: &dyn Fn() -> Result<(AppliedSet, WithheldSet), String>,
 ) -> Result<(), String> {
     let bounds = known_complete.as_ref().map(std::slice::from_ref);
     let seams = ClosureSeams { blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, sealed: None };
@@ -2050,20 +2051,23 @@ pub fn verify_parcel_closure_with(
         return Ok(());
     };
 
-    let applied = applied().map_err(|error| format!(
-        "{} The record of the redactions applied here cannot be read either: {}",
+    let (applied, withheld) = removed().map_err(|error| format!(
+        "{} The record of the redactions applied here, or of the content withheld here, cannot be \
+        read either: {}",
         missing, error
     ))?;
 
-    if applied.is_empty() {
+    let tolerated = Tolerated::removed_only(applied, withheld);
+
+    if tolerated.is_empty() {
         return Err(missing);
     }
 
-    let tolerated = Tolerated::removed_only(applied, WithheldSet::default());
     let tolerance = SealedTolerance::new(&tolerated);
     let seams = ClosureSeams { sealed: Some(&tolerance), ..seams };
 
     verify_closure_core(head, bounds, known_complete, &PathScope::full(), false, &seams)
+        .map_err(|refusal| withheld_beyond_files(refusal, &tolerated.withheld))
 }
 
 /// The object-store reads [`verify_closure_core`] varies by head (see
