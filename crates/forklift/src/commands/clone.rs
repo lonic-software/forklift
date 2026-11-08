@@ -594,6 +594,11 @@ async fn franchise_into_prepared_target(
     // that anchor, its office or a meta pallet is installed, so a refusal leaves no trust behind.
     // At the scope this clone asks for, which is not on disk yet. A cache fetches the parcels and
     // records their content, then fetches the verified head's own content, which it checks out.
+    // Leave out the content the remote reports redacted: it no longer serves it. Whether this
+    // clone can apply those redactions too is known only once the meta pallets are adopted below,
+    // and a head over history missing one it cannot is refused then.
+    client.skip_files(info.applied_redactions().into_iter().map(str::to_string).collect());
+
     let fetched = match &remote_head {
         Some(remote_head) => {
             let mut stats = remote_utils::fetch_history_at(client, remote_head, &pallet_name, &fetch_scope, &Progress::NONE).await?;
@@ -623,9 +628,11 @@ async fn franchise_into_prepared_target(
 
     report.meta_adopted = meta.adopted;
 
-    // Before the pallet's head is written, whose history may name content the remote reports
-    // applied, and so never fetched. A clone that fails after this keeps the redactions applied.
-    let early = lower::apply_reported(client.url(), &info);
+    // Before the pallet's head is written, whose history may name content the fetch left out. A
+    // clone that fails after this keeps the redactions applied, and warns so.
+    let mut early = AppliedEarly(Some(lower::apply_reported(client.url(), &info)));
+
+    lower::refuse_unapplied_skips(client)?;
 
     let (Some(remote_head), Some(stats)) = (remote_head, fetched) else {
         // Legitimately unborn: `resolve_pallet` already ruled out a typo before any of this
@@ -642,7 +649,7 @@ async fn franchise_into_prepared_target(
 
         report.pallet = pallet_name;
         report.unborn = true;
-        report.redactions = lower::settle_redactions(client.url(), &info, early, &mut None);
+        report.redactions = lower::settle_redactions(client.url(), &info, early.settle(), &mut None);
         emit_report(&mut report, client);
 
         return Ok(());
@@ -738,10 +745,29 @@ async fn franchise_into_prepared_target(
 
     // Once the clone is finished: a failure only warns, and `redact apply` finishes it. Nothing
     // here holds the store shared, so the deletion is not owed to this command's own hold.
-    report.redactions = lower::settle_redactions(client.url(), &info, early, &mut None);
+    report.redactions = lower::settle_redactions(client.url(), &info, early.settle(), &mut None);
     emit_report(&mut report, client);
 
     Ok(())
+}
+
+/// The redactions a clone applied before writing the pallet's head: settled once the clone is
+/// done, and named in a warning when it fails first, since their copies then stay.
+struct AppliedEarly(Option<Vec<String>>);
+
+impl AppliedEarly {
+    /// Hand the redactions on to be settled; the warning is no longer owed.
+    fn settle(&mut self) -> Vec<String> {
+        self.0.take().unwrap_or_default()
+    }
+}
+
+impl Drop for AppliedEarly {
+    fn drop(&mut self) {
+        if let Some(early) = self.0.take() {
+            lower::warn_applied_unsettled(&early);
+        }
+    }
 }
 
 /// Which pallet to check out, resolved from the handshake alone (see `resolve_pallet`).

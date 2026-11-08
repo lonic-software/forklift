@@ -2319,13 +2319,12 @@ pub struct RemoteClient {
     /// the command reads back through [`Self::batch_lane_closure`] to tell the user why it ran
     /// slow.
     batch_lane_closed: std::sync::Arc<std::sync::OnceLock<BatchLaneClosure>>,
-    /// The redactions this remote's last handshake reported applied, by hash, shared by every
-    /// clone. A fetch walk never asks for a file these name: the remote refuses its content, and a
-    /// ref write here takes history naming it without it only once the redaction is applied here
-    /// too, from a cell of this warehouse's own `@redactions` (see
-    /// [`applied_redactions::apply`](crate::util::applied_redactions::apply)). Empty until a
-    /// handshake is read.
-    reported_redacted: std::sync::Arc<std::sync::RwLock<std::sync::Arc<HashSet<String>>>>,
+    /// The file contents a fetch walk through this client, or any clone of it, never asks for nor
+    /// descends: content the remote reports redacted, set by [`Self::skip_files`]. Empty unless a
+    /// command set it, so every walk asks for every file it reaches by default.
+    skip_files: std::sync::Arc<std::sync::RwLock<std::sync::Arc<HashSet<String>>>>,
+    /// The members of `skip_files` a walk met and left out, read by [`Self::skipped_files`].
+    skipped_files: std::sync::Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 /// Compose the client-facing error for a non-success response, threading a server-side refusal
@@ -2523,7 +2522,8 @@ impl RemoteClient {
             base: url.trim_end_matches('/').to_string(),
             token,
             batch_lane_closed: Default::default(),
-            reported_redacted: Default::default(),
+            skip_files: Default::default(),
+            skipped_files: Default::default(),
         })
     }
 
@@ -3245,16 +3245,39 @@ impl RemoteClient {
             ).into());
         }
 
-        let reported: HashSet<String> = info.applied_redactions().into_iter().map(str::to_string).collect();
-        *self.reported_redacted.write().unwrap_or_else(std::sync::PoisonError::into_inner) = std::sync::Arc::new(reported);
-
         Ok(info)
     }
 
-    /// The redactions the last handshake read through this client, or any clone of it, reported
-    /// applied: the files a fetch walk does not ask this remote for.
-    fn reported_redacted(&self) -> std::sync::Arc<HashSet<String>> {
-        self.reported_redacted.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    /// Make every later fetch walk through this client, or any clone of it, leave out the files
+    /// whose content is one of `hashes`: never ask for them, nor descend their recipes. A command
+    /// sets this only to content the remote reports redacted, and only where it applies that
+    /// redaction here before writing a head over the history, since a ref write takes history
+    /// naming absent content only once the redaction is applied here (see
+    /// [`applied_redactions::apply`](crate::util::applied_redactions::apply)).
+    pub fn skip_files(&self, hashes: HashSet<String>) {
+        *self.skip_files.write().unwrap_or_else(std::sync::PoisonError::into_inner) = std::sync::Arc::new(hashes);
+    }
+
+    /// The files of [`Self::skip_files`] that a walk through this client, or any clone of it, met
+    /// and left out.
+    pub fn skipped_files(&self) -> HashSet<String> {
+        self.skipped_files.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    /// Whether a walk leaves out the file whose content is `hash`, noting it as skipped if so.
+    fn skips_file(&self, skip: &HashSet<String>, hash: &str) -> bool {
+        if !skip.contains(hash) {
+            return false;
+        }
+
+        self.skipped_files.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(hash.to_string());
+
+        true
+    }
+
+    /// The files a walk leaves out (see [`Self::skip_files`]).
+    fn skip_set(&self) -> std::sync::Arc<HashSet<String>> {
+        self.skip_files.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
     /// The head-wait budget to arm for *this* client instance's call to [`Self::missing_objects`]
@@ -5028,7 +5051,7 @@ async fn fetch_tree_closures(client: &RemoteClient,
                              seen: &mut ContentSeen,
                              stats: &mut FetchStats,
                              progress: &Progress) -> Result<(), String> {
-    let redacted = client.reported_redacted();
+    let skip = client.skip_set();
 
     while !tree_frontier.is_empty() {
         let tree_wave: Vec<String> = tree_frontier.drain(..)
@@ -5048,8 +5071,9 @@ async fn fetch_tree_closures(client: &RemoteClient,
             let tree = object_utils::load_tree(tree_hash)?;
 
             for (_, file) in tree.get_files() {
-                // A file the remote reports redacted is never asked for, nor its recipe descended.
-                if !redacted.contains(&file.hash) && seen.blobs.insert(file.hash.clone()) {
+                // A file the command skips (see `RemoteClient::skip_files`) is never asked for,
+                // nor its recipe descended.
+                if !client.skips_file(&skip, &file.hash) && seen.blobs.insert(file.hash.clone()) {
                     blob_wave.push(file.hash.clone());
 
                     // A chunked file's entry names a recipe: fetch it with the blob wave, then
@@ -5674,9 +5698,9 @@ async fn fetch_scoped_from(client: &RemoteClient,
     let mut parcel_frontier: Vec<String> = vec![head.to_string()];
     let mut signatures = walk_signatures();
 
-    // A file the remote reports redacted is never asked for, nor its recipe descended (see
-    // `fetch_tree_closures`).
-    let redacted = client.reported_redacted();
+    // A file the command skips is never asked for, nor its recipe descended (see
+    // `RemoteClient::skip_files`).
+    let skip = client.skip_set();
 
     while !parcel_frontier.is_empty() {
         let candidates: Vec<String> = parcel_frontier.drain(..)
@@ -5739,7 +5763,7 @@ async fn fetch_scoped_from(client: &RemoteClient,
                 // it is sealed, unless the classifier holds it in scope: the ignore files above a
                 // prefix are in every scope, though every declared prefix names a directory.
                 if scope.classify(&scope_join(&path, name)) == ScopeClass::InScope
-                    && !redacted.contains(&file.hash)
+                    && !client.skips_file(&skip, &file.hash)
                     && first_visit(&prior.blobs, &mut seen.blobs, &file.hash)
                 {
                     spine_blobs.push(file.hash.clone());
@@ -5780,7 +5804,7 @@ async fn fetch_scoped_from(client: &RemoteClient,
                 let tree = object_utils::load_tree(tree_hash)?;
 
                 for (_, file) in tree.get_files() {
-                    if !redacted.contains(&file.hash) && first_visit(&prior.blobs, &mut seen.blobs, &file.hash) {
+                    if !client.skips_file(&skip, &file.hash) && first_visit(&prior.blobs, &mut seen.blobs, &file.hash) {
                         blob_wave.push(file.hash.clone());
 
                         // Everything under an in-scope prefix is in scope, so every chunked file

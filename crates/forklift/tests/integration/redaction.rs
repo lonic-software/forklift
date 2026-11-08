@@ -2166,3 +2166,76 @@ fn a_lower_and_a_clone_take_history_naming_applied_content_without_it() {
     assert!(!empty.holds_loose(&hash));
     assert_eq!(applied_record(&empty), format!("/forklift-redactions-applied 1\n{}\n", hash));
 }
+
+/// A sparse clone and lower walk the in-scope files of every parcel: one named by history in scope,
+/// whose content the remote reports applied, is left out as a full fetch leaves it out. Revert:
+/// the sparse walk asks for every in-scope file regardless, and both are refused as redacted.
+#[test]
+fn a_sparse_clone_and_lower_take_in_scope_history_naming_applied_content_without_it() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-sparse-server-{}", std::process::id())));
+    let content = b"TOKEN=hunter2\n";
+
+    let owner = Warehouse::cloned("sparse-owner", &server.url);
+    owner.stack("src/keep.txt", b"keep\n", "keep");
+    owner.run_ok(&["lift"]);
+
+    let late = Warehouse::cloned_with("sparse-late", &server.url, &["--only", "src"]);
+
+    let behind = Warehouse::cloned("sparse-behind", &server.url);
+    behind.leaked("src/secret.env", content);
+    let hash = owner.redact_loaded("src/secret.env", content, "leaked token");
+    owner.run_ok(&["lift"]);
+    behind.run_ok(&["lower"]);
+    behind.run_ok(&["lift"]);
+
+    let lowered = late.json(&["lower"]);
+    assert_eq!(lowered["ok"], true, "{}", lowered);
+    assert_eq!(lowered["data"]["redactions"]["applied"], serde_json::json!([hash]), "{}", lowered);
+    assert_eq!(late.head("main"), server.main());
+
+    let fresh = Warehouse::cloned_with("sparse-fresh", &server.url, &["--only", "src"]);
+    assert_eq!(fresh.head("main"), server.main());
+    assert!(!fresh.holds_loose(&hash));
+    assert_eq!(applied_record(&fresh), format!("/forklift-redactions-applied 1\n{}\n", hash));
+}
+
+/// A lower applies what the remote reports applied before it writes anything, so one refused
+/// afterwards keeps the redaction applied and warns `redactions_unsettled`, naming it; the next
+/// lower goes through. Revert: dropping the warning on the refused path leaves its stderr silent.
+#[test]
+fn a_lower_refused_after_applying_a_redaction_warns_it_unsettled() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-refused-server-{}", std::process::id())));
+    let content = b"TOKEN=hunter2\n";
+
+    let owner = Warehouse::cloned("refused-owner", &server.url);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+
+    let late = Warehouse::cloned("refused-late", &server.url);
+
+    let behind = Warehouse::cloned("refused-behind", &server.url);
+    behind.leaked("secret.env", content);
+    let _ = std::fs::remove_file(behind.root.join("secret.env"));
+    behind.stack("more.txt", b"more\n", "more");
+    let hash = owner.redact_loaded("secret.env", content, "leaked token");
+    owner.run_ok(&["lift"]);
+    behind.run_ok(&["lower"]);
+    behind.run_ok(&["lift"]);
+
+    // An untracked file in the way of the one the remote's head adds refuses the lower.
+    std::fs::write(late.root.join("more.txt"), b"mine\n").unwrap();
+    let before = late.head("main");
+    let refused = late.run(&["--json", "lower"]);
+    assert!(!refused.status.success(), "{}", String::from_utf8_lossy(&refused.stdout));
+    assert_eq!(late.head("main"), before);
+    let warned = String::from_utf8_lossy(&refused.stderr);
+    assert!(warned.contains("\"redactions_unsettled\"") && warned.contains(&hash), "{}", warned);
+    assert_eq!(applied_record(&late), format!("/forklift-redactions-applied 1\n{}\n", hash));
+
+    std::fs::remove_file(late.root.join("more.txt")).unwrap();
+    let lowered = late.json(&["lower"]);
+    assert_eq!(lowered["ok"], true, "{}", lowered);
+    assert_eq!(late.head("main"), server.main());
+}

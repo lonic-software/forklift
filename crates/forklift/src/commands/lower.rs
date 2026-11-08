@@ -145,9 +145,11 @@ pub async fn handle_command(pallet: Option<String>,
     // materialized; diverged ones are reconciled by their pallet's policy.
     let meta = sync_meta(&client, &info, &keeps).await;
 
-    // Before any pallet's head is written, which may take history naming content the remote
-    // reports applied, and so never fetched.
+    // Before any pallet's history is fetched: what this applies, the fetch leaves out, as the
+    // remote no longer serves it; nothing else is left out, so a head write here never meets
+    // absent content it does not tolerate.
     let early = apply_reported(client.url(), &info);
+    skip_applied_reported(&client, &info);
 
     let mut report = LowerReport {
         adopted_genesis: trust.adopted_genesis,
@@ -1117,6 +1119,37 @@ pub(crate) fn apply_reported(url: &str, info: &forklift_core::model::remote::War
     })
 }
 
+/// Make `client`'s fetch walks leave out the content its handshake `info` reports redacted where
+/// this warehouse has applied that redaction too, so a ref write tolerates its absence. When the
+/// applied record cannot be read nothing is left out, and a fetch that needs the content is refused
+/// by the remote, as before.
+pub(crate) fn skip_applied_reported(client: &forklift_core::util::remote_utils::RemoteClient,
+                                    info: &forklift_core::model::remote::WarehouseInfo) {
+    let Ok(applied) = forklift_core::util::applied_redactions::read_applied() else { return };
+
+    client.skip_files(info.applied_redactions().into_iter()
+        .filter(|hash| applied.contains(hash))
+        .map(str::to_string)
+        .collect());
+}
+
+/// Refuse, as `content_redacted`, history `client`'s fetch left out content of (see
+/// [`RemoteClient::skip_files`]) when this warehouse has not applied that redaction: the remote
+/// no longer serves the content, and a head write here would find the history incomplete.
+///
+/// [`RemoteClient::skip_files`]: forklift_core::util::remote_utils::RemoteClient::skip_files
+pub(crate) fn refuse_unapplied_skips(client: &forklift_core::util::remote_utils::RemoteClient) -> Result<(), String> {
+    let applied = forklift_core::util::applied_redactions::read_applied()?;
+    let mut unapplied: Vec<String> = client.skipped_files().into_iter().filter(|hash| !applied.contains(hash)).collect();
+
+    unapplied.sort();
+
+    match unapplied.into_iter().next() {
+        Some(hash) => Err(forklift_core::util::applied_redactions::unapplied_skip_refusal(&hash)),
+        None => Ok(()),
+    }
+}
+
 /// Apply the redactions the remote at `url`, whose handshake is `info`, reports applied, once the
 /// pallet has landed and nothing here names their content any more, and delete the copies of
 /// those and of `early`, the ones [`apply_reported`] applied before the pallet's head was written.
@@ -1126,18 +1159,12 @@ pub(crate) fn apply_reported(url: &str, info: &forklift_core::model::remote::War
 /// owed by an earlier command is left to `redact apply` too.
 ///
 /// # Returns
-/// What was applied, deleted and kept; `None` when nothing was applied, or the apply failed.
+/// What was applied, deleted and kept; `None` when nothing was applied, here or early.
 pub(crate) fn settle_redactions(url: &str,
                                 info: &forklift_core::model::remote::WarehouseInfo,
                                 early: Vec<String>,
                                 store_access: &mut Option<forklift_core::util::lock_utils::StoreAccessLock>) -> Option<redact::Settled> {
-    let report = forklift_core::util::applied_redactions::RemoteReport::of(url, info);
-    let later = redact::apply_on_report(&report).unwrap_or_else(|why| {
-        output::warn_redactions_unsettled(&format!(
-            "The redactions the remote reports applied were not applied here: {}", why.trim_end()
-        ));
-        Vec::new()
-    });
+    let later = apply_reported(url, info);
     let applied: Vec<String> = early.into_iter().chain(later).collect();
 
     if applied.is_empty() {

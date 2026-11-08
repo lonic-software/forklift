@@ -1102,8 +1102,8 @@ pub const CODE_REDACTIONS_UNSETTLED: &str = "redactions_unsettled";
 
 /// What to do about [`CODE_REDACTIONS_UNSETTLED`].
 pub const REDACTIONS_UNSETTLED_NEXT_STEP: &str =
-    "Resolve the reported cause, then run \"forklift redact apply\", which applies what the remote reports \
-     applied and deletes the copies. The command's own work is unaffected.";
+    "Run \"forklift redact apply\" once any cause named is resolved: it applies what the remote reports \
+     applied and deletes the copies. The warning leaves the command's own outcome as it was.";
 
 /// Surface a lower or clone that could not settle its remote's applied redactions, on the stderr
 /// side-channel the other warnings use: the exit code stays the command's own.
