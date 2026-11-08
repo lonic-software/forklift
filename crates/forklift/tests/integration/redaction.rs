@@ -2306,9 +2306,18 @@ fn behind_an_applied_redaction(name: &str) -> Behind {
     std::fs::create_dir_all(owner.root.join("other")).unwrap();
     let hash = owner.redact_loaded("other/secret.env", content, "leaked token");
     owner.run_ok(&["lift"]);
-    let (_, info) = http(&server.url, "GET", "/v1/warehouse", b"");
-    let info: serde_json::Value = serde_json::from_str(&info).unwrap();
-    assert_eq!(info["redactions"], serde_json::json!([{ "hash": hash, "state": "deleted" }]), "{}", info);
+    // The server settles the apply after it answers the write, so its report may lag the lift.
+    let deleted = serde_json::json!([{ "hash": hash, "state": "deleted" }]);
+    let mut info = serde_json::Value::Null;
+    for _ in 0..500 {
+        let (_, body) = http(&server.url, "GET", "/v1/warehouse", b"");
+        info = serde_json::from_str(&body).unwrap();
+        if info["redactions"] == deleted {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(info["redactions"], deleted, "{}", info);
 
     Behind { server, sparse, cache, leak, hash }
 }
