@@ -14,6 +14,8 @@
 //! | `<warehouse>` | `trust`          | `anchor = <json>`  | the trust anchor               |
 //! | `<warehouse>` | `format`         | `state = <state>`  | the warehouse's format         |
 //! | `<warehouse>` | `redaction#<hash>` | `state = <json>` | where one redaction stands     |
+//! | `<warehouse>` | `chunk-fence`    | `state = <json>`   | the round of chunk deletion    |
+//! | `<warehouse>` | `chunk-ledger`   | `state = <json>`   | the recipes chunk rounds owe   |
 //!
 //! The format item's `state` is the format number (`1`), or `N>M owner step` while an upgrade
 //! from `N` to `M` holds it (`crate::format`). Every ref and trust write carries a fence on it as
@@ -38,7 +40,9 @@
 //! deciding (`crate::redaction`): its `state` is a versioned JSON record of the scan's verdicts
 //! and whether the redaction has applied. It is written by a `Put` conditioned on the exact
 //! bytes the writer read, behind the format fence, so two judges never overwrite each other's
-//! verdicts. A record of a version this build does not know fails every read of it.
+//! verdicts. A record of a version this build does not know fails every read of it. The chunk
+//! fence and the chunk ledger (`crate::head::chunks`) are written the same way, and a recipe's
+//! apply writes its redaction item and the ledger in one transaction ([`RefStore::put_items`]).
 //!
 //! The table's key schema must be `wh` (S, partition) and `entity` (S, sort); a deployment
 //! provisions it that way (the integration test creates exactly this table).
@@ -108,7 +112,7 @@ use crate::aws::sdk::describe;
 use crate::blocking::AsyncBridge;
 use crate::reissue::request_token;
 use crate::store::{
-    CasOutcome, ExpectedHead, FormatFence, FormatStore, OfficePrecondition, RedactionWrite, RedactionsPrecondition,
+    CasOutcome, ExpectedHead, FormatFence, FormatStore, ItemKey, ItemWrite, OfficePrecondition, RedactionWrite, RedactionsPrecondition,
     RefHead, RefListing,
     RefStore, TransientCause, TrustOutcome, TrustWriteOutcome, TRANSACTION_ATTEMPT_TIMEOUT,
 };
@@ -134,6 +138,19 @@ pub(crate) const ENTITY_TRUST: &str = "trust";
 pub(crate) const ENTITY_FORMAT: &str = "format";
 /// The sort-key prefix of a redaction item: `redaction#<hash>`.
 pub(crate) const ENTITY_REDACTION_PREFIX: &str = "redaction#";
+/// The sort key of the single chunk fence item.
+pub(crate) const ENTITY_CHUNK_FENCE: &str = "chunk-fence";
+/// The sort key of the single chunk ledger item.
+pub(crate) const ENTITY_CHUNK_LEDGER: &str = "chunk-ledger";
+
+/// The sort key of the item at `key`.
+pub(crate) fn item_entity(key: ItemKey<'_>) -> String {
+    match key {
+        ItemKey::Redaction(hash) => format!("{}{}", ENTITY_REDACTION_PREFIX, hash),
+        ItemKey::ChunkFence => ENTITY_CHUNK_FENCE.to_string(),
+        ItemKey::ChunkLedger => ENTITY_CHUNK_LEDGER.to_string(),
+    }
+}
 
 /// The sort key of a pallet head — `pallet#{wire}`, the qualified reference the fake keys on.
 fn pallet_entity(namespace: PalletNamespace, name: &str) -> String {
@@ -233,7 +250,7 @@ impl DynamoRefStore {
     /// same `TransactWriteItems` the pallet head CAS already needed (see this module's own
     /// docs), so the commit now conditions on everything the audit consumed, not only the one
     /// input the caller happened to be updating.
-    async fn get_item(
+    async fn read_item(
         &self,
         entity: &str,
     ) -> Result<Option<HashMap<String, AttributeValue>>, String> {
@@ -378,6 +395,29 @@ impl DynamoRefStore {
             .build()
     }
 
+    /// A `ConditionCheck` that the state item at `entity` still holds exactly `state`, or, for
+    /// `None`, that there is no such item.
+    fn state_condition_check(&self, entity: &str, state: Option<&str>) -> TransactWriteItem {
+        let builder = ConditionCheck::builder()
+            .set_key(Some(self.key(entity)))
+            .table_name(&self.table)
+            .return_values_on_condition_check_failure(ReturnValuesOnConditionCheckFailure::AllOld);
+
+        let builder = match state {
+            Some(state) => builder
+                .condition_expression("#s = :s")
+                .expression_attribute_names("#s", ATTR_STATE)
+                .expression_attribute_values(":s", s(state)),
+            None => builder
+                .condition_expression("attribute_not_exists(#e)")
+                .expression_attribute_names("#e", ATTR_ENTITY),
+        };
+
+        TransactWriteItem::builder()
+            .condition_check(builder.build().expect("every required ConditionCheck field is set"))
+            .build()
+    }
+
     /// The `Put` action that replaces the trust item, guarded on the incumbent anchor's **stored
     /// bytes** being exactly what the caller read. Always right after the format fence in the
     /// transaction `replace_trust` builds.
@@ -450,8 +490,10 @@ enum Precondition {
     RedactionsHead,
     /// The trust anchor's stored bytes, as [`RefStore::get_trust`] returned them.
     Anchor,
-    /// A redaction item's stored state, as [`RefStore::get_redaction`] returned it.
-    Redaction,
+    /// A state item's stored state, as [`RefStore::get_item`] returned it.
+    Item,
+    /// The chunk fence's stored state, as the ref update read it before its audit.
+    ChunkFence,
 }
 
 /// A `TransactWriteItems` under construction, together with the positional map of what each of
@@ -665,6 +707,7 @@ impl DynamoRefStore {
         office_head: OfficePrecondition<'_>,
         redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
+        chunk_fence: Option<Option<&str>>,
         format: &FormatFence,
         label: &str,
         request_token: &str,
@@ -727,6 +770,10 @@ impl DynamoRefStore {
 
         transaction.push(self.anchor_condition_check(anchor), Precondition::Anchor);
 
+        if let Some(fence) = chunk_fence {
+            transaction.push(self.state_condition_check(ENTITY_CHUNK_FENCE, fence), Precondition::ChunkFence);
+        }
+
         let refusal = transaction.send(&self.client, label, request_token).await?;
 
         Ok(match refusal {
@@ -741,9 +788,10 @@ impl DynamoRefStore {
             Some(Refusal::Moved(Precondition::RedactionsHead, _)) => CasOutcome::RedactionsMoved,
             Some(Refusal::Moved(Precondition::Anchor, _)) => CasOutcome::AnchorMoved,
             Some(Refusal::Moved(Precondition::Format, _)) => CasOutcome::FormatMoved,
-            // No action of a ref update conditions on a redaction item.
-            Some(Refusal::Moved(Precondition::Redaction, _)) => {
-                return Err(format!("{} was refused on a redaction-item precondition it never built.", label))
+            Some(Refusal::Moved(Precondition::ChunkFence, _)) => CasOutcome::ChunkFenceMoved,
+            // No action of a ref update writes a state item.
+            Some(Refusal::Moved(Precondition::Item, _)) => {
+                return Err(format!("{} was refused on a state-item precondition it never built.", label))
             }
         })
     }
@@ -754,14 +802,14 @@ impl RefStore for DynamoRefStore {
         let entity = pallet_entity(namespace, name);
 
         self.bridge.block_on(async {
-            Ok(self.get_item(&entity).await?.as_ref().map(ref_head_of).unwrap_or(RefHead::Absent))
+            Ok(self.read_item(&entity).await?.as_ref().map(ref_head_of).unwrap_or(RefHead::Absent))
         })
     }
 
     fn read_format(&self) -> Result<Option<String>, String> {
         self.bridge.block_on(async {
             Ok(self
-                .get_item(ENTITY_FORMAT)
+                .read_item(ENTITY_FORMAT)
                 .await?
                 .and_then(|item| item.get(ATTR_STATE).and_then(|value| value.as_s().ok()).cloned()))
         })
@@ -796,6 +844,7 @@ impl RefStore for DynamoRefStore {
         office_head: OfficePrecondition<'_>,
         redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
+        chunk_fence: Option<&str>,
         format: &FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
@@ -808,6 +857,7 @@ impl RefStore for DynamoRefStore {
             office_head,
             redactions,
             anchor,
+            Some(chunk_fence),
             format,
             "DynamoDB ref-update commit",
             request_token,
@@ -828,13 +878,15 @@ impl RefStore for DynamoRefStore {
         let entity = pallet_entity(namespace, name);
         let write = PalletWrite::Delete { old };
 
-        // A delete adds no content, so it checks nothing against the redactions.
+        // A delete adds no content, so it checks nothing against the redactions, and names nothing
+        // a round of chunk deletion could delete: the census counts a tombstone as a live head.
         self.bridge.block_on(self.commit(
             &entity,
             write,
             office_head,
             RedactionsPrecondition::NotConsumed,
             anchor,
+            None,
             format,
             "DynamoDB pallet delete",
             request_token,
@@ -895,68 +947,64 @@ impl RefStore for DynamoRefStore {
         Ok(self.default_pallet.clone())
     }
 
-    fn get_redaction(&self, hash: &str) -> Result<Option<String>, String> {
-        let entity = format!("{}{}", ENTITY_REDACTION_PREFIX, hash);
+    fn get_item(&self, key: ItemKey<'_>) -> Result<Option<String>, String> {
+        let entity = item_entity(key);
 
         self.bridge.block_on(async {
-            let Some(item) = self.get_item(&entity).await? else {
+            let Some(item) = self.read_item(&entity).await? else {
                 return Ok(None);
             };
 
             // An item with no readable state is not one this build wrote; reading it as absent
-            // would start the redaction over as pending.
+            // would start a redaction over as pending, or a round of chunk deletion over.
             match item.get(ATTR_STATE).and_then(|value| value.as_s().ok()) {
                 Some(state) => Ok(Some(state.clone())),
-                None => Err(format!("The redaction item for {} carries no state this build can read.", hash)),
+                None => Err(format!("The item {} carries no state this build can read.", entity)),
             }
         })
     }
 
-    fn put_redaction(
-        &self,
-        hash: &str,
-        state: &str,
-        expected: Option<&str>,
-        format: &FormatFence,
-    ) -> Result<RedactionWrite, String> {
-        let entity = format!("{}{}", ENTITY_REDACTION_PREFIX, hash);
-        let mut item = self.key(&entity);
-        item.insert(ATTR_STATE.to_string(), s(state));
-
-        let builder = Put::builder()
-            .set_item(Some(item))
-            .table_name(&self.table)
-            .return_values_on_condition_check_failure(ReturnValuesOnConditionCheckFailure::AllOld);
-
-        // String equality on the stored bytes, as the anchor's condition is: whatever moved
-        // them, the writer's verdicts were read from something else.
-        let put = match expected {
-            Some(bytes) => builder
-                .condition_expression("#s = :s")
-                .expression_attribute_names("#s", ATTR_STATE)
-                .expression_attribute_values(":s", s(bytes)),
-            None => builder
-                .condition_expression("attribute_not_exists(#e)")
-                .expression_attribute_names("#e", ATTR_ENTITY),
-        }
-        .build()
-        .expect("every required Put field is set");
-
+    fn put_items(&self, writes: &[ItemWrite<'_>], format: &FormatFence) -> Result<RedactionWrite, String> {
         let mut transaction = ConditionedTransaction::new();
 
         transaction.push(self.format_action(format), Precondition::Format);
-        transaction.push(TransactWriteItem::builder().put(put).build(), Precondition::Redaction);
+
+        for write in writes {
+            let mut item = self.key(&item_entity(write.key));
+            item.insert(ATTR_STATE.to_string(), s(write.state));
+
+            let builder = Put::builder()
+                .set_item(Some(item))
+                .table_name(&self.table)
+                .return_values_on_condition_check_failure(ReturnValuesOnConditionCheckFailure::AllOld);
+
+            // String equality on the stored bytes, as the anchor's condition is: whatever moved
+            // them, the writer's decisions were read from something else.
+            let put = match write.expected {
+                Some(bytes) => builder
+                    .condition_expression("#s = :s")
+                    .expression_attribute_names("#s", ATTR_STATE)
+                    .expression_attribute_values(":s", s(bytes)),
+                None => builder
+                    .condition_expression("attribute_not_exists(#e)")
+                    .expression_attribute_names("#e", ATTR_ENTITY),
+            }
+            .build()
+            .expect("every required Put field is set");
+
+            transaction.push(TransactWriteItem::builder().put(put).build(), Precondition::Item);
+        }
 
         self.bridge.block_on(async {
-            let refusal = transaction.send(&self.client, "DynamoDB redaction write", &request_token()).await?;
+            let refusal = transaction.send(&self.client, "DynamoDB state-item write", &request_token()).await?;
 
             match refusal {
                 None => Ok(RedactionWrite::Written),
                 Some(Refusal::Transient(cause)) => Ok(RedactionWrite::Transient(cause)),
                 Some(Refusal::Moved(Precondition::Format, _)) => Ok(RedactionWrite::FormatMoved),
-                Some(Refusal::Moved(Precondition::Redaction, _)) => Ok(RedactionWrite::Moved),
+                Some(Refusal::Moved(Precondition::Item, _)) => Ok(RedactionWrite::Moved),
                 Some(Refusal::Moved(precondition, _)) => Err(format!(
-                    "DynamoDB redaction write was refused on a {:?} precondition it never built.",
+                    "DynamoDB state-item write was refused on a {:?} precondition it never built.",
                     precondition
                 )),
             }
@@ -965,7 +1013,7 @@ impl RefStore for DynamoRefStore {
 
     fn get_trust(&self) -> Result<Option<(TrustAnchor, String)>, String> {
         self.bridge.block_on(async {
-            let Some(item) = self.get_item(ENTITY_TRUST).await? else {
+            let Some(item) = self.read_item(ENTITY_TRUST).await? else {
                 return Ok(None);
             };
 
@@ -1118,10 +1166,11 @@ impl RefStore for DynamoRefStore {
                         precondition it never built."
                         .to_string())
                 }
-                Some(Refusal::Moved(Precondition::Redaction, _)) => {
-                    return Err("DynamoDB anchor write was refused on a redaction-item \
-                        precondition it never built."
-                        .to_string())
+                Some(Refusal::Moved(precondition @ (Precondition::Item | Precondition::ChunkFence), _)) => {
+                    return Err(format!(
+                        "DynamoDB anchor write was refused on a {:?} precondition it never built.",
+                        precondition
+                    ))
                 }
             })
         })

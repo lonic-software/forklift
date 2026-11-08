@@ -79,6 +79,7 @@ fn this_build_serves_the_frozen_items() {
     assert_eq!(TrustAnchorDto::from(&anchor).genesis, hash('4'));
 
     assert!(forklift_aws_lambda::head::redaction_applied(&refs, &hash('8')).unwrap(), "the redaction item reads back");
+    forklift_aws_lambda::head::chunk_items_read(&refs).expect("the chunk deletion's items read back");
 }
 
 /// Every older AWS format's fixture the chain reaches upgrades through it and is then served; one

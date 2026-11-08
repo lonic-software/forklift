@@ -122,7 +122,12 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   hour after it applied, once every request then running has ended and every bundle URL handed out
   before has expired, the next request deletes those copies again, the bundles written before, and
   the redaction's scan progress; the handshake then reports it `deleted`. A redacted chunked file's
-  recipe and chunks are kept, its chunks still served, and it stays `deletion_owed`. Offloaded
+  chunks are deleted in rounds: until a round decides which of them nothing else in the warehouse
+  names, every chunk of its recipe answers `503` and is not stored again, and the round's census
+  and deletion hold ref updates back with `503` for as long as they run. The round deletes the
+  chunks only that recipe names, which are absent from then on, and keeps the rest. A second round
+  as late as the late sweep deletes a copy landed since, then the recipe itself, and only then is
+  the redaction `deleted`. A delete S3 refuses is retried, waiting longer each time. Offloaded
   bundles now live under `responses/{warehouse}/`; the `responses/` lifecycle rule expires the old
   shared keys. Deploying this needs the updated IAM policies: the verifier reads the DynamoDB table
   and deletes object versions, and the control plane keeps scan progress under `redaction-work/`

@@ -491,7 +491,7 @@ mod tests {
     }
 
     fn lift(refs: &dyn RefStore, fence: &FormatFence, expected: ExpectedHead, new: &str) -> CasOutcome {
-        refs.compare_and_set_head(PalletNamespace::User, "main", expected, new, OfficePrecondition::NotConsumed, RedactionsPrecondition::NotConsumed, None, fence, "t")
+        refs.compare_and_set_head(PalletNamespace::User, "main", expected, new, OfficePrecondition::NotConsumed, RedactionsPrecondition::NotConsumed, None, None, fence, "t")
             .expect("the fake does not fail")
     }
 

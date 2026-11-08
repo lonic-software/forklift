@@ -16,17 +16,20 @@
 //! Same blocking discipline as the control plane: `verify_and_promote` bridges S3 futures,
 //! so it runs on a blocking thread. It needs an object store and a ref store bound to the
 //! warehouse the staging key names ([`parse_staging_key`]): objects are keyed per warehouse, and
-//! the key is all an S3 event carries. The ref store is read for one thing only: the staged
-//! object's redaction item, before promoting and again after. Content whose redaction has
-//! applied is not promoted: its staged copy is deleted, and so is a canonical copy a promotion
-//! wrote (a recipe is kept, as the judge keeps it), and the event is consumed.
+//! the key is all an S3 event carries. The ref store is read for two things only: the staged
+//! object's redaction item, before promoting and again after, and the chunk round's fence.
+//! Content whose redaction has applied is not promoted: its staged copy is deleted, and so is a
+//! canonical copy a promotion wrote (a recipe whose chunks are still owed is kept, as the judge
+//! keeps it), and the event is consumed. Neither is a chunk of a recipe whose chunk round is
+//! running: its staged copy is deleted, so the lift naming it fails at its commit, and run again
+//! after the round, uploads it afresh.
 //!
 //! Build with `cargo build -p forklift-aws-lambda --features lambda --release`.
 
 use aws_lambda_events::event::s3::S3Event;
 use forklift_aws_lambda::aws::s3::parse_staging_key;
 use forklift_aws_lambda::aws::{build_clients, DynamoOps, DynamoRefStore, S3Ops};
-use forklift_aws_lambda::head::{delete_if_redaction_applied, AppliedCopies};
+use forklift_aws_lambda::head::{chunk_promotion_refused, delete_if_redaction_applied, AppliedCopies};
 use forklift_aws_lambda::store::{ObjectStore, PromoteOutcome};
 use forklift_aws_lambda::{config_from_env, AsyncBridge, S3ObjectStore};
 use lambda_runtime::{run, service_fn, Error, LambdaEvent};
@@ -120,10 +123,18 @@ async fn handler(event: LambdaEvent<S3Event>) -> Result<(), Error> {
         // anything is promoted, and an applied one has its copies deleted instead; it is read
         // again after the promotion, and an applied one has the copy just written deleted. An
         // item that cannot be read is a storage error too: never promoted on a guess.
-        let outcome = tokio::task::spawn_blocking(move || -> Result<Result<PromoteOutcome, AppliedCopies>, String> {
+        let outcome = tokio::task::spawn_blocking(move || -> Result<Result<PromoteOutcome, Refused>, String> {
             let before = delete_if_redaction_applied(&objects, &refs, &session, &hash)?;
             if before.applied() {
-                return Ok(Err(before));
+                return Ok(Err(Refused::Applied(before)));
+            }
+
+            // While a redacted-chunk round runs, a chunk of one of its recipes is not promoted: its
+            // staged copy is deleted, so the lift that needs it fails at its commit with
+            // `staged_upload_discarded`, and run again after the round, uploads it afresh.
+            if chunk_promotion_refused(&objects, &refs, std::slice::from_ref(&hash))?.is_some() {
+                objects.delete_staged_copy(&session, &hash)?;
+                return Ok(Err(Refused::RoundChunk));
             }
 
             let outcome = objects.verify_and_promote(&session, &hash)?;
@@ -135,7 +146,7 @@ async fn handler(event: LambdaEvent<S3Event>) -> Result<(), Error> {
             if !matches!(outcome, PromoteOutcome::Corrupt { .. }) {
                 let after = delete_if_redaction_applied(&objects, &refs, &session, &hash)?;
                 if after.applied() {
-                    return Ok(Err(after));
+                    return Ok(Err(Refused::Applied(after)));
                 }
             }
 
@@ -147,15 +158,19 @@ async fn handler(event: LambdaEvent<S3Event>) -> Result<(), Error> {
 
         let outcome = match outcome {
             Ok(outcome) => outcome,
-            Err(AppliedCopies::RecipeKept) => {
-                eprintln!("verifier: deleted staged object {}: its content is redacted, and its recipe is kept", key);
+            Err(Refused::RoundChunk) => {
+                eprintln!("verifier: deleted staged object {}: it is a chunk of a redacted file being deleted", key);
                 continue;
             }
-            Err(AppliedCopies::Deleted) => {
+            Err(Refused::Applied(AppliedCopies::RecipeKept)) => {
+                eprintln!("verifier: deleted staged object {}: its content is redacted, and the recipe is kept until its chunks are deleted", key);
+                continue;
+            }
+            Err(Refused::Applied(AppliedCopies::Deleted)) => {
                 eprintln!("verifier: deleted staged object {} and any canonical copy: its content is redacted", key);
                 continue;
             }
-            Err(AppliedCopies::Unapplied) => unreachable!("only an applied redaction stops a promotion"),
+            Err(Refused::Applied(AppliedCopies::Unapplied)) => unreachable!("only an applied redaction stops a promotion"),
         };
 
         match outcome {
@@ -170,6 +185,14 @@ async fn handler(event: LambdaEvent<S3Event>) -> Result<(), Error> {
     }
 
     Ok(())
+}
+
+/// Why a staged object was not promoted.
+enum Refused {
+    /// Its redaction has applied, and its copies were deleted.
+    Applied(AppliedCopies),
+    /// It is a chunk of a recipe whose redacted-chunk round is running.
+    RoundChunk,
 }
 
 /// Percent-decode an S3 event notification key: S3 encodes it the way a URL query string is

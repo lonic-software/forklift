@@ -21,7 +21,7 @@ use forklift_aws_lambda::head::{ObjectReadResult, ObjectWriteResult, TrustResult
 use forklift_aws_lambda::memory::{MemoryObjectStore, MemoryRefStore};
 use forklift_aws_lambda::scratch::Scratch;
 use forklift_aws_lambda::store::{
-    ExpectedHead, RefHead, RefListing,
+    ExpectedHead, ItemKey, ItemWrite, RedactionWrite, RefHead, RefListing,
     CasOutcome, ObjectStore, OfficePrecondition, RedactionsPrecondition, PromoteOutcome, PutOutcome, RefStore,
     SignatureOutcome, TransientCause, TrustOutcome, TrustWriteOutcome,
 };
@@ -443,7 +443,7 @@ fn gate_parcel<O: ObjectStore, R: RefStore>(head: &Head<O, R>,
 fn plant(refs: &MemoryRefStore, name: &str, new: &str) {
     let fence = forklift_aws_lambda::format::gate(refs).expect("format gate");
     let outcome = refs.compare_and_set_head(
-        pallet_utils::PalletNamespace::User, name, ExpectedHead::Unborn, new, OfficePrecondition::NotConsumed, RedactionsPrecondition::NotConsumed, None,
+        pallet_utils::PalletNamespace::User, name, ExpectedHead::Unborn, new, OfficePrecondition::NotConsumed, RedactionsPrecondition::NotConsumed, None, None,
         &fence, &request_token(),
     ).expect("plant");
     assert_eq!(outcome, CasOutcome::Committed);
@@ -585,7 +585,7 @@ fn plant_meta(refs: &MemoryRefStore, name: &str, expected: Option<&str>, new: &s
     let fence = forklift_aws_lambda::format::gate(refs).expect("format gate");
     let outcome = refs.compare_and_set_head(
         pallet_utils::PalletNamespace::Meta, name, expected.map_or(ExpectedHead::Unborn, ExpectedHead::At), new,
-        OfficePrecondition::NotConsumed, RedactionsPrecondition::NotConsumed, None, &fence, &request_token(),
+        OfficePrecondition::NotConsumed, RedactionsPrecondition::NotConsumed, None, None, &fence, &request_token(),
     ).expect("plant");
     assert_eq!(outcome, CasOutcome::Committed);
 }
@@ -729,20 +729,6 @@ impl RefStore for RedactionsMoveBeforeTheCommit {
         self.inner.read_format()
     }
 
-    fn get_redaction(&self, hash: &str) -> Result<Option<String>, String> {
-        self.inner.get_redaction(hash)
-    }
-
-    fn put_redaction(
-        &self,
-        hash: &str,
-        state: &str,
-        expected: Option<&str>,
-        format: &forklift_aws_lambda::FormatFence,
-    ) -> Result<forklift_aws_lambda::store::RedactionWrite, String> {
-        self.inner.put_redaction(hash, state, expected, format)
-    }
-
     fn partition_has_items(&self) -> Result<bool, String> {
         self.inner.partition_has_items()
     }
@@ -760,6 +746,7 @@ impl RefStore for RedactionsMoveBeforeTheCommit {
         office_head: OfficePrecondition<'_>,
         redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
+        chunk_fence: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
@@ -769,7 +756,7 @@ impl RefStore for RedactionsMoveBeforeTheCommit {
             plant_meta(&self.inner, REDACTIONS_PALLET_NAME, current.live(), &next);
         }
 
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, chunk_fence, format, request_token)
     }
 
     fn delete_head(
@@ -815,6 +802,18 @@ impl RefStore for RedactionsMoveBeforeTheCommit {
         request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
         self.inner.replace_trust(anchor, expected_anchor, office_head, format, request_token)
+    }
+
+    fn get_item(&self, key: forklift_aws_lambda::store::ItemKey<'_>) -> Result<Option<String>, String> {
+        self.inner.get_item(key)
+    }
+
+    fn put_items(
+        &self,
+        writes: &[forklift_aws_lambda::store::ItemWrite<'_>],
+        format: &forklift_aws_lambda::FormatFence,
+    ) -> Result<forklift_aws_lambda::store::RedactionWrite, String> {
+        self.inner.put_items(writes, format)
     }
 }
 
@@ -1315,6 +1314,7 @@ fn a_writer_promoting_themselves_is_forbidden_and_an_admin_promoting_them_is_not
             OfficePrecondition::NotConsumed,
             RedactionsPrecondition::NotConsumed,
             trust.as_ref().map(|(_, raw)| raw.as_str()),
+            None,
             &forklift_aws_lambda::format::gate(&head.refs).expect("format gate"),
             &request_token(),
         ),
@@ -1399,6 +1399,7 @@ fn an_office_and_an_anchor_never_exist_apart() {
             &office_head,
             OfficePrecondition::NotConsumed,
             RedactionsPrecondition::NotConsumed,
+            None,
             None,
             &forklift_aws_lambda::format::gate(&*refs).expect("format gate"),
             &request_token(),
@@ -2521,11 +2522,12 @@ impl RefStore for AsyncRefStore {
         office_head: OfficePrecondition<'_>,
         redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
+        chunk_fence: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
         self.bridge.block_on(suspending(|| {
-            self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
+            self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, chunk_fence, format, request_token)
         }))
     }
 
@@ -2571,6 +2573,18 @@ impl RefStore for AsyncRefStore {
         request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
         self.bridge.block_on(suspending(|| self.inner.replace_trust(anchor, expected_anchor, office_head, format, request_token)))
+    }
+
+    fn get_item(&self, key: forklift_aws_lambda::store::ItemKey<'_>) -> Result<Option<String>, String> {
+        self.inner.get_item(key)
+    }
+
+    fn put_items(
+        &self,
+        writes: &[forklift_aws_lambda::store::ItemWrite<'_>],
+        format: &forklift_aws_lambda::FormatFence,
+    ) -> Result<forklift_aws_lambda::store::RedactionWrite, String> {
+        self.inner.put_items(writes, format)
     }
 }
 
@@ -2666,10 +2680,11 @@ impl RefStore for SharedMemoryRefs {
         office_head: OfficePrecondition<'_>,
         redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
+        chunk_fence: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.0.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
+        self.0.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, chunk_fence, format, request_token)
     }
 
     fn delete_head(
@@ -2716,18 +2731,16 @@ impl RefStore for SharedMemoryRefs {
         self.0.replace_trust(anchor, expected_anchor, office_head, format, request_token)
     }
 
-    fn get_redaction(&self, hash: &str) -> Result<Option<String>, String> {
-        self.0.get_redaction(hash)
+    fn get_item(&self, key: forklift_aws_lambda::store::ItemKey<'_>) -> Result<Option<String>, String> {
+        self.0.get_item(key)
     }
 
-    fn put_redaction(
+    fn put_items(
         &self,
-        hash: &str,
-        state: &str,
-        expected: Option<&str>,
+        writes: &[forklift_aws_lambda::store::ItemWrite<'_>],
         format: &forklift_aws_lambda::FormatFence,
     ) -> Result<forklift_aws_lambda::store::RedactionWrite, String> {
-        self.0.put_redaction(hash, state, expected, format)
+        self.0.put_items(writes, format)
     }
 }
 
@@ -2784,6 +2797,7 @@ impl RefStore for OfficeMovesAfterTheSnapshot {
                         OfficePrecondition::NotConsumed,
                         RedactionsPrecondition::NotConsumed,
                         anchor_bytes.as_deref(),
+                        None,
                         &forklift_aws_lambda::format::gate(&*self.inner).expect("format gate"),
                         &request_token(),
                     )
@@ -2808,10 +2822,11 @@ impl RefStore for OfficeMovesAfterTheSnapshot {
         office_head: OfficePrecondition<'_>,
         redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
+        chunk_fence: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, chunk_fence, format, request_token)
     }
 
     fn delete_head(
@@ -2857,6 +2872,18 @@ impl RefStore for OfficeMovesAfterTheSnapshot {
     ) -> Result<TrustWriteOutcome, String> {
         self.inner.replace_trust(anchor, expected_anchor, office_head, format, request_token)
     }
+
+    fn get_item(&self, key: forklift_aws_lambda::store::ItemKey<'_>) -> Result<Option<String>, String> {
+        self.inner.get_item(key)
+    }
+
+    fn put_items(
+        &self,
+        writes: &[forklift_aws_lambda::store::ItemWrite<'_>],
+        format: &forklift_aws_lambda::FormatFence,
+    ) -> Result<forklift_aws_lambda::store::RedactionWrite, String> {
+        self.inner.put_items(writes, format)
+    }
 }
 
 /// Wraps a shared [`MemoryRefStore`]; the first time `ref_update`'s anchor snapshot read
@@ -2894,10 +2921,11 @@ impl RefStore for AnchorMovesAfterTheSnapshot {
         office_head: OfficePrecondition<'_>,
         redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
+        chunk_fence: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, chunk_fence, format, request_token)
     }
 
     fn delete_head(
@@ -2971,6 +2999,18 @@ impl RefStore for AnchorMovesAfterTheSnapshot {
         request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
         self.inner.replace_trust(anchor, expected_anchor, office_head, format, request_token)
+    }
+
+    fn get_item(&self, key: forklift_aws_lambda::store::ItemKey<'_>) -> Result<Option<String>, String> {
+        self.inner.get_item(key)
+    }
+
+    fn put_items(
+        &self,
+        writes: &[forklift_aws_lambda::store::ItemWrite<'_>],
+        format: &forklift_aws_lambda::FormatFence,
+    ) -> Result<forklift_aws_lambda::store::RedactionWrite, String> {
+        self.inner.put_items(writes, format)
     }
 }
 
@@ -3051,6 +3091,7 @@ impl RefStore for TransientOnCommit {
         office_head: OfficePrecondition<'_>,
         redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
+        chunk_fence: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
@@ -3074,7 +3115,7 @@ impl RefStore for TransientOnCommit {
             return Ok(self.refusal.clone());
         }
 
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, chunk_fence, format, request_token)
     }
 
     fn delete_head(
@@ -3119,6 +3160,18 @@ impl RefStore for TransientOnCommit {
         request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
         self.inner.replace_trust(anchor, expected_anchor, office_head, format, request_token)
+    }
+
+    fn get_item(&self, key: forklift_aws_lambda::store::ItemKey<'_>) -> Result<Option<String>, String> {
+        self.inner.get_item(key)
+    }
+
+    fn put_items(
+        &self,
+        writes: &[forklift_aws_lambda::store::ItemWrite<'_>],
+        format: &forklift_aws_lambda::FormatFence,
+    ) -> Result<forklift_aws_lambda::store::RedactionWrite, String> {
+        self.inner.put_items(writes, format)
     }
 }
 
@@ -3524,6 +3577,7 @@ fn an_untrusted_warehouses_concurrent_office_move_does_not_refuse_the_commit() {
             OfficePrecondition::NotConsumed,
             RedactionsPrecondition::NotConsumed,
             None,
+            None,
             &forklift_aws_lambda::format::gate(&*store).expect("format gate"),
             &request_token(),
         ),
@@ -3703,6 +3757,7 @@ fn a_concurrently_moved_unrelated_pallet_does_not_refuse_the_commit() {
                 OfficePrecondition::At(&office_head),
                 RedactionsPrecondition::NotConsumed,
                 Some(&anchor_bytes),
+                None,
                 &forklift_aws_lambda::format::gate(&head.refs).expect("format gate"),
                 &request_token(),
             )
@@ -3765,6 +3820,7 @@ fn seeded_trust(office_head: &str) -> (Arc<MemoryRefStore>, TrustAnchorDto, Stri
                 OfficePrecondition::NotConsumed,
                 RedactionsPrecondition::NotConsumed,
                 Some(&bytes),
+                None,
                 &forklift_aws_lambda::format::gate(&*store).expect("format gate"),
                 &request_token(),
             )
@@ -3949,6 +4005,7 @@ fn a_concurrently_moved_unrelated_pallet_does_not_refuse_the_re_genesis() {
                 OfficePrecondition::NotConsumed,
                 RedactionsPrecondition::NotConsumed,
                 Some(&bytes),
+                None,
                 &forklift_aws_lambda::format::gate(&*store).expect("format gate"),
                 &request_token(),
             )
@@ -4028,10 +4085,11 @@ impl RefStore for TransientOnAnchorWrite {
         office_head: OfficePrecondition<'_>,
         redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
+        chunk_fence: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, chunk_fence, format, request_token)
     }
 
     fn delete_head(
@@ -4097,6 +4155,18 @@ impl RefStore for TransientOnAnchorWrite {
 
         self.inner.replace_trust(anchor, expected_anchor, office_head, format, request_token)
     }
+
+    fn get_item(&self, key: forklift_aws_lambda::store::ItemKey<'_>) -> Result<Option<String>, String> {
+        self.inner.get_item(key)
+    }
+
+    fn put_items(
+        &self,
+        writes: &[forklift_aws_lambda::store::ItemWrite<'_>],
+        format: &forklift_aws_lambda::FormatFence,
+    ) -> Result<forklift_aws_lambda::store::RedactionWrite, String> {
+        self.inner.put_items(writes, format)
+    }
 }
 
 /// Wraps a shared [`MemoryRefStore`] and answers the anchor write with a chosen
@@ -4138,10 +4208,11 @@ impl RefStore for AnchorMovedOnAnchorWrite {
         office_head: OfficePrecondition<'_>,
         redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
+        chunk_fence: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, chunk_fence, format, request_token)
     }
 
     fn delete_head(
@@ -4186,6 +4257,18 @@ impl RefStore for AnchorMovedOnAnchorWrite {
         _request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
         Ok(TrustWriteOutcome::AnchorMoved { current: self.current.clone() })
+    }
+
+    fn get_item(&self, key: forklift_aws_lambda::store::ItemKey<'_>) -> Result<Option<String>, String> {
+        self.inner.get_item(key)
+    }
+
+    fn put_items(
+        &self,
+        writes: &[forklift_aws_lambda::store::ItemWrite<'_>],
+        format: &forklift_aws_lambda::FormatFence,
+    ) -> Result<forklift_aws_lambda::store::RedactionWrite, String> {
+        self.inner.put_items(writes, format)
     }
 }
 
@@ -4720,10 +4803,11 @@ impl RefStore for RacesTheDelete {
         office_head: OfficePrecondition<'_>,
         redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
+        chunk_fence: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, chunk_fence, format, request_token)
     }
 
     fn delete_head(
@@ -4799,6 +4883,18 @@ impl RefStore for RacesTheDelete {
     ) -> Result<TrustWriteOutcome, String> {
         self.inner.replace_trust(anchor, expected_anchor, office_head, format, request_token)
     }
+
+    fn get_item(&self, key: forklift_aws_lambda::store::ItemKey<'_>) -> Result<Option<String>, String> {
+        self.inner.get_item(key)
+    }
+
+    fn put_items(
+        &self,
+        writes: &[forklift_aws_lambda::store::ItemWrite<'_>],
+        format: &forklift_aws_lambda::FormatFence,
+    ) -> Result<forklift_aws_lambda::store::RedactionWrite, String> {
+        self.inner.put_items(writes, format)
+    }
 }
 
 /// `feature` lifted at `feature_v2` in a shared store, and a head over that store that races its
@@ -4825,6 +4921,7 @@ fn racing_lift(from: String, to: String) -> RacingWrite {
                 &to,
                 OfficePrecondition::NotConsumed,
                 RedactionsPrecondition::NotConsumed,
+                None,
                 None,
                 &forklift_aws_lambda::format::gate(&*store).expect("format gate"),
                 &request_token(),
@@ -5037,6 +5134,7 @@ fn an_office_lift_in_the_bootstrap_window_refuses_a_delete_it_denies() {
                 OfficePrecondition::NotConsumed,
                 RedactionsPrecondition::NotConsumed,
                 anchor.as_deref(),
+                None,
                 &forklift_aws_lambda::format::gate(&*store).expect("format gate"),
                 &request_token(),
             )
@@ -5435,24 +5533,6 @@ impl RefStore for LosesEveryRescan {
         self.inner.read_format()
     }
 
-    fn get_redaction(&self, hash: &str) -> Result<Option<String>, String> {
-        self.inner.get_redaction(hash)
-    }
-
-    fn put_redaction(
-        &self,
-        hash: &str,
-        state: &str,
-        expected: Option<&str>,
-        format: &forklift_aws_lambda::FormatFence,
-    ) -> Result<forklift_aws_lambda::store::RedactionWrite, String> {
-        if state.contains("\"scan\":1") {
-            return Ok(forklift_aws_lambda::store::RedactionWrite::Moved);
-        }
-
-        self.inner.put_redaction(hash, state, expected, format)
-    }
-
     fn partition_has_items(&self) -> Result<bool, String> {
         self.inner.partition_has_items()
     }
@@ -5470,10 +5550,11 @@ impl RefStore for LosesEveryRescan {
         office_head: OfficePrecondition<'_>,
         redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
+        chunk_fence: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
+        self.inner.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, chunk_fence, format, request_token)
     }
 
     fn delete_head(
@@ -5519,6 +5600,22 @@ impl RefStore for LosesEveryRescan {
         request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
         self.inner.replace_trust(anchor, expected_anchor, office_head, format, request_token)
+    }
+
+    fn get_item(&self, key: forklift_aws_lambda::store::ItemKey<'_>) -> Result<Option<String>, String> {
+        self.inner.get_item(key)
+    }
+
+    fn put_items(
+        &self,
+        writes: &[forklift_aws_lambda::store::ItemWrite<'_>],
+        format: &forklift_aws_lambda::FormatFence,
+    ) -> Result<forklift_aws_lambda::store::RedactionWrite, String> {
+        if writes.iter().any(|write| write.state.contains("\"scan\":1")) {
+            return Ok(forklift_aws_lambda::store::RedactionWrite::Moved);
+        }
+
+        self.inner.put_items(writes, format)
     }
 }
 
@@ -5680,13 +5777,13 @@ fn a_held_deletion_lease_is_left_alone_until_it_runs_out() {
     gate_file(&head, "x", "leaked\n");
     plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions);
 
-    let held = r#"{"version":1,"scan_complete":true,"holders":[],"applied_at":1,"lease_until":99999999999}"#;
+    let held = r#"{"version":2,"scan_complete":true,"holders":[],"applied_at":1,"lease_until":99999999999}"#;
     plant_item(&head.refs, &leak, held);
     assert_gone(&head.object_get(&leak).expect_err("applied"), &leak);
     assert!(head.objects.exists(&leak).expect("exists"), "another request holds the deletion");
     assert_eq!(head.refs.get_redaction(&leak).expect("item").as_deref(), Some(held));
 
-    plant_item(&head.refs, &leak, r#"{"version":1,"scan_complete":true,"holders":[],"applied_at":1,"lease_until":1}"#);
+    plant_item(&head.refs, &leak, r#"{"version":2,"scan_complete":true,"holders":[],"applied_at":1,"lease_until":1}"#);
     assert_gone(&head.object_get(&leak).expect_err("applied"), &leak);
     assert!(!head.objects.exists(&leak).expect("exists"), "the lease ran out: deleted");
 }
@@ -5695,7 +5792,7 @@ fn a_held_deletion_lease_is_left_alone_until_it_runs_out() {
 /// seconds before now: `extra` is spliced in as further fields.
 fn applied_item(ago: u64, extra: &str) -> String {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock").as_secs();
-    format!(r#"{{"version":1,"scan_complete":true,"holders":[],"applied_at":{}{}}}"#, now - ago, extra)
+    format!(r#"{{"version":2,"scan_complete":true,"holders":[],"applied_at":{}{}}}"#, now - ago, extra)
 }
 
 /// How long after its apply a redaction's late sweep is due: the Lambda ceiling, a presigned URL's
@@ -5755,47 +5852,220 @@ fn an_applied_blob_is_deleted_once_its_late_sweep_has_run() {
     assert_gone(&head.object_get(&leak).expect_err("still refused"), &leak);
 }
 
-/// An applied recipe keeps its object, its chunk list, until its chunks are deleted, so neither
-/// its first sweep run late nor any judge after says it is `deleted`.
-// Revert: end a late sweep as deleted whatever it kept → `deleted` → red. Revert: run the late
-// sweep for an item recorded as a recipe → with the object gone, that sweep says `deleted` → red.
-#[test]
-fn an_applied_recipe_is_never_reported_deleted() {
-    let area = Area::new("redaction-late-recipe");
-    prepare(&area, "red");
-    area.write_large_file("red/big.bin", 0xBAD, CHUNK_THRESHOLD + 50_000);
+/// A warehouse whose `main` keeps a chunked file sharing its first half with a chunked file an
+/// earlier head named and a redaction records: the recorded objects, `main`'s head, the redacted
+/// recipe, and its chunks split into those only it names and those the kept file names too.
+fn chunked_leak(area: &Area) -> (Harvest, String, String, Vec<String>, Vec<String>) {
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state as u8
+    };
+    let content: Vec<u8> = (0..CHUNK_THRESHOLD + 1024 * 1024).map(|_| next()).collect();
+    let mut kept = content[..content.len() / 2].to_vec();
+    kept.extend((0..CHUNK_THRESHOLD / 2 + 1024 * 1024).map(|_| next()));
+
+    prepare(area, "red");
+    std::fs::write(area.path("red/kept.bin"), &kept).expect("write");
+    area.forklift("red", &["load", "."]);
+    area.forklift("red", &["stack", "-m", "kept"]);
+    std::fs::write(area.path("red/big.bin"), &content).expect("write");
     area.forklift("red", &["load", "."]);
     area.forklift("red", &["stack", "-m", "leak"]);
     let leaked = harvest(&area.path("red")).head_of("main").expect("main head");
     area.forklift("red", &["remove", "big.bin"]);
     area.forklift("red", &["stack", "-m", "take the leak out"]);
+    let before = harvest(&area.path("red"));
+    let main = before.head_of("main").expect("main head");
+
+    let (recipe, own, shared) = {
+        let _scope = StorageRootScope::enter(&area.path("red"));
+        let file_hash = |head: &str, name: &str| {
+            let tree = object_utils::load_tree_shared(&object_utils::load_parcel(head).expect("parcel").tree_hash).expect("tree");
+            tree.get_files().find(|(file, _)| file.as_str() == name).map(|(_, file)| file.hash.clone()).expect("the file")
+        };
+        let recipe = file_hash(&leaked, "big.bin");
+        let named: std::collections::HashSet<String> = object_utils::recipe_chunk_hashes(&file_hash(&main, "kept.bin")).expect("chunks").into_iter().collect();
+        let (own, shared) = object_utils::recipe_chunk_hashes(&recipe).expect("chunks").into_iter().partition(|chunk| !named.contains(chunk));
+        (recipe, own, shared)
+    };
+
+    // The recorder's warehouse drops what it redacts; the server had it from before.
     area.forklift("red", &["redact", "record", &format!("{}:big.bin", leaked), "-m", "a leak"]);
-    let recorded = harvest(&area.path("red"));
+    let mut recorded = harvest(&area.path("red"));
+    for (hash, bytes) in before.objects {
+        recorded.objects.entry(hash).or_insert(bytes);
+    }
+
+    (recorded, main, recipe, own, shared)
+}
+
+/// Move every chunk ledger entry's apply, and when it is due, `seconds` into the past.
+fn age_chunk_ledger(refs: &MemoryRefStore, seconds: u64) {
+    let fence = forklift_aws_lambda::format::gate(refs).expect("format gate");
+    let stored = refs.get_item(ItemKey::ChunkLedger).expect("ledger").expect("a ledger");
+    let mut ledger: serde_json::Value = serde_json::from_str(&stored).expect("json");
+    for journal in ledger["recipes"].as_object_mut().expect("recipes").values_mut() {
+        for field in ["applied_at", "next_round_after"] {
+            journal[field] = (journal[field].as_u64().expect("seconds") - seconds).into();
+        }
+    }
+    let state = ledger.to_string();
+    let written = refs.put_items(&[ItemWrite { key: ItemKey::ChunkLedger, state: &state, expected: Some(&stored) }], &fence).expect("write");
+    assert_eq!(written, RedactionWrite::Written);
+}
+
+/// Assert `err` is a `503` naming `hash`.
+fn assert_withheld(err: &forklift_aws_lambda::error::HeadError, hash: &str) {
+    assert_eq!(err.status, Status::ServiceUnavailable, "{}", err.message);
+    assert!(err.message.contains(hash), "the refusal names the hash: {}", err.message);
+}
+
+/// An applied redaction of a chunked file deletes, over two rounds, the chunks only its recipe
+/// names, and then the recipe. Until a round's census decides, every chunk of the recipe is
+/// withheld with a `503` and none is stored again; once it has, a chunk another file names is
+/// served and the rest are deleted, absent. A copy landed after the first round is deleted by the
+/// late one, and only after the recipe is deleted does the handshake say `deleted`.
+// Revert: never withhold a chunk → the first GET answers 200 → red. Revert: refuse no promotion
+// while a round runs → the PUT stores the chunk → red. Revert: delete every chunk of the recipe →
+// the shared one is gone → red. Revert: settle a first round straight to the recipe's deletion →
+// the recipe is gone before the late round → red. Revert: never delete the recipe → it is kept →
+// red. Revert: let the audit verify a redacted recipe's chunks → the history is refused → red.
+#[test]
+fn an_applied_recipe_and_the_chunks_only_it_names_are_deleted_over_two_rounds() {
+    let area = Area::new("redaction-chunk-rounds");
+    let (recorded, main, recipe, own, shared) = chunked_leak(&area);
+    assert!(!own.is_empty() && !shared.is_empty(), "own {:?}, shared {:?}", own, shared);
+    let chunk_bytes = recorded.objects[&own[0]].clone();
 
     let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
     upload_all(&head, &recorded);
+    plant(&head.refs, "main", &main);
     plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &recorded.head_of("@redactions").expect("@redactions"));
-    let info = head.handshake().expect("handshake");
-    let recipe = info.redactions.expect("redactions")[0].hash.clone();
-    // The recorder's own warehouse no longer keeps the recipe; one holding the same file does.
-    prepare(&area, "wh");
-    area.write_large_file("wh/big.bin", 0xBAD, CHUNK_THRESHOLD + 50_000);
-    area.forklift("wh", &["load", "."]);
-    let stored = harvest(&area.path("wh"));
-    let bytes = stored.objects.get(&recipe).expect("the same file's recipe");
-    head.objects.put_verified(&recipe, bytes).expect("store the recipe");
 
-    plant_item(&head.refs, &recipe, &applied_item(LATE_SWEEP_AFTER + 40, ""));
+    // Applied, its round announced and waiting: every chunk is withheld, and none is stored.
     assert_eq!(served_state(&head, &recipe), Some(ServedRedactionState::DeletionOwed));
-    assert!(head.objects.exists(&recipe).expect("exists"), "the recipe is kept");
-    let item = head.refs.get_redaction(&recipe).expect("item").expect("an item");
-    assert!(item.contains(r#""recipe":true"#) && !item.contains(r#""deleted""#), "{}", item);
+    assert_withheld(&head.object_get(&own[0]).expect_err("undecided"), &own[0]);
+    assert_withheld(&head.object_get(&shared[0]).expect_err("undecided"), &shared[0]);
+    assert!(head.missing(&[own[0].clone(), shared[0].clone()]).expect("missing").is_empty(), "withheld is not absent");
+    assert_withheld(&head.object_put(&Principal::Static, None, &own[0], &chunk_bytes).expect_err("a round runs"), &own[0]);
+    assert!(head.objects.exists(&recipe).expect("exists"), "the recipe is kept while its chunks are owed");
 
-    // Recorded as a recipe, its late sweep is the chunk deletion's: none runs here, so even with
-    // the object gone nothing says deleted.
-    plant_item(&head.refs, &recipe, &applied_item(LATE_SWEEP_AFTER + 40, r#","swept":true,"recipe":true"#));
-    head.objects.delete_canonical(&recipe).expect("delete");
+    // The round runs: only what the kept file names is kept.
+    let head = head.with_chunk_round_wait(0);
     assert_eq!(served_state(&head, &recipe), Some(ServedRedactionState::DeletionOwed));
+    for chunk in &own {
+        assert!(!head.objects.exists(chunk).expect("exists"), "a chunk only the recipe names is deleted");
+    }
+    for chunk in &shared {
+        assert!(head.objects.exists(chunk).expect("exists"), "a chunk the kept file names is kept");
+    }
+    assert!(served(&head, &shared[0]), "a chunk the kept file names is served");
+    assert_eq!(head.object_get(&own[0]).expect_err("deleted").status, Status::NotFound);
+    assert_eq!(head.missing(&[own[0].clone(), shared[0].clone()]).expect("missing"), vec![own[0].clone()]);
+    assert!(head.objects.exists(&recipe).expect("exists"), "the recipe waits for the late round");
+    // A head whose history names the redacted file, its recipe still there and its own chunks
+    // gone, lifts: the audit does not read the chunks of a redacted recipe.
+    let request = RefUpdateRequest { old_head: None, new_head: main.clone(), tombstone: None };
+    head.ref_update(&Principal::Static, "again", &request).expect("the history lifts");
+
+    // A copy lands after the round, staged and canonical; the late round deletes both, then the
+    // recipe.
+    head.objects.stage("lift-9", &own[0], chunk_bytes.clone());
+    head.objects.put_verified(&own[0], &chunk_bytes).expect("a late copy");
+    let staged = head.objects.staged_count();
+    plant_item(&head.refs, &recipe, &applied_item(LATE_SWEEP_AFTER + 40, r#","swept":true"#));
+    age_chunk_ledger(&head.refs, LATE_SWEEP_AFTER + 40);
+    served_state(&head, &recipe);
+
+    assert!(!head.objects.exists(&own[0]).expect("exists"), "the late round deletes the copy landed since");
+    assert_eq!(head.objects.staged_count(), staged - 1, "and its staged copy");
+    assert!(head.objects.exists(&shared[0]).expect("exists"));
+    assert!(!head.objects.exists(&recipe).expect("exists"), "then the recipe is deleted");
+    assert_eq!(served_state(&head, &recipe), Some(ServedRedactionState::Deleted));
+    let ledger = head.refs.get_item(ItemKey::ChunkLedger).expect("ledger").expect("a ledger");
+    assert!(ledger.contains(r#""recipes":{}"#), "{}", ledger);
+    assert!(head.objects.exists(&shared[0]).expect("exists"));
+    assert!(served(&head, &shared[0]), "a chunk the kept file names is still served");
+}
+
+/// A recipe whose round S3 refused a delete of stays owed: once that round is down, its chunks are
+/// still withheld, the ones another file names too, until a round deletes them.
+// Revert: serve a refused recipe's chunks once a round has settled it → the shared chunk is
+// served → red.
+#[test]
+fn a_recipe_whose_delete_was_refused_keeps_its_chunks_withheld() {
+    let area = Area::new("redaction-chunk-refused");
+    let (recorded, main, recipe, _own, shared) = chunked_leak(&area);
+
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &recorded);
+    plant(&head.refs, "main", &main);
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &recorded.head_of("@redactions").expect("@redactions"));
+    let head = head.with_chunk_round_wait(0);
+    assert_eq!(served_state(&head, &recipe), Some(ServedRedactionState::DeletionOwed));
+    assert!(served(&head, &shared[0]), "settled, a chunk the kept file names is served");
+
+    // The round as it settles a refused recipe: owed, backed off, its round recorded.
+    let fence = forklift_aws_lambda::format::gate(&head.refs).expect("format gate");
+    let stored = head.refs.get_item(ItemKey::ChunkLedger).expect("ledger").expect("a ledger");
+    let mut ledger: serde_json::Value = serde_json::from_str(&stored).expect("json");
+    let journal = &mut ledger["recipes"][&recipe];
+    assert!(journal["settled_round"].is_u64(), "{}", stored);
+    journal["state"] = "owed".into();
+    journal["refusals"] = 1.into();
+    journal["next_round_after"] = 99_999_999_999u64.into();
+    let state = ledger.to_string();
+    let written = head.refs.put_items(&[ItemWrite { key: ItemKey::ChunkLedger, state: &state, expected: Some(&stored) }], &fence).expect("write");
+    assert_eq!(written, RedactionWrite::Written);
+
+    assert_withheld(&head.object_get(&shared[0]).expect_err("owed"), &shared[0]);
+}
+
+/// While a round deletes, a ref update answers `503` and moves nothing; once the round is down,
+/// it lifts.
+// Revert: let a ref update past a deleting fence → it commits → red.
+#[test]
+fn a_ref_update_waits_out_a_deleting_round() {
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    let fence = || forklift_aws_lambda::format::gate(&head.refs).expect("format gate");
+    let deleting = r#"{"version":1,"round":1,"phase":"deleting","started":0,"recipes":[],"lease_until":99999999999}"#;
+    let written = head.refs.put_items(&[ItemWrite { key: ItemKey::ChunkFence, state: deleting, expected: None }], &fence()).expect("write");
+    assert_eq!(written, RedactionWrite::Written);
+
+    let main = gate_parcel(&head, &[], vec![gate_file(&head, "x", "1")]);
+    let request = RefUpdateRequest { old_head: None, new_head: main.clone(), tombstone: None };
+    let err = head.ref_update(&Principal::Static, "main", &request).expect_err("a round deletes");
+    assert_eq!(err.status, Status::ServiceUnavailable, "{}", err.message);
+    assert_eq!(user_head(&head, "main"), None);
+
+    let down = r#"{"version":1,"round":1,"phase":"down","started":0,"recipes":[],"lease_until":null}"#;
+    let written = head.refs.put_items(&[ItemWrite { key: ItemKey::ChunkFence, state: down, expected: Some(deleting) }], &fence()).expect("write");
+    assert_eq!(written, RedactionWrite::Written);
+    head.ref_update(&Principal::Static, "main", &request).expect("the round is down");
+    assert_eq!(user_head(&head, "main"), Some(main));
+}
+
+/// A head commit conditioned on the fence it read is refused once the fence has moved.
+// Revert: drop the fence condition from the memory store's commit → it commits → red.
+#[test]
+fn a_head_commit_is_refused_once_the_chunk_fence_moved() {
+    let refs = MemoryRefStore::new();
+    let fence = || forklift_aws_lambda::format::gate(&refs).expect("format gate");
+    let commit = |chunk_fence: Option<&str>| refs.compare_and_set_head(
+        pallet_utils::PalletNamespace::User, "main", ExpectedHead::Unborn, &"1".repeat(64), OfficePrecondition::NotConsumed,
+        RedactionsPrecondition::NotConsumed, None, chunk_fence, &fence(), &request_token(),
+    ).expect("commit");
+
+    let announced = r#"{"version":1,"round":1,"phase":"announced","started":0,"recipes":[],"lease_until":null}"#;
+    let written = refs.put_items(&[ItemWrite { key: ItemKey::ChunkFence, state: announced, expected: None }], &fence()).expect("write");
+    assert_eq!(written, RedactionWrite::Written);
+
+    assert_eq!(commit(None), CasOutcome::ChunkFenceMoved, "read as absent, the fence is there now");
+    assert_eq!(commit(Some("{}")), CasOutcome::ChunkFenceMoved);
+    assert_eq!(commit(Some(announced)), CasOutcome::Committed);
 }
 
 /// A store whose every promotion is met by the redaction of what it promotes applying, just after
@@ -5913,10 +6183,13 @@ fn a_retried_lift_commit_deletes_the_copy_an_earlier_attempt_promoted() {
 }
 
 /// The staging verifier's check after its write deletes a promoted copy whose redaction applied,
-/// leaves one whose redaction did not, and keeps an applied recipe, as the judge does, while
-/// still answering that it applied.
+/// leaves one whose redaction did not, and keeps an applied recipe whose chunks the ledger still
+/// owes, as the judge does, while still answering that it applied. A recipe the ledger does not
+/// hold is kept while its late sweep, which journals it, has still to run, and once it has run is
+/// deleted as a blob is.
 // Revert: delete whatever the item says → the unapplied copy is gone → red. Revert: delete a
-// recipe too → it is gone → red.
+// recipe too → it is gone → red. Revert: keep every recipe → the one off the ledger is kept → red.
+// Revert: delete a recipe off the ledger before its late sweep → it is gone → red.
 #[test]
 fn the_check_after_a_promotion_deletes_only_applied_file_content() {
     use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
@@ -5942,6 +6215,10 @@ fn the_check_after_a_promotion_deletes_only_applied_file_content() {
     plant_item(&refs, &gone, &applied);
     plant_item(&refs, &kept, &pending);
     plant_item(&refs, &recipe.hash, &applied);
+    let (ledger, _) = forklift_aws_lambda::head::chunk_fixture_items([&recipe.hash, &"8".repeat(64), &"9".repeat(64)]).expect("items");
+    let fence = forklift_aws_lambda::format::gate(&refs).expect("format gate");
+    let written = refs.put_items(&[ItemWrite { key: ItemKey::ChunkLedger, state: &ledger, expected: None }], &fence).expect("write");
+    assert_eq!(written, RedactionWrite::Written);
 
     use forklift_aws_lambda::head::AppliedCopies;
     let delete = |hash: &str| forklift_aws_lambda::head::delete_if_redaction_applied(&objects, &refs, "lift-1", hash).expect("checked");
@@ -5954,6 +6231,20 @@ fn the_check_after_a_promotion_deletes_only_applied_file_content() {
     assert!(!objects.exists(&gone).expect("exists"));
     assert!(objects.exists(&kept).expect("exists"));
     assert!(objects.exists(&recipe.hash).expect("exists"));
+
+    let done = LooseObjectBuilder::build_recipe(&Recipe {
+        content_hash: "f".repeat(64),
+        total_size: 1,
+        chunks: vec![RecipeChunk { hash: "d".repeat(64), size: 1 }],
+    });
+    objects.put_verified(&done.hash, &done.content).expect("put");
+    plant_item(&refs, &done.hash, &applied);
+    assert_eq!(delete(&done.hash), AppliedCopies::RecipeKept, "off the ledger, its late sweep journals it");
+    assert!(objects.exists(&done.hash).expect("exists"));
+    let swept = format!(r#"{},"deleted":true}}"#, &applied[..applied.len() - 1]);
+    plant_item(&refs, &done.hash, &swept);
+    assert_eq!(delete(&done.hash), AppliedCopies::Deleted, "off the ledger after its late sweep, its chunks are done");
+    assert!(!objects.exists(&done.hash).expect("exists"));
 }
 
 /// A new pallet whose history names applied content no longer stored, below a head that does not
