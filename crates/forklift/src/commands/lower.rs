@@ -124,11 +124,14 @@ pub async fn handle_command(pallet: Option<String>,
             // Before any `@redactions` is here to tell whether this warehouse applies what the
             // remote reports applied: the fetch leaves it all out, and once the meta pallets are
             // synced below, history missing one this warehouse does not apply is refused.
+            // The take's verification may fetch more of that history, so it leaves it out too.
             client.skip_files(reported_applied(&info));
-            let fetched = remote_utils::fetch_history_scoped(&client, remote_head, target, &progress).await;
+            let taken = async {
+                remote_utils::fetch_history_scoped(&client, remote_head, target, &progress).await?;
+                take_utils::verify_take(Some(&client), &first_contact, remote_head, target, FetchAt::Warehouse).await
+            }.await;
             client.skip_files(std::collections::HashSet::new());
-            fetched?;
-            take_utils::verify_take(Some(&client), &first_contact, remote_head, target, FetchAt::Warehouse).await?;
+            taken?;
             verified.push(remote_head.as_str());
         }
 
@@ -156,10 +159,9 @@ pub async fn handle_command(pallet: Option<String>,
     // absent content it does not tolerate.
     let early = apply_reported(client.url(), &info);
 
-    if let Err(why) = refuse_unapplied_skips(&client) {
-        warn_applied_unsettled(&early);
-        return Err(why.into());
-    }
+    // Refused as the pallet's own failure, so the meta pallet that failed to bring the
+    // redaction here is reported with it.
+    let unapplied = refuse_unapplied_skips(&client);
 
     skip_applied_reported(&client, &info);
 
@@ -182,10 +184,11 @@ pub async fn handle_command(pallet: Option<String>,
         redactions: None,
     };
 
-    let lowered = match (named.is_some(), repair) {
-        (named, true) => repair_pallet(&client, &info, named, &mut report, &progress).await,
-        (true, false) => lower_named_pallet(&client, &info, &mut report, &progress).await,
-        (false, false) => lower_working_pallet(&client, &info, &mut report, &progress).await,
+    let lowered = match (unapplied, named.is_some(), repair) {
+        (Err(why), _, _) => Err(why.into()),
+        (Ok(()), named, true) => repair_pallet(&client, &info, named, &mut report, &progress).await,
+        (Ok(()), true, false) => lower_named_pallet(&client, &info, &mut report, &progress).await,
+        (Ok(()), false, false) => lower_working_pallet(&client, &info, &mut report, &progress).await,
     };
 
     report.batch_lane = client.batch_lane_closure();
