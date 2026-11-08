@@ -1121,6 +1121,7 @@ fn audit_cli_reports_what_the_record_held() {
     let stdout = String::from_utf8_lossy(&json.stdout);
     assert!(stdout.contains("\"held_by_hash\":1") || stdout.contains("\"held_by_hash\": 1"),
         "the --json envelope counts the held absence: {}", stdout);
+    assert!(!stdout.contains("\"withheld\""), "nothing withheld is omitted: {}", stdout);
 
     let human = warehouse.run_ok(&["audit", "--full"]);
     let human_stdout = String::from_utf8_lossy(&human.stdout);

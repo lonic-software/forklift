@@ -2674,14 +2674,15 @@ async fn post_upload_targets(State(state): State<Arc<AppState>>,
     let result = blocking(warehouse, move || {
         let (applied, withheld) = (read_applied()?, read_withheld()?);
 
-        // A chunk an owed deletion withholds is answered `direct`, as `missing` lists it: the
-        // deletion may take the stored copy before this lift's ref write, and an upload after it
-        // stores the chunk again.
-        let owed_chunks = withheld_among(&gate, &withholding::removed_from(&applied, &withheld), &request.hashes)?;
-
         // A redacted hash refuses the lift: the client checks its history against its own
         // redactions first, so one asked about here is a client that did not.
         request.hashes.iter().try_for_each(|hash| refuse_removed(&applied, &WithheldSet::default(), hash))?;
+
+        // A chunk an owed deletion withholds is answered `direct`, as `missing` lists it, so the
+        // lift uploads it: should the deletion take the stored copy before the upload, the upload
+        // stores it again. One the deletion takes between the upload and the ref write is gone,
+        // and the ref write refuses the lift.
+        let owed_chunks = withheld_among(&gate, &withholding::removed_from(&applied, &withheld), &request.hashes)?;
 
         let mut response = UploadTargetsResponse {
             present: Vec::new(),

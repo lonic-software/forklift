@@ -116,10 +116,10 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   withheld while nothing serves the root is carried out when it is next served. A chunked file is
   withheld by its hash too: until its copy is deleted, the server serves a chunk only that file
   names as absent, and one another file shares as before. A command that needs withheld content
-  from that remote fails with the new `content_withheld` code (exit 51). `audit` on a served root
-  counts an absent withheld file apart, as `withheld` in `--json`, and the `--json` schema is now
-  32. A client that already holds a withheld file's recipe is answered for the chunks only
-  that file names as for any absent object.
+  from that remote fails with the new `content_withheld` code (exit 51). `audit --full` on a served
+  root counts an absent withheld file apart, as `withheld` in `--json`, and the `--json` schema is
+  now 32. A client that already holds a withheld file's recipe is answered for the chunks only that
+  file names as for any absent object.
 
 - **forklift-server applies redactions, and the `--json` schema is now 28.** Part of content
   redaction: after each lift or pallet deletion, the server applies every recorded redaction that

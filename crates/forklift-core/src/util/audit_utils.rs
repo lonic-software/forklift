@@ -2080,9 +2080,10 @@ struct ClosureSeams<'a> {
 }
 
 /// The sealed-by-hash record, the applied redactions and the withheld content a walk holds
-/// absences against, and the absent objects it held by each, kept apart. The audit and the client's ref gate pass one, and
-/// either remote's push gate passes the applied redactions alone: a remote must hold the whole
-/// closure of every head it accepts but for the content it redacted.
+/// absences against, and the absent objects it held by each, kept apart. The audit and the
+/// client's ref gate pass one, and either remote's push gate passes the applied redactions and
+/// withheld content alone: a remote must hold the whole closure of every head it accepts but for
+/// the content it redacted or withholds.
 pub struct SealedTolerance<'a> {
     tolerated: &'a Tolerated,
     held: RefCell<HashSet<String>>,
