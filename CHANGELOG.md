@@ -117,8 +117,8 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   withheld by its hash too: until its copy is deleted, the server serves a chunk only that file
   names as absent, and one another file shares as before. A command that needs withheld content
   from that remote fails with the new `content_withheld` code (exit 51), and the `--json` schema is
-  now 31. A client that already holds a withheld file's recipe is answered for its chunks as for
-  any absent object.
+  now 31. A client that already holds a withheld file's recipe is answered for the chunks only
+  that file names as for any absent object.
 
 - **forklift-server applies redactions, and the `--json` schema is now 28.** Part of content
   redaction: after each lift or pallet deletion, the server applies every recorded redaction that
