@@ -4227,7 +4227,7 @@ impl RemoteClient {
     /// A storage-backed head answers `targets` (presigned staging `PUT` URLs) for what it wants
     /// staged and `direct` for what it verifies inline; a direct head answers every missing hash
     /// in `direct` with empty `targets`, so one client code path serves both heads. `present`
-    /// (the complement of `missing`) is skipped.
+    /// is skipped, and so is `withheld`.
     ///
     /// Deliberately **not** on [`Posture::BoundedReads`], the same reasoning as
     /// [`Self::missing_objects`]: the server side (`forklift-server/src/server.rs`'s
@@ -4245,6 +4245,7 @@ impl RemoteClient {
             present: Vec::new(),
             targets: BTreeMap::new(),
             direct: Vec::new(),
+            withheld: Vec::new(),
         };
 
         for batch in hashes.chunks(MAX_UPLOAD_TARGETS_BATCH) {
@@ -4277,6 +4278,7 @@ impl RemoteClient {
             merged.present.extend(body.present);
             merged.targets.extend(body.targets);
             merged.direct.extend(body.direct);
+            merged.withheld.extend(body.withheld);
         }
 
         Ok(Some(merged))
@@ -7309,8 +7311,9 @@ async fn negotiate_and_upload(client: &RemoteClient,
     // failure before any bytes move.
     refuse_if_commit_pagination_unsupported(negotiation.targets.len(), chunking_supported)?;
 
-    // `present` is already on the remote (skip). `direct` goes to the control plane for inline
-    // verification; `targets` go straight to storage under the session's staging prefix.
+    // `present` is already on the remote, and `withheld` is never taken by it (skip both).
+    // `direct` goes to the control plane for inline verification; `targets` go straight to storage
+    // under the session's staging prefix.
     let mut tally = upload_tally(progress, negotiation.direct.len() + negotiation.targets.len());
     upload_objects(client, &negotiation.direct, &mut tally).await?;
     upload_to_targets(client, &negotiation.targets, &mut tally).await?;
@@ -10126,7 +10129,7 @@ mod tests {
                     (hash, target)
                 })
                 .collect();
-            let response = UploadTargetsResponse { present: Vec::new(), targets, direct: Vec::new() };
+            let response = UploadTargetsResponse { present: Vec::new(), targets, direct: Vec::new(), withheld: Vec::new() };
             ("200 OK", serde_json::to_string(&response).unwrap())
         } else {
             // A staging PUT or a commit call: exactly the upload/commit phase the gate exists to
@@ -11456,8 +11459,11 @@ mod tests {
             remote.hits_for(&format!("/v1/objects/{}", hashes[0])) > 1,
             "the throttle was retried before giving up"
         );
+        // The patience runs from the first refusal; this clock started before the first request
+        // was sent, so a loaded runner overruns it by that request's time (2.8 ms on Windows CI).
+        let margin = std::time::Duration::from_secs(1);
         assert!(
-            elapsed < FAST.throttle_patience,
+            elapsed < FAST.throttle_patience + margin,
             "elapsed {:?} overran the throttle patience {:?}", elapsed, FAST.throttle_patience
         );
     }
@@ -11517,8 +11523,11 @@ mod tests {
             "the error names the unavailable patience: {}", error
         );
         assert!(remote.hits_for(&format!("/v1/objects/{}", hashes[0])) > 1, "the 503 was retried");
+        // The patience runs from the first refusal; this clock started before the first request
+        // was sent, so a loaded runner overruns it by that request's time (2.8 ms on Windows CI).
+        let margin = std::time::Duration::from_secs(1);
         assert!(
-            elapsed < FAST.unavailable_patience,
+            elapsed < FAST.unavailable_patience + margin,
             "elapsed {:?} overran the unavailable patience {:?}", elapsed, FAST.unavailable_patience
         );
     }

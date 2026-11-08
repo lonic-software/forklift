@@ -94,6 +94,14 @@
 //! holds it only where a file's content sits ([`At::File`]). A tree or a chunk absent under an
 //! applied hash, which only a cell naming such a hash by itself could bring about, is judged as if
 //! no redaction named it: a chunk no redaction covers, since other files may share it.
+//!
+//! ## Withheld content
+//!
+//! A head's host may withhold a file's content ([`withholding`]) while the warehouse's heads keep
+//! naming it, so the head may lack it: it never took it, or deleted it. A walk holds such an
+//! absence too, where a file's content sits, as it holds a redacted one: never damage, never
+//! fetched, and kept apart from both other sets. The record of withheld content only grows, so a
+//! walk that leaned on it stays sound once its caller acts on the result.
 
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::io::{Seek, Write};
@@ -104,6 +112,7 @@ use crate::globals;
 use crate::util::{applied_redactions, audit_utils, bay_utils, file_utils, object_utils, office_utils, origin_move, origin_utils, pack_utils, record_utils, recovery_utils, sign_utils};
 use crate::util::applied_redactions::AppliedSet;
 use crate::util::lock_utils::{RefLock, StoreAccessExclusive, StoreAccessLock};
+use crate::util::withholding::{self, WithheldSet};
 
 /// The record's file name under the shared forklift root.
 const FILE_NAME_SEALED: &str = "sealed";
@@ -412,13 +421,15 @@ pub fn read_sealed() -> Result<SealedSet, String> {
     })
 }
 
-/// Why a walk may meet an object absent without that being damage (see Applied redactions in the
-/// module doc comment): the sealed record holds it, or a redaction this warehouse applied names
-/// it. The two are kept apart, since only the record leans on a remote.
+/// Why a walk may meet an object absent without that being damage (see Applied redactions and
+/// Withheld content in the module doc comment): the sealed record holds it, a redaction this
+/// warehouse applied names it, or its head withholds it. The three are kept apart, since only the
+/// record leans on a remote.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Tolerated {
     pub sealed: SealedSet,
     pub applied: AppliedSet,
+    pub withheld: WithheldSet,
 }
 
 /// Which set holds an absent object.
@@ -428,6 +439,8 @@ pub enum Held {
     Sealed,
     /// An applied redaction: nobody is promised to hold it, and nothing fetches it.
     Redacted,
+    /// Withheld by this warehouse's head: it serves and takes none of it, and nothing fetches it.
+    Withheld,
 }
 
 /// Where a walk meets an object: what an applied redaction may hold there.
@@ -442,18 +455,22 @@ pub enum At {
 }
 
 impl Tolerated {
-    /// Only the applied redactions: for a warehouse whose every other object must be present.
-    pub fn applied_only(applied: AppliedSet) -> Tolerated {
-        Tolerated { sealed: SealedSet::default(), applied }
+    /// Only the applied redactions and the withheld content: for a warehouse whose every other
+    /// object must be present.
+    pub fn removed_only(applied: AppliedSet, withheld: WithheldSet) -> Tolerated {
+        Tolerated { sealed: SealedSet::default(), applied, withheld }
     }
 
-    /// Which set holds `hash`, met `at`, if either does. An applied redaction holds a file's
-    /// content only (see Applied redactions in the module doc comment), and there wins over a
-    /// record of the same hash: nothing fetches a redacted object. Checks no presence: a held
-    /// object that is present is held by nothing, and walked.
+    /// Which set holds `hash`, met `at`, if any does. An applied redaction, and then withheld
+    /// content, holds a file's content only (see Applied redactions in the module doc comment), and
+    /// there wins over a record of the same hash: nothing fetches either. A redaction wins over a
+    /// withholding, since it is for good. Checks no presence: a held object that is present is held
+    /// by nothing, and walked.
     pub fn held(&self, hash: &str, at: At) -> Option<Held> {
         if at == At::File && self.applied.contains(hash) {
             Some(Held::Redacted)
+        } else if at == At::File && self.withheld.contains(hash) {
+            Some(Held::Withheld)
         } else if self.sealed.contains(hash) {
             Some(Held::Sealed)
         } else {
@@ -461,19 +478,30 @@ impl Tolerated {
         }
     }
 
-    /// Whether neither set holds anything.
+    /// Whether no set holds anything.
     pub fn is_empty(&self) -> bool {
-        self.sealed.is_empty() && self.applied.is_empty()
+        self.sealed.is_empty() && self.applied.is_empty() && self.withheld.is_empty()
     }
 }
 
-/// Read the sealed record and the applied redactions, for a walk that judges an absence.
+/// Read the sealed record, the applied redactions and the withheld content, for a walk that judges
+/// an absence.
 ///
 /// # Returns
-/// * `Ok(Tolerated)` - Both sets.
-/// * `Err(String)`   - If either record cannot be read or parsed.
+/// * `Ok(Tolerated)` - The three sets.
+/// * `Err(String)`   - If any record cannot be read or parsed.
 pub fn read_tolerated() -> Result<Tolerated, String> {
-    Ok(Tolerated { sealed: read_sealed()?, applied: applied_redactions::read_applied()? })
+    Ok(Tolerated { sealed: read_sealed()?, ..read_removed()? })
+}
+
+/// Read the applied redactions and the withheld content alone ([`Tolerated::removed_only`]), for a
+/// walk in a warehouse whose every other object must be present.
+///
+/// # Returns
+/// * `Ok(Tolerated)` - Both sets, and an empty sealed set.
+/// * `Err(String)`   - If either record cannot be read or parsed.
+pub fn read_removed() -> Result<Tolerated, String> {
+    Ok(Tolerated::removed_only(applied_redactions::read_applied()?, withholding::read_withheld()?))
 }
 
 /// Read and parse the record at `path`.
@@ -878,10 +906,10 @@ pub fn bound(_hold: &StoreAccessExclusive, parcels: &[String]) -> Result<Bounded
     if sealed.is_empty() {
         return Ok(Bounded::default());
     }
-    let tolerated = Tolerated { sealed, applied: applied_redactions::read_applied()? };
+    let tolerated = Tolerated { sealed, ..read_removed()? };
 
-    // An object absent by an applied redaction is a boundary like a recorded one, never damage,
-    // so a cache that applied a redaction still shrinks its record.
+    // An object absent by an applied redaction or a withholding is a boundary like a recorded one,
+    // never damage, so a cache that applied a redaction still shrinks its record.
     let (drop, skipped) = match walk(parcels, &tolerated, Unrecorded::Damage)? {
         Ok(walked) => {
             let mut drop = HashSet::new();
@@ -968,7 +996,7 @@ impl Walked {
 
         match tolerated.held(hash, at) {
             // A boundary too, but never one a remote is leaned on for, so not among `absent`.
-            Some(Held::Redacted) => return Ok(Met::Absent),
+            Some(Held::Redacted | Held::Withheld) => return Ok(Met::Absent),
             Some(Held::Sealed) => {}
             None if unrecorded == Unrecorded::Damage => return Ok(Met::Unrecorded),
             None => {}
@@ -2085,8 +2113,60 @@ mod tests {
         assert_eq!(tolerated.held(&both, At::File), Some(Held::Redacted));
         assert_eq!(tolerated.held(&sealed_only, At::File), Some(Held::Sealed));
         assert_eq!(tolerated.held(&neither, At::File), None);
-        assert!(!tolerated.is_empty() && !Tolerated::applied_only(tolerated.applied.clone()).is_empty());
+        assert!(!tolerated.is_empty() && !Tolerated::removed_only(tolerated.applied.clone(), WithheldSet::default()).is_empty());
         assert!(Tolerated::default().is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Withheld content holds a file's content only, below an applied redaction of the same hash
+    /// and above the record: both of the others are read beside it.
+    ///
+    /// Revert: drop the withheld arm of `held` → the withheld-only hash is held by nothing → red;
+    /// look it up before the applied set → the redacted hash reads as withheld → red.
+    #[test]
+    fn withheld_content_is_held_as_withheld_where_a_file_sits() {
+        let (root, _scope) = scratch("held-withheld");
+        let (redacted, withheld, sealed_too) = ("1".repeat(64), "5".repeat(64), "6".repeat(64));
+        append(&[(SealOp::Record, &sealed_too)]).unwrap();
+        applied_redactions::apply_for_test(&[&redacted]);
+        for hash in [&redacted, &withheld, &sealed_too] {
+            withholding::withhold(hash, "court order 7").unwrap();
+        }
+
+        for tolerated in [read_tolerated().unwrap(), read_removed().unwrap()] {
+            assert_eq!(tolerated.held(&redacted, At::File), Some(Held::Redacted));
+            assert_eq!(tolerated.held(&withheld, At::File), Some(Held::Withheld));
+            assert_eq!(tolerated.held(&sealed_too, At::File), Some(Held::Withheld));
+            assert_eq!(tolerated.held(&withheld, At::Tree), None);
+            assert_eq!(tolerated.held(&withheld, At::Chunk), None);
+        }
+        assert_eq!(read_tolerated().unwrap().held(&sealed_too, At::Tree), Some(Held::Sealed));
+        assert!(read_removed().unwrap().sealed.is_empty());
+        assert!(!Tolerated::removed_only(AppliedSet::default(), withholding::read_withheld().unwrap()).is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A closure refusal naming a withheld hash, bare or as an object's path, says the host
+    /// withholds it; one naming none is left as it is.
+    ///
+    /// Revert: match the whole hash → the path form gets no note → red.
+    #[test]
+    fn a_refusal_naming_a_withheld_hash_says_the_host_withholds_it() {
+        let (root, _scope) = scratch("withheld-note");
+        let withheld = "7".repeat(64);
+        withholding::withhold(&withheld, "court order 8").unwrap();
+        let set = withholding::read_withheld().unwrap();
+        let note = format!("This server's host withholds {}", withheld);
+
+        let bare = format!("The history behind x is incomplete: {} is missing.", withheld);
+        let path = format!("Error while reading \"objects/{}/{}\": not found", &withheld[..2], &withheld[2..]);
+        for refusal in [bare, path] {
+            assert!(crate::util::audit_utils::withheld_beyond_files(refusal.clone(), &set).contains(&note), "{}", refusal);
+        }
+        let other = format!("{} is missing.", "8".repeat(64));
+        assert_eq!(crate::util::audit_utils::withheld_beyond_files(other.clone(), &set), other);
 
         std::fs::remove_dir_all(&root).ok();
     }

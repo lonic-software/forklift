@@ -462,6 +462,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             present: Vec::new(),
             targets: BTreeMap::new(),
             direct: Vec::new(),
+            withheld: Vec::new(),
         };
 
         // Dedupe, keeping first-occurrence order — the order `present`/`direct` are built in

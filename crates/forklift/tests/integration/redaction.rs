@@ -2501,6 +2501,97 @@ fn git_export_leaves_out_a_file_whose_redaction_is_applied_and_names_it() {
     assert!(human.contains("of 2 commit(s)"), "{}", human);
 }
 
+/// A lift may name content the server's host withholds and the server never held: nothing asks
+/// for its bytes, the upload negotiation answers it withheld and `missing` leaves it out, and the
+/// ref writes tolerate its absence, including one that moves the file to another directory. The
+/// server still lacks it, and refuses it.
+///
+/// Revert: answer a withheld hash as `direct` in the negotiation → the negotiation names it there;
+/// drop the withheld arm of the closure tolerance → the lift's ref write is refused; list a
+/// withheld hash as missing → `missing` names it.
+#[test]
+fn a_lift_naming_withheld_content_lands_without_its_bytes() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-takedown-unheld-server-{}", std::process::id())));
+
+    let owner = Warehouse::cloned("takedown-unheld-owner", &server.url);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+
+    let content = b"a film the server never held\n";
+    let hash = hash_of(content);
+    let statement = "court order 2026-41";
+    let added = withhold(&server.root, &["add", &hash, "--statement", statement]);
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+
+    let (status, body) = http(&server.url, "POST", "/v1/objects/missing",
+                              format!("{{\"hashes\":[\"{}\"]}}", hash).as_bytes());
+    assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, body);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["missing"], serde_json::json!([]), "{}", body);
+
+    let (status, body) = http(&server.url, "POST", "/v1/objects/upload-targets",
+                              format!("{{\"session\":\"s\",\"hashes\":[\"{}\"]}}", hash).as_bytes());
+    assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, body);
+    let negotiated: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(negotiated["withheld"], serde_json::json!([hash]), "{}", body);
+    assert_eq!(negotiated["direct"], serde_json::json!([]), "{}", body);
+
+    owner.stack("film.mkv", content, "film");
+    owner.run_ok(&["lift"]);
+    assert_eq!(server.main(), owner.head("main"));
+
+    // A tree that moves the file elsewhere names it again; the write tolerates that too.
+    std::fs::create_dir_all(owner.root.join("films")).unwrap();
+    std::fs::write(owner.root.join("films/film.mkv"), content).unwrap();
+    std::fs::remove_file(owner.root.join("film.mkv")).unwrap();
+    owner.run_ok(&["load", "."]);
+    owner.run_ok(&["stack", "-m", "move the film"]);
+    owner.run_ok(&["lift"]);
+    assert_eq!(server.main(), owner.head("main"));
+
+    // The server never took the bytes, and refuses them.
+    let (status, info) = http(&server.url, "GET", "/v1/warehouse", b"");
+    assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, info);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&info).unwrap()["withheld"], serde_json::json!([
+        { "hash": hash, "statement": statement, "state": "deleted" }
+    ]), "{}", info);
+    let (status, body) = http(&server.url, "GET", &format!("/v1/objects/{}", hash), b"");
+    assert!(status.starts_with("HTTP/1.1 451"), "{} / {}", status, body);
+}
+
+/// Only a file's content is tolerated absent for being withheld: a lift whose history names a
+/// withheld hash as a parcel is refused, and the refusal says the host withholds it, since the
+/// negotiation never asked for it.
+///
+/// Revert: drop either note → the refusal reads as history the client failed to upload.
+#[test]
+fn a_lift_naming_a_withheld_hash_as_history_says_the_host_withholds_it() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-takedown-parcel-server-{}", std::process::id())));
+
+    let owner = Warehouse::cloned("takedown-parcel-owner", &server.url);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+    let lifted = server.main();
+
+    // The head itself.
+    owner.stack("draft.txt", b"draft\n", "draft");
+    let draft = owner.head("main");
+    let added = withhold(&server.root, &["add", &draft, "--statement", "court order 2026-42"]);
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    let refused = owner.run(&["lift"]);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success() && stderr.contains("host withholds it"), "{}", stderr);
+    assert_eq!(server.main(), lifted);
+
+    // A parcel the new head descends from.
+    owner.stack("final.txt", b"final\n", "final");
+    let refused = owner.run(&["lift"]);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success() && stderr.contains(&format!("host withholds {}", draft)), "{}", stderr);
+    assert_eq!(server.main(), lifted);
+}
+
 /// Run `forklift-server withhold` with `args` against the server root at `root`.
 fn withhold(root: &std::path::Path, args: &[&str]) -> Output {
     std::process::Command::new(common::server_binary()).env("FORKLIFT_FSYNC", "0")
@@ -2554,8 +2645,6 @@ fn a_server_withholds_content_on_its_hosts_statement_while_it_serves() {
     let refusals = [
         ("get", http(&server.url, "GET", &object, b"")),
         ("put", http(&server.url, "PUT", &object, &object_utils::blob_bytes(content))),
-        ("upload-targets", http(&server.url, "POST", "/v1/objects/upload-targets",
-                                format!("{{\"session\":\"s\",\"hashes\":[\"{}\"]}}", hash).as_bytes())),
     ];
     for (surface, (status, body)) in refusals {
         assert!(status.starts_with("HTTP/1.1 451"), "{}: {} / {}", surface, status, body);

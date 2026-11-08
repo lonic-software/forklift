@@ -2547,12 +2547,18 @@ async fn post_missing(State(state): State<Arc<AppState>>,
 
     let gate = Arc::clone(&warehouse);
     let result = blocking(warehouse, move || {
-        // A withheld chunk is missing here, as `GET` answers it: a lift naming it uploads it.
-        let withheld = withheld_among(&gate, &read_applied()?, &request.hashes)?;
+        // A chunk a redaction's owed deletion withholds is missing here, as `GET` answers it: a
+        // lift naming it uploads it. Content the host withholds is never missing, held or not:
+        // this head takes none of it, and its ref writes tolerate its absence.
+        let owed_chunks = withheld_among(&gate, &read_applied()?, &request.hashes)?;
+        let host_withheld = read_withheld()?;
         let mut missing: Vec<String> = Vec::new();
 
         for hash in request.hashes {
-            if withheld.contains(&hash) || !file_utils::does_object_exist(&hash).map_err(internal)? {
+            if host_withheld.contains(&hash) {
+                continue;
+            }
+            if owed_chunks.contains(&hash) || !file_utils::does_object_exist(&hash).map_err(internal)? {
                 missing.push(hash);
             }
         }
@@ -2662,12 +2668,15 @@ async fn post_upload_targets(State(state): State<Arc<AppState>>,
     let result = blocking(warehouse, move || {
         let (applied, withheld) = (read_applied()?, read_withheld()?);
 
-        request.hashes.iter().try_for_each(|hash| refuse_removed(&applied, &withheld, hash))?;
+        // A redacted hash refuses the lift: the client checks its history against its own
+        // redactions first, so one asked about here is a client that did not.
+        request.hashes.iter().try_for_each(|hash| refuse_removed(&applied, &WithheldSet::default(), hash))?;
 
         let mut response = UploadTargetsResponse {
             present: Vec::new(),
             targets: std::collections::BTreeMap::new(),
             direct: Vec::new(),
+            withheld: Vec::new(),
         };
 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2677,7 +2686,11 @@ async fn post_upload_targets(State(state): State<Arc<AppState>>,
                 continue;
             }
 
-            if file_utils::does_object_exist(&hash).map_err(unprocessable)? {
+            // Content the host withholds is never taken, but a lift may name it: its ref write
+            // tolerates the absence. So it is answered apart rather than refusing the lift.
+            if withheld.contains(&hash) {
+                response.withheld.push(hash);
+            } else if file_utils::does_object_exist(&hash).map_err(unprocessable)? {
                 response.present.push(hash);
             } else {
                 // No staging prefix here — the client PUTs the body and the head verifies it
@@ -3107,11 +3120,16 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                 // A first anchor arrives over an unborn office, so nothing above ties its
                 // `adopts` to held history — but every warehouse that adopts this anchor later
                 // fetches that history from here. The client uploads it before the anchor.
+                // Strictly, nothing tolerated: a pin is served whole to every adopter, so one naming
+                // content this head withholds or redacted is a pin it can never serve.
                 audit_utils::require_adopted_history(
                     anchor.adopts.as_deref(),
                     &|head| audit_utils::verify_parcel_closure(head, None),
                 )
-                .map_err(|refusal| (StatusCode::UNPROCESSABLE_ENTITY, refusal))?;
+                .or_else(|refusal| Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    audit_utils::withheld_beyond_files(refusal, &read_withheld()?),
+                )))?;
 
                 ref_write_test_checkpoint(TRUST_WRITE_SEAM);
 
@@ -3269,9 +3287,14 @@ async fn post_ref_update(State(state): State<Arc<AppState>>,
             }
 
             if !file_utils::does_object_exist(&request.new_head).map_err(internal)? {
+                // The negotiation never asks for withheld content, so say why this one is absent.
+                let why = match read_withheld()?.contains(&request.new_head) {
+                    true => " This server's host withholds it, so it never takes it.",
+                    false => "",
+                };
                 return Err(unprocessable(format!(
-                    "The new head {} has not been uploaded.",
-                    request.new_head
+                    "The new head {} has not been uploaded.{}",
+                    request.new_head, why
                 )));
             }
 

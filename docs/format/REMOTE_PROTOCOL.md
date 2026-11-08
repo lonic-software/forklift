@@ -231,17 +231,20 @@ rather than the warehouse's, by the hash a tree names for a file, with the host'
 plain line, at most 1000 characters). Unlike a redaction it needs nothing to stop naming the
 content: pallet heads keep naming the file and history is unchanged. From the moment the host
 lists it, the remote refuses the content on the routes below with `451`, and the bundle never
-carries it. `missing` still answers for it as for any object: held while the remote keeps its
-copy, missing once it lacks it, so a lift naming it then uploads it and is refused. `state` is
+carries it. A lift may still name it, and uploads nothing for it (below). `state` is
 `deletion_owed` while the remote still holds a copy, `deleted` once it holds none; a client reads a
 state it does not know as `deletion_owed`. A head that does not withhold content sends `null` or
 omits the field.
 
-**Withheld content is refused.** `GET` and `PUT` of `/v1/objects/{hash}` for a withheld hash, and
-`upload-targets` naming it, answer `451` with `code` `content_withheld`, the host's statement in
-the message, and `details.hash` and `details.statement`. `batch` and the subtree endpoint leave it
-out, as they do an applied redaction's content. A hash both redacted and withheld is answered
-`410`.
+**Withheld content is refused.** `GET` and `PUT` of `/v1/objects/{hash}` for a withheld hash
+answer `451` with `code` `content_withheld`, the host's statement in the message, and
+`details.hash` and `details.statement`. `batch` and the subtree endpoint leave it out, as they do
+an applied redaction's content. A hash both redacted and withheld is answered `410`.
+
+**Withheld content is still named.** Pallet heads may keep naming a withheld file, and a lift may
+name it without uploading it: `missing` never lists a withheld hash, `upload-targets` answers it in
+`withheld`, and a ref update tolerates its absence wherever a file names it, moved or copied
+included. Only a file's content is tolerated so; a tree, parcel or recipe is never withheld.
 
 **Applied redactions are refused.** Once a head has applied a redaction, `GET` and `PUT` of
 `/v1/objects/{hash}` for its hash answer `410` with `code` `content_redacted` and the hash in
@@ -284,8 +287,8 @@ repeat it back. The object store answers for that spelling alone.
 ### `POST /v1/objects/missing`
 
 Body: `{"hashes": ["<hash>", …]}` (at most 10 000 per request — batch larger sets).
-Response: `{"missing": ["<hash>", …]}` — the subset the remote does not have. Used by
-`lift` to negotiate what to upload.
+Response: `{"missing": ["<hash>", …]}` — the subset the remote does not have and would take. Used
+by `lift` to negotiate what to upload. A withheld hash is never listed, held or not.
 
 ### `POST /v1/objects/upload-targets` (additive; storage-backed heads)
 
@@ -301,16 +304,19 @@ Response — one verdict per hash, and not a single object body sent to learn it
 {
   "present": ["<hash>", …],
   "targets": { "<hash>": "<presigned PUT url>", … },
-  "direct":  ["<hash>", …]
+  "direct":  ["<hash>", …],
+  "withheld": ["<hash>", …]
 }
 ```
 
-`present` are objects the remote already has (do not upload them; it is exactly the
-complement of `missing`, so this call subsumes that one on the upload path). `targets` are
+`present` are objects the remote already has (do not upload them; this call subsumes `missing`
+on the upload path). `targets` are
 presigned `PUT`s into the session's **staging prefix** — the bytes go straight to storage,
 bypassing the control plane, and are not fetchable until the session commit promotes them.
 `direct` are objects to `PUT` to `/v1/objects/{hash}` as usual, for the head to verify
-inline.
+inline. `withheld` (additive) are objects the head's host withholds: not uploaded, and a ref
+update may name them all the same; the field is left out when empty. A hash in none of the lists
+is not uploaded either, so a client that does not know `withheld` behaves the same.
 
 A direct head (`forklift-server`) answers with every missing hash in `direct` and an empty
 `targets`, so one client code path serves both heads. Without this call, a client uploading
