@@ -3126,7 +3126,10 @@ async fn put_trust(State(state): State<Arc<AppState>>,
                     anchor.adopts.as_deref(),
                     &|head| audit_utils::verify_parcel_closure(head, None),
                 )
-                .map_err(|refusal| (StatusCode::UNPROCESSABLE_ENTITY, refusal))?;
+                .or_else(|refusal| Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    audit_utils::withheld_beyond_files(refusal, &read_withheld()?),
+                )))?;
 
                 ref_write_test_checkpoint(TRUST_WRITE_SEAM);
 

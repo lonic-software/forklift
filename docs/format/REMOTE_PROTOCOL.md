@@ -309,8 +309,8 @@ Response — one verdict per hash, and not a single object body sent to learn it
 }
 ```
 
-`present` are objects the remote already has (do not upload them; with `withheld` it is exactly
-the complement of `missing`, so this call subsumes that one on the upload path). `targets` are
+`present` are objects the remote already has (do not upload them; this call subsumes `missing`
+on the upload path). `targets` are
 presigned `PUT`s into the session's **staging prefix** — the bytes go straight to storage,
 bypassing the control plane, and are not fetchable until the session commit promotes them.
 `direct` are objects to `PUT` to `/v1/objects/{hash}` as usual, for the head to verify

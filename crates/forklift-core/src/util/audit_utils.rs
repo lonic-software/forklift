@@ -1871,16 +1871,17 @@ pub fn verify_parcel_closure_for_write(head: &str,
     Ok(pallet_utils::VerifiedClosure::new(head, PathScope::full(), known_complete))
 }
 
-/// `refusal`, a closure walk's, saying so when it names a hash this head withholds: such a hash is
-/// tolerated absent only as a file's content, so one the walk met as a tree, a parcel or a chunk
-/// still refuses the write, and the plain refusal would read as history the client failed to upload
-/// (the negotiation never asks for withheld content). A refusal may name the hash as an object's
+/// `refusal`, a closure walk's, saying so when it names a hash this head withholds. A ref write
+/// tolerates such a hash absent only as a file's content, and a first anchor's adopted history not
+/// at all, so either may still be refused over one; the plain refusal would read as history the
+/// client failed to upload, and name lifting it as the way out, when the negotiation never asks
+/// for withheld content and no upload of it is taken. A refusal may name the hash as an object's
 /// path, `<2 hex>/<62 hex>`, so the hash is found by its tail.
-fn withheld_beyond_files(refusal: String, withheld: &WithheldSet) -> String {
+pub fn withheld_beyond_files(refusal: String, withheld: &WithheldSet) -> String {
     match withheld.entries().find(|(hash, _)| hash.get(2..).is_some_and(|tail| refusal.contains(tail))) {
         Some((hash, _)) => format!(
-            "{} This server's host withholds {}, so it never takes it, and it is tolerated absent only \
-            as a file's content; here history names it as something else.",
+            "{} This server's host withholds {}, so it never takes it, and the refusal stands while \
+            it does.",
             refusal, hash
         ),
         None => refusal,
@@ -2119,9 +2120,10 @@ impl<'a> SealedTolerance<'a> {
         matches!(self.tolerated.held(hash, At::File), Some(Held::Redacted | Held::Withheld))
     }
 
-    /// Whether the absent object `hash`, met `at`, is held, by the record, or by an applied redaction
-    /// or a withholding (a file's content only), tallying it under the record or the redaction that
-    /// holds it if so; withheld content is not tallied. Call only at an absence: a held object that is present
+    /// Whether the absent object `hash`, met `at`, is held, by the record, or by an applied
+    /// redaction or a withholding (a file's content only), tallying it under the record or the
+    /// redaction that holds it if so; withheld content is not tallied. Call only at an absence: a
+    /// held object that is present
     /// is held by nothing.
     fn holds_absent(&self, hash: &str, at: At) -> bool {
         match self.tolerated.held(hash, at) {

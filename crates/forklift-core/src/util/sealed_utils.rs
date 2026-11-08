@@ -2148,6 +2148,29 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// A closure refusal naming a withheld hash, bare or as an object's path, says the host
+    /// withholds it; one naming none is left as it is.
+    ///
+    /// Revert: match the whole hash → the path form gets no note → red.
+    #[test]
+    fn a_refusal_naming_a_withheld_hash_says_the_host_withholds_it() {
+        let (root, _scope) = scratch("withheld-note");
+        let withheld = "7".repeat(64);
+        withholding::withhold(&withheld, "court order 8").unwrap();
+        let set = withholding::read_withheld().unwrap();
+        let note = format!("This server's host withholds {}", withheld);
+
+        let bare = format!("The history behind x is incomplete: {} is missing.", withheld);
+        let path = format!("Error while reading \"objects/{}/{}\": not found", &withheld[..2], &withheld[2..]);
+        for refusal in [bare, path] {
+            assert!(crate::util::audit_utils::withheld_beyond_files(refusal.clone(), &set).contains(&note), "{}", refusal);
+        }
+        let other = format!("{} is missing.", "8".repeat(64));
+        assert_eq!(crate::util::audit_utils::withheld_beyond_files(other.clone(), &set), other);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// An applied redaction holds a file's content only: met as a tree or a chunk, its hash is held
     /// by the record alone, if at all.
     ///

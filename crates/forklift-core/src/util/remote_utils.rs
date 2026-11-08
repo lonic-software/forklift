@@ -4227,8 +4227,7 @@ impl RemoteClient {
     /// A storage-backed head answers `targets` (presigned staging `PUT` URLs) for what it wants
     /// staged and `direct` for what it verifies inline; a direct head answers every missing hash
     /// in `direct` with empty `targets`, so one client code path serves both heads. `present`
-    /// (the complement of `missing`, but for what the head withholds) is skipped, and so is
-    /// `withheld`.
+    /// is skipped, and so is `withheld`.
     ///
     /// Deliberately **not** on [`Posture::BoundedReads`], the same reasoning as
     /// [`Self::missing_objects`]: the server side (`forklift-server/src/server.rs`'s

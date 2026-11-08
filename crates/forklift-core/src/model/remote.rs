@@ -349,8 +349,7 @@ pub struct UploadTargetsRequest {
 /// The response of `POST /v1/objects/upload-targets`: one verdict per requested hash, so a
 /// client learns in a single body-less round trip what to skip, what to send straight to
 /// storage, and what to hand the control plane. It subsumes `POST /v1/objects/missing` for
-/// the upload path (`present` is the complement of `missing`, but for what a head withholds: it
-/// is in `withheld` and in neither of those).
+/// the upload path.
 #[derive(Serialize, Deserialize)]
 pub struct UploadTargetsResponse {
     /// Objects the remote already has at their canonical key. Do not upload them.
