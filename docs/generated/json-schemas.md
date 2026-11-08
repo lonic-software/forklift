@@ -1263,6 +1263,32 @@ A command not listed here either reports only the generic human-message shape `{
       ],
       "type": "object"
     },
+    "RedactedFile": {
+      "description": "A file an export or a mirror left out of the commits it wrote, because this warehouse applied a\nredaction of its content.",
+      "properties": {
+        "hash": {
+          "description": "Its content's hash: the redaction's.",
+          "type": "string"
+        },
+        "parcels": {
+          "description": "The parcels whose commits left it out, in the order they were written.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "path": {
+          "description": "The file's path in the parcels' trees, `/`-separated.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "hash",
+        "parcels"
+      ],
+      "type": "object"
+    },
     "SkippedTag": {
       "description": "A tag an export or a mirror left out.",
       "properties": {
@@ -1325,6 +1351,13 @@ A command not listed here either reports only the generic human-message shape `{
     },
     "path": {
       "type": "string"
+    },
+    "redacted": {
+      "description": "The files left out because this warehouse applied a redaction of their content: each by\npath, with the parcels whose commits carry no version of it in its place.",
+      "items": {
+        "$ref": "#/$defs/RedactedFile"
+      },
+      "type": "array"
     },
     "remote_left_behind": {
       "description": "The configured remote's pallets this export lacks as they stand there: a user pallet with no\nbranch here, or whose remote head is not an exported parcel, or `@tags` when the remote's is\nnot one held here. Empty when no remote is configured or it could not be asked.",
@@ -1468,6 +1501,13 @@ A command not listed here either reports only the generic human-message shape `{
         "pallet": {
           "type": "string"
         },
+        "redacted": {
+          "description": "The files left out of the commits this run wrote, because this warehouse applied a\nredaction of their content: each by path, with the parcels whose commits left it out.\nCommits written before the redaction applied keep the file (`.forklift/mirror.git`).",
+          "items": {
+            "$ref": "#/$defs/RedactedFile"
+          },
+          "type": "array"
+        },
         "status": {
           "$ref": "#/$defs/MirrorStatus"
         }
@@ -1476,6 +1516,32 @@ A command not listed here either reports only the generic human-message shape `{
         "pallet",
         "status",
         "exported"
+      ],
+      "type": "object"
+    },
+    "RedactedFile": {
+      "description": "A file an export or a mirror left out of the commits it wrote, because this warehouse applied a\nredaction of its content.",
+      "properties": {
+        "hash": {
+          "description": "Its content's hash: the redaction's.",
+          "type": "string"
+        },
+        "parcels": {
+          "description": "The parcels whose commits left it out, in the order they were written.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "path": {
+          "description": "The file's path in the parcels' trees, `/`-separated.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "hash",
+        "parcels"
       ],
       "type": "object"
     },
@@ -2353,6 +2419,13 @@ A command not listed here either reports only the generic human-message shape `{
         "pallet": {
           "type": "string"
         },
+        "redacted": {
+          "description": "The files left out of the commits this run wrote, because this warehouse applied a\nredaction of their content: each by path, with the parcels whose commits left it out.\nCommits written before the redaction applied keep the file (`.forklift/mirror.git`).",
+          "items": {
+            "$ref": "#/$defs/RedactedFile"
+          },
+          "type": "array"
+        },
         "refused_tags": {
           "description": "Tags git refused, or already holds as another object, with the step that clears each.",
           "items": {
@@ -2471,6 +2544,32 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "string"
         }
       ]
+    },
+    "RedactedFile": {
+      "description": "A file an export or a mirror left out of the commits it wrote, because this warehouse applied a\nredaction of its content.",
+      "properties": {
+        "hash": {
+          "description": "Its content's hash: the redaction's.",
+          "type": "string"
+        },
+        "parcels": {
+          "description": "The parcels whose commits left it out, in the order they were written.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "path": {
+          "description": "The file's path in the parcels' trees, `/`-separated.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "hash",
+        "parcels"
+      ],
+      "type": "object"
     },
     "SkippedTag": {
       "description": "A tag an export or a mirror left out.",

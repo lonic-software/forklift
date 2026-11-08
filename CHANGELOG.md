@@ -123,6 +123,13 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   removed, and widens over history naming it; and a cache's read of content its remote reports
   redacted is refused as `content_redacted` (exit 49), as `scope fetch` over it is, rather than as
   a generic error.
+- **`git export` and `git mirror` leave out redacted files, and the `--json` schema is now 30.**
+  A file whose redaction this warehouse applied is left out of every commit they write, with
+  nothing in its place, and a folder that held only such files goes with it; before, the export
+  failed on the missing content. Both name each such file with the parcels whose commits left it
+  out (`redacted` in `--json`). The same parcel now exports to a different commit than it did
+  before the redaction, so a mirror exported again from scratch does not fast-forward the branches
+  it pushed before; commits a mirror wrote earlier keep the file.
 - **The AWS head applies redactions.** A redaction that no pallet head, deleted pallet's tombstone
   or metadata history names applies on the AWS head when a request names its content, or after a
   lift or pallet deletion. The head then refuses that content as `content_redacted` on object

@@ -85,7 +85,13 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 29** (current): a warehouse with a remote applies a redaction on the remote's report.
+**Schema 30** (current): `git export` and `git mirror` leave out a file whose redaction this
+warehouse applied. `git export`'s result and each pallet outcome of `git mirror` (and of a lift's
+`mirror`) carry `redacted` when they left one out: per file, `path`, `hash` (the redaction's) and
+`parcels` (each parcel whose new commit left it out). Nothing is written in its place, and a folder
+that held only such files is left out with them.
+
+**Schema 29**: a warehouse with a remote applies a redaction on the remote's report.
 `lower` and `clone` carry `redactions` when they applied one: `applied` (the hashes this command
 applied: the remote reports them applied, and nothing here names their content), `deletion` (as
 `redact apply`'s), and `mirror_copy` (a sentence naming `.forklift/mirror.git`, which may hold a

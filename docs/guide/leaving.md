@@ -117,6 +117,10 @@ $ forklift haul list --state all --json > hauls.json
 $ forklift haul show <haul> --json > haul-<haul>.json
 ```
 
+A file whose content was redacted (`forklift redact`) is left out of every commit that carried
+it, and the export names it with those parcels. Nothing stands in its place, so those commits
+differ from the ones an export before the redaction wrote.
+
 The signatures can only be checked by Forklift. If you may need to prove later who stacked what,
 keep the warehouse folder: `forklift audit` checks it offline, with no server.
 
