@@ -27,7 +27,12 @@
       "Sid": "DeleteRedactedCopies",
       "Effect": "Allow",
       "Action": "s3:DeleteObjectVersion",
-      "Resource": ["${bucket_arn}/objects/*", "${bucket_arn}/staging/*"]
+      "Resource": [
+        "${bucket_arn}/objects/*",
+        "${bucket_arn}/staging/*",
+        "${bucket_arn}/responses/*",
+        "${bucket_arn}/redaction-work/*"
+      ]
     },
     {
       "Sid": "ListRedactedVersions",

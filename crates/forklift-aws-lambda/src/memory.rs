@@ -41,9 +41,10 @@ pub struct MemoryObjectStore {
     /// Uploads that bypassed the head, keyed by `(session, hash)` — the in-memory stand-in
     /// for an S3 staging prefix. Invisible to `exists`/`get` until promoted.
     staged: Mutex<HashMap<(String, String), Vec<u8>>>,
-    /// Offloaded response bodies (`batch` bundles), keyed by their content hash — the
-    /// stand-in for an ephemeral S3 prefix served by presigned `GET`. Never an object.
-    responses: Mutex<HashMap<String, Vec<u8>>>,
+    /// Offloaded response bodies (`batch` bundles), keyed by their content hash, with when each
+    /// was last written — the stand-in for an ephemeral S3 prefix served by presigned `GET`.
+    /// Never an object.
+    responses: Mutex<HashMap<String, (Vec<u8>, std::time::SystemTime)>>,
     /// How many object bodies have been read out of the store — each one an S3 `GET` in the
     /// real backend, so tests can assert what the audit mirror does *not* fetch.
     reads: AtomicUsize,
@@ -113,7 +114,20 @@ impl MemoryObjectStore {
     pub fn offloaded_response(&self, url: &str) -> Option<Vec<u8>> {
         let key = url.rsplit('/').next()?;
 
-        self.responses.lock().unwrap().get(key).cloned()
+        self.responses.lock().unwrap().get(key).map(|(bytes, _)| bytes.clone())
+    }
+
+    /// Make every offloaded response read as written `by` earlier than it was, standing in for
+    /// the time a redaction's late sweep waits.
+    pub fn age_responses(&self, by: std::time::Duration) {
+        for (_, written) in self.responses.lock().unwrap().values_mut() {
+            *written -= by;
+        }
+    }
+
+    /// How many offloaded responses the store holds.
+    pub fn response_count(&self) -> usize {
+        self.responses.lock().unwrap().len()
     }
 }
 
@@ -283,6 +297,18 @@ impl ObjectStore for MemoryObjectStore {
         Ok(())
     }
 
+    fn work_delete_under(&self, prefix: &str) -> Result<(), String> {
+        self.work.lock().unwrap().retain(|name, _| !name.starts_with(prefix));
+
+        Ok(())
+    }
+
+    fn delete_responses_before(&self, cutoff: std::time::SystemTime) -> Result<(), String> {
+        self.responses.lock().unwrap().retain(|_, (_, written)| *written >= cutoff);
+
+        Ok(())
+    }
+
     fn offload_response(&self, bytes: Vec<u8>) -> Result<OffloadedResponse, String> {
         let Some(base) = &self.redirect_base else {
             return Ok(OffloadedResponse::Inline(bytes));
@@ -291,7 +317,7 @@ impl ObjectStore for MemoryObjectStore {
         // A content-addressed *response* key, deliberately outside the `objects/` namespace.
         let key = object_utils::hash_object_bytes(&bytes);
 
-        self.responses.lock().unwrap().insert(key.clone(), bytes);
+        self.responses.lock().unwrap().insert(key.clone(), (bytes, std::time::SystemTime::now()));
 
         Ok(OffloadedResponse::Url(format!("{}/responses/{}", base, key)))
     }

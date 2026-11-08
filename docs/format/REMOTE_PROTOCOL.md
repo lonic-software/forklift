@@ -168,7 +168,7 @@ The serverless head decides each redaction where its content would move, from st
 consistent reads. A `GET` or `PUT` of an object, `upload-targets` and `batch` judge each hash
 they name that `@redactions` records, and apply a redaction nothing holds before they answer.
 After each ref update or `DELETE` commits, and at the handshake, the head judges every
-redaction not yet applied, as best effort: a failure there is logged, and the write is answered
+redaction, as best effort: a failure there is logged, and the write is answered
 all the same. The first judge of a redaction reads every pallet's tree and every metadata
 history, which may take several requests. What it found is kept, so later judges read the pallet
 heads, plus the parents of a metadata pallet seen naming the content whose head has moved. A
@@ -181,10 +181,14 @@ first request that finds a redaction applied deletes the copies the store keeps 
 object and its staged copy in every lift session, every version of each. It holds a lease in the
 redaction's item while it does, so requests that find it applied together delete once, and one
 that ends holding the lease leaves the deletion to the first request after the lease runs out. A
-deletion that fails is logged and retried by a later request. For now an applied redaction stays
+deletion that fails is logged and retried by a later request. The redaction stays
 `deletion_owed` after that: a `batch` answer that bundled the content before it applied may still
-be downloadable until its URL expires, and an applied recipe's object and chunks are kept, its
-chunks still served.
+be downloadable until its URL expires, and a request that was running when it applied may still
+write a copy. The first request to judge it once every such request has ended and every such URL
+has expired (at least 1920 seconds after it applied) deletes the copies again, and the
+`batch` answers written before those requests ended; the redaction is then `deleted`. For now an
+applied recipe's object and chunks are kept, its chunks still served, and it stays
+`deletion_owed`.
 
 forklift-server deletes an applied redaction's content in its own process right after applying
 it. It drains that one warehouse: new requests for it get `503` until the deletion ends (which may

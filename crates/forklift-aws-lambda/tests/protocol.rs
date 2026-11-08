@@ -5691,6 +5691,113 @@ fn a_held_deletion_lease_is_left_alone_until_it_runs_out() {
     assert!(!head.objects.exists(&leak).expect("exists"), "the lease ran out: deleted");
 }
 
+/// The redaction item of `hash` as the judge leaves it after its first sweep, but applied `ago`
+/// seconds before now: `extra` is spliced in as further fields.
+fn applied_item(ago: u64, extra: &str) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock").as_secs();
+    format!(r#"{{"version":1,"scan_complete":true,"holders":[],"applied_at":{}{}}}"#, now - ago, extra)
+}
+
+/// How long after its apply a redaction's late sweep is due: the Lambda ceiling, a presigned URL's
+/// lifetime and the margin, written out here rather than read from the code under test.
+const LATE_SWEEP_AFTER: u64 = 900 + 60 + 900 + 60;
+
+/// An applied blob's late sweep, once a presigned URL's lifetime past the last request that could
+/// have judged it pending, deletes what arrived since the first sweep, every response bundle
+/// written before that request's end, and the redaction's work objects; only then does the
+/// handshake say `deleted`. Before it is due, the bundles and the late copy are kept.
+// Revert: never run the late sweep → the state stays `deletion_owed` → red. Revert: delete every
+// response → the bundle written after the cutoff is gone → red. Revert: delete no response → the
+// old bundle is kept → red. Revert: run the late sweep at once → the bundle is gone before it is
+// due → red.
+#[test]
+fn an_applied_blob_is_deleted_once_its_late_sweep_has_run() {
+    let area = Area::new("redaction-late-sweep");
+    let (redactions, recorded) = recorded_redactions(&area, "red", &["leaked\n"]);
+    let leak = blob_hash("leaked\n");
+    let head = Head::new(MemoryObjectStore::with_redirect("https://s3.example/bucket"), MemoryRefStore::new());
+    for (hash, bytes) in &recorded.objects {
+        head.objects.put_verified(hash, bytes).expect("seed an object");
+    }
+    let blob = |content: &str| {
+        use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+        let object = LooseObjectBuilder::build_blob(&forklift_core::model::blob::Blob { content: content.as_bytes().to_vec() });
+        head.objects.put_verified(&object.hash, &object.content).expect("seed an object");
+        object.hash
+    };
+    blob("leaked\n");
+    let other = blob("1");
+
+    head.batch(&[leak.clone(), other.clone()]).expect("a bundle holding the content, before the redaction");
+    assert_eq!(head.objects.response_count(), 1);
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions[0]);
+    assert_gone(&head.object_get(&leak).expect_err("applied"), &leak);
+    assert!(!head.objects.exists(&leak).expect("exists"), "the first sweep");
+
+    head.objects.stage("lift-9", &leak, b"leaked\n".to_vec());
+    head.objects.work_put(&format!("{}/walk-x", leak), b"{}").expect("work");
+    head.objects.work_put(&format!("{}/pallets", other), b"{}").expect("work");
+    assert_eq!(served_state(&head, &leak), Some(ServedRedactionState::DeletionOwed));
+    assert_eq!(head.objects.response_count(), 1, "not due: the bundle is kept");
+    assert_eq!(head.objects.staged_count(), 1, "not due: the late copy is kept");
+
+    plant_item(&head.refs, &leak, &applied_item(LATE_SWEEP_AFTER + 40, r#","swept":true"#));
+    head.objects.age_responses(std::time::Duration::from_secs(1_200));
+    head.batch(std::slice::from_ref(&other)).expect("a bundle written after the cutoff");
+    assert_eq!(head.objects.response_count(), 2);
+
+    assert_eq!(served_state(&head, &leak), Some(ServedRedactionState::Deleted));
+    assert_eq!(head.objects.response_count(), 1, "only the bundle written after the cutoff is kept");
+    assert_eq!(head.objects.staged_count(), 0, "the copy staged after the first sweep is deleted");
+    assert_eq!(head.objects.work_names(), vec![format!("{}/pallets", other)], "only another redaction's work is kept");
+    let item = head.refs.get_redaction(&leak).expect("item").expect("an item");
+    assert!(item.contains(r#""deleted":true"#) && !item.contains("lease_until"), "{}", item);
+    assert_gone(&head.object_get(&leak).expect_err("still refused"), &leak);
+}
+
+/// An applied recipe keeps its object, its chunk list, until its chunks are deleted, so neither
+/// its first sweep run late nor any judge after says it is `deleted`.
+// Revert: end a late sweep as deleted whatever it kept → `deleted` → red. Revert: run the late
+// sweep for an item recorded as a recipe → with the object gone, that sweep says `deleted` → red.
+#[test]
+fn an_applied_recipe_is_never_reported_deleted() {
+    let area = Area::new("redaction-late-recipe");
+    prepare(&area, "red");
+    area.write_large_file("red/big.bin", 0xBAD, CHUNK_THRESHOLD + 50_000);
+    area.forklift("red", &["load", "."]);
+    area.forklift("red", &["stack", "-m", "leak"]);
+    let leaked = harvest(&area.path("red")).head_of("main").expect("main head");
+    area.forklift("red", &["remove", "big.bin"]);
+    area.forklift("red", &["stack", "-m", "take the leak out"]);
+    area.forklift("red", &["redact", "record", &format!("{}:big.bin", leaked), "-m", "a leak"]);
+    let recorded = harvest(&area.path("red"));
+
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &recorded);
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &recorded.head_of("@redactions").expect("@redactions"));
+    let info = head.handshake().expect("handshake");
+    let recipe = info.redactions.expect("redactions")[0].hash.clone();
+    // The recorder's own warehouse no longer keeps the recipe; one holding the same file does.
+    prepare(&area, "wh");
+    area.write_large_file("wh/big.bin", 0xBAD, CHUNK_THRESHOLD + 50_000);
+    area.forklift("wh", &["load", "."]);
+    let stored = harvest(&area.path("wh"));
+    let bytes = stored.objects.get(&recipe).expect("the same file's recipe");
+    head.objects.put_verified(&recipe, bytes).expect("store the recipe");
+
+    plant_item(&head.refs, &recipe, &applied_item(LATE_SWEEP_AFTER + 40, ""));
+    assert_eq!(served_state(&head, &recipe), Some(ServedRedactionState::DeletionOwed));
+    assert!(head.objects.exists(&recipe).expect("exists"), "the recipe is kept");
+    let item = head.refs.get_redaction(&recipe).expect("item").expect("an item");
+    assert!(item.contains(r#""recipe":true"#) && !item.contains(r#""deleted""#), "{}", item);
+
+    // Recorded as a recipe, its late sweep is the chunk deletion's: none runs here, so even with
+    // the object gone nothing says deleted.
+    plant_item(&head.refs, &recipe, &applied_item(LATE_SWEEP_AFTER + 40, r#","swept":true,"recipe":true"#));
+    head.objects.delete_canonical(&recipe).expect("delete");
+    assert_eq!(served_state(&head, &recipe), Some(ServedRedactionState::DeletionOwed));
+}
+
 /// A store whose every promotion is met by the redaction of what it promotes applying, just after
 /// the promotion's write: the race the check after the write closes.
 struct AppliesDuringPromotion {
