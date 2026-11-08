@@ -345,6 +345,11 @@ refusal_codes! {
     /// heads that hold it, and the next step takes the file out of one so the redaction can be
     /// recorded.
     HeadNamesContent => "head_names_content",
+
+    /// The remote withholds the content: its host took it down (a legal takedown, not a
+    /// redaction), so it neither serves nor takes it. The details carry the hash and the host's
+    /// statement. A copy this warehouse holds is unaffected.
+    ContentWithheld => "content_withheld",
 }
 
 impl RefusalCode {

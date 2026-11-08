@@ -32,7 +32,7 @@ use forklift_core::model::hooks::{
 use forklift_core::model::remote::{
     ErrorResponse, HoldAnswer, HoldsRequest, HoldsResponse, MissingObjectsRequest,
     MissingObjectsResponse, RefDeleteRequest, RefUpdateRequest,
-    ResolveRequest, ResolveResponse, ServedRedaction, ServedRedactionState, TrustAnchorDto, UploadTargetsRequest, UploadTargetsResponse,
+    ResolveRequest, ResolveResponse, ServedRedaction, ServedRedactionState, ServedWithholding, ServedWithholdingState, TrustAnchorDto, UploadTargetsRequest, UploadTargetsResponse,
     WarehouseInfo, MAX_MISSING_BATCH, MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
     REFUSAL_NOT_AN_OBJECT_HASH, distinct_resolve_identifiers, resolve_answer_cap,
 };
@@ -48,6 +48,7 @@ use forklift_core::util::{
     sealed_utils, sign_utils, tree_utils, warehouse_utils,
 };
 use forklift_core::util::applied_redactions::AppliedSet;
+use forklift_core::util::withholding::{self, WithheldSet};
 use subtle::ConstantTimeEq;
 
 /// One served warehouse: its storage root, its bundle-rebuild state and the locks it is served
@@ -1498,17 +1499,42 @@ fn served_redactions() -> Result<Vec<ServedRedaction>, HandlerError> {
     }).collect()
 }
 
+/// What this head withholds, for the handshake: each hash with the host's statement, its deletion
+/// owed while the store still holds a copy. A store that cannot tell reports the deletion owed, as
+/// a handshake must not fail over one object.
+fn served_withheld() -> Result<Vec<ServedWithholding>, HandlerError> {
+    Ok(read_withheld()?.entries().map(|(hash, statement)| ServedWithholding {
+        hash: hash.clone(),
+        statement: statement.clone(),
+        state: match file_utils::does_object_exist(hash) {
+            Ok(false) => ServedWithholdingState::Deleted,
+            _ => ServedWithholdingState::DeletionOwed,
+        },
+    }).collect())
+}
+
 /// The redactions this warehouse applied, read for a request that serves or takes objects by hash.
 fn read_applied() -> Result<AppliedSet, HandlerError> {
     applied_redactions::read_applied().map_err(internal)
 }
 
-/// Refuse a request naming `hash` with a `410`, when a redaction this warehouse applied names it:
-/// its bytes are never served or taken again, whether or not they are deleted yet.
-fn refuse_redacted(applied: &AppliedSet, hash: &str) -> Result<(), HandlerError> {
-    match applied.contains(hash) {
-        true => Err((StatusCode::GONE, applied_redactions::served_refusal(hash))),
-        false => Ok(()),
+/// What this head withholds ([`withholding`]), read for a request that serves or takes objects by
+/// hash.
+fn read_withheld() -> Result<WithheldSet, HandlerError> {
+    withholding::read_withheld().map_err(internal)
+}
+
+/// Refuse a request naming `hash` with a `410`, when a redaction this warehouse applied names it,
+/// or with a `451`, when its host withholds it: its bytes are not served or taken, whether or not
+/// they are deleted yet. A redaction wins, since it is for good.
+fn refuse_removed(applied: &AppliedSet, withheld: &WithheldSet, hash: &str) -> Result<(), HandlerError> {
+    if applied.contains(hash) {
+        return Err((StatusCode::GONE, applied_redactions::served_refusal(hash)));
+    }
+
+    match withheld.statement(hash) {
+        Some(statement) => Err((StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, withholding::served_refusal(hash, statement))),
+        None => Ok(()),
     }
 }
 
@@ -2489,6 +2515,7 @@ async fn get_warehouse(State(state): State<Arc<AppState>>,
             // live refs are.
             tombstones: Some(forklift_core::util::tombstone_utils::read_tombstones().map_err(internal)?),
             redactions: Some(served_redactions()?),
+            withheld: Some(served_withheld()?),
         })
     }).await;
 
@@ -2633,9 +2660,9 @@ async fn post_upload_targets(State(state): State<Arc<AppState>>,
     }
 
     let result = blocking(warehouse, move || {
-        let applied = read_applied()?;
+        let (applied, withheld) = (read_applied()?, read_withheld()?);
 
-        request.hashes.iter().try_for_each(|hash| refuse_redacted(&applied, hash))?;
+        request.hashes.iter().try_for_each(|hash| refuse_removed(&applied, &withheld, hash))?;
 
         let mut response = UploadTargetsResponse {
             present: Vec::new(),
@@ -2852,7 +2879,7 @@ async fn get_object(State(state): State<Arc<AppState>>,
     let gate = Arc::clone(&warehouse);
     let result = blocking(warehouse, move || {
         let applied = read_applied()?;
-        refuse_redacted(&applied, &hash)?;
+        refuse_removed(&applied, &read_withheld()?, &hash)?;
 
         if !file_utils::does_object_exist(&hash).map_err(unprocessable)?
             || !withheld_among(&gate, &applied, std::slice::from_ref(&hash))?.is_empty() {
@@ -2891,9 +2918,9 @@ async fn put_object(State(state): State<Arc<AppState>>,
     let result = blocking(warehouse, move || {
         require_uploader(&principal)?;
 
-        // An upload that checked before a redaction applied and stores after is never served: every
-        // read checks too.
-        refuse_redacted(&read_applied()?, &hash)?;
+        // An upload that checked before a redaction applied, or before its host withheld it, and
+        // stores after is never served: every read checks too.
+        refuse_removed(&read_applied()?, &read_withheld()?, &hash)?;
 
         object_utils::store_object_bytes(&hash, &body).map_err(unprocessable)
     }).await;

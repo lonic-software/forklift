@@ -9457,6 +9457,7 @@ mod tests {
             chunking: true,
             tombstones: Some(BTreeMap::from([("gone".to_string(), deleted)])),
             redactions: None,
+            withheld: None,
         };
 
         assert_eq!(held_elsewhere(&info, "feature"), vec![main.clone()]);

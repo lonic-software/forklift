@@ -2500,3 +2500,73 @@ fn git_export_leaves_out_a_file_whose_redaction_is_applied_and_names_it() {
     assert!(human.contains("Left out \"other/secret.env\""), "{}", human);
     assert!(human.contains("of 2 commit(s)"), "{}", human);
 }
+
+/// Run `forklift-server withhold` with `args` against the server root at `root`.
+fn withhold(root: &std::path::Path, args: &[&str]) -> Output {
+    std::process::Command::new(common::server_binary()).env("FORKLIFT_FSYNC", "0")
+        .arg("withhold").args(args).args(["--root", root.to_str().unwrap()])
+        .output().unwrap()
+}
+
+/// A takedown on forklift-server takes effect while it serves: every surface that reads or takes
+/// the content answers `451` with the host's statement, the handshake lists
+/// it with the deletion owed, and the head naming the file is untouched. The bundle that held it is
+/// withdrawn. A tree's hash is refused, as a redaction's would be.
+///
+/// Revert: answer a withheld hash as served on `GET` (drop the withheld arm of the refusal) → the
+/// read is a `200`; drop the handshake's list → `withheld` is null.
+#[test]
+fn a_server_withholds_content_on_its_hosts_statement_while_it_serves() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-withheld-server-{}", std::process::id())));
+
+    let owner = Warehouse::cloned("withheld-owner", &server.url);
+    let content = b"leaked film\n";
+    owner.stack("film.mkv", content, "film");
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+    let head = server.main();
+    let hash = hash_of(content);
+
+    let built = std::process::Command::new(common::server_binary()).env("FORKLIFT_FSYNC", "0")
+        .args(["bundle", "--root", server.root.to_str().unwrap()]).output().unwrap();
+    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+    let bundle = server.root.join(".forklift/bundles/latest");
+    assert!(bundle.exists(), "a bundle is published: {:?}", std::fs::read_dir(server.root.join(".forklift/bundles")));
+
+    let statement = "DMCA notice 2026-117 from Example Studios";
+    let added = withhold(&server.root, &["add", &hash, "--statement", statement]);
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    assert!(String::from_utf8_lossy(&added.stdout).contains("Withheld"), "{:?}", added);
+    assert!(!bundle.exists(), "the bundle that held the content is withdrawn");
+
+    let listed = withhold(&server.root, &["list"]);
+    assert_eq!(String::from_utf8_lossy(&listed.stdout), format!("{} {}\n", hash, statement));
+
+    let (status, info) = http(&server.url, "GET", "/v1/warehouse", b"");
+    assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, info);
+    let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+    assert_eq!(info["withheld"], serde_json::json!([
+        { "hash": hash, "statement": statement, "state": "deletion_owed" }
+    ]), "{}", info);
+
+    let object = format!("/v1/objects/{}", hash);
+    let refusals = [
+        ("get", http(&server.url, "GET", &object, b"")),
+        ("put", http(&server.url, "PUT", &object, &object_utils::blob_bytes(content))),
+        ("upload-targets", http(&server.url, "POST", "/v1/objects/upload-targets",
+                                format!("{{\"session\":\"s\",\"hashes\":[\"{}\"]}}", hash).as_bytes())),
+    ];
+    for (surface, (status, body)) in refusals {
+        assert!(status.starts_with("HTTP/1.1 451"), "{}: {} / {}", surface, status, body);
+        assert!(body.contains("content_withheld") && body.contains(statement), "{}: {}", surface, body);
+    }
+
+    // History is the warehouse's: the head naming the file stays.
+    assert_eq!(server.main(), head);
+
+    // A takedown removes one file's content: a parcel's hash is refused.
+    let parcel = withhold(&server.root, &["add", &head, "--statement", statement]);
+    assert!(!parcel.status.success(), "{:?}", parcel);
+    assert_eq!(withhold(&server.root, &["list"]).stdout, listed.stdout);
+}

@@ -375,6 +375,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             tombstones: Some(tombstones),
             // Every redaction `@redactions` records, each judged first.
             redactions: Some(self.served_redactions()?),
+            // This head withholds nothing yet, so it reports nothing.
+            withheld: None,
         })
     }
 

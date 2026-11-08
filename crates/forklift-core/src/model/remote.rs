@@ -104,6 +104,42 @@ pub struct WarehouseInfo {
     /// or `None` says it reports nothing. An **additive** field like [`Self::tombstones`].
     #[serde(default)]
     pub redactions: Option<Vec<ServedRedaction>>,
+
+    /// The content this head's host withholds (a legal takedown, not a redaction), each with the
+    /// host's statement. `Some` (possibly empty) also says the head refuses every hash it lists,
+    /// with a `451` and code `content_withheld`, on every route that serves or takes objects by
+    /// hash, and that a closure it serves may lack them; absent or `None` says it reports nothing.
+    /// An **additive** field like [`Self::redactions`].
+    #[serde(default)]
+    pub withheld: Option<Vec<ServedWithholding>>,
+}
+
+/// One withheld object, as a head reports it in [`WarehouseInfo::withheld`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServedWithholding {
+    /// The withheld object's hash.
+    pub hash: String,
+
+    /// Why the host withholds it, in the host's words.
+    pub statement: String,
+
+    /// Whether the head still stores a copy, or has deleted every one it held.
+    pub state: ServedWithholdingState,
+}
+
+/// Where a withholding stands on a head ([`ServedWithholding::state`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServedWithholdingState {
+    /// The head refuses the content, and has not deleted every copy of it yet.
+    DeletionOwed,
+
+    /// The head refuses the content, and holds no copy of it.
+    Deleted,
+
+    /// A state this build does not know. The content is withheld all the same.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One redaction, as a head reports it in [`WarehouseInfo::redactions`].
@@ -545,6 +581,7 @@ mod tests {
             chunking: true,
             tombstones: None,
             redactions: None,
+            withheld: None,
         };
 
         let wire = serde_json::to_string(&info).expect("serialize");
