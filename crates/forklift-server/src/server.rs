@@ -160,7 +160,7 @@ struct WarehouseHandle {
 #[derive(Default)]
 struct ChunkGate {
     /// The applied redactions and withheld hashes `candidates` was read for; `None` until it is
-    /// read.
+    /// read, and once a deletion has run.
     basis: Option<AppliedSet>,
 
     /// The chunks of the removed recipes the store held, and the chunks the journal owes.

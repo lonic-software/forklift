@@ -2848,7 +2848,7 @@ fn a_served_root_withholds_a_chunked_file_and_the_chunks_only_it_names() {
 
         let (status, body) = ask("GET", &format!("/v1/objects/{}", own[0]), b"");
         assert!(status.starts_with("HTTP/1.1 404"), "{}, {} bytes", status, body.len());
-        assert!(stored(&own[0]), "the server still holds the chunk");
+        assert!(stored(&recipe) && stored(&own[0]), "the server still holds the recipe and chunk");
 
         let (status, _) = ask("GET", &format!("/v1/objects/{}", shared[0]), b"");
         assert!(status.starts_with("HTTP/1.1 200"), "{}", status);
