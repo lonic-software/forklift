@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -9,7 +9,8 @@ use forklift_core::model::parcel::Parcel;
 use forklift_core::error::sanitize;
 use forklift_core::util::tag_utils::{self, AttributedTag};
 use forklift_core::util::{file_utils, haul_utils, kv_utils, manifest_utils, object_utils, office_utils};
-use forklift_core::util::{bay_utils, pallet_utils, park_utils};
+use forklift_core::util::{applied_redactions, bay_utils, pallet_utils, park_utils};
+use forklift_core::util::applied_redactions::AppliedSet;
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef};
 use forklift_core::util::remote_utils::RemoteClient;
 use crate::commands::pallet::{relation_to_remote, RemoteRelation};
@@ -37,7 +38,9 @@ pub(crate) const EXPORT_LAYOUT: u32 = 1;
 ///
 /// The objects are deterministic (§9.8): every commit ends in a line naming its parcel and the
 /// export layout, and no git configuration or environment of the user's reaches an object write, so
-/// the same history exports to the same commits on any machine.
+/// the same history exports to the same commits on any machine that applied the same redactions.
+/// A file whose redaction this warehouse applied is left out of every commit that carried it, never
+/// replaced by a placeholder, and the report names it by path and parcel.
 ///
 /// # Arguments
 /// * `path` - Where to create the git repository (must be empty or nonexistent).
@@ -104,12 +107,13 @@ pub async fn handle_command(path: &str) -> Result<(), String> {
         parked += park_utils::read_parked_in(&dir)?.len();
     }
     let RemoteCheck { left_behind, unchecked, .. } = remote.unwrap_or_default();
+    let applied = applied_redactions::read_applied()?;
 
     std::fs::create_dir_all(target)
         .map_err(|e| format!("Error while creating \"{}\": {}", path, e))?;
     let repo = GitRepo::create(target)?;
 
-    let mut exporter = Exporter::new(&repo);
+    let mut exporter = Exporter::new(&repo, applied);
     for parcel in &order {
         exporter.export_parcel(parcel)?;
     }
@@ -147,6 +151,7 @@ pub async fn handle_command(path: &str) -> Result<(), String> {
         unreadable_tags: tags.unreadable,
         current,
         not_exported,
+        redacted: exporter.take_redacted(),
         signed,
         parked,
         remote_left_behind: left_behind,
@@ -554,6 +559,11 @@ struct ExportedCommit {
 /// a parcel's tree is converted against its first parent's, whose git hashes are read back from
 /// the repository, so a parcel built on a commit an earlier run wrote also costs git processes in
 /// proportion to its changed paths, not to its tree's size.
+///
+/// A file whose content is an applied redaction's hash is left out of the git tree, and a folder
+/// that held nothing else is left out with it. Whatever this run converts it converts that way, but
+/// a seeded commit may have been written before the redaction applied, so a tree of one is reused
+/// only when nothing under it is redacted.
 pub(crate) struct Exporter<'a> {
     repo: &'a GitRepo,
     exported: HashMap<String, ExportedCommit>,
@@ -561,10 +571,22 @@ pub(crate) struct Exporter<'a> {
     trees: HashMap<String, String>,
     trees_written: usize,
     blobs_written: usize,
+    /// The redactions applied here, whose files every commit leaves out.
+    applied: AppliedSet,
+    /// The files each converted forklift tree left out, by path under it and content hash. A tree
+    /// that left nothing out has no entry.
+    omitted_in: HashMap<String, Vec<(String, String)>>,
+    /// The forklift trees that held entries, every one of which was left out.
+    emptied: HashSet<String>,
+    /// Whether nothing under a forklift tree is redacted, for the trees asked about.
+    clean: HashMap<String, bool>,
+    /// The files left out of the commits written since the last [`Self::take_redacted`], by path
+    /// and content hash, each with the parcels whose commits left it out, in the order written.
+    redacted: BTreeMap<(String, String), Vec<String>>,
 }
 
 impl<'a> Exporter<'a> {
-    pub(crate) fn new(repo: &'a GitRepo) -> Exporter<'a> {
+    pub(crate) fn new(repo: &'a GitRepo, applied: AppliedSet) -> Exporter<'a> {
         Exporter {
             repo,
             exported: HashMap::new(),
@@ -572,7 +594,42 @@ impl<'a> Exporter<'a> {
             trees: HashMap::new(),
             trees_written: 0,
             blobs_written: 0,
+            applied,
+            omitted_in: HashMap::new(),
+            emptied: HashSet::new(),
+            clean: HashMap::new(),
+            redacted: BTreeMap::new(),
         }
+    }
+
+    /// The files left out of the commits written since the last call, sorted by path.
+    pub(crate) fn take_redacted(&mut self) -> Vec<RedactedFile> {
+        std::mem::take(&mut self.redacted).into_iter()
+            .map(|((path, hash), parcels)| RedactedFile { path, hash, parcels })
+            .collect()
+    }
+
+    /// Whether nothing under the forklift tree `forklift_hash` is a file an applied redaction
+    /// names, so a git tree written for it before the redaction applied still holds no copy.
+    fn is_clean(&mut self, forklift_hash: &str) -> Result<bool, String> {
+        if self.applied.is_empty() {
+            return Ok(true);
+        }
+        if let Some(clean) = self.clean.get(forklift_hash) {
+            return Ok(*clean);
+        }
+
+        let tree = object_utils::load_tree(forklift_hash)?;
+        let mut clean = !tree.get_files().any(|(_, item)| self.applied.contains(&item.hash));
+        for (_, item) in tree.get_subtrees() {
+            if !clean {
+                break;
+            }
+            clean = self.is_clean(&item.hash)?;
+        }
+
+        self.clean.insert(forklift_hash.to_string(), clean);
+        Ok(clean)
     }
 
     /// Record that `parcel` is already in the repository as `commit`, whose git tree is
@@ -621,6 +678,9 @@ impl<'a> Exporter<'a> {
         let base = parents.first().map(|parent| (parent.forklift_tree.clone(), parent.git_tree.clone()));
 
         let tree = self.convert_tree(&parcel.tree_hash, base.as_ref().map(|(forklift, git)| (forklift.as_str(), git.as_str())))?;
+        for (path, hash) in self.omitted_in.get(&parcel.tree_hash).cloned().unwrap_or_default() {
+            self.redacted.entry((path, hash)).or_default().push(forklift_hash.to_string());
+        }
         let mut args = vec!["commit-tree".to_string(), tree.clone()];
         for commit in parent_commits {
             args.extend(["-p".to_string(), commit]);
@@ -657,13 +717,14 @@ impl<'a> Exporter<'a> {
     /// same path in the first parent, with the git tree it was exported as. An entry this run has
     /// not converted yet, whose forklift hash matches the base's entry of the same name and kind,
     /// reuses that entry's git hash. Only the hash: the mode is always recomputed from the entry's
-    /// own type.
+    /// own type. A file an applied redaction names is never reused, and a base tree equal to this
+    /// one is reused only when nothing under it is redacted.
     fn convert_tree(&mut self, forklift_hash: &str, base: Option<(&str, &str)>) -> Result<String, String> {
         if let Some(hash) = self.trees.get(forklift_hash) {
             return Ok(hash.clone());
         }
         if let Some((base_forklift, base_git)) = base {
-            if base_forklift == forklift_hash {
+            if base_forklift == forklift_hash && self.is_clean(forklift_hash)? {
                 self.trees.insert(forklift_hash.to_string(), base_git.to_string());
                 return Ok(base_git.to_string());
             }
@@ -678,8 +739,15 @@ impl<'a> Exporter<'a> {
         let mut base_entries: Option<HashMap<String, (String, String)>> = None;
 
         let mut entries = String::new();
+        let mut omitted: Vec<(String, String)> = Vec::new();
 
         for (name, item) in tree.get_files() {
+            // Left out, never replaced: placeholder content would read as a real version of it.
+            if self.applied.contains(&item.hash) {
+                omitted.push((name.to_string(), item.hash.clone()));
+                continue;
+            }
+
             let mode = match item.item_type {
                 DirEntryType::Executable | DirEntryType::ExecutableChunked => "100755",
                 DirEntryType::SymbolicLink => "120000",
@@ -714,7 +782,19 @@ impl<'a> Exporter<'a> {
                 }
             }
             let subtree = self.convert_tree(&item.hash, base_subtree.as_ref().map(|(forklift, git)| (forklift.as_str(), git.as_str())))?;
-            entries.push_str(&format!("040000 tree {}\t{}\0", subtree, name));
+            if let Some(under) = self.omitted_in.get(&item.hash) {
+                omitted.extend(under.iter().map(|(path, hash)| (format!("{}/{}", name, path), hash.clone())));
+            }
+            // A folder that held only redacted files is left out with them.
+            if !self.emptied.contains(&item.hash) {
+                entries.push_str(&format!("040000 tree {}\t{}\0", subtree, name));
+            }
+        }
+        if entries.is_empty() && !omitted.is_empty() {
+            self.emptied.insert(forklift_hash.to_string());
+        }
+        if !omitted.is_empty() {
+            self.omitted_in.insert(forklift_hash.to_string(), omitted);
         }
 
         // NUL-terminated (`-z`): a name may hold a newline or tab, and without `-z` mktree also
@@ -1011,6 +1091,11 @@ pub(crate) struct ExportReport {
     /// this warehouse's and, when it was asked, the remote's. `@tags` is exported, so never here.
     not_exported: Vec<String>,
 
+    /// The files left out because this warehouse applied a redaction of their content: each by
+    /// path, with the parcels whose commits carry no version of it in its place.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    redacted: Vec<RedactedFile>,
+
     /// Whether this warehouse has an office, so its parcels and tags carry signatures the export
     /// drops.
     #[serde(skip)]
@@ -1047,6 +1132,31 @@ pub(crate) struct LeftBehind {
     head: String,
 }
 
+/// A file an export or a mirror left out of the commits it wrote, because this warehouse applied a
+/// redaction of its content.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize, Debug)]
+pub(crate) struct RedactedFile {
+    /// The file's path in the parcels' trees, `/`-separated.
+    path: String,
+
+    /// Its content's hash: the redaction's.
+    hash: String,
+
+    /// The parcels whose commits left it out, in the order they were written.
+    parcels: Vec<String>,
+}
+
+/// Print each of `redacted` as a line of human output.
+pub(crate) fn render_redacted(redacted: &[RedactedFile]) {
+    for file in redacted {
+        println!(
+            "  Left out \"{}\" ({}) of {} commit(s): its redaction is applied here.",
+            sanitize(&file.path), file.hash, file.parcels.len()
+        );
+    }
+}
+
 /// How an export's human output names a meta pallet it did not export.
 fn describe_not_exported(name: &str) -> String {
     let bare = name.trim_start_matches(pallet_utils::META_QUALIFIER);
@@ -1081,6 +1191,8 @@ impl CommandOutput for ExportReport {
         if let Some(current) = &self.current {
             println!("Checked out \"{}\".", current);
         }
+
+        render_redacted(&self.redacted);
 
         // A remote's pallet names are its own text.
         for left in &self.remote_left_behind {
@@ -1296,7 +1408,7 @@ mod tests {
         ], Some("merge"));
 
         let repo = create_repo(&warehouse);
-        let mut exporter = Exporter::new(&repo);
+        let mut exporter = Exporter::new(&repo, AppliedSet::default());
         let tip = export(&mut exporter, &merge);
 
         let commit = |hash: &str| String::from_utf8(git_bytes(&repo, &["cat-file", "commit", hash])).unwrap();
@@ -1342,12 +1454,12 @@ mod tests {
         let moved = store_parcel(&tree(b"two\n", "moved"), &[&second], vec![action(ParcelActionType::Stack, "op", 3_000)], Some("moved"));
 
         let repo = create_repo(&warehouse);
-        let mut earlier = Exporter::new(&repo);
+        let mut earlier = Exporter::new(&repo, AppliedSet::default());
         export(&mut earlier, &first);
         assert_eq!((earlier.trees_written, earlier.blobs_written), (4, 9));
 
         // A later run knows only the commit it builds on, as the mirror does.
-        let mut later = Exporter::new(&repo);
+        let mut later = Exporter::new(&repo, AppliedSet::default());
         later.exported.insert(first.clone(), earlier.exported[&first].clone());
         export(&mut later, &second);
         assert_eq!((later.trees_written, later.blobs_written), (3, 1),
@@ -1372,7 +1484,7 @@ mod tests {
         std::fs::write(git_dir.join("info").join("attributes"), "* text\n").unwrap();
         git_bytes(&repo, &["config", "core.autocrlf", "true"]);
 
-        let mut exporter = Exporter::new(&repo);
+        let mut exporter = Exporter::new(&repo, AppliedSet::default());
         let commit = export(&mut exporter, &parcel);
 
         assert_eq!(git_bytes(&repo, &["cat-file", "blob", &format!("{}:crlf.txt", commit)]), content.concat());
@@ -1388,7 +1500,7 @@ mod tests {
         let parcel = store_parcel(&tree, &[], vec![action(ParcelActionType::Stack, "op", 1_000)], Some(description));
 
         let repo = create_repo(&warehouse);
-        let mut exporter = Exporter::new(&repo);
+        let mut exporter = Exporter::new(&repo, AppliedSet::default());
         let commit = export(&mut exporter, &parcel);
 
         let raw = git_bytes(&repo, &["cat-file", "commit", &commit]);

@@ -6,11 +6,11 @@ use forklift_core::util::lock_utils::MirrorLock;
 use forklift_core::util::progress_utils::Progress;
 use forklift_core::util::remote_utils::{self, RemoteClient};
 use forklift_core::util::{
-    config_utils, file_utils, graph_utils, merge_utils, meta_tree, mirror_utils, object_utils,
+    applied_redactions, config_utils, file_utils, graph_utils, merge_utils, meta_tree, mirror_utils, object_utils,
     pallet_utils, scope_utils, tag_utils, take_utils,
 };
 use forklift_core::util::take_utils::{FetchAt, TakeTrust};
-use crate::commands::export_git::{self, Exporter, GitRepo, SkippedTag, WritableTag, EXPORT_LAYOUT};
+use crate::commands::export_git::{self, Exporter, GitRepo, RedactedFile, SkippedTag, WritableTag, EXPORT_LAYOUT};
 use crate::events;
 use crate::output::{self, CommandOutput};
 
@@ -516,7 +516,7 @@ impl<'a> Run<'a> {
             url,
             from: mirror_utils::warehouse_root(),
             unattended,
-            exporter: Exporter::new(repo),
+            exporter: Exporter::new(repo, applied_redactions::read_applied()?),
             boundaries: Vec::new(),
             pending,
             refused,
@@ -561,10 +561,13 @@ impl<'a> Run<'a> {
     /// Mirror one pallet at `remote_head` (its head on the Forklift remote), keeping `record` up to
     /// date: its entry is written once the pallet is exported, before the push.
     async fn mirror(&mut self, pallet: &str, remote_head: Option<&str>, record: &mut BTreeMap<String, String>) -> PalletMirror {
-        match self.try_mirror(pallet, remote_head, record).await {
+        let mut outcome = match self.try_mirror(pallet, remote_head, record).await {
             Ok(outcome) => outcome,
             Err(problem) => problem.into_outcome(pallet),
-        }
+        };
+        outcome.redacted = self.exporter.take_redacted();
+
+        outcome
     }
 
     async fn try_mirror(&mut self, pallet: &str, remote_head: Option<&str>, record: &mut BTreeMap<String, String>)
@@ -1112,15 +1115,23 @@ pub(crate) struct PalletMirror {
     /// Why the pallet was skipped or not mirrored, with the step that clears it.
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+
+    /// The files left out of the commits this run wrote, because this warehouse applied a
+    /// redaction of their content: each by path, with the parcels whose commits left it out.
+    /// Commits written before the redaction applied keep the file (`.forklift/mirror.git`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    redacted: Vec<RedactedFile>,
 }
 
 impl PalletMirror {
     fn new(pallet: &str, status: MirrorStatus, message: String) -> PalletMirror {
-        PalletMirror { pallet: pallet.to_string(), status, commit: None, exported: 0, message: Some(message) }
+        PalletMirror { pallet: pallet.to_string(), status, commit: None, exported: 0, message: Some(message), redacted: Vec::new() }
     }
 
     fn in_step(pallet: &str, status: MirrorStatus, commit: &str, exported: usize) -> PalletMirror {
-        PalletMirror { pallet: pallet.to_string(), status, commit: Some(commit.to_string()), exported, message: None }
+        PalletMirror {
+            pallet: pallet.to_string(), status, commit: Some(commit.to_string()), exported, message: None, redacted: Vec::new(),
+        }
     }
 
     /// The outcome as one line of human output.
@@ -1140,6 +1151,7 @@ impl PalletMirror {
             MirrorStatus::Skipped => println!("Skipped \"{}\": {}", self.pallet, message),
             _ => println!("Did not mirror \"{}\": {}", self.pallet, message),
         }
+        export_git::render_redacted(&self.redacted);
     }
 }
 

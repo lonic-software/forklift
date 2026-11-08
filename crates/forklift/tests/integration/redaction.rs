@@ -2440,3 +2440,63 @@ fn a_walk_over_an_unreadable_applied_record_takes_nothing_back() {
     assert!(widened["error"]["message"].as_str().unwrap().contains("record of applied redactions"), "{}", widened);
     assert!(!sparse.holds_loose(&hash), "the walk fetched content past an unreadable record");
 }
+
+/// The paths of every file and folder in the git commit `commit` of the repository at `repo`.
+fn git_paths(repo: &std::path::Path, commit: &str) -> Vec<String> {
+    let listed = std::process::Command::new("git")
+        .args(["ls-tree", "-r", "-t", "--name-only", commit])
+        .current_dir(repo)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", if cfg!(windows) { "NUL" } else { "/dev/null" })
+        .output()
+        .unwrap();
+    assert!(listed.status.success(), "{}", String::from_utf8_lossy(&listed.stderr));
+    String::from_utf8_lossy(&listed.stdout).lines().map(str::to_string).collect()
+}
+
+/// `git export` leaves a file whose redaction this warehouse applied out of every commit that
+/// carried it, never writing anything in its place, and a folder that held nothing else goes with
+/// it; every other file is exported as before. The report names the file by path, with each parcel
+/// whose commit left it out.
+///
+/// Revert: export the file as before → the export fails, reading the deleted content. Revert: keep
+/// a folder every entry of which was left out → the leak's commit holds an empty `other`.
+#[test]
+fn git_export_leaves_out_a_file_whose_redaction_is_applied_and_names_it() {
+    let warehouse = Warehouse::new("export-omit");
+    let content = b"TOKEN=hunter2\n";
+    warehouse.stack("keep.txt", b"keep\n", "keep");
+    warehouse.stack("other/secret.env", content, "leak");
+    let leak = warehouse.head("main");
+    warehouse.stack("keep.txt", b"keep 2\n", "change");
+    let change = warehouse.head("main");
+    warehouse.run_ok(&["remove", "other/secret.env"]);
+    warehouse.run_ok(&["stack", "-m", "take the leak out"]);
+
+    let recorded = recorded_hash(&warehouse, &format!("{}:other/secret.env", leak), "leaked token");
+    let hash = recorded["data"]["hash"].as_str().unwrap().to_string();
+    assert_eq!(recorded["data"]["status"]["state"], "applied", "{}", recorded);
+    assert!(!warehouse.holds_loose(&hash));
+
+    let target = warehouse.root.parent().unwrap().join("exported");
+    let exported = warehouse.json(&["git", "export", target.to_str().unwrap()]);
+    assert_eq!(exported["ok"], true, "{}", exported);
+    assert_eq!(exported["data"]["commits"], 4, "{}", exported);
+    assert_eq!(exported["data"]["redacted"], serde_json::json!([
+        { "path": "other/secret.env", "hash": hash, "parcels": [leak, change] }
+    ]), "{}", exported);
+
+    let commits = std::process::Command::new("git").args(["rev-list", "--all"]).current_dir(&target)
+        .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", if cfg!(windows) { "NUL" } else { "/dev/null" })
+        .output().unwrap();
+    let commits = String::from_utf8_lossy(&commits.stdout).lines().map(str::to_string).collect::<Vec<_>>();
+    assert_eq!(commits.len(), 4, "{:?}", commits);
+    for commit in &commits {
+        assert_eq!(git_paths(&target, commit), vec!["keep.txt".to_string()], "commit {}", commit);
+    }
+
+    let human = String::from_utf8_lossy(&warehouse.run_ok(&["git", "export", target.with_extension("2").to_str().unwrap()]).stdout)
+        .into_owned();
+    assert!(human.contains("Left out \"other/secret.env\""), "{}", human);
+    assert!(human.contains("of 2 commit(s)"), "{}", human);
+}
