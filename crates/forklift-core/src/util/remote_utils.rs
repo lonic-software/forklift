@@ -11522,11 +11522,11 @@ mod tests {
         );
     }
 
-    /// A throttle met after a run of `503`s gets the throttle patience from its own first answer,
-    /// not from the request's first attempt: the drain's refusals are not charged to it. The
-    /// `503`s here outlast the throttle patience before the `429` arrives, and run the backoff up
-    /// past it. Revert: count every patience from the first attempt, or share one backoff → the
-    /// first `429` is already past its patience and fails.
+    /// A throttle met after a run of `503`s starts a run of its own: neither the drain nor the
+    /// throttle before it is charged to it. The `503`s here outlast the throttle patience after
+    /// the first `429` and run the backoff up past it. Revert: count every patience from the first
+    /// attempt, share one backoff, or keep a kind's run across the other kind → the second `429`
+    /// is already past its patience and fails.
     #[test]
     fn a_throttle_after_a_drain_gets_its_own_patience() {
         const UNAVAILABLE: &str = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\n\
