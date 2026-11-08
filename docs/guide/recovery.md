@@ -226,6 +226,14 @@ hold the content. A chunked file can be in a head under another recipe with the 
 head's path names the other recipe, so where no head holds the object itself, record it by its
 hash. The error's `next_step` names the commands for one of the heads and the record that fits.
 
+### `content_withheld` (exit 51)
+
+The remote's host withholds content the command needed: a takedown, such as a legal notice, made by
+whoever runs that server, not by the warehouse's admins. The message carries the host's statement.
+The remote no longer serves that content, nor takes it, and nothing you do here changes that; a copy
+you already hold stays yours. The history that names the file is unchanged. Take the content from
+another remote that holds it, or ask the host about the statement.
+
 ### `merge_conflicts` (exit 47)
 
 `lower` merged the remote's diverged head into your pallet, and both sides changed the same paths.

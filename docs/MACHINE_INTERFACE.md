@@ -85,7 +85,11 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 30** (current): `git export` and `git mirror` leave out a file whose redaction this
+**Schema 31** (current): the `content_withheld` error code exists (exit 51). A remote answers it,
+with `451`, for content its host withholds; a command that needed that content from the remote
+fails with it, with the remote's words, the host's statement among them, in `message`.
+
+**Schema 30**: `git export` and `git mirror` leave out a file whose redaction this
 warehouse applied. `git export`'s result and each pallet outcome of `git mirror` (and of a lift's
 `mirror`) carry `redacted` when they left one out: per file, `path`, `hash` (the redaction's) and
 `parcels` (each parcel whose new commit left it out). Nothing is written in its place, and a folder
