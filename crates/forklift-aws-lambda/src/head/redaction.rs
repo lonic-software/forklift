@@ -1189,11 +1189,9 @@ mod tests {
     #[test]
     fn the_late_sweeps_bounds_keep_a_margin_past_each_wait() {
         let applied_at = 1_000_000;
-        assert!(response_cutoff(applied_at) >= applied_at + INVOCATION_CEILING + LATE_SWEEP_MARGIN);
-        assert!(
-            late_sweep_due(applied_at)
-                >= response_cutoff(applied_at) + crate::aws::PRESIGN_TTL.as_secs() + LATE_SWEEP_MARGIN
-        );
+        // The Lambda ceiling and the presigned URL TTL are 900 s each, with 60 s past each.
+        assert!(response_cutoff(applied_at) >= applied_at + 900 + 60);
+        assert!(late_sweep_due(applied_at) >= response_cutoff(applied_at) + 900 + 60);
     }
 
     #[test]
