@@ -21,7 +21,7 @@ use forklift_aws_lambda::head::{ObjectReadResult, ObjectWriteResult, TrustResult
 use forklift_aws_lambda::memory::{MemoryObjectStore, MemoryRefStore};
 use forklift_aws_lambda::scratch::Scratch;
 use forklift_aws_lambda::store::{
-    ExpectedHead, RefHead, RefListing,
+    ExpectedHead, ItemKey, ItemWrite, RedactionWrite, RefHead, RefListing,
     CasOutcome, ObjectStore, OfficePrecondition, RedactionsPrecondition, PromoteOutcome, PutOutcome, RefStore,
     SignatureOutcome, TransientCause, TrustOutcome, TrustWriteOutcome,
 };
@@ -5852,47 +5852,181 @@ fn an_applied_blob_is_deleted_once_its_late_sweep_has_run() {
     assert_gone(&head.object_get(&leak).expect_err("still refused"), &leak);
 }
 
-/// An applied recipe keeps its object, its chunk list, until its chunks are deleted, so neither
-/// its first sweep run late nor any judge after says it is `deleted`.
-// Revert: end a late sweep as deleted whatever it kept → `deleted` → red. Revert: run the late
-// sweep for an item recorded as a recipe → with the object gone, that sweep says `deleted` → red.
-#[test]
-fn an_applied_recipe_is_never_reported_deleted() {
-    let area = Area::new("redaction-late-recipe");
-    prepare(&area, "red");
-    area.write_large_file("red/big.bin", 0xBAD, CHUNK_THRESHOLD + 50_000);
+/// A warehouse whose `main` keeps a chunked file sharing its first half with a chunked file an
+/// earlier head named and a redaction records: the recorded objects, `main`'s head, the redacted
+/// recipe, and its chunks split into those only it names and those the kept file names too.
+fn chunked_leak(area: &Area) -> (Harvest, String, String, Vec<String>, Vec<String>) {
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state as u8
+    };
+    let content: Vec<u8> = (0..CHUNK_THRESHOLD + 1024 * 1024).map(|_| next()).collect();
+    let mut kept = content[..content.len() / 2].to_vec();
+    kept.extend((0..CHUNK_THRESHOLD / 2 + 1024 * 1024).map(|_| next()));
+
+    prepare(area, "red");
+    std::fs::write(area.path("red/kept.bin"), &kept).expect("write");
+    area.forklift("red", &["load", "."]);
+    area.forklift("red", &["stack", "-m", "kept"]);
+    std::fs::write(area.path("red/big.bin"), &content).expect("write");
     area.forklift("red", &["load", "."]);
     area.forklift("red", &["stack", "-m", "leak"]);
     let leaked = harvest(&area.path("red")).head_of("main").expect("main head");
     area.forklift("red", &["remove", "big.bin"]);
     area.forklift("red", &["stack", "-m", "take the leak out"]);
+    let before = harvest(&area.path("red"));
+    let main = before.head_of("main").expect("main head");
+
+    let (recipe, own, shared) = {
+        let _scope = StorageRootScope::enter(&area.path("red"));
+        let file_hash = |head: &str, name: &str| {
+            let tree = object_utils::load_tree_shared(&object_utils::load_parcel(head).expect("parcel").tree_hash).expect("tree");
+            tree.get_files().find(|(file, _)| file.as_str() == name).map(|(_, file)| file.hash.clone()).expect("the file")
+        };
+        let recipe = file_hash(&leaked, "big.bin");
+        let named: std::collections::HashSet<String> = object_utils::recipe_chunk_hashes(&file_hash(&main, "kept.bin")).expect("chunks").into_iter().collect();
+        let (own, shared) = object_utils::recipe_chunk_hashes(&recipe).expect("chunks").into_iter().partition(|chunk| !named.contains(chunk));
+        (recipe, own, shared)
+    };
+
+    // The recorder's warehouse drops what it redacts; the server had it from before.
     area.forklift("red", &["redact", "record", &format!("{}:big.bin", leaked), "-m", "a leak"]);
-    let recorded = harvest(&area.path("red"));
+    let mut recorded = harvest(&area.path("red"));
+    for (hash, bytes) in before.objects {
+        recorded.objects.entry(hash).or_insert(bytes);
+    }
+
+    (recorded, main, recipe, own, shared)
+}
+
+/// Move every chunk ledger entry's apply, and when it is due, `seconds` into the past.
+fn age_chunk_ledger(refs: &MemoryRefStore, seconds: u64) {
+    let fence = forklift_aws_lambda::format::gate(refs).expect("format gate");
+    let stored = refs.get_item(ItemKey::ChunkLedger).expect("ledger").expect("a ledger");
+    let mut ledger: serde_json::Value = serde_json::from_str(&stored).expect("json");
+    for journal in ledger["recipes"].as_object_mut().expect("recipes").values_mut() {
+        for field in ["applied_at", "next_round_after"] {
+            journal[field] = (journal[field].as_u64().expect("seconds") - seconds).into();
+        }
+    }
+    let state = ledger.to_string();
+    let written = refs.put_items(&[ItemWrite { key: ItemKey::ChunkLedger, state: &state, expected: Some(&stored) }], &fence).expect("write");
+    assert_eq!(written, RedactionWrite::Written);
+}
+
+/// Assert `err` is a `503` naming `hash`.
+fn assert_withheld(err: &forklift_aws_lambda::error::HeadError, hash: &str) {
+    assert_eq!(err.status, Status::ServiceUnavailable, "{}", err.message);
+    assert!(err.message.contains(hash), "the refusal names the hash: {}", err.message);
+}
+
+/// An applied redaction of a chunked file deletes, over two rounds, the chunks only its recipe
+/// names, and then the recipe. Until a round's census decides, every chunk of the recipe is
+/// withheld with a `503` and none is stored again; once it has, a chunk another file names is
+/// served and the rest are deleted, absent. A copy landed after the first round is deleted by the
+/// late one, and only after the recipe is deleted does the handshake say `deleted`.
+// Revert: never withhold a chunk → the first GET answers 200 → red. Revert: delete every chunk of
+// the recipe → the shared one is gone → red. Revert: skip the late round → the late copy is kept →
+// red. Revert: never delete the recipe → it is kept and the state stays `deletion_owed` → red.
+#[test]
+fn an_applied_recipe_and_the_chunks_only_it_names_are_deleted_over_two_rounds() {
+    let area = Area::new("redaction-chunk-rounds");
+    let (recorded, main, recipe, own, shared) = chunked_leak(&area);
+    assert!(!own.is_empty() && !shared.is_empty(), "own {:?}, shared {:?}", own, shared);
+    let chunk_bytes = recorded.objects[&own[0]].clone();
 
     let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
     upload_all(&head, &recorded);
+    plant(&head.refs, "main", &main);
     plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &recorded.head_of("@redactions").expect("@redactions"));
-    let info = head.handshake().expect("handshake");
-    let recipe = info.redactions.expect("redactions")[0].hash.clone();
-    // The recorder's own warehouse no longer keeps the recipe; one holding the same file does.
-    prepare(&area, "wh");
-    area.write_large_file("wh/big.bin", 0xBAD, CHUNK_THRESHOLD + 50_000);
-    area.forklift("wh", &["load", "."]);
-    let stored = harvest(&area.path("wh"));
-    let bytes = stored.objects.get(&recipe).expect("the same file's recipe");
-    head.objects.put_verified(&recipe, bytes).expect("store the recipe");
 
-    plant_item(&head.refs, &recipe, &applied_item(LATE_SWEEP_AFTER + 40, ""));
+    // Applied, its round announced and waiting: every chunk is withheld, and none is stored.
     assert_eq!(served_state(&head, &recipe), Some(ServedRedactionState::DeletionOwed));
-    assert!(head.objects.exists(&recipe).expect("exists"), "the recipe is kept");
-    let item = head.refs.get_redaction(&recipe).expect("item").expect("an item");
-    assert!(item.contains(r#""recipe":true"#) && !item.contains(r#""deleted""#), "{}", item);
+    assert_withheld(&head.object_get(&own[0]).expect_err("undecided"), &own[0]);
+    assert_withheld(&head.object_get(&shared[0]).expect_err("undecided"), &shared[0]);
+    assert!(head.missing(&[own[0].clone(), shared[0].clone()]).expect("missing").is_empty(), "withheld is not absent");
+    assert_withheld(&head.object_put(&Principal::Static, None, &own[0], &chunk_bytes).expect_err("a round runs"), &own[0]);
+    assert!(head.objects.exists(&recipe).expect("exists"), "the recipe is kept while its chunks are owed");
 
-    // Recorded as a recipe, its late sweep is the chunk deletion's: none runs here, so even with
-    // the object gone nothing says deleted.
-    plant_item(&head.refs, &recipe, &applied_item(LATE_SWEEP_AFTER + 40, r#","swept":true,"recipe":true"#));
-    head.objects.delete_canonical(&recipe).expect("delete");
+    // The round runs: only what the kept file names is kept.
+    let head = head.with_chunk_round_wait(0);
     assert_eq!(served_state(&head, &recipe), Some(ServedRedactionState::DeletionOwed));
+    for chunk in &own {
+        assert!(!head.objects.exists(chunk).expect("exists"), "a chunk only the recipe names is deleted");
+    }
+    for chunk in &shared {
+        assert!(head.objects.exists(chunk).expect("exists"), "a chunk the kept file names is kept");
+    }
+    assert!(served(&head, &shared[0]), "a chunk the kept file names is served");
+    assert_eq!(head.object_get(&own[0]).expect_err("deleted").status, Status::NotFound);
+    assert_eq!(head.missing(&[own[0].clone(), shared[0].clone()]).expect("missing"), vec![own[0].clone()]);
+    assert!(head.objects.exists(&recipe).expect("exists"), "the recipe waits for the late round");
+
+    // A copy lands after the round, staged and canonical; the late round deletes both, then the
+    // recipe.
+    head.objects.stage("lift-9", &own[0], chunk_bytes.clone());
+    head.objects.put_verified(&own[0], &chunk_bytes).expect("a late copy");
+    let staged = head.objects.staged_count();
+    plant_item(&head.refs, &recipe, &applied_item(LATE_SWEEP_AFTER + 40, r#","swept":true"#));
+    age_chunk_ledger(&head.refs, LATE_SWEEP_AFTER + 40);
+    served_state(&head, &recipe);
+
+    assert!(!head.objects.exists(&own[0]).expect("exists"), "the late round deletes the copy landed since");
+    assert_eq!(head.objects.staged_count(), staged - 1, "and its staged copy");
+    assert!(head.objects.exists(&shared[0]).expect("exists"));
+    assert!(!head.objects.exists(&recipe).expect("exists"), "then the recipe is deleted");
+    assert_eq!(served_state(&head, &recipe), Some(ServedRedactionState::Deleted));
+    let ledger = head.refs.get_item(ItemKey::ChunkLedger).expect("ledger").expect("a ledger");
+    assert!(ledger.contains(r#""recipes":{}"#), "{}", ledger);
+    assert!(head.objects.exists(&shared[0]).expect("exists"));
+    assert!(served(&head, &shared[0]), "a chunk the kept file names is still served");
+}
+
+/// While a round deletes, a ref update answers `503` and moves nothing; once the round is down,
+/// it lifts.
+// Revert: let a ref update past a deleting fence → it commits → red.
+#[test]
+fn a_ref_update_waits_out_a_deleting_round() {
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    let fence = || forklift_aws_lambda::format::gate(&head.refs).expect("format gate");
+    let deleting = r#"{"version":1,"round":1,"phase":"deleting","started":0,"recipes":[],"lease_until":99999999999}"#;
+    let written = head.refs.put_items(&[ItemWrite { key: ItemKey::ChunkFence, state: deleting, expected: None }], &fence()).expect("write");
+    assert_eq!(written, RedactionWrite::Written);
+
+    let main = gate_parcel(&head, &[], vec![gate_file(&head, "x", "1")]);
+    let request = RefUpdateRequest { old_head: None, new_head: main.clone(), tombstone: None };
+    let err = head.ref_update(&Principal::Static, "main", &request).expect_err("a round deletes");
+    assert_eq!(err.status, Status::ServiceUnavailable, "{}", err.message);
+    assert_eq!(user_head(&head, "main"), None);
+
+    let down = r#"{"version":1,"round":1,"phase":"down","started":0,"recipes":[],"lease_until":null}"#;
+    let written = head.refs.put_items(&[ItemWrite { key: ItemKey::ChunkFence, state: down, expected: Some(deleting) }], &fence()).expect("write");
+    assert_eq!(written, RedactionWrite::Written);
+    head.ref_update(&Principal::Static, "main", &request).expect("the round is down");
+    assert_eq!(user_head(&head, "main"), Some(main));
+}
+
+/// A head commit conditioned on the fence it read is refused once the fence has moved.
+// Revert: drop the fence condition from the memory store's commit → it commits → red.
+#[test]
+fn a_head_commit_is_refused_once_the_chunk_fence_moved() {
+    let refs = MemoryRefStore::new();
+    let fence = || forklift_aws_lambda::format::gate(&refs).expect("format gate");
+    let commit = |chunk_fence: Option<&str>| refs.compare_and_set_head(
+        pallet_utils::PalletNamespace::User, "main", ExpectedHead::Unborn, &"1".repeat(64), OfficePrecondition::NotConsumed,
+        RedactionsPrecondition::NotConsumed, None, chunk_fence, &fence(), &request_token(),
+    ).expect("commit");
+
+    let announced = r#"{"version":1,"round":1,"phase":"announced","started":0,"recipes":[],"lease_until":null}"#;
+    let written = refs.put_items(&[ItemWrite { key: ItemKey::ChunkFence, state: announced, expected: None }], &fence()).expect("write");
+    assert_eq!(written, RedactionWrite::Written);
+
+    assert_eq!(commit(None), CasOutcome::ChunkFenceMoved, "read as absent, the fence is there now");
+    assert_eq!(commit(Some("{}")), CasOutcome::ChunkFenceMoved);
+    assert_eq!(commit(Some(announced)), CasOutcome::Committed);
 }
 
 /// A store whose every promotion is met by the redaction of what it promotes applying, just after
