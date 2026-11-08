@@ -998,9 +998,20 @@ pub fn record_state(haul_id: &str,
 /// * `Ok(Vec<String>)` - The proposed heads, in path order; empty while `@haul` is unborn.
 /// * `Err(String)`     - If the `@haul` head could not be read, or a state cell could not be.
 pub fn unmerged_haul_heads() -> Result<Vec<String>, String> {
-    let Some(state) = meta_tree::read_meta_head(HAUL_PALLET_NAME, &HaulRules)? else {
-        return Ok(Vec::new());
-    };
+    match pallet_utils::get_meta_pallet_head(HAUL_PALLET_NAME)? {
+        Some(head) => unmerged_haul_heads_at(&head),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// [`unmerged_haul_heads`] at the `@haul` head `head`, whose objects the store holds: what a
+/// head that keeps its refs elsewhere reads.
+///
+/// # Returns
+/// * `Ok(Vec<String>)` - The proposed heads, in path order.
+/// * `Err(String)`     - If the head's state, or a state cell, could not be read.
+pub fn unmerged_haul_heads_at(head: &str) -> Result<Vec<String>, String> {
+    let state = meta_tree::read_meta_state(HAUL_PALLET_NAME, head, &HaulRules)?;
 
     let mut heads = Vec::new();
 

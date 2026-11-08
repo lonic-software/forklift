@@ -218,18 +218,40 @@ pub enum ExpectedHead<'a> {
     At(&'a str),
 }
 
-/// The outcome of [`RefStore::put_redaction`].
+/// The outcome of [`RefStore::put_items`] and [`RefStore::put_redaction`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RedactionWrite {
-    /// The item now holds the new state.
+    /// Every item now holds its new state.
     Written,
-    /// The item no longer held what the caller expected; nothing was written.
+    /// An item no longer held what the caller expected; nothing was written.
     Moved,
     /// The format item no longer held what the fence names; nothing was written.
     FormatMoved,
     /// Refused for a reason that shows nothing moved, or with an unknown fate: read the item
     /// again to learn which.
     Transient(TransientCause),
+}
+
+/// One of the items, beside the pallet heads, that a head writes with
+/// [`RefStore::put_items`]: each holds one versioned JSON state, read and written whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemKey<'a> {
+    /// The redaction item of this hash: where that redaction stands.
+    Redaction(&'a str),
+    /// The chunk fence: which round of chunk deletion runs, and how far it is. Every ref update
+    /// conditions on it.
+    ChunkFence,
+    /// The chunk ledger: each applied recipe whose chunks or object a round still owes.
+    ChunkLedger,
+}
+
+/// One write of [`RefStore::put_items`]: `state` replaces the item at `key`, on condition that
+/// it still holds `expected`, the bytes [`RefStore::get_item`] returned (`None`: no item yet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ItemWrite<'a> {
+    pub key: ItemKey<'a>,
+    pub state: &'a str,
+    pub expected: Option<&'a str>,
 }
 
 /// Every pallet with an entry, across both namespaces: those live, and those deleted.
@@ -281,6 +303,9 @@ pub enum CasOutcome {
     /// The format item no longer holds what the [`FormatFence`] expected: an upgrade marked it,
     /// or a concurrent first write stamped it. The caller reads it again.
     FormatMoved,
+    /// The chunk fence no longer holds what the ref update read before its audit: a round of
+    /// chunk deletion moved on, and what the audit found present may be deleted.
+    ChunkFenceMoved,
     /// The commit was refused for a reason that establishes nothing about whether any of its
     /// inputs actually moved — on DynamoDB, `TransactionConflict` (another transaction
     /// concurrently touching one of this commit's items, the shared office item principally).
@@ -566,6 +591,13 @@ pub trait ObjectStore {
         Err("This object store keeps no redaction work objects.".to_string())
     }
 
+    /// Write the redaction work object `name` only if there is none yet: `Ok(true)` when this
+    /// call wrote it, `Ok(false)` when one was already there, which is kept as it was. What freezes
+    /// a census, so every request that finishes one deletes from the same answer.
+    fn work_create(&self, _name: &str, _bytes: &[u8]) -> Result<bool, String> {
+        Err("This object store keeps no redaction work objects.".to_string())
+    }
+
     /// Delete the redaction work object `name`; an absent one is no error.
     fn work_delete(&self, _name: &str) -> Result<(), String> {
         Err("This object store keeps no redaction work objects.".to_string())
@@ -618,6 +650,11 @@ pub trait RefStore {
     ///   checked against. Ignored when `namespace`/`name` name `@redactions` itself, as
     ///   `office_head` is for the office. A moved one is [`CasOutcome::RedactionsMoved`].
     ///
+    /// * `chunk_fence` — the chunk fence's stored state as the ref update read it before its
+    ///   audit, `None` when there was no fence item: a round of chunk deletion that moved since
+    ///   commits nothing, as [`CasOutcome::ChunkFenceMoved`]. Every ref update reads it, so it has
+    ///   no "not consumed" state.
+    ///
     /// A mismatch on any of them commits nothing and reports *which* input moved via
     /// [`CasOutcome`] — the caller cannot tell a moved pallet head from a moved office head
     /// or a moved anchor without that distinction, and the client-facing refusal differs
@@ -637,6 +674,7 @@ pub trait RefStore {
         office_head: OfficePrecondition<'_>,
         redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
+        chunk_fence: Option<&str>,
         format: &FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String>;
@@ -670,8 +708,8 @@ pub trait RefStore {
     ///
     /// The default keeps no redaction items and fails every read, loudly: a store that cannot
     /// say whether a redaction applied must never be read as one where it is pending.
-    fn get_redaction(&self, _hash: &str) -> Result<Option<String>, String> {
-        Err("This ref store keeps no redaction items.".to_string())
+    fn get_redaction(&self, hash: &str) -> Result<Option<String>, String> {
+        self.get_item(ItemKey::Redaction(hash))
     }
 
     /// Write `state` as the redaction item for `hash`, on condition that the item still holds
@@ -679,11 +717,29 @@ pub trait RefStore {
     /// yet), and that the format item still holds what `format` names.
     fn put_redaction(
         &self,
-        _hash: &str,
-        _state: &str,
-        _expected: Option<&str>,
-        _format: &FormatFence,
+        hash: &str,
+        state: &str,
+        expected: Option<&str>,
+        format: &FormatFence,
     ) -> Result<RedactionWrite, String> {
+        self.put_items(&[ItemWrite { key: ItemKey::Redaction(hash), state, expected }], format)
+    }
+
+    /// The stored state of the item at `key`, read strongly consistently, or `None` when there is
+    /// none. The bytes are returned as stored, so [`put_items`](RefStore::put_items) can condition
+    /// on exactly them.
+    ///
+    /// The default keeps no such items and fails every read, loudly: a store that cannot say
+    /// whether a redaction applied, or whether a round of chunk deletion runs, must never be read
+    /// as one where nothing is owed.
+    fn get_item(&self, _key: ItemKey<'_>) -> Result<Option<String>, String> {
+        Err("This ref store keeps no redaction items.".to_string())
+    }
+
+    /// Make every write of `writes` at once, or none: each on condition that its item still holds
+    /// what it expects, and all on condition that the format item still holds what `format`
+    /// names. Two writes never name one item.
+    fn put_items(&self, _writes: &[ItemWrite<'_>], _format: &FormatFence) -> Result<RedactionWrite, String> {
         Err("This ref store keeps no redaction items.".to_string())
     }
 

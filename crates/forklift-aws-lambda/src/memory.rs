@@ -24,12 +24,12 @@ use forklift_core::util::redaction_utils::REDACTIONS_PALLET_NAME;
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef, DEFAULT_PALLET_NAME};
 
 use crate::aws::dynamo::{
-    ATTR_ANCHOR, ATTR_DELETED_HEAD, ATTR_HEAD, ATTR_STATE, ENTITY_FORMAT, ENTITY_PALLET_PREFIX, ENTITY_REDACTION_PREFIX,
-    ENTITY_TRUST,
+    item_entity, ATTR_ANCHOR, ATTR_DELETED_HEAD, ATTR_HEAD, ATTR_STATE, ENTITY_CHUNK_FENCE, ENTITY_CHUNK_LEDGER,
+    ENTITY_FORMAT, ENTITY_PALLET_PREFIX, ENTITY_REDACTION_PREFIX, ENTITY_TRUST,
 };
 use crate::store::{
     CasOutcome, ExpectedHead, FormatFence, FormatStore, ObjectAccess, ObjectStore, OffloadedResponse,
-    OfficePrecondition, PromoteOutcome, PutOutcome, PutTarget, RedactionWrite, RedactionsPrecondition, RefHead, RefListing, RefStore,
+    ItemKey, ItemWrite, OfficePrecondition, PromoteOutcome, PutOutcome, PutTarget, RedactionWrite, RedactionsPrecondition, RefHead, RefListing, RefStore,
     SignatureOutcome, TrustOutcome, TrustWriteOutcome,
 };
 
@@ -291,6 +291,17 @@ impl ObjectStore for MemoryObjectStore {
         Ok(())
     }
 
+    fn work_create(&self, name: &str, bytes: &[u8]) -> Result<bool, String> {
+        let mut work = self.work.lock().unwrap();
+
+        if work.contains_key(name) {
+            return Ok(false);
+        }
+        work.insert(name.to_string(), bytes.to_vec());
+
+        Ok(true)
+    }
+
     fn work_delete(&self, name: &str) -> Result<(), String> {
         self.work.lock().unwrap().remove(name);
 
@@ -344,8 +355,9 @@ struct RefState {
     /// The format item's state, or `None` while the warehouse has none — the item
     /// `DynamoRefStore` keeps beside the pallets and the anchor.
     format: Option<String>,
-    /// Each redaction item's stored state, keyed by the redacted hash.
-    redactions: HashMap<String, String>,
+    /// The stored state of each item [`RefStore::put_items`] writes (the redaction items and the
+    /// chunk fence and ledger), keyed by the sort key `DynamoRefStore` gives it.
+    items: HashMap<String, String>,
 }
 
 /// An in-memory [`RefStore`]. Pallet heads are keyed by their qualified wire reference
@@ -362,7 +374,7 @@ impl Default for MemoryRefStore {
                 pallets: HashMap::new(),
                 trust: None,
                 format: None,
-                redactions: HashMap::new(),
+                items: HashMap::new(),
             }),
             default_pallet: DEFAULT_PALLET_NAME.to_string(),
         }
@@ -395,8 +407,8 @@ impl MemoryRefStore {
         if let Some(trust) = &state.trust {
             items.push((ENTITY_TRUST.to_string(), ATTR_ANCHOR.to_string(), trust.clone()));
         }
-        for (hash, redaction) in &state.redactions {
-            items.push((format!("{}{}", ENTITY_REDACTION_PREFIX, hash), ATTR_STATE.to_string(), redaction.clone()));
+        for (entity, item) in &state.items {
+            items.push((entity.clone(), ATTR_STATE.to_string(), item.clone()));
         }
         for (wire, head) in &state.pallets {
             let entity = format!("{}{}", ENTITY_PALLET_PREFIX, wire);
@@ -433,8 +445,11 @@ impl MemoryRefStore {
 
             match (entity.as_str(), pallet, attribute.as_str()) {
                 (ENTITY_FORMAT, _, ATTR_STATE) => state.format = Some(value.clone()),
+                (ENTITY_CHUNK_FENCE | ENTITY_CHUNK_LEDGER, _, ATTR_STATE) => {
+                    state.items.insert(entity.clone(), value.clone());
+                }
                 (_, None, ATTR_STATE) if redaction.is_some() => {
-                    state.redactions.insert(redaction.unwrap_or_default().to_string(), value.clone());
+                    state.items.insert(entity.clone(), value.clone());
                 }
                 (ENTITY_TRUST, _, ATTR_ANCHOR) => state.trust = Some(value.clone()),
                 (_, Some(wire), ATTR_HEAD) => { state.pallets.insert(wire.to_string(), RefHead::Live(value.clone())); }
@@ -511,6 +526,7 @@ impl MemoryRefStore {
         office: Option<Option<&str>>,
         redactions: Option<Option<&str>>,
         anchor: Option<&str>,
+        chunk_fence: Option<Option<&str>>,
     ) -> Option<CasOutcome> {
         if let Some(office_head) = office {
             let current_office = state.live_head(&Self::key(PalletNamespace::Meta, OFFICE_PALLET_NAME));
@@ -530,6 +546,12 @@ impl MemoryRefStore {
 
         if state.trust.as_deref() != anchor {
             return Some(CasOutcome::AnchorMoved);
+        }
+
+        if let Some(fence) = chunk_fence {
+            if state.items.get(ENTITY_CHUNK_FENCE).map(String::as_str) != fence {
+                return Some(CasOutcome::ChunkFenceMoved);
+            }
         }
 
         None
@@ -590,6 +612,7 @@ impl RefStore for MemoryRefStore {
         office_head: OfficePrecondition<'_>,
         redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
+        chunk_fence: Option<&str>,
         format: &FormatFence,
         _request_token: &str,
     ) -> Result<CasOutcome, String> {
@@ -618,7 +641,7 @@ impl RefStore for MemoryRefStore {
             return Ok(CasOutcome::Conflict { current });
         }
 
-        if let Some(moved) = Self::moved_inputs(&state, office, redactions, anchor) {
+        if let Some(moved) = Self::moved_inputs(&state, office, redactions, anchor, Some(chunk_fence)) {
             return Ok(moved);
         }
 
@@ -653,7 +676,7 @@ impl RefStore for MemoryRefStore {
             return Ok(CasOutcome::Conflict { current });
         }
 
-        if let Some(moved) = Self::moved_inputs(&state, office, None, anchor) {
+        if let Some(moved) = Self::moved_inputs(&state, office, None, anchor, None) {
             return Ok(moved);
         }
 
@@ -684,29 +707,25 @@ impl RefStore for MemoryRefStore {
         Ok(self.default_pallet.clone())
     }
 
-    fn get_redaction(&self, hash: &str) -> Result<Option<String>, String> {
-        Ok(self.state.lock().unwrap().redactions.get(hash).cloned())
+    fn get_item(&self, key: ItemKey<'_>) -> Result<Option<String>, String> {
+        Ok(self.state.lock().unwrap().items.get(&item_entity(key)).cloned())
     }
 
-    fn put_redaction(
-        &self,
-        hash: &str,
-        state: &str,
-        expected: Option<&str>,
-        format: &FormatFence,
-    ) -> Result<RedactionWrite, String> {
+    fn put_items(&self, writes: &[ItemWrite<'_>], format: &FormatFence) -> Result<RedactionWrite, String> {
         let mut guard = self.state.lock().unwrap();
 
         if !guard.format_holds(format) {
             return Ok(RedactionWrite::FormatMoved);
         }
 
-        if guard.redactions.get(hash).map(String::as_str) != expected {
+        if writes.iter().any(|write| guard.items.get(&item_entity(write.key)).map(String::as_str) != write.expected) {
             return Ok(RedactionWrite::Moved);
         }
 
         guard.apply_format(format);
-        guard.redactions.insert(hash.to_string(), state.to_string());
+        for write in writes {
+            guard.items.insert(item_entity(write.key), write.state.to_string());
+        }
 
         Ok(RedactionWrite::Written)
     }

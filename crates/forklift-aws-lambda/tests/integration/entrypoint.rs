@@ -109,10 +109,11 @@ impl RefStore for SharedRefs {
         office_head: OfficePrecondition<'_>,
         redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
+        chunk_fence: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
-        self.0.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
+        self.0.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, chunk_fence, format, request_token)
     }
     fn delete_head(
         &self,
@@ -152,6 +153,18 @@ impl RefStore for SharedRefs {
         request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
         self.0.replace_trust(anchor, expected_anchor, office_head, format, request_token)
+    }
+
+    fn get_item(&self, key: forklift_aws_lambda::store::ItemKey<'_>) -> Result<Option<String>, String> {
+        self.0.get_item(key)
+    }
+
+    fn put_items(
+        &self,
+        writes: &[forklift_aws_lambda::store::ItemWrite<'_>],
+        format: &forklift_aws_lambda::FormatFence,
+    ) -> Result<forklift_aws_lambda::store::RedactionWrite, String> {
+        self.0.put_items(writes, format)
     }
 }
 
@@ -1101,6 +1114,7 @@ fn a_shared_bearer_holder_may_move_any_pallet_including_the_office() {
                 OfficePrecondition::NotConsumed,
                 RedactionsPrecondition::NotConsumed,
                 Some(stored_anchor.as_str()),
+                None,
                 &forklift_aws_lambda::format::gate(&*main_fixture.refs).expect("format gate"),
                 &request_token(),
             )
@@ -1800,11 +1814,12 @@ impl RefStore for MarkedMidRequest {
         office_head: OfficePrecondition<'_>,
         redactions: RedactionsPrecondition<'_>,
         anchor: Option<&str>,
+        chunk_fence: Option<&str>,
         format: &forklift_aws_lambda::FormatFence,
         request_token: &str,
     ) -> Result<CasOutcome, String> {
         self.0.set_format(Some("2>3 operator 0"));
-        self.0.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, format, request_token)
+        self.0.compare_and_set_head(namespace, name, expected, new, office_head, redactions, anchor, chunk_fence, format, request_token)
     }
     fn delete_head(
         &self,
@@ -1844,6 +1859,18 @@ impl RefStore for MarkedMidRequest {
         request_token: &str,
     ) -> Result<TrustWriteOutcome, String> {
         self.0.replace_trust(anchor, expected_anchor, office_head, format, request_token)
+    }
+
+    fn get_item(&self, key: forklift_aws_lambda::store::ItemKey<'_>) -> Result<Option<String>, String> {
+        self.0.get_item(key)
+    }
+
+    fn put_items(
+        &self,
+        writes: &[forklift_aws_lambda::store::ItemWrite<'_>],
+        format: &forklift_aws_lambda::FormatFence,
+    ) -> Result<forklift_aws_lambda::store::RedactionWrite, String> {
+        self.0.put_items(writes, format)
     }
 }
 

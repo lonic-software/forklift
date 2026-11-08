@@ -13,7 +13,7 @@ pub fn upholds_the_tombstone_contract(refs: &impl RefStore) {
     let two = "2".repeat(64);
     let office = "3".repeat(64);
     let cas = |expected, new: &str| {
-        refs.compare_and_set_head(User, "feature", expected, new, OfficePrecondition::NotConsumed, RedactionsPrecondition::NotConsumed, None, &forklift_aws_lambda::format::gate(&*refs).expect("format gate"), &request_token())
+        refs.compare_and_set_head(User, "feature", expected, new, OfficePrecondition::NotConsumed, RedactionsPrecondition::NotConsumed, None, None, &forklift_aws_lambda::format::gate(&*refs).expect("format gate"), &request_token())
             .expect("cas")
     };
     let delete = |old: &str, office_head| {
@@ -60,7 +60,7 @@ pub fn upholds_the_tombstone_contract(refs: &impl RefStore) {
     // Once an office exists, a delete conditioned on it being unborn is refused for the office,
     // and one conditioned on its head lands.
     assert_eq!(
-        refs.compare_and_set_head(Meta, OFFICE_PALLET_NAME, ExpectedHead::Unborn, &office, OfficePrecondition::NotConsumed, RedactionsPrecondition::NotConsumed, None, &forklift_aws_lambda::format::gate(&*refs).expect("format gate"), &request_token())
+        refs.compare_and_set_head(Meta, OFFICE_PALLET_NAME, ExpectedHead::Unborn, &office, OfficePrecondition::NotConsumed, RedactionsPrecondition::NotConsumed, None, None, &forklift_aws_lambda::format::gate(&*refs).expect("format gate"), &request_token())
             .expect("office"),
         CasOutcome::Committed
     );

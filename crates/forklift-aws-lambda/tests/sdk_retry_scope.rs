@@ -124,6 +124,7 @@ async fn the_ref_update_commit_sends_one_request_per_call() {
             OfficePrecondition::NotConsumed,
             RedactionsPrecondition::NotConsumed,
             None,
+            None,
             &forklift_aws_lambda::FormatFence::At("1".to_string()),
             &request_token(),
         )
@@ -204,6 +205,7 @@ async fn a_stalled_transaction_is_abandoned_at_the_attempt_timeout() {
             &"c".repeat(64),
             OfficePrecondition::NotConsumed,
             RedactionsPrecondition::NotConsumed,
+            None,
             None,
             &forklift_aws_lambda::FormatFence::At("1".to_string()),
             &request_token(),

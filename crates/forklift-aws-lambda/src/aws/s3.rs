@@ -438,7 +438,8 @@ impl S3ObjectStore {
 
     /// An unconditional `PUT` — for the ephemeral response prefix, where a repeated offload of
     /// the same content-addressed bundle harmlessly overwrites itself, and for a redaction scan's
-    /// work objects, which only ever hold its latest progress.
+    /// work objects, which only ever hold its latest progress (a frozen census is the one work
+    /// object written with [`put_if_absent`](Self::put_if_absent) instead).
     async fn put_overwrite(&self, key: &str, bytes: Vec<u8>) -> Result<(), String> {
         self.client
             .put_object()
@@ -972,6 +973,14 @@ impl ObjectStore for S3ObjectStore {
         let key = work_key(&self.warehouse, name);
 
         self.bridge.block_on(self.put_overwrite(&key, bytes.to_vec()))
+    }
+
+    fn work_create(&self, name: &str, bytes: &[u8]) -> Result<bool, String> {
+        let key = work_key(&self.warehouse, name);
+
+        self.bridge.block_on(async {
+            Ok(matches!(self.put_if_absent(&key, bytes.to_vec()).await?, Conditional::Written))
+        })
     }
 
     fn work_delete_under(&self, prefix: &str) -> Result<(), String> {

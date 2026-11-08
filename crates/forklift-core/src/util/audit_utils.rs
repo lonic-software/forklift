@@ -2089,6 +2089,13 @@ impl<'a> SealedTolerance<'a> {
         self.tolerated.is_empty()
     }
 
+    /// Whether the present recipe `hash` is applied content, whose chunks are never checked: a
+    /// remote may delete an applied recipe's chunks before the recipe itself. Nothing is tallied,
+    /// as nothing absent is held.
+    fn skips_chunks_of(&self, hash: &str) -> bool {
+        self.tolerated.held(hash, At::File) == Some(Held::Redacted)
+    }
+
     /// Whether the absent object `hash`, met `at`, is held, by the record or by an applied redaction
     /// (a file's content only), tallying
     /// it under the one that holds it if so. Call only at an absence: a held object that is present
@@ -2565,7 +2572,7 @@ fn verify_tree_closure_scoped(tree_hash: &str,
         // An in-scope chunked file on the spine: its recipe is present (checked just above), so
         // descend it and verify its chunks at the audit's content level, exactly as the
         // fully-in-scope walk does.
-        if file.item_type.is_chunked() {
+        if file.item_type.is_chunked() && !sealed.is_some_and(|sealed| sealed.skips_chunks_of(&file.hash)) {
             verify_chunked_file(&file.hash, reverify, sealed, load_recipe_chunks, chunks_missing)?;
         }
     }
@@ -2780,8 +2787,10 @@ fn verify_tree_closure(tree_hash: &str,
             // present, or the file becomes silently unmaterializable the moment someone fetches it.
             // (gc's own descent is presence-*tolerant*; this one is the opposite, exactly because a
             // ref move is a durability promise a fetch is not.) The prune above only reaches this for
-            // a file no candidate base already vouches for, so W4 is never weakened.
-            if file.item_type.is_chunked() {
+            // a file no candidate base already vouches for, so W4 is never weakened. An applied
+            // redaction's recipe is the one exception: its chunks are never checked, as the remote
+            // that redacted it may delete them before the recipe itself.
+            if file.item_type.is_chunked() && !sealed.is_some_and(|sealed| sealed.skips_chunks_of(&file.hash)) {
                 verify_chunked_file(&file.hash, reverify, sealed, load_recipe_chunks, chunks_missing)?;
             }
         }

@@ -65,8 +65,10 @@ use crate::store::{
     RedactionsPrecondition, RefHead, RefStore, SignatureOutcome, TransientCause, TrustOutcome, TrustWriteOutcome,
 };
 
+mod chunks;
 mod redaction;
 
+pub use chunks::{fixture_items as chunk_fixture_items, items_read as chunk_items_read, refuses_promotion as chunk_promotion_refused, Withheld, ROUND_RETRY_AFTER_SECONDS};
 pub use redaction::{delete_if_applied as delete_if_redaction_applied, AppliedCopies, is_applied as redaction_applied, record_state as redaction_record};
 
 /// The `genesis` of a stored anchor's bytes.
@@ -204,6 +206,9 @@ pub struct Head<O: ObjectStore, R: RefStore> {
     /// When set, how many object reads one request's redaction scans may spend in all: a test's
     /// knob, so a scan spans requests. `None` bounds them by `deadline` alone.
     scan_step_limit: Option<usize>,
+    /// How long an announced chunk round waits before its census, in seconds: `chunks::ROUND_WAIT`
+    /// but in a test.
+    chunk_round_wait: u64,
 }
 
 impl<O: ObjectStore, R: RefStore> Head<O, R> {
@@ -220,6 +225,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             batch_byte_budget: BATCH_BYTE_BUDGET,
             batch_answer_reserve: BATCH_ANSWER_RESERVE,
             scan_step_limit: None,
+            chunk_round_wait: chunks::ROUND_WAIT,
         }
     }
 
@@ -248,6 +254,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             batch_byte_budget: BATCH_BYTE_BUDGET,
             batch_answer_reserve: BATCH_ANSWER_RESERVE,
             scan_step_limit: None,
+            chunk_round_wait: chunks::ROUND_WAIT,
         }
     }
 
@@ -384,8 +391,13 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     pub fn missing(&self, hashes: &[String]) -> HeadResult<Vec<String>> {
         self.reject_malformed_batch(hashes)?;
 
-        let absent: HashSet<String> =
+        let mut absent: HashSet<String> =
             self.objects.objects_missing(hashes).map_err(HeadError::internal)?.into_iter().collect();
+
+        // A chunk only an applied recipe names reads as absent once a round's census found so,
+        // though its delete may not have landed yet.
+        let withheld = chunks::withheld(&self.objects, &self.refs, hashes).map_err(HeadError::internal)?;
+        absent.extend(withheld.into_iter().filter(|(_, withheld)| *withheld == Withheld::Absent).map(|(hash, _)| hash));
 
         Ok(hashes.iter().filter(|hash| absent.contains(hash.as_str())).cloned().collect())
     }
@@ -500,6 +512,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     pub fn object_get(&self, hash: &str) -> HeadResult<ObjectReadResult> {
         require_object_hash(hash)?;
         self.refuse_redacted(&[hash.to_string()])?;
+        self.refuse_withheld_chunk(hash)?;
 
         match self.objects.access(hash).map_err(HeadError::internal)? {
             Some(ObjectAccess::Direct(bytes)) => Ok(ObjectReadResult::Bytes(bytes)),
@@ -535,6 +548,10 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     .to_string(),
             )),
             PutTarget::Direct => {
+                if chunks::refuses_promotion(&self.objects, &self.refs, &[hash.to_string()]).map_err(HeadError::internal)?.is_some() {
+                    return Err(chunks::promotion_refused(hash));
+                }
+
                 // A hash mismatch is a client error (`422`): nothing unverified is stored.
                 let outcome =
                     self.objects.put_verified(hash, bytes).map_err(HeadError::unprocessable)?;
@@ -933,6 +950,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             )));
         }
 
+        // A redacted-chunk round's census judges which chunks no head names, and its delete acts on
+        // that: no head may commit across it. Read before the closure audit, so the commit fails
+        // when a round's census starts after this read.
+        let chunk_fence = self.chunk_fence_for_update()?;
+
         // An office is the chain an anchor verifies; one lifted without an anchor is a state
         // clients read as a stripped anchor, so it is never created. Same as the server, and
         // decided before any audit work. The commit conditions on the anchor still being absent.
@@ -1238,6 +1260,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 office_head_for_commit,
                 redactions_for_commit,
                 anchor_bytes.as_deref(),
+                chunk_fence.as_deref(),
             )?;
 
             match outcome {
@@ -1257,6 +1280,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 }
                 CasOutcome::OfficeMoved { current } => return Err(self.office_moved(&current)),
                 CasOutcome::AnchorMoved => return Err(self.anchor_moved()),
+                // A round's census started after the fence read above; the audit is not run again
+                // against a round that blocks every commit until its delete is done.
+                CasOutcome::ChunkFenceMoved => return Err(self.chunk_fence_moved()),
                 CasOutcome::Transient(_) => return Err(self.transient_contention(uncertain)),
                 CasOutcome::FormatMoved => unreachable!("`fenced` answers a moved format itself"),
             }
@@ -1294,6 +1320,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         office_head: OfficePrecondition<'_>,
         redactions: RedactionsPrecondition<'_>,
         anchor_bytes: Option<&str>,
+        chunk_fence: Option<&str>,
     ) -> HeadResult<(CasOutcome, bool)> {
         let uncertain = Cell::new(false);
         let outcome = fenced(
@@ -1310,6 +1337,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                             office_head,
                             redactions,
                             anchor_bytes,
+                            chunk_fence,
                             fence,
                             token,
                         )
@@ -1439,6 +1467,10 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 CasOutcome::OfficeMoved { current } => return Err(self.office_moved(&current)),
                 CasOutcome::AnchorMoved => return Err(self.anchor_moved()),
                 CasOutcome::FormatMoved => unreachable!("`fenced` answers a moved format itself"),
+                CasOutcome::ChunkFenceMoved => {
+                    return Err(HeadError::internal("A pallet delete was refused on a chunk fence \
+                        precondition it never built."))
+                }
                 CasOutcome::RedactionsMoved => {
                     return Err(HeadError::internal("A pallet delete was refused on a @redactions \
                         precondition it never built."))
@@ -1506,8 +1538,10 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         // A recorded hash is judged first: an applied or undecided one is left out of the bundle,
         // as an object the store lacks is.
         let verdicts = self.judge_hashes(hashes)?;
+        let chunks_withheld = chunks::withheld(&self.objects, &self.refs, hashes).map_err(HeadError::internal)?;
         let withheld = |hash: &str| {
             matches!(verdicts.get(hash), Some(redaction::Verdict::Applied { .. } | redaction::Verdict::Undecided(_)))
+                || chunks_withheld.contains_key(hash)
         };
 
         let scratch = self.scratch().map_err(HeadError::internal)?;
@@ -1635,6 +1669,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         // deleted, and so is a canonical copy an earlier attempt of this commit promoted.
         let named: Vec<String> = control_plane.iter().chain(blobs.iter()).cloned().collect();
         self.refuse_applied_staged(session, &named)?;
+
+        // While a redacted-chunk round runs, none of its recipes' chunks is promoted.
+        if let Some(hash) = chunks::refuses_promotion(&self.objects, &self.refs, control_plane).map_err(HeadError::internal)? {
+            return Err(chunks::promotion_refused(&hash));
+        }
 
         let mut promoted = Vec::new();
 

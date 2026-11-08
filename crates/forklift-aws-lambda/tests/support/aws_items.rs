@@ -9,7 +9,7 @@ use forklift_aws_lambda::format::{gate, AWS_FORMAT};
 use forklift_aws_lambda::reissue::request_token;
 use forklift_aws_lambda::head::redaction_record;
 use forklift_aws_lambda::store::{
-    CasOutcome, ExpectedHead, OfficePrecondition, RedactionWrite, RedactionsPrecondition, RefStore, TrustOutcome,
+    CasOutcome, ExpectedHead, ItemKey, ItemWrite, OfficePrecondition, RedactionWrite, RedactionsPrecondition, RefStore, TrustOutcome,
 };
 use forklift_core::model::remote::TrustAnchorDto;
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
@@ -47,14 +47,15 @@ pub fn hash(digit: char) -> String {
 }
 
 /// Write a warehouse holding every kind of item: the format, a live pallet, a deleted one, the
-/// office pallet, the trust anchor and an applied redaction's item, which records a holder. Each
+/// office pallet, the trust anchor, an applied redaction's item, which records a holder, and the
+/// chunk deletion's ledger and fence. Each
 /// goes through the store's own write paths, each with its own request token as a Lambda's are
 /// (DynamoDB refuses a token reused for a different transaction).
 pub fn populate(refs: &impl RefStore) {
     let fence = || gate(refs).expect("the fixture warehouse is served");
     let set = |namespace, name, new: &str| {
         let outcome = refs.compare_and_set_head(
-            namespace, name, ExpectedHead::Unborn, new, OfficePrecondition::NotConsumed, RedactionsPrecondition::NotConsumed, None, &fence(), &request_token(),
+            namespace, name, ExpectedHead::Unborn, new, OfficePrecondition::NotConsumed, RedactionsPrecondition::NotConsumed, None, None, &fence(), &request_token(),
         ).unwrap();
         assert!(matches!(outcome, CasOutcome::Committed), "{:?}", outcome);
     };
@@ -80,5 +81,13 @@ pub fn populate(refs: &impl RefStore) {
 
     let record = redaction_record(true, &[("gone".to_string(), hash('2'))], Some(1_780_000_001));
     let written = refs.put_redaction(&hash('8'), &record, None, &fence()).unwrap();
+    assert!(matches!(written, RedactionWrite::Written), "{:?}", written);
+
+    let (ledger, chunk_fence) = forklift_aws_lambda::head::chunk_fixture_items([&hash('9'), &hash('a'), &hash('b')]).unwrap();
+    let writes = [
+        ItemWrite { key: ItemKey::ChunkLedger, state: &ledger, expected: None },
+        ItemWrite { key: ItemKey::ChunkFence, state: &chunk_fence, expected: None },
+    ];
+    let written = refs.put_items(&writes, &fence()).unwrap();
     assert!(matches!(written, RedactionWrite::Written), "{:?}", written);
 }
