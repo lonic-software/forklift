@@ -776,8 +776,8 @@ fn withhold(root: &str, hash: &str, statement: &str) -> Result<(), String> {
 
     match withholding::withhold(hash, statement)? {
         Withheld::Added => println!(
-            "Withheld {}: it is no longer served or taken, and every request for it is given the \
-            statement.", hash
+            "Withheld {}: it is no longer served or taken, and a read or upload of it is given \
+            the statement.", hash
         ),
         Withheld::Restated => println!("{} was withheld already; its statement is replaced.", hash),
         Withheld::Unchanged => println!("{} is withheld already, with this statement.", hash),
