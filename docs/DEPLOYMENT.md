@@ -310,8 +310,9 @@ unswept forever. This is explicitly called out as an operational, not a code, ga
   markers left once those go would otherwise accumulate, and the redaction sweep lists them. That
   matters for redacted content: a copy staged after its redaction's deletion ran is deleted,
   every version of it, by its own verifier event or the lift commit naming it. One whose event
-  never succeeds is left to these rules, and is gone only after the staging expiry plus the
-  noncurrent expiry: 8 days at the suggested 7, current for the first 7.
+  never succeeds is left to these rules, and is gone no sooner than the staging expiry plus the
+  noncurrent expiry: 8 days at the suggested 7, current for the first 7, and often a day or two
+  later (S3 rounds each to midnight UTC and runs lifecycle actions asynchronously).
 
 ### Recommended: expire the `responses/` prefix
 
