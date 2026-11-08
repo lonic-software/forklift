@@ -3953,8 +3953,8 @@ const WITHHELD_POLL: std::time::Duration = std::time::Duration::from_secs(5);
 /// baseline, start its first redaction run, then watch the record ([`watch_withheld`]). The
 /// baseline is read first, so a hash withheld after it is the watch's to act on, at worst asking
 /// for one more round. Requests are served before it is read, so a hash in it may have been
-/// withheld while a bundle download already ran: with anything withheld, the downloads are cut,
-/// as the watch cuts them. A run that finds something withheld and no bundle published rebuilds
+/// withheld while a bundle download already ran: when its bundle is withdrawn, the downloads are
+/// cut, as the watch cuts them. A run that finds something withheld and no bundle published rebuilds
 /// it, since withholding withdrew it whether or not a copy is here to delete.
 fn start_serving(state: &Arc<AppState>, handle: &Arc<WarehouseHandle>) {
     let state = Arc::clone(state);
@@ -3970,10 +3970,8 @@ fn start_serving(state: &Arc<AppState>, handle: &Arc<WarehouseHandle>) {
 
         let seen = match baseline {
             Ok((seen, withdrawn)) => {
-                if !seen.is_empty() {
-                    cut_bundle_downloads(&handle);
-                }
                 if withdrawn {
+                    cut_bundle_downloads(&handle);
                     handle.rebuild_after_drain.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
                 Some(seen)
@@ -4005,8 +4003,8 @@ fn withheld_hashes(withheld: &WithheldSet) -> std::collections::BTreeSet<String>
 ///
 /// Between reads the watch holds no reference to the handle, and it takes none while the handle is
 /// drained, so a drain and an idle let-go are not held up by it; it ends once the handle is no
-/// longer served. A record that cannot be read is
-/// read again at the next poll: the requests that read it are refused meanwhile.
+/// longer served. A record that cannot be read is read again at the next poll: the requests that
+/// read it are refused meanwhile.
 async fn watch_withheld(state: Arc<AppState>,
                         weak: std::sync::Weak<WarehouseHandle>,
                         mut seen: Option<std::collections::BTreeSet<String>>) {
@@ -4130,8 +4128,8 @@ fn finish_round(state: &AppState, warehouse: &Arc<WarehouseHandle>, applied: boo
 
 /// Delete the applied and withheld content this warehouse holds that no census root holds
 /// ([`redaction_deleter::applied_copies`]), when there is any: drain the warehouse ([`drain`]),
-/// then delete it ([`delete_drained`]) and serve the warehouse again. A handle that is not a served warehouse's (a test fixture) holds no locks to delete
-/// under, and deletes nothing.
+/// then delete it ([`delete_drained`]) and serve the warehouse again. A handle that is not a
+/// served warehouse's (a test fixture) holds no locks to delete under, and deletes nothing.
 ///
 /// # Returns
 /// Whether the deletion is owed: the census failed, or the warehouse could not be drained, or its
@@ -6730,6 +6728,29 @@ mod tests {
 
         drop(state);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The handshake reports a withheld hash's deletion owed while the store holds a copy, and
+    /// done once it holds none.
+    ///
+    /// Revert: report every withheld hash deleted → the stored one is not `deletion_owed`.
+    #[test]
+    fn the_handshake_owes_a_withheld_deletion_while_a_copy_is_stored() {
+        let root = scratch_dir("withheld-handshake");
+        let _scope = StorageRootScope::enter(&root);
+        warehouse_utils::prepare_warehouse(warehouse_utils::PrepareMode::Full).unwrap();
+
+        let bytes: &[u8] = &object_utils::blob_bytes(b"a withheld copy still stored");
+        let stored = object_utils::hash_object_bytes(bytes);
+        object_utils::store_object_bytes(&stored, bytes).unwrap();
+        let gone = object_utils::hash_object_bytes(&object_utils::blob_bytes(b"never stored here"));
+        withholding::withhold(&stored, "statement").unwrap();
+        withholding::withhold(&gone, "statement").unwrap();
+
+        let states: HashMap<String, ServedWithholdingState> = served_withheld().unwrap().into_iter()
+            .map(|served| (served.hash, served.state)).collect();
+        assert!(matches!(states[&stored], ServedWithholdingState::DeletionOwed));
+        assert!(matches!(states[&gone], ServedWithholdingState::Deleted));
     }
 
     /// Letting a warehouse go forgets its cached packs. Once it is not live, another process may
