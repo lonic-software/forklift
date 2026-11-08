@@ -160,8 +160,8 @@ pub enum Withheld {
 /// * `Err(String)`  - `hash` is not an object hash, or the store holds it as other than a file's
 ///                    unchunked content, `statement` is not one plain line of at most
 ///                    [`STATEMENT_MAX_CHARS`], the record cannot be read, or the bundle could not
-///                    be withdrawn or the record written. A write that failed after its rename has still landed:
-///                    read the record back to learn which.
+///                    be withdrawn or the record written. A write that failed after its rename
+///                    has still landed: read the record back to learn which.
 pub fn withhold(hash: &str, statement: &str) -> Result<Withheld, String> {
     if !object_utils::is_object_hash(hash) {
         return Err(format!("\"{}\" is not an object hash.", hash));

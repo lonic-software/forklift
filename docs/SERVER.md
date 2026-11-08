@@ -329,8 +329,8 @@ revocation by more than about a day.
   and the statement (one plain line, at most 1000 characters). The list is kept in
   `<root>/.forklift/withheld`. Not yet: a chunked file this server holds cannot be withheld (its
   chunks would still be served), and if a hash withheld before it arrived turns out to be a
-  chunked file's, its chunks are still taken and served; the stored copy is kept (the handshake says `deletion_owed`), `missing` does not
-  report it missing once it is deleted, a bundle
+  chunked file's, its chunks are still taken and served; the stored copy is kept (the handshake says `deletion_owed`), `missing` reports it
+  missing once the server lacks it, so a lift naming it uploads it and is refused, a bundle
   download already under way is not cut, the bundle is rebuilt only when it next would be, and
   there is no command to lift a takedown.
 - **Redactions:** after every pallet update or deletion, the server applies each redaction

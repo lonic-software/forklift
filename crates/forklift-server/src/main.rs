@@ -133,7 +133,7 @@ enum Command {
     /// Withhold a file's content on its host's authority, or list what is withheld
     #[command(
         long_about = "Withholding is a takedown: the host stops serving a file's content and \
-                      refuses to take it, at once, whatever names it, and every request for it is \
+                      refuses to take it, at once, whatever names it, and a read or upload of it is \
                       answered with the host's statement. Pallets keep naming the file; the \
                       warehouse's history is unchanged. Clients keep the copies they hold. It \
                       takes effect while the warehouse is being served."
@@ -157,7 +157,8 @@ enum WithholdAction {
         /// The content's object hash
         hash: String,
 
-        /// Why it is withheld, as every request for it is told: one plain line of at most 1000 characters, with no control character
+        /// Why it is withheld, as a refused request is told: one plain line of at most 1000
+        /// characters, with no control character, separator or direction mark
         #[arg(long)]
         statement: String,
     },

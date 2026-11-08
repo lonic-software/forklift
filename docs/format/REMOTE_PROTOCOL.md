@@ -231,8 +231,8 @@ rather than the warehouse's, by the hash a tree names for a file, with the host'
 plain line, at most 1000 characters). Unlike a redaction it needs nothing to stop naming the
 content: pallet heads keep naming the file and history is unchanged. From the moment the host
 lists it, the remote refuses the content on the routes below with `451`, and the bundle never
-carries it. `missing` still answers for it as for any object: it reports the hash held while the
-remote keeps its copy. `state` is
+carries it. `missing` still answers for it as for any object: held while the remote keeps its
+copy, missing once it lacks it, so a lift naming it then uploads it and is refused. `state` is
 `deletion_owed` while the remote still holds a copy, `deleted` once it holds none; a client reads a
 state it does not know as `deletion_owed`. A head that does not withhold content sends `null` or
 omits the field.
