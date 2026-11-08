@@ -404,10 +404,7 @@ pub(crate) fn apply_on_report(report: &RemoteReport) -> Result<Vec<String>, Stri
 
     // Only a redaction the report lists can apply here, so with none that is not applied yet
     // nothing is scanned.
-    if !read.redactions.iter().any(|attributed| {
-        let hash = &attributed.redaction.hash;
-        !before.contains(hash) && report.lists(hash)
-    }) {
+    if !lists_unapplied(&read, &before, report) {
         return Ok(Vec::new());
     }
 
@@ -415,6 +412,28 @@ pub(crate) fn apply_on_report(report: &RemoteReport) -> Result<Vec<String>, Stri
         .filter(|status| status.state.is_applied() && !before.contains(&status.hash))
         .map(|status| status.hash)
         .collect())
+}
+
+/// Whether `report`, the remote's, lists applied a redaction recorded here that is not applied
+/// here yet: one that [`apply_on_report`] may apply.
+///
+/// # Returns
+/// * `Ok(bool)`    - Whether it lists one.
+/// * `Err(String)` - The redactions or the applied record could not be read.
+pub(crate) fn report_lists_unapplied(report: &RemoteReport) -> Result<bool, String> {
+    let before = applied_redactions::read_applied()?;
+    let read = redaction_utils::read_redactions()?;
+
+    Ok(lists_unapplied(&read, &before, report))
+}
+
+/// Whether `report` lists a redaction `read` holds that `applied` does not.
+fn lists_unapplied(read: &redaction_utils::RedactionsRead, applied: &applied_redactions::AppliedSet,
+                   report: &RemoteReport) -> bool {
+    read.redactions.iter().any(|attributed| {
+        let hash = &attributed.redaction.hash;
+        !applied.contains(hash) && report.lists(hash)
+    })
 }
 
 /// Delete the copies of every applied redaction's content that nothing here still needs

@@ -653,7 +653,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "null"
         }
       ],
-      "description": "What was done about the redactions the remote reports applied: those applied here, and the\ncopies deleted and kept. Absent when nothing was applied and no copy was left to delete."
+      "description": "What was done about the redactions the remote reports applied: those applied here, and the\ncopies deleted and kept. Absent when this command applied none; `redact apply` finishes a\ndeletion an earlier command left owed."
     },
     "remote": {
       "type": "string"
@@ -3057,7 +3057,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "null"
         }
       ],
-      "description": "What was done about the redactions the remote reports applied: those applied here, and the\ncopies deleted and kept. Absent when nothing was applied and no copy was left to delete."
+      "description": "What was done about the redactions the remote reports applied: those applied here, and the\ncopies deleted and kept. Absent when this command applied none; `redact apply` finishes a\ndeletion an earlier command left owed."
     },
     "repair": {
       "anyOf": [

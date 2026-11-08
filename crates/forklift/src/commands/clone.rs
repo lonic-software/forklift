@@ -930,7 +930,8 @@ pub(crate) struct CloneReport {
     batch_lane: Option<BatchLaneClosure>,
 
     /// What was done about the redactions the remote reports applied: those applied here, and the
-    /// copies deleted and kept. Absent when nothing was applied and no copy was left to delete.
+    /// copies deleted and kept. Absent when this command applied none; `redact apply` finishes a
+    /// deletion an earlier command left owed.
     #[serde(skip_serializing_if = "Option::is_none")]
     redactions: Option<redact::Settled>,
 }
