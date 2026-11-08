@@ -2200,7 +2200,15 @@ large file's chunks that no other file shares, except a copy that a checkout's b
 consolidation or pick in progress, or staged work still names. Those copies are listed with what
 holds them, and kept until the file is taken out of that state and `forklift redact apply` runs
 again. The deletion needs the object store to itself: while a command in another bay or a server is
-using it, the deletion is reported as owed, and `forklift redact apply` finishes it later. Neither
+using it, the deletion is reported as owed, and `forklift redact apply` finishes it later.
+
+In a warehouse with a remote, a redaction applies here only once the remote has applied it too:
+until then it lists as waiting for the remote, so the warehouse can still lift history its remote
+serves. `lower` and `clone` read the remote's report as they take what it serves, apply every
+redaction it lists applied that nothing here names any more, and delete the copies; `redact apply`
+asks the remote for its report first, and says so when it cannot reach it. A git mirror
+(`.forklift/mirror.git`) may still hold a copy exported before the redaction: nothing here deletes
+it, and the command that applied the redaction names it. Neither
 `redact record` nor `redact apply` is an agent tool under `forklift mcp`.
 
 ### `remote` — the remote and the origin

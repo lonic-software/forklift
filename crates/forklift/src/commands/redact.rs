@@ -4,11 +4,12 @@ use serde::Serialize;
 use forklift_core::error::{sanitize, CoreError, RefusalCode};
 use forklift_core::util::kv_utils::short;
 use forklift_core::util::office_utils::Role;
-use forklift_core::util::applied_redactions::{self, RedactionState, RedactionStatus};
+use forklift_core::util::applied_redactions::{self, RedactionState, RedactionStatus, RemoteReport};
 use forklift_core::util::lock_utils::{ServeLock, StoreAccessLock, StoreLock};
 use forklift_core::util::redaction_deleter::{self, Checkout, CopyHolder, Deletion};
 use forklift_core::util::redaction_utils::{self, AttributedRedaction, HeadHolder, RedactedKind, Redaction};
-use forklift_core::util::{config_utils, object_utils, pallet_utils, remote_utils};
+use forklift_core::util::remote_utils::RemoteClient;
+use forklift_core::util::{config_utils, mirror_utils, object_utils, pallet_utils, remote_utils};
 use crate::cli::RedactAction;
 use crate::commands::lower;
 use crate::events;
@@ -19,7 +20,8 @@ use crate::output::{self, CommandOutput};
 ///
 /// * `redact` / `redact list`             - List every redaction and where it stands.
 /// * `redact record <target> -m <reason>` - Record a redaction (admin only), and apply it if it can.
-/// * `redact apply`                       - Apply every redaction that can be now.
+/// * `redact apply`                       - Apply every redaction that can be now, asking the
+///                                          remote, when one is configured, which it has applied.
 ///
 /// # Arguments
 /// * `action` - The redact subcommand (`None` lists the redactions).
@@ -30,7 +32,7 @@ use crate::output::{self, CommandOutput};
 pub async fn handle_command(action: Option<RedactAction>) -> Result<(), String> {
     match action {
         Some(RedactAction::Record { target, message }) => record(&target, &message),
-        Some(RedactAction::Apply) => apply(),
+        Some(RedactAction::Apply) => apply().await,
         Some(RedactAction::List) | None => list(),
     }
 }
@@ -128,7 +130,7 @@ fn record(target: &str, reason: &str) -> Result<(), String> {
     };
 
     let applied = redaction_utils::read_redactions()
-        .and_then(|read| applied_redactions::apply(&read, Some(&hash)));
+        .and_then(|read| applied_redactions::apply(&read, Some(&hash), None));
     let apply_failed = applied.is_err();
     let state = applied
         .map(|statuses| statuses.into_iter().next().map(|status| status.state))
@@ -141,6 +143,7 @@ fn record(target: &str, reason: &str) -> Result<(), String> {
     if apply_failed {
         output::emit(&Recorded {
             hash, chunked: kind == RedactedKind::Recipe, redactions_head, status: StateView::from(&state), deletion: None,
+            mirror_copy: None,
         });
 
         return Ok(());
@@ -152,8 +155,11 @@ fn record(target: &str, reason: &str) -> Result<(), String> {
         hash, why.trim_end()
     ))?;
 
+    let mirror_copy = mirror_copy(state.is_applied());
+
     output::emit(&Recorded {
         hash, chunked: kind == RedactedKind::Recipe, redactions_head, status: StateView::from(&state), deletion,
+        mirror_copy,
     });
 
     Ok(())
@@ -176,7 +182,7 @@ fn record(target: &str, reason: &str) -> Result<(), String> {
 ///                             none, and its failure added to the reason).
 /// * `Err(String)`           - If the census under the locks or the deletion could not be carried
 ///                             out (an unreadable pack, bay state or recipe, or a failed delete).
-fn delete_applied() -> Result<Option<DeletionView>, String> {
+pub(crate) fn delete_applied() -> Result<Option<DeletionView>, String> {
     let (held, uncounted) = match redaction_deleter::applied_copies() {
         Ok(copies) if !copies.owes_deletion() => {
             return Ok((!copies.held.is_empty()).then(|| DeletionView::from(Deletion { held: copies.held, ..Deletion::default() })));
@@ -344,20 +350,147 @@ fn list() -> Result<(), String> {
 }
 
 /// Apply every redaction that can be now, delete the copies of every applied redaction's content
-/// that nothing here still needs ([`delete_applied`]), and list them all as [`list`] does.
-fn apply() -> Result<(), String> {
+/// that nothing here still needs ([`delete_applied`]), and list them all as [`list`] does. With a
+/// remote configured, its handshake is read first, since only its report applies a redaction
+/// here, and only while some redaction is not applied yet; a remote that cannot be read leaves
+/// every clean one pending, and the list says why.
+async fn apply() -> Result<(), String> {
     let read = redaction_utils::read_redactions()?;
-    let statuses = applied_redactions::apply(&read, None)?;
+    let before = applied_redactions::read_applied()?;
+
+    // The remote is asked only while some redaction here is still to apply.
+    let waiting = read.redactions.iter().any(|attributed| !before.contains(&attributed.redaction.hash));
+    let (report, remote_unread) = match waiting && RemoteClient::is_configured() {
+        true => match remote_report().await {
+            Ok(report) => (Some(report), None),
+            Err(why) => (None, Some(why)),
+        },
+        false => (None, None),
+    };
+    let statuses = applied_redactions::apply(&read, None, report.as_ref())?;
     let deletion = delete_applied().map_err(|why| format!(
         "Every redaction that can be applied now is (see \"forklift redact list\"), but deleting the \
         redacted content failed: {} Copies already deleted stay deleted; once that is fixed, run \
         \"forklift redact apply\" again to finish.",
         why.trim_end()
     ))?;
+    let newly = statuses.iter().any(|status| status.state.is_applied() && !before.contains(&status.hash));
 
-    output::emit(&RedactionList { deletion, ..RedactionList::new(&read, &statuses) });
+    output::emit(&RedactionList {
+        deletion, remote_unread, mirror_copy: mirror_copy(newly), ..RedactionList::new(&read, &statuses)
+    });
 
     Ok(())
+}
+
+/// The configured remote's report of the redactions it has applied, from its handshake.
+async fn remote_report() -> Result<RemoteReport, String> {
+    let client = RemoteClient::for_warehouse()?;
+    let info = client.fetch_info().await?;
+
+    Ok(RemoteReport::of(client.url(), &info))
+}
+
+/// Apply every redaction `report`, the remote's, lists applied that nothing here names any more,
+/// for lower and clone once they have taken what the remote serves (see [`applied_redactions::apply`]).
+///
+/// # Returns
+/// * `Ok(Vec<String>)` - The redactions this applied, which were not applied before.
+/// * `Err(String)`     - The redactions, the applied record, the configuration or the warehouse's
+///                       mode could not be read, or the apply could not be written.
+pub(crate) fn apply_on_report(report: &RemoteReport) -> Result<Vec<String>, String> {
+    let before = applied_redactions::read_applied()?;
+    let read = redaction_utils::read_redactions()?;
+
+    // Only a redaction the report lists can apply here, so with none that is not applied yet
+    // nothing is scanned.
+    if !lists_unapplied(&read, &before, report) {
+        return Ok(Vec::new());
+    }
+
+    Ok(applied_redactions::apply(&read, None, Some(report))?.into_iter()
+        .filter(|status| status.state.is_applied() && !before.contains(&status.hash))
+        .map(|status| status.hash)
+        .collect())
+}
+
+/// Whether `report` lists a redaction `read` holds that `applied` does not.
+fn lists_unapplied(read: &redaction_utils::RedactionsRead, applied: &applied_redactions::AppliedSet,
+                   report: &RemoteReport) -> bool {
+    read.redactions.iter().any(|attributed| {
+        let hash = &attributed.redaction.hash;
+        !applied.contains(hash) && report.lists(hash)
+    })
+}
+
+/// Delete the copies of every applied redaction's content that nothing here still needs
+/// ([`delete_applied`]), after lower or clone applied `applied`, and say what that did. The
+/// command's store-access hold must be released first, or the deletion is owed. A deletion that
+/// fails only warns, naming `redact apply`: the redactions stay applied, and the result says so.
+pub(crate) fn settle_applied(applied: Vec<String>) -> Settled {
+    let deletion = delete_applied().unwrap_or_else(|why| {
+        output::warn_redactions_unsettled(&format!(
+            "The redactions the remote reports applied were applied here, but deleting their content \
+            failed: {} Copies already deleted stay deleted.",
+            why.trim_end()
+        ));
+        None
+    });
+    let mirror_copy = mirror_copy(true);
+
+    Settled { applied, deletion, mirror_copy }
+}
+
+/// What to say about the git mirror's copy once `applied` says a redaction was applied in this
+/// command: a file the mirror exported before stays in its repository as a git blob, which no
+/// deletion here reaches, and its history may already be pushed, so it is not rewritten. `None`
+/// when nothing was applied or there is no mirror repository.
+fn mirror_copy(applied: bool) -> Option<String> {
+    let path = mirror_utils::mirror_repository_path();
+
+    (applied && path.exists()).then(|| format!(
+        "The git mirror at \"{}\" may hold a copy of the redacted content, exported before the \
+        redaction; nothing here deletes it, and a copy already pushed from it is not reached. To remove \
+        it here, delete \"{}\".",
+        path.to_string_lossy(), path.to_string_lossy()
+    ))
+}
+
+/// What lower or clone did about the redactions its remote reports applied.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub(crate) struct Settled {
+    /// The redactions this command applied: the remote reports them applied, and nothing here
+    /// names their content any more.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    applied: Vec<String>,
+
+    /// What deleting the copies of every applied redaction's content did; absent when no applied
+    /// redaction's object was left to delete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deletion: Option<DeletionView>,
+
+    /// When a redaction was applied and this warehouse has a git mirror repository: that it may
+    /// hold a copy of the content, and how to remove it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mirror_copy: Option<String>,
+}
+
+impl Settled {
+    /// Print what was applied, deleted and kept, and the mirror's copy.
+    pub(crate) fn render_human(&self) {
+        for hash in &self.applied {
+            println!("Applied the redaction of {}: the remote reports it applied.", hash);
+        }
+
+        if let Some(deletion) = &self.deletion {
+            deletion.render_human();
+        }
+
+        if let Some(copy) = &self.mirror_copy {
+            println!("{}", sanitize(copy));
+        }
+    }
 }
 
 /// The result of recording a redaction.
@@ -380,6 +513,11 @@ pub(crate) struct Recorded {
     /// redaction's object was left to delete.
     #[serde(skip_serializing_if = "Option::is_none")]
     deletion: Option<DeletionView>,
+
+    /// When the redaction was applied and this warehouse has a git mirror repository: that it may
+    /// hold a copy of the content, and how to remove it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mirror_copy: Option<String>,
 }
 
 impl CommandOutput for Recorded {
@@ -397,6 +535,10 @@ impl CommandOutput for Recorded {
 
         if let Some(deletion) = &self.deletion {
             deletion.render_human();
+        }
+
+        if let Some(copy) = &self.mirror_copy {
+            println!("{}", sanitize(copy));
         }
     }
 }
@@ -577,6 +719,16 @@ pub(crate) struct RedactionList {
     /// absent from `redact list`, and when no applied redaction's object was left to delete.
     #[serde(skip_serializing_if = "Option::is_none")]
     deletion: Option<DeletionView>,
+
+    /// For `redact apply` with a remote configured, why its handshake could not be read: each
+    /// redaction nothing here names stays pending until a run that reads it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_unread: Option<String>,
+
+    /// For `redact apply`, when it applied a redaction and this warehouse has a git mirror
+    /// repository: that it may hold a copy of the content, and how to remove it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mirror_copy: Option<String>,
 }
 
 /// One redaction.
@@ -620,7 +772,7 @@ impl RedactionList {
             .map(|cell| UnreadableView { hash: cell.hash.clone(), reason: cell.reason.clone() })
             .collect();
 
-        RedactionList { redactions, unreadable, deletion: None }
+        RedactionList { redactions, unreadable, deletion: None, remote_unread: None, mirror_copy: None }
     }
 }
 
@@ -790,8 +942,20 @@ impl CommandOutput for RedactionList {
             println!("{}  (unreadable: {})", cell.hash, sanitize(&cell.reason));
         }
 
+        if let Some(why) = &self.remote_unread {
+            println!(
+                "The remote's report of what it has applied could not be read, so no redaction waiting for it \
+                was applied: {}",
+                sanitize(why)
+            );
+        }
+
         if let Some(deletion) = &self.deletion {
             deletion.render_human();
+        }
+
+        if let Some(copy) = &self.mirror_copy {
+            println!("{}", sanitize(copy));
         }
     }
 }

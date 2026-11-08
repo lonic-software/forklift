@@ -12,7 +12,7 @@ use forklift_core::util::{
 use forklift_core::util::take_utils::{FetchAt, TakeTrust};
 use forklift_core::util::operation_utils::{Operation, OperationKind};
 use crate::commands::consolidate::{self, MergeStatus};
-use crate::commands::{merge_abort, office, shift};
+use crate::commands::{merge_abort, office, redact, shift};
 use crate::events;
 use crate::output::{self, CommandOutput};
 
@@ -48,6 +48,8 @@ use crate::output::{self, CommandOutput};
 ///              one is refused (`confirmation_required`) before the remote is contacted.
 /// * `repair`  - Whether a remote head no client can check out is repaired: a parcel stacked on it
 ///              removes every name that opens the metadata folder (see [`repair_pallet`]).
+/// * `store_access` - The command's shared store-access hold, released once the pallet has landed
+///              and a redaction was applied, so that its copies can be deleted ([`settle_redactions`]).
 ///
 /// # Returns
 /// * `Ok(())`      - If every pallet is now in sync with the remote (or ahead of it).
@@ -56,7 +58,12 @@ use crate::output::{self, CommandOutput};
 ///                   such pallet, the warehouse is dirty, the
 ///                   histories diverged, a meta pallet conflicted or failed to sync, or a transfer
 ///                   failed.
-pub async fn handle_command(pallet: Option<String>, expect: Option<String>, keep: Vec<String>, confirm: bool, repair: bool) -> Result<(), String> {
+pub async fn handle_command(pallet: Option<String>,
+                            expect: Option<String>,
+                            keep: Vec<String>,
+                            confirm: bool,
+                            repair: bool,
+                            store_access: &mut Option<forklift_core::util::lock_utils::StoreAccessLock>) -> Result<(), String> {
     let keeps = parse_keeps(&keep)?;
 
     // Rule 5: a "theirs" resolution destroys local changes nobody else made. One is accepted only
@@ -154,6 +161,7 @@ pub async fn handle_command(pallet: Option<String>, expect: Option<String>, keep
         batch_lane: None,
         repair: None,
         merged: None,
+        redactions: None,
     };
 
     let lowered = match (named.is_some(), repair) {
@@ -163,6 +171,14 @@ pub async fn handle_command(pallet: Option<String>, expect: Option<String>, keep
     };
 
     report.batch_lane = client.batch_lane_closure();
+
+    // Only once everything went through, so the report that carries what was applied reaches the
+    // output: a failed or conflicting meta pallet fails the command, and its error document has no
+    // room for it. The apply is deferred, and the local copy stays until then: the next lower that
+    // goes through, or `redact apply`, applies on the remote's report as this one would have.
+    if lowered.is_ok() && report.meta_failed.is_empty() && report.meta_conflicts.is_empty() {
+        report.redactions = settle_redactions(client.url(), &info, store_access);
+    }
 
     // The most severe outcome decides the exit: the working pallet's own failure, then a meta
     // pallet that failed, then a meta conflict. The report shows what did go through.
@@ -951,6 +967,12 @@ pub(crate) struct LowerReport {
     /// The merge parcel stacked, when the outcome is `merged`.
     #[serde(skip_serializing_if = "Option::is_none")]
     merged: Option<String>,
+
+    /// What was done about the redactions the remote reports applied: those applied here, and the
+    /// copies deleted and kept. Absent when this command applied none; `redact apply` finishes a
+    /// deletion an earlier command left owed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redactions: Option<redact::Settled>,
 }
 
 impl LowerReport {
@@ -1060,8 +1082,41 @@ impl CommandOutput for LowerReport {
             }
         }
 
+        if let Some(redactions) = &self.redactions {
+            redactions.render_human();
+        }
+
         output::print_batch_lane(self.batch_lane);
     }
+}
+
+/// Apply the redactions the remote at `url`, whose handshake is `info`, reports applied, once the
+/// pallet has landed and nothing here names their content any more, and delete their copies.
+/// Deleting needs the store exclusive, so when something was applied `store_access`, this
+/// command's shared hold, is released first: everything the command writes is published by then.
+/// A failure only warns, naming `redact apply`, since the lower itself went through; a deletion
+/// owed by an earlier command is left to `redact apply` too.
+///
+/// # Returns
+/// What was applied, deleted and kept; `None` when nothing was applied, or the apply failed.
+pub(crate) fn settle_redactions(url: &str,
+                                info: &forklift_core::model::remote::WarehouseInfo,
+                                store_access: &mut Option<forklift_core::util::lock_utils::StoreAccessLock>) -> Option<redact::Settled> {
+    let report = forklift_core::util::applied_redactions::RemoteReport::of(url, info);
+    let applied = match redact::apply_on_report(&report) {
+        Ok(applied) if applied.is_empty() => return None,
+        Ok(applied) => applied,
+        Err(why) => {
+            output::warn_redactions_unsettled(&format!(
+                "The redactions the remote reports applied were not applied here: {}", why.trim_end()
+            ));
+            return None;
+        }
+    };
+
+    drop(store_access.take());
+
+    Some(redact::settle_applied(applied))
 }
 
 /// Refuse a lower whose diff (`ops` and `removed_dirs`) reaches a path with a local change: it

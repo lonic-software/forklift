@@ -384,6 +384,148 @@ A command not listed here either reports only the generic human-message shape `{
         }
       ]
     },
+    "DeletionView": {
+      "description": "What deleting the copies of the applied redactions' content did.",
+      "properties": {
+        "bytes_freed": {
+          "description": "Bytes freed on disk: loose files deleted, plus what the old packs held beyond the packs a\nrepack wrote.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "chunks_deleted": {
+          "description": "Chunks deleted: those of a deleted recipe that no unredacted object names.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "deleted": {
+          "description": "The applied redactions' objects (blobs and recipes) deleted.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "kept": {
+          "description": "Applied redactions whose copies are kept, because a checkout's state still names them (or a\npallet head or meta pallet's history, as a guard). Taking the file out of that state and\nrunning `redact apply` again deletes them.",
+          "items": {
+            "$ref": "#/$defs/KeptView"
+          },
+          "type": "array"
+        },
+        "owed": {
+          "description": "Why the deletion did not run, when it is owed because a lock it needs is taken: other\nobject-store maintenance is running, another process is using the object store, or the\nwarehouse root is being served. Running `redact apply` again once that ends finishes it.\n`kept` then lists the copies held as a census taken without the locks found them; it is\nempty, and the reason says why, when that census could not be taken. Any other failure to\ndelete fails the command instead.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "deleted",
+        "chunks_deleted",
+        "bytes_freed"
+      ],
+      "type": "object"
+    },
+    "HolderKind": {
+      "description": "The kind of a kept copy's holder.",
+      "oneOf": [
+        {
+          "const": "pallet",
+          "description": "A pallet head's tree.",
+          "type": "string"
+        },
+        {
+          "const": "meta_history",
+          "description": "A meta pallet's history.",
+          "type": "string"
+        },
+        {
+          "const": "adopted_history",
+          "description": "The history the trust anchor adopts.",
+          "type": "string"
+        },
+        {
+          "const": "base",
+          "description": "A checkout's base.",
+          "type": "string"
+        },
+        {
+          "const": "parked",
+          "description": "A parcel parked in a checkout.",
+          "type": "string"
+        },
+        {
+          "const": "consolidation",
+          "description": "A consolidation in progress in a checkout.",
+          "type": "string"
+        },
+        {
+          "const": "pick",
+          "description": "A cherry-pick in progress in a checkout.",
+          "type": "string"
+        },
+        {
+          "const": "staged",
+          "description": "Work staged in a checkout.",
+          "type": "string"
+        }
+      ]
+    },
+    "HolderView": {
+      "description": "What names a kept copy.",
+      "properties": {
+        "bay": {
+          "description": "For a checkout's state, the bay; absent for the warehouse's own working tree.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "description": "The holder in words, as the human output prints it (unsanitized).",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/HolderKind",
+          "description": "The kind of holder."
+        },
+        "pallet": {
+          "description": "For `pallet`, the pallet; for `meta_history`, the meta pallet, with its `@`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "description"
+      ],
+      "type": "object"
+    },
+    "KeptView": {
+      "description": "An applied redaction whose copy is kept.",
+      "properties": {
+        "hash": {
+          "description": "The redacted object.",
+          "type": "string"
+        },
+        "holders": {
+          "description": "What names the copy.",
+          "items": {
+            "$ref": "#/$defs/HolderView"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "hash",
+        "holders"
+      ],
+      "type": "object"
+    },
     "RepairReport": {
       "description": "The repair parcel a `--repair` lower stacked.",
       "properties": {
@@ -403,6 +545,37 @@ A command not listed here either reports only the generic human-message shape `{
         "parcel",
         "removed"
       ],
+      "type": "object"
+    },
+    "Settled": {
+      "description": "What lower or clone did about the redactions its remote reports applied.",
+      "properties": {
+        "applied": {
+          "description": "The redactions this command applied: the remote reports them applied, and nothing here\nnames their content any more.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "deletion": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeletionView"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What deleting the copies of every applied redaction's content did; absent when no applied\nredaction's object was left to delete."
+        },
+        "mirror_copy": {
+          "description": "When a redaction was applied and this warehouse has a git mirror repository: that it may\nhold a copy of the content, and how to remove it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
       "type": "object"
     }
   },
@@ -470,6 +643,17 @@ A command not listed here either reports only the generic human-message shape `{
     "pallet": {
       "description": "The pallet checked out.",
       "type": "string"
+    },
+    "redactions": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Settled"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "What was done about the redactions the remote reports applied: those applied here, and the\ncopies deleted and kept. Absent when this command applied none; `redact apply` finishes a\ndeletion an earlier command left owed."
     },
     "remote": {
       "type": "string"
@@ -2455,6 +2639,148 @@ A command not listed here either reports only the generic human-message shape `{
         }
       ]
     },
+    "DeletionView": {
+      "description": "What deleting the copies of the applied redactions' content did.",
+      "properties": {
+        "bytes_freed": {
+          "description": "Bytes freed on disk: loose files deleted, plus what the old packs held beyond the packs a\nrepack wrote.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "chunks_deleted": {
+          "description": "Chunks deleted: those of a deleted recipe that no unredacted object names.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "deleted": {
+          "description": "The applied redactions' objects (blobs and recipes) deleted.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "kept": {
+          "description": "Applied redactions whose copies are kept, because a checkout's state still names them (or a\npallet head or meta pallet's history, as a guard). Taking the file out of that state and\nrunning `redact apply` again deletes them.",
+          "items": {
+            "$ref": "#/$defs/KeptView"
+          },
+          "type": "array"
+        },
+        "owed": {
+          "description": "Why the deletion did not run, when it is owed because a lock it needs is taken: other\nobject-store maintenance is running, another process is using the object store, or the\nwarehouse root is being served. Running `redact apply` again once that ends finishes it.\n`kept` then lists the copies held as a census taken without the locks found them; it is\nempty, and the reason says why, when that census could not be taken. Any other failure to\ndelete fails the command instead.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "deleted",
+        "chunks_deleted",
+        "bytes_freed"
+      ],
+      "type": "object"
+    },
+    "HolderKind": {
+      "description": "The kind of a kept copy's holder.",
+      "oneOf": [
+        {
+          "const": "pallet",
+          "description": "A pallet head's tree.",
+          "type": "string"
+        },
+        {
+          "const": "meta_history",
+          "description": "A meta pallet's history.",
+          "type": "string"
+        },
+        {
+          "const": "adopted_history",
+          "description": "The history the trust anchor adopts.",
+          "type": "string"
+        },
+        {
+          "const": "base",
+          "description": "A checkout's base.",
+          "type": "string"
+        },
+        {
+          "const": "parked",
+          "description": "A parcel parked in a checkout.",
+          "type": "string"
+        },
+        {
+          "const": "consolidation",
+          "description": "A consolidation in progress in a checkout.",
+          "type": "string"
+        },
+        {
+          "const": "pick",
+          "description": "A cherry-pick in progress in a checkout.",
+          "type": "string"
+        },
+        {
+          "const": "staged",
+          "description": "Work staged in a checkout.",
+          "type": "string"
+        }
+      ]
+    },
+    "HolderView": {
+      "description": "What names a kept copy.",
+      "properties": {
+        "bay": {
+          "description": "For a checkout's state, the bay; absent for the warehouse's own working tree.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "description": "The holder in words, as the human output prints it (unsanitized).",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/HolderKind",
+          "description": "The kind of holder."
+        },
+        "pallet": {
+          "description": "For `pallet`, the pallet; for `meta_history`, the meta pallet, with its `@`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "description"
+      ],
+      "type": "object"
+    },
+    "KeptView": {
+      "description": "An applied redaction whose copy is kept.",
+      "properties": {
+        "hash": {
+          "description": "The redacted object.",
+          "type": "string"
+        },
+        "holders": {
+          "description": "What names the copy.",
+          "items": {
+            "$ref": "#/$defs/HolderView"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "hash",
+        "holders"
+      ],
+      "type": "object"
+    },
     "LowerOutcome": {
       "description": "What a lower did to the pallet it lowered.",
       "oneOf": [
@@ -2595,6 +2921,37 @@ A command not listed here either reports only the generic human-message shape `{
         "removed"
       ],
       "type": "object"
+    },
+    "Settled": {
+      "description": "What lower or clone did about the redactions its remote reports applied.",
+      "properties": {
+        "applied": {
+          "description": "The redactions this command applied: the remote reports them applied, and nothing here\nnames their content any more.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "deletion": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeletionView"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What deleting the copies of every applied redaction's content did; absent when no applied\nredaction's object was left to delete."
+        },
+        "mirror_copy": {
+          "description": "When a redaction was applied and this warehouse has a git mirror repository: that it may\nhold a copy of the content, and how to remove it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2690,6 +3047,17 @@ A command not listed here either reports only the generic human-message shape `{
     },
     "pallet": {
       "type": "string"
+    },
+    "redactions": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Settled"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "What was done about the redactions the remote reports applied: those applied here, and the\ncopies deleted and kept. Absent when this command applied none; `redact apply` finishes a\ndeletion an earlier command left owed."
     },
     "repair": {
       "anyOf": [
@@ -6504,6 +6872,13 @@ A command not listed here either reports only the generic human-message shape `{
       "description": "The redacted object.",
       "type": "string"
     },
+    "mirror_copy": {
+      "description": "When the redaction was applied and this warehouse has a git mirror repository: that it may\nhold a copy of the content, and how to remove it.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "redactions_head": {
       "description": "The new head of the @redactions meta pallet.",
       "type": "string"
@@ -6845,11 +7220,25 @@ A command not listed here either reports only the generic human-message shape `{
       ],
       "description": "For `redact apply`, what deleting the copies of every applied redaction's content did;\nabsent from `redact list`, and when no applied redaction's object was left to delete."
     },
+    "mirror_copy": {
+      "description": "For `redact apply`, when it applied a redaction and this warehouse has a git mirror\nrepository: that it may hold a copy of the content, and how to remove it.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "redactions": {
       "items": {
         "$ref": "#/$defs/RedactionView"
       },
       "type": "array"
+    },
+    "remote_unread": {
+      "description": "For `redact apply` with a remote configured, why its handshake could not be read: each\nredaction nothing here names stays pending until a run that reads it.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "unreadable": {
       "description": "Redactions this forklift cannot read — a newer schema, or a malformed cell. Listed, never\ndropped.",
