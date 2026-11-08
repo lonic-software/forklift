@@ -11,7 +11,6 @@ use crate::model::tree_item::TreeItem;
 use crate::util::office_utils::{KeyRecord, OfficeState, TrustAnchor};
 use crate::util::scope_utils::{PathScope, ScopeClass};
 use crate::util::{cache_miss, fanout_utils, file_utils, graph_utils, object_utils, office_utils, pallet_utils, sign_utils};
-use crate::util::applied_redactions::AppliedSet;
 use crate::util::sealed_utils::{At, Held, Tolerated};
 use crate::util::withholding::WithheldSet;
 use crate::util::pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions};
@@ -1817,7 +1816,7 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
         &local_chunks_missing,
         &|hash| object_utils::recipe_chunk_hashes(hash),
         &|hash| object_utils::load_tree(hash),
-        &|| Ok((AppliedSet::default(), WithheldSet::default())),
+        &|| Ok(Tolerated::default()),
     )
 }
 
@@ -1841,32 +1840,15 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
 ///                           record cannot be read.
 pub fn verify_parcel_closure_for_write(head: &str,
                                        known_complete: Option<&str>) -> Result<pallet_utils::VerifiedClosure, String> {
-    if let Err(missing) = verify_parcel_closure(head, known_complete) {
-        let tolerated = crate::util::sealed_utils::read_removed().map_err(|error| format!(
-            "{} The record of the redactions applied here, or of the content withheld here, cannot \
-            be read either: {}",
-            missing, error
-        ))?;
-
-        if tolerated.is_empty() {
-            return Err(missing);
-        }
-
-        let tolerance = SealedTolerance::new(&tolerated);
-        let seams = ClosureSeams {
-            blob_exists: &|hash| file_utils::does_object_exist(hash),
-            chunks_missing: &local_chunks_missing,
-            load_recipe_chunks: &|hash| object_utils::recipe_chunk_hashes(hash),
-            load_base_tree: &|hash| object_utils::load_tree(hash),
-            sealed: Some(&tolerance),
-        };
-
-        verify_closure_core(
-            head, known_complete.as_ref().map(std::slice::from_ref), known_complete, &PathScope::full(),
-            false, &seams,
-        )
-        .map_err(|refusal| withheld_beyond_files(refusal, &tolerated.withheld))?;
-    }
+    verify_parcel_closure_with(
+        head,
+        known_complete,
+        &|hash| file_utils::does_object_exist(hash),
+        &local_chunks_missing,
+        &|hash| object_utils::recipe_chunk_hashes(hash),
+        &|hash| object_utils::load_tree(hash),
+        &crate::util::sealed_utils::read_removed,
+    )?;
 
     Ok(pallet_utils::VerifiedClosure::new(head, PathScope::full(), known_complete))
 }
@@ -2042,7 +2024,7 @@ pub fn verify_parcel_closure_with(
     chunks_missing: &dyn Fn(&[String]) -> Result<Vec<String>, String>,
     load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
     load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>,
-    removed: &dyn Fn() -> Result<(AppliedSet, WithheldSet), String>,
+    removed: &dyn Fn() -> Result<Tolerated, String>,
 ) -> Result<(), String> {
     let bounds = known_complete.as_ref().map(std::slice::from_ref);
     let seams = ClosureSeams { blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, sealed: None };
@@ -2051,13 +2033,11 @@ pub fn verify_parcel_closure_with(
         return Ok(());
     };
 
-    let (applied, withheld) = removed().map_err(|error| format!(
+    let tolerated = removed().map_err(|error| format!(
         "{} The record of the redactions applied here, or of the content withheld here, cannot be \
         read either: {}",
         missing, error
     ))?;
-
-    let tolerated = Tolerated::removed_only(applied, withheld);
 
     if tolerated.is_empty() {
         return Err(missing);

@@ -2590,7 +2590,7 @@ pub(crate) mod tests {
                 &|_| Ok(Vec::new()),
                 &|hash| crate::util::object_utils::recipe_chunk_hashes(hash),
                 &|hash| crate::util::object_utils::load_tree(hash),
-                &|| Ok(removed.clone()),
+                &|| Ok(crate::util::sealed_utils::Tolerated::removed_only(removed.0.clone(), removed.1.clone())),
             )
         }
 
