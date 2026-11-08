@@ -39,7 +39,7 @@ use forklift_aws_lambda::reissue::request_token;
 use forklift_aws_lambda::aws::s3::parse_staging_key;
 use forklift_aws_lambda::aws::{build_clients, build_stores, AwsConfig, DynamoOps, S3Ops};
 use forklift_aws_lambda::store::{
-    ExpectedHead, RefHead,
+    ExpectedHead, ItemKey, ItemWrite, RedactionWrite, RefHead,
     CasOutcome, ObjectAccess, ObjectStore, OffloadedResponse, OfficePrecondition, RedactionsPrecondition, PromoteOutcome, PutOutcome,
     PutTarget, RefStore, SignatureOutcome, TrustOutcome, TrustWriteOutcome,
 };
@@ -1357,6 +1357,63 @@ async fn dynamo_ref_store_writes_the_frozen_aws_items() {
 
     assert_eq!(stored, aws_items::frozen_items(),
         "DynamoDB stores other items than AWS format {}'s fixture froze on the memory store", AWS_FORMAT);
+}
+
+/// The chunk deletion's items over real DynamoDB: a write of several items is one transaction,
+/// refused whole when any one of them moved, and a head commit conditioned on the fence it read is
+/// refused once the fence moved, the fence's absence included. A census frozen once stays the first
+/// one written. The memory fake compares `Option`s, which says nothing of how DynamoDB evaluates a
+/// `Put` on absence or a `ConditionCheck` on a state.
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamo_ref_store_writes_the_chunk_items_whole_and_fences_head_commits_on_them() {
+    let Some(endpoint) = endpoint() else {
+        eprintln!("skipping: FORKLIFT_AWS_TEST_ENDPOINT is unset");
+        return;
+    };
+
+    let config = test_config(&endpoint);
+    provision(&config).await;
+
+    let bridge = AsyncBridge::current().expect("a multi-thread runtime");
+    let (objects, refs) = build_stores(&config, bridge).await.expect("stores");
+
+    tokio::task::spawn_blocking(move || {
+        let fence = || format::gate(&refs).expect("format gate");
+        let write = |writes: &[ItemWrite<'_>]| refs.put_items(writes, &fence()).expect("write");
+        let commit = |name: &str, chunk_fence: Option<&str>| refs.compare_and_set_head(
+            PalletNamespace::User, name, ExpectedHead::Unborn, &"1".repeat(64), OfficePrecondition::NotConsumed,
+            RedactionsPrecondition::NotConsumed, None, chunk_fence, &fence(), &request_token(),
+        ).expect("commit");
+
+        assert_eq!(commit("before", None), CasOutcome::Committed, "no fence, read as none");
+
+        let ledger = r#"{"version":1,"recipes":{}}"#;
+        let announced = r#"{"version":1,"round":1,"phase":"announced","started":0,"recipes":[],"lease_until":null}"#;
+        assert_eq!(write(&[
+            ItemWrite { key: ItemKey::ChunkLedger, state: ledger, expected: None },
+            ItemWrite { key: ItemKey::ChunkFence, state: announced, expected: None },
+        ]), RedactionWrite::Written);
+        assert_eq!(refs.get_item(ItemKey::ChunkLedger).expect("read").as_deref(), Some(ledger));
+        assert_eq!(refs.get_item(ItemKey::ChunkFence).expect("read").as_deref(), Some(announced));
+
+        // One of the two moved: neither is written.
+        let census = r#"{"version":1,"round":1,"phase":"census","started":0,"recipes":[],"lease_until":null}"#;
+        assert_eq!(write(&[
+            ItemWrite { key: ItemKey::ChunkLedger, state: "{}", expected: Some(ledger) },
+            ItemWrite { key: ItemKey::ChunkFence, state: census, expected: Some("{}") },
+        ]), RedactionWrite::Moved);
+        assert_eq!(refs.get_item(ItemKey::ChunkLedger).expect("read").as_deref(), Some(ledger));
+
+        assert_eq!(commit("absent", None), CasOutcome::ChunkFenceMoved, "read as none, the fence is there now");
+        assert_eq!(commit("other", Some(census)), CasOutcome::ChunkFenceMoved);
+        assert_eq!(commit("held", Some(announced)), CasOutcome::Committed);
+
+        assert!(objects.work_create("chunks/census-1-final", b"first").expect("create"));
+        assert!(!objects.work_create("chunks/census-1-final", b"second").expect("create"));
+        assert_eq!(objects.work_get("chunks/census-1-final").expect("read").as_deref(), Some(&b"first"[..]));
+    })
+    .await
+    .expect("the chunk items");
 }
 
 #[path = "support/aws_items.rs"]
