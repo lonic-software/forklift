@@ -68,6 +68,21 @@ longer serves (below), under maintenance, or not yet servable, or a hook it depe
 unreachable. The request can be sent again after the wait. The
 serverless head's `503`s are described with the endpoints that send them.
 
+**Refused for now, on either head:** a `429`, and a `503` that carries `Retry-After`, are
+refusals sent before the request changed anything, so the identical request may be sent again
+once the wait has passed, a mutation as well as a read. A head that cannot say that of a `503`
+(such as the serverless head's answer to a write it could not confirm) sends it without `Retry-After`,
+and the endpoint's section says what such a `503` leaves unknown. The client waits these refusals
+out on every request but `POST /v1/resolve` (best effort, which takes any refusal as nothing
+resolved) and the lift commit (which retries on its own terms, below): each wait is the
+`Retry-After` when it is delta-seconds, never sooner than the client's own backoff, plus a random
+share of that backoff, so a wave of refused requests does not return at once. It stops after a
+bounded time, and then fails with the remote's last answer: 30 seconds from the first of a run of
+`429`s and 2 minutes from the first of a run of `503`s, where a refusal of the other kind ends a
+run, and 2½ minutes in all from the first refusal of either; or sooner, when the next wait would
+pass one of those bounds. Outside
+the lift commit, the client does not send a request again after a `503` without `Retry-After`.
+
 **Redirects:** `GET`/`PUT` on object endpoints may answer `307` with a `Location`
 pointing at a storage URL (a presigned S3 URL in the hosted service). Clients must
 follow redirects for object bodies. The server head serves bytes directly.
@@ -380,10 +395,8 @@ changes what is fetchable, only how fast.
 
 The raw (uncompressed) object bytes, or `404`, or `410` with `code` `content_redacted` when the
 remote has applied a redaction of it. The client verifies the hash before storing. A client that falls back from the batch endpoint sends many of these at once, so a
-rate-limited head may answer `429`. The client retries after `Retry-After` (delta-seconds, never
-sooner than its own backoff, plus a random share of it so a wave of refused fetches does not
-return at once) for a bounded time, then fails with that answer. It treats a `429` on
-`POST /v1/objects/batch` and on the subtree endpoint the same way.
+rate-limited head may answer `429`, which the client waits out as every refusal for now
+(above).
 
 ### `PUT /v1/objects/{hash}[?session={id}]`
 
@@ -665,7 +678,7 @@ The answers:
 | `503` with `Forklift-Commit: not-ready` and `Retry-After` | Some blob is still staged, not yet verified. | Retry the identical request. |
 | `422` with code `staged_upload_discarded` | An object is in neither place, or a control-plane object was corrupt and has been discarded. Retrying can never succeed. | Stop; running the lift again uploads it afresh. |
 | `429` | Rate limited. | Retry after `Retry-After` (delta-seconds). |
-| other `5xx` | Says nothing about the session. | Retry. |
+| other `5xx` | Says nothing about the session. | Retry, after its `Retry-After` when a `503` carries one. |
 
 A refusal is always a `4xx`; no `5xx` from this endpoint is one. A client classifies the
 answer from the **status line and headers alone**: the not-ready

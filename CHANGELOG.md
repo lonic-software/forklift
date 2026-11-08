@@ -12,6 +12,13 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 ### Changed
 
+- **Commands wait for a remote that is unavailable for a moment.** A remote that answers `503`
+  with `Retry-After`, as a server does while it deletes or settles redacted content, or while the
+  AWS head deletes a redacted file's chunks, is asked again after the wait, for up to 2 minutes,
+  instead of failing `clone`, `lower`, `lift` and every other command that talks to it at once.
+  A `lift` also waits out a rate limit on its uploads and on moving the remote's pallet. A `503`
+  without `Retry-After` still fails at once.
+
 - **The AWS head keeps each warehouse's objects apart.** Objects, signatures and staged uploads are
   stored under the warehouse's own keys in the bucket, so one warehouse can no longer learn whether
   another holds an object. This is AWS format 2: a warehouse made by an earlier build is refused

@@ -1247,6 +1247,7 @@ dependencies = [
  "ed25519-dalek",
  "flate2",
  "flume",
+ "http 1.4.2",
  "hyper",
  "libc",
  "memmap2",

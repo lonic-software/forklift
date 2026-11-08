@@ -629,7 +629,8 @@ or does not descend from it, and when a ref update or delete finds its pallet de
 
 A warehouse cloned with `--cache` holds some content by hash alone, and a command that reads
 such content fetches it from the warehouse's origin as it reads. When the origin cannot be reached,
-answers as an unavailable server (`502`, `503` or `504`), or keeps throttling, the command refuses
+answers as an unavailable server (`502`, `503` or `504`; a `503` with `Retry-After` once it has
+been waited out), or keeps throttling, the command refuses
 with `cache_miss` (exit 36), naming the object in `message`. `next_step` names the origin: running
 the same command again once it can be reached is the way out. Not every command keeps the code
 yet: one that reads the content inside a step of its own can fail with a plain error instead,

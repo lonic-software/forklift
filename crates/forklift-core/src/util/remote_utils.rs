@@ -186,19 +186,29 @@ fn sendable_pallet(pallet: &str) -> Result<&str, String> {
 /// builds in memory while still amortizing the round trip over many objects.
 const BATCH_FETCH_CHUNK: usize = 512;
 
-/// The backoff between retried attempts, a staged lift's commits and a throttled object fetch's
-/// GETs alike: ~0.2 s doubling to a 3 s cap. Every sleep spends from the caller's own deadline
-/// ([`Budgets::commit_deadline`], [`Budgets::throttle_patience`]), which is what bounds the
-/// retrying, so the schedule only paces it.
+/// The backoff between retried attempts, a staged lift's commits and a request refused for now
+/// alike: ~0.2 s doubling to a 3 s cap. Every sleep spends from the caller's own deadline
+/// ([`Budgets::commit_deadline`], [`Budgets::throttle_patience`],
+/// [`Budgets::unavailable_patience`]), which is what bounds the retrying, so the schedule only
+/// paces it.
 const RETRY_BACKOFF_START: std::time::Duration = std::time::Duration::from_millis(200);
 const RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// How long a fetch keeps retrying a `429`, from its first attempt (see
-/// [`RemoteClient::send_waiting_out_throttle`]). Uncalibrated policy: the hosted API's default-route
-/// throttle (50 rps, burst 100) is what a loose fallback of [`CONCURRENT_TRANSFERS`] GETs runs into,
-/// and nothing measures how long it takes to drain. A fetch still throttled past this fails loudly
-/// with the remote's answer.
+/// How long a request keeps retrying a `429`, from the first one it met (see [`RefusalPacer`]).
+/// Uncalibrated policy: the hosted API's default-route throttle (50 rps, burst 100) is what a
+/// loose fallback of [`CONCURRENT_TRANSFERS`] GETs runs into, and nothing measures how long it
+/// takes to drain. A request still throttled past this fails loudly with the remote's answer.
 const FETCH_THROTTLE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a request keeps retrying a `503` that carries `Retry-After`, from the first one it met
+/// (see [`RefusalPacer`]). Uncalibrated policy, sized against
+/// `forklift-server/src/server.rs` as it stood when it was set: a drain for a redaction's deletion
+/// waits up to 30 s for the warehouse's requests to end (`DRAIN_WAIT`), a content request waits up
+/// to 10 s for an owed apply (`APPLY_WAIT`), and each `503` asks for 10 s (`RETRY_AFTER_SECONDS`);
+/// this outlasts a few of those. It is not sized to outlast the serverless head's redacted-chunk
+/// round, which refuses ref updates while its census and delete run; a request still refused past
+/// it fails loudly with the remote's answer.
+const UNAVAILABLE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The wait before retrying a throttled attempt: the remote's `Retry-After` when it sent one,
 /// never shorter than the backoff, so a `Retry-After: 0` cannot become a tight loop.
@@ -259,9 +269,11 @@ enum CommitAttempt {
     /// delta-seconds, when it sent a readable one.
     Throttled { retry_after: Option<std::time::Duration> },
 
-    /// A `5xx` without the not-ready header: a gateway timeout, a crash, a bug. The commit is
-    /// idempotent and promotion resumes where it stopped, so a retry is safe and may finish it.
-    Undetermined { status: u16 },
+    /// A `5xx` without the not-ready header: a gateway timeout, a crash, a bug, or a `503` refusing
+    /// the commit for now. The commit is idempotent and promotion resumes where it stopped, so a
+    /// retry is safe and may finish it. `retry_after` is a `503`'s `Retry-After` in delta-seconds,
+    /// when it sent a readable one.
+    Undetermined { status: u16, retry_after: Option<std::time::Duration> },
 
     /// The connection could not be made, so nothing was sent.
     NotSent { detail: String },
@@ -285,6 +297,82 @@ fn retry_after_seconds(response: &reqwest::Response) -> Option<std::time::Durati
     let value = response.headers().get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
 
     value.trim().parse::<u64>().ok().map(std::time::Duration::from_secs)
+}
+
+/// The patience a response refusing its request for now is waited out under, or `None` when it is
+/// an answer: a `429` gets [`Budgets::throttle_patience`], and a `503` carrying `Retry-After`, in
+/// any form, [`Budgets::unavailable_patience`]. The header's presence is the remote's word that the
+/// refusal is for now (a value that is not delta-seconds still counts, its wait the backoff); a
+/// `503` without it is an answer.
+fn refused_for_now(response: &reqwest::Response, budgets: &Budgets) -> Option<std::time::Duration> {
+    match response.status() {
+        reqwest::StatusCode::TOO_MANY_REQUESTS => Some(budgets.throttle_patience),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE if response.headers().contains_key(reqwest::header::RETRY_AFTER) => {
+            Some(budgets.unavailable_patience)
+        }
+        _ => None,
+    }
+}
+
+/// How one request's re-sends are paced while its remote refuses it for now (see
+/// [`refused_for_now`]). Each wait is the remote's `Retry-After` floored at the backoff (see
+/// [`throttle_wait`]), [`jittered`], the backoff doubling up to [`RETRY_BACKOFF_CAP`].
+///
+/// A run of one kind of refusal has its own backoff and its own patience, counted from the run's
+/// first refusal, and a refusal of the other kind ends it: a throttle met after a server came back
+/// from a drain is waited out as any throttle is, rather than charged the time and the backoff
+/// that run, or an earlier throttle, ran up. Since runs can then alternate, the whole wait is also
+/// capped at the two patiences summed, from the first refusal of any kind.
+struct RefusalPacer {
+    first: Option<tokio::time::Instant>,
+    run: Option<RefusalRun>,
+}
+
+/// The current run of one kind of refusal within a [`RefusalPacer`]: which kind, when its first
+/// refusal came, and the backoff its next wait is floored at.
+struct RefusalRun {
+    throttled: bool,
+    since: tokio::time::Instant,
+    delay: std::time::Duration,
+}
+
+/// What [`RefusalPacer::pace`] makes of an answer.
+enum Pace {
+    /// Not a refusal for now: the request's answer.
+    Answer(reqwest::Response),
+    /// A refusal for now, sent again after this wait.
+    Wait(std::time::Duration),
+    /// A refusal for now whose next wait would overrun this patience: the error.
+    GiveUp(reqwest::Response, std::time::Duration),
+}
+
+impl RefusalPacer {
+    fn new() -> RefusalPacer {
+        RefusalPacer { first: None, run: None }
+    }
+
+    fn pace(&mut self, response: reqwest::Response, budgets: &Budgets) -> Pace {
+        let Some(patience) = refused_for_now(&response, budgets) else { return Pace::Answer(response) };
+        let now = tokio::time::Instant::now();
+        let throttled = response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS;
+        let first = *self.first.get_or_insert(now);
+        if self.run.as_ref().is_none_or(|run| run.throttled != throttled) {
+            self.run = Some(RefusalRun { throttled, since: now, delay: RETRY_BACKOFF_START });
+        }
+        let run = self.run.as_mut().expect("a run was just started");
+
+        let wait = jittered(throttle_wait(retry_after_seconds(&response), run.delay), run.delay);
+        run.delay = (run.delay * 2).min(RETRY_BACKOFF_CAP);
+        let cap = budgets.throttle_patience + budgets.unavailable_patience;
+
+        if now + wait >= run.since + patience {
+            Pace::GiveUp(response, patience)
+        } else if now + wait >= first + cap {
+            Pace::GiveUp(response, cap)
+        } else {
+            Pace::Wait(wait)
+        }
+    }
 }
 
 /// `url`'s path and query, the part after its origin. Built from the parts: slicing the
@@ -1066,8 +1154,11 @@ struct Budgets {
     commit_attempt_allowance: std::time::Duration,
     /// [`MIN_COMMIT_ATTEMPT`]'s role: the least post-connect time a commit attempt starts with.
     min_commit_attempt: std::time::Duration,
-    /// [`FETCH_THROTTLE_PATIENCE`]'s role: how long `fetch_object` keeps retrying a `429`.
+    /// [`FETCH_THROTTLE_PATIENCE`]'s role: how long a request keeps retrying a `429`.
     throttle_patience: std::time::Duration,
+    /// [`UNAVAILABLE_PATIENCE`]'s role: how long a request keeps retrying a `503` with
+    /// `Retry-After`.
+    unavailable_patience: std::time::Duration,
 }
 
 impl Budgets {
@@ -1086,6 +1177,7 @@ impl Budgets {
             commit_attempt_allowance: COMMIT_ATTEMPT_ALLOWANCE,
             min_commit_attempt: MIN_COMMIT_ATTEMPT,
             throttle_patience: FETCH_THROTTLE_PATIENCE,
+            unavailable_patience: UNAVAILABLE_PATIENCE,
         }
     }
 
@@ -1248,9 +1340,8 @@ impl tokio_stream::Stream for UploadChunks {
 /// which a presigned S3 `PUT` rejects outright (see [`RemoteClient::put_presigned`]'s doc). An
 /// empty body marks `progress` exhausted immediately, up front: there would otherwise be no chunk
 /// whose yielding ever sets the flag.
-fn watched_upload_body(bytes: Vec<u8>, progress: Arc<UploadProgress>) -> (reqwest::Body, usize) {
-    let len = bytes.len();
-    let body = bytes::Bytes::from(bytes);
+fn watched_upload_body(body: bytes::Bytes, progress: Arc<UploadProgress>) -> (reqwest::Body, usize) {
+    let len = body.len();
 
     if body.is_empty() {
         progress.mark_exhausted();
@@ -1940,7 +2031,7 @@ mod clients {
                                                budgets: &super::Budgets,
                                                destination: RequestDestination<'_>,
                                                method: reqwest::Method,
-                                               bytes: Vec<u8>) -> WatchdogOutcome {
+                                               bytes: bytes::Bytes) -> WatchdogOutcome {
             let progress = super::UploadProgress::new();
             let (body, body_len) = super::watched_upload_body(bytes, progress.clone());
 
@@ -2241,6 +2332,7 @@ mod clients {
     /// [`Clients::send_on`] (every other request), named explicitly rather than letting
     /// a caller hand in a pre-built `reqwest::RequestBuilder` or a bare `reqwest::Client` (the seam
     /// both of those functions exist to close; see their own docs).
+    #[derive(Clone, Copy)]
     pub(super) enum RequestDestination<'a> {
         /// A path relative to the remote's `base`, with the bearer token attached (if one is
         /// configured) — the control-plane shape almost every caller needs:
@@ -3199,7 +3291,7 @@ impl RemoteClient {
     /// Fetch the warehouse handshake and check the protocol version.
     pub async fn fetch_info(&self) -> Result<WarehouseInfo, String> {
         let posture = Posture::BoundedReads;
-        let outcome = self.send_waiting_out_throttle(
+        let outcome = self.send_waiting_out(
             posture, reqwest::Method::GET, "/v1/warehouse", SendBody::Empty, "the handshake"
         ).await?;
         let response = self.response_from_send(
@@ -3340,7 +3432,7 @@ impl RemoteClient {
 
         for batch in hashes.chunks(MAX_MISSING_BATCH) {
             let posture = Posture::HeadDeadline { head: self.presence_negotiation_budget(batch.len()) };
-            let outcome = self.send_waiting_out_throttle(
+            let outcome = self.send_waiting_out(
                 posture,
                 reqwest::Method::POST, "/v1/objects/missing",
                 SendBody::json(&MissingObjectsRequest { hashes: batch.to_vec() })?,
@@ -3385,7 +3477,7 @@ impl RemoteClient {
 
         for batch in candidates.chunks(MAX_HOLDS_CANDIDATES) {
             let posture = Posture::HeadDeadline { head: self.retryable_head_budget() };
-            let outcome = self.send_waiting_out_throttle(
+            let outcome = self.send_waiting_out(
                 posture,
                 reqwest::Method::POST, &route,
                 SendBody::json(&HoldsRequest { candidates: batch.to_vec() })?,
@@ -3689,7 +3781,7 @@ impl RemoteClient {
             .collect();
 
         let post_posture = Posture::HeadDeadlineNoRedirect { head: self.batch_head_budget() };
-        let outcome = self.send_waiting_out_throttle(
+        let outcome = self.send_waiting_out(
             post_posture,
             reqwest::Method::POST, "/v1/objects/batch",
             SendBody::json(&MissingObjectsRequest { hashes })?,
@@ -3748,55 +3840,79 @@ impl RemoteClient {
         }
     }
 
-    /// [`Self::send_on`], re-sending while the remote answers `429`: every route of the hosted API
-    /// shares one throttle, so a read that meets it is expected to wait rather than fail the
-    /// command. Every read rides this but [`Self::resolve`], which is best-effort and treats any
-    /// refusal as "nothing resolved"; mutations do not (a staged lift's commit has its own retry).
-    /// Each wait is the remote's `Retry-After` floored at the backoff (see [`throttle_wait`]),
-    /// [`jittered`]; once the next one would overrun [`Budgets::throttle_patience`] from the first
-    /// attempt, the last `429` is the error, named as `refused` (`what`, the refused request) with
-    /// the patience it outlasted. Every other outcome, transport failures and head-wait expiries
+    /// [`Self::send_on`], re-sending while the remote refuses the request for now: a `429`, or a
+    /// `503` carrying `Retry-After`. The protocol makes both a refusal sent before the request
+    /// changed anything, so sending it again is as safe for a mutation as for a read; a `503`
+    /// without `Retry-After` makes no such claim (the serverless head's contention answer may have
+    /// landed) and is handed back like any other answer. Every route of the hosted API shares one
+    /// throttle, and either head refuses a warehouse's requests for a while as it deletes or
+    /// settles redacted content, so a request that meets either is expected to wait rather than
+    /// fail the command. Every read rides this but [`Self::resolve`], which is best-effort and
+    /// treats any refusal as "nothing resolved"; so does every mutation but a staged lift's commit,
+    /// which has its own retry ([`commit_one_batch`]).
+    ///
+    /// [`RefusalPacer`] paces the re-sends; once the next wait would overrun a refusal's patience,
+    /// the last refusal is the error, named as refusing `what` (the refused request) with the
+    /// patience it outlasted. Every other outcome, transport failures and head-wait expiries
     /// included, is handed back untouched.
-    async fn send_waiting_out_throttle(&self,
-                                       posture: Posture,
-                                       method: reqwest::Method,
-                                       path: &str,
-                                       body: SendBody,
-                                       what: &str) -> Result<SendOutcome, String> {
-        self.send_waiting_out_throttle_with(posture, method, path, body, reqwest::header::HeaderMap::new(), what).await
+    async fn send_waiting_out(&self,
+                              posture: Posture,
+                              method: reqwest::Method,
+                              path: &str,
+                              body: SendBody,
+                              what: &str) -> Result<SendOutcome, String> {
+        self.send_waiting_out_with(posture, method, path, body, reqwest::header::HeaderMap::new(), what).await
     }
 
-    /// [`Self::send_waiting_out_throttle`] with request `headers`, sent again on every retry.
-    async fn send_waiting_out_throttle_with(&self,
-                                            posture: Posture,
-                                            method: reqwest::Method,
-                                            path: &str,
-                                            body: SendBody,
-                                            headers: reqwest::header::HeaderMap,
-                                            what: &str) -> Result<SendOutcome, String> {
-        let deadline = tokio::time::Instant::now() + self.budgets.throttle_patience;
-        let mut delay = RETRY_BACKOFF_START;
+    /// [`Self::send_waiting_out`] with request `headers`, sent again on every retry.
+    async fn send_waiting_out_with(&self,
+                                   posture: Posture,
+                                   method: reqwest::Method,
+                                   path: &str,
+                                   body: SendBody,
+                                   headers: reqwest::header::HeaderMap,
+                                   what: &str) -> Result<SendOutcome, String> {
+        let mut pacer = RefusalPacer::new();
 
         loop {
             let outcome = self.send_on_with(posture, method.clone(), path, body.clone(), headers.clone()).await;
-            let response = match outcome {
-                SendOutcome::Sent(response)
-                    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => response,
-                outcome => return Ok(outcome),
-            };
+            let SendOutcome::Sent(response) = outcome else { return Ok(outcome) };
 
-            let wait = jittered(throttle_wait(retry_after_seconds(&response), delay), delay);
-            delay = (delay * 2).min(RETRY_BACKOFF_CAP);
-
-            if tokio::time::Instant::now() + wait >= deadline {
-                // No parenthesis in the action: `is_transient_failure` reads the first one after
-                // "The remote refused " as the status.
-                let action = format!("{} after retrying for up to {:?}", what, self.budgets.throttle_patience);
-                return Err(self.error_of(response, &action).await);
+            match pacer.pace(response, &self.budgets) {
+                Pace::Answer(response) => return Ok(SendOutcome::Sent(response)),
+                Pace::Wait(wait) => tokio::time::sleep(wait).await,
+                Pace::GiveUp(response, patience) => return Err(self.outlasted(response, what, patience).await),
             }
+        }
+    }
 
-            drop(response);
-            tokio::time::sleep(wait).await;
+    /// The error of a refusal for now that outlasted `patience`, named as refusing `what`.
+    async fn outlasted(&self, response: reqwest::Response, what: &str, patience: std::time::Duration) -> String {
+        // No parenthesis in the action: `is_transient_failure` reads the first one after
+        // "The remote refused " as the status.
+        self.error_of(response, &format!("{} after retrying for up to {:?}", what, patience)).await
+    }
+
+    /// [`Self::send_waiting_out`] for an upload's body, which rides
+    /// [`clients::Clients::send_with_watchdog`] rather than [`Self::send_on`]: the same refusals,
+    /// waits and patience, an upload sent again in full on every retry. `bytes` is shared, so a
+    /// retry copies nothing.
+    async fn upload_waiting_out(&self,
+                                destination: RequestDestination<'_>,
+                                method: reqwest::Method,
+                                bytes: bytes::Bytes,
+                                what: &str) -> Result<WatchdogOutcome, String> {
+        let mut pacer = RefusalPacer::new();
+
+        loop {
+            let outcome = self.clients.send_with_watchdog(&self.budgets, destination, method.clone(), bytes.clone()).await;
+            let WatchdogOutcome::Sent(response) = outcome else { return Ok(outcome) };
+
+            match pacer.pace(response, &self.budgets) {
+                Pace::Answer(response) => return Ok(WatchdogOutcome::Sent(response)),
+                Pace::Wait(wait) => tokio::time::sleep(wait).await,
+                Pace::GiveUp(response, patience) => return Err(self.outlasted(response, what, patience).await),
+            }
         }
     }
 
@@ -3898,7 +4014,7 @@ impl RemoteClient {
                                path: &str,
                                subtree: &str) -> Result<Option<bundle_utils::ImportStats>, String> {
         let posture = Posture::HeadDeadlineNoRedirect { head: self.batch_head_budget() };
-        let outcome = self.send_waiting_out_throttle(
+        let outcome = self.send_waiting_out(
             posture,
             reqwest::Method::GET, &format!(
                 "/v1/parcels/{}/subtree/{}", parcel, encode_path_segments(path)
@@ -4009,8 +4125,9 @@ impl RemoteClient {
     /// Fetch one object's raw bytes. On [`Posture::BoundedObjectReads`], not [`Posture::BoundedReads`]
     /// — see [`FETCH_OBJECT_READ_TIMEOUT`]'s doc for why this call needs the looser budget.
     ///
-    /// A `429` is waited out (see [`Self::send_waiting_out_throttle`]). A degraded batch fetch
-    /// sends a whole wave of these at once, which is exactly what a rate-limited head throttles.
+    /// A `429`, or a `503` with `Retry-After`, is waited out (see [`Self::send_waiting_out`]). A
+    /// degraded batch fetch sends a whole wave of these at once, which is exactly what a
+    /// rate-limited head throttles.
     pub async fn fetch_object(&self, hash: &str) -> Result<Vec<u8>, String> {
         match self.fetch_object_classified(hash).await {
             ObjectFetch::Fetched(bytes) => Ok(bytes),
@@ -4021,16 +4138,16 @@ impl RemoteClient {
     /// [`Self::fetch_object`], telling a remote that could not serve the object now from one that
     /// answered and refused: a cache warehouse's read refuses the first as a cache miss it can
     /// retry once the origin is reachable, and the second as the remote's own answer. A remote that
-    /// could not be reached, stopped answering, answered `502`, `503` or `504`, or kept throttling
-    /// past the patience is the first; any other answer is the second.
+    /// could not be reached, stopped answering, answered `502`, `503` or `504`, or kept refusing
+    /// for now past the patience is the first; any other answer is the second.
     pub async fn fetch_object_classified(&self, hash: &str) -> ObjectFetch {
         let posture = Posture::BoundedObjectReads;
-        let outcome = match self.send_waiting_out_throttle(
+        let outcome = match self.send_waiting_out(
             posture, reqwest::Method::GET, &format!("/v1/objects/{}", hash), SendBody::Empty,
             &format!("object {}", hash),
         ).await {
             Ok(outcome) => outcome,
-            // Only a throttle that outlasted the patience is an error here.
+            // Only a refusal for now that outlasted its patience is an error here.
             Err(e) => return ObjectFetch::Unreachable(e),
         };
         let response = match outcome {
@@ -4079,15 +4196,17 @@ impl RemoteClient {
     /// body and then wedges (during the inline hash-verify this endpoint's own doc names above) is
     /// bounded too — see [`clients::Clients::send_with_watchdog`]'s doc for that phase's own,
     /// size-scaled bound instead of the unbounded wait an earlier version of this fix left it with.
+    ///
+    /// A `429`, or a `503` with `Retry-After`, is waited out (see [`Self::upload_waiting_out`]).
     pub async fn upload_object(&self, hash: &str, bytes: Vec<u8>) -> Result<(), String> {
         let action = format!("uploading object {}", hash);
         let path = format!("/v1/objects/{}", hash);
-        let outcome = self.clients.send_with_watchdog(
-            &self.budgets,
+        let outcome = self.upload_waiting_out(
             RequestDestination::Authenticated { base: &self.base, token: self.token.as_deref(), path: &path },
             reqwest::Method::PUT,
-            bytes,
-        ).await;
+            bytes.into(),
+            &format!("object {}", hash),
+        ).await?;
         let response = self.response_from_watchdog(&action, outcome)?;
 
         if response.status().is_redirection() {
@@ -4130,7 +4249,7 @@ impl RemoteClient {
 
         for batch in hashes.chunks(MAX_UPLOAD_TARGETS_BATCH) {
             let posture = Posture::HeadDeadline { head: self.presence_negotiation_budget(batch.len()) };
-            let outcome = self.send_waiting_out_throttle(
+            let outcome = self.send_waiting_out(
                 posture,
                 reqwest::Method::POST, "/v1/objects/upload-targets",
                 SendBody::json(&UploadTargetsRequest {
@@ -4187,7 +4306,7 @@ impl RemoteClient {
             &self.budgets,
             RequestDestination::Presigned { url },
             reqwest::Method::PUT,
-            bytes,
+            bytes.into(),
         ).await;
         let response = self.response_from_watchdog(action, outcome)?;
 
@@ -4218,7 +4337,7 @@ impl RemoteClient {
     /// - `429` → `Throttled`, with its `Retry-After`;
     /// - any other `4xx` → a terminal refusal (auth, an absent endpoint, a corrupt, missing or
     ///   discarded object), its body read under the error-body budget only to word it;
-    /// - `5xx` without the header → `Undetermined`;
+    /// - `5xx` without the header → `Undetermined`, with a `503`'s `Retry-After`;
     /// - a transport failure → `NotSent` when the connection could not be made (unless the TLS
     ///   handshake was rejected), `Lost` when it was reset or cut off after sending, and a
     ///   terminal error for anything else (a rejected TLS handshake, an answer that is not HTTP).
@@ -4279,7 +4398,9 @@ impl RemoteClient {
         // A `408` is an intermediary giving up on the request before the remote answered it: no
         // more an answer about the session than a `5xx` is.
         if status.is_server_error() || status == reqwest::StatusCode::REQUEST_TIMEOUT {
-            return Ok(CommitAttempt::Undetermined { status: status.as_u16() });
+            let retry_after = if status == reqwest::StatusCode::SERVICE_UNAVAILABLE { retry_after_seconds(&response) } else { None };
+
+            return Ok(CommitAttempt::Undetermined { status: status.as_u16(), retry_after });
         }
 
         Err(self.error_of(response, "the lift commit").await)
@@ -4318,7 +4439,7 @@ impl RemoteClient {
     /// Fetch a parcel's signature sidecar (`None` for unsigned parcels).
     pub async fn fetch_signature(&self, parcel_hash: &str) -> Result<Option<Vec<u8>>, String> {
         let posture = Posture::BoundedReads;
-        let outcome = self.send_waiting_out_throttle(
+        let outcome = self.send_waiting_out(
             posture, reqwest::Method::GET, &format!("/v1/signatures/{}", parcel_hash),
             SendBody::Empty, &format!("the signature of {}", parcel_hash),
         ).await?;
@@ -4373,11 +4494,11 @@ impl RemoteClient {
     /// uncertainty wording (see [`Self::response_from_send_mutation`]): the write may have landed.
     pub async fn upload_signature(&self, parcel_hash: &str, bytes: Vec<u8>) -> Result<(), String> {
         let action = format!("uploading the signature of {}", parcel_hash);
-        let outcome = self.send_on(
+        let outcome = self.send_waiting_out(
             Posture::HeadDeadlineNoRedirect { head: self.retryable_head_budget() },
             reqwest::Method::PUT, &format!("/v1/signatures/{}", parcel_hash),
-            SendBody::Bytes(bytes),
-        ).await;
+            SendBody::Bytes(bytes), &format!("the signature of {}", parcel_hash),
+        ).await?;
         let response = self.response_from_send_mutation(&action, outcome)?;
 
         if response.status().is_redirection() {
@@ -4401,11 +4522,11 @@ impl RemoteClient {
     /// `spawn_blocking` pool (see [`RETRYABLE_HEAD_PATIENCE`]'s residuals).
     pub async fn put_trust(&self, anchor: &TrustAnchorDto) -> Result<(), String> {
         let action = "uploading the trust anchor";
-        let outcome = self.send_on(
+        let outcome = self.send_waiting_out(
             Posture::HeadDeadlineNoRedirect { head: self.retryable_head_budget() },
             reqwest::Method::PUT, "/v1/trust",
-            SendBody::json(anchor)?,
-        ).await;
+            SendBody::json(anchor)?, "the trust anchor",
+        ).await?;
         let response = self.response_from_send_mutation(action, outcome)?;
 
         if response.status().is_redirection() {
@@ -4431,6 +4552,9 @@ impl RemoteClient {
     ///
     /// `tombstone`, on a creation (`old_head` `None`) of a pallet the remote deleted, is the head
     /// its tombstone holds: it acknowledges the deletion, which the remote requires.
+    ///
+    /// A `429`, or a `503` with `Retry-After`, is waited out (see [`Self::send_waiting_out`]); a
+    /// `503` without it is the remote's answer, since that one may have moved the pallet.
     pub async fn update_ref(&self,
                             pallet: &str,
                             old_head: Option<&str>,
@@ -4444,11 +4568,11 @@ impl RemoteClient {
         let action = format!("moving the remote pallet \"{}\"", pallet);
         let route = pallet_route(pallet).map_err(|error| format!("Error while {}: {}", action, error))?;
 
-        let outcome = self.send_on(
+        let outcome = self.send_waiting_out(
             Posture::UnboundedNoRedirect(UnboundedTicket::Fork94),
             reqwest::Method::POST, &route,
-            SendBody::json(&body)?,
-        ).await;
+            SendBody::json(&body)?, &format!("moving pallet \"{}\"", pallet),
+        ).await?;
         let response = self.response_from_send_mutation(&action, outcome)?;
 
         if response.status().is_redirection() {
@@ -4468,7 +4592,8 @@ impl RemoteClient {
     ///
     /// Rides [`Posture::HeadDeadlineNoRedirect`], sized by [`Self::retryable_head_budget`], as
     /// [`Self::put_trust`] does: the removal walks no history, and a mutation on this client never
-    /// follows a redirect. A head-wait expiry says the delete may have landed.
+    /// follows a redirect. A head-wait expiry says the delete may have landed. A `429`, or a `503`
+    /// with `Retry-After`, is waited out (see [`Self::send_waiting_out`]).
     pub async fn delete_ref(&self, pallet: &str, old_head: &str) -> Result<(), String> {
         let action = format!("deleting the remote pallet \"{}\"", pallet);
 
@@ -4477,11 +4602,11 @@ impl RemoteClient {
         }
         let route = pallet_route(pallet).map_err(|error| format!("Error while {}: {}", action, error))?;
 
-        let outcome = self.send_on(
+        let outcome = self.send_waiting_out(
             Posture::HeadDeadlineNoRedirect { head: self.retryable_head_budget() },
             reqwest::Method::DELETE, &format!("{}?old_head={}", route, old_head),
-            SendBody::Empty,
-        ).await;
+            SendBody::Empty, &format!("deleting pallet \"{}\"", pallet),
+        ).await?;
         let response = self.response_from_send_mutation(&action, outcome)?;
 
         if response.status().is_redirection() {
@@ -4559,7 +4684,7 @@ impl RemoteClient {
             }
 
             let posture = Posture::BoundedReads;
-            let outcome = self.send_waiting_out_throttle_with(
+            let outcome = self.send_waiting_out_with(
                 posture, reqwest::Method::GET, "/v1/bundles/latest", SendBody::Empty, headers, "the bundle fetch"
             ).await?;
             let response = self.response_from_send("fetching the bundle", posture, outcome)?;
@@ -4739,7 +4864,7 @@ pub enum ObjectFetch {
     Fetched(Vec<u8>),
     /// The remote could not serve it now: it could not be reached, stopped answering before the
     /// object arrived, answered as a gateway or unavailable server (`502`–`504`), or kept
-    /// throttling.
+    /// refusing for now (a `429`, or a `503` with `Retry-After`) past the patience.
     Unreachable(String),
     /// The remote answered, and refused to hand the object over.
     Refused(String),
@@ -7322,7 +7447,9 @@ async fn commit_one_batch(client: &RemoteClient,
 
         let wait = match &attempt {
             CommitAttempt::Committed => return Ok(()),
-            CommitAttempt::Throttled { retry_after } => throttle_wait(*retry_after, delay),
+            CommitAttempt::Throttled { retry_after } | CommitAttempt::Undetermined { retry_after, .. } => {
+                throttle_wait(*retry_after, delay)
+            }
             _ => delay,
         };
         delay = (delay * 2).min(RETRY_BACKOFF_CAP);
@@ -7378,7 +7505,7 @@ fn commit_deadline_message(last_answer: Option<&CommitAttempt>,
                 .map(|wait| format!(", asking for a wait of {}s", wait.as_secs())).unwrap_or_default(),
             unchanged
         ),
-        Some(CommitAttempt::Undetermined { status }) => format!(
+        Some(CommitAttempt::Undetermined { status, .. }) => format!(
             "{}; the remote's last answer was {}. {}; running the lift again is safe.",
             missed, status, unchanged
         ),
@@ -10714,51 +10841,118 @@ mod tests {
         (url, requests)
     }
 
-    /// Every route of the hosted API shares one throttle, so every read meets the same `429`s the
-    /// loose GETs do: each waits one out and re-sends, and only the answer after it decides (here a
-    /// `404`, which each of these reads takes as an answer). Without the retry the first `429` is
-    /// the command's error.
+    /// Every route of the hosted API shares one throttle, and a server refuses every route for now
+    /// alike while it drains or applies, so every read meets the same `429`s and `503`s with
+    /// `Retry-After` the loose GETs do: each waits one out and re-sends, and only the answer after
+    /// it decides (here a `404`, which each of these reads takes as an answer). Without the retry
+    /// the first refusal is the command's error.
     #[test]
-    fn the_reads_wait_out_a_throttle() {
+    fn the_reads_wait_out_a_refusal_for_now() {
         const THROTTLED: &str = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\n\
+            Content-Length: 0\r\nConnection: close\r\n\r\n";
+        const UNAVAILABLE: &str = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\n\
             Content-Length: 0\r\nConnection: close\r\n\r\n";
         const ABSENT: &str = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
-        let (url, requests) = start_answering_remote(vec![THROTTLED, THROTTLED, ABSENT]);
-        let client = fast_client(&url);
-        let outcome = runtime.block_on(client.fetch_batch(&["a".repeat(64)]))
-            .expect("a throttled batch POST is re-sent, not failed");
-        assert!(matches!(outcome, BatchOutcome::EndpointAbsent), "{:?}", outcome);
-        assert_eq!(*requests.lock().unwrap(), 3, "two throttled POSTs, then the one that answered");
+        for (index, refusal) in [THROTTLED, UNAVAILABLE].into_iter().enumerate() {
+            let (url, requests) = start_answering_remote(vec![refusal, refusal, ABSENT]);
+            let client = fast_client(&url);
+            let outcome = runtime.block_on(client.fetch_batch(&["a".repeat(64)]))
+                .expect("a refused batch POST is re-sent, not failed");
+            assert!(matches!(outcome, BatchOutcome::EndpointAbsent), "{:?}", outcome);
+            assert_eq!(*requests.lock().unwrap(), 3, "two refused POSTs, then the one that answered");
 
-        let (url, requests) = start_answering_remote(vec![THROTTLED, ABSENT]);
-        let client = fast_client(&url);
-        let outcome = runtime.block_on(client.fetch_subtree(&"p".repeat(64), "src", &"t".repeat(64)))
-            .expect("a throttled subtree GET is re-sent, not failed");
-        assert!(outcome.is_none(), "the 404 after the throttle is the absence signal");
-        assert_eq!(*requests.lock().unwrap(), 2);
+            let (url, requests) = start_answering_remote(vec![refusal, ABSENT]);
+            let client = fast_client(&url);
+            let outcome = runtime.block_on(client.fetch_subtree(&"p".repeat(64), "src", &"t".repeat(64)))
+                .expect("a refused subtree GET is re-sent, not failed");
+            assert!(outcome.is_none(), "the 404 after the refusal is the absence signal");
+            assert_eq!(*requests.lock().unwrap(), 2);
 
-        let (url, requests) = start_answering_remote(vec![THROTTLED, ABSENT]);
-        let client = fast_client(&url);
-        let signature = runtime.block_on(client.fetch_signature(&"p".repeat(64)))
-            .expect("a throttled signature GET is re-sent, not failed");
-        assert!(signature.is_none(), "the 404 after the throttle is an unsigned parcel");
-        assert_eq!(*requests.lock().unwrap(), 2);
+            let (url, requests) = start_answering_remote(vec![refusal, ABSENT]);
+            let client = fast_client(&url);
+            let signature = runtime.block_on(client.fetch_signature(&"p".repeat(64)))
+                .expect("a refused signature GET is re-sent, not failed");
+            assert!(signature.is_none(), "the 404 after the refusal is an unsigned parcel");
+            assert_eq!(*requests.lock().unwrap(), 2);
 
-        let (url, requests) = start_answering_remote(vec![THROTTLED, ABSENT]);
-        let client = fast_client(&url);
-        let scratch = Scratch::new("throttled-bundle");
-        let fetched = runtime.block_on(download_whole_bundle(&client, &scratch.root.join("bundle")))
-            .expect("a throttled bundle GET is re-sent, not failed");
-        assert_eq!(fetched, BundleDownload::Absent, "the 404 after the throttle is no bundle");
-        assert_eq!(*requests.lock().unwrap(), 2);
+            let (url, requests) = start_answering_remote(vec![refusal, ABSENT]);
+            let client = fast_client(&url);
+            let scratch = Scratch::new(&format!("refused-bundle-{}", index));
+            let fetched = runtime.block_on(download_whole_bundle(&client, &scratch.root.join("bundle")))
+                .expect("a refused bundle GET is re-sent, not failed");
+            assert_eq!(fetched, BundleDownload::Absent, "the 404 after the refusal is no bundle");
+            assert_eq!(*requests.lock().unwrap(), 2);
 
-        let (url, requests) = start_answering_remote(vec![THROTTLED, ABSENT]);
-        let client = fast_client(&url);
-        let Err(error) = runtime.block_on(client.fetch_info()) else { panic!("the handshake 404 is an error") };
-        assert!(error.contains("404"), "the answer after the throttle decides, not the 429: {}", error);
-        assert_eq!(*requests.lock().unwrap(), 2);
+            let (url, requests) = start_answering_remote(vec![refusal, ABSENT]);
+            let client = fast_client(&url);
+            let Err(error) = runtime.block_on(client.fetch_info()) else { panic!("the handshake 404 is an error") };
+            assert!(error.contains("404"), "the answer after the refusal decides, not the refusal: {}", error);
+            assert_eq!(*requests.lock().unwrap(), 2);
+        }
+    }
+
+    /// A `503` with `Retry-After` is a refusal sent before the request changed anything, on either
+    /// head, so every mutation that rides the wait re-sends it, and only the answer after it
+    /// decides. A `503` without the header may have landed, so a mutation takes it as the remote's
+    /// answer and does not send again. Revert: leave a mutation on the plain send → its `503` is
+    /// the error; retry every `503` → the plain one is sent twice.
+    #[test]
+    fn the_mutations_wait_out_a_503_with_retry_after_and_take_one_without_it() {
+        const UNAVAILABLE: &str = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\n\
+            Content-Length: 0\r\nConnection: close\r\n\r\n";
+        const MAYBE_LANDED: &str = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\
+            Connection: close\r\n\r\n";
+        const DONE: &str = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        // Each future borrows the client alone, so the closures own their arguments.
+        type Mutation = Box<dyn for<'c> Fn(&'c RemoteClient) -> std::pin::Pin<Box<
+            dyn std::future::Future<Output = Result<(), String>> + 'c>>>;
+        let mutations: Vec<(&str, Mutation)> = vec![
+            ("upload_object", Box::new(move |client| {
+                let hash = "a".repeat(64);
+                Box::pin(async move { client.upload_object(&hash, b"bytes".to_vec()).await })
+            })),
+            ("upload_signature", Box::new(move |client| {
+                let hash = "a".repeat(64);
+                Box::pin(async move { client.upload_signature(&hash, b"sig".to_vec()).await })
+            })),
+            ("put_trust", Box::new(move |client| {
+                let anchor = TrustAnchorDto {
+                    genesis: "g".repeat(64),
+                    enabled_at: 0,
+                    boundary: Vec::new(),
+                    prior_genesis: None,
+                    adopts: None,
+                };
+                Box::pin(async move { client.put_trust(&anchor).await })
+            })),
+            ("update_ref", Box::new(move |client| {
+                let hash = "a".repeat(64);
+                Box::pin(async move { client.update_ref("main", Some(&hash), &hash, None).await })
+            })),
+            ("delete_ref", Box::new(move |client| {
+                let hash = "a".repeat(64);
+                Box::pin(async move { client.delete_ref("feature", &hash).await })
+            })),
+        ];
+
+        for (name, mutation) in &mutations {
+            let (url, requests) = start_answering_remote(vec![UNAVAILABLE, UNAVAILABLE, DONE]);
+            let client = fast_client(&url);
+            runtime.block_on(mutation(&client))
+                .unwrap_or_else(|error| panic!("{}: a 503 with Retry-After is re-sent, not failed: {}", name, error));
+            assert_eq!(*requests.lock().unwrap(), 3, "{}: two refusals, then the one that answered", name);
+
+            let (url, requests) = start_answering_remote(vec![MAYBE_LANDED, DONE]);
+            let client = fast_client(&url);
+            let error = runtime.block_on(mutation(&client))
+                .expect_err(&format!("{}: a 503 without Retry-After is the answer", name));
+            assert!(error.contains("503"), "{}: {}", name, error);
+            assert_eq!(*requests.lock().unwrap(), 1, "{}: a 503 that may have landed is not sent again", name);
+        }
     }
 
     #[test]
@@ -11267,20 +11461,145 @@ mod tests {
         );
     }
 
-    /// Only a throttle is retried: a `503` from the object endpoint fails on the first answer, as
-    /// it always did.
+    /// A `503` without `Retry-After` is not a refusal for now the remote vouches for, so the
+    /// object endpoint fails on the first answer. Revert: retry every `503` → two hits.
     #[test]
-    fn fetch_object_does_not_retry_a_server_error() {
+    fn fetch_object_does_not_retry_a_503_without_retry_after() {
         let (hashes, objects) = unstored_chunks("server-error", 1);
-        let remote = ScriptedObjectRemote::start(objects, 503, 1, Some(0));
+        let remote = ScriptedObjectRemote::start(objects, 503, 1, None);
         let client = fast_client(&remote.url);
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let error = runtime.block_on(client.fetch_object(&hashes[0]))
-            .expect_err("a 503 is not retried here");
+            .expect_err("a 503 without Retry-After is not retried");
 
         assert!(error.contains("(503)"), "{}", error);
         assert_eq!(remote.hits_for(&format!("/v1/objects/{}", hashes[0])), 1);
+    }
+
+    /// A `503` carrying `Retry-After` is the server refusing for now, with nothing changed, so the
+    /// fetch waits it out and the answer after it decides. Revert: retry only a `429` → the `503`
+    /// is the error.
+    #[test]
+    fn fetch_object_waits_out_a_503_with_retry_after() {
+        let (hashes, objects) = unstored_chunks("unavailable", 1);
+        let expected = objects[&hashes[0]].clone();
+        let remote = ScriptedObjectRemote::start(objects, 503, 1, Some(0));
+        let client = fast_client(&remote.url);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let bytes = runtime.block_on(client.fetch_object(&hashes[0]))
+            .expect("one 503 with Retry-After is waited out");
+
+        assert_eq!(bytes, expected);
+        assert_eq!(remote.hits_for(&format!("/v1/objects/{}", hashes[0])), 2, "one retry");
+    }
+
+    /// A server that stays unavailable is retried under its own patience, not the throttle's, and
+    /// then the last `503` is the error, naming the patience it outlasted. Revert: arm a `503` with
+    /// the throttle patience → the error names that figure.
+    #[test]
+    fn fetch_object_gives_up_on_a_lasting_503_within_the_unavailable_patience() {
+        let (hashes, objects) = unstored_chunks("lasting-unavailable", 1);
+        let remote = ScriptedObjectRemote::start(objects, 503, usize::MAX, Some(0));
+        let client = fast_client(&remote.url);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let started = std::time::Instant::now();
+        let error = runtime.block_on(client.fetch_object(&hashes[0]))
+            .expect_err("a server that never comes back must fail");
+        let elapsed = started.elapsed();
+
+        assert!(error.contains("(503)"), "the error names the remote's answer: {}", error);
+        assert!(
+            error.contains(&format!("after retrying for up to {:?}", FAST.unavailable_patience)),
+            "the error names the unavailable patience: {}", error
+        );
+        assert!(remote.hits_for(&format!("/v1/objects/{}", hashes[0])) > 1, "the 503 was retried");
+        assert!(
+            elapsed < FAST.unavailable_patience,
+            "elapsed {:?} overran the unavailable patience {:?}", elapsed, FAST.unavailable_patience
+        );
+    }
+
+    /// A throttle met after a run of `503`s starts a run of its own: neither the drain nor the
+    /// throttle before it is charged to it. The `503`s here outlast the throttle patience after
+    /// the first `429` and run the backoff up past it. Revert: count every patience from the first
+    /// attempt, share one backoff, or keep a kind's run across the other kind → the second `429`
+    /// is already past its patience and fails.
+    #[test]
+    fn a_throttle_after_a_drain_gets_its_own_patience() {
+        const UNAVAILABLE: &str = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\n\
+            Content-Length: 0\r\nConnection: close\r\n\r\n";
+        const THROTTLED: &str = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\n\
+            Content-Length: 0\r\nConnection: close\r\n\r\n";
+        const ABSENT: &str = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        // Four `503`s wait at least 0.2 + 0.4 + 0.8 + 1.6 s, past the 2.59 s throttle patience,
+        // and at most half as long again, well inside this unavailable patience.
+        let budgets = Budgets { unavailable_patience: std::time::Duration::from_secs(9), ..FAST };
+        let (url, requests) = start_answering_remote(vec![
+            THROTTLED, UNAVAILABLE, UNAVAILABLE, UNAVAILABLE, UNAVAILABLE, THROTTLED, ABSENT,
+        ]);
+        let client = RemoteClient::new_test_with_budgets(&url, budgets);
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let started = std::time::Instant::now();
+        let signature = runtime.block_on(client.fetch_signature(&"p".repeat(64)))
+            .expect("the throttle after the drain is waited out");
+        let elapsed = started.elapsed();
+
+        assert!(signature.is_none(), "the 404 after the refusals is an unsigned parcel");
+        assert_eq!(*requests.lock().unwrap(), 7);
+        assert!(elapsed > FAST.throttle_patience, "the 503s outlasted the throttle patience ({:?})", elapsed);
+    }
+
+    /// Alternating refusals restart their runs, so neither kind's patience ends them; the cap on
+    /// the whole wait, the two patiences summed from the first refusal, does. Revert: drop the cap
+    /// → the hundred alternating answers are all waited out, well past it.
+    #[test]
+    fn alternating_refusals_end_at_the_summed_patience() {
+        const UNAVAILABLE: &str = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\n\
+            Content-Length: 0\r\nConnection: close\r\n\r\n";
+        const THROTTLED: &str = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\n\
+            Content-Length: 0\r\nConnection: close\r\n\r\n";
+        let answers: Vec<&'static str> = (0..100).map(|i| if i % 2 == 0 { THROTTLED } else { UNAVAILABLE }).collect();
+        let (url, _) = start_answering_remote(answers);
+        let client = fast_client(&url);
+        let cap = FAST.throttle_patience + FAST.unavailable_patience;
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let started = std::time::Instant::now();
+        let error = runtime.block_on(client.fetch_signature(&"p".repeat(64)))
+            .expect_err("refusals that never stop must fail");
+        let elapsed = started.elapsed();
+
+        assert!(error.contains(&format!("after retrying for up to {:?}", cap)), "the error names the cap: {}", error);
+        assert!(elapsed < cap, "elapsed {:?} overran the cap {:?}", elapsed, cap);
+    }
+
+    /// Which answers are a refusal for now, and under which patience: the header's presence is the
+    /// signal on a `503`, whatever its form, and no other status is retried for carrying it.
+    #[test]
+    fn refused_for_now_is_a_429_or_a_503_with_retry_after() {
+        let response = |status: u16, retry_after: Option<&str>| {
+            let mut builder = http::Response::builder().status(status);
+            if let Some(value) = retry_after {
+                builder = builder.header("Retry-After", value);
+            }
+            reqwest::Response::from(builder.body(Vec::<u8>::new()).unwrap())
+        };
+
+        assert_eq!(refused_for_now(&response(429, None), &FAST), Some(FAST.throttle_patience));
+        assert_eq!(refused_for_now(&response(503, Some("5")), &FAST), Some(FAST.unavailable_patience));
+        assert_eq!(
+            refused_for_now(&response(503, Some("Wed, 21 Oct 2026 07:28:00 GMT")), &FAST),
+            Some(FAST.unavailable_patience),
+            "a date form still says the refusal is for now"
+        );
+        assert_eq!(refused_for_now(&response(503, None), &FAST), None);
+        assert_eq!(refused_for_now(&response(500, Some("5")), &FAST), None);
+        assert_eq!(refused_for_now(&response(502, Some("5")), &FAST), None);
+        assert_eq!(refused_for_now(&response(200, Some("5")), &FAST), None);
     }
 
     /// An unavailable server and a throttle outlasting the patience are a remote that could not
@@ -11814,6 +12133,10 @@ mod tests {
     /// gives.
     const TEST_FETCH_THROTTLE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
 
+    /// Mirrors production `UNAVAILABLE_PATIENCE`, for the reason `TEST_TIGHT_READ_TIMEOUT`'s doc
+    /// gives.
+    const TEST_UNAVAILABLE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
+
     /// The budgets a waiting fixture builds its client with. Every value is distinct from every
     /// other one and from every production figure, and so is every sum a budget is armed as
     /// (connect plus one allowance), so an arm site that reads the wrong field, or a production
@@ -11839,6 +12162,7 @@ mod tests {
         commit_attempt_allowance: std::time::Duration::from_millis(1_270),
         min_commit_attempt: std::time::Duration::from_millis(90),
         throttle_patience: std::time::Duration::from_millis(2_590),
+        unavailable_patience: std::time::Duration::from_millis(3_710),
     };
 
     /// [`FAST`]'s connect bound for a client that routes through Tor, standing in for
@@ -11888,6 +12212,7 @@ mod tests {
             commit_attempt_allowance: millis(5_100),
             min_commit_attempt: millis(4_700),
             throttle_patience: millis(6_600),
+            unavailable_patience: millis(10_100),
         }
         .checked()
     }
@@ -11912,11 +12237,11 @@ mod tests {
             let Budgets {
                 connect: _, read, object_read, batch_head_patience, error_body_read, upload_silence,
                 retryable_head_patience, commit_deadline, commit_attempt_allowance,
-                min_commit_attempt, throttle_patience,
+                min_commit_attempt, throttle_patience, unavailable_patience,
             } = b;
             [read, object_read, batch_head_patience, error_body_read, upload_silence,
                 retryable_head_patience, commit_deadline, commit_attempt_allowance,
-                min_commit_attempt, throttle_patience]
+                min_commit_attempt, throttle_patience, unavailable_patience]
         };
         let connects = [budgets.connect, PRODUCTION_MIRROR.connect, PRODUCTION_MIRROR_TOR.connect];
         let mut rivals: Vec<std::time::Duration> = allowances(budgets).into_iter()
@@ -11991,6 +12316,7 @@ mod tests {
         commit_attempt_allowance: TEST_COMMIT_ATTEMPT_ALLOWANCE,
         min_commit_attempt: TEST_MIN_COMMIT_ATTEMPT,
         throttle_patience: TEST_FETCH_THROTTLE_PATIENCE,
+        unavailable_patience: TEST_UNAVAILABLE_PATIENCE,
     };
 
     /// [`PRODUCTION_MIRROR`] for a dial through Tor, which differs in the connect bound alone.
@@ -15336,6 +15662,23 @@ mod tests {
 
         assert_eq!(outcome, Ok(()));
         assert!(elapsed >= std::time::Duration::from_secs(1), "the Retry-After was not waited ({:?})", elapsed);
+    }
+
+    /// A `503` without the not-ready header is undetermined and retried, as before; when it carries
+    /// `Retry-After`, the retry waits it rather than the backoff. Revert: drop the `503`'s
+    /// `Retry-After` from the undetermined answer → the retry comes after the 200 ms backoff.
+    #[test]
+    fn an_unavailable_commit_waits_out_its_retry_after() {
+        let remote = CommitRemote::start(vec![
+            CommitAnswer::Reply("HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1"),
+            CommitAnswer::Reply(COMMITTED),
+        ]);
+
+        let (outcome, elapsed) = commit_batch(&remote.url, commit_budgets(5_230));
+
+        assert_eq!(outcome, Ok(()));
+        assert!(elapsed >= std::time::Duration::from_secs(1), "the Retry-After was not waited ({:?})", elapsed);
+        assert_eq!(remote.connections(), 2);
     }
 
     /// A `Retry-After` longer than the deadline leaves is not waited: the batch fails at once,
