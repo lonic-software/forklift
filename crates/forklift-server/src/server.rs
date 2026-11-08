@@ -2547,11 +2547,17 @@ async fn post_missing(State(state): State<Arc<AppState>>,
 
     let gate = Arc::clone(&warehouse);
     let result = blocking(warehouse, move || {
-        // A withheld chunk is missing here, as `GET` answers it: a lift naming it uploads it.
+        // A chunk a redaction's owed deletion withholds is missing here, as `GET` answers it: a
+        // lift naming it uploads it. Content the host withholds is never missing, held or not:
+        // this head takes none of it, and its ref writes tolerate its absence.
         let withheld = withheld_among(&gate, &read_applied()?, &request.hashes)?;
+        let taken_down = read_withheld()?;
         let mut missing: Vec<String> = Vec::new();
 
         for hash in request.hashes {
+            if taken_down.contains(&hash) {
+                continue;
+            }
             if withheld.contains(&hash) || !file_utils::does_object_exist(&hash).map_err(internal)? {
                 missing.push(hash);
             }
@@ -2662,12 +2668,15 @@ async fn post_upload_targets(State(state): State<Arc<AppState>>,
     let result = blocking(warehouse, move || {
         let (applied, withheld) = (read_applied()?, read_withheld()?);
 
-        request.hashes.iter().try_for_each(|hash| refuse_removed(&applied, &withheld, hash))?;
+        // A redacted hash refuses the lift: the client checks its history against its own
+        // redactions first, so one asked about here is a client that did not.
+        request.hashes.iter().try_for_each(|hash| refuse_removed(&applied, &WithheldSet::default(), hash))?;
 
         let mut response = UploadTargetsResponse {
             present: Vec::new(),
             targets: std::collections::BTreeMap::new(),
             direct: Vec::new(),
+            withheld: Vec::new(),
         };
 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2677,7 +2686,11 @@ async fn post_upload_targets(State(state): State<Arc<AppState>>,
                 continue;
             }
 
-            if file_utils::does_object_exist(&hash).map_err(unprocessable)? {
+            // Content the host withholds is never taken, but a lift may name it: its ref write
+            // tolerates the absence. So it is answered apart rather than refusing the lift.
+            if withheld.contains(&hash) {
+                response.withheld.push(hash);
+            } else if file_utils::does_object_exist(&hash).map_err(unprocessable)? {
                 response.present.push(hash);
             } else {
                 // No staging prefix here — the client PUTs the body and the head verifies it

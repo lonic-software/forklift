@@ -1486,7 +1486,8 @@ fn closure_to_verify(namespace: PalletNamespace, expected: Option<&str>, new: &s
 /// some user-pallet ref already reaches ([`audit_utils::verify_ref_head_closure`]), refusing with
 /// [`RefUpdateError::Incomplete`] otherwise. `expected`, the ref's current head, is one of those.
 ///
-/// Any warehouse tolerates an absent object a redaction it applied names. A partial warehouse
+/// Any warehouse tolerates an absent file's content a redaction it applied names, or its head
+/// withholds. A partial warehouse
 /// (sparse, or a cache) also tolerates one the sealed-by-hash record holds; a full warehouse
 /// tolerates nothing else. The mode and the records are read only when the walk without them
 /// fails, so a warehouse holding the whole closure never depends on them.
@@ -1528,13 +1529,13 @@ fn verify_new_head(name: &str,
 
     let unreadable = |error: String| RefUpdateError::Failed(format!(
         "Cannot tell whether the history of {} is complete: {}, and the record of objects held by \
-        hash, or of the redactions applied here, cannot be read. {}",
+        hash, of the redactions applied here or of the content withheld here, cannot be read. {}",
         &new[..new.len().min(12)], missing.trim_end_matches('.'), error
     ));
 
     let tolerated = match partial {
         true => crate::util::sealed_utils::read_tolerated().map_err(unreadable)?,
-        false => Tolerated::applied_only(crate::util::applied_redactions::read_applied().map_err(unreadable)?),
+        false => crate::util::sealed_utils::read_removed().map_err(unreadable)?,
     };
 
     if tolerated.is_empty() {

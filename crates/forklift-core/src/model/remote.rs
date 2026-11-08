@@ -294,7 +294,8 @@ pub struct MissingObjectsRequest {
     pub hashes: Vec<String>,
 }
 
-/// The response of `POST /v1/objects/missing`: the subset the remote does not have.
+/// The response of `POST /v1/objects/missing`: the subset the remote does not have and would take.
+/// A hash its host withholds is never listed, held or not: the head takes none of it.
 #[derive(Serialize, Deserialize)]
 pub struct MissingObjectsResponse {
     pub missing: Vec<String>,
@@ -362,6 +363,12 @@ pub struct UploadTargetsResponse {
     /// Objects with no presigned target: `PUT` their bytes to `/v1/objects/{hash}` as usual
     /// and the head verifies them inline. A direct head answers with every missing hash here.
     pub direct: Vec<String>,
+
+    /// Objects the head's host withholds: the head takes none of them, held or not, so they are
+    /// not uploaded, and a ref update may name them all the same. Empty, and left out, from a head
+    /// that withholds none of those asked about.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub withheld: Vec<String>,
 }
 
 /// The body of `POST /v1/pallets/{name}` — the CAS ref update.

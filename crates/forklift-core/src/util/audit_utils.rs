@@ -13,6 +13,7 @@ use crate::util::scope_utils::{PathScope, ScopeClass};
 use crate::util::{cache_miss, fanout_utils, file_utils, graph_utils, object_utils, office_utils, pallet_utils, sign_utils};
 use crate::util::applied_redactions::AppliedSet;
 use crate::util::sealed_utils::{At, Held, Tolerated};
+use crate::util::withholding::WithheldSet;
 use crate::util::pallet_utils::{AnchorPrecondition, OfficePrecondition, PalletsPrecondition, RefPreconditions};
 
 /// Why an office chain did not verify. The heads answer the two classes differently: an
@@ -1825,31 +1826,32 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
 /// full scope: in a sparse warehouse the write verifies again at its own. The proof records
 /// `known_complete`, which a write accepts only as the head its compare-and-set expects.
 ///
-/// An absent file's content a redaction this warehouse applied names is tolerated, as the ref
-/// write's own verification tolerates it: the history of every head still names the content the
-/// redaction took away. The same hash absent where the closure names it as a tree or a chunk is
-/// not, since a redaction never takes either away. Nothing else absent is. The applied record is
-/// read only when the walk without it fails, so a warehouse holding the whole closure never depends
-/// on it; and it only ever grows, so the write need not read it again under its lock.
+/// An absent file's content a redaction this warehouse applied names, or its head withholds, is
+/// tolerated, as the ref write's own verification tolerates it: the history of every head still
+/// names the content the redaction took away or the head does not hold. The same hash absent where
+/// the closure names it as a tree or a chunk is not, since neither takes one away. Nothing else
+/// absent is. The records are read only when the walk without them fails, so a warehouse holding
+/// the whole closure never depends on them; and both only ever grow, so the write need not read
+/// them again under its lock.
 ///
 /// # Returns
 /// * `Ok(VerifiedClosure)` - Everything is present, or absent only where an applied redaction
-///                           names it as a file's content.
-/// * `Err(String)`         - If a parcel, tree or blob is missing (or unreadable), or the applied
+///                           names it, or the head withholds it, as a file's content.
+/// * `Err(String)`         - If a parcel, tree or blob is missing (or unreadable), or either
 ///                           record cannot be read.
 pub fn verify_parcel_closure_for_write(head: &str,
                                        known_complete: Option<&str>) -> Result<pallet_utils::VerifiedClosure, String> {
     if let Err(missing) = verify_parcel_closure(head, known_complete) {
-        let applied = crate::util::applied_redactions::read_applied().map_err(|error| format!(
-            "{} The record of the redactions applied here cannot be read either: {}",
+        let tolerated = crate::util::sealed_utils::read_removed().map_err(|error| format!(
+            "{} The record of the redactions applied here, or of the content withheld here, cannot \
+            be read either: {}",
             missing, error
         ))?;
 
-        if applied.is_empty() {
+        if tolerated.is_empty() {
             return Err(missing);
         }
 
-        let tolerated = Tolerated::applied_only(applied);
         let tolerance = SealedTolerance::new(&tolerated);
         let seams = ClosureSeams {
             blob_exists: &|hash| file_utils::does_object_exist(hash),
@@ -2039,7 +2041,7 @@ pub fn verify_parcel_closure_with(
         return Err(missing);
     }
 
-    let tolerated = Tolerated::applied_only(applied);
+    let tolerated = Tolerated::removed_only(applied, WithheldSet::default());
     let tolerance = SealedTolerance::new(&tolerated);
     let seams = ClosureSeams { sealed: Some(&tolerance), ..seams };
 
@@ -2067,11 +2069,17 @@ pub struct SealedTolerance<'a> {
     tolerated: &'a Tolerated,
     held: RefCell<HashSet<String>>,
     redacted: RefCell<HashSet<String>>,
+    withheld: RefCell<HashSet<String>>,
 }
 
 impl<'a> SealedTolerance<'a> {
     pub fn new(tolerated: &'a Tolerated) -> SealedTolerance<'a> {
-        SealedTolerance { tolerated, held: RefCell::new(HashSet::new()), redacted: RefCell::new(HashSet::new()) }
+        SealedTolerance {
+            tolerated,
+            held: RefCell::new(HashSet::new()),
+            redacted: RefCell::new(HashSet::new()),
+            withheld: RefCell::new(HashSet::new()),
+        }
     }
 
     /// How many distinct absent objects the walk held by hash alone, on the record.
@@ -2085,15 +2093,21 @@ impl<'a> SealedTolerance<'a> {
         self.redacted.borrow().len()
     }
 
+    /// How many distinct absent objects the walk held because this warehouse's head withholds
+    /// them.
+    pub fn withheld(&self) -> usize {
+        self.withheld.borrow().len()
+    }
+
     fn is_empty(&self) -> bool {
         self.tolerated.is_empty()
     }
 
-    /// Whether the present recipe `hash` is applied content, whose chunks are never checked: a
-    /// remote may delete an applied recipe's chunks before the recipe itself. Nothing is tallied,
-    /// as nothing absent is held.
+    /// Whether the present recipe `hash` is applied or withheld content, whose chunks are never
+    /// checked: a head may delete such a recipe's chunks before the recipe itself. Nothing is
+    /// tallied, as nothing absent is held.
     fn skips_chunks_of(&self, hash: &str) -> bool {
-        self.tolerated.held(hash, At::File) == Some(Held::Redacted)
+        matches!(self.tolerated.held(hash, At::File), Some(Held::Redacted | Held::Withheld))
     }
 
     /// Whether the absent object `hash`, met `at`, is held, by the record or by an applied redaction
@@ -2104,6 +2118,7 @@ impl<'a> SealedTolerance<'a> {
         match self.tolerated.held(hash, at) {
             Some(Held::Sealed) => self.held.borrow_mut().insert(hash.to_string()),
             Some(Held::Redacted) => self.redacted.borrow_mut().insert(hash.to_string()),
+            Some(Held::Withheld) => self.withheld.borrow_mut().insert(hash.to_string()),
             None => return false,
         };
         true

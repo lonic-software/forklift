@@ -4245,6 +4245,7 @@ impl RemoteClient {
             present: Vec::new(),
             targets: BTreeMap::new(),
             direct: Vec::new(),
+            withheld: Vec::new(),
         };
 
         for batch in hashes.chunks(MAX_UPLOAD_TARGETS_BATCH) {
@@ -4277,6 +4278,7 @@ impl RemoteClient {
             merged.present.extend(body.present);
             merged.targets.extend(body.targets);
             merged.direct.extend(body.direct);
+            merged.withheld.extend(body.withheld);
         }
 
         Ok(Some(merged))
@@ -7309,8 +7311,9 @@ async fn negotiate_and_upload(client: &RemoteClient,
     // failure before any bytes move.
     refuse_if_commit_pagination_unsupported(negotiation.targets.len(), chunking_supported)?;
 
-    // `present` is already on the remote (skip). `direct` goes to the control plane for inline
-    // verification; `targets` go straight to storage under the session's staging prefix.
+    // `present` is already on the remote, and `withheld` is never taken by it (skip both).
+    // `direct` goes to the control plane for inline verification; `targets` go straight to storage
+    // under the session's staging prefix.
     let mut tally = upload_tally(progress, negotiation.direct.len() + negotiation.targets.len());
     upload_objects(client, &negotiation.direct, &mut tally).await?;
     upload_to_targets(client, &negotiation.targets, &mut tally).await?;
@@ -10126,7 +10129,7 @@ mod tests {
                     (hash, target)
                 })
                 .collect();
-            let response = UploadTargetsResponse { present: Vec::new(), targets, direct: Vec::new() };
+            let response = UploadTargetsResponse { present: Vec::new(), targets, direct: Vec::new(), withheld: Vec::new() };
             ("200 OK", serde_json::to_string(&response).unwrap())
         } else {
             // A staging PUT or a commit call: exactly the upload/commit phase the gate exists to
