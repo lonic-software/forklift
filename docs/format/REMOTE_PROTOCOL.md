@@ -227,10 +227,12 @@ does not apply redactions sends `null` or omits the field; a client then treats 
 the remote's `@redactions` pallet holds as pending.
 
 `withheld` (additive) lists the content this remote's host withholds: a takedown, the host's act
-rather than the warehouse's, by the hash of a file's content, with the host's `statement` (one line with no control
-character, at most 1000 characters). Unlike a redaction it needs nothing to stop naming the content: pallet heads keep
-naming the file and history is unchanged. From the moment the host lists it, the remote refuses the
-content on every route with `451` (below), and the bundle never carries it. `state` is
+rather than the warehouse's, by the hash a tree names for a file, with the host's `statement` (one
+plain line, at most 1000 characters). Unlike a redaction it needs nothing to stop naming the
+content: pallet heads keep naming the file and history is unchanged. From the moment the host
+lists it, the remote refuses the content on the routes below with `451`, and the bundle never
+carries it. `missing` still answers for it as for any object: it reports the hash held while the
+remote keeps its copy. `state` is
 `deletion_owed` while the remote still holds a copy, `deleted` once it holds none; a client reads a
 state it does not know as `deletion_owed`. A head that does not withhold content sends `null` or
 omits the field.

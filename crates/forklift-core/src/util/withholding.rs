@@ -105,11 +105,14 @@ pub fn read_withheld() -> Result<WithheldSet, String> {
 }
 
 /// Whether `statement` may be a takedown's: not blank, at most [`STATEMENT_MAX_CHARS`] long, and
-/// one line with no control character, since every terminal that shows a refusal prints it.
+/// one plain line, since every terminal that shows a refusal prints it: no control character, line
+/// or paragraph separator, or direction mark, override or isolate, which would reorder its display.
 fn valid_statement(statement: &str) -> bool {
-    !statement.trim().is_empty()
-        && statement.chars().count() <= STATEMENT_MAX_CHARS
-        && !statement.chars().any(char::is_control)
+    let plain = |c: char| !c.is_control() && !matches!(
+        c, '\u{2028}' | '\u{2029}' | '\u{200e}' | '\u{200f}' | '\u{061c}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    );
+
+    !statement.trim().is_empty() && statement.chars().count() <= STATEMENT_MAX_CHARS && statement.chars().all(plain)
 }
 
 /// The content this warehouse never serves or takes: what a redaction applied here names, and
@@ -148,13 +151,16 @@ pub enum Withheld {
 /// already leaves the content out. A hash the store holds as a tree, a parcel or a chunk is
 /// refused: a takedown removes one file's content, as a redaction does. So is a chunked file's
 /// recipe, for now: its chunks would still be served. One the store lacks is withheld all the
-/// same, so it is never taken.
+/// same, so it is never taken; should it be a chunked file's recipe, nothing here can tell, and its
+/// chunks are still taken and served, as they are for a recipe uploaded while this runs (an
+/// upload takes no ref lock).
 ///
 /// # Returns
 /// * `Ok(Withheld)` - What changed.
-/// * `Err(String)`  - `hash` is not an object hash, not a file's content or a chunked file's,
-///                    `statement` is blank, too long or holds a control character, the record cannot be read, or the bundle could not be withdrawn or
-///                    the record written. A write that failed after its rename has still landed:
+/// * `Err(String)`  - `hash` is not an object hash, or the store holds it as other than a file's
+///                    unchunked content, `statement` is not one plain line of at most
+///                    [`STATEMENT_MAX_CHARS`], the record cannot be read, or the bundle could not
+///                    be withdrawn or the record written. A write that failed after its rename has still landed:
 ///                    read the record back to learn which.
 pub fn withhold(hash: &str, statement: &str) -> Result<Withheld, String> {
     if !object_utils::is_object_hash(hash) {
@@ -165,8 +171,8 @@ pub fn withhold(hash: &str, statement: &str) -> Result<Withheld, String> {
 
     if !valid_statement(statement) {
         return Err(format!(
-            "The statement must be one line, not blank, with no control character, and at most {} \
-            characters long.", STATEMENT_MAX_CHARS
+            "The statement must be one plain line, not blank, with no control character, separator \
+            or direction mark, and at most {} characters long.", STATEMENT_MAX_CHARS
         ));
     }
 
@@ -280,6 +286,8 @@ mod tests {
         assert!(withhold(A, "   ").is_err());
         assert!(withhold(A, "two\nlines").is_err());
         assert!(withhold(A, "\u{1b}[2Kforged").is_err());
+        assert!(withhold(A, "line\u{2028}separated").is_err());
+        assert!(withhold(A, "reordered \u{202e}txt.exe").is_err());
         assert!(withhold(A, &"x".repeat(STATEMENT_MAX_CHARS + 1)).is_err());
         assert!(withhold(A, &"x".repeat(STATEMENT_MAX_CHARS)).is_ok());
         assert_eq!(read_withheld().unwrap().entries().count(), 1);

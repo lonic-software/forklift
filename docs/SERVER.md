@@ -323,12 +323,14 @@ revocation by more than about a day.
 - **Withholding:** `forklift-server withhold add --root … HASH --statement "…"` withholds a
   file's content on the host's own authority, as for a legal takedown, and `forklift-server
   withhold list --root …` shows what is withheld. It takes effect at once, while the root is
-  served: every route answers a request for the content with `451` (`content_withheld`) and the
-  statement, uploads of it are refused, the latest bundle is taken down and every bundle built
+  served: a read or upload of the content by its hash is answered with `451`
+  (`content_withheld`) and the statement, a batch or subtree fetch leaves it out, the latest bundle is taken down and every bundle built
   after leaves the content out. Pallets keep naming the file, and the handshake lists the hash
-  and the statement (one line, at most 1000 characters). The list is kept in
-  `<root>/.forklift/withheld`. Not yet: a chunked file's content is refused (its chunks would
-  still be served), the stored copy is kept (the handshake says `deletion_owed`), a bundle
+  and the statement (one plain line, at most 1000 characters). The list is kept in
+  `<root>/.forklift/withheld`. Not yet: a chunked file this server holds cannot be withheld (its
+  chunks would still be served), and if a hash withheld before it arrived turns out to be a
+  chunked file's, its chunks are still taken and served; the stored copy is kept (the handshake says `deletion_owed`), `missing` does not
+  report it missing once it is deleted, a bundle
   download already under way is not cut, the bundle is rebuilt only when it next would be, and
   there is no command to lift a takedown.
 - **Redactions:** after every pallet update or deletion, the server applies each redaction

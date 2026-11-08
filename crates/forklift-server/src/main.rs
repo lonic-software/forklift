@@ -157,7 +157,7 @@ enum WithholdAction {
         /// The content's object hash
         hash: String,
 
-        /// Why it is withheld, as every request for it is told: one line, at most 1000 characters
+        /// Why it is withheld, as every request for it is told: one plain line of at most 1000 characters, with no control character
         #[arg(long)]
         statement: String,
     },
