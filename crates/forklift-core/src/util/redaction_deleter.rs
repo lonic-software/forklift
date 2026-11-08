@@ -22,7 +22,7 @@
 //! redacted blob or recipe, and the chunks of a recipe no unredacted object names. Those chunks
 //! are recorded in a journal ([`ChunksOwed`]) before the recipe goes, so a deletion cut short
 //! between the two leaves them owed, not orphaned. Until they are gone, a server serves them as
-//! absent ([`withheld_chunks`]).
+//! absent ([`withheld_chunks`]), a withheld recipe's as an applied redaction's.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -49,8 +49,9 @@ fn chunks_owed_path() -> PathBuf {
     forklift_root().join(FILE_NAME_CHUNKS_OWED)
 }
 
-/// The chunks a deletion still owes: each a chunk of an applied redaction's recipe that no other
-/// object named when the deletion started, beside that recipe's hash.
+/// The chunks a deletion still owes: each a chunk of a recipe it deletes, an applied redaction's
+/// or a withheld one, that no other object named when the deletion started, beside that recipe's
+/// hash.
 ///
 /// [`delete_applied`] deletes a recipe before its chunks, so that no present recipe ever lacks
 /// one. Once the recipe is gone, nothing names its chunks, so the journal is what lets a deletion
@@ -403,12 +404,12 @@ fn present_owed_chunks(owed: &ChunksOwed) -> Result<HashSet<String>, String> {
     Ok(present)
 }
 
-/// The applied redactions whose deletion still owes a chunk: a journal entry names a chunk of the
-/// recipe that the store still holds. Such a redaction is not yet deleted, whether or not its
-/// recipe is gone.
+/// The applied redactions and withheld hashes whose deletion still owes a chunk: a journal entry
+/// names a chunk of the recipe that the store still holds. Such a one is not yet deleted, whether
+/// or not its recipe is gone.
 ///
 /// # Returns
-/// * `Ok(HashSet<String>)` - The applied recipes that owe a chunk.
+/// * `Ok(HashSet<String>)` - The recipes that owe a chunk.
 /// * `Err(String)`         - If the journal could not be read, or whether a chunk is present could
 ///                           not be told.
 pub fn recipes_owing_chunks() -> Result<HashSet<String>, String> {
@@ -418,60 +419,61 @@ pub fn recipes_owing_chunks() -> Result<HashSet<String>, String> {
     Ok(owed.pairs().filter(|(_, chunk)| present.contains(chunk)).map(|(recipe, _)| recipe.clone()).collect())
 }
 
-/// The chunks a server serves as absent while a redaction's deletion is owed: those of an applied
-/// redaction's recipe the store still holds, held by a bay or not, and those the journal owes, less
-/// every chunk an object that is not an applied redaction's names, as the collector finds them. A
-/// chunk such an object names is no part of the redaction (its ban never extends to the chunks of
-/// another file), so it stays served; the rest are bytes only the redacted content used.
+/// The chunks a server serves as absent while a deletion is owed: those of a removed recipe (an
+/// applied redaction's or a withheld one) the store still holds, held by a bay or not, and those
+/// the journal owes, less every chunk an object that is not removed names, as the collector finds
+/// them. A chunk such an object names is no part of the removed content (neither a ban nor a
+/// takedown extends to the chunks of another file), so it stays served; the rest are bytes only
+/// the removed content used.
 ///
 /// The candidates are found cheaply ([`withheld_candidates`]); only when there are any is the live
 /// set walked.
 ///
 /// # Arguments
-/// * `applied` - The applied redactions.
+/// * `removed` - The applied redactions and the withheld hashes ([`withholding::removed`]).
 ///
 /// # Returns
 /// * `Ok((HashSet<String>, HashSet<String>))` - The candidates, and of them the chunks withheld.
 /// * `Err(String)` - If the journal, a recipe or the live set could not be read.
-pub fn withheld_chunks(applied: &AppliedSet) -> Result<(HashSet<String>, HashSet<String>), String> {
-    let candidates = withheld_candidates(applied)?;
-    let withheld = withheld_among_candidates(&candidates, applied)?;
+pub fn withheld_chunks(removed: &AppliedSet) -> Result<(HashSet<String>, HashSet<String>), String> {
+    let candidates = withheld_candidates(removed)?;
+    let withheld = withheld_among_candidates(&candidates, removed)?;
 
     Ok((candidates, withheld))
 }
 
-/// Of `candidates`, as [`withheld_candidates`] read them for `applied`, the chunks no object but an
-/// applied redaction's names: walks the live set, unless there is no candidate.
+/// Of `candidates`, as [`withheld_candidates`] read them for `removed`, the chunks no object but a
+/// removed one names: walks the live set, unless there is no candidate.
 ///
 /// # Returns
 /// * `Ok(HashSet<String>)` - The withheld chunks.
 /// * `Err(String)`         - If the live set could not be read.
 pub fn withheld_among_candidates(candidates: &HashSet<String>,
-                                 applied: &AppliedSet) -> Result<HashSet<String>, String> {
+                                 removed: &AppliedSet) -> Result<HashSet<String>, String> {
     if candidates.is_empty() {
         return Ok(HashSet::new());
     }
 
-    // Every applied hash is excluded, present or not, so a chunk only one reaches is withheld
+    // Every removed hash is excluded, present or not, so a chunk only one reaches is withheld
     // rather than served. The walk excludes a hash only where a file entry names it and always
-    // descends a subtree, so an applied hash held as a tree keeps nothing beneath it out.
-    let live = gc_utils::collect_live_set_excluding(&applied.hashes().cloned().collect())?;
+    // descends a subtree, so a removed hash held as a tree keeps nothing beneath it out.
+    let live = gc_utils::collect_live_set_excluding(&removed.hashes().cloned().collect())?;
 
     Ok(candidates.iter().filter(|chunk| !live.contains(*chunk)).cloned().collect())
 }
 
-/// The chunks [`withheld_chunks`] judges: every chunk of an applied redaction's recipe the store
-/// holds, and every chunk the journal owes. Reads only those recipes and the journal.
+/// The chunks [`withheld_chunks`] judges: every chunk of a removed recipe the store holds, and
+/// every chunk the journal owes. Reads only those recipes and the journal.
 ///
 /// # Returns
 /// * `Ok(HashSet<String>)` - The candidates.
-/// * `Err(String)`         - If the journal could not be read, or an applied redaction's object
-///                           the store holds could not be read: its chunks are never served on a
-///                           guess. One held as a tree, a parcel or a chunk names none.
-pub fn withheld_candidates(applied: &AppliedSet) -> Result<HashSet<String>, String> {
+/// * `Err(String)`         - If the journal could not be read, or a removed object the store holds
+///                           could not be read: its chunks are never served on a guess. One held
+///                           as a tree, a parcel or a chunk names none.
+pub fn withheld_candidates(removed: &AppliedSet) -> Result<HashSet<String>, String> {
     let mut candidates = read_chunks_owed()?.chunks();
 
-    for hash in applied.hashes() {
+    for hash in removed.hashes() {
         if redaction_utils::stored_type(hash)? == Some(ObjectType::Recipe) {
             candidates.extend(object_utils::recipe_chunk_hashes(hash)?);
         }
@@ -827,6 +829,14 @@ mod tests {
     /// old history, beside a live recipe sharing its other chunk. Returns (recipe, own chunk,
     /// shared chunk, live recipe).
     fn packed_chunked_leak() -> (String, String, String, String) {
+        let leak = packed_chunked_file();
+        applied_redactions::apply_for_test(&[&leak.0]);
+
+        leak
+    }
+
+    /// [`packed_chunked_leak`]'s fixture, with nothing applied.
+    fn packed_chunked_file() -> (String, String, String, String) {
         let (own_chunk, shared_chunk, other_chunk) = (pack_chunk(b"own"), store_chunk(b"shared"), store_chunk(b"other"));
         let recipe = store_recipe(&[(own_chunk.clone(), 3), (shared_chunk.clone(), 6)]);
         let live_recipe = store_recipe(&[(shared_chunk.clone(), 6), (other_chunk, 5)]);
@@ -836,7 +846,6 @@ mod tests {
         pack_utils::compact(true, false, false, &Progress::NONE).unwrap();
         assert!(pack_utils::is_in_packs(&recipe).unwrap(), "the fixture packs the recipe");
         assert!(pack_utils::is_in_packs(&own_chunk).unwrap(), "the fixture packs the chunk");
-        applied_redactions::apply_for_test(&[&recipe]);
 
         (recipe, own_chunk, shared_chunk, live_recipe)
     }
@@ -1323,5 +1332,40 @@ mod tests {
             assert!(present(hash), "kept: {}", hash);
         }
         assert!(!applied_copies().unwrap().owes_deletion(), "nothing is left to delete");
+    }
+
+    /// A withheld chunked file's own chunk is served as absent while a checkout's staged work holds
+    /// its recipe, with nothing applied, and the chunk a live recipe shares is not. Once the
+    /// staged work lets go, the deletion takes the recipe and its own chunk, though the head still
+    /// names the file, and keeps the shared one.
+    ///
+    /// Revert: judge the chunks by the applied redactions alone → nothing is a candidate; leave
+    /// the withheld record out of the deletion → the recipe stays.
+    #[test]
+    fn a_withheld_recipes_own_chunks_are_served_as_absent_then_deleted() {
+        let _scratch = Scratch::new("withheld-recipe");
+        let (recipe, own_chunk, shared_chunk, live_recipe) = packed_chunked_file();
+        set_main(&store_parcel(&store_tree(&[
+            ("big.bin", &recipe, DirEntryType::NormalChunked),
+            ("other.bin", &live_recipe, DirEntryType::NormalChunked),
+        ]), Vec::new()));
+        plant_staged_shard("b", &[("big.bin", &recipe, DirEntryType::NormalChunked)]);
+        withholding::withhold(&recipe, "DMCA notice 10").unwrap();
+        assert!(applied_redactions::read_applied().unwrap().is_empty());
+
+        let (candidates, withheld) = withheld_chunks(&withholding::removed().unwrap()).unwrap();
+
+        assert_eq!(candidates, HashSet::from([own_chunk.clone(), shared_chunk.clone()]));
+        assert_eq!(withheld, HashSet::from([own_chunk.clone()]));
+        let kept = delete().unwrap();
+        assert!(kept.objects.is_empty() && present(&recipe), "the staged work holds it: {:?}", kept.objects);
+
+        plant_staged_shard("b", &[]);
+        let deletion = delete().unwrap();
+
+        assert_eq!(deletion.objects, vec![recipe.clone()]);
+        assert_eq!(deletion.chunks, 1);
+        assert!(!present(&recipe) && !present(&own_chunk));
+        assert!(present(&shared_chunk) && present(&live_recipe));
     }
 }

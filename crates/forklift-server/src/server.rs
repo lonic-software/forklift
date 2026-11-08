@@ -141,7 +141,7 @@ struct WarehouseHandle {
     /// discharges some and when the warehouse is drained.
     applies_wake: tokio::sync::Notify,
 
-    /// Which chunks are served as absent while a redaction's deletion is owed ([`withheld_among`]).
+    /// Which chunks are served as absent while a deletion is owed ([`withheld_among`]).
     chunk_gate: std::sync::Mutex<ChunkGate>,
 
     /// Held while [`withheld_among`] walks the live set, so one request walks at a time and the
@@ -155,15 +155,15 @@ struct WarehouseHandle {
     ref_writes_finished: std::sync::atomic::AtomicU64,
 }
 
-/// The chunks a warehouse serves as absent while a redaction's deletion is owed (see
+/// The chunks a warehouse serves as absent while a deletion is owed (see
 /// [`redaction_deleter::withheld_chunks`]), as last worked out.
 #[derive(Default)]
 struct ChunkGate {
-    /// The applied redactions `candidates` was read for; `None` until it is read, and once a
-    /// deletion has run.
+    /// The applied redactions and withheld hashes `candidates` was read for; `None` until it is
+    /// read.
     basis: Option<AppliedSet>,
 
-    /// The chunks of the applied recipes the store held, and the chunks the journal owes.
+    /// The chunks of the removed recipes the store held, and the chunks the journal owes.
     candidates: std::collections::HashSet<String>,
 
     /// The candidates no other object names, with the count of ref writes started before the walk
@@ -1500,14 +1500,17 @@ fn served_redactions() -> Result<Vec<ServedRedaction>, HandlerError> {
 }
 
 /// What this head withholds, for the handshake: each hash with the host's statement, its deletion
-/// owed while the store still holds a copy. A store that cannot tell reports the deletion owed, as
-/// a handshake must not fail over one object.
+/// owed while the store still holds a copy, or while the deletion owes a chunk of it (as for an
+/// applied redaction, see [`served_redactions`]). A store or a journal that cannot be read reports
+/// the deletion owed, as a handshake must not fail over one object.
 fn served_withheld() -> Result<Vec<ServedWithholding>, HandlerError> {
+    let owing_chunks = redaction_deleter::recipes_owing_chunks();
+
     Ok(read_withheld()?.entries().map(|(hash, statement)| ServedWithholding {
         hash: hash.clone(),
         statement: statement.clone(),
-        state: match file_utils::does_object_exist(hash) {
-            Ok(false) => ServedWithholdingState::Deleted,
+        state: match (file_utils::does_object_exist(hash), &owing_chunks) {
+            (Ok(false), Ok(owing)) if !owing.contains(hash) => ServedWithholdingState::Deleted,
             _ => ServedWithholdingState::DeletionOwed,
         },
     }).collect())
@@ -1538,33 +1541,33 @@ fn refuse_removed(applied: &AppliedSet, withheld: &WithheldSet, hash: &str) -> R
     }
 }
 
-/// Of `hashes`, the chunks `warehouse` serves as absent: those only an applied redaction's recipe
-/// names, while its deletion is owed ([`redaction_deleter::withheld_chunks`]). They are not
-/// redacted (a redaction's ban never extends to a chunk), so they are answered as the deletion
-/// will leave them, absent, not refused. Run in a request's blocking closure, beside its
-/// `applied` read.
+/// Of `hashes`, the chunks `warehouse` serves as absent: those only removed recipes name (an
+/// applied redaction's or a withheld one's), while their deletion is owed
+/// ([`redaction_deleter::withheld_chunks`]). They are not refused (neither a ban nor a takedown
+/// extends to a chunk), so they are answered as the deletion will leave them, absent. Run in a
+/// request's blocking closure, beside its read of `removed`, the applied redactions and withheld
+/// hashes ([`withholding::removed_from`]).
 ///
-/// The candidates are read again whenever the applied set differs from theirs, which is cheap,
-/// and not at all while nothing is applied. Then the only deletion can be a withheld one, and
-/// withholding refuses a recipe's hash, so no chunk is owed to it.
+/// The candidates are read again whenever the removed set differs from theirs, which is cheap,
+/// and not at all while nothing is removed: then no deletion ever ran, and no journal was written.
 /// Only a request naming a candidate needs the live set, walked once per ref write here (a walk
 /// a ref write overlapped is never kept) and at most every [`CHUNK_GATE_TTL`], one walk at a time.
 fn withheld_among(warehouse: &WarehouseHandle,
-                  applied: &AppliedSet,
+                  removed: &AppliedSet,
                   hashes: &[String]) -> Result<std::collections::HashSet<String>, HandlerError> {
     use std::sync::atomic::Ordering;
 
-    if applied.is_empty() {
+    if removed.is_empty() {
         return Ok(std::collections::HashSet::new());
     }
 
     // The withheld chunks among `hashes` when the gate knows them now, or else the candidates
-    // for this applied set, which a walk is to judge.
+    // for this removed set, which a walk is to judge.
     type Answer = Result<std::collections::HashSet<String>, std::collections::HashSet<String>>;
     let answer = |gate: &mut ChunkGate| -> Result<Answer, HandlerError> {
-        if gate.basis.as_ref() != Some(applied) {
-            gate.candidates = redaction_deleter::withheld_candidates(applied).map_err(internal)?;
-            gate.basis = Some(applied.clone());
+        if gate.basis.as_ref() != Some(removed) {
+            gate.candidates = redaction_deleter::withheld_candidates(removed).map_err(internal)?;
+            gate.basis = Some(removed.clone());
             gate.withheld = None;
         }
 
@@ -1589,7 +1592,7 @@ fn withheld_among(warehouse: &WarehouseHandle,
     let _walk = warehouse.chunk_gate_walk.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // Another request may have walked while this one waited. The candidates come from the same
-    // look, under the same lock, that matched them to this applied set.
+    // look, under the same lock, that matched them to this removed set.
     let candidates = match answer(&mut lock_gate(warehouse))? {
         Ok(withheld) => return Ok(withheld),
         Err(candidates) => candidates,
@@ -1600,11 +1603,11 @@ fn withheld_among(warehouse: &WarehouseHandle,
     let settled = started == warehouse.ref_writes_finished.load(Ordering::SeqCst);
     let at = std::time::Instant::now();
 
-    let withheld = redaction_deleter::withheld_among_candidates(&candidates, applied).map_err(internal)?;
+    let withheld = redaction_deleter::withheld_among_candidates(&candidates, removed).map_err(internal)?;
     let among = hashes.iter().filter(|hash| withheld.contains(*hash)).cloned().collect();
 
     let mut gate = lock_gate(warehouse);
-    if settled && gate.basis.as_ref() == Some(applied) {
+    if settled && gate.basis.as_ref() == Some(removed) {
         gate.withheld = Some((started, at, withheld));
     }
 
@@ -2548,11 +2551,12 @@ async fn post_missing(State(state): State<Arc<AppState>>,
 
     let gate = Arc::clone(&warehouse);
     let result = blocking(warehouse, move || {
-        // A chunk a redaction's owed deletion withholds is missing here, as `GET` answers it: a
-        // lift naming it uploads it. Content the host withholds is never missing, held or not:
-        // this head takes none of it, and its ref writes tolerate its absence.
-        let owed_chunks = withheld_among(&gate, &read_applied()?, &request.hashes)?;
+        // A chunk an owed deletion withholds is missing here, as `GET` answers it: a lift naming
+        // it uploads it. Content the host withholds is never missing, held or not: this head
+        // takes none of it, and its ref writes tolerate its absence.
         let host_withheld = read_withheld()?;
+        let removed = withholding::removed_from(&read_applied()?, &host_withheld);
+        let owed_chunks = withheld_among(&gate, &removed, &request.hashes)?;
         let mut missing: Vec<String> = Vec::new();
 
         for hash in request.hashes {
@@ -2738,7 +2742,8 @@ async fn post_objects_batch(State(state): State<Arc<AppState>>,
 
     let gate = Arc::clone(&warehouse);
     let result = blocking(warehouse, move || {
-        let withheld = withheld_among(&gate, &read_applied()?, &request.hashes)?;
+        let removed = withholding::removed().map_err(internal)?;
+        let withheld = withheld_among(&gate, &removed, &request.hashes)?;
         let hashes: Vec<String> = request.hashes.into_iter().filter(|hash| !withheld.contains(hash)).collect();
 
         bundle_utils::build_partial_bundle(&hashes).map_err(internal)
@@ -2892,11 +2897,12 @@ async fn get_object(State(state): State<Arc<AppState>>,
 
     let gate = Arc::clone(&warehouse);
     let result = blocking(warehouse, move || {
-        let applied = read_applied()?;
-        refuse_removed(&applied, &read_withheld()?, &hash)?;
+        let (applied, withheld) = (read_applied()?, read_withheld()?);
+        refuse_removed(&applied, &withheld, &hash)?;
 
         if !file_utils::does_object_exist(&hash).map_err(unprocessable)?
-            || !withheld_among(&gate, &applied, std::slice::from_ref(&hash))?.is_empty() {
+            || !withheld_among(&gate, &withholding::removed_from(&applied, &withheld), std::slice::from_ref(&hash))?
+                .is_empty() {
             return Err((StatusCode::NOT_FOUND, format!("No object {} exists.", hash)));
         }
 
@@ -6751,6 +6757,36 @@ mod tests {
             .map(|served| (served.hash, served.state)).collect();
         assert!(matches!(states[&stored], ServedWithholdingState::DeletionOwed));
         assert!(matches!(states[&gone], ServedWithholdingState::Deleted));
+
+        drop(_scope);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A withheld recipe the store no longer holds is still owed while the chunk journal owes a
+    /// chunk of it the store holds, as a deletion cut short between its passes leaves it.
+    ///
+    /// Revert: judge a withheld hash by its object alone → the recipe reads `deleted`.
+    #[test]
+    fn the_handshake_owes_a_withheld_deletion_while_a_chunk_of_it_is_owed() {
+        let root = scratch_dir("withheld-handshake-chunks");
+        let _scope = StorageRootScope::enter(&root);
+        warehouse_utils::prepare_warehouse(warehouse_utils::PrepareMode::Full).unwrap();
+
+        let chunk_bytes: &[u8] = &object_utils::blob_bytes(b"a chunk the journal still owes");
+        let chunk = object_utils::hash_object_bytes(chunk_bytes);
+        object_utils::store_object_bytes(&chunk, chunk_bytes).unwrap();
+        let recipe = object_utils::hash_object_bytes(&object_utils::blob_bytes(b"a deleted recipe"));
+        withholding::withhold(&recipe, "statement").unwrap();
+        let journal = forklift_core::util::record_utils::to_bytes(
+            "redactions-chunks-owed", 1, [format!("{} {}", recipe, chunk)]
+        );
+        std::fs::write(root.join(FOLDER_NAME_FORKLIFT_ROOT).join("redactions-chunks-owed"), journal).unwrap();
+        assert_eq!(redaction_deleter::recipes_owing_chunks().unwrap(), [recipe.clone()].into());
+
+        let served = served_withheld().unwrap();
+
+        assert_eq!(served.len(), 1);
+        assert!(matches!(served[0].state, ServedWithholdingState::DeletionOwed));
 
         drop(_scope);
         let _ = std::fs::remove_dir_all(&root);

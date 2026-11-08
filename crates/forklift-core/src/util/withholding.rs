@@ -13,8 +13,11 @@
 //! an applied redaction's ([`redaction_deleter`](crate::util::redaction_deleter)), under a census
 //! that history never holds a copy for.
 //!
-//! (The chunks a redaction's deletion serves as absent are a different thing, named "withheld" in
-//! [`redaction_deleter`](crate::util::redaction_deleter) only for how they are served.)
+//! A chunked file is withheld by its recipe's hash. Its chunks are not refused by hash, since other
+//! content may share them; until the deletion is done, a server serves the chunks only withheld or
+//! redacted recipes name as absent, which
+//! [`redaction_deleter`](crate::util::redaction_deleter) also calls "withheld", for how they are
+//! served.
 //!
 //! The list is head-local configuration, not history: the record at `<forklift root>/withheld`
 //! lists each withheld hash beside its statement, in the [`record_utils`] form, one
@@ -128,10 +131,12 @@ fn valid_statement(statement: &str) -> bool {
 /// * `Ok(AppliedSet)` - Both, as one set of hashes.
 /// * `Err(String)`    - Either record cannot be read.
 pub fn removed() -> Result<AppliedSet, String> {
-    let applied = applied_redactions::read_applied()?;
-    let withheld = read_withheld()?;
+    Ok(removed_from(&applied_redactions::read_applied()?, &read_withheld()?))
+}
 
-    Ok(AppliedSet::of(applied.hashes().cloned().chain(withheld.statements.into_keys())))
+/// The content [`removed`] names, of `applied` and `withheld` already read.
+pub fn removed_from(applied: &AppliedSet, withheld: &WithheldSet) -> AppliedSet {
+    AppliedSet::of(applied.hashes().chain(withheld.statements.keys()).cloned())
 }
 
 /// What [`withhold`] did.
@@ -154,16 +159,18 @@ pub enum Withheld {
 /// withheld or redacted since it began ([`bundle_utils::build_bundle`]). So no bundle holding
 /// withheld content is published once the record is; a statement restated leaves the bundle, which
 /// already leaves the content out. A hash the store holds as a tree, a parcel or a chunk is
-/// refused: a takedown removes one file's content, as a redaction does. So is a chunked file's
-/// recipe, for now: its chunks would still be served. One the store lacks is withheld all the
-/// same, so it is never taken; should it be a chunked file's recipe, nothing here can tell, and its
-/// chunks are still taken and served, as they are for a recipe uploaded while this runs (an
-/// upload takes no ref lock).
+/// refused: a takedown removes one file's content, as a redaction does. A chunked file's recipe is
+/// a file's content, and is withheld; a server then serves the chunks no other object names as
+/// absent ([`redaction_deleter::withheld_chunks`]). One the store lacks is withheld all the same,
+/// so it is never taken; should it be a chunked file's recipe, nothing here can tell, and its
+/// chunks are still taken and served, since no recipe the store holds names them.
+///
+/// [`redaction_deleter::withheld_chunks`]: crate::util::redaction_deleter::withheld_chunks
 ///
 /// # Returns
 /// * `Ok(Withheld)` - What changed.
 /// * `Err(String)`  - `hash` is not an object hash, or the store holds it as other than a file's
-///                    unchunked content, `statement` is not one plain line of at most
+///                    content, `statement` is not one plain line of at most
 ///                    [`STATEMENT_MAX_CHARS`], the record cannot be read, or the bundle could not
 ///                    be withdrawn or the record written. A write that failed after its rename
 ///                    has still landed: read the record back to learn which.
@@ -182,11 +189,7 @@ pub fn withhold(hash: &str, statement: &str) -> Result<Withheld, String> {
     }
 
     match redaction_utils::stored_type(hash)? {
-        None | Some(ObjectType::Blob) => {}
-        Some(ObjectType::Recipe) => return Err(format!(
-            "Object {} is a chunked file's content. Withholding one is not supported yet: its chunks \
-            would still be served.", hash
-        )),
+        None | Some(ObjectType::Blob | ObjectType::Recipe) => {}
         Some(other) => return Err(format!(
             "Object {} is a {:?}, not a file's content: a takedown withholds one file's content.", hash, other
         )),
@@ -298,10 +301,10 @@ mod tests {
         assert_eq!(read_withheld().unwrap().entries().count(), 1);
     }
 
-    // Revert: accept a recipe → the chunked file is withheld while its chunks are served; accept a
-    // chunk → a chunk other files share is withheld.
+    // Revert: refuse a recipe → the chunked file is not withheld; accept a chunk → a chunk other
+    // files share is withheld.
     #[test]
-    fn a_chunked_file_or_a_chunk_is_never_withheld() {
+    fn a_chunked_file_is_withheld_and_a_chunk_never_is() {
         use crate::builder::object::loose_object_builder::LooseObjectBuilder;
         use crate::model::chunk::Chunk;
         use crate::model::recipe::{Recipe, RecipeChunk};
@@ -318,9 +321,10 @@ mod tests {
         let mut recipe_object = LooseObjectBuilder::build_recipe(&recipe);
         recipe_object.store().unwrap();
 
-        assert!(withhold(&recipe_object.hash, "statement").unwrap_err().contains("chunked file"));
+        assert_eq!(withhold(&recipe_object.hash, "statement").unwrap(), Withheld::Added);
         assert!(withhold(&chunk_object.hash, "statement").unwrap_err().contains("not a file's content"));
-        assert!(read_withheld().unwrap().is_empty());
+        let set = read_withheld().unwrap();
+        assert_eq!(set.entries().map(|(hash, _)| hash.as_str()).collect::<Vec<_>>(), [recipe_object.hash.as_str()]);
     }
 
     // Revert: read an unknown version or a malformed entry as nothing withheld → served again.
