@@ -11575,7 +11575,10 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(error.contains(&format!("after retrying for up to {:?}", cap)), "the error names the cap: {}", error);
-        assert!(elapsed < cap, "elapsed {:?} overran the cap {:?}", elapsed, cap);
+        // The cap runs from the first refusal; this clock started before the first request was
+        // sent, so a loaded runner overruns it by that request's time (6.301 s on macOS CI).
+        let margin = std::time::Duration::from_secs(1);
+        assert!(elapsed < cap + margin, "elapsed {:?} overran the cap {:?}", elapsed, cap);
     }
 
     /// Which answers are a refusal for now, and under which patience: the header's presence is the
