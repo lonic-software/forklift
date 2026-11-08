@@ -163,8 +163,6 @@ pub async fn handle_command(pallet: Option<String>,
     // redaction here is reported with it.
     let unapplied = refuse_unapplied_skips(&client);
 
-    skip_applied_reported(&client, &info);
-
     let mut report = LowerReport {
         adopted_genesis: trust.adopted_genesis,
         office_moved: trust.office_moved,
@@ -1137,20 +1135,6 @@ pub(crate) fn apply_reported(url: &str, info: &forklift_core::model::remote::War
 /// The content the remote whose handshake is `info` reports redacted and applied.
 pub(crate) fn reported_applied(info: &forklift_core::model::remote::WarehouseInfo) -> std::collections::HashSet<String> {
     info.applied_redactions().into_iter().map(str::to_string).collect()
-}
-
-/// Make `client`'s fetch walks leave out the content its handshake `info` reports redacted where
-/// this warehouse has applied that redaction too, so a ref write tolerates its absence. When the
-/// applied record cannot be read nothing is left out, and a fetch that needs the content is refused
-/// by the remote, as before.
-pub(crate) fn skip_applied_reported(client: &forklift_core::util::remote_utils::RemoteClient,
-                                    info: &forklift_core::model::remote::WarehouseInfo) {
-    let Ok(applied) = forklift_core::util::applied_redactions::read_applied() else { return };
-
-    client.skip_files(info.applied_redactions().into_iter()
-        .filter(|hash| applied.contains(hash))
-        .map(str::to_string)
-        .collect());
 }
 
 /// Refuse, as `content_redacted`, history `client`'s fetch left out content of (see
