@@ -2249,21 +2249,26 @@ fn a_first_contact_lower_takes_history_naming_applied_content_without_it() {
         .join(format!("forklift-redaction-first-server-{}", std::process::id())));
     let content = b"TOKEN=hunter2\n";
 
+    // An enrolled office, so a warehouse new to this remote takes its anchor at first contact.
     let owner = Warehouse::cloned("first-owner", &server.url);
+    owner.run_ok(&["office", "enroll"]);
     owner.stack("notes.txt", b"notes\n", "notes");
+    let leak = owner.leaked("secret.env", content);
+    let hash = recorded_hash(&owner, &format!("{}:secret.env", leak), "leaked token")["data"]["hash"]
+        .as_str().unwrap().to_string();
+    // The server applies the redaction once `@redactions` lands, refusing the rest of this lift;
+    // the next one leaves the content out.
+    owner.run(&["lift"]);
     owner.run_ok(&["lift"]);
-
-    let behind = Warehouse::cloned("first-behind", &server.url);
-    behind.leaked("secret.env", content);
-    let hash = owner.redact_loaded("secret.env", content, "leaked token");
-    owner.run_ok(&["lift"]);
-    behind.run_ok(&["lower"]);
-    behind.run_ok(&["lift"]);
+    let (_, info) = http(&server.url, "GET", "/v1/warehouse", b"");
+    let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+    assert_eq!(info["redactions"], serde_json::json!([{ "hash": hash, "state": "deleted" }]), "{}", info);
 
     let fresh = Warehouse::new("first-fresh");
     fresh.run_ok(&["config", "set", "remote.url", &server.url]);
     let lowered = fresh.json(&["lower"]);
     assert_eq!(lowered["ok"], true, "{}", lowered);
+    assert!(lowered["data"]["adopted_genesis"].is_string(), "{}", lowered);
     assert_eq!(lowered["data"]["redactions"]["applied"], serde_json::json!([hash]), "{}", lowered);
     assert_eq!(fresh.head("main"), server.main());
     assert!(!fresh.holds_loose(&hash));
