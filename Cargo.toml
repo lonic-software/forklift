@@ -80,6 +80,9 @@ schemars = { version = "1.2", features = ["chrono04"] }
 subtle = "2.6"
 # Test-only (a forklift-core dev-dependency): already in the tree through reqwest's gzip decoder.
 flate2 = "1"
+# Test-only (a forklift-core dev-dependency): already in the tree through reqwest, which builds a
+# `Response` from one.
+http = "1"
 
 # Key derivation runs in every test that unlocks a passphrase-protected key. Unoptimised, as a
 # test build leaves it, each derivation cost about 0.2 s more on an M-series Mac: the six in

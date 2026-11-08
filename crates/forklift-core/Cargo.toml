@@ -45,6 +45,8 @@ windows-sys = { workspace = true }
 # The capped-reader tests serve a gzip body; flate2 is already in the tree through reqwest's
 # `gzip` decoder, so this pins no new crate.
 flate2 = { workspace = true }
+# Builds a `reqwest::Response` without a server, for the status classifiers' unit tests.
+http = { workspace = true }
 
 [features]
 docgen = ["dep:schemars"]
