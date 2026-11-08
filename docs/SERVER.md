@@ -333,9 +333,9 @@ revocation by more than about a day.
   cuts a bundle download already under way, deletes the stored copy, and rebuilds the bundle when
   rebuilds are configured (`--rebuild-after-lifts`). The deletion drains the warehouse briefly, as
   a redaction's does. A copy that metadata history, the history the trust anchor adopted, or a
-  checkout's parked, consolidating, cherry-picked or staged work still names, is kept (the handshake says `deletion_owed`); a
-  pallet head or a checkout's base naming the file keeps nothing, and the handshake says
-  `deleted` once no copy is left. A takedown added while the root is not served is carried out
+  checkout's parked, consolidating, cherry-picked or staged work still names, is kept (the
+  handshake says `deletion_owed`); a pallet head or a checkout's base naming the file keeps
+  nothing, and the handshake says `deleted` once no copy is left. A takedown added while the root is not served is carried out
   when it is next served. Not yet: a chunked file this server holds cannot be withheld (its
   chunks would still be served), and if a hash withheld before it arrived turns out to be a
   chunked file's, its chunks are still taken and served; and there is no command to lift a

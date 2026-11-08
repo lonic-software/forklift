@@ -3954,8 +3954,8 @@ const WITHHELD_POLL: std::time::Duration = std::time::Duration::from_secs(5);
 /// baseline is read first, so a hash withheld after it is the watch's to act on, at worst asking
 /// for one more round. Requests are served before it is read, so a hash in it may have been
 /// withheld while a bundle download already ran: when its bundle is withdrawn, the downloads are
-/// cut, as the watch cuts them. A run that finds something withheld and no bundle published rebuilds
-/// it, since withholding withdrew it whether or not a copy is here to delete.
+/// cut, as the watch cuts them. A run that finds something withheld and no bundle published
+/// rebuilds it, since withholding withdrew it whether or not a copy is here to delete.
 fn start_serving(state: &Arc<AppState>, handle: &Arc<WarehouseHandle>) {
     let state = Arc::clone(state);
     let handle = Arc::clone(handle);
@@ -6751,6 +6751,9 @@ mod tests {
             .map(|served| (served.hash, served.state)).collect();
         assert!(matches!(states[&stored], ServedWithholdingState::DeletionOwed));
         assert!(matches!(states[&gone], ServedWithholdingState::Deleted));
+
+        drop(_scope);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Letting a warehouse go forgets its cached packs. Once it is not live, another process may
