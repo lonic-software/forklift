@@ -1339,8 +1339,8 @@ mod tests {
     /// staged work lets go, the deletion takes the recipe and its own chunk, though the head still
     /// names the file, and keeps the shared one.
     ///
-    /// Revert: judge the chunks by the applied redactions alone → nothing is a candidate; leave
-    /// the withheld record out of the deletion → the recipe stays.
+    /// Revert: refuse a recipe's hash in the takedown → it fails; leave the withheld record out of
+    /// the deletion's targets → the recipe stays.
     #[test]
     fn a_withheld_recipes_own_chunks_are_served_as_absent_then_deleted() {
         let _scratch = Scratch::new("withheld-recipe");
