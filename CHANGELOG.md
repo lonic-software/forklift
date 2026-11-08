@@ -117,8 +117,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   When a `lower` or `clone` cannot finish this, it warns `redactions_unsettled` and names
   `forklift redact apply`. A `clone` or `lower` of history naming such content no longer fails
   with `content_redacted`: it never asks for the content, and applies the redaction before writing
-  the pallet's head. A `lower` that then fails, or whose metadata did not lower, keeps the copies
-  and warns; the next one that goes through, or `redact apply`, deletes them.
+  the pallet's head. A `lower` or `clone` that then fails, or a `lower` whose metadata did not
+  lower, keeps the copies and warns; the next one that goes through, or `redact apply`, deletes
+  them.
 - **The AWS head applies redactions.** A redaction that no pallet head, deleted pallet's tombstone
   or metadata history names applies on the AWS head when a request names its content, or after a
   lift or pallet deletion. The head then refuses that content as `content_redacted` on object

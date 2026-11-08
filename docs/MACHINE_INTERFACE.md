@@ -1005,9 +1005,10 @@ Example session:
   delete the copies of applied content, writes a `redactions_unsettled` warning to the same channel;
   `message` names the cause and `next_step` names `forklift redact apply`, which finishes either.
   The command's own result stands and its exit code is unchanged. Both apply what the remote
-  reports applied before writing a pallet's head, since the history they take may name content
-  they never fetched; a `lower` that then fails, or whose meta pallet failed or conflicted, deletes
-  no copies and warns with this code, naming the redactions it applied.
+  reports applied before writing a pallet's head, and do not fetch that content: a `lower` leaves
+  out only what it applied, and a `clone` that could not apply one is refused with
+  `content_redacted`. A `lower` or `clone` that then fails, or a `lower` whose meta pallet failed
+  or conflicted, deletes no copies and warns with this code, naming the redactions it applied.
 * The same stderr channel also carries a maintenance warning, in the same shape:
   `{ "lonic_json": 1, "tool": "forklift", "warning": "maintenance_unavailable", "message": "…", "next_step":
   "Resolve the reported cause; …" }`. It means background auto-maintenance could not even decide
