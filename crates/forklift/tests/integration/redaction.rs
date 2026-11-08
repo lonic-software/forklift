@@ -2378,3 +2378,39 @@ fn a_cache_reads_content_its_remote_applied_a_redaction_of_as_redacted() {
     assert!(refused["message"].as_str().unwrap().contains("its content has been removed for good"), "{}", refused);
     assert!(!fresh.holds_loose(&behind.hash));
 }
+
+/// A sparse clone fetches the ignore files above its scope, which are in every scope: one that
+/// history names with content the remote applied a redaction of is left out as an in-scope file
+/// is, and the clone applies the redaction and goes through. Revert: ask for every ignore file on
+/// the walk's spine regardless → the remote refuses it and the clone fails as redacted.
+#[test]
+fn a_sparse_clone_takes_history_naming_an_applied_ignore_file_above_its_scope() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-spine-server-{}", std::process::id())));
+    let content = b"TOKEN=hunter2\n";
+
+    let owner = Warehouse::cloned("spine-owner", &server.url);
+    owner.stack("src/keep.txt", b"keep\n", "keep");
+    owner.run_ok(&["lift"]);
+
+    let behind = Warehouse::cloned("spine-behind", &server.url);
+    behind.leaked(".gitignore", content);
+    let hash = owner.redact_loaded(".gitignore", content, "leaked token");
+    owner.run_ok(&["lift"]);
+    behind.run_ok(&["lower"]);
+    behind.run_ok(&["lift"]);
+
+    let empty = Warehouse::empty("spine-fresh");
+    let cloned = forklift_command()
+        .args(["--json", "clone", &server.url, empty.root.to_str().unwrap(), "--only", "src"])
+        .env("FORKLIFT_GLOBAL_CONFIG", empty.home.join("global-config.toml"))
+        .env("FORKLIFT_KEYS_DIR", empty.home.join("keys"))
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&cloned.stdout)
+        .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&cloned.stderr)));
+    assert_eq!(report["ok"], true, "{}", report);
+    assert_eq!(report["data"]["redactions"]["applied"], serde_json::json!([hash]), "{}", report);
+    assert_eq!(empty.head("main"), server.main());
+    assert!(!empty.holds_loose(&hash));
+}
