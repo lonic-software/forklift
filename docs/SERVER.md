@@ -336,10 +336,11 @@ revocation by more than about a day.
   checkout's parked, consolidating, cherry-picked or staged work still names, is kept (the
   handshake says `deletion_owed`); a pallet head or a checkout's base naming the file keeps
   nothing, and the handshake says `deleted` once no copy is left. A takedown added while the root is not served is carried out
-  when it is next served. Not yet: a chunked file this server holds cannot be withheld (its
-  chunks would still be served), and if a hash withheld before it arrived turns out to be a
-  chunked file's, its chunks are still taken and served; and there is no command to lift a
-  takedown.
+  when it is next served. A chunked file is withheld by its hash as well: until its copy is
+  deleted, a chunk only that file names is served as absent (`404`, left out of a batch, listed
+  missing), and a chunk another file shares is served as before; the deletion takes the file's
+  own chunks with it. Not yet: if a hash withheld before it arrived turns out to be a chunked
+  file's, its chunks are still taken and served; and there is no command to lift a takedown.
 - **Redactions:** after every pallet update or deletion, the server applies each redaction
   recorded on `@redactions` that no pallet head, tombstone or metadata history it holds still
   names. One a tombstone holds applies at the first pallet update after `forklift-server

@@ -244,7 +244,10 @@ an applied redaction's content. A hash both redacted and withheld is answered `4
 **Withheld content is still named.** Pallet heads may keep naming a withheld file, and a lift may
 name it without uploading it: `missing` never lists a withheld hash, `upload-targets` answers it in
 `withheld`, and a ref update tolerates its absence wherever a file names it, moved or copied
-included. Only a file's content is tolerated so; a tree, parcel or recipe is never withheld.
+included. Only a file's content is tolerated so, a chunked file's recipe among it; a tree, parcel
+or chunk is never withheld. A withheld recipe's chunks are not refused by hash, since other content
+may share them: until its deletion is done, forklift-server serves a chunk that only withheld or
+redacted recipes name as absent, as it does for an applied redaction (below).
 
 **Applied redactions are refused.** Once a head has applied a redaction, `GET` and `PUT` of
 `/v1/objects/{hash}` for its hash answer `410` with `code` `content_redacted` and the hash in

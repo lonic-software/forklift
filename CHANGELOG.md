@@ -113,9 +113,11 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   list. Within seconds the running server cuts a bundle download already under way, deletes its
   stored copy unless metadata history, the history the trust anchor adopted, or a checkout's
   unfinished work still names it, and rebuilds the bundle when `--rebuild-after-lifts` is set; one
-  withheld while nothing serves the root is carried out when it is next served. A chunked file
-  cannot be withheld yet. A command that needs the content from that remote fails with the new
-  `content_withheld` code (exit 51), and the `--json` schema is now 31.
+  withheld while nothing serves the root is carried out when it is next served. A chunked file is
+  withheld by its hash too: until its copy is deleted, the server serves a chunk only that file
+  names as absent, and one another file shares as before. A command that needs the content from
+  that remote fails with the new `content_withheld` code (exit 51), and the `--json` schema is now
+  31.
 
 - **forklift-server applies redactions, and the `--json` schema is now 28.** Part of content
   redaction: after each lift or pallet deletion, the server applies every recorded redaction that

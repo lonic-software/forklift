@@ -150,7 +150,7 @@ enum Command {
 #[derive(Subcommand)]
 enum WithholdAction {
     /// Withhold a file's content, by its object hash, with a statement saying why. Withholding a
-    /// hash again replaces its statement. A chunked file cannot be withheld yet
+    /// hash again replaces its statement
     Add {
         /// The warehouse root to change
         #[arg(long)]
