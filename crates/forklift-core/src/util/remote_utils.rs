@@ -3281,9 +3281,9 @@ impl RemoteClient {
     /// The files a walk leaves out (see [`Self::skip_files`]): those set, and with `applied`, the
     /// content of every redaction this warehouse applied. When the record of applied redactions
     /// cannot be read, the walk is refused: asking for what it meets would take back content
-    /// removed here on purpose from a remote that has not removed it. A meta history's walk takes no `applied`: no meta cell may name an applied
-    /// hash, so a served chain naming one must reach the ref gate that refuses it whole, rather than
-    /// be taken with the cell's blob left out.
+    /// removed here on purpose from a remote that has not removed it. A meta history's walk takes
+    /// no `applied`: no meta cell may name an applied hash, so a served chain naming one must reach
+    /// the ref gate that refuses it whole, rather than be taken with the cell's blob left out.
     fn skip_set(&self, applied: bool) -> Result<std::sync::Arc<HashSet<String>>, String> {
         let set = self.skip_files.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
 
