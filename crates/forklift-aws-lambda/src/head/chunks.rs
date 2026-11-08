@@ -11,8 +11,8 @@
 //! the same transaction as the redaction item that learns its content is a recipe. Each entry
 //! runs through three states:
 //!
-//! 1. `owed`: its chunks have not been deleted yet. Until its first round settles, every chunk of
-//!    it is withheld from serving.
+//! 1. `owed`: its chunks have not been deleted yet. Until a round deletes them, every chunk of it
+//!    is withheld from serving, also after a round whose deletes S3 refused.
 //! 2. `late`: a round deleted its chunks. One more round, due once every presigned upload of the
 //!    content has expired, deletes any chunk such an upload landed after the first.
 //! 3. `recipe_deleting`: its chunks are done; the recipe object itself goes, with no fence and no
