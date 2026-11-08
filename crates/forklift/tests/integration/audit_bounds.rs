@@ -19,6 +19,7 @@ use std::process::Output;
 use forklift_core::globals::StorageRootScope;
 use forklift_core::util::{
     audit_utils, file_utils, graph_utils, object_utils, office_utils, pallet_utils, sealed_utils, tree_utils,
+    withholding,
 };
 use forklift_core::util::scope_utils::PathScope;
 use forklift_core::util::audit_utils::SealedTolerance;
@@ -811,16 +812,16 @@ fn subtree(head: &str, path: &str) -> String {
 /// The audit as `forklift audit` runs it, against the warehouse's sealed record. Returns how many
 /// absent objects the record held.
 fn audit(head: &str, scope: &PathScope, full: bool) -> Result<usize, String> {
-    audit_counting(head, scope, full).map(|(held, _)| held)
+    audit_counting(head, scope, full).map(|(held, ..)| held)
 }
 
-/// [`audit`], returning how many absent objects the record held and how many an applied
-/// redaction did, apart.
-fn audit_counting(head: &str, scope: &PathScope, full: bool) -> Result<(usize, usize), String> {
+/// [`audit`], returning how many absent objects the record held, how many an applied redaction
+/// did and how many the host's withholding did, apart.
+fn audit_counting(head: &str, scope: &PathScope, full: bool) -> Result<(usize, usize, usize), String> {
     let tolerated = sealed_utils::read_tolerated()?;
     let tolerance = SealedTolerance::new(&tolerated);
     audit_utils::verify_parcel_closure_scoped(head, None, scope, full, Some(&tolerance))?;
-    Ok((tolerance.held(), tolerance.redacted()))
+    Ok((tolerance.held(), tolerance.redacted(), tolerance.withheld()))
 }
 
 /// The blob (or recipe) a file path names in a parcel's root tree.
@@ -887,9 +888,53 @@ fn audit_tolerates_an_applied_absence_and_counts_it_apart() {
         assert!(err.contains(&c), "{}", err);
 
         warehouse.seal(&[&b, &c]);
-        assert_eq!(audit_counting(&head, &full, false).unwrap(), (1, 2), "c held; a and b redacted");
-        assert_eq!(audit_counting(&head, &full, true).unwrap(), (1, 2), "audit --full tolerates it too");
+        assert_eq!(audit_counting(&head, &full, false).unwrap(), (1, 2, 0), "c held; a and b redacted");
+        assert_eq!(audit_counting(&head, &full, true).unwrap(), (1, 2, 0), "audit --full tolerates it too");
     });
+}
+
+/// An absent file the host withholds is tolerated with no sealed record, and counted apart from
+/// what the record holds and what a redaction applied here does; one a redaction names as well is
+/// counted as redacted, and one the record names as well as withheld. An absence none names is
+/// still a loss.
+///
+/// Revert: leave a withheld absence untallied, or tally it as held → `withheld` miscounts → red.
+#[test]
+fn audit_tolerates_a_withheld_absence_and_counts_it_apart() {
+    let warehouse = Warehouse::new("withheld-blob");
+    let head = warehouse.stack_files(&[("a.txt", "a\n"), ("b.txt", "b\n"), ("c.txt", "c\n"), ("d.txt", "d\n"),
+                                       ("e.txt", "e\n")], "K");
+
+    warehouse.scoped(|| {
+        let full = PathScope::full();
+        let [a, b, c, d, e] = ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"].map(|path| file_hash(&head, path));
+        for hash in [&a, &b, &c] {
+            withholding::withhold(hash, "Withheld on a court order.").unwrap();
+        }
+        for hash in [&a, &b, &c, &d, &e] {
+            warehouse.delete_object(hash);
+        }
+        warehouse.apply(&[&a]);
+        warehouse.seal(&[&c, &d]);
+
+        let err = audit(&head, &full, false).expect_err("an absence none names is a loss");
+        assert!(err.contains(&e), "{}", err);
+
+        warehouse.seal(&[&c, &d, &e]);
+        assert_eq!(audit_counting(&head, &full, false).unwrap(), (2, 1, 2),
+            "d and e held; a redacted; b and c withheld");
+        assert_eq!(audit_counting(&head, &full, true).unwrap(), (2, 1, 2), "audit --full tolerates it too");
+    });
+
+    let json = warehouse.run_ok(&["audit", "--full", "--json"]);
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let scope = &report["data"]["scope"];
+    assert_eq!((&scope["held_by_hash"], &scope["redacted"], &scope["withheld"]), (&2.into(), &1.into(), &2.into()),
+        "the --json envelope counts each apart: {}", report);
+
+    let human = warehouse.run_ok(&["audit", "--full"]);
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(human_stdout.contains("2 absent object(s) are withheld"), "{}", human_stdout);
 }
 
 /// A recorded object that is present seals nothing: audit walks it as any other tree, so an

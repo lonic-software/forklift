@@ -2073,20 +2073,21 @@ struct ClosureSeams<'a> {
     chunks_missing: &'a dyn Fn(&[String]) -> Result<Vec<String>, String>,
     load_recipe_chunks: &'a dyn Fn(&str) -> Result<Vec<String>, String>,
     load_base_tree: &'a dyn Fn(&str) -> Result<TreeItem, String>,
-    /// The sealed-by-hash record and the applied redactions, for the audit and the client's ref
-    /// gate, or the applied redactions alone for either remote's push gate; `None` for a walk that
+    /// The sealed-by-hash record, the applied redactions and the withheld content, for the audit
+    /// and the client's ref gate, or the last two alone for either remote's push gate; `None` for a walk that
     /// tolerates no absence.
     sealed: Option<&'a SealedTolerance<'a>>,
 }
 
-/// The sealed-by-hash record and the applied redactions a walk holds absences against, and the
-/// absent objects it held by each, kept apart. The audit and the client's ref gate pass one, and
+/// The sealed-by-hash record, the applied redactions and the withheld content a walk holds
+/// absences against, and the absent objects it held by each, kept apart. The audit and the client's ref gate pass one, and
 /// either remote's push gate passes the applied redactions alone: a remote must hold the whole
 /// closure of every head it accepts but for the content it redacted.
 pub struct SealedTolerance<'a> {
     tolerated: &'a Tolerated,
     held: RefCell<HashSet<String>>,
     redacted: RefCell<HashSet<String>>,
+    withheld: RefCell<HashSet<String>>,
 }
 
 impl<'a> SealedTolerance<'a> {
@@ -2095,6 +2096,7 @@ impl<'a> SealedTolerance<'a> {
             tolerated,
             held: RefCell::new(HashSet::new()),
             redacted: RefCell::new(HashSet::new()),
+            withheld: RefCell::new(HashSet::new()),
         }
     }
 
@@ -2109,6 +2111,12 @@ impl<'a> SealedTolerance<'a> {
         self.redacted.borrow().len()
     }
 
+    /// How many distinct absent objects the walk held because this warehouse's host withholds
+    /// them and no redaction applied here names them.
+    pub fn withheld(&self) -> usize {
+        self.withheld.borrow().len()
+    }
+
     fn is_empty(&self) -> bool {
         self.tolerated.is_empty()
     }
@@ -2121,15 +2129,13 @@ impl<'a> SealedTolerance<'a> {
     }
 
     /// Whether the absent object `hash`, met `at`, is held, by the record, or by an applied
-    /// redaction or a withholding (a file's content only), tallying it under the record or the
-    /// redaction that holds it if so; withheld content is not tallied. Call only at an absence: a
-    /// held object that is present
-    /// is held by nothing.
+    /// redaction or a withholding (a file's content only), tallying it under whichever holds it if
+    /// so. Call only at an absence: a held object that is present is held by nothing.
     fn holds_absent(&self, hash: &str, at: At) -> bool {
         match self.tolerated.held(hash, at) {
             Some(Held::Sealed) => self.held.borrow_mut().insert(hash.to_string()),
             Some(Held::Redacted) => self.redacted.borrow_mut().insert(hash.to_string()),
-            Some(Held::Withheld) => true,
+            Some(Held::Withheld) => self.withheld.borrow_mut().insert(hash.to_string()),
             None => return false,
         };
         true

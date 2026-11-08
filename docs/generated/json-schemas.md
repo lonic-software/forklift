@@ -54,7 +54,7 @@ A command not listed here either reports only the generic human-message shape `{
           "type": "integer"
         },
         "in_scope_content": {
-          "description": "In-scope content: every tree was re-hashed on read and every blob confirmed present, except\nthe absent objects counted in `held_by_hash` and in `redacted`.",
+          "description": "In-scope content: every tree was re-hashed on read and every blob confirmed present, except\nthe absent objects counted in `held_by_hash`, `redacted` and `withheld`.",
           "type": "string"
         },
         "out_of_scope_content": {
@@ -79,6 +79,12 @@ A command not listed here either reports only the generic human-message shape `{
         "signatures": {
           "description": "Signatures — the office chain and every parcel — are verified in full regardless of\nscope (parcels and their sidecars are always fully present).",
           "type": "string"
+        },
+        "withheld": {
+          "description": "How many absent objects are absent because this warehouse's host withholds them (as\n`forklift-server withhold` records) and no redaction applied here names them: their\nabsence is accounted for, not damage, and fails nothing. Nothing beneath them was checked.\nOmitted when none.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [

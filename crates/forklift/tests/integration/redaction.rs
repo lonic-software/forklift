@@ -1863,11 +1863,12 @@ fn a_lift_sends_no_chunk_of_a_file_the_server_applied_a_redaction_of() {
 }
 
 /// While forklift-server owes the deletion of a chunked file's redaction, it serves the chunks only
-/// that file named as absent, by hash, in a batch and as missing, and the handshake reports
-/// the deletion owed; a chunk another file names is still served. Once the deletion runs, the
-/// handshake reports it deleted.
+/// that file named as absent, by hash, in a batch, as missing and to upload-targets, and the
+/// handshake reports the deletion owed; a chunk another file names is still served. Once the
+/// deletion runs, the handshake reports it deleted.
 ///
-/// Revert: serve a redacted recipe's chunks by hash → the GET of one answers 200.
+/// Revert: serve a redacted recipe's chunks by hash → the GET of one answers 200; answer one
+/// present to upload-targets → `direct` is empty.
 #[test]
 fn a_server_owing_a_deletion_serves_the_chunks_only_its_recipe_names_as_absent() {
     let server = Server::start(&std::env::temp_dir()
@@ -1969,6 +1970,13 @@ fn a_server_owing_a_deletion_serves_the_chunks_only_its_recipe_names_as_absent()
         let missing: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(missing["missing"], serde_json::json!([own[0]]), "{}", body);
 
+        // And upload-targets answers it to be uploaded, as missing does.
+        let (status, body) = http(&server.url, "POST", "/v1/objects/upload-targets",
+                                  serde_json::json!({ "session": "s", "hashes": asked }).to_string().as_bytes());
+        assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, body);
+        let targets: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!((&targets["direct"], &targets["present"]), (&serde_json::json!([own[0]]), &serde_json::json!([shared[0]])),
+            "{}", body);
     }
 
     // A ref write asks for a round, which deletes the content now the store is free.
@@ -2765,7 +2773,8 @@ fn a_served_root_deletes_a_withheld_copy_and_rebuilds_its_bundle() {
 /// recipe and its own chunks, and keeps the shared ones.
 ///
 /// Revert: judge the chunks by the applied redactions alone on `GET` → the own chunk is a `200`;
-/// refuse a recipe's hash → the takedown fails.
+/// refuse a recipe's hash → the takedown fails; judge the chunks by the applied redactions alone
+/// on upload-targets → the own chunk is answered present.
 #[test]
 fn a_served_root_withholds_a_chunked_file_and_the_chunks_only_it_names() {
     let server = Server::start(&std::env::temp_dir()
@@ -2868,6 +2877,14 @@ fn a_served_root_withholds_a_chunked_file_and_the_chunks_only_it_names() {
         assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, body);
         let missing: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(missing["missing"], serde_json::json!([own[0]]), "{}", body);
+
+        // Upload-targets answers the own chunk to be uploaded, as missing does, and the recipe
+        // as withheld.
+        let (status, body) = ask("POST", "/v1/objects/upload-targets", serde_json::json!({ "session": "s", "hashes": asked }).to_string().as_bytes());
+        assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, body);
+        let targets: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!((&targets["direct"], &targets["present"], &targets["withheld"]),
+                   (&serde_json::json!([own[0]]), &serde_json::json!([shared[0]]), &serde_json::json!([recipe])), "{}", body);
     }
 
     // A ref write asks for a round, which deletes the content now the store is free.
