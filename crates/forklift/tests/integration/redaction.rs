@@ -2065,9 +2065,11 @@ fn a_lower_applies_what_the_remote_reports_applied_and_deletes_the_copy_here() {
 }
 
 /// `redact apply` in a warehouse with a remote reads the remote's handshake, and applies on its
-/// report; a remote it cannot reach leaves a clean redaction pending, and the list says why.
+/// report; a remote it cannot reach leaves a clean redaction pending, and the list says why. A
+/// fresh clone applies on the report too.
 ///
-/// Revert: apply with no report in `redact apply` → the reachable case stays pending.
+/// Revert: apply with no report in `redact apply` → the reachable case stays pending. Revert:
+/// drop the apply in clone → the clone reports nothing applied.
 #[test]
 fn redact_apply_reads_the_remote_s_report_and_says_when_it_cannot() {
     let server = Server::start(&std::env::temp_dir()
@@ -2097,4 +2099,16 @@ fn redact_apply_reads_the_remote_s_report_and_says_when_it_cannot() {
     assert_eq!(applied["data"].get("remote_unread"), None, "{}", applied);
     assert_eq!(applied["data"]["redactions"][0]["status"]["state"], "applied", "{}", applied);
     assert_eq!(applied_record(&owner), format!("/forklift-redactions-applied 1\n{}\n", hash));
+
+    // A fresh clone applies it as it takes the remote's warehouse.
+    let empty = Warehouse::empty("report-clone");
+    let cloned = forklift_command()
+        .args(["--json", "clone", &server.url, empty.root.to_str().unwrap()])
+        .env("FORKLIFT_GLOBAL_CONFIG", empty.home.join("global-config.toml"))
+        .env("FORKLIFT_KEYS_DIR", empty.home.join("keys"))
+        .output()
+        .unwrap();
+    let cloned: serde_json::Value = serde_json::from_slice(&cloned.stdout).unwrap();
+    assert_eq!(cloned["data"]["redactions"]["applied"], serde_json::json!([hash]), "{}", cloned);
+    assert_eq!(applied_record(&empty), format!("/forklift-redactions-applied 1\n{}\n", hash));
 }
