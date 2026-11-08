@@ -1584,3 +1584,58 @@ fn an_export_without_a_remote_asks_nothing_and_counts_parked_work() {
     assert!(!failed.status.success(), "{}", stdout(&failed));
     assert!(!area.path("out-failed").exists());
 }
+
+/// A mirror run after this warehouse applied a redaction leaves the file out of every commit it
+/// writes, and names it with the parcels whose commits left it out. That holds for a commit built
+/// on one an earlier run wrote while the file was there: a folder git already holds with the file
+/// is not reused. The earlier commit keeps it, as nothing rewrites what was pushed.
+///
+/// Revert: reuse a seeded commit's tree with no check for redacted content → the change's commit
+/// holds `other/secret.env` and the report names nothing.
+#[test]
+fn a_mirror_leaves_out_a_file_whose_redaction_is_applied_even_under_a_reused_folder() {
+    let fixture = Fixture::new("redacted");
+    let area = &fixture.area;
+
+    area.stack("a", "other/secret.env", "TOKEN=hunter2\n", "leak");
+    let leak = area.lift("a")["head"].as_str().unwrap().to_string();
+    let leaked = tip(&fixture.git, "main").unwrap();
+    assert!(git_ok(&fixture.git, &["ls-tree", "-r", "--name-only", &leaked]).contains("other/secret.env"));
+
+    // Lifted without mirroring: the change still carries the file, in a folder it did not touch.
+    area.forklift_ok("a", &["config", "set", "mirror.auto", "off"]);
+    area.stack("a", "code.txt", "v2\n", "change");
+    let change = std::fs::read_to_string(area.path("a/.forklift/pallets/main")).unwrap().trim().to_string();
+    std::fs::remove_file(area.path("a/other/secret.env")).unwrap();
+    area.forklift_ok("a", &["load", "."]);
+    area.forklift_ok("a", &["stack", "-m", "take the leak out"]);
+    area.lift("a");
+
+    let recorded = area.json("a", &["redact", "record", &format!("{}:other/secret.env", leak), "-m", "leaked token"]);
+    let hash = recorded["hash"].as_str().unwrap().to_string();
+    area.lift("a");
+    // The server settles the apply after it answers the write, so its report may lag the lift.
+    let mut state = serde_json::Value::Null;
+    for _ in 0..500 {
+        area.forklift("a", &["redact", "apply"]);
+        state = area.json("a", &["redact", "list"])["redactions"][0]["status"]["state"].clone();
+        if state == "applied" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(state, "applied");
+
+    let mirrored = area.json("a", &["git", "mirror"]);
+    let main = outcome(&mirrored, "main");
+    assert_eq!(main["status"], "pushed", "{}", mirrored);
+    assert_eq!(main["exported"], 2, "{}", mirrored);
+    let tip_commit = tip(&fixture.git, "main").unwrap();
+    let change_commit = git_ok(&fixture.git, &["rev-parse", &format!("{}^", tip_commit)]);
+    assert_eq!(last_line(&fixture.git, &change_commit), parcel_line(&change));
+    assert_eq!(main["redacted"], serde_json::json!([
+        { "path": "other/secret.env", "hash": hash, "parcels": [change] }
+    ]), "{}", mirrored);
+    assert_eq!(git_ok(&fixture.git, &["ls-tree", "-r", "--name-only", &change_commit]), "code.txt");
+    assert_eq!(git_ok(&fixture.git, &["rev-parse", &format!("{}^", change_commit)]), leaked);
+}
