@@ -197,8 +197,8 @@ A `forklift-server` remote applies a redaction once none of its pallet heads nam
 and from then on refuses that content with this code; the message names the object. A `lift` of
 history that names the content leaves it out, since the remote no longer takes it. When the remote
 applied the redaction while the lift was running, the upload is refused: run `forklift lift` again.
-A `clone` or `lower` that must fetch history naming the content is refused too, and this build
-has no way around that yet: keep working in a warehouse that already holds that history.
+A `clone` or `lower` that takes history naming the content never asks the remote for it: it
+applies the redaction here before writing the pallet's head, so the history lands without it.
 
 Once this warehouse has applied a redaction, it never takes back history naming that content, not
 even a head or metadata history the remote serves. This happens when the redaction was applied

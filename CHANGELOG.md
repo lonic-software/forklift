@@ -106,8 +106,7 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   lifts of history that names it without the content; `lift` no longer uploads it, nor a chunked
   file's chunks that only it names. Its handshake
   reports each redaction as pending or applied, and a warehouse takes a head the server serves over
-  a redaction only while the server reports it pending. A fresh `clone` or a `lower` that must
-  fetch history naming the content is refused with `content_redacted` for now. The AWS head
+  a redaction only while the server reports it pending. The AWS head
   refuses a lift naming content `@redactions` records, as `content_redacted`.
 - **A warehouse applies a redaction once its remote has, and the `--json` schema is now 29.**
   `lower` and `clone` read which redactions the remote reports applied and, for each one nothing
@@ -116,8 +115,11 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   first, and says when it cannot reach it. A command that applied a redaction also names the git
   mirror (`.forklift/mirror.git`), whose copy exported before the redaction nothing here deletes.
   When a `lower` or `clone` cannot finish this, it warns `redactions_unsettled` and names
-  `forklift redact apply`; a `lower` whose metadata did not lower applies nothing, and the next one
-  that goes through does.
+  `forklift redact apply`. A `clone` or `lower` of history naming such content no longer fails
+  with `content_redacted`: it never asks for the content, and applies the redaction before writing
+  the pallet's head. A `lower` or `clone` that then fails, or a `lower` whose metadata did not
+  lower, keeps the copies and warns; the next one that goes through, or `redact apply`, deletes
+  them.
 - **The AWS head applies redactions.** A redaction that no pallet head, deleted pallet's tombstone
   or metadata history names applies on the AWS head when a request names its content, or after a
   lift or pallet deletion. The head then refuses that content as `content_redacted` on object

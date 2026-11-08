@@ -94,7 +94,8 @@ report while some redaction is not applied yet; when it cannot read it, its list
 `remote_unread` with the reason, and every redaction waiting for the remote stays pending. `redact
 record` and `redact apply` carry `mirror_copy` when they applied a redaction. The
 `redactions_unsettled` warning says a lower or clone could not apply on the remote's report or
-delete the copies, and names `forklift redact apply`.
+delete the copies, or applied and then did not go through, and names `forklift redact apply`. Both
+take history naming content the remote reports applied without fetching that content.
 
 **Schema 28**: a `forklift-server` remote applies redactions. `content_redacted`
 (exit 49) is also returned by `clone`, `lower` and `lift` when the remote refuses content whose
@@ -1003,9 +1004,11 @@ Example session:
 * A `lower` or `clone` that could not apply the redactions its remote reports applied, or could not
   delete the copies of applied content, writes a `redactions_unsettled` warning to the same channel;
   `message` names the cause and `next_step` names `forklift redact apply`, which finishes either.
-  The command's own result stands and its exit code is unchanged. A `lower` whose meta pallet
-  failed or conflicted applies nothing on the report, without a warning: the next `lower` that goes
-  through, or `redact apply`, does.
+  The command's own result stands and its exit code is unchanged. Both apply what the remote
+  reports applied before writing a pallet's head, and do not fetch that content: a `lower` leaves
+  out only what it applied, and a `clone` that could not apply one is refused with
+  `content_redacted`. A `lower` or `clone` that then fails, or a `lower` whose meta pallet failed
+  or conflicted, deletes no copies and warns with this code, naming the redactions it applied.
 * The same stderr channel also carries a maintenance warning, in the same shape:
   `{ "lonic_json": 1, "tool": "forklift", "warning": "maintenance_unavailable", "message": "…", "next_step":
   "Resolve the reported cause; …" }`. It means background auto-maintenance could not even decide

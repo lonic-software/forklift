@@ -231,8 +231,9 @@ rather than landing history without it. No lift naming that object lands there a
 A ref update tolerates the absence of an applied redaction's content where the closure it checks
 names it as a file's content, never as a tree or a chunk, so a client lifting history that names
 the content does not upload it: it offers no file entry naming content the handshake reports
-applied, and does not descend such a recipe. A client that must fetch such content (a clone or
-`lower` of history that names it) is refused with `content_redacted`.
+applied, and does not descend such a recipe. A client fetching history that names such content
+(a clone or `lower`) does not ask for it either, and before writing the pallet's head applies the
+redaction from its own `@redactions` cell, so its own ref write tolerates the absence the same way.
 
 **Pallet reference form.** Keys in `pallets` (and the `{name}` of the ref-update
 endpoint) are *qualified references*: a user pallet is bare (`main`), a **meta pallet** —

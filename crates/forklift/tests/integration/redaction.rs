@@ -1589,19 +1589,6 @@ fn a_server_applies_a_redaction_no_head_names_and_refuses_its_content() {
     behind.run_ok(&["lower"]);
     behind.run_ok(&["lift"]);
     assert_eq!(server.main(), behind.head("main"));
-
-    // Until the server serves the redaction's absence, a fresh clone that must fetch the content
-    // is refused as redacted: loud, never a quiet gap.
-    let empty = Warehouse::empty("served-clone");
-    let cloned = forklift_command()
-        .args(["clone", &server.url, empty.root.to_str().unwrap()])
-        .env("FORKLIFT_GLOBAL_CONFIG", empty.home.join("global-config.toml"))
-        .env("FORKLIFT_KEYS_DIR", empty.home.join("keys"))
-        .output()
-        .unwrap();
-    assert!(!cloned.status.success());
-    assert!(String::from_utf8_lossy(&cloned.stderr).contains(&format!("Object {} is redacted", hash)),
-            "{}", String::from_utf8_lossy(&cloned.stderr));
 }
 
 /// Content forklift-server holds is deleted once a redaction of it applies: the server drains the
@@ -2122,4 +2109,168 @@ fn redact_apply_reads_the_remote_s_report_and_says_when_it_cannot() {
     let cloned: serde_json::Value = serde_json::from_slice(&cloned.stdout).unwrap();
     assert_eq!(cloned["data"]["redactions"]["applied"], serde_json::json!([hash]), "{}", cloned);
     assert_eq!(applied_record(&empty), format!("/forklift-redactions-applied 1\n{}\n", hash));
+}
+
+/// A lower into a warehouse that never held the content, and a fresh clone, take history naming
+/// content the remote reports applied without fetching it: each applies the redaction on the
+/// remote's report before it writes the pallet's head, whose history check then holds the absence
+/// as redacted. Neither holds a copy, and each lands on the remote's head.
+///
+/// Revert: fetch every file the history names, whatever the remote reports applied → the remote
+/// refuses the content and the lower fails as redacted. Revert: apply only once the pallet has
+/// landed → the head write finds the history incomplete.
+#[test]
+fn a_lower_and_a_clone_take_history_naming_applied_content_without_it() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-absent-server-{}", std::process::id())));
+    let content = b"TOKEN=hunter2\n";
+
+    let owner = Warehouse::cloned("absent-owner", &server.url);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+
+    // Cloned before the leak goes up, so it never holds the content.
+    let late = Warehouse::cloned("absent-late", &server.url);
+
+    // Its history names the leak; the redaction goes up first, so the server applies it at once
+    // and takes that history without the content.
+    let behind = Warehouse::cloned("absent-behind", &server.url);
+    behind.leaked("secret.env", content);
+    let hash = owner.redact_loaded("secret.env", content, "leaked token");
+    owner.run_ok(&["lift"]);
+    behind.run_ok(&["lower"]);
+    behind.run_ok(&["lift"]);
+    let (_, info) = http(&server.url, "GET", "/v1/warehouse", b"");
+    let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+    assert_eq!(info["redactions"], serde_json::json!([{ "hash": hash, "state": "deleted" }]), "{}", info);
+
+    let lowered = late.json(&["lower"]);
+    assert_eq!(lowered["ok"], true, "{}", lowered);
+    assert_eq!(lowered["data"]["redactions"]["applied"], serde_json::json!([hash]), "{}", lowered);
+    assert_eq!(late.head("main"), server.main());
+    assert!(!late.holds_loose(&hash));
+    assert_eq!(applied_record(&late), format!("/forklift-redactions-applied 1\n{}\n", hash));
+
+    let empty = Warehouse::empty("absent-clone");
+    let cloned = forklift_command()
+        .args(["--json", "clone", &server.url, empty.root.to_str().unwrap()])
+        .env("FORKLIFT_GLOBAL_CONFIG", empty.home.join("global-config.toml"))
+        .env("FORKLIFT_KEYS_DIR", empty.home.join("keys"))
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&cloned.stdout)
+        .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&cloned.stderr)));
+    assert_eq!(report["ok"], true, "{}", report);
+    assert_eq!(report["data"]["redactions"]["applied"], serde_json::json!([hash]), "{}", report);
+    assert_eq!(empty.head("main"), server.main());
+    assert!(!empty.holds_loose(&hash));
+    assert_eq!(applied_record(&empty), format!("/forklift-redactions-applied 1\n{}\n", hash));
+}
+
+/// A sparse clone and lower walk the in-scope files of every parcel: one named by history in scope,
+/// whose content the remote reports applied, is left out as a full fetch leaves it out. Revert:
+/// the sparse walk asks for every in-scope file regardless, and both are refused as redacted.
+#[test]
+fn a_sparse_clone_and_lower_take_in_scope_history_naming_applied_content_without_it() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-sparse-server-{}", std::process::id())));
+    let content = b"TOKEN=hunter2\n";
+
+    let owner = Warehouse::cloned("sparse-owner", &server.url);
+    owner.stack("src/keep.txt", b"keep\n", "keep");
+    owner.run_ok(&["lift"]);
+
+    let late = Warehouse::cloned_with("sparse-late", &server.url, &["--only", "src"]);
+
+    let behind = Warehouse::cloned("sparse-behind", &server.url);
+    behind.leaked("src/secret.env", content);
+    let hash = owner.redact_loaded("src/secret.env", content, "leaked token");
+    owner.run_ok(&["lift"]);
+    behind.run_ok(&["lower"]);
+    behind.run_ok(&["lift"]);
+
+    let lowered = late.json(&["lower"]);
+    assert_eq!(lowered["ok"], true, "{}", lowered);
+    assert_eq!(lowered["data"]["redactions"]["applied"], serde_json::json!([hash]), "{}", lowered);
+    assert_eq!(late.head("main"), server.main());
+
+    let fresh = Warehouse::cloned_with("sparse-fresh", &server.url, &["--only", "src"]);
+    assert_eq!(fresh.head("main"), server.main());
+    assert!(!fresh.holds_loose(&hash));
+    assert_eq!(applied_record(&fresh), format!("/forklift-redactions-applied 1\n{}\n", hash));
+}
+
+/// A lower applies what the remote reports applied before it writes anything, so one refused
+/// afterwards keeps the redaction applied and warns `redactions_unsettled`, naming it; the next
+/// lower goes through. Revert: dropping the warning on the refused path leaves its stderr silent.
+#[test]
+fn a_lower_refused_after_applying_a_redaction_warns_it_unsettled() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-refused-server-{}", std::process::id())));
+    let content = b"TOKEN=hunter2\n";
+
+    let owner = Warehouse::cloned("refused-owner", &server.url);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+
+    let late = Warehouse::cloned("refused-late", &server.url);
+
+    let behind = Warehouse::cloned("refused-behind", &server.url);
+    behind.leaked("secret.env", content);
+    let _ = std::fs::remove_file(behind.root.join("secret.env"));
+    behind.stack("more.txt", b"more\n", "more");
+    let hash = owner.redact_loaded("secret.env", content, "leaked token");
+    owner.run_ok(&["lift"]);
+    behind.run_ok(&["lower"]);
+    behind.run_ok(&["lift"]);
+
+    // An untracked file in the way of the one the remote's head adds refuses the lower.
+    std::fs::write(late.root.join("more.txt"), b"mine\n").unwrap();
+    let before = late.head("main");
+    let refused = late.run(&["--json", "lower"]);
+    assert!(!refused.status.success(), "{}", String::from_utf8_lossy(&refused.stdout));
+    assert_eq!(late.head("main"), before);
+    let warned = String::from_utf8_lossy(&refused.stderr);
+    assert!(warned.contains("\"redactions_unsettled\"") && warned.contains(&hash), "{}", warned);
+    assert_eq!(applied_record(&late), format!("/forklift-redactions-applied 1\n{}\n", hash));
+
+    std::fs::remove_file(late.root.join("more.txt")).unwrap();
+    let lowered = late.json(&["lower"]);
+    assert_eq!(lowered["ok"], true, "{}", lowered);
+    assert_eq!(late.head("main"), server.main());
+}
+
+/// A first-contact lower fetches the pallet's history before any `@redactions` is here: it leaves
+/// out what the remote reports applied, applies it once the meta pallets are synced, and takes the
+/// head. Revert: fetching every file at first contact, and the lower is refused as redacted.
+#[test]
+fn a_first_contact_lower_takes_history_naming_applied_content_without_it() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-redaction-first-server-{}", std::process::id())));
+    let content = b"TOKEN=hunter2\n";
+
+    // An enrolled office, so a warehouse new to this remote takes its anchor at first contact.
+    let owner = Warehouse::cloned("first-owner", &server.url);
+    owner.run_ok(&["office", "enroll"]);
+    owner.stack("notes.txt", b"notes\n", "notes");
+    let leak = owner.leaked("secret.env", content);
+    let hash = recorded_hash(&owner, &format!("{}:secret.env", leak), "leaked token")["data"]["hash"]
+        .as_str().unwrap().to_string();
+    // The server applies the redaction once `@redactions` lands, refusing the rest of this lift;
+    // the next one leaves the content out.
+    owner.run(&["lift"]);
+    owner.run_ok(&["lift"]);
+    let (_, info) = http(&server.url, "GET", "/v1/warehouse", b"");
+    let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+    assert_eq!(info["redactions"], serde_json::json!([{ "hash": hash, "state": "deleted" }]), "{}", info);
+
+    let fresh = Warehouse::new("first-fresh");
+    fresh.run_ok(&["config", "set", "remote.url", &server.url]);
+    let lowered = fresh.json(&["lower"]);
+    assert_eq!(lowered["ok"], true, "{}", lowered);
+    assert!(lowered["data"]["adopted_genesis"].is_string(), "{}", lowered);
+    assert_eq!(lowered["data"]["redactions"]["applied"], serde_json::json!([hash]), "{}", lowered);
+    assert_eq!(fresh.head("main"), server.main());
+    assert!(!fresh.holds_loose(&hash));
+    assert_eq!(applied_record(&fresh), format!("/forklift-redactions-applied 1\n{}\n", hash));
 }

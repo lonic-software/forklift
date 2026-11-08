@@ -131,6 +131,23 @@ pub(crate) fn absent_read_refusal(hash: &str) -> Result<Option<String>, String> 
     ).into()))
 }
 
+/// The `content_redacted` refusal of a fetch that left out `hash`, the content of a file, because
+/// the remote reports its redaction applied, when this warehouse could not apply it too: the remote
+/// no longer serves the content, so the history cannot be taken here whole. `details` carries the
+/// hash.
+pub fn unapplied_skip_refusal(hash: &str) -> String {
+    crate::error::CoreError::refusal_with_details(
+        crate::error::RefusalCode::ContentRedacted,
+        format!(
+            "The remote no longer serves object {}, as it has applied its redaction, and this \
+            warehouse could not apply that redaction too, so the history naming it cannot be taken.",
+            hash
+        ),
+        "Run \"forklift redact list\" to see the redaction and why it is not applied here.",
+        serde_json::json!({ "hash": hash }),
+    ).into()
+}
+
 /// The [`RefusalCode::ContentRedacted`] refusal a server answers a request for `hash` with, read or
 /// upload, once a redaction it applied names it: whether or not the bytes are deleted yet, they are
 /// never served or taken again.
