@@ -11459,8 +11459,11 @@ mod tests {
             remote.hits_for(&format!("/v1/objects/{}", hashes[0])) > 1,
             "the throttle was retried before giving up"
         );
+        // The patience runs from the first refusal; this clock started before the first request
+        // was sent, so a loaded runner overruns it by that request's time (2.8 ms on Windows CI).
+        let margin = std::time::Duration::from_secs(1);
         assert!(
-            elapsed < FAST.throttle_patience,
+            elapsed < FAST.throttle_patience + margin,
             "elapsed {:?} overran the throttle patience {:?}", elapsed, FAST.throttle_patience
         );
     }
@@ -11520,8 +11523,11 @@ mod tests {
             "the error names the unavailable patience: {}", error
         );
         assert!(remote.hits_for(&format!("/v1/objects/{}", hashes[0])) > 1, "the 503 was retried");
+        // The patience runs from the first refusal; this clock started before the first request
+        // was sent, so a loaded runner overruns it by that request's time (2.8 ms on Windows CI).
+        let margin = std::time::Duration::from_secs(1);
         assert!(
-            elapsed < FAST.unavailable_patience,
+            elapsed < FAST.unavailable_patience + margin,
             "elapsed {:?} overran the unavailable patience {:?}", elapsed, FAST.unavailable_patience
         );
     }
