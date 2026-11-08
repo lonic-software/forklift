@@ -423,10 +423,12 @@ pub fn delete_if_applied<O: ObjectStore + ?Sized, R: RefStore + ?Sized>(
     objects.delete_staged_copy(session, hash)?;
 
     // A recipe is the list its chunks are found by, so it goes only once they are done; a copy
-    // promoted after its deletion is deleted as a blob's is.
+    // promoted after its deletion is deleted as a blob's is. One the ledger has never held, as
+    // when it lands after a redaction that applied without it, is kept for the late sweep, which
+    // journals it; landed after that sweep, it is deleted as a blob's is.
     if stored_type(objects, hash)? == Some(ObjectType::Recipe)
         && !record.recipe_deleted
-        && !super::chunks::recipe_may_go(refs, hash)?
+        && !super::chunks::recipe_may_go(refs, hash, record.deleted)?
     {
         return Ok(AppliedCopies::RecipeKept);
     }

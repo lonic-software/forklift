@@ -368,10 +368,13 @@ pub(super) fn journal<R: RefStore + ?Sized>(refs: &R, hash: &str, applied_at: u6
 /// Whether the applied recipe `hash` may be deleted: its chunks are done, and the ledger has moved
 /// it to `recipe_deleting` or taken it off. A promotion that writes it again then has it deleted,
 /// as a blob's is.
-pub(super) fn recipe_may_go<R: RefStore + ?Sized>(refs: &R, hash: &str) -> Result<bool, String> {
+///
+/// `unjournaled` is the answer when the ledger does not hold it: no round will find its chunks
+/// unless a sweep still to run journals it.
+pub(super) fn recipe_may_go<R: RefStore + ?Sized>(refs: &R, hash: &str, unjournaled: bool) -> Result<bool, String> {
     let (_, ledger) = read_ledger(refs)?;
 
-    Ok(ledger.recipes.get(hash).is_none_or(|journal| journal.state == State::RecipeDeleting))
+    Ok(ledger.recipes.get(hash).map_or(unjournaled, |journal| journal.state == State::RecipeDeleting))
 }
 
 /// Whether a promotion of `hash` must be refused now: a round is running, and `hash` is a chunk of
@@ -394,13 +397,13 @@ pub fn refuses_promotion<O: ObjectStore + ?Sized, R: RefStore + ?Sized>(objects:
 
 /// Which of `hashes` are chunks an applied recipe names that must not be served as usual:
 ///
-/// - every chunk of a recipe no round has settled yet, and of a recipe in the running round, is
-///   unavailable;
+/// - every chunk of a recipe no round has deleted the chunks of yet, and of a recipe in the
+///   running round, is unavailable;
 /// - once the round's census is frozen, a chunk of one of its recipes is absent when the census
 ///   found nothing else naming it, and served when it found something.
 ///
-/// A recipe that a round has settled is served as usual between rounds: a later head may name its
-/// chunks legitimately. Unavailable wins over absent.
+/// A recipe whose chunks a round has deleted is served as usual between rounds: a later head may
+/// name its chunks legitimately. Unavailable wins over absent.
 pub fn withheld<O: ObjectStore + ?Sized, R: RefStore + ?Sized>(objects: &O, refs: &R, hashes: &[String]) -> Result<HashMap<String, Withheld>, String> {
     let (_, ledger) = read_ledger(refs)?;
     let mut answer = HashMap::new();
@@ -409,15 +412,35 @@ pub fn withheld<O: ObjectStore + ?Sized, R: RefStore + ?Sized>(objects: &O, refs
         return Ok(answer);
     }
 
-    let (_, fence) = read_fence(refs)?;
-    let round: &[String] = if fence.phase == Phase::Down { &[] } else { &fence.recipes };
-    let unnamed = match fence.phase {
-        Phase::Deleting => Some(read_frozen(objects, fence.round)?),
-        _ => None,
-    };
+    // The round that froze a census deletes it as it lowers the fence: a census found missing
+    // under a fence read deleting is read again under the fence as it now stands.
+    let (_, mut fence) = read_fence(refs)?;
+    let mut unnamed = None;
+    for attempt in 0..ROUND_ATTEMPTS {
+        if fence.phase != Phase::Deleting {
+            break;
+        }
 
+        match read_frozen(objects, fence.round) {
+            Ok(frozen) => {
+                unnamed = Some(frozen);
+                break;
+            }
+            Err(error) => {
+                let (_, now) = read_fence(refs)?;
+                if now == fence || attempt + 1 == ROUND_ATTEMPTS {
+                    return Err(error);
+                }
+                fence = now;
+            }
+        }
+    }
+    let round: &[String] = if fence.phase == Phase::Down { &[] } else { &fence.recipes };
+
+    // Owed until a round has deleted its chunks: one whose deletes S3 refused stays owed, and its
+    // chunks withheld, though that round has settled it.
     let unsettled = ledger.recipes.iter()
-        .filter(|(_, journal)| journal.state == State::Owed && journal.settled_round.is_none())
+        .filter(|(_, journal)| journal.state == State::Owed)
         .map(|(recipe, _)| recipe);
     let withheld: BTreeSet<&String> = unsettled.chain(round.iter()).collect();
     let wanted: HashSet<&str> = hashes.iter().map(String::as_str).collect();
@@ -702,9 +725,17 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         let wanted: BTreeSet<String> = lists.values().flat_map(|chunks| chunks.iter().cloned()).collect();
         let applied = self.applied_set().map_err(HeadError::internal)?;
 
+        // A census still running holds no verdict, so one this build cannot read is taken again,
+        // never read as some other progress.
         let saved = self.objects.work_get(&census_name(fence.round)).map_err(HeadError::internal)?
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            .and_then(|stored| decode::<Census>("chunk census", &stored, CENSUS_VERSION).ok());
+            .and_then(|bytes| {
+                let read = String::from_utf8(bytes).map_err(|_| "it is not text".to_string())
+                    .and_then(|stored| decode::<Census>("chunk census", &stored, CENSUS_VERSION));
+                read.map_err(|why| eprintln!(
+                    "forklift-aws-lambda: the saved census of chunk round {} is taken again: {}",
+                    fence.round, why
+                )).ok()
+            });
 
         let mut census = match saved {
             Some(census) => census,

@@ -21,7 +21,8 @@
 //! Content whose redaction has applied is not promoted: its staged copy is deleted, and so is a
 //! canonical copy a promotion wrote (a recipe whose chunks are still owed is kept, as the judge
 //! keeps it), and the event is consumed. Neither is a chunk of a recipe whose chunk round is
-//! running: its staged copy is deleted, so the lift naming it fails and is retried.
+//! running: its staged copy is deleted, so the lift naming it fails at its commit, and run again
+//! after the round, uploads it afresh.
 //!
 //! Build with `cargo build -p forklift-aws-lambda --features lambda --release`.
 
@@ -129,8 +130,8 @@ async fn handler(event: LambdaEvent<S3Event>) -> Result<(), Error> {
             }
 
             // While a redacted-chunk round runs, a chunk of one of its recipes is not promoted: its
-            // staged copy is deleted, so the lift that needs it fails at its commit and succeeds
-            // when run again after the round.
+            // staged copy is deleted, so the lift that needs it fails at its commit with
+            // `staged_upload_discarded`, and run again after the round, uploads it afresh.
             if chunk_promotion_refused(&objects, &refs, std::slice::from_ref(&hash))?.is_some() {
                 objects.delete_staged_copy(&session, &hash)?;
                 return Ok(Err(Refused::RoundChunk));

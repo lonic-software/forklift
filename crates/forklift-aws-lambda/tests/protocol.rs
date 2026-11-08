@@ -5991,6 +5991,39 @@ fn an_applied_recipe_and_the_chunks_only_it_names_are_deleted_over_two_rounds() 
     assert!(served(&head, &shared[0]), "a chunk the kept file names is still served");
 }
 
+/// A recipe whose round S3 refused a delete of stays owed: once that round is down, its chunks are
+/// still withheld, the ones another file names too, until a round deletes them.
+// Revert: serve a refused recipe's chunks once a round has settled it → the shared chunk is
+// served → red.
+#[test]
+fn a_recipe_whose_delete_was_refused_keeps_its_chunks_withheld() {
+    let area = Area::new("redaction-chunk-refused");
+    let (recorded, main, recipe, _own, shared) = chunked_leak(&area);
+
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &recorded);
+    plant(&head.refs, "main", &main);
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &recorded.head_of("@redactions").expect("@redactions"));
+    let head = head.with_chunk_round_wait(0);
+    assert_eq!(served_state(&head, &recipe), Some(ServedRedactionState::DeletionOwed));
+    assert!(served(&head, &shared[0]), "settled, a chunk the kept file names is served");
+
+    // The round as it settles a refused recipe: owed, backed off, its round recorded.
+    let fence = forklift_aws_lambda::format::gate(&head.refs).expect("format gate");
+    let stored = head.refs.get_item(ItemKey::ChunkLedger).expect("ledger").expect("a ledger");
+    let mut ledger: serde_json::Value = serde_json::from_str(&stored).expect("json");
+    let journal = &mut ledger["recipes"][&recipe];
+    assert!(journal["settled_round"].is_u64(), "{}", stored);
+    journal["state"] = "owed".into();
+    journal["refusals"] = 1.into();
+    journal["next_round_after"] = 99_999_999_999u64.into();
+    let state = ledger.to_string();
+    let written = head.refs.put_items(&[ItemWrite { key: ItemKey::ChunkLedger, state: &state, expected: Some(&stored) }], &fence).expect("write");
+    assert_eq!(written, RedactionWrite::Written);
+
+    assert_withheld(&head.object_get(&shared[0]).expect_err("owed"), &shared[0]);
+}
+
 /// While a round deletes, a ref update answers `503` and moves nothing; once the round is down,
 /// it lifts.
 // Revert: let a ref update past a deleting fence → it commits → red.
@@ -6151,10 +6184,12 @@ fn a_retried_lift_commit_deletes_the_copy_an_earlier_attempt_promoted() {
 
 /// The staging verifier's check after its write deletes a promoted copy whose redaction applied,
 /// leaves one whose redaction did not, and keeps an applied recipe whose chunks the ledger still
-/// owes, as the judge does, while still answering that it applied. A recipe the ledger no longer
-/// holds is deleted as a blob is.
+/// owes, as the judge does, while still answering that it applied. A recipe the ledger does not
+/// hold is kept while its late sweep, which journals it, has still to run, and once it has run is
+/// deleted as a blob is.
 // Revert: delete whatever the item says → the unapplied copy is gone → red. Revert: delete a
 // recipe too → it is gone → red. Revert: keep every recipe → the one off the ledger is kept → red.
+// Revert: delete a recipe off the ledger before its late sweep → it is gone → red.
 #[test]
 fn the_check_after_a_promotion_deletes_only_applied_file_content() {
     use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
@@ -6204,7 +6239,11 @@ fn the_check_after_a_promotion_deletes_only_applied_file_content() {
     });
     objects.put_verified(&done.hash, &done.content).expect("put");
     plant_item(&refs, &done.hash, &applied);
-    assert_eq!(delete(&done.hash), AppliedCopies::Deleted, "off the ledger, its chunks are done");
+    assert_eq!(delete(&done.hash), AppliedCopies::RecipeKept, "off the ledger, its late sweep journals it");
+    assert!(objects.exists(&done.hash).expect("exists"));
+    let swept = format!(r#"{},"deleted":true}}"#, &applied[..applied.len() - 1]);
+    plant_item(&refs, &done.hash, &swept);
+    assert_eq!(delete(&done.hash), AppliedCopies::Deleted, "off the ledger after its late sweep, its chunks are done");
     assert!(!objects.exists(&done.hash).expect("exists"));
 }
 
