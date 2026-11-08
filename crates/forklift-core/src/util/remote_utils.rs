@@ -3278,11 +3278,18 @@ impl RemoteClient {
         true
     }
 
-    /// The files a walk leaves out (see [`Self::skip_files`]): those set, and the content of every
-    /// redaction this warehouse applied. When the record of applied redactions cannot be read, only
-    /// those set: the walk then asks for what it meets, and the remote refuses it as redacted.
-    fn skip_set(&self) -> std::sync::Arc<HashSet<String>> {
+    /// The files a walk leaves out (see [`Self::skip_files`]): those set, and with `applied`, the
+    /// content of every redaction this warehouse applied. When the record of applied redactions
+    /// cannot be read, only those set: the walk then asks for what it meets, and the remote refuses
+    /// it as redacted. A meta history's walk takes no `applied`: no meta cell may name an applied
+    /// hash, so a served chain naming one must reach the ref gate that refuses it whole, rather than
+    /// be taken with the cell's blob left out.
+    fn skip_set(&self, applied: bool) -> std::sync::Arc<HashSet<String>> {
         let set = self.skip_files.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+
+        if !applied {
+            return set;
+        }
 
         match crate::util::applied_redactions::read_applied() {
             Ok(applied) if !applied.is_empty() => {
@@ -4922,7 +4929,7 @@ pub async fn fetch_history_within(client: &RemoteClient,
         }
     }
 
-    Ok(walk_history(client, head, &complete, true, progress).await?.0)
+    Ok(walk_history(client, head, &complete, true, &client.skip_set(true), progress).await?.0)
 }
 
 /// [`fetch_history`] for meta history, bounded by the meta pallet heads alone. Meta history is held
@@ -4945,7 +4952,7 @@ pub async fn fetch_meta_history(client: &RemoteClient,
         .map(|(_, head)| head)
         .collect();
 
-    Ok(walk_history(client, head, &complete, true, progress).await?.0)
+    Ok(walk_history(client, head, &complete, true, &client.skip_set(false), progress).await?.0)
 }
 
 /// Every local ref head, user pallets and meta pallets alike, and therefore every closure already
@@ -4974,7 +4981,7 @@ fn all_ref_heads() -> Result<Vec<String>, String> {
 pub async fn fetch_parcels_only(client: &RemoteClient,
                                 head: &str,
                                 progress: &Progress) -> Result<FetchStats, String> {
-    Ok(walk_history(client, head, &all_ref_heads()?, false, progress).await?.0)
+    Ok(walk_history(client, head, &all_ref_heads()?, false, &HashSet::new(), progress).await?.0)
 }
 
 /// The bounded parcel walk of [`fetch_history_within`]: every parcel and signature from `head` down
@@ -4985,6 +4992,7 @@ async fn walk_history(client: &RemoteClient,
                       head: &str,
                       complete: &[String],
                       content: bool,
+                      skip: &HashSet<String>,
                       progress: &Progress) -> Result<(FetchStats, Vec<String>), String> {
     let mut stats = FetchStats::default();
     let mut skipped_roots: Vec<String> = Vec::new();
@@ -5032,7 +5040,7 @@ async fn walk_history(client: &RemoteClient,
             parcel_frontier.extend(parcel.parents);
         }
 
-        fetch_tree_closures(client, tree_frontier, &mut seen, &mut stats, progress).await?;
+        fetch_tree_closures(client, tree_frontier, skip, &mut seen, &mut stats, progress).await?;
     }
 
     signatures.finish()?;
@@ -5060,10 +5068,10 @@ struct ContentSeen {
 /// then their blobs and recipes, then each recipe's chunks.
 async fn fetch_tree_closures(client: &RemoteClient,
                              mut tree_frontier: Vec<String>,
+                             skip: &HashSet<String>,
                              seen: &mut ContentSeen,
                              stats: &mut FetchStats,
                              progress: &Progress) -> Result<(), String> {
-    let skip = client.skip_set();
 
     while !tree_frontier.is_empty() {
         let tree_wave: Vec<String> = tree_frontier.drain(..)
@@ -5131,7 +5139,7 @@ async fn fetch_tree_closures(client: &RemoteClient,
 pub async fn fetch_cache(client: &RemoteClient,
                          head: &str,
                          progress: &Progress) -> Result<FetchStats, String> {
-    let (stats, skipped_roots) = walk_history(client, head, &all_ref_heads()?, false, progress).await?;
+    let (stats, skipped_roots) = walk_history(client, head, &all_ref_heads()?, false, &HashSet::new(), progress).await?;
 
     sealed_utils::record_absences_under(&skipped_roots)?;
 
@@ -5169,7 +5177,7 @@ pub async fn fetch_head_content(client: &RemoteClient,
         let root = object_utils::load_parcel(head)?.tree_hash;
         let mut seen = ContentSeen::default();
 
-        if let Err(why) = fetch_tree_closures(client, vec![root.clone()], &mut seen, &mut stats, progress).await {
+        if let Err(why) = fetch_tree_closures(client, vec![root.clone()], &client.skip_set(true), &mut seen, &mut stats, progress).await {
             return Err(match sealed_utils::record_absences_under(&[root]) {
                 Ok(()) => why,
                 Err(unrecorded) => format!("{} What it left absent could not be recorded either: {}", why, unrecorded),
@@ -5716,7 +5724,7 @@ async fn fetch_scoped_from(client: &RemoteClient,
 
     // A file the command skips is never asked for, nor its recipe descended (see
     // `RemoteClient::skip_files`).
-    let skip = client.skip_set();
+    let skip = client.skip_set(true);
 
     while !parcel_frontier.is_empty() {
         let candidates: Vec<String> = parcel_frontier.drain(..)
