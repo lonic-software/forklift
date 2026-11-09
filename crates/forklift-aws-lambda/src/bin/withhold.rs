@@ -88,12 +88,17 @@ fn main() -> ExitCode {
 fn run(arguments: &Arguments, store: &DynamoRefStore) -> Result<(), String> {
     match &arguments.command {
         Command::Add { hash, statement } => {
-            let line = match withheld::add(store, hash, statement)? {
+            let added = withheld::add(store, hash, statement)?;
+            let line = match added {
                 Added::Added => "is now recorded as withheld",
                 Added::Restated => "was recorded as withheld already; its statement is now the one given",
                 Added::Unchanged => "was recorded as withheld already, with this statement",
+                Added::InPlace => "is recorded as withheld, with this statement",
             };
             println!("{} {} in {}.", hash, line, arguments.warehouse);
+            if added == Added::InPlace {
+                println!("A write's fate was unknown, so whether this run recorded it cannot be told.");
+            }
             println!("This build's head does not act on withheld items yet, so it still serves the content.");
         }
         Command::List => {

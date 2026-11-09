@@ -414,6 +414,13 @@ impl MemoryRefStore {
 
     /// Make the next [`RefStore::put_items`] calls answer `causes`, in turn, as transient
     /// refusals that wrote nothing.
+    ///
+    /// Within one call the hooks act in this order: a write [`race_next_write`] armed lands first,
+    /// then a refusal armed here answers before any check, and a write that passes its checks
+    /// lands before [`land_next_writes_unknown`] answers its fate unknown.
+    ///
+    /// [`race_next_write`]: MemoryRefStore::race_next_write
+    /// [`land_next_writes_unknown`]: MemoryRefStore::land_next_writes_unknown
     pub fn refuse_next_writes(&self, causes: &[TransientCause]) {
         self.state.lock().unwrap().writes_refused.extend(causes.iter().copied());
     }

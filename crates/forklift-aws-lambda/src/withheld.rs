@@ -185,6 +185,9 @@ pub enum Added {
     Restated,
     /// The hash was withheld already, with this statement; nothing was written.
     Unchanged,
+    /// The hash is withheld, with this statement, but a write of this add's had an unknown fate:
+    /// it may have landed late, so whether this add made the record cannot be told.
+    InPlace,
 }
 
 /// Withhold `hash` in the warehouse behind `refs`, with the host's `statement`.
@@ -220,10 +223,10 @@ fn add_at<R: RefStore + ?Sized>(
 
     let statement = withholding::checked_statement(statement)?;
 
-    // What the last write would have done, while its fate is unknown: a later read that finds the
-    // statement in place reports that, not that the hash was withheld already. A write that
-    // certainly did not land (refused as moved, contended or throttled) clears it.
-    let mut unknown: Option<Added> = None;
+    // Whether a write of this add's had an unknown fate. It stays set: such a write may still
+    // commit after a later one is certainly refused, so a later read that finds the statement in
+    // place cannot tell this add's write from another writer's.
+    let mut fate_unknown = false;
 
     for attempt in 0..WRITE_ATTEMPTS {
         let stored = refs.get_item(ItemKey::Withheld(hash))?;
@@ -236,7 +239,7 @@ fn add_at<R: RefStore + ?Sized>(
                 if held.statement == statement {
                     // Nothing is written, but the answer still says the warehouse is served.
                     format::gate(refs).map_err(|error| error.message)?;
-                    return Ok(unknown.unwrap_or(Added::Unchanged));
+                    return Ok(if fate_unknown { Added::InPlace } else { Added::Unchanged });
                 }
 
                 (Added::Restated, WithheldItem { statement: statement.to_string(), ..held })
@@ -258,12 +261,13 @@ fn add_at<R: RefStore + ?Sized>(
             .map_err(|error| error.message)?
         {
             RedactionWrite::Written => return Ok(added),
-            // Read the item again: another writer changed it.
-            RedactionWrite::Moved => unknown = None,
+            // Read the item again: another writer changed it, or an earlier write of this add's
+            // of unknown fate landed late.
+            RedactionWrite::Moved => {}
             // Read the item again, after a pause: this write's fate is unknown, or the table is
             // contended or throttled.
             RedactionWrite::Transient(cause) => {
-                unknown = (cause == TransientCause::FateUnknown).then_some(added);
+                fate_unknown |= cause == TransientCause::FateUnknown;
                 if attempt + 1 < WRITE_ATTEMPTS {
                     pause(attempt);
                 }
@@ -334,29 +338,29 @@ mod tests {
     // Revert: answer `Unchanged` whenever the statement is in place → the adds that landed with
     // an unknown fate read as made already → red.
     #[test]
-    fn an_add_whose_write_landed_with_an_unknown_fate_says_what_it_did() {
+    fn an_add_whose_write_had_an_unknown_fate_never_says_it_was_withheld_already() {
         let refs = served();
         let hash = "e".repeat(64);
         let pauses = std::cell::RefCell::new(Vec::new());
         let pause = |attempt: usize| pauses.borrow_mut().push(attempt);
 
         refs.land_next_writes_unknown(1);
-        assert_eq!(add_at(&refs, &hash, "court order 1", 7, &pause).unwrap(), Added::Added);
+        assert_eq!(add_at(&refs, &hash, "court order 1", 7, &pause).unwrap(), Added::InPlace);
         assert_eq!(list(&refs).unwrap()[0].item, WithheldItem::new("court order 1", 7));
         assert_eq!(*pauses.borrow(), vec![0], "one pause, after the write of unknown fate");
 
         refs.land_next_writes_unknown(1);
-        assert_eq!(add_at(&refs, &hash, "court order 2", 9, &pause).unwrap(), Added::Restated);
+        assert_eq!(add_at(&refs, &hash, "court order 2", 9, &pause).unwrap(), Added::InPlace);
         assert_eq!(list(&refs).unwrap()[0].item, WithheldItem::new("court order 2", 7));
 
         assert_eq!(add_at(&refs, &hash, "court order 2", 9, &pause).unwrap(), Added::Unchanged);
     }
 
-    // Revert: remember every transient refusal as a write that may have landed → the throttled
-    // add reads the other writer's item as its own → red. Revert: keep it past a moved write →
-    // the add that lost the race reads as made → red.
+    // Revert: count every transient refusal as a write of unknown fate → the throttled add reads
+    // as uncertain → red. Revert: forget the unknown fate on a later certain refusal → the add
+    // whose first write landed late reads as withheld already → red.
     #[test]
-    fn an_add_that_certainly_wrote_nothing_never_claims_the_item_in_place() {
+    fn an_add_is_uncertain_only_after_a_write_of_unknown_fate() {
         let refs = served();
         let hash = "a1".repeat(32);
         let theirs = encode(&WithheldItem::new("court order", 3));
@@ -370,13 +374,17 @@ mod tests {
         };
         assert_eq!(add_at(&refs, &hash, "court order", 7, &pause).unwrap(), Added::Unchanged);
 
-        // Of unknown fate and not landed; the next write loses the race to the same statement.
+        // Of unknown fate; it lands late, while the next write is refused as contended.
         let hash = "b2".repeat(32);
         let entity = format!("withheld#{}", hash);
-        refs.refuse_next_writes(&[TransientCause::FateUnknown]);
-        let pause = |_: usize| refs.race_next_write(&entity, &theirs);
-        assert_eq!(add_at(&refs, &hash, "court order", 7, &pause).unwrap(), Added::Unchanged);
-        assert_eq!(list(&refs).unwrap()[1].item.withheld_at, 3, "theirs, not this add's");
+        let late = encode(&WithheldItem::new("court order", 7));
+        refs.refuse_next_writes(&[TransientCause::FateUnknown, TransientCause::Contended]);
+        let pause = |attempt: usize| {
+            if attempt == 1 {
+                refs.race_next_write(&entity, &late);
+            }
+        };
+        assert_eq!(add_at(&refs, &hash, "court order", 7, &pause).unwrap(), Added::InPlace);
 
         // Of unknown fate and not landed, then written: added.
         let hash = "c3".repeat(32);
