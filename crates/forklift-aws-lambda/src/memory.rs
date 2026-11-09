@@ -25,12 +25,12 @@ use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef, DEFAULT_PALL
 
 use crate::aws::dynamo::{
     item_entity, ATTR_ANCHOR, ATTR_DELETED_HEAD, ATTR_HEAD, ATTR_STATE, ENTITY_CHUNK_FENCE, ENTITY_CHUNK_LEDGER,
-    ENTITY_FORMAT, ENTITY_PALLET_PREFIX, ENTITY_REDACTION_PREFIX, ENTITY_TRUST,
+    ENTITY_FORMAT, ENTITY_PALLET_PREFIX, ENTITY_REDACTION_PREFIX, ENTITY_TRUST, ENTITY_WITHHELD_PREFIX,
 };
 use crate::store::{
     CasOutcome, ExpectedHead, FormatFence, FormatStore, ObjectAccess, ObjectStore, OffloadedResponse,
     ItemKey, ItemWrite, OfficePrecondition, PromoteOutcome, PutOutcome, PutTarget, RedactionWrite, RedactionsPrecondition, RefHead, RefListing, RefStore,
-    SignatureOutcome, TrustOutcome, TrustWriteOutcome,
+    SignatureOutcome, TransientCause, TrustOutcome, TrustWriteOutcome,
 };
 
 /// An in-memory [`ObjectStore`]. Object bytes are the uncompressed wire form, keyed by hash.
@@ -358,6 +358,15 @@ struct RefState {
     /// The stored state of each item [`RefStore::put_items`] writes (the redaction items and the
     /// chunk fence and ledger), keyed by the sort key `DynamoRefStore` gives it.
     items: HashMap<String, String>,
+    /// How many of the next [`RefStore::put_items`] calls that would write land and then answer
+    /// as a write of unknown fate, as one whose response DynamoDB lost.
+    writes_landing_unknown: usize,
+    /// What the next [`RefStore::put_items`] calls answer instead of writing, each a transient
+    /// refusal that wrote nothing.
+    writes_refused: std::collections::VecDeque<TransientCause>,
+    /// An item another writer puts, by sort key and state, just before the next
+    /// [`RefStore::put_items`] call checks its conditions.
+    racing_write: Option<(String, String)>,
 }
 
 /// An in-memory [`RefStore`]. Pallet heads are keyed by their qualified wire reference
@@ -375,6 +384,9 @@ impl Default for MemoryRefStore {
                 trust: None,
                 format: None,
                 items: HashMap::new(),
+                writes_landing_unknown: 0,
+                writes_refused: std::collections::VecDeque::new(),
+                racing_write: None,
             }),
             default_pallet: DEFAULT_PALLET_NAME.to_string(),
         }
@@ -392,6 +404,31 @@ impl MemoryRefStore {
     /// formats were recorded.
     pub fn set_format(&self, state: Option<&str>) {
         self.state.lock().unwrap().format = state.map(str::to_string);
+    }
+
+    /// Make the next `count` [`RefStore::put_items`] calls that write land, then answer as writes
+    /// of unknown fate: the stand-in for a transaction that committed and whose response was lost.
+    pub fn land_next_writes_unknown(&self, count: usize) {
+        self.state.lock().unwrap().writes_landing_unknown = count;
+    }
+
+    /// Make the next [`RefStore::put_items`] calls answer `causes`, in turn, as transient
+    /// refusals that wrote nothing.
+    ///
+    /// Within one call the hooks act in this order: a write [`race_next_write`] armed lands first,
+    /// then a refusal armed here answers before any check, and a write that passes its checks
+    /// lands before [`land_next_writes_unknown`] answers its fate unknown.
+    ///
+    /// [`race_next_write`]: MemoryRefStore::race_next_write
+    /// [`land_next_writes_unknown`]: MemoryRefStore::land_next_writes_unknown
+    pub fn refuse_next_writes(&self, causes: &[TransientCause]) {
+        self.state.lock().unwrap().writes_refused.extend(causes.iter().copied());
+    }
+
+    /// Have another writer put `state` as the item of sort key `entity` just before the next
+    /// [`RefStore::put_items`] call checks its conditions, as a write racing it would.
+    pub fn race_next_write(&self, entity: &str, state: &str) {
+        self.state.lock().unwrap().racing_write = Some((entity.to_string(), state.to_string()));
     }
 
     /// This store's state as the DynamoDB items `DynamoRefStore` keeps for it: each item's sort
@@ -442,13 +479,14 @@ impl MemoryRefStore {
             }
             let pallet = entity.strip_prefix(ENTITY_PALLET_PREFIX).filter(|wire| !wire.is_empty());
             let redaction = entity.strip_prefix(ENTITY_REDACTION_PREFIX).filter(|hash| !hash.is_empty());
+            let withheld = entity.strip_prefix(ENTITY_WITHHELD_PREFIX).filter(|hash| !hash.is_empty());
 
             match (entity.as_str(), pallet, attribute.as_str()) {
                 (ENTITY_FORMAT, _, ATTR_STATE) => state.format = Some(value.clone()),
                 (ENTITY_CHUNK_FENCE | ENTITY_CHUNK_LEDGER, _, ATTR_STATE) => {
                     state.items.insert(entity.clone(), value.clone());
                 }
-                (_, None, ATTR_STATE) if redaction.is_some() => {
+                (_, None, ATTR_STATE) if redaction.is_some() || withheld.is_some() => {
                     state.items.insert(entity.clone(), value.clone());
                 }
                 (ENTITY_TRUST, _, ATTR_ANCHOR) => state.trust = Some(value.clone()),
@@ -711,8 +749,28 @@ impl RefStore for MemoryRefStore {
         Ok(self.state.lock().unwrap().items.get(&item_entity(key)).cloned())
     }
 
+    fn list_withheld(&self) -> Result<Vec<(String, String)>, String> {
+        let state = self.state.lock().unwrap();
+        // In no order: `withheld::list` sorts.
+        Ok(state
+            .items
+            .iter()
+            .filter_map(|(entity, item)| {
+                entity.strip_prefix(ENTITY_WITHHELD_PREFIX).map(|hash| (hash.to_string(), item.clone()))
+            })
+            .collect())
+    }
+
     fn put_items(&self, writes: &[ItemWrite<'_>], format: &FormatFence) -> Result<RedactionWrite, String> {
         let mut guard = self.state.lock().unwrap();
+
+        if let Some((entity, state)) = guard.racing_write.take() {
+            guard.items.insert(entity, state);
+        }
+
+        if let Some(cause) = guard.writes_refused.pop_front() {
+            return Ok(RedactionWrite::Transient(cause));
+        }
 
         if !guard.format_holds(format) {
             return Ok(RedactionWrite::FormatMoved);
@@ -725,6 +783,11 @@ impl RefStore for MemoryRefStore {
         guard.apply_format(format);
         for write in writes {
             guard.items.insert(item_entity(write.key), write.state.to_string());
+        }
+
+        if guard.writes_landing_unknown > 0 {
+            guard.writes_landing_unknown -= 1;
+            return Ok(RedactionWrite::Transient(TransientCause::FateUnknown));
         }
 
         Ok(RedactionWrite::Written)

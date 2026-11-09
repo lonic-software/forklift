@@ -33,6 +33,7 @@
 pub mod config;
 pub mod dynamo;
 pub mod dynamo_ops;
+pub mod operator;
 pub mod s3;
 pub mod s3_ops;
 

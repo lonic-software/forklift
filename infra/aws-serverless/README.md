@@ -148,8 +148,9 @@ them with `templatefile()` and never hand-writes the S3/DynamoDB/Logs statements
 contain. Only the deployment-conditional statements — KMS (above) and the DLQ send permission
 (below) — are added here, since neither is the product of an unconditional SDK call.
 
-The crate's third policy, `iam/operator.policy.json`, is for the operator who runs
-`forklift-aws-upgrade` to upgrade warehouses to a new format, from their own machine. This module
+The crate's third policy, `iam/operator.policy.json`, is for the operator who runs the crate's
+operator binaries from their own machine: `forklift-aws-upgrade`, which upgrades warehouses to a
+new format, and `forklift-aws-withhold`, which records content the host withholds. This module
 deploys no role for it; attach it to the role the operator uses.
 
 ## Variables and outputs

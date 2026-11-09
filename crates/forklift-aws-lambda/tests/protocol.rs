@@ -808,6 +808,10 @@ impl RefStore for RedactionsMoveBeforeTheCommit {
         self.inner.get_item(key)
     }
 
+    fn list_withheld(&self) -> Result<Vec<(String, String)>, String> {
+        self.inner.list_withheld()
+    }
+
     fn put_items(
         &self,
         writes: &[forklift_aws_lambda::store::ItemWrite<'_>],
@@ -2579,6 +2583,10 @@ impl RefStore for AsyncRefStore {
         self.inner.get_item(key)
     }
 
+    fn list_withheld(&self) -> Result<Vec<(String, String)>, String> {
+        self.inner.list_withheld()
+    }
+
     fn put_items(
         &self,
         writes: &[forklift_aws_lambda::store::ItemWrite<'_>],
@@ -2735,6 +2743,10 @@ impl RefStore for SharedMemoryRefs {
         self.0.get_item(key)
     }
 
+    fn list_withheld(&self) -> Result<Vec<(String, String)>, String> {
+        self.0.list_withheld()
+    }
+
     fn put_items(
         &self,
         writes: &[forklift_aws_lambda::store::ItemWrite<'_>],
@@ -2877,6 +2889,10 @@ impl RefStore for OfficeMovesAfterTheSnapshot {
         self.inner.get_item(key)
     }
 
+    fn list_withheld(&self) -> Result<Vec<(String, String)>, String> {
+        self.inner.list_withheld()
+    }
+
     fn put_items(
         &self,
         writes: &[forklift_aws_lambda::store::ItemWrite<'_>],
@@ -3003,6 +3019,10 @@ impl RefStore for AnchorMovesAfterTheSnapshot {
 
     fn get_item(&self, key: forklift_aws_lambda::store::ItemKey<'_>) -> Result<Option<String>, String> {
         self.inner.get_item(key)
+    }
+
+    fn list_withheld(&self) -> Result<Vec<(String, String)>, String> {
+        self.inner.list_withheld()
     }
 
     fn put_items(
@@ -3164,6 +3184,10 @@ impl RefStore for TransientOnCommit {
 
     fn get_item(&self, key: forklift_aws_lambda::store::ItemKey<'_>) -> Result<Option<String>, String> {
         self.inner.get_item(key)
+    }
+
+    fn list_withheld(&self) -> Result<Vec<(String, String)>, String> {
+        self.inner.list_withheld()
     }
 
     fn put_items(
@@ -4160,6 +4184,10 @@ impl RefStore for TransientOnAnchorWrite {
         self.inner.get_item(key)
     }
 
+    fn list_withheld(&self) -> Result<Vec<(String, String)>, String> {
+        self.inner.list_withheld()
+    }
+
     fn put_items(
         &self,
         writes: &[forklift_aws_lambda::store::ItemWrite<'_>],
@@ -4261,6 +4289,10 @@ impl RefStore for AnchorMovedOnAnchorWrite {
 
     fn get_item(&self, key: forklift_aws_lambda::store::ItemKey<'_>) -> Result<Option<String>, String> {
         self.inner.get_item(key)
+    }
+
+    fn list_withheld(&self) -> Result<Vec<(String, String)>, String> {
+        self.inner.list_withheld()
     }
 
     fn put_items(
@@ -4945,6 +4977,10 @@ impl RefStore for RacesTheDelete {
 
     fn get_item(&self, key: forklift_aws_lambda::store::ItemKey<'_>) -> Result<Option<String>, String> {
         self.inner.get_item(key)
+    }
+
+    fn list_withheld(&self) -> Result<Vec<(String, String)>, String> {
+        self.inner.list_withheld()
     }
 
     fn put_items(
@@ -5663,6 +5699,10 @@ impl RefStore for LosesEveryRescan {
 
     fn get_item(&self, key: forklift_aws_lambda::store::ItemKey<'_>) -> Result<Option<String>, String> {
         self.inner.get_item(key)
+    }
+
+    fn list_withheld(&self) -> Result<Vec<(String, String)>, String> {
+        self.inner.list_withheld()
     }
 
     fn put_items(

@@ -238,6 +238,9 @@ pub enum RedactionWrite {
 pub enum ItemKey<'a> {
     /// The redaction item of this hash: where that redaction stands.
     Redaction(&'a str),
+    /// The withheld item of this hash: the host's statement, and how far withholding it has got
+    /// (`crate::withheld`).
+    Withheld(&'a str),
     /// The chunk fence: which round of chunk deletion runs, and how far it is. Every ref update
     /// conditions on it.
     ChunkFence,
@@ -735,6 +738,13 @@ pub trait RefStore {
     fn get_item(&self, _key: ItemKey<'_>) -> Result<Option<String>, String> {
         Err("This ref store keeps no redaction items.".to_string())
     }
+
+    /// Every withheld item of the warehouse, each as its hash and its stored state, read strongly
+    /// consistently and in full, so a withhold made before the read began is listed.
+    ///
+    /// In no particular order. It has no default, so a store wrapping another cannot compile
+    /// without forwarding it.
+    fn list_withheld(&self) -> Result<Vec<(String, String)>, String>;
 
     /// Make every write of `writes` at once, or none: each on condition that its item still holds
     /// what it expects, and all on condition that the format item still holds what `format`

@@ -2769,3 +2769,49 @@ async fn the_cli_lifts_and_franchises_a_chunked_file_over_s3_and_dynamodb() {
         "the cloned chunked file must be byte-identical to the source"
     );
 }
+
+/// The withheld items over real DynamoDB: an operator's add is refused on a warehouse holding
+/// nothing, lands beside a pallet's first write, and the listing reads every item back, across
+/// pages, in hash order, with none of the warehouse's other items and none of another's.
+// Revert: drop the pagination in `query_prefix` → only the first page is listed → red.
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamo_ref_store_lists_every_withheld_item_of_its_warehouse() {
+    let Some(endpoint) = endpoint() else {
+        eprintln!("skipping: FORKLIFT_AWS_TEST_ENDPOINT is unset");
+        return;
+    };
+
+    let config = test_config(&endpoint);
+    provision(&config).await;
+
+    let bridge = AsyncBridge::current().expect("a multi-thread runtime");
+    let (_s3, dynamo) = build_clients(&config).await.expect("clients");
+    let (_objects, refs) = build_stores(&config, bridge.clone()).await.expect("stores");
+    let other = DynamoRefStore::new(dynamo, config.table.clone(), unique("warehouse"), "main".to_string(), bridge);
+
+    tokio::task::spawn_blocking(move || {
+        let first = "a".repeat(64);
+        let refused = forklift_aws_lambda::withheld::add(&refs, &first, "order").expect_err("an unborn warehouse");
+        assert!(refused.contains("holds nothing yet"), "{}", refused);
+
+        let fence = format::gate(&refs).expect("a new warehouse is served");
+        refs.compare_and_set_head(PalletNamespace::User, "main", ExpectedHead::Unborn, &"1".repeat(64),
+            OfficePrecondition::NotConsumed, RedactionsPrecondition::NotConsumed, None, None, &fence, &request_token())
+            .expect("the first write stamps the format");
+
+        // Each statement near its cap, so the items span more than one 1 MB page.
+        let statement = "s".repeat(forklift_core::util::withholding::STATEMENT_MAX_CHARS);
+        let mut hashes: Vec<String> = (0..1200u32).map(|n| format!("{:064x}", n)).collect();
+        for hash in &hashes {
+            forklift_aws_lambda::withheld::add(&refs, hash, &statement).expect("add");
+        }
+        hashes.sort();
+
+        let listed = forklift_aws_lambda::withheld::list(&refs).expect("list");
+        assert_eq!(listed.iter().map(|entry| entry.hash.clone()).collect::<Vec<_>>(), hashes);
+        assert!(listed.iter().all(|entry| entry.item.statement == statement));
+        assert!(forklift_aws_lambda::withheld::list(&other).expect("list another").is_empty());
+    })
+    .await
+    .expect("the withheld items");
+}

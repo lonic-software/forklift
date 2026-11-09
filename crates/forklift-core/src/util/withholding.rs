@@ -112,6 +112,24 @@ pub fn read_withheld() -> Result<WithheldSet, String> {
     Ok(set)
 }
 
+/// `statement`, trimmed, when it may be a takedown's ([`valid_statement`]), as every head that
+/// withholds checks it before recording it.
+///
+/// # Returns
+/// * `Ok(&str)`    - The trimmed statement.
+/// * `Err(String)` - It is not one plain line of at most [`STATEMENT_MAX_CHARS`], or is blank.
+pub fn checked_statement(statement: &str) -> Result<&str, String> {
+    let statement = statement.trim();
+
+    match valid_statement(statement) {
+        true => Ok(statement),
+        false => Err(format!(
+            "The statement must be one plain line, not blank, with no control character, separator \
+            or direction mark, and at most {} characters long.", STATEMENT_MAX_CHARS
+        )),
+    }
+}
+
 /// Whether `statement` may be a takedown's: not blank, at most [`STATEMENT_MAX_CHARS`] long, and
 /// one plain line, since every terminal that shows a refusal prints it: no control character, line
 /// or paragraph separator, or direction mark, override or isolate, which would reorder its display.
@@ -179,14 +197,7 @@ pub fn withhold(hash: &str, statement: &str) -> Result<Withheld, String> {
         return Err(format!("\"{}\" is not an object hash.", hash));
     }
 
-    let statement = statement.trim();
-
-    if !valid_statement(statement) {
-        return Err(format!(
-            "The statement must be one plain line, not blank, with no control character, separator \
-            or direction mark, and at most {} characters long.", STATEMENT_MAX_CHARS
-        ));
-    }
+    let statement = checked_statement(statement)?;
 
     match redaction_utils::stored_type(hash)? {
         None | Some(ObjectType::Blob | ObjectType::Recipe) => {}

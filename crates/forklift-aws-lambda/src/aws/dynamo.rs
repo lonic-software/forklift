@@ -14,6 +14,7 @@
 //! | `<warehouse>` | `trust`          | `anchor = <json>`  | the trust anchor               |
 //! | `<warehouse>` | `format`         | `state = <state>`  | the warehouse's format         |
 //! | `<warehouse>` | `redaction#<hash>` | `state = <json>` | where one redaction stands     |
+//! | `<warehouse>` | `withheld#<hash>` | `state = <json>` | content its host withholds     |
 //! | `<warehouse>` | `chunk-fence`    | `state = <json>`   | the round of chunk deletion    |
 //! | `<warehouse>` | `chunk-ledger`   | `state = <json>`   | the recipes chunk rounds owe   |
 //!
@@ -43,6 +44,11 @@
 //! verdicts. A record of a version this build does not know fails every read of it. The chunk
 //! fence and the chunk ledger (`crate::head::chunks`) are written the same way, and a recipe's
 //! apply writes its redaction item and the ledger in one transaction ([`RefStore::put_items`]).
+//!
+//! A withheld item exists for each hash the warehouse's host withholds (`crate::withheld`): its
+//! `state` is a versioned JSON record of the host's statement and how far withholding the content
+//! has got. It is written the same way, and listed with one strongly consistent `Query` on
+//! `withheld#`, as pallets are ([`RefStore::list_withheld`]).
 //!
 //! The table's key schema must be `wh` (S, partition) and `entity` (S, sort); a deployment
 //! provisions it that way (the integration test creates exactly this table).
@@ -138,6 +144,8 @@ pub(crate) const ENTITY_TRUST: &str = "trust";
 pub(crate) const ENTITY_FORMAT: &str = "format";
 /// The sort-key prefix of a redaction item: `redaction#<hash>`.
 pub(crate) const ENTITY_REDACTION_PREFIX: &str = "redaction#";
+/// The sort-key prefix of a withheld item: `withheld#<hash>`.
+pub(crate) const ENTITY_WITHHELD_PREFIX: &str = "withheld#";
 /// The sort key of the single chunk fence item.
 pub(crate) const ENTITY_CHUNK_FENCE: &str = "chunk-fence";
 /// The sort key of the single chunk ledger item.
@@ -147,6 +155,7 @@ pub(crate) const ENTITY_CHUNK_LEDGER: &str = "chunk-ledger";
 pub(crate) fn item_entity(key: ItemKey<'_>) -> String {
     match key {
         ItemKey::Redaction(hash) => format!("{}{}", ENTITY_REDACTION_PREFIX, hash),
+        ItemKey::Withheld(hash) => format!("{}{}", ENTITY_WITHHELD_PREFIX, hash),
         ItemKey::ChunkFence => ENTITY_CHUNK_FENCE.to_string(),
         ItemKey::ChunkLedger => ENTITY_CHUNK_LEDGER.to_string(),
     }
@@ -231,6 +240,40 @@ impl DynamoRefStore {
             (ATTR_WAREHOUSE.to_string(), s(self.warehouse.clone())),
             (ATTR_ENTITY.to_string(), s(entity)),
         ])
+    }
+
+    /// Every item of the warehouse's partition whose sort key begins with `prefix`, read with one
+    /// strongly consistent `Query`, page by page to the end.
+    async fn query_prefix(&self, prefix: &str) -> Result<Vec<HashMap<String, AttributeValue>>, String> {
+        let mut items = Vec::new();
+        let mut start_key: Option<HashMap<String, AttributeValue>> = None;
+
+        loop {
+            let mut request = self
+                .client
+                .query()
+                .table_name(&self.table)
+                .key_condition_expression("#wh = :wh AND begins_with(#e, :prefix)")
+                .expression_attribute_names("#wh", ATTR_WAREHOUSE)
+                .expression_attribute_names("#e", ATTR_ENTITY)
+                .expression_attribute_values(":wh", s(self.warehouse.clone()))
+                .expression_attribute_values(":prefix", s(prefix))
+                .consistent_read(true);
+
+            if let Some(key) = start_key.take() {
+                request = request.set_exclusive_start_key(Some(key));
+            }
+
+            let page = request.send().await.map_err(|err| describe("DynamoDB query", err))?;
+            items.extend(page.items().iter().cloned());
+
+            match page.last_evaluated_key() {
+                Some(key) if !key.is_empty() => start_key = Some(key.clone()),
+                _ => break,
+            }
+        }
+
+        Ok(items)
     }
 
     /// Read one item by its sort key, strongly consistent.
@@ -894,53 +937,46 @@ impl RefStore for DynamoRefStore {
     }
 
     fn list_refs(&self) -> Result<RefListing, String> {
-        self.bridge.block_on(async {
-            let mut listing = RefListing::default();
-            let mut start_key: Option<HashMap<String, AttributeValue>> = None;
+        let mut listing = RefListing::default();
 
-            loop {
-                let mut request = self
-                    .client
-                    .query()
-                    .table_name(&self.table)
-                    .key_condition_expression("#wh = :wh AND begins_with(#e, :prefix)")
-                    .expression_attribute_names("#wh", ATTR_WAREHOUSE)
-                    .expression_attribute_names("#e", ATTR_ENTITY)
-                    .expression_attribute_values(":wh", s(self.warehouse.clone()))
-                    .expression_attribute_values(":prefix", s(ENTITY_PALLET_PREFIX))
-                    .consistent_read(true);
+        for item in self.bridge.block_on(self.query_prefix(ENTITY_PALLET_PREFIX))? {
+            let entity = item.get(ATTR_ENTITY).and_then(|value| value.as_s().ok());
+            let Some(wire) = entity.and_then(|entity| entity.strip_prefix(ENTITY_PALLET_PREFIX)) else {
+                continue;
+            };
 
-                if let Some(key) = start_key.take() {
-                    request = request.set_exclusive_start_key(Some(key));
-                }
-
-                let page =
-                    request.send().await.map_err(|err| describe("DynamoDB query", err))?;
-
-                for item in page.items() {
-                    let entity = item.get(ATTR_ENTITY).and_then(|value| value.as_s().ok());
-                    let Some(wire) = entity.and_then(|entity| entity.strip_prefix(ENTITY_PALLET_PREFIX))
-                    else {
-                        continue;
-                    };
-
-                    match ref_head_of(item) {
-                        RefHead::Live(head) => listing.live.push((PalletRef::parse(wire)?, head)),
-                        RefHead::Deleted(head) => {
-                            listing.tombstones.push((PalletRef::parse(wire)?, head))
-                        }
-                        RefHead::Absent => {}
-                    }
-                }
-
-                match page.last_evaluated_key() {
-                    Some(key) if !key.is_empty() => start_key = Some(key.clone()),
-                    _ => break,
-                }
+            match ref_head_of(&item) {
+                RefHead::Live(head) => listing.live.push((PalletRef::parse(wire)?, head)),
+                RefHead::Deleted(head) => listing.tombstones.push((PalletRef::parse(wire)?, head)),
+                RefHead::Absent => {}
             }
+        }
 
-            Ok(listing)
-        })
+        Ok(listing)
+    }
+
+    fn list_withheld(&self) -> Result<Vec<(String, String)>, String> {
+        let mut withheld = Vec::new();
+
+        for item in self.bridge.block_on(self.query_prefix(ENTITY_WITHHELD_PREFIX))? {
+            let entity = item.get(ATTR_ENTITY).and_then(|value| value.as_s().ok());
+            let Some(hash) = entity.and_then(|entity| entity.strip_prefix(ENTITY_WITHHELD_PREFIX)) else {
+                continue;
+            };
+
+            // An item with no readable state is not one this build wrote; listing it as absent
+            // would serve content its host withholds.
+            match item.get(ATTR_STATE).and_then(|value| value.as_s().ok()) {
+                Some(state) => withheld.push((hash.to_string(), state.clone())),
+                None => return Err(format!(
+                    "The item {}{} carries no state this build can read.",
+                    ENTITY_WITHHELD_PREFIX,
+                    hash.escape_debug()
+                )),
+            }
+        }
+
+        Ok(withheld)
     }
 
     fn default_pallet(&self) -> Result<String, String> {
