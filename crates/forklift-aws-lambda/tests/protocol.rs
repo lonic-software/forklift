@@ -4526,6 +4526,65 @@ fn a_first_anchor_adopting_history_the_head_does_not_hold_is_refused() {
     head.put_trust(&Principal::Static, &anchor).expect("adopted history held");
 }
 
+/// A first anchor's adopted history is held strictly: one naming content a redaction applied
+/// here took away is refused, as on the served root, since every warehouse that adopts the pin
+/// fetches it whole from here and the head can never serve it.
+// Revert: tolerate the applied redactions in `require_adopted_history` → the anchor lands → red.
+#[test]
+fn a_first_anchor_adopting_history_naming_redacted_content_is_refused() {
+    let area = Area::new("first-anchor-adopts-redacted");
+    prepare(&area, "wh");
+    area.forklift("wh", &["office", "enroll"]);
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "-m", "signed"]);
+
+    let office = harvest(&area.path("wh"));
+    let office_head = office.head_of(&format!("@{}", OFFICE_PALLET_NAME)).expect("office head");
+    let (record, content) = {
+        let _scope = StorageRootScope::enter(&area.path("wh"));
+        let mut tree = object_utils::load_tree(&object_utils::load_parcel(&office_head).expect("parcel").tree_hash)
+            .expect("the office tree");
+        let record = loop {
+            if let Some((_, file)) = tree.get_files().next() {
+                break file.hash.clone();
+            }
+            let (_, subtree) = tree.get_subtrees().next().expect("the office tree names a record");
+            tree = object_utils::load_tree(&subtree.hash).expect("a subtree");
+        };
+        let content = String::from_utf8(object_utils::load_blob(&record).expect("the record").content).expect("text");
+        (record, content)
+    };
+
+    // A meta pallet's content is never redacted where its history names it, so the redaction is
+    // recorded in a warehouse where only a file holds the same bytes.
+    let (redactions, recorded) = recorded_redactions(&area, "red", &[&content]);
+    assert_eq!(blob_hash(&content), record);
+
+    let anchor = TrustAnchorDto {
+        genesis: "e".repeat(64),
+        adopts: Some(office_head.clone()),
+        ..office.trust.clone().expect("trust")
+    };
+
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    // Every object but the content the redaction took away.
+    for harvest in [&recorded, &office] {
+        for (hash, bytes) in harvest.objects.iter().filter(|(hash, _)| **hash != record) {
+            head.object_put(&Principal::Static, None, hash, bytes).expect("upload object");
+        }
+        for (hash, sidecar) in &harvest.signatures {
+            head.signature_put(&Principal::Static, hash, sidecar).expect("upload signature");
+        }
+    }
+    plant_meta(&head.refs, REDACTIONS_PALLET_NAME, None, &redactions[0]);
+    plant_item(&head.refs, &record, &forklift_aws_lambda::head::redaction_record(true, &[], Some(1)));
+
+    let err = head.put_trust(&Principal::Static, &anchor).expect_err("the pin names redacted content");
+    assert_eq!(err.status, Status::Unprocessable, "{}", err.message);
+    assert!(err.message.contains(&record), "the refusal names the content: {}", err.message);
+}
+
 /// A first anchor adopting a head that is not office history is refused even with its history
 /// held: clients refuse such an anchor, and a stored anchor is a one-way door.
 // Revert: drop the office-shape check from `require_adopted_history` → the anchor is stored.

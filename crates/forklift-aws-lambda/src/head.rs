@@ -51,6 +51,8 @@ use forklift_core::util::authority_utils::{self, Denied, Principal};
 use forklift_core::util::office_utils::{self, OfficeState, TrustAnchor, OFFICE_PALLET_NAME};
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef, RefUpdateError};
 use forklift_core::util::redaction_utils::{self, REDACTIONS_PALLET_NAME};
+use forklift_core::util::sealed_utils::Tolerated;
+use forklift_core::util::withholding::WithheldSet;
 use forklift_core::util::haul_utils::{self, HAUL_PALLET_NAME};
 use forklift_core::util::{
     audit_utils, bundle_utils, file_utils, merge_utils, meta_tree, object_utils, pallet_utils, sign_utils,
@@ -1068,7 +1070,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 &chunks_missing,
                 &load_recipe_chunks,
                 &load_base_tree,
-                &|| self.applied_set(),
+                // This head withholds nothing yet, so only its applied redactions are tolerated.
+                &|| Ok(Tolerated::removed_only(self.applied_set()?, WithheldSet::default())),
             )
             .map_err(HeadError::unprocessable)?;
 
@@ -1948,7 +1951,10 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     },
                     // A creation (`known_complete: None`) takes no prune candidates.
                     &|hash| Err(format!("Tree {} was read as a prune base, but nothing bounds this walk.", hash)),
-                    &|| self.applied_set(),
+                    // Strictly, nothing tolerated, as on the served root: a pin is served whole to
+                    // every adopter, so one naming content this head redacted or withholds is a pin
+                    // it can never serve.
+                    &|| Ok(Tolerated::default()),
                 )
             };
 

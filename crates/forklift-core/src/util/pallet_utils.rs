@@ -2577,6 +2577,50 @@ pub(crate) mod tests {
             assert!(crate::util::audit_utils::verify_parcel_closure_for_write(&damaged, Some(&head)).is_err());
         }
 
+        /// The closure check a remote's ref update runs over its own store, with `removed` as the
+        /// redactions it applied and the content it withholds.
+        fn remote_closure(head: &str,
+                          base: Option<&str>,
+                          removed: (crate::util::applied_redactions::AppliedSet,
+                                    crate::util::withholding::WithheldSet)) -> Result<(), String> {
+            crate::util::audit_utils::verify_parcel_closure_with(
+                head,
+                base,
+                &|hash| file_utils::does_object_exist(hash),
+                &|_| Ok(Vec::new()),
+                &|hash| crate::util::object_utils::recipe_chunk_hashes(hash),
+                &|hash| crate::util::object_utils::load_tree(hash),
+                &|| Ok(crate::util::sealed_utils::Tolerated::removed_only(removed.0.clone(), removed.1.clone())),
+            )
+        }
+
+        // Revert: pass `WithheldSet::default()` to the tolerance again → the head naming the
+        // withheld blob is refused. Revert: tolerate withheld content wherever it is met → the
+        // absent root tree is accepted. Revert: drop the `withheld_beyond_files` mapping → the
+        // refusal over the root tree does not say the host withholds it.
+        #[test]
+        fn a_remote_closure_tolerates_withheld_content_only_as_a_file() {
+            let (_root, _scope) = scratch("closure-withheld-remote");
+            let base = parcel(&two_dirs("a0", "b0"), &[]);
+            let head = parcel(&two_dirs("a1", "withheld"), &[&base]);
+            let withheld = blob("withheld");
+            remove(&withheld);
+            let none = || (Default::default(), Default::default());
+
+            assert!(remote_closure(&head, Some(&base), none()).is_err(), "an absence nothing names is damage");
+
+            crate::util::withholding::withhold(&withheld, "court order 9").unwrap();
+            let removed = || (Default::default(), crate::util::withholding::read_withheld().unwrap());
+            remote_closure(&head, Some(&base), removed()).expect("withheld file content is tolerated");
+
+            let root_tree = two_dirs("a2", "b2");
+            let next = parcel(&root_tree, &[&head]);
+            remove(&root_tree);
+            crate::util::withholding::withhold(&root_tree, "court order 10").unwrap();
+            let refused = remote_closure(&next, Some(&head), removed()).expect_err("a withheld tree is damage");
+            assert!(refused.contains(&format!("This server's host withholds {}", root_tree)), "{}", refused);
+        }
+
         // Revert: stop comparing the token's bound → a walk cut at a parcel no ref reaches skips the
         // root `head` reuses from it, so the write takes that token and lands over a lost blob.
         #[test]
