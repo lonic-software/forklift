@@ -3,19 +3,19 @@
 //!
 //! Withholding is a takedown on the host's own authority, as on a served root
 //! (`forklift_core::util::withholding`): the host lists a file's content hash with a statement,
-//! and the head stops serving and taking it, whatever names it. Each item is a versioned JSON
+//! for the head to stop serving and taking it, whatever names it. Each item is a versioned JSON
 //! record of the statement, when the hash was withheld, and how far withholding it has got. The
-//! operator writes it with `forklift-aws-withhold` ([`add`]); the head lists every item on the
-//! requests it gates, with one strongly consistent `Query` ([`list`]), so the next request after a
-//! withhold sees it, with nothing to poll.
+//! operator writes it with `forklift-aws-withhold` ([`add`]). [`list`] reads every item with one
+//! strongly consistent `Query`, so a head listing them on each request it gates sees a withhold
+//! on the next request, with nothing to poll. No request of this build's head lists them yet.
 //!
 //! An item of a version this build does not read, or that does not parse, fails every listing,
 //! loudly, and is never written over: a head that cannot tell what its host withholds must never
 //! serve as if it withheld nothing.
 //!
 //! The operator's role reads no object, so [`add`] cannot tell what the store holds the hash as.
-//! The head settles that from the store before it answers, and an item whose hash the store holds
-//! as a tree, a parcel or a chunk, which is no file's content, never applies.
+//! That is the head's to settle from the store, and an item whose hash the store holds as a tree,
+//! a parcel or a chunk, which is no file's content, never applies.
 
 use std::time::SystemTime;
 
@@ -31,6 +31,10 @@ pub const ITEM_VERSION: u64 = 1;
 /// How many of [`add`]'s writes may lose a race, or end with their fate unknown, before it gives
 /// up.
 const WRITE_ATTEMPTS: usize = 8;
+
+/// How long [`add`] pauses after the first write whose fate is unknown; each later one doubles it,
+/// so the pauses between the eight attempts add up to about 13 seconds.
+const UNKNOWN_FATE_PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// A withheld item's record. The fields past the statement are written by the head as it carries
 /// the withholding out, each only once true (or, for the lease, while held), so the record an
@@ -197,18 +201,30 @@ pub enum Added {
 ///                   this build does not serve, the item held already cannot be read, or the
 ///                   write kept losing races or failing.
 pub fn add<R: RefStore + ?Sized>(refs: &R, hash: &str, statement: &str) -> Result<Added, String> {
-    add_at(refs, hash, statement, epoch_seconds(SystemTime::now()))
+    let pause = |attempt: usize| std::thread::sleep(UNKNOWN_FATE_PAUSE * (1 << attempt));
+    add_at(refs, hash, statement, epoch_seconds(SystemTime::now()), &pause)
 }
 
-/// [`add`], withheld at `now`.
-fn add_at<R: RefStore + ?Sized>(refs: &R, hash: &str, statement: &str, now: u64) -> Result<Added, String> {
+/// [`add`], withheld at `now`, calling `pause` with the attempt's index (from 0) before reading
+/// the item again after a write whose fate is unknown.
+fn add_at<R: RefStore + ?Sized>(
+    refs: &R,
+    hash: &str,
+    statement: &str,
+    now: u64,
+    pause: &dyn Fn(usize),
+) -> Result<Added, String> {
     if !object_utils::is_object_hash(hash) {
         return Err(format!("\"{}\" is not an object hash.", hash));
     }
 
     let statement = withholding::checked_statement(statement)?;
 
-    for _ in 0..WRITE_ATTEMPTS {
+    // What the last write whose fate is unknown would have done, had it landed. A later read that
+    // finds the statement in place reports that, not that the hash was withheld already.
+    let mut unknown: Option<Added> = None;
+
+    for attempt in 0..WRITE_ATTEMPTS {
         let stored = refs.get_item(ItemKey::Withheld(hash))?;
 
         let (added, item) = match &stored {
@@ -217,7 +233,9 @@ fn add_at<R: RefStore + ?Sized>(refs: &R, hash: &str, statement: &str, now: u64)
                 let held = decode(hash, stored)?;
 
                 if held.statement == statement {
-                    return Ok(Added::Unchanged);
+                    // Nothing is written, but the answer still says the warehouse is served.
+                    format::gate(refs).map_err(|error| error.message)?;
+                    return Ok(unknown.unwrap_or(Added::Unchanged));
                 }
 
                 (Added::Restated, WithheldItem { statement: statement.to_string(), ..held })
@@ -239,8 +257,16 @@ fn add_at<R: RefStore + ?Sized>(refs: &R, hash: &str, statement: &str, now: u64)
             .map_err(|error| error.message)?
         {
             RedactionWrite::Written => return Ok(added),
-            // Read the item again: another writer changed it, or this write's fate is unknown.
-            RedactionWrite::Moved | RedactionWrite::Transient(_) => continue,
+            // Read the item again: another writer changed it.
+            RedactionWrite::Moved => continue,
+            // Read the item again, after a pause: this write's fate is unknown, or the table is
+            // contended or throttled.
+            RedactionWrite::Transient(_) => {
+                unknown = Some(added);
+                if attempt + 1 < WRITE_ATTEMPTS {
+                    pause(attempt);
+                }
+            }
             RedactionWrite::FormatMoved => unreachable!("fenced never returns an outcome `moved` names"),
         }
     }
@@ -278,13 +304,13 @@ mod tests {
         let refs = served();
         let hash = "b".repeat(64);
 
-        assert_eq!(add_at(&refs, &hash, "  court order 1 ", 7).unwrap(), Added::Added);
+        assert_eq!(add_at(&refs, &hash, "  court order 1 ", 7, &|_| {}).unwrap(), Added::Added);
         let listed = list(&refs).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].hash, hash);
         assert_eq!(listed[0].item, WithheldItem::new("court order 1", 7));
 
-        assert_eq!(add_at(&refs, &hash, "court order 1", 9).unwrap(), Added::Unchanged);
+        assert_eq!(add_at(&refs, &hash, "court order 1", 9, &|_| {}).unwrap(), Added::Unchanged);
         assert_eq!(list(&refs).unwrap()[0].item.withheld_at, 7, "nothing was written");
 
         // A record the head has carried forward keeps its progress when restated.
@@ -292,25 +318,61 @@ mod tests {
         let fence = FormatFence::At(format::AWS_FORMAT.to_string());
         let write = ItemWrite { key: ItemKey::Withheld(&hash), state: &encode(&progressed), expected: Some(&listed[0].stored) };
         assert_eq!(refs.put_items(&[write], &fence).unwrap(), RedactionWrite::Written);
-        assert_eq!(add_at(&refs, &hash, "court order 2", 9).unwrap(), Added::Restated);
+        assert_eq!(add_at(&refs, &hash, "court order 2", 9, &|_| {}).unwrap(), Added::Restated);
         assert_eq!(
             list(&refs).unwrap()[0].item,
             WithheldItem { statement: "court order 2".to_string(), ..progressed }
         );
 
         let empty = MemoryRefStore::new();
-        let refused = add_at(&empty, &hash, "court order 3", 7).unwrap_err();
+        let refused = add_at(&empty, &hash, "court order 3", 7, &|_| {}).unwrap_err();
         assert!(refused.contains("holds nothing yet"), "{}", refused);
         assert!(empty.items().is_empty(), "nothing was written: {:?}", empty.items());
+    }
+
+    // Revert: answer `Unchanged` whenever the statement is in place → the adds that landed with
+    // an unknown fate read as made already → red.
+    #[test]
+    fn an_add_whose_write_landed_with_an_unknown_fate_says_what_it_did() {
+        let refs = served();
+        let hash = "e".repeat(64);
+        let pauses = std::cell::RefCell::new(Vec::new());
+        let pause = |attempt: usize| pauses.borrow_mut().push(attempt);
+
+        refs.land_next_writes_unknown(1);
+        assert_eq!(add_at(&refs, &hash, "court order 1", 7, &pause).unwrap(), Added::Added);
+        assert_eq!(list(&refs).unwrap()[0].item, WithheldItem::new("court order 1", 7));
+        assert_eq!(*pauses.borrow(), vec![0], "one pause, after the write of unknown fate");
+
+        refs.land_next_writes_unknown(1);
+        assert_eq!(add_at(&refs, &hash, "court order 2", 9, &pause).unwrap(), Added::Restated);
+        assert_eq!(list(&refs).unwrap()[0].item, WithheldItem::new("court order 2", 7));
+
+        assert_eq!(add_at(&refs, &hash, "court order 2", 9, &pause).unwrap(), Added::Unchanged);
+    }
+
+    // Revert: answer `Unchanged` before the gate → the add on a warehouse of another format
+    // succeeds → red.
+    #[test]
+    fn an_unchanged_add_still_refuses_a_warehouse_this_build_does_not_serve() {
+        let refs = served();
+        let hash = "f".repeat(64);
+        assert_eq!(add_at(&refs, &hash, "court order", 7, &|_| {}).unwrap(), Added::Added);
+
+        refs.set_format(Some("999"));
+        assert!(add_at(&refs, &hash, "court order", 7, &|_| {}).is_err(), "refused, not unchanged");
+
+        refs.set_format(Some(&format::AWS_FORMAT.to_string()));
+        assert_eq!(add_at(&refs, &hash, "court order", 7, &|_| {}).unwrap(), Added::Unchanged);
     }
 
     // Revert: skip the statement check → the two-line statement is written.
     #[test]
     fn an_add_refuses_what_is_not_a_hash_or_not_a_statement() {
         let refs = served();
-        assert!(add_at(&refs, "not-a-hash", "court order", 7).unwrap_err().contains("not an object hash"));
-        assert!(add_at(&refs, &"c".repeat(64), "two\nlines", 7).unwrap_err().contains("one plain line"));
-        assert!(add_at(&refs, &"c".repeat(64), &"x".repeat(withholding::STATEMENT_MAX_CHARS + 1), 7).is_err());
+        assert!(add_at(&refs, "not-a-hash", "court order", 7, &|_| {}).unwrap_err().contains("not an object hash"));
+        assert!(add_at(&refs, &"c".repeat(64), "two\nlines", 7, &|_| {}).unwrap_err().contains("one plain line"));
+        assert!(add_at(&refs, &"c".repeat(64), &"x".repeat(withholding::STATEMENT_MAX_CHARS + 1), 7, &|_| {}).is_err());
         assert!(list(&refs).unwrap().is_empty());
     }
 
@@ -330,7 +392,7 @@ mod tests {
         assert!(list(&newer).unwrap_err().contains("of a version this build does not read (2)"));
         let unknown = with(r#"{"version":1,"statement":"s","withheld_at":1,"later":true}"#);
         assert!(list(&unknown).unwrap_err().contains("cannot be read"));
-        assert!(add_at(&unknown, &hash, "other", 7).is_err(), "never written over");
+        assert!(add_at(&unknown, &hash, "other", 7, &|_| {}).is_err(), "never written over");
         let bare = with("{}");
         assert!(list(&bare).unwrap_err().contains("(none)"));
 

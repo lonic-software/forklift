@@ -742,11 +742,9 @@ pub trait RefStore {
     /// Every withheld item of the warehouse, each as its hash and its stored state, read strongly
     /// consistently and in full, so a withhold made before the read began is listed.
     ///
-    /// The default keeps no such items and fails, loudly: a store that cannot say what its host
-    /// withholds must never be read as one withholding nothing.
-    fn list_withheld(&self) -> Result<Vec<(String, String)>, String> {
-        Err("This ref store keeps no withheld items.".to_string())
-    }
+    /// It has no default: a store that forgot to list them would be read as one whose host
+    /// withholds nothing.
+    fn list_withheld(&self) -> Result<Vec<(String, String)>, String>;
 
     /// Make every write of `writes` at once, or none: each on condition that its item still holds
     /// what it expects, and all on condition that the format item still holds what `format`

@@ -704,6 +704,16 @@ issues (`PutItem`, `UpdateItem`, `ConditionCheckItem`). `dynamodb:Scan` is grant
 neither Lambda's policy: `--all` finds the table's warehouses by scanning it, and nothing a request
 does needs to see past its own warehouse's partition.
 
+### `forklift-aws-withhold`
+
+The operator's withholding binary runs under the same `iam/operator.policy.json`, never as a
+Lambda. `forklift-aws-withhold --table <table> <warehouse> add <hash> --statement <text>` records
+a file's content hash with the host's statement as the warehouse's `withheld#<hash>` item, and
+`list` shows each item with how far withholding it has got. It reads the item and the format item
+(`GetItem`), lists the items (`Query`), and writes one by a transaction conditioned on the item
+and on the format item (`PutItem`, `ConditionCheckItem`). It reads no object. This build's head
+does not act on the items yet, so the content is still served.
+
 ### `s3:ListBucket` on both roles is unconditional, and has to be
 
 This is a non-obvious operational fact, found against a real AWS account, not derived from the SDK

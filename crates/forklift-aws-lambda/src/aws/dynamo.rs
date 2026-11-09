@@ -242,23 +242,6 @@ impl DynamoRefStore {
         ])
     }
 
-    /// Read one item by its sort key, strongly consistent.
-    ///
-    /// DynamoDB's default eventually-consistent read can serve a replica that has not yet
-    /// absorbed the last write; `consistent_read(true)` pins this read to the same partition
-    /// the CAS writes land on, at roughly double the read cost. That closes the *read* half of
-    /// a staleness window that otherwise exists wherever `get_head`/`get_trust` feed a
-    /// decision: `ref_update` reads the office head and the trust anchor once per request to
-    /// decide what to audit against, and an eventually-consistent read could hand back an
-    /// office head DynamoDB had already moved past.
-    ///
-    /// The other half — a concurrent office re-key or re-genesis landing between that read and
-    /// the commit — used to be an open window at this commit's ancestor: `compare_and_set_head`
-    /// conditioned on the target pallet's own head alone, so the office head and the anchor
-    /// could move freely underneath a running audit. FORK-95 closed it by folding both into the
-    /// same `TransactWriteItems` the pallet head CAS already needed (see this module's own
-    /// docs), so the commit now conditions on everything the audit consumed, not only the one
-    /// input the caller happened to be updating.
     /// Every item of the warehouse's partition whose sort key begins with `prefix`, read with one
     /// strongly consistent `Query`, page by page to the end.
     async fn query_prefix(&self, prefix: &str) -> Result<Vec<HashMap<String, AttributeValue>>, String> {
@@ -293,6 +276,23 @@ impl DynamoRefStore {
         Ok(items)
     }
 
+    /// Read one item by its sort key, strongly consistent.
+    ///
+    /// DynamoDB's default eventually-consistent read can serve a replica that has not yet
+    /// absorbed the last write; `consistent_read(true)` pins this read to the same partition
+    /// the CAS writes land on, at roughly double the read cost. That closes the *read* half of
+    /// a staleness window that otherwise exists wherever `get_head`/`get_trust` feed a
+    /// decision: `ref_update` reads the office head and the trust anchor once per request to
+    /// decide what to audit against, and an eventually-consistent read could hand back an
+    /// office head DynamoDB had already moved past.
+    ///
+    /// The other half — a concurrent office re-key or re-genesis landing between that read and
+    /// the commit — used to be an open window at this commit's ancestor: `compare_and_set_head`
+    /// conditioned on the target pallet's own head alone, so the office head and the anchor
+    /// could move freely underneath a running audit. FORK-95 closed it by folding both into the
+    /// same `TransactWriteItems` the pallet head CAS already needed (see this module's own
+    /// docs), so the commit now conditions on everything the audit consumed, not only the one
+    /// input the caller happened to be updating.
     async fn read_item(
         &self,
         entity: &str,
@@ -970,7 +970,8 @@ impl RefStore for DynamoRefStore {
                 Some(state) => withheld.push((hash.to_string(), state.clone())),
                 None => return Err(format!(
                     "The item {}{} carries no state this build can read.",
-                    ENTITY_WITHHELD_PREFIX, hash
+                    ENTITY_WITHHELD_PREFIX,
+                    hash.escape_debug()
                 )),
             }
         }

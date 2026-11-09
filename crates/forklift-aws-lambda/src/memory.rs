@@ -30,7 +30,7 @@ use crate::aws::dynamo::{
 use crate::store::{
     CasOutcome, ExpectedHead, FormatFence, FormatStore, ObjectAccess, ObjectStore, OffloadedResponse,
     ItemKey, ItemWrite, OfficePrecondition, PromoteOutcome, PutOutcome, PutTarget, RedactionWrite, RedactionsPrecondition, RefHead, RefListing, RefStore,
-    SignatureOutcome, TrustOutcome, TrustWriteOutcome,
+    SignatureOutcome, TransientCause, TrustOutcome, TrustWriteOutcome,
 };
 
 /// An in-memory [`ObjectStore`]. Object bytes are the uncompressed wire form, keyed by hash.
@@ -358,6 +358,9 @@ struct RefState {
     /// The stored state of each item [`RefStore::put_items`] writes (the redaction items and the
     /// chunk fence and ledger), keyed by the sort key `DynamoRefStore` gives it.
     items: HashMap<String, String>,
+    /// How many of the next [`RefStore::put_items`] calls that would write land and then answer
+    /// as a write of unknown fate, as one whose response DynamoDB lost.
+    writes_landing_unknown: usize,
 }
 
 /// An in-memory [`RefStore`]. Pallet heads are keyed by their qualified wire reference
@@ -375,6 +378,7 @@ impl Default for MemoryRefStore {
                 trust: None,
                 format: None,
                 items: HashMap::new(),
+                writes_landing_unknown: 0,
             }),
             default_pallet: DEFAULT_PALLET_NAME.to_string(),
         }
@@ -392,6 +396,12 @@ impl MemoryRefStore {
     /// formats were recorded.
     pub fn set_format(&self, state: Option<&str>) {
         self.state.lock().unwrap().format = state.map(str::to_string);
+    }
+
+    /// Make the next `count` [`RefStore::put_items`] calls that write land, then answer as writes
+    /// of unknown fate: the stand-in for a transaction that committed and whose response was lost.
+    pub fn land_next_writes_unknown(&self, count: usize) {
+        self.state.lock().unwrap().writes_landing_unknown = count;
     }
 
     /// This store's state as the DynamoDB items `DynamoRefStore` keeps for it: each item's sort
@@ -714,17 +724,14 @@ impl RefStore for MemoryRefStore {
 
     fn list_withheld(&self) -> Result<Vec<(String, String)>, String> {
         let state = self.state.lock().unwrap();
-        let mut withheld: Vec<(String, String)> = state
+        // In no order: `withheld::list` sorts.
+        Ok(state
             .items
             .iter()
             .filter_map(|(entity, item)| {
                 entity.strip_prefix(ENTITY_WITHHELD_PREFIX).map(|hash| (hash.to_string(), item.clone()))
             })
-            .collect();
-
-        // In sort-key order, as a `Query` returns them.
-        withheld.sort();
-        Ok(withheld)
+            .collect())
     }
 
     fn put_items(&self, writes: &[ItemWrite<'_>], format: &FormatFence) -> Result<RedactionWrite, String> {
@@ -741,6 +748,11 @@ impl RefStore for MemoryRefStore {
         guard.apply_format(format);
         for write in writes {
             guard.items.insert(item_entity(write.key), write.state.to_string());
+        }
+
+        if guard.writes_landing_unknown > 0 {
+            guard.writes_landing_unknown -= 1;
+            return Ok(RedactionWrite::Transient(TransientCause::FateUnknown));
         }
 
         Ok(RedactionWrite::Written)

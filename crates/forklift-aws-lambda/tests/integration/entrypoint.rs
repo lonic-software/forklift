@@ -159,6 +159,10 @@ impl RefStore for SharedRefs {
         self.0.get_item(key)
     }
 
+    fn list_withheld(&self) -> Result<Vec<(String, String)>, String> {
+        self.0.list_withheld()
+    }
+
     fn put_items(
         &self,
         writes: &[forklift_aws_lambda::store::ItemWrite<'_>],
@@ -1863,6 +1867,10 @@ impl RefStore for MarkedMidRequest {
 
     fn get_item(&self, key: forklift_aws_lambda::store::ItemKey<'_>) -> Result<Option<String>, String> {
         self.0.get_item(key)
+    }
+
+    fn list_withheld(&self) -> Result<Vec<(String, String)>, String> {
+        self.0.list_withheld()
     }
 
     fn put_items(
