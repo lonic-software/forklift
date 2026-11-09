@@ -183,11 +183,12 @@ pub enum Added {
     /// The hash was withheld already; its statement now is the one given, and nothing else of its
     /// record changed.
     Restated,
-    /// The hash was withheld already, with this statement; nothing was written.
+    /// The hash was withheld already, with this statement, and no write of this add's had an
+    /// unknown fate; nothing was written.
     Unchanged,
     /// The hash is withheld, with this statement, but a write of this add's had an unknown fate:
     /// it may have landed late, so whether this add made the record cannot be told.
-    InPlace,
+    Uncertain,
 }
 
 /// Withhold `hash` in the warehouse behind `refs`, with the host's `statement`.
@@ -198,7 +199,7 @@ pub enum Added {
 /// misspelt id never makes one.
 ///
 /// # Returns
-/// * `Ok(Added)`   - What changed.
+/// * `Ok(Added)`   - What changed, or that it cannot be told ([`Added::Uncertain`]).
 /// * `Err(String)` - `hash` is not an object hash, `statement` is not one plain line of at most
 ///                   [`withholding::STATEMENT_MAX_CHARS`], the warehouse is new or in a format
 ///                   this build does not serve, the item held already cannot be read, or the
@@ -239,7 +240,7 @@ fn add_at<R: RefStore + ?Sized>(
                 if held.statement == statement {
                     // Nothing is written, but the answer still says the warehouse is served.
                     format::gate(refs).map_err(|error| error.message)?;
-                    return Ok(if fate_unknown { Added::InPlace } else { Added::Unchanged });
+                    return Ok(if fate_unknown { Added::Uncertain } else { Added::Unchanged });
                 }
 
                 (Added::Restated, WithheldItem { statement: statement.to_string(), ..held })
@@ -345,12 +346,12 @@ mod tests {
         let pause = |attempt: usize| pauses.borrow_mut().push(attempt);
 
         refs.land_next_writes_unknown(1);
-        assert_eq!(add_at(&refs, &hash, "court order 1", 7, &pause).unwrap(), Added::InPlace);
+        assert_eq!(add_at(&refs, &hash, "court order 1", 7, &pause).unwrap(), Added::Uncertain);
         assert_eq!(list(&refs).unwrap()[0].item, WithheldItem::new("court order 1", 7));
         assert_eq!(*pauses.borrow(), vec![0], "one pause, after the write of unknown fate");
 
         refs.land_next_writes_unknown(1);
-        assert_eq!(add_at(&refs, &hash, "court order 2", 9, &pause).unwrap(), Added::InPlace);
+        assert_eq!(add_at(&refs, &hash, "court order 2", 9, &pause).unwrap(), Added::Uncertain);
         assert_eq!(list(&refs).unwrap()[0].item, WithheldItem::new("court order 2", 7));
 
         assert_eq!(add_at(&refs, &hash, "court order 2", 9, &pause).unwrap(), Added::Unchanged);
@@ -384,7 +385,7 @@ mod tests {
                 refs.race_next_write(&entity, &late);
             }
         };
-        assert_eq!(add_at(&refs, &hash, "court order", 7, &pause).unwrap(), Added::InPlace);
+        assert_eq!(add_at(&refs, &hash, "court order", 7, &pause).unwrap(), Added::Uncertain);
 
         // Of unknown fate and not landed, then written: added.
         let hash = "c3".repeat(32);

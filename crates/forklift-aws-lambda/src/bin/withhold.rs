@@ -93,10 +93,10 @@ fn run(arguments: &Arguments, store: &DynamoRefStore) -> Result<(), String> {
                 Added::Added => "is now recorded as withheld",
                 Added::Restated => "was recorded as withheld already; its statement is now the one given",
                 Added::Unchanged => "was recorded as withheld already, with this statement",
-                Added::InPlace => "is recorded as withheld, with this statement",
+                Added::Uncertain => "is recorded as withheld, with this statement",
             };
             println!("{} {} in {}.", hash, line, arguments.warehouse);
-            if added == Added::InPlace {
+            if added == Added::Uncertain {
                 println!("A write's fate was unknown, so whether this run recorded it cannot be told.");
             }
             println!("This build's head does not act on withheld items yet, so it still serves the content.");
