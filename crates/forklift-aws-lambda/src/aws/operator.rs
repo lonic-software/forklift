@@ -71,7 +71,7 @@ impl TableOptions {
 /// * `Err(String)` - The runtime or the client could not be built, `command` failed, or it stopped
 ///                   unexpectedly.
 pub fn run_on_table<T: Send + 'static>(
-    table: &Table,
+    table: Table,
     command: impl FnOnce(DynamoOps, AsyncBridge) -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
     let runtime = tokio::runtime::Builder::new_multi_thread()

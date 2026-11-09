@@ -23,7 +23,7 @@ use forklift_core::util::{object_utils, withholding};
 use serde::{Deserialize, Serialize};
 
 use crate::format;
-use crate::store::{FormatFence, ItemKey, ItemWrite, RedactionWrite, RefStore};
+use crate::store::{FormatFence, ItemKey, ItemWrite, RedactionWrite, RefStore, TransientCause};
 
 /// The version of the withheld item this build writes and reads.
 pub const ITEM_VERSION: u64 = 1;
@@ -32,9 +32,9 @@ pub const ITEM_VERSION: u64 = 1;
 /// up.
 const WRITE_ATTEMPTS: usize = 8;
 
-/// How long [`add`] pauses after the first write whose fate is unknown; each later one doubles it,
-/// so the pauses between the eight attempts add up to about 13 seconds.
-const UNKNOWN_FATE_PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
+/// How long [`add`] pauses after its first write refused as transient; each later pause doubles
+/// it, so the pauses between the eight attempts add up to about 13 seconds.
+const TRANSIENT_PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// A withheld item's record. The fields past the statement are written by the head as it carries
 /// the withholding out, each only once true (or, for the lease, while held), so the record an
@@ -201,12 +201,12 @@ pub enum Added {
 ///                   this build does not serve, the item held already cannot be read, or the
 ///                   write kept losing races or failing.
 pub fn add<R: RefStore + ?Sized>(refs: &R, hash: &str, statement: &str) -> Result<Added, String> {
-    let pause = |attempt: usize| std::thread::sleep(UNKNOWN_FATE_PAUSE * (1 << attempt));
+    let pause = |attempt: usize| std::thread::sleep(TRANSIENT_PAUSE * (1 << attempt));
     add_at(refs, hash, statement, epoch_seconds(SystemTime::now()), &pause)
 }
 
 /// [`add`], withheld at `now`, calling `pause` with the attempt's index (from 0) before reading
-/// the item again after a write whose fate is unknown.
+/// the item again after a write refused as transient.
 fn add_at<R: RefStore + ?Sized>(
     refs: &R,
     hash: &str,
@@ -220,8 +220,9 @@ fn add_at<R: RefStore + ?Sized>(
 
     let statement = withholding::checked_statement(statement)?;
 
-    // What the last write whose fate is unknown would have done, had it landed. A later read that
-    // finds the statement in place reports that, not that the hash was withheld already.
+    // What the last write would have done, while its fate is unknown: a later read that finds the
+    // statement in place reports that, not that the hash was withheld already. A write that
+    // certainly did not land (refused as moved, contended or throttled) clears it.
     let mut unknown: Option<Added> = None;
 
     for attempt in 0..WRITE_ATTEMPTS {
@@ -258,11 +259,11 @@ fn add_at<R: RefStore + ?Sized>(
         {
             RedactionWrite::Written => return Ok(added),
             // Read the item again: another writer changed it.
-            RedactionWrite::Moved => continue,
+            RedactionWrite::Moved => unknown = None,
             // Read the item again, after a pause: this write's fate is unknown, or the table is
             // contended or throttled.
-            RedactionWrite::Transient(_) => {
-                unknown = Some(added);
+            RedactionWrite::Transient(cause) => {
+                unknown = (cause == TransientCause::FateUnknown).then_some(added);
                 if attempt + 1 < WRITE_ATTEMPTS {
                     pause(attempt);
                 }
@@ -349,6 +350,52 @@ mod tests {
         assert_eq!(list(&refs).unwrap()[0].item, WithheldItem::new("court order 2", 7));
 
         assert_eq!(add_at(&refs, &hash, "court order 2", 9, &pause).unwrap(), Added::Unchanged);
+    }
+
+    // Revert: remember every transient refusal as a write that may have landed → the throttled
+    // add reads the other writer's item as its own → red. Revert: keep it past a moved write →
+    // the add that lost the race reads as made → red.
+    #[test]
+    fn an_add_that_certainly_wrote_nothing_never_claims_the_item_in_place() {
+        let refs = served();
+        let hash = "a1".repeat(32);
+        let theirs = encode(&WithheldItem::new("court order", 3));
+
+        // Throttled; another operator withholds it, with the same statement, during the pause.
+        refs.refuse_next_writes(&[TransientCause::Contended]);
+        let fence = FormatFence::At(format::AWS_FORMAT.to_string());
+        let pause = |_: usize| {
+            let write = ItemWrite { key: ItemKey::Withheld(&hash), state: &theirs, expected: None };
+            assert_eq!(refs.put_items(&[write], &fence).unwrap(), RedactionWrite::Written);
+        };
+        assert_eq!(add_at(&refs, &hash, "court order", 7, &pause).unwrap(), Added::Unchanged);
+
+        // Of unknown fate and not landed; the next write loses the race to the same statement.
+        let hash = "b2".repeat(32);
+        let entity = format!("withheld#{}", hash);
+        refs.refuse_next_writes(&[TransientCause::FateUnknown]);
+        let pause = |_: usize| refs.race_next_write(&entity, &theirs);
+        assert_eq!(add_at(&refs, &hash, "court order", 7, &pause).unwrap(), Added::Unchanged);
+        assert_eq!(list(&refs).unwrap()[1].item.withheld_at, 3, "theirs, not this add's");
+
+        // Of unknown fate and not landed, then written: added.
+        let hash = "c3".repeat(32);
+        refs.refuse_next_writes(&[TransientCause::FateUnknown]);
+        assert_eq!(add_at(&refs, &hash, "court order", 7, &|_| {}).unwrap(), Added::Added);
+    }
+
+    // Revert: pause after the last attempt too → an eighth pause → red.
+    #[test]
+    fn an_add_refused_every_time_pauses_between_attempts_only_and_says_so() {
+        let refs = served();
+        let pauses = std::cell::RefCell::new(Vec::new());
+        refs.refuse_next_writes(&[TransientCause::Contended; WRITE_ATTEMPTS]);
+
+        let refused = add_at(&refs, &"d4".repeat(32), "court order", 7, &|attempt| pauses.borrow_mut().push(attempt))
+            .unwrap_err();
+        assert!(refused.contains("Run the command again"), "{}", refused);
+        assert_eq!(*pauses.borrow(), (0..WRITE_ATTEMPTS - 1).collect::<Vec<_>>());
+        assert!(list(&refs).unwrap().is_empty());
     }
 
     // Revert: answer `Unchanged` before the gate → the add on a warehouse of another format

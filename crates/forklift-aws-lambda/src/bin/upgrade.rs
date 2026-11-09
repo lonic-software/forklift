@@ -84,8 +84,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let table = arguments.table.clone();
-    operator::exit(run_on_table(&table, move |dynamodb, bridge| run(&arguments, dynamodb, bridge)))
+    operator::exit(run_on_table(arguments.table.clone(), move |dynamodb, bridge| run(&arguments, dynamodb, bridge)))
 }
 
 fn run(arguments: &Arguments, dynamodb: forklift_aws_lambda::aws::DynamoOps, bridge: AsyncBridge) -> Result<(), String> {

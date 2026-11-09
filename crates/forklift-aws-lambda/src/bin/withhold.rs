@@ -73,8 +73,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let table = arguments.table.clone();
-    operator::exit(run_on_table(&table, move |dynamodb, bridge| {
+    operator::exit(run_on_table(arguments.table.clone(), move |dynamodb, bridge| {
         let store = DynamoRefStore::new(
             dynamodb,
             arguments.table.name.clone(),
@@ -121,6 +120,6 @@ fn progress(item: &WithheldItem) -> &'static str {
         WithheldItem { swept: true, kept: true, .. } => "withheld, copy kept for history",
         WithheldItem { swept: true, .. } => "withheld, deleting",
         WithheldItem { settled: true, .. } => "withheld, deletion owed",
-        _ => "withheld, not yet seen by the head",
+        _ => "recorded",
     }
 }

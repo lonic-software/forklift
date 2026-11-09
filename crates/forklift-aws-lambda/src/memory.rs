@@ -361,6 +361,12 @@ struct RefState {
     /// How many of the next [`RefStore::put_items`] calls that would write land and then answer
     /// as a write of unknown fate, as one whose response DynamoDB lost.
     writes_landing_unknown: usize,
+    /// What the next [`RefStore::put_items`] calls answer instead of writing, each a transient
+    /// refusal that wrote nothing.
+    writes_refused: std::collections::VecDeque<TransientCause>,
+    /// An item another writer puts, by sort key and state, just before the next
+    /// [`RefStore::put_items`] call checks its conditions.
+    racing_write: Option<(String, String)>,
 }
 
 /// An in-memory [`RefStore`]. Pallet heads are keyed by their qualified wire reference
@@ -379,6 +385,8 @@ impl Default for MemoryRefStore {
                 format: None,
                 items: HashMap::new(),
                 writes_landing_unknown: 0,
+                writes_refused: std::collections::VecDeque::new(),
+                racing_write: None,
             }),
             default_pallet: DEFAULT_PALLET_NAME.to_string(),
         }
@@ -402,6 +410,18 @@ impl MemoryRefStore {
     /// of unknown fate: the stand-in for a transaction that committed and whose response was lost.
     pub fn land_next_writes_unknown(&self, count: usize) {
         self.state.lock().unwrap().writes_landing_unknown = count;
+    }
+
+    /// Make the next [`RefStore::put_items`] calls answer `causes`, in turn, as transient
+    /// refusals that wrote nothing.
+    pub fn refuse_next_writes(&self, causes: &[TransientCause]) {
+        self.state.lock().unwrap().writes_refused.extend(causes.iter().copied());
+    }
+
+    /// Have another writer put `state` as the item of sort key `entity` just before the next
+    /// [`RefStore::put_items`] call checks its conditions, as a write racing it would.
+    pub fn race_next_write(&self, entity: &str, state: &str) {
+        self.state.lock().unwrap().racing_write = Some((entity.to_string(), state.to_string()));
     }
 
     /// This store's state as the DynamoDB items `DynamoRefStore` keeps for it: each item's sort
@@ -736,6 +756,14 @@ impl RefStore for MemoryRefStore {
 
     fn put_items(&self, writes: &[ItemWrite<'_>], format: &FormatFence) -> Result<RedactionWrite, String> {
         let mut guard = self.state.lock().unwrap();
+
+        if let Some((entity, state)) = guard.racing_write.take() {
+            guard.items.insert(entity, state);
+        }
+
+        if let Some(cause) = guard.writes_refused.pop_front() {
+            return Ok(RedactionWrite::Transient(cause));
+        }
 
         if !guard.format_holds(format) {
             return Ok(RedactionWrite::FormatMoved);
