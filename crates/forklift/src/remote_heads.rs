@@ -22,8 +22,8 @@ pub(crate) struct RemoteHeld {
 /// so it never runs without them: an unreachable or untrusted remote refuses before anything
 /// changes.
 ///
-/// A handshake with no withheld list reports nothing withheld, as for an origin move: a head that
-/// lists none refuses nothing as withheld.
+/// A handshake with no withheld list is read as withholding nothing, as for an origin move: a
+/// withholding the head does not report is one this cannot see.
 ///
 /// A recorded head counts only when the remote answers that it holds it, so the record never frees
 /// more than the current heads alone unless the remote affirms it; when the confirmation cannot be
