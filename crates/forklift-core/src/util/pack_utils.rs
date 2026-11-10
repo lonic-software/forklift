@@ -3694,7 +3694,17 @@ fn compact_bounded(all: bool,
         (None, Some(lock_utils::StoreAccessLock::try_shared()?))
     };
 
-    compact_held(all, redelta, salvage, progress, table_bound, &HashSet::new(), &HashSet::new())
+    let stats = compact_held(all, redelta, salvage, progress, table_bound, &HashSet::new(), &HashSet::new())?;
+
+    // A full repack holds exclusive store access, so it also drops what the unavailable record
+    // lists that is present again, or that nothing names any more when the live walk was whole. Its
+    // error is ignored: the record then only stays larger than it needs to be, and must not fail
+    // the repack that already landed.
+    if let Some(hold) = &_store_exclusive {
+        let _ = crate::util::unavailable::prune(hold);
+    }
+
+    Ok(stats)
 }
 
 /// A full repack for an eviction (DESIGN.html §7.6.1): [`compact`] with `all`, keeping the live set

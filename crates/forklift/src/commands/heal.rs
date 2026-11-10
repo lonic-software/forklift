@@ -1,7 +1,7 @@
 use serde::Serialize;
 use forklift_core::util::lock_utils::StoreAccessLock;
 use forklift_core::util::operation_utils::{self, RecoveryOutcome};
-use forklift_core::util::{recovery_utils, sealed_utils};
+use forklift_core::util::{recovery_utils, sealed_utils, unavailable};
 use crate::output::{self, CommandOutput};
 
 /// Handle the `heal` command: rebuild a damaged sealed-object record from the part before the
@@ -85,6 +85,7 @@ pub async fn handle_command(store_access: &StoreAccessLock) -> Result<(), String
     // nothing while it is present, but were it lost later it would read as held rather than lost.
     let mut notes = outcome.notes;
     let (unsealed, unseal_failed) = unseal_present(store_access, &mut notes);
+    drop_present_unavailable(&mut notes);
 
     output::emit(&HealReport {
         record_rebuilt,
@@ -99,6 +100,23 @@ pub async fn handle_command(store_access: &StoreAccessLock) -> Result<(), String
     });
 
     Ok(())
+}
+
+/// Drop the unavailable record's entry of every object the store holds, whose content came back,
+/// noting how many went, or why none could. Heal never drops an absent entry: it runs under the
+/// shared store hold, beside a fetch that may have recorded one and not yet written its head.
+fn drop_present_unavailable(notes: &mut Vec<String>) {
+    match unavailable::drop_present() {
+        Ok(0) => {}
+        Ok(dropped) => notes.push(format!(
+            "{} object(s) recorded unavailable are in the store again, so their record was removed.",
+            dropped
+        )),
+        Err(error) => notes.push(format!(
+            "The record of content this warehouse cannot get was not checked against the store. {}",
+            error
+        )),
+    }
 }
 
 /// Remove the sealed-object record of every object the store holds, pushing each one's coverage

@@ -19,7 +19,7 @@ use std::process::Output;
 use forklift_core::globals::StorageRootScope;
 use forklift_core::util::{
     audit_utils, file_utils, graph_utils, object_utils, office_utils, pallet_utils, sealed_utils, tree_utils,
-    withholding,
+    unavailable, withholding,
 };
 use forklift_core::util::scope_utils::PathScope;
 use forklift_core::util::audit_utils::SealedTolerance;
@@ -935,6 +935,130 @@ fn audit_tolerates_a_withheld_absence_and_counts_it_apart() {
     let human = warehouse.run_ok(&["audit", "--full"]);
     let human_stdout = String::from_utf8_lossy(&human.stdout);
     assert!(human_stdout.contains("2 absent object(s) are withheld"), "{}", human_stdout);
+}
+
+/// An absent file the unavailable record lists is tolerated with no sealed record, and counted
+/// apart from what the record holds, what a redaction applied here does and what the host
+/// withholds; one the host withholds as well is counted as withheld, and one the record names as
+/// well as unavailable. An absence none names is still a loss, and the audit passes once the record
+/// holds it.
+///
+/// Revert: leave an unavailable absence untallied, or tally it as held → `unavailable` miscounts
+/// → red; drop it from the --json scope → red; drop its human line → red.
+#[test]
+fn audit_tolerates_an_unavailable_absence_and_counts_it_apart() {
+    let warehouse = Warehouse::new("unavailable-blob");
+    let head = warehouse.stack_files(&[("a.txt", "a\n"), ("b.txt", "b\n"), ("c.txt", "c\n"), ("d.txt", "d\n")], "K");
+
+    warehouse.scoped(|| {
+        let full = PathScope::full();
+        let [a, b, c, d] = ["a.txt", "b.txt", "c.txt", "d.txt"].map(|path| file_hash(&head, path));
+        withholding::withhold(&a, "Withheld here on a court order.").unwrap();
+        unavailable::record([&a, &b, &c].map(|hash| (hash.clone(), "Withheld by the remote's host.".to_string()))).unwrap();
+        for hash in [&a, &b, &c, &d] {
+            warehouse.delete_object(hash);
+        }
+        warehouse.seal(&[&c]);
+
+        let err = audit(&head, &full, true).expect_err("an absence none names is a loss");
+        assert!(err.contains(&d), "{}", err);
+
+        warehouse.seal(&[&c, &d]);
+        let tolerated = sealed_utils::read_tolerated().unwrap();
+        let tolerance = SealedTolerance::new(&tolerated);
+        audit_utils::verify_parcel_closure_scoped(&head, None, &full, true, Some(&tolerance)).unwrap();
+        assert_eq!((tolerance.held(), tolerance.redacted(), tolerance.withheld(), tolerance.unavailable()), (1, 0, 1, 2),
+            "d held; a withheld; b and c unavailable");
+    });
+
+    let json = warehouse.run_ok(&["audit", "--full", "--json"]);
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let scope = &report["data"]["scope"];
+    assert_eq!((&scope["held_by_hash"], &scope["withheld"], &scope["unavailable"]), (&1.into(), &1.into(), &2.into()),
+        "the --json envelope counts each apart: {}", report);
+
+    let human = warehouse.run_ok(&["audit", "--full"]);
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(human_stdout.contains("2 absent object(s) are unavailable"), "{}", human_stdout);
+}
+
+/// A full warehouse writes a head whose new parcel names a file it lacks only when the unavailable
+/// record lists that file's content: its ref gate reads the record beside the applied redactions.
+///
+/// Revert: leave the record out of `read_removed` → the write is refused as incomplete → red.
+#[test]
+fn a_full_warehouse_writes_a_head_lacking_only_unavailable_content() {
+    let warehouse = Warehouse::new("unavailable-head");
+    let first = warehouse.stack("a.txt", "a\n", "first");
+    let second = warehouse.stack("film.mkv", "the withheld film\n", "second");
+    let pallet = warehouse.current_pallet();
+    let none = pallet_utils::RefPreconditions::NONE;
+
+    warehouse.scoped(|| {
+        let film = file_hash(&second, "film.mkv");
+        // Nothing reaches `second` once its pallet moves back, so a write of it walks its parcel.
+        pallet_utils::update_pallet_head(&pallet, Some(&second), &first, &none).unwrap();
+        warehouse.delete_object(&film);
+
+        let refused = pallet_utils::update_pallet_head("other", None, &second, &none)
+            .expect_err("a head lacking unrecorded content is refused");
+        assert!(String::from(refused).contains(&film), "the refusal names the missing file");
+
+        unavailable::record([(film.clone(), "Withheld by the remote's host.".to_string())]).unwrap();
+        pallet_utils::update_pallet_head("other", None, &second, &none).expect("the unavailable file is tolerated");
+        assert_eq!(pallet_utils::get_pallet_head("other").unwrap().as_deref(), Some(second.as_str()));
+    });
+}
+
+/// A full repack drops the unavailable record's entries that nothing names and those whose object
+/// is back, and keeps an absent one a head names. A record it cannot read fails nothing: the
+/// repack has landed, and the record is left as it is.
+///
+/// Revert: drop the prune from the full repack → the unnamed entry stays → red; let its error
+/// fail the repack → the garbled record fails `store compact --all` → red.
+#[test]
+fn a_full_repack_prunes_the_unavailable_record_and_never_fails_over_it() {
+    let warehouse = Warehouse::new("unavailable-prune");
+    let head = warehouse.stack_files(&[("a.txt", "a\n"), ("film.mkv", "the withheld film\n")], "K");
+    let (present, film, unnamed) = warehouse.scoped(|| (file_hash(&head, "a.txt"), file_hash(&head, "film.mkv"), "9".repeat(64)));
+    warehouse.delete_object(&film);
+    let statement = |hash: &String| (hash.clone(), "Withheld by the remote's host.".to_string());
+    warehouse.scoped(|| unavailable::record([&present, &film, &unnamed].map(statement)).unwrap());
+
+    warehouse.run_ok(&["store", "compact", "--all"]);
+    let kept = warehouse.scoped(|| unavailable::read_unavailable().unwrap());
+    assert_eq!(kept.entries().map(|(hash, _)| hash.clone()).collect::<Vec<_>>(), [film.clone()],
+        "only the absent file a head names stays");
+
+    let record = warehouse.root.join(".forklift").join("unavailable");
+    std::fs::write(&record, "/forklift-unavailable 999\n").unwrap();
+    warehouse.run_ok(&["store", "compact", "--all"]);
+    assert_eq!(std::fs::read_to_string(&record).unwrap(), "/forklift-unavailable 999\n", "never written over");
+}
+
+/// Heal drops the unavailable record's entry of an object the store holds again and notes it, and
+/// keeps an absent one, even one nothing names; a record it cannot read is a note, not a failure.
+///
+/// Revert: drop heal's step → the present entry stays → red; drop absent entries too → the
+/// unnamed one goes → red; return the error → the garbled record fails heal → red.
+#[test]
+fn heal_drops_a_present_unavailable_entry_and_keeps_an_absent_one() {
+    let warehouse = Warehouse::new("unavailable-heal");
+    let head = warehouse.stack("a.txt", "a\n", "K");
+    let (present, unnamed) = warehouse.scoped(|| (file_hash(&head, "a.txt"), "9".repeat(64)));
+    let statement = |hash: &String| (hash.clone(), "Withheld by the remote's host.".to_string());
+    warehouse.scoped(|| unavailable::record([&present, &unnamed].map(statement)).unwrap());
+
+    let healed = warehouse.run_ok(&["heal", "--json"]);
+    let report: serde_json::Value = serde_json::from_slice(&healed.stdout).unwrap();
+    assert!(report["data"]["notes"].to_string().contains("1 object(s) recorded unavailable are in the store again"), "{}", report);
+    let kept = warehouse.scoped(|| unavailable::read_unavailable().unwrap());
+    assert_eq!(kept.entries().map(|(hash, _)| hash.clone()).collect::<Vec<_>>(), [unnamed]);
+
+    std::fs::write(warehouse.root.join(".forklift").join("unavailable"), "/forklift-unavailable 999\n").unwrap();
+    let healed = warehouse.run_ok(&["heal", "--json"]);
+    let report: serde_json::Value = serde_json::from_slice(&healed.stdout).unwrap();
+    assert!(report["data"]["notes"].to_string().contains("was not checked against the store"), "{}", report);
 }
 
 /// A recorded object that is present seals nothing: audit walks it as any other tree, so an

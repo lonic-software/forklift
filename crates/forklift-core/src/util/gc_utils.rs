@@ -159,6 +159,12 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
         }
     }
 
+    // Under the same hold and against the same live set, drop what the unavailable record lists
+    // that is present again, or that nothing names any more when the walk was whole
+    // (`unavailable::prune_against`): a served root has no client to do it. Its error is ignored: the
+    // record then only stays larger than it needs to be, and must not fail the sweep that landed.
+    let _ = crate::util::unavailable::prune_against(&_store_access, &live);
+
     Ok(stats)
 }
 
@@ -194,8 +200,40 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
 /// An applied redaction's object no deletion census root names is not live
 /// ([`redaction_deleter::unheld_applied`]), and a recipe of one is not descended for its chunks: the
 /// collection and a repack then delete it like garbage, and every chunk only it named.
-pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
-    collect_live_set_excluding(&redaction_deleter::unheld_applied()?)
+pub(crate) fn collect_live_set() -> Result<LiveSet, String> {
+    let walk = walk_live_set(&redaction_deleter::unheld_applied()?)?;
+    // A parcel gap the sealed record holds can come back by a refill, which pushes its tree's
+    // absences down into that record, so it bounds what the walk saw as an absent tree does. A
+    // record that cannot be read is judged to hold every gap: the walk is then not whole, and
+    // nothing here fails over it.
+    let whole = !walk.met_absent_tree
+        && (walk.parcel_gaps.is_empty()
+            || crate::util::sealed_utils::read_sealed()
+                .map(|sealed| walk.parcel_gaps.iter().all(|gap| !sealed.contains(gap)))
+                .unwrap_or(false));
+
+    Ok(LiveSet { hashes: walk.live, whole })
+}
+
+/// What [`collect_live_set`] marked live, and whether its walk saw the whole closure its roots
+/// name.
+#[derive(Debug)]
+pub(crate) struct LiveSet {
+    /// Every hash marked live.
+    pub(crate) hashes: HashSet<String>,
+    /// False once the walk met an absent tree, below which it cannot tell what is named, or an
+    /// absent parcel the sealed record holds, which a refill can bring back with its tree: a hash
+    /// missing from `hashes` is unreachable only when this is true. Any other absent parcel, as a
+    /// trust boundary may name, leaves it true: nothing refills it, and what its tree names comes
+    /// back only by fetching that parcel.
+    pub(crate) whole: bool,
+}
+
+impl LiveSet {
+    /// Whether `hash` was marked live.
+    pub(crate) fn contains(&self, hash: &str) -> bool {
+        self.hashes.contains(hash)
+    }
 }
 
 /// [`collect_live_set`], with `excluded` (the unheld applied redactions) given. An excluded hash a
@@ -203,6 +241,21 @@ pub(crate) fn collect_live_set() -> Result<HashSet<String>, String> {
 /// chunk stays live,
 /// since a redaction's ban never extends to the chunks of another file.
 pub(crate) fn collect_live_set_excluding(excluded: &HashSet<String>) -> Result<HashSet<String>, String> {
+    Ok(walk_live_set(excluded)?.live)
+}
+
+/// What [`walk_live_set`] found.
+struct LiveWalk {
+    /// Every hash marked live.
+    live: HashSet<String>,
+    /// Whether it met an absent tree.
+    met_absent_tree: bool,
+    /// The absent parcels a root or an ancestor named.
+    parcel_gaps: Vec<String>,
+}
+
+/// The walk behind [`collect_live_set`] and [`collect_live_set_excluding`].
+fn walk_live_set(excluded: &HashSet<String>) -> Result<LiveWalk, String> {
     // Pallet heads (both namespaces), haul heads, tombstone heads, the git mirror's roots, bay-scoped
     // parcel roots, trust-pin roots and staged shard leaves: the sources this function shares, hash
     // for hash, with `recovery_utils::collect_walk_roots` through `recovery_utils::gc_root_sources`,
@@ -223,7 +276,9 @@ pub(crate) fn collect_live_set_excluding(excluded: &HashSet<String>) -> Result<H
         crate::util::office_utils::TrustPinReadPolicy::FailClosed,
     )?;
 
-    let parcels = collect_reachable_for_sweep(&sources.heads())?;
+    // The parcel walk `collect_reachable_for_sweep` runs, keeping its gaps.
+    let (parcels, parcel_gaps) = audit_utils::collect_reachable_noting_gaps(&sources.heads(), file_utils::is_present_for_sweep)?;
+    let mut met_absent_tree = false;
 
     let mut live: HashSet<String> = HashSet::new();
     let mut tree_queue: VecDeque<String> = VecDeque::new();
@@ -287,6 +342,7 @@ pub(crate) fn collect_live_set_excluding(excluded: &HashSet<String>) -> Result<H
         // orphan is kept while the fetch might still resume and complete it, and only one
         // abandoned past the grace period ages into legitimate, re-fetchable garbage.
         if !file_utils::is_present_for_sweep(&tree_hash)? {
+            met_absent_tree = true;
             continue;
         }
 
@@ -318,7 +374,7 @@ pub(crate) fn collect_live_set_excluding(excluded: &HashSet<String>) -> Result<H
         }
     }
 
-    Ok(live)
+    Ok(LiveWalk { live, met_absent_tree, parcel_gaps })
 }
 
 /// Mark every chunk of a chunked file's recipe live, presence-tolerantly.
@@ -633,6 +689,30 @@ pub(crate) mod tests {
         // The blob *beneath* the sealed boundary is never reached (the boundary was not descended)
         // — correct, and by the store invariant it is absent locally anyway.
         assert!(!live.contains(&f.web_blob), "nothing beneath a sealed boundary is individually marked");
+
+        // So the walk says it was not whole: a hash it left unmarked may sit below the boundary.
+        // Revert: never clear `whole` at an absent tree → true here.
+        assert!(!live.whole, "a walk that stopped at an absent tree is not whole");
+    }
+
+    /// A walk that met no absent tree says it was whole, though a root names an absent parcel, as
+    /// a trust boundary may, unless the sealed record holds that parcel. Revert: start `whole`
+    /// false, or clear it at every parcel gap → red.
+    #[test]
+    fn a_walk_meeting_no_absent_tree_is_whole() {
+        let _scratch = Scratch::new("live-set-whole");
+        let f = build_fixture();
+        delete_object(&f.readme_blob);
+        pallet_utils::tests::update_pallet_head_unverified("gone", None, &"9".repeat(64), &pallet_utils::RefPreconditions::NONE).unwrap();
+
+        let live = collect_live_set().unwrap();
+        assert!(live.contains(&f.web_blob) && live.whole, "an absent blob under a present tree leaves the walk whole");
+
+        // A gap the sealed record holds can be refilled with its tree, so it bounds the walk.
+        // Revert: ignore the sealed record → still whole.
+        crate::util::origin_utils::write_for_tests("http://origin.test");
+        crate::util::sealed_utils::append(&[(crate::util::sealed_utils::SealOp::Record, &"9".repeat(64))]).unwrap();
+        assert!(!collect_live_set().unwrap().whole, "a refillable parcel gap is a boundary");
     }
 
     /// A pallet deleted in a served root keeps its history through its tombstone: gc marks the

@@ -1847,7 +1847,7 @@ pub fn verify_parcel_closure_for_write(head: &str,
         &local_chunks_missing,
         &|hash| object_utils::recipe_chunk_hashes(hash),
         &|hash| object_utils::load_tree(hash),
-        &crate::util::sealed_utils::read_removed,
+        &crate::util::sealed_utils::read_redacted_and_withheld,
     )?;
 
     Ok(pallet_utils::VerifiedClosure::new(head, PathScope::full(), known_complete))
@@ -2128,8 +2128,8 @@ struct ClosureSeams<'a> {
     sealed: Option<&'a SealedTolerance<'a>>,
 }
 
-/// The sealed-by-hash record, the applied redactions and the withheld content a walk holds
-/// absences against, and the absent objects it held by each, kept apart. The audit and the
+/// The sealed-by-hash record, the applied redactions, the withheld content and the unavailable
+/// content a walk holds absences against, and the absent objects it held by each, kept apart. The audit and the
 /// client's ref gate pass one, and either remote's push gate passes the applied redactions and
 /// withheld content alone: a remote must hold the whole closure of every head it accepts but for
 /// the content it redacted or withholds.
@@ -2138,6 +2138,7 @@ pub struct SealedTolerance<'a> {
     held: RefCell<HashSet<String>>,
     redacted: RefCell<HashSet<String>>,
     withheld: RefCell<HashSet<String>>,
+    unavailable: RefCell<HashSet<String>>,
 }
 
 impl<'a> SealedTolerance<'a> {
@@ -2147,6 +2148,7 @@ impl<'a> SealedTolerance<'a> {
             held: RefCell::new(HashSet::new()),
             redacted: RefCell::new(HashSet::new()),
             withheld: RefCell::new(HashSet::new()),
+            unavailable: RefCell::new(HashSet::new()),
         }
     }
 
@@ -2167,6 +2169,12 @@ impl<'a> SealedTolerance<'a> {
         self.withheld.borrow().len()
     }
 
+    /// How many distinct absent objects the walk held because this warehouse recorded them
+    /// unavailable, its remote's host withholding them, and nothing above names them.
+    pub fn unavailable(&self) -> usize {
+        self.unavailable.borrow().len()
+    }
+
     fn is_empty(&self) -> bool {
         self.tolerated.is_empty()
     }
@@ -2179,13 +2187,14 @@ impl<'a> SealedTolerance<'a> {
     }
 
     /// Whether the absent object `hash`, met `at`, is held, by the record, or by an applied
-    /// redaction or a withholding (a file's content only), tallying it under whichever holds it if
+    /// redaction, a withholding or the unavailable record (a file's content only), tallying it under whichever holds it if
     /// so. Call only at an absence: a held object that is present is held by nothing.
     fn holds_absent(&self, hash: &str, at: At) -> bool {
         match self.tolerated.held(hash, at) {
             Some(Held::Sealed) => self.held.borrow_mut().insert(hash.to_string()),
             Some(Held::Redacted) => self.redacted.borrow_mut().insert(hash.to_string()),
             Some(Held::Withheld) => self.withheld.borrow_mut().insert(hash.to_string()),
+            Some(Held::Unavailable) => self.unavailable.borrow_mut().insert(hash.to_string()),
             None => return false,
         };
         true

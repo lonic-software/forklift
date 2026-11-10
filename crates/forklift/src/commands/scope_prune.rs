@@ -1,6 +1,6 @@
 use serde::Serialize;
 use forklift_core::error::{CoreError, RefusalCode};
-use forklift_core::util::{bay_utils, journal_utils};
+use forklift_core::util::{bay_utils, journal_utils, unavailable};
 use forklift_core::util::lock_utils::StoreAccessLock;
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::scope_utils::{self, PathScope, ScopeClass};
@@ -119,6 +119,12 @@ pub async fn handle_command(paths: Vec<String>, confirm: bool) -> Result<(), Str
     scope_utils::set_fetch_scope(&post_prune)?;
 
     let stats = prune_utils::free_objects(&plan.to_free, &store_access)?;
+
+    // Under the same hold, drop what the unavailable record lists that is present again, or that
+    // nothing names any more when the live walk was whole (`unavailable::prune`). Its
+    // error is ignored: the record then only stays larger than it needs to be, and must not fail
+    // the prune that already landed.
+    let _ = unavailable::prune(&store_access);
 
     output::emit(&ScopePruneReport {
         preview: false,

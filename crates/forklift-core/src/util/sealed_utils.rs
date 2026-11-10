@@ -102,6 +102,15 @@
 //! absence too, where a file's content sits, as it holds a redacted one: never damage, never
 //! fetched, and kept apart from both other sets. The record of withheld content only grows, so a
 //! walk that leaned on it stays sound once its caller acts on the result.
+//!
+//! ## Unavailable content
+//!
+//! A fetch leaves out a file's content its remote's host withholds, and this warehouse records what
+//! it lacks of it ([`unavailable`]). A walk holds such an absence where a file's content sits, below
+//! a redaction and a withholding and above the sealed record: never damage, never fetched, and
+//! never recorded sealed, since no remote serves it. The record shrinks only by an entry whose
+//! object is present, which a walk walks, or under exclusive store access, which no walk under the
+//! shared hold overlaps.
 
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::io::{Seek, Write};
@@ -112,6 +121,7 @@ use crate::globals;
 use crate::util::{applied_redactions, audit_utils, bay_utils, file_utils, object_utils, office_utils, origin_move, origin_utils, pack_utils, record_utils, recovery_utils, sign_utils};
 use crate::util::applied_redactions::AppliedSet;
 use crate::util::lock_utils::{RefLock, StoreAccessExclusive, StoreAccessLock};
+use crate::util::unavailable::{self, UnavailableSet};
 use crate::util::withholding::{self, WithheldSet};
 
 /// The record's file name under the shared forklift root.
@@ -422,14 +432,16 @@ pub fn read_sealed() -> Result<SealedSet, String> {
 }
 
 /// Why a walk may meet an object absent without that being damage (see Applied redactions and
-/// Withheld content in the module doc comment): the sealed record holds it, a redaction this
-/// warehouse applied names it, or its head withholds it. The three are kept apart, since only the
+/// Withheld content and Unavailable content in the module doc comment): the sealed record holds it,
+/// a redaction this warehouse applied names it, its head withholds it, or its remote's host does
+/// and this warehouse recorded it unavailable. The four are kept apart, since only the sealed
 /// record leans on a remote.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Tolerated {
     pub sealed: SealedSet,
     pub applied: AppliedSet,
     pub withheld: WithheldSet,
+    pub unavailable: UnavailableSet,
 }
 
 /// Which set holds an absent object.
@@ -441,6 +453,8 @@ pub enum Held {
     Redacted,
     /// Withheld by this warehouse's head: it serves and takes none of it, and nothing fetches it.
     Withheld,
+    /// Recorded unavailable: the remote's host withholds it, so nothing fetches it.
+    Unavailable,
 }
 
 /// Where a walk meets an object: what an applied redaction may hold there.
@@ -456,21 +470,24 @@ pub enum At {
 
 impl Tolerated {
     /// Only the applied redactions and the withheld content: for a warehouse whose every other
-    /// object must be present.
+    /// object must be present, and that records nothing unavailable.
     pub fn removed_only(applied: AppliedSet, withheld: WithheldSet) -> Tolerated {
-        Tolerated { sealed: SealedSet::default(), applied, withheld }
+        Tolerated { sealed: SealedSet::default(), applied, withheld, unavailable: UnavailableSet::default() }
     }
 
     /// Which set holds `hash`, met `at`, if any does. An applied redaction, and then withheld
-    /// content, holds a file's content only (see Applied redactions in the module doc comment), and
-    /// there wins over a record of the same hash: nothing fetches either. A redaction wins over a
-    /// withholding, since it is for good. Checks no presence: a held object that is present is held
-    /// by nothing, and walked.
+    /// content, and then unavailable content, holds a file's content only (see Applied redactions
+    /// in the module doc comment), and there wins over a record of the same hash: nothing fetches
+    /// any. A redaction wins over a withholding, since it is for good, and this head's withholding
+    /// over a remote's. Checks no presence: a held object that is present is held by nothing, and
+    /// walked.
     pub fn held(&self, hash: &str, at: At) -> Option<Held> {
         if at == At::File && self.applied.contains(hash) {
             Some(Held::Redacted)
         } else if at == At::File && self.withheld.contains(hash) {
             Some(Held::Withheld)
+        } else if at == At::File && self.unavailable.contains(hash) {
+            Some(Held::Unavailable)
         } else if self.sealed.contains(hash) {
             Some(Held::Sealed)
         } else {
@@ -480,27 +497,41 @@ impl Tolerated {
 
     /// Whether no set holds anything.
     pub fn is_empty(&self) -> bool {
-        self.sealed.is_empty() && self.applied.is_empty() && self.withheld.is_empty()
+        self.sealed.is_empty() && self.applied.is_empty() && self.withheld.is_empty() && self.unavailable.is_empty()
     }
 }
 
-/// Read the sealed record, the applied redactions and the withheld content, for a walk that judges
-/// an absence.
+/// Read the sealed record, the applied redactions, the withheld content and the unavailable
+/// content, for a walk that judges an absence.
 ///
 /// # Returns
-/// * `Ok(Tolerated)` - The three sets.
+/// * `Ok(Tolerated)` - The four sets.
 /// * `Err(String)`   - If any record cannot be read or parsed.
 pub fn read_tolerated() -> Result<Tolerated, String> {
     Ok(Tolerated { sealed: read_sealed()?, ..read_removed()? })
 }
 
-/// Read the applied redactions and the withheld content alone ([`Tolerated::removed_only`]), for a
-/// walk in a warehouse whose every other object must be present.
+/// Read the applied redactions, the withheld content and the unavailable content, for a walk in a
+/// warehouse whose every other object must be present.
 ///
 /// # Returns
-/// * `Ok(Tolerated)` - Both sets, and an empty sealed set.
-/// * `Err(String)`   - If either record cannot be read or parsed.
+/// * `Ok(Tolerated)` - The three sets, and an empty sealed set.
+/// * `Err(String)`   - If any record cannot be read or parsed.
 pub fn read_removed() -> Result<Tolerated, String> {
+    Ok(Tolerated {
+        unavailable: unavailable::read_unavailable()?,
+        ..Tolerated::removed_only(applied_redactions::read_applied()?, withholding::read_withheld()?)
+    })
+}
+
+/// Read the applied redactions and the withheld content alone, for a server's push gate: a served
+/// root lacks nothing its unavailable record lists, so a push never leans on that record, and both
+/// of these only ever grow.
+///
+/// # Returns
+/// * `Ok(Tolerated)` - The two sets, and empty sealed and unavailable sets.
+/// * `Err(String)`   - If either record cannot be read or parsed.
+pub fn read_redacted_and_withheld() -> Result<Tolerated, String> {
     Ok(Tolerated::removed_only(applied_redactions::read_applied()?, withholding::read_withheld()?))
 }
 
@@ -746,12 +777,16 @@ fn append_decided_locked(
 
     let ops = decide(&set)?;
 
-    // An absence an applied redaction names is never claimed held by a remote, whatever a caller
-    // decided. The applied record is read here, under the ref lock an apply adds to it under, so a
-    // redaction applied between a caller's walk and this append is still seen.
+    // An absence an applied redaction names, or one recorded unavailable, is never claimed held by
+    // a remote, whatever a caller decided. Both records are read here, under the ref lock each is
+    // added to under, so a redaction applied or content recorded unavailable between a caller's
+    // walk and this append is still seen.
     let ops = if ops.iter().any(|(op, _)| *op == SealOp::Record) {
         let applied = applied_redactions::read_applied()?;
-        ops.into_iter().filter(|(op, hash)| *op != SealOp::Record || !applied.contains(hash)).collect()
+        let unavailable = unavailable::read_unavailable()?;
+        ops.into_iter()
+            .filter(|(op, hash)| *op != SealOp::Record || !(applied.contains(hash) || unavailable.contains(hash)))
+            .collect()
     } else {
         ops
     };
@@ -996,7 +1031,7 @@ impl Walked {
 
         match tolerated.held(hash, at) {
             // A boundary too, but never one a remote is leaned on for, so not among `absent`.
-            Some(Held::Redacted | Held::Withheld) => return Ok(Met::Absent),
+            Some(Held::Redacted | Held::Withheld | Held::Unavailable) => return Ok(Met::Absent),
             Some(Held::Sealed) => {}
             None if unrecorded == Unrecorded::Damage => return Ok(Met::Unrecorded),
             None => {}
@@ -2241,6 +2276,78 @@ mod tests {
         append(&[(SealOp::Record, &redacted_blob), (SealOp::Record, &lost)]).unwrap();
         assert!(read_sealed().unwrap().contains(&lost), "a plain append records");
         redacted_unrecorded("a plain append");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Unavailable content holds a file's content only, below an applied redaction and a
+    /// withholding of the same hash and above the record, and a full warehouse's read holds it too.
+    ///
+    /// Revert: drop the unavailable arm of `held` → the unavailable-only hash is held by nothing →
+    /// red; look it up before the withheld set → the withheld hash reads as unavailable → red;
+    /// leave it out of `read_removed` → the full warehouse's read holds nothing → red.
+    #[test]
+    fn unavailable_content_is_held_as_unavailable_where_a_file_sits() {
+        let (root, _scope) = scratch("held-unavailable");
+        let (redacted, withheld, unavailable_only, sealed_too) = ("1".repeat(64), "5".repeat(64), "6".repeat(64), "7".repeat(64));
+        append(&[(SealOp::Record, &sealed_too)]).unwrap();
+        applied_redactions::apply_for_test(&[&redacted]);
+        withholding::withhold(&withheld, "court order 7").unwrap();
+        unavailable::record([&redacted, &withheld, &unavailable_only, &sealed_too].map(|hash| (hash.clone(), "DMCA notice 3".to_string()))).unwrap();
+
+        for tolerated in [read_tolerated().unwrap(), read_removed().unwrap()] {
+            assert_eq!(tolerated.held(&redacted, At::File), Some(Held::Redacted));
+            assert_eq!(tolerated.held(&withheld, At::File), Some(Held::Withheld));
+            assert_eq!(tolerated.held(&unavailable_only, At::File), Some(Held::Unavailable));
+            assert_eq!(tolerated.held(&sealed_too, At::File), Some(Held::Unavailable));
+            assert_eq!(tolerated.held(&unavailable_only, At::Tree), None);
+            assert_eq!(tolerated.held(&unavailable_only, At::Chunk), None);
+        }
+        assert_eq!(read_tolerated().unwrap().held(&sealed_too, At::Tree), Some(Held::Sealed));
+        assert!(!Tolerated { unavailable: unavailable::read_unavailable().unwrap(), ..Tolerated::default() }.is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// No append records an absence the unavailable record lists: the fetch's recording, the
+    /// unseal's push-down, the refill's and a caller's own ops all leave it out, read under the lock.
+    ///
+    /// Revert: drop the unavailable filter in `append_decided_locked` → each path records it → red.
+    #[test]
+    fn no_append_records_an_absence_the_unavailable_record_lists() {
+        use crate::enums::dir_entry_type::DirEntryType;
+        use crate::util::gc_utils::tests::store_tree;
+
+        let (root, _scope) = scratch("record-unavailable");
+        let (unavailable_blob, lost) = ("4".repeat(64), "6".repeat(64));
+        let tree = store_tree(&[
+            ("film.mkv", &unavailable_blob, DirEntryType::Normal),
+            ("lost.txt", &lost, DirEntryType::Normal),
+        ]);
+        unavailable::record([(unavailable_blob.clone(), "DMCA notice 4".to_string())]).unwrap();
+        let unrecorded = |why: &str| assert!(!read_sealed().unwrap().contains(&unavailable_blob), "{}: recorded", why);
+
+        record_absences_under(std::slice::from_ref(&tree)).unwrap();
+        assert!(read_sealed().unwrap().contains(&lost), "the fetch's recording records");
+        unrecorded("the fetch's recording");
+
+        append(&[(SealOp::Remove, &lost), (SealOp::Record, &tree)]).unwrap();
+        let unsealed = unseal(&hold(), std::slice::from_ref(&tree)).unwrap();
+        assert_eq!(unsealed.pushed_down, vec![lost.clone()]);
+        unrecorded("the unseal");
+
+        let bytes = crate::util::file_utils::retrieve_object_by_hash(&tree).unwrap();
+        let (folder, file) = crate::util::file_utils::get_path_for_object(&tree).unwrap();
+        std::fs::remove_file(PathBuf::from(folder).join(file)).unwrap();
+        append(&[(SealOp::Remove, &lost), (SealOp::Record, &tree)]).unwrap();
+        refill_all(&hold(), &[(tree.as_str(), bytes.as_slice())]).unwrap();
+        assert!(read_sealed().unwrap().contains(&lost), "the refill pushes down");
+        unrecorded("the refill");
+
+        append(&[(SealOp::Remove, &lost)]).unwrap();
+        append(&[(SealOp::Record, &unavailable_blob), (SealOp::Record, &lost)]).unwrap();
+        assert!(read_sealed().unwrap().contains(&lost), "a plain append records");
+        unrecorded("a plain append");
 
         std::fs::remove_dir_all(&root).ok();
     }
