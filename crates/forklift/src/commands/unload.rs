@@ -6,7 +6,7 @@ use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::path_utils::{self, WarehousePath};
 use forklift_core::util::scope_utils::{self, PathScope, ScopeClass};
 use forklift_core::util::{
-    file_utils, inventory_utils, load_guard_utils, object_utils, pallet_utils, tree_utils,
+    file_utils, inventory_utils, load_guard_utils, object_utils, pallet_utils, shift_utils, tree_utils,
 };
 use crate::commands::restore::{matching_content, tracked_path, Restored};
 use crate::output;
@@ -86,6 +86,9 @@ fn unstage(path: &WarehousePath) -> Result<(), String> {
     // `replace_subtree` through this ledger, or the batch's publish, which reads its own.
     let mut ledger = inventory_utils::ShardLedger::read()?;
 
+    // Content left out of a checkout stays left out of the reset (see `unstaged_entry`).
+    let not_checked_out = shift_utils::NotCheckedOut::read()?;
+
     let treat_as_directory = path.is_root()
         || ledger.holds(path.as_key())
         || matches!(head_entry, Some(HeadEntry::Tree { .. }));
@@ -102,7 +105,7 @@ fn unstage(path: &WarehousePath) -> Result<(), String> {
             // written to this bay's working directory.
             let scope = scope_utils::current_scope()?;
 
-            build_unstaged_shards(&ledger, tree, path.as_key(), hash, &mut shards, &scope)?;
+            build_unstaged_shards(&ledger, tree, path.as_key(), hash, &mut shards, &scope, &not_checked_out)?;
         }
 
         ledger.replace_subtree(path.as_key(), &shards)?;
@@ -122,7 +125,7 @@ fn unstage(path: &WarehousePath) -> Result<(), String> {
         Some(HeadEntry::File { hash, item_type }) => {
             // As in `build_unstaged_shards`, an unreadable shard only costs the shortcut.
             let current = ledger.inventory(parent.as_key()).unwrap_or(None);
-            let entry = unstaged_entry(parent.as_key(), &file_name, hash, item_type, current.as_ref())?;
+            let entry = unstaged_entry(parent.as_key(), &file_name, hash, item_type, current.as_ref(), &not_checked_out)?;
 
             // An entry that already matched the head changes only its stat data, which keeps the
             // rollups (see `ShardMutationBatch`).
@@ -240,6 +243,7 @@ fn nothing_staged_under(ledger: &inventory_utils::ShardLedger, path: &WarehouseP
 ///                 hash for the root of the walk).
 /// * `shards`    - The collected shards.
 /// * `scope`     - The active bay's checkout scope.
+/// * `not_checked_out` - The content a checkout leaves out.
 ///
 /// Once a level is itself fully in scope (`ScopeClass::InScope`), everything below it is
 /// included without further per-entry classification — the classifier's own "nothing below
@@ -253,7 +257,8 @@ fn build_unstaged_shards(ledger: &inventory_utils::ShardLedger,
                          key: &str,
                          tree_hash: &str,
                          shards: &mut BTreeMap<String, Inventory>,
-                         scope: &PathScope) -> Result<(), String> {
+                         scope: &PathScope,
+                         not_checked_out: &shift_utils::NotCheckedOut) -> Result<(), String> {
     // Hoisted once per directory (not per entry): a full (unscoped) scope, or a level already
     // fully in scope, never needs the per-entry classify calls below — short-circuit them away
     // entirely on that hot, common path.
@@ -276,7 +281,7 @@ fn build_unstaged_shards(ledger: &inventory_utils::ShardLedger,
             }
         }
 
-        inventory.add_item(unstaged_entry(key, name, item.hash.clone(), item.item_type, current.as_ref())?);
+        inventory.add_item(unstaged_entry(key, name, item.hash.clone(), item.item_type, current.as_ref(), not_checked_out)?);
     }
 
     // `tree_hash` is a byte-for-byte-trustworthy rollup for this shard only when the reset here
@@ -299,7 +304,7 @@ fn build_unstaged_shards(ledger: &inventory_utils::ShardLedger,
         }
 
         let subtree_loaded = object_utils::load_tree(&subtree.hash)?;
-        build_unstaged_shards(ledger, &subtree_loaded, &child_key, &subtree.hash, shards, scope)?;
+        build_unstaged_shards(ledger, &subtree_loaded, &child_key, &subtree.hash, shards, scope, not_checked_out)?;
     }
 
     Ok(())
@@ -309,7 +314,9 @@ fn build_unstaged_shards(ledger: &inventory_utils::ShardLedger,
 /// head's content, with the stat data of the working file when it provably holds that content,
 /// and zeroed stat data (see `build_stale_inventory_item`) otherwise, so the next comparison
 /// rehashes it. A file the current entry already proves by stat keeps that entry; any other is
-/// compared by content, never written.
+/// compared by content, never written. Content the unavailable record lists and the store lacks
+/// is reset to an entry not checked out ([`InventoryItemState::Unavailable`]), as every checkout
+/// stages it, whatever file stands at the path.
 ///
 /// # Arguments
 /// * `parent_key` - The warehouse path key of the file's directory.
@@ -317,15 +324,21 @@ fn build_unstaged_shards(ledger: &inventory_utils::ShardLedger,
 /// * `hash`       - The head's blob hash for the file.
 /// * `item_type`  - The head's type for the file.
 /// * `current`    - The directory's shard before the reset, if it has one.
+/// * `not_checked_out` - The content a checkout leaves out.
 ///
 /// # Returns
 /// * `Ok(InventoryItem)` - The entry to record.
-/// * `Err(String)`       - If the clock probe could not be stamped.
+/// * `Err(String)`       - If the clock probe could not be stamped, or the store not consulted.
 fn unstaged_entry(parent_key: &str,
                   name: &str,
                   hash: String,
                   item_type: DirEntryType,
-                  current: Option<&Inventory>) -> Result<InventoryItem, String> {
+                  current: Option<&Inventory>,
+                  not_checked_out: &shift_utils::NotCheckedOut) -> Result<InventoryItem, String> {
+    if not_checked_out.holds(&hash)? {
+        return Ok(inventory_utils::build_unavailable_inventory_item(name, hash, item_type));
+    }
+
     let stale = inventory_utils::build_stale_inventory_item(name, hash, item_type);
 
     let file_path = tracked_path(parent_key, name);

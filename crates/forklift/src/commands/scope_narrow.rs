@@ -169,7 +169,7 @@ async fn ensure_narrow_targets_are_clean(current: &PathScope,
     let unstaged = stocktake_utils::collect_unstaged_changes().await?;
 
     let tracked_dirty = staged.iter()
-        .chain(unstaged.iter().filter(|change| change.kind != ChangeKind::Untracked))
+        .chain(unstaged.iter().filter(|change| change.kind.is_tracked_change()))
         .find(|change| leaving(&change.path));
 
     if let Some(change) = tracked_dirty {

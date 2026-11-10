@@ -137,7 +137,7 @@ fn ensure_directory_present(ledger: &inventory_utils::ShardLedger, key: &str) ->
         let Some(inventory) = ledger.inventory(shard_key)? else { continue };
 
         files.extend(inventory.get_items()
-            .filter(|(_, item)| item.state != InventoryItemState::Deleted && item.item_type != DirEntryType::Tree)
+            .filter(|(_, item)| !skipped_by_directory_restore(item))
             .map(|(_, item)| (item.hash.clone(), item.item_type)));
     }
 
@@ -168,6 +168,7 @@ fn restore_worktree_directory(ledger: &inventory_utils::ShardLedger, key: &str, 
     let mut restored_any = false;
     let mut restored_count = 0usize;
     let mut matched_count = 0usize;
+    let mut not_checked_out = 0usize;
     let mut batch = inventory_utils::ShardMutationBatch::over(ledger);
     let mut result: Result<(), String> = Ok(());
 
@@ -188,7 +189,8 @@ fn restore_worktree_directory(ledger: &inventory_utils::ShardLedger, key: &str, 
 
         for (_, item) in inventory.get_items() {
             // The plan judged no folder entry, so none is written either.
-            if item.state == InventoryItemState::Deleted || item.item_type == DirEntryType::Tree {
+            if skipped_by_directory_restore(item) {
+                not_checked_out += usize::from(item.state == InventoryItemState::Unavailable);
                 continue;
             }
 
@@ -244,7 +246,24 @@ fn restore_worktree_directory(ledger: &inventory_utils::ShardLedger, key: &str, 
         ));
     }
 
+    if not_checked_out > 0 {
+        output::message(format!(
+            "Left out {} file(s) not checked out: the remote's host withholds their content and this \
+            warehouse lacks it.",
+            not_checked_out
+        ));
+    }
+
     Ok(())
+}
+
+/// Whether a directory restore leaves an entry alone, before its plan, its presence phase and its
+/// writes: a staged removal, a folder entry, and a file not checked out because its content is
+/// unavailable (which it reports), whose bytes no restore could write. A file standing at that
+/// path is the user's, and is left as it is.
+fn skipped_by_directory_restore(item: &InventoryItem) -> bool {
+    matches!(item.state, InventoryItemState::Deleted | InventoryItemState::Unavailable)
+        || item.item_type == DirEntryType::Tree
 }
 
 /// The files under the directory at `key` whose changes restoring it would discard, refusing a
@@ -272,7 +291,7 @@ fn plan_directory(ledger: &inventory_utils::ShardLedger, key: &str, confirm: boo
         let Some(inventory) = ledger.inventory(shard_key)? else { continue };
 
         for (_, item) in inventory.get_items() {
-            if item.state == InventoryItemState::Deleted || item.item_type == DirEntryType::Tree {
+            if skipped_by_directory_restore(item) {
                 continue;
             }
 

@@ -1,5 +1,5 @@
 use serde::Serialize;
-use forklift_core::util::stocktake_utils::Change;
+use forklift_core::util::stocktake_utils::{Change, ChangeKind};
 use forklift_core::util::{merge_utils, object_utils, pallet_utils, stocktake_utils};
 use crate::output::{self, CommandOutput};
 
@@ -39,6 +39,12 @@ pub async fn handle_command(summary: bool) -> Result<(), String> {
     let (unstaged, staged) = tokio::join!(stocktake_utils::collect_unstaged_changes(), staged);
     let (staged, unstaged) = (staged?, unstaged?);
 
+    // A file not checked out because its content is unavailable is no change to stage; it is
+    // reported apart.
+    let (unavailable, unstaged): (Vec<Change>, Vec<Change>) = unstaged.into_iter()
+        .partition(|change| change.kind == ChangeKind::Unavailable);
+    let unavailable: Vec<String> = unavailable.into_iter().map(|change| change.path).collect();
+
     // Another bay or process may have moved the pallet past the tree this bay holds.
     let moved_to = position.head()?.filter(|moved| head.as_ref() != Some(moved));
 
@@ -49,10 +55,12 @@ pub async fn handle_command(summary: bool) -> Result<(), String> {
         consolidation_in_progress: consolidation,
         staged_count: staged.len(),
         unstaged_count: unstaged.len(),
+        unavailable_count: unavailable.len(),
         // `--summary` keeps the counts and drops the per-path lists — the token-cheap
         // overview an agent asks for before deciding whether to pull the full report.
         staged: if summary { Vec::new() } else { staged },
         unstaged: if summary { Vec::new() } else { unstaged },
+        unavailable: if summary { Vec::new() } else { unavailable },
         summary,
     };
 
@@ -96,6 +104,16 @@ pub(crate) struct StocktakeReport {
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     unstaged: Vec<Change>,
 
+    /// How many files the head names are not checked out because the remote's host withholds
+    /// their content and this warehouse lacks it (omitted when `0`). They are no change: the next
+    /// parcel still names them, and only `forklift remove` stages their removal.
+    #[serde(skip_serializing_if = "is_zero")]
+    unavailable_count: usize,
+
+    /// The paths of those files (empty under `--summary`).
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    unavailable: Vec<String>,
+
     /// Whether this is a counts-only report.
     summary: bool,
 }
@@ -127,6 +145,10 @@ impl CommandOutput for StocktakeReport {
             println!();
             println!("{} staged, {} not loaded.", self.staged_count, self.unstaged_count);
 
+            if self.unavailable_count > 0 {
+                println!("{} file(s) not checked out: the remote's host withholds their content.", self.unavailable_count);
+            }
+
             return;
         }
 
@@ -147,7 +169,23 @@ impl CommandOutput for StocktakeReport {
             println!("Changes not in the inventory (use \"forklift load\" to stage them):");
             print_changes(&self.unstaged);
         }
+
+        if !self.unavailable.is_empty() {
+            println!();
+            println!(
+                "Not checked out: the remote's host withholds their content and this warehouse lacks it. \
+                They stay in the next parcel; \"forklift remove\" stages their removal:"
+            );
+
+            for path in &self.unavailable {
+                println!("  {}", path);
+            }
+        }
     }
+}
+
+fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).

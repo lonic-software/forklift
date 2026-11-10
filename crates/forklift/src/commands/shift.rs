@@ -1,5 +1,4 @@
 use serde::Serialize;
-use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{alias_utils, cherry_pick_utils, file_utils, inventory_utils, merge_utils, object_utils, operation_utils, pallet_utils, shift_utils, stocktake_utils};
 use forklift_core::util::operation_utils::{Operation, OperationKind};
 use crate::commands::{consolidate, merge_abort};
@@ -286,7 +285,7 @@ async fn has_staged_changes(tree_hash: Option<&str>) -> Result<bool, String> {
 async fn has_unstaged_changes() -> Result<bool, String> {
     Ok(stocktake_utils::collect_unstaged_changes().await?
         .into_iter()
-        .any(|change| change.kind != ChangeKind::Untracked))
+        .any(|change| change.kind.is_tracked_change()))
 }
 
 /// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).

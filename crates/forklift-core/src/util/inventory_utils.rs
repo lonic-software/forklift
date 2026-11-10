@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use crate::model::task::inventory_builder::inventory_builder_task::InventoryBuil
 use crate::model::task::TaskExecutor;
 use crate::parser;
 use crate::traits::task_context::TaskContext;
-use crate::util::{alias_utils, chunk_utils, fanout_utils, file_utils, load_guard_utils, object_utils, office_utils, path_utils, record_utils, redaction_utils, tree_utils, warehouse_utils};
+use crate::util::{alias_utils, chunk_utils, fanout_utils, file_utils, load_guard_utils, object_utils, office_utils, path_utils, record_utils, redaction_utils, tree_utils, unavailable, warehouse_utils};
 use crate::util::object_utils::IngestMode;
 use crate::util::path_utils::WarehousePath;
 use crate::util::scope_utils::{PathScope, ScopeClass};
@@ -186,6 +186,12 @@ pub async fn add_changes_to_inventory(path: &WarehousePath, check: &mut alias_ut
     }
 
     load_guard_utils::mark_load_completed(path.as_key());
+
+    // A load that stored content the unavailable record lists (a file put back at a path not
+    // checked out) drops its entry: the content is no longer unavailable here. Best effort, after
+    // the load landed: the record then only stays larger than it needs to be, which `heal` or a
+    // prune shrinks, and a listed hash the store holds is never left out of a checkout.
+    let _ = unavailable::drop_present();
 
     Ok(())
 }
@@ -1089,6 +1095,11 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
 
         context.dirty_inventory_paths.lock().await.remove(path.as_key());
 
+        // The names of the directories this walk descends into, so that a directory standing
+        // where an entry was not checked out stages that entry's removal (see
+        // `carry_over_missing_entries_as_deleted`).
+        let mut directory_names: HashSet<String> = HashSet::new();
+
         for entry in directory {
             let name = file_utils::get_name_for_file_or_directory(&entry)?;
             let entry_path = path.child(&name);
@@ -1159,6 +1170,8 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
 
                 inventory.add_item(index_item);
             } else {
+                directory_names.insert(name.clone());
+
                 let new_task = Box::pin(build_inventory(
                     context.clone(),
                     Arc::new(entry_path),
@@ -1177,7 +1190,7 @@ fn build_inventory(context: Arc<InventoryBuilderContext>,
         // per-directory merge-join. A real content change (a state flip to `Deleted`), caught
         // the same way as any other by `inventory_content_matches` below.
         if let Some(old_inventory) = existing_inventory.as_ref() {
-            carry_over_missing_entries_as_deleted(old_inventory, &mut inventory);
+            carry_over_missing_entries_as_deleted(old_inventory, &mut inventory, &directory_names);
         }
 
         let key = path.as_key().to_string();
@@ -1500,6 +1513,11 @@ fn decide_tracked_refresh(key: &str, blob_batch: &file_utils::WriteBatch) -> Res
         };
 
         let Ok(metadata) = file_utils::get_symlink_metadata_for_path(&file_path) else {
+            // An entry not checked out stays so: no load turns it into a removal.
+            if item.state == InventoryItemState::Unavailable {
+                continue;
+            }
+
             // The file is gone from disk: its removal becomes staged.
             inventory.mark_item_deleted(&name);
             changed = true;
@@ -2000,6 +2018,12 @@ pub fn build_stale_inventory_item(name: &str, hash: String, item_type: DirEntryT
     }
 }
 
+/// Build the entry of a file not checked out because its content is unavailable: the tree's hash
+/// and type, no stat, at [`InventoryItemState::Unavailable`].
+pub fn build_unavailable_inventory_item(name: &str, hash: String, item_type: DirEntryType) -> InventoryItem {
+    InventoryItem { state: InventoryItemState::Unavailable, ..build_stale_inventory_item(name, hash, item_type) }
+}
+
 impl ShardLedger {
     /// Load the inventory shard for the given key (or an empty one), apply the given change,
     /// and save it back, registering the key first if it is not yet.
@@ -2108,19 +2132,26 @@ fn sweep_unregistered_shards() {
 
 /// Carry over the entries of the previous inventory that were not re-added by the directory
 /// walk (their file was deleted, renamed, or replaced by a directory),
-/// marking them as staged removals.
+/// marking them as staged removals, but an entry not checked out because its content is
+/// unavailable, which stays so: no load turns it into a removal. Only a directory standing at its
+/// path, which the next parcel cannot hold beside a file of the same name, stages its removal.
 ///
 /// # Arguments
 /// * `old_inventory` - The inventory of the previous load.
 /// * `new_inventory` - The inventory being rebuilt from the working directory.
-fn carry_over_missing_entries_as_deleted(old_inventory: &Inventory, new_inventory: &mut Inventory) {
+/// * `directory_names` - The names of the directories the walk found in this directory.
+fn carry_over_missing_entries_as_deleted(old_inventory: &Inventory,
+                                         new_inventory: &mut Inventory,
+                                         directory_names: &HashSet<String>) {
     let missing_items: Vec<InventoryItem> = old_inventory.get_items()
         .filter(|(name, _)| new_inventory.get_item_by_name(name).is_none())
         .map(|(_, item)| (**item).clone())
         .collect();
 
     for mut item in missing_items {
-        item.state = InventoryItemState::Deleted;
+        if item.state != InventoryItemState::Unavailable || directory_names.contains(&item.name) {
+            item.state = InventoryItemState::Deleted;
+        }
         new_inventory.add_item(item);
     }
 }
@@ -2774,6 +2805,15 @@ pub fn classify_file_against_entry(existing: &InventoryItem,
                                    anchor: file_utils::StatAnchor) -> Result<FileVerdict, String> {
     let item_type = effective_kind(existing, metadata, item_type)?;
 
+    // A file standing where an entry is not checked out (its content unavailable) is never taken
+    // as that content, whatever it hashes to: it is loaded as a change at its own hash, which
+    // stores its bytes, so a head move carries it rather than removing the only copy.
+    if existing.state == InventoryItemState::Unavailable {
+        let (item, object) = build_item_and_object_for_file(path, name, item_type, mode, anchor)?;
+
+        return Ok(FileVerdict::Modified(item, object));
+    }
+
     if is_entry_unchanged(existing, metadata, item_type, path) {
         return Ok(FileVerdict::UnchangedByStat);
     }
@@ -3044,7 +3084,7 @@ mod tests {
         let mut new_inventory = Inventory::new();
         new_inventory.add_item(item("kept.txt", 1, InventoryItemState::Normal));
 
-        carry_over_missing_entries_as_deleted(&old_inventory, &mut new_inventory);
+        carry_over_missing_entries_as_deleted(&old_inventory, &mut new_inventory, &HashSet::new());
 
         assert_eq!(new_inventory.get_items_count(), 2);
         assert!(new_inventory.get_item_by_name("kept.txt").unwrap().state == InventoryItemState::Normal);
@@ -3058,7 +3098,7 @@ mod tests {
 
         let mut new_inventory = Inventory::new();
 
-        carry_over_missing_entries_as_deleted(&old_inventory, &mut new_inventory);
+        carry_over_missing_entries_as_deleted(&old_inventory, &mut new_inventory, &HashSet::new());
 
         assert!(new_inventory.get_item_by_name("removed.txt").unwrap().state == InventoryItemState::Deleted);
     }

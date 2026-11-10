@@ -133,7 +133,7 @@ async fn diff_worktree(filter: Option<&WarehousePath>, verbose: bool) -> Result<
         let changes = stocktake_utils::collect_unstaged_changes().await?;
 
         let files = changes.iter()
-            .filter(|change| change.kind != ChangeKind::Untracked && is_within(&change.path, filter))
+            .filter(|change| change.kind.is_tracked_change() && is_within(&change.path, filter))
             .map(DiffFileSummary::from_change)
             .collect();
 
@@ -149,15 +149,15 @@ async fn diff_worktree(filter: Option<&WarehousePath>, verbose: bool) -> Result<
     let preload_filter = filter.cloned();
     let (changes, shards) = stocktake_utils::collect_unstaged_changes_with_shards(move |change| {
         match change.kind {
-            ChangeKind::Untracked => false,
+            ChangeKind::Untracked | ChangeKind::Unavailable => false,
             ChangeKind::Removed => true,
             _ => is_within(&change.path, preload_filter.as_ref()),
         }
     }).await?;
 
-    // Untracked files are not diffed (stocktake reports them).
+    // Untracked files and files not checked out are not diffed (stocktake reports them).
     let selected: Vec<&Change> = changes.iter()
-        .filter(|change| change.kind != ChangeKind::Untracked && is_within(&change.path, filter))
+        .filter(|change| change.kind.is_tracked_change() && is_within(&change.path, filter))
         .collect();
 
     if selected.is_empty() {
