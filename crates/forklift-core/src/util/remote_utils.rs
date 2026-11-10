@@ -6943,18 +6943,19 @@ struct UploadedHistory {
 }
 
 impl UploadedHistory {
-    /// This upload followed by `again`, an upload of the same history: the objects either sent,
-    /// the parcels and signatures as `again` counts them (it sends every signature anew), and the
-    /// withheld content either met.
+    /// This upload followed by `again`, an upload of the same history walked further: the objects
+    /// and signatures either sent, the parcels new past the remote's heads as this upload counts
+    /// them (`again` also counts what it walked past those heads), and the withheld content either
+    /// met.
     fn then(self, again: UploadedHistory) -> UploadedHistory {
         let mut withheld: Vec<String> = self.withheld.into_iter().chain(again.withheld).collect();
         withheld.sort();
         withheld.dedup();
 
         UploadedHistory {
-            new_parcels: again.new_parcels,
+            new_parcels: self.new_parcels,
             uploaded_objects: self.uploaded_objects + again.uploaded_objects,
-            uploaded_signatures: again.uploaded_signatures,
+            uploaded_signatures: self.uploaded_signatures + again.uploaded_signatures,
             withheld,
         }
     }
@@ -10430,7 +10431,12 @@ mod tests {
         let gone_tree = store_tree(&[("gone.txt", &gone_blob, Normal)]);
         let gone = stack_with_tree(Vec::new(), &gone_tree, "gone");
 
-        lift_over(&remote, "on gone", vec![gone.clone()], BTreeMap::new(), Some(&gone)).expect("the second ref update lands");
+        let LiftResult::Lifted(stats) = lift_over(&remote, "on gone", vec![gone.clone()], BTreeMap::new(), Some(&gone))
+            .expect("the second ref update lands") else {
+            panic!("the lift was up to date");
+        };
+        // Revert: count the parcels as the wider second walk does → 2 → red.
+        assert_eq!(stats.new_parcels, 1, "the tombstone's head is not new to the remote");
 
         let negotiated = remote.negotiated.lock().unwrap().clone();
         assert_eq!(negotiated.len(), 2);
