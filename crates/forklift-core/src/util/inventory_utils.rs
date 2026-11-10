@@ -655,7 +655,9 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
     // and withdraws its start marker. Judged after phase 0, which makes every recipe the walk
     // stored readable; the blobs it made durable stay unnamed.
     if blob_batch_published {
-        if let Some((path, hash)) = staged_redacted(&writes)? {
+        let named = staged_redacted(&writes).inspect_err(|_| load_guard_utils::withdraw_start(recorded.as_ref()))?;
+
+        if let Some((path, hash)) = named {
             load_guard_utils::withdraw_start(recorded.as_ref());
 
             return Err(load_refusal(&path, &hash));
@@ -3004,7 +3006,7 @@ fn add_file_to_inventory(path: &WarehousePath) -> Result<(), String> {
     };
 
     if let Some(guard) = redaction_utils::staging_guard()? {
-        if let Some(hash) = guard.names_file(path.as_key(), &item.hash, item.item_type)? {
+        if let Some(hash) = guard.names_file(&item.hash, item.item_type)? {
             return Err(load_refusal(path.as_key(), &hash));
         }
     }
@@ -3043,9 +3045,8 @@ fn staged_redacted(writes: &BTreeMap<String, Inventory>) -> Result<Option<(Strin
                 continue;
             }
 
-            let path = if key.is_empty() { name.to_string() } else { format!("{}/{}", key, name) };
-
-            if let Some(hash) = guard.names_file(&path, &item.hash, item.item_type)? {
+            if let Some(hash) = guard.names_file(&item.hash, item.item_type)? {
+                let path = if key.is_empty() { name.to_string() } else { format!("{}/{}", key, name) };
 
                 return Ok(Some((path, hash)));
             }

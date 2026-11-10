@@ -848,6 +848,10 @@ impl RedactedSet {
             return Ok(None);
         }
 
+        // A recipe this warehouse does not hold carries no chunks it could hand on: a partial
+        // warehouse skips it and records it skipped, and any warehouse skips the recipe of content
+        // its remote's host withholds (see `shift_utils::NotCheckedOut`). A head that receives the
+        // parcel judges it against its own redactions.
         let chunks = match objects.recipe_chunks(hash) {
             Ok(chunks) => chunks,
             Err(error) => match partial {
@@ -855,6 +859,7 @@ impl RedactedSet {
                     skipped.insert(hash.to_string());
                     return Ok(None);
                 }
+                _ if crate::util::shift_utils::NotCheckedOut::read()?.holds(hash)? => return Ok(None),
                 _ => return Err(error),
             },
         };
@@ -960,28 +965,7 @@ pub fn staging_guard() -> Result<Option<StagingGuard>, String> {
 
 impl StagingGuard {
     /// The redacted hash a file of content `hash`, stored as `item_type`, names, if any.
-    /// A chunked file at `path` whose content this warehouse leaves out
-    /// ([`crate::util::shift_utils::NotCheckedOut`]) cannot be matched against a chunk-list
-    /// redaction: its recipe is not here. A full warehouse refuses it, as its head write refuses a
-    /// tree naming a recipe it cannot read; a partial one skips it, as its head write does.
-    pub fn names_file(&self, path: &str, hash: &str, item_type: DirEntryType) -> Result<Option<String>, String> {
-        if !self.partial
-            && item_type.is_chunked()
-            && !self.set.chunk_lists.is_empty()
-            && !self.set.hashes.contains(hash)
-            && !file_utils::does_object_exist(hash)?
-            && crate::util::shift_utils::NotCheckedOut::read()?.holds(hash)? {
-            return Err(crate::error::CoreError::refusal_with_details(
-                crate::error::RefusalCode::ContentWithheld,
-                format!("Cannot judge \"{}\" against this warehouse's redactions: its content {} is withheld by the \
-                         host of this warehouse's remote, and a redaction here matches files by their chunk list, \
-                         which only the content's recipe names. Nothing was changed.", path, hash),
-                "Only a warehouse that holds the content can judge it; until then, nothing this warehouse writes \
-                 can name the file.",
-                serde_json::json!({ "path": path, "hash": hash }),
-            ).into());
-        }
-
+    pub fn names_file(&self, hash: &str, item_type: DirEntryType) -> Result<Option<String>, String> {
         let mut skipped = HashSet::new();
 
         self.set.names_file(hash, item_type, &LocalObjects, self.partial.then_some(&mut skipped))
@@ -1026,7 +1010,7 @@ pub fn refuse_redacted_writes(ops: &[crate::util::shift_utils::FileOp],
             continue;
         };
 
-        if let Some(hash) = guard.names_file(path, hash, *item_type)? {
+        if let Some(hash) = guard.names_file(hash, *item_type)? {
             let next_step = match applied.names_hash(&hash, &LocalObjects) {
                 true => fresh_clone_next_step(),
                 false => next_step(path),
