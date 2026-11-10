@@ -182,9 +182,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             // redaction's does: a tree or a chunk of that hash a lift uploads later is refused, and
             // the lift fails rather than landing without it. A header this build cannot read is
             // never guessed at: the item stays unsettled, so it applies and only its own hash is
-            // refused, and each request reads and logs it again. The canonical store holds only
-            // objects the verifier parsed, so this is a damaged object, which stays loud until it
-            // is repaired.
+            // refused, and each request reads and logs it again. The verifier checks only that an
+            // object's bytes hash to its key, so this is content no client of this build writes,
+            // and it stays loud rather than cheap.
             let bytes = match self.objects.get(&hash) {
                 Ok(bytes) => bytes,
                 Err(error) => return Ok(Settled::Unsettled(format!(
