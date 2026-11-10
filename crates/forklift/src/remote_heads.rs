@@ -18,8 +18,12 @@ pub(crate) struct RemoteHeld {
 /// reaches (`scope prune`, `evict`), and the content its host withholds: its pallet heads, and for
 /// each pallet deleted there the head its tombstone keeps, from a handshake whose trust is judged
 /// as a lower would judge it but adopts nothing, and the earlier heads of the held-heads record
-/// that the remote confirms its pallets still reach. The caller frees only what these heads reach, so it never runs without them: an
-/// unreachable or untrusted remote refuses before anything changes.
+/// that the remote confirms its pallets still reach. The caller frees only what these heads reach,
+/// so it never runs without them: an unreachable or untrusted remote refuses before anything
+/// changes.
+///
+/// A handshake with no withheld list reports nothing withheld, as for an origin move: a head that
+/// lists none refuses nothing as withheld.
 ///
 /// A recorded head counts only when the remote answers that it holds it, so the record never frees
 /// more than the current heads alone unless the remote affirms it; when the confirmation cannot be
@@ -33,8 +37,8 @@ pub(crate) struct RemoteHeld {
 /// * `Ok(RemoteHeld)` - The head of every pallet the remote holds or keeps a tombstone of, and the
 ///   confirmed recorded heads, beside the hashes its handshake lists withheld.
 /// * `Err(String)`     - If no remote is configured, a partial warehouse's remote is not its
-///   origin, it cannot be reached, its trust state is
-///   refused, or the held-heads record does not parse; the message ends with `note`.
+///   origin, it cannot be reached, its trust state is refused, or the held-heads record does not
+///   parse; the message ends with `note`.
 pub(crate) async fn held_by_remote(note: &str) -> Result<RemoteHeld, String> {
     let client = RemoteClient::for_warehouse().map_err(|e| error::append_to_message(e.into(), note))?;
     let info = client.fetch_info().await.map_err(|e| error::append_to_message(e, note))?;

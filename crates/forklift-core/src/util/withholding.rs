@@ -10,9 +10,9 @@
 //! negotiation answers it as withheld rather than asking for it. The handshake's withheld list
 //! publishes it, so a client can tell the content is unavailable from that remote rather than
 //! damaged or redacted: an origin move counts it as not held by the new server, and a cache's
-//! eviction or a sparse warehouse's prune keeps the copy here. A served head deletes its copy as it deletes
-//! an applied redaction's ([`redaction_deleter`](crate::util::redaction_deleter)), under a census
-//! that history never holds a copy for.
+//! eviction or a sparse warehouse's prune keeps the copy here. A served head deletes its copy as it
+//! deletes an applied redaction's ([`redaction_deleter`](crate::util::redaction_deleter)), under a
+//! census that history never holds a copy for.
 //!
 //! A chunked file is withheld by its recipe's hash. Its chunks are not refused by hash, since other
 //! content may share them; until the deletion is done, a server serves the chunks only withheld or

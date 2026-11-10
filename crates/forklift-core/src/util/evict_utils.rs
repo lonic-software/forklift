@@ -350,8 +350,9 @@ struct HeldClosure {
     present: Vec<String>,
     /// Every object met, present or not: the whole closure the origin holds.
     seen: HashSet<String>,
-    /// The objects kept for withheld content: each withheld object met, a withheld recipe's
-    /// chunks, and every present tree that names one of them.
+    /// The objects kept for withheld content: each present withheld object met, every chunk a
+    /// present withheld recipe names (present or not, and so not always in `present`), and every
+    /// present tree that names one of them.
     withheld: HashSet<String>,
 }
 

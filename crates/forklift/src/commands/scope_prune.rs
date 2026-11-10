@@ -50,7 +50,7 @@ pub async fn handle_command(paths: Vec<String>, confirm: bool) -> Result<(), Str
     // The remote's heads are read next, outside the store hold, so a slow remote never keeps
     // other bays' writers out. A remote ref can move after this read, and the plan cannot see it;
     // the store hold does not reach the remote, so reading under it would leave the same window.
-    let held = remote_pallet_heads().await?;
+    let held = remote_held().await?;
 
     // Exclusive store access before the judgement the plan uses (FORK-150). The keep-set depends
     // on the fetch scope `judge_request` reads and on every bay's checkout scope, not only
@@ -229,7 +229,7 @@ fn judge_request(paths: &[String]) -> Result<PruneRequest, String> {
 /// ([`crate::remote_heads::held_by_remote`]). The prune frees only what history these heads reach
 /// needs and the remote can still serve, so an unreachable or untrusted remote refuses it before
 /// anything changes.
-async fn remote_pallet_heads() -> Result<crate::remote_heads::RemoteHeld, String> {
+async fn remote_held() -> Result<crate::remote_heads::RemoteHeld, String> {
     crate::remote_heads::held_by_remote(
         "\"forklift scope prune\" asks the remote which history it holds, so that it never frees work that \
         exists only here; nothing was changed.",

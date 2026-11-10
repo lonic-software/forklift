@@ -22,8 +22,8 @@
 //!
 //! Content the remote's host withholds (its handshake's withheld list) is in the remote's history
 //! but may not come back from it, so it is kept too: a withheld file, a withheld recipe's chunks,
-//! and every tree under the pruned path on the way to one. Keeping the trees above it keeps the
-//! child-before-parent invariant below whole: no kept object sits under a freed tree.
+//! and every tree under the pruned path on the way to one. Keeping the trees above it means no
+//! object kept for withheld content sits under a freed tree, so a resumed prune walks to it again.
 //!
 //! A chunked large file (§9.4b) reaches one level deeper: its tree entry names a *recipe*, whose
 //! chunks are content-addressed objects reachable only through it. Freeing such a file frees its
@@ -307,8 +307,9 @@ struct PruneTargets {
     /// Every present object there, children before parents.
     ordered: Vec<String>,
 
-    /// Of `ordered`, the objects kept for withheld content: each withheld object, a withheld
-    /// recipe's chunks, and every tree that names one of them.
+    /// The objects kept for withheld content: each present withheld object, every chunk a present
+    /// withheld recipe names (present or not, and so not always in `ordered`), and every tree that
+    /// names one of them.
     withheld: HashSet<String>,
 }
 
