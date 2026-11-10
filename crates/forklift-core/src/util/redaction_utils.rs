@@ -848,10 +848,6 @@ impl RedactedSet {
             return Ok(None);
         }
 
-        // A recipe this warehouse does not hold carries no chunks it could hand on: a partial
-        // warehouse skips it and records it skipped, and any warehouse skips the recipe of content
-        // its remote's host withholds (see `shift_utils::NotCheckedOut`). A head that receives the
-        // parcel judges it against its own redactions.
         let chunks = match objects.recipe_chunks(hash) {
             Ok(chunks) => chunks,
             Err(error) => match partial {
@@ -859,7 +855,6 @@ impl RedactedSet {
                     skipped.insert(hash.to_string());
                     return Ok(None);
                 }
-                _ if crate::util::shift_utils::NotCheckedOut::read()?.holds(hash)? => return Ok(None),
                 _ => return Err(error),
             },
         };
@@ -941,6 +936,7 @@ fn tree_names(tree: &str,
 pub struct StagingGuard {
     set: RedactedSet,
     partial: bool,
+
     /// The `@redactions` head `set` was read at.
     head: String,
 }
