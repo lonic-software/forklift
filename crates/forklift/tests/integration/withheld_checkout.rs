@@ -476,10 +476,12 @@ fn a_merge_and_a_pick_leave_their_unavailable_files_out() {
 }
 
 /// A merge or pick whose line merge needs content left out refuses `content_withheld` before it
-/// changes anything, naming the file and the host's statement.
+/// changes anything, naming the file and the host's statement, and the way out: taking this
+/// pallet's own change to the file out, after which the merge leaves the file out when their
+/// version is withheld too, and takes their version when only ours is.
 ///
-/// Revert: drop the refusal → the merge dies reading the absent blob with a store error, not
-/// the refusal → red.
+/// Revert: drop the refusal → the merge dies reading the absent blob, refused by the read with
+/// no path → red.
 #[test]
 fn a_merge_that_must_read_withheld_content_refuses_content_withheld() {
     let (warehouse, feature) = withheld_feature("refuse");
@@ -492,43 +494,114 @@ fn a_merge_that_must_read_withheld_content_refuses_content_withheld() {
         assert_eq!(report["error"]["code"], "content_withheld", "{}", report);
         assert_eq!(report["error"]["details"]["path"], "film.mkv", "{}", report);
         assert_eq!(report["error"]["details"]["statement"], "Withheld by the remote's host.", "{}", report);
+        let next_step = report["error"]["next_step"].as_str().unwrap_or_default();
+        assert!(next_step.contains("this pallet's own change to it taken out") && next_step.contains("the merge leaves the file out"), "{}", report);
 
         assert_eq!(std::fs::read_to_string(warehouse.root.join("film.mkv")).unwrap(), "the film on main\n");
         let report = warehouse.stocktake();
         assert_eq!((&report["staged_count"], &report["unstaged_count"]), (&0.into(), &0.into()), "{}", report);
         assert!(!warehouse.run(&["abort"]).status.success(), "nothing is in progress to abort");
     }
+
+    // The way out it names: with main's own change to the film taken out, the merge leaves it out.
+    warehouse.stack_files(&[("film.mkv", OLD_FILM)], "main takes its change out");
+    warehouse.run_ok(&["consolidate", "feature"]);
+    assert!(!warehouse.exists("film.mkv"), "the merge left their film out");
+    assert_eq!(paths(&warehouse.stocktake()["unavailable"]), ["extra/new.bin", "film.mkv"]);
+
+    // Our own version withheld and theirs held: taking our change out takes their version.
+    let (warehouse, _) = withheld_feature("refuse-ours");
+    warehouse.stack_files(&[("film.mkv", "the film on main\n")], "main changes the film");
+    warehouse.run_ok(&["shift", "feature"]);
+    let output = warehouse.run(&["consolidate", "main", "--json"]);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!((output.status.code(), &report["error"]["code"]), (Some(51), &"content_withheld".into()), "{}", report);
+    let next_step = report["error"]["next_step"].as_str().unwrap_or_default();
+    assert!(next_step.contains("the merge takes the other side's version"), "{}", report);
+    warehouse.stack_files(&[("film.mkv", OLD_FILM)], "feature takes its change out");
+    warehouse.run_ok(&["consolidate", "main"]);
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("film.mkv")).unwrap(), "the film on main\n");
 }
 
 /// A conflict over content left out refuses too: putting their withheld version back where we
-/// deleted the file, and keeping our withheld version where they deleted it.
+/// deleted the file (the way out named, putting the file back, then leaves it out), and keeping
+/// our withheld version where they deleted it (the way out named, taking our change out, then
+/// takes their deletion).
 ///
 /// Revert: drop the put-back arm, or the conflict arm, of the refusal → the first merges by
-/// reading the absent blob and dies with a store error, the second stages a conflict at a path
-/// holding no file → red.
+/// reading the absent blob and is refused by the read with no path, the second stages a conflict
+/// at a path holding no file → red.
 #[test]
 fn a_conflict_over_withheld_content_refuses_content_withheld() {
-    let refused = |warehouse: &Warehouse, args: &[&str]| {
+    let refused = |warehouse: &Warehouse, args: &[&str]| -> String {
         let output = warehouse.run(&[args, &["--json"]].concat());
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!((output.status.code(), &report["error"]["code"]), (Some(51), &"content_withheld".into()), "{}", report);
         assert_eq!(report["error"]["details"]["path"], "film.mkv", "{}", report);
+        report["error"]["next_step"].as_str().unwrap_or_default().to_string()
     };
 
     let (warehouse, _) = withheld_feature("refuse-put-back");
     warehouse.run_ok(&["remove", "film.mkv"]);
     warehouse.run_ok(&["stack", "-m", "main deletes the film"]);
     let before = warehouse.stocktake();
-    refused(&warehouse, &["consolidate", "feature"]);
+    let next_step = refused(&warehouse, &["consolidate", "feature"]);
+    assert!(next_step.contains("this pallet's deletion of it taken out") && next_step.contains("the merge leaves the file out"), "{}", next_step);
     assert_eq!(warehouse.stocktake(), before, "the merge changed nothing");
+    // The way out it names: with the film put back as it was, the merge leaves their film out.
+    warehouse.stack_files(&[("film.mkv", OLD_FILM)], "main puts the film back");
+    warehouse.run_ok(&["consolidate", "feature"]);
+    assert!(!warehouse.exists("film.mkv"), "the merge left their film out");
 
     let (warehouse, _) = withheld_feature("refuse-keep-ours");
     warehouse.run_ok(&["remove", "film.mkv"]);
     warehouse.run_ok(&["stack", "-m", "main deletes the film"]);
     std::fs::remove_file(warehouse.root.join("film.mkv")).unwrap();
     warehouse.run_ok(&["shift", "feature"]);
-    refused(&warehouse, &["consolidate", "main"]);
+    let next_step = refused(&warehouse, &["consolidate", "main"]);
+    assert!(next_step.contains("the merge takes the other side's deletion of it"), "{}", next_step);
     assert_eq!(warehouse.stocktake()["unavailable_count"], 2, "the merge changed nothing");
+    // The way out it names: with our change taken out (the film as it was), their deletion goes through.
+    warehouse.stack_files(&[("film.mkv", OLD_FILM)], "feature takes its change out");
+    warehouse.run_ok(&["consolidate", "main"]);
+    assert!(!warehouse.exists("film.mkv"), "the merge took their deletion");
+    assert_eq!(paths(&warehouse.stocktake()["unavailable"]), ["extra/new.bin"]);
+}
+
+/// A merge whose base version is left out cannot take one's own change out (that needs the file
+/// as it was before), so it names the way out that reads nothing: making this pallet's file the
+/// same as the other side's version, which this warehouse holds. Following it, the merge goes
+/// through.
+///
+/// Revert: drop the base check in `withheld_way_out` → the next step names taking the change out
+/// → red.
+#[test]
+fn a_merge_whose_base_is_withheld_names_matching_theirs() {
+    let warehouse = Warehouse::new("refuse-base");
+    let base = warehouse.stack_files(&[("a.txt", "a\n"), ("film.mkv", OLD_FILM)], "main");
+    warehouse.run_ok(&["pallet", "create", "feature"]);
+    warehouse.stack_files(&[("film.mkv", "the film on feature\n")], "feature");
+    warehouse.run_ok(&["shift", "main"]);
+    warehouse.stack_files(&[("film.mkv", "the film on main\n")], "main changes the film");
+
+    warehouse.scoped(|| {
+        let withheld = file_hash(&base, "film.mkv");
+        unavailable::record([(withheld.clone(), "Withheld by the remote's host.".to_string())]).unwrap();
+        warehouse.delete_object(&withheld);
+    });
+
+    let output = warehouse.run(&["consolidate", "feature", "--json"]);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!((output.status.code(), &report["error"]["code"]), (Some(51), &"content_withheld".into()), "{}", report);
+    let next_step = report["error"]["next_step"].as_str().unwrap_or_default();
+    assert!(next_step.contains("made the same as the other side's version"), "{}", report);
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("film.mkv")).unwrap(), "the film on main\n");
+
+    // The way out it names: main's film made the same as feature's, and the merge goes through.
+    let theirs = warehouse.run_ok(&["show", "feature:film.mkv"]);
+    warehouse.stack_files(&[("film.mkv", &String::from_utf8_lossy(&theirs.stdout))], "main takes feature's film");
+    warehouse.run_ok(&["consolidate", "feature"]);
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("film.mkv")).unwrap(), "the film on feature\n");
 }
 
 /// `consolidate feature` into `main`, stopped at a conflict over `a.txt` (both sides changed it),
@@ -629,4 +702,53 @@ fn a_resolved_merge_keeps_the_files_it_left_out() {
     let report = warehouse.stocktake();
     assert_eq!(paths(&report["unavailable"]), ["extra/new.bin", "film.mkv"], "{}", report);
     assert_eq!((&report["staged_count"], &report["unstaged_count"]), (&0.into(), &0.into()), "{}", report);
+}
+
+/// A read that needs the bytes of a file not checked out refuses `content_withheld`, carrying the
+/// hash and the host's statement, rather than reporting a missing object: `show`, `blame`, a `diff`
+/// between revisions that prints its lines, and a `restore` of that file. A `diff --json` lists the
+/// change without reading the bytes, and the same reads of content this warehouse holds succeed.
+/// Loading the same bytes at the path checks the file out again, and the read then succeeds.
+///
+/// Revert: drop the read path's unavailable arm (`unavailable::absent_read_refusal`) → each read
+/// fails with a raw missing-object error and no code → red.
+#[test]
+fn a_read_of_a_file_not_checked_out_refuses_content_withheld() {
+    let (warehouse, feature) = withheld_feature("reads");
+    let withheld = warehouse.scoped(|| file_hash(&feature, "film.mkv"));
+    warehouse.run_ok(&["shift", "feature"]);
+
+    let reads: [&[&str]; 3] = [
+        &["show", "feature:film.mkv"],
+        &["blame", "film.mkv"],
+        &["restore", "film.mkv"],
+    ];
+    for args in reads {
+        let output = warehouse.run(&[args, &["--json"]].concat());
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+        assert_eq!(output.status.code(), Some(51), "{:?}: {}{}", args, report, String::from_utf8_lossy(&output.stderr));
+        assert_eq!(report["error"]["code"], "content_withheld", "{:?}: {}", args, report);
+        assert_eq!(report["error"]["details"]["hash"], withheld.as_str(), "{:?}: {}", args, report);
+        assert_eq!(report["error"]["details"]["statement"], "Withheld by the remote's host.", "{:?}: {}", args, report);
+    }
+
+    let diff = warehouse.run(&["diff", "main", "feature", "film.mkv"]);
+    let stderr = String::from_utf8_lossy(&diff.stderr);
+    assert_eq!(diff.status.code(), Some(51), "{}{}", String::from_utf8_lossy(&diff.stdout), stderr);
+    assert!(stderr.contains("Withheld by the remote's host."), "{}", stderr);
+    let listed = warehouse.run_ok(&["diff", "main", "feature", "--json"]);
+    assert!(String::from_utf8_lossy(&listed.stdout).contains("film.mkv"));
+
+    let shown = warehouse.run_ok(&["show", "main:film.mkv"]);
+    assert_eq!(String::from_utf8_lossy(&shown.stdout), OLD_FILM);
+    warehouse.run_ok(&["blame", "a.txt"]);
+
+    // The way out the guide names: the same bytes, got some other way, put at the path and loaded.
+    std::fs::write(warehouse.root.join("film.mkv"), WITHHELD_FILM).unwrap();
+    warehouse.run_ok(&["load", "film.mkv"]);
+    let report = warehouse.stocktake();
+    assert_eq!(paths(&report["unavailable"]), ["extra/new.bin"], "the loaded file is checked out again: {}", report);
+    assert_eq!((&report["staged_count"], &report["unstaged_count"]), (&0.into(), &0.into()), "{}", report);
+    let shown = warehouse.run_ok(&["show", "feature:film.mkv"]);
+    assert_eq!(String::from_utf8_lossy(&shown.stdout), WITHHELD_FILM);
 }

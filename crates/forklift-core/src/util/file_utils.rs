@@ -2501,6 +2501,14 @@ fn read_object_uncached(hash: &str) -> Result<Vec<u8>, String> {
                 return Err(refusal);
             }
 
+            // Absent because this warehouse's remote withholds it and a fetch left it out: refused
+            // as withheld, with the host's statement, never as a missing object. An unreadable
+            // unavailable record leaves the absence undecided in the same way.
+            let unavailable = super::unavailable::absent_read_refusal(hash);
+            if let Ok(Some(refusal)) = unavailable {
+                return Err(refusal);
+            }
+
             // The same NotFound-shaped message the read path has always produced for this case —
             // reconstructed here (rather than carried on the `Absent` variant, which is bare by
             // design) since nothing about the message depends on which of the two `Absent`
@@ -2511,9 +2519,15 @@ fn read_object_uncached(hash: &str) -> Result<Vec<u8>, String> {
                 "Error while reading object from file \"{}\": {}",
                 file_path, std::io::Error::from(std::io::ErrorKind::NotFound)
             );
-            Err(match applied {
+            let missing = match applied {
                 Err(record) => format!(
                     "{}. Whether a redaction removed it could not be told: {}", missing, record
+                ),
+                Ok(_) => missing,
+            };
+            Err(match unavailable {
+                Err(record) => format!(
+                    "{}. Whether its remote withholds it could not be told: {}", missing, record
                 ),
                 Ok(_) => missing,
             })

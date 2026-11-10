@@ -1859,7 +1859,9 @@ The remote only accepts **fast-forward** updates — no force push.
 **Content the remote withholds** (a legal takedown its host recorded) is not uploaded: the remote
 takes history naming it without it. That covers a withheld chunked file's own chunks; a chunk
 another file shares is still sent, unless the host withholds that chunk too. The lift lists what
-it left out, each hash with the host's statement (`withheld` under `--json`).
+it left out, each hash with the host's statement (`withheld` under `--json`). A lift to another
+remote of history naming content this warehouse never received, because its own remote withholds
+it, refuses with `content_withheld` (exit 51): there are no bytes here to upload.
 
 **Optimistic lift:** if the remote moved and the two changes merge without
 conflicts (different files, or edits to the same file that a three-way merge combines),
