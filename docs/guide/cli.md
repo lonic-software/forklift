@@ -1869,7 +1869,8 @@ auto-merged. Its fetch takes the remote's history without content the remote's h
 withholds, as `lower` does, and the merge leaves such a file not checked out. A merge
 that would have to read such a file refuses with `content_withheld` (exit 51) before it
 changes any file, rather than with the diverged error below: lowering would make the
-same merge and meet the same refusal. Only a clean warehouse qualifies (the merge materializes), and a
+same merge and meet the same refusal.
+Only a clean warehouse qualifies (the merge materializes), and a
 **conflicting overlap** (changes the three-way merge cannot combine) still stops with
 the diverged error (`diverged`, exit 5), leaving
 the warehouse untouched: `lower` merges the remote head in, and a `lift` publishes the merge. A remote holding parcels you have not lowered yet — its head unknown here, or moved
