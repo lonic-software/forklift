@@ -246,7 +246,7 @@ use crate::util::{
     office_utils, pack_utils, pallet_utils, record_utils, remote_utils, scope_utils, sealed_utils, sign_utils, tag_utils,
     signature_table, taint_utils, tombstone_utils,
 };
-use crate::util::sealed_utils::{At, Tolerated};
+use crate::util::sealed_utils::{At, Held, Tolerated};
 use crate::util::progress_utils::Progress;
 use crate::util::scope_utils::{PathScope, ScopeClass};
 
@@ -2266,8 +2266,14 @@ fn walk_closure_for(
     let mut visited_parcels = ParcelVisits::default();
 
     // A staged object is the bay's own work, which the remote need not hold, so the record never
-    // holds its absence.
+    // holds its absence. Content a redaction, this head's withholding or the unavailable record
+    // holds is absent by that set's account, as in the sealed record's own walk: an entry not
+    // checked out stages content the remote's host withholds.
     for (hash, item_type) in &roots.shard_referenced {
+        if !targets.contains(hash) && is_recorded_boundary(sealed, corrupt, hash) {
+            continue;
+        }
+
         check_leaf(hash, *item_type, targets, corrupt, None, &mut referenced, &mut unwalked, reborrow_sink(&mut sink))?;
     }
 
@@ -2798,6 +2804,15 @@ fn check_leaf(
 /// wrong, so it stays a loss.
 fn held_by_hash(sealed: Option<&Tolerated>, corrupt: &BTreeSet<String>, hash: &str, at: At) -> bool {
     !corrupt.contains(hash) && sealed.is_some_and(|sealed| sealed.held(hash, at).is_some())
+}
+
+/// Whether a staged file's content is held by a set no remote is leaned on for (an applied
+/// redaction, this head's withholding, or the unavailable record), and is not a corrupt boundary.
+/// The sealed record alone never holds a staged object's absence (see [`walk_closure_for`]).
+fn is_recorded_boundary(sealed: Option<&Tolerated>, corrupt: &BTreeSet<String>, hash: &str) -> bool {
+    !corrupt.contains(hash) && sealed.is_some_and(|sealed| {
+        matches!(sealed.held(hash, At::File), Some(Held::Redacted | Held::Withheld | Held::Unavailable))
+    })
 }
 
 /// Whether, and how cleanly, [`attempt_heal_driven_refetch`] actually consulted a configured

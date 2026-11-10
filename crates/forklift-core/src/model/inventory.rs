@@ -151,8 +151,17 @@ impl Inventory {
     /// * `true`  - If at least one item changed state.
     /// * `false` - If the inventory was empty or all items were already staged for removal.
     pub fn mark_all_items_deleted(&mut self) -> bool {
+        self.mark_items_deleted_keeping(&[])
+    }
+
+    /// Mark every item as staged for removal, but one in a state of `kept`.
+    ///
+    /// # Returns
+    /// * `true`  - If at least one item changed state.
+    /// * `false` - If none did.
+    pub fn mark_items_deleted_keeping(&mut self, kept: &[InventoryItemState]) -> bool {
         let names_to_mark: Vec<String> = self.items_by_name.iter()
-            .filter(|(_, item)| item.state != InventoryItemState::Deleted)
+            .filter(|(_, item)| item.state != InventoryItemState::Deleted && !kept.contains(&item.state))
             .map(|(name, _)| name.clone())
             .collect();
 

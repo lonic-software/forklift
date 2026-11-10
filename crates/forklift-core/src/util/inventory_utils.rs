@@ -621,7 +621,17 @@ pub async fn create_inventory_for_directory(path: &WarehousePath) -> Result<(), 
                 Err(e) => { result = Err(Some(e)); break; }
             };
 
-            if inventory.mark_all_items_deleted() {
+            // An entry not checked out stays so, as in `carry_over_missing_entries_as_deleted`:
+            // its directory may never have been written, when everything in it is not checked
+            // out. Only a non-directory standing at the directory's path, or above it, stages
+            // its removal.
+            let kept: &[InventoryItemState] = if non_directory_stands_over(dirty_key) {
+                &[]
+            } else {
+                &[InventoryItemState::Unavailable]
+            };
+
+            if inventory.mark_items_deleted_keeping(kept) {
                 writes.insert(dirty_key.clone(), inventory);
             }
         }
@@ -2128,6 +2138,28 @@ fn sweep_unregistered_shards() {
             }
         }
     }
+}
+
+/// Whether something other than a real directory (a file, or a symlink) stands at the working
+/// path of the directory `key` or of one of its ancestors: what the next parcel cannot hold
+/// beside the entries of that directory. A path that cannot be read stands nothing over it.
+fn non_directory_stands_over(key: &str) -> bool {
+    if key.is_empty() {
+        return false;
+    }
+
+    let mut path = std::path::PathBuf::new();
+    for component in key.split('/') {
+        path.push(component);
+
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return true,
+            Err(_) => return false,
+        }
+    }
+
+    false
 }
 
 /// Carry over the entries of the previous inventory that were not re-added by the directory

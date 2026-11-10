@@ -85,7 +85,11 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 37** (current): `audit`'s `scope` carries `unavailable`, the absent objects this
+**Schema 38** (current): `stocktake` carries `unavailable_count` and `unavailable`, the files
+the head names that are not checked out because the remote's host withholds their content and this
+warehouse lacks it (both absent when none). They are no longer counted in `unstaged`.
+
+**Schema 37**: `audit`'s `scope` carries `unavailable`, the absent objects this
 warehouse recorded unavailable because its remote's host withholds them (absent when none).
 
 **Schema 36**: the `remote_history_incomplete` error code exists (exit 52): a remote

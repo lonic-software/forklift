@@ -1,0 +1,312 @@
+//! A file whose content the unavailable record lists, and the store lacks, is not checked out: the
+//! head keeps naming it, no file stands at its path, and its inventory entry stays `Unavailable`
+//! through every head move, load, unload and directory restore, so nothing turns it into a removal
+//! unasked. A file put at its path is loaded as a change, and `forklift remove` stages a removal.
+
+use std::path::PathBuf;
+use std::process::Output;
+
+use forklift_core::globals::StorageRootScope;
+use forklift_core::util::{file_utils, object_utils, unavailable};
+
+use crate::common;
+use common::forklift_command;
+
+/// The content `feature` changes `film.mkv` to, which the remote's host withholds.
+const WITHHELD_FILM: &str = "the withheld film\n";
+
+/// The content of `film.mkv` on `main`, which this warehouse holds.
+const OLD_FILM: &str = "the old film\n";
+
+/// One isolated, signed warehouse with its own home for global config + keys.
+struct Warehouse {
+    root: PathBuf,
+    home: PathBuf,
+}
+
+impl Warehouse {
+    fn new(name: &str) -> Warehouse {
+        let base = std::env::temp_dir().join(format!("forklift-withheld-checkout-{}-{}", name, std::process::id()));
+        let root = base.join("warehouse");
+        let home = base.join("home");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+
+        let warehouse = Warehouse { root, home };
+        warehouse.run_ok(&["prepare"]);
+        warehouse.run_ok(&["config", "set", "operator.identifier", "withheld@forklift"]);
+        warehouse.run_ok(&["office", "enroll"]);
+
+        warehouse
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        forklift_command()
+            .args(args)
+            .current_dir(&self.root)
+            .env("FORKLIFT_GLOBAL_CONFIG", self.home.join("global-config.toml"))
+            .env("FORKLIFT_KEYS_DIR", self.home.join("keys"))
+            .output()
+            .unwrap()
+    }
+
+    fn run_ok(&self, args: &[&str]) -> Output {
+        let output = self.run(args);
+        assert!(
+            output.status.success(),
+            "`{}` failed: {}{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    fn write(&self, file: &str, content: &str) {
+        let path = self.root.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    fn stack_files(&self, files: &[(&str, &str)], message: &str) -> String {
+        for (file, content) in files {
+            self.write(file, content);
+        }
+        self.run_ok(&["load", "."]);
+        self.run_ok(&["stack", "-m", message]);
+
+        self.head()
+    }
+
+    fn head(&self) -> String {
+        let pallet = std::fs::read_to_string(self.root.join(".forklift").join("position"))
+            .unwrap()
+            .lines()
+            .nth(1)
+            .unwrap()
+            .to_string();
+
+        std::fs::read_to_string(self.root.join(".forklift").join("pallets").join(pallet)).unwrap().trim().to_string()
+    }
+
+    fn delete_object(&self, hash: &str) {
+        let objects = self.root.join(".forklift").join("objects").join(&hash[0..2]);
+        std::fs::remove_file(objects.join(&hash[2..])).expect("the object existed");
+    }
+
+    fn scoped<T>(&self, work: impl FnOnce() -> T) -> T {
+        let _scope = StorageRootScope::enter(&self.root);
+
+        work()
+    }
+
+    fn exists(&self, file: &str) -> bool {
+        self.root.join(file).symlink_metadata().is_ok()
+    }
+
+    /// `stocktake --json`'s data.
+    fn stocktake(&self) -> serde_json::Value {
+        let output = self.run_ok(&["stocktake", "--json"]);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+        report["data"].clone()
+    }
+}
+
+/// The paths a stocktake list names, sorted.
+fn paths(list: &serde_json::Value) -> Vec<String> {
+    let mut paths: Vec<String> = list.as_array().map(|items| items.iter().map(|item| {
+        item.as_str().map(str::to_string).unwrap_or_else(|| item["path"].as_str().unwrap().to_string())
+    }).collect()).unwrap_or_default();
+    paths.sort();
+
+    paths
+}
+
+/// The `(kind, path)` pairs a stocktake list of changes names, sorted.
+fn changes(list: &serde_json::Value) -> Vec<(String, String)> {
+    let mut changes: Vec<(String, String)> = list.as_array().map(|items| items.iter().map(|item| {
+        (item["kind"].as_str().unwrap().to_string(), item["path"].as_str().unwrap().to_string())
+    }).collect()).unwrap_or_default();
+    changes.sort();
+
+    changes
+}
+
+fn file_hash(head: &str, path: &str) -> String {
+    let root = object_utils::load_parcel(head).unwrap().tree_hash;
+    object_utils::resolve_tree_file(&root, path).unwrap().expect("the path is a file").0
+}
+
+/// `main` holds `a.txt` and `film.mkv` at [`OLD_FILM`]; `feature` changes `film.mkv` to
+/// [`WITHHELD_FILM`] and adds `extra/new.bin`, both recorded unavailable and absent from the store.
+/// The bay is left on `main`. Returns the warehouse and `feature`'s head.
+fn withheld_feature(name: &str) -> (Warehouse, String) {
+    let warehouse = Warehouse::new(name);
+    warehouse.stack_files(&[("a.txt", "a\n"), ("film.mkv", OLD_FILM)], "main");
+    warehouse.run_ok(&["pallet", "create", "feature"]);
+    let feature = warehouse.stack_files(&[("film.mkv", WITHHELD_FILM), ("extra/new.bin", "withheld new\n")], "feature");
+    warehouse.run_ok(&["shift", "main"]);
+
+    warehouse.scoped(|| {
+        let withheld = [file_hash(&feature, "film.mkv"), file_hash(&feature, "extra/new.bin")];
+        unavailable::record(withheld.iter().map(|hash| (hash.clone(), "Withheld by the remote's host.".to_string()))).unwrap();
+        for hash in &withheld {
+            warehouse.delete_object(hash);
+        }
+    });
+
+    (warehouse, feature)
+}
+
+/// A head move writes no file whose content is unavailable: a new one is left out, and a changed
+/// one is removed rather than left holding the old tree's bytes. Both stay staged at the head's
+/// hash, and stocktake lists them apart from changes, with the bay clean: a shift away and back
+/// is not refused, and brings the old bytes back and leaves them out again.
+///
+/// Revert: drop the skip's removal of the old file → `film.mkv` keeps the old bytes → red; take
+/// an `Unavailable` entry as a change (`is_tracked_change` true for it) → the shift away is
+/// refused → red; count it in `unstaged` → red.
+#[test]
+fn a_head_move_leaves_unavailable_content_out_and_the_bay_clean() {
+    let (warehouse, _) = withheld_feature("shift");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("film.mkv")).unwrap(), OLD_FILM);
+
+    warehouse.run_ok(&["shift", "feature"]);
+    assert!(!warehouse.exists("film.mkv"), "the changed file's old bytes are removed, not left under the new hash");
+    assert!(!warehouse.exists("extra/new.bin"), "the new file is not written");
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("a.txt")).unwrap(), "a\n");
+
+    let report = warehouse.stocktake();
+    assert_eq!(paths(&report["unavailable"]), ["extra/new.bin", "film.mkv"], "{}", report);
+    assert_eq!((&report["unavailable_count"], &report["staged_count"], &report["unstaged_count"]),
+        (&2.into(), &0.into(), &0.into()), "{}", report);
+
+    let human = warehouse.run_ok(&["stocktake"]);
+    let human = String::from_utf8_lossy(&human.stdout);
+    assert!(human.contains("Not checked out") && human.contains("film.mkv"), "{}", human);
+
+    let summary: serde_json::Value = serde_json::from_slice(&warehouse.run_ok(&["stocktake", "--summary", "--json"]).stdout).unwrap();
+    assert_eq!(summary["data"]["unavailable_count"], 2, "{}", summary);
+    assert!(summary["data"].get("unavailable").is_none(), "--summary drops the list: {}", summary);
+
+    warehouse.run_ok(&["shift", "main"]);
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("film.mkv")).unwrap(), OLD_FILM);
+    assert!(warehouse.stocktake().get("unavailable_count").is_none(), "nothing is unavailable on main");
+
+    warehouse.run_ok(&["shift", "feature"]);
+    assert!(!warehouse.exists("film.mkv"));
+    assert_eq!(warehouse.stocktake()["unavailable_count"], 2);
+}
+
+/// A load keeps an entry not checked out as it is, and the next parcel names the file at the
+/// head's hash: `stack` neither drops it nor refuses its absent content. Audit and heal count none
+/// of it as lost.
+///
+/// Revert: let the load's carry-over, or its pass over a directory gone from disk, stage it
+/// `Deleted` → stocktake reports a removal and the stacked tree lacks it → red; leave the record out of the staged-content check → `stack`
+/// refuses → red; let the audit walk report a staged unavailable leaf → heal fails → red.
+#[test]
+fn a_load_and_a_stack_keep_a_file_not_checked_out() {
+    let (warehouse, feature) = withheld_feature("load");
+    warehouse.run_ok(&["shift", "feature"]);
+
+    warehouse.write("b.txt", "b\n");
+    warehouse.run_ok(&["load", "."]);
+    let report = warehouse.stocktake();
+    assert_eq!(changes(&report["staged"]), [("added".to_string(), "b.txt".to_string())], "{}", report);
+    assert_eq!(paths(&report["unavailable"]), ["extra/new.bin", "film.mkv"], "{}", report);
+
+    let healed = warehouse.run_ok(&["heal", "--json"]);
+    let healed: serde_json::Value = serde_json::from_slice(&healed.stdout).unwrap();
+    assert!(!healed["data"].to_string().contains("missing"), "{}", healed);
+
+    warehouse.run_ok(&["stack", "-m", "b"]);
+    let head = warehouse.head();
+    warehouse.scoped(|| {
+        for path in ["film.mkv", "extra/new.bin"] {
+            assert_eq!(file_hash(&head, path), file_hash(&feature, path), "{} is named as the head named it", path);
+        }
+    });
+    warehouse.run_ok(&["audit"]);
+    assert_eq!(paths(&warehouse.stocktake()["unavailable"]), ["extra/new.bin", "film.mkv"]);
+}
+
+/// `unload`'s reset, a directory restore and a park and its pop keep an entry not checked out:
+/// the restore leaves it out and says how many it left, and writes nothing at its path.
+///
+/// Revert: let unload's reset start it `Normal` → stocktake reports it removed → red; let a
+/// directory restore plan it → the restore fails over its absent content → red; drop its report
+/// → red; let park's refresh of tracked entries stage a missing one's removal → red.
+#[test]
+fn unload_restore_and_park_keep_a_file_not_checked_out() {
+    let (warehouse, _) = withheld_feature("unload");
+    warehouse.run_ok(&["shift", "feature"]);
+    let unavailable = ["extra/new.bin", "film.mkv"];
+
+    warehouse.write("a.txt", "changed\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["unload", "."]);
+    let report = warehouse.stocktake();
+    assert_eq!(paths(&report["unavailable"]), unavailable, "{}", report);
+    assert_eq!(changes(&report["unstaged"]), [("modified".to_string(), "a.txt".to_string())], "{}", report);
+
+    let restored = warehouse.run_ok(&["restore", ".", "--confirm"]);
+    let restored = String::from_utf8_lossy(&restored.stdout);
+    assert!(restored.contains("Left out 2 file(s) not checked out"), "{}", restored);
+    assert!(!warehouse.exists("film.mkv") && !warehouse.exists("extra/new.bin"));
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("a.txt")).unwrap(), "a\n");
+    assert_eq!(paths(&warehouse.stocktake()["unavailable"]), unavailable);
+
+    warehouse.write("a.txt", "parked\n");
+    warehouse.run_ok(&["load", "."]);
+    warehouse.run_ok(&["park"]);
+    assert_eq!(paths(&warehouse.stocktake()["unavailable"]), unavailable);
+    warehouse.run_ok(&["park", "pop"]);
+    let report = warehouse.stocktake();
+    assert_eq!(paths(&report["unavailable"]), unavailable, "{}", report);
+    assert_eq!(changes(&report["staged"]), [("modified".to_string(), "a.txt".to_string())], "{}", report);
+}
+
+/// A file put at a path not checked out is loaded as a change at its own hash, never taken for the
+/// withheld content: bytes equal to it are stored, which makes the entry an ordinary one and drops
+/// the record's entry, and other bytes are a modification. `forklift remove` stages a removal on
+/// purpose, and a directory standing at the path stages the file's removal.
+///
+/// Revert: compare a file at an `Unavailable` entry by stat → the equal bytes are never stored
+/// and the record keeps the entry → red; keep an `Unavailable` entry over a directory at its path
+/// → no removal is staged → red.
+#[test]
+fn a_file_put_back_a_removal_and_a_directory_end_a_file_not_checked_out() {
+    let (warehouse, feature) = withheld_feature("put-back");
+    warehouse.run_ok(&["shift", "feature"]);
+
+    warehouse.write("film.mkv", WITHHELD_FILM);
+    warehouse.write("extra/new.bin", "other bytes\n");
+    warehouse.run_ok(&["load", "."]);
+    let report = warehouse.stocktake();
+    assert!(report.get("unavailable").is_none(), "{}", report);
+    assert_eq!(changes(&report["staged"]), [("modified".to_string(), "extra/new.bin".to_string())], "{}", report);
+
+    warehouse.scoped(|| {
+        let film = file_hash(&feature, "film.mkv");
+        assert!(file_utils::does_object_exist(&film).unwrap(), "the put-back bytes are stored");
+        let record = unavailable::read_unavailable().unwrap();
+        assert!(!record.contains(&film), "the record drops content the store holds again");
+        assert!(record.contains(&file_hash(&feature, "extra/new.bin")), "other bytes drop nothing");
+    });
+
+    let (warehouse, _) = withheld_feature("remove");
+    warehouse.run_ok(&["shift", "feature"]);
+    warehouse.run_ok(&["remove", "film.mkv"]);
+    warehouse.write("extra/new.bin/inner.txt", "a directory now\n");
+    warehouse.run_ok(&["load", "."]);
+    let report = warehouse.stocktake();
+    assert!(report.get("unavailable").is_none(), "{}", report);
+    assert_eq!(changes(&report["staged"]), [
+        ("added".to_string(), "extra/new.bin/inner.txt".to_string()),
+        ("removed".to_string(), "extra/new.bin".to_string()),
+        ("removed".to_string(), "film.mkv".to_string()),
+    ], "{}", report);
+}
