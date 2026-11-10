@@ -4097,7 +4097,7 @@ mod tests {
         std::fs::write(sealed_utils::sealed_path(), b"not a sealed record").unwrap();
 
         let walk = enumerate_absent_reachable(&BTreeSet::new()).unwrap();
-        assert!(walk.degraded_sources.iter().any(|note| note.contains("objects held by hash alone or redacted could not be told apart")),
+        assert!(walk.degraded_sources.iter().any(|note| note.contains("objects held by hash alone, redacted or unavailable could not be told apart")),
             "{:?}", walk.degraded_sources);
         assert_eq!(walk.hashes, [held].into_iter().collect::<BTreeSet<String>>());
 
