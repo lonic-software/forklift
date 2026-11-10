@@ -424,7 +424,11 @@ impl ServingRefusal {
                 name
             ),
             ServingRefusal::Unavailable(count) => format!(
-                "{} lacks {} file{} its pallets reach: {} remote's host withholds the content, so a                 fetch left {} out (.forklift/unavailable). A client trusts a server to hold the whole                 history it serves. Load the missing files' bytes into this warehouse, then serve it                 again.",
+                "{} lacks {} file{} its record of unavailable content lists: {} remote's host withholds \
+                the content, so a fetch left {} out (.forklift/unavailable). A client trusts a server \
+                to hold the whole history it serves. Load the missing files' bytes into this \
+                warehouse, or, if no pallet reaches them any more, run `forklift store compact --all` \
+                there to drop their entries; then serve it again.",
                 name,
                 count,
                 if count == 1 { "" } else { "s" },
@@ -6709,7 +6713,7 @@ mod tests {
         let refused = WarehouseHandle::serving(lacking.clone(), false).err().expect("a root lacking content is refused");
         assert!(matches!(refused, ServingRefusal::Unavailable(1)), "{:?}", refused);
         let message = refused.message("\"/srv/wh\"");
-        assert!(message.starts_with("\"/srv/wh\" lacks 1 file its pallets reach"), "{}", message);
+        assert!(message.starts_with("\"/srv/wh\" lacks 1 file its record of unavailable content lists"), "{}", message);
         assert!(message.contains("Load the missing files' bytes into this warehouse"), "{}", message);
         assert!(!lacking.join(FOLDER_NAME_FORKLIFT_ROOT).join("serve.lock").exists(), "a refused root keeps no serve lock");
 

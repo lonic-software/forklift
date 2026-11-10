@@ -977,7 +977,8 @@ fn redacted_absent_note(count: usize) -> String {
 /// unavailable — see [`ClosureWalkResult::unavailable_absent`].
 fn unavailable_absent_note(count: usize) -> String {
     format!(
-        "{} object(s) this warehouse recorded unavailable are absent from the store: its remote's         host withholds their content, and none of them is counted as lost.",
+        "{} object(s) this warehouse recorded unavailable are absent from the store: its remote's \
+        host withholds their content, and none of them is counted as lost.",
         count
     )
 }

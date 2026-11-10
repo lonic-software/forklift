@@ -352,7 +352,9 @@ impl CommandOutput for AuditReport {
 
         if let Some(AuditScope { unavailable: unavailable @ 1.., .. }) = &self.scope {
             println!(
-                "{} absent object(s) are unavailable: this warehouse's remote withholds their                 content on its host's statement, so their absence is accounted for, not damage.                 Loading the same file's bytes brings them back.",
+                "{} absent object(s) are unavailable: this warehouse's remote withholds their \
+                content on its host's statement, so their absence is accounted for, not damage. \
+                Loading the same file's bytes brings them back.",
                 unavailable
             );
         }

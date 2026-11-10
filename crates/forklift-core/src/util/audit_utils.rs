@@ -1847,7 +1847,7 @@ pub fn verify_parcel_closure_for_write(head: &str,
         &local_chunks_missing,
         &|hash| object_utils::recipe_chunk_hashes(hash),
         &|hash| object_utils::load_tree(hash),
-        &crate::util::sealed_utils::read_removed,
+        &crate::util::sealed_utils::read_redacted_and_withheld,
     )?;
 
     Ok(pallet_utils::VerifiedClosure::new(head, PathScope::full(), known_complete))

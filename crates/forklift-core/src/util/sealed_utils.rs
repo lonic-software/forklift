@@ -524,6 +524,17 @@ pub fn read_removed() -> Result<Tolerated, String> {
     })
 }
 
+/// Read the applied redactions and the withheld content alone, for a server's push gate: a served
+/// root lacks nothing its unavailable record lists, so a push never leans on that record, and both
+/// of these only ever grow.
+///
+/// # Returns
+/// * `Ok(Tolerated)` - The two sets, and empty sealed and unavailable sets.
+/// * `Err(String)`   - If either record cannot be read or parsed.
+pub fn read_redacted_and_withheld() -> Result<Tolerated, String> {
+    Ok(Tolerated::removed_only(applied_redactions::read_applied()?, withholding::read_withheld()?))
+}
+
 /// Read and parse the record at `path`.
 ///
 /// # Returns

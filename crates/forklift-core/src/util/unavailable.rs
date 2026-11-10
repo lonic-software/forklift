@@ -246,12 +246,16 @@ pub fn prune(hold: &StoreAccessExclusive) -> Result<usize, String> {
         return Ok(0);
     }
 
-    prune_against(hold, &gc_utils::collect_live_set()?)
+    let (live, whole) = gc_utils::collect_live_set_saying_whole()?;
+
+    prune_against(hold, &live, whole)
 }
 
-/// [`prune`], against `live`, a live set the caller computed under `_hold`.
-pub(crate) fn prune_against(_hold: &StoreAccessExclusive, live: &HashSet<String>) -> Result<usize, String> {
-    drop_where(|hash| Ok(file_utils::is_present_for_sweep(hash)? || !live.contains(hash)))
+/// [`prune`], against `live`, a live set the caller computed under `_hold`. `whole` says the walk
+/// behind it saw every hash its roots name. When it stopped at an absent parcel or tree, an entry
+/// missing from `live` may sit below that boundary, so only present entries are dropped.
+pub(crate) fn prune_against(_hold: &StoreAccessExclusive, live: &HashSet<String>, whole: bool) -> Result<usize, String> {
+    drop_where(|hash| Ok(file_utils::is_present_for_sweep(hash)? || (whole && !live.contains(hash))))
 }
 
 #[cfg(test)]
@@ -345,20 +349,21 @@ mod tests {
     }
 
     // Revert: drop the liveness check → the named absent entry goes; keep every absent entry →
-    // the unnamed one stays.
+    // the unnamed one stays; ignore `whole` → the walk that stopped at a boundary drops B.
     #[test]
-    fn the_prune_drops_an_absent_entry_only_when_nothing_live_names_it() {
+    fn the_prune_drops_an_absent_entry_only_when_a_whole_walk_names_it_nowhere() {
         let _scratch = Scratch::new("prune");
         std::fs::create_dir_all(file_utils::get_path_objects_root()).unwrap();
         record([(A.to_string(), "statement".to_string()), (B.to_string(), "statement".to_string())]).unwrap();
         let hold = crate::util::lock_utils::StoreAccessLock::try_exclusive().unwrap();
 
         let live: HashSet<String> = [A.to_string()].into();
-        assert_eq!(prune_against(&hold, &live).unwrap(), 1);
+        assert_eq!(prune_against(&hold, &live, false).unwrap(), 0, "B may sit below an absent tree");
+        assert_eq!(prune_against(&hold, &live, true).unwrap(), 1);
         let set = read_unavailable().unwrap();
         assert!(set.contains(A) && !set.contains(B));
 
-        assert_eq!(prune_against(&hold, &HashSet::new()).unwrap(), 1);
+        assert_eq!(prune_against(&hold, &HashSet::new(), true).unwrap(), 1);
         assert!(!unavailable_path().exists(), "an empty record is removed");
     }
 
