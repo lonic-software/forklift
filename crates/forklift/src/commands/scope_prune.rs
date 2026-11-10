@@ -50,7 +50,7 @@ pub async fn handle_command(paths: Vec<String>, confirm: bool) -> Result<(), Str
     // The remote's heads are read next, outside the store hold, so a slow remote never keeps
     // other bays' writers out. A remote ref can move after this read, and the plan cannot see it;
     // the store hold does not reach the remote, so reading under it would leave the same window.
-    let remote_heads = remote_pallet_heads().await?;
+    let held = remote_held().await?;
 
     // Exclusive store access before the judgement the plan uses (FORK-150). The keep-set depends
     // on the fetch scope `judge_request` reads and on every bay's checkout scope, not only
@@ -68,7 +68,7 @@ pub async fn handle_command(paths: Vec<String>, confirm: bool) -> Result<(), Str
     // The plan reads the head a haul not yet merged proposes under the same hold: every haul
     // write takes it shared.
     let removed_heads = journal_utils::removed_heads()?;
-    let plan = prune_utils::plan_prune(&to_reclaim, &post_prune, &remote_heads, &removed_heads, &store_access)?;
+    let plan = prune_utils::plan_prune(&to_reclaim, &post_prune, &held.heads, &held.withheld, &removed_heads, &store_access)?;
 
     // Rule 5: freeing content is destructive, so it needs --confirm. A plan that frees nothing
     // only narrows the fetch scope, which "scope fetch" undoes, so it runs without it.
@@ -82,6 +82,7 @@ pub async fn handle_command(paths: Vec<String>, confirm: bool) -> Result<(), Str
             would_free: plan.to_free.len(),
             still_packed: plan.still_packed,
             retained_shared: plan.retained_shared,
+            kept_withheld: plan.kept_withheld,
             kept_unlifted: plan.kept_unlifted,
             kept_for_hauls: plan.kept_for_hauls,
             kept_for_mirror: plan.kept_for_mirror,
@@ -128,6 +129,7 @@ pub async fn handle_command(paths: Vec<String>, confirm: bool) -> Result<(), Str
         would_free: plan.to_free.len(),
         still_packed: plan.still_packed,
         retained_shared: plan.retained_shared,
+        kept_withheld: plan.kept_withheld,
         kept_unlifted: plan.kept_unlifted,
         kept_for_hauls: plan.kept_for_hauls,
         kept_for_mirror: plan.kept_for_mirror,
@@ -223,10 +225,11 @@ fn judge_request(paths: &[String]) -> Result<PruneRequest, String> {
     Ok(PruneRequest { post_prune, to_reclaim, all_resumed })
 }
 
-/// The heads whose history the remote holds ([`crate::remote_heads::held_by_remote`]). The prune
-/// frees only what history these heads reach needs, so an unreachable or untrusted remote refuses
-/// it before anything changes.
-async fn remote_pallet_heads() -> Result<Vec<String>, String> {
+/// The heads whose history the remote holds, and the content its host withholds
+/// ([`crate::remote_heads::held_by_remote`]). The prune frees only what history these heads reach
+/// needs and the remote can still serve, so an unreachable or untrusted remote refuses it before
+/// anything changes.
+async fn remote_held() -> Result<crate::remote_heads::RemoteHeld, String> {
     crate::remote_heads::held_by_remote(
         "\"forklift scope prune\" asks the remote which history it holds, so that it never frees work that \
         exists only here; nothing was changed.",
@@ -294,6 +297,11 @@ pub(crate) struct ScopePruneReport {
     /// fetched, or with a meta pallet. Distinct from `still_packed`: this content stays by
     /// design, not pending a future repack.
     retained_shared: usize,
+
+    /// Candidates kept because the remote's host withholds them, or content beneath them, which the
+    /// remote may not serve again: withheld content, a withheld chunked file's chunks, and the
+    /// trees on the way to either. A later prune frees them only once the withholding ends.
+    kept_withheld: usize,
 
     /// Candidates kept because lifting history the remote does not hold reads them: work stacked
     /// here and never lifted, or lifted to a remote head the remote did not confirm. Some may be the
@@ -390,6 +398,14 @@ impl CommandOutput for ScopePruneReport {
                 "{} object(s) are inside packs and are not reclaimed by this prune; a scope-aware \
                 repack is not yet built, so they remain on disk (harmless, sealed by hash).",
                 self.still_packed
+            );
+        }
+
+        if self.kept_withheld > 0 {
+            println!(
+                "{} object(s) were kept because the remote withholds them, or content beneath them, \
+                and may not serve it again.",
+                self.kept_withheld
             );
         }
 

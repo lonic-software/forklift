@@ -8322,7 +8322,7 @@ fn an_interrupted_evict_leaves_a_readable_warehouse_and_a_rerun_finishes() {
         let store_lock = forklift_core::util::lock_utils::StoreLock::acquire().unwrap();
         let serve_lock = forklift_core::util::lock_utils::ServeLock::acquire().unwrap();
         let hold = forklift_core::util::lock_utils::StoreAccessLock::try_exclusive().unwrap();
-        let plan = evict_utils::plan_evict(&held, &hold).unwrap();
+        let plan = evict_utils::plan_evict(&held, &std::collections::HashSet::new(), &hold).unwrap();
         assert!(plan.to_free.len() >= 3, "the oldest parcel's content is planned");
 
         // The last object goes last; make its folder refuse the delete, so the run stops there.

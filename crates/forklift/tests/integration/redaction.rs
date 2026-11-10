@@ -2962,3 +2962,88 @@ fn a_move_to_an_origin_withholding_leaned_on_content_reads_the_previous_origin()
     assert_eq!(moved["data"]["previous_origin_withheld"], "unreachable", "{}", moved);
     assert!(moved["data"]["previous_origin_unreachable"].is_string(), "{}", moved);
 }
+
+/// A cache keeps its copy of content its origin's host withholds: an eviction counts it kept and
+/// leaves it readable, where it frees the copy of content the origin still serves. A read of
+/// withheld content the cache never fetched is refused as the origin answered it, withheld.
+///
+/// Revert: read no withheld list from the handshake → the eviction frees the film and counts
+/// nothing kept. Revert: word the miss hook's failed fetch as plain text → the draft's read is
+/// refused as `error`.
+#[test]
+fn a_cache_keeps_what_its_origin_withholds_and_a_miss_on_it_is_withheld() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-takedown-evict-server-{}", std::process::id())));
+    let film = b"leaked film\n";
+    let draft = b"a draft the host takes down\n";
+
+    let owner = Warehouse::cloned("takedown-evict-owner", &server.url);
+    owner.stack("film.mkv", film, "film");
+    owner.stack("trailer.mkv", b"trailer\n", "trailer");
+    owner.stack("docs/notes.txt", draft, "draft");
+    owner.run_ok(&["lift"]);
+    let old = server.main();
+    owner.stack("film.mkv", b"poster\n", "poster");
+    owner.stack("trailer.mkv", b"teaser\n", "teaser");
+    owner.stack("docs/notes.txt", b"notes\n", "notes");
+    owner.run_ok(&["lift"]);
+
+    // The cache reads the old film and trailer, so it holds copies its checkout does not need.
+    let cache = Warehouse::cloned_with("takedown-evict-cache", &server.url, &["--cache"]);
+    for path in ["film.mkv", "trailer.mkv"] {
+        cache.run_ok(&["show", &format!("{}:{}", old, path)]);
+    }
+    let (film_hash, trailer_hash) = (hash_of(film), hash_of(b"trailer\n"));
+    assert!(cache.holds_loose(&film_hash) && cache.holds_loose(&trailer_hash));
+
+    let statement = "DMCA notice 2026-118 from Example Studios";
+    for hash in [&film_hash, &hash_of(draft)] {
+        let added = withhold(&server.root, &["add", hash, "--statement", statement]);
+        assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    }
+
+    let evicted = cache.json(&["store", "evict"]);
+    assert_eq!(evicted["ok"], true, "{}", evicted);
+    assert!(evicted["data"]["kept_withheld"].as_u64().unwrap() >= 1, "{}", evicted);
+    assert!(cache.holds_loose(&film_hash), "the withheld copy is kept: {}", evicted);
+    assert!(!cache.holds_loose(&trailer_hash), "a served copy is freed: {}", evicted);
+    let shown = cache.run_ok(&["show", &format!("{}:film.mkv", old)]);
+    assert_eq!(shown.stdout, film);
+
+    let refused = cache.json(&["show", &format!("{}:docs/notes.txt", old)]);
+    assert_eq!(refused["ok"], false, "{}", refused);
+    assert_eq!(refused["error"]["code"], "content_withheld", "{}", refused);
+    assert!(refused["error"]["message"].as_str().unwrap().contains(statement), "{}", refused);
+    assert!(!cache.holds_loose(&hash_of(draft)));
+}
+
+/// A sparse warehouse's prune keeps its copy of content the remote's host withholds, and the
+/// folder above it, where it frees what the remote still serves.
+///
+/// Revert: pass the prune no withheld list → the film is freed and nothing is counted kept.
+#[test]
+fn a_prune_keeps_what_the_remote_withholds() {
+    let server = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-takedown-prune-server-{}", std::process::id())));
+    let film = b"leaked film\n";
+
+    let owner = Warehouse::cloned("takedown-prune-owner", &server.url);
+    owner.stack("media/film.mkv", film, "film");
+    owner.stack("media/trailer.mkv", b"trailer\n", "trailer");
+    owner.stack("src/keep.txt", b"keep\n", "keep");
+    owner.run_ok(&["lift"]);
+
+    let sparse = Warehouse::cloned_with("takedown-prune-sparse", &server.url, &["--only", "media", "--only", "src"]);
+    let (film_hash, trailer_hash) = (hash_of(film), hash_of(b"trailer\n"));
+    assert!(sparse.holds_loose(&film_hash) && sparse.holds_loose(&trailer_hash));
+
+    let added = withhold(&server.root, &["add", &film_hash, "--statement", "DMCA notice 2026-119"]);
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+
+    sparse.run_ok(&["scope", "narrow", "media"]);
+    let pruned = sparse.json(&["scope", "prune", "--confirm", "media"]);
+    assert_eq!(pruned["ok"], true, "{}", pruned);
+    assert_eq!(pruned["data"]["kept_withheld"], 3, "the film and both media folders naming it: {}", pruned);
+    assert!(sparse.holds_loose(&film_hash), "the withheld copy is kept: {}", pruned);
+    assert!(!sparse.holds_loose(&trailer_hash), "a served copy is freed: {}", pruned);
+}

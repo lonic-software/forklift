@@ -118,6 +118,11 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   copy is kept, an update to a meta pallet that would newly name it is refused `451`. A chunked file's chunks
   that only it names are deleted, and then its recipe, as for a redacted file.
 
+- **A cache or sparse warehouse keeps content its remote withholds.** `store evict` and
+  `scope prune` no longer free a copy of content the remote's host withholds, as for a legal
+  takedown, since the remote may not serve it again; the folders above it stay with it, and both
+  reports count what was kept in `kept_withheld`. `--json` schema is now 34.
+
 - **`remote move` knows what the new origin withholds.** A cache or sparse warehouse moving to a
   server whose host withholds content it relies on its origin for no longer counts that content as
   held there. The move asks the previous origin: while that origin answers and does not withhold

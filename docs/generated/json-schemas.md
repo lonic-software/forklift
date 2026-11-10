@@ -5523,6 +5523,12 @@ A command not listed here either reports only the generic human-message shape `{
       "minimum": 0,
       "type": "integer"
     },
+    "kept_withheld": {
+      "description": "Candidates kept because the remote's host withholds them, or content beneath them, which the\nremote may not serve again: withheld content, a withheld chunked file's chunks, and the\ntrees on the way to either. A later prune frees them only once the withholding ends.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
     "pruned": {
       "description": "The fetched path(s) pruned (forgotten) from the warehouse fetch scope.",
       "items": {
@@ -5570,6 +5576,7 @@ A command not listed here either reports only the generic human-message shape `{
     "would_free",
     "still_packed",
     "retained_shared",
+    "kept_withheld",
     "kept_unlifted",
     "kept_for_hauls",
     "kept_for_mirror",
@@ -6489,6 +6496,12 @@ A command not listed here either reports only the generic human-message shape `{
       "minimum": 0,
       "type": "integer"
     },
+    "kept_withheld": {
+      "description": "Objects kept because the origin's host withholds them or content beneath them, which the\norigin may not serve again: withheld content, a withheld chunked file's chunks, and the trees\non the way to either.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
     "not_held": {
       "description": "Present objects only local history reaches (unlifted work, a haul, a deleted pallet), which\nthe origin is not known to hold. Lifting that work lets a later eviction free them.",
       "format": "uint",
@@ -6546,6 +6559,7 @@ A command not listed here either reports only the generic human-message shape `{
     "bytes_freed",
     "kept_for_checkouts",
     "kept_local",
+    "kept_withheld",
     "not_held",
     "still_packed",
     "heads_not_lowered",

@@ -20,6 +20,11 @@
 //! remote's heads do not reach needs: work stacked here and never lifted, and the parents its
 //! lift compares against (FORK-251, [`retain_unlifted`]).
 //!
+//! Content the remote's host withholds (its handshake's withheld list) is in the remote's history
+//! but may not come back from it, so it is kept too: a withheld file, a withheld recipe's chunks,
+//! and every tree under the pruned path on the way to one. Keeping the trees above it means no
+//! object kept for withheld content sits under a freed tree, so a resumed prune walks to it again.
+//!
 //! A chunked large file (§9.4b) reaches one level deeper: its tree entry names a *recipe*, whose
 //! chunks are content-addressed objects reachable only through it. Freeing such a file frees its
 //! recipe *and* every chunk — the recipe is descended while still present to enumerate them, and
@@ -75,6 +80,12 @@ pub struct PrunePlan {
     /// not content a repack could someday reclaim — so a caller reporting "nothing was freed"
     /// can tell the two apart instead of leaving the reason unstated.
     pub retained_shared: usize,
+
+    /// Candidates kept because the remote's host withholds them, or they lead to such content: a
+    /// withheld file's content, a withheld recipe's chunks, and the trees on the way to either under
+    /// the pruned path. The remote may not serve it again, so the copy here stays; neither lifting
+    /// nor a later prune frees it while the withholding lasts.
+    pub kept_withheld: usize,
 
     /// Candidates kept because lifting history the remote is not known to hold reads them: work
     /// stacked here and never lifted, or lifted to a remote head the remote did not confirm it
@@ -132,6 +143,8 @@ pub struct PruneStats {
 /// * `remote_heads`    - The remote's pallet heads, from a handshake whose trust was checked, and
 ///   the recorded heads it confirmed it still holds. History they reach is what the remote holds;
 ///   every other parcel keeps its content under the pruned path (see [`retain_unlifted`]).
+/// * `withheld`        - The content the remote's host withholds, from the same handshake: never
+///   freed, nor any tree on the way to it ([`PrunePlan::kept_withheld`]).
 /// * `removed_heads`   - The heads of pallets deleted here whose delete can still be undone
 ///   (`journal_utils::removed_heads`). They join the local pallet heads, never `remote_heads`:
 ///   their unlifted history may be the only copy.
@@ -142,10 +155,11 @@ pub fn plan_prune(
     pruned_prefixes: &[String],
     post_prune: &PathScope,
     remote_heads: &[String],
+    withheld: &HashSet<String>,
     removed_heads: &[String],
     _store_access: &StoreAccessExclusive,
 ) -> Result<PrunePlan, String> {
-    plan_from(pruned_prefixes, post_prune, remote_heads, removed_heads, root_sources()?)
+    plan_from(pruned_prefixes, post_prune, remote_heads, withheld, removed_heads, root_sources()?)
 }
 
 /// [`plan_prune`] over root sources already read, the haul heads among them: one read serves
@@ -154,6 +168,7 @@ fn plan_from(
     pruned_prefixes: &[String],
     post_prune: &PathScope,
     remote_heads: &[String],
+    withheld: &HashSet<String>,
     removed_heads: &[String],
     sources: recovery_utils::GcRootSources,
 ) -> Result<PrunePlan, String> {
@@ -198,20 +213,28 @@ fn plan_from(
     // Ordered children-before-parents (see the module doc): filtering this sequence (never
     // reordering it) preserves that property in `to_free`, which is what makes a partial
     // `free_objects` run — and a later re-`plan_prune` call over the same path — resumable.
-    let targets = collect_prune_targets(&user_parcels, pruned_prefixes, &tolerated)?;
+    let targets = collect_prune_targets(&user_parcels, pruned_prefixes, &tolerated, withheld)?;
 
     let mut to_free: Vec<String> = Vec::new();
     let mut still_packed = 0usize;
     let mut retained_shared = 0usize;
+    let mut kept_withheld = 0usize;
     let mut kept_unlifted = 0usize;
     let mut kept_for_hauls = 0usize;
     let mut kept_for_mirror = 0usize;
     let mut kept_for_deleted = 0usize;
 
-    for hash in &targets {
+    for hash in &targets.ordered {
         // Shared with a retained path by content-addressing (or with a meta pallet): must stay.
         if retained.contains(hash) {
             retained_shared += 1;
+            continue;
+        }
+
+        // The remote may not serve it again, and lifting would not change that: checked before the
+        // pack and unlifted keeps, whose reports promise a later run could free it.
+        if targets.withheld.contains(hash) {
+            kept_withheld += 1;
             continue;
         }
 
@@ -276,7 +299,18 @@ fn plan_from(
         kept_for_deltas = candidates - to_free.len();
     }
 
-    Ok(PrunePlan { to_free, still_packed, retained_shared, kept_unlifted, kept_for_hauls, kept_for_mirror, kept_for_deleted, kept_for_deltas, unlifted_pallets })
+    Ok(PrunePlan { to_free, still_packed, retained_shared, kept_withheld, kept_unlifted, kept_for_hauls, kept_for_mirror, kept_for_deleted, kept_for_deltas, unlifted_pallets })
+}
+
+/// What [`collect_prune_targets`] finds under the pruned paths.
+struct PruneTargets {
+    /// Every present object there, children before parents.
+    ordered: Vec<String>,
+
+    /// The objects kept for withheld content: each present withheld object, every chunk a present
+    /// withheld recipe names (present or not, and so not always in `ordered`), and every tree that
+    /// names one of them.
+    withheld: HashSet<String>,
 }
 
 /// `live_parcels`, then every `held` parcel they do not reach, once: the user history a prune
@@ -839,15 +873,18 @@ fn collect_prune_targets(
     user_parcels: &[String],
     pruned_prefixes: &[String],
     tolerated: &Tolerated,
-) -> Result<Vec<String>, String> {
+    withheld: &HashSet<String>,
+) -> Result<PruneTargets, String> {
     /// One step of the explicit (non-recursive) post-order walk: a tree not yet expanded, or a
-    /// tree whose children have all been visited and is ready to be appended to `ordered`.
+    /// tree whose children have all been visited and is ready to be appended to `ordered` (with
+    /// every child it names, when any content is withheld).
     enum Step {
         Expand(String),
-        Finalize(String),
+        Finalize { hash: String, children: Vec<String> },
     }
 
     let mut ordered: Vec<String> = Vec::new();
+    let mut kept: HashSet<String> = HashSet::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut stack: Vec<Step> = Vec::new();
 
@@ -864,8 +901,16 @@ fn collect_prune_targets(
     while let Some(step) = stack.pop() {
         match step {
             // Popped only after every child pushed below it has been fully processed (LIFO), so
-            // appending here is exactly the post-order position: after every descendant.
-            Step::Finalize(hash) => ordered.push(hash),
+            // appending here is exactly the post-order position: after every descendant. A child
+            // met before through another tree was judged then: trees form no cycle, so it was
+            // finalized before this one.
+            Step::Finalize { hash, children } => {
+                if withheld.contains(&hash) || children.iter().any(|child| kept.contains(child)) {
+                    kept.insert(hash.clone());
+                }
+
+                ordered.push(hash);
+            }
 
             Step::Expand(hash) => {
                 if !seen.insert(hash.clone()) {
@@ -883,7 +928,14 @@ fn collect_prune_targets(
 
                 // This tree's own position comes after all its children: push its Finalize
                 // first so it sits *underneath* them on the stack and pops last.
-                stack.push(Step::Finalize(hash.clone()));
+                let children = if withheld.is_empty() {
+                    Vec::new()
+                } else {
+                    tree.get_files().map(|(_, file)| file.hash.clone())
+                        .chain(tree.get_subtrees().map(|(_, subtree)| subtree.hash.clone()))
+                        .collect()
+                };
+                stack.push(Step::Finalize { hash: hash.clone(), children });
 
                 for (_, file) in tree.get_files() {
                     if !seen.insert(file.hash.clone()) {
@@ -897,6 +949,11 @@ fn collect_prune_targets(
                         continue;
                     }
 
+                    let withheld_file = withheld.contains(&file.hash);
+                    if withheld_file {
+                        kept.insert(file.hash.clone());
+                    }
+
                     // A chunked file's tree-entry hash names a recipe, whose chunks are reachable
                     // *only* through it. Descend the recipe WHILE IT IS STILL PRESENT to enumerate
                     // its chunks, and place them BEFORE the recipe in `ordered` (children before
@@ -904,9 +961,15 @@ fn collect_prune_targets(
                     // a killed run stays resumable: on the next call an absent recipe proves its
                     // chunks were already freed, while a present recipe still names every chunk a
                     // partial free left behind. A chunk shared with a retained scope is filtered out
-                    // later by `plan_prune`'s `retained` check, never here.
+                    // later by `plan_prune`'s `retained` check, never here. A withheld recipe
+                    // keeps every chunk, one met first through another recipe too: the host also
+                    // withholds the chunks only that recipe names, which nothing here tells apart.
                     if file.item_type.is_chunked() {
                         for chunk in object_utils::recipe_chunk_hashes(&file.hash)? {
+                            if withheld_file {
+                                kept.insert(chunk.clone());
+                            }
+
                             if seen.insert(chunk.clone()) && file_utils::does_object_exist(&chunk)? {
                                 ordered.push(chunk);
                             }
@@ -923,7 +986,7 @@ fn collect_prune_targets(
         }
     }
 
-    Ok(ordered)
+    Ok(PruneTargets { ordered, withheld: kept })
 }
 
 /// The hash of the subtree at warehouse path `key` under `root_tree_hash`, as
@@ -1145,7 +1208,7 @@ mod tests {
 
         // Prune src/web, keeping src/api in scope.
         let post_prune = PathScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], &store_access()).unwrap();
 
         // Exactly the pruned subtree's closure is freed.
         assert_eq!(plan.to_free.len(), 2);
@@ -1168,6 +1231,71 @@ mod tests {
         // prune frees the pruned path, not every out-of-scope object.
         assert!(!plan.to_free.contains(&f.readme_blob),
             "prune must free only the pruned path, not all out-of-scope content");
+    }
+
+    /// Content the remote withholds under the pruned path stays, with a withheld recipe's chunks
+    /// (one shared with a recipe that goes) and every tree on the way to either, while what sits
+    /// beside them is freed; a second prune over the same path finds nothing more to free.
+    ///
+    /// Revert: drop the withheld arm of the plan → the withheld objects are freed → red. Revert:
+    /// keep only the withheld hash, not the trees above it → `deep` and `web` are freed → red.
+    /// Revert: keep a withheld recipe's chunks only when first met through it → `shared_chunk`,
+    /// met first through `other_recipe`, is freed → red.
+    #[test]
+    fn plan_prune_keeps_withheld_content_and_the_trees_above_it() {
+        let _scratch = Scratch::new("withheld");
+
+        let film = store_blob("film\n");
+        let beside = store_blob("beside\n");
+        let inner = store_tree(&[("beside.txt", &beside, DirEntryType::Normal), ("film.bin", &film, DirEntryType::Normal)]);
+        let deep = store_tree(&[("inner", &inner, DirEntryType::Tree)]);
+
+        let lone_chunk = store_chunk(b"lone");
+        let shared_chunk = store_chunk(b"shared");
+        let other_chunk = store_chunk(b"other");
+        let recipe = store_recipe(&[(lone_chunk.clone(), 4), (shared_chunk.clone(), 6)]);
+        let other_recipe = store_recipe(&[(shared_chunk.clone(), 6), (other_chunk.clone(), 5)]);
+
+        let w = store_blob("w\n");
+        // `a.bin` sorts before `big.bin`, so the walk meets the shared chunk through it first.
+        let web = store_tree(&[
+            ("a.bin", &other_recipe, DirEntryType::NormalChunked),
+            ("big.bin", &recipe, DirEntryType::NormalChunked),
+            ("deep", &deep, DirEntryType::Tree),
+            ("w.txt", &w, DirEntryType::Normal),
+        ]);
+        let api_blob = store_blob("api\n");
+        let api = store_tree(&[("a.txt", &api_blob, DirEntryType::Normal)]);
+        let src = store_tree(&[("api", &api, DirEntryType::Tree), ("web", &web, DirEntryType::Tree)]);
+        let root = store_tree(&[("src", &src, DirEntryType::Tree)]);
+        let parcel = store_parcel(&root, Vec::new());
+        pallet_utils::update_pallet_head("main", None, &parcel, &pallet_utils::RefPreconditions::NONE).unwrap();
+
+        let post_prune = PathScope::from_prefixes(["src/api"]);
+        let withheld: HashSet<String> = [film.clone(), recipe.clone()].into();
+        let hold = store_access();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &withheld, &[], &hold).unwrap();
+
+        let freed: HashSet<&String> = plan.to_free.iter().collect();
+        assert_eq!(freed, [&beside, &w, &other_recipe, &other_chunk].into_iter().collect());
+        assert_eq!(plan.kept_withheld, 7, "film, inner, deep, the recipe, both its chunks and web");
+        assert_eq!((plan.retained_shared, plan.kept_unlifted), (0, 0));
+
+        free_objects(&plan.to_free, &hold).unwrap();
+        for hash in [&film, &inner, &deep, &web, &recipe, &lone_chunk, &shared_chunk] {
+            assert!(loose_exists(hash), "{} is kept", hash);
+        }
+        assert!(!loose_exists(&beside) && !loose_exists(&other_chunk));
+
+        // Kept trees stay above what they keep, so a resumed prune walks the same keep set.
+        let again = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &withheld, &[], &hold).unwrap();
+        assert!(again.to_free.is_empty(), "{:?}", again.to_free);
+        assert_eq!(again.kept_withheld, 7);
+
+        // Without a withholding what is left is freed.
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], &hold).unwrap();
+        assert_eq!(plan.kept_withheld, 0);
+        assert_eq!(plan.to_free.len(), 7, "{:?}", plan.to_free);
     }
 
     /// A parcel over a tree of meta form, `.forklift/tracked/cells/cell`, whose one cell is `blob`.
@@ -1194,7 +1322,7 @@ mod tests {
         sources.pin_parcels.push((adopted.clone(), office_utils::PinAbsencePolicy::Loss));
 
         let post_prune = PathScope::from_prefixes(["src/api"]);
-        let plan = plan_from(&["src/web".to_string()], &post_prune, &lifted(), &[], sources).unwrap();
+        let plan = plan_from(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], sources).unwrap();
 
         assert!(!plan.to_free.contains(&f.web_blob),
             "a blob the adopted office history holds must not be freed: {:?}", plan.to_free);
@@ -1218,7 +1346,7 @@ mod tests {
         sources.pin_parcels.push((pinned, office_utils::PinAbsencePolicy::Gap));
 
         let post_prune = PathScope::from_prefixes(["src/api"]);
-        let plan = plan_from(&["src/web".to_string()], &post_prune, &lifted(), &[], sources).unwrap();
+        let plan = plan_from(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], sources).unwrap();
 
         assert!(plan.to_free.contains(&f.web_blob),
             "a pinned tree holds the blob only out of scope, so it is freed: {:?}", plan.to_free);
@@ -1258,7 +1386,7 @@ mod tests {
             let removed = plant(&mut sources, &crafted);
 
             let post_prune = PathScope::from_prefixes(["src/api"]);
-            let plan = plan_from(&["src/web".to_string()], &post_prune, &remote_heads, &removed, sources).unwrap();
+            let plan = plan_from(&["src/web".to_string()], &post_prune, &remote_heads, &HashSet::new(), &removed, sources).unwrap();
 
             assert!(plan.to_free.contains(&f.web_blob), "{}: {:?}", route, plan.to_free);
         }
@@ -1284,7 +1412,7 @@ mod tests {
         remote_heads.push(user);
 
         let post_prune = PathScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string(), "README".to_string()], &post_prune, &remote_heads, &[], &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string(), "README".to_string()], &post_prune, &remote_heads, &HashSet::new(), &[], &store_access()).unwrap();
 
         assert!(!plan.to_free.contains(&f.web_blob), "{:?}", plan.to_free);
         assert!(!plan.to_free.contains(&f.readme_blob), "{:?}", plan.to_free);
@@ -1311,7 +1439,7 @@ mod tests {
             }
 
             let post_prune = PathScope::from_prefixes(["src/api"]);
-            assert!(plan_from(&["src/web".to_string()], &post_prune, &lifted(), &[], sources).is_err(), "adopted: {}", adopted);
+            assert!(plan_from(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], sources).is_err(), "adopted: {}", adopted);
         }
     }
 
@@ -1323,7 +1451,7 @@ mod tests {
         let f = build_fixture();
 
         let post_prune = PathScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[], &[], &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[], &HashSet::new(), &[], &store_access()).unwrap();
 
         assert!(plan.to_free.is_empty(), "unlifted content must not be freed: {:?}", plan.to_free);
         assert_eq!(plan.kept_unlifted, 2, "the web tree and blob are kept for unlifted history");
@@ -1331,7 +1459,7 @@ mod tests {
 
         // A remote head absent here reaches nothing, so it lifts nothing.
         let absent = "0".repeat(64);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[absent], &[], &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[absent], &HashSet::new(), &[], &store_access()).unwrap();
         assert!(plan.to_free.is_empty(), "an absent remote head must not count as reaching history");
         assert!(loose_exists(&f.web_blob));
     }
@@ -1361,7 +1489,7 @@ mod tests {
         ).unwrap();
 
         let post_prune = PathScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[], &store_access())
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &HashSet::new(), &[], &store_access())
             .unwrap();
 
         assert_eq!(plan.to_free, vec![f.web_blob.clone()], "only the parent's unread blob is freed");
@@ -1374,12 +1502,12 @@ mod tests {
         pallet_utils::update_pallet_head(
             "main", Some(child.as_str()), &grandchild, &pallet_utils::RefPreconditions::NONE,
         ).unwrap();
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[], &store_access())
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &HashSet::new(), &[], &store_access())
             .unwrap();
         assert_eq!(plan.kept_unlifted, 3);
         assert_eq!(plan.unlifted_pallets, vec!["main".to_string()], "named through its descendant head");
 
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[child], &[], &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[child], &HashSet::new(), &[], &store_access()).unwrap();
         for freed in [&f.web_tree, &f.web_blob, &web_tree_v2, &web_blob_v2] {
             assert!(plan.to_free.contains(freed), "lifted history is freed: {}", freed);
         }
@@ -1410,7 +1538,7 @@ mod tests {
         let deleted = store_parcel(&root_tree_v2, vec![f.parcel.clone()]);
 
         let post_prune = PathScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[deleted.clone()], &store_access())
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &HashSet::new(), &[deleted.clone()], &store_access())
             .unwrap();
 
         assert_eq!(plan.to_free, vec![f.web_blob.clone()], "only the parent's unread blob is freed");
@@ -1418,7 +1546,7 @@ mod tests {
         assert_eq!(plan.kept_unlifted, 0, "no live pallet has unlifted work");
         assert!(plan.unlifted_pallets.is_empty(), "a deleted pallet is not named as one to lift");
 
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[], &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &HashSet::new(), &[], &store_access()).unwrap();
         assert!(plan.to_free.contains(&f.web_tree), "with no removed head the parent's web tree is freed");
 
         // A haul proposing that head keeps the same history, counted apart; held by both, it
@@ -1429,10 +1557,10 @@ mod tests {
             sources.haul_heads = vec![head.clone()];
             sources
         };
-        let plan = plan_from(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[], proposing(&deleted)).unwrap();
+        let plan = plan_from(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &HashSet::new(), &[], proposing(&deleted)).unwrap();
         assert_eq!(plan.to_free, vec![f.web_blob.clone()], "a haul's proposed history is kept like a deleted pallet's");
         assert_eq!((plan.kept_for_hauls, plan.kept_for_deleted, plan.kept_unlifted), (3, 0, 0));
-        let plan = plan_from(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[deleted.clone()], proposing(&deleted)).unwrap();
+        let plan = plan_from(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &HashSet::new(), &[deleted.clone()], proposing(&deleted)).unwrap();
         assert_eq!((plan.kept_for_hauls, plan.kept_for_deleted), (3, 0));
 
         // The git mirror's roots hold it the same way, counted apart; behind a haul in precedence.
@@ -1442,28 +1570,28 @@ mod tests {
             sources.mirror_roots = vec![head.clone()];
             sources
         };
-        let plan = plan_from(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[], mirroring(&deleted)).unwrap();
+        let plan = plan_from(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &HashSet::new(), &[], mirroring(&deleted)).unwrap();
         assert_eq!(plan.to_free, vec![f.web_blob.clone()], "the mirror's history is kept like a deleted pallet's");
         assert_eq!((plan.kept_for_mirror, plan.kept_for_deleted, plan.kept_unlifted), (3, 0, 0));
         let mut both = proposing(&deleted);
         both.mirror_roots = vec![deleted.clone()];
-        let plan = plan_from(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[], both).unwrap();
+        let plan = plan_from(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &HashSet::new(), &[], both).unwrap();
         assert_eq!((plan.kept_for_hauls, plan.kept_for_mirror), (3, 0));
 
         // A tombstone of a served root holds it as this delete's removed heads do. Mutation: leave
         // the tombstone heads out of the removed heads → the parent's web tree is freed.
         let mut tombstoned = root_sources().unwrap();
         tombstoned.tombstone_heads = vec![deleted.clone()];
-        let plan = plan_from(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[], tombstoned).unwrap();
+        let plan = plan_from(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &HashSet::new(), &[], tombstoned).unwrap();
         assert_eq!(plan.to_free, vec![f.web_blob.clone()], "a tombstone's history is kept like a deleted pallet's");
         assert_eq!((plan.kept_for_deleted, plan.kept_unlifted), (3, 0));
 
         // A live pallet sharing the unlifted history counts it as its own.
         pallet_utils::update_pallet_head("feature", None, &deleted, &pallet_utils::RefPreconditions::NONE).unwrap();
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[deleted.clone()], &store_access())
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &HashSet::new(), &[deleted.clone()], &store_access())
             .unwrap();
         assert_eq!((plan.kept_unlifted, plan.kept_for_deleted), (3, 0));
-        let plan = plan_from(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[], proposing(&deleted)).unwrap();
+        let plan = plan_from(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &HashSet::new(), &[], proposing(&deleted)).unwrap();
         assert_eq!((plan.kept_unlifted, plan.kept_for_hauls), (3, 0), "a live pallet's own history counts for it");
     }
 
@@ -1491,7 +1619,7 @@ mod tests {
         ).unwrap();
 
         let post_prune = PathScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[], &store_access())
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &HashSet::new(), &[], &store_access())
             .unwrap();
         assert_eq!(plan.kept_unlifted, 0);
         assert!(plan.unlifted_pallets.is_empty());
@@ -1511,7 +1639,7 @@ mod tests {
         pallet_utils::update_pallet_head("other", None, &web_child, &pallet_utils::RefPreconditions::NONE)
             .unwrap();
 
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[], &store_access())
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &HashSet::new(), &[], &store_access())
             .unwrap();
         assert_eq!(plan.kept_unlifted, 3, "other's new web tree and blob, and its base tree");
         assert_eq!(plan.unlifted_pallets, vec!["other".to_string()], "main's lift frees nothing here");
@@ -1541,7 +1669,7 @@ mod tests {
         ).unwrap();
 
         let post_prune = PathScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], &store_access()).unwrap();
 
         // The shared blob stays (retained via src/api); only web's unique tree object is freed.
         assert!(!plan.to_free.contains(&shared_blob), "a blob shared with a retained path must not be freed");
@@ -1561,7 +1689,7 @@ mod tests {
         ]);
 
         let post_prune = PathScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], &store_access()).unwrap();
 
         assert!(!plan.to_free.contains(&f.web_blob), "a blob a staged entry shares must not be freed");
         assert!(plan.to_free.contains(&f.web_tree), "the pruned subtree's unique object is still freed");
@@ -1594,7 +1722,7 @@ mod tests {
         plant_parked("b", &src_tree_with("api", "y.txt", &f.web_blob));
 
         let post_prune = PathScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], &store_access()).unwrap();
         assert!(!plan.to_free.contains(&f.web_blob), "a blob parked in scope must not be freed");
         assert!(plan.to_free.contains(&f.web_tree), "the head's own unique tree is still freed");
     }
@@ -1612,7 +1740,7 @@ mod tests {
         plant_parked("b", &snapshot);
 
         let post_prune = PathScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], &store_access()).unwrap();
 
         // The parked work is no history, so never a target: it survives.
         for hash in [&edit, &web] {
@@ -1637,7 +1765,7 @@ mod tests {
         plant_parked("b", &store_tree(&[("src", &src, DirEntryType::Tree)]));
 
         let post_prune = PathScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], &store_access()).unwrap();
         assert!(plan.to_free.contains(&f.web_blob));
     }
 
@@ -1663,7 +1791,7 @@ mod tests {
         std::fs::write(dir.join("consolidation"), crate::util::merge_utils::consolidation_state_bytes(&state)).unwrap();
 
         let post_prune = PathScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], &store_access()).unwrap();
         assert!(!plan.to_free.contains(&f.web_blob), "a blob the consolidation holds in scope must not be freed");
         assert!(plan.to_free.contains(&f.web_tree), "the head's own unique tree is still freed");
     }
@@ -1701,7 +1829,7 @@ mod tests {
         ).unwrap();
 
         let post_prune = PathScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], &store_access()).unwrap();
 
         // Both versions of the pruned subtree — and both their blobs — are freed.
         for freed in [&web_v1_tree, &web_v1_blob, &web_v2_tree, &web_v2_blob] {
@@ -1764,7 +1892,7 @@ mod tests {
             let post_prune = PathScope::from_prefixes(["src/api"]);
             let hold = store_access();
 
-            let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &hold).unwrap();
+            let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], &hold).unwrap();
             assert_eq!(plan.kept_for_deltas, usize::from(on_web));
             assert_eq!(plan.to_free.contains(&web_blob), !on_web);
             assert!(!plan.to_free.is_empty(), "on_web {}: the web tree goes either way", on_web);
@@ -1788,9 +1916,9 @@ mod tests {
             let f = build_fixture();
             pack_as_unreadable(&store_blob("stray\n"), how);
             let post_prune = PathScope::from_prefixes(["src/api"]);
-            let plan = || plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access());
+            let plan = || plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], &store_access());
 
-            let nothing = plan_prune(&["never/fetched".to_string()], &PathScope::from_prefixes(["src"]), &lifted(), &[], &store_access());
+            let nothing = plan_prune(&["never/fetched".to_string()], &PathScope::from_prefixes(["src"]), &lifted(), &HashSet::new(), &[], &store_access());
             if !nothing.is_ok_and(|plan| plan.to_free.is_empty()) {
                 return Some(format!("{:?}: nothing to free, nothing to ask", how));
             }
@@ -1825,7 +1953,7 @@ mod tests {
         let f = build_fixture();
 
         let post_prune = PathScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], &store_access()).unwrap();
 
         assert!(loose_exists(&f.web_tree) && loose_exists(&f.web_blob), "the pruned objects start present");
 
@@ -1870,7 +1998,7 @@ mod tests {
         ).unwrap();
 
         let post_prune = PathScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], &store_access()).unwrap();
 
         assert_eq!(plan.to_free.len(), 3, "web_tree, inner_tree and deep_blob");
         let pos = |h: &str| plan.to_free.iter().position(|x| x == h).unwrap();
@@ -1889,7 +2017,7 @@ mod tests {
         let f = build_fixture();
 
         let post_prune = PathScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], &store_access()).unwrap();
         assert_eq!(plan.to_free.len(), 2, "src/web's tree and blob are the whole plan");
 
         // Simulate an interruption: free only the first item in plan order (a child, by
@@ -1901,7 +2029,7 @@ mod tests {
 
         // Re-planning over the exact same path must not error on the now-absent blob, and must
         // recompute exactly what the interruption left: just the parent tree.
-        let resumed_plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access())
+        let resumed_plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], &store_access())
             .expect("re-planning after a partial free must tolerate the absent object");
         assert_eq!(resumed_plan.to_free, rest, "the resumed plan is exactly what the interruption left");
 
@@ -1945,7 +2073,7 @@ mod tests {
         ).unwrap();
 
         let post_prune = PathScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], &store_access()).unwrap();
 
         // The recipe and both chunks and the web tree are freed — nothing else.
         for freed in [&recipe, &c1, &c2, &web_tree] {
@@ -2006,7 +2134,7 @@ mod tests {
         ).unwrap();
 
         let post_prune = PathScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], &store_access()).unwrap();
 
         // The shared chunk (and the api-only chunk and recipe) survive; web's unique chunk, its
         // recipe and its tree are freed.
@@ -2069,7 +2197,7 @@ mod tests {
         ).unwrap();
 
         let post_prune = PathScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], &store_access()).unwrap();
 
         // Nothing of the giant file is freed: the recipe and both its chunks are still needed by
         // src/api/giant.bin. Only web's own (unshared) tree and note blob are freed.
@@ -2118,7 +2246,7 @@ mod tests {
         ).unwrap();
 
         let post_prune = PathScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], &store_access()).unwrap();
         assert_eq!(plan.to_free.len(), 4, "2 chunks + recipe + web tree");
 
         // Simulate an interruption after freeing just the first chunk (the plan's own leading
@@ -2129,7 +2257,7 @@ mod tests {
 
         // Re-planning must not error on the absent chunk, and must recompute exactly what is left:
         // the surviving chunk, the recipe (still present, still names its chunks) and the tree.
-        let resumed = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access())
+        let resumed = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], &store_access())
             .expect("re-planning after a partial chunk free must tolerate the absent chunk");
         assert_eq!(resumed.to_free, plan.to_free[1..].to_vec(),
             "the resumed plan is exactly the interruption's remainder");
@@ -2149,7 +2277,7 @@ mod tests {
     fn plan_outcome(how: Unreadable, unreadable: &str, kept: &str) -> Option<String> {
         let post_prune = PathScope::from_prefixes(["src/api"]);
 
-        match plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()) {
+        match plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], &store_access()) {
             Ok(plan) if plan.to_free.contains(&kept.to_string()) => {
                 Some(format!("{:?}: the plan frees {}, which the unreadable object references", how, kept))
             }
@@ -2256,13 +2384,13 @@ mod tests {
 
         let post_prune = PathScope::from_prefixes(["src/api"]);
         let remote = [f.parcel.clone()];
-        let Err(error) = plan_prune(&["src/web".to_string()], &post_prune, &remote, &[], &store_access()) else {
+        let Err(error) = plan_prune(&["src/web".to_string()], &post_prune, &remote, &HashSet::new(), &[], &store_access()) else {
             panic!("an unrecorded absent tree fails the plan");
         };
         assert!(error.contains(&held_src[2..]), "the plan fails on the absent tree itself: {}", error);
 
         seal(&[&held_src]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &remote, &[], &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &remote, &HashSet::new(), &[], &store_access()).unwrap();
         let freed: HashSet<String> = plan.to_free.iter().cloned().collect();
         assert_eq!(freed, [f.web_tree, f.web_blob].into_iter().collect());
         assert_eq!(plan.kept_unlifted, 0, "nothing beneath a tree held by hash alone is kept");
@@ -2281,7 +2409,7 @@ mod tests {
         seal(&[&held_src]);
 
         let post_prune = PathScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &[], &store_access())
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &[f.parcel.clone()], &HashSet::new(), &[], &store_access())
             .unwrap();
         assert!(plan.to_free.is_empty(), "the unlifted change keeps the whole pruned path: {:?}", plan.to_free);
         assert_eq!(plan.kept_unlifted, 2);
@@ -2301,7 +2429,7 @@ mod tests {
         seal(&[&held_src]);
 
         let post_prune = PathScope::from_prefixes(["README.md"]);
-        let plan = plan_prune(&["src".to_string()], &post_prune, &[], &[], &store_access()).unwrap();
+        let plan = plan_prune(&["src".to_string()], &post_prune, &[], &HashSet::new(), &[], &store_access()).unwrap();
         assert!(plan.kept_unlifted > 0, "main's unlifted change keeps its path");
         assert_eq!(plan.unlifted_pallets, vec!["main".to_string()]);
     }
@@ -2324,7 +2452,7 @@ mod tests {
         seal(&[&held_lib, &held_deep, &held_top]);
 
         let post_prune = PathScope::from_prefixes(["src/api", "lib", "big.bin"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], &store_access()).unwrap();
         let freed: HashSet<String> = plan.to_free.iter().cloned().collect();
         assert_eq!(freed, [f.web_tree, f.web_blob].into_iter().collect());
     }
@@ -2346,7 +2474,7 @@ mod tests {
         crate::util::applied_redactions::apply_for_test(&[&redacted]);
 
         let post_prune = PathScope::from_prefixes(["src/api", "leak.bin"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], &store_access()).unwrap();
         let freed: HashSet<String> = plan.to_free.iter().cloned().collect();
         assert_eq!(freed, [f.web_tree, f.web_blob].into_iter().collect());
     }
@@ -2364,7 +2492,7 @@ mod tests {
         seal(&[&api, &src]);
 
         let post_prune = PathScope::from_prefixes(["src/api"]);
-        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()).unwrap();
+        let plan = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], &store_access()).unwrap();
         assert_eq!(plan.to_free, vec![f.web_tree], "the blob the present recorded tree names is kept");
     }
 
@@ -2378,7 +2506,7 @@ mod tests {
         std::fs::write(sealed_utils::sealed_path(), b"not a sealed record").unwrap();
 
         let post_prune = PathScope::from_prefixes(["src/api"]);
-        let Err(error) = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &[], &store_access()) else {
+        let Err(error) = plan_prune(&["src/web".to_string()], &post_prune, &lifted(), &HashSet::new(), &[], &store_access()) else {
             panic!("an unreadable record must fail the plan");
         };
         assert!(error.contains("sealed-object record") && error.contains("Run \"forklift heal\"")
