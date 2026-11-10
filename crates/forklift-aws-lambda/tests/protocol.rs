@@ -389,6 +389,8 @@ fn a_ref_update_with_a_missing_blob_is_refused() {
     let request = RefUpdateRequest { old_head: None, new_head: main_head, tombstone: None };
     let err = head.ref_update(&Principal::Static, "main", &request).expect_err("incomplete closure");
     assert_eq!(err.status, Status::Unprocessable);
+    // Revert: answer the closure refusal as plain text → no code → the client cannot retry → red.
+    assert_eq!(refusal_code(&err.message), Some(RefusalCode::RemoteHistoryIncomplete), "{}", err.message);
 }
 
 /// A blob, tree or parcel built in memory and uploaded to `head` in its wire form.
@@ -924,6 +926,7 @@ fn a_ref_update_with_a_missing_chunk_is_refused() {
     let request = RefUpdateRequest { old_head: None, new_head: main_head.clone(), tombstone: None };
     let err = head.ref_update(&Principal::Static, "main", &request).expect_err("a missing chunk fails the closure");
     assert_eq!(err.status, Status::Unprocessable);
+    assert_eq!(refusal_code(&err.message), Some(RefusalCode::RemoteHistoryIncomplete), "{}", err.message);
 
     // The control: upload the withheld chunk, and the identical update now commits.
     head.object_put(&Principal::Static, None, &victim, &harvest.objects[&victim]).expect("upload the last chunk");
@@ -1540,7 +1543,7 @@ fn a_staged_object_is_not_fetchable_until_it_is_verified_and_promoted() {
     assert_eq!(refusal_code(&err.message), Some(RefusalCode::StagedUploadDiscarded), "{}", err.message);
 }
 
-/// The discarded-upload refusal's framed code, read back the way the client reads it.
+/// A refusal's framed code, read back the way the client reads it.
 fn refusal_code(message: &str) -> Option<RefusalCode> {
     match CoreError::from(message.to_string()) {
         CoreError::Refusal { code, .. } => Some(code),
