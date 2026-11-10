@@ -1865,7 +1865,9 @@ it left out, each hash with the host's statement (`withheld` under `--json`).
 conflicts (different files, or edits to the same file that a three-way merge combines),
 `lift` **auto-lowers, consolidates and retries** on its own — so a fleet of agents
 stacking to one pallet stops serializing through a human. It reports how many times it
-auto-merged. Only a clean warehouse qualifies (the merge materializes), and a
+auto-merged. Its fetch takes the remote's history without content the remote's host
+withholds, as `lower` does: the merge leaves such a file not checked out, and refuses with
+`content_withheld` (exit 51) if it would have to read it. Only a clean warehouse qualifies (the merge materializes), and a
 **conflicting overlap** (changes the three-way merge cannot combine) still stops with
 the diverged error (`diverged`, exit 5), leaving
 the warehouse untouched: `lower` merges the remote head in, and a `lift` publishes the merge. A remote holding parcels you have not lowered yet — its head unknown here, or moved
