@@ -2356,7 +2356,7 @@ mod tests {
     /// descend there, and that loses nothing: refilling the tree pushes the entry's absent object
     /// down into this record, so a walk meeting it holds it by hash, never as damage.
     ///
-    /// Revert: skip absent leaves in `refill_all`.s push-down → the dropped object is held by
+    /// Revert: skip absent leaves in `refill_all`'s push-down → the dropped object is held by
     /// nothing → red.
     #[test]
     fn an_unavailable_entry_pruned_below_an_absent_tree_comes_back_sealed_on_refill() {
