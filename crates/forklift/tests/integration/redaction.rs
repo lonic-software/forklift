@@ -2906,7 +2906,8 @@ fn a_served_root_withholds_a_chunked_file_and_the_chunks_only_it_names() {
 /// new origin will not supply.
 ///
 /// Revert: let the walk find a withheld file held by the new server → the first move goes through
-/// reporting nothing withheld. Revert: never read the previous origin's handshake (read every
+/// reporting nothing withheld. Revert: lean only on the absent trees the walk from the roots met,
+/// not on what is beneath them → the same. Revert: never read the previous origin's handshake (read every
 /// previous origin as withholding) → the first move goes through. Revert: refuse over a previous
 /// origin that does not answer → the last move is refused.
 #[test]
@@ -2916,9 +2917,9 @@ fn a_move_to_an_origin_withholding_leaned_on_content_reads_the_previous_origin()
     let server = Server::start(&first_root);
 
     let owner = Warehouse::cloned("takedown-move-owner", &server.url);
-    // A draft no cache fetches, so each leans on its origin for it.
-    owner.stack("notes.txt", b"a draft the host takes down\n", "draft");
-    owner.stack("notes.txt", b"notes\n", "notes");
+    // A draft no cache fetches, so each leans on its origin for it, beneath two trees it lacks.
+    owner.stack("docs/notes.txt", b"a draft the host takes down\n", "draft");
+    owner.stack("docs/notes.txt", b"notes\n", "notes");
     owner.run_ok(&["lift"]);
     let draft = hash_of(b"a draft the host takes down\n");
     let statement = "court order 2026-77";
