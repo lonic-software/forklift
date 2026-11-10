@@ -18,7 +18,11 @@
 //! - the parcels a parked, consolidating or picking bay names, and the trust pins: their
 //!   own trees, not their ancestry;
 //! - every staged inventory leaf, and a chunked one's chunks: staged work must never depend on the
-//!   network, even when it shares a blob with history the origin holds.
+//!   network, even when it shares a blob with history the origin holds;
+//! - content the origin's host withholds (its handshake's withheld list), a withheld recipe's
+//!   chunks, and every tree on the way to one: the origin may no longer serve it, so the copy here
+//!   is kept, and a tree above it with it, since a sweep only keeps what a present path from a root
+//!   reaches.
 //!
 //! History only this warehouse holds (unlifted work, a haul, a deleted pallet's head) is never in
 //! the origin's closure, so it is never evicted, with no special case: the subtraction does it.
@@ -77,6 +81,10 @@ pub struct EvictPlan {
     /// picking bay, a trust pin, or staged work.
     pub kept_local: usize,
 
+    /// Objects that stay because the origin's host withholds them, or they lead to such content:
+    /// a withheld file's content, a withheld recipe's chunks, and the trees above either.
+    pub kept_withheld: usize,
+
     /// Present content only local history reaches, which the origin is not known to hold.
     pub not_held: usize,
 
@@ -126,6 +134,8 @@ pub struct EvictStats {
 /// # Arguments
 /// * `held_heads`    - The heads the origin holds, from a trusted handshake: its live pallet and
 ///                     tombstone heads and the recorded heads it confirmed.
+/// * `withheld`      - The content the origin's host withholds, from the same handshake, which it
+///                     may not serve again: never evicted.
 /// * `_store_access` - Exclusive store access, held until [`carry_out`] returns.
 ///
 /// # Returns
@@ -133,7 +143,9 @@ pub struct EvictStats {
 /// * `Err(String)`   - If an object the origin's history reaches is absent and the record does not
 ///                     hold it (damage: `heal` repairs the record first), or a local root, the
 ///                     record or the store cannot be read. Nothing is changed.
-pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -> Result<EvictPlan, String> {
+pub fn plan_evict(held_heads: &[String],
+                  withheld: &HashSet<String>,
+                  _store_access: &StoreAccessExclusive) -> Result<EvictPlan, String> {
     let _unfetched = cache_miss::Unfetched::enter();
     let tolerated = sealed_utils::read_tolerated()?;
     let sealed = &tolerated.sealed;
@@ -147,7 +159,7 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
     }
 
     let held_parcels = sorted(gc_utils::collect_reachable_for_sweep(held_heads)?);
-    let held = walk_held(&held_parcels, &tolerated)?;
+    let held = walk_held(&held_parcels, &tolerated, withheld)?;
 
     let bay_dirs = bay_utils::all_bay_state_dirs()?;
     let sources = recovery_utils::gc_root_sources(
@@ -196,6 +208,7 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
         to_record: Vec::new(),
         kept_for_checkouts: 0,
         kept_local: 0,
+        kept_withheld: 0,
         not_held: local,
         heads_not_lowered,
         to_unseal: Vec::new(),
@@ -211,6 +224,8 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
             || (tolerated.applied.contains(&hash) && !redaction_utils::holds_as_file_content(&hash))
         {
             plan.kept_local += 1;
+        } else if held.withheld.contains(&hash) {
+            plan.kept_withheld += 1;
         } else {
             // Present (the walk said so), so an object no pack holds is loose. One a pack holds
             // may have a loose copy too, which nothing else would delete.
@@ -245,7 +260,7 @@ pub fn plan_evict(held_heads: &[String], _store_access: &StoreAccessExclusive) -
     plan.repack = !plan.to_drop.is_empty() || delta_on_loose;
     plan.to_unseal = sealed_utils::present_recorded(sealed)?
         .into_iter()
-        .filter(|hash| checkout_keep.contains(hash) || local_keep.contains(hash))
+        .filter(|hash| checkout_keep.contains(hash) || local_keep.contains(hash) || held.withheld.contains(hash))
         .collect();
 
     Ok(plan)
@@ -335,6 +350,9 @@ struct HeldClosure {
     present: Vec<String>,
     /// Every object met, present or not: the whole closure the origin holds.
     seen: HashSet<String>,
+    /// The objects kept for withheld content: each withheld object met, a withheld recipe's
+    /// chunks, and every present tree that names one of them.
+    withheld: HashSet<String>,
 }
 
 /// Walk the content closure of `parcels`, the parcels the origin's heads reach, children before
@@ -342,15 +360,19 @@ struct HeldClosure {
 /// nothing beneath it is a target. An absent object the record does not hold fails the walk: the
 /// record is meant to cover every absence in a cache, so this one is damage, and recording it now
 /// would claim the origin holds what may simply be lost.
-fn walk_held(parcels: &[String], sealed: &Tolerated) -> Result<HeldClosure, String> {
+///
+/// Beside it, the walk gathers what stays for `withheld` content ([`HeldClosure::withheld`]): a
+/// tree is judged once every child is, so one naming a kept object is kept too.
+fn walk_held(parcels: &[String], sealed: &Tolerated, withheld: &HashSet<String>) -> Result<HeldClosure, String> {
     /// One step of the explicit post-order walk: a tree to expand (with the object that named it,
-    /// for the error), or one whose children are all done.
+    /// for the error), or one whose children are all done (with every child it names, when any
+    /// content is withheld).
     enum Step {
         Expand { hash: String, named_by: String },
-        Finalize(String),
+        Finalize { hash: String, children: Vec<String> },
     }
 
-    let mut closure = HeldClosure { present: Vec::new(), seen: HashSet::new() };
+    let mut closure = HeldClosure { present: Vec::new(), seen: HashSet::new(), withheld: HashSet::new() };
     let mut stack: Vec<Step> = Vec::new();
 
     for parcel in parcels.iter().rev() {
@@ -360,8 +382,14 @@ fn walk_held(parcels: &[String], sealed: &Tolerated) -> Result<HeldClosure, Stri
 
     while let Some(step) = stack.pop() {
         let (hash, named_by) = match step {
-            // Popped only after every child pushed above it is done (LIFO): the post-order spot.
-            Step::Finalize(hash) => {
+            // Popped only after every child pushed above it is done (LIFO): the post-order spot. A
+            // child met before through another tree was judged then: trees form no cycle, so it
+            // was finalized before this one.
+            Step::Finalize { hash, children } => {
+                if withheld.contains(&hash) || children.iter().any(|child| closure.withheld.contains(child)) {
+                    closure.withheld.insert(hash.clone());
+                }
+
                 closure.present.push(hash);
                 continue;
             }
@@ -378,17 +406,34 @@ fn walk_held(parcels: &[String], sealed: &Tolerated) -> Result<HeldClosure, Stri
 
         let tree = object_utils::load_tree(&hash)?;
 
-        stack.push(Step::Finalize(hash.clone()));
+        let children = if withheld.is_empty() {
+            Vec::new()
+        } else {
+            tree.get_files().map(|(_, file)| file.hash.clone())
+                .chain(tree.get_subtrees().map(|(_, subtree)| subtree.hash.clone()))
+                .collect()
+        };
+        stack.push(Step::Finalize { hash: hash.clone(), children });
 
         for (_, file) in tree.get_files() {
             if !closure.seen.insert(file.hash.clone()) || !held_present(&file.hash, At::File, &hash, sealed)? {
                 continue;
             }
 
+            let kept = withheld.contains(&file.hash);
+            if kept {
+                closure.withheld.insert(file.hash.clone());
+            }
+
             // A chunked entry names a recipe whose chunks only it reaches: they go before it, read
             // while it is still present, so a killed run that freed some leaves the rest listed.
+            // A withheld recipe keeps every chunk, one met first through another recipe too.
             if file.item_type.is_chunked() {
                 for chunk in object_utils::recipe_chunk_hashes(&file.hash)? {
+                    if kept {
+                        closure.withheld.insert(chunk.clone());
+                    }
+
                     if closure.seen.insert(chunk.clone()) && held_present(&chunk, At::Chunk, &file.hash, sealed)? {
                         closure.present.push(chunk);
                     }
@@ -671,7 +716,7 @@ mod tests {
         let h = history();
         let hold = store_access();
 
-        let plan = plan_evict(&[h.held.clone()], &hold).unwrap();
+        let plan = plan_evict(&[h.held.clone()], &HashSet::new(), &hold).unwrap();
 
         let freed: HashSet<&String> = plan.to_free.iter().collect();
         assert_eq!(freed, [&h.held_root, &h.a, &h.dir, &h.shared].into_iter().collect());
@@ -689,8 +734,72 @@ mod tests {
         assert!(present(&h.local_root) && present(&h.b) && present(&h.held) && present(&h.local));
 
         // A second run finds nothing more to do: the evicted tree is a recorded boundary.
-        let again = plan_evict(&[h.held.clone()], &hold).unwrap();
+        let again = plan_evict(&[h.held.clone()], &HashSet::new(), &hold).unwrap();
         assert!(again.to_free.is_empty() && again.to_record.is_empty());
+    }
+
+    /// Content the origin withholds stays, with a withheld recipe's chunks (one shared with a
+    /// recipe that goes too) and every tree on the way to either, while what sits beside them
+    /// goes; a withheld file already absent here keeps nothing above it.
+    ///
+    /// Revert: drop the withheld arm of the plan → the withheld objects are evicted → red. Revert:
+    /// keep only the withheld hash, not the trees above it → `deep` is freed → red. Revert: keep a
+    /// withheld recipe's chunks only when first met through it → `shared_chunk`, met first through
+    /// `other_recipe`, is freed → red.
+    #[test]
+    fn plan_keeps_withheld_content_and_the_trees_above_it() {
+        use crate::util::gc_utils::tests::{store_chunk, store_recipe};
+        let _scratch = Scratch::new("withheld");
+
+        let film = store_blob("film\n");
+        let beside = store_blob("beside\n");
+        let inner = store_tree(&[("film.bin", &film, DirEntryType::Normal), ("beside.txt", &beside, DirEntryType::Normal)]);
+        let deep = store_tree(&[("inner", &inner, DirEntryType::Tree)]);
+
+        let lone_chunk = store_chunk(b"lone");
+        let shared_chunk = store_chunk(b"shared");
+        let other_chunk = store_chunk(b"other");
+        let recipe = store_recipe(&[(lone_chunk.clone(), 4), (shared_chunk.clone(), 6)]);
+        let other_recipe = store_recipe(&[(shared_chunk.clone(), 6), (other_chunk.clone(), 5)]);
+
+        let gone = store_blob("gone\n");
+        let gone_dir = store_tree(&[("gone.bin", &gone, DirEntryType::Normal)]);
+        let (folder, file) = file_utils::get_path_for_object(&gone).unwrap();
+        std::fs::remove_file(PathBuf::from(folder).join(file)).unwrap();
+        sealed_utils::append(&[(SealOp::Record, gone.as_str())]).unwrap();
+
+        let a = store_blob("a\n");
+        // `a.bin` sorts before `big.bin`, so the walk meets the shared chunk through it first.
+        let root = store_tree(&[
+            ("a.bin", &other_recipe, DirEntryType::NormalChunked),
+            ("a.txt", &a, DirEntryType::Normal),
+            ("big.bin", &recipe, DirEntryType::NormalChunked),
+            ("deep", &deep, DirEntryType::Tree),
+            ("gone", &gone_dir, DirEntryType::Tree),
+        ]);
+        let held = store_parcel(&root, Vec::new());
+        set_main(&held);
+        position(None);
+        let hold = store_access();
+
+        let withheld: HashSet<String> = [film.clone(), recipe.clone(), gone.clone()].into();
+        let plan = plan_evict(&[held.clone()], &withheld, &hold).unwrap();
+
+        let evicted: HashSet<&String> = plan.to_evict.iter().collect();
+        assert_eq!(evicted, [&beside, &a, &other_recipe, &other_chunk, &gone_dir].into_iter().collect());
+        assert_eq!(plan.kept_withheld, 7, "film, inner, deep, the recipe, both its chunks and the root tree");
+        assert_eq!((plan.kept_for_checkouts, plan.kept_local), (0, 0));
+
+        carry(&plan, &hold).unwrap();
+        for hash in [&film, &inner, &deep, &root, &recipe, &lone_chunk, &shared_chunk] {
+            assert!(present(hash), "{} is kept", hash);
+        }
+        assert!(!present(&beside) && !present(&other_chunk));
+
+        // Without a withholding the same history frees them all.
+        let plan = plan_evict(&[held], &HashSet::new(), &hold).unwrap();
+        assert_eq!(plan.kept_withheld, 0);
+        assert!(plan.to_evict.contains(&film) && plan.to_evict.contains(&root) && plan.to_evict.contains(&shared_chunk));
     }
 
     #[test]
@@ -701,7 +810,7 @@ mod tests {
         sealed_utils::append(&[(SealOp::Record, h.dir.as_str())]).unwrap();
         let hold = store_access();
 
-        let plan = plan_evict(&[h.held.clone()], &hold).unwrap();
+        let plan = plan_evict(&[h.held.clone()], &HashSet::new(), &hold).unwrap();
 
         assert_eq!(plan.to_free.iter().collect::<HashSet<_>>(), [&h.held_root, &h.a].into_iter().collect());
         assert_eq!(plan.kept_for_checkouts, 2, "dir and shared.txt, which the base tree holds");
@@ -729,7 +838,7 @@ mod tests {
         pallet_utils::update_meta_pallet_head("notes", None, &parcel, &pallet_utils::RefPreconditions::NONE).unwrap();
         let hold = store_access();
 
-        let plan = plan_evict(&[parcel], &hold).unwrap();
+        let plan = plan_evict(&[parcel], &HashSet::new(), &hold).unwrap();
 
         assert!(plan.to_free.is_empty());
         assert_eq!(plan.kept_local, 3);
@@ -746,7 +855,7 @@ mod tests {
         }).unwrap();
         let hold = store_access();
 
-        let plan = plan_evict(&[adopted], &hold).unwrap();
+        let plan = plan_evict(&[adopted], &HashSet::new(), &hold).unwrap();
 
         assert!(!plan.to_free.contains(&old_root), "{:?}", plan.to_free);
     }
@@ -759,7 +868,7 @@ mod tests {
         let (parcel, root) = metadata_parcel("crafted\n");
         let hold = store_access();
 
-        let plan = plan_evict(&[parcel], &hold).unwrap();
+        let plan = plan_evict(&[parcel], &HashSet::new(), &hold).unwrap();
 
         assert!(plan.to_free.contains(&root), "{:?}", plan.to_free);
         assert_eq!(plan.to_free.len(), 3, "{:?}", plan.to_free);
@@ -773,11 +882,11 @@ mod tests {
         std::fs::remove_file(PathBuf::from(folder).join(file)).unwrap();
         let hold = store_access();
 
-        let error = plan_evict(&[h.held.clone()], &hold).err().unwrap();
+        let error = plan_evict(&[h.held.clone()], &HashSet::new(), &hold).err().unwrap();
         assert!(error.contains(&h.shared) && error.contains("forklift heal"), "{}", error);
 
         sealed_utils::append(&[(SealOp::Record, h.shared.as_str())]).unwrap();
-        let plan = plan_evict(&[h.held.clone()], &hold).unwrap();
+        let plan = plan_evict(&[h.held.clone()], &HashSet::new(), &hold).unwrap();
         assert!(!plan.to_free.contains(&h.shared) && plan.to_free.contains(&h.dir));
     }
 
@@ -787,7 +896,7 @@ mod tests {
         let h = history();
         let hold = store_access();
 
-        let plan = plan_evict(&[h.held.clone(), "e".repeat(64)], &hold).unwrap();
+        let plan = plan_evict(&[h.held.clone(), "e".repeat(64)], &HashSet::new(), &hold).unwrap();
         assert_eq!(plan.heads_not_lowered, 1);
         assert_eq!(plan.to_free.len(), 4);
     }
@@ -802,7 +911,7 @@ mod tests {
         let _scratch = Scratch::new("record-first");
         let h = history();
         let hold = store_access();
-        let plan = plan_evict(&[h.held.clone()], &hold).unwrap();
+        let plan = plan_evict(&[h.held.clone()], &HashSet::new(), &hold).unwrap();
 
         let (folder, _) = file_utils::get_path_for_object(&plan.to_free[0]).unwrap();
         std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
@@ -898,7 +1007,7 @@ mod tests {
         let f = versions();
         let hold = store_access();
 
-        let plan = plan_evict(&[f.held.clone()], &hold).unwrap();
+        let plan = plan_evict(&[f.held.clone()], &HashSet::new(), &hold).unwrap();
         assert!(plan.to_drop.contains(&f.v[0]) && plan.to_drop.contains(&f.v[1]), "{:?}", plan.to_drop);
         assert!(!plan.to_free.contains(&f.v[0]) && !plan.to_free.contains(&f.v[1]), "neither is loose");
 
@@ -920,7 +1029,7 @@ mod tests {
             read_fresh(&f.roots[kept]).unwrap_or_else(|e| panic!("root {} reads: {}", kept, e));
         }
 
-        let again = plan_evict(&[f.held.clone()], &hold).unwrap();
+        let again = plan_evict(&[f.held.clone()], &HashSet::new(), &hold).unwrap();
         assert!(again.to_evict.is_empty() && again.to_drop.is_empty(), "a second run has nothing to do");
     }
 
@@ -943,7 +1052,7 @@ mod tests {
         position(None);
         let hold = store_access();
 
-        let plan = plan_evict(&[held.clone()], &hold).unwrap();
+        let plan = plan_evict(&[held.clone()], &HashSet::new(), &hold).unwrap();
         assert!(plan.to_drop.is_empty() && plan.to_free.contains(&held_blob), "sanity: the base is loose only");
         assert!(plan.repack, "a packed delta stands on it");
 
@@ -969,7 +1078,7 @@ mod tests {
         std::fs::write(&loose, &bytes).unwrap();
         let hold = store_access();
 
-        let plan = plan_evict(&[h.held.clone()], &hold).unwrap();
+        let plan = plan_evict(&[h.held.clone()], &HashSet::new(), &hold).unwrap();
         assert!(plan.to_free.contains(&h.a) && plan.to_drop.contains(&h.a), "both copies are planned");
         assert_eq!(plan.to_free, vec![h.a.clone()], "every other object is packed only");
 
@@ -1001,7 +1110,7 @@ mod tests {
         position(None);
         let hold = store_access();
 
-        let plan = plan_evict(&[held.clone()], &hold).unwrap();
+        let plan = plan_evict(&[held.clone()], &HashSet::new(), &hold).unwrap();
         assert!(plan.to_drop.contains(&held_blob) && plan.repack, "sanity: the held blob is dropped");
         let stats = carry(&plan, &hold).unwrap();
         assert!(stats.bytes_freed * 2 >= pack_bytes, "{} freed, the dropped pack held {}", stats.bytes_freed, pack_bytes);
@@ -1045,7 +1154,7 @@ mod tests {
                 pack_utils::tests::pack_as_unreadable(&store_blob("stray\n"), how);
                 let hold = store_access();
 
-                let Err(error) = plan_evict(&[held], &hold) else { return Some(format!("{:?} packed {}: must refuse", how, packed)) };
+                let Err(error) = plan_evict(&[held], &HashSet::new(), &hold) else { return Some(format!("{:?} packed {}: must refuse", how, packed)) };
                 if !error.contains("nothing was changed") {
                     return Some(format!("{:?} packed {}: {}", how, packed, error));
                 }
@@ -1082,7 +1191,7 @@ mod tests {
         pack_utils::compact(false, false, false, &Progress::NONE).unwrap();
         let hold = store_access();
 
-        let plan = plan_evict(&[h.held.clone()], &hold).unwrap();
+        let plan = plan_evict(&[h.held.clone()], &HashSet::new(), &hold).unwrap();
         assert!(!plan.to_drop.is_empty(), "sanity: the repack runs");
         carry(&plan, &hold).unwrap();
 
@@ -1113,7 +1222,7 @@ mod tests {
         let h = history();
         let hold = store_access();
 
-        let plan = plan_evict(&[h.held.clone()], &hold).unwrap();
+        let plan = plan_evict(&[h.held.clone()], &HashSet::new(), &hold).unwrap();
         let stats = carry(&plan, &hold).unwrap();
 
         assert_eq!((stats.record_dropped, stats.record_bound_skipped.as_deref()), (2, None));
@@ -1132,7 +1241,7 @@ mod tests {
         let _scratch = Scratch::new("bound-fails");
         let h = history();
         let hold = store_access();
-        let plan = plan_evict(&[h.held.clone()], &hold).unwrap();
+        let plan = plan_evict(&[h.held.clone()], &HashSet::new(), &hold).unwrap();
         assert!(!plan.repack, "sanity: no repack reads the bays after the plan");
 
         let mut broken = 0;
@@ -1166,7 +1275,7 @@ mod tests {
         let root_bytes = file_utils::retrieve_object_by_hash(&h.held_root).unwrap();
         let hold = store_access();
 
-        carry(&plan_evict(&[h.held.clone()], &hold).unwrap(), &hold).unwrap();
+        carry(&plan_evict(&[h.held.clone()], &HashSet::new(), &hold).unwrap(), &hold).unwrap();
         assert_record(&[&h.held_root, &h.dir], "sanity: bounded");
 
         sealed_utils::refill_all(&hold, &[(h.held_root.as_str(), root_bytes.as_slice())]).unwrap();
@@ -1189,7 +1298,7 @@ mod tests {
         std::fs::remove_file(PathBuf::from(folder).join(file)).unwrap();
         let hold = store_access();
 
-        let stats = carry(&plan_evict(&[h.held.clone()], &hold).unwrap(), &hold).unwrap();
+        let stats = carry(&plan_evict(&[h.held.clone()], &HashSet::new(), &hold).unwrap(), &hold).unwrap();
 
         let skipped = stats.record_bound_skipped.expect("the bound is skipped");
         assert!(skipped.contains(&h.b) && skipped.contains(&h.local_root), "{}", skipped);
@@ -1257,7 +1366,7 @@ mod tests {
         delete_object(&h.shared);
         let hold = store_access();
 
-        let plan = plan_evict(&[h.held.clone()], &hold).unwrap();
+        let plan = plan_evict(&[h.held.clone()], &HashSet::new(), &hold).unwrap();
         assert!(!plan.to_free.contains(&h.shared) && plan.to_free.contains(&h.dir), "{:?}", plan.to_free);
         assert!(!plan.to_record.contains(&h.shared), "{:?}", plan.to_record);
 
@@ -1276,7 +1385,7 @@ mod tests {
         crate::util::applied_redactions::apply_for_test(&[&h.shared]);
         let hold = store_access();
 
-        let plan = plan_evict(&[h.held.clone()], &hold).unwrap();
+        let plan = plan_evict(&[h.held.clone()], &HashSet::new(), &hold).unwrap();
         assert!(plan.to_evict.contains(&h.shared), "{:?}", plan.to_evict);
         assert!(!plan.to_record.contains(&h.shared) && plan.to_record.contains(&h.dir), "{:?}", plan.to_record);
 
@@ -1296,7 +1405,7 @@ mod tests {
         crate::util::applied_redactions::apply_for_test(&[&h.dir]);
         let hold = store_access();
 
-        let plan = plan_evict(&[h.held.clone()], &hold).unwrap();
+        let plan = plan_evict(&[h.held.clone()], &HashSet::new(), &hold).unwrap();
         assert!(!plan.to_evict.contains(&h.dir) && plan.to_evict.contains(&h.shared), "{:?}", plan.to_evict);
     }
 

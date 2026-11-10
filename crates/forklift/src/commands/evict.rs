@@ -12,8 +12,10 @@ use crate::output::{self, CommandOutput};
 /// changes when the configured remote is not the origin, or the origin cannot be reached or is not
 /// trusted. Then, under exclusive store access, it plans: the content of the origin's history,
 /// minus every meta pallet, each checkout's base tree, the parcels a parked, consolidating or
-/// picking bay names, the trust pins, and staged work. Every object it frees is recorded
-/// first, so an interrupted eviction leaves a readable warehouse and running it again finishes.
+/// picking bay names, the trust pins, staged work, and content the origin's host withholds (with
+/// every tree on the way to it), which the origin may no longer serve. Every object it frees is
+/// recorded first, so an interrupted eviction leaves a readable warehouse and running it again
+/// finishes.
 /// Loose copies are deleted; packed objects go by a full repack that keeps everything else, so
 /// like `store compact --all` it refuses while the warehouse root is served. Last, the record is bounded:
 /// the record of an evicted object nothing present names any more is dropped.
@@ -37,7 +39,7 @@ pub async fn handle_command(dry_run: bool) -> Result<(), String> {
 
     // Read outside the store hold, so a slow origin never keeps other bays' writers out. A ref can
     // move on the origin after this read; the hold does not reach the origin either way.
-    let held_heads = crate::remote_heads::held_by_remote(
+    let held = crate::remote_heads::held_by_remote(
         "\"forklift store evict\" asks the origin which history it holds, so that it only frees what the origin can \
         refill; nothing was changed.",
     ).await?;
@@ -55,7 +57,7 @@ pub async fn handle_command(dry_run: bool) -> Result<(), String> {
         and can be removed. {}", e
     ))?;
     let store_access = StoreAccessLock::try_exclusive()?;
-    let plan = evict_utils::plan_evict(&held_heads, &store_access)?;
+    let plan = evict_utils::plan_evict(&held.heads, &held.withheld, &store_access)?;
 
     let stats = if dry_run {
         None
@@ -72,6 +74,7 @@ pub async fn handle_command(dry_run: bool) -> Result<(), String> {
         bytes_freed: stats.as_ref().map_or(0, |stats| stats.bytes_freed),
         kept_for_checkouts: plan.kept_for_checkouts,
         kept_local: plan.kept_local,
+        kept_withheld: plan.kept_withheld,
         not_held: plan.not_held,
         still_packed: stats.as_ref().map_or(0, |stats| stats.still_packed),
         heads_not_lowered: plan.heads_not_lowered,
@@ -114,6 +117,11 @@ pub(crate) struct EvictReport {
     /// Objects the origin holds that stay for a meta pallet, a parked, consolidating or
     /// picking bay, a trust pin, or staged work.
     kept_local: usize,
+
+    /// Objects kept because the origin's host withholds them or content beneath them, which the
+    /// origin may not serve again: withheld content, a withheld chunked file's chunks, and the trees
+    /// on the way to either.
+    kept_withheld: usize,
 
     /// Present objects only local history reaches (unlifted work, a haul, a deleted pallet), which
     /// the origin is not known to hold. Lifting that work lets a later eviction free them.
@@ -187,6 +195,14 @@ impl CommandOutput for EvictReport {
                 "{} object(s) were kept for metadata, trust records, staged work, or a parked or \
                 in-progress operation.",
                 self.kept_local
+            );
+        }
+
+        if self.kept_withheld > 0 {
+            println!(
+                "{} object(s) were kept because the origin withholds them, or content beneath them, and \
+                may not serve it again.",
+                self.kept_withheld
             );
         }
 
