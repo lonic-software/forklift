@@ -135,6 +135,13 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   uncoded error. A lift refused that way asks again what the remote lacks, uploads it, and tries
   the move once more; a second refusal fails the lift with that code. `--json` schema is now 36.
 
+- **A warehouse records content its remote withholds and it lacks.** The new `unavailable` record
+  lists such content beside the host's statement. An absence it lists is not damage: `audit` counts
+  it apart, as `unavailable` in `--json`, and passes, `heal` reports it apart, and nothing records
+  it as held by its origin. forklift-server refuses to serve a root lacking content the record
+  lists. The record drops an entry once the content is back, or once nothing names it.
+  `--json` schema is now 37.
+
 - **`remote move` knows what the new origin withholds.** A cache or sparse warehouse moving to a
   server whose host withholds content it relies on its origin for no longer counts that content as
   held there. The move asks the previous origin: while that origin answers and does not withhold

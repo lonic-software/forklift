@@ -28,6 +28,7 @@ pub mod tag_utils;
 pub mod redaction_utils;
 pub mod applied_redactions;
 pub mod withholding;
+pub mod unavailable;
 pub mod redaction_deleter;
 pub mod cherry_pick_utils;
 pub mod pallet_utils;

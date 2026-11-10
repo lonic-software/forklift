@@ -1,7 +1,7 @@
 use serde::Serialize;
 use forklift_core::util::evict_utils;
 use forklift_core::util::lock_utils::{ServeLock, StoreAccessLock, StoreLock};
-use forklift_core::util::scope_utils;
+use forklift_core::util::{scope_utils, unavailable};
 use crate::events;
 use crate::output::{self, CommandOutput};
 
@@ -64,6 +64,14 @@ pub async fn handle_command(dry_run: bool) -> Result<(), String> {
     } else {
         Some(evict_utils::carry_out(&plan, &store_lock, &serve_lock, &store_access, &events::progress())?)
     };
+
+    // Under the same hold, drop what the unavailable record lists that nothing names any more,
+    // whether or not the eviction freed anything. Its error is ignored: the record then only stays
+    // larger than it needs to be, and must not fail the eviction that already landed. A dry run
+    // changes nothing.
+    if !dry_run {
+        let _ = unavailable::prune(&store_access);
+    }
 
     output::emit(&EvictReport {
         dry_run,

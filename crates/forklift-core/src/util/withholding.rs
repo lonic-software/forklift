@@ -140,7 +140,7 @@ pub fn checked_statement(statement: &str) -> Result<&str, String> {
 /// Whether `statement` may be a takedown's: not blank, at most [`STATEMENT_MAX_CHARS`] long, and
 /// one plain line, since every terminal that shows a refusal prints it: no control character, line
 /// or paragraph separator, or direction mark, override or isolate, which would reorder its display.
-fn valid_statement(statement: &str) -> bool {
+pub(crate) fn valid_statement(statement: &str) -> bool {
     let plain = |c: char| !c.is_control() && !matches!(
         c, '\u{2028}' | '\u{2029}' | '\u{200e}' | '\u{200f}' | '\u{061c}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
     );

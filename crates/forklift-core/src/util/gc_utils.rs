@@ -159,6 +159,11 @@ pub fn collect_garbage(grace_seconds: u64) -> Result<GcStats, String> {
         }
     }
 
+    // Under the same hold and against the same live set, drop what the unavailable record lists
+    // that nothing names any more: a served root has no client to do it. Its error is ignored: the
+    // record then only stays larger than it needs to be, and must not fail the sweep that landed.
+    let _ = crate::util::unavailable::prune_against(&_store_access, &live);
+
     Ok(stats)
 }
 

@@ -9,7 +9,7 @@ use forklift_core::util::lock_utils::{ServeLock, StoreAccessLock, StoreLock};
 use forklift_core::util::redaction_deleter::{self, Checkout, CopyHolder, Deletion};
 use forklift_core::util::redaction_utils::{self, AttributedRedaction, HeadHolder, RedactedKind, Redaction};
 use forklift_core::util::remote_utils::RemoteClient;
-use forklift_core::util::{config_utils, mirror_utils, object_utils, pallet_utils, remote_utils};
+use forklift_core::util::{config_utils, mirror_utils, object_utils, pallet_utils, remote_utils, unavailable};
 use crate::cli::RedactAction;
 use crate::commands::lower;
 use crate::events;
@@ -222,6 +222,11 @@ pub(crate) fn delete_applied() -> Result<Option<DeletionView>, String> {
     };
 
     let deletion = redaction_deleter::delete_applied(&store_lock, &serve_lock, &store_access, &events::progress())?;
+
+    // Under the same hold, drop what the unavailable record lists that nothing names any more. Its
+    // error is ignored: the record then only stays larger than it needs to be, and must not fail
+    // the deletion that already landed.
+    let _ = unavailable::prune(&store_access);
 
     Ok(Some(DeletionView::from(deletion)))
 }

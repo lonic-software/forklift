@@ -45,7 +45,7 @@ use forklift_core::util::lock_utils::{self, BaseServeLock, FormatLease, ServeLoc
 use forklift_core::util::{
     applied_redactions, audit_utils, body_utils, bay_utils, bundle_utils, file_utils, franchise_utils, hook_utils, merge_utils, meta_tree,
     object_utils, office_utils, origin_utils, pack_utils, pallet_utils, progress_utils, redaction_deleter, redaction_utils, scope_utils,
-    sealed_utils, sign_utils, tree_utils, warehouse_utils,
+    sealed_utils, sign_utils, tree_utils, unavailable, warehouse_utils,
 };
 use forklift_core::util::applied_redactions::AppliedSet;
 use forklift_core::util::withholding::{self, WithheldSet};
@@ -237,7 +237,9 @@ impl WarehouseHandle {
     /// inferred from the mode. And so is a root that records an origin, which only a partial
     /// warehouse is prepared with. Once is enough here too: a new claim is refused where no origin
     /// is recorded, and the push-downs that record without one start only from entries already
-    /// there, or run only in a cache; with neither an entry nor an origin, nothing adds one.
+    /// there, or run only in a cache; with neither an entry nor an origin, nothing adds one. And so
+    /// is a root that lacks content its unavailable record lists, which a fetch left out because
+    /// its remote's host withholds it; an entry whose object it holds counts nothing.
     fn serving(root: PathBuf, wait: bool) -> Result<WarehouseHandle, ServingRefusal> {
         use forklift_core::error::RefusalCode;
         // Acquire inside the root's storage scope so the locks land at this warehouse's store
@@ -271,6 +273,11 @@ impl WarehouseHandle {
             }
             if origin_utils::read_origin().map_err(ServingRefusal::Unreadable)?.is_some() {
                 return Err(ServingRefusal::Origin);
+            }
+            // An entry the store holds again is no gap: only the absent ones count.
+            let unavailable = unavailable::absent_count().map_err(ServingRefusal::Unreadable)?;
+            if unavailable > 0 {
+                return Err(ServingRefusal::Unavailable(unavailable));
             }
 
             let serve_lock = ServeLock::acquire().map_err(ServingRefusal::Busy)?;
@@ -361,8 +368,8 @@ enum ServingRefusal {
     /// running. One whose format could not be checked is [`ServingRefusal::Unreadable`]. The others this server holds are served all the same.
     OtherFormat(String),
 
-    /// Its warehouse marker, fetch scope, sealed-object record or origin record could not be read,
-    /// or its served mark could not be read or written.
+    /// Its warehouse marker, fetch scope, sealed-object record, origin record or unavailable record
+    /// could not be read, or its served mark could not be read or written.
     Unreadable(String),
 
     /// It is sparse or a cache, so it may lack content, and is never served.
@@ -376,6 +383,11 @@ enum ServingRefusal {
     /// lacks content, and it is never served. The message does not name the origin: a
     /// `--warehouses` server sends it to clients, and a URL can carry credentials.
     Origin,
+
+    /// It lacks this many objects its unavailable record lists: content a fetch left out because
+    /// its remote's host withholds it, so it may lack content its pallets reach, and it is not
+    /// served until that content is back.
+    Unavailable(usize),
 }
 
 impl ServingRefusal {
@@ -410,6 +422,14 @@ impl ServingRefusal {
                 reach. A client trusts a server to hold the whole history it serves. Clone that \
                 origin again into a new root, without --only or --cache, and serve that.",
                 name
+            ),
+            ServingRefusal::Unavailable(count) => format!(
+                "{} lacks {} file{} its pallets reach: {} remote's host withholds the content, so a                 fetch left {} out (.forklift/unavailable). A client trusts a server to hold the whole                 history it serves. Load the missing files' bytes into this warehouse, then serve it                 again.",
+                name,
+                count,
+                if count == 1 { "" } else { "s" },
+                if count == 1 { "its" } else { "their" },
+                if count == 1 { "it" } else { "them" },
             ),
         }
     }
@@ -2211,7 +2231,7 @@ fn resolve_handle(state: &AppState,
     // until the handle is let go. Refuses (503) if a `gc` or full repack is running against this
     // warehouse, or another server already serves it — serving it then would be unsafe. A partial
     // or sealed warehouse, or one that records an origin, stays refused (409) until it is
-    // replaced, one whose records cannot be read gets a 500, and an unfinished clone (503) until
+    // replaced, one lacking content its unavailable record lists (409) until that is back, one whose records cannot be read gets a 500, and an unfinished clone (503) until
     // it is resumed or deleted.
     let handle = Arc::new(
         WarehouseHandle::serving(root, false).map_err(|refusal| match refusal {
@@ -2244,7 +2264,8 @@ fn resolve_handle(state: &AppState,
                 )
             }
             ServingRefusal::Unreadable(reason) => internal(reason),
-            refusal @ (ServingRefusal::Partial | ServingRefusal::Sealed(_) | ServingRefusal::Origin) => (
+            refusal @ (ServingRefusal::Partial | ServingRefusal::Sealed(_) | ServingRefusal::Origin
+                | ServingRefusal::Unavailable(_)) => (
                 StatusCode::CONFLICT,
                 refusal.message(&format!("Warehouse \"{}\"", id)),
             ),

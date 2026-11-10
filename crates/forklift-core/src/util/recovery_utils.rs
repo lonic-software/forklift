@@ -973,6 +973,15 @@ fn redacted_absent_note(count: usize) -> String {
     )
 }
 
+/// Plain-language note for the objects a torn rescan held because this warehouse recorded them
+/// unavailable — see [`ClosureWalkResult::unavailable_absent`].
+fn unavailable_absent_note(count: usize) -> String {
+    format!(
+        "{} object(s) this warehouse recorded unavailable are absent from the store: its remote's         host withholds their content, and none of them is counted as lost.",
+        count
+    )
+}
+
 /// Plain-language note for a tag read that failed (FORK-83) — see [`WalkRoots::tags_unread`].
 /// The error can quote a synced `@tags` record, so it is sanitized.
 fn tags_unread_note(error: &str) -> String {
@@ -1200,6 +1209,9 @@ fn rescan_torn_taint(
         }
         if walk.redacted_absent > 0 {
             notes.push(redacted_absent_note(walk.redacted_absent));
+        }
+        if walk.unavailable_absent > 0 {
+            notes.push(unavailable_absent_note(walk.unavailable_absent));
         }
 
         Ok(HealOutcome {
@@ -2006,6 +2018,11 @@ pub(crate) struct ClosureWalkResult {
     /// reached or not. Zero for every other walk. Folded into a note on the `Ok` path only — see
     /// [`redacted_absent_note`].
     pub redacted_absent: usize,
+    /// How many objects the unavailable record lists are absent from the store, which
+    /// [`enumerate_absent_reachable`] holds rather than records, counted as `redacted_absent` is.
+    /// Zero for every other walk. Folded into a note on the `Ok` path only — see
+    /// [`unavailable_absent_note`].
+    pub unavailable_absent: usize,
 }
 
 /// Walk every durable ref source's closure looking for `targets`, returning the subset actually
@@ -2022,6 +2039,7 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
             hashes: BTreeSet::new(), degraded_sources: Vec::new(), unwalked: Vec::new(),
             never_held_pins: BTreeSet::new(), never_held_tags: Vec::new(), tags_unread: None,
             redacted_absent: 0,
+            unavailable_absent: 0,
         });
     }
 
@@ -2043,6 +2061,7 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
         never_held_tags: outcome.never_held_tags,
         tags_unread: roots.tags_unread,
         redacted_absent: 0,
+        unavailable_absent: 0,
     })
 }
 
@@ -2065,7 +2084,7 @@ pub(crate) fn closure_references_any(targets: &BTreeSet<String>) -> Result<Closu
 /// Likewise an absent tree, recipe, chunk or leaf that the sealed-object record holds is held by
 /// hash alone (the remote holds it and its closure) and is neither recorded nor descended into, and
 /// so is one a redaction this warehouse applied names (its bytes were taken away on purpose, so it
-/// is not lost). A parcel, a staged object and a corrupt boundary are never held. A sealed-object
+/// is not lost), and one this warehouse recorded unavailable (its remote's host withholds it). A parcel, a staged object and a corrupt boundary are never held. A sealed-object
 /// record or a record of applied redactions that cannot be read is a degraded source, and the walk
 /// then holds nothing.
 ///
@@ -2102,7 +2121,7 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
     // object held by hash alone, or redacted, reads as lost.
     let sealed = sealed_utils::read_tolerated().unwrap_or_else(|error| {
         roots.degraded_sources.push(format!(
-            "objects held by hash alone or redacted could not be told apart from lost ones this run. {}.",
+            "objects held by hash alone, redacted or unavailable could not be told apart from lost ones this run. {}.",
             error.trim_end_matches('.')
         ));
         Tolerated::default()
@@ -2113,15 +2132,16 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
         let mut collecting_sink = |hash: &str| { absent.insert(hash.to_string()); };
         walk_closure_for(&empty_targets, &roots, corrupt, &scope, Some(&sealed), Some(&mut collecting_sink))?
     };
-    let mut redacted_absent = 0;
-
-    // Only a note reads this count, so a presence check that fails counts nothing rather than
+    // Only a note reads these counts, so a presence check that fails counts nothing rather than
     // failing the rescan the walk itself completed.
-    for hash in sealed.applied.hashes() {
-        if matches!(file_utils::raw_object_present(hash), Ok(false)) {
-            redacted_absent += 1;
-        }
-    }
+    let absent_count = |hashes: &mut dyn Iterator<Item = &String>| {
+        hashes.filter(|hash| matches!(file_utils::raw_object_present(hash), Ok(false))).count()
+    };
+    let redacted_absent = absent_count(&mut sealed.applied.hashes());
+    // A hash both lists is counted as redacted only, as the walk holds it.
+    let unavailable_absent = absent_count(&mut sealed.unavailable.entries()
+        .map(|(hash, _)| hash)
+        .filter(|hash| !sealed.applied.contains(hash) && !sealed.withheld.contains(hash)));
 
     Ok(ClosureWalkResult {
         hashes: absent,
@@ -2131,6 +2151,7 @@ pub(crate) fn enumerate_absent_reachable(corrupt: &BTreeSet<String>) -> Result<C
         never_held_tags: outcome.never_held_tags,
         tags_unread: roots.tags_unread,
         redacted_absent,
+        unavailable_absent,
     })
 }
 

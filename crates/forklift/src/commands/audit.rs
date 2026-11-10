@@ -87,8 +87,9 @@ pub fn handle_command(pallet: Option<String>, full: bool) -> Result<(), String> 
         let is_cache = scope_utils::is_cache_mode()?;
 
         if is_sparse || full || is_cache {
-            // An object absent because a redaction this warehouse applied names it, or because its
-            // host withholds it, is held too, and each is tallied apart from what the record holds.
+            // An object absent because a redaction this warehouse applied names it, because its
+            // host withholds it, or because its remote's host does and it is recorded unavailable,
+            // is held too, and each is tallied apart from what the record holds.
             let tolerated = sealed_utils::read_tolerated()?;
             let sealed = SealedTolerance::new(&tolerated);
             audit_utils::verify_parcel_closure_scoped(&head, None, &fetch_scope, full, Some(&sealed))?;
@@ -99,6 +100,7 @@ pub fn handle_command(pallet: Option<String>, full: bool) -> Result<(), String> 
                 sealed.held(),
                 sealed.redacted(),
                 sealed.withheld(),
+                sealed.unavailable(),
                 sealed_utils::present_recorded(&tolerated.sealed)?.len(),
             ));
         }
@@ -167,7 +169,7 @@ pub(crate) struct AuditScope {
     signatures: &'static str,
 
     /// In-scope content: every tree was re-hashed on read and every blob confirmed present, except
-    /// the absent objects counted in `held_by_hash`, `redacted` and `withheld`.
+    /// the absent objects counted in `held_by_hash`, `redacted`, `withheld` and `unavailable`.
     in_scope_content: &'static str,
 
     /// How many absent objects the warehouse's sealed record holds by hash alone: each is pinned to
@@ -188,6 +190,13 @@ pub(crate) struct AuditScope {
     /// Omitted when none.
     #[serde(skip_serializing_if = "crate::output::is_zero")]
     withheld: usize,
+
+    /// How many absent objects are absent because this warehouse's remote withholds them: a fetch
+    /// left their content out on the remote host's statement, and this warehouse recorded them
+    /// unavailable. Their absence is accounted for, not damage, and fails nothing; loading the
+    /// same bytes brings them back. Omitted when none.
+    #[serde(skip_serializing_if = "crate::output::is_zero")]
+    unavailable: usize,
 
     /// How many objects the sealed record names that are on disk all the same. That fails
     /// nothing: a recorded object that is present is checked like any other. `heal` removes the
@@ -219,9 +228,10 @@ impl AuditScope {
     /// * `held`        - How many absent objects the sealed record held by hash alone.
     /// * `redacted`    - How many absent objects a redaction applied here held.
     /// * `withheld`    - How many absent objects the host's withholding held.
+    /// * `unavailable` - How many absent objects the unavailable record held.
     /// * `present`     - How many objects the sealed record names that the store holds.
     fn new(fetch_scope: Option<Vec<String>>, cache: bool, full: bool, held: usize, redacted: usize, withheld: usize,
-           present: usize) -> AuditScope {
+           unavailable: usize, present: usize) -> AuditScope {
         let sparse = fetch_scope.is_some();
 
         AuditScope {
@@ -232,6 +242,7 @@ impl AuditScope {
             held_by_hash: held,
             redacted,
             withheld,
+            unavailable,
             present_and_recorded: present,
             chunks: if full {
                 "re-read and re-hashed; each fully-present chunked file re-assembled to verify its content hash"
@@ -243,9 +254,10 @@ impl AuditScope {
         }
     }
 
-    /// Whether the walk passed over any absent object, held by hash, redacted or withheld.
+    /// Whether the walk passed over any absent object, held by hash, redacted, withheld or
+    /// unavailable.
     fn excepts_absent(&self) -> bool {
-        self.held_by_hash > 0 || self.redacted > 0 || self.withheld > 0
+        self.held_by_hash > 0 || self.redacted > 0 || self.withheld > 0 || self.unavailable > 0
     }
 }
 
@@ -335,6 +347,13 @@ impl CommandOutput for AuditReport {
                 "{} absent object(s) are withheld: this warehouse's host withholds their content, \
                 so their absence is accounted for, not damage. Nothing beneath them was checked.",
                 withheld
+            );
+        }
+
+        if let Some(AuditScope { unavailable: unavailable @ 1.., .. }) = &self.scope {
+            println!(
+                "{} absent object(s) are unavailable: this warehouse's remote withholds their                 content on its host's statement, so their absence is accounted for, not damage.                 Loading the same file's bytes brings them back.",
+                unavailable
             );
         }
 
