@@ -1080,7 +1080,13 @@ fn sort_withheld(pending: &mut Vec<PendingAction>, withheld: WithheldReads) -> R
                         The host's statement: {}",
                         path, hash, statement
                     ),
-                    "The remote cannot supply the content; only a warehouse that holds it can make this merge.",
+                    format!(
+                        "The remote cannot supply the content. Both sides changed \"{}\", and a merge reads \
+                        nothing of a file only the other side changed, so with this pallet's own change to it \
+                        taken out the merge leaves the file out; otherwise only a warehouse that holds the \
+                        content can make it.",
+                        path
+                    ),
                     serde_json::json!({ "path": path, "hash": hash, "statement": statement }),
                 ).into());
             }

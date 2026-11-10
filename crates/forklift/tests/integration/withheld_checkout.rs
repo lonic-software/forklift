@@ -476,10 +476,11 @@ fn a_merge_and_a_pick_leave_their_unavailable_files_out() {
 }
 
 /// A merge or pick whose line merge needs content left out refuses `content_withheld` before it
-/// changes anything, naming the file and the host's statement.
+/// changes anything, naming the file and the host's statement, and the way out: taking this
+/// pallet's own change to the file out.
 ///
-/// Revert: drop the refusal → the merge dies reading the absent blob with a store error, not
-/// the refusal → red.
+/// Revert: drop the refusal → the merge dies reading the absent blob, refused by the read with
+/// no path → red.
 #[test]
 fn a_merge_that_must_read_withheld_content_refuses_content_withheld() {
     let (warehouse, feature) = withheld_feature("refuse");
@@ -492,6 +493,8 @@ fn a_merge_that_must_read_withheld_content_refuses_content_withheld() {
         assert_eq!(report["error"]["code"], "content_withheld", "{}", report);
         assert_eq!(report["error"]["details"]["path"], "film.mkv", "{}", report);
         assert_eq!(report["error"]["details"]["statement"], "Withheld by the remote's host.", "{}", report);
+        let next_step = report["error"]["next_step"].as_str().unwrap_or_default();
+        assert!(next_step.contains("this pallet's own change to it taken out"), "{}", report);
 
         assert_eq!(std::fs::read_to_string(warehouse.root.join("film.mkv")).unwrap(), "the film on main\n");
         let report = warehouse.stocktake();
@@ -504,8 +507,8 @@ fn a_merge_that_must_read_withheld_content_refuses_content_withheld() {
 /// deleted the file, and keeping our withheld version where they deleted it.
 ///
 /// Revert: drop the put-back arm, or the conflict arm, of the refusal → the first merges by
-/// reading the absent blob and dies with a store error, the second stages a conflict at a path
-/// holding no file → red.
+/// reading the absent blob and is refused by the read with no path, the second stages a conflict
+/// at a path holding no file → red.
 #[test]
 fn a_conflict_over_withheld_content_refuses_content_withheld() {
     let refused = |warehouse: &Warehouse, args: &[&str]| {
