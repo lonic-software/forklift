@@ -912,6 +912,15 @@ impl<'l> ShardMutationBatch<'l> {
         self.update(parent_key, |inventory| inventory.add_item(entry))
     }
 
+    /// Record a file left out of the working directory ([`crate::util::shift_utils::NotCheckedOut`])
+    /// in its parent's shard, `Unavailable` at `hash`. Nothing is statted: the path holds no file.
+    pub fn stage_unavailable(&mut self, path: &str, hash: String, item_type: DirEntryType) -> Result<(), String> {
+        let (parent_key, name) = split_path_key(path);
+        let item = build_unavailable_inventory_item(name, hash, item_type);
+
+        self.update(parent_key, |inventory| { inventory.add_item(item); })
+    }
+
     /// Stat a file just written with content not stored yet (e.g. a merge result), record it in
     /// its parent's shard, and stage its blob into this batch's own write batch — made durable
     /// before any shard is published, so no published entry names a blob that is not. Call it

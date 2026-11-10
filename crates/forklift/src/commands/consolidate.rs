@@ -547,6 +547,7 @@ pub(crate) fn ensure_no_untracked_collisions(actions: &[MergeAction],
                                              target: &str) -> Result<inventory_utils::ShardLedger, String> {
     shift_utils::check_planned_paths(actions.iter().filter_map(|action| match action {
         MergeAction::TakeTheirs { path, .. }
+        | MergeAction::LeaveOut { path, .. }
         | MergeAction::Delete { path }
         | MergeAction::Merged { path, .. }
         | MergeAction::Conflict { path, .. } => Some(path.as_str()),
@@ -569,6 +570,9 @@ pub(crate) fn ensure_no_untracked_collisions(actions: &[MergeAction],
     for action in actions {
         let new_path = match action {
             MergeAction::TakeTheirs { path, is_new: true, .. } => Some(path),
+            // Writes nothing, but stages the path: an untracked file there would stand under an
+            // entry that names other content, and read as that entry's file.
+            MergeAction::LeaveOut { path, is_new: true, .. } => Some(path),
             // A delete/modify conflict re-creates a file we deleted.
             MergeAction::Conflict { path, .. } if conflict_writes(action) => Some(path),
             _ => None,
@@ -645,6 +649,7 @@ pub(crate) fn keep_aliased_files(actions: &mut Vec<MergeAction>,
     let our_tree = object_utils::load_tree(our_tree_hash)?;
     let planned: HashSet<&str> = actions.iter().map(|action| match action {
         MergeAction::TakeTheirs { path, .. }
+        | MergeAction::LeaveOut { path, .. }
         | MergeAction::Delete { path }
         | MergeAction::Merged { path, .. }
         | MergeAction::Conflict { path, .. }
@@ -790,47 +795,13 @@ fn apply_merge_actions_to(ledger: &inventory_utils::ShardLedger,
         }
     }
 
-    // Which of their files are left out is decided before any write, as a checkout decides it.
-    let not_checked_out = shift_utils::NotCheckedOut::read()?;
-    let mut writes: Vec<(&MergeAction, bool)> = Vec::new();
-
-    for action in actions.iter().filter(|action| !matches!(action, MergeAction::Delete { .. })) {
-        let left_out = match action {
-            MergeAction::TakeTheirs { hash, .. } => not_checked_out.holds(hash)?,
-            _ => false,
-        };
-        writes.push((action, left_out));
-    }
+    let writes: Vec<&MergeAction> = actions.iter().filter(|action| !matches!(action, MergeAction::Delete { .. })).collect();
 
     // Their blobs load ahead on worker threads while the writes land here, in order.
-    shift_utils::write_in_order(&writes, |(action, left_out)| match action {
-        MergeAction::TakeTheirs { hash, item_type, .. } if !left_out => Some((hash.as_str(), *item_type)),
+    shift_utils::write_in_order(&writes, |action| match action {
+        MergeAction::TakeTheirs { hash, item_type, .. } => Some((hash.as_str(), *item_type)),
         _ => None,
-    }, |(action, left_out), content| match action {
-        MergeAction::TakeTheirs { path, hash, item_type, is_new } if *left_out => {
-            leave_out_theirs(path, hash, *item_type, *is_new, batch)
-        }
-        _ => apply_merge_action(ledger, action, content, batch, conflict_paths),
-    })
-}
-
-/// Take their file at `path` whose content this warehouse leaves out
-/// ([`shift_utils::NotCheckedOut`]): write nothing, remove the file our side had there (as a
-/// checkout's skip does, so the path never holds our bytes under their hash), and stage the entry
-/// `Unavailable` at their hash.
-fn leave_out_theirs(path: &str,
-                    hash: &str,
-                    item_type: DirEntryType,
-                    is_new: bool,
-                    batch: &mut inventory_utils::ShardMutationBatch) -> Result<(), String> {
-    if !is_new {
-        shift_utils::apply_file_op(&shift_utils::FileOp::Remove { path: path.to_string() })?;
-    }
-
-    let (parent_key, name) = inventory_utils::split_path_key(path);
-    let item = inventory_utils::build_unavailable_inventory_item(name, hash.to_string(), item_type);
-
-    batch.update(parent_key, |inventory| { inventory.add_item(item); })
+    }, |action, content| apply_merge_action(ledger, action, content, batch, conflict_paths))
 }
 
 /// Apply one merge action to the working directory, and stage its inventory change into
@@ -848,6 +819,11 @@ fn apply_merge_action(ledger: &inventory_utils::ShardLedger,
         MergeAction::TakeTheirs { path, hash, item_type, is_new } => {
             shift_utils::write_tracked_file_from(path, hash, *item_type, *is_new, content)?;
             batch.stage_file_from_stat(path, hash.clone(), *item_type)
+        }
+
+        MergeAction::LeaveOut { path, hash, item_type, is_new } => {
+            shift_utils::leave_out(path, *is_new)?;
+            batch.stage_unavailable(path, hash.clone(), *item_type)
         }
 
         MergeAction::Delete { path } => {

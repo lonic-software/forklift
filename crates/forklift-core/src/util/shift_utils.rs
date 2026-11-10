@@ -725,12 +725,21 @@ pub fn apply_ops_each(ops: &[FileOp],
             return after(op, Applied::Done);
         }
 
-        if !is_new {
-            apply_file_op(&FileOp::Remove { path: path.clone() })?;
-        }
+        leave_out(path, *is_new)?;
 
         after(op, Applied::NotCheckedOut)
     })
+}
+
+/// Leave the file at `path` out of the working directory, its content being one this warehouse
+/// does not check out ([`NotCheckedOut`]): write nothing, and remove the file the old tree had there
+/// unless `is_new`, so the path never holds stale bytes under the new hash.
+pub fn leave_out(path: &str, is_new: bool) -> Result<(), String> {
+    if !is_new {
+        apply_file_op(&FileOp::Remove { path: path.to_string() })?;
+    }
+
+    Ok(())
 }
 
 /// Below this many blobs to load, a materializer loads each one itself: the prefetch's threads

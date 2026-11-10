@@ -339,10 +339,7 @@ pub fn pop_parked() -> Result<(), String> {
 
     let applied = shift_utils::apply_ops_each(&ops, &removed_dirs, |op, applied| match op {
         FileOp::Write { path, hash, item_type, .. } if applied == Applied::NotCheckedOut => {
-            let (parent_key, name) = inventory_utils::split_path_key(path);
-            let item = inventory_utils::build_unavailable_inventory_item(name, hash.clone(), *item_type);
-
-            batch.update(parent_key, |inventory| { inventory.add_item(item); })
+            batch.stage_unavailable(path, hash.clone(), *item_type)
         }
         FileOp::Write { path, hash, item_type, .. } => batch.stage_file_from_stat(path, hash.clone(), *item_type),
         FileOp::Remove { path } => {
