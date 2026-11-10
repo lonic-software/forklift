@@ -144,9 +144,9 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
 
 - **A file whose content the remote's host withholds stays in the head, not checked out.** Where
   the `unavailable` record lists a file's content and this warehouse lacks it, a head move such as
-  `shift`, and `park`, `park pop`, `unload` and a directory `restore`, write no file at its path and
-  keep it staged as the head names it, so the next parcel still names it; a load never turns its
-  absence into a removal, and `forklift remove` stages one on purpose. A file put at the path is
+  `shift` or `undo`, and `park`, `park pop`, `unload` and a directory `restore`, write no file at
+  its path and keep it staged as the head names it, so the next parcel still names it; a load
+  never turns its absence into a removal, and `forklift remove` stages one on purpose. A file put at the path is
   loaded as a change. `stocktake` lists such files apart, as `unavailable` in `--json`, and they
   do not make the bay unclean; `audit` and `heal` do not count staged ones as lost. `--json` schema
   is now 38.
