@@ -238,7 +238,8 @@ omits the field. A host lists a hash without saying what it is, so a head that h
 as a tree, a parcel or a chunk does not withhold it and leaves it out of this list; one that lacks
 the object withholds it whatever it is, as with a redaction (below). The AWS head
 learns which on the first request after the host lists it, and answers that request `503` with
-`Retry-After` when it cannot find out in time, never as if nothing were withheld.
+`Retry-After` when it cannot find out in time, never as if nothing were withheld. A stored object
+whose kind it cannot read is withheld until it can, refused like any other withheld content.
 
 **Withheld content is refused.** `GET` and `PUT` of `/v1/objects/{hash}` for a withheld hash
 answer `451` with `code` `content_withheld`, the host's statement in the message, and

@@ -6487,11 +6487,12 @@ fn a_withheld_hash_the_store_lacks_applies_to_a_tree_uploaded_later() {
     assert!(listed[0].item.settled && !listed[0].item.never_applies, "{:?}", listed[0].item);
 }
 
-/// An object whose header this build cannot read is never guessed at: settling its withheld item
-/// fails loudly, every object request answers `500`, and the item stays unsettled.
-// Revert: settle an unreadable header as a blob → the request is served → red.
+/// An object whose header this build cannot read is never guessed at: its withheld item stays
+/// unsettled and applies, so its own hash is refused `451`, while other content is served.
+// Revert: settle an unreadable header as never applying → it is served → red. Revert: fail the
+// listing on it → other content is refused → red.
 #[test]
-fn a_withheld_object_whose_header_cannot_be_read_is_refused_loudly() {
+fn a_withheld_object_whose_header_cannot_be_read_is_refused_alone() {
     let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
     let main = gate_parcel(&head, &[], vec![gate_file(&head, "x", "1")]);
     plant(&head.refs, "main", &main);
@@ -6499,9 +6500,8 @@ fn a_withheld_object_whose_header_cannot_be_read_is_refused_loudly() {
     head.objects.put_verified(&odd, b"no header at all").expect("seed");
     withhold(&head, &odd);
 
-    let err = head.object_get(&main).expect_err("not guessed at");
-    assert_eq!(err.status, Status::Internal, "{}", err.message);
-    assert!(err.message.contains(&odd), "{}", err.message);
+    assert!(served(&head, &main), "other content is served");
+    assert_host_withheld(&head.object_get(&odd).expect_err("not guessed at"), &odd);
     let listed = forklift_aws_lambda::withheld::list(&head.refs).expect("list");
     assert!(!listed[0].item.settled, "{:?}", listed[0].item);
 }

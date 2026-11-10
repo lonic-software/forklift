@@ -116,7 +116,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// # Returns
     /// * `Ok(Withholding)` - Every item, settled.
     /// * `Err(HeadError)`  - The items could not be listed or one cannot be read (`500`), or one
-    ///                       was not settled within this request (`503`, with `Retry-After`).
+    ///                       was not settled within this request (`503`, with `Retry-After`). An
+    ///                       item whose object's header cannot be read stays unsettled and applies,
+    ///                       refusing only its own hash.
     pub(super) fn withholding(&self) -> HeadResult<Withholding> {
         let mut budget = self.scan_budget();
         let mut items = Vec::new();
@@ -179,7 +181,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             // object cannot tell what it is, so the item applies, whatever it names, as a
             // redaction's does: a tree or a chunk of that hash a lift uploads later is refused, and
             // the lift fails rather than landing without it. A header this build cannot read is
-            // refused loudly, never guessed at.
+            // never guessed at: the item stays unsettled, so it applies and only its own hash is
+            // refused, and each request logs it.
             let bytes = match self.objects.get(&hash) {
                 Ok(bytes) => bytes,
                 Err(error) => return Ok(Settled::Unsettled(format!(
@@ -189,13 +192,18 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 ))),
             };
             let kind = match bytes.as_deref() {
-                Some(bytes) => Some(object_utils::peek_object_header(bytes).map(|(object_type, _)| object_type).map_err(|error| {
-                    HeadError::internal(format!(
-                        "Object {} cannot be read ({:?}), so whether this warehouse's host withholds it \
-                        as a file's content cannot be settled.",
-                        hash, error
-                    ))
-                })?),
+                Some(bytes) => match object_utils::peek_object_header(bytes) {
+                    Ok((object_type, _)) => Some(object_type),
+                    Err(error) => {
+                        eprintln!(
+                            "forklift-aws-lambda: object {} has a header this build cannot read ({:?}), so \
+                            whether its host withholds it as a file's content cannot be settled; it is \
+                            refused until it can be.",
+                            hash, error
+                        );
+                        return Ok(Settled::Item(listed));
+                    }
+                },
                 None => None,
             };
 
