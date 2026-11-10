@@ -1127,7 +1127,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     Ok(Tolerated::removed_only(self.applied_set()?, withholding.applying()))
                 },
             )
-            .map_err(|refusal| unsettled.take().unwrap_or_else(|| HeadError::unprocessable(refusal)))?;
+            // An incomplete history is classified, so a lift can tell it apart and upload again.
+            .map_err(|refusal| unsettled.take().unwrap_or_else(|| HeadError::unprocessable(refusal.for_ref_update())))?;
 
             // A creation over a tombstone lifts only when it acknowledged the deletion and its
             // new head descends from the deleted one. Checked after the closure, so the walk of
@@ -2023,6 +2024,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     // it can never serve.
                     &|| Ok(Tolerated::default()),
                 )
+                .map_err(String::from)
             };
 
             // A refusal naming withheld content says so. Listed only on the refusal, without

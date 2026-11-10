@@ -6541,13 +6541,28 @@ async fn lift_pallet_inner(client: &RemoteClient,
 
     refuse_redacted_head(pallet, local_head, remote_head)?;
 
-    let UploadedHistory { new_parcels, uploaded_objects, uploaded_signatures, withheld } =
-        // An acknowledged tombstone's head is held on the remote (a gc root), so a re-creation
-        // uploads only the work past it.
-        upload_history(client, local_head, remote_head.or(tombstone),
-                       &held_elsewhere(info, pallet), info, progress).await?;
+    // An acknowledged tombstone's head is held on the remote (a gc root), so a re-creation uploads
+    // only the work past it.
+    let base = remote_head.or(tombstone);
+    let elsewhere = held_elsewhere(info, pallet);
+    let mut uploaded = upload_history(client, local_head, base, &elsewhere, info, progress).await?;
 
-    client.update_ref(pallet, remote_head, local_head, tombstone).await?;
+    // The remote may answer an object present and then delete it before the ref update: content
+    // it owed a deletion. Its closure check then refuses the head as incomplete, and the
+    // negotiation, asked again, answers that object missing. So the upload runs once more; the
+    // update after it reports whatever it answers.
+    if let Err(refusal) = client.update_ref(pallet, remote_head, local_head, tombstone).await {
+        if !is_remote_history_incomplete(&refusal) {
+            return Err(refusal);
+        }
+
+        let again = upload_history(client, local_head, base, &elsewhere, info, progress).await?;
+        uploaded = uploaded.then(again);
+
+        client.update_ref(pallet, remote_head, local_head, tombstone).await?;
+    }
+
+    let UploadedHistory { new_parcels, uploaded_objects, uploaded_signatures, withheld } = uploaded;
 
     // After the compare-and-set, so a refused or failed lift records nothing; best-effort, since
     // the remote has the head now and an error here would read as a lift that did not land.
@@ -6920,6 +6935,30 @@ struct UploadedHistory {
 
     /// The withheld content the history names, sorted ([`LiftStats::withheld`]).
     withheld: Vec<String>,
+}
+
+impl UploadedHistory {
+    /// This upload followed by `again`, an upload of the same history: the objects either sent,
+    /// the parcels and signatures as `again` counts them (it sends every signature anew), and the
+    /// withheld content either met.
+    fn then(self, again: UploadedHistory) -> UploadedHistory {
+        let mut withheld: Vec<String> = self.withheld.into_iter().chain(again.withheld).collect();
+        withheld.sort();
+        withheld.dedup();
+
+        UploadedHistory {
+            new_parcels: again.new_parcels,
+            uploaded_objects: self.uploaded_objects + again.uploaded_objects,
+            uploaded_signatures: again.uploaded_signatures,
+            withheld,
+        }
+    }
+}
+
+/// Whether `refusal`, a ref update's, is the remote's [`RefusalCode::RemoteHistoryIncomplete`].
+fn is_remote_history_incomplete(refusal: &str) -> bool {
+    crate::error::deframe(refusal)
+        .is_some_and(|(code, _, _)| code == RefusalCode::RemoteHistoryIncomplete.as_str())
 }
 
 /// What a lift's closure walk ([`collect_changed_closure`]) never offers the remote, and the
@@ -10220,6 +10259,142 @@ mod tests {
         assert!(!negotiated[1].contains(&withheld_chunks[1]));
 
         assert_eq!(uploaded.withheld, vec![withheld_recipe], "the unoffered hash is not reported");
+    }
+
+    /// A remote that answers every negotiated hash `direct` and each ref update with the next of
+    /// `refs` (status and body), `200` once they run out. Records each negotiation's hashes, each
+    /// object `PUT` and how many ref updates it was sent.
+    struct RefusingRefRemote {
+        url: String,
+        negotiated: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+        put: Arc<std::sync::Mutex<Vec<String>>>,
+        ref_updates: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl RefusingRefRemote {
+        fn start(refs: Vec<(u16, String)>) -> RefusingRefRemote {
+            use std::io::Write;
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let negotiated = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let put = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let ref_updates = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (negotiated_log, put_log, ref_count) = (Arc::clone(&negotiated), Arc::clone(&put), Arc::clone(&ref_updates));
+
+            std::thread::spawn(move || {
+                let mut refs = refs.into_iter();
+
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let Some((method, path, _, body)) = read_test_request(&mut stream) else { continue };
+
+                    let (status, response) = if path == "/v1/objects/upload-targets" {
+                        let request: UploadTargetsRequest = serde_json::from_slice(&body).unwrap();
+                        negotiated_log.lock().unwrap().push(request.hashes.clone());
+                        (200, serde_json::to_string(&UploadTargetsResponse {
+                            present: Vec::new(), targets: BTreeMap::new(), direct: request.hashes, withheld: Vec::new(),
+                        }).unwrap())
+                    } else if method == "POST" && path == "/v1/pallets/main" {
+                        ref_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        refs.next().unwrap_or((200, "{}".to_string()))
+                    } else {
+                        if method == "PUT" {
+                            if let Some(hash) = path.strip_prefix("/v1/objects/") {
+                                put_log.lock().unwrap().push(hash.to_string());
+                            }
+                        }
+                        (200, "{}".to_string())
+                    };
+
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        status, response.len(), response
+                    );
+                    let _ = stream.flush();
+                }
+            });
+
+            RefusingRefRemote { url, negotiated, put, ref_updates }
+        }
+
+        /// The body a remote's ref update answers an incomplete history with.
+        fn incomplete() -> (u16, String) {
+            (422, serde_json::json!({
+                "error": "Blob 00ab is missing. This remote does not hold the new head's whole history.",
+                "code": "remote_history_incomplete",
+                "next_step": "forklift lift",
+            }).to_string())
+        }
+    }
+
+    /// Lift `main` at a fresh one-file head to `remote`, which has no such pallet yet.
+    fn lift_to(remote: &RefusingRefRemote, content: &str) -> Result<LiftResult, String> {
+        use crate::enums::dir_entry_type::DirEntryType::Normal;
+
+        let blob = store_blob(content);
+        let root = store_tree(&[("file.txt", &blob, Normal)]);
+        let head = stack_with_tree(Vec::new(), &root, content);
+
+        let info = WarehouseInfo {
+            protocol: PROTOCOL_VERSION.to_string(),
+            default_pallet: "main".to_string(),
+            pallets: BTreeMap::new(),
+            trust: None,
+            chunking: true,
+            tombstones: None,
+            redactions: None,
+            withheld: None,
+        };
+
+        let client = RemoteClient::new(&remote.url, None).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        runtime.block_on(lift_pallet_inner(&client, "main", &head, None, None, false, &info, &Progress::NONE))
+    }
+
+    /// A ref update refused as an incomplete history — content the remote deleted after it was
+    /// negotiated — is answered by one more negotiation and upload, then one more ref update,
+    /// which lands; the stats count the objects both uploads sent.
+    ///
+    /// Revert: return the refusal as it is → the lift fails after one ref update.
+    #[test]
+    fn a_lift_refused_as_incomplete_uploads_again_and_lands() {
+        let _scratch = Scratch::new("lift-retry-incomplete");
+        let remote = RefusingRefRemote::start(vec![RefusingRefRemote::incomplete()]);
+
+        let LiftResult::Lifted(stats) = lift_to(&remote, "retried").expect("the second ref update lands") else {
+            panic!("the lift was up to date");
+        };
+
+        assert_eq!(remote.ref_updates.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(remote.negotiated.lock().unwrap().len(), 2, "the upload is negotiated again");
+        let put = remote.put.lock().unwrap().len();
+        assert_eq!(put, 6, "a parcel, a tree and a blob, sent twice");
+        assert_eq!(stats.uploaded_objects, put);
+        assert_eq!(stats.new_parcels, 1);
+    }
+
+    /// The retry happens once: a second incomplete refusal is the lift's answer, with its code.
+    /// Any other refusal is not retried at all.
+    ///
+    /// Revert: retry until the ref update lands → three ref updates. Retry on any refusal of the
+    /// ref update → the uncoded one is sent twice.
+    #[test]
+    fn a_lift_retries_only_an_incomplete_history_and_only_once() {
+        let _scratch = Scratch::new("lift-retry-bounded");
+
+        let remote = RefusingRefRemote::start(vec![RefusingRefRemote::incomplete(), RefusingRefRemote::incomplete()]);
+        let refused = lift_to(&remote, "twice").err().expect("the second refusal stands");
+        assert_eq!(remote.ref_updates.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(is_remote_history_incomplete(&refused), "the code reaches the caller: {}", refused);
+
+        let other = (422, serde_json::json!({"error": "Blob 00ab is missing."}).to_string());
+        let remote = RefusingRefRemote::start(vec![other]);
+        let refused = lift_to(&remote, "once").err().expect("an uncoded refusal stands");
+        assert_eq!(remote.ref_updates.load(std::sync::atomic::Ordering::SeqCst), 1, "{}", refused);
+        assert_eq!(remote.negotiated.lock().unwrap().len(), 1);
     }
 
     /// Plant a blob above the whole-object ceiling directly, bypassing `LooseObject::store`'s

@@ -575,6 +575,10 @@ error_codes! {
 
     /// The remote's host withholds content the command needed; nothing it would have written was.
     ContentWithheld,
+
+    /// The remote refused to move a pallet because the new head's history is not all there, even
+    /// after the lift uploaded it again; nothing moved.
+    RemoteHistoryIncomplete,
 }
 
 impl ErrorCode {
@@ -631,6 +635,7 @@ impl ErrorCode {
             ErrorCode::ContentRedacted => RefusalCode::ContentRedacted.as_str(),
             ErrorCode::HeadNamesContent => RefusalCode::HeadNamesContent.as_str(),
             ErrorCode::ContentWithheld => RefusalCode::ContentWithheld.as_str(),
+            ErrorCode::RemoteHistoryIncomplete => RefusalCode::RemoteHistoryIncomplete.as_str(),
         }
     }
 
@@ -690,6 +695,7 @@ impl ErrorCode {
             ErrorCode::ContentRedacted => 49,
             ErrorCode::HeadNamesContent => 50,
             ErrorCode::ContentWithheld => 51,
+            ErrorCode::RemoteHistoryIncomplete => 52,
         }
     }
 
@@ -823,6 +829,8 @@ impl ErrorCode {
                 "The object to redact is in a pallet head; take the file out of that head first. Nothing was recorded",
             ErrorCode::ContentWithheld =>
                 "The remote's host withholds content the command needed (a takedown, not a redaction), so the remote neither serves nor takes it; a copy this warehouse holds is kept",
+            ErrorCode::RemoteHistoryIncomplete =>
+                "The remote refused to move a pallet because part of the new head's history is absent there or unreadable, even after the lift negotiated and uploaded again; nothing moved",
         }
     }
 
@@ -880,6 +888,7 @@ impl ErrorCode {
             RefusalCode::ContentRedacted => ErrorCode::ContentRedacted,
             RefusalCode::HeadNamesContent => ErrorCode::HeadNamesContent,
             RefusalCode::ContentWithheld => ErrorCode::ContentWithheld,
+            RefusalCode::RemoteHistoryIncomplete => ErrorCode::RemoteHistoryIncomplete,
         }
     }
 }
@@ -1483,6 +1492,7 @@ mod tests {
             (RefusalCode::ContentRedacted, "content_redacted", 49),
             (RefusalCode::HeadNamesContent, "head_names_content", 50),
             (RefusalCode::ContentWithheld, "content_withheld", 51),
+            (RefusalCode::RemoteHistoryIncomplete, "remote_history_incomplete", 52),
         ];
 
         // The table covers every code, so a new one cannot ship without its row.

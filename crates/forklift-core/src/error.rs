@@ -350,6 +350,13 @@ refusal_codes! {
     /// redaction), so it neither serves nor takes it. The details carry the hash and the host's
     /// statement. A copy this warehouse holds is unaffected.
     ContentWithheld => "content_withheld",
+
+    /// A remote refused to move a pallet because the new head's history is not all there: an
+    /// object the head reaches is absent, or the remote could not read it, and no redaction it
+    /// applied nor content its host withholds accounts for it. Nothing moved. After a lift's
+    /// upload this is most often content the remote deleted after the negotiation answered it
+    /// present (a deletion it owed), so a lift negotiates and uploads again, once, by itself.
+    RemoteHistoryIncomplete => "remote_history_incomplete",
 }
 
 impl RefusalCode {
