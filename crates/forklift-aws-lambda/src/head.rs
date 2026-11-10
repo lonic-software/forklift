@@ -35,7 +35,7 @@
 //! tokio refuses to let a runtime worker block on the futures an SDK-backed store bridges.
 //! See `blocking.rs`.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
@@ -52,7 +52,6 @@ use forklift_core::util::office_utils::{self, OfficeState, TrustAnchor, OFFICE_P
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef, RefUpdateError};
 use forklift_core::util::redaction_utils::{self, REDACTIONS_PALLET_NAME};
 use forklift_core::util::sealed_utils::Tolerated;
-use forklift_core::util::withholding::WithheldSet;
 use forklift_core::util::haul_utils::{self, HAUL_PALLET_NAME};
 use forklift_core::util::{
     audit_utils, bundle_utils, file_utils, merge_utils, meta_tree, object_utils, pallet_utils, sign_utils,
@@ -69,6 +68,7 @@ use crate::store::{
 
 mod chunks;
 mod redaction;
+mod withholding;
 
 pub use chunks::{fixture_items as chunk_fixture_items, items_read as chunk_items_read, refuses_promotion as chunk_promotion_refused, Withheld, ROUND_RETRY_AFTER_SECONDS};
 pub use redaction::{delete_if_applied as delete_if_redaction_applied, AppliedCopies, is_applied as redaction_applied, record_state as redaction_record};
@@ -352,6 +352,15 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
     /// `GET /v1/warehouse` — the handshake: protocol version, refs and trust.
     pub fn handshake(&self) -> HeadResult<WarehouseInfo> {
+        let withholding = self.withholding()?;
+        let redactions = self.served_redactions()?;
+
+        // A withheld recipe settling journaled starts its chunk round too; the redactions advanced
+        // it already when there are any.
+        if redactions.is_empty() && withholding.has_recipe() {
+            self.advance_round_logged();
+        }
+
         let listing = self.refs.list_refs().map_err(HeadError::internal)?;
         let pallets: BTreeMap<String, String> =
             listing.live.into_iter().map(|(pallet_ref, head)| (pallet_ref.to_wire(), head)).collect();
@@ -376,9 +385,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             // map as a head that keeps no tombstones.
             tombstones: Some(tombstones),
             // Every redaction `@redactions` records, each judged first.
-            redactions: Some(self.served_redactions()?),
-            // This head withholds nothing yet, so it reports nothing.
-            withheld: None,
+            redactions: Some(redactions),
+            // Every withheld item that applies, each settled first but for one whose object's header
+            // cannot be read. Always present, empty or not: a client reads an absent list as a head
+            // that reports nothing.
+            withheld: Some(withholding.served()),
         })
     }
 
@@ -395,6 +406,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     pub fn missing(&self, hashes: &[String]) -> HeadResult<Vec<String>> {
         self.reject_malformed_batch(hashes)?;
 
+        // Settled first, so a withheld recipe's chunks are gated below. Content its host
+        // withholds is never listed: this head takes no copy of it.
+        let withholding = self.withholding()?;
+        let withheld_content = withholding.applying();
+
         let mut absent: HashSet<String> =
             self.objects.objects_missing(hashes).map_err(HeadError::internal)?.into_iter().collect();
 
@@ -403,7 +419,10 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         let withheld = chunks::withheld(&self.objects, &self.refs, hashes).map_err(HeadError::internal)?;
         absent.extend(withheld.into_iter().filter(|(_, withheld)| *withheld == Withheld::Absent).map(|(hash, _)| hash));
 
-        Ok(hashes.iter().filter(|hash| absent.contains(hash.as_str())).cloned().collect())
+        Ok(hashes.iter()
+            .filter(|hash| absent.contains(hash.as_str()) && !withheld_content.contains(hash))
+            .cloned()
+            .collect())
     }
 
     /// `POST /v1/holds/{name}` — which of `candidates` the pallet still holds, its head or
@@ -477,6 +496,13 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         // any probe or presign, so no target is ever handed out for it.
         self.refuse_redacted(&unique)?;
 
+        // Content the host withholds is never taken, but a lift may name it: its ref update
+        // tolerates the absence. So it is answered apart, never probed or given a target.
+        let withheld = self.withholding()?.applying();
+        let (withheld_hashes, unique): (Vec<String>, Vec<String>) =
+            unique.into_iter().partition(|hash| withheld.contains(hash));
+        response.withheld = withheld_hashes;
+
         // One bulk probe instead of one `exists` per unique hash: on the AWS head this is the
         // bounded-concurrency S3 `HeadObject` batch, not up to a thousand serial round trips for
         // a large negotiation. `put_target` (a local presign, no network round trip) still runs
@@ -517,6 +543,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     pub fn object_get(&self, hash: &str) -> HeadResult<ObjectReadResult> {
         require_object_hash(hash)?;
         self.refuse_redacted(&[hash.to_string()])?;
+        // Settled before the chunk gate, so a withheld recipe's chunks are gated.
+        let withholding = self.withholding()?;
+        self.refuse_withheld(&withholding, &[hash.to_string()])?;
         self.refuse_withheld_chunk(hash)?;
 
         match self.objects.access(hash).map_err(HeadError::internal)? {
@@ -544,6 +573,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         self.require_uploader(caller)?;
         require_object_hash(hash)?;
         self.refuse_redacted(&[hash.to_string()])?;
+        let withholding = self.withholding()?;
+        self.refuse_withheld(&withholding, &[hash.to_string()])?;
 
         match self.objects.put_target(session, hash).map_err(HeadError::internal)? {
             PutTarget::Staged(url) => Ok(ObjectWriteResult::Redirect(url)),
@@ -949,9 +980,21 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
         // The new head must be present — a ref never points at a missing parcel.
         if !self.objects.exists(&request.new_head).map_err(HeadError::internal)? {
+            // The negotiation never asks for withheld content, so say why this one is absent. Read
+            // only on this refusal; a listing that fails leaves the plain one, logged.
+            let why = match self.withheld_listing() {
+                Ok(listed) if withholding::applying(&listed).contains(&request.new_head) =>
+                    " This warehouse's host withholds it, so it never takes it.",
+                Ok(_) => "",
+                Err(error) => {
+                    eprintln!("ref update: the withheld items could not be listed for a refusal: {}", error);
+                    ""
+                }
+            };
+
             return Err(HeadError::unprocessable(format!(
-                "The new head {} has not been uploaded.",
-                request.new_head
+                "The new head {} has not been uploaded.{}",
+                request.new_head, why
             )));
         }
 
@@ -1063,6 +1106,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
                 object_utils::parse_tree_bytes(hash, &bytes)
             };
+            let unsettled: RefCell<Option<HeadError>> = RefCell::new(None);
             audit_utils::verify_parcel_closure_with(
                 &request.new_head,
                 request.old_head.as_deref(),
@@ -1070,10 +1114,20 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 &chunks_missing,
                 &load_recipe_chunks,
                 &load_base_tree,
-                // This head withholds nothing yet, so only its applied redactions are tolerated.
-                &|| Ok(Tolerated::removed_only(self.applied_set()?, WithheldSet::default())),
+                // Its applied redactions and the content its host withholds, each item settled
+                // first. Settling that does not finish within the request is its own `503`, never
+                // the walk's `422`.
+                &|| {
+                    let withholding = self.withholding().map_err(|error| {
+                        let message = error.message.clone();
+                        unsettled.replace(Some(error));
+                        message
+                    })?;
+
+                    Ok(Tolerated::removed_only(self.applied_set()?, withholding.applying()))
+                },
             )
-            .map_err(HeadError::unprocessable)?;
+            .map_err(|refusal| unsettled.take().unwrap_or_else(|| HeadError::unprocessable(refusal)))?;
 
             // A creation over a tombstone lifts only when it acknowledged the deletion and its
             // new head descends from the deleted one. Checked after the closure, so the walk of
@@ -1543,10 +1597,14 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
         // A recorded hash is judged first: an applied or undecided one is left out of the bundle,
         // as an object the store lacks is.
+        // Content its host withholds is left out too, settled before the chunk gate so a withheld
+        // recipe's chunks are gated.
         let verdicts = self.judge_hashes(hashes)?;
+        let host_withheld = self.withholding()?.applying();
         let chunks_withheld = chunks::withheld(&self.objects, &self.refs, hashes).map_err(HeadError::internal)?;
         let withheld = |hash: &str| {
             matches!(verdicts.get(hash), Some(redaction::Verdict::Applied { .. } | redaction::Verdict::Undecided(_)))
+                || host_withheld.contains(hash)
                 || chunks_withheld.contains_key(hash)
         };
 
@@ -1672,9 +1730,12 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         self.require_uploader(caller)?;
 
         // Redacted content is never promoted, and the commit is refused: its staged copy is
-        // deleted, and so is a canonical copy an earlier attempt of this commit promoted.
+        // deleted, and so is a canonical copy an earlier attempt of this commit promoted. So is
+        // content its host withholds, refused `451`, its staged copy deleted. Settled first, so a
+        // withheld recipe's chunks are gated below.
+        let withholding = self.withholding()?;
         let named: Vec<String> = control_plane.iter().chain(blobs.iter()).cloned().collect();
-        self.refuse_applied_staged(session, &named)?;
+        self.refuse_applied_staged(session, &named, &withholding)?;
 
         // While a redacted-chunk round runs, none of its recipes' chunks is promoted.
         if let Some(hash) = chunks::refuses_promotion(&self.objects, &self.refs, control_plane).map_err(HeadError::internal)? {
@@ -1710,7 +1771,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
         // A redaction that applied between the check above and a promotion's write found no
         // object to delete: the copy just written is deleted here instead.
-        self.refuse_applied_promoted(session, &promoted)?;
+        self.refuse_applied_promoted(session, &promoted, &withholding)?;
 
         self.check_blobs_promoted(session, blobs)?;
 
@@ -1958,8 +2019,18 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 )
             };
 
-            audit_utils::require_adopted_history(Some(adopts), &verify_closure)
-                .map_err(HeadError::unprocessable)
+            // A refusal naming withheld content says so. Listed only on the refusal, without
+            // settling: the note names what the host lists, and a listing that fails leaves the
+            // plain refusal, logged.
+            audit_utils::require_adopted_history(Some(adopts), &verify_closure).map_err(|refusal| {
+                match self.withheld_listing() {
+                    Ok(listed) => HeadError::unprocessable(audit_utils::withheld_beyond_files(refusal, &withholding::applying(&listed))),
+                    Err(error) => {
+                        eprintln!("trust: the withheld items could not be listed for a refusal: {}", error);
+                        HeadError::unprocessable(refusal)
+                    }
+                }
+            })
         })
     }
 

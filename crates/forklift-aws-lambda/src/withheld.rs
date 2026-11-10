@@ -6,8 +6,8 @@
 //! for the head to stop serving and taking it, whatever names it. Each item is a versioned JSON
 //! record of the statement, when the hash was withheld, and how far withholding it has got. The
 //! operator writes it with `forklift-aws-withhold` ([`add`]). [`list`] reads every item with one
-//! strongly consistent `Query`, so a head listing them on each request it gates sees a withhold
-//! on the next request, with nothing to poll. No request of this build's head lists them yet.
+//! strongly consistent `Query`, so the head, listing them on each request it gates, sees a withhold
+//! on the next request, with nothing to poll (`head::withholding`).
 //!
 //! An item of a version this build does not read, or that does not parse, fails every listing,
 //! loudly, and is never written over: a head that cannot tell what its host withholds must never
@@ -142,6 +142,20 @@ pub fn decode(hash: &str, stored: &str) -> Result<WithheldItem, String> {
         cannot be told. Nothing was written over it.",
         hash, error
     ))
+}
+
+/// Whether the host withholds `hash` as a file's content, by its own item: what the staging
+/// verifier and a lift commit read before they promote a staged copy. An item not settled yet
+/// applies; one settled as naming no file's content does not.
+///
+/// # Returns
+/// * `Ok(bool)`    - Whether an item of `hash` applies; `false` when there is none.
+/// * `Err(String)` - The item could not be read, or its record cannot be ([`decode`]).
+pub fn applies<R: RefStore + ?Sized>(refs: &R, hash: &str) -> Result<bool, String> {
+    match refs.get_item(ItemKey::Withheld(hash))? {
+        Some(stored) => Ok(!decode(hash, &stored)?.never_applies),
+        None => Ok(false),
+    }
 }
 
 /// The record as the JSON the item stores.

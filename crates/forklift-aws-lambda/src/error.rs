@@ -35,6 +35,9 @@ pub enum Status {
     /// `410` — the content asked for was redacted from this warehouse, and is never served or
     /// accepted again (`content_redacted`).
     Gone,
+    /// `451` — the host of this warehouse withholds the content asked for: it is not served or
+    /// accepted while it does (`content_withheld`).
+    UnavailableForLegalReasons,
     /// `422` — a verification failure: a bad hash, a missing closure, a failed audit.
     Unprocessable,
     /// `503` — a transient refusal that does not claim any input moved (DynamoDB transaction
@@ -57,6 +60,7 @@ impl Status {
             Status::NotFound => 404,
             Status::Conflict => 409,
             Status::Gone => 410,
+            Status::UnavailableForLegalReasons => 451,
             Status::Unprocessable => 422,
             Status::ServiceUnavailable => 503,
             Status::Internal => 500,
@@ -142,6 +146,13 @@ impl HeadError {
     /// `applied_redactions::served_refusal` frames, so the body carries `content_redacted`.
     pub fn gone(message: impl Into<String>) -> HeadError {
         HeadError::with(Status::Gone, message)
+    }
+
+    /// A `451 Unavailable For Legal Reasons` — content this warehouse's host withholds. `message`
+    /// is the classified refusal `withholding::served_refusal` frames, so the body carries
+    /// `content_withheld` and the host's statement.
+    pub fn withheld(message: impl Into<String>) -> HeadError {
+        HeadError::with(Status::UnavailableForLegalReasons, message)
     }
 
     /// A `503 Service Unavailable` answered with `Retry-After: seconds`: the request may succeed

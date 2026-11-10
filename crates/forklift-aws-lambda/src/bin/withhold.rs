@@ -10,7 +10,9 @@
 //! The table and its endpoint are named as for every operator binary
 //! ([`forklift_aws_lambda::aws::operator`]). The role reads no object, so `add` records the hash
 //! with its statement and nothing more: what the store holds the hash as, and what to delete, is
-//! the head's to work out. This build's head does not read the record yet, so `add` says so.
+//! the head's to work out. The head refuses the content from its next request on; this build's
+//! head deletes a chunked file's chunks that only it names and then its recipe, but no other copy
+//! yet, so `add` says so.
 
 use std::process::ExitCode;
 
@@ -99,7 +101,7 @@ fn run(arguments: &Arguments, store: &DynamoRefStore) -> Result<(), String> {
             if added == Added::Uncertain {
                 println!("A write's fate was unknown, so whether this run recorded it cannot be told.");
             }
-            println!("This build's head does not act on withheld items yet, so it still serves the content.");
+            println!("The head refuses the content from its next request on. For a chunked file it deletes the chunks only that file names, then its recipe; this build's head deletes no other copy yet.");
         }
         Command::List => {
             let listed = withheld::list(store)?;
