@@ -12,7 +12,7 @@ use crate::traits::task_context::TaskContext;
 use crate::types::task::Task;
 use crate::util::scope_utils::{self, PathScope, ScopeClass};
 use crate::error::{CoreError, RefusalCode};
-use crate::util::{alias_utils, audit_utils, fanout_utils, file_utils, inventory_utils, object_utils};
+use crate::util::{alias_utils, audit_utils, fanout_utils, file_utils, inventory_utils, object_utils, unavailable};
 
 /// Build (and store) tree objects from an already-parsed [`inventory_utils::PreparedInventory`]
 /// snapshot, bottom-up: one tree object per inventoried directory, staged into `batch` instead of
@@ -356,7 +356,9 @@ const PARALLEL_PROBE_THRESHOLD: usize = 256;
 /// against its bases: an entry whose hash equals the head's at the same path (a whole subtree
 /// included, and every subtree the rollup skip injected by hash) is not staged work, and no
 /// remedy in this bay could restore it. A staged entry that is absent is loss, not a sparse gap:
-/// it was loaded into this bay, and a sparse bay keeps no shard for what it leaves out. Nothing
+/// it was loaded into this bay, and a sparse bay keeps no shard for what it leaves out. The one
+/// exception is content the unavailable record lists: an entry not checked out stages it, and
+/// the next parcel names it as the head did. Nothing
 /// after the build can tell the two apart (`audit` accepts a parcel naming an absent object), so
 /// only a later `restore` would fail (FORK-157).
 ///
@@ -396,10 +398,19 @@ pub fn require_staged_content_present(root: &TreeItem, head_tree_hash: Option<&s
     let present = probe_all(&wanted, |chunk| file_utils::does_object_exist(chunk))?;
     let absent: HashSet<&str> = wanted.iter().zip(present).filter(|(_, present)| !present).map(|(chunk, _)| *chunk).collect();
 
+    // Content recorded unavailable is staged by an entry not checked out, never loaded here: it is
+    // absent by the record's account, not lost. The record is read only when something is absent.
+    let unavailable = if probes.iter().any(|probe| matches!(probe, StagedObject::Absent)) {
+        unavailable::read_unavailable()?
+    } else {
+        unavailable::UnavailableSet::default()
+    };
+
     let mut lost = Vec::new();
     for ((path, hash, _), probe) in changed.iter().zip(&probes) {
         match probe {
             StagedObject::Present => {}
+            StagedObject::Absent if unavailable.contains(hash) => {}
             StagedObject::Absent => lost.push((path, format!("its content {} is missing from the store", hash))),
             StagedObject::Chunked(chunks) => {
                 let absent_of = |chunks: &[String]| Ok(chunks.iter().filter(|chunk| absent.contains(chunk.as_str())).cloned().collect());

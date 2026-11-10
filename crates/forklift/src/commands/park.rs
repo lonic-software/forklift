@@ -4,7 +4,7 @@ use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
 use forklift_core::enums::parcel_action_type::ParcelActionType;
 use forklift_core::model::parcel::Parcel;
 use forklift_core::model::parcel_action::ParcelAction;
-use forklift_core::util::shift_utils::FileOp;
+use forklift_core::util::shift_utils::{Applied, FileOp};
 use serde::Serialize;
 use forklift_core::util::{
     alias_utils, cherry_pick_utils, config_utils, file_utils, inventory_utils, load_guard_utils, merge_utils, object_utils,
@@ -337,7 +337,13 @@ pub fn pop_parked() -> Result<(), String> {
     // Every entry is staged through one batch, each written file statted right after its write.
     let mut batch = inventory_utils::ShardMutationBatch::new();
 
-    let applied = shift_utils::apply_ops_each(&ops, &removed_dirs, |op| match op {
+    let applied = shift_utils::apply_ops_each(&ops, &removed_dirs, |op, applied| match op {
+        FileOp::Write { path, hash, item_type, .. } if applied == Applied::NotCheckedOut => {
+            let (parent_key, name) = inventory_utils::split_path_key(path);
+            let item = inventory_utils::build_unavailable_inventory_item(name, hash.clone(), *item_type);
+
+            batch.update(parent_key, |inventory| { inventory.add_item(item); })
+        }
         FileOp::Write { path, hash, item_type, .. } => batch.stage_file_from_stat(path, hash.clone(), *item_type),
         FileOp::Remove { path } => {
             let (parent_key, name) = inventory_utils::split_path_key(path);

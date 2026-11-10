@@ -7,8 +7,8 @@ use crate::model::inventory::{Inventory, InventoryItem};
 use crate::model::tree_item::TreeItem;
 use crate::util::progress_utils::Progress;
 use crate::util::scope_utils::{self, PathScope, ScopeClass};
-use crate::util::stocktake_utils::{self, ChangeKind};
-use crate::util::{alias_utils, audit_utils, cache_miss, config_utils, fanout_utils, file_utils, inventory_utils, object_utils, office_utils, tree_utils, warehouse_utils};
+use crate::util::stocktake_utils;
+use crate::util::{alias_utils, audit_utils, cache_miss, config_utils, fanout_utils, file_utils, inventory_utils, object_utils, office_utils, tree_utils, unavailable, warehouse_utils};
 
 /// A single file operation needed to turn one tree into another in the working directory.
 pub enum FileOp {
@@ -636,42 +636,95 @@ pub fn collect_collisions(ops: &[FileOp], removed_dirs: &[String]) -> Result<Vec
 /// * `Ok(())`      - If every operation applied.
 /// * `Err(String)` - If a file system operation failed.
 pub fn apply_ops(ops: &[FileOp], removed_dirs: &[String]) -> Result<(), String> {
-    apply_ops_each(ops, removed_dirs, |_| Ok(()))
+    apply_ops_each(ops, removed_dirs, |_, _| Ok(()))
+}
+
+/// How [`apply_ops_each`] applied one operation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Applied {
+    /// The removal or write landed.
+    Done,
+
+    /// A write left the file out: its content is recorded unavailable (the remote's host withholds
+    /// it) and the store lacks it. The path holds no file, and the entry is staged
+    /// [`InventoryItemState::Unavailable`].
+    NotCheckedOut,
+}
+
+/// The content a checkout leaves out: what the unavailable record lists and the store lacks.
+/// Read once per checkout; an unreadable record fails it, since unavailable content must never
+/// be taken for a file to write or a removal to stage.
+pub struct NotCheckedOut {
+    record: unavailable::UnavailableSet,
+}
+
+impl NotCheckedOut {
+    /// Read the unavailable record.
+    pub fn read() -> Result<NotCheckedOut, String> {
+        Ok(NotCheckedOut { record: unavailable::read_unavailable()? })
+    }
+
+    /// Whether a file of this content is left out: the record lists it and the store lacks it.
+    /// Only a listed hash is probed.
+    pub fn holds(&self, hash: &str) -> Result<bool, String> {
+        Ok(self.record.contains(hash) && !file_utils::does_object_exist(hash)?)
+    }
 }
 
 /// [`apply_ops`], calling `after` with each operation once it has applied (for progress, or to
 /// stage it). The one place the removals-first order lives: every materializer applies through
 /// here.
 ///
+/// A write of content recorded unavailable that the store lacks ([`NotCheckedOut`]) writes
+/// nothing: where the path held the old tree's file (a changed file, which a diff emits as one
+/// write and no removal), that file is removed as a removal would remove it, so the path never
+/// holds stale bytes under the new hash. `after` then hears [`Applied::NotCheckedOut`].
+///
 /// # Arguments
 /// * `ops`          - The file operations to apply.
 /// * `removed_dirs` - The directories a diff found source-only (deepest first).
-/// * `after`        - Called after each operation applies; an error stops the run.
+/// * `after`        - Called after each operation applies, with how; an error stops the run.
 ///
 /// # Returns
 /// * `Ok(())`      - If every operation applied.
 /// * `Err(String)` - If a file system operation, or `after`, failed.
 pub fn apply_ops_each(ops: &[FileOp],
                       removed_dirs: &[String],
-                      mut after: impl FnMut(&FileOp) -> Result<(), String>) -> Result<(), String> {
+                      mut after: impl FnMut(&FileOp, Applied) -> Result<(), String>) -> Result<(), String> {
+    // Which writes are left out is decided before anything is applied, so an unreadable record or
+    // a failed probe refuses the checkout with the working directory untouched.
+    let not_checked_out = NotCheckedOut::read()?;
+    let mut writes: Vec<(&FileOp, bool)> = Vec::new();
+
+    for op in ops.iter().filter(|op| matches!(op, FileOp::Write { .. })) {
+        let FileOp::Write { hash, .. } = op else { continue };
+        writes.push((op, not_checked_out.holds(hash)?));
+    }
+
     for op in ops.iter().filter(|op| matches!(op, FileOp::Remove { .. })) {
         apply_file_op(op)?;
-        after(op)?;
+        after(op, Applied::Done)?;
     }
 
     remove_empty_directories(removed_dirs);
 
-    let writes: Vec<&FileOp> = ops.iter().filter(|op| matches!(op, FileOp::Write { .. })).collect();
+    write_in_order(&writes, |(op, skipped)| match op {
+        FileOp::Write { hash, item_type, .. } if !skipped => Some((hash.as_str(), *item_type)),
+        _ => None,
+    }, |(op, skipped), content| {
+        let FileOp::Write { path, hash, item_type, is_new } = op else { return Ok(()) };
 
-    write_in_order(&writes, |op| match op {
-        FileOp::Write { hash, item_type, .. } => Some((hash.as_str(), *item_type)),
-        FileOp::Remove { .. } => None,
-    }, |op, content| {
-        if let FileOp::Write { path, hash, item_type, is_new } = op {
+        if !skipped {
             write_tracked_file_from(path, hash, *item_type, *is_new, content)?;
+
+            return after(op, Applied::Done);
         }
 
-        after(op)
+        if !is_new {
+            apply_file_op(&FileOp::Remove { path: path.clone() })?;
+        }
+
+        after(op, Applied::NotCheckedOut)
     })
 }
 
@@ -1337,7 +1390,7 @@ pub async fn collect_carried(head_tree: Option<&str>) -> Result<Vec<CarriedEntry
 
     let mut paths: BTreeSet<String> = BTreeSet::new();
 
-    for change in staged.iter().chain(unstaged.iter().filter(|change| change.kind != ChangeKind::Untracked)) {
+    for change in staged.iter().chain(unstaged.iter().filter(|change| change.kind.is_tracked_change())) {
         paths.insert(change.path.clone());
         paths.extend(change.moved_from.clone());
     }
@@ -1441,6 +1494,11 @@ pub fn build_inventories_for_tree(root_tree_hash: &str,
 /// directory there; one without is left out. Every shard holding a carried path, and each of its
 /// ancestors, loses its rollup: its content is no longer the tree's, and a rollup left equal to
 /// the tree's would let a stocktake skip the carried change.
+///
+/// A tree file whose content the unavailable record lists and the store lacks ([`NotCheckedOut`])
+/// is staged [`InventoryItemState::Unavailable`] at the tree's hash, under both provenances, and
+/// is never stat'ed or read: a file found at its path is not taken for that content. Its shard
+/// keeps its rollup, since the entry still holds the tree's hash.
 pub fn build_inventories_carrying(root_tree_hash: &str,
                                   provenance: TreeProvenance,
                                   carried: &[CarriedEntry]) -> Result<TreeInventories, String> {
@@ -1468,9 +1526,17 @@ pub fn build_inventories_carrying(root_tree_hash: &str,
         TreeProvenance::Verify => file_utils::take_stat_anchor()?,
     };
 
-    // Each record says whether its file held the tree entry.
+    let not_checked_out = NotCheckedOut::read()?;
+
+    // Each record says whether its file held the tree entry. A file whose content is left out is
+    // staged Unavailable with no stat, under either provenance: no file at its path is trusted as
+    // that content, and one standing there reads as a change.
     let record = |file: &TreeFile| -> Result<(InventoryItem, bool), String> {
         let path = Path::new(&file.key);
+
+        if not_checked_out.holds(&file.hash)? {
+            return Ok((inventory_utils::build_unavailable_inventory_item(file.name(), file.hash.clone(), file.item_type), true));
+        }
 
         match provenance {
             TreeProvenance::Written(_) => inventory_utils::build_inventory_item_from_stat(
@@ -1736,7 +1802,7 @@ pub fn materialize_tree(from_tree: Option<&str>,
     // would land on the old name through the alias and the removal after it would delete it.
     let mut done = 0;
 
-    apply_ops_each(&ops, &removed_dirs, |op| {
+    apply_ops_each(&ops, &removed_dirs, |op, _| {
         done += 1;
         progress.fraction(done, ops.len(), || op_path(op).to_string());
         Ok(())
