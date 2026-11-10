@@ -240,7 +240,6 @@ pub async fn check_new_origin(client: &RemoteClient,
     Ok(checked)
 }
 
-/// Whether this warehouse may lack the withheld content `hash`, so the walk seeks it: it does not
 /// Sorts the withheld recipes held here beneath a tree leaned on. A chunk of such a recipe is
 /// held on the new server while another recipe names it, and that server lists as missing a
 /// chunk only withheld recipes name, so the chunks absent here are asked about, each mapped to
@@ -274,6 +273,7 @@ fn answered_recipes(asked: &HashMap<String, Vec<String>>, missing: &[String]) ->
     missing.iter().flat_map(|chunk| asked.get(chunk).into_iter().flatten().cloned()).collect()
 }
 
+/// Whether this warehouse may lack the withheld content `hash`, so the walk seeks it: it does not
 /// hold it, or holds it as a recipe some of whose chunks it does not hold.
 fn lacks_withheld(hash: &str) -> Result<bool, String> {
     if !sealed_utils::is_present(hash)? {
@@ -616,8 +616,10 @@ mod tests {
         assert_eq!(answered_recipes(&asked, &[lone.clone()]), one);
         assert!(answered_recipes(&asked, &[]).is_empty(), "a chunk the server holds leaves the recipe out");
         let twin = store_recipe(&[(lone.clone(), 1)]);
+        let mut withheld = withheld.clone();
+        withheld.insert(twin.as_str(), "court order");
         let (_, asked) = leaned_asks(&HashSet::from([withheld_recipe.clone(), twin.clone()]), &withheld).unwrap();
-        assert_eq!(answered_recipes(&asked, &[lone.clone()]), HashSet::from([withheld_recipe.clone(), twin]));
+        assert_eq!(answered_recipes(&asked, &[lone.clone()]), HashSet::from([withheld_recipe.clone(), twin.clone()]));
         let mut withholding_chunk = withheld.clone();
         withholding_chunk.insert(lone.as_str(), "court order");
         let (settled, asked) = leaned_asks(&one, &withholding_chunk).unwrap();
