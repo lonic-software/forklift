@@ -3485,3 +3485,27 @@ fn heal_fetches_a_damaged_object_back_without_recording_withheld_content() {
     };
     assert_eq!(record, 0, "heal records no withheld content unavailable");
 }
+
+/// A lift to a remote other than the one whose host withholds the film, of a head naming it,
+/// refuses `content_withheld` with the hash and the host's statement: this warehouse cannot upload
+/// content it was never given, and the other remote's `main` does not move.
+///
+/// Revert: drop the read path's unavailable arm → the upload's read of the film fails as a raw
+/// missing object, with no code → red.
+#[test]
+fn a_lift_to_another_remote_refuses_content_withheld_here() {
+    let mut takedown = takedown("lift-elsewhere");
+    takedown.withhold_new_film(false);
+    let writer = takedown.writer("takedown-lift-elsewhere-writer", &[]);
+    left_out_film(&writer, &takedown);
+
+    let other = Server::start(&std::env::temp_dir()
+        .join(format!("forklift-takedown-lift-elsewhere-other-{}", std::process::id())));
+    writer.run_ok(&["config", "set", "remote.url", &other.url]);
+
+    let lifted = writer.json(&["lift"]);
+    assert_eq!(lifted["error"]["code"], "content_withheld", "{}", lifted);
+    assert_eq!(lifted["error"]["details"]["hash"], takedown.film.as_str(), "{}", lifted);
+    assert_eq!(lifted["error"]["details"]["statement"], TAKEDOWN, "{}", lifted);
+    assert!(!other.root.join(".forklift/pallets/main").exists(), "the other remote's main moved: {}", lifted);
+}
