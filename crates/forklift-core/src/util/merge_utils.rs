@@ -1032,11 +1032,6 @@ pub fn compute_merge_actions_with(base_hash: &str,
     resolve_pending(pending, ours_label, theirs_label)
 }
 
-/// Settle, before any blob is read, every entry that names content this warehouse leaves out
-/// ([`shift_utils::NotCheckedOut`]). A one-sided take of it becomes a [`MergeAction::LeaveOut`]:
-/// no read. A file both sides changed is handed to `withheld`: a line merge, or a version put back
-/// in conflict, would have to read bytes the remote's host withholds, and a version kept in conflict
-/// would stand at a path holding no file.
 /// Which side of a merge changed a file whose merge needs its content, as far as the way out of a
 /// `content_withheld` refusal goes.
 enum Side<'a> {
@@ -1048,6 +1043,11 @@ enum Side<'a> {
     TheyDeleted,
 }
 
+/// Settle, before any blob is read, every entry that names content this warehouse leaves out
+/// ([`shift_utils::NotCheckedOut`]). A one-sided take of it becomes a [`MergeAction::LeaveOut`]:
+/// no read. A file both sides changed is handed to `withheld`: a line merge, or a version put back
+/// in conflict, would have to read bytes the remote's host withholds, and a version kept in conflict
+/// would stand at a path holding no file.
 fn sort_withheld(pending: &mut Vec<PendingAction>, withheld: WithheldReads) -> Result<(), String> {
     let not_checked_out = shift_utils::NotCheckedOut::read()?;
     let mut unknown = Vec::new();
@@ -1083,24 +1083,24 @@ fn sort_withheld(pending: &mut Vec<PendingAction>, withheld: WithheldReads) -> R
             WithheldReads::Refuse => {
                 let statement = not_checked_out.statement(hash).unwrap_or_default();
 
-                // Only content the other side brings can be left out: a merge reads nothing of a
-                // file only the other side changed. So taking this pallet's own change out is a way
-                // out exactly when the content left out is theirs.
-                let next_step = match side {
-                    Side::BothChanged(their_hash) if their_hash == hash => format!(
-                        "Both sides changed \"{}\"; with this pallet's own change to it taken out, only the \
-                        other side changes it and the merge leaves the file out. Otherwise only a warehouse \
-                        that holds the content can make this merge.",
-                        path
-                    ),
-                    Side::WeDeleted => format!(
-                        "This pallet deleted \"{}\" and the other side changed it; with the deletion taken out \
-                        (the file put back as it was), only the other side changes it and the merge leaves the \
-                        file out. Otherwise only a warehouse that holds the content can make this merge.",
-                        path
-                    ),
-                    _ => "Only a warehouse that holds the content can make this merge.".to_string(),
+                // Taking this pallet's own change to the file out leaves the other side's alone to
+                // decide it, which reads nothing: their deletion goes through, their version is
+                // taken, or, when this warehouse leaves that version out too, the file is left out.
+                let outcome = match side {
+                    Side::TheyDeleted => "the merge takes the other side's deletion of it",
+                    Side::WeDeleted => "the merge leaves the file out",
+                    Side::BothChanged(their_hash) if not_checked_out.holds(their_hash)? => "the merge leaves the file out",
+                    Side::BothChanged(_) => "the merge takes the other side's version",
                 };
+                let change = match side {
+                    Side::WeDeleted => "this pallet's deletion of it taken out (the file put back as it was)",
+                    _ => "this pallet's own change to it taken out (the file as it was before)",
+                };
+                let next_step = format!(
+                    "With {}, only the other side changes \"{}\" and {}. Otherwise only a warehouse that \
+                    holds the content can make this merge.",
+                    change, path, outcome
+                );
 
                 return Err(crate::error::CoreError::refusal_with_details(
                     crate::error::RefusalCode::ContentWithheld,

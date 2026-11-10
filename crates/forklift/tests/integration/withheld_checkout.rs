@@ -477,7 +477,8 @@ fn a_merge_and_a_pick_leave_their_unavailable_files_out() {
 
 /// A merge or pick whose line merge needs content left out refuses `content_withheld` before it
 /// changes anything, naming the file and the host's statement, and the way out: taking this
-/// pallet's own change to the file out, after which the merge leaves the file out.
+/// pallet's own change to the file out, after which the merge leaves the file out when their
+/// version is withheld too, and takes their version when only ours is.
 ///
 /// Revert: drop the refusal → the merge dies reading the absent blob, refused by the read with
 /// no path → red.
@@ -494,7 +495,7 @@ fn a_merge_that_must_read_withheld_content_refuses_content_withheld() {
         assert_eq!(report["error"]["details"]["path"], "film.mkv", "{}", report);
         assert_eq!(report["error"]["details"]["statement"], "Withheld by the remote's host.", "{}", report);
         let next_step = report["error"]["next_step"].as_str().unwrap_or_default();
-        assert!(next_step.contains("with this pallet's own change to it taken out"), "{}", report);
+        assert!(next_step.contains("this pallet's own change to it taken out") && next_step.contains("the merge leaves the file out"), "{}", report);
 
         assert_eq!(std::fs::read_to_string(warehouse.root.join("film.mkv")).unwrap(), "the film on main\n");
         let report = warehouse.stocktake();
@@ -507,11 +508,25 @@ fn a_merge_that_must_read_withheld_content_refuses_content_withheld() {
     warehouse.run_ok(&["consolidate", "feature"]);
     assert!(!warehouse.exists("film.mkv"), "the merge left their film out");
     assert_eq!(paths(&warehouse.stocktake()["unavailable"]), ["extra/new.bin", "film.mkv"]);
+
+    // Our own version withheld and theirs held: taking our change out takes their version.
+    let (warehouse, _) = withheld_feature("refuse-ours");
+    warehouse.stack_files(&[("film.mkv", "the film on main\n")], "main changes the film");
+    warehouse.run_ok(&["shift", "feature"]);
+    let output = warehouse.run(&["consolidate", "main", "--json"]);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!((output.status.code(), &report["error"]["code"]), (Some(51), &"content_withheld".into()), "{}", report);
+    let next_step = report["error"]["next_step"].as_str().unwrap_or_default();
+    assert!(next_step.contains("the merge takes the other side's version"), "{}", report);
+    warehouse.stack_files(&[("film.mkv", OLD_FILM)], "feature takes its change out");
+    warehouse.run_ok(&["consolidate", "main"]);
+    assert_eq!(std::fs::read_to_string(warehouse.root.join("film.mkv")).unwrap(), "the film on main\n");
 }
 
 /// A conflict over content left out refuses too: putting their withheld version back where we
 /// deleted the file (the way out named, putting the file back, then leaves it out), and keeping
-/// our withheld version where they deleted it (no way out named).
+/// our withheld version where they deleted it (the way out named, taking our change out, then
+/// takes their deletion).
 ///
 /// Revert: drop the put-back arm, or the conflict arm, of the refusal → the first merges by
 /// reading the absent blob and is refused by the read with no path, the second stages a conflict
@@ -531,7 +546,7 @@ fn a_conflict_over_withheld_content_refuses_content_withheld() {
     warehouse.run_ok(&["stack", "-m", "main deletes the film"]);
     let before = warehouse.stocktake();
     let next_step = refused(&warehouse, &["consolidate", "feature"]);
-    assert!(next_step.contains("with the deletion taken out"), "{}", next_step);
+    assert!(next_step.contains("this pallet's deletion of it taken out") && next_step.contains("the merge leaves the file out"), "{}", next_step);
     assert_eq!(warehouse.stocktake(), before, "the merge changed nothing");
     // The way out it names: with the film put back as it was, the merge leaves their film out.
     warehouse.stack_files(&[("film.mkv", OLD_FILM)], "main puts the film back");
@@ -544,8 +559,13 @@ fn a_conflict_over_withheld_content_refuses_content_withheld() {
     std::fs::remove_file(warehouse.root.join("film.mkv")).unwrap();
     warehouse.run_ok(&["shift", "feature"]);
     let next_step = refused(&warehouse, &["consolidate", "main"]);
-    assert_eq!(next_step, "Only a warehouse that holds the content can make this merge.", "our own content is withheld: no way out to name");
+    assert!(next_step.contains("the merge takes the other side's deletion of it"), "{}", next_step);
     assert_eq!(warehouse.stocktake()["unavailable_count"], 2, "the merge changed nothing");
+    // The way out it names: with our change taken out (the film as it was), their deletion goes through.
+    warehouse.stack_files(&[("film.mkv", OLD_FILM)], "feature takes its change out");
+    warehouse.run_ok(&["consolidate", "main"]);
+    assert!(!warehouse.exists("film.mkv"), "the merge took their deletion");
+    assert_eq!(paths(&warehouse.stocktake()["unavailable"]), ["extra/new.bin"]);
 }
 
 /// `consolidate feature` into `main`, stopped at a conflict over `a.txt` (both sides changed it),
