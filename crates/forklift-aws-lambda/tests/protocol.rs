@@ -6701,3 +6701,248 @@ fn a_first_anchor_adopting_history_naming_withheld_content_says_so() {
     assert_eq!(err.status, Status::Unprocessable, "{}", err.message);
     assert!(err.message.contains("host withholds"), "{}", err.message);
 }
+
+/// The withheld item of `hash`, as listed.
+fn withheld_item<O: ObjectStore>(head: &Head<O, MemoryRefStore>, hash: &str) -> forklift_aws_lambda::withheld::WithheldItem {
+    forklift_aws_lambda::withheld::list(&head.refs).expect("list").into_iter()
+        .find(|listed| listed.hash == hash)
+        .expect("an item")
+        .item
+}
+
+/// Rewrite the withheld item of `hash` through `change`, over whatever it holds.
+fn rewrite_withheld(refs: &MemoryRefStore, hash: &str, change: impl FnOnce(&mut serde_json::Value)) {
+    let fence = forklift_aws_lambda::format::gate(refs).expect("format gate");
+    let stored = refs.get_item(ItemKey::Withheld(hash)).expect("item").expect("an item");
+    let mut item: serde_json::Value = serde_json::from_str(&stored).expect("json");
+    change(&mut item);
+    let state = item.to_string();
+    let written = refs.put_items(&[ItemWrite { key: ItemKey::Withheld(hash), state: &state, expected: Some(&stored) }], &fence).expect("write");
+    assert_eq!(written, RedactionWrite::Written);
+}
+
+/// Move the withhold of `hash` `seconds` into the past.
+fn age_withheld(refs: &MemoryRefStore, hash: &str, seconds: u64) {
+    rewrite_withheld(refs, hash, |item| item["withheld_at"] = (item["withheld_at"].as_u64().expect("seconds") - seconds).into());
+}
+
+/// A withheld blob loses its staged copies at once, and once its late step is due, its canonical
+/// copy, though a user head still names it, with every response bundle that may hold it and its
+/// work objects; then the handshake reports it deleted. Another redaction's work is kept.
+// Revert: skip `delete_staged` in the early step → the staged copy stays → red. Revert: delete the
+// canonical copy in the early step → it is gone before the late step → red. Revert: skip
+// `delete_canonical` in the late step → red. Revert: skip `delete_responses_before` → red.
+// Revert: skip `work_delete_under` → red. Revert: report Deleted without `deleted` → red.
+#[test]
+fn a_withheld_blob_loses_its_staged_copies_and_then_its_canonical_one_late() {
+    use forklift_core::builder::object::loose_object_builder::LooseObjectBuilder;
+    use forklift_core::enums::dir_entry_type::DirEntryType;
+    use forklift_core::model::tree_item::TreeItem;
+
+    // A store that stages uploads takes none outright, so the objects are seeded.
+    let head = Head::new(MemoryObjectStore::with_redirect("https://s3.example/bucket"), MemoryRefStore::new());
+    let seed = |object: forklift_core::model::object::loose_object::LooseObject| {
+        head.objects.put_verified(&object.hash, &object.content).expect("seed an object");
+        object.hash
+    };
+    let (leak, other) = (blob_hash("taken down\n"), blob_hash("1"));
+    let mut root = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+    for (name, content) in [("x", "taken down\n"), ("y", "1")] {
+        let hash = seed(LooseObjectBuilder::build_blob(&forklift_core::model::blob::Blob { content: content.as_bytes().to_vec() }));
+        root.add_child(TreeItem::new(name.to_string(), hash, DirEntryType::Normal));
+    }
+    root.hash = seed(LooseObjectBuilder::build_tree(&root));
+    let main = seed(LooseObjectBuilder::build_parcel(&forklift_core::model::parcel::Parcel {
+        tree_hash: root.hash, parents: Vec::new(), actions: Vec::new(), description: Some("gate".to_string()),
+    }));
+    plant(&head.refs, "main", &main);
+
+    head.batch(&[leak.clone(), other.clone()]).expect("a bundle holding the content, before the withhold");
+    head.objects.stage("lift-9", &leak, blob_object("taken down\n"));
+    withhold(&head, &leak);
+
+    assert_eq!(served_withheld(&head), vec![(leak.clone(), STATEMENT.to_string(), ServedWithholdingState::DeletionOwed)]);
+    assert_eq!(head.objects.staged_count(), 0, "the staged copy goes at once");
+    assert!(head.objects.exists(&leak).expect("exists"), "the canonical copy waits for the late step");
+    let item = withheld_item(&head, &leak);
+    assert!(item.swept && !item.deleted && !item.kept && item.lease_until.is_none(), "{:?}", item);
+
+    // A copy staged after the first step, and work objects, before the late step is due.
+    head.objects.stage("lift-10", &leak, blob_object("taken down\n"));
+    head.objects.work_put(&format!("withheld-{}/x", leak), b"{}").expect("work");
+    head.objects.work_put(&format!("{}/pallets", other), b"{}").expect("work");
+    head.objects.age_responses(std::time::Duration::from_secs(1_200));
+    head.batch(std::slice::from_ref(&other)).expect("a bundle written after the cutoff");
+    assert_eq!(head.objects.response_count(), 2);
+    assert_eq!(head.objects.staged_count(), 1, "not due: the late copy is kept");
+
+    age_withheld(&head.refs, &leak, LATE_SWEEP_AFTER + 40);
+    assert_eq!(served_withheld(&head), vec![(leak.clone(), STATEMENT.to_string(), ServedWithholdingState::Deleted)]);
+    assert!(!head.objects.exists(&leak).expect("exists"), "the late step deletes the canonical copy");
+    assert_eq!(head.objects.staged_count(), 0, "and the copy staged after the first step");
+    assert_eq!(head.objects.response_count(), 1, "only the bundle written after the cutoff is kept");
+    assert_eq!(head.objects.work_names(), vec![format!("{}/pallets", other)], "only another redaction's work is kept");
+    let item = withheld_item(&head, &leak);
+    assert!(item.swept && item.deleted && !item.kept && item.lease_until.is_none(), "{:?}", item);
+    assert_host_withheld(&head.object_get(&leak).expect_err("still refused"), &leak);
+    assert!(head.objects.exists(&other).expect("exists"), "other content is kept");
+}
+
+/// A meta history's head whose first parcel names `content` as a file, and whose second, on it,
+/// does not: the second's hash.
+fn meta_history_naming<O: ObjectStore, R: RefStore>(head: &Head<O, R>, content: &str, other: &str) -> String {
+    let first = gate_parcel(head, &[], vec![gate_file(head, "cell", content)]);
+    gate_parcel(head, &[&first], vec![gate_file(head, "cell", other)])
+}
+
+/// A withheld blob that meta history, or the trust anchor's adopted history, names is kept for
+/// good once its late step is due: its canonical copy stays, its staged copies go, and the
+/// handshake reports its deletion owed from then on. The walk spans requests when a request
+/// cannot finish it.
+// Revert: walk no meta pallet → the blob it names is deleted → red. Revert: walk no adopts pin →
+// the blob only it names is deleted → red. Revert: never save the walk → under the step limit it
+// never finishes → red. Revert: delete the canonical copy when kept → red.
+#[test]
+fn a_withheld_blob_meta_or_adopted_history_names_is_kept_for_good() {
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    let meta = meta_history_naming(&head, "a cell\n", "a later cell\n");
+    let adopted = meta_history_naming(&head, "an adopted cell\n", "a later adopted cell\n");
+    plant_meta(&head.refs, "tags", None, &meta);
+    let fence = forklift_aws_lambda::format::gate(&head.refs).expect("format gate");
+    let anchor = office_utils::TrustAnchor {
+        genesis: "e".repeat(64),
+        enabled_at: 0,
+        boundary: Vec::new(),
+        prior_genesis: Some("d".repeat(64)),
+        adopts: Some(adopted),
+    };
+    assert_eq!(head.refs.put_trust_if_absent(&anchor, &fence, &request_token()).expect("trust"), TrustOutcome::Established);
+
+    let (cell, adopted_cell) = (blob_hash("a cell\n"), blob_hash("an adopted cell\n"));
+    for hash in [&cell, &adopted_cell] {
+        withhold(&head, hash);
+    }
+    served_withheld(&head);
+    served_withheld(&head);
+    for hash in [&cell, &adopted_cell] {
+        head.objects.stage("lift-9", hash, b"a late copy".to_vec());
+        age_withheld(&head.refs, hash, LATE_SWEEP_AFTER + 40);
+    }
+
+    // One step a request, and one object read a step: the walks span requests.
+    let head = head.with_scan_step_limit(1);
+    let mut requests = 0;
+    while !(withheld_item(&head, &cell).deleted && withheld_item(&head, &adopted_cell).deleted) {
+        requests += 1;
+        assert!(requests < 40, "the walks finish");
+        served_withheld(&head);
+    }
+    assert!(requests > 2, "the walks spanned requests: {}", requests);
+
+    for hash in [&cell, &adopted_cell] {
+        let item = withheld_item(&head, hash);
+        assert!(item.kept && item.swept && item.deleted, "{:?}", item);
+        assert!(head.objects.exists(hash).expect("exists"), "a kept blob keeps its canonical copy");
+    }
+    assert_eq!(head.objects.staged_count(), 0, "its staged copies go");
+    assert!(head.objects.work_names().is_empty(), "the saved walks go: {:?}", head.objects.work_names());
+    let states: Vec<ServedWithholdingState> = served_withheld(&head).into_iter().map(|(_, _, state)| state).collect();
+    assert_eq!(states, vec![ServedWithholdingState::DeletionOwed; 2]);
+}
+
+/// A meta kind's format marker is kept from the moment it is settled, with no walk: no deletion
+/// may leave a kind uncreatable.
+// Revert: drop the format-marker keep from `settle` → nothing names it, and the late step
+// deletes it → red.
+#[test]
+fn a_withheld_format_marker_is_kept_from_settling() {
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    let marker = "forklift-meta 1 kv";
+    let main = gate_parcel(&head, &[], vec![gate_file(&head, "format", marker)]);
+    plant(&head.refs, "main", &main);
+    let hash = blob_hash(marker);
+    withhold(&head, &hash);
+
+    served_withheld(&head);
+    assert!(withheld_item(&head, &hash).kept, "kept at settling");
+    age_withheld(&head.refs, &hash, LATE_SWEEP_AFTER + 40);
+    served_withheld(&head);
+
+    let item = withheld_item(&head, &hash);
+    assert!(item.kept && item.deleted, "{:?}", item);
+    assert!(head.objects.exists(&hash).expect("exists"), "the marker is kept");
+    assert_host_withheld(&head.object_get(&hash).expect_err("still refused"), &hash);
+}
+
+/// Every file content hash a parcel's tree names, read from the warehouse at `root`.
+fn tree_files(root: &Path, parcel: &str) -> std::collections::HashSet<String> {
+    let _scope = StorageRootScope::enter(root);
+    let mut files = std::collections::HashSet::new();
+    let mut pending = vec![object_utils::load_parcel(parcel).expect("parcel").tree_hash];
+    while let Some(hash) = pending.pop() {
+        let tree = object_utils::load_tree(&hash).expect("tree");
+        files.extend(tree.get_files().map(|(_, file)| file.hash.clone()));
+        pending.extend(tree.get_subtrees().map(|(_, subtree)| subtree.hash.clone()));
+    }
+    files
+}
+
+/// Until its item is recorded kept, a meta pallet's update that newly names withheld content is
+/// refused `451` with the statement, and one whose old head's tree names it already lifts; so
+/// does one whose old head only names it in its history, adding nothing that names it. A kept
+/// item refuses nothing.
+// Revert: drop `refuse_meta_naming_withheld` from `ref_update` → the first update commits → red.
+// Revert: bound nothing by the old head's tree → the second is refused → red. Revert: judge the
+// whole history rather than the segment → the third is refused → red. Revert: guard kept items
+// too → the last is refused → red.
+#[test]
+fn a_meta_update_newly_naming_withheld_content_is_refused_451() {
+    let area = Area::new("withheld-meta");
+    prepare(&area, "wh");
+    area.write_file("wh/notes.txt", "notes\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "-m", "notes"]);
+    let mut heads = Vec::new();
+    for step in [&["manifest", "set", "main", "k1", "v1"][..], &["manifest", "set", "main", "k2", "v2"],
+                 &["manifest", "set", "main", "k3", "v3"], &["manifest", "unset", "main", "k2"],
+                 &["manifest", "unset", "main", "k3"], &["manifest", "set", "main", "k4", "v4"]] {
+        area.forklift("wh", step);
+        heads.push(harvest(&area.path("wh")).head_of("@kv").expect("kv head"));
+    }
+    let tagged = harvest(&area.path("wh"));
+    let added: Vec<String> = tree_files(&area.path("wh"), &heads[1]).difference(&tree_files(&area.path("wh"), &heads[0])).cloned().collect();
+    assert_eq!(added.len(), 1, "k2 adds one cell: {:?}", added);
+    let cell = added[0].clone();
+    assert!(!tree_files(&area.path("wh"), &heads[4]).contains(&cell) && !tree_files(&area.path("wh"), &heads[5]).contains(&cell));
+    let meta_head = |head: &Head<MemoryObjectStore, MemoryRefStore>| {
+        head.refs.get_head(pallet_utils::PalletNamespace::Meta, "kv").unwrap().live().map(str::to_string)
+    };
+    let update = |head: &Head<MemoryObjectStore, MemoryRefStore>, old: usize, new: usize| {
+        head.ref_update(&Principal::Static, "@kv", &RefUpdateRequest {
+            old_head: Some(heads[old].clone()), new_head: heads[new].clone(), tombstone: None,
+        })
+    };
+
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &tagged);
+    plant(&head.refs, "main", &tagged.head_of("main").expect("main"));
+    withhold(&head, &cell);
+    plant_meta(&head.refs, "kv", None, &heads[0]);
+
+    assert_host_withheld(&update(&head, 0, 1).expect_err("k2 newly names it"), &cell);
+    assert_eq!(meta_head(&head), Some(heads[0].clone()));
+
+    plant_meta(&head.refs, "kv", Some(&heads[0]), &heads[1]);
+    update(&head, 1, 2).expect("its old head's tree names it");
+    plant_meta(&head.refs, "kv", Some(&heads[2]), &heads[4]);
+    update(&head, 4, 5).expect("only its old head's history names it, and it adds nothing naming it");
+    assert_eq!(meta_head(&head), Some(heads[5].clone()));
+
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &tagged);
+    plant(&head.refs, "main", &tagged.head_of("main").expect("main"));
+    withhold(&head, &cell);
+    rewrite_withheld(&head.refs, &cell, |item| item["kept"] = true.into());
+    plant_meta(&head.refs, "kv", None, &heads[0]);
+    update(&head, 0, 1).expect("a kept item refuses nothing");
+}

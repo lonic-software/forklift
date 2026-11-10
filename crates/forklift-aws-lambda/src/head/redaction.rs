@@ -61,7 +61,7 @@ use crate::store::{ItemKey, ItemWrite, ObjectStore, RedactionWrite, RefListing, 
 const RECORD_VERSION: u64 = 2;
 
 /// The version of the work objects this build writes and reads.
-const WORK_VERSION: u64 = 1;
+pub(super) const WORK_VERSION: u64 = 1;
 
 /// How many of one judge's item writes may lose a race to another request, or end with their fate
 /// unknown, before it answers the redaction undecided. A write that lands is the judge's own
@@ -316,7 +316,7 @@ fn encode_record(record: &Record) -> HeadResult<String> {
 
 /// A work object's bytes as `T`, checked for [`WORK_VERSION`]. A work object holds no verdict, so
 /// one this build cannot read is dropped and its work done again.
-fn decode_work<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Option<T> {
+pub(super) fn decode_work<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Option<T> {
     let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
 
     match value.get("version").and_then(serde_json::Value::as_u64) {
@@ -342,7 +342,7 @@ pub(super) const LATE_SWEEP_MARGIN: u64 = 60;
 /// content of a redaction that applied at `applied_at`: a request that judged the redaction
 /// pending before it applied ends within [`INVOCATION_CEILING`], and every later one leaves the
 /// content out. [`LATE_SWEEP_MARGIN`] later still, for the clocks.
-fn response_cutoff(applied_at: u64) -> u64 {
+pub(super) fn response_cutoff(applied_at: u64) -> u64 {
     applied_at.saturating_add(INVOCATION_CEILING).saturating_add(LATE_SWEEP_MARGIN)
 }
 

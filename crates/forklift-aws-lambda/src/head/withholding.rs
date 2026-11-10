@@ -19,6 +19,13 @@
 //! every request that serves or takes objects settles every unsettled item before it answers, and
 //! answers `503` only when that does not finish within the request.
 //!
+//! After settling, such a request with time to spare runs one owed deletion step, never changing
+//! its answer ([`Head::withheld_deletion_step`]): staged copies at once, and once the late sweep
+//! is due, a blob's canonical copy unless meta or adopted history names it, which a resumable walk
+//! decides. Until that walk records it kept, a meta pallet's ref update refuses to newly name it
+//! ([`Head::refuse_meta_naming_withheld`]). The handshake reports an item deleted only once
+//! every copy is gone, so a kept one reports its deletion owed for good.
+//!
 //! The cost: one strongly consistent `Query` per such request, reading every item whole. An item
 //! is its statement (at most 1000 characters) and a few flags, so a strongly consistent read
 //! unit (4 KB) covers about four; a warehouse whose host withholds nothing pays the smallest
@@ -26,14 +33,26 @@
 //! item, because the split saves bytes, not the round trip, and only pays once a host withholds
 //! hundreds of hashes.
 
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, SystemTime};
+
+use serde::{Deserialize, Serialize};
+
 use forklift_core::model::remote::{ServedWithholding, ServedWithholdingState};
 use forklift_core::enums::object_type::ObjectType;
+use forklift_core::util::meta_tree;
 use forklift_core::util::object_utils;
+use forklift_core::util::pallet_utils::PalletNamespace;
+use forklift_core::util::redaction_utils::{HoldingWalk, WalkObjects, WalkProgress};
 use forklift_core::util::withholding::{self, WithheldSet};
 
-use super::redaction::{epoch_seconds, Budget, UNDECIDED_RETRY_AFTER_SECONDS, WRITE_ATTEMPTS};
+use super::redaction::{
+    decode_work, epoch_seconds, late_sweep_due, response_cutoff, Budget, INVOCATION_CEILING, SWEEP_LEASE_MARGIN,
+    UNDECIDED_RETRY_AFTER_SECONDS, WORK_VERSION, WRITE_ATTEMPTS,
+};
 use super::Head;
 use crate::error::{HeadError, HeadResult};
+use crate::scratch::MirroredObjects;
 use crate::store::{ItemKey, ItemWrite, ObjectStore, RefStore};
 use crate::withheld::{self, Listed, WithheldItem};
 
@@ -97,6 +116,81 @@ fn deleted(item: &WithheldItem) -> bool {
     !item.kept && item.swept && item.deleted && (!item.recipe || item.recipe_deleted)
 }
 
+/// Whether `item` is owed a deletion step at `now`: its staged copies are not swept yet, or its
+/// late step is due and not done.
+fn owed(item: &WithheldItem, now: u64) -> bool {
+    item.settled
+        && !item.never_applies
+        && item.lease_until.is_none_or(|until| until <= now)
+        && (!item.swept || (!item.deleted && now >= late_sweep_due(item.withheld_at)))
+}
+
+/// The prefix every work object of the withheld item of `hash` is named under: apart from a
+/// redaction's of the same hash, whose late sweep deletes its own prefix.
+fn work_prefix(hash: &str) -> String {
+    format!("withheld-{}/", hash)
+}
+
+/// The name of the work object holding the walk for whether meta or adopted history names the
+/// withheld blob `hash`.
+fn walk_name(hash: &str) -> String {
+    format!("{}keepers", work_prefix(hash))
+}
+
+/// The work object holding the walk for a withheld blob's keepers part way: the history heads
+/// still to walk after the one `walk` is walking.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SavedKeepers {
+    version: u64,
+    heads: Vec<String>,
+    walk: HoldingWalk,
+}
+
+/// What the walk for a withheld blob's keepers found.
+enum Keepers {
+    /// Meta or adopted history names the blob: its canonical copy stays.
+    Named,
+
+    /// Nothing does: its canonical copy may go.
+    None,
+
+    /// The walk has not finished within this request, for this reason; it is saved.
+    Stopped(String),
+}
+
+/// Walk the tree `root` and every tree under it not in `trees`, adding each to `trees`, and
+/// offer every file's content hash to `found` until it answers.
+///
+/// # Returns
+/// * `Ok(Some(T))` - What `found` answered.
+/// * `Ok(None)`    - It never answered.
+/// * `Err(String)` - A tree could not be read.
+fn walk_files<T>(
+    root: &str,
+    objects: &dyn WalkObjects,
+    trees: &mut HashSet<String>,
+    found: &mut dyn FnMut(&str) -> Option<T>,
+) -> Result<Option<T>, String> {
+    let mut pending = vec![root.to_string()];
+
+    while let Some(hash) = pending.pop() {
+        if !trees.insert(hash.clone()) {
+            continue;
+        }
+
+        let tree = objects.load_tree(&hash)?;
+        for (_, file) in tree.get_files() {
+            if let Some(answer) = found(&file.hash) {
+                return Ok(Some(answer));
+            }
+        }
+        pending.extend(tree.get_subtrees().map(|(_, subtree)| subtree.hash.clone()));
+    }
+
+    Ok(None)
+}
+
 /// What settling one item found.
 enum Settled {
     /// The item, as recorded settled.
@@ -123,6 +217,16 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     ///                       was not settled within this request (`503`, with `Retry-After`).
     pub(super) fn withholding(&self) -> HeadResult<Withholding> {
         let mut budget = self.scan_budget();
+        let mut withholding = self.settled_withholding(&mut budget)?;
+
+        self.advance_withheld_deletion(&mut withholding, &mut budget);
+
+        Ok(withholding)
+    }
+
+    /// [`withholding`](Self::withholding), without the deletion step: for a request that reads it
+    /// inside a ref update's scratch scope, where a walk would open its own.
+    pub(super) fn settled_withholding(&self, budget: &mut Budget) -> HeadResult<Withholding> {
         let mut items = Vec::new();
 
         for listed in self.withheld_listing()? {
@@ -131,7 +235,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 continue;
             }
 
-            match self.settle(listed, &mut budget)? {
+            match self.settle(listed, budget)? {
                 Settled::Item(listed) => items.push(listed),
                 Settled::Unsettled(why) => return Err(HeadError::retry_after(why, UNDECIDED_RETRY_AFTER_SECONDS)),
             }
@@ -212,7 +316,13 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             };
 
             let next = match kind {
-                None | Some(ObjectType::Blob) => WithheldItem { settled: true, ..listed.item.clone() },
+                // A format marker is named by every parcel of its kind, so it is kept from the
+                // start, with no walk: no deletion may leave a kind uncreatable.
+                None | Some(ObjectType::Blob) => WithheldItem {
+                    settled: true,
+                    kept: listed.item.kept || meta_tree::format_marker_hashes().contains(&hash),
+                    ..listed.item.clone()
+                },
                 Some(ObjectType::Recipe) => WithheldItem { settled: true, recipe: true, ..listed.item.clone() },
                 Some(_) => WithheldItem { settled: true, never_applies: true, ..listed.item.clone() },
             };
@@ -250,6 +360,251 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             "Other requests kept changing the withheld item for {} while this one settled it.",
             listed.hash
         )))
+    }
+
+    /// Run one owed deletion step, for the first item of `withholding` owed one, within `budget`:
+    /// best effort, as redaction's judge sweeps, so a failure is logged and never answered, and a
+    /// request without time to spare skips it.
+    /// The listing takes the item as the step wrote it, so the answer reports what is done.
+    fn advance_withheld_deletion(&self, withholding: &mut Withholding, budget: &mut Budget) {
+        let now = epoch_seconds(SystemTime::now());
+
+        let Some(listed) = withholding.items.iter_mut().find(|listed| owed(&listed.item, now)) else {
+            return;
+        };
+
+        if !budget.timely() {
+            return;
+        }
+
+        match self.withheld_deletion_step(listed, now, budget) {
+            Ok(Some(written)) => *listed = written,
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "forklift-aws-lambda: a deletion step for withheld content {} failed: {}",
+                listed.hash, error.message
+            ),
+        }
+    }
+
+    /// One deletion step for `listed`, under a lease its item holds, so two requests never run
+    /// one at once; the lease outlasts the request, so one that dies holding it leaves the step to
+    /// the first request after it ends.
+    ///
+    /// - Before [`late_sweep_due`], delete every staged copy. A blob's canonical copy waits for the
+    ///   late step, and a recipe's for the chunk ledger, which settling journaled it in.
+    /// - Once it is due, no request begun before the withhold is still running: for a blob not
+    ///   kept, walk every meta pallet's history and the adopted history for one naming it, saving
+    ///   the walk between requests. Named, it is kept; otherwise its canonical copy is deleted.
+    ///   Either is for good: a meta ref update never comes to name content that is neither
+    ///   ([`Head::refuse_meta_naming_withheld`]). Then delete every staged copy again, every response
+    ///   bundle written before [`response_cutoff`], and the item's work objects.
+    ///
+    /// # Returns
+    /// * `Ok(Some(Listed))` - The item as the step wrote it.
+    /// * `Ok(None)`         - Another request holds the step, or the item moved.
+    /// * `Err(HeadError)`   - A read, a write or a delete failed: the step stays owed.
+    fn withheld_deletion_step(&self, listed: &Listed, now: u64, budget: &mut Budget) -> HeadResult<Option<Listed>> {
+        let hash = &listed.hash;
+        let until = budget.deadline.map_or(now + INVOCATION_CEILING, epoch_seconds) + SWEEP_LEASE_MARGIN;
+        let leased = WithheldItem { lease_until: Some(until), ..listed.item.clone() };
+        let leased_state = withheld::encode(&leased);
+
+        if !self.write_items(&[ItemWrite { key: ItemKey::Withheld(hash), state: &leased_state, expected: Some(&listed.stored) }], budget)? {
+            return Ok(None);
+        }
+
+        let late = now >= late_sweep_due(leased.withheld_at);
+        let deleted = self.delete_withheld_copies(hash, &leased, late, budget);
+        let next = match &deleted {
+            Ok(Some(kept)) => WithheldItem { swept: true, kept: *kept, deleted: late, lease_until: None, ..leased.clone() },
+            Ok(None) | Err(_) => WithheldItem { lease_until: None, ..leased.clone() },
+        };
+
+        // Lost, the lease simply runs out, and the first request after it takes the step again.
+        let state = withheld::encode(&next);
+        let written = self.write_items(&[ItemWrite { key: ItemKey::Withheld(hash), state: &state, expected: Some(&leased_state) }], budget)?;
+
+        deleted?;
+        Ok(written.then(|| Listed { hash: hash.clone(), stored: state, item: next }))
+    }
+
+    /// Delete the copies the store keeps of `hash`, withheld as `item`, for the step
+    /// [`withheld_deletion_step`](Self::withheld_deletion_step) describes.
+    ///
+    /// # Returns
+    /// * `Ok(Some(kept))` - The step is done: whether the blob's canonical copy is kept.
+    /// * `Ok(None)`       - The walk for its keepers stopped part way; it is saved.
+    /// * `Err(HeadError)` - A read or a delete failed: the step stays owed.
+    fn delete_withheld_copies(&self, hash: &str, item: &WithheldItem, late: bool, budget: &mut Budget) -> HeadResult<Option<bool>> {
+        self.objects.delete_staged(hash).map_err(HeadError::internal)?;
+
+        if !late {
+            return Ok(Some(item.kept));
+        }
+
+        let kept = match item.kept || item.recipe {
+            true => item.kept,
+            false => match self.walk_keepers(hash, budget)? {
+                Keepers::Named => true,
+                Keepers::None => {
+                    self.objects.delete_canonical(hash).map_err(HeadError::internal)?;
+                    false
+                }
+                Keepers::Stopped(why) => {
+                    eprintln!("forklift-aws-lambda: {}", why);
+                    return Ok(None);
+                }
+            },
+        };
+
+        let cutoff = SystemTime::UNIX_EPOCH + Duration::from_secs(response_cutoff(item.withheld_at));
+        self.objects.delete_responses_before(cutoff).map_err(HeadError::internal)?;
+        self.objects.work_delete_under(&work_prefix(hash)).map_err(HeadError::internal)?;
+
+        Ok(Some(kept))
+    }
+
+    /// Whether meta history or the trust anchor's adopted history names the blob `hash`: walk the
+    /// history of every meta pallet's head, live or deleted, and of the anchor's adopts pin, from
+    /// the walk saved by an earlier request, within `budget`, saving it again when it stops part
+    /// way. The heads are read once, when the walk starts after [`late_sweep_due`]: a meta ref
+    /// update after that newly names no withheld content that is not kept, and every head it
+    /// leaves behind is in the history of the head it writes.
+    fn walk_keepers(&self, hash: &str, budget: &mut Budget) -> HeadResult<Keepers> {
+        let name = walk_name(hash);
+        let saved = self.objects.work_get(&name).map_err(HeadError::internal)?
+            .and_then(|bytes| decode_work::<SavedKeepers>(&bytes));
+
+        let (mut heads, mut walk) = match saved {
+            Some(saved) => (saved.heads, Some(saved.walk)),
+            None => (self.history_heads()?, None),
+        };
+
+        let scratch = self.scratch().map_err(HeadError::internal)?;
+        let stepped: Result<Option<bool>, String> = scratch.scoped(|| {
+            let objects = MirroredObjects::new(&self.objects);
+
+            loop {
+                let current = match &mut walk {
+                    Some(current) => current,
+                    None => match heads.pop() {
+                        Some(head) => walk.insert(HoldingWalk::of_history(&head)),
+                        None => return Ok(Some(false)),
+                    },
+                };
+
+                if !budget.spend() {
+                    return Ok(None);
+                }
+
+                match current.step_for_hash(hash, &objects)? {
+                    WalkProgress::Names => return Ok(Some(true)),
+                    WalkProgress::Clear => walk = None,
+                    WalkProgress::Going => {}
+                }
+            }
+        });
+
+        let why = match stepped {
+            Ok(Some(true)) => return Ok(Keepers::Named),
+            Ok(Some(false)) => return Ok(Keepers::None),
+            Ok(None) => format!("The walk for whether meta history names withheld content {} has not finished yet.", hash),
+            Err(why) => format!("Whether meta history names withheld content {} cannot be told yet: {}", hash, why),
+        };
+
+        // A walk the budget stopped between heads resumes at the next one.
+        let walk = match walk {
+            Some(walk) => walk,
+            None => match heads.pop() {
+                Some(head) => HoldingWalk::of_history(&head),
+                None => return Ok(Keepers::None),
+            },
+        };
+        let bytes = serde_json::to_vec(&SavedKeepers { version: WORK_VERSION, heads, walk })
+            .map_err(|error| HeadError::internal(format!("encoding a withheld item's walk failed: {}", error)))?;
+        self.objects.work_put(&name, &bytes).map_err(HeadError::internal)?;
+
+        Ok(Keepers::Stopped(why))
+    }
+
+    /// Every head whose history may name content a meta cell is verified by: each meta pallet's,
+    /// live or deleted, and the trust anchor's adopts pin, each once.
+    fn history_heads(&self) -> HeadResult<Vec<String>> {
+        let listing = self.refs.list_refs().map_err(HeadError::internal)?;
+        let mut heads: Vec<String> = listing.live.iter().chain(&listing.tombstones)
+            .filter(|(pallet, _)| pallet.namespace == PalletNamespace::Meta)
+            .map(|(_, head)| head.clone())
+            .collect();
+
+        if let Some((anchor, _)) = self.refs.get_trust().map_err(HeadError::internal)? {
+            heads.extend(anchor.adopts);
+        }
+
+        heads.sort();
+        heads.dedup();
+
+        Ok(heads)
+    }
+
+    /// Refuse a meta pallet's update to `new_head` from `old_head` that newly names withheld
+    /// content the late step may still delete: content no item records kept, as a file of a tree
+    /// in the parcels from `new_head` back to `old_head`, that `old_head`'s own tree does not name.
+    /// With no old head, nothing is named. Read before the ref is written, so a meta history never
+    /// comes to rest on a copy a sweep deletes. Its old head is meta history the late walk finds,
+    /// so the content it names stays named, and content only the old head's history names is
+    /// found there too: a parcel the update adds may name it again. An item added after this
+    /// listing is not late yet, and this request ends before it is.
+    ///
+    /// # Returns
+    /// * `Ok(())`         - The update newly names no such content.
+    /// * `Err(HeadError)` - It does (`451`, with the host's statement), or the items or an object
+    ///                      could not be read (`500`).
+    pub(super) fn refuse_meta_naming_withheld(&self, new_head: &str, old_head: Option<&str>, objects: &dyn WalkObjects) -> HeadResult<()> {
+        let listing = self.withheld_listing()?;
+        let guarded: HashMap<&str, &str> = listing.iter()
+            .filter(|listed| !listed.item.never_applies && !listed.item.kept)
+            .map(|listed| (listed.hash.as_str(), listed.item.statement.as_str()))
+            .collect();
+
+        if guarded.is_empty() {
+            return Ok(());
+        }
+
+        let mut trees: HashSet<String> = HashSet::new();
+        let mut named: HashSet<String> = HashSet::new();
+
+        if let Some(old_head) = old_head {
+            let root = objects.load_parcel(old_head).map_err(HeadError::internal)?.tree_hash;
+            walk_files(&root, objects, &mut trees, &mut |file| {
+                if guarded.contains_key(file) {
+                    named.insert(file.to_string());
+                }
+                None::<()>
+            }).map_err(HeadError::internal)?;
+        }
+
+        let mut parcels: HashSet<String> = HashSet::new();
+        let mut pending = vec![new_head.to_string()];
+
+        while let Some(parcel) = pending.pop() {
+            if Some(parcel.as_str()) == old_head || !parcels.insert(parcel.clone()) {
+                continue;
+            }
+
+            let parcel = objects.load_parcel(&parcel).map_err(HeadError::internal)?;
+            let found = walk_files(&parcel.tree_hash, objects, &mut trees, &mut |file| {
+                guarded.get(file).filter(|_| !named.contains(file)).map(|statement| (file.to_string(), statement.to_string()))
+            }).map_err(HeadError::internal)?;
+
+            if let Some((hash, statement)) = found {
+                return Err(HeadError::withheld(withholding::served_refusal(&hash, &statement)));
+            }
+
+            pending.extend(parcel.parents);
+        }
+
+        Ok(())
     }
 
     /// Record on the withheld item of `hash`, if there is one, that its recipe object has been

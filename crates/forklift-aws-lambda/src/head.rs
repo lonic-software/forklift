@@ -1118,7 +1118,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 // first. Settling that does not finish within the request is its own `503`, never
                 // the walk's `422`.
                 &|| {
-                    let withholding = self.withholding().map_err(|error| {
+                    let withholding = self.settled_withholding(&mut self.scan_budget()).map_err(|error| {
                         let message = error.message.clone();
                         unsettled.replace(Some(error));
                         message
@@ -1159,6 +1159,11 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                             .to_string(),
                     ));
                 }
+            }
+
+            // A meta pallet's update newly names no withheld content its late step may delete.
+            if is_meta {
+                self.refuse_meta_naming_withheld(&request.new_head, request.old_head.as_deref(), &MirroredObjects::new(&self.objects))?;
             }
 
             // Every head a user pallet takes can be checked out, judged against the old head or a
