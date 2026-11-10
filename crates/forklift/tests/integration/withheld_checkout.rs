@@ -500,6 +500,37 @@ fn a_merge_that_must_read_withheld_content_refuses_content_withheld() {
     }
 }
 
+/// A conflict over content left out refuses too: putting their withheld version back where we
+/// deleted the file, and keeping our withheld version where they deleted it.
+///
+/// Revert: drop the put-back arm, or the conflict arm, of the refusal → the first merges by
+/// reading the absent blob and dies with a store error, the second stages a conflict at a path
+/// holding no file → red.
+#[test]
+fn a_conflict_over_withheld_content_refuses_content_withheld() {
+    let refused = |warehouse: &Warehouse, args: &[&str]| {
+        let output = warehouse.run(&[args, &["--json"]].concat());
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!((output.status.code(), &report["error"]["code"]), (Some(51), &"content_withheld".into()), "{}", report);
+        assert_eq!(report["error"]["details"]["path"], "film.mkv", "{}", report);
+    };
+
+    let (warehouse, _) = withheld_feature("refuse-put-back");
+    warehouse.run_ok(&["remove", "film.mkv"]);
+    warehouse.run_ok(&["stack", "-m", "main deletes the film"]);
+    let before = warehouse.stocktake();
+    refused(&warehouse, &["consolidate", "feature"]);
+    assert_eq!(warehouse.stocktake(), before, "the merge changed nothing");
+
+    let (warehouse, _) = withheld_feature("refuse-keep-ours");
+    warehouse.run_ok(&["remove", "film.mkv"]);
+    warehouse.run_ok(&["stack", "-m", "main deletes the film"]);
+    std::fs::remove_file(warehouse.root.join("film.mkv")).unwrap();
+    warehouse.run_ok(&["shift", "feature"]);
+    refused(&warehouse, &["consolidate", "main"]);
+    assert_eq!(warehouse.stocktake()["unavailable_count"], 2, "the merge changed nothing");
+}
+
 /// Aborting a merge that stopped at a conflict puts back our version of a file it left out,
 /// without counting the path as a change to discard: no file standing there is what it wrote.
 ///
