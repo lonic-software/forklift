@@ -12,7 +12,8 @@
 //!
 //! An item applies from the moment it is added. It never applies when the store holds its hash
 //! as no file's content (a tree, a parcel or a chunk); a request learns which by settling it
-//! ([`Head::withholding`]), reading the object once and recording what it is. Settling a recipe
+//! ([`Head::withholding`]), reading the object once and recording what it is; one whose header
+//! this build cannot read is never recorded, so it applies and is read again by every request. Settling a recipe
 //! journals it in the chunk ledger in the same transaction, which is what gates its chunks (the
 //! chunk gate reads only the ledger, and a chunk request names no recipe). So every request that
 //! serves or takes objects settles every unsettled item before it answers, and answers `503`
@@ -36,7 +37,8 @@ use crate::error::{HeadError, HeadResult};
 use crate::store::{ItemKey, ItemWrite, ObjectStore, RefStore};
 use crate::withheld::{self, Listed, WithheldItem};
 
-/// Every withheld item of a warehouse, each settled: what one request read.
+/// Every withheld item of a warehouse, each settled but for one whose object's header cannot be
+/// read: what one request read.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Withholding {
     items: Vec<Listed>,
@@ -110,8 +112,8 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         withheld::list(&self.refs).map_err(HeadError::internal)
     }
 
-    /// Every withheld item, each settled first: what a request that serves or takes objects reads
-    /// before it answers.
+    /// Every withheld item, each settled first where its object can be read: what a request that
+    /// serves or takes objects reads before it answers.
     ///
     /// # Returns
     /// * `Ok(Withholding)` - Every item, settled, but for one whose object's header cannot be
