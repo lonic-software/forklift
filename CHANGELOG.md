@@ -151,6 +151,13 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   they do not make the bay unclean; `audit` and `heal` do not count staged ones as lost. `--json`
   schema is now 38.
 
+- **`clone`, `lower` and `scope fetch` take a head naming withheld content.** Content the remote's
+  host withholds, as for a legal takedown, is no longer asked for: a full, `--cache` or `--only`
+  clone, a `lower` and a `scope fetch` take the history without it, record it in the `unavailable`
+  record with the host's statement, and check the head out without the file, instead of failing
+  with `content_withheld`. A cache never fetches it when a head move needs the file, and `heal`
+  finishes an interrupted `lower` without it, removing the file's old version.
+
 - **`remote move` knows what the new origin withholds.** A cache or sparse warehouse moving to a
   server whose host withholds content it relies on its origin for no longer counts that content as
   held there. The move asks the previous origin: while that origin answers and does not withhold

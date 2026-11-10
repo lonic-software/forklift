@@ -243,6 +243,9 @@ The remote no longer serves that content, nor takes it, and nothing you do here 
 you already hold stays yours. The history that names the file is unchanged. Take the content from
 another remote that holds it, or ask the host about the statement.
 
+`clone`, `lower` and `scope fetch` do not stop here: they take the history without the content and
+check the head out without the file, which `forklift stocktake` then lists as not checked out.
+
 ### `merge_conflicts` (exit 47)
 
 `lower` merged the remote's diverged head into your pallet, and both sides changed the same paths.
