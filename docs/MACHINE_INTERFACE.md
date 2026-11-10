@@ -85,7 +85,13 @@ control and may leave stdout empty. A consumer that finds no document classifies
 exit status alone. Forklift has no prompt that handles a cancellation itself, so it never
 exits 130 on its own: Ctrl-C anywhere, the passphrase prompt included, is a death by signal.
 
-**Schema 32** (current): `audit`'s `scope`, when present (a `--full`, sparse or cache audit),
+**Schema 33** (current): `remote move`'s result carries `withheld`, the content this warehouse
+relies on its origin for that the new origin's host withholds (each `hash` and `statement`; empty
+when none), `previous_origin_withheld` (why the move went ahead regardless: `withholds`,
+`unrecorded` or `unreachable`) and `previous_origin_unreachable` (the previous origin's error).
+An `origin_move_incomplete` refusal may carry `details.withheld` and `details.withheld_count`.
+
+**Schema 32**: `audit`'s `scope`, when present (a `--full`, sparse or cache audit),
 carries `withheld`, the count of absent objects that the host of a served root withholds and no
 applied redaction names; it is omitted when none. Such an absence fails nothing.
 
@@ -676,6 +682,12 @@ stay, and change nothing a command reads. `next_step` says to copy the old origi
 new server, on the server's side, and run the move again. `details.missing` lists the objects not
 found, sorted, up to the first thousand, and `details.missing_count` counts them all; the message
 names the first ten.
+
+Content the new server's host withholds is not held there. When the previous origin still serves
+some that this warehouse relies on, the move refuses with the same code: `details.withheld` lists
+it, up to the first thousand, each as `hash` and the host's `statement`, `details.withheld_count`
+counts it, and `details.missing` is empty. `next_step` says to keep the previous origin while it
+serves that content.
 
 ```json
 "details": {

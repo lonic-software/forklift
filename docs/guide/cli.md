@@ -2265,6 +2265,17 @@ the move again. The heads recorded from earlier lowers (the fetched-heads ledger
 record above) are not checked: `scope fetch` and `scope prune` already ask the origin about each of them
 rather than trust it.
 
+Content the new server's host withholds (a legal takedown) is not held there, though its history
+names it. When this warehouse lacks such content and relies on its origin for it, the move asks the
+previous origin, dialed with the configured `remote.token`. While that origin answers and still
+serves the content, the move is refused with `origin_move_incomplete`, naming it in
+`details.withheld` (each `hash` with the host's `statement`). When the previous origin withholds it
+too, no previous origin is recorded, or it does not answer, the move goes ahead, since it deletes
+nothing and a dead origin would otherwise hold the warehouse for good. The report then lists the
+content in `withheld`, which the new origin will not supply, says why in
+`previous_origin_withheld` (`withholds`, `unrecorded` or `unreachable`), and gives the previous
+origin's error in `previous_origin_unreachable`.
+
 While the move runs, everything else that talks to the remote or changes what it checks refuses
 with `origin_move_pending` (above), and a second `remote move` refuses the same way. A move that fails
 before it starts rewriting the origin leaves the origin as it was and no record of the move; the parcels and

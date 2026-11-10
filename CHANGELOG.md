@@ -118,6 +118,12 @@ earns one is listed in the [contributor guide](docs/guide/contributing.md#8-keep
   copy is kept, an update to a meta pallet that would newly name it is refused `451`. A chunked file's chunks
   that only it names are deleted, and then its recipe, as for a redacted file.
 
+- **`remote move` knows what the new origin withholds.** A cache or sparse warehouse moving to a
+  server whose host withholds content it relies on its origin for no longer counts that content as
+  held there. The move asks the previous origin: while that origin still serves the content, the
+  move is refused with `origin_move_incomplete`, naming it in `details.withheld`; when it withholds
+  it too, is not recorded or does not answer, the move goes ahead and lists the content in
+  `withheld`, with why in `previous_origin_withheld`. `--json` schema is now 33.
 - **A forklift-server host can withhold content, as for a legal takedown.** `forklift-server
   withhold add --root … HASH --statement "…"` stops the server serving or taking a file's content
   at once: a read or upload of it is answered `451` with the host's statement; `withhold list`
